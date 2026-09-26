@@ -1,0 +1,11 @@
+{
+  "name": "limitless-local",
+  "owner": { "name": "Limitless" },
+  "plugins": [
+    {
+      "name": "limitless",
+      "source": "./claude-plugin",
+      "description": "Limitless factory MCP and delegation skill"
+    }
+  ]
+}
