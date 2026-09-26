@@ -509,3 +509,42 @@ describe("resume after restart", () => {
     }
   });
 });
+
+describe("repo cache concurrency", () => {
+  test("concurrent runs share one clone of a remote repo", async () => {
+    const { ensureCache } = await import("../src/git/repos.ts");
+    const origin = join(dir, "origin");
+    mkdirSync(origin);
+    writeFileSync(join(origin, "a.txt"), "a\n");
+    await sh(["git", "init", "-q", "-b", "main"], { cwd: origin });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "."], { cwd: origin });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], { cwd: origin });
+    const paths = {
+      home: dir,
+      db: "",
+      repos: join(dir, "repos"),
+      work: join(dir, "work"),
+      runs: "",
+      configDir: "",
+    };
+    const repo = {
+      id: "r",
+      slug: "o/origin",
+      kind: "github" as const,
+      url: origin,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr" as const,
+      createdAt: 0,
+    };
+    const caches = await Promise.all([
+      ensureCache(paths, repo),
+      ensureCache(paths, repo),
+      ensureCache(paths, repo),
+    ]);
+    for (const c of caches) {
+      const r = await sh(["git", "rev-parse", "origin/main"], { cwd: c });
+      expect(r.stdout.trim()).toHaveLength(40);
+    }
+  });
+});
