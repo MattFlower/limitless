@@ -776,6 +776,20 @@ export class Store {
     return (r.s as number) + (chat.s as number);
   }
 
+  providerSpendBetween(provider: string, since: number, before: number): number {
+    const invocation = this.db
+      .query(
+        "SELECT COALESCE(SUM(cost_usd),0) AS s FROM invocations WHERE provider = ? AND started_at >= ? AND started_at < ?",
+      )
+      .get(provider, since, before) as Row;
+    const chat = this.db
+      .query(
+        "SELECT COALESCE(SUM(cost_usd),0) AS s FROM chat_calls WHERE provider = ? AND started_at >= ? AND started_at < ?",
+      )
+      .get(provider, since, before) as Row;
+    return (invocation.s as number) + (chat.s as number);
+  }
+
   // ---- events --------------------------------------------------------------
 
   addEvent(ev: {
@@ -1033,6 +1047,24 @@ export class Store {
         row.consecutiveFailures,
         Date.now(),
       );
+  }
+
+  putOpenRouterReading(reading: {
+    usage: number;
+    at: number;
+    limit: number | null;
+    remaining: number | null;
+    reset: string | null;
+  }): void {
+    this.db
+      .query(
+        `INSERT INTO provider_state (provider, state, updated_at, reported_usage_usd, reported_at, key_limit, limit_remaining, limit_reset)
+       VALUES ('openrouter', 'ok', ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(provider) DO UPDATE SET reported_usage_usd = excluded.reported_usage_usd,
+         reported_at = excluded.reported_at, key_limit = excluded.key_limit,
+         limit_remaining = excluded.limit_remaining, limit_reset = excluded.limit_reset`,
+      )
+      .run(reading.at, reading.usage, reading.at, reading.limit, reading.remaining, reading.reset);
   }
 
   publishProvider(msg: Extract<StreamMessage, { kind: "provider" }>): void {

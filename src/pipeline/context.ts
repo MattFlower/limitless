@@ -214,6 +214,11 @@ export class RunContext {
       if (!harness) throw new Error(`No harness registered for ${target.harness}`);
 
       const release = await tracker.acquire(target.provider, this.signal);
+      if (!(await tracker.preflight(target.provider))) {
+        release();
+        lastFailure = `${target.modelId}: no capacity after provider refresh`;
+        continue;
+      }
       const invocation = store.createInvocation({
         runId: this.run.id,
         stageId: opts.stage.id,

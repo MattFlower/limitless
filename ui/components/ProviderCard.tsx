@@ -69,5 +69,36 @@ export const ProviderCard: Component<{ provider: ProviderStatus }> = (props) => 
         </Show>
       </div>
     </Show>
+    <Show when={props.provider.id === "openrouter"}>
+      <div class="provider-meta">
+        <span>
+          estimated (30d) {money(props.provider.spendUsd ?? 0)} vs reported (monthly){" "}
+          {props.provider.reportedUsageUsd === null || props.provider.reportedUsageUsd === undefined
+            ? "unavailable"
+            : money(props.provider.reportedUsageUsd)}
+        </span>
+      </div>
+      <div class="provider-meta">
+        <span>
+          reading{" "}
+          {props.provider.reportedAt === null || props.provider.reportedAt === undefined
+            ? "unavailable"
+            : new Date(props.provider.reportedAt).toLocaleString()}
+        </span>
+      </div>
+      <div class="provider-meta">
+        <span>
+          key limit{" "}
+          {props.provider.limit === null || props.provider.limit === undefined
+            ? "unavailable"
+            : money(props.provider.limit)}{" "}
+          · remaining{" "}
+          {props.provider.limitRemaining === null || props.provider.limitRemaining === undefined
+            ? "unavailable"
+            : money(props.provider.limitRemaining)}{" "}
+          · reset {props.provider.limitReset ?? "unavailable"}
+        </span>
+      </div>
+    </Show>
   </div>
 );

@@ -33,6 +33,8 @@ export interface FactoryOptions {
     clear: (timer: ReturnType<typeof setInterval>) => void;
   };
   clock?: () => number;
+  fetch?: typeof fetch;
+  providerTimer?: { set: typeof setInterval; clear: typeof clearInterval };
 }
 
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
@@ -66,6 +68,8 @@ export class Factory {
       cfg.secrets,
       { openrouter: cfg.openrouterBudgetUsd },
       opts.clock,
+      opts.fetch,
+      opts.providerTimer,
     );
     this.router = new Router(
       this.tracker,
@@ -100,6 +104,7 @@ export class Factory {
         .then((result) => this.reportGc(result))
         .catch((error) => console.error(`[gc] ${(error as Error).message}`));
     }, 60 * 60_000);
+    this.tracker.start();
     // Only forward to servers we can actually authenticate against.
     this.tunnels.start(
       this.providerDefs
@@ -110,6 +115,7 @@ export class Factory {
   }
 
   async stop(): Promise<void> {
+    this.tracker.stop();
     if (this.gcInterval) this.gcTimer.clear(this.gcInterval);
     this.gcInterval = null;
     await this.gcInFlight;
