@@ -15,6 +15,7 @@ Usage:
   limitless cancel <run>                  Cancel a run
   limitless answer <run> "<text>"         Answer a run's open question(s)
   limitless providers                     Provider health and quota
+  limitless providers enable|disable <id>  Change runtime provider availability
   limitless gc [--dry-run]                Clean up expired worktrees, logs and debug events
   limitless mcp                           MCP stdio proxy (daemon must be running)
   limitless integrations install [--write] Print setup; --write installs the Codex skill
@@ -196,6 +197,11 @@ async function main(): Promise<void> {
         llamaBinary:
           typeof local.twilight_llama_binary === "string" ? local.twilight_llama_binary : undefined,
         secrets: cfg.secrets,
+        setEnabled: async (id, enabled) => {
+          await api(`/api/providers/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}`, {
+            method: "POST",
+          });
+        },
       });
       for (const [name, state] of Object.entries(report))
         console.log(`${name}: service ${state.service}; endpoint ${state.endpoint}`);
@@ -304,6 +310,17 @@ async function main(): Promise<void> {
       });
     }
     case "providers": {
+      if (rest.length) {
+        const [action, id] = rest;
+        if (rest.length !== 2 || (action !== "enable" && action !== "disable") || !id)
+          throw new Error("usage: limitless providers enable|disable <id>");
+        const provider = await api<import("../core/types.ts").ProviderStatus>(
+          `/api/providers/${encodeURIComponent(id)}/${action}`,
+          { method: "POST" },
+        );
+        console.log(`${provider.id}: ${provider.state}${provider.reason ? ` (${provider.reason})` : ""}`);
+        return;
+      }
       const ps =
         await api<
           {

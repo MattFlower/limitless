@@ -103,6 +103,15 @@ export function getProviders(): Promise<ProviderStatus[]> {
   return request<ProviderStatus[]>("/api/providers");
 }
 
+export function setProviderEnabled(id: string, enabled: boolean): Promise<ProviderStatus> {
+  return request<ProviderStatus>(
+    `/api/providers/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}`,
+    {
+      method: "POST",
+    },
+  );
+}
+
 export function getAlerts(): Promise<QuotaAlert[]> {
   return request<QuotaAlert[]>("/api/alerts");
 }

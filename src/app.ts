@@ -36,6 +36,7 @@ export interface FactoryOptions {
   clock?: () => number;
   fetch?: typeof fetch;
   providerTimer?: { set: typeof setInterval; clear: typeof clearInterval };
+  healthFetch?: typeof fetch;
 }
 
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
@@ -71,6 +72,7 @@ export class Factory {
       opts.clock,
       opts.fetch,
       opts.providerTimer,
+      opts.healthFetch,
     );
     this.router = new Router(
       this.tracker,

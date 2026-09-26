@@ -1119,4 +1119,13 @@ export class Store {
       )
       .run(key, JSON.stringify(value));
   }
+
+  getProviderEnabledOverride(id: string): boolean | null {
+    const value = this.getSetting<unknown>(`provider_enabled:${id}`, null);
+    return typeof value === "boolean" ? value : null;
+  }
+
+  setProviderEnabledOverride(id: string, enabled: boolean): void {
+    this.setSetting(`provider_enabled:${id}`, enabled);
+  }
 }

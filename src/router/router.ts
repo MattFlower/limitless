@@ -132,7 +132,7 @@ export class Router {
         }
         const why = this.tracker.unavailableReason(m.provider) ?? this.tracker.modelUnavailableReason(m.id);
         if (why) {
-          skipped.push({ modelId: id, reason: `${m.provider}: ${why}` });
+          skipped.push({ modelId: id, reason: why === "disabled" ? "disabled" : `${m.provider}: ${why}` });
           continue;
         }
         group.push(m);
