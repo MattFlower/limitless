@@ -14,7 +14,8 @@ Usage:
   limitless cancel <run>                  Cancel a run
   limitless answer <run> "<text>"         Answer a run's open question(s)
   limitless providers                     Provider health and quota
-  limitless service install|uninstall|status   Manage the launchd daemon + tunnel
+  limitless service install [--tunnel] [--no-mtplx]   launchd agents: daemon, mtplx (+ tunnel)
+  limitless service uninstall|status
   limitless deploy [ref]                  Deploy a ref (default origin/main) to the release checkout
 
 Environment: LIMITLESS_URL (default http://127.0.0.1:7400)`;
@@ -149,6 +150,8 @@ async function main(): Promise<void> {
       status: { type: "string", short: "s" },
       n: { type: "string", short: "n" },
       help: { type: "boolean", short: "h" },
+      tunnel: { type: "boolean" },
+      "no-mtplx": { type: "boolean" },
     },
   });
   const [cmd, ...rest] = positionals;
@@ -239,7 +242,9 @@ async function main(): Promise<void> {
     case "service": {
       const svc = await import("./service.ts");
       const port = Number(process.env.LIMITLESS_PORT ?? 7400);
-      if (rest[0] === "install") return svc.install(port);
+      if (rest[0] === "install") {
+        return svc.install(port, { tunnel: values.tunnel === true, mtplx: values["no-mtplx"] !== true });
+      }
       if (rest[0] === "uninstall") return svc.uninstall();
       return svc.status(port);
     }

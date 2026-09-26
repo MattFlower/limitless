@@ -5,6 +5,9 @@ import { sh } from "../util/proc.ts";
 
 const LABEL = "cc.mattflower.limitless";
 const TUNNEL_LABEL = "cc.mattflower.limitless-tunnel";
+const MTPLX_LABEL = "cc.mattflower.limitless-mtplx";
+const MTPLX_MODEL = process.env.LIMITLESS_MTPLX_MODEL ?? "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality";
+const ALL_LABELS = [LABEL, MTPLX_LABEL, TUNNEL_LABEL];
 const REPO_URL = "git@github.com:MattFlower/limitless.git";
 
 const home = homedir();
@@ -15,6 +18,7 @@ const uid = userInfo().uid;
 const PATH = [
   join(home, ".local", "bin"),
   join(home, ".bun", "bin"),
+  join(home, ".mtplx", "bin"),
   "/opt/homebrew/bin",
   "/usr/local/bin",
   "/usr/bin",
@@ -100,7 +104,7 @@ async function health(port: number, timeoutMs = 30_000): Promise<boolean> {
   return false;
 }
 
-export async function install(port: number): Promise<void> {
+export async function install(port: number, opts: { tunnel?: boolean; mtplx?: boolean } = {}): Promise<void> {
   mkdirSync(logDir, { recursive: true });
   mkdirSync(agentsDir, { recursive: true });
   await ensureRelease();
@@ -108,7 +112,29 @@ export async function install(port: number): Promise<void> {
   const units: [string, string][] = [
     [LABEL, plist(LABEL, [join(home, ".bun", "bin", "bun"), join(appDir, "src", "cli", "main.ts"), "serve"])],
   ];
-  const tunnel = tunnelConfig(port);
+  if (opts.mtplx !== false) {
+    units.push([
+      MTPLX_LABEL,
+      plist(MTPLX_LABEL, [
+        join(home, ".mtplx", "bin", "mtplx"),
+        "serve",
+        "--model",
+        MTPLX_MODEL,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+        "--api-key",
+        "mtplx-local",
+        "--batching-preset",
+        "agent",
+        "--yes",
+      ]),
+    ]);
+  }
+  // The public tunnel is opt-in: only once webhook authentication is in place.
+  const tunnel = opts.tunnel ? tunnelConfig(port) : null;
+  if (opts.tunnel && !tunnel) console.warn("no cloudflared credentials found; skipping tunnel");
   if (tunnel) {
     units.push([
       TUNNEL_LABEL,
@@ -126,7 +152,7 @@ export async function install(port: number): Promise<void> {
 }
 
 export async function uninstall(): Promise<void> {
-  for (const label of [LABEL, TUNNEL_LABEL]) {
+  for (const label of ALL_LABELS) {
     if (await loaded(label)) await launchctl(["bootout", `gui/${uid}/${label}`]);
     const path = join(agentsDir, `${label}.plist`);
     if (existsSync(path)) unlinkSync(path);
@@ -169,8 +195,7 @@ export async function deploy(port: number, ref = "origin/main"): Promise<void> {
 }
 
 export async function status(port: number): Promise<void> {
-  for (const label of [LABEL, TUNNEL_LABEL])
-    console.log(`${label}: ${(await loaded(label)) ? "loaded" : "not loaded"}`);
+  for (const label of ALL_LABELS) console.log(`${label}: ${(await loaded(label)) ? "loaded" : "not loaded"}`);
   if (existsSync(join(appDir, ".git"))) {
     const head = (await sh(["git", "log", "-1", "--format=%h %s"], { cwd: appDir })).stdout.trim();
     console.log(`release: ${head}`);
