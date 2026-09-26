@@ -129,7 +129,7 @@ async function serve(): Promise<void> {
     console.log(`\n${sig}: stopping (active runs will resume on restart)...`);
     await integrations.stop();
     await factory.stop();
-    server.stop(true);
+    await server.stop(true);
     factory.store.close();
     process.exit(0);
   };

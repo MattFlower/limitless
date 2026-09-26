@@ -1,4 +1,5 @@
-import type { RunContext } from "./context.ts";
+import type { Invocation } from "../core/types.ts";
+import type { RunContext, RunState } from "./context.ts";
 
 function money(n: number): string {
   return n === 0 ? "$0" : n < 0.01 ? "<$0.01" : `$${n.toFixed(2)}`;
@@ -8,97 +9,132 @@ function escapeCell(s: string): string {
   return s.replace(/\|/g, "\\|").replace(/\n+/g, " ").slice(0, 300);
 }
 
-/** Markdown evidence report used as the PR body and stored as the run's report artifact. */
-export function buildReport(ctx: RunContext, success: boolean): string {
-  const { run, state } = ctx;
-  const out: string[] = [];
-  out.push(
-    success
+function table(header: string[], rows: string[][]): string {
+  return [
+    `| ${header.join(" | ")} |`,
+    `|${header.map(() => "---").join("|")}|`,
+    ...rows.map((r) => `| ${r.join(" | ")} |`),
+  ].join("\n");
+}
+
+export interface ReportInput {
+  success: boolean;
+  runId: string;
+  prompt: string;
+  state: Pick<
+    RunState,
+    "implementerReport" | "spec" | "lastVerify" | "lastGates" | "lastReview" | "lastAudit"
+  >;
+  invocations: Invocation[];
+  totals: { costUsd: number; costEquivUsd: number };
+  runUrl: string;
+}
+
+/** Markdown evidence report used as the PR body. Each block is one markdown element. */
+export function renderReport(input: ReportInput): string {
+  const { state } = input;
+  const blocks: string[] = [
+    input.success
       ? "Built by **Limitless** — every gate below passed."
       : "⚠️ Built by **Limitless** but it **needs a human**: the checks below did not all pass.",
-  );
-
-  out.push(
     "## Request",
-    run.prompt
+    input.prompt
       .split("\n")
       .map((l) => `> ${l}`)
       .join("\n"),
-  );
+  ];
 
-  if (state.implementerReport) {
-    out.push("## Implementer's summary", state.implementerReport.trim().slice(0, 5000));
-  }
+  if (state.implementerReport)
+    blocks.push("## Implementer's summary", state.implementerReport.trim().slice(0, 5000));
 
   if (state.spec) {
-    out.push("## Acceptance criteria");
     const verify = state.lastVerify;
-    out.push("| | Criterion | Evidence |", "|---|---|---|");
-    for (const ac of state.spec.acceptance_criteria) {
-      const v = verify?.criteria.find((c) => c.id === ac.id);
-      const icon = !v ? "·" : v.status === "met" ? "✅" : v.status === "unmet" ? "❌" : "❔";
-      out.push(
-        `| ${icon} ${ac.id} | ${escapeCell(ac.criterion)} | ${escapeCell(v?.evidence ?? "not verified")} |`,
-      );
-    }
-    if (verify) out.push(`\nVerified by \`${verify.modelId}\` (a different session than the implementer).`);
+    blocks.push(
+      "## Acceptance criteria",
+      table(
+        ["", "Criterion", "Evidence"],
+        state.spec.acceptance_criteria.map((ac) => {
+          const v = verify?.criteria.find((c) => c.id === ac.id);
+          const icon = !v ? "·" : v.status === "met" ? "✅" : v.status === "unmet" ? "❌" : "❔";
+          return [`${icon} ${ac.id}`, escapeCell(ac.criterion), escapeCell(v?.evidence ?? "not verified")];
+        }),
+      ),
+    );
+    if (verify) blocks.push(`Verified by \`${verify.modelId}\` in a separate session from the implementer.`);
     if (state.spec.assumptions.length) {
-      out.push("\n**Assumptions**", ...state.spec.assumptions.map((a) => `- ${a}`));
+      blocks.push("**Assumptions**", state.spec.assumptions.map((a) => `- ${a}`).join("\n"));
     }
   }
 
+  blocks.push("## Checks");
   if (state.lastGates?.length) {
-    out.push("## Checks", "| Check | Result | Command |", "|---|---|---|");
-    for (const g of state.lastGates) {
-      const icon = g.blocking ? "❌" : g.verdict === "still_failing" ? "⚠️" : "✅";
-      out.push(
-        `| ${g.name} | ${icon} ${g.verdict.replace("_", " ")} | \`${escapeCell(g.result.command)}\` |`,
-      );
-    }
+    blocks.push(
+      table(
+        ["Check", "Result", "Command"],
+        state.lastGates.map((g) => {
+          const icon = g.blocking ? "❌" : g.verdict === "still_failing" ? "⚠️" : "✅";
+          return [g.name, `${icon} ${g.verdict.replace("_", " ")}`, `\`${escapeCell(g.result.command)}\``];
+        }),
+      ),
+    );
   } else {
-    out.push("## Checks", "No automated checks were detected for this repository.");
+    blocks.push("No automated checks were detected for this repository.");
   }
 
   if (state.lastReview) {
     const r = state.lastReview;
-    out.push(`## Code review (\`${r.modelId}\`)`, `**${r.verdict}** — ${r.summary}`);
+    blocks.push(`## Code review (\`${r.modelId}\`)`, `**${r.verdict}** — ${r.summary}`);
     if (r.findings.length) {
-      out.push(
-        ...r.findings.map(
-          (f) => `- ${f.severity}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title}`,
-        ),
+      blocks.push(
+        r.findings
+          .map(
+            (f) =>
+              `- ${f.severity}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title}`,
+          )
+          .join("\n"),
       );
     }
   }
 
-  const warnings = state.lastAudit ?? [];
-  if (warnings.length) {
-    out.push(
+  const audit = state.lastAudit ?? [];
+  if (audit.length) {
+    blocks.push(
       "## Audit flags",
-      ...warnings.map((f) => `- ${f.severity} [${f.rule}] ${f.file ? `${f.file}: ` : ""}${f.detail}`),
+      audit.map((f) => `- ${f.severity} [${f.rule}] ${f.file ? `${f.file}: ` : ""}${f.detail}`).join("\n"),
     );
   }
 
-  const invocations = ctx.store.listInvocations(run.id);
-  if (invocations.length) {
-    out.push(
+  if (input.invocations.length) {
+    blocks.push(
       "## Work log",
-      "| Role | Model | Status | Tokens in/out | Cost | Duration |",
-      "|---|---|---|---|---|---|",
-    );
-    for (const inv of invocations) {
-      const dur = inv.finishedAt ? `${Math.round((inv.finishedAt - inv.startedAt) / 1000)}s` : "–";
-      const cost = inv.costUsd > 0 ? money(inv.costUsd) : `${money(inv.costEquivUsd)} equiv.`;
-      out.push(
-        `| ${inv.role} | \`${inv.modelId}\` | ${inv.status} | ${(inv.inputTokens + inv.cacheReadTokens).toLocaleString()} / ${inv.outputTokens.toLocaleString()} | ${cost} | ${dur} |`,
-      );
-    }
-    const latest = ctx.store.getRun(run.id) ?? run;
-    out.push(
-      `\n**Total:** ${money(latest.costUsd)} spent, ${money(latest.costEquivUsd)} API-equivalent on subscriptions.`,
+      table(
+        ["Role", "Model", "Status", "Tokens in / out", "Cost", "Duration"],
+        input.invocations.map((inv) => [
+          inv.role,
+          `\`${inv.modelId}\``,
+          inv.status,
+          `${(inv.inputTokens + inv.cacheReadTokens).toLocaleString("en-US")} / ${inv.outputTokens.toLocaleString("en-US")}`,
+          inv.costUsd > 0 ? money(inv.costUsd) : `${money(inv.costEquivUsd)} equiv.`,
+          inv.finishedAt ? `${Math.round((inv.finishedAt - inv.startedAt) / 1000)}s` : "–",
+        ]),
+      ),
+      `**Total:** ${money(input.totals.costUsd)} spent, ${money(input.totals.costEquivUsd)} API-equivalent on subscriptions.`,
     );
   }
 
-  out.push("", `Run \`${run.id}\` · ${ctx.deps.cfg.uiUrl}/runs/${run.id}`, "", "🤖 Generated by Limitless");
-  return out.join("\n\n").replace(/\n{3,}/g, "\n\n");
+  blocks.push(`Run \`${input.runId}\` · ${input.runUrl}`, "🤖 Generated by Limitless");
+  return `${blocks.join("\n\n")}\n`;
+}
+
+export function buildReport(ctx: RunContext, success: boolean): string {
+  const latest = ctx.store.getRun(ctx.run.id) ?? ctx.run;
+  return renderReport({
+    success,
+    runId: ctx.run.id,
+    prompt: ctx.run.prompt,
+    state: ctx.state,
+    invocations: ctx.store.listInvocations(ctx.run.id),
+    totals: { costUsd: latest.costUsd, costEquivUsd: latest.costEquivUsd },
+    runUrl: `${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}`,
+  });
 }
