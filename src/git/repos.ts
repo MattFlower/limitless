@@ -252,10 +252,20 @@ export async function createPullRequest(
 }
 
 /** Merge now if possible; if branch protection requires checks, enable auto-merge instead. */
-export async function mergePullRequest(prUrl: string, cwd: string): Promise<"merged" | "auto" | "failed"> {
-  const now = await sh(["gh", "pr", "merge", prUrl, "--squash", "--delete-branch"], { cwd, allowFail: true });
+export async function mergePullRequest(
+  prUrl: string,
+  cwd: string,
+  title?: string,
+): Promise<"merged" | "auto" | "failed"> {
+  // Squash with the PR title as the subject, not the first round's commit message.
+  const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
+  const subject = title ? ["--subject", number ? `${title} (#${number})` : title] : [];
+  const now = await sh(["gh", "pr", "merge", prUrl, "--squash", "--delete-branch", ...subject], {
+    cwd,
+    allowFail: true,
+  });
   if (now.exitCode === 0) return "merged";
-  const auto = await sh(["gh", "pr", "merge", prUrl, "--squash", "--auto", "--delete-branch"], {
+  const auto = await sh(["gh", "pr", "merge", prUrl, "--squash", "--auto", "--delete-branch", ...subject], {
     cwd,
     allowFail: true,
   });
