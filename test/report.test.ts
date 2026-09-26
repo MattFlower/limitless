@@ -77,3 +77,17 @@ test("needs-human report says so", () => {
   });
   expect(md).toContain("needs a human");
 });
+
+test("reports for runs started from an issue close it", () => {
+  const md = renderReport({
+    success: true,
+    runId: "r3",
+    prompt: "x",
+    state: {},
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "u",
+    closesIssue: 3,
+  });
+  expect(md).toContain("Closes #3");
+});
