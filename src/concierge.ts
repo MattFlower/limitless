@@ -98,6 +98,7 @@ export class Concierge {
         await this.execute(conversationId, action, origin);
       }
     } catch (error) {
+      if (request.type === "confirm") store.resetChatConfirmation(conversationId, request.proposalId);
       store.addChatMessage(conversationId, "assistant", (error as Error).message, { error: true });
     }
     return this.history(conversationId);

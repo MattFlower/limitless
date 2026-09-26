@@ -434,6 +434,23 @@ export class Store {
     });
   }
 
+  resetChatConfirmation(conversationId: string, id: string): void {
+    this.chatTransaction(() => {
+      const proposal = this.chatProposal(conversationId, id);
+      // Creation can fail before consumption; never undo a committed run linkage.
+      if (proposal.state !== "confirmed" || proposal.runId) return;
+      this.db.query("UPDATE chat_proposals SET state = 'pending', confirmed_at = NULL WHERE id = ?").run(id);
+      this.addChatMessage(
+        conversationId,
+        "assistant",
+        "Run creation failed. Edit or confirm the proposal to retry.",
+        {
+          proposal: this.chatProposal(conversationId, id),
+        },
+      );
+    });
+  }
+
   createChatRun(repo: Repo, req: CreateRunRequest, conversationId: string, proposalId: string): Run {
     return this.chatTransaction(() => {
       const proposal = this.chatProposal(conversationId, proposalId);

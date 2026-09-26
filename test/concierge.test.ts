@@ -214,12 +214,96 @@ test("failed atomic consumption rolls back the run and emits no run link, allowi
   expect(failed.messages.at(-1)?.content).toContain("storage failure");
   expect(f.factory.store.listRuns()).toHaveLength(0);
   expect(events).toEqual([]);
-  expect(failed.proposals[0]?.state).toBe("confirmed");
+  expect(failed.proposals[0]).toMatchObject({ state: "pending", confirmedAt: null, runId: null });
   f.factory.store.db.exec("DROP TRIGGER reject_consumption");
   await f.factory.concierge.submit("one", { type: "confirm", proposalId: proposal.id });
   expect(f.factory.store.listRuns()).toHaveLength(1);
   expect(events).toHaveLength(2);
   unsubscribe();
+});
+
+test.each(["chat", "discord"] as const)(
+  "%s repository resolution failure allows editing and requires fresh confirmation after reopen",
+  async (source) => {
+    const origin = { source, requestedBy: "owner" };
+    f.action({ type: "propose_run", ...proposalFields, repo: "not a repo!!" });
+    const history = await f.factory.concierge.submit("one", { type: "text", text: "Build this" }, origin);
+    const proposal = history.proposals[0];
+    if (!proposal) throw new Error("missing proposal");
+    const states: string[] = [];
+    const unsubscribe = f.factory.store.subscribe((msg) => {
+      if (msg.kind === "chat" && msg.message.outcome?.proposal) {
+        const update = msg.message.outcome.proposal;
+        expect(f.factory.store.chatProposal("one", update.id)).toEqual(update);
+        states.push(update.state);
+      }
+    });
+    const failed = await f.factory.concierge.submit(
+      "one",
+      { type: "confirm", proposalId: proposal.id },
+      origin,
+    );
+    unsubscribe();
+    expect(failed.messages.at(-1)?.content).toContain("Cannot parse repo");
+    expect(failed.messages.at(-1)?.outcome?.error).toBe(true);
+    expect(states).toEqual(["confirmed", "pending"]);
+    expect(failed.proposals[0]).toMatchObject({ state: "pending", confirmedAt: null, runId: null });
+    expect(f.factory.store.listRuns()).toHaveLength(0);
+    f.reopen();
+    expect(f.factory.store.chatProposal("one", proposal.id).state).toBe("pending");
+    const edited = await f.factory.concierge.submit(
+      "one",
+      { type: "edit", proposalId: proposal.id, proposal: proposalFields },
+      origin,
+    );
+    const revised = edited.proposals.at(-1);
+    if (!revised) throw new Error("missing revised proposal");
+    expect(revised.id).not.toBe(proposal.id);
+    expect(revised).toMatchObject({ ...proposalFields, state: "pending", confirmedAt: null });
+    expect(f.factory.store.listRuns()).toHaveLength(0);
+    await expect(
+      f.factory.concierge.submit("one", { type: "confirm", proposalId: proposal.id }, origin),
+    ).rejects.toThrow("no longer pending");
+    await f.factory.concierge.submit("one", { type: "confirm", proposalId: revised.id }, origin);
+    expect(f.factory.store.listRuns()).toHaveLength(1);
+    expect(f.factory.store.listRuns()[0]).toMatchObject({
+      repoSlug: proposalFields.repo,
+      prompt: proposalFields.prompt,
+      profile: proposalFields.profile,
+      title: proposalFields.title,
+      source,
+      requestedBy: "owner",
+    });
+    f.reopen();
+    await f.factory.concierge.submit("one", { type: "confirm", proposalId: revised.id }, origin);
+    expect(f.factory.store.listRuns()).toHaveLength(1);
+  },
+);
+
+test("a new model proposal can replace a proposal whose repository failed resolution", async () => {
+  f.action({ type: "propose_run", ...proposalFields, repo: "not a repo!!" });
+  const proposal = (await send()).proposals[0];
+  if (!proposal) throw new Error("missing proposal");
+  await f.factory.concierge.submit("one", { type: "confirm", proposalId: proposal.id });
+  const replacement = await propose();
+  expect(replacement).toMatchObject({ ...proposalFields, state: "pending", confirmedAt: null });
+  expect(f.factory.store.chatProposal("one", proposal.id).state).toBe("superseded");
+  expect(f.factory.store.listRuns()).toHaveLength(0);
+});
+
+test("a failure after consumption preserves the committed run and cannot re-enable confirmation", async () => {
+  const proposal = await propose();
+  const addEvent = spyOn(f.factory.store, "addEvent").mockImplementation(() => {
+    throw new Error("simulated log failure");
+  });
+  const failed = await f.factory.concierge.submit("one", { type: "confirm", proposalId: proposal.id });
+  addEvent.mockRestore();
+  expect(failed.messages.at(-1)?.content).toContain("log failure");
+  expect(failed.proposals[0]?.state).toBe("consumed");
+  expect(failed.proposals[0]?.runId).toBe(f.factory.store.listRuns()[0]?.id);
+  f.reopen();
+  await f.factory.concierge.submit("one", { type: "confirm", proposalId: proposal.id });
+  expect(f.factory.store.listRuns()).toHaveLength(1);
 });
 
 test("provider concurrency is shared across conversations, fallback is bounded and chat costs count", async () => {
