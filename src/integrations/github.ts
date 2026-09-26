@@ -41,6 +41,7 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
   if (!p || !fullName || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(fullName))
     return { note: "malformed repository identity", error: true };
   if (!owner) return { note: "GitHub owner is not configured" };
+  if (fullName.split("/")[0] !== owner) return { note: "repository owner is not configured owner" };
   const base = { repo: fullName, source: "github" as const };
   const issue = object(p.issue);
   const pr = object(p.pull_request);

@@ -170,6 +170,37 @@ test("maps all Dependabot actions to quick existing-branch delivery", async () =
   }
 });
 
+test.each([
+  ["issues", "github-issue.json"],
+  ["issue_comment", "github-comment.json"],
+  ["pull_request", "github-pr.json"],
+])("ignores %s for another repository owner despite allowed actor logins", async (event, file) => {
+  const foreignRepo = "other-owner/limitless";
+  store.upsertRepo({
+    slug: foreignRepo,
+    kind: "github",
+    url: "unused",
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  // Keep allowed actors and PR head/base identities; only the canonical owner differs.
+  const payload = JSON.parse(fixture(file).replaceAll("MattFlower/limitless", foreignRepo)) as Record<
+    string,
+    unknown
+  >;
+  payload.repository = { full_name: foreignRepo, owner: { login: cfg.githubOwner } };
+  const h = handler();
+  const body = JSON.stringify(payload);
+  expect((await h(request(body, "foreign-owner", true, event))).status).toBe(200);
+  expect((await h(request(body, "foreign-owner", true, event))).status).toBe(200);
+  expect(requests).toHaveLength(0);
+  expect(store.listRuns()).toHaveLength(0);
+  expect(store.db.query("SELECT status, note, run_id FROM inbox").all()).toEqual([
+    { status: "ignored", note: "repository owner is not configured owner", run_id: null },
+  ]);
+});
+
 test("filters unsupported, unauthorized, wrong label, malformed and fork payloads", async () => {
   const issue = JSON.parse(fixture("github-issue.json")) as Record<string, unknown>;
   const pr = JSON.parse(fixture("github-pr.json")) as Record<string, unknown>;
@@ -217,7 +248,6 @@ test("filters unsupported, unauthorized, wrong label, malformed and fork payload
   expect(requests).toHaveLength(0);
   expect(mapGitHubEvent("ping", issue, "MattFlower").request).toBeUndefined();
   expect(
-    mapGitHubEvent("issues", { ...issue, repository: { full_name: "some-org/project" } }, "MattFlower")
-      .request?.repo,
-  ).toBe("some-org/project");
+    mapGitHubEvent("issues", { ...issue, repository: { full_name: "some-org/project" } }, "MattFlower"),
+  ).toEqual({ note: "repository owner is not configured owner" });
 });
