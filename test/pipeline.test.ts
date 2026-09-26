@@ -755,3 +755,73 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(f.store.getRun(run.id)?.error).toContain("Still failing");
   });
 });
+
+test("drain blocks queued starts across ticks and completion without pausing active stages", async () => {
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let entered = () => {};
+  const atTriage = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let firstSignal: AbortSignal | undefined;
+  let calls = 0;
+  const f = start(async (s) => {
+    if (roleOf(s) === "triage") {
+      calls++;
+      if (calls === 1) {
+        firstSignal = s.signal;
+        entered();
+        await held;
+      }
+      return { structured: triage({ suggested_profile: "quick" }) };
+    }
+    if (roleOf(s) === "review") return { structured: approve };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  try {
+    const first = await f.createRun({ repo: repoDir, prompt: "change" });
+    await atTriage;
+    expect(f.scheduler.draining).toBe(false);
+    f.scheduler.drain();
+    f.scheduler.drain();
+    const queued = await f.createRun({ repo: repoDir, prompt: "second" });
+    const retry = await f.retryRun(first.id);
+    const extra = await Promise.all(
+      Array.from({ length: 3 }, () => f.createRun({ repo: repoDir, prompt: "more" })),
+    );
+    await Promise.resolve(); // Queue notifications also pass through tick.
+    f.scheduler.tick();
+    expect(f.scheduler.activeRunIds).toEqual([first.id]);
+    expect(firstSignal?.aborted).toBe(false);
+    expect(f.store.getRun(queued.id)?.status).toBe("queued");
+    expect(f.store.getRun(retry.id)?.status).toBe("queued");
+    release();
+    expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    await Bun.sleep(10);
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    expect(calls).toBe(1);
+    expect(f.store.getRunDetail(first.id)?.stages.map((s) => s.name)).toContain("review");
+    f.scheduler.tick();
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    f.scheduler.resume();
+    f.scheduler.resume();
+    expect(f.scheduler.activeRunIds.length).toBe(f.cfg.maxConcurrentRuns);
+    expect(f.scheduler.activeRunIds.length).toBeLessThanOrEqual(f.cfg.maxConcurrentRuns);
+    expect(await waitFor(f, queued.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(await waitFor(f, retry.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    for (const run of extra) {
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    }
+    await f.stop();
+    f.scheduler.drain();
+    const stopped = await f.createRun({ repo: repoDir, prompt: "after stop" });
+    f.scheduler.resume();
+    f.scheduler.tick();
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    expect(f.store.getRun(stopped.id)?.status).toBe("queued");
+  } finally {
+    release();
+  }
+});

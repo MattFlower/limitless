@@ -210,8 +210,10 @@ export class RunContext {
         );
       }
       tried.push(target.modelId);
-      const harness = harnesses[target.harness];
-      if (!harness) throw new Error(`No harness registered for ${target.harness}`);
+      const useHttp = ["triage", "chat", "summarize"].includes(opts.role) && !!target.openai;
+      const harnessName = useHttp ? "llm" : target.harness;
+      const harness = harnesses[harnessName];
+      if (!harness) throw new Error(`No harness registered for ${harnessName}`);
 
       const release = await tracker.acquire(target.provider, this.signal);
       if (!(await tracker.preflight(target.provider))) {
@@ -223,7 +225,7 @@ export class RunContext {
         runId: this.run.id,
         stageId: opts.stage.id,
         role: opts.role,
-        harness: target.harness,
+        harness: harnessName,
         provider: target.provider,
         model: target.model,
         modelId: target.modelId,
@@ -246,6 +248,7 @@ export class RunContext {
           target,
           mode: opts.mode,
           ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
+          ...(opts.schema ? { schema: opts.schema } : {}),
           timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUTS[opts.role],
           idleTimeoutMs: opts.idleTimeoutMs ?? 10 * 60_000,
           maxToolCalls: opts.maxToolCalls ?? (opts.mode === "edit" ? 400 : 150),

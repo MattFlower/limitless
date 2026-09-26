@@ -10,6 +10,7 @@ export class Scheduler {
   private active = new Map<string, { controller: AbortController; done: Promise<unknown> }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopping = false;
+  private drainEnabled = false;
   private unsubscribe: (() => void) | null = null;
 
   constructor(
@@ -44,12 +45,27 @@ export class Scheduler {
     return [...this.active.keys()];
   }
 
+  get draining(): boolean {
+    return this.drainEnabled;
+  }
+
+  drain(): void {
+    this.drainEnabled = true;
+  }
+
+  resume(): void {
+    this.drainEnabled = false;
+    this.tick();
+  }
+
   tick(): void {
     if (this.stopping) return;
     this.deps.tracker.refreshAlerts();
+    if (this.draining) return;
     const capacity = this.maxConcurrent - this.active.size;
     if (capacity <= 0) return;
     for (const run of this.deps.store.nextQueuedRuns(capacity)) {
+      if (this.stopping || this.draining) return;
       if (this.active.has(run.id)) continue;
       const controller = new AbortController();
       const done = executeRun(this.deps, run.id, controller.signal)

@@ -232,9 +232,11 @@ export class Concierge {
       const target = router.route("chat", "small", { exclude: tried }).candidates[0];
       if (!target) break;
       tried.push(target.modelId);
-      const harness = harnesses[target.harness];
+      // Chat needs no tools, so it skips the agent CLI when the provider speaks plain HTTP.
+      const harnessName = target.openai ? "llm" : target.harness;
+      const harness = harnesses[harnessName];
       if (!harness) {
-        failure = `No harness registered for ${target.harness}`;
+        failure = `No harness registered for ${harnessName}`;
         continue;
       }
       const release = await tracker.acquire(target.provider, signal);
@@ -256,6 +258,7 @@ export class Concierge {
           noTools: true,
           privateSession: true,
           jsonSchema: toStrictJsonSchema(ChatOutputSchema),
+          schema: ChatOutputSchema,
           timeoutMs: 60_000,
           idleTimeoutMs: 30_000,
           maxToolCalls: 0,

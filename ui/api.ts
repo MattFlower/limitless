@@ -2,6 +2,7 @@
 // the UI can never drift from the wire shape.
 import type {
   CreateRunRequest,
+  HealthResponse,
   ProviderStatus,
   Question,
   QuotaAlert,
@@ -43,6 +44,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(message, res.status);
   }
   return text ? (JSON.parse(text) as T) : (undefined as T);
+}
+
+export function getHealth(): Promise<HealthResponse> {
+  return request<HealthResponse>("/api/health", { signal: AbortSignal.timeout(5000) });
 }
 
 export function listRuns(opts: { status?: RunStatus[]; limit?: number } = {}): Promise<Run[]> {

@@ -39,6 +39,22 @@ test("chat role uses readonly, no-tools structured output with bounded persisted
   expect(f.factory.tracker.status("fake")?.inFlight).toBe(0);
 });
 
+test("chat uses the direct HTTP harness with its schema when the provider has an OpenAI endpoint", async () => {
+  expect(f.harnessCalls).toEqual([]);
+  await send("hi");
+  expect(f.harnessCalls).toEqual(["fake"]);
+
+  const http = chatFixture({ openaiBaseUrl: "http://127.0.0.1:9/v1" });
+  try {
+    const history = await http.factory.concierge.submit("one", { type: "text", text: "hi" });
+    expect(history.messages.at(-1)?.content).toBe("Hello");
+    expect(http.harnessCalls).toEqual(["llm"]);
+    expect(http.specs[0]?.schema).toBe(ChatOutputSchema);
+  } finally {
+    http.close();
+  }
+});
+
 test("proposals require explicit confirmation, ignoring fabricated textual authorization", async () => {
   const proposal = await propose();
   expect(f.factory.store.listRuns()).toHaveLength(0);

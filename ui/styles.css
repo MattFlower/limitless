@@ -1389,3 +1389,12 @@ p {
     padding: 6px 8px;
   }
 }
+
+.draining-banner {
+  padding: 14px 24px;
+  border-bottom: 2px solid #d99a32;
+  background: #493516;
+  color: #ffdc9b;
+  font-weight: 600;
+  text-align: center;
+}

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
 import type { Profile, Run, RunDetail, RunEvent } from "../core/types.ts";
+import { parseMaxWait } from "./deploy-wait.ts";
 
 const USAGE = `limitless — personal software factory
 
@@ -19,7 +20,9 @@ Usage:
   limitless integrations install [--write] Print setup; --write installs the Codex skill
   limitless service install [--tunnel] [--no-mtplx]   launchd agents: daemon, mtplx (+ tunnel)
   limitless service uninstall|status
-  limitless deploy [ref] [--smoke]        Deploy a ref (default origin/main); optionally run live smoke checks
+  limitless local up|down|status          Manage mtplx and twilight model servers
+  limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]
+        Deploy origin/main by default; drain for up to 2700s (45m). --now skips waiting.
 
 Environment: LIMITLESS_URL (default http://127.0.0.1:7400)`;
 
@@ -158,6 +161,8 @@ async function main(): Promise<void> {
       "dry-run": { type: "boolean" },
       "no-mtplx": { type: "boolean" },
       smoke: { type: "boolean" },
+      "max-wait": { type: "string" },
+      now: { type: "boolean" },
     },
   });
   const [cmd, ...rest] = positionals;
@@ -176,6 +181,31 @@ async function main(): Promise<void> {
       if (rest[0] !== "install") throw new Error("usage: limitless integrations install [--write]");
       const { installIntegrations } = await import("../integrations/install.ts");
       return installIntegrations({ write: values.write === true });
+    }
+    case "local": {
+      const action = rest[0];
+      if (rest.length !== 1 || (action !== "up" && action !== "down" && action !== "status"))
+        throw new Error("usage: limitless local up|down|status");
+      const { loadConfig } = await import("../config.ts");
+      const { manageLocal } = await import("./local.ts");
+      const cfg = loadConfig();
+      const local = (cfg.raw.local ?? {}) as Record<string, unknown>;
+      const report = await manageLocal(action, {
+        modelPath: typeof local.twilight_model_path === "string" ? local.twilight_model_path : "",
+        twilightHost: typeof local.twilight_host === "string" ? local.twilight_host : undefined,
+        llamaBinary:
+          typeof local.twilight_llama_binary === "string" ? local.twilight_llama_binary : undefined,
+        secrets: cfg.secrets,
+      });
+      for (const [name, state] of Object.entries(report))
+        console.log(`${name}: service ${state.service}; endpoint ${state.endpoint}`);
+      if (
+        Object.values(report).some(
+          (state) => state.service.includes("failed") || state.service === "unreachable",
+        )
+      )
+        process.exitCode = 1;
+      return;
     }
     case "run": {
       const prompt = rest.join(" ").trim() || (await Bun.stdin.text()).trim();
@@ -264,9 +294,14 @@ async function main(): Promise<void> {
       return svc.status(port);
     }
     case "deploy": {
+      const maxWaitMs = parseMaxWait(values["max-wait"]);
       const svc = await import("./service.ts");
-      if (rest.length > 1) throw new Error("usage: limitless deploy [ref] [--smoke]");
-      return svc.deploy(Number(process.env.LIMITLESS_PORT ?? 7400), rest[0], values.smoke === true);
+      if (rest.length > 1)
+        throw new Error("usage: limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]");
+      return svc.deploy(Number(process.env.LIMITLESS_PORT ?? 7400), rest[0], values.smoke === true, {
+        maxWaitMs,
+        now: values.now === true,
+      });
     }
     case "providers": {
       const ps =
