@@ -97,6 +97,7 @@ export interface Run {
   title: string;
   prompt: string;
   source: RunSource;
+  githubWebhookVerified: boolean;
   sourceRef: Record<string, unknown> | null;
   requestedBy: string | null;
   profile: Profile;
@@ -106,6 +107,7 @@ export interface Run {
   status: RunStatus;
   stage: StageName | null;
   baseBranch: string | null;
+  deliveryBranch: string | null;
   baseSha: string | null;
   branch: string | null;
   headSha: string | null;
@@ -234,6 +236,9 @@ export interface CreateRunRequest {
   sourceRef?: Record<string, unknown>;
   requestedBy?: string;
   priority?: number;
+  baseBranch?: string;
+  /** Existing same-repository PR head; accepted only from a verified GitHub webhook. */
+  deliveryBranch?: string;
 }
 
 /** Messages pushed on the global SSE stream. */

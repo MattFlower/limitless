@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHmac } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -7,6 +8,7 @@ import { loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
+import { githubWebhook } from "../src/integrations/github.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
@@ -170,6 +172,93 @@ afterEach(async () => {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("Dependabot run delivers to the existing PR head without creating a PR", async () => {
+    const bare = join(home, "github.git");
+    await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
+    await sh(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir });
+    const baseSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    let concurrent: string | null = null;
+    let content = "verified\n";
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ task_class: "dependency_update" }) };
+      if (role === "review") {
+        if (concurrent) {
+          const result = Bun.spawnSync(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], {
+            cwd: concurrent,
+          });
+          if (result.exitCode !== 0) throw new Error("concurrent push failed");
+          concurrent = null;
+        }
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": content }, text: "Verified dependency update" };
+    });
+    f.store.upsertRepo({
+      slug: "MattFlower/limitless",
+      kind: "github",
+      url: bare,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    f.cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
+    const trigger = async (sha: string, delivery: string) => {
+      const payload = JSON.parse(readFileSync(join(import.meta.dir, "data/github-pr.json"), "utf8")) as {
+        pull_request: { head: { sha: string } };
+      };
+      payload.pull_request.head.sha = sha;
+      const body = JSON.stringify(payload);
+      const response = await githubWebhook(f)(
+        new Request("http://localhost/webhooks/github", {
+          method: "POST",
+          body,
+          headers: {
+            "x-github-event": "pull_request",
+            "x-github-delivery": delivery,
+            "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+          },
+        }),
+      );
+      expect(response.status).toBe(201);
+      const { runId } = (await response.json()) as { runId: string };
+      const run = f.store.getRun(runId);
+      if (!run) throw new Error("webhook did not create run");
+      expect(run.githubWebhookVerified).toBe(true);
+      return run;
+    };
+    const run = await trigger(baseSha, "initial");
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const finished = f.store.getRun(run.id);
+    expect(finished?.prUrl).toBe("https://github.com/MattFlower/limitless/pull/18");
+    expect(
+      (await sh(["git", "ls-remote", bare, "refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir })).stdout,
+    ).toContain(finished?.headSha ?? "missing head");
+    expect(
+      (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+        .stdout,
+    ).toBe("");
+
+    const competitor = join(home, "competitor");
+    await sh(["git", "clone", "-q", bare, competitor], { cwd: home });
+    await sh(["git", "checkout", "-qb", "move", "origin/dependabot/npm/pkg-2"], { cwd: competitor });
+    writeFileSync(join(competitor, "competing.txt"), "new head\n");
+    await sh(["git", "add", "."], { cwd: competitor });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "competing update"], {
+      cwd: competitor,
+    });
+    const competingSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: competitor })).stdout.trim();
+    concurrent = competitor;
+    content = "verified again\n";
+    if (!finished?.headSha) throw new Error("missing delivered head");
+    const stale = await trigger(finished.headSha, "concurrent");
+    expect(await waitFor(f, stale.id, ["succeeded", "failed", "needs_human"])).toBe("failed");
+    expect(f.store.getRun(stale.id)?.error).toContain("PR head moved");
+    expect(
+      (await sh(["git", "ls-remote", bare, "refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir })).stdout,
+    ).toContain(competingSha);
+  });
+
   test("holdout starts alongside implementation, stays blind, and quick skips it", async () => {
     for (const profile of ["standard", "deep", "quick"] as const) {
       let implementStarted = false;

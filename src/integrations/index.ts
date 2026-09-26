@@ -1,6 +1,8 @@
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
 import { mountDiscord } from "./discord.ts";
+import { githubWebhook, runGh } from "./github.ts";
+import { startGitHubNotifier } from "./github-notifier.ts";
 import { mountMcp } from "./mcp-http.ts";
 
 export interface Integrations {
@@ -14,10 +16,22 @@ export interface Integrations {
 export async function mountIntegrations(factory: Factory): Promise<Integrations> {
   const mcp = mountMcp(factory);
   const discord = mountDiscord(factory);
+  const stopNotifier = startGitHubNotifier(factory.store, runGh);
   return {
-    routes: { "/mcp": (req, server) => mcp.handle(req, server.requestIP(req)?.address ?? null) },
-    notes: [...(await toolVersions()), "MCP: /mcp (loopback only)", discord.note],
+    routes: {
+      "/mcp": (req, server) => mcp.handle(req, server.requestIP(req)?.address ?? null),
+      "/webhooks/github": githubWebhook(factory),
+    },
+    notes: [
+      ...(await toolVersions()),
+      "MCP: /mcp (loopback only)",
+      discord.note,
+      factory.cfg.secrets.GITHUB_WEBHOOK_SECRET
+        ? "GitHub webhooks enabled"
+        : "GitHub webhooks disabled (GITHUB_WEBHOOK_SECRET is not configured)",
+    ],
     stop: async () => {
+      stopNotifier();
       await Promise.all([mcp.stop(), discord.stop()]);
     },
   };
