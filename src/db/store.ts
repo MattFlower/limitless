@@ -394,6 +394,17 @@ export class Store {
     return (this.db.query(sql).all(...params) as Row[]).map(toRun);
   }
 
+  /** Every finished run, without the UI list's default limit. */
+  finishedRuns(): Run[] {
+    return (
+      this.db
+        .query(
+          `${RUN_SELECT} WHERE runs.status IN ('succeeded','failed','cancelled','needs_human') AND runs.finished_at IS NOT NULL ORDER BY runs.finished_at, runs.id`,
+        )
+        .all() as Row[]
+    ).map(toRun);
+  }
+
   /** Oldest-first queue of runs waiting to start. */
   nextQueuedRuns(limit: number): Run[] {
     return (
@@ -592,6 +603,17 @@ export class Store {
     params.push(opts.limit ?? 1000);
     const events = (this.db.query(sql).all(...params) as Row[]).map(toEvent);
     return opts.tail ? events.reverse() : events;
+  }
+
+  countOldDebugEvents(before: number): number {
+    const row = this.db
+      .query("SELECT count(*) AS n FROM events WHERE level = 'debug' AND ts < ?")
+      .get(before) as Row;
+    return row.n as number;
+  }
+
+  deleteOldDebugEvents(before: number): number {
+    return this.db.query("DELETE FROM events WHERE level = 'debug' AND ts < ?").run(before).changes;
   }
 
   // ---- artifacts -----------------------------------------------------------

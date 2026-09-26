@@ -14,6 +14,7 @@ Usage:
   limitless cancel <run>                  Cancel a run
   limitless answer <run> "<text>"         Answer a run's open question(s)
   limitless providers                     Provider health and quota
+  limitless gc [--dry-run]                Clean up expired worktrees, logs and debug events
   limitless mcp                           MCP stdio proxy (daemon must be running)
   limitless integrations install [--write] Print setup; --write installs the Codex skill
   limitless service install [--tunnel] [--no-mtplx]   launchd agents: daemon, mtplx (+ tunnel)
@@ -154,6 +155,7 @@ async function main(): Promise<void> {
       help: { type: "boolean", short: "h" },
       tunnel: { type: "boolean" },
       write: { type: "boolean" },
+      "dry-run": { type: "boolean" },
       "no-mtplx": { type: "boolean" },
     },
   });
@@ -280,6 +282,22 @@ async function main(): Promise<void> {
           .join(", ");
         console.log(`${p.id.padEnd(11)} ${p.state.padEnd(9)} ${w} ${p.reason ? color.dim(p.reason) : ""}`);
       }
+      return;
+    }
+    case "gc": {
+      if (rest.length) throw new Error("usage: limitless gc [--dry-run]");
+      const result = await api<import("../gc.ts").GcResult>("/api/gc", {
+        method: "POST",
+        body: JSON.stringify({ dryRun: values["dry-run"] === true }),
+      });
+      console.log(
+        `${result.dryRun ? "Would clean" : "Cleaned"}: ${result.worktrees.length} worktrees, ${result.logs.length} logs, ${result.metadata.length} metadata entries, ${result.debugEvents} debug events`,
+      );
+      for (const path of result.worktrees) console.log(`  worktree ${path}`);
+      for (const path of result.logs) console.log(`  log ${path}`);
+      for (const entry of result.metadata) console.log(`  metadata ${entry}`);
+      for (const error of result.errors) console.error(color.red(`  error ${error}`));
+      if (result.errors.length) process.exitCode = 1;
       return;
     }
     default:
