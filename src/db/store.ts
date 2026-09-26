@@ -78,6 +78,7 @@ const toRun = (r: Row): Run => ({
   status: r.status as RunStatus,
   stage: (r.stage as StageName) ?? null,
   baseBranch: (r.base_branch as string) ?? null,
+  deliveryBranch: (r.delivery_branch as string) ?? null,
   baseSha: (r.base_sha as string) ?? null,
   branch: (r.branch as string) ?? null,
   headSha: (r.head_sha as string) ?? null,
@@ -336,8 +337,8 @@ export class Store {
     const title = req.title ?? req.prompt.split("\n")[0]?.slice(0, 80) ?? "Untitled";
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -349,6 +350,8 @@ export class Store {
         req.requestedBy ?? null,
         req.profile ?? "auto",
         req.priority ?? 0,
+        req.baseBranch ?? null,
+        req.deliveryBranch ?? null,
         Date.now(),
       );
     const run = this.getRun(id) as Run;
@@ -696,6 +699,12 @@ export class Store {
         entry.note ?? null,
       );
     return res.changes > 0;
+  }
+
+  finishInbox(id: string, status: "ignored" | "run_created" | "error", note: string, runId?: string): void {
+    this.db
+      .query("UPDATE inbox SET status = ?, note = ?, run_id = ? WHERE id = ?")
+      .run(status, note, runId ?? null, id);
   }
 
   // ---- settings ------------------------------------------------------------

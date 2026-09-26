@@ -138,6 +138,88 @@ afterEach(async () => {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("Dependabot run delivers to the existing PR head without creating a PR", async () => {
+    const bare = join(home, "github.git");
+    await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
+    await sh(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir });
+    const baseSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    let concurrent: string | null = null;
+    let content = "verified\n";
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ task_class: "dependency_update" }) };
+      if (role === "review") {
+        if (concurrent) {
+          const result = Bun.spawnSync(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], {
+            cwd: concurrent,
+          });
+          if (result.exitCode !== 0) throw new Error("concurrent push failed");
+          concurrent = null;
+        }
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": content }, text: "Verified dependency update" };
+    });
+    f.store.upsertRepo({
+      slug: "MattFlower/limitless",
+      kind: "github",
+      url: bare,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const run = await f.createRun({
+      repo: "MattFlower/limitless",
+      prompt: "Verify dependency update",
+      profile: "quick",
+      source: "github",
+      baseBranch: "dependabot/npm/pkg-2",
+      deliveryBranch: "dependabot/npm/pkg-2",
+      sourceRef: { kind: "pull_request", repo: "MattFlower/limitless", number: 18, headSha: baseSha },
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const finished = f.store.getRun(run.id);
+    expect(finished?.prUrl).toBe("https://github.com/MattFlower/limitless/pull/18");
+    expect(
+      (await sh(["git", "ls-remote", bare, "refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir })).stdout,
+    ).toContain(finished?.headSha ?? "missing head");
+    expect(
+      (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+        .stdout,
+    ).toBe("");
+
+    const competitor = join(home, "competitor");
+    await sh(["git", "clone", "-q", bare, competitor], { cwd: home });
+    await sh(["git", "checkout", "-qb", "move", "origin/dependabot/npm/pkg-2"], { cwd: competitor });
+    writeFileSync(join(competitor, "competing.txt"), "new head\n");
+    await sh(["git", "add", "."], { cwd: competitor });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "competing update"], {
+      cwd: competitor,
+    });
+    const competingSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: competitor })).stdout.trim();
+    concurrent = competitor;
+    content = "verified again\n";
+    const stale = await f.createRun({
+      repo: "MattFlower/limitless",
+      prompt: "Verify again",
+      profile: "quick",
+      source: "github",
+      baseBranch: "dependabot/npm/pkg-2",
+      deliveryBranch: "dependabot/npm/pkg-2",
+      sourceRef: {
+        kind: "pull_request",
+        repo: "MattFlower/limitless",
+        number: 18,
+        headSha: finished?.headSha,
+      },
+    });
+    expect(await waitFor(f, stale.id, ["succeeded", "failed", "needs_human"])).toBe("failed");
+    expect(f.store.getRun(stale.id)?.error).toContain("PR head moved");
+    expect(
+      (await sh(["git", "ls-remote", bare, "refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir })).stdout,
+    ).toContain(competingSha);
+  });
+
   test("happy path: triage → spec → implement → gates → review → verify → deliver", async () => {
     const seen: string[] = [];
     const f = start((s) => {

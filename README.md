@@ -82,6 +82,15 @@ codex_weekly = 0.90   # keeps 10% of ChatGPT usage free for you
 github = "MattFlower"
 ```
 
+### GitHub webhook
+
+Create a repository webhook at `https://limitless.mattflower.cc/webhooks/github` with
+content type `application/json`, a shared secret stored as `GITHUB_WEBHOOK_SECRET` in
+`~/.config/limitless/secrets.env`, and the **Issues**, **Issue comments**, and
+**Pull requests** events. The webhook is disabled until the secret is configured.
+Owner-labeled `limitless` issues and owner `/limitless ` comments create runs.
+Dependabot pull requests receive verification runs whose fixes update the existing PR branch.
+
 Per-repository settings go in a `.limitless.toml` at the repo root:
 
 ```toml

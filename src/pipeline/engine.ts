@@ -14,6 +14,7 @@ import {
   headSha,
   mergePullRequest,
   pushBranch,
+  pushExistingBranch,
   removeWorktree,
 } from "../git/repos.ts";
 import type { RouteConstraints } from "../router/router.ts";
@@ -113,6 +114,8 @@ async function prepare(ctx: RunContext): Promise<void> {
     await ensureCache(cfg.paths, ctx.repo);
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
     const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base);
+    if (ctx.run.deliveryBranch && ctx.run.sourceRef?.headSha !== wt.baseSha)
+      throw new Error("PR head moved before preparation");
     ctx.state.worktreePath = wt.path;
     ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha: wt.baseSha, branch: wt.branch });
     const gates = detectGates(wt.path);
@@ -588,6 +591,18 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     if (ctx.repo.kind !== "github") {
       ctx.log(`Local repo: work is on branch ${ctx.run.branch}`);
       return { summary: `branch ${ctx.run.branch} ready in ${ctx.repo.localPath}`, value: undefined };
+    }
+    if (ctx.run.deliveryBranch) {
+      if (!success) return { summary: "PR update needs human review; no push", value: undefined };
+      ctx.checkCancelled();
+      await pushExistingBranch(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.run.baseSha as string);
+      if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number") {
+        ctx.run = ctx.store.updateRun(ctx.run.id, {
+          prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef.number}`,
+        });
+      }
+      await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
+      return { summary: `updated existing PR branch ${ctx.run.deliveryBranch}`, value: undefined };
     }
     ctx.checkCancelled();
     await pushBranch(ctx.repo, cwd, ctx.run.branch as string);

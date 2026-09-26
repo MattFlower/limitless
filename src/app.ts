@@ -107,6 +107,8 @@ export class Factory {
       profile: run.profile,
       source: run.source,
       ...(run.sourceRef ? { sourceRef: run.sourceRef } : {}),
+      ...(run.baseBranch ? { baseBranch: run.baseBranch } : {}),
+      ...(run.deliveryBranch ? { deliveryBranch: run.deliveryBranch } : {}),
       ...(run.requestedBy ? { requestedBy: run.requestedBy } : {}),
     });
   }

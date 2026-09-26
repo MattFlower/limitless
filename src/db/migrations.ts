@@ -156,4 +156,9 @@ CREATE TABLE settings (
 );
 `,
   },
+  {
+    version: 2,
+    name: "existing_pr_delivery",
+    sql: "ALTER TABLE runs ADD COLUMN delivery_branch TEXT;",
+  },
 ];

@@ -106,6 +106,7 @@ export interface Run {
   status: RunStatus;
   stage: StageName | null;
   baseBranch: string | null;
+  deliveryBranch: string | null;
   baseSha: string | null;
   branch: string | null;
   headSha: string | null;
@@ -234,6 +235,9 @@ export interface CreateRunRequest {
   sourceRef?: Record<string, unknown>;
   requestedBy?: string;
   priority?: number;
+  baseBranch?: string;
+  /** Existing same-repository PR head to update after verification. */
+  deliveryBranch?: string;
 }
 
 /** Messages pushed on the global SSE stream. */
