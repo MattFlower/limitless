@@ -19,6 +19,7 @@ import {
   mergePullRequest,
   pushBranch,
   pushExistingBranch,
+  readFileAt,
   rebaseOnto,
   removeWorktree,
 } from "../git/repos.ts";
@@ -693,6 +694,11 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       if (ctx.state.pendingRebaseSha && ctx.state.pendingRebaseSha !== fetched)
         throw new Error("base changed during delivery rebase; refusing to publish");
       if (fetched !== recorded) {
+        // Audit against the new base's scripts, never the implementer's merged working tree.
+        ctx.state.baselineScripts = pickScripts(
+          await readFileAt(cwd, fetched, "package.json"),
+          gateScriptNames(ctx.state.gatesConfig as GateConfig),
+        );
         if (!ctx.state.pendingRebaseSha) {
           if (!(await isAncestor(cwd, recorded, fetched)))
             throw new Error("base branch no longer descends from the recorded base");

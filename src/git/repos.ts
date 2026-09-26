@@ -147,12 +147,18 @@ export async function fetchBase(paths: Paths, repo: Repo, branch: string): Promi
   const cache = cachePath(paths, repo);
   return withRepoLock(cache, async () => {
     const ref = `refs/heads/${branch}`;
-    await sh(["git", "fetch", "origin", `${ref}:refs/remotes/origin/${branch}`], {
+    await sh(["git", "fetch", "origin", `+${ref}:refs/remotes/origin/${branch}`], {
       cwd: cache,
       timeoutMs: 300_000,
     });
     return (await sh(["git", "rev-parse", `refs/remotes/origin/${branch}`], { cwd: cache })).stdout.trim();
   });
+}
+
+export async function readFileAt(cwd: string, revision: string, path: string): Promise<string | null> {
+  const entry = await sh(["git", "ls-tree", "--name-only", revision, "--", path], { cwd });
+  if (!entry.stdout.trim()) return null;
+  return (await sh(["git", "show", `${revision}:${path}`], { cwd })).stdout;
 }
 
 export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {

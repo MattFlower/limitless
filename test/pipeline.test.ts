@@ -210,8 +210,32 @@ describe("pipeline (fake agents, real git + gates)", () => {
     return sha;
   }
 
-  for (const kind of ["unchanged", "clean", "regressed", "conflict"] as const) {
+  for (const kind of [
+    "unchanged",
+    "clean",
+    "clean-scripts",
+    "regressed",
+    "conflict",
+    "conflict-scripts",
+    "rewritten",
+  ] as const) {
     test(`GitHub delivery handles ${kind} base`, async () => {
+      const conflict = kind === "conflict" || kind === "conflict-scripts";
+      const changedScripts = kind === "clean-scripts" || kind === "conflict-scripts";
+      if (changedScripts) {
+        writeFileSync(
+          join(repoDir, "package.json"),
+          JSON.stringify({ scripts: { check: "test -s greeting.txt" } }),
+        );
+        writeFileSync(
+          join(repoDir, ".limitless.toml"),
+          '[gates]\nchecks = [{ name = "check", run = "bun run check" }]\n',
+        );
+        await sh(["git", "add", "."], { cwd: repoDir });
+        await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "script gate"], {
+          cwd: repoDir,
+        });
+      }
       const bare = await githubFixture();
       let baseTip = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
       const originalBase = baseTip;
@@ -228,11 +252,32 @@ describe("pipeline (fake agents, real git + gates)", () => {
         if (role === "review") {
           reviews++;
           if (reviews === 1 && kind !== "unchanged") {
+            if (changedScripts) {
+              writeFileSync(
+                join(repoDir, "package.json"),
+                JSON.stringify({ scripts: { check: "test -s greeting.txt && test -f package.json" } }),
+              );
+            }
             baseTip = await advanceBase(
               bare,
-              kind === "conflict" ? "greeting.txt" : "base.txt",
+              conflict ? "greeting.txt" : "base.txt",
               kind === "regressed" ? "BAD base\n" : "new base\n",
             );
+            if (kind === "rewritten") {
+              // Replace the initial commit so the fetched base no longer descends from it.
+              baseTip = (
+                await sh(["git", "commit-tree", "HEAD^{tree}", "-m", "rewritten base"], {
+                  cwd: repoDir,
+                  env: {
+                    GIT_AUTHOR_NAME: "t",
+                    GIT_AUTHOR_EMAIL: "t@t",
+                    GIT_COMMITTER_NAME: "t",
+                    GIT_COMMITTER_EMAIL: "t@t",
+                  },
+                })
+              ).stdout.trim();
+              await sh(["git", "push", "--force", bare, `${baseTip}:refs/heads/main`], { cwd: repoDir });
+            }
           }
           return { structured: approve };
         }
@@ -242,7 +287,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
           return { structured: pass };
         }
         implementCalls++;
-        if (kind === "conflict" && implementCalls === 2) {
+        if (conflict && implementCalls === 2) {
           mergePrompt = s.prompt;
           expect((await sh(["git", "status", "--porcelain"], { cwd: s.cwd })).stdout).toBe("");
           expect(
@@ -262,7 +307,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
           return { text: "Resolved base conflict" };
         }
         const files: Record<string, string> = { "farewell.txt": "goodbye\n" };
-        if (kind === "conflict") files["greeting.txt"] = "hello from feature\n";
+        if (conflict) files["greeting.txt"] = "hello from feature\n";
         return { files };
       });
       registerGithub(f, bare);
@@ -272,22 +317,26 @@ describe("pipeline (fake agents, real git + gates)", () => {
         profile: "standard",
       });
       const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
-      expect(status).toBe(kind === "regressed" ? "failed" : "succeeded");
+      const blocked = kind === "regressed" || kind === "rewritten";
+      expect(status).toBe(blocked ? "failed" : "succeeded");
       const finished = f.store.getRun(run.id);
       const stages = f.store.listStages(run.id).map((s) => s.name);
       const gates = stages.filter((s) => s === "gates").length;
-      expect(gates).toBe(kind === "unchanged" ? 1 : 2);
-      expect(implementCalls).toBe(kind === "conflict" ? 2 : 1);
-      expect(reviews).toBe(kind === "conflict" ? 2 : 1);
-      expect(verifies).toBe(kind === "conflict" ? 2 : 1);
-      if (kind === "conflict") {
+      expect(gates).toBe(kind === "unchanged" || kind === "rewritten" ? 1 : 2);
+      expect(stages.filter((s) => s === "audit")).toHaveLength(conflict ? 2 : 1);
+      expect(implementCalls).toBe(conflict ? 2 : 1);
+      expect(reviews).toBe(conflict ? 2 : 1);
+      expect(verifies).toBe(conflict ? 2 : 1);
+      if (conflict) {
         expect(mergePrompt).toContain("git merge origin/main");
         expect(stages.slice(-6)).toEqual(["implement", "gates", "audit", "review", "verify", "deliver"]);
         expect(f.store.getArtifact(run.id, "diff.patch")).not.toContain("+new base");
       }
-      if (kind === "regressed") {
+      if (blocked) {
         expect(finished?.baseSha).toBe(originalBase);
-        expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).toContain("regressed");
+        if (kind === "regressed")
+          expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).toContain("regressed");
+        else expect(finished?.error).toContain("base branch no longer descends from the recorded base");
       } else {
         expect(finished?.baseSha).toBe(baseTip);
         expect(
@@ -303,7 +352,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
         ).toContain(finished?.headSha ?? "missing");
         if (kind === "unchanged") expect(finished?.headSha).toBe(checkedHead);
       }
-      if (kind === "regressed")
+      if (changedScripts) {
+        const state = f.store.getRunState<RunState>(run.id);
+        expect(state?.baselineScripts).toEqual({ check: "test -s greeting.txt && test -f package.json" });
+        expect(state?.lastAudit?.some((finding) => finding.rule === "gate-script-changed")).toBe(false);
+        expect(f.store.getArtifact(run.id, "diff.patch")).not.toContain("package.json");
+      }
+      if (blocked)
         expect(
           (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
             .stdout,
