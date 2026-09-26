@@ -7,6 +7,7 @@ import {
   DEFAULT_MAX_WAIT_MS,
   type DeployClient,
   type DeployClock,
+  DrainUnsupportedError,
   parseMaxWait,
 } from "../src/cli/deploy-wait.ts";
 import { deploy } from "../src/cli/service.ts";
@@ -323,4 +324,27 @@ test("release restoration failure does not prevent the bounded resume attempt", 
     /original health failure[\s\S]*restore failed/,
   );
   expect(f.calls.at(-1)).toBe("resume");
+});
+
+test("a daemon without the drain endpoint is restarted only with --now", async () => {
+  const legacy = () => {
+    const t = setup();
+    t.client.admin = async (action) => {
+      t.calls.push(action);
+      throw new DrainUnsupportedError(`POST /api/admin/${action}: HTTP 404`);
+    };
+    return t;
+  };
+  const refused = legacy();
+  await expect(deploy(7400, "origin/main", false, refused.opts)).rejects.toThrow("re-run with --now");
+  expect(refused.calls).not.toContain("restart");
+  expect(refused.calls).not.toContain("resume");
+  expect(refused.selected()).toBe("previous");
+
+  const now = legacy();
+  await deploy(7400, "origin/main", false, { ...now.opts, now: true });
+  expect(now.calls.filter((c) => c === "restart")).toHaveLength(1);
+  expect(now.calls).not.toContain("resume");
+  expect(now.selected()).toBe("next");
+  expect(now.logs.some((l) => l.includes("no drain endpoint"))).toBe(true);
 });

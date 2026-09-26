@@ -6,6 +6,7 @@ import {
   DEFAULT_MAX_WAIT_MS,
   type DeployClient,
   type DeployClock,
+  DrainUnsupportedError,
   deployClock,
   localDeployClient,
   requestAdmin,
@@ -39,7 +40,12 @@ const PATH = [
   "/sbin",
 ].join(":");
 
-function plist(label: string, args: string[], extraEnv: Record<string, string> = {}): string {
+function plist(
+  label: string,
+  args: string[],
+  extraEnv: Record<string, string> = {},
+  workingDirectory = appDir,
+): string {
   const env = { PATH, NODE_ENV: "production", ...extraEnv };
   const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -50,7 +56,7 @@ function plist(label: string, args: string[], extraEnv: Record<string, string> =
   <key>ProgramArguments</key>
   <array>${args.map((a) => `\n    <string>${xml(a)}</string>`).join("")}
   </array>
-  <key>WorkingDirectory</key><string>${xml(appDir)}</string>
+  <key>WorkingDirectory</key><string>${xml(workingDirectory)}</string>
   <key>EnvironmentVariables</key>
   <dict>${Object.entries(env)
     .map(([k, v]) => `\n    <key>${k}</key><string>${xml(v)}</string>`)
@@ -64,6 +70,24 @@ function plist(label: string, args: string[], extraEnv: Record<string, string> =
 </dict>
 </plist>
 `;
+}
+
+export function mtplxPlist(): string {
+  return plist(MTPLX_LABEL, [
+    join(home, ".mtplx", "bin", "mtplx"),
+    "serve",
+    "--model",
+    MTPLX_MODEL,
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8000",
+    "--api-key",
+    "mtplx-local",
+    "--batching-preset",
+    "agent",
+    "--yes",
+  ]);
 }
 
 async function launchctl(args: string[], allowFail = true) {
@@ -125,24 +149,7 @@ export async function install(port: number, opts: { tunnel?: boolean; mtplx?: bo
     [LABEL, plist(LABEL, [join(home, ".bun", "bin", "bun"), join(appDir, "src", "cli", "main.ts"), "serve"])],
   ];
   if (opts.mtplx !== false) {
-    units.push([
-      MTPLX_LABEL,
-      plist(MTPLX_LABEL, [
-        join(home, ".mtplx", "bin", "mtplx"),
-        "serve",
-        "--model",
-        MTPLX_MODEL,
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "8000",
-        "--api-key",
-        "mtplx-local",
-        "--batching-preset",
-        "agent",
-        "--yes",
-      ]),
-    ]);
+    units.push([MTPLX_LABEL, mtplxPlist()]);
   }
   // The public tunnel is opt-in: only once webhook authentication is in place.
   const tunnel = opts.tunnel ? tunnelConfig(port) : null;
@@ -231,8 +238,19 @@ export async function deploy(
     gatesPassed = true;
     // A lost response may still have enabled drain on the daemon.
     drainAttempted = true;
-    await requestAdmin(client, clock, "drain");
-    await waitForDrain(client, clock, maxWaitMs, opts.now === true, log);
+    try {
+      await requestAdmin(client, clock, "drain");
+      await waitForDrain(client, clock, maxWaitMs, opts.now === true, log);
+    } catch (error) {
+      if (!(error instanceof DrainUnsupportedError)) throw error;
+      // A daemon from before graceful deploys can only be replaced by restarting it outright.
+      drainAttempted = false;
+      if (!opts.now)
+        throw new Error(
+          "the running daemon has no drain endpoint (it predates graceful deploys); re-run with --now to restart it without draining",
+        );
+      log("--now: the running daemon has no drain endpoint; restarting without draining");
+    }
     restartAttempted = true;
     await restart();
     await waitForHealthy(client, clock);

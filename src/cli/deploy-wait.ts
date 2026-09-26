@@ -27,6 +27,9 @@ export const deployClock: DeployClock = {
   },
 };
 
+/** The running daemon has no drain endpoint: it predates graceful deploys. */
+export class DrainUnsupportedError extends Error {}
+
 export interface DeployClient {
   admin(action: "drain" | "resume", signal: AbortSignal): Promise<DrainState>;
   health(signal: AbortSignal): Promise<HealthResponse>;
@@ -66,6 +69,8 @@ export function localDeployClient(port: number): DeployClient {
       signal,
       headers: { "content-type": "application/json" },
     });
+    if (response.status === 404 && path.startsWith("/api/admin/"))
+      throw new DrainUnsupportedError(`${method} ${path}: HTTP 404`);
     if (!response.ok) throw new Error(`${method} ${path}: HTTP ${response.status}`);
     return response.json();
   }

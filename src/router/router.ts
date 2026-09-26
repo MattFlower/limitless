@@ -56,6 +56,8 @@ export class Router {
     if (m.effort) target.effort = m.effort;
     if (def.baseUrl)
       target.backend = { baseUrl: def.baseUrl, authToken: this.tracker.authToken(m.provider) ?? "" };
+    if (def.openaiBaseUrl)
+      target.openai = { baseUrl: def.openaiBaseUrl, authToken: this.tracker.authToken(m.provider) ?? "" };
     return target;
   }
 

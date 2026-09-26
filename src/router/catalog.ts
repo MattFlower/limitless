@@ -8,6 +8,8 @@ export interface ProviderDef {
   maxConcurrent: number;
   /** Anthropic-compatible endpoint for the claude harness (OpenRouter, mtplx, llama.cpp). */
   baseUrl?: string;
+  /** OpenAI-compatible endpoint for tool-free structured completions. */
+  openaiBaseUrl?: string;
   /** Name of the secret holding the API key for baseUrl. */
   apiKeySecret?: string;
   /** Static token for local servers that want one. */
@@ -52,6 +54,7 @@ export const PROVIDERS: ProviderDef[] = [
     billing: "metered",
     maxConcurrent: 4,
     baseUrl: "https://openrouter.ai/api",
+    openaiBaseUrl: "https://openrouter.ai/api/v1",
     apiKeySecret: "OPENROUTER_API_KEY",
   },
   {
@@ -61,6 +64,7 @@ export const PROVIDERS: ProviderDef[] = [
     billing: "free",
     maxConcurrent: 1,
     baseUrl: "http://127.0.0.1:8000",
+    openaiBaseUrl: "http://127.0.0.1:8000/v1",
     apiKey: "mtplx-local",
     healthUrl: "http://127.0.0.1:8000/v1/models",
   },
@@ -74,6 +78,7 @@ export const PROVIDERS: ProviderDef[] = [
     // When away from the LAN, set sshForward instead: { host: "twilight", localPort: 18080, remotePort: 8080 }
     // with baseUrl/healthUrl on http://127.0.0.1:18080.
     baseUrl: "http://twilight:8080",
+    openaiBaseUrl: "http://twilight:8080/v1",
     apiKeySecret: "TWILIGHT_API_KEY",
     healthUrl: "http://twilight:8080/v1/models",
   },
