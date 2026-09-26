@@ -9,6 +9,7 @@ import {
   extractJson,
   LoopDetector,
   priceOf,
+  redactJsonLine,
   type Usage,
 } from "./types.ts";
 
@@ -153,8 +154,11 @@ function buildArgs(spec: AgentSpec, sessionId: string): string[] {
     "--permission-mode",
     "dontAsk",
   ];
+  if (spec.privateSession) args.push("--no-session-persistence");
   const denied = ["Bash(git push:*)", "Bash(gh pr merge:*)", "Bash(gh repo delete:*)", "Bash(rm -rf /*)"];
-  if (spec.mode === "readonly") {
+  if (spec.noTools) {
+    args.push("--tools", "");
+  } else if (spec.mode === "readonly") {
     args.push("--tools", "Read,Grep,Glob,Bash");
     args.push("--allowedTools", "Read", "Grep", "Glob", "Bash");
     denied.push("Bash(git commit:*)", "Bash(git reset:*)", "Bash(git checkout:*)");
@@ -224,11 +228,11 @@ export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
     timeoutMs: spec.timeoutMs,
     idleTimeoutMs: spec.idleTimeoutMs,
     onStdoutLine: (line) => {
-      appendFileSync(spec.logPath, `${line}\n`);
+      appendFileSync(spec.logPath, `${redactJsonLine(line, spec.redactOutput)}\n`);
       parser.feed(line);
     },
     onStderrLine: (line) => {
-      appendFileSync(spec.logPath, `[stderr] ${line}\n`);
+      appendFileSync(spec.logPath, `[stderr] ${spec.redactOutput?.(line) ?? line}\n`);
       spec.onEvent({ type: "stderr", text: line });
     },
   });

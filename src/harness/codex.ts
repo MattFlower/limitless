@@ -11,6 +11,7 @@ import {
   extractJson,
   LoopDetector,
   priceOf,
+  redactJsonLine,
   type Usage,
 } from "./types.ts";
 
@@ -208,7 +209,7 @@ function findKey(obj: unknown, key: string): unknown {
   return null;
 }
 
-export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
+export function buildCodexArgs(spec: AgentSpec): string[] {
   const t = spec.target;
   const args = [
     "codex",
@@ -223,6 +224,21 @@ export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
     'approval_policy="never"',
   ];
   if (t.effort) args.push("-c", `model_reasoning_effort="${t.effort}"`);
+  if (spec.privateSession) args.push("--ephemeral", "--ignore-user-config");
+  if (spec.noTools) {
+    // Codex reads files only through its shell tool (and sub-agents); with both disabled, web search
+    // off and a read-only sandbox, a live check against codex-cli 0.157 confirmed the model cannot
+    // read files. --strict-config fails closed if these feature names ever change.
+    args.push(
+      "--strict-config",
+      "--disable",
+      "shell_tool",
+      "--disable",
+      "multi_agent",
+      "-c",
+      'web_search="disabled"',
+    );
+  }
   if (spec.mode === "readonly") {
     args.push("-s", "read-only");
   } else {
@@ -234,10 +250,16 @@ export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
     writeFileSync(schemaPath, JSON.stringify(spec.jsonSchema));
     args.push("--output-schema", schemaPath);
   }
-  let prompt = spec.prompt;
-  if (spec.systemAppend) prompt = `${spec.systemAppend}\n\n---\n\n${prompt}`;
   if (spec.resumeSessionId) args.push("resume", spec.resumeSessionId, "-");
   else args.push("-");
+
+  return args;
+}
+
+export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
+  const t = spec.target;
+  const args = buildCodexArgs(spec);
+  const prompt = spec.systemAppend ? `${spec.systemAppend}\n\n---\n\n${spec.prompt}` : spec.prompt;
 
   const loop = new LoopDetector(spec.maxToolCalls);
   const stuckController = new AbortController();
@@ -265,11 +287,11 @@ export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
     timeoutMs: spec.timeoutMs,
     idleTimeoutMs: spec.idleTimeoutMs,
     onStdoutLine: (line) => {
-      appendFileSync(spec.logPath, `${line}\n`);
+      appendFileSync(spec.logPath, `${redactJsonLine(line, spec.redactOutput)}\n`);
       parser.feed(line);
     },
     onStderrLine: (line) => {
-      appendFileSync(spec.logPath, `[stderr] ${line}\n`);
+      appendFileSync(spec.logPath, `[stderr] ${spec.redactOutput?.(line) ?? line}\n`);
       if (!line.startsWith("Reading additional input")) spec.onEvent({ type: "stderr", text: line });
     },
   });

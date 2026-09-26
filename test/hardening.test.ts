@@ -269,6 +269,7 @@ describe("pipeline hardening", () => {
   const policy = {
     triage: everyone,
     spec: everyone,
+    holdout: everyone,
     implement: everyone,
     review: everyone,
     verify: everyone,
@@ -279,11 +280,13 @@ describe("pipeline hardening", () => {
       ? "triage"
       : prompt.startsWith("Write the specification")
         ? "spec"
-        : prompt.startsWith("You are an adversarial")
-          ? "review"
-          : prompt.startsWith("You are the acceptance verifier")
-            ? "verify"
-            : "implement";
+        : prompt.startsWith("Write blind holdout checks")
+          ? "holdout"
+          : prompt.startsWith("You are an adversarial")
+            ? "review"
+            : prompt.startsWith("You are the acceptance verifier")
+              ? "verify"
+              : "implement";
 
   async function waitDone(f: Factory, id: string): Promise<string> {
     const deadline = Date.now() + 20_000;
@@ -334,6 +337,28 @@ describe("pipeline hardening", () => {
                 blocking_questions: [],
               },
             };
+          if (r === "holdout")
+            return {
+              structured: {
+                scenarios: [
+                  { id: "H-1", description: "case 1", steps: "cat a.txt", expected: "a", edge_case: false },
+                  {
+                    id: "H-2",
+                    description: "case 2",
+                    steps: "test -s a.txt",
+                    expected: "exit zero",
+                    edge_case: true,
+                  },
+                  {
+                    id: "H-3",
+                    description: "case 3",
+                    steps: "test ! -e b.txt",
+                    expected: "exit zero",
+                    edge_case: true,
+                  },
+                ],
+              },
+            };
           if (r === "review") {
             reviews++;
             return {
@@ -367,6 +392,9 @@ describe("pipeline hardening", () => {
                       criteria: [
                         { id: "AC-1", status: "met", evidence: "e" },
                         { id: "AC-2", status: "met", evidence: "e" },
+                        { id: "H-1", status: "met", evidence: "e" },
+                        { id: "H-2", status: "met", evidence: "e" },
+                        { id: "H-3", status: "met", evidence: "e" },
                       ],
                       overall: "pass",
                       notes: "",

@@ -58,6 +58,31 @@ export const SpecSchema = z.object({
 });
 export type Spec = z.infer<typeof SpecSchema>;
 
+export const HoldoutSchema = z
+  .object({
+    scenarios: z
+      .array(
+        z.object({
+          id: z.string(),
+          description: z.string().trim().min(1),
+          steps: z.string().trim().min(1),
+          expected: z.string().trim().min(1),
+          edge_case: z.boolean(),
+        }),
+      )
+      .min(3)
+      .max(8),
+  })
+  .superRefine(({ scenarios }, ctx) => {
+    if (scenarios.filter((s) => s.edge_case).length < 2)
+      ctx.addIssue({ code: "custom", message: "At least two edge or failure cases are required" });
+    scenarios.forEach((s, i) => {
+      if (s.id !== `H-${i + 1}`)
+        ctx.addIssue({ code: "custom", path: ["scenarios", i, "id"], message: "IDs must be sequential H-n" });
+    });
+  });
+export type Holdout = z.infer<typeof HoldoutSchema>;
+
 export const ReviewSchema = z.object({
   verdict: z.enum(["approve", "request_changes"]),
   summary: z.string(),
@@ -79,7 +104,7 @@ export const VerifySchema = z.object({
     z.object({
       id: z.string(),
       status: z.enum(["met", "unmet", "unclear"]),
-      evidence: z.string().describe("Command + observed output, or file:line references"),
+      evidence: z.string().trim().min(1).describe("Command + observed output, or file:line references"),
     }),
   ),
   overall: z.enum(["pass", "fail"]),
