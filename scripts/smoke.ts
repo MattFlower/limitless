@@ -58,12 +58,54 @@ const schema = {
   additionalProperties: false,
 };
 
-function cheapestModel(provider: string): ModelDef {
-  const model = MODELS.filter((m) => m.provider === provider).sort(
+function modelsByPrice(provider: string): ModelDef[] {
+  const models = MODELS.filter((m) => m.provider === provider).sort(
     (a, b) => a.price.input + a.price.output - b.price.input - b.price.output || a.id.localeCompare(b.id),
-  )[0];
+  );
+  if (models.length === 0) throw new Error(`no catalog model for ${provider}`);
+  return models;
+}
+
+function cheapestModel(provider: string): ModelDef {
+  const model = modelsByPrice(provider)[0];
   if (!model) throw new Error(`no catalog model for ${provider}`);
   return model;
+}
+
+/** Retry only the account-specific unsupported-model error, and disclose the model actually checked. */
+export async function checkCodexModels(
+  models: ModelDef[],
+  check: (model: ModelDef) => Promise<CheckResult>,
+): Promise<{ result: CheckResult; model: ModelDef }> {
+  const rejected: string[] = [];
+  const sorted = models.toSorted(
+    (a, b) => a.price.input + a.price.output - b.price.input - b.price.output || a.id.localeCompare(b.id),
+  );
+  for (const model of sorted) {
+    const result = await check(model);
+    if (
+      result.status !== "fail" ||
+      !/model is not supported when using Codex with a ChatGPT account/i.test(result.reason ?? "")
+    ) {
+      return {
+        model,
+        result:
+          result.status === "pass"
+            ? {
+                status: "pass",
+                reason: `model ${model.model}${rejected.length ? ` (${rejected.join(", ")} unsupported)` : ""}`,
+              }
+            : result,
+      };
+    }
+    rejected.push(model.model);
+  }
+  const model = sorted.at(-1);
+  if (!model) throw new Error("no Codex catalog models");
+  return {
+    model,
+    result: { status: "fail", reason: `no supported ChatGPT Codex model (${rejected.join(", ")})` },
+  };
 }
 
 function targetFor(provider: ProviderDef, model: ModelDef, authToken?: string): ModelTarget {
@@ -202,10 +244,22 @@ export async function main(): Promise<number> {
   for (const id of ["claude", "codex"]) {
     const provider = PROVIDERS.find((p) => p.id === id);
     if (!provider) throw new Error(`missing provider ${id}`);
-    const target = targetFor(provider, cheapestModel(id));
+    let target = targetFor(provider, cheapestModel(id));
     const harness = id === "claude" ? runClaude : runCodex;
     for (const kind of ["structured", "noTools", "edit", "quota"] as const) {
-      checks.push({ name: `${id} ${kind}`, run: () => liveCheck(harness, target, kind) });
+      checks.push({
+        name: `${id} ${kind}`,
+        run: async () => {
+          if (id === "codex" && kind === "structured") {
+            const selected = await checkCodexModels(modelsByPrice(id), (model) =>
+              liveCheck(harness, targetFor(provider, model), kind),
+            );
+            target = targetFor(provider, selected.model);
+            return selected.result;
+          }
+          return liveCheck(harness, target, kind);
+        },
+      });
     }
   }
   for (const id of ["mtplx", "twilight", "openrouter"]) {

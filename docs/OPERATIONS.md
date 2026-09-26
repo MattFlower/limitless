@@ -53,6 +53,8 @@ through their real harnesses. Both CLIs must be installed, logged in, and have u
 quota. The runner uses the cheapest catalog model per provider, spends a small amount of quota,
 and reports each check with a duration. It creates temporary git repositories and removes them
 after every check. Smoke is opt-in and is not part of `bun run check` or CI.
+If the ChatGPT account rejects the cheapest Codex model, the runner tries the next catalog model
+in price order and reports which model it used. Other CLI errors fail the check.
 
 The mtplx and twilight checks are skipped when their required key is absent or their health probe
 fails. OpenRouter is skipped when `OPENROUTER_API_KEY` is absent from the Limitless secrets file or

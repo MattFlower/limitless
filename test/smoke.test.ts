@@ -2,9 +2,10 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { exitCode, formatReport, quotaCheck, runChecks } from "../scripts/smoke.ts";
+import { checkCodexModels, exitCode, formatReport, quotaCheck, runChecks } from "../scripts/smoke.ts";
 import { deploy } from "../src/cli/service.ts";
 import type { AgentResult } from "../src/harness/types.ts";
+import { MODELS } from "../src/router/catalog.ts";
 import type { sh } from "../src/util/proc.ts";
 
 const result: AgentResult = {
@@ -88,6 +89,31 @@ test("subscription quota check rejects absent windows and accepts observed windo
       "codex",
     ),
   ).toEqual({ status: "pass" });
+});
+
+test("Codex smoke retries only an unsupported ChatGPT model and reports the selected model", async () => {
+  const models = MODELS.filter((model) => model.id === "codex/luna" || model.id === "codex/sol");
+  const attempted: string[] = [];
+  const selected = await checkCodexModels(models, async (model) => {
+    attempted.push(model.model);
+    return model.id === "codex/luna"
+      ? {
+          status: "fail",
+          reason: "The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account.",
+        }
+      : { status: "pass" };
+  });
+  expect(attempted).toEqual(["gpt-6-luna", "gpt-6-sol"]);
+  expect(selected.model.id).toBe("codex/sol");
+  expect(selected.result).toEqual({ status: "pass", reason: "model gpt-6-sol (gpt-6-luna unsupported)" });
+
+  attempted.length = 0;
+  const invalidFlag = await checkCodexModels(models, async (model) => {
+    attempted.push(model.model);
+    return { status: "fail", reason: "unknown flag --disable" };
+  });
+  expect(attempted).toEqual(["gpt-6-luna"]);
+  expect(invalidFlag.result).toEqual({ status: "fail", reason: "unknown flag --disable" });
 });
 
 test("deploy restores the previous checkout when injected smoke fails before restart", async () => {
