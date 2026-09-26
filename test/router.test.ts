@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/db/store.ts";
-import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
+import { MODELS, type ModelDef, type Policy, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 
@@ -78,6 +78,28 @@ function setup(secrets: Record<string, string> = {}) {
 }
 
 describe("Router", () => {
+  test("OpenAI URLs are distinct from agentic backends and protected providers need keys", () => {
+    const targets = new Router(
+      new ProviderTracker(PROVIDERS, store, reserves, { OPENROUTER_API_KEY: "or", TWILIGHT_API_KEY: "tw" }),
+      policy,
+      MODELS,
+    );
+    for (const [id, url] of [
+      ["mtplx/qwen-27b", "http://127.0.0.1:8000/v1"],
+      ["twilight/qwen-27b", "http://twilight:8080/v1"],
+      ["openrouter/deepseek-v4-pro", "https://openrouter.ai/api/v1"],
+    ] as const) {
+      const model = targets.model(id);
+      if (!model) throw new Error(`missing ${id}`);
+      const target = targets.toTarget(model);
+      expect(target.openai?.baseUrl).toBe(url);
+      expect(target.backend?.baseUrl).not.toBe(url);
+      expect(target.harness).toBe("claude");
+    }
+    const withoutKeys = new ProviderTracker(PROVIDERS, store, reserves, {});
+    expect(withoutKeys.isAvailable("openrouter")).toBe(false);
+    expect(withoutKeys.isAvailable("twilight")).toBe(false);
+  });
   test("orders interchangeable models by quota headroom", () => {
     const { tracker, router } = setup();
     tracker.observeWindows("claude", { five_hour: { utilization: 0.7, resetsAt: Date.now() + 3_600_000 } });

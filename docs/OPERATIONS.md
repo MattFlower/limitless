@@ -67,6 +67,26 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 
 ## Local models
 
+- `limitless local up|down|status` manages both model servers and reports service state plus
+  `/v1/models` endpoint health separately. `up` creates the mtplx launchd plist if absent and
+  generates `~/.config/systemd/user/limitless-llama.service` on twilight over SSH. Set the
+  installed GGUF path in `~/.config/limitless/config.toml` before `up`:
+
+  ```toml
+  [local]
+  twilight_model_path = "/absolute/path/to/model.gguf"
+  # twilight_host = "twilight"
+  # twilight_llama_binary = "/home/mflower/.local/share/limitless/llama-bin/llama-server"
+  ```
+
+  mtplx uses `http://127.0.0.1:8000/v1`; twilight uses `http://twilight:8080/v1`;
+  OpenRouter uses `https://openrouter.ai/api/v1` for direct structured completions. Agentic
+  calls retain their Anthropic-compatible Claude CLI endpoints. `limitless service install`
+  installs the daemon and can install the mtplx agent, while `limitless local` controls the
+  model servers independently. SSH access to twilight and an installed model/binary are required.
+  The twilight unit reads `TWILIGHT_API_KEY` from twilight's
+  `~/.config/limitless/secrets.env`; use the same key in the Mac's Limitless secrets file.
+
 - **Mac (mtplx):** the launchd agent keeps Qwen 3.8 27B (optimized-quality, ~30 GB, 262K context)
   loaded. Stop it to free memory: `launchctl bootout gui/$UID/cc.mattflower.limitless-mtplx`;
   `limitless service install` brings it back. Change the model with `LIMITLESS_MTPLX_MODEL` at

@@ -29,7 +29,12 @@ const PATH = [
   "/sbin",
 ].join(":");
 
-function plist(label: string, args: string[], extraEnv: Record<string, string> = {}): string {
+function plist(
+  label: string,
+  args: string[],
+  extraEnv: Record<string, string> = {},
+  workingDirectory = appDir,
+): string {
   const env = { PATH, NODE_ENV: "production", ...extraEnv };
   const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -40,7 +45,7 @@ function plist(label: string, args: string[], extraEnv: Record<string, string> =
   <key>ProgramArguments</key>
   <array>${args.map((a) => `\n    <string>${xml(a)}</string>`).join("")}
   </array>
-  <key>WorkingDirectory</key><string>${xml(appDir)}</string>
+  <key>WorkingDirectory</key><string>${xml(workingDirectory)}</string>
   <key>EnvironmentVariables</key>
   <dict>${Object.entries(env)
     .map(([k, v]) => `\n    <key>${k}</key><string>${xml(v)}</string>`)
@@ -54,6 +59,29 @@ function plist(label: string, args: string[], extraEnv: Record<string, string> =
 </dict>
 </plist>
 `;
+}
+
+export function mtplxPlist(): string {
+  return plist(
+    MTPLX_LABEL,
+    [
+      join(home, ".mtplx", "bin", "mtplx"),
+      "serve",
+      "--model",
+      MTPLX_MODEL,
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8000",
+      "--api-key",
+      "mtplx-local",
+      "--batching-preset",
+      "agent",
+      "--yes",
+    ],
+    {},
+    home,
+  );
 }
 
 async function launchctl(args: string[], allowFail = true) {
@@ -115,24 +143,7 @@ export async function install(port: number, opts: { tunnel?: boolean; mtplx?: bo
     [LABEL, plist(LABEL, [join(home, ".bun", "bin", "bun"), join(appDir, "src", "cli", "main.ts"), "serve"])],
   ];
   if (opts.mtplx !== false) {
-    units.push([
-      MTPLX_LABEL,
-      plist(MTPLX_LABEL, [
-        join(home, ".mtplx", "bin", "mtplx"),
-        "serve",
-        "--model",
-        MTPLX_MODEL,
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "8000",
-        "--api-key",
-        "mtplx-local",
-        "--batching-preset",
-        "agent",
-        "--yes",
-      ]),
-    ]);
+    units.push([MTPLX_LABEL, mtplxPlist()]);
   }
   // The public tunnel is opt-in: only once webhook authentication is in place.
   const tunnel = opts.tunnel ? tunnelConfig(port) : null;
