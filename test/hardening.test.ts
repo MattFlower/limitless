@@ -448,9 +448,18 @@ describe("resume after restart", () => {
     await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "."], { cwd: repo });
     await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], { cwd: repo });
 
-    const providers = [{ id: "a", label: "a", harness: "fake" as const, billing: "free" as const, maxConcurrent: 2 }];
+    const providers = [
+      { id: "a", label: "a", harness: "fake" as const, billing: "free" as const, maxConcurrent: 2 },
+    ];
     const models = [
-      { id: "a/m", provider: "a", model: "a", vendor: "anthropic" as const, tier: 4 as const, price: { input: 0, output: 0 } },
+      {
+        id: "a/m",
+        provider: "a",
+        model: "a",
+        vendor: "anthropic" as const,
+        tier: 4 as const,
+        price: { input: 0, output: 0 },
+      },
     ];
     const everyone = { default: ["a/m"] };
     const policy = { triage: everyone, implement: everyone, review: everyone } as never;
