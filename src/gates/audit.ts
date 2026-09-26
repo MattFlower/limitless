@@ -115,11 +115,13 @@ export function auditDiff(
     const touched = f.from ? [f.from, f.path] : [f.path];
     const hit = touched.find((p) => protectedRes.some((re) => re.test(p)));
     if (hit) {
+      // Protection is against tampering with what exists; adding a new file there is only notable.
+      const added = f.status.startsWith("A");
       findings.push({
         rule: "protected-path",
-        severity: "block",
+        severity: added ? "warn" : "block",
         file: hit,
-        detail: "Edited a protected path.",
+        detail: added ? "Added a file under a protected path." : "Edited a protected path.",
       });
     }
     if (f.status.startsWith("D") && TEST_FILE.test(f.path)) {

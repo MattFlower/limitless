@@ -548,3 +548,23 @@ describe("repo cache concurrency", () => {
     }
   });
 });
+
+test("adding a file under a protected path warns; editing one blocks", () => {
+  const f = auditDiff(
+    {
+      patch: "",
+      files: [
+        { status: "A", path: "test/fixtures/new.json" },
+        { status: "M", path: "test/fixtures/old.json" },
+      ],
+      stat: "",
+      added: 0,
+      removed: 0,
+    },
+    { taskClass: "feature", protectedPaths: ["test/fixtures/**"] },
+  );
+  expect(f.map((x) => `${x.file}:${x.severity}`)).toEqual([
+    "test/fixtures/new.json:warn",
+    "test/fixtures/old.json:block",
+  ]);
+});
