@@ -85,10 +85,10 @@ ingress:
   return path;
 }
 
-async function ensureRelease(): Promise<void> {
-  if (!existsSync(join(appDir, ".git"))) {
-    mkdirSync(join(appDir, ".."), { recursive: true });
-    await sh(["git", "clone", REPO_URL, appDir], { cwd: home, timeoutMs: 300_000 });
+async function ensureRelease(dir = appDir): Promise<void> {
+  if (!existsSync(join(dir, ".git"))) {
+    mkdirSync(join(dir, ".."), { recursive: true });
+    await sh(["git", "clone", REPO_URL, dir], { cwd: home, timeoutMs: 300_000 });
   }
 }
 
@@ -175,22 +175,34 @@ export async function uninstall(): Promise<void> {
  * Deploy a ref to the release checkout: gate on `bun run check`, restart, health-check, and roll
  * back to the previous commit if the new version does not come up.
  */
-export async function deploy(port: number, ref = "origin/main"): Promise<void> {
-  await ensureRelease();
-  const previous = (await sh(["git", "rev-parse", "HEAD"], { cwd: appDir })).stdout.trim();
-  await sh(["git", "fetch", "origin", "--prune"], { cwd: appDir, timeoutMs: 300_000 });
-  const target = (await sh(["git", "rev-parse", ref], { cwd: appDir })).stdout.trim();
+export async function deploy(
+  port: number,
+  ref = "origin/main",
+  smoke = false,
+  opts: { releaseDir?: string; command?: typeof sh } = {},
+): Promise<void> {
+  const dir = opts.releaseDir ?? appDir;
+  const command = opts.command ?? sh;
+  await ensureRelease(dir);
+  const previous = (await command(["git", "rev-parse", "HEAD"], { cwd: dir })).stdout.trim();
+  await command(["git", "fetch", "origin", "--prune"], { cwd: dir, timeoutMs: 300_000 });
+  const target = (await command(["git", "rev-parse", ref], { cwd: dir })).stdout.trim();
   if (target === previous) {
+    if (smoke) {
+      await command(["bun", "run", "check"], { cwd: dir, timeoutMs: 600_000 });
+      await command(["bun", "run", "smoke"], { cwd: dir, timeoutMs: 900_000 });
+    }
     console.log(`already at ${target.slice(0, 8)}`);
     return;
   }
-  await sh(["git", "checkout", "-q", "--detach", target], { cwd: appDir });
+  await command(["git", "checkout", "-q", "--detach", target], { cwd: dir });
   try {
-    await sh(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000 });
-    await sh(["bun", "run", "check"], { cwd: appDir, timeoutMs: 600_000 });
+    await command(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000 });
+    await command(["bun", "run", "check"], { cwd: dir, timeoutMs: 600_000 });
+    if (smoke) await command(["bun", "run", "smoke"], { cwd: dir, timeoutMs: 900_000 });
   } catch (e) {
-    await sh(["git", "checkout", "-q", "--detach", previous], { cwd: appDir });
-    await sh(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000, allowFail: true });
+    await command(["git", "checkout", "-q", "--detach", previous], { cwd: dir });
+    await command(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000, allowFail: true });
     throw new Error(`deploy gate failed; staying on ${previous.slice(0, 8)}\n${(e as Error).message}`);
   }
   await launchctl(["kickstart", "-k", `gui/${uid}/${LABEL}`], false);
@@ -199,8 +211,8 @@ export async function deploy(port: number, ref = "origin/main"): Promise<void> {
     return;
   }
   console.error("new version is unhealthy; rolling back");
-  await sh(["git", "checkout", "-q", "--detach", previous], { cwd: appDir });
-  await sh(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000, allowFail: true });
+  await command(["git", "checkout", "-q", "--detach", previous], { cwd: dir });
+  await command(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000, allowFail: true });
   await launchctl(["kickstart", "-k", `gui/${uid}/${LABEL}`], false);
   throw new Error(`rolled back to ${previous.slice(0, 8)}`);
 }
