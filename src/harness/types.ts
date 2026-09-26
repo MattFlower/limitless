@@ -1,3 +1,4 @@
+import type { ZodType } from "zod";
 import type { Billing, InvocationStatus, QuotaWindow } from "../core/types.ts";
 
 /** A concrete model on a concrete provider, as chosen by the router. */
@@ -12,6 +13,7 @@ export interface ModelTarget {
   effort?: string;
   /** For the claude harness pointed at a non-Anthropic backend (OpenRouter, mtplx, llama.cpp). */
   backend?: { baseUrl: string; authToken: string };
+  openai?: { baseUrl: string; authToken: string };
   /** $ per million tokens; used for metered cost and subscription cost-equivalence. */
   price?: { input: number; output: number; cacheRead?: number };
 }
@@ -34,6 +36,8 @@ export interface AgentSpec {
   /** "readonly" agents get no edit tools; the pipeline also resets the tree after them. */
   mode: "edit" | "readonly";
   jsonSchema?: Record<string, unknown>;
+  /** Runtime validation for HTTP structured completions. */
+  schema?: ZodType;
   resumeSessionId?: string;
   addDirs?: string[];
   timeoutMs: number;

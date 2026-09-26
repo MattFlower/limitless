@@ -6,6 +6,7 @@ import { collectGarbage, type GcResult } from "./gc.ts";
 import { resolveRepo } from "./git/repos.ts";
 import { runClaude } from "./harness/claude.ts";
 import { runCodex } from "./harness/codex.ts";
+import { runLlm } from "./harness/llm.ts";
 import type { Harness } from "./harness/types.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
 import {
@@ -81,7 +82,7 @@ export class Factory {
       store: this.store,
       router: this.router,
       tracker: this.tracker,
-      harnesses: opts.harnesses ?? { claude: runClaude, codex: runCodex },
+      harnesses: opts.harnesses ?? { claude: runClaude, codex: runCodex, llm: runLlm },
     };
     this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns);
     this.concierge = new Concierge(this);

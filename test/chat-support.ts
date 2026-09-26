@@ -15,19 +15,21 @@ export const proposalFields: ChatProposalFields = {
   title: "Useful feature",
 };
 
-export function chatFixture() {
+export function chatFixture(opts: { openaiBaseUrl?: string } = {}) {
   const home = mkdtempSync(join(tmpdir(), "limitless-chat-"));
   const cfg = loadConfig({ home, configDir: join(home, "config") });
   cfg.secrets = {};
   const specs: AgentSpec[] = [];
+  const harnessCalls: string[] = [];
+  const respond = (name: string) =>
+    fakeHarness((spec) => {
+      harnessCalls.push(name);
+      specs.push(spec);
+      return reply;
+    });
   let reply: FakeReply = { structured: { action: { type: "reply", text: "Hello" } } };
   const options: FactoryOptions = {
-    harnesses: {
-      fake: fakeHarness((spec) => {
-        specs.push(spec);
-        return reply;
-      }),
-    },
+    harnesses: { fake: respond("fake"), llm: respond("llm") },
     providers: [
       {
         id: "fake",
@@ -35,6 +37,7 @@ export function chatFixture() {
         harness: "fake" as const,
         billing: "subscription" as const,
         maxConcurrent: 1,
+        ...(opts.openaiBaseUrl ? { openaiBaseUrl: opts.openaiBaseUrl } : {}),
       },
     ],
     models: [
@@ -64,6 +67,7 @@ export function chatFixture() {
     },
     home,
     specs,
+    harnessCalls,
     action(action: ChatAction | unknown) {
       reply = { structured: { action } };
     },

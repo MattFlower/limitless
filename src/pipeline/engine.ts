@@ -186,7 +186,7 @@ async function triage(ctx: RunContext): Promise<void> {
       jsonSchema: toStrictJsonSchema(TriageSchema),
       schema: TriageSchema,
       requireStructured: true,
-      maxToolCalls: 15,
+      noTools: true,
     });
     await discardChanges(ctx.state.worktreePath as string);
     const t = TriageSchema.parse(result.structured);

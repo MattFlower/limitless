@@ -19,6 +19,7 @@ Usage:
   limitless integrations install [--write] Print setup; --write installs the Codex skill
   limitless service install [--tunnel] [--no-mtplx]   launchd agents: daemon, mtplx (+ tunnel)
   limitless service uninstall|status
+  limitless local up|down|status          Manage mtplx and twilight model servers
   limitless deploy [ref] [--smoke]        Deploy a ref (default origin/main); optionally run live smoke checks
 
 Environment: LIMITLESS_URL (default http://127.0.0.1:7400)`;
@@ -176,6 +177,31 @@ async function main(): Promise<void> {
       if (rest[0] !== "install") throw new Error("usage: limitless integrations install [--write]");
       const { installIntegrations } = await import("../integrations/install.ts");
       return installIntegrations({ write: values.write === true });
+    }
+    case "local": {
+      const action = rest[0];
+      if (rest.length !== 1 || (action !== "up" && action !== "down" && action !== "status"))
+        throw new Error("usage: limitless local up|down|status");
+      const { loadConfig } = await import("../config.ts");
+      const { manageLocal } = await import("./local.ts");
+      const cfg = loadConfig();
+      const local = (cfg.raw.local ?? {}) as Record<string, unknown>;
+      const report = await manageLocal(action, {
+        modelPath: typeof local.twilight_model_path === "string" ? local.twilight_model_path : "",
+        twilightHost: typeof local.twilight_host === "string" ? local.twilight_host : undefined,
+        llamaBinary:
+          typeof local.twilight_llama_binary === "string" ? local.twilight_llama_binary : undefined,
+        secrets: cfg.secrets,
+      });
+      for (const [name, state] of Object.entries(report))
+        console.log(`${name}: service ${state.service}; endpoint ${state.endpoint}`);
+      if (
+        Object.values(report).some(
+          (state) => state.service.includes("failed") || state.service === "unreachable",
+        )
+      )
+        process.exitCode = 1;
+      return;
     }
     case "run": {
       const prompt = rest.join(" ").trim() || (await Bun.stdin.text()).trim();
