@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -8,6 +8,7 @@ import { Store } from "../src/db/store.ts";
 import { runLlm } from "../src/harness/llm.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { RunContext } from "../src/pipeline/context.ts";
+import { triagePrompt } from "../src/pipeline/prompts.ts";
 import type { Policy, ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
@@ -88,6 +89,21 @@ test("direct completion sends model, schema, system and bearer token; captures u
     { role: "system", content: "private system" },
     { role: "user", content: "private question" },
   ]);
+  const log = readFileSync(join(dir, "log"), "utf8");
+  expect(log).toContain('"model":"selected-model"');
+  expect(log).toContain('"httpStatus":200');
+  expect(log).toContain('"inputTokens":12');
+  expect(log).not.toContain("private question");
+  expect(log).not.toContain("private system");
+  expect(log).not.toContain("local-token");
+});
+
+test("triage prompt uses only supplied repository context", () => {
+  const prompt = triagePrompt({ repoSlug: "local/test", prompt: "Change a file", tree: "src  test" });
+  expect(prompt).toContain("top-level entries provided below");
+  expect(prompt).toContain("src  test");
+  expect(prompt).toContain("cannot read repository files");
+  expect(prompt).not.toContain("a few file reads");
 });
 
 test("format rejection and fenced JSON use one repair request", async () => {

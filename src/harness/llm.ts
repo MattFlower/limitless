@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import {
   type AgentResult,
   emptyUsage,
@@ -39,8 +40,22 @@ function object(value: unknown): Record<string, unknown> | null {
 export const runLlm: Harness = async (spec) => {
   const endpoint = spec.target.openai;
   const usage = emptyUsage();
+  const log = (entry: Record<string, string | number>) =>
+    appendFileSync(spec.logPath, `${JSON.stringify(entry)}\n`);
+  const finish = (result: AgentResult): AgentResult => {
+    log({
+      event: "complete",
+      status: result.status,
+      inputTokens: usage.input,
+      outputTokens: usage.output,
+      costUsd: result.costUsd,
+      costEquivUsd: result.costEquivUsd,
+    });
+    return result;
+  };
+  log({ event: "start", provider: spec.target.provider, model: spec.target.model });
   if (!endpoint || !spec.jsonSchema || !spec.schema)
-    return failure("error", "HTTP completion requires an endpoint and a schema", usage, spec.target);
+    return finish(failure("error", "HTTP completion requires an endpoint and a schema", usage, spec.target));
 
   const timeout = AbortSignal.timeout(spec.timeoutMs);
   const signal = AbortSignal.any([spec.signal, timeout]);
@@ -50,11 +65,8 @@ export const runLlm: Harness = async (spec) => {
   let lastError = "invalid structured response";
   for (let attempt = 0; attempt < 2; attempt++) {
     if (signal.aborted)
-      return failure(
-        spec.signal.aborted ? "cancelled" : "timeout",
-        "completion interrupted",
-        usage,
-        spec.target,
+      return finish(
+        failure(spec.signal.aborted ? "cancelled" : "timeout", "completion interrupted", usage, spec.target),
       );
     const body: Record<string, unknown> = {
       model: spec.target.model,
@@ -66,6 +78,7 @@ export const runLlm: Harness = async (spec) => {
         type: "json_schema",
         json_schema: { name: "completion", strict: true, schema: spec.jsonSchema },
       };
+    log({ event: "request", attempt: attempt + 1, format: attempt === 0 ? "json_schema" : "plain" });
     try {
       const response = await fetch(`${endpoint.baseUrl.replace(/\/$/, "")}/chat/completions`, {
         method: "POST",
@@ -76,6 +89,7 @@ export const runLlm: Harness = async (spec) => {
         body: JSON.stringify(body),
         signal,
       });
+      log({ event: "response", attempt: attempt + 1, httpStatus: response.status });
       if (!response.ok) {
         if (attempt === 0 && [400, 422].includes(response.status)) {
           lastError = `structured format rejected (HTTP ${response.status})`;
@@ -86,13 +100,13 @@ export const runLlm: Harness = async (spec) => {
           continue;
         }
         const status = response.status === 429 ? "quota" : response.status >= 500 ? "unavailable" : "error";
-        return failure(status, `completion rejected (HTTP ${response.status})`, usage, spec.target);
+        return finish(failure(status, `completion rejected (HTTP ${response.status})`, usage, spec.target));
       }
       let data: unknown;
       try {
         data = await response.json();
       } catch {
-        return failure("unavailable", "malformed completion response", usage, spec.target);
+        return finish(failure("unavailable", "malformed completion response", usage, spec.target));
       }
       const parsed = object(data);
       const tokens = object(parsed?.usage);
@@ -103,7 +117,7 @@ export const runLlm: Harness = async (spec) => {
       const message = object(choice?.message);
       const content = message?.content;
       if (typeof content !== "string")
-        return failure("unavailable", "malformed completion response", usage, spec.target);
+        return finish(failure("unavailable", "malformed completion response", usage, spec.target));
       let candidate: unknown;
       try {
         candidate = JSON.parse(content);
@@ -113,7 +127,7 @@ export const runLlm: Harness = async (spec) => {
       const valid = spec.schema.safeParse(candidate);
       if (valid.success && object(valid.data)) {
         const cost = priceOf(usage, spec.target.price);
-        return {
+        return finish({
           status: "ok",
           error: null,
           finalText: content,
@@ -124,7 +138,7 @@ export const runLlm: Harness = async (spec) => {
           costUsd: spec.target.billing === "metered" ? cost : 0,
           costEquivUsd: cost,
           quota: null,
-        };
+        });
       }
       lastError = "completion failed schema validation";
       messages.push({
@@ -132,10 +146,11 @@ export const runLlm: Harness = async (spec) => {
         content: "Your previous answer was invalid. Return only a JSON object matching the requested schema.",
       });
     } catch {
-      if (spec.signal.aborted) return failure("cancelled", "completion cancelled", usage, spec.target);
-      if (timeout.aborted) return failure("timeout", "completion timed out", usage, spec.target);
-      return failure("unavailable", "completion transport failure", usage, spec.target);
+      if (spec.signal.aborted)
+        return finish(failure("cancelled", "completion cancelled", usage, spec.target));
+      if (timeout.aborted) return finish(failure("timeout", "completion timed out", usage, spec.target));
+      return finish(failure("unavailable", "completion transport failure", usage, spec.target));
     }
   }
-  return failure("error", lastError, usage, spec.target);
+  return finish(failure("error", lastError, usage, spec.target));
 };
