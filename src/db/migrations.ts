@@ -227,4 +227,14 @@ ALTER TABLE provider_state ADD COLUMN limit_remaining REAL;
 ALTER TABLE provider_state ADD COLUMN limit_reset TEXT;
 `,
   },
+  {
+    version: 7,
+    name: "delivery_rebase_round_checkpoint",
+    sql: `
+UPDATE runs SET state_json = json_set(state_json, '$.conflictRound', json_extract(state_json, '$.round'))
+WHERE json_type(state_json, '$.conflictRound') = 'true';
+UPDATE runs SET state_json = json_remove(state_json, '$.conflictRound')
+WHERE json_type(state_json, '$.conflictRound') = 'false';
+`,
+  },
 ];

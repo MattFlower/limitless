@@ -548,7 +548,7 @@ describe("resume after restart", () => {
 
 describe("repo cache concurrency", () => {
   test("concurrent runs share one clone of a remote repo", async () => {
-    const { ensureCache } = await import("../src/git/repos.ts");
+    const { ensureCache, fetchBase } = await import("../src/git/repos.ts");
     const origin = join(dir, "origin");
     mkdirSync(origin);
     writeFileSync(join(origin, "a.txt"), "a\n");
@@ -582,6 +582,19 @@ describe("repo cache concurrency", () => {
       const r = await sh(["git", "rev-parse", "origin/main"], { cwd: c });
       expect(r.stdout.trim()).toHaveLength(40);
     }
+
+    writeFileSync(join(origin, "b.txt"), "b\n");
+    await sh(["git", "add", "."], { cwd: origin });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "advance"], {
+      cwd: origin,
+    });
+    const tip = (await sh(["git", "rev-parse", "HEAD"], { cwd: origin })).stdout.trim();
+    const fetched = await Promise.all([
+      ...Array.from({ length: 8 }, () => fetchBase(paths, repo, "main")),
+      ensureCache(paths, repo),
+    ]);
+    expect(fetched.slice(0, -1)).toEqual(Array(8).fill(tip));
+    expect((await sh(["git", "rev-parse", "origin/main"], { cwd: caches[0] })).stdout.trim()).toBe(tip);
   });
 });
 

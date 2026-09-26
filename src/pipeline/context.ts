@@ -47,6 +47,15 @@ export interface RunState {
   implementerIssue?: string | null;
   /** Round whose implementation has been committed; resuming skips straight to its checks. */
   implementedRound?: number;
+  /** Delivery rebase target; gates must pass before this becomes run.baseSha. */
+  pendingRebaseSha?: string;
+  preRebaseGates?: GateComparison[];
+  /** Head before the delivery rebase; delivery falls back to it if the rebase regresses checks. */
+  preRebaseHead?: string;
+  /** Why delivery went ahead without rebasing onto the latest base (shown in the report). */
+  rebaseNote?: string;
+  /** The single extra implementation round allowed after a conflicting delivery rebase. */
+  conflictRound?: number;
   /** package.json scripts the gates depend on, as they were on the base branch. */
   baselineScripts?: Record<string, string>;
   feedback: string | null;
