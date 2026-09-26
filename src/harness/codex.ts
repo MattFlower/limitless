@@ -11,6 +11,7 @@ import {
   extractJson,
   LoopDetector,
   priceOf,
+  redactJsonLine,
   type Usage,
 } from "./types.ts";
 
@@ -208,7 +209,7 @@ function findKey(obj: unknown, key: string): unknown {
   return null;
 }
 
-export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
+export function buildCodexArgs(spec: AgentSpec): string[] {
   const t = spec.target;
   const args = [
     "codex",
@@ -224,6 +225,22 @@ export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
   ];
   if (t.effort) args.push("-c", `model_reasoning_effort="${t.effort}"`);
   if (spec.privateSession) args.push("--ephemeral", "--ignore-user-config");
+  if (spec.noTools) {
+    // Fail closed on unknown config keys and keep the model from reaching the filesystem.
+    args.push(
+      "--strict-config",
+      "-c",
+      "tools.disable_defaults=true",
+      "-c",
+      "features.shell_tool=false",
+      "-c",
+      "features.multi_agent=false",
+      "-c",
+      "include_apply_patch_tool=false",
+      "-c",
+      'web_search="disabled"',
+    );
+  }
   if (spec.mode === "readonly") {
     args.push("-s", "read-only");
   } else {
@@ -235,10 +252,16 @@ export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
     writeFileSync(schemaPath, JSON.stringify(spec.jsonSchema));
     args.push("--output-schema", schemaPath);
   }
-  let prompt = spec.prompt;
-  if (spec.systemAppend) prompt = `${spec.systemAppend}\n\n---\n\n${prompt}`;
   if (spec.resumeSessionId) args.push("resume", spec.resumeSessionId, "-");
   else args.push("-");
+
+  return args;
+}
+
+export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
+  const t = spec.target;
+  const args = buildCodexArgs(spec);
+  const prompt = spec.systemAppend ? `${spec.systemAppend}\n\n---\n\n${spec.prompt}` : spec.prompt;
 
   const loop = new LoopDetector(spec.maxToolCalls);
   const stuckController = new AbortController();
@@ -266,11 +289,11 @@ export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
     timeoutMs: spec.timeoutMs,
     idleTimeoutMs: spec.idleTimeoutMs,
     onStdoutLine: (line) => {
-      appendFileSync(spec.logPath, `${line}\n`);
+      appendFileSync(spec.logPath, `${redactJsonLine(line, spec.redactOutput)}\n`);
       parser.feed(line);
     },
     onStderrLine: (line) => {
-      appendFileSync(spec.logPath, `[stderr] ${line}\n`);
+      appendFileSync(spec.logPath, `[stderr] ${spec.redactOutput?.(line) ?? line}\n`);
       if (!line.startsWith("Reading additional input")) spec.onEvent({ type: "stderr", text: line });
     },
   });

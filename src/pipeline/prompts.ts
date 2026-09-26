@@ -146,15 +146,17 @@ export function formatReviewFeedback(review: Review): string {
     .join("\n")}`;
 }
 
-function redactHoldoutEvidence(evidence: string, scenario: Holdout["scenarios"][number]): string {
-  let safe = evidence;
+export function redactHoldoutText(value: string, holdout: Holdout): string {
+  let safe = value;
   const remove = (value: string, replacement: string) => {
     const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     safe = safe.replace(new RegExp(escaped, "gi"), replacement);
   };
-  for (const source of [scenario.description, scenario.steps, scenario.expected]) {
-    remove(source, "[private check]");
-    for (const token of source.match(/[A-Za-z0-9_-]{6,}/g) ?? []) remove(token, "[private input]");
+  for (const scenario of holdout.scenarios) {
+    for (const source of [scenario.description, scenario.steps, scenario.expected]) {
+      remove(source, "[private check]");
+      for (const token of source.match(/[A-Za-z0-9_-]{6,}/g) ?? []) remove(token, "[private input]");
+    }
   }
   return safe;
 }
@@ -167,7 +169,7 @@ export function formatVerifyFeedback(verify: Verify, spec: Spec | null, holdout?
     .map((c) => {
       const scenario = holdout?.scenarios.find((s) => s.id === c.id);
       return scenario
-        ? `- **${c.id}** (${c.status}) Observed failure: ${redactHoldoutEvidence(c.evidence, scenario)}`
+        ? `- **${c.id}** (${c.status}) Observed failure: ${redactHoldoutText(c.evidence, holdout as Holdout)}`
         : `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
     })
     .join("\n")}`;

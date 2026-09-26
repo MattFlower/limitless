@@ -9,6 +9,7 @@ import {
   extractJson,
   LoopDetector,
   priceOf,
+  redactJsonLine,
   type Usage,
 } from "./types.ts";
 
@@ -227,11 +228,11 @@ export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
     timeoutMs: spec.timeoutMs,
     idleTimeoutMs: spec.idleTimeoutMs,
     onStdoutLine: (line) => {
-      appendFileSync(spec.logPath, `${line}\n`);
+      appendFileSync(spec.logPath, `${redactJsonLine(line, spec.redactOutput)}\n`);
       parser.feed(line);
     },
     onStderrLine: (line) => {
-      appendFileSync(spec.logPath, `[stderr] ${line}\n`);
+      appendFileSync(spec.logPath, `[stderr] ${spec.redactOutput?.(line) ?? line}\n`);
       spec.onEvent({ type: "stderr", text: line });
     },
   });

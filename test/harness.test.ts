@@ -2,8 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ClaudeStreamParser } from "../src/harness/claude.ts";
-import { CodexStreamParser, parseRateLimits } from "../src/harness/codex.ts";
-import { type AgentEvent, extractJson, LoopDetector, priceOf } from "../src/harness/types.ts";
+import { buildCodexArgs, CodexStreamParser, parseRateLimits } from "../src/harness/codex.ts";
+import {
+  type AgentEvent,
+  type AgentSpec,
+  extractJson,
+  LoopDetector,
+  priceOf,
+  redactJsonLine,
+} from "../src/harness/types.ts";
+import { redactHoldoutText } from "../src/pipeline/prompts.ts";
 
 const fixture = (name: string) =>
   readFileSync(join(import.meta.dir, "fixtures", name), "utf8")
@@ -62,6 +70,40 @@ describe("ClaudeStreamParser", () => {
 });
 
 describe("CodexStreamParser", () => {
+  test("disables default tools for a blind structured call", () => {
+    const spec: AgentSpec = {
+      cwd: "/tmp/isolated",
+      prompt: "Write scenarios",
+      target: {
+        modelId: "codex/sol",
+        provider: "codex",
+        harness: "codex",
+        model: "gpt-6-sol",
+        vendor: "openai",
+        tier: 4,
+        billing: "subscription",
+      },
+      mode: "readonly",
+      timeoutMs: 1000,
+      idleTimeoutMs: 1000,
+      maxToolCalls: 0,
+      noTools: true,
+      privateSession: true,
+      signal: new AbortController().signal,
+      logPath: "/tmp/isolated/inv.log",
+      onEvent: () => {},
+    };
+    const args = buildCodexArgs(spec);
+    expect(args).toContain("tools.disable_defaults=true");
+    expect(args).toContain("features.shell_tool=false");
+    expect(args).toContain("include_apply_patch_tool=false");
+    expect(args).toContain("--strict-config");
+    expect(args).toContain("--ignore-user-config");
+    expect(args).toContain("--ephemeral");
+    expect(args).toContain("read-only");
+    expect(buildCodexArgs({ ...spec, noTools: false })).not.toContain("tools.disable_defaults=true");
+  });
+
   test("parses a real codex exec --json run", () => {
     const events: AgentEvent[] = [];
     const p = new CodexStreamParser((e) => events.push(e));
@@ -105,6 +147,30 @@ describe("CodexStreamParser", () => {
     expect(w?.seven_day?.resetsAt).toBe(1789867141000);
     expect(w?.five_hour?.utilization).toBeCloseTo(0.425);
   });
+});
+
+test("CLI transcript redaction handles escaped multi-line scenario text", () => {
+  const holdout = {
+    scenarios: [
+      {
+        id: "H-1",
+        description: "special case",
+        steps: "printf 'private'\nrun SECRET_MARKER_719",
+        expected: "done",
+        edge_case: false,
+      },
+      { id: "H-2", description: "edge two", steps: "exit 1", expected: "failure", edge_case: true },
+      { id: "H-3", description: "edge three", steps: "exit 2", expected: "failure", edge_case: true },
+    ],
+  };
+  const line = JSON.stringify({
+    type: "item.completed",
+    item: { text: "routine check: printf 'private'\nrun SECRET_MARKER_719" },
+  });
+  const redacted = redactJsonLine(line, (value) => redactHoldoutText(value, holdout));
+  expect(redacted).toContain("routine check");
+  expect(redacted).not.toContain("SECRET_MARKER_719");
+  expect(redacted).not.toContain("printf 'private'");
 });
 
 describe("LoopDetector", () => {

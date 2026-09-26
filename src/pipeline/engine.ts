@@ -32,6 +32,7 @@ import {
   formatVerifyFeedback,
   holdoutPrompt,
   implementPrompt,
+  redactHoldoutText,
   reviewPrompt,
   specPrompt,
   triagePrompt,
@@ -601,7 +602,8 @@ async function oneRound(
         jsonSchema: toStrictJsonSchema(VerifySchema),
         schema: VerifySchema,
         requireStructured: true,
-        privateOutput: true,
+        privateSession: true,
+        redactHoldout: true,
       });
       await discardChanges(cwd);
       const v = VerifySchema.parse(result.structured);
@@ -625,6 +627,17 @@ async function oneRound(
         { ...v, modelId: target.modelId, round },
       ];
       ctx.save();
+      ctx.store.putArtifact(
+        ctx.run.id,
+        `verify-${round}.json`,
+        "verify",
+        JSON.stringify(
+          { ...v, modelId: target.modelId, round },
+          (_key, value: unknown) =>
+            typeof value === "string" ? redactHoldoutText(value, ctx.state.holdout as Holdout) : value,
+          2,
+        ),
+      );
       const met = v.criteria.filter((c) => c.status === "met").length;
       return {
         summary: `${v.overall}: ${met}/${v.criteria.length} criteria met (${target.modelId})`,
@@ -654,7 +667,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
 
     const publish = () => {
       ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
-      if (success && ctx.state.holdout) {
+      if (ctx.state.holdout) {
         ctx.store.putArtifact(
           ctx.run.id,
           "holdout-scenarios.json",

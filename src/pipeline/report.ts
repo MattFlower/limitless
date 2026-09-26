@@ -66,7 +66,7 @@ export function renderReport(input: ReportInput): string {
     }
   }
 
-  if (input.success && state.holdout) {
+  if (state.holdout) {
     blocks.push(
       "## Holdout scenarios",
       table(

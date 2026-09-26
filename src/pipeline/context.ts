@@ -11,7 +11,7 @@ import type { GateComparison, GateRun } from "../gates/run.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../harness/types.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
-import { FACTORY_PREAMBLE } from "./prompts.ts";
+import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
 
 export interface EngineDeps {
@@ -89,6 +89,10 @@ export interface InvokeOptions {
   schema?: ZodType;
   /** Run without repository access or public/raw event output. */
   privateOutput?: boolean;
+  /** Prevent the CLI from persisting a private prompt in its own session store. */
+  privateSession?: boolean;
+  /** Redact holdout content from observable verifier events and transcripts. */
+  redactHoldout?: boolean;
   isolatedCwd?: boolean;
   noTools?: boolean;
 }
@@ -225,6 +229,10 @@ export class RunContext {
       });
       let result: AgentResult;
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
+      const redact =
+        opts.redactHoldout && this.state.holdout
+          ? (value: string) => redactHoldoutText(value, this.state.holdout as Holdout)
+          : undefined;
       try {
         result = await harness({
           cwd: opts.isolatedCwd ? (privateDir as string) : (this.state.worktreePath ?? this.runDir),
@@ -237,10 +245,13 @@ export class RunContext {
           idleTimeoutMs: opts.idleTimeoutMs ?? 10 * 60_000,
           maxToolCalls: opts.maxToolCalls ?? (opts.mode === "edit" ? 400 : 150),
           noTools: opts.noTools,
-          privateSession: opts.privateOutput,
+          privateSession: opts.privateOutput || opts.privateSession,
+          redactOutput: redact,
           signal: this.signal,
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
-          onEvent: opts.privateOutput ? () => {} : (ev) => this.onAgentEvent(invocation.id, ev, opts.role),
+          onEvent: opts.privateOutput
+            ? () => {}
+            : (ev) => this.onAgentEvent(invocation.id, ev, opts.role, redact),
         });
       } catch (e) {
         result = {
@@ -280,13 +291,23 @@ export class RunContext {
         cacheReadTokens: result.usage.cacheRead,
         numTurns: result.numTurns,
         sessionId: result.sessionId,
-        error: opts.privateOutput && result.error ? "private invocation failed" : result.error,
+        error:
+          opts.privateOutput && result.error
+            ? "private invocation failed"
+            : result.error && redact
+              ? redact(result.error)
+              : result.error,
         finishedAt: Date.now(),
       });
       if (result.quota?.windows) tracker.observeWindows(target.provider, result.quota.windows);
       tracker.record(target.provider, result.status, {
         exhaustedUntil: result.quota?.exhaustedUntil ?? null,
-        error: opts.privateOutput && result.error ? "private invocation failed" : result.error,
+        error:
+          opts.privateOutput && result.error
+            ? "private invocation failed"
+            : result.error && redact
+              ? redact(result.error)
+              : result.error,
       });
       this.run = store.refreshRunTotals(this.run.id);
 
@@ -295,19 +316,32 @@ export class RunContext {
         // A configuration problem with this model (e.g. not on the plan), not a task failure.
         tracker.blockModel(
           target.modelId,
-          opts.privateOutput ? "private invocation rejected" : (result.error ?? "rejected"),
+          opts.privateOutput
+            ? "private invocation rejected"
+            : (redact?.(result.error ?? "rejected") ?? result.error ?? "rejected"),
         );
-        lastFailure = `${target.modelId}: ${result.error ?? ""}`.slice(0, 300);
+        lastFailure = `${target.modelId}: ${redact?.(result.error ?? "") ?? result.error ?? ""}`.slice(
+          0,
+          300,
+        );
         this.log(`${target.modelId} rejected by provider; blocking it for 24h and falling back`, "warn");
         continue;
       }
       if (result.status === "quota" || result.status === "unavailable") {
-        lastFailure = `${target.modelId}: ${result.status} (${result.error ?? ""})`.slice(0, 300);
+        lastFailure =
+          `${target.modelId}: ${result.status} (${redact?.(result.error ?? "") ?? result.error ?? ""})`.slice(
+            0,
+            300,
+          );
         this.log(`${target.modelId} ${result.status}; falling back`, "warn");
         continue;
       }
       if (opts.requireStructured && (result.status !== "ok" || result.structured === null)) {
-        lastFailure = `${target.modelId}: ${result.error ?? "no structured output"}`.slice(0, 300);
+        lastFailure =
+          `${target.modelId}: ${redact?.(result.error ?? "no structured output") ?? result.error ?? "no structured output"}`.slice(
+            0,
+            300,
+          );
         this.log(`${target.modelId} failed to produce structured output; trying next model`, "warn");
         continue;
       }
@@ -320,14 +354,34 @@ export class RunContext {
     );
   }
 
-  private onAgentEvent(invocationId: number, ev: AgentEvent, role: Role): void {
+  private onAgentEvent(
+    invocationId: number,
+    ev: AgentEvent,
+    role: Role,
+    redact?: (value: string) => string,
+  ): void {
     const runId = this.run.id;
     const add = (
       type: RunEvent["type"],
       message: string,
       data?: unknown,
       level: RunEvent["level"] = "info",
-    ) => this.store.addEvent({ runId, invocationId, type, level, message, data });
+    ) =>
+      this.store.addEvent({
+        runId,
+        invocationId,
+        type,
+        level,
+        message: redact ? redact(message) : message,
+        data:
+          redact && data !== undefined
+            ? JSON.parse(
+                JSON.stringify(data, (_key, value: unknown) =>
+                  typeof value === "string" ? redact(value) : value,
+                ),
+              )
+            : data,
+      });
     switch (ev.type) {
       case "init":
         add("status", `session ${ev.sessionId}${ev.model ? ` (${ev.model})` : ""}`, undefined, "debug");

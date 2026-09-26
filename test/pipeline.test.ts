@@ -242,6 +242,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
         verifies++;
         return verifies === 1
           ? {
+              text: `ordinary verifier diagnostic; private input ${secret}`,
+              error: `verifier diagnostic included ${secret}`,
               structured: {
                 ...pass,
                 criteria: pass.criteria.map((c) =>
@@ -264,7 +266,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(s.prompt).not.toContain(privateHoldout.scenarios[1]?.steps);
         expect(f.store.getRunState<RunState>(runId)?.feedback).not.toContain(secret);
         expect(f.store.listArtifacts(runId).map((a) => a.name)).not.toContain("holdout-scenarios.json");
-        expect(f.store.listArtifacts(runId).map((a) => a.name)).not.toContain("verify-0.json");
+        expect(f.store.getArtifact(runId, "verify-0.json")).toContain("Observed failure");
+        expect(f.store.getArtifact(runId, "verify-0.json")).not.toContain(secret);
         expect(existsSync(join(s.cwd, "holdout-scenarios.json"))).toBe(false);
         for (const artifact of f.store.listArtifacts(runId))
           expect(f.store.getArtifact(runId, artifact.name)).not.toContain(secret);
@@ -289,8 +292,55 @@ describe("pipeline (fake agents, real git + gates)", () => {
         totals: { costUsd: 0, costEquivUsd: 0 },
         runUrl: "u",
       }),
-    ).not.toContain(secret);
+    ).toContain("## Holdout scenarios");
     expect(JSON.stringify(f.store.listEvents(run.id))).not.toContain(secret);
+    expect(JSON.stringify(f.store.listEvents(run.id))).toContain("ordinary verifier diagnostic");
+    const firstVerify = f.store.listInvocations(run.id).find((inv) => inv.role === "verify");
+    expect(firstVerify?.error).toContain("verifier diagnostic included");
+    expect(firstVerify?.error).not.toContain(secret);
+  });
+
+  test("needs-human delivery includes failed holdouts and restores full verify evidence", async () => {
+    const secret = "PRIVATE_FAILURE_CASE_872";
+    const privateHoldout = {
+      scenarios: holdout.scenarios.map((scenario) =>
+        scenario.id === "H-2" ? { ...scenario, steps: `run ${secret}` } : scenario,
+      ),
+    };
+    const failedVerify = {
+      ...pass,
+      criteria: pass.criteria.map((criterion) =>
+        criterion.id === "H-2"
+          ? { ...criterion, status: "unmet", evidence: `Observed empty output for ${secret}` }
+          : criterion,
+      ),
+    };
+    let runId = "";
+    let preDeliveryChecked = false;
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: privateHoldout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: failedVerify };
+      if (runId && !preDeliveryChecked && f.store.getRunState<RunState>(runId)?.round) {
+        preDeliveryChecked = true;
+        expect(f.store.getArtifact(runId, "holdout-scenarios.json")).toBeNull();
+        expect(f.store.getArtifact(runId, "verify-0.json")).not.toContain(secret);
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    runId = run.id;
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+    expect(preDeliveryChecked).toBe(true);
+    expect(f.store.getArtifact(run.id, "holdout-scenarios.json")).toContain(secret);
+    expect(f.store.getArtifact(run.id, "verify-0.json")).toContain(secret);
+    const report = f.store.getArtifact(run.id, "report.md") ?? "";
+    expect(report).toContain("## Holdout scenarios");
+    expect(report).toContain("H-2");
+    expect(report).toContain(`Observed empty output for ${secret}`);
   });
 
   test("completed holdout survives a stopped factory and is reused after restart", async () => {

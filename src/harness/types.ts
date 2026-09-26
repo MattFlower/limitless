@@ -43,6 +43,8 @@ export interface AgentSpec {
   noTools?: boolean;
   /** Do not retain CLI session transcripts for private structured calls. */
   privateSession?: boolean;
+  /** Redact private prompt content before writing the CLI transcript. */
+  redactOutput?: (text: string) => string;
   signal: AbortSignal;
   /** Raw stream is appended here for post-mortem debugging. */
   logPath: string;
@@ -71,6 +73,18 @@ export interface AgentResult {
 }
 
 export type Harness = (spec: AgentSpec) => Promise<AgentResult>;
+
+/** Redact string values before persisting a structured CLI event. */
+export function redactJsonLine(line: string, redact?: (text: string) => string): string {
+  if (!redact) return line;
+  try {
+    return JSON.stringify(JSON.parse(line), (_key, value: unknown) =>
+      typeof value === "string" ? redact(value) : value,
+    );
+  } catch {
+    return redact(line);
+  }
+}
 
 export const emptyUsage = (): Usage => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
