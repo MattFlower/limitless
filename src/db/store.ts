@@ -7,6 +7,7 @@ import type {
   Invocation,
   InvocationStatus,
   Question,
+  QuotaAlert,
   Repo,
   Role,
   Run,
@@ -667,6 +668,96 @@ export class Store {
   }
 
   // ---- provider state ------------------------------------------------------
+
+  listAlerts(now = Date.now()): QuotaAlert[] {
+    return (
+      this.db
+        .query(
+          "SELECT * FROM quota_alerts WHERE active = 1 AND (resets_at IS NULL OR resets_at > ?) ORDER BY created_at DESC",
+        )
+        .all(now) as Row[]
+    ).map((r) => ({
+      provider: r.provider as string,
+      window: r.window as string,
+      utilization: (r.utilization as number) ?? null,
+      resetsAt: (r.resets_at as number) ?? null,
+      severity: r.severity as QuotaAlert["severity"],
+      routing: r.routing as string,
+      createdAt: r.created_at as number,
+    }));
+  }
+
+  putAlert(alert: QuotaAlert): boolean {
+    const boundary = alert.resetsAt ?? 0;
+    const previous = this.db
+      .query(
+        "SELECT severity, created_at FROM quota_alerts WHERE provider = ? AND window = ? AND boundary = ?",
+      )
+      .get(alert.provider, alert.window, boundary) as Row | null;
+    const current: QuotaAlert = previous
+      ? {
+          ...alert,
+          severity: previous.severity === "exhausted" ? "exhausted" : alert.severity,
+          createdAt: previous.created_at as number,
+        }
+      : alert;
+    this.db
+      .query(
+        "UPDATE quota_alerts SET active = 0 WHERE provider = ? AND window = ? AND boundary != ? AND active = 1",
+      )
+      .run(alert.provider, alert.window, boundary);
+    const inserted =
+      this.db
+        .query(
+          `INSERT OR IGNORE INTO quota_alerts (provider, window, boundary, resets_at, utilization, severity, routing, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          current.provider,
+          current.window,
+          boundary,
+          current.resetsAt,
+          current.utilization,
+          current.severity,
+          current.routing,
+          current.createdAt,
+        ).changes > 0;
+    if (!inserted)
+      this.db
+        .query(
+          "UPDATE quota_alerts SET utilization = ?, severity = ?, routing = ?, active = 1 WHERE provider = ? AND window = ? AND boundary = ?",
+        )
+        .run(
+          current.utilization,
+          current.severity,
+          current.routing,
+          current.provider,
+          current.window,
+          boundary,
+        );
+    this.publish({
+      kind: "alert",
+      alert: current,
+      provider: current.provider,
+      window: current.window,
+      created: inserted,
+    });
+    return inserted;
+  }
+
+  clearAlert(provider: string, window: string): void {
+    const changed = this.db
+      .query("UPDATE quota_alerts SET active = 0 WHERE provider = ? AND window = ? AND active = 1")
+      .run(provider, window).changes;
+    if (changed) this.publish({ kind: "alert", alert: null, provider, window, created: false });
+  }
+
+  expireAlerts(now: number): void {
+    const expired = this.db
+      .query("SELECT provider, window FROM quota_alerts WHERE active = 1 AND resets_at <= ?")
+      .all(now) as Row[];
+    for (const row of expired) this.clearAlert(row.provider as string, row.window as string);
+  }
 
   getProviderRow(provider: string): Row | null {
     return this.db.query("SELECT * FROM provider_state WHERE provider = ?").get(provider) as Row | null;

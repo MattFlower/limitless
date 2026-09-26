@@ -78,6 +78,11 @@ claude_five_hour = 0.80
 claude_seven_day = 0.85
 codex_weekly = 0.90   # keeps 10% of ChatGPT usage free for you
 
+# Optional: reserve for an additional subscription provider/window.
+# Unspecified windows use 1.0 (the reported hard quota).
+[reserves.windows.my_provider]
+daily = 0.80
+
 [owners]
 github = "MattFlower"
 discord = "YOUR_DISCORD_USER_ID"

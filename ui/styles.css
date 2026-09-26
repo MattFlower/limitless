@@ -679,6 +679,22 @@ p {
 
 /* ---------------------------------------------------------------------- provider cards */
 
+.quota-alert {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  padding: 14px 18px;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--warning);
+  border-radius: 8px;
+  background: var(--warning-bg);
+}
+
+.quota-alert--exhausted {
+  border-left-color: var(--danger);
+  background: var(--danger-bg);
+}
+
 .provider-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));

@@ -198,7 +198,16 @@ export class DiscordIntegration {
   start(): void {
     this.unsubscribe = this.factory.store.subscribe((msg) => {
       if (this.stopped) return;
-      if (msg.kind === "stage" && msg.stage.status === "running") {
+      if (msg.kind === "alert" && msg.created && msg.alert) {
+        const channel = this.factory.cfg.discordChannelId;
+        if (channel) {
+          const a = msg.alert;
+          this.enqueue(
+            channel,
+            `Quota ${a.severity}: ${a.provider} · ${a.window} · ${a.utilization === null ? "utilization unknown" : `${(a.utilization * 100).toFixed(1)}% utilization`} · resets ${a.resetsAt === null ? "unknown" : new Date(a.resetsAt).toISOString()}. ${a.routing}`,
+          );
+        }
+      } else if (msg.kind === "stage" && msg.stage.status === "running") {
         const run = this.factory.store.getRun(msg.stage.runId);
         if (!run) return;
         const key = `${msg.stage.name}:${msg.stage.round}`;

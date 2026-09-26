@@ -15,6 +15,7 @@ const STATS_REFRESH_MS = 30_000;
 export const Dashboard: Component = () => {
   ensureLiveStore();
   const [stats, setStats] = createSignal<Stats | null>(null);
+  const [now, setNow] = createSignal(Date.now());
   const [statusFilter, setStatusFilter] = createSignal<RunStatus | null>(null);
 
   const refreshStats = () =>
@@ -24,7 +25,11 @@ export const Dashboard: Component = () => {
   onMount(() => {
     refreshStats();
     const t = setInterval(refreshStats, STATS_REFRESH_MS);
-    onCleanup(() => clearInterval(t));
+    const clock = setInterval(() => setNow(Date.now()), 1000);
+    onCleanup(() => {
+      clearInterval(t);
+      clearInterval(clock);
+    });
   });
 
   const runs = createMemo(() => Object.values(live.runs).sort((a, b) => b.createdAt - a.createdAt));
@@ -33,12 +38,34 @@ export const Dashboard: Component = () => {
     return f ? runs().filter((r) => r.status === f) : runs();
   });
   const providers = createMemo(() => Object.values(live.providers).sort((a, b) => a.id.localeCompare(b.id)));
+  const alerts = createMemo(() =>
+    Object.values(live.alerts).filter((a) => a.resetsAt === null || a.resetsAt > now()),
+  );
 
   return (
     <div class="page stack">
       <div class="page-header">
         <h1 class="page-title">Mission control</h1>
       </div>
+
+      <For each={alerts()}>
+        {(alert) => (
+          <div class={`quota-alert quota-alert--${alert.severity}`} role="alert">
+            <strong>
+              Quota {alert.severity}: {alert.provider} · {alert.window}
+            </strong>
+            <span>
+              {alert.utilization === null
+                ? "Utilization unknown"
+                : `${(alert.utilization * 100).toFixed(1)}% utilization`}
+            </span>
+            <span>
+              Resets {alert.resetsAt === null ? "unknown" : new Date(alert.resetsAt).toLocaleString()}
+            </span>
+            <span>{alert.routing}</span>
+          </div>
+        )}
+      </For>
 
       <Show when={stats()} fallback={<div class="centered-hint">loading stats…</div>}>
         {(s) => <KpiStrip totals={s().totals} />}
