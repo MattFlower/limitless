@@ -53,6 +53,7 @@ diffs, reviews, quota gauges, cost).
 | `limitless show <run>` / `logs <run> [-f]` | Details / event log |
 | `limitless cancel <run>` / `answer <run> "<text>"` | Cancel / answer an open question |
 | `limitless providers` | Health and quota of every provider |
+| `limitless gc [--dry-run]` | Clean up expired worktrees, invocation logs and debug events |
 | `limitless service install\|uninstall\|status` | Run the daemon (and Cloudflare tunnel) under launchd |
 | `limitless deploy [ref]` | Update the release checkout, gate on `bun run check`, restart, auto-rollback |
 
@@ -72,6 +73,12 @@ port = 7400
 max_concurrent_runs = 3
 max_rounds = 3
 openrouter_budget_usd = 50
+
+[retention]
+worktree_days = 3
+failed_worktree_days = 7
+log_days = 30
+debug_event_days = 14
 
 [reserves]            # stop using a subscription at this fraction of its window
 claude_five_hour = 0.80

@@ -1,6 +1,7 @@
 import type { Config } from "./config.ts";
 import type { CreateRunRequest, Question, Run } from "./core/types.ts";
 import { Store } from "./db/store.ts";
+import { collectGarbage, type GcResult } from "./gc.ts";
 import { resolveRepo } from "./git/repos.ts";
 import { runClaude } from "./harness/claude.ts";
 import { runCodex } from "./harness/codex.ts";
@@ -25,6 +26,11 @@ export interface FactoryOptions {
   models?: ModelDef[];
   policy?: Policy;
   store?: Store;
+  cleanup?: (dryRun: boolean) => Promise<GcResult>;
+  gcTimer?: {
+    set: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
+    clear: (timer: ReturnType<typeof setInterval>) => void;
+  };
   clock?: () => number;
 }
 
@@ -38,12 +44,18 @@ export class Factory {
   readonly startedAt = Date.now();
   private readonly tunnels = new SshTunnels((msg) => console.warn(`[tunnel] ${msg}`));
   private readonly providerDefs: ProviderDef[];
+  private readonly cleanup: (dryRun: boolean) => Promise<GcResult>;
+  private readonly gcTimer: NonNullable<FactoryOptions["gcTimer"]>;
+  private gcInterval: ReturnType<typeof setInterval> | null = null;
+  private gcInFlight: Promise<GcResult> | null = null;
 
   constructor(
     readonly cfg: Config,
     opts: FactoryOptions = {},
   ) {
     this.store = opts.store ?? new Store(cfg.paths.db);
+    this.cleanup = opts.cleanup ?? ((dryRun) => collectGarbage(this.store, cfg, { dryRun }));
+    this.gcTimer = opts.gcTimer ?? { set: setInterval, clear: clearInterval };
     this.providerDefs = opts.providers ?? PROVIDERS;
     this.tracker = new ProviderTracker(
       this.providerDefs,
@@ -73,8 +85,18 @@ export class Factory {
   }
 
   start(): void {
+    if (this.gcInterval) return;
     // UI development against seeded data must never launch real (paid) runs.
     if (process.env.LIMITLESS_NO_SCHEDULER === "1") return;
+    void this.gc()
+      .then((result) => this.reportGc(result))
+      .catch((error) => console.error(`[gc] ${(error as Error).message}`));
+    this.gcInterval = this.gcTimer.set(() => {
+      if (this.gcInFlight) return;
+      void this.gc()
+        .then((result) => this.reportGc(result))
+        .catch((error) => console.error(`[gc] ${(error as Error).message}`));
+    }, 60 * 60_000);
     // Only forward to servers we can actually authenticate against.
     this.tunnels.start(
       this.providerDefs
@@ -85,8 +107,27 @@ export class Factory {
   }
 
   async stop(): Promise<void> {
+    if (this.gcInterval) this.gcTimer.clear(this.gcInterval);
+    this.gcInterval = null;
+    await this.gcInFlight;
     this.tunnels.stop();
     await this.scheduler.stop();
+  }
+
+  gc(dryRun = false): Promise<GcResult> {
+    if (this.gcInFlight) throw new Error("cleanup already running");
+    const pass = this.cleanup(dryRun);
+    this.gcInFlight = pass;
+    void pass
+      .finally(() => {
+        if (this.gcInFlight === pass) this.gcInFlight = null;
+      })
+      .catch(() => undefined);
+    return pass;
+  }
+
+  private reportGc(result: GcResult): void {
+    for (const error of result.errors) console.warn(`[gc] ${error}`);
   }
 
   /** The second argument is factory-only provenance, never deserialized from a request. */

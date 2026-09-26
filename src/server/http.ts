@@ -124,6 +124,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/api/health": handle(() =>
       json({ ok: true, uptimeMs: Date.now() - factory.startedAt, active: factory.scheduler.activeRunIds }),
     ),
+    "/api/gc": {
+      POST: handle(async (req) => {
+        const input = await body<{ dryRun?: boolean }>(req);
+        return json(await factory.gc(input.dryRun === true));
+      }),
+    },
     "/api/runs": {
       GET: handle((req) => {
         const url = new URL(req.url);

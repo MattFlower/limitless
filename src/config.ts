@@ -24,6 +24,7 @@ export interface Reserves {
 
 export interface Config {
   paths: Paths;
+  retention: { worktreeDays: number; failedWorktreeDays: number; logDays: number; debugEventDays: number };
   port: number;
   host: string;
   publicUrl: string | null; // e.g. https://limitless.mattflower.cc (webhooks only)
@@ -66,6 +67,11 @@ function parseEnvFile(path: string): Record<string, string> {
 
 function num(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+
+function days(v: unknown, fallback: number): number {
+  const value = num(v, fallback);
+  return value >= 0 ? value : fallback;
 }
 
 function str(v: unknown, fallback: string | null): string | null {
@@ -111,11 +117,18 @@ export function loadConfig(
   const owners = (raw.owners ?? {}) as Record<string, unknown>;
   const discord = (raw.discord ?? {}) as Record<string, unknown>;
   const routing = (raw.routing ?? {}) as Record<string, unknown>;
+  const retention = (raw.retention ?? {}) as Record<string, unknown>;
   const port = overrides.port ?? num(Number(process.env.LIMITLESS_PORT) || server.port, 7400);
   const host = str(server.host, "127.0.0.1") as string;
 
   return {
     paths,
+    retention: {
+      worktreeDays: days(retention.worktree_days, 3),
+      failedWorktreeDays: days(retention.failed_worktree_days, 7),
+      logDays: days(retention.log_days, 30),
+      debugEventDays: days(retention.debug_event_days, 14),
+    },
     port,
     host,
     publicUrl: str(server.public_url, null),
