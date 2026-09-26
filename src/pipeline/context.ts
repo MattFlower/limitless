@@ -36,6 +36,12 @@ export interface RunState {
   roundsOnImplementer: number;
   triedImplementers: string[];
   implementerReport?: string;
+  /** Why the last implementer session ended badly (timeout, loop, error), fed back next round. */
+  implementerIssue?: string | null;
+  /** Round whose implementation has been committed; resuming skips straight to its checks. */
+  implementedRound?: number;
+  /** package.json scripts the gates depend on, as they were on the base branch. */
+  baselineScripts?: Record<string, string>;
   feedback: string | null;
   lastGates?: GateComparison[];
   lastAudit?: AuditFinding[];

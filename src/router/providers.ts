@@ -89,6 +89,7 @@ export class ProviderTracker {
     }
     const budget = this.budgets[id];
     if (budget !== undefined) {
+      if (!(budget > 0)) return 0; // a zero, negative or NaN budget means "never spend"
       const spent = this.store.providerSpendSince(id, now - MONTH_MS);
       min = Math.min(min, (budget - spent) / budget);
     }
@@ -136,8 +137,19 @@ export class ProviderTracker {
     while (p.inFlight >= p.def.maxConcurrent) {
       if (signal.aborted) throw new Error("cancelled");
       await new Promise<void>((resolve) => {
-        p.waiters.push(resolve);
-        signal.addEventListener("abort", () => resolve(), { once: true });
+        const wake = () => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        };
+        // A cancelled waiter must leave the queue, or a later release would wake a dead waiter
+        // and strand the live ones behind it.
+        const onAbort = () => {
+          const i = p.waiters.indexOf(wake);
+          if (i >= 0) p.waiters.splice(i, 1);
+          resolve();
+        };
+        p.waiters.push(wake);
+        signal.addEventListener("abort", onAbort, { once: true });
       });
     }
     p.inFlight++;

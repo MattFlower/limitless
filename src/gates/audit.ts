@@ -18,13 +18,15 @@ const LINT_CONFIG =
 const LOCKFILE =
   /(^|\/)(bun\.lockb?|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|go\.sum|uv\.lock|poetry\.lock)$/;
 
+// Anchored to the start of a statement so test *data* that mentions these (e.g. an auditor's own
+// fixtures inside string literals) doesn't trip them.
 const SKIP_MARKERS: [RegExp, string][] = [
-  [/\b(it|test|describe)\.(skip|only|todo)\s*\(/, "test skipped/focused with .skip/.only"],
-  [/\bx(it|describe|test)\s*\(/, "test disabled with xit/xdescribe"],
-  [/@pytest\.mark\.(skip|xfail)/, "pytest skip/xfail marker"],
-  [/\bt\.Skip(Now|f)?\(/, "Go t.Skip()"],
-  [/#\[ignore\]/, "Rust #[ignore]"],
-  [/@(Disabled|Ignore)\b/, "JUnit @Disabled/@Ignore"],
+  [/^\s*(it|test|describe)\.(skip|only|todo)\s*\(/, "test skipped/focused with .skip/.only"],
+  [/^\s*x(it|describe|test)\s*\(/, "test disabled with xit/xdescribe"],
+  [/^\s*@pytest\.mark\.(skip|xfail)/, "pytest skip/xfail marker"],
+  [/^\s*t\.Skip(Now|f)?\(/, "Go t.Skip()"],
+  [/^\s*#\[ignore\]/, "Rust #[ignore]"],
+  [/^\s*@(Disabled|Ignore)\b/, "JUnit @Disabled/@Ignore"],
 ];
 
 const SUPPRESSIONS: [RegExp, string][] = [
@@ -83,9 +85,20 @@ export function splitPatch(patch: string): FilePatch[] {
  * Deterministic checks for reward hacking and scope problems. Blocking findings send the work
  * back to the implementer; warnings are handed to the reviewer as things to scrutinize.
  */
+export interface GateScripts {
+  /** Script bodies the gate commands depend on (e.g. package.json "test"), before and after. */
+  before: Record<string, string>;
+  after: Record<string, string>;
+}
+
 export function auditDiff(
   diff: DiffInfo,
-  ctx: { taskClass: TaskClass | null; protectedPaths: string[]; toolCommands?: string[] },
+  ctx: {
+    taskClass: TaskClass | null;
+    protectedPaths: string[];
+    toolCommands?: string[];
+    gateScripts?: GateScripts;
+  },
 ): AuditFinding[] {
   const findings: AuditFinding[] = [];
   if (diff.files.length === 0 && ctx.taskClass !== "question") {
@@ -99,11 +112,13 @@ export function auditDiff(
 
   const protectedRes = ctx.protectedPaths.map(globToRegex);
   for (const f of diff.files) {
-    if (protectedRes.some((re) => re.test(f.path))) {
+    const touched = f.from ? [f.from, f.path] : [f.path];
+    const hit = touched.find((p) => protectedRes.some((re) => re.test(p)));
+    if (hit) {
       findings.push({
         rule: "protected-path",
         severity: "block",
-        file: f.path,
+        file: hit,
         detail: "Edited a protected path.",
       });
     }
@@ -113,6 +128,14 @@ export function auditDiff(
         severity: "warn",
         file: f.path,
         detail: "A test file was deleted.",
+      });
+    }
+    if (f.status.startsWith("R") && f.from && TEST_FILE.test(f.from) && !TEST_FILE.test(f.path)) {
+      findings.push({
+        rule: "test-moved-out",
+        severity: "block",
+        file: f.from,
+        detail: `Test file renamed to ${f.path}, where the test runner will no longer find it.`,
       });
     }
     if (TEST_CONFIG.test(f.path))
@@ -173,6 +196,22 @@ export function auditDiff(
       severity: "warn",
       detail: `Net ${assertionsRemoved - assertionsAdded} assertions removed from tests.`,
     });
+  }
+  const scripts = ctx.gateScripts;
+  if (scripts) {
+    for (const [name, before] of Object.entries(scripts.before)) {
+      const after = scripts.after[name];
+      if (after === before) continue;
+      findings.push({
+        rule: "gate-script-changed",
+        severity: "block",
+        file: "package.json",
+        detail:
+          after === undefined
+            ? `Removed the "${name}" script that a factory check runs.`
+            : `Changed the "${name}" script that a factory check runs ("${before}" → "${after}").`,
+      });
+    }
   }
   for (const cmd of ctx.toolCommands ?? []) {
     if (/--no-verify\b/.test(cmd)) {

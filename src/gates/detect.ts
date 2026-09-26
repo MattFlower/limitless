@@ -97,3 +97,34 @@ export function detectGates(cwd: string): GateConfig {
 
   return { setup, checks, source: checks.length || setup.length ? "detected" : "none", protectedPaths: [] };
 }
+
+/** package.json script names that gate commands invoke (e.g. "bun run lint" → "lint"). */
+export function gateScriptNames(cfg: GateConfig): string[] {
+  const names = new Set<string>();
+  for (const cmd of [...cfg.setup, ...cfg.checks.map((c) => c.run)]) {
+    const run = cmd.match(/^(?:bun|npm|pnpm|yarn)\s+run\s+([\w:.-]+)/);
+    const npmTest = /^(?:npm|pnpm|yarn)\s+test\b/.test(cmd);
+    const yarnScript = cmd.match(/^yarn\s+([\w:.-]+)/);
+    if (run?.[1]) names.add(run[1]);
+    else if (npmTest) names.add("test");
+    else if (yarnScript?.[1] && yarnScript[1] !== "install") names.add(yarnScript[1]);
+  }
+  return [...names];
+}
+
+/** Pick the named scripts out of a package.json body (missing names are omitted). */
+export function pickScripts(packageJson: string | null, names: string[]): Record<string, string> {
+  if (!packageJson) return {};
+  let scripts: Record<string, unknown> = {};
+  try {
+    scripts = ((JSON.parse(packageJson) as { scripts?: Record<string, unknown> }).scripts ?? {}) as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    return {};
+  }
+  const out: Record<string, string> = {};
+  for (const n of names) if (typeof scripts[n] === "string") out[n] = scripts[n] as string;
+  return out;
+}

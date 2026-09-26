@@ -21,10 +21,38 @@ const providers: ProviderDef[] = [
   },
 ];
 const models: ModelDef[] = [
-  { id: "claude/sonnet", provider: "claude", model: "claude-sonnet-5", vendor: "anthropic", tier: 4, price: { input: 2, output: 10 } },
-  { id: "claude/opus", provider: "claude", model: "claude-opus-5-5", vendor: "anthropic", tier: 5, price: { input: 4, output: 20 } },
-  { id: "codex/sol", provider: "codex", model: "gpt-6-sol", vendor: "openai", tier: 4, price: { input: 2, output: 10 } },
-  { id: "openrouter/ds", provider: "openrouter", model: "deepseek/x", vendor: "deepseek", tier: 4, price: { input: 0.3, output: 0.8 } },
+  {
+    id: "claude/sonnet",
+    provider: "claude",
+    model: "claude-sonnet-5",
+    vendor: "anthropic",
+    tier: 4,
+    price: { input: 2, output: 10 },
+  },
+  {
+    id: "claude/opus",
+    provider: "claude",
+    model: "claude-opus-5-5",
+    vendor: "anthropic",
+    tier: 5,
+    price: { input: 4, output: 20 },
+  },
+  {
+    id: "codex/sol",
+    provider: "codex",
+    model: "gpt-6-sol",
+    vendor: "openai",
+    tier: 4,
+    price: { input: 2, output: 10 },
+  },
+  {
+    id: "openrouter/ds",
+    provider: "openrouter",
+    model: "deepseek/x",
+    vendor: "deepseek",
+    tier: 4,
+    price: { input: 0.3, output: 0.8 },
+  },
 ];
 const policy = {
   implement: { default: ["claude/sonnet|codex/sol", "openrouter/ds"] },

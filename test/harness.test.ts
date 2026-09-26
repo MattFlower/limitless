@@ -6,7 +6,9 @@ import { CodexStreamParser, parseRateLimits } from "../src/harness/codex.ts";
 import { type AgentEvent, LoopDetector, priceOf } from "../src/harness/types.ts";
 
 const fixture = (name: string) =>
-  readFileSync(join(import.meta.dir, "fixtures", name), "utf8").split("\n").filter(Boolean);
+  readFileSync(join(import.meta.dir, "fixtures", name), "utf8")
+    .split("\n")
+    .filter(Boolean);
 
 describe("ClaudeStreamParser", () => {
   test("parses a real stream-json run with structured output and rate limits", () => {

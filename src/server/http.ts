@@ -34,6 +34,8 @@ function sse(
           cleanup?.();
         }
       };
+      // Flush headers right away so EventSource fires `open` before the first real message.
+      controller.enqueue(encoder.encode(": connected\n\n"));
       for (const m of backlog ?? []) send(m);
       const unsubscribe = subscribe(send);
       const keepAlive = setInterval(() => {
@@ -75,6 +77,12 @@ async function body<T>(req: Request): Promise<T> {
 
 export function startHttp(factory: Factory, extras: HttpExtras = {}): Server<undefined> {
   const { store } = factory;
+  const port = factory.cfg.port;
+  const allowedOrigins = new Set([
+    `http://127.0.0.1:${port}`,
+    `http://localhost:${port}`,
+    new URL(factory.cfg.uiUrl).origin,
+  ]);
   const handle =
     (
       fn: (
@@ -83,9 +91,21 @@ export function startHttp(factory: Factory, extras: HttpExtras = {}): Server<und
       ) => Response | Promise<Response>,
     ) =>
     async (req: Request & { params: Record<string, string> }, server: Server<undefined>) => {
+      const path = new URL(req.url).pathname;
       // Anything arriving through the Cloudflare tunnel may only reach /webhooks/*.
-      if (req.headers.get("cf-connecting-ip") && !new URL(req.url).pathname.startsWith("/webhooks/")) {
+      if (req.headers.get("cf-connecting-ip") && !path.startsWith("/webhooks/")) {
         return error("forbidden", 403);
+      }
+      // Runs execute code, so a web page in the operator's browser must not be able to create or
+      // control them (CSRF against localhost): mutations need a local Origin (or none, as from the
+      // CLI) and a JSON body type, which cross-origin pages can't send without a CORS preflight.
+      if (req.method !== "GET" && req.method !== "HEAD" && !path.startsWith("/webhooks/")) {
+        const origin = req.headers.get("origin");
+        if (origin && !allowedOrigins.has(origin)) return error("cross-origin request refused", 403);
+        const type = req.headers.get("content-type") ?? "";
+        if (!type.toLowerCase().startsWith("application/json")) {
+          return error("mutations require content-type: application/json", 415);
+        }
       }
       try {
         return await fn(req, server);
@@ -150,9 +170,14 @@ export function startHttp(factory: Factory, extras: HttpExtras = {}): Server<und
     "/api/runs/:id/stream": handle((req, server) => {
       const runId = req.params.id as string;
       const after = Number(new URL(req.url).searchParams.get("after") ?? 0);
-      const backlog = store
-        .listEvents(runId, { after, limit: 5000 })
-        .map((event) => ({ kind: "event", event }));
+      const backlog: StreamMessage[] = [];
+      for (let cursor = after; ; ) {
+        const page = store.listEvents(runId, { after: cursor, limit: 2000 });
+        for (const event of page) backlog.push({ kind: "event", event });
+        const last = page.at(-1);
+        if (!last || page.length < 2000) break;
+        cursor = last.id;
+      }
       return sse(
         req,
         server,

@@ -12,6 +12,8 @@ export interface ProcOptions {
   idleTimeoutMs?: number;
   onStdoutLine?: (line: string) => void;
   onStderrLine?: (line: string) => void;
+  /** Keep at most this many characters of stdout/stderr (the tail). Default 64k. */
+  tailLimit?: number;
 }
 
 export interface ProcResult {
@@ -20,17 +22,14 @@ export interface ProcResult {
   cancelled: boolean;
   timedOut: boolean;
   idleTimedOut: boolean;
-  stdout: string; // tail, bounded
-  stderr: string; // tail, bounded
+  stdout: string; // tail, bounded by tailLimit
+  stderr: string; // tail, bounded by tailLimit
+  /** True when output exceeded tailLimit and the head was dropped. */
+  truncated: boolean;
   durationMs: number;
 }
 
-const TAIL_LIMIT = 64_000;
-
-function appendTail(buf: string, chunk: string): string {
-  const next = buf + chunk;
-  return next.length > TAIL_LIMIT ? next.slice(next.length - TAIL_LIMIT) : next;
-}
+const DEFAULT_TAIL = 64_000;
 
 function lineSplitter(onLine?: (line: string) => void) {
   let pending = "";
@@ -69,6 +68,14 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
+    const limit = opts.tailLimit ?? DEFAULT_TAIL;
+    let truncated = false;
+    const appendTail = (buf: string, chunk: string): string => {
+      const next = buf + chunk;
+      if (next.length <= limit) return next;
+      truncated = true;
+      return next.slice(next.length - limit);
+    };
     let stdout = "";
     let stderr = "";
     let cancelled = false;
@@ -153,6 +160,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       for (const t of timers) clearTimeout(t);
       if (idleTimer) clearInterval(idleTimer);
       opts.signal?.removeEventListener("abort", onAbort);
+      // Reap anything the child left running in its process group (servers, watchers).
+      killTree("SIGTERM");
       resolve({
         exitCode: code,
         signal: sig,
@@ -161,14 +170,21 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
         idleTimedOut,
         stdout,
         stderr,
+        truncated,
         durationMs: Date.now() - started,
       });
     });
 
+    // A child that exits before reading its input raises EPIPE on stdin; that must not crash us.
+    child.stdin.on("error", (e) => {
+      stderr = appendTail(stderr, `\n[stdin error] ${e.message}`);
+    });
     if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
     else child.stdin.end();
   });
 }
+
+const SH_OUTPUT_LIMIT = 50_000_000;
 
 /** Convenience wrapper for short commands (git, gh). Throws on non-zero exit. */
 export async function sh(
@@ -186,8 +202,13 @@ export async function sh(
     cwd: opts.cwd,
     env: opts.env ?? (process.env as Record<string, string>),
     timeoutMs: opts.timeoutMs ?? 120_000,
+    // Callers parse this output (diffs, JSON); never silently hand them a truncated tail.
+    tailLimit: SH_OUTPUT_LIMIT,
     ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
   });
+  if (res.truncated) {
+    throw new Error(`Output of \`${cmd.join(" ")}\` exceeded ${SH_OUTPUT_LIMIT} characters`);
+  }
   if (res.exitCode !== 0 && !opts.allowFail) {
     throw new Error(
       `Command failed (${res.exitCode ?? res.signal}): ${cmd.join(" ")}\n${res.stderr.trim() || res.stdout.trim()}`.slice(
@@ -211,7 +232,18 @@ export function agentEnv(extra: Record<string, string> = {}): Record<string, str
     if (k === "GITHUB_TOKEN" || k === "GH_TOKEN") continue;
     env[k] = v;
   }
-  // Agents must not act on GitHub themselves (push, merge, comment); the factory does delivery.
-  // An invalid token makes `gh` fail fast instead of falling back to the operator's keyring login.
-  return { ...env, GH_TOKEN: "limitless-agents-have-no-github-access", ...extra };
+  delete env.SSH_AUTH_SOCK;
+  return {
+    ...env,
+    // Agents (and the repo code they write, which gates execute) must not act on GitHub or push:
+    // the factory does delivery. An invalid token makes `gh` fail fast instead of using the
+    // operator's keyring login; git over ssh fails; https credential helpers are disabled.
+    GH_TOKEN: "limitless-agents-have-no-github-access",
+    GIT_SSH_COMMAND: "sh -c 'echo \"limitless: agents cannot use git over ssh\" >&2; exit 1'",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "credential.helper",
+    GIT_CONFIG_VALUE_0: "",
+    ...extra,
+  };
 }

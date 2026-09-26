@@ -15,8 +15,22 @@ const providers: ProviderDef[] = [
   { id: "beta", label: "Beta", harness: "fake", billing: "subscription", maxConcurrent: 2 },
 ];
 const models: ModelDef[] = [
-  { id: "alpha/m", provider: "alpha", model: "alpha-1", vendor: "anthropic", tier: 4, price: { input: 1, output: 1 } },
-  { id: "beta/m", provider: "beta", model: "beta-1", vendor: "openai", tier: 4, price: { input: 1, output: 1 } },
+  {
+    id: "alpha/m",
+    provider: "alpha",
+    model: "alpha-1",
+    vendor: "anthropic",
+    tier: 4,
+    price: { input: 1, output: 1 },
+  },
+  {
+    id: "beta/m",
+    provider: "beta",
+    model: "beta-1",
+    vendor: "openai",
+    tier: 4,
+    price: { input: 1, output: 1 },
+  },
 ];
 const everyone = { default: ["alpha/m", "beta/m"] };
 const policy = {
@@ -71,12 +85,18 @@ const spec = {
   summary: "Add farewell.txt",
   assumptions: [],
   requirements: ["farewell.txt exists"],
-  acceptance_criteria: [{ id: "AC-1", criterion: "farewell.txt says goodbye", how_to_verify: "cat farewell.txt" }],
+  acceptance_criteria: [
+    { id: "AC-1", criterion: "farewell.txt says goodbye", how_to_verify: "cat farewell.txt" },
+  ],
   out_of_scope: [],
   blocking_questions: [],
 };
 const approve = { verdict: "approve", summary: "LGTM", findings: [] };
-const pass = { criteria: [{ id: "AC-1", status: "met", evidence: "cat shows goodbye" }], overall: "pass", notes: "" };
+const pass = {
+  criteria: [{ id: "AC-1", status: "met", evidence: "cat shows goodbye" }],
+  overall: "pass",
+  notes: "",
+};
 
 function start(handler: Handler): Factory {
   const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
@@ -90,7 +110,12 @@ function start(handler: Handler): Factory {
   return factory;
 }
 
-async function waitFor(f: Factory, runId: string, statuses: RunStatus[], timeoutMs = 20_000): Promise<RunStatus> {
+async function waitFor(
+  f: Factory,
+  runId: string,
+  statuses: RunStatus[],
+  timeoutMs = 20_000,
+): Promise<RunStatus> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const run = f.store.getRun(runId);
@@ -187,7 +212,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
                 verdict: "request_changes",
                 summary: "missing newline handling",
                 findings: [
-                  { severity: "blocker", file: "farewell.txt", line: 1, title: "Wrong text", detail: "Say goodbye politely", suggestion: "Use 'goodbye, friend'" },
+                  {
+                    severity: "blocker",
+                    file: "farewell.txt",
+                    line: 1,
+                    title: "Wrong text",
+                    detail: "Say goodbye politely",
+                    suggestion: "Use 'goodbye, friend'",
+                  },
                 ],
               },
             }
@@ -224,7 +256,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
       const role = roleOf(s);
       if (s.target.provider === "alpha") {
         alphaCalls++;
-        return { status: "error", error: "The 'alpha-1' model is not supported when using Codex with a ChatGPT account." };
+        return {
+          status: "error",
+          error: "The 'alpha-1' model is not supported when using Codex with a ChatGPT account.",
+        };
       }
       if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
       if (role === "review") return { structured: approve };
@@ -242,7 +277,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const f = start((s) => {
       const role = roleOf(s);
       if (role === "triage")
-        return { structured: triage({ ambiguity: "high", blocking_questions: ["Formal or casual farewell?"] }) };
+        return {
+          structured: triage({ ambiguity: "high", blocking_questions: ["Formal or casual farewell?"] }),
+        };
       if (role === "spec") {
         specPrompt = s.prompt;
         return { structured: spec };

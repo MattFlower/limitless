@@ -16,7 +16,9 @@ function tempDir(files: Record<string, string>): string {
 describe("detectGates", () => {
   test("bun project with scripts", () => {
     const dir = tempDir({
-      "package.json": JSON.stringify({ scripts: { lint: "biome check .", typecheck: "tsc", test: "bun test" } }),
+      "package.json": JSON.stringify({
+        scripts: { lint: "biome check .", typecheck: "tsc", test: "bun test" },
+      }),
       "bun.lock": "",
     });
     const g = detectGates(dir);
@@ -47,7 +49,10 @@ describe("detectGates", () => {
 
   test("go and rust", () => {
     expect(detectGates(tempDir({ "go.mod": "module x" })).checks.map((c) => c.name)).toEqual(["vet", "test"]);
-    expect(detectGates(tempDir({ "Cargo.toml": "[package]" })).checks.map((c) => c.name)).toEqual(["check", "test"]);
+    expect(detectGates(tempDir({ "Cargo.toml": "[package]" })).checks.map((c) => c.name)).toEqual([
+      "check",
+      "test",
+    ]);
   });
 });
 
@@ -72,11 +77,26 @@ describe("runGates / compareGates", () => {
     expect(run.checks[1]?.ok).toBe(false);
   });
 
-  const r = (name: string, ok: boolean) => ({ name, command: name, ok, exitCode: ok ? 0 : 1, durationMs: 1, output: "" });
+  const r = (name: string, ok: boolean) => ({
+    name,
+    command: name,
+    ok,
+    exitCode: ok ? 0 : 1,
+    durationMs: 1,
+    output: "",
+  });
 
   test("classifies regressions vs pre-existing failures", () => {
-    const baseline: GateRun = { setupOk: true, setup: [], checks: [r("lint", true), r("test", false), r("types", true)] };
-    const after: GateRun = { setupOk: true, setup: [], checks: [r("lint", false), r("test", false), r("types", true)] };
+    const baseline: GateRun = {
+      setupOk: true,
+      setup: [],
+      checks: [r("lint", true), r("test", false), r("types", true)],
+    };
+    const after: GateRun = {
+      setupOk: true,
+      setup: [],
+      checks: [r("lint", false), r("test", false), r("types", true)],
+    };
     const cmp = compareGates(baseline, after);
     expect(cmp.map((c) => [c.name, c.verdict, c.blocking])).toEqual([
       ["lint", "regressed", true],
@@ -87,7 +107,9 @@ describe("runGates / compareGates", () => {
 
   test("setup failure after change is blocking", () => {
     const after: GateRun = { setupOk: false, setup: [r("setup", false)], checks: [] };
-    expect(compareGates({ setupOk: true, setup: [r("setup", true)], checks: [] }, after)[0]?.blocking).toBe(true);
+    expect(compareGates({ setupOk: true, setup: [r("setup", true)], checks: [] }, after)[0]?.blocking).toBe(
+      true,
+    );
   });
 });
 
@@ -98,7 +120,9 @@ function diff(patch: string, files: { status: string; path: string }[]): DiffInf
 describe("auditDiff", () => {
   test("blocks an empty diff", () => {
     const f = auditDiff(diff("", []), { taskClass: "feature", protectedPaths: [] });
-    expect(f).toEqual([{ rule: "empty-diff", severity: "block", detail: "The implementation produced no changes." }]);
+    expect(f).toEqual([
+      { rule: "empty-diff", severity: "block", detail: "The implementation produced no changes." },
+    ]);
   });
 
   test("blocks newly skipped tests and flags suppressions", () => {
@@ -122,7 +146,11 @@ describe("auditDiff", () => {
   });
 
   test("blocks secrets and protected paths, warns on lockfiles and CI", () => {
-    const patch = ["diff --git a/cfg.ts b/cfg.ts", "+++ b/cfg.ts", `+const key = "ghp_${"a".repeat(36)}";`].join("\n");
+    const patch = [
+      "diff --git a/cfg.ts b/cfg.ts",
+      "+++ b/cfg.ts",
+      `+const key = "ghp_${"a".repeat(36)}";`,
+    ].join("\n");
     const f = auditDiff(
       diff(patch, [
         { status: "M", path: "cfg.ts" },
@@ -133,7 +161,12 @@ describe("auditDiff", () => {
       { taskClass: "feature", protectedPaths: ["db/migrations/**"] },
     );
     const rules = Object.fromEntries(f.map((x) => [x.rule, x.severity]));
-    expect(rules).toMatchObject({ secret: "block", "protected-path": "block", lockfile: "warn", "ci-config": "warn" });
+    expect(rules).toMatchObject({
+      secret: "block",
+      "protected-path": "block",
+      lockfile: "warn",
+      "ci-config": "warn",
+    });
   });
 
   test("lockfile changes are fine for dependency updates", () => {
@@ -148,9 +181,9 @@ describe("auditDiff", () => {
     const patch = [
       "diff --git a/t/x_test.go b/t/x_test.go",
       "+++ b/t/x_test.go",
-      "-  t.Errorf(\"a\")",
-      "-  t.Errorf(\"b\")",
-      "-  t.Fatal(\"c\")",
+      '-  t.Errorf("a")',
+      '-  t.Errorf("b")',
+      '-  t.Fatal("c")',
     ].join("\n");
     const f = auditDiff(diff(patch, [{ status: "M", path: "t/x_test.go" }]), {
       taskClass: "refactor",

@@ -1,7 +1,8 @@
-import { readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
-import { detectGates, type GateConfig } from "../gates/detect.ts";
+import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, runGates } from "../gates/run.ts";
 import {
   commitAll,
@@ -116,6 +117,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha: wt.baseSha, branch: wt.branch });
     const gates = detectGates(wt.path);
     ctx.state.gatesConfig = gates;
+    ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
     ctx.log(
       `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
     );
@@ -310,13 +312,10 @@ async function buildLoop(ctx: RunContext): Promise<void> {
   );
 }
 
-/** Returns true when every gate passes. */
-async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
+async function implementStage(ctx: RunContext, round: number): Promise<void> {
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.run.baseSha as string;
-
-  // --- implement
   await ctx.stage(
     "implement",
     async (stage) => {
@@ -362,6 +361,12 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
       );
       if (sha) ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha });
       ctx.save();
+      ctx.state.implementerIssue =
+        result.status === "ok"
+          ? null
+          : `${result.status}${result.error ? `: ${result.error}` : ""}`.slice(0, 500);
+      ctx.state.implementedRound = round;
+      ctx.save();
       if (result.status !== "ok") {
         ctx.log(`Implementer ended with ${result.status}: ${result.error ?? ""}`, "warn");
       }
@@ -372,6 +377,16 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
     },
     round,
   );
+}
+
+/** Returns true when every gate passes. */
+async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
+  const cwd = ctx.state.worktreePath as string;
+  const gates = ctx.state.gatesConfig as GateConfig;
+  const baseSha = ctx.run.baseSha as string;
+
+  // --- implement (skipped when resuming a round whose implementation already landed)
+  if (ctx.state.implementedRound !== round) await implementStage(ctx, round);
 
   // --- gates
   const comparison = await ctx.stage(
@@ -410,6 +425,10 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
         taskClass: ctx.run.taskClass,
         protectedPaths: gates.protectedPaths,
         toolCommands: ctx.state.toolCommands,
+        gateScripts: {
+          before: ctx.state.baselineScripts ?? {},
+          after: pickScripts(readPackageJson(cwd), gateScriptNames(gates)),
+        },
       });
       ctx.state.lastAudit = findings;
       for (const f of findings) {
@@ -435,7 +454,10 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
   const auditFeedback = formatAuditFeedback(audit);
   if (gateFeedback || auditFeedback) {
     // Don't spend reviewer tokens on work that fails deterministic checks.
-    ctx.state.feedback = [gateFeedback, auditFeedback].filter(Boolean).join("\n\n");
+    const issue = ctx.state.implementerIssue
+      ? `### Your previous session ended early\n${ctx.state.implementerIssue}\nKeep the next attempt focused and finish by running the checks.`
+      : "";
+    ctx.state.feedback = [issue, gateFeedback, auditFeedback].filter(Boolean).join("\n\n");
     ctx.save();
     ctx.log("Deterministic checks failed; sending feedback to implementer", "warn");
     return false;
@@ -465,6 +487,9 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
       });
       await discardChanges(cwd);
       const r = ReviewSchema.parse(result.structured);
+      // The verdict must agree with the findings: any blocker/major means changes are required.
+      if (r.findings.some((f) => f.severity === "blocker" || f.severity === "major"))
+        r.verdict = "request_changes";
       const sameVendor = target.vendor === ctx.state.implementer?.vendor;
       if (sameVendor) ctx.log("Review done by the implementer's vendor (no other vendor available)", "warn");
       ctx.state.lastReview = { ...r, modelId: target.modelId };
@@ -510,8 +535,17 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
       });
       await discardChanges(cwd);
       const v = VerifySchema.parse(result.structured);
-      // Never trust "pass" if any criterion is not met.
-      if (v.criteria.some((c) => c.status !== "met")) v.overall = "fail";
+      // Derive the verdict ourselves: every acceptance criterion must be reported, and met.
+      for (const ac of (ctx.state.spec as Spec).acceptance_criteria) {
+        if (!v.criteria.some((c) => c.id === ac.id)) {
+          v.criteria.push({
+            id: ac.id,
+            status: "unclear",
+            evidence: "The verifier did not report on this criterion.",
+          });
+        }
+      }
+      v.overall = v.criteria.every((c) => c.status === "met") ? "pass" : "fail";
       ctx.state.lastVerify = { ...v, modelId: target.modelId };
       ctx.store.putArtifact(
         ctx.run.id,
@@ -551,7 +585,9 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       ctx.log(`Local repo: work is on branch ${ctx.run.branch}`);
       return { summary: `branch ${ctx.run.branch} ready in ${ctx.repo.localPath}`, value: undefined };
     }
+    ctx.checkCancelled();
     await pushBranch(ctx.repo, cwd, ctx.run.branch as string);
+    ctx.checkCancelled();
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     const url = await createPullRequest(ctx.repo, {
       branch: ctx.run.branch as string,
@@ -568,6 +604,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     const policy = ctx.state.gatesConfig?.merge ?? ctx.repo.mergePolicy;
     let summary = `PR ${url}`;
     if (policy === "auto") {
+      ctx.checkCancelled();
       const outcome = await mergePullRequest(url, cwd);
       if (outcome === "merged") ctx.run = ctx.store.updateRun(ctx.run.id, { merged: true });
       summary += ` — ${outcome === "merged" ? "merged" : outcome === "auto" ? "auto-merge enabled" : "merge failed (left open)"}`;
@@ -578,6 +615,11 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
     return { summary, value: undefined };
   });
+}
+
+function readPackageJson(dir: string): string | null {
+  const path = join(dir, "package.json");
+  return existsSync(path) ? readFileSync(path, "utf8") : null;
 }
 
 export type { RunState };

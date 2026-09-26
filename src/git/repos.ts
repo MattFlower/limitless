@@ -27,9 +27,13 @@ export async function resolveRepo(store: Store, input: string): Promise<Repo> {
   if (isAbsolute(trimmed) || trimmed.startsWith("~") || trimmed.startsWith(".")) {
     const path = resolve(trimmed.replace(/^~/, process.env.HOME ?? "~"));
     if (!existsSync(join(path, ".git"))) throw new Error(`${path} is not a git repository`);
-    const slug = `local/${basename(path)}`;
-    const found = store.getRepoBySlug(slug);
-    if (found) return found;
+    const existing = store.listRepos().find((r) => r.kind === "local" && r.localPath === path);
+    if (existing) return existing;
+    // Two different directories can share a basename; disambiguate with a short path hash.
+    let slug = `local/${basename(path)}`;
+    if (store.getRepoBySlug(slug)) {
+      slug = `local/${basename(path)}-${new Bun.CryptoHasher("sha256").update(path).digest("hex").slice(0, 6)}`;
+    }
     const head = await sh(["git", "symbolic-ref", "--short", "HEAD"], { cwd: path, allowFail: true });
     return store.upsertRepo({
       slug,
@@ -135,9 +139,15 @@ export async function discardChanges(cwd: string): Promise<boolean> {
   return true;
 }
 
+export interface DiffFile {
+  status: string; // git name-status code: A, M, D, R100, C75, ...
+  path: string; // new path
+  from?: string; // old path for renames/copies
+}
+
 export interface DiffInfo {
   patch: string;
-  files: { status: string; path: string }[];
+  files: DiffFile[];
   stat: string;
   added: number;
   removed: number;
@@ -157,14 +167,18 @@ export async function diffSince(cwd: string, baseSha: string): Promise<DiffInfo>
     added += Number(a) || 0;
     removed += Number(r) || 0;
   }
-  const files = names.stdout
+  const files = parseNameStatus(names.stdout);
+  return { patch: patch.stdout, files, stat: stat.stdout, added, removed };
+}
+
+export function parseNameStatus(text: string): DiffFile[] {
+  return text
     .split("\n")
     .filter(Boolean)
     .map((l) => {
-      const parts = l.split("\t");
-      return { status: parts[0] ?? "", path: parts[parts.length - 1] ?? "" };
+      const [status = "", a = "", b] = l.split("\t");
+      return b !== undefined ? { status, path: b, from: a } : { status, path: a };
     });
-  return { patch: patch.stdout, files, stat: stat.stdout, added, removed };
 }
 
 export async function pushBranch(repo: Repo, cwd: string, branch: string): Promise<void> {

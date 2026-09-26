@@ -1,4 +1,4 @@
-import { runProcess } from "../util/proc.ts";
+import { agentEnv, runProcess } from "../util/proc.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 
 export interface GateResult {
@@ -16,7 +16,14 @@ export interface GateRun {
   checks: GateResult[];
 }
 
-export type GateVerdict = "pass" | "fixed" | "regressed" | "still_failing" | "new_failure" | "new_pass";
+export type GateVerdict =
+  | "pass"
+  | "fixed"
+  | "regressed"
+  | "still_failing"
+  | "new_failure"
+  | "new_pass"
+  | "not_run";
 
 export interface GateComparison {
   name: string;
@@ -31,7 +38,8 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   const res = await runProcess({
     cmd: ["/bin/sh", "-c", cmd.run],
     cwd,
-    env: { ...(process.env as Record<string, string>), CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" },
+    // Gates execute code the agent wrote; give them the same scrubbed environment as agents.
+    env: agentEnv({ CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" }),
     signal,
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
   });
@@ -73,14 +81,17 @@ export async function runGates(
 export function compareGates(baseline: GateRun | null, after: GateRun): GateComparison[] {
   const out: GateComparison[] = [];
   if (!after.setupOk) {
+    // Nothing downstream ran, so nothing was verified: always blocking, even if setup was
+    // already broken on the base branch.
     const failed = after.setup.find((s) => !s.ok);
-    if (failed) {
-      const baseFailed = baseline ? !baseline.setupOk : false;
+    if (failed) out.push({ name: failed.name, verdict: "regressed", blocking: true, result: failed });
+    const skipped = baseline?.checks ?? [];
+    for (const c of skipped) {
       out.push({
-        name: failed.name,
-        verdict: baseFailed ? "still_failing" : "regressed",
-        blocking: !baseFailed,
-        result: failed,
+        name: c.name,
+        verdict: "not_run",
+        blocking: true,
+        result: { ...c, ok: false, exitCode: null, durationMs: 0, output: "not run: setup failed" },
       });
     }
     return out;

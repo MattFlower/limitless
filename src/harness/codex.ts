@@ -302,7 +302,12 @@ export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
   if (proc.timedOut) return { ...base, status: "timeout", error: `timed out after ${spec.timeoutMs}ms` };
   if (proc.idleTimedOut)
     return { ...base, status: "stuck", error: `no output for ${Math.round(spec.idleTimeoutMs / 1000)}s` };
-  const failure = parser.failed ?? (proc.exitCode !== 0 ? proc.stderr.trim().slice(-2000) : null);
+  // Success requires a clean exit AND a completed turn; anything else is a failure with a reason.
+  let failure: string | null = parser.failed;
+  if (!failure && proc.exitCode !== 0) {
+    failure = proc.stderr.trim().slice(-2000) || `codex exited with ${proc.exitCode ?? proc.signal}`;
+  }
+  if (!failure && !parser.completed) failure = "codex exited without completing its turn";
   if (failure) {
     if (QUOTA_TEXT.test(failure)) {
       const exhaustedUntil = Math.max(
