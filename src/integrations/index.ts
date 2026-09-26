@@ -1,5 +1,6 @@
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
+import { mountDiscord } from "./discord.ts";
 import { mountMcp } from "./mcp-http.ts";
 
 export interface Integrations {
@@ -12,10 +13,13 @@ export interface Integrations {
 /** Wire trigger integrations (GitHub webhooks, Discord, MCP) into the daemon. */
 export async function mountIntegrations(factory: Factory): Promise<Integrations> {
   const mcp = mountMcp(factory);
+  const discord = mountDiscord(factory);
   return {
     routes: { "/mcp": (req, server) => mcp.handle(req, server.requestIP(req)?.address ?? null) },
-    notes: [...(await toolVersions()), "MCP: /mcp (loopback only)"],
-    stop: mcp.stop,
+    notes: [...(await toolVersions()), "MCP: /mcp (loopback only)", discord.note],
+    stop: async () => {
+      await Promise.all([mcp.stop(), discord.stop()]);
+    },
   };
 }
 

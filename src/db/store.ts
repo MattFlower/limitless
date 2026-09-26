@@ -361,6 +361,23 @@ export class Store {
     return r ? toRun(r) : null;
   }
 
+  setRunSourceRef(id: string, sourceRef: Record<string, unknown>): Run {
+    this.db.query("UPDATE runs SET source_ref = ? WHERE id = ?").run(json(sourceRef), id);
+    const run = this.getRun(id);
+    if (!run) throw new Error(`run ${id} not found`);
+    this.publish({ kind: "run", run });
+    return run;
+  }
+
+  getRunByDiscordThread(threadId: string): Run | null {
+    const row = this.db
+      .query(
+        `${RUN_SELECT} WHERE runs.source = 'discord' AND json_extract(runs.source_ref, '$.kind') = 'discord' AND json_extract(runs.source_ref, '$.threadId') = ? LIMIT 1`,
+      )
+      .get(threadId) as Row | null;
+    return row ? toRun(row) : null;
+  }
+
   listRuns(opts: { status?: RunStatus[]; limit?: number; repoId?: string } = {}): Run[] {
     const where: string[] = [];
     const params: (string | number)[] = [];

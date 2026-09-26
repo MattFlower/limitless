@@ -80,6 +80,11 @@ codex_weekly = 0.90   # keeps 10% of ChatGPT usage free for you
 
 [owners]
 github = "MattFlower"
+discord = "YOUR_DISCORD_USER_ID"
+
+[discord]
+channel_id = "YOUR_TEXT_CHANNEL_ID"
+notify_all = false # optional: announce completed runs from other sources
 ```
 
 Per-repository settings go in a `.limitless.toml` at the repo root:
@@ -95,6 +100,23 @@ protected_paths = ["migrations/**"]
 ```
 
 Without it, gates are auto-detected (package.json scripts, Cargo, Go, Python, Makefile).
+
+### Discord bot
+
+Create a **private bot** in the Discord Developer Portal, enable the **Message Content** privileged
+intent, and invite it using the OAuth2 URL Generator with the `bot` and `applications.commands`
+scopes. Grant it View Channel, Send Messages, Create Public Threads, and Send Messages in Threads
+in the configured text channel. Put `DISCORD_BOT_TOKEN`, `DISCORD_APP_ID`, and `DISCORD_GUILD_ID`
+in `secrets.env`, and set `[owners].discord` and `[discord].channel_id` in `config.toml` as above.
+If a setting is missing, startup reports why Discord is disabled. The bot uses an outbound gateway
+connection; no public interaction endpoint is needed.
+
+The owner can use `/build repo:<repo> prompt:<request> [profile:auto|quick|standard|deep]`,
+`/runs [status]`, `/run id:<id>`, and `/cancel id:<id>`. Each Discord run gets a public thread
+with brief progress, questions, and a final status and cost summary. Reply in that thread to answer
+the run's open questions. Commands and answers are restricted to the configured owner, though
+thread updates are visible to channel members. With `notify_all = true`, the channel also gets a
+brief notice when a run started elsewhere finishes.
 
 ## Models and routing
 
