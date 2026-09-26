@@ -295,3 +295,42 @@ export async function mergePullRequest(
   });
   return auto.exitCode === 0 ? "auto" : "failed";
 }
+
+/** Same stable top-level representation used in pipeline and eval prompts. */
+export function formatTopLevel(entries: string[]): string {
+  return entries
+    .filter((entry) => entry !== ".git")
+    .sort()
+    .slice(0, 60)
+    .join("  ");
+}
+
+/** Read only an exact commit from the bare cache; no worktree or default-branch fallback. */
+export async function pinnedTree(paths: Paths, store: Store, slug: string, sha: string): Promise<string> {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(slug) || !/^[a-fA-F0-9]{40}$/.test(sha))
+    throw new Error("invalid repository pin");
+  const registered = store.getRepoBySlug(slug);
+  const repo: Repo = {
+    id: slug,
+    slug,
+    kind: "github",
+    url: registered?.url ?? `https://github.com/${slug}.git`,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "none",
+    createdAt: 0,
+  };
+  const cache = cachePath(paths, repo);
+  if (!existsSync(cache)) await ensureCache(paths, repo);
+  return withRepoLock(cache, async () => {
+    const bare = await sh(["git", "rev-parse", "--is-bare-repository"], { cwd: cache });
+    if (bare.stdout.trim() !== "true") throw new Error(`eval repository cache is not bare: ${cache}`);
+    const check = () => sh(["git", "cat-file", "-e", `${sha}^{commit}`], { cwd: cache, allowFail: true });
+    if ((await check()).exitCode !== 0) {
+      await sh(["git", "fetch", "origin", sha], { cwd: cache, timeoutMs: 300_000 });
+      if ((await check()).exitCode !== 0) throw new Error(`pinned commit ${sha} missing in ${slug}`);
+    }
+    const tree = await sh(["git", "ls-tree", "--name-only", "-z", sha], { cwd: cache });
+    return formatTopLevel(tree.stdout.split("\0").filter(Boolean));
+  });
+}

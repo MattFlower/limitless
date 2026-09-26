@@ -141,6 +141,14 @@ export class ProviderTracker {
     return null;
   }
 
+  budgetUnavailableReason(id: string, now = this.clock()): string | null {
+    const budget = this.budgets[id];
+    return budget !== undefined &&
+      (!(budget > 0) || this.store.providerSpendSince(id, now - MONTH_MS) >= budget)
+      ? "provider budget exhausted"
+      : null;
+  }
+
   blockModel(modelId: string, reason: string, ms = 24 * 60 * 60 * 1000): void {
     this.modelBlocks.set(modelId, { until: this.clock() + ms, reason: reason.slice(0, 200) });
     this.refreshAlerts();

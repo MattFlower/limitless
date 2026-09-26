@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import type { Factory } from "./app.ts";
 import type { ChatAction, ChatConversation, ChatOrigin, ChatRequest, Run } from "./core/types.ts";
+import { selectHarness } from "./harness/select.ts";
 import { type AgentResult, emptyUsage, extractJson } from "./harness/types.ts";
 import { toStrictJsonSchema } from "./pipeline/schemas.ts";
 
@@ -233,7 +234,7 @@ export class Concierge {
       if (!target) break;
       tried.push(target.modelId);
       // Chat needs no tools, so it skips the agent CLI when the provider speaks plain HTTP.
-      const harnessName = target.openai ? "llm" : target.harness;
+      const { harnessName, noTools } = selectHarness("chat", target);
       const harness = harnesses[harnessName];
       if (!harness) {
         failure = `No harness registered for ${harnessName}`;
@@ -255,7 +256,7 @@ export class Concierge {
             "You are the Limitless chat concierge. Return structured data only. No tools or APIs are permitted.",
           target,
           mode: "readonly",
-          noTools: true,
+          noTools,
           privateSession: true,
           jsonSchema: toStrictJsonSchema(ChatOutputSchema),
           schema: ChatOutputSchema,

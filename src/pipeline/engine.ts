@@ -12,6 +12,7 @@ import {
   diffSince,
   discardChanges,
   ensureCache,
+  formatTopLevel,
   headSha,
   mergePullRequest,
   pushBranch,
@@ -162,10 +163,7 @@ async function prepare(ctx: RunContext): Promise<void> {
 
 function topLevel(path: string): string {
   try {
-    return readdirSync(path)
-      .filter((f) => f !== ".git")
-      .slice(0, 60)
-      .join("  ");
+    return formatTopLevel(readdirSync(path));
   } catch {
     return "(unavailable)";
   }
