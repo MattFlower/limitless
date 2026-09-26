@@ -274,13 +274,16 @@ export class ProviderTracker {
         const known = Object.entries(p.windows)
           .filter(([, w]) => w.resetsAt === null || w.resetsAt > now)
           .sort((a, b) => (a[1].resetsAt ?? Infinity) - (b[1].resetsAt ?? Infinity))[0];
-        this.alert(
-          id,
-          known?.[0] ?? "hard_limit",
-          known?.[1].utilization ?? null,
-          known?.[1].resetsAt ?? detail?.exhaustedUntil ?? null,
-          "exhausted",
-        );
+        let resetsAt = known ? known[1].resetsAt : (detail?.exhaustedUntil ?? null);
+        if (!known) {
+          // Retry cooldown estimates move on every rejection; reuse the durable alert boundary
+          // until it expires, including across restarts or changes in provider health.
+          const existing = this.store
+            .listAlerts(now)
+            .find((alert) => alert.provider === id && alert.window === "hard_limit");
+          if (existing) resetsAt = existing.resetsAt;
+        }
+        this.alert(id, known?.[0] ?? "hard_limit", known?.[1].utilization ?? null, resetsAt, "exhausted");
       }
     } else if (status === "unavailable" || status === "timeout") {
       p.consecutiveFailures++;

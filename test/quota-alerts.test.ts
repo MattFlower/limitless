@@ -169,6 +169,84 @@ test("disabled Discord and unavailable alternatives leave alerts in the API", as
   expect((await response.json()) as QuotaAlert[]).toHaveLength(2);
 });
 
+test("hard-limit reset estimates deduplicate across concurrent results, flapping, and restart", async () => {
+  const port = new FakeDiscord();
+  let mounted = mountDiscord(factory, port);
+  const cooldown = 30 * 60 * 1000;
+  const reset = now + cooldown;
+  const reject = () => factory.tracker.record("codex", "quota", { exhaustedUntil: now + cooldown });
+  reject();
+  const createdAt = alerts()[0]?.createdAt;
+  for (let i = 0; i < 3; i++) {
+    now += 5;
+    factory.tracker.record("codex", "ok");
+    reject();
+  }
+  await mounted.stop();
+  expect(port.posts).toHaveLength(1);
+  expect(port.posts[0]?.channel).toBe("alerts");
+  expect(alerts()).toMatchObject([
+    { provider: "codex", window: "hard_limit", severity: "exhausted", resetsAt: reset, createdAt },
+  ]);
+
+  // Deduplication must survive even when health masks the persisted exhausted state.
+  factory.tracker.setHealthy("codex", false);
+  store.close();
+  store = new Store(factory.cfg.paths.db);
+  factory = new Factory(factory.cfg, { store, providers, models, policy, clock: () => now });
+  mounted = mountDiscord(factory, port);
+  now += 5;
+  reject();
+  await mounted.stop();
+  expect(port.posts).toHaveLength(1);
+  expect(alerts()[0]).toMatchObject({ resetsAt: reset, createdAt });
+  expect(factory.tracker.status("codex")?.until).toBe(now + cooldown);
+
+  now = reset;
+  factory.scheduler.tick();
+  expect(alerts()).toEqual([]);
+  mounted = mountDiscord(factory, port);
+  reject();
+  now += 5;
+  reject();
+  await mounted.stop();
+  expect(port.posts).toHaveLength(2);
+  expect(alerts()).toMatchObject([{ provider: "codex", resetsAt: reset + cooldown }]);
+});
+
+test("an unknown hard-limit reset stays deduplicated when later rejections estimate a reset", async () => {
+  const port = new FakeDiscord();
+  let mounted = mountDiscord(factory, port);
+  factory.tracker.record("codex", "quota");
+  await mounted.stop();
+  store.close();
+  store = new Store(factory.cfg.paths.db);
+  factory = new Factory(factory.cfg, { store, providers, models, policy, clock: () => now });
+  mounted = mountDiscord(factory, port);
+  for (let i = 0; i < 3; i++) {
+    now += 5;
+    factory.tracker.record("codex", "quota", { exhaustedUntil: now + 30 * 60 * 1000 });
+  }
+  await mounted.stop();
+  expect(port.posts).toHaveLength(1);
+  expect(alerts()).toMatchObject([{ provider: "codex", window: "hard_limit", resetsAt: null }]);
+});
+
+test("quota rejection preserves a named window's unknown reset boundary", async () => {
+  const port = new FakeDiscord();
+  const mounted = mountDiscord(factory, port);
+  factory.tracker.observeWindows("codex", { five_hour: { utilization: 0.7, resetsAt: null } });
+  for (let i = 0; i < 3; i++) {
+    now += 5;
+    factory.tracker.record("codex", "quota", { exhaustedUntil: now + 30 * 60 * 1000 });
+  }
+  await mounted.stop();
+  expect(port.posts).toHaveLength(1);
+  expect(alerts()).toMatchObject([
+    { provider: "codex", window: "five_hour", severity: "exhausted", resetsAt: null },
+  ]);
+});
+
 test("alerts API returns current alerts and store publishes dashboard changes", async () => {
   const route = createHttpRoutes(factory)["/api/alerts"] as (
     req: Request,
