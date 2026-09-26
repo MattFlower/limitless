@@ -425,8 +425,13 @@ export class Store {
     ).map(toRun);
   }
 
-  updateRun(id: string, patch: RunPatch): Run {
+  /** Optional state is checkpointed atomically with the run's SHAs and other fields. */
+  updateRun(id: string, patch: RunPatch, state?: unknown): Run {
     const { sets, values } = buildUpdate(patch, RUN_PATCH_COLUMNS);
+    if (state !== undefined) {
+      sets.push("state_json = ?");
+      values.push(json(state));
+    }
     if (sets.length)
       this.db.query(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
     const run = this.getRun(id) as Run;

@@ -180,10 +180,10 @@ export async function rebaseOnto(cwd: string, baseSha: string): Promise<"clean" 
   if (result.exitCode === 0) return "clean";
   const state = await sh(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
   const apply = await sh(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
-  if (!existsSync(state.stdout.trim()) && !existsSync(apply.stdout.trim()))
+  if (!existsSync(resolve(cwd, state.stdout.trim())) && !existsSync(resolve(cwd, apply.stdout.trim())))
     throw new Error(`rebase failed: ${result.stderr || result.stdout}`);
   await sh(["git", "rebase", "--abort"], { cwd });
-  if (existsSync(state.stdout.trim()) || existsSync(apply.stdout.trim()))
+  if (existsSync(resolve(cwd, state.stdout.trim())) || existsSync(resolve(cwd, apply.stdout.trim())))
     throw new Error("rebase abort left worktree in rebase state");
   return "conflict";
 }
@@ -191,10 +191,11 @@ export async function rebaseOnto(cwd: string, baseSha: string): Promise<"clean" 
 export async function clearInterruptedRebase(cwd: string, expected: boolean): Promise<void> {
   const state = await sh(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
   const apply = await sh(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
-  if (!existsSync(state.stdout.trim()) && !existsSync(apply.stdout.trim())) return;
+  if (!existsSync(resolve(cwd, state.stdout.trim())) && !existsSync(resolve(cwd, apply.stdout.trim())))
+    return;
   if (!expected) throw new Error("worktree has an unexpected rebase in progress");
   await sh(["git", "rebase", "--abort"], { cwd });
-  if (existsSync(state.stdout.trim()) || existsSync(apply.stdout.trim()))
+  if (existsSync(resolve(cwd, state.stdout.trim())) || existsSync(resolve(cwd, apply.stdout.trim())))
     throw new Error("interrupted rebase could not be aborted");
 }
 

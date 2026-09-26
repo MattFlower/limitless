@@ -108,7 +108,12 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
     ctx.log(`Run ${needsHuman ? "needs a human" : "failed"}: ${message}`, "error", {
       stack: (e as Error).stack,
     });
-    if (e instanceof NeedsHumanError && ctx.state.worktreePath) {
+    if (
+      e instanceof NeedsHumanError &&
+      ctx.state.worktreePath &&
+      ctx.state.conflictRound === undefined &&
+      !ctx.state.pendingRebaseSha
+    ) {
       // Surface the unfinished work as a draft PR so a human can pick it up.
       try {
         await deliver(ctx, false);
@@ -319,7 +324,9 @@ function profile(ctx: RunContext): ResolvedProfile {
 
 async function buildLoop(ctx: RunContext): Promise<void> {
   const maxRounds =
-    Math.max(1, ctx.deps.cfg.maxRounds) + ROUNDS_PER_IMPLEMENTER + (ctx.state.conflictRound ? 1 : 0);
+    ctx.state.conflictRound !== undefined
+      ? ctx.state.conflictRound + 1
+      : Math.max(1, ctx.deps.cfg.maxRounds) + ROUNDS_PER_IMPLEMENTER;
   const holdout =
     profile(ctx) === "quick" || ctx.state.holdoutStatus === "complete"
       ? null
@@ -684,6 +691,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
   await ctx.stage("deliver", async () => {
     const cwd = ctx.state.worktreePath as string;
     await clearInterruptedRebase(cwd, Boolean(ctx.state.pendingRebaseSha));
+    // A stopped post-rebase check may have left generated files or formatter edits behind.
+    if (ctx.state.pendingRebaseSha) await discardChanges(cwd);
     const sha = await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
     const head = sha ?? (await headSha(cwd));
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
@@ -693,7 +702,9 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       const recorded = ctx.run.baseSha as string;
       if (ctx.state.pendingRebaseSha && ctx.state.pendingRebaseSha !== fetched)
         throw new Error("base changed during delivery rebase; refusing to publish");
-      if (fetched !== recorded) {
+      if (fetched !== recorded || ctx.state.pendingRebaseSha) {
+        if (ctx.state.conflictRound !== undefined)
+          throw new Error("base advanced again after conflict resolution; refusing to publish");
         // Audit against the new base's scripts, never the implementer's merged working tree.
         ctx.state.baselineScripts = pickScripts(
           await readFileAt(cwd, fetched, "package.json"),
@@ -709,19 +720,22 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         if (!(await isAncestor(cwd, fetched, await headSha(cwd)))) {
           const outcome = await rebaseOnto(cwd, fetched);
           if (outcome === "conflict") {
-            if (ctx.state.conflictRound) throw new Error("base advanced again after conflict resolution");
             ctx.state.pendingRebaseSha = undefined;
             ctx.state.preRebaseGates = undefined;
-            ctx.state.conflictRound = true;
             ctx.state.round++;
+            ctx.state.conflictRound = ctx.state.round;
             ctx.state.feedback = `The base branch advanced. Merge origin/${baseBranch} into this branch with \`git merge origin/${baseBranch}\`, resolve conflicts preserving both intents, and rerun the repository checks.`;
-            ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: await headSha(cwd) });
-            ctx.setPhase("loop");
+            ctx.state.phase = "loop";
+            ctx.run = ctx.store.updateRun(
+              ctx.run.id,
+              { baseSha: fetched, headSha: await headSha(cwd) },
+              ctx.state,
+            );
             return { summary: `rebase conflicted; resolution round ${ctx.state.round}`, value: undefined };
           }
         }
         const previous = ctx.state.preRebaseGates ?? [];
-        const checked = await ctx.stage(
+        await ctx.stage(
           "gates",
           async () => {
             const after = await runGates(cwd, ctx.state.gatesConfig as GateConfig, ctx.signal, (r) =>
@@ -735,7 +749,14 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             );
             ctx.checkCancelled();
             await discardChanges(cwd);
-            const comparison = compareGates(ctx.state.baseline ?? null, after);
+            // A check fixed by the implementation must stay fixed after rebasing, even when
+            // it failed on the original base. Persist that regression in the evidence too.
+            const comparison = compareGates(
+              previous.length
+                ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
+                : (ctx.state.baseline ?? null),
+              after,
+            );
             ctx.state.lastGates = comparison;
             ctx.save();
             ctx.store.putArtifact(
@@ -748,23 +769,16 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
               !after.setupOk ||
               comparison.some((c) => c.blocking) ||
               previous.some((c) => c.result.ok && !after.checks.find((r) => r.name === c.name)?.ok);
-            return {
-              summary: regressed
-                ? "post-rebase checks regressed"
-                : `${comparison.length} post-rebase checks ok`,
-              value: !regressed,
-            };
+            if (regressed) throw new Error("post-rebase gates regressed; delivery blocked");
+            return { summary: `${comparison.length} post-rebase checks ok`, value: undefined };
           },
           ctx.state.round,
         );
-        if (!checked) throw new Error("post-rebase gates regressed; delivery blocked");
-        ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: await headSha(cwd) });
+        const rebasedHead = await headSha(cwd);
         ctx.state.pendingRebaseSha = undefined;
         ctx.state.preRebaseGates = undefined;
-        ctx.save();
+        ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: rebasedHead }, ctx.state);
       }
-      if ((await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch)) !== ctx.run.baseSha)
-        throw new Error("base changed before publication; refusing to publish");
       if (!(await isAncestor(cwd, ctx.run.baseSha as string, await headSha(cwd))))
         throw new Error("run branch does not contain the current base");
     }
