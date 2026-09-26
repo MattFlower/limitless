@@ -12,9 +12,11 @@ const solidPlugin: BunPlugin = {
       const source = await Bun.file(args.path).text();
       const result = await transformAsync(source, {
         filename: args.path,
+        // Babel 8 dropped preset-typescript's isTSX option; enable JSX parsing explicitly.
+        parserOpts: { plugins: ["jsx", "typescript"] },
         presets: [
           [solid, { generate: "dom", hydratable: false }],
-          [ts, { isTSX: true, allExtensions: true }],
+          [ts, {}],
         ],
         sourceMaps: "inline",
       });
