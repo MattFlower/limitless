@@ -6,16 +6,20 @@ import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, runGates } from "../gates/run.ts";
 import {
+  clearInterruptedRebase,
   commitAll,
   createPullRequest,
   createWorktree,
   diffSince,
   discardChanges,
   ensureCache,
+  fetchBase,
   headSha,
+  isAncestor,
   mergePullRequest,
   pushBranch,
   pushExistingBranch,
+  rebaseOnto,
   removeWorktree,
 } from "../git/repos.ts";
 import type { RouteConstraints } from "../router/router.ts";
@@ -81,8 +85,13 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
     if (ctx.state.phase === "triage") await triage(ctx);
     if (ctx.state.phase === "clarify") await clarify(ctx);
     if (ctx.state.phase === "spec") await spec(ctx);
-    if (ctx.state.phase === "loop") await buildLoop(ctx);
-    if (ctx.state.phase === "deliver") await deliver(ctx, true);
+    while (ctx.state.phase === "loop" || ctx.state.phase === "deliver") {
+      if (ctx.state.phase === "loop") await buildLoop(ctx);
+      if (ctx.state.phase === "deliver") {
+        await deliver(ctx, true);
+        if (ctx.state.phase === "deliver") break;
+      }
+    }
     ctx.setPhase("done");
     ctx.run = deps.store.updateRun(runId, { status: "succeeded", stage: null, finishedAt: Date.now() });
     ctx.log("Run succeeded");
@@ -308,7 +317,8 @@ function profile(ctx: RunContext): ResolvedProfile {
 }
 
 async function buildLoop(ctx: RunContext): Promise<void> {
-  const maxRounds = Math.max(1, ctx.deps.cfg.maxRounds) + ROUNDS_PER_IMPLEMENTER;
+  const maxRounds =
+    Math.max(1, ctx.deps.cfg.maxRounds) + ROUNDS_PER_IMPLEMENTER + (ctx.state.conflictRound ? 1 : 0);
   const holdout =
     profile(ctx) === "quick" || ctx.state.holdoutStatus === "complete"
       ? null
@@ -672,9 +682,86 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     throw new Error("PR delivery base does not match the verified webhook head");
   await ctx.stage("deliver", async () => {
     const cwd = ctx.state.worktreePath as string;
+    await clearInterruptedRebase(cwd, Boolean(ctx.state.pendingRebaseSha));
     const sha = await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
     const head = sha ?? (await headSha(cwd));
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
+    if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch) {
+      const baseBranch = ctx.run.baseBranch as string;
+      const fetched = await fetchBase(cwd, baseBranch);
+      const recorded = ctx.run.baseSha as string;
+      if (ctx.state.pendingRebaseSha && ctx.state.pendingRebaseSha !== fetched)
+        throw new Error("base changed during delivery rebase; refusing to publish");
+      if (fetched !== recorded) {
+        if (!ctx.state.pendingRebaseSha) {
+          if (!(await isAncestor(cwd, recorded, fetched)))
+            throw new Error("base branch no longer descends from the recorded base");
+          ctx.state.pendingRebaseSha = fetched;
+          ctx.state.preRebaseGates = ctx.state.lastGates ?? [];
+          ctx.save();
+        }
+        if (!(await isAncestor(cwd, fetched, await headSha(cwd)))) {
+          const outcome = await rebaseOnto(cwd, fetched);
+          if (outcome === "conflict") {
+            if (ctx.state.conflictRound) throw new Error("base advanced again after conflict resolution");
+            ctx.state.pendingRebaseSha = undefined;
+            ctx.state.preRebaseGates = undefined;
+            ctx.state.conflictRound = true;
+            ctx.state.round++;
+            ctx.state.feedback = `The base branch advanced. Merge origin/${baseBranch} into this branch with \`git merge origin/${baseBranch}\`, resolve conflicts preserving both intents, and rerun the repository checks.`;
+            ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: await headSha(cwd) });
+            ctx.setPhase("loop");
+            return { summary: `rebase conflicted; resolution round ${ctx.state.round}`, value: undefined };
+          }
+        }
+        const previous = ctx.state.preRebaseGates ?? [];
+        const checked = await ctx.stage(
+          "gates",
+          async () => {
+            const after = await runGates(cwd, ctx.state.gatesConfig as GateConfig, ctx.signal, (r) =>
+              ctx.store.addEvent({
+                runId: ctx.run.id,
+                type: "gate",
+                level: r.ok ? "info" : "warn",
+                message: `${r.name}: ${r.ok ? "pass" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
+                data: r,
+              }),
+            );
+            ctx.checkCancelled();
+            await discardChanges(cwd);
+            const comparison = compareGates(ctx.state.baseline ?? null, after);
+            ctx.state.lastGates = comparison;
+            ctx.save();
+            ctx.store.putArtifact(
+              ctx.run.id,
+              `gates-rebase-${ctx.state.round}.json`,
+              "gates",
+              JSON.stringify(comparison, null, 2),
+            );
+            const regressed =
+              !after.setupOk ||
+              comparison.some((c) => c.blocking) ||
+              previous.some((c) => c.result.ok && !after.checks.find((r) => r.name === c.name)?.ok);
+            return {
+              summary: regressed
+                ? "post-rebase checks regressed"
+                : `${comparison.length} post-rebase checks ok`,
+              value: !regressed,
+            };
+          },
+          ctx.state.round,
+        );
+        if (!checked) throw new Error("post-rebase gates regressed; delivery blocked");
+        ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: await headSha(cwd) });
+        ctx.state.pendingRebaseSha = undefined;
+        ctx.state.preRebaseGates = undefined;
+        ctx.save();
+      }
+      if ((await fetchBase(cwd, baseBranch)) !== ctx.run.baseSha)
+        throw new Error("base changed before publication; refusing to publish");
+      if (!(await isAncestor(cwd, ctx.run.baseSha as string, await headSha(cwd))))
+        throw new Error("run branch does not contain the current base");
+    }
     const report = buildReport(ctx, success);
 
     const publish = () => {
@@ -714,6 +801,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       return { summary: `updated existing PR branch ${ctx.run.deliveryBranch}`, value: undefined };
     }
     ctx.checkCancelled();
+    if (success && (await fetchBase(cwd, ctx.run.baseBranch as string)) !== ctx.run.baseSha)
+      throw new Error("base changed before publication; refusing to publish");
     await pushBranch(ctx.repo, cwd, ctx.run.branch as string);
     ctx.checkCancelled();
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;

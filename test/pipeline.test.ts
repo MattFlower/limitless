@@ -49,6 +49,7 @@ const policy = {
 let home: string;
 let repoDir: string;
 let factory: Factory | null = null;
+const originalPath = process.env.PATH;
 
 async function makeRepo(): Promise<string> {
   const dir = join(home, "target");
@@ -165,6 +166,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  process.env.PATH = originalPath;
   await factory?.stop();
   factory?.store.close();
   factory = null;
@@ -172,6 +174,143 @@ afterEach(async () => {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  async function githubFixture(): Promise<string> {
+    const bare = join(home, "github.git");
+    await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
+    const bin = join(home, "bin");
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, "gh"),
+      '#!/bin/sh\ncase "$2" in\n  list) exit 0 ;;\n  create) echo https://github.com/test/repo/pull/1 ;;\nesac\n',
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${bin}:${originalPath}`;
+    return bare;
+  }
+
+  function registerGithub(f: Factory, bare: string): void {
+    f.store.upsertRepo({
+      slug: "test/repo",
+      kind: "github",
+      url: bare,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+  }
+
+  async function advanceBase(bare: string, file: string, content: string): Promise<string> {
+    writeFileSync(join(repoDir, file), content);
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "advance base"], {
+      cwd: repoDir,
+    });
+    const sha = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    await sh(["git", "push", bare, "HEAD:refs/heads/main"], { cwd: repoDir });
+    return sha;
+  }
+
+  for (const kind of ["unchanged", "clean", "regressed", "conflict"] as const) {
+    test(`GitHub delivery handles ${kind} base`, async () => {
+      const bare = await githubFixture();
+      let baseTip = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+      const originalBase = baseTip;
+      let implementCalls = 0;
+      let reviews = 0;
+      let verifies = 0;
+      let mergePrompt = "";
+      let checkedHead = "";
+      const f = start(async (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "standard" }) };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") {
+          reviews++;
+          if (reviews === 1 && kind !== "unchanged") {
+            baseTip = await advanceBase(
+              bare,
+              kind === "conflict" ? "greeting.txt" : "base.txt",
+              kind === "regressed" ? "BAD base\n" : "new base\n",
+            );
+          }
+          return { structured: approve };
+        }
+        if (role === "verify") {
+          verifies++;
+          checkedHead = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+          return { structured: pass };
+        }
+        implementCalls++;
+        if (kind === "conflict" && implementCalls === 2) {
+          mergePrompt = s.prompt;
+          expect((await sh(["git", "status", "--porcelain"], { cwd: s.cwd })).stdout).toBe("");
+          expect(
+            (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+              .stdout,
+          ).toBe("");
+          const merge = await sh(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", `origin/main`],
+            { cwd: s.cwd, allowFail: true },
+          );
+          expect(merge.exitCode).not.toBe(0);
+          writeFileSync(join(s.cwd, "greeting.txt"), "hello from both intents\nnew base\n");
+          await sh(["git", "add", "greeting.txt"], { cwd: s.cwd });
+          await sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "resolve merge"], {
+            cwd: s.cwd,
+          });
+          return { text: "Resolved base conflict" };
+        }
+        const files: Record<string, string> = { "farewell.txt": "goodbye\n" };
+        if (kind === "conflict") files["greeting.txt"] = "hello from feature\n";
+        return { files };
+      });
+      registerGithub(f, bare);
+      const run = await f.createRun({
+        repo: "test/repo",
+        prompt: "Add a farewell file",
+        profile: "standard",
+      });
+      const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
+      expect(status).toBe(kind === "regressed" ? "failed" : "succeeded");
+      const finished = f.store.getRun(run.id);
+      const stages = f.store.listStages(run.id).map((s) => s.name);
+      const gates = stages.filter((s) => s === "gates").length;
+      expect(gates).toBe(kind === "unchanged" ? 1 : 2);
+      expect(implementCalls).toBe(kind === "conflict" ? 2 : 1);
+      expect(reviews).toBe(kind === "conflict" ? 2 : 1);
+      expect(verifies).toBe(kind === "conflict" ? 2 : 1);
+      if (kind === "conflict") {
+        expect(mergePrompt).toContain("git merge origin/main");
+        expect(stages.slice(-6)).toEqual(["implement", "gates", "audit", "review", "verify", "deliver"]);
+        expect(f.store.getArtifact(run.id, "diff.patch")).not.toContain("+new base");
+      }
+      if (kind === "regressed") {
+        expect(finished?.baseSha).toBe(originalBase);
+        expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).toContain("regressed");
+      } else {
+        expect(finished?.baseSha).toBe(baseTip);
+        expect(
+          (
+            await sh(["git", "merge-base", "--is-ancestor", baseTip, finished?.headSha ?? ""], {
+              cwd: bare,
+              allowFail: true,
+            })
+          ).exitCode,
+        ).toBe(0);
+        expect(
+          (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
+        ).toContain(finished?.headSha ?? "missing");
+        if (kind === "unchanged") expect(finished?.headSha).toBe(checkedHead);
+      }
+      if (kind === "regressed")
+        expect(
+          (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+            .stdout,
+        ).toBe("");
+    });
+  }
+
   test("Dependabot run delivers to the existing PR head without creating a PR", async () => {
     const bare = join(home, "github.git");
     await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
