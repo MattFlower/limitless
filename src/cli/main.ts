@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
 import type { Profile, Run, RunDetail, RunEvent } from "../core/types.ts";
+import { parseMaxWait } from "./deploy-wait.ts";
 
 const USAGE = `limitless — personal software factory
 
@@ -20,7 +21,8 @@ Usage:
   limitless service install [--tunnel] [--no-mtplx]   launchd agents: daemon, mtplx (+ tunnel)
   limitless service uninstall|status
   limitless local up|down|status          Manage mtplx and twilight model servers
-  limitless deploy [ref] [--smoke]        Deploy a ref (default origin/main); optionally run live smoke checks
+  limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]
+        Deploy origin/main by default; drain for up to 2700s (45m). --now skips waiting.
 
 Environment: LIMITLESS_URL (default http://127.0.0.1:7400)`;
 
@@ -159,6 +161,8 @@ async function main(): Promise<void> {
       "dry-run": { type: "boolean" },
       "no-mtplx": { type: "boolean" },
       smoke: { type: "boolean" },
+      "max-wait": { type: "string" },
+      now: { type: "boolean" },
     },
   });
   const [cmd, ...rest] = positionals;
@@ -290,9 +294,14 @@ async function main(): Promise<void> {
       return svc.status(port);
     }
     case "deploy": {
+      const maxWaitMs = parseMaxWait(values["max-wait"]);
       const svc = await import("./service.ts");
-      if (rest.length > 1) throw new Error("usage: limitless deploy [ref] [--smoke]");
-      return svc.deploy(Number(process.env.LIMITLESS_PORT ?? 7400), rest[0], values.smoke === true);
+      if (rest.length > 1)
+        throw new Error("usage: limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]");
+      return svc.deploy(Number(process.env.LIMITLESS_PORT ?? 7400), rest[0], values.smoke === true, {
+        maxWaitMs,
+        now: values.now === true,
+      });
     }
     case "providers": {
       const ps =

@@ -262,6 +262,17 @@ export type StreamMessage =
   | { kind: "alert"; alert: QuotaAlert | null; provider: string; window: string; created: boolean }
   | { kind: "question"; question: Question };
 
+/** Process-local scheduler state; active includes executions waiting for input or capacity. */
+export interface DrainState {
+  draining: boolean;
+  active: string[];
+}
+
+export interface HealthResponse extends DrainState {
+  ok: boolean;
+  uptimeMs: number;
+}
+
 export interface ChatProposalFields {
   repo: string;
   prompt: string;
