@@ -67,7 +67,11 @@ function modelsByPrice(provider: string): ModelDef[] {
 }
 
 function cheapestModel(provider: string): ModelDef {
-  const model = modelsByPrice(provider)[0];
+  // On metered providers, ":free" variants are rate-limited and queue unpredictably; checking the
+  // contract with the cheapest paid model costs a fraction of a cent and gives stable timing.
+  const models = modelsByPrice(provider);
+  const paid = models.filter((m) => !m.model.endsWith(":free"));
+  const model = paid[0] ?? models[0];
   if (!model) throw new Error(`no catalog model for ${provider}`);
   return model;
 }
