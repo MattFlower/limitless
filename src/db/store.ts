@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { assertExistingBranchDelivery } from "../core/delivery.ts";
 import type {
   ArtifactMeta,
   CreateRunRequest,
@@ -69,6 +70,7 @@ const toRun = (r: Row): Run => ({
   title: r.title as string,
   prompt: r.prompt as string,
   source: r.source as Run["source"],
+  githubWebhookVerified: r.github_webhook_verified === 1,
   sourceRef: parse(r.source_ref, null),
   requestedBy: (r.requested_by as string) ?? null,
   profile: r.profile as Run["profile"],
@@ -332,13 +334,15 @@ export class Store {
 
   // ---- runs ----------------------------------------------------------------
 
-  createRun(repo: Repo, req: CreateRunRequest): Run {
+  // Provenance is an internal argument, never taken from the public request object.
+  createRun(repo: Repo, req: CreateRunRequest, verifiedGitHubWebhook = false): Run {
+    assertExistingBranchDelivery(repo, { ...req, githubWebhookVerified: verifiedGitHubWebhook });
     const id = newId();
     const title = req.title ?? req.prompt.split("\n")[0]?.slice(0, 80) ?? "Untitled";
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -352,6 +356,7 @@ export class Store {
         req.priority ?? 0,
         req.baseBranch ?? null,
         req.deliveryBranch ?? null,
+        verifiedGitHubWebhook ? 1 : 0,
         Date.now(),
       );
     const run = this.getRun(id) as Run;

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHmac } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -7,6 +8,7 @@ import { loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
+import { githubWebhook } from "../src/integrations/github.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 
@@ -168,15 +170,32 @@ describe("pipeline (fake agents, real git + gates)", () => {
       defaultBranch: "main",
       mergePolicy: "pr",
     });
-    const run = await f.createRun({
-      repo: "MattFlower/limitless",
-      prompt: "Verify dependency update",
-      profile: "quick",
-      source: "github",
-      baseBranch: "dependabot/npm/pkg-2",
-      deliveryBranch: "dependabot/npm/pkg-2",
-      sourceRef: { kind: "pull_request", repo: "MattFlower/limitless", number: 18, headSha: baseSha },
-    });
+    f.cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
+    const trigger = async (sha: string, delivery: string) => {
+      const payload = JSON.parse(readFileSync(join(import.meta.dir, "data/github-pr.json"), "utf8")) as {
+        pull_request: { head: { sha: string } };
+      };
+      payload.pull_request.head.sha = sha;
+      const body = JSON.stringify(payload);
+      const response = await githubWebhook(f)(
+        new Request("http://localhost/webhooks/github", {
+          method: "POST",
+          body,
+          headers: {
+            "x-github-event": "pull_request",
+            "x-github-delivery": delivery,
+            "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+          },
+        }),
+      );
+      expect(response.status).toBe(201);
+      const { runId } = (await response.json()) as { runId: string };
+      const run = f.store.getRun(runId);
+      if (!run) throw new Error("webhook did not create run");
+      expect(run.githubWebhookVerified).toBe(true);
+      return run;
+    };
+    const run = await trigger(baseSha, "initial");
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     const finished = f.store.getRun(run.id);
     expect(finished?.prUrl).toBe("https://github.com/MattFlower/limitless/pull/18");
@@ -199,20 +218,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const competingSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: competitor })).stdout.trim();
     concurrent = competitor;
     content = "verified again\n";
-    const stale = await f.createRun({
-      repo: "MattFlower/limitless",
-      prompt: "Verify again",
-      profile: "quick",
-      source: "github",
-      baseBranch: "dependabot/npm/pkg-2",
-      deliveryBranch: "dependabot/npm/pkg-2",
-      sourceRef: {
-        kind: "pull_request",
-        repo: "MattFlower/limitless",
-        number: 18,
-        headSha: finished?.headSha,
-      },
-    });
+    if (!finished?.headSha) throw new Error("missing delivered head");
+    const stale = await trigger(finished.headSha, "concurrent");
     expect(await waitFor(f, stale.id, ["succeeded", "failed", "needs_human"])).toBe("failed");
     expect(f.store.getRun(stale.id)?.error).toContain("PR head moved");
     expect(

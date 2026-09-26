@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { assertExistingBranchDelivery } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
@@ -70,6 +71,8 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
   if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
 
   try {
+    // Recheck persisted provenance on resume, including runs created before this guard existed.
+    assertExistingBranchDelivery(ctx.repo, ctx.run);
     if (ctx.state.phase === "prepare") await prepare(ctx);
     if (ctx.state.phase === "triage") await triage(ctx);
     if (ctx.state.phase === "clarify") await clarify(ctx);
@@ -109,6 +112,7 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
 // prepare: repo cache, worktree, gate detection, baseline
 
 async function prepare(ctx: RunContext): Promise<void> {
+  assertExistingBranchDelivery(ctx.repo, ctx.run);
   await ctx.stage("prepare", async () => {
     const { cfg, store } = ctx.deps;
     await ensureCache(cfg.paths, ctx.repo);
@@ -580,6 +584,9 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
 // deliver
 
 async function deliver(ctx: RunContext, success: boolean): Promise<void> {
+  assertExistingBranchDelivery(ctx.repo, ctx.run);
+  if (ctx.run.deliveryBranch && ctx.run.baseSha !== ctx.run.sourceRef?.headSha)
+    throw new Error("PR delivery base does not match the verified webhook head");
   await ctx.stage("deliver", async () => {
     const cwd = ctx.state.worktreePath as string;
     const sha = await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);

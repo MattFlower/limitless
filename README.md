@@ -90,6 +90,9 @@ content type `application/json`, a shared secret stored as `GITHUB_WEBHOOK_SECRE
 **Pull requests** events. The webhook is disabled until the secret is configured.
 Owner-labeled `limitless` issues and owner `/limitless ` comments create runs.
 Dependabot pull requests receive verification runs whose fixes update the existing PR branch.
+Existing-branch delivery requires recorded webhook authentication and Dependabot PR metadata;
+public run requests cannot enable it. Runs predating this authentication record must be
+triggered again through the webhook before they can update an existing branch.
 
 Per-repository settings go in a `.limitless.toml` at the repo root:
 

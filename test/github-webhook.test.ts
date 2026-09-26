@@ -40,11 +40,11 @@ function handler(): ReturnType<typeof githubWebhook> {
   const factory = {
     cfg,
     store,
-    createRun: async (req: CreateRunRequest): Promise<Run> => {
+    createRun: async (req: CreateRunRequest, verifiedGitHubWebhook = false): Promise<Run> => {
       requests.push(req);
       const repo = store.getRepoBySlug(req.repo);
       if (!repo) throw new Error("missing repo");
-      return store.createRun(repo, req);
+      return store.createRun(repo, req, verifiedGitHubWebhook);
     },
   } as Factory;
   return githubWebhook(factory);
@@ -91,7 +91,13 @@ test("disabled, missing, invalid and exact-body signatures", async () => {
   const missingDelivery = request(body, "missing");
   missingDelivery.headers.delete("x-github-delivery");
   expect((await h(missingDelivery)).status).toBe(400);
-  expect(store.db.query("SELECT COUNT(*) AS count FROM inbox").get()).toEqual({ count: 2 });
+  expect(store.db.query("SELECT COUNT(*) AS count FROM inbox").get()).toEqual({ count: 3 });
+  expect(store.db.query("SELECT status, note FROM inbox WHERE id = 'e'").get()).toEqual({
+    status: "error",
+    note: "invalid JSON",
+  });
+  expect((await h(request("{broken", "e"))).status).toBe(200);
+  expect((await h(new Request("http://localhost/webhooks/github"))).status).toBe(405);
   expect(requests).toHaveLength(2);
 });
 

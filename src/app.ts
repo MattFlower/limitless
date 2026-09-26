@@ -80,11 +80,12 @@ export class Factory {
     await this.scheduler.stop();
   }
 
-  async createRun(req: CreateRunRequest): Promise<Run> {
+  /** The second argument is factory-only provenance, never deserialized from a request. */
+  async createRun(req: CreateRunRequest, verifiedGitHubWebhook = false): Promise<Run> {
     if (!req.prompt?.trim()) throw new Error("prompt is required");
     if (!req.repo?.trim()) throw new Error("repo is required");
     const repo = await resolveRepo(this.store, req.repo);
-    const run = this.store.createRun(repo, req);
+    const run = this.store.createRun(repo, req, verifiedGitHubWebhook);
     this.store.addEvent({
       runId: run.id,
       type: "log",
@@ -100,17 +101,20 @@ export class Factory {
   async retryRun(id: string): Promise<Run> {
     const run = this.store.getRun(id);
     if (!run) throw new Error(`run ${id} not found`);
-    return this.createRun({
-      repo: run.repoSlug,
-      prompt: run.prompt,
-      title: run.title,
-      profile: run.profile,
-      source: run.source,
-      ...(run.sourceRef ? { sourceRef: run.sourceRef } : {}),
-      ...(run.baseBranch ? { baseBranch: run.baseBranch } : {}),
-      ...(run.deliveryBranch ? { deliveryBranch: run.deliveryBranch } : {}),
-      ...(run.requestedBy ? { requestedBy: run.requestedBy } : {}),
-    });
+    return this.createRun(
+      {
+        repo: run.repoSlug,
+        prompt: run.prompt,
+        title: run.title,
+        profile: run.profile,
+        source: run.source,
+        ...(run.sourceRef ? { sourceRef: run.sourceRef } : {}),
+        ...(run.baseBranch ? { baseBranch: run.baseBranch } : {}),
+        ...(run.deliveryBranch ? { deliveryBranch: run.deliveryBranch } : {}),
+        ...(run.requestedBy ? { requestedBy: run.requestedBy } : {}),
+      },
+      run.githubWebhookVerified,
+    );
   }
 
   /** Answer the given question, or every open question on the run. */

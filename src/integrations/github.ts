@@ -131,6 +131,8 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
 
 export function githubWebhook(factory: GitHubFactory): (req: Request) => Promise<Response> {
   return async (req) => {
+    if (req.method !== "POST")
+      return new Response("method not allowed", { status: 405, headers: { Allow: "POST" } });
     const secret = factory.cfg.secrets.GITHUB_WEBHOOK_SECRET;
     if (!secret) return new Response("GitHub webhooks disabled", { status: 503 });
     const bytes = new Uint8Array(await req.arrayBuffer());
@@ -138,13 +140,25 @@ export function githubWebhook(factory: GitHubFactory): (req: Request) => Promise
       return new Response("invalid signature", { status: 401 });
     const id = req.headers.get("x-github-delivery");
     if (!id) return new Response("missing delivery ID", { status: 400 });
+    const event = req.headers.get("x-github-event") ?? "unknown";
+    const raw = new TextDecoder().decode(bytes);
     let payload: unknown;
     try {
-      payload = JSON.parse(new TextDecoder().decode(bytes));
+      payload = JSON.parse(raw);
     } catch {
+      if (
+        !factory.store.recordInbox({
+          id,
+          source: "github",
+          kind: event,
+          payload: raw,
+          status: "error",
+          note: "invalid JSON",
+        })
+      )
+        return new Response("duplicate delivery", { status: 200 });
       return new Response("invalid JSON", { status: 400 });
     }
-    const event = req.headers.get("x-github-event") ?? "unknown";
     if (!factory.store.recordInbox({ id, source: "github", kind: event, payload, status: "processing" }))
       return new Response("duplicate delivery", { status: 200 });
     try {
@@ -153,7 +167,7 @@ export function githubWebhook(factory: GitHubFactory): (req: Request) => Promise
         factory.store.finishInbox(id, mapped.error ? "error" : "ignored", mapped.note);
         return new Response(mapped.note, { status: mapped.error ? 400 : 200 });
       }
-      const run = await factory.createRun(mapped.request);
+      const run = await factory.createRun(mapped.request, true);
       factory.store.finishInbox(id, "run_created", mapped.note, run.id);
       return Response.json({ runId: run.id }, { status: 201 });
     } catch (error) {
