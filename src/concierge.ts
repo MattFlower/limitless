@@ -245,7 +245,7 @@ export class Concierge {
       let result: AgentResult;
       try {
         if (signal.aborted) throw new Error("Chat request timed out");
-        if (!tracker.isAvailable(target.provider)) continue;
+        if (!(await tracker.preflight(target.provider))) continue;
         mkdirSync(cfg.paths.runs, { recursive: true });
         directory = mkdtempSync(join(cfg.paths.runs, "chat-"));
         result = await harness({

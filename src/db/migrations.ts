@@ -216,4 +216,15 @@ CREATE TABLE chat_calls (
 CREATE INDEX chat_calls_provider ON chat_calls(provider, started_at);
 `,
   },
+  {
+    version: 6,
+    name: "openrouter_key_usage",
+    sql: `
+ALTER TABLE provider_state ADD COLUMN reported_usage_usd REAL;
+ALTER TABLE provider_state ADD COLUMN reported_at INTEGER;
+ALTER TABLE provider_state ADD COLUMN key_limit REAL;
+ALTER TABLE provider_state ADD COLUMN limit_remaining REAL;
+ALTER TABLE provider_state ADD COLUMN limit_reset TEXT;
+`,
+  },
 ];

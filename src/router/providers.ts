@@ -17,8 +17,18 @@ interface ProviderRuntime {
   waiters: (() => void)[];
 }
 
+interface KeyReading {
+  usage: number;
+  at: number;
+  limit: number | null;
+  remaining: number | null;
+  reset: string | null;
+}
+
 const CIRCUIT_THRESHOLD = 3;
 const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+const POLL_MS = 10 * 60_000;
+const PREFLIGHT_MS = 2 * 60_000;
 
 /**
  * Tracks health, quota and concurrency per provider. The router asks it which providers are
@@ -29,6 +39,9 @@ export class ProviderTracker {
   /** Individual models a provider rejected (e.g. not available on this plan). */
   private modelBlocks = new Map<string, { until: number; reason: string }>();
   private routingFor: ((provider: string, exhausted: boolean) => string) | null = null;
+  private reading: KeyReading | null = null;
+  private refreshInFlight: Promise<boolean> | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     defs: ProviderDef[],
@@ -37,6 +50,11 @@ export class ProviderTracker {
     private readonly secrets: Record<string, string>,
     private readonly budgets: Record<string, number> = {},
     private readonly clock: () => number = Date.now,
+    private readonly fetchKey: typeof fetch = fetch,
+    private readonly timer: { set: typeof setInterval; clear: typeof clearInterval } = {
+      set: setInterval,
+      clear: clearInterval,
+    },
   ) {
     for (const def of defs) {
       let enabled = true;
@@ -46,6 +64,19 @@ export class ProviderTracker {
         disabledReason = `missing ${def.apiKeySecret}`;
       }
       const row = store.getProviderRow(def.id);
+      if (
+        def.id === "openrouter" &&
+        typeof row?.reported_usage_usd === "number" &&
+        typeof row.reported_at === "number"
+      ) {
+        this.reading = {
+          usage: row.reported_usage_usd,
+          at: row.reported_at,
+          limit: typeof row.key_limit === "number" ? row.key_limit : null,
+          remaining: typeof row.limit_remaining === "number" ? row.limit_remaining : null,
+          reset: typeof row.limit_reset === "string" ? row.limit_reset : null,
+        };
+      }
       const windows = row?.windows_json
         ? (JSON.parse(row.windows_json as string) as Record<string, QuotaWindow>)
         : {};
@@ -68,6 +99,104 @@ export class ProviderTracker {
 
   now(): number {
     return this.clock();
+  }
+
+  start(): void {
+    if (this.pollTimer || !this.isEnabled("openrouter")) return;
+    void this.refreshOpenRouter();
+    this.pollTimer = this.timer.set(() => {
+      void this.refreshOpenRouter();
+    }, POLL_MS);
+  }
+
+  stop(): void {
+    if (this.pollTimer) this.timer.clear(this.pollTimer);
+    this.pollTimer = null;
+  }
+
+  async preflight(id: string): Promise<boolean> {
+    if (id !== "openrouter") return this.isAvailable(id);
+    if (!this.isEnabled(id)) return false;
+    if (!this.reading || this.clock() - this.reading.at > PREFLIGHT_MS) await this.refreshOpenRouter();
+    return this.reading !== null && this.isAvailable(id);
+  }
+
+  refreshOpenRouter(): Promise<boolean> {
+    if (!this.isEnabled("openrouter")) return Promise.resolve(false);
+    if (this.refreshInFlight) return this.refreshInFlight;
+    const request = this.readOpenRouter();
+    this.refreshInFlight = request;
+    void request.finally(() => {
+      if (this.refreshInFlight === request) this.refreshInFlight = null;
+    });
+    return request;
+  }
+
+  private async readOpenRouter(): Promise<boolean> {
+    try {
+      const response = await this.fetchKey("https://openrouter.ai/api/v1/key", {
+        headers: { authorization: `Bearer ${this.authToken("openrouter")}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!response.ok) return false;
+      const body: unknown = await response.json();
+      if (!body || typeof body !== "object" || !("data" in body)) return false;
+      const data = body.data;
+      if (!data || typeof data !== "object") return false;
+      const fields = data as Record<string, unknown>;
+      if (
+        !["usage", "usage_daily", "usage_weekly", "usage_monthly"].every(
+          (name) =>
+            typeof fields[name] === "number" &&
+            Number.isFinite(fields[name]) &&
+            (fields[name] as number) >= 0,
+        )
+      )
+        return false;
+      const optional = (value: unknown) =>
+        value === null || (typeof value === "number" && Number.isFinite(value));
+      if (
+        !optional(fields.limit) ||
+        !optional(fields.limit_remaining) ||
+        (fields.limit_reset !== null && typeof fields.limit_reset !== "string")
+      )
+        return false;
+      const next: KeyReading = {
+        usage: fields.usage_monthly as number,
+        at: this.clock(),
+        limit: fields.limit as number | null,
+        remaining: fields.limit_remaining as number | null,
+        reset: fields.limit_reset as string | null,
+      };
+      const prior = this.reading;
+      if (prior && next.usage >= prior.usage && next.at > prior.at) {
+        const reported = next.usage - prior.usage;
+        const local = this.store.providerSpendBetween("openrouter", prior.at, next.at);
+        const drift = Math.abs(reported - local);
+        if (drift > 0.05 && drift > 0.2 * Math.max(reported, local)) {
+          this.store.addEvent({
+            runId: "provider:openrouter",
+            type: "log",
+            level: "warn",
+            message: `OpenRouter spend drift: reported $${reported.toFixed(4)}, local $${local.toFixed(4)}`,
+            data: {
+              provider: "openrouter",
+              reportedUsd: reported,
+              localUsd: local,
+              from: prior.at,
+              to: next.at,
+            },
+          });
+        }
+      }
+      this.store.putOpenRouterReading(next);
+      this.reading = next;
+      this.publish("openrouter");
+      this.refreshAlerts();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   setRoutingDescription(describe: (provider: string, exhausted: boolean) => string): void {
@@ -113,9 +242,19 @@ export class ProviderTracker {
     const budget = this.budgets[id];
     if (budget !== undefined) {
       if (!(budget > 0)) return 0; // a zero, negative or NaN budget means "never spend"
-      const spent = this.store.providerSpendSince(id, now - MONTH_MS);
+      const spent = Math.max(
+        this.store.providerSpendSince(id, now - MONTH_MS),
+        id === "openrouter" ? (this.reading?.usage ?? 0) : 0,
+      );
       min = Math.min(min, (budget - spent) / budget);
     }
+    if (
+      id === "openrouter" &&
+      this.reading?.remaining !== null &&
+      this.reading?.remaining !== undefined &&
+      this.reading.remaining <= 0
+    )
+      return 0;
     return min;
   }
 
@@ -353,6 +492,15 @@ export class ProviderTracker {
       windows: p.windows,
       spendUsd: p.def.billing === "metered" ? this.store.providerSpendSince(id, now - MONTH_MS) : null,
       budgetUsd: budget ?? null,
+      ...(id === "openrouter"
+        ? {
+            reportedUsageUsd: this.reading?.usage ?? null,
+            reportedAt: this.reading?.at ?? null,
+            limit: this.reading?.limit ?? null,
+            limitRemaining: this.reading?.remaining ?? null,
+            limitReset: this.reading?.reset ?? null,
+          }
+        : {}),
       inFlight: p.inFlight,
       maxConcurrent: p.def.maxConcurrent,
       updatedAt: now,
