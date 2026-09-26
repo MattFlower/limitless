@@ -225,6 +225,16 @@ export interface ProviderStatus {
   updatedAt: number;
 }
 
+export interface QuotaAlert {
+  provider: string;
+  window: string;
+  utilization: number | null;
+  resetsAt: number | null;
+  severity: "warning" | "exhausted";
+  routing: string;
+  createdAt: number;
+}
+
 export interface CreateRunRequest {
   repo: string;
   prompt: string;
@@ -243,4 +253,5 @@ export type StreamMessage =
   | { kind: "invocation"; invocation: Invocation }
   | { kind: "event"; event: RunEvent }
   | { kind: "provider"; provider: ProviderStatus }
+  | { kind: "alert"; alert: QuotaAlert | null; provider: string; window: string; created: boolean }
   | { kind: "question"; question: Question };

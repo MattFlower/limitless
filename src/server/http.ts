@@ -219,6 +219,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle(() => json(store.listRepos())),
     },
     "/api/providers": handle(() => json(factory.tracker.all())),
+    "/api/alerts": handle(() => json(store.listAlerts(factory.tracker.now()))),
     "/api/models": handle(() => json({ models: MODELS, policy: DEFAULT_POLICY })),
     "/api/stats": handle((req) => {
       const days = Number(new URL(req.url).searchParams.get("days") ?? 14);

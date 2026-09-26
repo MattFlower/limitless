@@ -55,6 +55,28 @@ export class Router {
     return target;
   }
 
+  describeFallback(provider: string, exhausted: boolean): string {
+    const alternatives = new Set<string>();
+    for (const [role, cases] of Object.entries(this.policy) as [Role, Policy[Role]][]) {
+      for (const [complexity, groups] of Object.entries(cases) as [Complexity | "default", string[]][]) {
+        const ids = groups.flatMap((group) => group.split("|"));
+        if (!ids.some((id) => this.models.get(id)?.provider === provider)) continue;
+        for (const candidate of this.route(role, complexity === "default" ? "medium" : complexity)
+          .candidates) {
+          if (candidate.provider !== provider) alternatives.add(candidate.provider);
+        }
+      }
+    }
+    const fallback = alternatives.size
+      ? `Eligible fallback providers: ${[...alternatives].join(", ")}.`
+      : "No eligible fallback providers are available.";
+    if (exhausted) return `Router skips ${provider}. ${fallback}`;
+    const reason = this.tracker.unavailableReason(provider);
+    return reason
+      ? `${provider} is currently unavailable (${reason}). ${fallback}`
+      : `${provider} remains eligible until its reserve is reached. ${fallback}`;
+  }
+
   /** Ordered, available candidates for a role. Never empty unless nothing at all is usable. */
   route(role: Role, complexity: Complexity, c: RouteConstraints = {}): RouteDecision {
     const entry = this.policy[role];

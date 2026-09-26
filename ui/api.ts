@@ -4,6 +4,7 @@ import type {
   CreateRunRequest,
   ProviderStatus,
   Question,
+  QuotaAlert,
   Repo,
   Run,
   RunDetail,
@@ -95,6 +96,10 @@ export function listEvents(
 
 export function getProviders(): Promise<ProviderStatus[]> {
   return request<ProviderStatus[]>("/api/providers");
+}
+
+export function getAlerts(): Promise<QuotaAlert[]> {
+  return request<QuotaAlert[]>("/api/alerts");
 }
 
 export function getModels(): Promise<{ models: ModelDef[]; policy: Policy }> {

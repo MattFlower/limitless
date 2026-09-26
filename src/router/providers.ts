@@ -1,5 +1,5 @@
 import type { Reserves } from "../config.ts";
-import type { InvocationStatus, ProviderStatus, QuotaWindow } from "../core/types.ts";
+import type { InvocationStatus, ProviderStatus, QuotaAlert, QuotaWindow } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import type { ProviderDef } from "./catalog.ts";
 
@@ -28,6 +28,7 @@ export class ProviderTracker {
   private providers = new Map<string, ProviderRuntime>();
   /** Individual models a provider rejected (e.g. not available on this plan). */
   private modelBlocks = new Map<string, { until: number; reason: string }>();
+  private routingFor: ((provider: string, exhausted: boolean) => string) | null = null;
 
   constructor(
     defs: ProviderDef[],
@@ -35,6 +36,7 @@ export class ProviderTracker {
     private readonly reserves: Reserves,
     private readonly secrets: Record<string, string>,
     private readonly budgets: Record<string, number> = {},
+    private readonly clock: () => number = Date.now,
   ) {
     for (const def of defs) {
       let enabled = true;
@@ -53,7 +55,7 @@ export class ProviderTracker {
         enabled,
         disabledReason,
         windows,
-        exhaustedUntil: row?.state === "exhausted" && until && until > Date.now() ? until : null,
+        exhaustedUntil: row?.state === "exhausted" && until && until > clock() ? until : null,
         exhaustedReason: row?.state === "exhausted" ? ((row.reason as string) ?? null) : null,
         consecutiveFailures: 0,
         circuitOpenUntil: null,
@@ -62,6 +64,14 @@ export class ProviderTracker {
         waiters: [],
       });
     }
+  }
+
+  now(): number {
+    return this.clock();
+  }
+
+  setRoutingDescription(describe: (provider: string, exhausted: boolean) => string): void {
+    this.routingFor = describe;
   }
 
   isEnabled(id: string): boolean {
@@ -80,7 +90,7 @@ export class ProviderTracker {
   }
 
   /** Fraction of the tightest reserve still available: 1 = untouched, <=0 = at/over reserve. */
-  headroom(id: string, now = Date.now()): number {
+  headroom(id: string, now = this.clock()): number {
     const p = this.providers.get(id);
     if (!p) return 0;
     const limits = this.reserveFor(id);
@@ -88,7 +98,7 @@ export class ProviderTracker {
     for (const [name, w] of Object.entries(p.windows)) {
       const cap = limits[name];
       if (cap === undefined) continue;
-      const util = w.resetsAt && w.resetsAt < now ? 0 : w.utilization;
+      const util = w.resetsAt !== null && w.resetsAt <= now ? 0 : w.utilization;
       min = Math.min(min, (cap - util) / cap);
     }
     const budget = this.budgets[id];
@@ -108,7 +118,7 @@ export class ProviderTracker {
     return {};
   }
 
-  unavailableReason(id: string, now = Date.now()): string | null {
+  unavailableReason(id: string, now = this.clock()): string | null {
     const p = this.providers.get(id);
     if (!p) return "unknown provider";
     if (!p.enabled) return p.disabledReason ?? "disabled";
@@ -121,10 +131,10 @@ export class ProviderTracker {
   }
 
   blockModel(modelId: string, reason: string, ms = 24 * 60 * 60 * 1000): void {
-    this.modelBlocks.set(modelId, { until: Date.now() + ms, reason: reason.slice(0, 200) });
+    this.modelBlocks.set(modelId, { until: this.clock() + ms, reason: reason.slice(0, 200) });
   }
 
-  modelUnavailableReason(modelId: string, now = Date.now()): string | null {
+  modelUnavailableReason(modelId: string, now = this.clock()): string | null {
     const block = this.modelBlocks.get(modelId);
     return block && block.until > now ? `model rejected: ${block.reason}` : null;
   }
@@ -173,8 +183,70 @@ export class ProviderTracker {
   observeWindows(id: string, windows: Record<string, QuotaWindow>): void {
     const p = this.providers.get(id);
     if (!p || !Object.keys(windows).length) return;
-    p.windows = { ...p.windows, ...windows };
+    const now = this.clock();
+    const prior = p.windows;
+    const current = Object.fromEntries(
+      Object.entries(windows).filter(([name, window]) => {
+        const previous = prior[name];
+        return (
+          !previous ||
+          previous.resetsAt === null ||
+          window.resetsAt === null ||
+          window.resetsAt >= previous.resetsAt
+        );
+      }),
+    );
+    if (!Object.keys(current).length) return;
+    p.windows = { ...p.windows, ...current };
     this.persist(id);
+    if (p.def.billing !== "subscription") return;
+    const limits = this.reserveFor(id);
+    for (const [name, window] of Object.entries(current)) {
+      const cap = limits[name];
+      if (cap === undefined) continue;
+      if (window.resetsAt !== null && window.resetsAt <= now) {
+        this.store.clearAlert(id, name);
+        continue;
+      }
+      if (
+        prior[name] &&
+        prior[name].resetsAt !== window.resetsAt &&
+        window.utilization + Number.EPSILON < cap * 0.75
+      )
+        this.store.clearAlert(id, name);
+      if (window.utilization + Number.EPSILON >= cap * 0.75) {
+        this.alert(
+          id,
+          name,
+          window.utilization,
+          window.resetsAt,
+          window.utilization >= cap ? "exhausted" : "warning",
+        );
+      }
+    }
+  }
+
+  private alert(
+    id: string,
+    window: string,
+    utilization: number | null,
+    resetsAt: number | null,
+    severity: QuotaAlert["severity"],
+  ): void {
+    const routing =
+      this.routingFor?.(id, severity === "exhausted") ??
+      (severity === "exhausted"
+        ? "Router skips this provider; no eligible fallback providers are known."
+        : "Provider remains eligible until its reserve is reached.");
+    this.store.putAlert({
+      provider: id,
+      window,
+      utilization,
+      resetsAt,
+      severity,
+      routing,
+      createdAt: this.clock(),
+    });
   }
 
   record(
@@ -184,10 +256,22 @@ export class ProviderTracker {
   ): void {
     const p = this.providers.get(id);
     if (!p) return;
-    const now = Date.now();
+    const now = this.clock();
     if (status === "quota") {
       p.exhaustedUntil = detail?.exhaustedUntil ?? now + 60 * 60 * 1000;
       p.exhaustedReason = (detail?.error ?? "quota exhausted").slice(0, 300);
+      if (p.def.billing === "subscription") {
+        const known = Object.entries(p.windows)
+          .filter(([, w]) => w.resetsAt === null || w.resetsAt > now)
+          .sort((a, b) => (a[1].resetsAt ?? Infinity) - (b[1].resetsAt ?? Infinity))[0];
+        this.alert(
+          id,
+          known?.[0] ?? "hard_limit",
+          known?.[1].utilization ?? null,
+          known?.[1].resetsAt ?? detail?.exhaustedUntil ?? null,
+          "exhausted",
+        );
+      }
     } else if (status === "unavailable" || status === "timeout") {
       p.consecutiveFailures++;
       if (p.consecutiveFailures >= CIRCUIT_THRESHOLD) {
@@ -235,7 +319,7 @@ export class ProviderTracker {
   status(id: string): ProviderStatus | null {
     const p = this.providers.get(id);
     if (!p) return null;
-    const now = Date.now();
+    const now = this.clock();
     const reason = this.unavailableReason(id, now);
     let state: ProviderStatus["state"] = "ok";
     if (!p.enabled) state = "disabled";

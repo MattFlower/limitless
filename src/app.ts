@@ -25,6 +25,7 @@ export interface FactoryOptions {
   models?: ModelDef[];
   policy?: Policy;
   store?: Store;
+  clock?: () => number;
 }
 
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
@@ -44,14 +45,22 @@ export class Factory {
   ) {
     this.store = opts.store ?? new Store(cfg.paths.db);
     this.providerDefs = opts.providers ?? PROVIDERS;
-    this.tracker = new ProviderTracker(this.providerDefs, this.store, cfg.reserves, cfg.secrets, {
-      openrouter: cfg.openrouterBudgetUsd,
-    });
+    this.tracker = new ProviderTracker(
+      this.providerDefs,
+      this.store,
+      cfg.reserves,
+      cfg.secrets,
+      { openrouter: cfg.openrouterBudgetUsd },
+      opts.clock,
+    );
     this.router = new Router(
       this.tracker,
       opts.policy ?? DEFAULT_POLICY,
       opts.models ?? MODELS,
       cfg.preferProviders,
+    );
+    this.tracker.setRoutingDescription((provider, exhausted) =>
+      this.router.describeFallback(provider, exhausted),
     );
     this.deps = {
       cfg,
