@@ -191,6 +191,7 @@ async function main(): Promise<void> {
         twilightHost: typeof local.twilight_host === "string" ? local.twilight_host : undefined,
         llamaBinary:
           typeof local.twilight_llama_binary === "string" ? local.twilight_llama_binary : undefined,
+        secrets: cfg.secrets,
       });
       for (const [name, state] of Object.entries(report))
         console.log(`${name}: service ${state.service}; endpoint ${state.endpoint}`);

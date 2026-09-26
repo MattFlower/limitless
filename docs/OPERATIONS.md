@@ -69,8 +69,9 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 
 - `limitless local up|down|status` manages both model servers and reports service state plus
   `/v1/models` endpoint health separately. `up` creates the mtplx launchd plist if absent and
-  generates `~/.config/systemd/user/limitless-llama.service` on twilight over SSH. Set the
-  installed GGUF path in `~/.config/limitless/config.toml` before `up`:
+  starts `limitless-llama.service` on twilight over SSH. An installed unit is never overwritten
+  (it may carry host-specific tuning such as a patched chat template); only when none exists does
+  `up` generate one, which needs the installed GGUF path in `~/.config/limitless/config.toml`:
 
   ```toml
   [local]
@@ -84,8 +85,8 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
   calls retain their Anthropic-compatible Claude CLI endpoints. `limitless service install`
   installs the daemon and can install the mtplx agent, while `limitless local` controls the
   model servers independently. SSH access to twilight and an installed model/binary are required.
-  The twilight unit reads `TWILIGHT_API_KEY` from twilight's
-  `~/.config/limitless/secrets.env`; use the same key in the Mac's Limitless secrets file.
+  The generated unit reads its API key from twilight's `~/.config/limitless/llama-api-key` (so it
+  never appears in the process list); put the same value in the Mac's `TWILIGHT_API_KEY`.
 
 - **Mac (mtplx):** the launchd agent keeps Qwen 3.8 27B (optimized-quality, ~30 GB, 262K context)
   loaded. Stop it to free memory: `launchctl bootout gui/$UID/cc.mattflower.limitless-mtplx`;

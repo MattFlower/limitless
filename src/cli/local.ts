@@ -1,12 +1,13 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
-import { PROVIDERS } from "../router/catalog.ts";
+import { MODELS, PROVIDERS } from "../router/catalog.ts";
 import { sh } from "../util/proc.ts";
 import { mtplxPlist } from "./service.ts";
 
 const label = "cc.mattflower.limitless-mtplx";
 const unitName = "limitless-llama.service";
+const unitPath = `~/.config/systemd/user/${unitName}`;
 type Runner = typeof sh;
 
 export interface LocalOptions {
@@ -15,7 +16,9 @@ export interface LocalOptions {
   llamaBinary?: string;
   mtplxPlistPath?: string;
   command?: Runner;
-  probe?: (url: string) => Promise<boolean>;
+  /** Secrets for provider API keys, so the health probe authenticates like the router does. */
+  secrets?: Record<string, string>;
+  probe?: (url: string, token?: string) => Promise<boolean>;
 }
 
 function systemdQuote(value: string): string {
@@ -24,18 +27,25 @@ function systemdQuote(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+/**
+ * A starting-point unit for a fresh host: full GPU offload, 128K context with a q8 KV cache, one slot,
+ * Jinja chat templates, and the model alias the catalog routes to. The API key is read from a file
+ * so it never appears in the process list.
+ */
 export function twilightUnit(
   modelPath: string,
   binary = "/home/mflower/.local/share/limitless/llama-bin/llama-server",
+  alias = MODELS.find((m) => m.provider === "twilight")?.model ?? "local",
 ): string {
+  if (!/^[\w.-]+$/.test(alias)) throw new Error(`invalid llama-server alias: ${alias}`);
   return `[Unit]
 Description=Limitless llama-server
 After=network-online.target
 
 [Service]
-EnvironmentFile=%h/.config/limitless/secrets.env
-ExecStart=${systemdQuote(binary)} -m ${systemdQuote(modelPath)} --host 0.0.0.0 --port 8080 --api-key \${TWILIGHT_API_KEY}
+ExecStart=${systemdQuote(binary)} -m ${systemdQuote(modelPath)} --alias ${alias} -c 131072 -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -np 1 --jinja --host 0.0.0.0 --port 8080 --api-key-file %h/.config/limitless/llama-api-key --metrics
 Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=default.target
@@ -51,8 +61,6 @@ export async function manageLocal(
   action: "up" | "down" | "status",
   opts: LocalOptions,
 ): Promise<LocalReport> {
-  if (action === "up" && !opts.modelPath)
-    throw new Error("set [local].twilight_model_path in config.toml before running limitless local up");
   const command = opts.command ?? sh;
   const host = opts.twilightHost ?? "twilight";
   const path = opts.mtplxPlistPath ?? join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
@@ -63,9 +71,10 @@ export async function manageLocal(
     run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, ...args], stdin);
   const probe =
     opts.probe ??
-    (async (url: string) => {
+    (async (url: string, token?: string) => {
       try {
-        return (await fetch(url, { signal: AbortSignal.timeout(2000) })).ok;
+        const headers: Record<string, string> = token ? { authorization: `Bearer ${token}` } : {};
+        return (await fetch(url, { headers, signal: AbortSignal.timeout(2000) })).ok;
       } catch {
         return false;
       }
@@ -93,31 +102,44 @@ export async function manageLocal(
           ? "loaded"
           : "not loaded";
 
+  // Never overwrite an installed unit: it may carry host-specific tuning (chat template, flags).
+  const startTwilight = async (): Promise<string> => {
+    const exists = await ssh(["test", "-f", unitPath]);
+    if (exists.exitCode === 255) return "unreachable";
+    if (exists.exitCode !== 0) {
+      if (!opts.modelPath) return "unit missing: set [local].twilight_model_path";
+      const write = await ssh(
+        [`mkdir -p ~/.config/systemd/user && cat > ${unitPath}`],
+        twilightUnit(opts.modelPath, opts.llamaBinary),
+      );
+      if (write.exitCode !== 0) return write.exitCode === 255 ? "unreachable" : "unit write failed";
+      if ((await ssh(["systemctl", "--user", "daemon-reload"])).exitCode !== 0) return "start failed";
+    }
+    const start = await ssh(["systemctl", "--user", "enable", "--now", unitName]);
+    return start.exitCode === 0 ? "active" : "start failed";
+  };
+
   let remoteService = "unreachable";
   const current = await ssh(["systemctl", "--user", "is-active", unitName]);
   if (current.exitCode === 255) {
     remoteService = "unreachable";
   } else if (action === "up") {
-    const unit = twilightUnit(opts.modelPath, opts.llamaBinary);
-    const write = await ssh(
-      ["mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/limitless-llama.service"],
-      unit,
-    );
-    if (write.exitCode === 0) {
-      const reload = await ssh(["systemctl", "--user", "daemon-reload"]);
-      const start =
-        reload.exitCode === 0 ? await ssh(["systemctl", "--user", "enable", "--now", unitName]) : reload;
-      remoteService = start.exitCode === 0 ? "active" : "start failed";
-    } else remoteService = write.exitCode === 255 ? "unreachable" : "unit write failed";
+    remoteService = await startTwilight();
   } else if (action === "down" && current.exitCode === 0) {
     const stop = await ssh(["systemctl", "--user", "stop", unitName]);
     remoteService = stop.exitCode === 0 ? "stopped" : "stop failed";
   } else remoteService = action === "down" ? "stopped" : current.exitCode === 0 ? "active" : "inactive";
 
+  const token = (id: string) => {
+    const provider = PROVIDERS.find((p) => p.id === id);
+    return provider?.apiKey ?? (provider?.apiKeySecret ? opts.secrets?.[provider.apiKeySecret] : undefined);
+  };
   const mtplxUrl = PROVIDERS.find((p) => p.id === "mtplx")?.healthUrl ?? "http://127.0.0.1:8000/v1/models";
   const twilightUrl = `http://${host}:8080/v1/models`;
+  const healthy = async (url: string, id: string) =>
+    (await probe(url, token(id))) ? "healthy" : "unreachable";
   return {
-    mtplx: { service: localService, endpoint: (await probe(mtplxUrl)) ? "healthy" : "unreachable" },
-    twilight: { service: remoteService, endpoint: (await probe(twilightUrl)) ? "healthy" : "unreachable" },
+    mtplx: { service: localService, endpoint: await healthy(mtplxUrl, "mtplx") },
+    twilight: { service: remoteService, endpoint: await healthy(twilightUrl, "twilight") },
   };
 }
