@@ -27,6 +27,7 @@ export class Router {
     private readonly tracker: ProviderTracker,
     private readonly policy: Policy = DEFAULT_POLICY,
     models: ModelDef[] = MODELS,
+    private readonly preferProviders: string[] = [],
   ) {
     this.models = new Map(models.map((m) => [m.id, m]));
   }
@@ -88,8 +89,11 @@ export class Router {
         }
         group.push(m);
       }
-      // Interchangeable models: most headroom first (spreads load across subscriptions).
-      group.sort((a, b) => this.tracker.headroom(b.provider) - this.tracker.headroom(a.provider));
+      // Interchangeable models: preferred providers first, then most headroom (spreads load).
+      const pref = (m: ModelDef) => (this.preferProviders.includes(m.provider) ? 0 : 1);
+      group.sort(
+        (a, b) => pref(a) - pref(b) || this.tracker.headroom(b.provider) - this.tracker.headroom(a.provider),
+      );
       for (const m of group) (c.avoidVendor && m.vendor === c.avoidVendor ? sameVendor : preferred).push(m);
     };
 

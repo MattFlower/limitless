@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import type { ZodType } from "zod";
 import type { Config } from "../config.ts";
 import type { Complexity, Invocation, Repo, Role, Run, RunEvent, Stage, StageName } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
@@ -77,6 +78,8 @@ export interface InvokeOptions {
   maxToolCalls?: number;
   /** Retry a failed structured-output call once on the next candidate. */
   requireStructured?: boolean;
+  /** Validates structured output; invalid output counts as a failed call (next candidate). */
+  schema?: ZodType;
 }
 
 export interface InvokeOutcome {
@@ -238,6 +241,17 @@ export class RunContext {
         };
       } finally {
         release();
+      }
+      if (opts.schema && result.status === "ok" && result.structured !== null) {
+        const parsed = opts.schema.safeParse(result.structured);
+        result = parsed.success
+          ? { ...result, structured: parsed.data }
+          : {
+              ...result,
+              status: "error",
+              structured: null,
+              error: `structured output failed validation: ${parsed.error.message.slice(0, 500)}`,
+            };
       }
 
       const updated = store.updateInvocation(invocation.id, {

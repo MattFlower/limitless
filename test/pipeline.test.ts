@@ -272,6 +272,24 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(f.tracker.modelUnavailableReason("alpha/m")).toContain("not supported");
   });
 
+  test("schema-invalid structured output falls through to the next model", async () => {
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage" && s.target.provider === "alpha") return { structured: { title: 42 } };
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const triageInvs = f.store.listInvocations(run.id).filter((i) => i.role === "triage");
+    expect(triageInvs.map((i) => [i.provider, i.status])).toEqual([
+      ["alpha", "error"],
+      ["beta", "ok"],
+    ]);
+    expect(triageInvs[0]?.error).toContain("failed validation");
+  });
+
   test("asks the human when triage finds blocking ambiguity, then continues", async () => {
     let specPrompt = "";
     const f = start((s) => {

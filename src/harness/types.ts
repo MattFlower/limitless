@@ -106,3 +106,35 @@ export class LoopDetector {
     return null;
   }
 }
+
+/**
+ * Pull a JSON object out of free text: a fenced ```json block if present, otherwise the last
+ * balanced {...} that parses. Weaker models often answer with JSON in prose instead of calling a
+ * structured-output tool.
+ */
+export function extractJson(text: string): unknown {
+  if (!text) return null;
+  const fenced = [...text.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)].map((m) => m[1] ?? "");
+  for (const block of fenced.reverse()) {
+    try {
+      return JSON.parse(block);
+    } catch {
+      // try the next candidate
+    }
+  }
+  for (let end = text.lastIndexOf("}"); end > 0; end = text.lastIndexOf("}", end - 1)) {
+    let depth = 0;
+    for (let i = end; i >= 0; i--) {
+      const ch = text[i];
+      if (ch === "}") depth++;
+      else if (ch === "{" && --depth === 0) {
+        try {
+          return JSON.parse(text.slice(i, end + 1));
+        } catch {
+          break;
+        }
+      }
+    }
+  }
+  return null;
+}

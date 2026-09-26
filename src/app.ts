@@ -17,6 +17,7 @@ import {
 import { ProviderTracker } from "./router/providers.ts";
 import { Router } from "./router/router.ts";
 import { Scheduler } from "./scheduler.ts";
+import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
   harnesses?: Record<string, Harness>;
@@ -34,16 +35,24 @@ export class Factory {
   readonly scheduler: Scheduler;
   readonly deps: EngineDeps;
   readonly startedAt = Date.now();
+  private readonly tunnels = new SshTunnels((msg) => console.warn(`[tunnel] ${msg}`));
+  private readonly providerDefs: ProviderDef[];
 
   constructor(
     readonly cfg: Config,
     opts: FactoryOptions = {},
   ) {
     this.store = opts.store ?? new Store(cfg.paths.db);
-    this.tracker = new ProviderTracker(opts.providers ?? PROVIDERS, this.store, cfg.reserves, cfg.secrets, {
+    this.providerDefs = opts.providers ?? PROVIDERS;
+    this.tracker = new ProviderTracker(this.providerDefs, this.store, cfg.reserves, cfg.secrets, {
       openrouter: cfg.openrouterBudgetUsd,
     });
-    this.router = new Router(this.tracker, opts.policy ?? DEFAULT_POLICY, opts.models ?? MODELS);
+    this.router = new Router(
+      this.tracker,
+      opts.policy ?? DEFAULT_POLICY,
+      opts.models ?? MODELS,
+      cfg.preferProviders,
+    );
     this.deps = {
       cfg,
       store: this.store,
@@ -57,10 +66,17 @@ export class Factory {
   start(): void {
     // UI development against seeded data must never launch real (paid) runs.
     if (process.env.LIMITLESS_NO_SCHEDULER === "1") return;
+    // Only forward to servers we can actually authenticate against.
+    this.tunnels.start(
+      this.providerDefs
+        .filter((p) => p.sshForward && this.tracker.isEnabled(p.id))
+        .map((p) => p.sshForward as NonNullable<ProviderDef["sshForward"]>),
+    );
     this.scheduler.start();
   }
 
   async stop(): Promise<void> {
+    this.tunnels.stop();
     await this.scheduler.stop();
   }
 

@@ -64,6 +64,10 @@ export class ProviderTracker {
     }
   }
 
+  isEnabled(id: string): boolean {
+    return this.providers.get(id)?.enabled ?? false;
+  }
+
   def(id: string): ProviderDef | undefined {
     return this.providers.get(id)?.def;
   }
@@ -214,7 +218,8 @@ export class ProviderTracker {
         .map(async (p) => {
           try {
             const headers: Record<string, string> = {};
-            if (p.def.apiKey) headers.authorization = `Bearer ${p.def.apiKey}`;
+            const token = this.authToken(p.def.id);
+            if (token) headers.authorization = `Bearer ${token}`;
             const res = await fetch(p.def.healthUrl as string, {
               signal: AbortSignal.timeout(3000),
               headers,

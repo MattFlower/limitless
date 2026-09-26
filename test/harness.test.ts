@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ClaudeStreamParser } from "../src/harness/claude.ts";
 import { CodexStreamParser, parseRateLimits } from "../src/harness/codex.ts";
-import { type AgentEvent, LoopDetector, priceOf } from "../src/harness/types.ts";
+import { type AgentEvent, extractJson, LoopDetector, priceOf } from "../src/harness/types.ts";
 
 const fixture = (name: string) =>
   readFileSync(join(import.meta.dir, "fixtures", name), "utf8")
@@ -128,4 +128,23 @@ test("priceOf charges cache reads at a discount", () => {
   const usage = { input: 1_000_000, output: 1_000_000, cacheRead: 1_000_000, cacheWrite: 0 };
   expect(priceOf(usage, { input: 2, output: 10 })).toBeCloseTo(2 + 10 + 0.2);
   expect(priceOf(usage, undefined)).toBe(0);
+});
+
+describe("extractJson", () => {
+  test("prefers the last fenced json block", () => {
+    expect(extractJson('first ```json\n{"a":1}\n``` then ```json\n{"a":2}\n```')).toEqual({ a: 2 });
+  });
+  test("finds a trailing object in prose", () => {
+    expect(extractJson('The file contains hello.\n\n{"content": "hello"}\n\nDone.')).toEqual({
+      content: "hello",
+    });
+  });
+  test("handles nested objects and ignores broken candidates", () => {
+    expect(extractJson('noise {broken} and {"a": {"b": [1, {"c": 2}]}}')).toEqual({
+      a: { b: [1, { c: 2 }] },
+    });
+  });
+  test("returns null when there is no JSON", () => {
+    expect(extractJson("no json here")).toBeNull();
+  });
 });

@@ -35,6 +35,8 @@ export class Scheduler {
     this.tick();
     // Probe local model servers now and every minute.
     void this.deps.tracker.probe();
+    // Re-probe shortly after startup, once ssh forwards to remote model servers are up.
+    setTimeout(() => void this.deps.tracker.probe(), 8_000).unref?.();
     setInterval(() => void this.deps.tracker.probe(), 60_000).unref?.();
   }
 

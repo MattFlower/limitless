@@ -165,3 +165,14 @@ describe("ProviderTracker concurrency", () => {
     expect(tracker.status("claude")?.inFlight).toBe(0);
   });
 });
+
+describe("provider preference", () => {
+  test("preferred providers go first among interchangeable models", () => {
+    const tracker = new ProviderTracker(providers, store, reserves, {}, { openrouter: 50 });
+    tracker.observeWindows("codex", { seven_day: { utilization: 0.6, resetsAt: Date.now() + 86_400_000 } });
+    const plain = new Router(tracker, policy, models);
+    expect(plain.route("implement", "small").candidates[0]?.modelId).toBe("claude/sonnet");
+    const preferring = new Router(tracker, policy, models, ["codex"]);
+    expect(preferring.route("implement", "small").candidates[0]?.modelId).toBe("codex/sol");
+  });
+});

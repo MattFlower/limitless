@@ -8,6 +8,7 @@ import {
   type AgentResult,
   type AgentSpec,
   emptyUsage,
+  extractJson,
   LoopDetector,
   priceOf,
   type Usage,
@@ -282,7 +283,7 @@ export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
     try {
       structured = JSON.parse(parser.lastMessage);
     } catch {
-      structured = null;
+      structured = extractJson(parser.lastMessage);
     }
   }
   const equiv = priceOf(parser.usage, t.price);

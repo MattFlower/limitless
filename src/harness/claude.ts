@@ -6,6 +6,7 @@ import {
   type AgentResult,
   type AgentSpec,
   emptyUsage,
+  extractJson,
   LoopDetector,
   priceOf,
   type Usage,
@@ -281,7 +282,11 @@ export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
     return { ...base, status: unavailable ? "unavailable" : "error", error: text.slice(0, 2000) };
   }
   if (spec.jsonSchema && parser.structured === null) {
-    return { ...base, status: "error", error: "agent did not return the required structured output" };
+    const recovered = extractJson(parser.finalText || parser.lastAssistantText);
+    if (recovered === null) {
+      return { ...base, status: "error", error: "agent did not return the required structured output" };
+    }
+    return { ...base, structured: recovered, status: "ok", error: null };
   }
   return { ...base, status: "ok", error: null };
 }

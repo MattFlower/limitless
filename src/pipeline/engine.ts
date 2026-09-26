@@ -173,6 +173,7 @@ async function triage(ctx: RunContext): Promise<void> {
         tree: topLevel(ctx.state.worktreePath as string),
       }),
       jsonSchema: toStrictJsonSchema(TriageSchema),
+      schema: TriageSchema,
       requireStructured: true,
       maxToolCalls: 15,
     });
@@ -260,6 +261,7 @@ async function spec(ctx: RunContext): Promise<void> {
       complexity: ctx.complexity,
       prompt: specPrompt({ prompt: ctx.run.prompt, answers: ctx.state.answers }),
       jsonSchema: toStrictJsonSchema(SpecSchema),
+      schema: SpecSchema,
       requireStructured: true,
       maxToolCalls: 60,
     });
@@ -483,6 +485,7 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
           implementerReport: ctx.state.implementerReport ?? "",
         }),
         jsonSchema: toStrictJsonSchema(ReviewSchema),
+        schema: ReviewSchema,
         requireStructured: true,
       });
       await discardChanges(cwd);
@@ -531,6 +534,7 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
         constraints: { avoidVendor: ctx.state.implementer?.vendor },
         prompt: verifyPrompt({ prompt: ctx.run.prompt, spec: ctx.state.spec as Spec, baseSha }),
         jsonSchema: toStrictJsonSchema(VerifySchema),
+        schema: VerifySchema,
         requireStructured: true,
       });
       await discardChanges(cwd);

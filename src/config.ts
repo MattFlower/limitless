@@ -30,6 +30,8 @@ export interface Config {
   maxRounds: number; // implement ⇄ feedback rounds before escalation
   openrouterBudgetUsd: number;
   reserves: Reserves;
+  /** Providers to try first among interchangeable models (e.g. use up a subscription). */
+  preferProviders: string[];
   githubOwner: string | null; // allowlisted GitHub login for triggers
   discordOwnerId: string | null;
   secrets: Record<string, string>;
@@ -103,6 +105,7 @@ export function loadConfig(
   const limits = (raw.limits ?? {}) as Record<string, unknown>;
   const reserves = (raw.reserves ?? {}) as Record<string, unknown>;
   const owners = (raw.owners ?? {}) as Record<string, unknown>;
+  const routing = (raw.routing ?? {}) as Record<string, unknown>;
   const port = overrides.port ?? num(Number(process.env.LIMITLESS_PORT) || server.port, 7400);
   const host = str(server.host, "127.0.0.1") as string;
 
@@ -121,6 +124,9 @@ export function loadConfig(
       codexWeekly: num(reserves.codex_weekly, 0.9),
       codexFiveHour: num(reserves.codex_five_hour, 0.9),
     },
+    preferProviders: Array.isArray(routing.prefer)
+      ? routing.prefer.filter((p): p is string => typeof p === "string")
+      : [],
     githubOwner: str(owners.github, "MattFlower"),
     discordOwnerId: str(owners.discord, null),
     secrets,
