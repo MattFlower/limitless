@@ -148,7 +148,7 @@ If a setting is missing, startup reports why Discord is disabled. The bot uses a
 connection; no public interaction endpoint is needed.
 
 The owner can use `/build repo:<repo> prompt:<request> [profile:auto|quick|standard|deep]`,
-`/runs [status]`, `/run id:<id>`, and `/cancel id:<id>`. Each Discord run gets a public thread
+`/runs [status]`, `/show id:<id>`, and `/cancel id:<id>`. Each Discord run gets a public thread
 with brief progress, questions, and a final status and cost summary. Reply in that thread to answer
 the run's open questions. Commands and answers are restricted to the configured owner, though
 thread updates are visible to channel members. With `notify_all = true`, the channel also gets a
