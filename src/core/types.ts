@@ -97,6 +97,7 @@ export interface Run {
   title: string;
   prompt: string;
   source: RunSource;
+  githubWebhookVerified: boolean;
   sourceRef: Record<string, unknown> | null;
   requestedBy: string | null;
   profile: Profile;
@@ -106,6 +107,7 @@ export interface Run {
   status: RunStatus;
   stage: StageName | null;
   baseBranch: string | null;
+  deliveryBranch: string | null;
   baseSha: string | null;
   branch: string | null;
   headSha: string | null;
@@ -225,6 +227,16 @@ export interface ProviderStatus {
   updatedAt: number;
 }
 
+export interface QuotaAlert {
+  provider: string;
+  window: string;
+  utilization: number | null;
+  resetsAt: number | null;
+  severity: "warning" | "exhausted";
+  routing: string;
+  createdAt: number;
+}
+
 export interface CreateRunRequest {
   repo: string;
   prompt: string;
@@ -234,6 +246,9 @@ export interface CreateRunRequest {
   sourceRef?: Record<string, unknown>;
   requestedBy?: string;
   priority?: number;
+  baseBranch?: string;
+  /** Existing same-repository PR head; accepted only from a verified GitHub webhook. */
+  deliveryBranch?: string;
 }
 
 /** Messages pushed on the global SSE stream. */
@@ -243,4 +258,5 @@ export type StreamMessage =
   | { kind: "invocation"; invocation: Invocation }
   | { kind: "event"; event: RunEvent }
   | { kind: "provider"; provider: ProviderStatus }
+  | { kind: "alert"; alert: QuotaAlert | null; provider: string; window: string; created: boolean }
   | { kind: "question"; question: Question };

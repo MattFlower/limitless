@@ -85,6 +85,11 @@ claude_five_hour = 0.80
 claude_seven_day = 0.85
 codex_weekly = 0.90   # keeps 10% of ChatGPT usage free for you
 
+# Optional: reserve for an additional subscription provider/window.
+# Unspecified windows use 1.0 (the reported hard quota).
+[reserves.windows.my_provider]
+daily = 0.80
+
 [owners]
 github = "MattFlower"
 discord = "YOUR_DISCORD_USER_ID"
@@ -93,6 +98,18 @@ discord = "YOUR_DISCORD_USER_ID"
 channel_id = "YOUR_TEXT_CHANNEL_ID"
 notify_all = false # optional: announce completed runs from other sources
 ```
+
+### GitHub webhook
+
+Create a repository webhook at `https://limitless.mattflower.cc/webhooks/github` with
+content type `application/json`, a shared secret stored as `GITHUB_WEBHOOK_SECRET` in
+`~/.config/limitless/secrets.env`, and the **Issues**, **Issue comments**, and
+**Pull requests** events. The webhook is disabled until the secret is configured.
+Owner-labeled `limitless` issues and owner `/limitless ` comments create runs.
+Dependabot pull requests receive verification runs whose fixes update the existing PR branch.
+Existing-branch delivery requires recorded webhook authentication and Dependabot PR metadata;
+public run requests cannot enable it. Runs predating this authentication record must be
+triggered again through the webhook before they can update an existing branch.
 
 Per-repository settings go in a `.limitless.toml` at the repo root:
 

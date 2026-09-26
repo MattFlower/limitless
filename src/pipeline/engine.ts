@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { assertExistingBranchDelivery } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
@@ -14,6 +15,7 @@ import {
   headSha,
   mergePullRequest,
   pushBranch,
+  pushExistingBranch,
   removeWorktree,
 } from "../git/repos.ts";
 import type { RouteConstraints } from "../router/router.ts";
@@ -73,6 +75,8 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
   if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
 
   try {
+    // Recheck persisted provenance on resume, including runs created before this guard existed.
+    assertExistingBranchDelivery(ctx.repo, ctx.run);
     if (ctx.state.phase === "prepare") await prepare(ctx);
     if (ctx.state.phase === "triage") await triage(ctx);
     if (ctx.state.phase === "clarify") await clarify(ctx);
@@ -112,11 +116,14 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
 // prepare: repo cache, worktree, gate detection, baseline
 
 async function prepare(ctx: RunContext): Promise<void> {
+  assertExistingBranchDelivery(ctx.repo, ctx.run);
   await ctx.stage("prepare", async () => {
     const { cfg, store } = ctx.deps;
     await ensureCache(cfg.paths, ctx.repo);
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
     const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base);
+    if (ctx.run.deliveryBranch && ctx.run.sourceRef?.headSha !== wt.baseSha)
+      throw new Error("PR head moved before preparation");
     ctx.state.worktreePath = wt.path;
     ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha: wt.baseSha, branch: wt.branch });
     const gates = detectGates(wt.path);
@@ -660,6 +667,9 @@ async function oneRound(
 // deliver
 
 async function deliver(ctx: RunContext, success: boolean): Promise<void> {
+  assertExistingBranchDelivery(ctx.repo, ctx.run);
+  if (ctx.run.deliveryBranch && ctx.run.baseSha !== ctx.run.sourceRef?.headSha)
+    throw new Error("PR delivery base does not match the verified webhook head");
   await ctx.stage("deliver", async () => {
     const cwd = ctx.state.worktreePath as string;
     const sha = await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
@@ -690,6 +700,18 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       publish();
       ctx.log(`Local repo: work is on branch ${ctx.run.branch}`);
       return { summary: `branch ${ctx.run.branch} ready in ${ctx.repo.localPath}`, value: undefined };
+    }
+    if (ctx.run.deliveryBranch) {
+      if (!success) return { summary: "PR update needs human review; no push", value: undefined };
+      ctx.checkCancelled();
+      await pushExistingBranch(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.run.baseSha as string);
+      if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number") {
+        ctx.run = ctx.store.updateRun(ctx.run.id, {
+          prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef.number}`,
+        });
+      }
+      await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
+      return { summary: `updated existing PR branch ${ctx.run.deliveryBranch}`, value: undefined };
     }
     ctx.checkCancelled();
     await pushBranch(ctx.repo, cwd, ctx.run.branch as string);

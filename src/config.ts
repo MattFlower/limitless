@@ -18,6 +18,8 @@ export interface Reserves {
   /** Stop using Codex at this used fraction (user asked to keep 10% free). */
   codexWeekly: number;
   codexFiveHour: number;
+  /** Optional reserve fractions for additional provider quota windows. */
+  windows?: Record<string, Record<string, number>>;
 }
 
 export interface Config {
@@ -139,6 +141,17 @@ export function loadConfig(
       claudeSevenDay: num(reserves.claude_seven_day, 0.85),
       codexWeekly: num(reserves.codex_weekly, 0.9),
       codexFiveHour: num(reserves.codex_five_hour, 0.9),
+      windows: Object.fromEntries(
+        Object.entries((reserves.windows ?? {}) as Record<string, unknown>).map(([provider, value]) => [
+          provider,
+          Object.fromEntries(
+            Object.entries(value && typeof value === "object" ? value : {}).filter(
+              (entry): entry is [string, number] =>
+                typeof entry[1] === "number" && Number.isFinite(entry[1]) && entry[1] > 0,
+            ),
+          ),
+        ]),
+      ),
     },
     preferProviders: Array.isArray(routing.prefer)
       ? routing.prefer.filter((p): p is string => typeof p === "string")

@@ -156,4 +156,32 @@ CREATE TABLE settings (
 );
 `,
   },
+  {
+    version: 2,
+    name: "existing_pr_delivery",
+    sql: "ALTER TABLE runs ADD COLUMN delivery_branch TEXT;",
+  },
+  {
+    version: 3,
+    name: "verified_github_origin",
+    sql: "ALTER TABLE runs ADD COLUMN github_webhook_verified INTEGER NOT NULL DEFAULT 0;",
+  },
+  {
+    version: 4,
+    name: "quota_alerts",
+    sql: `
+CREATE TABLE quota_alerts (
+  provider TEXT NOT NULL,
+  window TEXT NOT NULL,
+  boundary INTEGER NOT NULL,
+  resets_at INTEGER,
+  utilization REAL,
+  severity TEXT NOT NULL,
+  routing TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (provider, window, boundary)
+);
+`,
+  },
 ];

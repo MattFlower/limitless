@@ -25,6 +25,7 @@ limitless logs <run> -f             # follow a run
 limitless gc --dry-run              # preview hourly retention cleanup
 limitless service status            # launchd units, release commit, health
 limitless deploy                    # ship origin/main (gated, auto-rollback)
+limitless deploy --smoke            # also run live CLI contract checks before restart
 ```
 
 (`limitless` is `bun src/cli/main.ts` from a checkout, or link it onto your PATH.)
@@ -37,11 +38,32 @@ limitless deploy                    # ship origin/main (gated, auto-rollback)
      there — **a failing check aborts the deploy and keeps the old version**;
    - restarts the daemon via launchd and waits for `/api/health`;
    - **rolls back** to the previous commit and restarts again if the new version doesn't come up.
+   Add `--smoke` (with or without an explicit ref) to run live CLI contract checks in the release
+   checkout after `bun run check` and before restart. A smoke failure restores the previous
+   checkout through the same deploy gate failure path.
 3. Runs in flight are interrupted by the restart and **resume** at the step they were on
    (the worktree and run state are persisted; a round whose implementation already committed
    goes straight to its checks).
 
 Changing the launchd units themselves (PATH, arguments) needs `limitless service install`.
+
+## Live CLI smoke checks
+
+Run `bun run smoke` manually from a checkout to check the installed `claude` and `codex` binaries
+through their real harnesses. Both CLIs must be installed, logged in, and have usable subscription
+quota. The runner uses the cheapest catalog model per provider, spends a small amount of quota,
+and reports each check with a duration. It creates temporary git repositories and removes them
+after every check. Smoke is opt-in and is not part of `bun run check` or CI.
+The no-tools checks fail on any observed tool call or disclosure of a random local file token.
+Codex no-tools calls ignore user configuration and disable MCP, plugins, apps, code mode, shell,
+sub-agents, image viewing, and web search; they retain session rollouts for quota inspection.
+If the ChatGPT account rejects the cheapest Codex model, the runner tries the next catalog model
+in price order and reports which model it used. Other CLI errors fail the check.
+
+The mtplx and twilight checks are skipped when their required key is absent or their health probe
+fails. OpenRouter is skipped when `OPENROUTER_API_KEY` is absent from the Limitless secrets file or
+environment. An attempted check that fails exits nonzero; skips alone do not. Use
+`limitless deploy [ref] --smoke` to require these checks during deployment.
 
 ## Local models
 

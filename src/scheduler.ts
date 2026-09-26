@@ -46,6 +46,7 @@ export class Scheduler {
 
   tick(): void {
     if (this.stopping) return;
+    this.deps.tracker.refreshAlerts();
     const capacity = this.maxConcurrent - this.active.size;
     if (capacity <= 0) return;
     for (const run of this.deps.store.nextQueuedRuns(capacity)) {

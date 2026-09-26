@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { assertExistingBranchDelivery } from "../core/delivery.ts";
 import type {
   ArtifactMeta,
   CreateRunRequest,
@@ -6,6 +7,7 @@ import type {
   Invocation,
   InvocationStatus,
   Question,
+  QuotaAlert,
   Repo,
   Role,
   Run,
@@ -69,6 +71,7 @@ const toRun = (r: Row): Run => ({
   title: r.title as string,
   prompt: r.prompt as string,
   source: r.source as Run["source"],
+  githubWebhookVerified: r.github_webhook_verified === 1,
   sourceRef: parse(r.source_ref, null),
   requestedBy: (r.requested_by as string) ?? null,
   profile: r.profile as Run["profile"],
@@ -78,6 +81,7 @@ const toRun = (r: Row): Run => ({
   status: r.status as RunStatus,
   stage: (r.stage as StageName) ?? null,
   baseBranch: (r.base_branch as string) ?? null,
+  deliveryBranch: (r.delivery_branch as string) ?? null,
   baseSha: (r.base_sha as string) ?? null,
   branch: (r.branch as string) ?? null,
   headSha: (r.head_sha as string) ?? null,
@@ -331,13 +335,15 @@ export class Store {
 
   // ---- runs ----------------------------------------------------------------
 
-  createRun(repo: Repo, req: CreateRunRequest): Run {
+  // Provenance is an internal argument, never taken from the public request object.
+  createRun(repo: Repo, req: CreateRunRequest, verifiedGitHubWebhook = false): Run {
+    assertExistingBranchDelivery(repo, { ...req, githubWebhookVerified: verifiedGitHubWebhook });
     const id = newId();
     const title = req.title ?? req.prompt.split("\n")[0]?.slice(0, 80) ?? "Untitled";
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -349,6 +355,9 @@ export class Store {
         req.requestedBy ?? null,
         req.profile ?? "auto",
         req.priority ?? 0,
+        req.baseBranch ?? null,
+        req.deliveryBranch ?? null,
+        verifiedGitHubWebhook ? 1 : 0,
         Date.now(),
       );
     const run = this.getRun(id) as Run;
@@ -682,6 +691,96 @@ export class Store {
 
   // ---- provider state ------------------------------------------------------
 
+  listAlerts(now = Date.now()): QuotaAlert[] {
+    return (
+      this.db
+        .query(
+          "SELECT * FROM quota_alerts WHERE active = 1 AND (resets_at IS NULL OR resets_at > ?) ORDER BY created_at DESC",
+        )
+        .all(now) as Row[]
+    ).map((r) => ({
+      provider: r.provider as string,
+      window: r.window as string,
+      utilization: (r.utilization as number) ?? null,
+      resetsAt: (r.resets_at as number) ?? null,
+      severity: r.severity as QuotaAlert["severity"],
+      routing: r.routing as string,
+      createdAt: r.created_at as number,
+    }));
+  }
+
+  putAlert(alert: QuotaAlert): boolean {
+    const boundary = alert.resetsAt ?? 0;
+    const previous = this.db
+      .query(
+        "SELECT severity, created_at FROM quota_alerts WHERE provider = ? AND window = ? AND boundary = ?",
+      )
+      .get(alert.provider, alert.window, boundary) as Row | null;
+    const current: QuotaAlert = previous
+      ? {
+          ...alert,
+          severity: previous.severity === "exhausted" ? "exhausted" : alert.severity,
+          createdAt: previous.created_at as number,
+        }
+      : alert;
+    this.db
+      .query(
+        "UPDATE quota_alerts SET active = 0 WHERE provider = ? AND window = ? AND boundary != ? AND active = 1",
+      )
+      .run(alert.provider, alert.window, boundary);
+    const inserted =
+      this.db
+        .query(
+          `INSERT OR IGNORE INTO quota_alerts (provider, window, boundary, resets_at, utilization, severity, routing, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          current.provider,
+          current.window,
+          boundary,
+          current.resetsAt,
+          current.utilization,
+          current.severity,
+          current.routing,
+          current.createdAt,
+        ).changes > 0;
+    if (!inserted)
+      this.db
+        .query(
+          "UPDATE quota_alerts SET utilization = ?, severity = ?, routing = ?, active = 1 WHERE provider = ? AND window = ? AND boundary = ?",
+        )
+        .run(
+          current.utilization,
+          current.severity,
+          current.routing,
+          current.provider,
+          current.window,
+          boundary,
+        );
+    this.publish({
+      kind: "alert",
+      alert: current,
+      provider: current.provider,
+      window: current.window,
+      created: inserted,
+    });
+    return inserted;
+  }
+
+  clearAlert(provider: string, window: string): void {
+    const changed = this.db
+      .query("UPDATE quota_alerts SET active = 0 WHERE provider = ? AND window = ? AND active = 1")
+      .run(provider, window).changes;
+    if (changed) this.publish({ kind: "alert", alert: null, provider, window, created: false });
+  }
+
+  expireAlerts(now: number): void {
+    const expired = this.db
+      .query("SELECT provider, window FROM quota_alerts WHERE active = 1 AND resets_at <= ?")
+      .all(now) as Row[];
+    for (const row of expired) this.clearAlert(row.provider as string, row.window as string);
+  }
+
   getProviderRow(provider: string): Row | null {
     return this.db.query("SELECT * FROM provider_state WHERE provider = ?").get(provider) as Row | null;
   }
@@ -743,6 +842,12 @@ export class Store {
         entry.note ?? null,
       );
     return res.changes > 0;
+  }
+
+  finishInbox(id: string, status: "ignored" | "run_created" | "error", note: string, runId?: string): void {
+    this.db
+      .query("UPDATE inbox SET status = ?, note = ?, run_id = ? WHERE id = ?")
+      .run(status, note, runId ?? null, id);
   }
 
   // ---- settings ------------------------------------------------------------

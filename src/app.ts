@@ -31,6 +31,7 @@ export interface FactoryOptions {
     set: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
     clear: (timer: ReturnType<typeof setInterval>) => void;
   };
+  clock?: () => number;
 }
 
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
@@ -56,14 +57,22 @@ export class Factory {
     this.cleanup = opts.cleanup ?? ((dryRun) => collectGarbage(this.store, cfg, { dryRun }));
     this.gcTimer = opts.gcTimer ?? { set: setInterval, clear: clearInterval };
     this.providerDefs = opts.providers ?? PROVIDERS;
-    this.tracker = new ProviderTracker(this.providerDefs, this.store, cfg.reserves, cfg.secrets, {
-      openrouter: cfg.openrouterBudgetUsd,
-    });
+    this.tracker = new ProviderTracker(
+      this.providerDefs,
+      this.store,
+      cfg.reserves,
+      cfg.secrets,
+      { openrouter: cfg.openrouterBudgetUsd },
+      opts.clock,
+    );
     this.router = new Router(
       this.tracker,
       opts.policy ?? DEFAULT_POLICY,
       opts.models ?? MODELS,
       cfg.preferProviders,
+    );
+    this.tracker.setRoutingDescription((provider, exhausted) =>
+      this.router.describeFallback(provider, exhausted),
     );
     this.deps = {
       cfg,
@@ -121,11 +130,12 @@ export class Factory {
     for (const error of result.errors) console.warn(`[gc] ${error}`);
   }
 
-  async createRun(req: CreateRunRequest): Promise<Run> {
+  /** The second argument is factory-only provenance, never deserialized from a request. */
+  async createRun(req: CreateRunRequest, verifiedGitHubWebhook = false): Promise<Run> {
     if (!req.prompt?.trim()) throw new Error("prompt is required");
     if (!req.repo?.trim()) throw new Error("repo is required");
     const repo = await resolveRepo(this.store, req.repo);
-    const run = this.store.createRun(repo, req);
+    const run = this.store.createRun(repo, req, verifiedGitHubWebhook);
     this.store.addEvent({
       runId: run.id,
       type: "log",
@@ -141,15 +151,20 @@ export class Factory {
   async retryRun(id: string): Promise<Run> {
     const run = this.store.getRun(id);
     if (!run) throw new Error(`run ${id} not found`);
-    return this.createRun({
-      repo: run.repoSlug,
-      prompt: run.prompt,
-      title: run.title,
-      profile: run.profile,
-      source: run.source,
-      ...(run.sourceRef ? { sourceRef: run.sourceRef } : {}),
-      ...(run.requestedBy ? { requestedBy: run.requestedBy } : {}),
-    });
+    return this.createRun(
+      {
+        repo: run.repoSlug,
+        prompt: run.prompt,
+        title: run.title,
+        profile: run.profile,
+        source: run.source,
+        ...(run.sourceRef ? { sourceRef: run.sourceRef } : {}),
+        ...(run.baseBranch ? { baseBranch: run.baseBranch } : {}),
+        ...(run.deliveryBranch ? { deliveryBranch: run.deliveryBranch } : {}),
+        ...(run.requestedBy ? { requestedBy: run.requestedBy } : {}),
+      },
+      run.githubWebhookVerified,
+    );
   }
 
   /** Answer the given question, or every open question on the run. */

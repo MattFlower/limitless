@@ -211,6 +211,30 @@ export async function pushBranch(repo: Repo, cwd: string, branch: string): Promi
   });
 }
 
+/** Update an existing PR head only if it still points at the commit we prepared from. */
+export async function pushExistingBranch(
+  repo: Repo,
+  cwd: string,
+  branch: string,
+  baseSha: string,
+): Promise<void> {
+  if (repo.kind !== "github" || !repo.url) throw new Error("existing PR delivery requires a GitHub repo");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") || branch.endsWith("/"))
+    throw new Error("invalid PR head branch");
+  const ref = `refs/heads/${branch}`;
+  const remote = await sh(["git", "ls-remote", repo.url, ref], { cwd });
+  if (remote.stdout.split("\t")[0] !== baseSha) throw new Error("PR head moved since the run started");
+  const ancestor = await sh(["git", "merge-base", "--is-ancestor", baseSha, "HEAD"], {
+    cwd,
+    allowFail: true,
+  });
+  if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
+  await sh(["git", "push", `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
+    cwd,
+    timeoutMs: 300_000,
+  });
+}
+
 export async function createPullRequest(
   repo: Repo,
   opts: { branch: string; base: string; title: string; body: string; cwd: string; draft?: boolean },

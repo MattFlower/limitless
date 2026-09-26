@@ -224,17 +224,28 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
     'approval_policy="never"',
   ];
   if (t.effort) args.push("-c", `model_reasoning_effort="${t.effort}"`);
-  if (spec.privateSession) args.push("--ephemeral", "--ignore-user-config");
+  if (spec.privateSession) args.push("--ephemeral");
+  if (spec.privateSession || spec.noTools) args.push("--ignore-user-config");
   if (spec.noTools) {
-    // Codex reads files only through its shell tool (and sub-agents); with both disabled, web search
-    // off and a read-only sandbox, a live check against codex-cli 0.157 confirmed the model cannot
-    // read files. --strict-config fails closed if these feature names ever change.
+    // A read-only sandbox still permits reads, including through MCP tools such as node_repl.
+    // Disable MCP discovery as well as built-in file access; retain rollouts unless privateSession
+    // was requested so subscription quota telemetry remains available.
     args.push(
       "--strict-config",
       "--disable",
       "shell_tool",
       "--disable",
       "multi_agent",
+      "--disable",
+      "apps",
+      "--disable",
+      "plugins",
+      "--disable",
+      "code_mode",
+      "--disable",
+      "view_image",
+      "-c",
+      "orchestrator.mcp.enabled=false",
       "-c",
       'web_search="disabled"',
     );

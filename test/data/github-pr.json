@@ -1,0 +1,18 @@
+{
+  "action": "opened",
+  "repository": { "full_name": "MattFlower/limitless" },
+  "sender": { "login": "dependabot[bot]" },
+  "number": 18,
+  "pull_request": {
+    "number": 18,
+    "title": "Bump pkg",
+    "body": "Do not test",
+    "user": { "login": "dependabot[bot]" },
+    "head": {
+      "ref": "dependabot/npm/pkg-2",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repo": { "full_name": "MattFlower/limitless" }
+    },
+    "base": { "repo": { "full_name": "MattFlower/limitless" } }
+  }
+}

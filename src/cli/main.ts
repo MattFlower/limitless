@@ -19,7 +19,7 @@ Usage:
   limitless integrations install [--write] Print setup; --write installs the Codex skill
   limitless service install [--tunnel] [--no-mtplx]   launchd agents: daemon, mtplx (+ tunnel)
   limitless service uninstall|status
-  limitless deploy [ref]                  Deploy a ref (default origin/main) to the release checkout
+  limitless deploy [ref] [--smoke]        Deploy a ref (default origin/main); optionally run live smoke checks
 
 Environment: LIMITLESS_URL (default http://127.0.0.1:7400)`;
 
@@ -157,6 +157,7 @@ async function main(): Promise<void> {
       write: { type: "boolean" },
       "dry-run": { type: "boolean" },
       "no-mtplx": { type: "boolean" },
+      smoke: { type: "boolean" },
     },
   });
   const [cmd, ...rest] = positionals;
@@ -264,7 +265,8 @@ async function main(): Promise<void> {
     }
     case "deploy": {
       const svc = await import("./service.ts");
-      return svc.deploy(Number(process.env.LIMITLESS_PORT ?? 7400), rest[0]);
+      if (rest.length > 1) throw new Error("usage: limitless deploy [ref] [--smoke]");
+      return svc.deploy(Number(process.env.LIMITLESS_PORT ?? 7400), rest[0], values.smoke === true);
     }
     case "providers": {
       const ps =
