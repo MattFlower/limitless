@@ -556,7 +556,13 @@ export class Store {
 
   listEvents(
     runId: string,
-    opts: { after?: number; limit?: number; invocationId?: number } = {},
+    opts: {
+      after?: number;
+      limit?: number;
+      invocationId?: number;
+      tail?: boolean;
+      excludeDebug?: boolean;
+    } = {},
   ): RunEvent[] {
     const params: (string | number)[] = [runId, opts.after ?? 0];
     let sql = "SELECT * FROM events WHERE run_id = ? AND id > ?";
@@ -564,9 +570,11 @@ export class Store {
       sql += " AND invocation_id = ?";
       params.push(opts.invocationId);
     }
-    sql += " ORDER BY id LIMIT ?";
+    if (opts.excludeDebug) sql += " AND level != 'debug'";
+    sql += ` ORDER BY id ${opts.tail ? "DESC" : "ASC"} LIMIT ?`;
     params.push(opts.limit ?? 1000);
-    return (this.db.query(sql).all(...params) as Row[]).map(toEvent);
+    const events = (this.db.query(sql).all(...params) as Row[]).map(toEvent);
+    return opts.tail ? events.reverse() : events;
   }
 
   // ---- artifacts -----------------------------------------------------------

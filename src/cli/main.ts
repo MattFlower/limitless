@@ -14,6 +14,8 @@ Usage:
   limitless cancel <run>                  Cancel a run
   limitless answer <run> "<text>"         Answer a run's open question(s)
   limitless providers                     Provider health and quota
+  limitless mcp                           MCP stdio proxy (daemon must be running)
+  limitless integrations install [--write] Print setup; --write installs the Codex skill
   limitless service install [--tunnel] [--no-mtplx]   launchd agents: daemon, mtplx (+ tunnel)
   limitless service uninstall|status
   limitless deploy [ref]                  Deploy a ref (default origin/main) to the release checkout
@@ -151,6 +153,7 @@ async function main(): Promise<void> {
       n: { type: "string", short: "n" },
       help: { type: "boolean", short: "h" },
       tunnel: { type: "boolean" },
+      write: { type: "boolean" },
       "no-mtplx": { type: "boolean" },
     },
   });
@@ -162,6 +165,15 @@ async function main(): Promise<void> {
   switch (cmd) {
     case "serve":
       return serve();
+    case "mcp": {
+      const { startStdio } = await import("../integrations/mcp.ts");
+      return startStdio(BASE);
+    }
+    case "integrations": {
+      if (rest[0] !== "install") throw new Error("usage: limitless integrations install [--write]");
+      const { installIntegrations } = await import("../integrations/install.ts");
+      return installIntegrations({ write: values.write === true });
+    }
     case "run": {
       const prompt = rest.join(" ").trim() || (await Bun.stdin.text()).trim();
       if (!prompt || !values.repo) throw new Error('usage: limitless run "<prompt>" --repo <repo>');
