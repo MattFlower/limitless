@@ -39,6 +39,10 @@ export interface AgentSpec {
   timeoutMs: number;
   idleTimeoutMs: number;
   maxToolCalls: number;
+  /** Structured authoring call; disallow tool access where the CLI supports it. */
+  noTools?: boolean;
+  /** Do not retain CLI session transcripts for private structured calls. */
+  privateSession?: boolean;
   signal: AbortSignal;
   /** Raw stream is appended here for post-mortem debugging. */
   logPath: string;

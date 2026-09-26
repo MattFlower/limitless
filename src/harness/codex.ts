@@ -223,6 +223,7 @@ export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
     'approval_policy="never"',
   ];
   if (t.effort) args.push("-c", `model_reasoning_effort="${t.effort}"`);
+  if (spec.privateSession) args.push("--ephemeral", "--ignore-user-config");
   if (spec.mode === "readonly") {
     args.push("-s", "read-only");
   } else {

@@ -23,7 +23,7 @@ export interface ReportInput {
   prompt: string;
   state: Pick<
     RunState,
-    "implementerReport" | "spec" | "lastVerify" | "lastGates" | "lastReview" | "lastAudit"
+    "implementerReport" | "spec" | "holdout" | "lastVerify" | "lastGates" | "lastReview" | "lastAudit"
   >;
   invocations: Invocation[];
   totals: { costUsd: number; costEquivUsd: number };
@@ -64,6 +64,24 @@ export function renderReport(input: ReportInput): string {
     if (state.spec.assumptions.length) {
       blocks.push("**Assumptions**", state.spec.assumptions.map((a) => `- ${a}`).join("\n"));
     }
+  }
+
+  if (input.success && state.holdout) {
+    blocks.push(
+      "## Holdout scenarios",
+      table(
+        ["", "Scenario", "Result", "Evidence"],
+        state.holdout.scenarios.map((scenario) => {
+          const result = state.lastVerify?.criteria.find((c) => c.id === scenario.id);
+          return [
+            scenario.id,
+            escapeCell(scenario.description),
+            result?.status ?? "unclear",
+            escapeCell(result?.evidence ?? "not verified"),
+          ];
+        }),
+      ),
+    );
   }
 
   blocks.push("## Checks");

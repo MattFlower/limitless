@@ -153,8 +153,11 @@ function buildArgs(spec: AgentSpec, sessionId: string): string[] {
     "--permission-mode",
     "dontAsk",
   ];
+  if (spec.privateSession) args.push("--no-session-persistence");
   const denied = ["Bash(git push:*)", "Bash(gh pr merge:*)", "Bash(gh repo delete:*)", "Bash(rm -rf /*)"];
-  if (spec.mode === "readonly") {
+  if (spec.noTools) {
+    args.push("--tools", "");
+  } else if (spec.mode === "readonly") {
     args.push("--tools", "Read,Grep,Glob,Bash");
     args.push("--allowedTools", "Read", "Grep", "Glob", "Bash");
     denied.push("Bash(git commit:*)", "Bash(git reset:*)", "Bash(git checkout:*)");

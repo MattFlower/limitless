@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -7,6 +7,8 @@ import { loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
+import type { RunState } from "../src/pipeline/context.ts";
+import { renderReport } from "../src/pipeline/report.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 
@@ -36,6 +38,7 @@ const everyone = { default: ["alpha/m", "beta/m"] };
 const policy = {
   triage: everyone,
   spec: everyone,
+  holdout: everyone,
   implement: everyone,
   review: { default: ["beta/m", "alpha/m"] },
   verify: { default: ["beta/m", "alpha/m"] },
@@ -59,12 +62,13 @@ async function makeRepo(): Promise<string> {
   return dir;
 }
 
-type Handler = (spec: AgentSpec) => FakeReply;
+type Handler = (spec: AgentSpec) => FakeReply | Promise<FakeReply>;
 
 function roleOf(spec: AgentSpec): string {
   const p = spec.prompt;
   if (p.startsWith("Classify this software task")) return "triage";
   if (p.startsWith("Write the specification")) return "spec";
+  if (p.startsWith("Write blind holdout checks")) return "holdout";
   if (p.startsWith("You are an adversarial code reviewer")) return "review";
   if (p.startsWith("You are the acceptance verifier")) return "verify";
   return "implement";
@@ -92,8 +96,36 @@ const spec = {
   blocking_questions: [],
 };
 const approve = { verdict: "approve", summary: "LGTM", findings: [] };
+const holdout = {
+  scenarios: [
+    {
+      id: "H-1",
+      description: "file appears",
+      steps: "cat farewell.txt",
+      expected: "goodbye",
+      edge_case: false,
+    },
+    {
+      id: "H-2",
+      description: "missing input",
+      steps: "test ! -e missing.txt",
+      expected: "exit zero",
+      edge_case: true,
+    },
+    {
+      id: "H-3",
+      description: "empty input",
+      steps: "test -s farewell.txt",
+      expected: "exit zero",
+      edge_case: true,
+    },
+  ],
+};
 const pass = {
-  criteria: [{ id: "AC-1", status: "met", evidence: "cat shows goodbye" }],
+  criteria: [
+    { id: "AC-1", status: "met", evidence: "cat shows goodbye" },
+    ...holdout.scenarios.map((s) => ({ id: s.id, status: "met", evidence: "observed expected result" })),
+  ],
   overall: "pass",
   notes: "",
 };
@@ -138,6 +170,246 @@ afterEach(async () => {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("holdout starts alongside implementation, stays blind, and quick skips it", async () => {
+    for (const profile of ["standard", "deep", "quick"] as const) {
+      let implementStarted = false;
+      let holdoutCalls = 0;
+      let holdoutCwd = "";
+      const f = start(async (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") {
+          holdoutCalls++;
+          holdoutCwd = s.cwd;
+          expect(s.mode).toBe("readonly");
+          expect(s.noTools).toBe(true);
+          expect(s.maxToolCalls).toBe(0);
+          expect(s.prompt).toContain("# Original request");
+          expect(s.prompt).toContain("# Specification");
+          expect(s.prompt).not.toContain("implementation marker");
+          expect(existsSync(join(s.cwd, "greeting.txt"))).toBe(false);
+          while (!implementStarted && !s.signal.aborted) await Bun.sleep(10);
+          return { structured: holdout };
+        }
+        if (role === "review") return { structured: approve };
+        if (role === "verify") return { structured: pass };
+        implementStarted = true;
+        return {
+          files: { "farewell.txt": "goodbye\n", "implementation-marker.txt": "implementation marker" },
+        };
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file", profile });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(holdoutCalls).toBe(profile === "quick" ? 0 : 1);
+      if (profile !== "quick") {
+        expect(holdoutCwd).not.toBe(join(f.cfg.paths.work, run.id));
+        const invs = f.store.listInvocations(run.id);
+        expect(invs.find((i) => i.role === "holdout")?.provider).toBe("beta");
+        expect(f.store.getRunState<RunState>(run.id)?.holdoutSameVendor).toBe(false);
+      }
+      await f.stop();
+      f.store.close();
+      factory = null;
+    }
+  });
+
+  test("unmet holdout feedback omits private inputs and publishes scenarios only after delivery", async () => {
+    const secret = "PRIVATE_HOLDOUT_TOKEN_729";
+    const privateHoldout = {
+      scenarios: holdout.scenarios.map((s) =>
+        s.id === "H-2"
+          ? {
+              ...s,
+              steps: `run ${secret}`,
+              description: `secret ${secret} check`,
+              expected: `result ${secret}`,
+            }
+          : s,
+      ),
+    };
+    let implementCalls = 0;
+    let verifies = 0;
+    let runId = "";
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: privateHoldout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") {
+        expect(s.prompt).toContain(secret);
+        verifies++;
+        return verifies === 1
+          ? {
+              structured: {
+                ...pass,
+                criteria: pass.criteria.map((c) =>
+                  c.id === "H-2"
+                    ? {
+                        ...c,
+                        status: "unmet",
+                        evidence: `Observed failure: ${secret} returned an empty response`,
+                      }
+                    : c,
+                ),
+              },
+            }
+          : { structured: pass };
+      }
+      implementCalls++;
+      if (implementCalls === 2) {
+        expect(s.prompt).toContain("Observed failure");
+        expect(s.prompt).not.toContain(secret);
+        expect(s.prompt).not.toContain(privateHoldout.scenarios[1]?.steps);
+        expect(f.store.getRunState<RunState>(runId)?.feedback).not.toContain(secret);
+        expect(f.store.listArtifacts(runId).map((a) => a.name)).not.toContain("holdout-scenarios.json");
+        expect(f.store.listArtifacts(runId).map((a) => a.name)).not.toContain("verify-0.json");
+        expect(existsSync(join(s.cwd, "holdout-scenarios.json"))).toBe(false);
+        for (const artifact of f.store.listArtifacts(runId))
+          expect(f.store.getArtifact(runId, artifact.name)).not.toContain(secret);
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    runId = run.id;
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(implementCalls).toBe(2);
+    expect(f.store.getArtifact(run.id, "holdout-scenarios.json")).toContain(secret);
+    const report = f.store.getArtifact(run.id, "report.md") ?? "";
+    expect(report).toContain("## Holdout scenarios");
+    expect(report).toContain("H-3");
+    expect(
+      renderReport({
+        success: false,
+        runId: run.id,
+        prompt: run.prompt,
+        state: f.store.getRunState<RunState>(run.id) as RunState,
+        invocations: [],
+        totals: { costUsd: 0, costEquivUsd: 0 },
+        runUrl: "u",
+      }),
+    ).not.toContain(secret);
+    expect(JSON.stringify(f.store.listEvents(run.id))).not.toContain(secret);
+  });
+
+  test("completed holdout survives a stopped factory and is reused after restart", async () => {
+    let holdoutCalls = 0;
+    let blockImplement = true;
+    const handler: Handler = (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") {
+        holdoutCalls++;
+        return { structured: holdout };
+      }
+      if (role === "review") return { structured: approve };
+      if (role === "verify") {
+        expect(s.prompt).toContain("H-3");
+        return { structured: pass };
+      }
+      return blockImplement ? { delayMs: 30_000 } : { files: { "farewell.txt": "goodbye\n" } };
+    };
+    const f = start(handler);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    const deadline = Date.now() + 10_000;
+    while (
+      (f.store.getRunState<RunState>(run.id)?.holdoutStatus !== "complete" ||
+        f.store.getRun(run.id)?.stage !== "implement") &&
+      Date.now() < deadline
+    )
+      await Bun.sleep(10);
+    expect(f.store.getRunState<RunState>(run.id)?.holdoutStatus).toBe("complete");
+    await f.stop();
+    f.store.close();
+    blockImplement = false;
+    const restarted = start(handler);
+    expect(await waitFor(restarted, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(holdoutCalls).toBe(1);
+    expect(restarted.store.getRunState<RunState>(run.id)?.holdout?.scenarios).toEqual(holdout.scenarios);
+  });
+
+  test("interrupted holdout is retried after restart and remains unpublished while stopped", async () => {
+    let holdoutCalls = 0;
+    let slow = true;
+    const handler: Handler = (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") {
+        holdoutCalls++;
+        return slow ? { structured: holdout, delayMs: 30_000 } : { structured: holdout };
+      }
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: pass };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    };
+    const f = start(handler);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    const deadline = Date.now() + 10_000;
+    while (f.store.getRunState<RunState>(run.id)?.holdoutStatus !== "generating" && Date.now() < deadline)
+      await Bun.sleep(10);
+    expect(f.store.getRunState<RunState>(run.id)?.holdoutStatus).toBe("generating");
+    await f.stop();
+    expect(f.store.listArtifacts(run.id).map((a) => a.name)).not.toContain("holdout-scenarios.json");
+    f.store.close();
+    slow = false;
+    const restarted = start(handler);
+    expect(await waitFor(restarted, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(holdoutCalls).toBe(2);
+    expect(restarted.store.getArtifact(run.id, "holdout-scenarios.json")).toContain("H-3");
+  });
+
+  test("holdout uses same-vendor fallback and invalid output routes to another model", async () => {
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout" && s.target.provider === "beta") return { structured: { scenarios: [] } };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: pass };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "holdout")
+        .map((i) => i.status),
+    ).toEqual(["error", "ok"]);
+    expect(f.store.getRunState<RunState>(run.id)?.holdoutSameVendor).toBe(true);
+    expect(f.store.getRunState<RunState>(run.id)?.holdoutModelId).toBe("alpha/m");
+  });
+
+  test("missing holdout verdict fails despite an overall pass claim", async () => {
+    let verifyCalls = 0;
+    let implementCalls = 0;
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") {
+        verifyCalls++;
+        return {
+          structured:
+            verifyCalls === 1 ? { ...pass, criteria: pass.criteria.filter((c) => c.id !== "H-3") } : pass,
+        };
+      }
+      implementCalls++;
+      if (implementCalls === 2) expect(s.prompt).toContain("H-3");
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(implementCalls).toBe(2);
+    expect(verifyCalls).toBe(2);
+  });
+
   test("happy path: triage → spec → implement → gates → review → verify → deliver", async () => {
     const seen: string[] = [];
     const f = start((s) => {
@@ -145,6 +417,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       seen.push(`${role}:${s.target.modelId}`);
       if (role === "triage") return { structured: triage() };
       if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
       if (role === "review") return { structured: approve };
       if (role === "verify") return { structured: pass };
       return { files: { "farewell.txt": "goodbye\n" }, text: "Added farewell.txt" };
@@ -159,6 +432,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       "prepare",
       "triage",
       "spec",
+      "holdout",
       "implement",
       "gates",
       "audit",
@@ -302,6 +576,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         specPrompt = s.prompt;
         return { structured: spec };
       }
+      if (role === "holdout") return { structured: holdout };
       if (role === "review") return { structured: approve };
       if (role === "verify") return { structured: pass };
       return { files: { "farewell.txt": "goodbye\n" } };
