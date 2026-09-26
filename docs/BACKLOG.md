@@ -9,15 +9,23 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 1 | M3 | GitHub webhook trigger | done — #4 (+ GitHub IP allowlist by orchestrator); live on limitless-sandbox |
 | 2 | M3 | MCP server + skills for Claude Code and Codex | done — #1 |
 | 3 | M2 | Blind holdout scenarios | done — #3 (Codex flags fixed by orchestrator) |
-| 4 | M2 | Rebase onto the moving base branch before delivery | todo |
+| 4 | M2 | Rebase onto the moving base branch before delivery | in review |
 | 5 | M3 | Discord bot | done — #2 |
-| 6 | M3 | Chat concierge (UI + Discord free text) | todo |
-| 7 | M4 | Direct-HTTP LLM path + local model servers | todo |
-| 8 | M4 | OpenRouter spend reconciliation | todo |
+| 6 | M3 | Chat concierge (UI + Discord free text) | done — #8 |
+| 7 | M4 | Direct-HTTP LLM path + local model servers | done — #9 (unit-overwrite and concierge fixes by orchestrator) |
+| 8 | M4 | OpenRouter spend reconciliation | in progress |
 | 9 | M5 | Retention and cleanup | done — #5 |
 | 10 | M2 | Live CLI contract smoke tests | done — #7 (`limitless deploy --smoke`) |
 | 11 | M3 | Quota alerts (Discord + UI) | done — #6 |
-| 12 | M5 | Graceful (draining) deploys | todo |
+| 12 | M5 | Graceful (draining) deploys | done — #10 (bootstrap path by orchestrator) |
+| 13 | M4 | Discord `/run` → `/show` | todo |
+| 14 | M4 | Enable/disable providers at runtime | todo |
+| 15 | M4 | Fresher, Desktop-consistent quota readings | todo |
+| 16 | M6 | Provider workload analytics | todo |
+| 17 | M6 | Config-defined providers + `limitless init` | todo |
+| 18 | M6 | Model-origin constraints | todo |
+| 19 | M6 | Discreet mode + approval-gated merges | todo |
+| 20 | M6 | Packaging: Homebrew tap + curl installer | todo |
 
 ---
 
@@ -225,3 +233,44 @@ of their current step, but the model work already done in that step is lost.
 - Tests: drain stops new starts but not active runs; deploy waits and times out correctly (inject a
   fake health client and clock).
 
+## 13. Discord `/run` → `/show`
+
+Owner feedback: `/run` reads as the verb (start a run), but it shows one. Rename the slash command
+to `/show` (same options and output); keep `/build` for starting work. Update the command
+registration, help text, docs, and tests. No alias: the bot is private and has one user.
+
+## 14. Enable/disable providers at runtime
+
+twilight shouldn't have to run all the time; the owner turns it on when things are busy.
+
+- Persisted per-provider `enabled` override (settings table) on top of config: `limitless providers
+  enable|disable <id>`, `POST /api/providers/:id/enable|disable` (same locality/CSRF rules), and a
+  toggle on the UI provider card. Disabled providers are skipped by the router with reason
+  "disabled", get no health probes (no noise while twilight is off), and show as disabled.
+- `limitless local down` disables the providers it stops; `local up` re-enables them once healthy.
+- Tests: router skips disabled providers; overrides survive a restart; no probes while disabled.
+
+## 15. Fresher, Desktop-consistent quota readings
+
+The Claude Max percentages lag Claude Desktop by about 1 point: our readings only update when a
+Limitless invocation reports rate limits, while other clients (including the orchestrator's own
+session) spend the same subscription in between, and the UI rounds to the nearest percent.
+
+- Show each window's reading age ("as of 12 min ago") on provider cards and in `limitless providers`.
+- Round utilization up (like Claude Desktop) for display; keep raw values in the API.
+- Tests for the formatting and age display.
+
+## 16–20. M6 (after M4/M5)
+
+- **16 Provider workload analytics** — per provider and role over time (day/week): invocations,
+  tokens, wall time, API-equivalent $, share of total; a UI page and `/api/stats/providers`.
+- **17 Config-defined providers + `limitless init`** — providers, models and policy come from config
+  (built-in presets for claude/codex/OpenRouter/OpenAI-compatible local servers); `init` detects
+  installed CLIs, their login type (subscription vs API key), and local servers, then writes config.
+- **18 Model-origin constraints** — catalog models carry an origin; config can exclude origins (the
+  work machine excludes China-origin models); the router enforces it and evals cover allowed models.
+- **19 Discreet mode + approval-gated merges** — per-repo: neutral branch/commit names, PR bodies
+  without Limitless branding or local links; a merge policy that waits for a required approval before
+  merging (or leaves merging to the human).
+- **20 Packaging** — compiled binaries on GitHub releases, a formula in `MattFlower/homebrew-recipes`,
+  and a curl installer (private-repo access needs a token; decide public vs private first).
