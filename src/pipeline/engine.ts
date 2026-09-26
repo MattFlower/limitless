@@ -531,6 +531,7 @@ async function oneRound(
         mode: "readonly",
         complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
         constraints: { avoidVendor: ctx.state.implementer?.vendor },
+        timeoutMs: readingTimeout(diff.added + diff.removed),
         prompt: reviewPrompt({
           prompt: ctx.run.prompt,
           spec: ctx.state.spec ?? null,
@@ -593,6 +594,7 @@ async function oneRound(
         mode: "readonly",
         complexity: ctx.complexity,
         constraints: { avoidVendor: ctx.state.implementer?.vendor },
+        timeoutMs: readingTimeout(diff.added + diff.removed, 25),
         prompt: verifyPrompt({
           prompt: ctx.run.prompt,
           spec: ctx.state.spec as Spec,
@@ -720,6 +722,14 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
     return { summary, value: undefined };
   });
+}
+
+/**
+ * Review and verify have to read the whole change: 20 minutes (25 for verify) plus 2 minutes per
+ * 100 changed lines, capped at an hour. A timeout throws away a partial review, so err long.
+ */
+export function readingTimeout(changedLines: number, baseMinutes = 20): number {
+  return Math.min(60, baseMinutes + Math.ceil(changedLines / 100) * 2) * 60_000;
 }
 
 function readPackageJson(dir: string): string | null {

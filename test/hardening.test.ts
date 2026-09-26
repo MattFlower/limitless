@@ -596,3 +596,11 @@ test("adding a file under a protected path warns; editing one blocks", () => {
     "test/fixtures/old.json:block",
   ]);
 });
+
+test("review/verify timeouts scale with the size of the change", async () => {
+  const { readingTimeout } = await import("../src/pipeline/engine.ts");
+  expect(readingTimeout(0)).toBe(20 * 60_000);
+  expect(readingTimeout(935)).toBe(40 * 60_000);
+  expect(readingTimeout(935, 25)).toBe(45 * 60_000);
+  expect(readingTimeout(10_000)).toBe(60 * 60_000);
+});
