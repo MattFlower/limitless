@@ -226,3 +226,64 @@ describe("extractJson", () => {
     expect(extractJson("no json here")).toBeNull();
   });
 });
+
+test("a no-tools Claude call returning StructuredOutput is not stopped by a zero tool budget", async () => {
+  const { runClaude } = await import("../src/harness/claude.ts");
+  const { mkdtempSync, writeFileSync, chmodSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(join(tmpdir(), "limitless-fakeclaude-"));
+  // A stand-in `claude` that replays a stream ending in a StructuredOutput tool call.
+  const lines = [
+    { type: "system", subtype: "init", session_id: "s1", model: "m" },
+    {
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id: "t1", name: "StructuredOutput", input: { ok: true } }] },
+    },
+    {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      session_id: "s1",
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {},
+      result: "",
+      structured_output: { ok: true },
+    },
+  ];
+  writeFileSync(
+    join(dir, "claude"),
+    `#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' ${lines.map((l) => `'${JSON.stringify(l)}'`).join(" ")}\n`,
+  );
+  chmodSync(join(dir, "claude"), 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${dir}:${oldPath}`;
+  try {
+    const res = await runClaude({
+      cwd: dir,
+      prompt: "x",
+      mode: "readonly",
+      noTools: true,
+      jsonSchema: { type: "object" },
+      target: {
+        modelId: "c/m",
+        provider: "claude",
+        harness: "claude",
+        model: "m",
+        vendor: "anthropic",
+        tier: 4,
+        billing: "subscription",
+      },
+      timeoutMs: 10_000,
+      idleTimeoutMs: 10_000,
+      maxToolCalls: 0,
+      signal: new AbortController().signal,
+      logPath: join(dir, "log"),
+      onEvent: () => {},
+    });
+    expect(res.status).toBe("ok");
+    expect(res.structured).toEqual({ ok: true });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

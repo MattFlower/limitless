@@ -17,6 +17,7 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 9 | M5 | Retention and cleanup | done — #5 |
 | 10 | M2 | Live CLI contract smoke tests | done — #7 (`limitless deploy --smoke`) |
 | 11 | M3 | Quota alerts (Discord + UI) | done — #6 |
+| 12 | M5 | Graceful (draining) deploys | todo |
 
 ---
 
@@ -208,4 +209,19 @@ Tell the operator when a subscription reaches its reserve, so banked resets can 
   meanwhile (which providers it falls back to).
 - Tests with a fake Discord port and a fake clock: one alert per window, no alert storms on
   flapping, reset clears it.
+
+## 12. Graceful deploys
+
+Every `limitless deploy` restarts the daemon, interrupting in-flight runs; they resume at the start
+of their current step, but the model work already done in that step is lost.
+
+- Add `POST /api/admin/drain` (localhost only, same CSRF rules as other mutations) and
+  `POST /api/admin/resume`: while draining, the scheduler starts no new runs; `/api/health` reports
+  `draining: true` and the active run ids.
+- `limitless deploy` (after the check/smoke gates pass) drains, waits until no runs are active or
+  until `--max-wait` (default 45 minutes) expires, then restarts; `--now` skips waiting. On rollback
+  or failure, it resumes the scheduler. Print progress while waiting (active runs and their stages).
+- The daemon starts un-drained after a restart. Show a "draining" banner in the UI.
+- Tests: drain stops new starts but not active runs; deploy waits and times out correctly (inject a
+  fake health client and clock).
 

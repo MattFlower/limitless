@@ -13,6 +13,8 @@ import {
   type Usage,
 } from "./types.ts";
 
+export const STRUCTURED_OUTPUT_TOOL = "StructuredOutput";
+
 const QUOTA_TEXT =
   /(hit your (session|weekly|opus|sonnet|fable|usage) limit|usage limit reached|rate limit.*reset|out of (extra )?usage)/i;
 
@@ -223,7 +225,9 @@ export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
     if (ev.type === "text" || ev.type === "tool_call" || ev.type === "tool_result" || ev.type === "init") {
       lastProgress = Date.now();
     }
-    if (ev.type === "tool_call" && !stuckReason) {
+    // StructuredOutput is how Claude Code returns the final --json-schema answer, not agent work;
+    // counting it would trip a zero tool budget exactly when a no-tools call succeeds.
+    if (ev.type === "tool_call" && ev.name !== STRUCTURED_OUTPUT_TOOL && !stuckReason) {
       const reason = loop.observe(ev.name, ev.input);
       if (reason) {
         stuckReason = reason;
