@@ -2,6 +2,10 @@ import { Database } from "bun:sqlite";
 import { assertExistingBranchDelivery } from "../core/delivery.ts";
 import type {
   ArtifactMeta,
+  ChatMessage,
+  ChatOrigin,
+  ChatProposal,
+  ChatProposalFields,
   CreateRunRequest,
   EventType,
   Invocation,
@@ -231,6 +235,7 @@ function buildUpdate(patch: object, columns: Record<string, string>): { sets: st
 export class Store {
   readonly db: Database;
   private listeners = new Set<Listener>();
+  private pendingPublications: StreamMessage[] | null = null;
 
   constructor(path: string) {
     this.db = new Database(path, { create: true, strict: true });
@@ -271,6 +276,10 @@ export class Store {
   }
 
   private publish(msg: StreamMessage): void {
+    if (this.pendingPublications) {
+      this.pendingPublications.push(msg);
+      return;
+    }
     for (const l of this.listeners) {
       try {
         l(msg);
@@ -278,6 +287,200 @@ export class Store {
         // A broken subscriber must never break the pipeline.
       }
     }
+  }
+
+  /** Publish only after commit, including the run and its proposal linkage. */
+  private chatTransaction<T>(fn: () => T): T {
+    if (this.pendingPublications) return fn();
+    const messages: StreamMessage[] = [];
+    this.pendingPublications = messages;
+    let result: T;
+    try {
+      result = this.db.transaction(fn)();
+    } finally {
+      this.pendingPublications = null;
+    }
+    for (const message of messages) this.publish(message);
+    return result;
+  }
+
+  listChatMessages(conversationId: string, after = 0): ChatMessage[] {
+    return (
+      this.db
+        .query("SELECT * FROM chat_messages WHERE conversation_id = ? AND id > ? ORDER BY id")
+        .all(conversationId, after) as Row[]
+    ).map((r) => ({
+      id: r.id as number,
+      conversationId: r.conversation_id as string,
+      role: r.role as ChatMessage["role"],
+      content: r.content as string,
+      ts: r.ts as number,
+      runId: r.run_id as string | null,
+      outcome: parse(r.outcome_json, null),
+    }));
+  }
+
+  addChatMessage(
+    conversationId: string,
+    role: ChatMessage["role"],
+    content: string,
+    outcome: ChatMessage["outcome"] = null,
+    runId: string | null = null,
+  ): ChatMessage {
+    const ts = Date.now();
+    const inserted = this.db
+      .query(
+        "INSERT INTO chat_messages (conversation_id, role, content, run_id, ts, outcome_json) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(conversationId, role, content, runId, ts, json(outcome));
+    const message: ChatMessage = {
+      id: Number(inserted.lastInsertRowid),
+      conversationId,
+      role,
+      content,
+      ts,
+      runId,
+      outcome,
+    };
+    this.publish({ kind: "chat", message });
+    return message;
+  }
+
+  hasChatDelivery(conversationId: string, messageId: string): boolean {
+    return (
+      this.db
+        .query("SELECT 1 FROM chat_receipts WHERE conversation_id = ? AND message_id = ?")
+        .get(conversationId, messageId) !== null
+    );
+  }
+
+  claimChatDelivery(conversationId: string, messageId: string): boolean {
+    return (
+      this.db
+        .query("INSERT OR IGNORE INTO chat_receipts (conversation_id, message_id) VALUES (?, ?)")
+        .run(conversationId, messageId).changes === 1
+    );
+  }
+
+  listChatProposals(conversationId: string): ChatProposal[] {
+    return (
+      this.db
+        .query("SELECT * FROM chat_proposals WHERE conversation_id = ? ORDER BY rowid")
+        .all(conversationId) as Row[]
+    ).map((r) => ({
+      ...parse(r.fields_json, {} as ChatProposalFields),
+      id: r.id as string,
+      conversationId,
+      state: r.state as ChatProposal["state"],
+      confirmedAt: r.confirmed_at as number | null,
+      runId: r.run_id as string | null,
+      origin: parse(r.origin_json, {} as ChatOrigin),
+    }));
+  }
+
+  chatProposal(conversationId: string, id: string): ChatProposal {
+    const proposal = this.listChatProposals(conversationId).find((p) => p.id === id);
+    if (!proposal) throw new Error("Unknown proposal in this conversation");
+    return proposal;
+  }
+
+  proposeChat(conversationId: string, fields: ChatProposalFields, origin: ChatOrigin): ChatProposal {
+    return this.chatTransaction(() => {
+      const current = this.listChatProposals(conversationId).find(
+        (p) => p.state === "pending" || p.state === "confirmed",
+      );
+      if (current?.state === "confirmed")
+        throw new Error("Confirm the existing proposal again to finish creating its run");
+      if (current) {
+        this.db.query("UPDATE chat_proposals SET state = 'superseded' WHERE id = ?").run(current.id);
+        this.addChatMessage(conversationId, "assistant", "Proposal replaced.", {
+          proposal: { ...current, state: "superseded" },
+        });
+      }
+      const proposal: ChatProposal = {
+        ...fields,
+        id: newId("proposal_"),
+        conversationId,
+        state: "pending",
+        confirmedAt: null,
+        runId: null,
+        origin,
+      };
+      this.db
+        .query(
+          "INSERT INTO chat_proposals (id, conversation_id, fields_json, origin_json, state) VALUES (?, ?, ?, ?, 'pending')",
+        )
+        .run(proposal.id, conversationId, json(fields), json(origin));
+      this.addChatMessage(conversationId, "assistant", "Review this proposal and confirm to create a run.", {
+        action: { type: "propose_run", ...fields },
+        proposal,
+      });
+      return proposal;
+    });
+  }
+
+  confirmChat(conversationId: string, id: string): ChatProposal {
+    return this.chatTransaction(() => {
+      const proposal = this.chatProposal(conversationId, id);
+      if (proposal.state === "superseded")
+        throw new Error("Proposal has been superseded; confirm the current proposal");
+      if (proposal.state !== "pending") return proposal;
+      this.db
+        .query("UPDATE chat_proposals SET state = 'confirmed', confirmed_at = ? WHERE id = ?")
+        .run(Date.now(), id);
+      const confirmed = this.chatProposal(conversationId, id);
+      this.addChatMessage(conversationId, "assistant", "Proposal confirmed.", { proposal: confirmed });
+      return confirmed;
+    });
+  }
+
+  createChatRun(repo: Repo, req: CreateRunRequest, conversationId: string, proposalId: string): Run {
+    return this.chatTransaction(() => {
+      const proposal = this.chatProposal(conversationId, proposalId);
+      if (proposal.state === "consumed" && proposal.runId) {
+        const run = this.getRun(proposal.runId);
+        if (!run) throw new Error("Created run is no longer available");
+        return run;
+      }
+      if (proposal.state !== "confirmed" || !proposal.confirmedAt)
+        throw new Error("Explicit confirmation is required");
+      if (
+        req.repo !== proposal.repo ||
+        req.prompt !== proposal.prompt ||
+        req.profile !== proposal.profile ||
+        req.title !== proposal.title
+      )
+        throw new Error("Confirmed proposal fields cannot be changed");
+      const run = this.createRun(repo, req);
+      this.db
+        .query("UPDATE chat_proposals SET state = 'consumed', run_id = ? WHERE id = ?")
+        .run(run.id, proposalId);
+      this.addChatMessage(
+        conversationId,
+        "assistant",
+        `Run ${run.id} created.`,
+        {
+          action: { type: "create_run", proposalId },
+          proposal: this.chatProposal(conversationId, proposalId),
+        },
+        run.id,
+      );
+      return run;
+    });
+  }
+
+  recordChatCall(
+    conversationId: string,
+    provider: string,
+    modelId: string,
+    startedAt: number,
+    result: import("../harness/types.ts").AgentResult,
+  ): void {
+    this.db
+      .query(
+        "INSERT INTO chat_calls (conversation_id, provider, model_id, result_json, cost_usd, started_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(conversationId, provider, modelId, JSON.stringify(result), result.costUsd, startedAt);
   }
 
   // ---- repos ---------------------------------------------------------------
@@ -550,7 +753,10 @@ export class Store {
     const r = this.db
       .query("SELECT COALESCE(SUM(cost_usd),0) AS s FROM invocations WHERE provider = ? AND started_at >= ?")
       .get(provider, since) as Row;
-    return r.s as number;
+    const chat = this.db
+      .query("SELECT COALESCE(SUM(cost_usd),0) AS s FROM chat_calls WHERE provider = ? AND started_at >= ?")
+      .get(provider, since) as Row;
+    return (r.s as number) + (chat.s as number);
   }
 
   // ---- events --------------------------------------------------------------
