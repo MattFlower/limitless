@@ -10,5 +10,21 @@ export interface Integrations {
 
 /** Wire trigger integrations (GitHub webhooks, Discord, MCP) into the daemon. */
 export async function mountIntegrations(_factory: Factory): Promise<Integrations> {
-  return { routes: {}, notes: [], stop: async () => {} };
+  return { routes: {}, notes: await toolVersions(), stop: async () => {} };
+}
+
+/** Which agent CLIs the daemon will actually run (PATH mix-ups have bitten us before). */
+async function toolVersions(): Promise<string[]> {
+  const notes: string[] = [];
+  for (const bin of ["claude", "codex", "gh", "git"]) {
+    const path = Bun.which(bin);
+    if (!path) {
+      notes.push(`${bin}: NOT FOUND on PATH`);
+      continue;
+    }
+    const proc = Bun.spawnSync([path, "--version"], { stdout: "pipe", stderr: "pipe" });
+    const version = proc.stdout.toString().trim().split("\n")[0] ?? "";
+    notes.push(`${bin}: ${version} (${path})`);
+  }
+  return notes;
 }
