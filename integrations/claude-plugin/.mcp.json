@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "limitless": {
+      "type": "stdio",
+      "command": "bun",
+      "args": ["${LIMITLESS_REPO}/src/cli/main.ts", "mcp"]
+    }
+  }
+}

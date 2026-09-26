@@ -34,6 +34,8 @@ export interface Config {
   preferProviders: string[];
   githubOwner: string | null; // allowlisted GitHub login for triggers
   discordOwnerId: string | null;
+  discordChannelId: string | null;
+  discordNotifyAll: boolean;
   secrets: Record<string, string>;
   /** Raw config.toml overrides (routing policy, providers) consumed by their modules. */
   raw: Record<string, unknown>;
@@ -105,6 +107,7 @@ export function loadConfig(
   const limits = (raw.limits ?? {}) as Record<string, unknown>;
   const reserves = (raw.reserves ?? {}) as Record<string, unknown>;
   const owners = (raw.owners ?? {}) as Record<string, unknown>;
+  const discord = (raw.discord ?? {}) as Record<string, unknown>;
   const routing = (raw.routing ?? {}) as Record<string, unknown>;
   const port = overrides.port ?? num(Number(process.env.LIMITLESS_PORT) || server.port, 7400);
   const host = str(server.host, "127.0.0.1") as string;
@@ -129,6 +132,8 @@ export function loadConfig(
       : [],
     githubOwner: str(owners.github, "MattFlower"),
     discordOwnerId: str(owners.discord, null),
+    discordChannelId: str(discord.channel_id, null),
+    discordNotifyAll: discord.notify_all === true,
     secrets,
     raw,
   };

@@ -6,9 +6,9 @@ with `limitless deploy`. Status is tracked here and in the UI.
 
 | # | Milestone | Task | Status |
 |---|---|---|---|
-| 1 | M3 | GitHub webhook trigger | todo |
-| 2 | M3 | MCP server + skills for Claude Code and Codex | todo |
-| 3 | M2 | Blind holdout scenarios | todo |
+| 1 | M3 | GitHub webhook trigger | in progress (factory) |
+| 2 | M3 | MCP server + skills for Claude Code and Codex | in progress (factory) |
+| 3 | M2 | Blind holdout scenarios | in progress (factory) |
 | 4 | M2 | Rebase onto the moving base branch before delivery | todo |
 | 5 | M3 | Discord bot | todo |
 | 6 | M3 | Chat concierge (UI + Discord free text) | todo |
