@@ -226,17 +226,15 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
   if (t.effort) args.push("-c", `model_reasoning_effort="${t.effort}"`);
   if (spec.privateSession) args.push("--ephemeral", "--ignore-user-config");
   if (spec.noTools) {
-    // Fail closed on unknown config keys and keep the model from reaching the filesystem.
+    // Codex reads files only through its shell tool (and sub-agents); with both disabled, web search
+    // off and a read-only sandbox, a live check against codex-cli 0.157 confirmed the model cannot
+    // read files. --strict-config fails closed if these feature names ever change.
     args.push(
       "--strict-config",
-      "-c",
-      "tools.disable_defaults=true",
-      "-c",
-      "features.shell_tool=false",
-      "-c",
-      "features.multi_agent=false",
-      "-c",
-      "include_apply_patch_tool=false",
+      "--disable",
+      "shell_tool",
+      "--disable",
+      "multi_agent",
       "-c",
       'web_search="disabled"',
     );

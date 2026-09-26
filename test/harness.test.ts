@@ -94,14 +94,13 @@ describe("CodexStreamParser", () => {
       onEvent: () => {},
     };
     const args = buildCodexArgs(spec);
-    expect(args).toContain("tools.disable_defaults=true");
-    expect(args).toContain("features.shell_tool=false");
-    expect(args).toContain("include_apply_patch_tool=false");
+    expect(args.join(" ")).toContain("--disable shell_tool --disable multi_agent");
+    expect(args).toContain('web_search="disabled"');
     expect(args).toContain("--strict-config");
     expect(args).toContain("--ignore-user-config");
     expect(args).toContain("--ephemeral");
     expect(args).toContain("read-only");
-    expect(buildCodexArgs({ ...spec, noTools: false })).not.toContain("tools.disable_defaults=true");
+    expect(buildCodexArgs({ ...spec, noTools: false })).not.toContain("shell_tool");
   });
 
   test("parses a real codex exec --json run", () => {
