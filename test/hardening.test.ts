@@ -519,18 +519,26 @@ describe("resume after restart", () => {
     const run = await first.createRun({ repo, prompt: "add b" });
     const deadline = Date.now() + 10_000;
     while (first.store.getRun(run.id)?.stage !== "review" && Date.now() < deadline) await Bun.sleep(20);
+    first.scheduler.drain();
+    expect(first.scheduler.draining).toBe(true);
     await first.stop(); // simulated restart mid-review
     expect(first.store.getRun(run.id)?.status).toBe("queued");
     first.store.close();
 
     reviewDelay = 0;
     const second = new Factory(cfg, { providers, models, policy, harnesses: { fake: harness } });
+    expect(second.scheduler.draining).toBe(false);
+    // Also cover an abrupt shutdown that left a persisted running status.
+    second.store.updateRun(run.id, { status: "running" });
     second.start();
     try {
       const end = Date.now() + 10_000;
       while (second.store.getRun(run.id)?.status !== "succeeded" && Date.now() < end) await Bun.sleep(20);
       expect(second.store.getRun(run.id)?.status).toBe("succeeded");
       expect(implementCalls).toBe(1);
+      expect(
+        second.store.listEvents(run.id).some((event) => event.message.includes("re-queued to resume")),
+      ).toBe(true);
     } finally {
       await second.stop();
       second.store.close();

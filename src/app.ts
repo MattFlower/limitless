@@ -1,3 +1,4 @@
+import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
 import type { CreateRunRequest, Question, Run } from "./core/types.ts";
 import { Store } from "./db/store.ts";
@@ -5,6 +6,7 @@ import { collectGarbage, type GcResult } from "./gc.ts";
 import { resolveRepo } from "./git/repos.ts";
 import { runClaude } from "./harness/claude.ts";
 import { runCodex } from "./harness/codex.ts";
+import { runLlm } from "./harness/llm.ts";
 import type { Harness } from "./harness/types.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
 import {
@@ -32,11 +34,14 @@ export interface FactoryOptions {
     clear: (timer: ReturnType<typeof setInterval>) => void;
   };
   clock?: () => number;
+  fetch?: typeof fetch;
+  providerTimer?: { set: typeof setInterval; clear: typeof clearInterval };
 }
 
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
 export class Factory {
   readonly store: Store;
+  readonly concierge: Concierge;
   readonly tracker: ProviderTracker;
   readonly router: Router;
   readonly scheduler: Scheduler;
@@ -64,6 +69,8 @@ export class Factory {
       cfg.secrets,
       { openrouter: cfg.openrouterBudgetUsd },
       opts.clock,
+      opts.fetch,
+      opts.providerTimer,
     );
     this.router = new Router(
       this.tracker,
@@ -79,9 +86,10 @@ export class Factory {
       store: this.store,
       router: this.router,
       tracker: this.tracker,
-      harnesses: opts.harnesses ?? { claude: runClaude, codex: runCodex },
+      harnesses: opts.harnesses ?? { claude: runClaude, codex: runCodex, llm: runLlm },
     };
     this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns);
+    this.concierge = new Concierge(this);
   }
 
   start(): void {
@@ -97,6 +105,7 @@ export class Factory {
         .then((result) => this.reportGc(result))
         .catch((error) => console.error(`[gc] ${(error as Error).message}`));
     }, 60 * 60_000);
+    this.tracker.start();
     // Only forward to servers we can actually authenticate against.
     this.tunnels.start(
       this.providerDefs
@@ -107,6 +116,7 @@ export class Factory {
   }
 
   async stop(): Promise<void> {
+    this.tracker.stop();
     if (this.gcInterval) this.gcTimer.clear(this.gcInterval);
     this.gcInterval = null;
     await this.gcInFlight;
@@ -131,11 +141,17 @@ export class Factory {
   }
 
   /** The second argument is factory-only provenance, never deserialized from a request. */
-  async createRun(req: CreateRunRequest, verifiedGitHubWebhook = false): Promise<Run> {
+  async createRun(
+    req: CreateRunRequest,
+    verifiedGitHubWebhook = false,
+    chat?: { conversationId: string; proposalId: string },
+  ): Promise<Run> {
     if (!req.prompt?.trim()) throw new Error("prompt is required");
     if (!req.repo?.trim()) throw new Error("repo is required");
     const repo = await resolveRepo(this.store, req.repo);
-    const run = this.store.createRun(repo, req, verifiedGitHubWebhook);
+    const run = chat
+      ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
+      : this.store.createRun(repo, req, verifiedGitHubWebhook);
     this.store.addEvent({
       runId: run.id,
       type: "log",

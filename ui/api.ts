@@ -2,6 +2,7 @@
 // the UI can never drift from the wire shape.
 import type {
   CreateRunRequest,
+  HealthResponse,
   ProviderStatus,
   Question,
   QuotaAlert,
@@ -43,6 +44,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(message, res.status);
   }
   return text ? (JSON.parse(text) as T) : (undefined as T);
+}
+
+export function getHealth(): Promise<HealthResponse> {
+  return request<HealthResponse>("/api/health", { signal: AbortSignal.timeout(5000) });
 }
 
 export function listRuns(opts: { status?: RunStatus[]; limit?: number } = {}): Promise<Run[]> {
@@ -152,6 +157,36 @@ export function openRunStream(
     } catch {
       // ignore malformed frame
     }
+  };
+  return () => source.close();
+}
+
+export function getChat(id: string): Promise<import("../src/core/types.ts").ChatConversation> {
+  return request(`/api/chat/${encodeURIComponent(id)}`);
+}
+
+export function postChat(
+  id: string,
+  input: import("../src/core/types.ts").ChatRequest,
+): Promise<import("../src/core/types.ts").ChatConversation> {
+  return request(`/api/chat/${encodeURIComponent(id)}/messages`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function openChatStream(
+  id: string,
+  after: number,
+  onMessage: (message: import("../src/core/types.ts").ChatMessage) => void,
+  onConnected: (connected: boolean) => void,
+): () => void {
+  const source = new EventSource(`/api/chat/${encodeURIComponent(id)}/stream?after=${after}`);
+  source.onopen = () => onConnected(true);
+  source.onerror = () => onConnected(false);
+  source.onmessage = (event) => {
+    const update = JSON.parse(event.data) as import("../src/core/types.ts").ChatStreamMessage;
+    if (update.kind === "chat" && update.message.conversationId === id) onMessage(update.message);
   };
   return () => source.close();
 }

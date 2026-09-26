@@ -1,6 +1,8 @@
+import { BlockList, isIP } from "node:net";
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
-import type { CreateRunRequest, RunStatus, StreamMessage } from "../core/types.ts";
+import { ChatRequestSchema } from "../concierge.ts";
+import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeStats } from "../db/stats.ts";
 import { DEFAULT_POLICY, MODELS } from "../router/catalog.ts";
 
@@ -10,6 +12,10 @@ export interface HttpExtras {
   /** HTML entry for the SPA (Bun HTML import). */
   ui?: unknown;
 }
+
+const loopback = new BlockList();
+loopback.addSubnet("127.0.0.0", 8, "ipv4");
+loopback.addAddress("::1", "ipv6");
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -21,6 +27,7 @@ function sse(
   server: Server<undefined>,
   subscribe: (send: (msg: unknown) => void) => () => void,
   backlog?: unknown[],
+  eventId?: (msg: unknown) => number,
 ): Response {
   server.timeout(req, 0);
   let cleanup: (() => void) | null = null;
@@ -29,7 +36,9 @@ function sse(
       const encoder = new TextEncoder();
       const send = (msg: unknown) => {
         try {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(msg)}\n\n`));
+          controller.enqueue(
+            encoder.encode(`${eventId ? `id: ${eventId(msg)}\n` : ""}data: ${JSON.stringify(msg)}\n\n`),
+          );
         } catch {
           cleanup?.();
         }
@@ -49,14 +58,16 @@ function sse(
         unsubscribe();
         clearInterval(keepAlive);
       };
-      req.signal.addEventListener("abort", () => {
+      const abort = () => {
         cleanup?.();
         try {
           controller.close();
         } catch {
           // already closed
         }
-      });
+      };
+      req.signal.addEventListener("abort", abort, { once: true });
+      if (req.signal.aborted) abort();
     },
     cancel() {
       cleanup?.();
@@ -109,7 +120,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         const origin = req.headers.get("origin");
         if (origin && !allowedOrigins.has(origin)) return error("cross-origin request refused", 403);
         const type = req.headers.get("content-type") ?? "";
-        if (!type.toLowerCase().startsWith("application/json")) {
+        if (type.split(";")[0]?.trim().toLowerCase() !== "application/json") {
           return error("mutations require content-type: application/json", 415);
         }
       }
@@ -120,9 +131,61 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       }
     };
 
+  const drainState = () => ({
+    draining: factory.scheduler.draining,
+    active: factory.scheduler.activeRunIds,
+  });
+  const admin = (action: "drain" | "resume") => ({
+    POST: handle((req, server) => {
+      const peer = server.requestIP(req)?.address;
+      if (!peer || !isIP(peer) || !loopback.check(peer, isIP(peer) === 6 ? "ipv6" : "ipv4")) {
+        return error("admin endpoints require a loopback peer", 403);
+      }
+      factory.scheduler[action]();
+      return json(drainState());
+    }),
+  });
+
+  const conversation = (req: Request & { params: Record<string, string> }) => {
+    const id = req.params.conversationId ?? "";
+    // Discord conversations are a separate transport namespace.
+    if (!/^[\w-]{1,128}$/.test(id)) throw new Error("Invalid conversation ID");
+    return id;
+  };
   const routes: Record<string, unknown> = {
+    "/api/admin/drain": admin("drain"),
+    "/api/admin/resume": admin("resume"),
+    "/api/chat/:conversationId": {
+      GET: handle((req) => json(factory.concierge.history(conversation(req)))),
+    },
+    "/api/chat/:conversationId/messages": {
+      POST: handle(async (req) =>
+        json(
+          await factory.concierge.submit(
+            conversation(req),
+            ChatRequestSchema.parse(await body<unknown>(req)),
+          ),
+        ),
+      ),
+    },
+    "/api/chat/:conversationId/stream": handle((req, server) => {
+      const id = conversation(req);
+      const url = new URL(req.url);
+      const after = Number(req.headers.get("last-event-id") ?? url.searchParams.get("after") ?? 0);
+      if (!Number.isSafeInteger(after) || after < 0) throw new Error("Invalid chat cursor");
+      return sse(
+        req,
+        server,
+        (send) =>
+          store.subscribe((msg) => {
+            if (msg.kind === "chat" && msg.message.conversationId === id && msg.message.id > after) send(msg);
+          }),
+        store.listChatMessages(id, after).map((message) => ({ kind: "chat", message })),
+        (msg) => (msg as import("../core/types.ts").ChatStreamMessage).message.id,
+      );
+    }),
     "/api/health": handle(() =>
-      json({ ok: true, uptimeMs: Date.now() - factory.startedAt, active: factory.scheduler.activeRunIds }),
+      json({ ok: true, uptimeMs: Date.now() - factory.startedAt, ...drainState() } satisfies HealthResponse),
     ),
     "/api/gc": {
       POST: handle(async (req) => {
@@ -217,7 +280,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/api/stream": handle((req, server) =>
       sse(req, server, (send) =>
         store.subscribe((msg) => {
-          if (msg.kind !== "event") send(msg);
+          if (msg.kind !== "event" && msg.kind !== "chat") send(msg);
         }),
       ),
     ),

@@ -23,7 +23,7 @@ function quoteRequest(prompt: string): string {
 }
 
 export function triagePrompt(input: { repoSlug: string; prompt: string; tree: string }): string {
-  return `Classify this software task for an automated coding pipeline. Look at the repository briefly only if you need to (a few file reads at most).
+  return `Classify this software task for an automated coding pipeline using the request and top-level entries provided below. You cannot read repository files in this stage; leave uncertain details for later stages.
 
 Repository: ${input.repoSlug}
 Top-level entries:

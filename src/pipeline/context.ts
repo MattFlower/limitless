@@ -50,6 +50,10 @@ export interface RunState {
   /** Delivery rebase target; gates must pass before this becomes run.baseSha. */
   pendingRebaseSha?: string;
   preRebaseGates?: GateComparison[];
+  /** Head before the delivery rebase; delivery falls back to it if the rebase regresses checks. */
+  preRebaseHead?: string;
+  /** Why delivery went ahead without rebasing onto the latest base (shown in the report). */
+  rebaseNote?: string;
   /** The single extra implementation round allowed after a conflicting delivery rebase. */
   conflictRound?: number;
   /** package.json scripts the gates depend on, as they were on the base branch. */
@@ -215,15 +219,22 @@ export class RunContext {
         );
       }
       tried.push(target.modelId);
-      const harness = harnesses[target.harness];
-      if (!harness) throw new Error(`No harness registered for ${target.harness}`);
+      const useHttp = ["triage", "chat", "summarize"].includes(opts.role) && !!target.openai;
+      const harnessName = useHttp ? "llm" : target.harness;
+      const harness = harnesses[harnessName];
+      if (!harness) throw new Error(`No harness registered for ${harnessName}`);
 
       const release = await tracker.acquire(target.provider, this.signal);
+      if (!(await tracker.preflight(target.provider))) {
+        release();
+        lastFailure = `${target.modelId}: no capacity after provider refresh`;
+        continue;
+      }
       const invocation = store.createInvocation({
         runId: this.run.id,
         stageId: opts.stage.id,
         role: opts.role,
-        harness: target.harness,
+        harness: harnessName,
         provider: target.provider,
         model: target.model,
         modelId: target.modelId,
@@ -246,6 +257,7 @@ export class RunContext {
           target,
           mode: opts.mode,
           ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
+          ...(opts.schema ? { schema: opts.schema } : {}),
           timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUTS[opts.role],
           idleTimeoutMs: opts.idleTimeoutMs ?? 10 * 60_000,
           maxToolCalls: opts.maxToolCalls ?? (opts.mode === "edit" ? 400 : 150),

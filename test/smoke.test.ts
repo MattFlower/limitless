@@ -202,9 +202,26 @@ test("deploy restores the previous checkout when injected smoke fails before res
     return { stdout: "", stderr: "", exitCode: 0 };
   };
   try {
-    await expect(deploy(7400, "feature", true, { releaseDir: dir, command })).rejects.toThrow(
-      "deploy gate failed; staying on previous",
-    );
+    await expect(
+      deploy(7400, "feature", true, {
+        releaseDir: dir,
+        command,
+        client: {
+          admin: async () => {
+            throw new Error("admin must not be called before smoke passes");
+          },
+          health: async () => {
+            throw new Error("health must not be called before smoke passes");
+          },
+          run: async () => {
+            throw new Error("run lookup must not be called before smoke passes");
+          },
+        },
+        restart: async () => {
+          throw new Error("restart must not be called before smoke passes");
+        },
+      }),
+    ).rejects.toThrow("deploy gate failed; staying on previous");
     expect(selected).toBe("previous-commit");
     expect(calls).toEqual([
       "git rev-parse HEAD",

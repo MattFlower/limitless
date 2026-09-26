@@ -210,6 +210,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
     return sha;
   }
 
+  async function assertPublished(bare: string): Promise<void> {
+    expect(
+      (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+        .stdout,
+    ).not.toBe("");
+  }
+
   async function assertUnpublished(bare: string): Promise<void> {
     expect(
       (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
@@ -358,8 +365,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
         profile: "standard",
       });
       const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
-      const blocked = kind.endsWith("regressed") || kind === "rewritten";
-      expect(status).toBe(blocked ? "failed" : "succeeded");
+      // Rebasing is best-effort: these fall back to delivering the gated head on its original base.
+      const fallback = kind.endsWith("regressed") || kind === "rewritten";
+      expect(status).toBe("succeeded");
       const finished = f.store.getRun(run.id);
       const stages = f.store.listStages(run.id).map((s) => s.name);
       const gates = stages.filter((s) => s === "gates").length;
@@ -377,18 +385,29 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(stages.slice(-6)).toEqual(["implement", "gates", "audit", "review", "verify", "deliver"]);
         expect(f.store.getArtifact(run.id, "diff.patch")).not.toContain("+new base");
       }
-      if (blocked) {
+      if (fallback) {
         expect(finished?.baseSha).toBe(originalBase);
+        const state = f.store.getRunState<RunState>(run.id);
+        expect(f.store.getArtifact(run.id, "report.md")).toContain(state?.rebaseNote ?? "missing note");
+        expect(
+          (
+            await sh(["git", "merge-base", "--is-ancestor", baseTip, finished?.headSha ?? ""], {
+              cwd: bare,
+              allowFail: true,
+            })
+          ).exitCode,
+        ).not.toBe(0);
         if (kind.endsWith("regressed")) {
+          expect(state?.rebaseNote).toContain("checks regressed");
           expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).toContain("regressed");
-          expect(f.store.getRunState<RunState>(run.id)?.lastGates?.some((g) => g.blocking)).toBe(true);
+          expect(state?.lastGates?.some((g) => g.blocking)).toBe(false);
           expect(
             f.store
               .listStages(run.id)
               .filter((s) => s.name === "gates")
               .at(-1)?.status,
           ).toBe("failed");
-        } else expect(finished?.error).toContain("base branch no longer descends from the recorded base");
+        } else expect(state?.rebaseNote).toContain("no longer descends from the recorded base");
       } else {
         expect(finished?.baseSha).toBe(baseTip);
         expect(
@@ -410,7 +429,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(state?.lastAudit?.some((finding) => finding.rule === "gate-script-changed")).toBe(false);
         expect(f.store.getArtifact(run.id, "diff.patch")).not.toContain("package.json");
       }
-      if (blocked) await assertUnpublished(bare);
+      await assertPublished(bare);
     });
   }
 
@@ -473,9 +492,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       registerGithub(f, bare);
       const run = await f.createRun({ repo: "test/repo", prompt: "Add a farewell", profile: "standard" });
       const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
-      expect(status).toBe(
-        outcome === "exhausted" ? "succeeded" : outcome === "base-moved" ? "failed" : "needs_human",
-      );
+      expect(status).toBe(outcome === "exhausted" || outcome === "base-moved" ? "succeeded" : "needs_human");
       expect(implementsCount).toBe(normalRounds + 1);
       expect(f.store.getRun(run.id)?.baseSha).toBe(baseTip);
       expect(f.store.getRunState<RunState>(run.id)?.conflictRound).toBe(normalRounds);
@@ -492,6 +509,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(
           (await sh(["git", "merge-base", "--is-ancestor", baseTip, head], { cwd: bare })).exitCode,
         ).toBe(0);
+      } else if (outcome === "base-moved") {
+        expect(f.store.getRunState<RunState>(run.id)?.rebaseNote).toContain("advanced again");
+        await assertPublished(bare);
       } else {
         await assertUnpublished(bare);
       }
@@ -571,14 +591,18 @@ describe("pipeline (fake agents, real git + gates)", () => {
         await assertUnpublished(bare);
         await advanceBase(bare, "again.txt", "newer base\n");
         writeFileSync(release, "finish gates");
-        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("failed");
-        expect(f.store.getRun(run.id)?.error).toContain("base changed before publication");
-        expect(f.store.getRun(run.id)?.baseSha).toBe(baseTip);
+        // The head that passed the post-rebase gates is published; the newer base is the PR's concern.
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        const published = f.store.getRun(run.id);
+        expect(published?.baseSha).toBe(baseTip);
         expect(f.store.listStages(run.id).filter((s) => s.name === "gates")).toHaveLength(2);
         expect(implementsCount).toBe(1);
         expect(reviews).toBe(1);
         expect(verifies).toBe(1);
-        await assertUnpublished(bare);
+        expect(
+          (await sh(["git", "show", `${published?.headSha}:greeting.txt`], { cwd: bare })).stdout,
+        ).not.toContain("dirty");
+        await assertPublished(bare);
         return;
       }
       await f.stop();
@@ -609,17 +633,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
       }
       f.store.close();
       restarting = true;
-      if (checkpoint === "base-moved") await advanceBase(bare, "again.txt", "newer base\n");
+      if (checkpoint === "base-moved") baseTip = await advanceBase(bare, "again.txt", "newer base\n");
       writeFileSync(release, "resume");
       const resumed = start(handler);
-      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe(
-        checkpoint === "base-moved" ? "failed" : "succeeded",
-      );
-      if (checkpoint === "base-moved") {
-        expect(resumed.store.getRun(run.id)?.error).toContain("base changed during delivery rebase");
-        await assertUnpublished(bare);
-        return;
-      }
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       const finished = resumed.store.getRun(run.id);
       expect(finished?.baseSha).toBe(baseTip);
       expect(resumed.store.getRunState<RunState>(run.id)?.pendingRebaseSha).toBeUndefined();
@@ -1221,4 +1238,74 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(implement.length).toBe(5);
     expect(f.store.getRun(run.id)?.error).toContain("Still failing");
   });
+});
+
+test("drain blocks queued starts across ticks and completion without pausing active stages", async () => {
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let entered = () => {};
+  const atTriage = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let firstSignal: AbortSignal | undefined;
+  let calls = 0;
+  const f = start(async (s) => {
+    if (roleOf(s) === "triage") {
+      calls++;
+      if (calls === 1) {
+        firstSignal = s.signal;
+        entered();
+        await held;
+      }
+      return { structured: triage({ suggested_profile: "quick" }) };
+    }
+    if (roleOf(s) === "review") return { structured: approve };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  try {
+    const first = await f.createRun({ repo: repoDir, prompt: "change" });
+    await atTriage;
+    expect(f.scheduler.draining).toBe(false);
+    f.scheduler.drain();
+    f.scheduler.drain();
+    const queued = await f.createRun({ repo: repoDir, prompt: "second" });
+    const retry = await f.retryRun(first.id);
+    const extra = await Promise.all(
+      Array.from({ length: 3 }, () => f.createRun({ repo: repoDir, prompt: "more" })),
+    );
+    await Promise.resolve(); // Queue notifications also pass through tick.
+    f.scheduler.tick();
+    expect(f.scheduler.activeRunIds).toEqual([first.id]);
+    expect(firstSignal?.aborted).toBe(false);
+    expect(f.store.getRun(queued.id)?.status).toBe("queued");
+    expect(f.store.getRun(retry.id)?.status).toBe("queued");
+    release();
+    expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    await Bun.sleep(10);
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    expect(calls).toBe(1);
+    expect(f.store.getRunDetail(first.id)?.stages.map((s) => s.name)).toContain("review");
+    f.scheduler.tick();
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    f.scheduler.resume();
+    f.scheduler.resume();
+    expect(f.scheduler.activeRunIds.length).toBe(f.cfg.maxConcurrentRuns);
+    expect(f.scheduler.activeRunIds.length).toBeLessThanOrEqual(f.cfg.maxConcurrentRuns);
+    expect(await waitFor(f, queued.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(await waitFor(f, retry.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    for (const run of extra) {
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    }
+    await f.stop();
+    f.scheduler.drain();
+    const stopped = await f.createRun({ repo: repoDir, prompt: "after stop" });
+    f.scheduler.resume();
+    f.scheduler.tick();
+    expect(f.scheduler.activeRunIds).toEqual([]);
+    expect(f.store.getRun(stopped.id)?.status).toBe("queued");
+  } finally {
+    release();
+  }
 });

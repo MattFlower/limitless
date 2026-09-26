@@ -208,6 +208,12 @@ export async function commitAll(cwd: string, message: string): Promise<string | 
   return headSha(cwd);
 }
 
+/** Move the worktree's branch back to a known commit, discarding everything after it. */
+export async function resetTo(cwd: string, sha: string): Promise<void> {
+  await sh(["git", "reset", "--hard", "-q", sha], { cwd });
+  await sh(["git", "clean", "-fdq"], { cwd });
+}
+
 /** Throw away any uncommitted changes (used after read-only stages). */
 export async function discardChanges(cwd: string): Promise<boolean> {
   const status = await sh(["git", "status", "--porcelain"], { cwd });

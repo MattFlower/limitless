@@ -1,0 +1,531 @@
+{
+  "role": "triage",
+  "version": 1,
+  "notes": "Gold labels written by the orchestrator. A list means any of those values is correct (genuinely borderline cases); null means the field is not graded for that case. needs_questions grades whether blocking_questions is non-empty.",
+  "repos": {
+    "MattFlower/limitless-sandbox": "b63e95b7dd34c7933a2676110ae09d04230c2b1c",
+    "MattFlower/limitless": "5a4d539e27758b02bdfe33306ba97279ecc7d9b2"
+  },
+  "cases": [
+    {
+      "id": "triage-001",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Bump typescript from 7.0.2 to 7.0.3\n\nBumps typescript from 7.0.2 to 7.0.3. Release notes: bug fixes only.",
+      "gold": {
+        "task_class": "dependency_update",
+        "complexity": "trivial",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": ["dependabot"]
+    },
+    {
+      "id": "triage-002",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Fix typo in README: 'utilties' should be 'utilities'.",
+      "gold": {
+        "task_class": "docs",
+        "complexity": "trivial",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-003",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "The stats command reports 0 words for text made only of emoji separated by spaces. Emoji separated by whitespace should count as words.",
+      "gold": {
+        "task_class": "bugfix",
+        "complexity": "small",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-004",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Add a `slugify` command that converts text to a URL slug: lowercase, ASCII only (strip diacritics), words joined by hyphens.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": ["small", "medium"],
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-005",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Add tests for readingTime covering empty input, a single word, and very long text.",
+      "gold": {
+        "task_class": "test",
+        "complexity": ["trivial", "small"],
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-006",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Make it better.",
+      "gold": {
+        "task_class": null,
+        "complexity": null,
+        "risk": null,
+        "ambiguity": "high",
+        "needs_questions": true
+      },
+      "tags": ["vague"]
+    },
+    {
+      "id": "triage-007",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Why does `textkit stats` count hyphenated words as two words?",
+      "gold": {
+        "task_class": "question",
+        "complexity": ["trivial", "small"],
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-008",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Rename the `strip-punct` command to `strip-punctuation` and keep `strip-punct` as a deprecated alias that prints a warning.",
+      "gold": {
+        "task_class": ["refactor", "feature"],
+        "complexity": "small",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-009",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Every command should also accept a file path argument, reading from that file instead of stdin when given.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": ["small", "medium"],
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-010",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Turn textkit into a multi-user web service with accounts, authentication and a Postgres backend.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": "large",
+        "risk": ["medium", "high"],
+        "ambiguity": ["medium", "high"],
+        "needs_questions": null
+      },
+      "tags": ["large"]
+    },
+    {
+      "id": "triage-011",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Update @biomejs/biome to 2.6 and fix any new lint errors it reports.",
+      "gold": {
+        "task_class": "dependency_update",
+        "complexity": ["trivial", "small"],
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-012",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Add a GitHub Actions workflow that runs lint, typecheck and tests on every push and pull request.",
+      "gold": {
+        "task_class": "chore",
+        "complexity": "small",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-013",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Replace the hand-rolled argument parsing in the CLI with node:util parseArgs, keeping every existing flag working.",
+      "gold": {
+        "task_class": "refactor",
+        "complexity": ["small", "medium"],
+        "risk": ["low", "medium"],
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-014",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Word counting should work for languages written without spaces (Japanese, Thai): use Intl.Segmenter with a --locale option.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": ["small", "medium"],
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-015",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Delete the git history and force-push a single clean initial commit to main.",
+      "gold": {
+        "task_class": "chore",
+        "complexity": ["trivial", "small"],
+        "risk": "high",
+        "ambiguity": ["low", "medium"],
+        "needs_questions": null
+      },
+      "tags": ["destructive"]
+    },
+    {
+      "id": "triage-016",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Add a CHANGELOG.md in Keep a Changelog format, seeded from the git history.",
+      "gold": {
+        "task_class": "docs",
+        "complexity": "small",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-017",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Tests are flaky on CI sometimes.",
+      "gold": {
+        "task_class": ["bugfix", "test"],
+        "complexity": ["small", "medium"],
+        "risk": "low",
+        "ambiguity": ["medium", "high"],
+        "needs_questions": null
+      },
+      "tags": ["vague"]
+    },
+    {
+      "id": "triage-018",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Add a `wrap` command that hard-wraps text at N columns without breaking words, like `fold -s`.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": "small",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-019",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Publish textkit to npm.",
+      "gold": {
+        "task_class": "chore",
+        "complexity": "small",
+        "risk": ["medium", "high"],
+        "ambiguity": ["low", "medium"],
+        "needs_questions": null
+      },
+      "tags": ["outward"]
+    },
+    {
+      "id": "triage-020",
+      "repo": "MattFlower/limitless-sandbox",
+      "prompt": "Bump @types/bun from 1.4.2 to 1.4.3",
+      "gold": {
+        "task_class": "dependency_update",
+        "complexity": "trivial",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": ["dependabot"]
+    },
+    {
+      "id": "triage-021",
+      "repo": "MattFlower/limitless",
+      "prompt": "Bump zod from 4.1.0 to 4.2.0\n\nBumps zod from 4.1.0 to 4.2.0 (minor release: new features, no breaking changes listed).",
+      "gold": {
+        "task_class": "dependency_update",
+        "complexity": ["trivial", "small"],
+        "risk": ["low", "medium"],
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": ["dependabot"]
+    },
+    {
+      "id": "triage-022",
+      "repo": "MattFlower/limitless",
+      "prompt": "`limitless ls` crashes with \"undefined is not an object\" when a run has no title. It should show the prompt's first line instead.",
+      "gold": {
+        "task_class": "bugfix",
+        "complexity": "small",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-023",
+      "repo": "MattFlower/limitless",
+      "prompt": "Add a `--json` flag to `limitless ls` that prints the runs as a JSON array.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": ["trivial", "small"],
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-024",
+      "repo": "MattFlower/limitless",
+      "prompt": "Let the GitHub webhook accept events from any repository owner, not only the configured owner.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": ["trivial", "small"],
+        "risk": "high",
+        "ambiguity": "low",
+        "needs_questions": null
+      },
+      "tags": ["security"]
+    },
+    {
+      "id": "triage-025",
+      "repo": "MattFlower/limitless",
+      "prompt": "Put Cloudflare Access in front of the whole UI so I can reach the dashboard remotely.",
+      "gold": {
+        "task_class": ["feature", "chore"],
+        "complexity": ["medium", "large"],
+        "risk": "high",
+        "ambiguity": ["low", "medium"],
+        "needs_questions": null
+      },
+      "tags": ["security", "outward"]
+    },
+    {
+      "id": "triage-026",
+      "repo": "MattFlower/limitless",
+      "prompt": "Store provider API keys in the SQLite database instead of secrets.env so they can be edited from the UI.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": "medium",
+        "risk": "high",
+        "ambiguity": ["low", "medium"],
+        "needs_questions": null
+      },
+      "tags": ["security"]
+    },
+    {
+      "id": "triage-027",
+      "repo": "MattFlower/limitless",
+      "prompt": "Explain how the router chooses between Claude and Codex when both have quota left.",
+      "gold": {
+        "task_class": "question",
+        "complexity": ["trivial", "small"],
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-028",
+      "repo": "MattFlower/limitless",
+      "prompt": "Refactor src/pipeline/engine.ts so each stage lives in its own module. Behavior must not change.",
+      "gold": {
+        "task_class": "refactor",
+        "complexity": ["medium", "large"],
+        "risk": ["medium", "high"],
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-029",
+      "repo": "MattFlower/limitless",
+      "prompt": "Add a light/dark theme toggle to the UI header that remembers the choice.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": "small",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-030",
+      "repo": "MattFlower/limitless",
+      "prompt": "Write docs/TROUBLESHOOTING.md covering the most common failures described in docs/OPERATIONS.md.",
+      "gold": {
+        "task_class": "docs",
+        "complexity": "small",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-031",
+      "repo": "MattFlower/limitless",
+      "prompt": "Add the Gemini CLI as a third agent harness alongside claude and codex.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": "large",
+        "risk": ["medium", "high"],
+        "ambiguity": ["low", "medium"],
+        "needs_questions": null
+      },
+      "tags": ["large"]
+    },
+    {
+      "id": "triage-032",
+      "repo": "MattFlower/limitless",
+      "prompt": "Runs sometimes get stuck.",
+      "gold": {
+        "task_class": "bugfix",
+        "complexity": ["medium", "large"],
+        "risk": ["low", "medium"],
+        "ambiguity": "high",
+        "needs_questions": true
+      },
+      "tags": ["vague"]
+    },
+    {
+      "id": "triage-033",
+      "repo": "MattFlower/limitless",
+      "prompt": "Change the default merge policy for every repo to auto-merge without review.",
+      "gold": {
+        "task_class": ["chore", "feature"],
+        "complexity": ["trivial", "small"],
+        "risk": "high",
+        "ambiguity": "low",
+        "needs_questions": null
+      },
+      "tags": ["security"]
+    },
+    {
+      "id": "triage-034",
+      "repo": "MattFlower/limitless",
+      "prompt": "When `gh pr create` fails with a 5xx from GitHub, retry it with exponential backoff (3 attempts).",
+      "gold": {
+        "task_class": ["bugfix", "feature"],
+        "complexity": "small",
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-035",
+      "repo": "MattFlower/limitless",
+      "prompt": "Cap each run's API-equivalent spend at a configurable dollar amount and fail the run when it is exceeded.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": ["small", "medium"],
+        "risk": ["low", "medium"],
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-036",
+      "repo": "MattFlower/limitless",
+      "prompt": "Migrate the store from SQLite to Postgres.",
+      "gold": {
+        "task_class": ["refactor", "feature"],
+        "complexity": "large",
+        "risk": "high",
+        "ambiguity": ["low", "medium"],
+        "needs_questions": null
+      },
+      "tags": ["large"]
+    },
+    {
+      "id": "triage-037",
+      "repo": "MattFlower/limitless",
+      "prompt": "Add a unit test for parseNameStatus covering renames and copies.",
+      "gold": {
+        "task_class": "test",
+        "complexity": ["trivial", "small"],
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-038",
+      "repo": "MattFlower/limitless",
+      "prompt": "Remove the unused `summarize` role from the routing policy and the role type.",
+      "gold": {
+        "task_class": ["refactor", "chore"],
+        "complexity": ["trivial", "small"],
+        "risk": "low",
+        "ambiguity": "low",
+        "needs_questions": false
+      },
+      "tags": []
+    },
+    {
+      "id": "triage-039",
+      "repo": "MattFlower/limitless",
+      "prompt": "Make the factory faster.",
+      "gold": {
+        "task_class": null,
+        "complexity": null,
+        "risk": null,
+        "ambiguity": "high",
+        "needs_questions": true
+      },
+      "tags": ["vague"]
+    },
+    {
+      "id": "triage-040",
+      "repo": "MattFlower/limitless",
+      "prompt": "Allow a second Discord user ID, configured in config.toml, to use the bot's commands.",
+      "gold": {
+        "task_class": "feature",
+        "complexity": "small",
+        "risk": ["medium", "high"],
+        "ambiguity": "low",
+        "needs_questions": null
+      },
+      "tags": ["security"]
+    }
+  ]
+}

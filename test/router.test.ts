@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/db/store.ts";
-import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
+import { type AgentResult, emptyUsage } from "../src/harness/types.ts";
+import { MODELS, type ModelDef, type Policy, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 
@@ -78,6 +79,28 @@ function setup(secrets: Record<string, string> = {}) {
 }
 
 describe("Router", () => {
+  test("OpenAI URLs are distinct from agentic backends and protected providers need keys", () => {
+    const targets = new Router(
+      new ProviderTracker(PROVIDERS, store, reserves, { OPENROUTER_API_KEY: "or", TWILIGHT_API_KEY: "tw" }),
+      policy,
+      MODELS,
+    );
+    for (const [id, url] of [
+      ["mtplx/qwen-27b", "http://127.0.0.1:8000/v1"],
+      ["twilight/qwen-27b", "http://twilight:8080/v1"],
+      ["openrouter/deepseek-v4-pro", "https://openrouter.ai/api/v1"],
+    ] as const) {
+      const model = targets.model(id);
+      if (!model) throw new Error(`missing ${id}`);
+      const target = targets.toTarget(model);
+      expect(target.openai?.baseUrl).toBe(url);
+      expect(target.backend?.baseUrl).not.toBe(url);
+      expect(target.harness).toBe("claude");
+    }
+    const withoutKeys = new ProviderTracker(PROVIDERS, store, reserves, {});
+    expect(withoutKeys.isAvailable("openrouter")).toBe(false);
+    expect(withoutKeys.isAvailable("twilight")).toBe(false);
+  });
   test("orders interchangeable models by quota headroom", () => {
     const { tracker, router } = setup();
     tracker.observeWindows("claude", { five_hour: { utilization: 0.7, resetsAt: Date.now() + 3_600_000 } });
@@ -174,5 +197,178 @@ describe("provider preference", () => {
     expect(plain.route("implement", "small").candidates[0]?.modelId).toBe("claude/sonnet");
     const preferring = new Router(tracker, policy, models, ["codex"]);
     expect(preferring.route("implement", "small").candidates[0]?.modelId).toBe("codex/sol");
+  });
+});
+
+describe("OpenRouter reconciliation", () => {
+  let now = 1_000_000;
+  let calls = 0;
+  let payload: unknown;
+  let fail = false;
+  let tick: (() => void) | null = null;
+  let intervalMs = 0;
+  const reading = (monthly: number, remaining = 20, label = "private-label") => ({
+    data: {
+      usage: monthly,
+      usage_daily: monthly,
+      usage_weekly: monthly,
+      usage_monthly: monthly,
+      limit: 20,
+      limit_remaining: remaining,
+      limit_reset: "daily",
+      label,
+    },
+  });
+  const result = (costUsd: number): AgentResult => ({
+    status: "ok",
+    finalText: "",
+    structured: null,
+    sessionId: null,
+    usage: emptyUsage(),
+    numTurns: 0,
+    costUsd,
+    costEquivUsd: 0,
+    error: null,
+    quota: null,
+  });
+  const make = (key = "sentinel-key") => {
+    const fetchKey = (async (_url: string | URL | Request, init?: RequestInit) => {
+      calls++;
+      expect(init?.headers).toEqual({ authorization: `Bearer ${key}` });
+      if (fail) throw new Error("offline sentinel-key");
+      return Response.json(payload);
+    }) as typeof fetch;
+    const timer = {
+      set: ((fn: () => void, ms: number) => {
+        tick = fn;
+        intervalMs = ms;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval,
+      clear: ((_id: ReturnType<typeof setInterval>) => {
+        tick = null;
+      }) as typeof clearInterval,
+    };
+    return new ProviderTracker(
+      providers,
+      store,
+      reserves,
+      key ? { OPENROUTER_API_KEY: key } : {},
+      { openrouter: 50 },
+      () => now,
+      fetchKey,
+      timer,
+    );
+  };
+  beforeEach(() => {
+    now = 1_000_000;
+    calls = 0;
+    payload = reading(0);
+    fail = false;
+    tick = null;
+    intervalMs = 0;
+  });
+
+  test("uses the larger reported or local spend and retains exhausted readings", async () => {
+    const tracker = make();
+    expect(await tracker.preflight("openrouter")).toBe(true);
+    store.recordChatCall("chat", "openrouter", "openrouter/ds", now, result(60));
+    expect(tracker.headroom("openrouter")).toBeLessThanOrEqual(0);
+    payload = reading(51);
+    now += 120_001;
+    await tracker.refreshOpenRouter();
+    expect(tracker.headroom("openrouter")).toBeLessThanOrEqual(0);
+    expect(tracker.status("openrouter")?.spendUsd).toBe(60);
+    expect(tracker.status("openrouter")?.reportedUsageUsd).toBe(51);
+    expect(JSON.stringify(tracker.status("openrouter"))).not.toContain("sentinel-key");
+    expect(JSON.stringify(tracker.status("openrouter"))).not.toContain("private-label");
+  });
+
+  test("failed and malformed readings retain the last successful value and exhaustion", async () => {
+    const tracker = make();
+    fail = true;
+    expect(await tracker.preflight("openrouter")).toBe(false);
+    payload = reading(10, 0);
+    fail = false;
+    expect(await tracker.preflight("openrouter")).toBe(false);
+    const at = tracker.status("openrouter")?.reportedAt;
+    now += 120_001;
+    fail = true;
+    expect(await tracker.preflight("openrouter")).toBe(false);
+    fail = false;
+    payload = { data: { ...reading(1).data, usage_monthly: "1" } };
+    expect(await tracker.refreshOpenRouter()).toBe(false);
+    expect(tracker.status("openrouter")?.reportedAt).toBe(at);
+    expect(tracker.status("openrouter")?.limitRemaining).toBe(0);
+    payload = reading(11, 10);
+    expect(await tracker.preflight("openrouter")).toBe(true);
+  });
+
+  test("polls enabled keys at startup and ten minute ticks; coalesces preflight", async () => {
+    const disabled = make("");
+    disabled.start();
+    expect(calls).toBe(0);
+    const tracker = make();
+    tracker.start();
+    await Bun.sleep(0);
+    expect(calls).toBe(1);
+    expect(intervalMs).toBe(10 * 60_000);
+    now += 119_000;
+    expect(await tracker.preflight("openrouter")).toBe(true);
+    expect(calls).toBe(1);
+    now += 2_000;
+    await Promise.all([tracker.preflight("openrouter"), tracker.preflight("openrouter")]);
+    expect(calls).toBe(2);
+    now += 10 * 60_000;
+    tick?.();
+    await Bun.sleep(0);
+    expect(calls).toBe(3);
+    tracker.stop();
+    expect(tick).toBeNull();
+  });
+
+  test("persists reading across restart and failed refresh", async () => {
+    let tracker = make();
+    payload = reading(55, 0);
+    await tracker.refreshOpenRouter();
+    store.close();
+    store = new Store(join(dir, "db.sqlite"));
+    tracker = make();
+    fail = true;
+    now += 120_001;
+    expect(await tracker.preflight("openrouter")).toBe(false);
+    expect(tracker.status("openrouter")?.reportedUsageUsd).toBe(55);
+    expect(tracker.headroom("openrouter")).toBeLessThanOrEqual(0);
+  });
+
+  test("warns only for material drift and ignores monthly reset", async () => {
+    const tracker = make();
+    await tracker.refreshOpenRouter();
+    now += 1_000;
+    payload = reading(0.04);
+    await tracker.refreshOpenRouter();
+    expect(store.listEvents("provider:openrouter")).toHaveLength(0);
+    now += 1_000;
+    payload = reading(0);
+    await tracker.refreshOpenRouter();
+    now += 1_000;
+    store.recordChatCall("chat", "openrouter", "openrouter/ds", now, result(1));
+    now += 1_000;
+    payload = reading(1.05);
+    await tracker.refreshOpenRouter();
+    expect(store.listEvents("provider:openrouter")).toHaveLength(0);
+    now += 1_000;
+    store.recordChatCall("chat", "openrouter", "openrouter/ds", now, result(1));
+    now += 1_000;
+    payload = reading(2.35);
+    await tracker.refreshOpenRouter();
+    const events = store.listEvents("provider:openrouter");
+    expect(events).toHaveLength(1);
+    expect(events[0]?.level).toBe("warn");
+    expect(events[0]?.data).toMatchObject({ localUsd: 1, reportedUsd: 1.3 });
+    expect(JSON.stringify(events)).not.toContain("private-label");
+    now += 1_000;
+    payload = reading(0.01);
+    await tracker.refreshOpenRouter();
+    expect(store.listEvents("provider:openrouter")).toHaveLength(1);
   });
 });
