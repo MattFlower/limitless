@@ -1,6 +1,7 @@
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
 import { mountDiscord } from "./discord.ts";
+import { mountMcp } from "./mcp-http.ts";
 
 export interface Integrations {
   routes: Record<string, (req: Request, server: Server<undefined>) => Response | Promise<Response>>;
@@ -11,8 +12,15 @@ export interface Integrations {
 
 /** Wire trigger integrations (GitHub webhooks, Discord, MCP) into the daemon. */
 export async function mountIntegrations(factory: Factory): Promise<Integrations> {
+  const mcp = mountMcp(factory);
   const discord = mountDiscord(factory);
-  return { routes: {}, notes: [...(await toolVersions()), discord.note], stop: discord.stop };
+  return {
+    routes: { "/mcp": (req, server) => mcp.handle(req, server.requestIP(req)?.address ?? null) },
+    notes: [...(await toolVersions()), "MCP: /mcp (loopback only)", discord.note],
+    stop: async () => {
+      await Promise.all([mcp.stop(), discord.stop()]);
+    },
+  };
 }
 
 /** Which agent CLIs the daemon will actually run (PATH mix-ups have bitten us before). */
