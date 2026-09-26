@@ -53,6 +53,9 @@ through their real harnesses. Both CLIs must be installed, logged in, and have u
 quota. The runner uses the cheapest catalog model per provider, spends a small amount of quota,
 and reports each check with a duration. It creates temporary git repositories and removes them
 after every check. Smoke is opt-in and is not part of `bun run check` or CI.
+The no-tools checks fail on any observed tool call or disclosure of a random local file token.
+Codex no-tools calls ignore user configuration and disable MCP, plugins, apps, code mode, shell,
+sub-agents, image viewing, and web search; they retain session rollouts for quota inspection.
 If the ChatGPT account rejects the cheapest Codex model, the runner tries the next catalog model
 in price order and reports which model it used. Other CLI errors fail the check.
 

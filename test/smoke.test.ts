@@ -1,10 +1,18 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkCodexModels, exitCode, formatReport, quotaCheck, runChecks } from "../scripts/smoke.ts";
+import {
+  checkCodexModels,
+  exitCode,
+  formatReport,
+  liveCheck,
+  quotaCheck,
+  runChecks,
+} from "../scripts/smoke.ts";
 import { deploy } from "../src/cli/service.ts";
-import type { AgentResult } from "../src/harness/types.ts";
+import { CodexStreamParser } from "../src/harness/codex.ts";
+import type { AgentResult, ModelTarget } from "../src/harness/types.ts";
 import { MODELS } from "../src/router/catalog.ts";
 import type { sh } from "../src/util/proc.ts";
 
@@ -89,6 +97,69 @@ test("subscription quota check rejects absent windows and accepts observed windo
       "codex",
     ),
   ).toEqual({ status: "pass" });
+});
+
+test("noTools smoke rejects MCP calls and token leaks and cleans up after every outcome", async () => {
+  const target: ModelTarget = {
+    modelId: "codex/luna",
+    provider: "codex",
+    harness: "codex",
+    model: "gpt-6-luna",
+    vendor: "openai",
+    tier: 3,
+    billing: "subscription",
+  };
+  for (const scenario of ["mcp", "raw", "text", "throw", "pass"] as const) {
+    let cwd = "";
+    const rows = await runChecks([
+      {
+        name: scenario,
+        run: () =>
+          liveCheck(
+            async (spec) => {
+              cwd = spec.cwd;
+              expect(existsSync(join(cwd, ".git"))).toBe(true);
+              expect(spec.noTools).toBe(true);
+              expect(spec.mode).toBe("readonly");
+              expect(spec.timeoutMs).toBeLessThanOrEqual(60_000);
+              const token = readFileSync(join(cwd, "secret.txt"), "utf8");
+              expect(spec.prompt).not.toContain(token);
+              writeFileSync(spec.logPath, scenario === "raw" ? token : "");
+              if (scenario === "throw") throw new Error("fake invocation failed");
+              if (scenario === "mcp") {
+                const parser = new CodexStreamParser(spec.onEvent);
+                parser.feed(
+                  JSON.stringify({
+                    type: "item.started",
+                    item: {
+                      id: "read",
+                      type: "mcp_tool_call",
+                      server: "node_repl",
+                      tool: "js",
+                      arguments: { code: "fs.readFileSync('secret.txt', 'utf8')" },
+                    },
+                  }),
+                );
+              }
+              return { ...result, finalText: scenario === "text" ? token : "Cannot read files." };
+            },
+            target,
+            "noTools",
+          ),
+      },
+    ]);
+    expect(cwd).not.toBe("");
+    expect(existsSync(cwd)).toBe(false);
+    expect(rows[0]?.status).toBe(scenario === "pass" ? "pass" : "fail");
+    const reasons = {
+      mcp: "tool call observed",
+      raw: "local file token appeared in raw stream",
+      text: "local file token appeared in output",
+      throw: "Error: fake invocation failed",
+      pass: undefined,
+    };
+    expect(rows[0]?.reason).toBe(reasons[scenario]);
+  }
 });
 
 test("Codex smoke retries only an unsupported ChatGPT model and reports the selected model", async () => {

@@ -153,7 +153,7 @@ function status(result: AgentResult): CheckResult {
     : { status: "fail", reason: result.error ?? result.status };
 }
 
-async function liveCheck(
+export async function liveCheck(
   harness: Harness,
   target: ModelTarget,
   kind: "structured" | "noTools" | "edit" | "quota",

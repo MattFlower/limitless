@@ -101,6 +101,19 @@ describe("CodexStreamParser", () => {
     expect(args).toContain("--ephemeral");
     expect(args).toContain("read-only");
     expect(buildCodexArgs({ ...spec, noTools: false })).not.toContain("shell_tool");
+
+    // Smoke calls are not private: they must still isolate tools without losing quota rollouts.
+    const smokeArgs = buildCodexArgs({ ...spec, privateSession: false });
+    expect(smokeArgs).toContain("--ignore-user-config");
+    expect(smokeArgs).not.toContain("--ephemeral");
+    expect(smokeArgs).toContain("orchestrator.mcp.enabled=false");
+    for (const feature of ["apps", "plugins", "code_mode", "view_image"]) {
+      expect(smokeArgs.join(" ")).toContain(`--disable ${feature}`);
+    }
+    const editArgs = buildCodexArgs({ ...spec, privateSession: false, noTools: false, mode: "edit" });
+    expect(editArgs).not.toContain("--ignore-user-config");
+    expect(editArgs).not.toContain("orchestrator.mcp.enabled=false");
+    expect(editArgs).toContain("workspace-write");
   });
 
   test("parses a real codex exec --json run", () => {
