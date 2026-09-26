@@ -98,6 +98,7 @@ export class Router {
         complexity,
         constraints: { ...c, exclude: c.exclude ? [...c.exclude] : undefined },
       });
+    this.tracker.refreshAlerts();
     return decision;
   }
 

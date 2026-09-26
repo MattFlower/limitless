@@ -129,6 +129,8 @@ test("Discord sends once across flapping and restart; failure leaves alert visib
   await mounted.stop();
   expect(port.posts).toHaveLength(1);
   expect(port.posts[0]?.channel).toBe("alerts");
+  store.close();
+  store = new Store(factory.cfg.paths.db);
   factory = new Factory(factory.cfg, { store, providers, models, policy, clock: () => now });
   mounted = mountDiscord(factory, port);
   factory.tracker.observeWindows("claude", { five_hour: { utilization: 0.8, resetsAt: reset } });
@@ -265,4 +267,137 @@ test("fallback description respects the selected route constraints", () => {
   const routing = alerts().find((alert) => alert.provider === "A")?.routing;
   expect(routing).toContain("B");
   expect(routing).not.toContain("D");
+});
+
+for (const discord of ["enabled", "disabled", "failing"] as const) {
+  test(`existing alerts refresh fallback eligibility with Discord ${discord}`, async () => {
+    const defs: ProviderDef[] = ["A", "B", "C", "D"].map((id) => ({
+      id,
+      label: id,
+      harness: "fake",
+      billing: "subscription",
+      maxConcurrent: 1,
+    }));
+    const choices: ModelDef[] = defs.map(({ id }) => ({
+      id: `${id}/model`,
+      provider: id,
+      model: "test",
+      vendor: "anthropic",
+      tier: 4,
+      price: { input: 0, output: 0 },
+    }));
+    factory.cfg.reserves.windows = { A: { daily: 1 } };
+    factory = new Factory(factory.cfg, {
+      store,
+      providers: defs,
+      models: choices,
+      policy: { implement: { default: ["A/model|B/model|C/model"] } } as Policy,
+      clock: () => now,
+    });
+    const port = new FakeDiscord();
+    port.fail = discord === "failing";
+    if (discord === "disabled") factory.cfg.secrets.DISCORD_BOT_TOKEN = "";
+    const mounted = mountDiscord(factory, port);
+    const changes: StreamMessage[] = [];
+    const unsubscribe = store.subscribe((msg) => changes.push(msg));
+    const route = createHttpRoutes(factory)["/api/alerts"] as (
+      req: Request,
+      server: never,
+    ) => Promise<Response>;
+    const read = async () => {
+      const response = await route(new Request("http://localhost/api/alerts"), undefined as never);
+      return ((await response.json()) as QuotaAlert[]).find((alert) => alert.provider === "A");
+    };
+    try {
+      for (let i = 0; i < 3; i++) factory.tracker.record("C", "unavailable");
+      const reset = now + 100_000;
+      factory.tracker.observeWindows("A", { daily: { utilization: 0.75, resetsAt: reset } });
+      expect((await read())?.routing).toBe(
+        "A remains eligible until its reserve is reached. Eligible fallback providers: B.",
+      );
+      factory.tracker.observeWindows("A", { daily: { utilization: 1, resetsAt: reset } });
+      expect((await read())?.routing).toBe("Router skips A. Eligible fallback providers: B.");
+      const createdAt = (await read())?.createdAt;
+      // No new A telemetry: B becoming unavailable must update A's banner immediately.
+      factory.tracker.record("B", "quota", { exhaustedUntil: now + 30_000 });
+      expect(alerts().find((alert) => alert.provider === "A")?.routing).toBe(
+        "Router skips A. No eligible fallback providers are available.",
+      );
+      expect(changes.at(-1)).toMatchObject({
+        kind: "alert",
+        created: false,
+        alert: { provider: "A", routing: "Router skips A. No eligible fallback providers are available." },
+      });
+      // Repeated telemetry used to restore the permanently frozen fallback list.
+      factory.tracker.observeWindows("A", { daily: { utilization: 1, resetsAt: reset } });
+      expect(await read()).toMatchObject({
+        severity: "exhausted",
+        createdAt,
+        routing: "Router skips A. No eligible fallback providers are available.",
+      });
+      now += 30_001;
+      factory.scheduler.tick();
+      expect(alerts().find((alert) => alert.provider === "A")?.routing).toBe(
+        "Router skips A. Eligible fallback providers: B.",
+      );
+      factory.tracker.blockModel("B/model", "not on plan", 10_000);
+      expect((await read())?.routing).toContain("No eligible fallback");
+      now += 10_001;
+      expect((await read())?.routing).toBe("Router skips A. Eligible fallback providers: B.");
+      factory.tracker.setHealthy("B", false);
+      expect((await read())?.routing).toContain("No eligible fallback");
+      factory.tracker.setHealthy("B", true);
+      expect((await read())?.routing).toBe("Router skips A. Eligible fallback providers: B.");
+      factory.tracker.observeWindows("A", { daily: { utilization: 0.76, resetsAt: reset } });
+      expect(await read()).toMatchObject({
+        severity: "exhausted",
+        routing: "A remains eligible until its reserve is reached. Eligible fallback providers: B.",
+      });
+      expect(
+        changes.filter((msg) => msg.kind === "alert" && msg.provider === "A" && msg.created),
+      ).toHaveLength(1);
+    } finally {
+      unsubscribe();
+      await mounted.stop();
+    }
+    expect(port.posts.filter((post) => post.content.includes(": A ·"))).toHaveLength(
+      discord === "enabled" ? 1 : 0,
+    );
+  });
+}
+
+test("the SSE endpoint streams exhaustion, fallback changes and timed clearing", async () => {
+  const routes = createHttpRoutes(factory);
+  const stream = routes["/api/stream"] as (req: Request, server: never) => Promise<Response>;
+  const response = await stream(new Request("http://localhost/api/stream"), { timeout: () => {} } as never);
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("missing SSE body");
+  const nextAlert = async () => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error("SSE ended before alert");
+      const text = new TextDecoder().decode(value);
+      if (!text.startsWith("data: ")) continue;
+      const msg = JSON.parse(text.slice(6)) as StreamMessage;
+      if (msg.kind === "alert" && msg.provider === "claude") return msg;
+    }
+  };
+  try {
+    const reset = now + 100_000;
+    factory.tracker.observeWindows("claude", { five_hour: { utilization: 0.6, resetsAt: reset } });
+    expect(await nextAlert()).toMatchObject({ created: true, alert: { severity: "warning" } });
+    factory.tracker.record("claude", "quota", { exhaustedUntil: reset });
+    expect(await nextAlert()).toMatchObject({ created: false, alert: { severity: "exhausted" } });
+    factory.tracker.record("codex", "quota", { exhaustedUntil: reset });
+    expect(await nextAlert()).toMatchObject({
+      created: false,
+      alert: { routing: "Router skips claude. No eligible fallback providers are available." },
+    });
+    now = reset + 1;
+    factory.scheduler.tick();
+    expect(await nextAlert()).toMatchObject({ created: false, alert: null });
+    expect(alerts()).toEqual([]);
+  } finally {
+    await reader.cancel();
+  }
 });

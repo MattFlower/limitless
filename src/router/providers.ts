@@ -72,6 +72,17 @@ export class ProviderTracker {
 
   setRoutingDescription(describe: (provider: string, exhausted: boolean) => string): void {
     this.routingFor = describe;
+    this.refreshAlerts();
+  }
+
+  /** Eligibility can change without new telemetry from the alerted provider. */
+  refreshAlerts(): void {
+    this.store.expireAlerts(this.clock());
+    if (!this.routingFor) return;
+    for (const alert of this.store.listAlerts(this.clock())) {
+      const routing = this.routingFor(alert.provider, this.status(alert.provider)?.state === "exhausted");
+      if (routing !== alert.routing) this.store.putAlert({ ...alert, routing });
+    }
   }
 
   isEnabled(id: string): boolean {
@@ -132,6 +143,7 @@ export class ProviderTracker {
 
   blockModel(modelId: string, reason: string, ms = 24 * 60 * 60 * 1000): void {
     this.modelBlocks.set(modelId, { until: this.clock() + ms, reason: reason.slice(0, 200) });
+    this.refreshAlerts();
   }
 
   modelUnavailableReason(modelId: string, now = this.clock()): string | null {
@@ -232,7 +244,7 @@ export class ProviderTracker {
     severity: QuotaAlert["severity"],
   ): void {
     const routing =
-      this.routingFor?.(id, severity === "exhausted") ??
+      this.routingFor?.(id, this.status(id)?.state === "exhausted") ??
       (severity === "exhausted"
         ? "Router skips this provider; no eligible fallback providers are known."
         : "Provider remains eligible until its reserve is reached.");
@@ -361,6 +373,7 @@ export class ProviderTracker {
       consecutiveFailures: p.consecutiveFailures,
     });
     this.store.publishProvider({ kind: "provider", provider: st });
+    this.refreshAlerts();
   }
 
   private publish(id: string): void {

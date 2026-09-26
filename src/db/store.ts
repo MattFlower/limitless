@@ -683,14 +683,13 @@ export class Store {
     const boundary = alert.resetsAt ?? 0;
     const previous = this.db
       .query(
-        "SELECT severity, routing, created_at FROM quota_alerts WHERE provider = ? AND window = ? AND boundary = ?",
+        "SELECT severity, created_at FROM quota_alerts WHERE provider = ? AND window = ? AND boundary = ?",
       )
       .get(alert.provider, alert.window, boundary) as Row | null;
     const current: QuotaAlert = previous
       ? {
           ...alert,
           severity: previous.severity === "exhausted" ? "exhausted" : alert.severity,
-          routing: previous.severity === "exhausted" ? (previous.routing as string) : alert.routing,
           createdAt: previous.created_at as number,
         }
       : alert;
@@ -743,6 +742,13 @@ export class Store {
       .query("UPDATE quota_alerts SET active = 0 WHERE provider = ? AND window = ? AND active = 1")
       .run(provider, window).changes;
     if (changed) this.publish({ kind: "alert", alert: null, provider, window, created: false });
+  }
+
+  expireAlerts(now: number): void {
+    const expired = this.db
+      .query("SELECT provider, window FROM quota_alerts WHERE active = 1 AND resets_at <= ?")
+      .all(now) as Row[];
+    for (const row of expired) this.clearAlert(row.provider as string, row.window as string);
   }
 
   getProviderRow(provider: string): Row | null {
