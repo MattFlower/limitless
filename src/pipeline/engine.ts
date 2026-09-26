@@ -688,7 +688,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch) {
       const baseBranch = ctx.run.baseBranch as string;
-      const fetched = await fetchBase(cwd, baseBranch);
+      const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch);
       const recorded = ctx.run.baseSha as string;
       if (ctx.state.pendingRebaseSha && ctx.state.pendingRebaseSha !== fetched)
         throw new Error("base changed during delivery rebase; refusing to publish");
@@ -757,7 +757,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         ctx.state.preRebaseGates = undefined;
         ctx.save();
       }
-      if ((await fetchBase(cwd, baseBranch)) !== ctx.run.baseSha)
+      if ((await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch)) !== ctx.run.baseSha)
         throw new Error("base changed before publication; refusing to publish");
       if (!(await isAncestor(cwd, ctx.run.baseSha as string, await headSha(cwd))))
         throw new Error("run branch does not contain the current base");
@@ -801,7 +801,10 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       return { summary: `updated existing PR branch ${ctx.run.deliveryBranch}`, value: undefined };
     }
     ctx.checkCancelled();
-    if (success && (await fetchBase(cwd, ctx.run.baseBranch as string)) !== ctx.run.baseSha)
+    if (
+      success &&
+      (await fetchBase(ctx.deps.cfg.paths, ctx.repo, ctx.run.baseBranch as string)) !== ctx.run.baseSha
+    )
       throw new Error("base changed before publication; refusing to publish");
     await pushBranch(ctx.repo, cwd, ctx.run.branch as string);
     ctx.checkCancelled();

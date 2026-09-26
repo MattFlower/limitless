@@ -143,10 +143,16 @@ export async function headSha(cwd: string): Promise<string> {
   return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
 }
 
-export async function fetchBase(cwd: string, branch: string): Promise<string> {
-  const ref = `refs/heads/${branch}`;
-  await sh(["git", "fetch", "origin", `${ref}:refs/remotes/origin/${branch}`], { cwd, timeoutMs: 300_000 });
-  return (await sh(["git", "rev-parse", `refs/remotes/origin/${branch}`], { cwd })).stdout.trim();
+export async function fetchBase(paths: Paths, repo: Repo, branch: string): Promise<string> {
+  const cache = cachePath(paths, repo);
+  return withRepoLock(cache, async () => {
+    const ref = `refs/heads/${branch}`;
+    await sh(["git", "fetch", "origin", `${ref}:refs/remotes/origin/${branch}`], {
+      cwd: cache,
+      timeoutMs: 300_000,
+    });
+    return (await sh(["git", "rev-parse", `refs/remotes/origin/${branch}`], { cwd: cache })).stdout.trim();
+  });
 }
 
 export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
