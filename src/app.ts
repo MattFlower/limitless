@@ -1,0 +1,106 @@
+import type { Config } from "./config.ts";
+import type { CreateRunRequest, Question, Run } from "./core/types.ts";
+import { Store } from "./db/store.ts";
+import { resolveRepo } from "./git/repos.ts";
+import { runClaude } from "./harness/claude.ts";
+import { runCodex } from "./harness/codex.ts";
+import type { Harness } from "./harness/types.ts";
+import type { EngineDeps } from "./pipeline/context.ts";
+import {
+  DEFAULT_POLICY,
+  MODELS,
+  type ModelDef,
+  type Policy,
+  PROVIDERS,
+  type ProviderDef,
+} from "./router/catalog.ts";
+import { ProviderTracker } from "./router/providers.ts";
+import { Router } from "./router/router.ts";
+import { Scheduler } from "./scheduler.ts";
+
+export interface FactoryOptions {
+  harnesses?: Record<string, Harness>;
+  providers?: ProviderDef[];
+  models?: ModelDef[];
+  policy?: Policy;
+  store?: Store;
+}
+
+/** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
+export class Factory {
+  readonly store: Store;
+  readonly tracker: ProviderTracker;
+  readonly router: Router;
+  readonly scheduler: Scheduler;
+  readonly deps: EngineDeps;
+  readonly startedAt = Date.now();
+
+  constructor(
+    readonly cfg: Config,
+    opts: FactoryOptions = {},
+  ) {
+    this.store = opts.store ?? new Store(cfg.paths.db);
+    this.tracker = new ProviderTracker(opts.providers ?? PROVIDERS, this.store, cfg.reserves, cfg.secrets, {
+      openrouter: cfg.openrouterBudgetUsd,
+    });
+    this.router = new Router(this.tracker, opts.policy ?? DEFAULT_POLICY, opts.models ?? MODELS);
+    this.deps = {
+      cfg,
+      store: this.store,
+      router: this.router,
+      tracker: this.tracker,
+      harnesses: opts.harnesses ?? { claude: runClaude, codex: runCodex },
+    };
+    this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns);
+  }
+
+  start(): void {
+    // UI development against seeded data must never launch real (paid) runs.
+    if (process.env.LIMITLESS_NO_SCHEDULER === "1") return;
+    this.scheduler.start();
+  }
+
+  async stop(): Promise<void> {
+    await this.scheduler.stop();
+  }
+
+  async createRun(req: CreateRunRequest): Promise<Run> {
+    if (!req.prompt?.trim()) throw new Error("prompt is required");
+    if (!req.repo?.trim()) throw new Error("repo is required");
+    const repo = await resolveRepo(this.store, req.repo);
+    const run = this.store.createRun(repo, req);
+    this.store.addEvent({
+      runId: run.id,
+      type: "log",
+      message: `Run created from ${run.source}${run.requestedBy ? ` by ${run.requestedBy}` : ""}`,
+    });
+    return run;
+  }
+
+  cancelRun(id: string, by = "user"): boolean {
+    return this.scheduler.cancel(id, by);
+  }
+
+  async retryRun(id: string): Promise<Run> {
+    const run = this.store.getRun(id);
+    if (!run) throw new Error(`run ${id} not found`);
+    return this.createRun({
+      repo: run.repoSlug,
+      prompt: run.prompt,
+      title: run.title,
+      profile: run.profile,
+      source: run.source,
+      ...(run.sourceRef ? { sourceRef: run.sourceRef } : {}),
+      ...(run.requestedBy ? { requestedBy: run.requestedBy } : {}),
+    });
+  }
+
+  /** Answer the given question, or every open question on the run. */
+  answer(runId: string, answer: string, by = "user", questionId?: number): Question[] {
+    const open = this.store
+      .listQuestions(runId)
+      .filter((q) => q.answer === null && (questionId === undefined || q.id === questionId));
+    if (!open.length) throw new Error("no open questions on this run");
+    return open.map((q) => this.store.answerQuestion(q.id, answer, by));
+  }
+}

@@ -1,0 +1,108 @@
+import type { Billing, InvocationStatus, QuotaWindow } from "../core/types.ts";
+
+/** A concrete model on a concrete provider, as chosen by the router. */
+export interface ModelTarget {
+  modelId: string; // catalog id, e.g. "claude/sonnet"
+  provider: string; // "claude" | "codex" | "openrouter" | "mtplx" | "twilight"
+  harness: "claude" | "codex" | "fake";
+  model: string; // backend model name passed to the CLI / API
+  vendor: string;
+  tier: number;
+  billing: Billing;
+  effort?: string;
+  /** For the claude harness pointed at a non-Anthropic backend (OpenRouter, mtplx, llama.cpp). */
+  backend?: { baseUrl: string; authToken: string };
+  /** $ per million tokens; used for metered cost and subscription cost-equivalence. */
+  price?: { input: number; output: number; cacheRead?: number };
+}
+
+export type AgentEvent =
+  | { type: "init"; sessionId: string; model?: string }
+  | { type: "text"; text: string }
+  | { type: "thinking"; text: string }
+  | { type: "tool_call"; id: string; name: string; input: unknown }
+  | { type: "tool_result"; id: string; output: string; isError: boolean }
+  | { type: "rate_limit"; status: string; windows: Record<string, QuotaWindow>; resetsAt: number | null }
+  | { type: "stderr"; text: string }
+  | { type: "status"; text: string };
+
+export interface AgentSpec {
+  cwd: string;
+  prompt: string;
+  systemAppend?: string;
+  target: ModelTarget;
+  /** "readonly" agents get no edit tools; the pipeline also resets the tree after them. */
+  mode: "edit" | "readonly";
+  jsonSchema?: Record<string, unknown>;
+  resumeSessionId?: string;
+  addDirs?: string[];
+  timeoutMs: number;
+  idleTimeoutMs: number;
+  maxToolCalls: number;
+  signal: AbortSignal;
+  /** Raw stream is appended here for post-mortem debugging. */
+  logPath: string;
+  onEvent: (e: AgentEvent) => void;
+}
+
+export interface Usage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+export interface AgentResult {
+  status: InvocationStatus;
+  finalText: string;
+  structured: unknown;
+  sessionId: string | null;
+  usage: Usage;
+  numTurns: number;
+  costUsd: number; // real money spent
+  costEquivUsd: number; // API list-price equivalent
+  error: string | null;
+  /** Quota telemetry observed during the run (Claude rate_limit_event / Codex rollout). */
+  quota: { windows: Record<string, QuotaWindow>; exhaustedUntil: number | null } | null;
+}
+
+export type Harness = (spec: AgentSpec) => Promise<AgentResult>;
+
+export const emptyUsage = (): Usage => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+
+export function priceOf(usage: Usage, price: ModelTarget["price"]): number {
+  if (!price) return 0;
+  const cacheRead = price.cacheRead ?? price.input * 0.1;
+  return (
+    (usage.input * price.input +
+      usage.cacheWrite * price.input * 1.25 +
+      usage.cacheRead * cacheRead +
+      usage.output * price.output) /
+    1_000_000
+  );
+}
+
+/**
+ * Detects an agent stuck repeating the same tool call, or blowing through its tool budget.
+ * Returns a reason string when the run should be stopped.
+ */
+export class LoopDetector {
+  private recent: string[] = [];
+  private total = 0;
+  constructor(
+    private readonly maxToolCalls: number,
+    private readonly maxIdenticalInWindow = 6,
+    private readonly window = 12,
+  ) {}
+
+  observe(name: string, input: unknown): string | null {
+    this.total++;
+    if (this.total > this.maxToolCalls) return `exceeded tool-call budget (${this.maxToolCalls})`;
+    const key = `${name}:${JSON.stringify(input)}`;
+    this.recent.push(key);
+    if (this.recent.length > this.window) this.recent.shift();
+    const same = this.recent.filter((k) => k === key).length;
+    if (same >= this.maxIdenticalInWindow) return `repeated the same ${name} call ${same} times`;
+    return null;
+  }
+}

@@ -1,0 +1,129 @@
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+export interface Paths {
+  home: string; // ~/.limitless
+  db: string;
+  repos: string; // bare repo cache
+  work: string; // worktrees
+  runs: string; // per-run artifacts & logs
+  configDir: string; // ~/.config/limitless
+}
+
+export interface Reserves {
+  /** Stop using Claude when the 5-hour window utilization reaches this fraction. */
+  claudeFiveHour: number;
+  claudeSevenDay: number;
+  /** Stop using Codex at this used fraction (user asked to keep 10% free). */
+  codexWeekly: number;
+  codexFiveHour: number;
+}
+
+export interface Config {
+  paths: Paths;
+  port: number;
+  host: string;
+  publicUrl: string | null; // e.g. https://limitless.mattflower.cc (webhooks only)
+  uiUrl: string; // where the UI is reachable locally, used in PR bodies
+  maxConcurrentRuns: number;
+  maxRounds: number; // implement ⇄ feedback rounds before escalation
+  openrouterBudgetUsd: number;
+  reserves: Reserves;
+  githubOwner: string | null; // allowlisted GitHub login for triggers
+  discordOwnerId: string | null;
+  secrets: Record<string, string>;
+  /** Raw config.toml overrides (routing policy, providers) consumed by their modules. */
+  raw: Record<string, unknown>;
+}
+
+function parseEnvFile(path: string): Record<string, string> {
+  if (!existsSync(path)) return {};
+  const out: Record<string, string> = {};
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq < 0) continue;
+    const key = trimmed
+      .slice(0, eq)
+      .trim()
+      .replace(/^export\s+/, "");
+    let value = trimmed.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+function num(v: unknown, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+
+function str(v: unknown, fallback: string | null): string | null {
+  return typeof v === "string" && v.length > 0 ? v : fallback;
+}
+
+export function loadConfig(
+  overrides: Partial<{ home: string; configDir: string; port: number }> = {},
+): Config {
+  const home = overrides.home ?? process.env.LIMITLESS_HOME ?? join(homedir(), ".limitless");
+  const configDir =
+    overrides.configDir ?? process.env.LIMITLESS_CONFIG_DIR ?? join(homedir(), ".config", "limitless");
+  const paths: Paths = {
+    home,
+    db: join(home, "limitless.db"),
+    repos: join(home, "repos"),
+    work: join(home, "work"),
+    runs: join(home, "runs"),
+    configDir,
+  };
+  for (const dir of [paths.home, paths.repos, paths.work, paths.runs]) mkdirSync(dir, { recursive: true });
+
+  const tomlPath = join(configDir, "config.toml");
+  const raw: Record<string, unknown> = existsSync(tomlPath)
+    ? (Bun.TOML.parse(readFileSync(tomlPath, "utf8")) as Record<string, unknown>)
+    : {};
+  const secrets = { ...parseEnvFile(join(configDir, "secrets.env")) };
+  // Environment variables win over the secrets file (useful for tests and CI).
+  for (const key of [
+    "OPENROUTER_API_KEY",
+    "DISCORD_BOT_TOKEN",
+    "DISCORD_APP_ID",
+    "DISCORD_GUILD_ID",
+    "GITHUB_WEBHOOK_SECRET",
+  ]) {
+    const v = process.env[key];
+    if (v) secrets[key] = v;
+  }
+
+  const server = (raw.server ?? {}) as Record<string, unknown>;
+  const limits = (raw.limits ?? {}) as Record<string, unknown>;
+  const reserves = (raw.reserves ?? {}) as Record<string, unknown>;
+  const owners = (raw.owners ?? {}) as Record<string, unknown>;
+  const port = overrides.port ?? num(Number(process.env.LIMITLESS_PORT) || server.port, 7400);
+  const host = str(server.host, "127.0.0.1") as string;
+
+  return {
+    paths,
+    port,
+    host,
+    publicUrl: str(server.public_url, null),
+    uiUrl: str(server.ui_url, `http://localhost:${port}`) as string,
+    maxConcurrentRuns: num(limits.max_concurrent_runs, 3),
+    maxRounds: num(limits.max_rounds, 3),
+    openrouterBudgetUsd: num(limits.openrouter_budget_usd, 50),
+    reserves: {
+      claudeFiveHour: num(reserves.claude_five_hour, 0.8),
+      claudeSevenDay: num(reserves.claude_seven_day, 0.85),
+      codexWeekly: num(reserves.codex_weekly, 0.9),
+      codexFiveHour: num(reserves.codex_five_hour, 0.9),
+    },
+    githubOwner: str(owners.github, "MattFlower"),
+    discordOwnerId: str(owners.discord, null),
+    secrets,
+    raw,
+  };
+}

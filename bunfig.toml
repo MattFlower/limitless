@@ -1,0 +1,5 @@
+[serve.static]
+plugins = ["./scripts/solid-plugin.ts"]
+
+[test]
+root = "./test"

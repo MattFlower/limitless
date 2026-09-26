@@ -1,0 +1,99 @@
+import { z } from "zod";
+
+/** JSON Schema acceptable to both Claude (--json-schema) and OpenAI strict structured outputs. */
+export function toStrictJsonSchema(schema: z.ZodType): Record<string, unknown> {
+  const raw = z.toJSONSchema(schema) as Record<string, unknown>;
+  const clean = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(clean);
+    if (!node || typeof node !== "object") return node;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      if (k === "$schema" || k === "minimum" || k === "maximum") continue;
+      out[k] = clean(v);
+    }
+    return out;
+  };
+  return clean(raw) as Record<string, unknown>;
+}
+
+export const TaskClassEnum = z.enum([
+  "dependency_update",
+  "bugfix",
+  "feature",
+  "refactor",
+  "docs",
+  "test",
+  "chore",
+  "question",
+]);
+export const ComplexityEnum = z.enum(["trivial", "small", "medium", "large"]);
+
+export const TriageSchema = z.object({
+  title: z.string().describe("Short imperative title for the work, max ~70 chars"),
+  task_class: TaskClassEnum,
+  complexity: ComplexityEnum,
+  risk: z.enum(["low", "medium", "high"]),
+  ambiguity: z.enum(["low", "medium", "high"]),
+  blocking_questions: z
+    .array(z.string())
+    .describe("Only questions whose answers would substantially change the implementation"),
+  summary: z.string().describe("One or two sentences restating what must be done"),
+  suggested_profile: z.enum(["quick", "standard", "deep"]),
+});
+export type Triage = z.infer<typeof TriageSchema>;
+
+export const SpecSchema = z.object({
+  summary: z.string(),
+  assumptions: z.array(z.string()),
+  requirements: z.array(z.string()),
+  acceptance_criteria: z.array(
+    z.object({
+      id: z.string().describe("AC-1, AC-2, ..."),
+      criterion: z.string().describe("Observable, testable statement of behavior"),
+      how_to_verify: z.string().describe("Concrete command, test, or inspection that proves it"),
+    }),
+  ),
+  out_of_scope: z.array(z.string()),
+  blocking_questions: z.array(z.string()),
+});
+export type Spec = z.infer<typeof SpecSchema>;
+
+export const ReviewSchema = z.object({
+  verdict: z.enum(["approve", "request_changes"]),
+  summary: z.string(),
+  findings: z.array(
+    z.object({
+      severity: z.enum(["blocker", "major", "minor", "nit"]),
+      file: z.string().describe("Path, or empty string for general findings"),
+      line: z.number().int().describe("Line number, or 0 if not applicable"),
+      title: z.string(),
+      detail: z.string(),
+      suggestion: z.string(),
+    }),
+  ),
+});
+export type Review = z.infer<typeof ReviewSchema>;
+
+export const VerifySchema = z.object({
+  criteria: z.array(
+    z.object({
+      id: z.string(),
+      status: z.enum(["met", "unmet", "unclear"]),
+      evidence: z.string().describe("Command + observed output, or file:line references"),
+    }),
+  ),
+  overall: z.enum(["pass", "fail"]),
+  notes: z.string(),
+});
+export type Verify = z.infer<typeof VerifySchema>;
+
+export function renderSpec(spec: Spec): string {
+  const list = (items: string[]) => (items.length ? items.map((i) => `- ${i}`).join("\n") : "- (none)");
+  return [
+    `## Summary\n${spec.summary}`,
+    `## Requirements\n${list(spec.requirements)}`,
+    `## Acceptance criteria\n${spec.acceptance_criteria.map((a) => `- **${a.id}** ${a.criterion}\n  - verify: ${a.how_to_verify}`).join("\n")}`,
+    `## Assumptions\n${list(spec.assumptions)}`,
+    `## Out of scope\n${list(spec.out_of_scope)}`,
+  ].join("\n\n");
+}
