@@ -1,0 +1,5 @@
+{
+  "name": "limitless",
+  "version": "0.1.0",
+  "description": "Delegate background repository work to a running Limitless factory."
+}

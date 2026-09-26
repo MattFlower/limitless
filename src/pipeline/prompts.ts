@@ -1,7 +1,7 @@
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
-import { type Review, renderSpec, type Spec, type Verify } from "./schemas.ts";
+import { type Holdout, type Review, renderSpec, type Spec, type Verify } from "./schemas.ts";
 
 /** Appended to every factory agent's system prompt. */
 export const FACTORY_PREAMBLE = `You are a worker inside Limitless, an autonomous software factory.
@@ -57,6 +57,10 @@ Produce:
 - out_of_scope: tempting things that should NOT be done.
 - blocking_questions: only if the task truly cannot proceed sensibly without an answer; otherwise empty.
 Return the JSON object.`;
+}
+
+export function holdoutPrompt(input: { prompt: string; spec: Spec }): string {
+  return `Write blind holdout checks for this request. You have only the original request and completed specification. Do not inspect a repository or implementation. Return 3–8 concrete scenarios with sequential IDs H-1, H-2, ... Each needs a short description, exact executable steps or inputs, and an expected observable outcome. Mark edge_case true for at least two edge or failure cases that are not literally listed in the acceptance criteria. Return the JSON object.\n\n# Original request\n${quoteRequest(input.prompt)}\n\n# Specification\n${renderSpec(input.spec)}`;
 }
 
 function checksSection(cfg: GateConfig, baseline: GateRun | null): string {
@@ -142,11 +146,33 @@ export function formatReviewFeedback(review: Review): string {
     .join("\n")}`;
 }
 
-export function formatVerifyFeedback(verify: Verify, spec: Spec | null): string {
+export function redactHoldoutText(value: string, holdout: Holdout): string {
+  let safe = value;
+  const remove = (value: string, replacement: string) => {
+    const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    safe = safe.replace(new RegExp(escaped, "gi"), replacement);
+  };
+  for (const scenario of holdout.scenarios) {
+    for (const source of [scenario.description, scenario.steps, scenario.expected]) {
+      remove(source, "[private check]");
+      for (const token of source.match(/[A-Za-z0-9_-]{6,}/g) ?? []) remove(token, "[private input]");
+    }
+  }
+  return safe;
+}
+
+export function formatVerifyFeedback(verify: Verify, spec: Spec | null, holdout?: Holdout): string {
   const unmet = verify.criteria.filter((c) => c.status !== "met");
   if (!unmet.length) return "";
   const text = (id: string) => spec?.acceptance_criteria.find((a) => a.id === id)?.criterion ?? "";
-  return `### Acceptance criteria not met\n${unmet.map((c) => `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`).join("\n")}`;
+  return `### Checks not met\n${unmet
+    .map((c) => {
+      const scenario = holdout?.scenarios.find((s) => s.id === c.id);
+      return scenario
+        ? `- **${c.id}** (${c.status}) Observed failure: ${redactHoldoutText(c.evidence, holdout as Holdout)}`
+        : `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
+    })
+    .join("\n")}`;
 }
 
 function gateTable(cmp: GateComparison[]): string {
@@ -202,7 +228,12 @@ Do not modify files. You may run read-only commands and the test suite.
 Return verdict "request_changes" if there is any blocker or major finding, otherwise "approve".`;
 }
 
-export function verifyPrompt(input: { prompt: string; spec: Spec; baseSha: string }): string {
+export function verifyPrompt(input: {
+  prompt: string;
+  spec: Spec;
+  holdout: Holdout;
+  baseSha: string;
+}): string {
   return `You are the acceptance verifier for an automated coding pipeline. Decide whether the implementation on this branch actually satisfies each acceptance criterion. Be skeptical: verify by running commands, executing the code, and reading the implementation — never by trusting comments, commit messages, or the implementer's claims.
 
 # Original request
@@ -211,6 +242,9 @@ ${quoteRequest(input.prompt)}
 # Acceptance criteria
 ${input.spec.acceptance_criteria.map((a) => `- **${a.id}** ${a.criterion}\n  - how to verify: ${a.how_to_verify}`).join("\n")}
 
+# Blind holdout scenarios
+${input.holdout.scenarios.map((s) => `- **${s.id}** ${s.description}\n  - steps: ${s.steps}\n  - expected: ${s.expected}`).join("\n")}
+
 The change is \`git diff ${input.baseSha}..HEAD\`. Do not modify repository files (scratch files under /tmp are fine).
-For each criterion return met / unmet / unclear with concrete evidence (the command you ran and what you observed, or file:line references). overall = "pass" only if every criterion is met.`;
+For each acceptance criterion and holdout scenario return met / unmet / unclear with concrete evidence (the command you ran and what you observed, or file:line references). For unmet holdouts, describe the observed failure in evidence without repeating the scenario text or private inputs. overall = "pass" only if every entry is met.`;
 }

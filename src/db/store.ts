@@ -369,6 +369,23 @@ export class Store {
     return r ? toRun(r) : null;
   }
 
+  setRunSourceRef(id: string, sourceRef: Record<string, unknown>): Run {
+    this.db.query("UPDATE runs SET source_ref = ? WHERE id = ?").run(json(sourceRef), id);
+    const run = this.getRun(id);
+    if (!run) throw new Error(`run ${id} not found`);
+    this.publish({ kind: "run", run });
+    return run;
+  }
+
+  getRunByDiscordThread(threadId: string): Run | null {
+    const row = this.db
+      .query(
+        `${RUN_SELECT} WHERE runs.source = 'discord' AND json_extract(runs.source_ref, '$.kind') = 'discord' AND json_extract(runs.source_ref, '$.threadId') = ? LIMIT 1`,
+      )
+      .get(threadId) as Row | null;
+    return row ? toRun(row) : null;
+  }
+
   listRuns(opts: { status?: RunStatus[]; limit?: number; repoId?: string } = {}): Run[] {
     const where: string[] = [];
     const params: (string | number)[] = [];
@@ -564,7 +581,13 @@ export class Store {
 
   listEvents(
     runId: string,
-    opts: { after?: number; limit?: number; invocationId?: number } = {},
+    opts: {
+      after?: number;
+      limit?: number;
+      invocationId?: number;
+      tail?: boolean;
+      excludeDebug?: boolean;
+    } = {},
   ): RunEvent[] {
     const params: (string | number)[] = [runId, opts.after ?? 0];
     let sql = "SELECT * FROM events WHERE run_id = ? AND id > ?";
@@ -572,9 +595,11 @@ export class Store {
       sql += " AND invocation_id = ?";
       params.push(opts.invocationId);
     }
-    sql += " ORDER BY id LIMIT ?";
+    if (opts.excludeDebug) sql += " AND level != 'debug'";
+    sql += ` ORDER BY id ${opts.tail ? "DESC" : "ASC"} LIMIT ?`;
     params.push(opts.limit ?? 1000);
-    return (this.db.query(sql).all(...params) as Row[]).map(toEvent);
+    const events = (this.db.query(sql).all(...params) as Row[]).map(toEvent);
+    return opts.tail ? events.reverse() : events;
   }
 
   // ---- artifacts -----------------------------------------------------------

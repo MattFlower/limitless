@@ -15,11 +15,13 @@ const appDir = process.env.LIMITLESS_APP_DIR ?? join(home, ".limitless", "app");
 const logDir = join(home, ".limitless", "logs");
 const agentsDir = join(home, "Library", "LaunchAgents");
 const uid = userInfo().uid;
+// Same precedence as the operator's shell: Homebrew before ~/.bun/bin, which may hold stale
+// globally-installed npm copies of the agent CLIs.
 const PATH = [
   join(home, ".local", "bin"),
+  "/opt/homebrew/bin",
   join(home, ".bun", "bin"),
   join(home, ".mtplx", "bin"),
-  "/opt/homebrew/bin",
   "/usr/local/bin",
   "/usr/bin",
   "/bin",
@@ -143,9 +145,18 @@ export async function install(port: number, opts: { tunnel?: boolean; mtplx?: bo
   }
   for (const [label, content] of units) {
     const path = join(agentsDir, `${label}.plist`);
-    if (await loaded(label)) await launchctl(["bootout", `gui/${uid}/${label}`]);
+    if (await loaded(label)) {
+      await launchctl(["bootout", `gui/${uid}/${label}`]);
+      // bootout returns before the old instance is gone; bootstrapping too early fails with EIO.
+      for (let i = 0; i < 30 && (await loaded(label)); i++) await Bun.sleep(500);
+    }
     writeFileSync(path, content);
-    await launchctl(["bootstrap", `gui/${uid}`, path], false);
+    let ok = false;
+    for (let attempt = 0; attempt < 5 && !ok; attempt++) {
+      if (attempt) await Bun.sleep(1000 * attempt);
+      ok = (await launchctl(["bootstrap", `gui/${uid}`, path])).exitCode === 0;
+    }
+    if (!ok) throw new Error(`launchctl bootstrap failed for ${label}`);
     console.log(`installed ${label}`);
   }
   console.log((await health(port)) ? "daemon healthy" : "daemon did not become healthy — check the log");

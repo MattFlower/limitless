@@ -269,6 +269,7 @@ describe("pipeline hardening", () => {
   const policy = {
     triage: everyone,
     spec: everyone,
+    holdout: everyone,
     implement: everyone,
     review: everyone,
     verify: everyone,
@@ -279,11 +280,13 @@ describe("pipeline hardening", () => {
       ? "triage"
       : prompt.startsWith("Write the specification")
         ? "spec"
-        : prompt.startsWith("You are an adversarial")
-          ? "review"
-          : prompt.startsWith("You are the acceptance verifier")
-            ? "verify"
-            : "implement";
+        : prompt.startsWith("Write blind holdout checks")
+          ? "holdout"
+          : prompt.startsWith("You are an adversarial")
+            ? "review"
+            : prompt.startsWith("You are the acceptance verifier")
+              ? "verify"
+              : "implement";
 
   async function waitDone(f: Factory, id: string): Promise<string> {
     const deadline = Date.now() + 20_000;
@@ -334,6 +337,28 @@ describe("pipeline hardening", () => {
                 blocking_questions: [],
               },
             };
+          if (r === "holdout")
+            return {
+              structured: {
+                scenarios: [
+                  { id: "H-1", description: "case 1", steps: "cat a.txt", expected: "a", edge_case: false },
+                  {
+                    id: "H-2",
+                    description: "case 2",
+                    steps: "test -s a.txt",
+                    expected: "exit zero",
+                    edge_case: true,
+                  },
+                  {
+                    id: "H-3",
+                    description: "case 3",
+                    steps: "test ! -e b.txt",
+                    expected: "exit zero",
+                    edge_case: true,
+                  },
+                ],
+              },
+            };
           if (r === "review") {
             reviews++;
             return {
@@ -367,6 +392,9 @@ describe("pipeline hardening", () => {
                       criteria: [
                         { id: "AC-1", status: "met", evidence: "e" },
                         { id: "AC-2", status: "met", evidence: "e" },
+                        { id: "H-1", status: "met", evidence: "e" },
+                        { id: "H-2", status: "met", evidence: "e" },
+                        { id: "H-3", status: "met", evidence: "e" },
                       ],
                       overall: "pass",
                       notes: "",
@@ -508,4 +536,71 @@ describe("resume after restart", () => {
       second.store.close();
     }
   });
+});
+
+describe("repo cache concurrency", () => {
+  test("concurrent runs share one clone of a remote repo", async () => {
+    const { ensureCache } = await import("../src/git/repos.ts");
+    const origin = join(dir, "origin");
+    mkdirSync(origin);
+    writeFileSync(join(origin, "a.txt"), "a\n");
+    await sh(["git", "init", "-q", "-b", "main"], { cwd: origin });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "."], { cwd: origin });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], { cwd: origin });
+    const paths = {
+      home: dir,
+      db: "",
+      repos: join(dir, "repos"),
+      work: join(dir, "work"),
+      runs: "",
+      configDir: "",
+    };
+    const repo = {
+      id: "r",
+      slug: "o/origin",
+      kind: "github" as const,
+      url: origin,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr" as const,
+      createdAt: 0,
+    };
+    const caches = await Promise.all([
+      ensureCache(paths, repo),
+      ensureCache(paths, repo),
+      ensureCache(paths, repo),
+    ]);
+    for (const c of caches) {
+      const r = await sh(["git", "rev-parse", "origin/main"], { cwd: c });
+      expect(r.stdout.trim()).toHaveLength(40);
+    }
+  });
+});
+
+test("adding a file under a protected path warns; editing one blocks", () => {
+  const f = auditDiff(
+    {
+      patch: "",
+      files: [
+        { status: "A", path: "test/fixtures/new.json" },
+        { status: "M", path: "test/fixtures/old.json" },
+      ],
+      stat: "",
+      added: 0,
+      removed: 0,
+    },
+    { taskClass: "feature", protectedPaths: ["test/fixtures/**"] },
+  );
+  expect(f.map((x) => `${x.file}:${x.severity}`)).toEqual([
+    "test/fixtures/new.json:warn",
+    "test/fixtures/old.json:block",
+  ]);
+});
+
+test("review/verify timeouts scale with the size of the change", async () => {
+  const { readingTimeout } = await import("../src/pipeline/engine.ts");
+  expect(readingTimeout(0)).toBe(20 * 60_000);
+  expect(readingTimeout(935)).toBe(40 * 60_000);
+  expect(readingTimeout(935, 25)).toBe(45 * 60_000);
+  expect(readingTimeout(10_000)).toBe(60 * 60_000);
 });

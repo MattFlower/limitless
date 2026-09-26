@@ -6,15 +6,17 @@ with `limitless deploy`. Status is tracked here and in the UI.
 
 | # | Milestone | Task | Status |
 |---|---|---|---|
-| 1 | M3 | GitHub webhook trigger | todo |
-| 2 | M3 | MCP server + skills for Claude Code and Codex | todo |
-| 3 | M2 | Blind holdout scenarios | todo |
+| 1 | M3 | GitHub webhook trigger | in review (factory) |
+| 2 | M3 | MCP server + skills for Claude Code and Codex | done — #1 |
+| 3 | M2 | Blind holdout scenarios | done — #3 (Codex flags fixed by orchestrator) |
 | 4 | M2 | Rebase onto the moving base branch before delivery | todo |
-| 5 | M3 | Discord bot | todo |
+| 5 | M3 | Discord bot | done — #2 |
 | 6 | M3 | Chat concierge (UI + Discord free text) | todo |
 | 7 | M4 | Direct-HTTP LLM path + local model servers | todo |
 | 8 | M4 | OpenRouter spend reconciliation | todo |
 | 9 | M5 | Retention and cleanup | todo |
+| 10 | M2 | Live CLI contract smoke tests | todo |
+| 11 | M3 | Quota alerts (Discord + UI) | todo |
 
 ---
 
@@ -171,3 +173,39 @@ A conversational front door shared by the UI `/chat` page and Discord free-text 
   metadata, delete per-run log files after 30 days, and cap the `events` table by deleting debug
   events older than 14 days. Run hourly in the daemon; `limitless gc [--dry-run]` on demand.
 - Tests on temp directories and a temp DB.
+
+## 10. Live CLI contract smoke tests
+
+Unit tests use the fake harness, so nothing verifies that the flags and stream formats we rely on
+still work with the installed `claude` and `codex` binaries. Twice already (Codex models on the
+ChatGPT plan; Codex no-tools flags) a PR passed every gate and still failed against the real CLI.
+
+- `scripts/smoke.ts`, run with `bun run smoke` (never part of `bun run check` or CI — it spends a
+  little subscription quota and needs local logins). Each check runs the real harness function
+  (`runClaude` / `runCodex`) against a throwaway temp git repo with the cheapest model on that
+  provider and a tiny prompt, with a short timeout, and prints a pass/fail table with durations:
+  - claude: read-only structured output (json schema) returns the expected object; `noTools` really
+    has no file access (ask it to read a file containing a random token; the token must not appear);
+    edit mode can write a file; the stream reports rate-limit windows.
+  - codex: same four checks (structured output, `noTools` cannot read the token, edit mode writes,
+    rate-limit windows read from the rollout).
+  - each local/metered provider that is healthy (mtplx, twilight, OpenRouter via the claude
+    harness): structured output works (recovered from prose is acceptable).
+  - Skip providers that are disabled or down, and say so.
+- `limitless deploy --smoke` runs it after the check gate and before restarting; a failure aborts
+  the deploy like a failing check does. Document in docs/OPERATIONS.md.
+- A unit test for the smoke runner's reporting logic with injected fake check functions.
+
+## 11. Quota alerts
+
+Tell the operator when a subscription reaches its reserve, so banked resets can be applied in time.
+
+- When a provider transitions into `exhausted` (quota reserve reached, or a hard limit hit), or
+  crosses 75% of its reserve for the first time in a window, emit one alert per provider per window:
+  a Discord message in the configured channel (when Discord is enabled) and a banner on the UI
+  dashboard (a new `alerts` field on `/api/providers` or a small `/api/alerts` endpoint).
+- Include the provider, which window, utilization, when it resets, and what the router will do
+  meanwhile (which providers it falls back to).
+- Tests with a fake Discord port and a fake clock: one alert per window, no alert storms on
+  flapping, reset clears it.
+

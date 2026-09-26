@@ -32,7 +32,9 @@ import {
   formatGateFeedback,
   formatReviewFeedback,
   formatVerifyFeedback,
+  holdoutPrompt,
   implementPrompt,
+  redactHoldoutText,
   reviewPrompt,
   specPrompt,
   triagePrompt,
@@ -40,6 +42,8 @@ import {
 } from "./prompts.ts";
 import { buildReport } from "./report.ts";
 import {
+  type Holdout,
+  HoldoutSchema,
   type Review,
   ReviewSchema,
   renderSpec,
@@ -287,6 +291,7 @@ async function spec(ctx: RunContext): Promise<void> {
       s.assumptions.push(...ctx.state.answers);
     }
     ctx.state.spec = s;
+    ctx.state.specAuthorVendor = target.vendor;
     ctx.setPhase("loop");
     return {
       summary: `${s.acceptance_criteria.length} acceptance criteria (${target.modelId})`,
@@ -304,20 +309,67 @@ function profile(ctx: RunContext): ResolvedProfile {
 
 async function buildLoop(ctx: RunContext): Promise<void> {
   const maxRounds = Math.max(1, ctx.deps.cfg.maxRounds) + ROUNDS_PER_IMPLEMENTER;
-  while (ctx.state.round < maxRounds) {
-    ctx.checkCancelled();
-    const round = ctx.state.round;
-    const passed = await oneRound(ctx, round);
-    if (passed) {
-      ctx.setPhase("deliver");
-      return;
+  const holdout =
+    profile(ctx) === "quick" || ctx.state.holdoutStatus === "complete"
+      ? null
+      : authorHoldout(ctx).then(
+          () => null,
+          (error: unknown) => error as Error,
+        );
+  try {
+    while (ctx.state.round < maxRounds) {
+      ctx.checkCancelled();
+      const round = ctx.state.round;
+      const passed = await oneRound(ctx, round, holdout);
+      if (passed) {
+        ctx.setPhase("deliver");
+        return;
+      }
+      ctx.state.round++;
+      ctx.state.roundsOnImplementer++;
+      ctx.save();
     }
-    ctx.state.round++;
-    ctx.state.roundsOnImplementer++;
-    ctx.save();
+    throw new NeedsHumanError(
+      `Still failing after ${ctx.state.round} implementation rounds. Last feedback:\n${ctx.state.feedback ?? ""}`,
+    );
+  } finally {
+    if (holdout) await holdout;
   }
-  throw new NeedsHumanError(
-    `Still failing after ${ctx.state.round} implementation rounds. Last feedback:\n${ctx.state.feedback ?? ""}`,
+}
+
+async function authorHoldout(ctx: RunContext): Promise<void> {
+  await ctx.stage(
+    "holdout",
+    async (stage) => {
+      ctx.state.holdoutStatus = "generating";
+      ctx.save();
+      const { result, target } = await ctx.invoke({
+        role: "holdout",
+        stage,
+        mode: "readonly",
+        complexity: ctx.complexity,
+        constraints: { avoidVendor: ctx.state.specAuthorVendor },
+        prompt: holdoutPrompt({ prompt: ctx.run.prompt, spec: ctx.state.spec as Spec }),
+        jsonSchema: toStrictJsonSchema(HoldoutSchema),
+        schema: HoldoutSchema,
+        requireStructured: true,
+        privateOutput: true,
+        isolatedCwd: true,
+        noTools: true,
+        maxToolCalls: 0,
+      });
+      ctx.state.holdout = HoldoutSchema.parse(result.structured);
+      ctx.state.holdoutModelId = target.modelId;
+      ctx.state.holdoutSameVendor = target.vendor === ctx.state.specAuthorVendor;
+      ctx.state.holdoutStatus = "complete";
+      ctx.save();
+      return {
+        summary: `authored ${ctx.state.holdout.scenarios.length} private scenarios (${target.modelId})`,
+        value: undefined,
+      };
+    },
+    0,
+    true,
   );
 }
 
@@ -389,7 +441,11 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
 }
 
 /** Returns true when every gate passes. */
-async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
+async function oneRound(
+  ctx: RunContext,
+  round: number,
+  holdout: Promise<Error | null> | null,
+): Promise<boolean> {
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.run.baseSha as string;
@@ -482,6 +538,7 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
         mode: "readonly",
         complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
         constraints: { avoidVendor: ctx.state.implementer?.vendor },
+        timeoutMs: readingTimeout(diff.added + diff.removed),
         prompt: reviewPrompt({
           prompt: ctx.run.prompt,
           spec: ctx.state.spec ?? null,
@@ -526,10 +583,15 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
   }
 
   // --- verify acceptance criteria (standard/deep)
-  if (profile(ctx) === "quick" || !ctx.state.spec?.acceptance_criteria.length) {
+  if (profile(ctx) === "quick") {
     ctx.state.lastVerify = null;
     return true;
   }
+  if (holdout) {
+    const failure = await holdout;
+    if (failure) throw failure;
+  }
+  if (!ctx.state.holdout) throw new NeedsHumanError("Holdout scenarios are unavailable");
   const verify: Verify = await ctx.stage(
     "verify",
     async (stage) => {
@@ -539,18 +601,29 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
         mode: "readonly",
         complexity: ctx.complexity,
         constraints: { avoidVendor: ctx.state.implementer?.vendor },
-        prompt: verifyPrompt({ prompt: ctx.run.prompt, spec: ctx.state.spec as Spec, baseSha }),
+        timeoutMs: readingTimeout(diff.added + diff.removed, 25),
+        prompt: verifyPrompt({
+          prompt: ctx.run.prompt,
+          spec: ctx.state.spec as Spec,
+          holdout: ctx.state.holdout as Holdout,
+          baseSha,
+        }),
         jsonSchema: toStrictJsonSchema(VerifySchema),
         schema: VerifySchema,
         requireStructured: true,
+        privateSession: true,
+        redactHoldout: true,
       });
       await discardChanges(cwd);
       const v = VerifySchema.parse(result.structured);
       // Derive the verdict ourselves: every acceptance criterion must be reported, and met.
-      for (const ac of (ctx.state.spec as Spec).acceptance_criteria) {
-        if (!v.criteria.some((c) => c.id === ac.id)) {
+      for (const id of [
+        ...(ctx.state.spec as Spec).acceptance_criteria.map((ac) => ac.id),
+        ...(ctx.state.holdout as Holdout).scenarios.map((scenario) => scenario.id),
+      ]) {
+        if (!v.criteria.some((c) => c.id === id)) {
           v.criteria.push({
-            id: ac.id,
+            id,
             status: "unclear",
             evidence: "The verifier did not report on this criterion.",
           });
@@ -558,11 +631,21 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
       }
       v.overall = v.criteria.every((c) => c.status === "met") ? "pass" : "fail";
       ctx.state.lastVerify = { ...v, modelId: target.modelId };
+      ctx.state.verifyResults = [
+        ...(ctx.state.verifyResults ?? []).filter((previous) => previous.round !== round),
+        { ...v, modelId: target.modelId, round },
+      ];
+      ctx.save();
       ctx.store.putArtifact(
         ctx.run.id,
         `verify-${round}.json`,
         "verify",
-        JSON.stringify({ ...v, model: target.modelId }, null, 2),
+        JSON.stringify(
+          { ...v, modelId: target.modelId, round },
+          (_key, value: unknown) =>
+            typeof value === "string" ? redactHoldoutText(value, ctx.state.holdout as Holdout) : value,
+          2,
+        ),
       );
       const met = v.criteria.filter((c) => c.status === "met").length;
       return {
@@ -573,7 +656,7 @@ async function oneRound(ctx: RunContext, round: number): Promise<boolean> {
     round,
   );
   if (verify.overall !== "pass") {
-    ctx.state.feedback = formatVerifyFeedback(verify, ctx.state.spec ?? null);
+    ctx.state.feedback = formatVerifyFeedback(verify, ctx.state.spec ?? null, ctx.state.holdout);
     ctx.save();
     return false;
   }
@@ -593,9 +676,28 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     const head = sha ?? (await headSha(cwd));
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
     const report = buildReport(ctx, success);
-    ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+
+    const publish = () => {
+      ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+      if (ctx.state.holdout) {
+        ctx.store.putArtifact(
+          ctx.run.id,
+          "holdout-scenarios.json",
+          "holdout",
+          JSON.stringify(ctx.state.holdout, null, 2),
+        );
+        for (const result of ctx.state.verifyResults ?? [])
+          ctx.store.putArtifact(
+            ctx.run.id,
+            `verify-${result.round}.json`,
+            "verify",
+            JSON.stringify(result, null, 2),
+          );
+      }
+    };
 
     if (ctx.repo.kind !== "github") {
+      publish();
       ctx.log(`Local repo: work is on branch ${ctx.run.branch}`);
       return { summary: `branch ${ctx.run.branch} ready in ${ctx.repo.localPath}`, value: undefined };
     }
@@ -624,6 +726,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       draft: !success,
     });
     ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
+    publish();
     ctx.log(`Pull request: ${url}`);
     if (!success) return { summary: `draft for human: ${url}`, value: undefined };
 
@@ -631,7 +734,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     let summary = `PR ${url}`;
     if (policy === "auto") {
       ctx.checkCancelled();
-      const outcome = await mergePullRequest(url, cwd);
+      const outcome = await mergePullRequest(url, cwd, ctx.run.title);
       if (outcome === "merged") ctx.run = ctx.store.updateRun(ctx.run.id, { merged: true });
       summary += ` — ${outcome === "merged" ? "merged" : outcome === "auto" ? "auto-merge enabled" : "merge failed (left open)"}`;
       ctx.log(summary, outcome === "failed" ? "warn" : "info");
@@ -641,6 +744,14 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
     return { summary, value: undefined };
   });
+}
+
+/**
+ * Review and verify have to read the whole change: 20 minutes (25 for verify) plus 2 minutes per
+ * 100 changed lines, capped at an hour. A timeout throws away a partial review, so err long.
+ */
+export function readingTimeout(changedLines: number, baseMinutes = 20): number {
+  return Math.min(60, baseMinutes + Math.ceil(changedLines / 100) * 2) * 60_000;
 }
 
 function readPackageJson(dir: string): string | null {

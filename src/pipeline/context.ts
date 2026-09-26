@@ -1,4 +1,5 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ZodType } from "zod";
 import type { Config } from "../config.ts";
@@ -10,8 +11,8 @@ import type { GateComparison, GateRun } from "../gates/run.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../harness/types.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
-import { FACTORY_PREAMBLE } from "./prompts.ts";
-import type { Review, Spec, Triage, Verify } from "./schemas.ts";
+import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
+import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
 
 export interface EngineDeps {
   cfg: Config;
@@ -31,6 +32,11 @@ export interface RunState {
   baseline?: GateRun | null;
   triage?: Triage;
   spec?: Spec | null;
+  specAuthorVendor?: string;
+  holdout?: Holdout;
+  holdoutStatus?: "generating" | "complete";
+  holdoutModelId?: string;
+  holdoutSameVendor?: boolean;
   answers: string[];
   round: number;
   implementer?: { modelId: string; tier: number; vendor: string };
@@ -48,6 +54,7 @@ export interface RunState {
   lastAudit?: AuditFinding[];
   lastReview?: Review & { modelId: string };
   lastVerify?: (Verify & { modelId: string }) | null;
+  verifyResults?: (Verify & { modelId: string; round: number })[];
   toolCommands: string[];
 }
 
@@ -80,6 +87,14 @@ export interface InvokeOptions {
   requireStructured?: boolean;
   /** Validates structured output; invalid output counts as a failed call (next candidate). */
   schema?: ZodType;
+  /** Run without repository access or public/raw event output. */
+  privateOutput?: boolean;
+  /** Prevent the CLI from persisting a private prompt in its own session store. */
+  privateSession?: boolean;
+  /** Redact holdout content from observable verifier events and transcripts. */
+  redactHoldout?: boolean;
+  isolatedCwd?: boolean;
+  noTools?: boolean;
 }
 
 export interface InvokeOutcome {
@@ -154,9 +169,10 @@ export class RunContext {
     name: StageName,
     fn: (stage: Stage) => Promise<{ summary: string; value: T }>,
     round = 0,
+    background = false,
   ): Promise<T> {
     this.checkCancelled();
-    this.run = this.store.updateRun(this.run.id, { stage: name });
+    if (!background) this.run = this.store.updateRun(this.run.id, { stage: name });
     const stage = this.store.startStage(this.run.id, name, round);
     try {
       const { summary, value } = await fn(stage);
@@ -188,6 +204,7 @@ export class RunContext {
       const target = decision.candidates[0];
       if (!target) {
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
+        if (opts.privateOutput) throw new NoCapacityError(`No model available for ${opts.role}`);
         throw new NoCapacityError(
           `No model available for ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}. Skipped: ${why || "none configured"}`,
         );
@@ -211,9 +228,14 @@ export class RunContext {
         skipped: decision.skipped,
       });
       let result: AgentResult;
+      const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
+      const redact =
+        opts.redactHoldout && this.state.holdout
+          ? (value: string) => redactHoldoutText(value, this.state.holdout as Holdout)
+          : undefined;
       try {
         result = await harness({
-          cwd: this.state.worktreePath ?? this.runDir,
+          cwd: opts.isolatedCwd ? (privateDir as string) : (this.state.worktreePath ?? this.runDir),
           prompt: opts.prompt,
           systemAppend: [opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n"),
           target,
@@ -222,9 +244,14 @@ export class RunContext {
           timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUTS[opts.role],
           idleTimeoutMs: opts.idleTimeoutMs ?? 10 * 60_000,
           maxToolCalls: opts.maxToolCalls ?? (opts.mode === "edit" ? 400 : 150),
+          noTools: opts.noTools,
+          privateSession: opts.privateOutput || opts.privateSession,
+          redactOutput: redact,
           signal: this.signal,
-          logPath: join(this.runDir, `inv-${invocation.id}.log`),
-          onEvent: (ev) => this.onAgentEvent(invocation.id, ev, opts.role),
+          logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
+          onEvent: opts.privateOutput
+            ? () => {}
+            : (ev) => this.onAgentEvent(invocation.id, ev, opts.role, redact),
         });
       } catch (e) {
         result = {
@@ -241,6 +268,7 @@ export class RunContext {
         };
       } finally {
         release();
+        if (privateDir) rmSync(privateDir, { recursive: true, force: true });
       }
       if (opts.schema && result.status === "ok" && result.structured !== null) {
         const parsed = opts.schema.safeParse(result.structured);
@@ -263,51 +291,97 @@ export class RunContext {
         cacheReadTokens: result.usage.cacheRead,
         numTurns: result.numTurns,
         sessionId: result.sessionId,
-        error: result.error,
+        error:
+          opts.privateOutput && result.error
+            ? "private invocation failed"
+            : result.error && redact
+              ? redact(result.error)
+              : result.error,
         finishedAt: Date.now(),
       });
       if (result.quota?.windows) tracker.observeWindows(target.provider, result.quota.windows);
       tracker.record(target.provider, result.status, {
         exhaustedUntil: result.quota?.exhaustedUntil ?? null,
-        error: result.error,
+        error:
+          opts.privateOutput && result.error
+            ? "private invocation failed"
+            : result.error && redact
+              ? redact(result.error)
+              : result.error,
       });
       this.run = store.refreshRunTotals(this.run.id);
 
       if (result.status === "cancelled" || this.signal.aborted) throw new CancelledError();
       if (result.status !== "ok" && MODEL_REJECTED.test(result.error ?? "")) {
         // A configuration problem with this model (e.g. not on the plan), not a task failure.
-        tracker.blockModel(target.modelId, result.error ?? "rejected");
-        lastFailure = `${target.modelId}: ${result.error ?? ""}`.slice(0, 300);
-        this.log(`${target.modelId} rejected by provider; blocking it for 24h and falling back`, "warn", {
-          error: result.error,
-        });
+        tracker.blockModel(
+          target.modelId,
+          opts.privateOutput
+            ? "private invocation rejected"
+            : (redact?.(result.error ?? "rejected") ?? result.error ?? "rejected"),
+        );
+        lastFailure = `${target.modelId}: ${redact?.(result.error ?? "") ?? result.error ?? ""}`.slice(
+          0,
+          300,
+        );
+        this.log(`${target.modelId} rejected by provider; blocking it for 24h and falling back`, "warn");
         continue;
       }
       if (result.status === "quota" || result.status === "unavailable") {
-        lastFailure = `${target.modelId}: ${result.status} (${result.error ?? ""})`.slice(0, 300);
-        this.log(`${target.modelId} ${result.status}; falling back`, "warn", { error: result.error });
+        lastFailure =
+          `${target.modelId}: ${result.status} (${redact?.(result.error ?? "") ?? result.error ?? ""})`.slice(
+            0,
+            300,
+          );
+        this.log(`${target.modelId} ${result.status}; falling back`, "warn");
         continue;
       }
       if (opts.requireStructured && (result.status !== "ok" || result.structured === null)) {
-        lastFailure = `${target.modelId}: ${result.error ?? "no structured output"}`.slice(0, 300);
-        this.log(`${target.modelId} failed to produce structured output; trying next model`, "warn", {
-          error: result.error,
-        });
+        lastFailure =
+          `${target.modelId}: ${redact?.(result.error ?? "no structured output") ?? result.error ?? "no structured output"}`.slice(
+            0,
+            300,
+          );
+        this.log(`${target.modelId} failed to produce structured output; trying next model`, "warn");
         continue;
       }
       return { result, target, invocation: updated };
     }
-    throw new NoCapacityError(`Gave up routing ${opts.role}: ${lastFailure ?? "no candidates"}`);
+    throw new NoCapacityError(
+      opts.privateOutput
+        ? `Gave up routing ${opts.role}`
+        : `Gave up routing ${opts.role}: ${lastFailure ?? "no candidates"}`,
+    );
   }
 
-  private onAgentEvent(invocationId: number, ev: AgentEvent, role: Role): void {
+  private onAgentEvent(
+    invocationId: number,
+    ev: AgentEvent,
+    role: Role,
+    redact?: (value: string) => string,
+  ): void {
     const runId = this.run.id;
     const add = (
       type: RunEvent["type"],
       message: string,
       data?: unknown,
       level: RunEvent["level"] = "info",
-    ) => this.store.addEvent({ runId, invocationId, type, level, message, data });
+    ) =>
+      this.store.addEvent({
+        runId,
+        invocationId,
+        type,
+        level,
+        message: redact ? redact(message) : message,
+        data:
+          redact && data !== undefined
+            ? JSON.parse(
+                JSON.stringify(data, (_key, value: unknown) =>
+                  typeof value === "string" ? redact(value) : value,
+                ),
+              )
+            : data,
+      });
     switch (ev.type) {
       case "init":
         add("status", `session ${ev.sessionId}${ev.model ? ` (${ev.model})` : ""}`, undefined, "debug");

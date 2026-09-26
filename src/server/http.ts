@@ -75,7 +75,7 @@ async function body<T>(req: Request): Promise<T> {
   }
 }
 
-export function startHttp(factory: Factory, extras: HttpExtras = {}): Server<undefined> {
+export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Record<string, unknown> {
   const { store } = factory;
   const port = factory.cfg.port;
   const allowedOrigins = new Set([
@@ -93,13 +93,19 @@ export function startHttp(factory: Factory, extras: HttpExtras = {}): Server<und
     async (req: Request & { params: Record<string, string> }, server: Server<undefined>) => {
       const path = new URL(req.url).pathname;
       // Anything arriving through the Cloudflare tunnel may only reach /webhooks/*.
-      if (req.headers.get("cf-connecting-ip") && !path.startsWith("/webhooks/")) {
+      if (req.headers.has("cf-connecting-ip") && !path.startsWith("/webhooks/")) {
         return error("forbidden", 403);
       }
       // Runs execute code, so a web page in the operator's browser must not be able to create or
       // control them (CSRF against localhost): mutations need a local Origin (or none, as from the
       // CLI) and a JSON body type, which cross-origin pages can't send without a CORS preflight.
-      if (req.method !== "GET" && req.method !== "HEAD" && !path.startsWith("/webhooks/")) {
+      // MCP enforces origins for every method and lets the SDK validate protocol bodies.
+      if (
+        path !== "/mcp" &&
+        req.method !== "GET" &&
+        req.method !== "HEAD" &&
+        !path.startsWith("/webhooks/")
+      ) {
         const origin = req.headers.get("origin");
         if (origin && !allowedOrigins.has(origin)) return error("cross-origin request refused", 403);
         const type = req.headers.get("content-type") ?? "";
@@ -156,6 +162,8 @@ export function startHttp(factory: Factory, extras: HttpExtras = {}): Server<und
       return json(
         store.listEvents(req.params.id as string, {
           after: Number(url.searchParams.get("after") ?? 0),
+          tail: url.searchParams.get("tail") === "true",
+          excludeDebug: url.searchParams.get("excludeDebug") === "true",
           limit: Math.min(5000, Number(url.searchParams.get("limit") ?? 1000)),
           ...(inv ? { invocationId: Number(inv) } : {}),
         }),
@@ -227,11 +235,15 @@ export function startHttp(factory: Factory, extras: HttpExtras = {}): Server<und
     routes["/chat"] = extras.ui;
   }
 
+  return routes;
+}
+
+export function startHttp(factory: Factory, extras: HttpExtras = {}): Server<undefined> {
   return Bun.serve({
     hostname: factory.cfg.host,
     port: factory.cfg.port,
     development: process.env.NODE_ENV !== "production" && process.env.LIMITLESS_DEV === "1",
-    routes: routes as never,
+    routes: createHttpRoutes(factory, extras) as never,
     fetch(req) {
       const path = new URL(req.url).pathname;
       if (path.startsWith("/api/")) return error("not found", 404);

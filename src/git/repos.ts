@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
@@ -70,18 +70,38 @@ export function cachePath(paths: Paths, repo: Repo): string {
 }
 
 /** Make sure a fresh bare mirror exists (GitHub repos) and is fetched. */
+const cacheLocks = new Map<string, Promise<unknown>>();
+
+/** Serialize work on one repo cache (clone/fetch/worktree add) across concurrent runs. */
+export async function withRepoLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = cacheLocks.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(fn);
+  cacheLocks.set(key, next);
+  try {
+    return await next;
+  } finally {
+    if (cacheLocks.get(key) === next) cacheLocks.delete(key);
+  }
+}
+
+/** Make sure a fresh bare mirror exists (GitHub repos) and is fetched. */
 export async function ensureCache(paths: Paths, repo: Repo): Promise<string> {
   const cache = cachePath(paths, repo);
   if (repo.kind === "local") return cache;
-  if (!existsSync(cache)) {
-    mkdirSync(paths.repos, { recursive: true });
-    await sh(["git", "clone", "--bare", repo.url as string, cache], { cwd: paths.repos, timeoutMs: 600_000 });
-    await sh(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], { cwd: cache });
-  }
-  // Agents run inside worktrees of this repo; make any push attempt from them fail.
-  await sh(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
-  await sh(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000 });
-  return cache;
+  return withRepoLock(cache, async () => {
+    if (!existsSync(cache)) {
+      mkdirSync(paths.repos, { recursive: true });
+      // Clone to a temporary path and rename, so a crash never leaves a half-configured cache.
+      const tmp = `${cache}.tmp-${process.pid}-${Date.now()}`;
+      await sh(["git", "clone", "--bare", repo.url as string, tmp], { cwd: paths.repos, timeoutMs: 600_000 });
+      await sh(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], { cwd: tmp });
+      renameSync(tmp, cache);
+    }
+    // Agents run inside worktrees of this repo; make any push attempt from them fail.
+    await sh(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
+    await sh(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000 });
+    return cache;
+  });
 }
 
 export interface Worktree {
@@ -107,9 +127,11 @@ export async function createWorktree(
     const base = await sh(["git", "rev-parse", baseRef], { cwd: cache });
     return { path, branch, baseSha: base.stdout.trim() || head.stdout.trim() };
   }
-  const base = await sh(["git", "rev-parse", baseRef], { cwd: cache });
-  await sh(["git", "worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
-  return { path, branch, baseSha: base.stdout.trim() };
+  return withRepoLock(cache, async () => {
+    const base = await sh(["git", "rev-parse", baseRef], { cwd: cache });
+    await sh(["git", "worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
+    return { path, branch, baseSha: base.stdout.trim() };
+  });
 }
 
 export async function removeWorktree(paths: Paths, repo: Repo, path: string): Promise<void> {
@@ -254,10 +276,20 @@ export async function createPullRequest(
 }
 
 /** Merge now if possible; if branch protection requires checks, enable auto-merge instead. */
-export async function mergePullRequest(prUrl: string, cwd: string): Promise<"merged" | "auto" | "failed"> {
-  const now = await sh(["gh", "pr", "merge", prUrl, "--squash", "--delete-branch"], { cwd, allowFail: true });
+export async function mergePullRequest(
+  prUrl: string,
+  cwd: string,
+  title?: string,
+): Promise<"merged" | "auto" | "failed"> {
+  // Squash with the PR title as the subject, not the first round's commit message.
+  const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
+  const subject = title ? ["--subject", number ? `${title} (#${number})` : title] : [];
+  const now = await sh(["gh", "pr", "merge", prUrl, "--squash", "--delete-branch", ...subject], {
+    cwd,
+    allowFail: true,
+  });
   if (now.exitCode === 0) return "merged";
-  const auto = await sh(["gh", "pr", "merge", prUrl, "--squash", "--auto", "--delete-branch"], {
+  const auto = await sh(["gh", "pr", "merge", prUrl, "--squash", "--auto", "--delete-branch", ...subject], {
     cwd,
     allowFail: true,
   });

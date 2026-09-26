@@ -71,7 +71,8 @@ test("disabled, missing, invalid and exact-body signatures", async () => {
   const h = handler();
   cfg.secrets.GITHUB_WEBHOOK_SECRET = "";
   const integrations = await mountIntegrations({ cfg, store } as Factory);
-  expect(integrations.notes[0]).toContain("disabled");
+  expect(integrations.notes.find((n) => n.startsWith("GitHub webhooks"))).toContain("disabled");
+  await integrations.stop();
   await integrations.stop();
   expect((await h(request(body))).status).toBe(503);
   cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
