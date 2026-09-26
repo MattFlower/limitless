@@ -206,7 +206,23 @@ export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
   let stuckReason: string | null = null;
   const signal = AbortSignal.any([spec.signal, stuckController.signal]);
 
+  // Byte-level inactivity isn't enough: a degraded stream can trickle `thinking_tokens` counters
+  // for many minutes without any real progress. Only text, tool calls and tool results count.
+  let lastProgress = Date.now();
+  const progressWatch = setInterval(
+    () => {
+      if (stuckReason || Date.now() - lastProgress <= spec.idleTimeoutMs) return;
+      stuckReason = `no progress (text or tool activity) for ${Math.round(spec.idleTimeoutMs / 1000)}s`;
+      spec.onEvent({ type: "status", text: `stopping agent: ${stuckReason}` });
+      stuckController.abort();
+    },
+    Math.min(spec.idleTimeoutMs, 10_000),
+  );
+
   const parser = new ClaudeStreamParser((ev) => {
+    if (ev.type === "text" || ev.type === "tool_call" || ev.type === "tool_result" || ev.type === "init") {
+      lastProgress = Date.now();
+    }
     if (ev.type === "tool_call" && !stuckReason) {
       const reason = loop.observe(ev.name, ev.input);
       if (reason) {
@@ -253,6 +269,7 @@ export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
         : null,
   };
 
+  clearInterval(progressWatch);
   if (proc.cancelled && stuckReason) return { ...base, status: "stuck", error: stuckReason };
   if (proc.cancelled) return { ...base, status: "cancelled", error: "cancelled" };
   if (proc.timedOut) return { ...base, status: "timeout", error: `timed out after ${spec.timeoutMs}ms` };
