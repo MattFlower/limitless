@@ -6,7 +6,7 @@ with `limitless deploy`. Status is tracked here and in the UI.
 
 | # | Milestone | Task | Status |
 |---|---|---|---|
-| 1 | M3 | GitHub webhook trigger | in review (factory) |
+| 1 | M3 | GitHub webhook trigger | done — #4 (+ GitHub IP allowlist by orchestrator); live on limitless-sandbox |
 | 2 | M3 | MCP server + skills for Claude Code and Codex | done — #1 |
 | 3 | M2 | Blind holdout scenarios | done — #3 (Codex flags fixed by orchestrator) |
 | 4 | M2 | Rebase onto the moving base branch before delivery | todo |
@@ -14,9 +14,9 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 6 | M3 | Chat concierge (UI + Discord free text) | todo |
 | 7 | M4 | Direct-HTTP LLM path + local model servers | todo |
 | 8 | M4 | OpenRouter spend reconciliation | todo |
-| 9 | M5 | Retention and cleanup | todo |
-| 10 | M2 | Live CLI contract smoke tests | todo |
-| 11 | M3 | Quota alerts (Discord + UI) | todo |
+| 9 | M5 | Retention and cleanup | done — #5 |
+| 10 | M2 | Live CLI contract smoke tests | done — #7 (`limitless deploy --smoke`) |
+| 11 | M3 | Quota alerts (Discord + UI) | done — #6 |
 
 ---
 
