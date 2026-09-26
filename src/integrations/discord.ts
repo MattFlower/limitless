@@ -10,6 +10,7 @@ import {
   type Message,
 } from "discord.js";
 import type { Factory } from "../app.ts";
+import { ChatRequestSchema } from "../concierge.ts";
 import type { Config } from "../config.ts";
 import { type Profile, type Run, type RunStatus, TERMINAL_STATUSES } from "../core/types.ts";
 
@@ -22,6 +23,9 @@ export interface DiscordCommand {
 }
 
 export interface DiscordMessage {
+  id?: string;
+  guildId?: string | null;
+  mentioned?: boolean;
   channelId: string;
   userId: string;
   content: string;
@@ -122,9 +126,14 @@ export class GatewayDiscordPort implements DiscordPort {
     });
     this.client.on("messageCreate", (message: Message) => {
       void onMessage({
+        id: message.id,
+        guildId: message.guildId,
+        mentioned: this.client.user ? message.mentions.users.has(this.client.user.id) : false,
         channelId: message.channelId,
         userId: message.author.id,
-        content: message.content,
+        content: this.client.user
+          ? message.content.replace(new RegExp(`<@!?${this.client.user.id}>`, "g"), "").trim()
+          : message.content,
         bot: message.author.bot,
       }).catch((error) => console.error("[discord] message:", error));
     });
@@ -189,6 +198,7 @@ export class DiscordIntegration {
   private readonly finalSent = new Set<string>();
   private readonly noticeSent = new Set<string>();
   private readonly queues = new Map<string, Promise<void>>();
+  private readonly mentionQueues = new Map<string, Promise<void>>();
 
   constructor(
     private readonly factory: Factory,
@@ -322,13 +332,7 @@ export class DiscordIntegration {
           requestedBy: command.userId,
           sourceRef: { kind: "discord", channelId: channel },
         });
-        try {
-          const threadId = await this.port.createThread(channel, run.title.slice(0, 100));
-          this.factory.store.setRunSourceRef(run.id, { kind: "discord", channelId: channel, threadId });
-          this.enqueue(threadId, `Run ${run.id} started. Reply here to answer questions.`);
-        } catch (error) {
-          console.error("[discord] create thread:", error);
-        }
+        await this.attachThread(run);
         await command.reply(`Run ${run.id} queued: ${this.runUrl(run.id)}`);
       } else if (command.name === "runs") {
         const status = options.status;
@@ -388,9 +392,85 @@ export class DiscordIntegration {
     }
   }
 
+  private async attachThread(run: Run): Promise<void> {
+    if (this.threadId(this.factory.store.getRun(run.id) ?? run)) return;
+    const channel = this.factory.cfg.discordChannelId;
+    if (!channel) return;
+    try {
+      const threadId = await this.port.createThread(channel, run.title.slice(0, 100));
+      this.factory.store.setRunSourceRef(run.id, {
+        ...run.sourceRef,
+        kind: "discord",
+        channelId: channel,
+        threadId,
+      });
+      this.enqueue(threadId, `Run ${run.id} started. Reply here to answer questions.`);
+    } catch (error) {
+      console.error("[discord] create thread:", error);
+    }
+  }
+
+  private async mention(message: DiscordMessage): Promise<void> {
+    const conversationId = `discord:${message.guildId}:${message.channelId}:${message.userId}`;
+    const previous = this.mentionQueues.get(conversationId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          const before = this.factory.concierge.history(conversationId).messages.at(-1)?.id ?? 0;
+          const confirm = message.content.match(/^confirm\s+(\S+)$/i);
+          const edit = message.content.match(/^edit\s+(\S+)\s+([\s\S]+)$/i);
+          const input = confirm
+            ? { type: "confirm", proposalId: confirm[1] }
+            : edit
+              ? { type: "edit", proposalId: edit[1], proposal: JSON.parse(edit[2] ?? "") }
+              : { type: "text", text: message.content };
+          const history = await this.factory.concierge.submit(
+            conversationId,
+            ChatRequestSchema.parse(input),
+            {
+              source: "discord",
+              requestedBy: message.userId,
+              channelId: message.channelId,
+              messageId: message.id,
+            },
+          );
+          for (const proposal of history.proposals) {
+            if (proposal.runId) {
+              const run = this.factory.store.getRun(proposal.runId);
+              if (run) await this.attachThread(run);
+            }
+          }
+          for (const reply of history.messages.filter((m) => m.id > before && m.role === "assistant")) {
+            const proposal = reply.outcome?.proposal;
+            let content = reply.content;
+            if (proposal?.state === "pending")
+              content += `\nProposal: ${proposal.id}\nRepo: ${proposal.repo}\nTitle: ${proposal.title}\nProfile: ${proposal.profile}\nPrompt: ${proposal.prompt}\nMention me with: confirm ${proposal.id}\nTo edit, mention me with: edit ${proposal.id} {"repo":"...","prompt":"...","profile":"auto","title":"..."}\nEdits require fresh confirmation.`;
+            if (reply.runId) content += `\n${this.runUrl(reply.runId)}`;
+            for (let offset = 0; offset < content.length; offset += 1900)
+              this.enqueue(message.channelId, content.slice(offset, offset + 1900));
+          }
+        } catch (error) {
+          this.enqueue(message.channelId, `Chat error: ${(error as Error).message}`.slice(0, 1900));
+        }
+      });
+    this.mentionQueues.set(conversationId, next);
+    try {
+      await next;
+    } finally {
+      if (this.mentionQueues.get(conversationId) === next) this.mentionQueues.delete(conversationId);
+    }
+  }
+
   async message(message: DiscordMessage): Promise<void> {
     if (message.bot || message.userId !== this.factory.cfg.discordOwnerId || !message.content.trim()) return;
     const run = this.factory.store.getRunByDiscordThread(message.channelId);
+    if (message.mentioned) {
+      if (!message.id || message.guildId !== this.factory.cfg.secrets.DISCORD_GUILD_ID) return;
+      if (message.channelId !== this.factory.cfg.discordChannelId && !run) return;
+      await this.mention(message);
+      return;
+    }
     if (!run) return;
     try {
       this.factory.answer(run.id, message.content.trim(), `discord:${message.userId}`);

@@ -184,4 +184,36 @@ CREATE TABLE quota_alerts (
 );
 `,
   },
+  {
+    version: 5,
+    name: "chat_concierge",
+    sql: `
+ALTER TABLE chat_messages ADD COLUMN outcome_json TEXT;
+CREATE TABLE chat_proposals (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  fields_json TEXT NOT NULL,
+  origin_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending','superseded','confirmed','consumed')),
+  confirmed_at INTEGER,
+  run_id TEXT UNIQUE REFERENCES runs(id)
+);
+CREATE UNIQUE INDEX chat_current ON chat_proposals(conversation_id) WHERE state IN ('pending','confirmed');
+CREATE TABLE chat_receipts (
+  conversation_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  PRIMARY KEY (conversation_id, message_id)
+);
+CREATE TABLE chat_calls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  conversation_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  cost_usd REAL NOT NULL,
+  started_at INTEGER NOT NULL
+);
+CREATE INDEX chat_calls_provider ON chat_calls(provider, started_at);
+`,
+  },
 ];

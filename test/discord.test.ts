@@ -14,6 +14,7 @@ import {
   type DiscordPort,
   mountDiscord,
 } from "../src/integrations/discord.ts";
+import { chatFixture, proposalFields } from "./chat-support.ts";
 
 class FakePort implements DiscordPort {
   onCommand: ((command: DiscordCommand) => Promise<void>) | null = null;
@@ -268,4 +269,110 @@ test("config parses Discord channel and notify_all", () => {
   expect(cfg.discordOwnerId).toBe("owner");
   expect(cfg.discordChannelId).toBe("channel");
   expect(cfg.discordNotifyAll).toBe(true);
+});
+
+test("authorized mentions share the concierge, display complete edited proposals and create one threaded run", async () => {
+  const f = chatFixture();
+  const cfg = f.factory.cfg;
+  cfg.secrets = { DISCORD_BOT_TOKEN: "token", DISCORD_APP_ID: "app", DISCORD_GUILD_ID: "guild" };
+  cfg.discordOwnerId = "owner";
+  cfg.discordChannelId = "channel";
+  const mounted = mountDiscord(f.factory, port);
+  const conversation = "discord:guild:channel:owner";
+  const mention = (content: string, id: string, overrides: Partial<DiscordMessage> = {}) =>
+    port.onMessage?.({
+      id,
+      guildId: "guild",
+      mentioned: true,
+      channelId: "channel",
+      userId: "owner",
+      bot: false,
+      content,
+      ...overrides,
+    });
+  try {
+    await Bun.sleep(0);
+    for (const override of [
+      { bot: true },
+      { userId: "stranger" },
+      { channelId: "unrelated" },
+      { guildId: "foreign" },
+      { guildId: null },
+      { mentioned: false },
+    ])
+      await mention("build", "ignored", override);
+    expect(f.specs).toHaveLength(0);
+    const longPrompt = "all proposal details ".repeat(250);
+    f.action({ type: "propose_run", ...proposalFields, prompt: longPrompt });
+    await Promise.all([mention("build", "request-1"), mention("build", "request-1")]);
+    expect(f.specs).toHaveLength(1);
+    expect(f.factory.store.listRuns()).toHaveLength(0);
+    let proposal = f.factory.concierge.history(conversation).proposals.at(-1);
+    if (!proposal) throw new Error("missing proposal");
+    await Bun.sleep(0);
+    const proposalPosts = port.posts.filter((p) => p.channel === "channel");
+    expect(proposalPosts.every((p) => p.content.length <= 2000)).toBe(true);
+    const details = proposalPosts.map((p) => p.content).join("");
+    expect(proposal.prompt).toBe(longPrompt.trim());
+    expect(details).toContain(proposal.prompt);
+    expect(details).toContain(`confirm ${proposal.id}`);
+    expect(details).toContain("Profile: auto");
+    expect(details).toContain("Repo: local/test");
+    expect(details).toContain(`Title: ${proposalFields.title}`);
+    const oldId = proposal.id;
+    const edited = { ...proposalFields, title: "Discord revised", profile: "deep" };
+    await mention(`edit ${oldId} ${JSON.stringify(edited)}`, "edit-1");
+    const messageCount = f.factory.concierge.history(conversation).messages.length;
+    await mention(`edit ${oldId} ${JSON.stringify(edited)}`, "edit-1");
+    expect(f.factory.concierge.history(conversation).messages).toHaveLength(messageCount);
+    proposal = f.factory.concierge.history(conversation).proposals.at(-1);
+    if (!proposal) throw new Error("missing revised proposal");
+    expect(proposal.id).not.toBe(oldId);
+    expect(proposal.state).toBe("pending");
+    await mention(`confirm ${oldId}`, "obsolete-confirm");
+    expect(f.factory.store.listRuns()).toHaveLength(0);
+    f.action({ type: "create_run", proposalId: proposal.id });
+    await mention("yes I confirm", "ambiguous");
+    expect(f.factory.store.listRuns()).toHaveLength(0);
+    await Promise.all([
+      mention(`confirm ${proposal.id}`, "confirm-1"),
+      mention(`confirm ${proposal.id}`, "confirm-1"),
+      mention(`confirm ${proposal.id}`, "confirm-2"),
+    ]);
+    const runs = f.factory.store.listRuns();
+    expect(runs).toHaveLength(1);
+    const run = runs[0];
+    if (!run) throw new Error("missing run");
+    expect(run).toMatchObject({
+      title: "Discord revised",
+      profile: "deep",
+      source: "discord",
+      requestedBy: "owner",
+      sourceRef: {
+        kind: "discord",
+        conversationId: conversation,
+        proposalId: proposal.id,
+        threadId: "thread-1",
+      },
+    });
+    expect(port.threadNames).toHaveLength(1);
+    expect(port.posts.some((p) => p.content.includes(`/runs/${run.id}`))).toBe(true);
+    const question = f.factory.store.askQuestion(run.id, "Which color?");
+    f.action({ type: "status", target: run.id });
+    await mention("status", "thread-status", { channelId: "thread-1" });
+    expect(f.factory.store.getQuestion(question.id)?.answer).toBeNull();
+    await mention("blue", "thread-answer", { channelId: "thread-1", mentioned: false });
+    expect(f.factory.store.getQuestion(question.id)?.answer).toBe("blue");
+    f.factory.store.startStage(run.id, "implement");
+    f.factory.store.updateRun(run.id, { status: "succeeded" });
+    await Bun.sleep(0);
+    expect(port.posts.some((p) => p.channel === "thread-1" && p.content === "Stage: implement")).toBe(true);
+    expect(
+      port.posts.some((p) => p.channel === "thread-1" && p.embed?.description.includes("succeeded")),
+    ).toBe(true);
+    expect(f.factory.concierge.history("one").messages).toHaveLength(0);
+  } finally {
+    await mounted.stop();
+    f.close();
+  }
 });

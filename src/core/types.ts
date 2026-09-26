@@ -253,6 +253,7 @@ export interface CreateRunRequest {
 
 /** Messages pushed on the global SSE stream. */
 export type StreamMessage =
+  | ChatStreamMessage
   | { kind: "run"; run: Run }
   | { kind: "stage"; stage: Stage }
   | { kind: "invocation"; invocation: Invocation }
@@ -260,3 +261,59 @@ export type StreamMessage =
   | { kind: "provider"; provider: ProviderStatus }
   | { kind: "alert"; alert: QuotaAlert | null; provider: string; window: string; created: boolean }
   | { kind: "question"; question: Question };
+
+export interface ChatProposalFields {
+  repo: string;
+  prompt: string;
+  profile: Profile;
+  title: string;
+}
+
+export type ChatAction =
+  | { type: "reply"; text: string }
+  | ({ type: "propose_run" } & ChatProposalFields)
+  | { type: "create_run"; proposalId: string }
+  | { type: "status"; target: string }
+  | { type: "answer_question"; runId: string; answer: string };
+
+export type ChatRequest =
+  | { type: "text"; text: string }
+  | { type: "confirm"; proposalId: string }
+  | { type: "edit"; proposalId: string; proposal: ChatProposalFields };
+
+export interface ChatOrigin {
+  source: "chat" | "discord";
+  requestedBy: string;
+  channelId?: string;
+  messageId?: string;
+}
+
+export interface ChatProposal extends ChatProposalFields {
+  id: string;
+  conversationId: string;
+  state: "pending" | "superseded" | "confirmed" | "consumed";
+  confirmedAt: number | null;
+  runId: string | null;
+  origin: ChatOrigin;
+}
+
+export interface ChatMessage {
+  id: number;
+  conversationId: string;
+  role: "user" | "assistant";
+  content: string;
+  ts: number;
+  runId: string | null;
+  outcome: {
+    action?: ChatAction;
+    proposal?: ChatProposal;
+    error?: boolean;
+  } | null;
+}
+
+export interface ChatConversation {
+  messages: ChatMessage[];
+  proposals: ChatProposal[];
+}
+
+export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
