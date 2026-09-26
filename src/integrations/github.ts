@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Factory } from "../app.ts";
 import type { CreateRunRequest } from "../core/types.ts";
+import { inAnyCidr } from "../util/cidr.ts";
 import { sh } from "../util/proc.ts";
 
 type GitHubFactory = Pick<Factory, "cfg" | "store" | "createRun">;
@@ -130,12 +131,44 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
   return { note: `unsupported ${event}.${action ?? "unknown"}` };
 }
 
-export function githubWebhook(factory: GitHubFactory): (req: Request) => Promise<Response> {
+/** GitHub's published webhook source ranges (api.github.com/meta), cached for a day. */
+export type HookRanges = () => Promise<string[] | null>;
+
+export function githubHookRanges(fetcher: typeof fetch = fetch): HookRanges {
+  let cached: { at: number; ranges: string[] } | null = null;
+  return async () => {
+    if (cached && Date.now() - cached.at < 86_400_000) return cached.ranges;
+    try {
+      const res = await fetcher("https://api.github.com/meta", { signal: AbortSignal.timeout(5000) });
+      const hooks = ((await res.json()) as { hooks?: unknown }).hooks;
+      if (!res.ok || !Array.isArray(hooks) || !hooks.every((h) => typeof h === "string"))
+        throw new Error("bad meta");
+      cached = { at: Date.now(), ranges: hooks as string[] };
+    } catch {
+      // Keep serving a stale list if we have one; with none, the HMAC check alone decides.
+    }
+    return cached?.ranges ?? null;
+  };
+}
+
+const defaultRanges = githubHookRanges();
+
+export function githubWebhook(
+  factory: GitHubFactory,
+  ranges: HookRanges = defaultRanges,
+): (req: Request) => Promise<Response> {
   return async (req) => {
     if (req.method !== "POST")
       return new Response("method not allowed", { status: 405, headers: { Allow: "POST" } });
     const secret = factory.cfg.secrets.GITHUB_WEBHOOK_SECRET;
     if (!secret) return new Response("GitHub webhooks disabled", { status: 503 });
+    // Defense in depth for deliveries arriving through the Cloudflare tunnel: the client IP must be
+    // one of GitHub's hook ranges. (Local forwards for development carry no cf-connecting-ip.)
+    const clientIp = req.headers.get("cf-connecting-ip");
+    if (clientIp) {
+      const allowed = await ranges();
+      if (allowed && !inAnyCidr(clientIp, allowed)) return new Response("forbidden", { status: 403 });
+    }
     const bytes = new Uint8Array(await req.arrayBuffer());
     if (!verifyGitHubSignature(bytes, req.headers.get("x-hub-signature-256"), secret))
       return new Response("invalid signature", { status: 401 });
