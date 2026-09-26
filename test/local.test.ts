@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { manageLocal, twilightUnit } from "../src/cli/local.ts";
 import type { sh } from "../src/util/proc.ts";
@@ -23,6 +23,10 @@ test("up generates units and starts services; repeated up avoids launchd bootstr
   const opts = { modelPath: "/models/Qwen 27B.gguf", mtplxPlistPath: path, command, probe: async () => true };
   expect((await manageLocal("up", opts)).twilight.service).toBe("active");
   expect(readFileSync(path, "utf8")).toContain("mtplx");
+  const appDir = process.env.LIMITLESS_APP_DIR ?? join(homedir(), ".limitless", "app");
+  expect(readFileSync(path, "utf8")).toContain(
+    `<key>WorkingDirectory</key><string>${appDir.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</string>`,
+  );
   expect(input[0]).toContain('-m "/models/Qwen 27B.gguf"');
   expect(calls.some((c) => c.includes("bootstrap"))).toBe(true);
   calls.length = 0;

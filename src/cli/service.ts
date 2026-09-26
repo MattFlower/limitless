@@ -62,26 +62,21 @@ function plist(
 }
 
 export function mtplxPlist(): string {
-  return plist(
-    MTPLX_LABEL,
-    [
-      join(home, ".mtplx", "bin", "mtplx"),
-      "serve",
-      "--model",
-      MTPLX_MODEL,
-      "--host",
-      "127.0.0.1",
-      "--port",
-      "8000",
-      "--api-key",
-      "mtplx-local",
-      "--batching-preset",
-      "agent",
-      "--yes",
-    ],
-    {},
-    home,
-  );
+  return plist(MTPLX_LABEL, [
+    join(home, ".mtplx", "bin", "mtplx"),
+    "serve",
+    "--model",
+    MTPLX_MODEL,
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8000",
+    "--api-key",
+    "mtplx-local",
+    "--batching-preset",
+    "agent",
+    "--yes",
+  ]);
 }
 
 async function launchctl(args: string[], allowFail = true) {
