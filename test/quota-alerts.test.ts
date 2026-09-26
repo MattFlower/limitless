@@ -188,3 +188,81 @@ test("alerts API returns current alerts and store publishes dashboard changes", 
   expect(changes.some((m) => m.kind === "alert" && m.alert === null)).toBe(true);
   unsubscribe();
 });
+
+test("generic subscription windows use their configured reserves independently", async () => {
+  const port = new FakeDiscord();
+  const genericProviders: ProviderDef[] = [
+    { id: "A", label: "A", harness: "fake", billing: "subscription", maxConcurrent: 1 },
+    { id: "B", label: "B", harness: "fake", billing: "subscription", maxConcurrent: 1 },
+  ];
+  const genericModels: ModelDef[] = models.map((model, i) => ({
+    ...model,
+    id: `${i === 0 ? "A" : "B"}/model`,
+    provider: i === 0 ? "A" : "B",
+  }));
+  factory.cfg.reserves.windows = { A: { daily: 0.8, weekly: 1 } };
+  factory = new Factory(factory.cfg, {
+    store,
+    providers: genericProviders,
+    models: genericModels,
+    policy: { implement: { default: ["A/model|B/model"] } } as Policy,
+    clock: () => now,
+  });
+  const mounted = mountDiscord(factory, port);
+  const dailyReset = now + 3_600_000;
+  const weeklyReset = now + 7_200_000;
+  factory.tracker.observeWindows("A", {
+    daily: { utilization: 0.5999, resetsAt: dailyReset },
+    weekly: { utilization: 0.7499, resetsAt: weeklyReset },
+  });
+  expect(alerts()).toEqual([]);
+  factory.tracker.observeWindows("A", {
+    daily: { utilization: 0.6, resetsAt: dailyReset },
+    weekly: { utilization: 0.75, resetsAt: weeklyReset },
+  });
+  expect(alerts()).toMatchObject([
+    { provider: "A", window: "daily", severity: "warning", utilization: 0.6 },
+    { provider: "A", window: "weekly", severity: "warning", utilization: 0.75 },
+  ]);
+  factory.tracker.observeWindows("A", { daily: { utilization: 0.8, resetsAt: dailyReset } });
+  expect(alerts().find((alert) => alert.window === "daily")?.severity).toBe("exhausted");
+  await mounted.stop();
+  expect(port.posts).toHaveLength(2);
+  now = dailyReset + 1;
+  expect(alerts().map((alert) => alert.window)).toEqual(["weekly"]);
+  const nextReset = now + 3_600_000;
+  factory.tracker.observeWindows("A", { daily: { utilization: 0.6, resetsAt: nextReset } });
+  expect(alerts().find((alert) => alert.window === "daily")?.resetsAt).toBe(nextReset);
+});
+
+test("fallback description respects the selected route constraints", () => {
+  const defs: ProviderDef[] = ["A", "B", "D"].map((id) => ({
+    id,
+    label: id,
+    harness: "fake",
+    billing: "subscription",
+    maxConcurrent: 1,
+  }));
+  const choices: ModelDef[] = ["A", "B", "D"].map((id) => ({
+    id: `${id}/model`,
+    provider: id,
+    model: "test",
+    vendor: id === "A" ? "anthropic" : "openai",
+    tier: 4,
+    price: { input: 0, output: 0 },
+  }));
+  factory = new Factory(factory.cfg, {
+    store,
+    providers: defs,
+    models: choices,
+    policy: { implement: { default: ["A/model|B/model|D/model"] } } as Policy,
+    clock: () => now,
+  });
+  expect(
+    factory.router.route("implement", "medium", { exclude: ["D/model"] }).candidates.map((c) => c.provider),
+  ).toEqual(["A", "B"]);
+  factory.tracker.record("A", "quota");
+  const routing = alerts().find((alert) => alert.provider === "A")?.routing;
+  expect(routing).toContain("B");
+  expect(routing).not.toContain("D");
+});

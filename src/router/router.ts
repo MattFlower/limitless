@@ -22,6 +22,10 @@ export interface RouteDecision {
 
 export class Router {
   private readonly models: Map<string, ModelDef>;
+  private readonly lastRoute = new Map<
+    string,
+    { role: Role; complexity: Complexity; constraints: RouteConstraints }
+  >();
 
   constructor(
     private readonly tracker: ProviderTracker,
@@ -57,14 +61,21 @@ export class Router {
 
   describeFallback(provider: string, exhausted: boolean): string {
     const alternatives = new Set<string>();
+    const selected = this.lastRoute.get(provider);
+    const routes: { role: Role; complexity: Complexity; constraints: RouteConstraints }[] = selected
+      ? [selected]
+      : [];
     for (const [role, cases] of Object.entries(this.policy) as [Role, Policy[Role]][]) {
+      if (selected) break;
       for (const [complexity, groups] of Object.entries(cases) as [Complexity | "default", string[]][]) {
         const ids = groups.flatMap((group) => group.split("|"));
         if (!ids.some((id) => this.models.get(id)?.provider === provider)) continue;
-        for (const candidate of this.route(role, complexity === "default" ? "medium" : complexity)
-          .candidates) {
-          if (candidate.provider !== provider) alternatives.add(candidate.provider);
-        }
+        routes.push({ role, complexity: complexity === "default" ? "medium" : complexity, constraints: {} });
+      }
+    }
+    for (const route of routes) {
+      for (const candidate of this.decideRoute(route.role, route.complexity, route.constraints).candidates) {
+        if (candidate.provider !== provider) alternatives.add(candidate.provider);
       }
     }
     const fallback = alternatives.size
@@ -79,6 +90,18 @@ export class Router {
 
   /** Ordered, available candidates for a role. Never empty unless nothing at all is usable. */
   route(role: Role, complexity: Complexity, c: RouteConstraints = {}): RouteDecision {
+    const decision = this.decideRoute(role, complexity, c);
+    const selected = decision.candidates[0];
+    if (selected)
+      this.lastRoute.set(selected.provider, {
+        role,
+        complexity,
+        constraints: { ...c, exclude: c.exclude ? [...c.exclude] : undefined },
+      });
+    return decision;
+  }
+
+  private decideRoute(role: Role, complexity: Complexity, c: RouteConstraints): RouteDecision {
     const entry = this.policy[role];
     const groups = entry?.[complexity] ?? entry?.default ?? [];
     const skipped: RouteDecision["skipped"] = [];

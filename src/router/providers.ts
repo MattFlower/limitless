@@ -93,11 +93,9 @@ export class ProviderTracker {
   headroom(id: string, now = this.clock()): number {
     const p = this.providers.get(id);
     if (!p) return 0;
-    const limits = this.reserveFor(id);
     let min = 1;
     for (const [name, w] of Object.entries(p.windows)) {
-      const cap = limits[name];
-      if (cap === undefined) continue;
+      const cap = this.reserveFor(id, name);
       const util = w.resetsAt !== null && w.resetsAt <= now ? 0 : w.utilization;
       min = Math.min(min, (cap - util) / cap);
     }
@@ -110,12 +108,14 @@ export class ProviderTracker {
     return min;
   }
 
-  private reserveFor(id: string): Record<string, number> {
-    if (id === "claude")
-      return { five_hour: this.reserves.claudeFiveHour, seven_day: this.reserves.claudeSevenDay };
-    if (id === "codex")
-      return { five_hour: this.reserves.codexFiveHour, seven_day: this.reserves.codexWeekly };
-    return {};
+  private reserveFor(id: string, window: string): number {
+    const configured = this.reserves.windows?.[id]?.[window];
+    if (configured !== undefined) return configured;
+    if (id === "claude" && window === "five_hour") return this.reserves.claudeFiveHour;
+    if (id === "claude" && window === "seven_day") return this.reserves.claudeSevenDay;
+    if (id === "codex" && window === "five_hour") return this.reserves.codexFiveHour;
+    if (id === "codex" && window === "seven_day") return this.reserves.codexWeekly;
+    return 1;
   }
 
   unavailableReason(id: string, now = this.clock()): string | null {
@@ -200,10 +200,8 @@ export class ProviderTracker {
     p.windows = { ...p.windows, ...current };
     this.persist(id);
     if (p.def.billing !== "subscription") return;
-    const limits = this.reserveFor(id);
     for (const [name, window] of Object.entries(current)) {
-      const cap = limits[name];
-      if (cap === undefined) continue;
+      const cap = this.reserveFor(id, name);
       if (window.resetsAt !== null && window.resetsAt <= now) {
         this.store.clearAlert(id, name);
         continue;
