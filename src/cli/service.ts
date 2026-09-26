@@ -2,6 +2,16 @@ import { existsSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from "n
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { sh } from "../util/proc.ts";
+import {
+  DEFAULT_MAX_WAIT_MS,
+  type DeployClient,
+  type DeployClock,
+  deployClock,
+  localDeployClient,
+  requestAdmin,
+  waitForDrain,
+  waitForHealthy,
+} from "./deploy-wait.ts";
 
 const LABEL = "cc.mattflower.limitless";
 const TUNNEL_LABEL = "cc.mattflower.limitless-tunnel";
@@ -85,10 +95,10 @@ ingress:
   return path;
 }
 
-async function ensureRelease(dir = appDir): Promise<void> {
+async function ensureRelease(dir = appDir, command: typeof sh = sh): Promise<void> {
   if (!existsSync(join(dir, ".git"))) {
     mkdirSync(join(dir, ".."), { recursive: true });
-    await sh(["git", "clone", REPO_URL, dir], { cwd: home, timeoutMs: 300_000 });
+    await command(["git", "clone", REPO_URL, dir], { cwd: home, timeoutMs: 300_000 });
   }
 }
 
@@ -179,11 +189,26 @@ export async function deploy(
   port: number,
   ref = "origin/main",
   smoke = false,
-  opts: { releaseDir?: string; command?: typeof sh } = {},
+  opts: {
+    releaseDir?: string;
+    command?: typeof sh;
+    client?: DeployClient;
+    clock?: DeployClock;
+    restart?: () => Promise<unknown>;
+    log?: (message: string) => void;
+    maxWaitMs?: number;
+    now?: boolean;
+  } = {},
 ): Promise<void> {
   const dir = opts.releaseDir ?? appDir;
   const command = opts.command ?? sh;
-  await ensureRelease(dir);
+  const maxWaitMs = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
+  if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs < 0) throw new Error("invalid deployment wait budget");
+  const client = opts.client ?? localDeployClient(port);
+  const clock = opts.clock ?? deployClock;
+  const restart = opts.restart ?? (() => launchctl(["kickstart", "-k", `gui/${uid}/${LABEL}`], false));
+  const log = opts.log ?? console.log;
+  await ensureRelease(dir, command);
   const previous = (await command(["git", "rev-parse", "HEAD"], { cwd: dir })).stdout.trim();
   await command(["git", "fetch", "origin", "--prune"], { cwd: dir, timeoutMs: 300_000 });
   const target = (await command(["git", "rev-parse", ref], { cwd: dir })).stdout.trim();
@@ -192,29 +217,47 @@ export async function deploy(
       await command(["bun", "run", "check"], { cwd: dir, timeoutMs: 600_000 });
       await command(["bun", "run", "smoke"], { cwd: dir, timeoutMs: 900_000 });
     }
-    console.log(`already at ${target.slice(0, 8)}`);
+    log(`already at ${target.slice(0, 8)}`);
     return;
   }
-  await command(["git", "checkout", "-q", "--detach", target], { cwd: dir });
+  let drainAttempted = false;
+  let restartAttempted = false;
+  let gatesPassed = false;
   try {
+    await command(["git", "checkout", "-q", "--detach", target], { cwd: dir });
     await command(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000 });
     await command(["bun", "run", "check"], { cwd: dir, timeoutMs: 600_000 });
     if (smoke) await command(["bun", "run", "smoke"], { cwd: dir, timeoutMs: 900_000 });
-  } catch (e) {
-    await command(["git", "checkout", "-q", "--detach", previous], { cwd: dir });
-    await command(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000, allowFail: true });
-    throw new Error(`deploy gate failed; staying on ${previous.slice(0, 8)}\n${(e as Error).message}`);
+    gatesPassed = true;
+    // A lost response may still have enabled drain on the daemon.
+    drainAttempted = true;
+    await requestAdmin(client, clock, "drain");
+    await waitForDrain(client, clock, maxWaitMs, opts.now === true, log);
+    restartAttempted = true;
+    await restart();
+    await waitForHealthy(client, clock);
+    log(`deployed ${previous.slice(0, 8)} → ${target.slice(0, 8)}`);
+  } catch (error) {
+    const cleanupErrors: string[] = [];
+    const cleanup = async (name: string, action: () => Promise<unknown>) => {
+      try {
+        await action();
+      } catch (error) {
+        cleanupErrors.push(`${name}: ${String(error)}`);
+      }
+    };
+    await cleanup("restore previous release", async () => {
+      await command(["git", "checkout", "-q", "--detach", previous], { cwd: dir });
+      await command(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000 });
+    });
+    if (restartAttempted) await cleanup("restart previous release", restart);
+    if (drainAttempted) await cleanup("resume scheduler", () => requestAdmin(client, clock, "resume"));
+    throw new Error(
+      `${gatesPassed ? "deploy failed; rollback attempted to" : "deploy gate failed; staying on"} ${previous.slice(0, 8)}\n${String(error)}` +
+        (cleanupErrors.length ? `\nCleanup failures:\n${cleanupErrors.join("\n")}` : ""),
+      { cause: error },
+    );
   }
-  await launchctl(["kickstart", "-k", `gui/${uid}/${LABEL}`], false);
-  if (await health(port, 45_000)) {
-    console.log(`deployed ${previous.slice(0, 8)} → ${target.slice(0, 8)}`);
-    return;
-  }
-  console.error("new version is unhealthy; rolling back");
-  await command(["git", "checkout", "-q", "--detach", previous], { cwd: dir });
-  await command(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000, allowFail: true });
-  await launchctl(["kickstart", "-k", `gui/${uid}/${LABEL}`], false);
-  throw new Error(`rolled back to ${previous.slice(0, 8)}`);
 }
 
 export async function status(port: number): Promise<void> {

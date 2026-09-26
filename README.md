@@ -55,7 +55,18 @@ diffs, reviews, quota gauges, cost).
 | `limitless providers` | Health and quota of every provider |
 | `limitless gc [--dry-run]` | Clean up expired worktrees, invocation logs and debug events |
 | `limitless service install\|uninstall\|status` | Run the daemon (and Cloudflare tunnel) under launchd |
-| `limitless deploy [ref]` | Update the release checkout, gate on `bun run check`, restart, auto-rollback |
+| `limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]` | Gate the release, drain active runs, restart, auto-rollback |
+
+Deploy drains the scheduler after checks (and optional live smoke checks) pass, waiting up to
+2700 seconds for active runs to finish. `--max-wait` accepts non-negative integer seconds;
+`--now` or `--max-wait 0` restarts without waiting. Progress includes active run IDs and stages.
+New runs remain queued during drain; active work, answers, and cancellation continue normally.
+The UI shows drain mode, and a restarted daemon starts with scheduling enabled.
+
+Local operators can also POST `/api/admin/drain` or `/api/admin/resume` with
+`Content-Type: application/json`. These require a loopback peer and the normal mutation Origin
+checks. `/api/health` reports `draining` and the scheduler's `active` run IDs. Deploy fails
+explicitly if the running daemon does not support drain; failures attempt rollback and resume.
 
 ## Configuration
 

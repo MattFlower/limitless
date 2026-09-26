@@ -1,6 +1,7 @@
+import { BlockList, isIP } from "node:net";
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
-import type { CreateRunRequest, RunStatus, StreamMessage } from "../core/types.ts";
+import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeStats } from "../db/stats.ts";
 import { DEFAULT_POLICY, MODELS } from "../router/catalog.ts";
 
@@ -10,6 +11,10 @@ export interface HttpExtras {
   /** HTML entry for the SPA (Bun HTML import). */
   ui?: unknown;
 }
+
+const loopback = new BlockList();
+loopback.addSubnet("127.0.0.0", 8, "ipv4");
+loopback.addAddress("::1", "ipv6");
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -109,7 +114,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         const origin = req.headers.get("origin");
         if (origin && !allowedOrigins.has(origin)) return error("cross-origin request refused", 403);
         const type = req.headers.get("content-type") ?? "";
-        if (!type.toLowerCase().startsWith("application/json")) {
+        if (type.split(";")[0]?.trim().toLowerCase() !== "application/json") {
           return error("mutations require content-type: application/json", 415);
         }
       }
@@ -120,9 +125,26 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       }
     };
 
+  const drainState = () => ({
+    draining: factory.scheduler.draining,
+    active: factory.scheduler.activeRunIds,
+  });
+  const admin = (action: "drain" | "resume") => ({
+    POST: handle((req, server) => {
+      const peer = server.requestIP(req)?.address;
+      if (!peer || !isIP(peer) || !loopback.check(peer, isIP(peer) === 6 ? "ipv6" : "ipv4")) {
+        return error("admin endpoints require a loopback peer", 403);
+      }
+      factory.scheduler[action]();
+      return json(drainState());
+    }),
+  });
+
   const routes: Record<string, unknown> = {
+    "/api/admin/drain": admin("drain"),
+    "/api/admin/resume": admin("resume"),
     "/api/health": handle(() =>
-      json({ ok: true, uptimeMs: Date.now() - factory.startedAt, active: factory.scheduler.activeRunIds }),
+      json({ ok: true, uptimeMs: Date.now() - factory.startedAt, ...drainState() } satisfies HealthResponse),
     ),
     "/api/gc": {
       POST: handle(async (req) => {
