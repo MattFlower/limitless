@@ -108,7 +108,8 @@ export const MODELS: ModelDef[] = [
     tier: 3,
     price: { input: 1, output: 5, cacheRead: 0.1 },
   },
-  // OpenAI via the ChatGPT subscription.
+  // OpenAI via the ChatGPT subscription. The $100 plan serves gpt-6-astra and the gpt-5.6 family
+  // through Codex (gpt-6-sol/luna are API-only for this plan).
   {
     id: "codex/astra",
     provider: "codex",
@@ -121,7 +122,7 @@ export const MODELS: ModelDef[] = [
   {
     id: "codex/sol",
     provider: "codex",
-    model: "gpt-6-sol",
+    model: "gpt-5.6-sol",
     vendor: "openai",
     tier: 4,
     effort: "medium",
@@ -130,11 +131,11 @@ export const MODELS: ModelDef[] = [
   {
     id: "codex/luna",
     provider: "codex",
-    model: "gpt-6-luna",
+    model: "gpt-5.6-luna",
     vendor: "openai",
     tier: 3,
     effort: "medium",
-    price: { input: 0.1, output: 0.5 },
+    price: { input: 0.2, output: 1.2 },
   },
   // Metered open models via OpenRouter (tiers are provisional until the M4 eval suite calibrates them).
   {

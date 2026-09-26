@@ -26,6 +26,8 @@ const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
  */
 export class ProviderTracker {
   private providers = new Map<string, ProviderRuntime>();
+  /** Individual models a provider rejected (e.g. not available on this plan). */
+  private modelBlocks = new Map<string, { until: number; reason: string }>();
 
   constructor(
     defs: ProviderDef[],
@@ -111,6 +113,15 @@ export class ProviderTracker {
       return `circuit open after ${p.consecutiveFailures} failures`;
     if (this.headroom(id, now) <= 0) return "at reserve limit";
     return null;
+  }
+
+  blockModel(modelId: string, reason: string, ms = 24 * 60 * 60 * 1000): void {
+    this.modelBlocks.set(modelId, { until: Date.now() + ms, reason: reason.slice(0, 200) });
+  }
+
+  modelUnavailableReason(modelId: string, now = Date.now()): string | null {
+    const block = this.modelBlocks.get(modelId);
+    return block && block.until > now ? `model rejected: ${block.reason}` : null;
   }
 
   isAvailable(id: string): boolean {

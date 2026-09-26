@@ -14,6 +14,8 @@ Usage:
   limitless cancel <run>                  Cancel a run
   limitless answer <run> "<text>"         Answer a run's open question(s)
   limitless providers                     Provider health and quota
+  limitless service install|uninstall|status   Manage the launchd daemon + tunnel
+  limitless deploy [ref]                  Deploy a ref (default origin/main) to the release checkout
 
 Environment: LIMITLESS_URL (default http://127.0.0.1:7400)`;
 
@@ -233,6 +235,17 @@ async function main(): Promise<void> {
       });
       console.log("Answered");
       return;
+    }
+    case "service": {
+      const svc = await import("./service.ts");
+      const port = Number(process.env.LIMITLESS_PORT ?? 7400);
+      if (rest[0] === "install") return svc.install(port);
+      if (rest[0] === "uninstall") return svc.uninstall();
+      return svc.status(port);
+    }
+    case "deploy": {
+      const svc = await import("./service.ts");
+      return svc.deploy(Number(process.env.LIMITLESS_PORT ?? 7400), rest[0]);
     }
     case "providers": {
       const ps =

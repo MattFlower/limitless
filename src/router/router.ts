@@ -81,7 +81,7 @@ export class Router {
           skipped.push({ modelId: id, reason: `below tier ${c.minTier}` });
           continue;
         }
-        const why = this.tracker.unavailableReason(m.provider);
+        const why = this.tracker.unavailableReason(m.provider) ?? this.tracker.modelUnavailableReason(m.id);
         if (why) {
           skipped.push({ modelId: id, reason: `${m.provider}: ${why}` });
           continue;

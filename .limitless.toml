@@ -1,0 +1,13 @@
+# Gates and policy the Limitless factory applies when it works on this repository.
+[gates]
+setup = ["bun install --frozen-lockfile"]
+checks = [
+  { name = "lint", run = "bun run lint" },
+  { name = "typecheck", run = "bun run typecheck" },
+  { name = "test", run = "bun test" },
+]
+
+[policy]
+# Changes to the factory itself are reviewed by the orchestrator before merging.
+merge = "pr"
+protected_paths = ["test/fixtures/**"]

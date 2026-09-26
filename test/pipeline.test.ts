@@ -218,6 +218,25 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(f.tracker.status("alpha")?.state).toBe("exhausted");
   });
 
+  test("a model the provider rejects is blocked and skipped without burning rounds", async () => {
+    let alphaCalls = 0;
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (s.target.provider === "alpha") {
+        alphaCalls++;
+        return { status: "error", error: "The 'alpha-1' model is not supported when using Codex with a ChatGPT account." };
+      }
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(alphaCalls).toBe(1);
+    expect(f.store.listStages(run.id).filter((s) => s.name === "implement").length).toBe(1);
+    expect(f.tracker.modelUnavailableReason("alpha/m")).toContain("not supported");
+  });
+
   test("asks the human when triage finds blocking ambiguity, then continues", async () => {
     let specPrompt = "";
     const f = start((s) => {

@@ -44,6 +44,9 @@ export interface RunState {
   toolCommands: string[];
 }
 
+const MODEL_REJECTED =
+  /model[^.]{0,80}(is not supported|not found|does not exist|not available)|unknown model|invalid model|model_not_found/i;
+
 export class CancelledError extends Error {
   constructor() {
     super("cancelled");
@@ -251,6 +254,15 @@ export class RunContext {
       this.run = store.refreshRunTotals(this.run.id);
 
       if (result.status === "cancelled" || this.signal.aborted) throw new CancelledError();
+      if (result.status !== "ok" && MODEL_REJECTED.test(result.error ?? "")) {
+        // A configuration problem with this model (e.g. not on the plan), not a task failure.
+        tracker.blockModel(target.modelId, result.error ?? "rejected");
+        lastFailure = `${target.modelId}: ${result.error ?? ""}`.slice(0, 300);
+        this.log(`${target.modelId} rejected by provider; blocking it for 24h and falling back`, "warn", {
+          error: result.error,
+        });
+        continue;
+      }
       if (result.status === "quota" || result.status === "unavailable") {
         lastFailure = `${target.modelId}: ${result.status} (${result.error ?? ""})`.slice(0, 300);
         this.log(`${target.modelId} ${result.status}; falling back`, "warn", { error: result.error });
