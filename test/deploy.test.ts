@@ -92,7 +92,7 @@ function setup() {
 test("deploy gates, drains, refreshes stages and restarts once after completion", async () => {
   const f = setup();
   await deploy(7400, "feature", true, f.opts);
-  expect(f.calls.slice(0, 8)).toEqual([
+  expect(f.calls.slice(0, 9)).toEqual([
     "git rev-parse HEAD",
     "git fetch origin --prune",
     "git rev-parse feature",
@@ -100,6 +100,7 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
     "bun install --frozen-lockfile",
     "bun run check",
     "bun run smoke",
+    "bun scripts/check-migration-copy.ts",
     "drain",
   ]);
   expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
@@ -108,6 +109,19 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
   expect(f.logs.join("\n")).toContain("run-a (review)");
   expect(f.logs.join("\n")).toContain("Drain complete");
   expect(f.calls.slice(-3)).toEqual(["health", "restart", "health"]);
+});
+
+test("migration copy gate failure prevents drain and restart", async () => {
+  const f = setup();
+  const command = f.opts.command;
+  f.opts.command = async (args, opts) => {
+    if (args.join(" ") === "bun scripts/check-migration-copy.ts") throw new Error("copy changed");
+    return command(args, opts);
+  };
+  await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("copy changed");
+  expect(f.selected()).toBe("previous");
+  expect(f.calls).not.toContain("drain");
+  expect(f.calls).not.toContain("restart");
 });
 
 test("initially empty and unchanged ref do not wait", async () => {

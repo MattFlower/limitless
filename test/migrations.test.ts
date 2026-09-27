@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { checkMigrationCopy } from "../scripts/check-migration-copy.ts";
 import { MIGRATION_DIR, migrationNames, runMigrations, verifyShipped } from "../src/db/migration-runner.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
 import { Store } from "../src/db/store.ts";
@@ -104,6 +105,50 @@ test("upgrading a current database without new files leaves application schema a
     ).toEqual(schema);
     expect(store.db.query("SELECT * FROM settings ORDER BY key").all()).toEqual(settings);
     store.close();
+  });
+});
+
+test("deployment check uses a production database copy and leaves the source untouched", () => {
+  temporary((directory, path) => {
+    legacyDatabase(path, true);
+    const before = new Database(path);
+    const original = before.query("SELECT * FROM schema_migrations ORDER BY version").all();
+    before.close();
+    checkMigrationCopy(path, directory);
+    const after = new Database(path);
+    expect(after.query("SELECT * FROM schema_migrations ORDER BY version").all()).toEqual(original);
+    expect(after.query("SELECT value FROM settings WHERE key = 'sentinel'").get()).toEqual({
+      value: "unchanged",
+    });
+    after.close();
+  });
+});
+
+test("deployment check applies pending SQL only to its copy", () => {
+  temporary((directory, path) => {
+    legacyDatabase(path, true);
+    writeFileSync(join(directory, "20260927T1500-deploy.sql"), "CREATE TABLE deployed (id INTEGER);");
+    checkMigrationCopy(path, directory);
+    const source = new Database(path);
+    expect(source.query("SELECT name FROM sqlite_master WHERE name = 'deployed'").get()).toBeNull();
+    source.close();
+  });
+});
+
+test("deployment check rejects unexpected application changes without pending files", () => {
+  temporary((directory, path) => {
+    const db = new Database(path);
+    db.exec(
+      "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+    );
+    for (const migration of MIGRATIONS.slice(0, -1)) {
+      db.exec(migration.sql);
+      db.query("INSERT INTO schema_migrations VALUES (?, ?, 1)").run(migration.version, migration.name);
+    }
+    db.close();
+    expect(() => checkMigrationCopy(path, directory)).toThrow(
+      "migration copy changed application schema or data",
+    );
   });
 });
 
