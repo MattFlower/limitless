@@ -1,4 +1,5 @@
 // Small, dependency-free formatting helpers shared by every page.
+import { utilizationPercent } from "../../src/core/quota-format.ts";
 
 /** Real-money formatting: "$12.34", "$0.004" for tiny metered amounts. */
 export function money(n: number): string {
@@ -22,8 +23,7 @@ export function compactNumber(n: number): string {
 }
 
 export function pct(fraction: number): string {
-  if (!Number.isFinite(fraction)) return "0%";
-  return `${Math.round(Math.max(0, fraction) * 100)}%`;
+  return utilizationPercent(fraction);
 }
 
 const SECOND = 1000;

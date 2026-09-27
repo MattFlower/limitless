@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
+import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import type { Profile, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
 
@@ -339,12 +340,12 @@ async function main(): Promise<void> {
             id: string;
             state: string;
             reason: string | null;
-            windows: Record<string, { utilization: number }>;
+            windows: Record<string, { utilization: number; observedAt?: number | null }>;
           }[]
         >("/api/providers");
       for (const p of ps) {
         const w = Object.entries(p.windows)
-          .map(([k, v]) => `${k} ${Math.round(v.utilization * 100)}%`)
+          .map(([k, v]) => `${k} ${utilizationPercent(v.utilization)} (${observationAge(v.observedAt)})`)
           .join(", ");
         console.log(`${p.id.padEnd(11)} ${p.state.padEnd(9)} ${w} ${p.reason ? color.dim(p.reason) : ""}`);
       }

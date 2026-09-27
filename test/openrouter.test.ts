@@ -132,6 +132,7 @@ test("pipeline and chat refresh exhausted key before harness and use fallback", 
 
 test("provider API returns usage fields without key or label", async () => {
   setup();
+  factory.tracker.observeWindows("fallback", { five_hour: { utilization: 0.721, resetsAt: null } });
   await factory.tracker.refreshOpenRouter();
   const route = createHttpRoutes(factory)["/api/providers"] as (
     req: Request,
@@ -143,6 +144,14 @@ test("provider API returns usage fields without key or label", async () => {
   expect(body).toContain('"reportedAt":1000000');
   expect(body).toContain('"limitRemaining":49');
   expect(body).toContain('"limitReset":"daily"');
+  const statuses = JSON.parse(body) as {
+    id: string;
+    windows: Record<string, { utilization: number; observedAt: number | null }>;
+  }[];
+  expect(statuses.find((p) => p.id === "fallback")?.windows.five_hour).toMatchObject({
+    utilization: 0.721,
+    observedAt: now,
+  });
   expect(body).not.toContain("sentinel-key");
   expect(body).not.toContain("sentinel-label");
   expect(factory.tracker.status("fallback")?.reportedUsageUsd).toBeUndefined();
