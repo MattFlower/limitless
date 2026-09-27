@@ -65,7 +65,12 @@ import {
   type Verify,
   VerifySchema,
 } from "./schemas.ts";
-import { blockedOnly, ENVIRONMENT_BLOCKED, normalizeVerify } from "./verification.ts";
+import {
+  blockedOnly,
+  ENVIRONMENT_BLOCKED,
+  normalizeVerify,
+  preDeliveryVerifyArtifact,
+} from "./verification.ts";
 
 const ROUNDS_PER_IMPLEMENTER = 2;
 
@@ -779,13 +784,11 @@ async function oneRound(
             ctx.run.id,
             attempt === 0 ? `verify-${round}.json` : `verify-${round}-retry.json`,
             "verify",
-            JSON.stringify(
+            preDeliveryVerifyArtifact(
               { ...v, modelId: target.modelId, round, attempt },
-              (_key, value: unknown) =>
-                typeof value === "string"
-                  ? redactHoldoutText(value, ctx.state.holdout as Holdout, publicSources)
-                  : value,
-              2,
+              ctx.state.spec as Spec,
+              ctx.state.holdout as Holdout,
+              publicSources,
             ),
           );
           const met = v.criteria.filter((c) => c.status === "met").length;
