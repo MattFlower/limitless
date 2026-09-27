@@ -32,6 +32,8 @@ export interface Stats {
     costEquivUsd: number;
     active: number;
     queued: number;
+    openNeedsHuman: number;
+    openNeedsHumanRate: number;
   };
 }
 
@@ -139,7 +141,8 @@ export function computeStats(store: Store, days = 14): Stats {
     .query(
       `SELECT COUNT(*) AS runs, SUM(status = 'succeeded') AS succeeded, SUM(cost_usd) AS cost_usd,
               SUM(cost_equiv_usd) AS cost_equiv_usd,
-              SUM(status IN ('running','waiting_input')) AS active, SUM(status = 'queued') AS queued
+              SUM(status IN ('running','waiting_input')) AS active, SUM(status = 'queued') AS queued,
+              SUM(status = 'needs_human') AS open_needs_human
          FROM runs WHERE created_at >= ?`,
     )
     .get(since) as Record<string, number>;
@@ -171,6 +174,8 @@ export function computeStats(store: Store, days = 14): Stats {
       costEquivUsd: Number(totals.cost_equiv_usd ?? 0),
       active: Number(totals.active ?? 0),
       queued: Number(totals.queued ?? 0),
+      openNeedsHuman: Number(totals.open_needs_human ?? 0),
+      openNeedsHumanRate: totals.runs ? Number(totals.open_needs_human ?? 0) / Number(totals.runs) : 0,
     },
   };
 }
