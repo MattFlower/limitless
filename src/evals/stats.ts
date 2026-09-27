@@ -133,7 +133,10 @@ function implementMetrics(rows: EvalTrial[]) {
   const initialFailures = evaluated.filter(
     (t) => first(t).pass === false && ["gates", "audit", "hidden_tests"].includes(first(t).reason ?? ""),
   );
-  const recoveryExecutions = initialFailures.filter((t) => !t.details.cache);
+  const attempted = initialFailures.filter((t) =>
+    t.details.rounds?.slice(1).some((r) => r.status === "ok" && r.pass !== null),
+  );
+  const recoveryExecutions = attempted.filter((t) => !t.details.cache);
   const recovered = initialFailures.filter((t) => t.pass).length;
   const executedRecoveries = recoveryExecutions.filter((t) => t.pass).length;
   const rate = (numerator: number, denominator: number) => ({
@@ -153,7 +156,8 @@ function implementMetrics(rows: EvalTrial[]) {
     passAt1: rate(evaluated.filter((t) => first(t).pass).length, evaluated.length),
     passAtR: rate(evaluated.filter((t) => t.pass).length, evaluated.length),
     recovery: {
-      ...rate(recovered, initialFailures.length),
+      ...rate(recovered, attempted.length),
+      notAttempted: initialFailures.length - attempted.length,
       executedTrials: recoveryExecutions.length,
       executedRecoveries,
       costPerRecoveryUsd: recoveryCost("costUsd"),

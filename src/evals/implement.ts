@@ -7,17 +7,20 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import type { EvalGrade, EvalStrategy } from "../core/types.ts";
+import type { EvalGrade, EvalStrategy, EvalTrial } from "../core/types.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
 import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
+import { withScratch } from "../harness/scratch.ts";
 import type { ModelTarget } from "../harness/types.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../pipeline/prompts.ts";
 import type { Router } from "../router/router.ts";
+import { EFFORT_LEVELS } from "../router/targets.ts";
 import { agentEnv, runProcess, sh } from "../util/proc.ts";
 import type { hiddenContents, ImplementCase } from "./cases.ts";
 import { gatesAt } from "./prepare.ts";
@@ -102,10 +105,7 @@ export async function gradeImplement(
   };
   const snapshot = restore ? mkdtempSync(join(dirname(cwd), "grade-")) : undefined;
   let snapshotReady = false;
-  const copy = (from: string, to: string) => {
-    for (const name of readdirSync(from))
-      cpSync(join(from, name), join(to, name), { recursive: true, verbatimSymlinks: true });
-  };
+  const modes = new Map<string, number>();
   try {
     signal.throwIfAborted();
     await sh(["git", "add", "-A"], { cwd, env, signal });
@@ -129,8 +129,13 @@ export async function gradeImplement(
     );
     evidence.commit = (await sh(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
     if (snapshot) {
-      // Restore Git metadata too: grading commands may stage/commit hidden inputs or leave logs.
-      copy(cwd, snapshot);
+      // Keep candidate Git metadata private: graders may commit hidden inputs.
+      // Reconstruct files only after failure; never copy the worktree (including dependencies).
+      cpSync(join(cwd, ".git"), join(snapshot, ".git"), { recursive: true, verbatimSymlinks: true });
+      for (const path of (await sh(["git", "ls-files", "-z"], { cwd, env, signal })).stdout
+        .split("\0")
+        .filter(Boolean))
+        if (!lstatSync(join(cwd, path)).isSymbolicLink()) modes.set(path, statSync(join(cwd, path)).mode);
       snapshotReady = true;
     }
     const after = await runGates(cwd, prepared.gates, signal);
@@ -157,14 +162,16 @@ export async function gradeImplement(
     evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");
     evidence.auditWarnings = findings.filter((finding) => finding.severity === "warn");
     inject(cwd, files);
-    const hidden = await runProcess({
-      cmd: ["/bin/sh", "-c", item.hidden.command],
-      cwd,
-      env,
-      signal,
-      timeoutMs: item.hidden.timeoutSec * 1000,
-      tailLimit: 6000,
-    });
+    const hidden = await withScratch(cwd, (scratch) =>
+      runProcess({
+        cmd: ["/bin/sh", "-c", item.hidden.command],
+        cwd,
+        env: agentEnv({ HOME: scratch, TMPDIR: scratch, TMP: scratch, TEMP: scratch }),
+        signal,
+        timeoutMs: item.hidden.timeoutSec * 1000,
+        tailLimit: 6000,
+      }),
+    );
     signal.throwIfAborted();
     evidence.hidden = {
       exitCode: hidden.exitCode,
@@ -194,9 +201,15 @@ export async function gradeImplement(
   } finally {
     if (snapshot) {
       try {
-        if (snapshotReady) {
+        if (snapshotReady && evidence.reason !== null && !signal.aborted) {
           for (const name of readdirSync(cwd)) rmSync(join(cwd, name), { recursive: true, force: true });
-          copy(snapshot, cwd);
+          cpSync(join(snapshot, ".git"), join(cwd, ".git"), { recursive: true, verbatimSymlinks: true });
+          await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "HEAD"], {
+            cwd,
+            env,
+            signal,
+          });
+          for (const [path, mode] of modes) chmodSync(join(cwd, path), mode);
         }
       } finally {
         rmSync(snapshot, { recursive: true, force: true });
@@ -214,29 +227,19 @@ export async function gradeImplement(
 
 export function nextImplementTarget(
   router: Router,
-  item: ImplementCase,
+  chain: EvalTrial["details"]["switchChain"],
   target: ModelTarget,
   strategy: EvalStrategy,
 ) {
   if (strategy === "retry") return target;
   if (strategy === "switch") {
-    const decision = router.route("implement", item.complexity);
-    const next = decision.candidates
-      .filter((candidate) => candidate.tier > target.tier)
-      .sort((a, b) => a.tier - b.tier)[0];
-    if (!next)
-      for (const skipped of decision.skipped) {
-        const model = router.model(skipped.modelId.split("@")[0] ?? "");
-        if (
-          model &&
-          model.tier > target.tier &&
-          (skipped.reason === "disabled" || skipped.reason.startsWith(`${model.provider}:`))
-        )
-          throw new Error(`Stronger policy target unavailable: ${skipped.reason}`);
-      }
-    return next;
+    const next = chain?.find((candidate) => candidate.tier > target.tier);
+    if (!next) return undefined;
+    const model = router.model(next.modelId);
+    if (!model) throw new Error("Switch target unavailable: model removed");
+    return { ...router.toTarget(model, next.effort), tier: next.tier };
   }
-  const levels: NonNullable<ModelTarget["effort"]>[] = ["none", "low", "medium", "high"];
+  const levels = EFFORT_LEVELS;
   const index = target.effort === undefined ? -1 : levels.indexOf(target.effort);
   const model = router.model(target.modelId);
   if (index < 0 || !model) return undefined;

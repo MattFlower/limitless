@@ -7,6 +7,7 @@ import type { CaseFile } from "../src/evals/cases.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { Triage } from "../src/pipeline/schemas.ts";
+import type { ModelDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 
 export const answer: Triage = {
@@ -35,7 +36,7 @@ export function deferred<T>() {
   });
   return { promise, resolve };
 }
-export async function evalFixture() {
+export async function evalFixture(extraModels: ModelDef[] = []) {
   const home = mkdtempSync(join(tmpdir(), "limitless-eval-"));
   const cfg = loadConfig({ home, configDir: join(home, "config") });
   cfg.secrets = {};
@@ -96,6 +97,7 @@ export async function evalFixture() {
       { id: "provider-b", label: "B", harness: "fake", billing: "subscription", maxConcurrent: 1 },
     ],
     models: [
+      ...extraModels,
       {
         id: "candidate-a",
         provider: "openrouter",
@@ -119,7 +121,7 @@ export async function evalFixture() {
         price: { input: 1, output: 1 },
       },
     ],
-    harnesses: { fake: harness("fake"), llm: harness("llm") },
+    harnesses: { fake: harness("fake"), codex: harness("codex"), llm: harness("llm") },
   });
   return {
     home,

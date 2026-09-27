@@ -88,6 +88,18 @@ export class Router {
     return target;
   }
 
+  /** Policy order only: no health filtering, headroom sorting or routing side effects. */
+  policyTargets(role: Role, complexity: Complexity) {
+    const entry = this.policy[role];
+    return (entry?.[complexity] ?? entry?.default ?? []).flatMap((group) =>
+      group.split("|").flatMap((id) => {
+        if (!this.model(parseTarget(id).modelId)) return [];
+        const { model, effort } = this.resolveFor(role, id);
+        return [{ modelId: model.id, effort: effort ?? null, tier: model.tier }];
+      }),
+    );
+  }
+
   describeFallback(provider: string, exhausted: boolean): string {
     const alternatives = new Set<string>();
     const effortAlternatives = new Set<string>();

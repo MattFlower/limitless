@@ -378,8 +378,9 @@ test("multi-round reports count independent trials, recovery costs, cache eviden
   };
   expect(summary()?.recovery).toMatchObject({
     numerator: 0,
-    denominator: 1,
-    rate: 0,
+    denominator: 0,
+    notAttempted: 1,
+    rate: null,
     costPerRecoveryUsd: null,
   });
 });

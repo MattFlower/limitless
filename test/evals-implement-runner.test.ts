@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import {
   chmodSync,
   cpSync,
@@ -13,6 +14,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type { ImplementCase } from "../src/evals/cases.ts";
+import { formatEvalReport } from "../src/evals/format.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { runGates } from "../src/gates/run.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
@@ -25,8 +27,9 @@ import { enableEfforts, evalFixture } from "./evals-support.ts";
 async function fixture(
   gate = "test ! -f broken",
   baseFiles: (home: string) => Record<string, string> = () => ({}),
+  extraModels: Parameters<typeof evalFixture>[0] = [],
 ) {
-  const f = await evalFixture();
+  const f = await evalFixture(extraModels);
   await sh(["git", "checkout", "--detach", f.sha], { cwd: f.source });
   writeFileSync(
     join(f.source, ".limitless.toml"),
@@ -533,6 +536,10 @@ for (const rounds of [1, 3])
             }
           : { status: "skipped", pass: null, costUsd: 0.1 },
       );
+      if (rounds > 1) {
+        expect(report.trials[0]?.details.grade?.implement?.reason).toBe("hidden_tests");
+        expect(report.summaries[0]?.implement?.recovery).toMatchObject({ denominator: 0, notAttempted: 1 });
+      }
       expect(f.factory.store.cachedEvalTrials(report.trials[0]?.cacheKey ?? "")).toEqual([]);
       expect(cwd && existsSync(cwd)).toBe(false);
       expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
@@ -634,6 +641,7 @@ for (const strategy of ["retry", "effort", "switch"] as const)
 test("single-round strategies share legacy inputs and cache; multi-round identities differ", async () => {
   const f = await fixture();
   try {
+    enableEfforts(f);
     const first = (await f.run()).trials[0];
     for (const strategy of ["retry", "effort", "switch"]) {
       const cached = (await f.run({ rounds: 1, strategy })).trials[0];
@@ -669,6 +677,11 @@ for (const kind of [
     const f = await fixture();
     try {
       if (kind === "effort") enableEfforts(f).effort = "high";
+      if (kind === "effort" || kind === "default") {
+        await expect(f.run({ rounds: 2, strategy: "effort" })).rejects.toThrow("higher supported effort");
+        expect(f.calls).toHaveLength(0);
+        return;
+      }
       if (kind === "timeout") {
         f.item.hidden.command = "sleep 10";
         f.item.hidden.timeoutSec = 0.05;
@@ -683,14 +696,16 @@ for (const kind of [
           status: kind === "error" ? "error" : "ok",
         };
       });
-      const t = (
-        await f.run({
-          rounds: 2,
-          strategy:
-            kind === "effort" || kind === "default" ? "effort" : kind === "switch" ? "switch" : "retry",
-          maxUsd: kind === "budget" ? 0.1 : 1,
-        })
-      ).trials[0];
+      const report = await f.run({
+        rounds: 2,
+        strategy: kind === "switch" ? "switch" : "retry",
+        maxUsd: kind === "budget" ? 0.1 : 1,
+      });
+      const t = report.trials[0];
+      if (["budget", "unavailable", "switch"].includes(kind)) {
+        expect(t?.details.grade?.implement?.reason).toBe("hidden_tests");
+        expect(report.summaries[0]?.implement?.recovery).toMatchObject({ denominator: 0, notAttempted: 1 });
+      }
       const repeats = kind === "limit" || kind === "missing-session";
       expect(f.calls).toHaveLength(repeats ? 2 : 1);
       expect(f.calls.every((s) => s.resumeSessionId === undefined)).toBe(true);
@@ -709,6 +724,163 @@ for (const kind of [
       if (["budget", "error", "timeout", "unavailable"].includes(kind))
         expect(f.factory.store.cachedEvalTrials(t?.cacheKey ?? "")).toEqual([]);
     } finally {
+      await f.close();
+    }
+  });
+
+for (const initial of [undefined, "high"] as const)
+  test(`effort resolves ${initial ?? "lowest"} and reaches xhigh`, async () => {
+    const f = await fixture();
+    try {
+      const model = enableEfforts(f);
+      model.effort = initial;
+      model.supportedEfforts = ["xhigh", "high", "low"];
+      f.respond(() => ({ files: { answer: "wrong" } }));
+      const report = await f.run({ rounds: 5, strategy: "effort" });
+      expect(f.calls.map((s) => s.target.effort)).toEqual(
+        initial ? ["high", "xhigh"] : ["low", "high", "xhigh"],
+      );
+      expect(report.trials[0]?.effort).toBe(initial ?? "low");
+      await expect(f.run({ models: ["candidate-a@xhigh"], strategy: "effort" })).rejects.toThrow(
+        "higher supported effort",
+      );
+    } finally {
+      await f.close();
+    }
+  });
+
+for (const succeeds of [true, false])
+  test(`failed resume falls back once, accounts for both calls, fresh succeeds=${succeeds}`, async () => {
+    const f = await fixture();
+    try {
+      f.respond((s) => ({
+        files: { answer: f.calls.length === 1 ? "wrong" : "correct" },
+        status: s.resumeSessionId || (f.calls.length > 1 && !succeeds) ? "error" : "ok",
+        error: "session unavailable",
+        costUsd: 0.1,
+      }));
+      const report = await f.run({ rounds: 3 });
+      expect(f.calls).toHaveLength(3);
+      expect(f.calls[1]?.resumeSessionId).toBe("fake-session");
+      expect(f.calls[2]?.resumeSessionId).toBeUndefined();
+      expect(f.calls[2]?.prompt).toBe(f.calls[1]?.prompt);
+      expect(report.trials[0]?.details.rounds?.[1]).toMatchObject({
+        resumeFailed: true,
+        pass: succeeds ? true : null,
+      });
+      expect(report.trials[0]?.details.rounds?.[1]?.costUsd).toBeCloseTo(0.2);
+      expect(report.trials[0]?.costUsd).toBeCloseTo(0.3);
+      expect(report.summaries[0]?.implement?.recovery).toMatchObject({
+        denominator: succeeds ? 1 : 0,
+        notAttempted: succeeds ? 0 : 1,
+      });
+      if (!succeeds) expect(report.trials[0]?.details.grade?.implement?.reason).toBe("hidden_tests");
+    } finally {
+      await f.close();
+    }
+  });
+
+test("switch freezes policy order, ignores live headroom, records harness and keys the chain", async () => {
+  const f = await fixture();
+  const policy = f.factory.policy.implement.small;
+  const route = spyOn(f.factory.router, "route");
+  try {
+    const model = f.factory.router.model("candidate-b");
+    const provider = f.factory.tracker.def("provider-b");
+    if (!model || !provider) throw new Error("missing target");
+    model.tier = 2;
+    provider.harness = "codex";
+    f.factory.policy.implement.small = ["candidate-a", "candidate-b"];
+    f.respond(() => {
+      f.factory.policy.implement.small = ["candidate-a"];
+      return { files: { answer: f.calls.length === 1 ? "wrong" : "correct" } };
+    });
+    const report = await f.run({ rounds: 2, strategy: "switch" });
+    expect(f.calls.map((s) => s.target.modelId)).toEqual(["candidate-a", "candidate-b"]);
+    expect(report.trials[0]?.harness).toBe("codex");
+    expect(report.trials[0]?.details.rounds?.map((r) => r.harness)).toEqual(["fake", "codex"]);
+    expect(route).not.toHaveBeenCalled();
+    const changed = await f.run({ rounds: 2, strategy: "switch" });
+    expect(changed.trials[0]?.cacheKey).not.toBe(report.trials[0]?.cacheKey);
+    expect(changed.summaries[0]?.cached).toBe(0);
+    f.factory.policy.implement.small = ["candidate-a", "candidate-b"];
+    const cached = await f.run({ rounds: 2, strategy: "switch" });
+    expect(cached.trials[0]?.harness).toBe("codex");
+    expect(cached.summaries[0]?.cached).toBe(1);
+  } finally {
+    route.mockRestore();
+    f.factory.policy.implement.small = policy;
+    await f.close();
+  }
+});
+
+test("unavailable next tier never skips to a higher available tier", async () => {
+  const f = await fixture(undefined, undefined, [
+    {
+      id: "top",
+      provider: "openrouter",
+      model: "top",
+      tier: 3,
+      vendor: "other",
+      origin: "unknown",
+      baseOrigin: "unknown",
+      supportedEfforts: [],
+      price: { input: 1, output: 1 },
+    },
+  ]);
+  const policy = f.factory.policy.implement.small;
+  try {
+    const model = f.factory.router.model("candidate-b");
+    if (!model) throw new Error("missing model");
+    model.tier = 2;
+    f.factory.policy.implement.small = ["candidate-a", "candidate-b", "top"];
+    f.factory.tracker.setEnabled("provider-b", false);
+    f.respond(() => ({ files: { answer: "wrong" } }));
+    const report = await f.run({ rounds: 3, strategy: "switch" });
+    expect(f.calls).toHaveLength(1);
+    expect(report.trials[0]?.details.grade?.implement?.reason).toBe("hidden_tests");
+    expect(report.summaries[0]?.implement?.recovery).toMatchObject({ denominator: 0, notAttempted: 1 });
+  } finally {
+    f.factory.policy.implement.small = policy;
+    await f.close();
+  }
+});
+
+for (const rounds of [1, 2])
+  test(`grading avoids worktree copies and isolates hidden HOME/TMPDIR (rounds=${rounds})`, async () => {
+    const f = await fixture();
+    const copies = spyOn(fs, "cpSync");
+    try {
+      f.item.hidden.command += '; result=$?; printf "%s\\n%s" "$HOME" "$TMPDIR"; exit $result';
+      f.save();
+      const report = await f.run({ rounds });
+      expect(report.trials[0]?.pass).toBe(true);
+      const paths = report.trials[0]?.details.grade?.implement?.hidden?.output.split("\n") ?? [];
+      expect(paths).toHaveLength(2);
+      expect(paths[0]).toBe(paths[1]);
+      expect(paths.every((p) => !existsSync(p))).toBe(true);
+      expect(
+        copies.mock.calls.filter(
+          ([from]) => String(from).startsWith(`${f.calls[0]?.cwd}/`) && !String(from).endsWith("/.git"),
+        ),
+      ).toHaveLength(0);
+      if (rounds === 1)
+        expect(copies.mock.calls.filter(([from]) => String(from).endsWith("/.git"))).toHaveLength(0);
+      const text = formatEvalReport(report);
+      expect(text.includes("strategy=")).toBe(rounds > 1);
+      expect(text.includes("recovery")).toBe(rounds > 1);
+      expect(text.match(/pass@1 /g)).toHaveLength(1);
+      expect(copies.mock.calls.filter(([, to]) => to === join(f.calls[0]?.cwd ?? "", ".git"))).toHaveLength(
+        0,
+      );
+      copies.mockClear();
+      f.respond(() => ({ files: { answer: "wrong" } }));
+      await f.run({ rounds, cache: false });
+      expect(
+        copies.mock.calls.filter(([from]) => from === join(f.calls.at(-1)?.cwd ?? "", ".git")),
+      ).toHaveLength(rounds - 1);
+    } finally {
+      copies.mockRestore();
       await f.close();
     }
   });

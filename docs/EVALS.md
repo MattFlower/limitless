@@ -196,6 +196,33 @@ Failure reasons are `hidden_tests` (nonzero hidden command), `gates` (blocking g
 `audit` (blocking findings), `timeout` (candidate or grading timeout), and `error` (preparation,
 harness, or grading failure). Errors and timeouts are not cached; completed grades are reusable.
 
+Implementation evals accept `--rounds N` (default 1, including the initial attempt) and
+`--strategy retry|effort|switch` (default retry). Each repetition is one independent trial;
+rounds retain candidate edits and stop at a pass, round limit, budget/cancellation, operational
+failure, or exhausted strategy. `retry` keeps the target; `effort` starts at an explicit
+`model@effort`, otherwise the catalog default or lowest supported level, then advances through
+all supported levels (including xhigh/max). Submission rejects effort targets without a higher
+level. `switch` freezes the case complexity's implement policy at submission, choosing the first
+policy entry at each successively higher tier, independent of health/headroom. Its resolved
+chain is part of the multi-round cache key. An unavailable next target stops recovery; it never
+skips a tier. Retry/effort resume the session when possible; a failed resume gets one fresh
+attempt with identical feedback, recorded as `resumeFailed: true`, with both calls charged.
+Each round records its harness; the trial harness follows the last invocation.
+
+Reports show pass@1 (initial passes), and for multi-round trials pass@R (passes by the final
+allowed round), recovery (later passes / initially failed trials with a graded recovery), and
+recovery **not attempted** separately. Budget/cancel stops and operational failures before any
+recovery grade preserve the initial grade and do not count as failed recoveries. Incremental
+cost per recovery divides post-initial-round spend across attempted recoveries by successful
+recoveries, excluding cached trials; empty denominators are n/a. Cached grades still contribute
+to pass/recovery rates. Single-round reports omit strategy, pass@R and recovery lines.
+
+Hidden commands run with a disposable per-grade HOME/TMPDIR, deleted on every exit. Grading
+keeps a private Git checkpoint only when another round is possible, avoiding full worktree
+copies. After a failed grade it rebuilds candidate files and modes from that checkpoint, removing
+hidden files, commits and artifacts; generated/ignored files may need rebuilding. Passing and
+final rounds need no restoration. Hidden output is never included in recovery feedback.
+
 ## Policy generation and review
 
 `limitless eval policy` reads persisted evidence and effective settings through the daemon API;
