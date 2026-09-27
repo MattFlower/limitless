@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { reviewPrompt } from "../src/pipeline/prompts.ts";
 import { blockingReviewFindings, reviewVerdict } from "../src/pipeline/review.ts";
 import { LaterReviewSchema, type Review, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 
@@ -89,3 +90,17 @@ for (const severity of ["blocker", "major", "minor", "nit"] as const) {
       );
   });
 }
+
+test("reviewers may not block on verification they could not perform", () => {
+  const prompt = reviewPrompt({
+    prompt: "Tidy the dashboard cards",
+    spec: null,
+    baseSha: "abc",
+    stat: "",
+    gates: [],
+    audit: [],
+    implementerReport: "",
+  });
+  expect(prompt).toContain("Every finding must name a concrete defect in the change");
+  expect(prompt).toContain("report it as minor at most, never blocker or major");
+});

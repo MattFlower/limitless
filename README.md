@@ -8,6 +8,9 @@ enough, across your Claude and ChatGPT subscriptions, OpenRouter, and local GPUs
 limitless run "Add a --json flag to the export command" --repo MattFlower/some-repo -f
 ```
 
+New to Limitless? Start with the **[user guide](docs/GUIDE.md)**: install, first run, triggers,
+reading a run, routing, costs, operations and troubleshooting.
+
 ## How a run works
 
 ```

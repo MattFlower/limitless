@@ -699,12 +699,20 @@ p {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 12px;
+  align-items: stretch;
 }
 .provider-card {
   padding: 13px 15px;
+  display: grid;
+  grid-row: span 2;
+  grid-template-rows: subgrid;
+  min-width: 0;
+}
+.provider-card-top {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
 }
 .provider-head {
   display: flex;
@@ -738,7 +746,7 @@ p {
 .provider-workload-head,
 .provider-workload-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 55px 66px;
+  grid-template-columns: minmax(0, 1fr) 48px 60px;
   gap: 4px;
   padding: 3px 0;
 }
@@ -752,6 +760,16 @@ p {
 .provider-workload-head span:not(:first-child),
 .provider-workload-row span:not(:first-child) {
   text-align: right;
+  white-space: nowrap;
+}
+.provider-workload-row .nowrap {
+  white-space: nowrap;
+}
+.provider-gauges {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
 }
 
 .cost-chart {
@@ -906,9 +924,27 @@ p {
 .gauge-label {
   display: flex;
   justify-content: space-between;
+  gap: 8px;
   font-family: var(--font-mono);
   font-size: 10.5px;
   color: var(--text-faint);
+}
+.gauge-label span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gauge-value {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.gauge-details {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
 }
 .gauge-track {
   height: 6px;
