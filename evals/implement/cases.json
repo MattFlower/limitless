@@ -1,0 +1,309 @@
+{
+  "role": "implement",
+  "version": 1,
+  "notes": "Implement-role eval cases. A trial checks out `base`, gives the agent `prompt`, then copies `hidden.files` (from hidden/<id>/) into the worktree and runs `hidden.command`; exit 0 = pass. `head` is the upstream reference commit for replays; for authored cases (source 'authored') it equals `base` and the reference solution is reference/<id>.patch, used only for validation. All hidden files are new paths (test/hidden-<id>.test.ts) so the agent's own test edits don't interfere. Validation evidence: validation/<id>.log and REPORT.md.",
+  "cases": [
+    {
+      "id": "impl-001",
+      "repo": "MattFlower/limitless-sandbox",
+      "base": "a9077daebc73a7b840c6a387e36247eed25e09f4",
+      "head": "5abbed1dfdf84ed57d72351e56bd4dffc26bdece",
+      "complexity": "small",
+      "prompt": "Add a `readingTime` utility to textkit. Export `readingTime(text: string, wpm = 200): number` from `src/text.ts`: it returns the estimated reading time in whole minutes, rounded up, counting words the same way `wordCount` does. Non-empty text takes at least 1 minute; empty or whitespace-only text takes 0. Reject a `wpm` that is not a positive, finite number with a `RangeError` - validate it first, so an invalid rate throws even for empty text.\n\nExpose it in the CLI as `textkit reading-time [--wpm N] <text>` (the `--wpm` option comes directly after the command). The command's output is just the number of minutes, e.g. `1`. A missing or invalid `--wpm` value should surface the same `RangeError`. Update the CLI usage text and the README, and add tests.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-001.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-001.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "https://github.com/MattFlower/limitless-sandbox/pull/1 (squash 5abbed1)",
+      "tags": [
+        "sandbox",
+        "replay",
+        "feature",
+        "cli"
+      ],
+      "notes": "Replay of sandbox PR #1. Prompt is the original request plus the details the original tests pinned (export location, CLI output is the bare number, validation before the empty-text shortcut, CLI propagates RangeError). Hidden test is a new file with only readingTime and reading-time CLI tests; at base it fails at link time because src/text.ts has no readingTime export."
+    },
+    {
+      "id": "impl-002",
+      "repo": "MattFlower/limitless-sandbox",
+      "base": "5abbed1dfdf84ed57d72351e56bd4dffc26bdece",
+      "head": "61cb05f31b3d0ad749bae39ae6687e963ac774c4",
+      "complexity": "small",
+      "prompt": "Add a `stats` command to the textkit CLI that reports characters, words, sentences, paragraphs and estimated reading time for the given text.\n\n- Put the counting logic in a reusable `textStats(text: string)` function exported from `src/text.ts`, returning `{ characters, words, sentences, paragraphs, readingTime }` (all numbers).\n- `characters` is the string's length (whitespace included); `words` and `readingTime` reuse the existing `wordCount` and `readingTime` (default rate).\n- Sentences end with `.`, `!` or `?`; a run such as `?!` or `...` counts as one terminator.\n- Paragraphs are separated by one or more blank (empty or whitespace-only) lines, with LF or CRLF line endings. Leading and trailing blank lines don't create paragraphs, and empty text has 0.\n- Plain output (`textkit stats <text>`) is an aligned two-column table with these rows in order: `Characters`, `Words`, `Sentences`, `Paragraphs`, `Reading time`. Pad each label to the width of the longest label, follow it with two spaces, then the value; reading time is shown as `<n> minutes`.\n- `textkit stats --json <text>` (flag directly after the command) prints the `textStats` object as JSON instead.\n\nUpdate the usage text and README, and add tests.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-002.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-002.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "https://github.com/MattFlower/limitless-sandbox/pull/2 (squash 61cb05f)",
+      "tags": [
+        "sandbox",
+        "replay",
+        "feature",
+        "cli",
+        "output-format"
+      ],
+      "notes": "Replay of sandbox PR #2. The original request said only 'an aligned two-column table'; the prompt now pins labels, order, padding and the 'minutes' unit because the hidden test asserts the exact table (as the original PR test did). Unterminated sentences are deliberately not tested (the request leaves them ambiguous). JSON key order is not asserted."
+    },
+    {
+      "id": "impl-003",
+      "repo": "MattFlower/limitless-sandbox",
+      "base": "61cb05f31b3d0ad749bae39ae6687e963ac774c4",
+      "head": "b63e95b7dd34c7933a2676110ae09d04230c2b1c",
+      "complexity": "small",
+      "prompt": "Add a strip-punctuation command.\n\nAdd a `stripPunctuation(text)` utility to `src/text.ts` that removes ASCII and common Unicode punctuation (including curly quotes and em/en dashes) while keeping letters (accented ones included), digits, whitespace and emoji. Punctuation is deleted, not replaced with a space (`hello-world` becomes `helloworld`). For ASCII, treat every printable character that is not a letter, digit or space as punctuation, including symbols such as `#`, `@`, `+` and `$`. Collapse any runs of whitespace left behind into a single space and trim the result.\n\nExpose it in the CLI as `textkit strip-punctuation <text>` (arguments are joined with spaces like the other commands; no text gives empty output), update the usage text and README, and add tests covering accented letters, emoji (keep them), and empty input.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-003.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-003.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "https://github.com/MattFlower/limitless-sandbox/pull/4 (squash b63e95b; from an issue)",
+      "tags": [
+        "sandbox",
+        "replay",
+        "feature",
+        "cli",
+        "unicode"
+      ],
+      "notes": "Replay of sandbox PR #4 (issue-triggered). Prompt is the issue text plus two clarifications the original tests relied on: deletion rather than replacement, and ASCII symbols count as punctuation. Non-ASCII symbols (e.g. currency signs) are not tested because the request is ambiguous about them."
+    },
+    {
+      "id": "impl-004",
+      "repo": "MattFlower/limitless-sandbox",
+      "base": "b63e95b7dd34c7933a2676110ae09d04230c2b1c",
+      "head": "b63e95b7dd34c7933a2676110ae09d04230c2b1c",
+      "complexity": "trivial",
+      "prompt": "Bug: `titleCase` (in `src/text.ts`, also used by `textkit title`) capitalizes letters in the middle of words and misses words that start with a non-ASCII letter:\n\n- `titleCase(\"café au lait\")` returns `\"CafÉ Au Lait\"`\n- `titleCase(\"don't stop\")` returns `\"Don'T Stop\"`\n- `titleCase(\"élan vital\")` returns `\"éLan Vital\"`\n\nIt should capitalize only the first letter of each word. Treat a letter as the start of a word unless it immediately follows another letter, a digit, or an apostrophe (`'` or `’`). That keeps today's behaviour for hyphens and other punctuation (`well-known` → `Well-Known`, `(quoted)` → `(Quoted)`, `3rd` stays `3rd`), and it must work for any script, not just Latin. Leave everything else unchanged; don't lowercase the rest of a word. Add regression tests.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-004.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-004.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "authored (genuine bug in src/text.ts titleCase at b63e95b: \\b is ASCII-only even with the u flag)",
+      "tags": [
+        "sandbox",
+        "authored",
+        "bug-fix",
+        "unicode",
+        "regex"
+      ],
+      "notes": "Authored. head = base because there is no upstream fix; reference solution in reference/impl-004.patch (negative lookbehind for letter/mark/digit/apostrophe). Hidden test adds Greek, curly apostrophe and mixed-case inputs beyond the examples in the report."
+    },
+    {
+      "id": "impl-005",
+      "repo": "MattFlower/limitless-sandbox",
+      "base": "b63e95b7dd34c7933a2676110ae09d04230c2b1c",
+      "head": "b63e95b7dd34c7933a2676110ae09d04230c2b1c",
+      "complexity": "small",
+      "prompt": "Add a word-wrap utility and a `wrap` command to textkit.\n\n- Export `wrap(text: string, width = 80): string` from `src/text.ts`. Split the text into words on whitespace (any run of spaces, tabs or newlines is one separator) and fill lines greedily: each line holds as many words as fit, separated by single spaces, without exceeding `width` characters (a line exactly `width` long is fine). A word longer than `width` goes on a line of its own and is not broken. Join lines with `\\n`, with no trailing newline. Empty or whitespace-only text returns an empty string.\n- `width` must be a positive integer; otherwise throw a `RangeError`, even when the text is empty.\n- CLI: `textkit wrap [--width N] <text>`, with `--width` directly after the command the way `reading-time --wpm` works; the default width is 80. A missing or invalid width surfaces the `RangeError`.\n\nUpdate the usage text and README, and add tests.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-005.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-005.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "authored",
+      "tags": [
+        "sandbox",
+        "authored",
+        "feature",
+        "cli",
+        "algorithm"
+      ],
+      "notes": "Authored. head = base; reference solution in reference/impl-005.patch. Width is tested only with single-code-unit characters, so .length vs code-point counting does not matter."
+    },
+    {
+      "id": "impl-006",
+      "repo": "MattFlower/limitless-sandbox",
+      "base": "b63e95b7dd34c7933a2676110ae09d04230c2b1c",
+      "head": "b63e95b7dd34c7933a2676110ae09d04230c2b1c",
+      "complexity": "medium",
+      "prompt": "Add a word-frequency report to textkit.\n\n- Export `wordFrequencies(text: string, options?: { ignoreCase?: boolean }): { word: string; count: number }[]` from `src/text.ts`.\n  - Split words on whitespace. Strip leading and trailing characters that aren't letters or digits (Unicode-aware, so `café` and `naïve` survive): `\"Hello,` counts as `Hello`. Keep punctuation inside a word (`don't`, `well-known`). Ignore tokens that end up empty (such as `—` or `...`).\n  - Matching is case-sensitive by default. With `ignoreCase: true`, words are compared and reported in lowercase.\n  - Order the result by count, highest first; words with equal counts keep the order in which they first appear in the text.\n- CLI: `textkit freq [--top N] [--ignore-case] <text>`. The options come before the text and may appear in either order. Print one line per word in the form `<count> <word>` (e.g. `3 the`), most frequent first; `--top N` limits the output to the first N lines. No words gives empty output. If `--top` is missing its value or isn't a positive integer, throw a `RangeError`.\n\nUpdate the usage text and README, and add tests.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-006.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-006.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "authored",
+      "tags": [
+        "sandbox",
+        "authored",
+        "feature",
+        "cli",
+        "options-parsing",
+        "unicode"
+      ],
+      "notes": "Authored. head = base; reference solution in reference/impl-006.patch. Tie-break by first appearance (not alphabetical) is deliberate and pinned in the prompt; the hidden test uses a case where alphabetical order would differ."
+    },
+    {
+      "id": "impl-007",
+      "repo": "MattFlower/limitless",
+      "base": "ed0277402a5f7a4a982b9395a8ca10f71f350444",
+      "head": "5ef5c3720d0ca21f904e55988757ad7c24b6b4e6",
+      "complexity": "trivial",
+      "prompt": "Discord `/run` → `/show`\n\nOwner feedback: `/run` reads as the verb (start a run), but it shows one. Rename the Discord slash command to `/show` (same options and output); keep `/build` for starting work. Update the command registration, help text, docs, and tests. No alias: the bot is private and has one user.\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). Keep changes consistent with the existing architecture and code style, and make `bun run check` pass.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-007.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-007.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "https://github.com/MattFlower/limitless/pull/13 (squash 5ef5c37)",
+      "tags": [
+        "limitless",
+        "replay",
+        "rename",
+        "discord",
+        "chat-command"
+      ],
+      "notes": "Replay of PR #13 with its original request (the optional smoke-test sentence removed). Hidden test drives mountDiscord through a fake DiscordPort. The old /run name is only required not to show run details (the original test required no reply at all; relaxed so an 'unknown command' reply is acceptable)."
+    },
+    {
+      "id": "impl-008",
+      "repo": "MattFlower/limitless",
+      "base": "38d114bc5b9cf212619ebdf52587ddff87291f6a",
+      "head": "1f63b3e8cb729febd8251b1a5971edaba258c855",
+      "complexity": "trivial",
+      "prompt": "The diff audit blocks new files under protected paths.\n\n`auditDiff` in `src/gates/audit.ts` raises a blocking `protected-path` finding for any change that touches a protected path. In a self-hosting run, adding new webhook payload fixtures under `test/fixtures/**` (a protected path) was blocked, although only changes to files that already exist there can tamper with tests. Make a newly added file (git status `A`) under a protected path produce a `warn` finding instead (same `protected-path` rule, with a detail saying a file was added under a protected path). Modifications, deletions, renames and copies that touch a protected path must still block. Add a regression test.\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). Keep changes consistent with the existing architecture and code style, and make `bun run check` pass.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-008.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-008.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "https://github.com/MattFlower/limitless/commit/1f63b3e8cb729febd8251b1a5971edaba258c855 (direct commit)",
+      "tags": [
+        "limitless",
+        "replay",
+        "bug-fix",
+        "gates",
+        "audit"
+      ],
+      "notes": "Replay of a direct commit on main (base = its parent). Prompt written from the commit message. Hidden test checks severities of protected-path findings for A/M/D/R entries; the detail text is not asserted."
+    },
+    {
+      "id": "impl-009",
+      "repo": "MattFlower/limitless",
+      "base": "9b1fdc4ed851e0bef1f321e682d4e630a85e3231",
+      "head": "c98f1f95a32456b0e30b5594a716096623e04bdb",
+      "complexity": "trivial",
+      "prompt": "PRs for issue-triggered runs should close the issue on merge.\n\nWhen a run was started from a GitHub issue, its PR body (the evidence report built in `src/pipeline/report.ts`) should contain GitHub's closing keyword so that merging the PR closes the issue.\n\n- Add an optional `closesIssue?: number` field to `ReportInput`. When it is set, `renderReport` includes a line `Closes #<number>` near the end of the report (before the run link). Without it, the report must not contain a closing keyword.\n- In `buildReport`, set it for runs whose `sourceRef` is an issue reference - `{ kind: \"issue\", repo: \"<owner/name>\", number }`, as created by the GitHub webhook integration - but only when the issue is in the same repository as the run (`ctx.repo.slug`). Issues in other repositories, pull-request references and other sources must not produce the keyword.\n\nAdd tests.\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). Keep changes consistent with the existing architecture and code style, and make `bun run check` pass.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-009.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-009.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "https://github.com/MattFlower/limitless/commit/c98f1f95a32456b0e30b5594a716096623e04bdb (direct commit)",
+      "tags": [
+        "limitless",
+        "replay",
+        "feature",
+        "report",
+        "github"
+      ],
+      "notes": "Replay of a direct commit on main. Hidden test checks renderReport with and without closesIssue and buildReport on a real RunContext/Store (same-repo issue, other-repo issue, pull_request ref, no sourceRef). The original commit only tested renderReport."
+    },
+    {
+      "id": "impl-010",
+      "repo": "MattFlower/limitless",
+      "base": "14ca24e8ae4bd6c935da31133e55e823a88229b9",
+      "head": "9b1fdc4ed851e0bef1f321e682d4e630a85e3231",
+      "complexity": "small",
+      "prompt": "Claude harness: StructuredOutput is counted as agent tool use.\n\nHoldout authors run with `noTools: true` and a zero tool budget (`maxToolCalls: 0`). Claude Code returns the final `--json-schema` answer as a `StructuredOutput` tool call in its stream, and `runClaude` (`src/harness/claude.ts`) feeds every tool call into the `LoopDetector`, so the budget check trips exactly when a no-tools call succeeds: the session is stopped and reported as `stuck` instead of `ok`, which silently pushes holdouts onto another vendor.\n\n`StructuredOutput` calls must not count toward the tool-call budget or the repeated-call loop detection; real tool calls must still be counted as before. A no-tools call that answers via `StructuredOutput` should return status `ok` with the structured result. Add a regression test that does not invoke the real `claude` CLI (for example, a stand-in executable on PATH).\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). Keep changes consistent with the existing architecture and code style, and make `bun run check` pass.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-010.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-010.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "https://github.com/MattFlower/limitless/commit/9b1fdc4ed851e0bef1f321e682d4e630a85e3231 (direct commit)",
+      "tags": [
+        "limitless",
+        "replay",
+        "bug-fix",
+        "harness",
+        "subprocess"
+      ],
+      "notes": "Replay of a direct commit on main (the commit also added a backlog entry, irrelevant here). Hidden test runs runClaude against a shell-script stand-in for `claude` prepended to PATH; no real CLI or network. Also checks that repeated StructuredOutput calls do not trip the loop detector and that a real tool call still exceeds a zero budget (status 'stuck'). Stable over 6 repeated runs at base and reference."
+    },
+    {
+      "id": "impl-011",
+      "repo": "MattFlower/limitless",
+      "base": "7f839b063fdb63ca6d004ea3dd471deabf78a4be",
+      "head": "b126f298ba01edcaf8503f19ea963c5531bf904e",
+      "complexity": "medium",
+      "prompt": "Quota alerts name the wrong window on a quota rejection.\n\nIn `src/router/providers.ts`, when a subscription provider's call is rejected for quota (`ProviderTracker.record(id, \"quota\", { exhaustedUntil })`), the exhausted alert is attributed to the earliest-resetting known quota window rather than the window that was actually exhausted. That mislabels alerts - for example, with Claude's `five_hour` window at 40% and `seven_day` at 85% (its reserve), the rejection is reported as a five-hour exhaustion - and once the five-hour window resets, the next rejection produces a second, duplicate alert.\n\nAttribute the alert to a known, not-yet-reset window whose utilization is at or above its reserve (the same per-window reserve `observeWindows` uses), with that window's reset time. When no known window is at its reserve, record it as `hard_limit` with the reported `exhaustedUntil`, keeping the existing behaviour that repeated rejections reuse the open `hard_limit` alert rather than creating new ones. Alerts stay deduplicated per provider and window. Add regression tests and update any existing tests that relied on the old attribution.\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). Keep changes consistent with the existing architecture and code style, and make `bun run check` pass.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-011.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-011.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "https://github.com/MattFlower/limitless/pull/19 (squash b126f29), defect 3 only",
+      "tags": [
+        "limitless",
+        "replay",
+        "bug-fix",
+        "router",
+        "quota",
+        "alerts"
+      ],
+      "notes": "One of five independent fixes in PR #19; the prompt covers only the quota-attribution defect. The reference commit also contains the Discord and gc fixes, which the hidden test does not exercise. A correct fix changes behaviour that existing tests in test/quota-alerts.test.ts assert (the reference PR edited them); the hidden command runs only the hidden file, but the prompt asks the agent to update them. Two hidden tests pass at base as regression guards."
+    },
+    {
+      "id": "impl-012",
+      "repo": "MattFlower/limitless",
+      "base": "23179a95ecbb3289e7c2bd460b24aeac7226cbc1",
+      "head": "e425c82813ef42de752092a746cbc6ae44eb348e",
+      "complexity": "medium",
+      "prompt": "Webhooks: only accept tunnel deliveries from GitHub's published hook ranges.\n\nAs defense in depth behind the HMAC check, GitHub webhook requests that arrive through the Cloudflare tunnel (they carry a `cf-connecting-ip` header) must come from the `hooks` CIDR ranges GitHub publishes at https://api.github.com/meta.\n\n- Add `src/util/cidr.ts` exporting `inCidr(address: string, cidr: string): boolean` and `inAnyCidr(address: string, cidrs: string[]): boolean`. Support IPv4 and IPv6 (including compressed `::` forms). Treat IPv4-mapped IPv6 addresses such as `::ffff:192.30.252.7` as IPv4. Addresses never match a range of the other family, and malformed addresses or ranges return `false` rather than throwing.\n- In `src/integrations/github.ts`, export `githubHookRanges(fetcher: typeof fetch = fetch): () => Promise<string[] | null>`. The returned function fetches the meta document and returns its `hooks` list, caching it for a day. A failed request, or a response without a `hooks` array of strings, counts as a failed fetch: keep serving the last good list, or return `null` if no list has ever been fetched successfully.\n- Give `githubWebhook(factory, ranges)` an optional second parameter of that function type (defaulting to a shared `githubHookRanges()` instance). For a POST with a `cf-connecting-ip` header, when the ranges are known and the address is in none of them, respond 403 before the signature check. Requests without that header (local forwards) and requests while the ranges are unknown go through the existing checks unchanged.\n\nAdd tests; they must not reach the network.\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). Keep changes consistent with the existing architecture and code style, and make `bun run check` pass.",
+      "spec": null,
+      "hidden": {
+        "files": [
+          "test/hidden-impl-012.test.ts"
+        ],
+        "command": "bun test test/hidden-impl-012.test.ts",
+        "timeoutSec": 300
+      },
+      "source": "https://github.com/MattFlower/limitless/commit/e425c82813ef42de752092a746cbc6ae44eb348e (direct commit)",
+      "tags": [
+        "limitless",
+        "replay",
+        "feature",
+        "security",
+        "networking",
+        "webhooks"
+      ],
+      "notes": "Replay of a direct commit on main; prompt expands the commit message into the interface the original test pinned. At base the hidden file fails at module resolution (src/util/cidr.ts does not exist). The 24-hour cache expiry and stale-on-failure refresh are not time-travel tested; the test checks one fetch for two calls, the exact meta URL, and null when never fetched."
+    }
+  ]
+}
