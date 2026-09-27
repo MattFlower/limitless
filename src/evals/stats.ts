@@ -63,7 +63,7 @@ export function pairedBootstrap(differences: number[], options: StatsOptions = {
     ...settings,
   };
 }
-function completeCases(trials: EvalTrial[], k: number) {
+export function completeCases(trials: EvalTrial[], k: number) {
   const groups = new Map<string, EvalTrial[]>();
   for (const trial of trials) {
     if (trial.pass === null || !["ok", "error"].includes(trial.status)) continue;

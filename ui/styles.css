@@ -1398,3 +1398,9 @@ p {
   font-weight: 600;
   text-align: center;
 }
+
+.eval-report {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 1rem;
+}

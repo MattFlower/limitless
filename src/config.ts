@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { evalSettings } from "./evals/settings.ts";
+
 export interface Paths {
   home: string; // ~/.limitless
   db: string;
@@ -98,6 +100,7 @@ export function loadConfig(
   const raw: Record<string, unknown> = existsSync(tomlPath)
     ? (Bun.TOML.parse(readFileSync(tomlPath, "utf8")) as Record<string, unknown>)
     : {};
+  evalSettings(raw);
   const secrets = { ...parseEnvFile(join(configDir, "secrets.env")) };
   // Environment variables win over the secrets file (useful for tests and CI).
   for (const key of [

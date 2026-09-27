@@ -2,7 +2,9 @@ import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
 import type { CreateRunRequest, Question, Run } from "./core/types.ts";
 import { Store } from "./db/store.ts";
+import { type EvalPolicyResponse, generatePolicy } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
+import { evalSettings } from "./evals/settings.ts";
 import { collectGarbage, type GcResult } from "./gc.ts";
 import { resolveRepo } from "./git/repos.ts";
 import { runClaude } from "./harness/claude.ts";
@@ -18,6 +20,7 @@ import {
   PROVIDERS,
   type ProviderDef,
 } from "./router/catalog.ts";
+import { loadPolicy } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
 import { Router } from "./router/router.ts";
 import { Scheduler } from "./scheduler.ts";
@@ -25,6 +28,8 @@ import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
   evalCasePath?: string;
+  /** Explicit overlay location; the daemon supplies its application checkout's path. */
+  policyPath?: string;
   harnesses?: Record<string, Harness>;
   providers?: ProviderDef[];
   models?: ModelDef[];
@@ -44,6 +49,9 @@ export interface FactoryOptions {
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
 export class Factory {
   readonly store: Store;
+  readonly policy: Policy;
+  readonly models: ModelDef[];
+  readonly evalSettings: ReturnType<typeof evalSettings>;
   readonly evals: EvalRunner;
   readonly concierge: Concierge;
   readonly tracker: ProviderTracker;
@@ -62,6 +70,11 @@ export class Factory {
     readonly cfg: Config,
     opts: FactoryOptions = {},
   ) {
+    this.models = opts.models ?? MODELS;
+    this.evalSettings = evalSettings(cfg.raw);
+    this.policy =
+      opts.policy ??
+      (opts.policyPath === undefined ? DEFAULT_POLICY : loadPolicy(opts.policyPath, this.models));
     this.store = opts.store ?? new Store(cfg.paths.db);
     this.cleanup = opts.cleanup ?? ((dryRun) => collectGarbage(this.store, cfg, { dryRun }));
     this.gcTimer = opts.gcTimer ?? { set: setInterval, clear: clearInterval };
@@ -77,12 +90,7 @@ export class Factory {
       opts.providerTimer,
       opts.healthFetch,
     );
-    this.router = new Router(
-      this.tracker,
-      opts.policy ?? DEFAULT_POLICY,
-      opts.models ?? MODELS,
-      cfg.preferProviders,
-    );
+    this.router = new Router(this.tracker, this.policy, this.models, cfg.preferProviders);
     this.tracker.setRoutingDescription((provider, exhausted) =>
       this.router.describeFallback(provider, exhausted),
     );
@@ -96,6 +104,28 @@ export class Factory {
     this.evals = new EvalRunner(this.deps, opts.evalCasePath);
     this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns);
     this.concierge = new Concierge(this);
+  }
+
+  evalPolicy(evalIds?: string[]): EvalPolicyResponse {
+    const evidence = this.store
+      .listEvalRuns()
+      .map((run) => ({ run, trials: this.store.listEvalTrials(run.id) }));
+    return {
+      evaluation: generatePolicy({
+        evidence,
+        models: this.models,
+        providers: this.providerDefs,
+        settings: this.evalSettings,
+        evalIds,
+      }),
+      policy: this.policy,
+      models: this.models,
+      runs: evidence.map(({ run, trials }) => ({
+        ...run,
+        costUsd: trials.reduce((n, t) => n + t.costUsd, 0),
+        costEquivUsd: trials.reduce((n, t) => n + t.costEquivUsd, 0),
+      })),
+    };
   }
 
   start(): void {

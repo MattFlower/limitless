@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import type { Profile, Run, RunDetail, RunEvent } from "../core/types.ts";
@@ -12,6 +13,7 @@ Usage:
         [--profile auto|quick|standard|deep] [--title <t>] [-f|--follow]
   limitless eval run <role> --models a,b [--k N] [--cases id,id] [--max-usd X] [--no-cache] [--follow]
   limitless eval report <eval-id> [--json]
+  limitless eval policy [--evals id,id] [--write]
   limitless ls [--status s1,s2] [-n 20]   List runs
   limitless show <run>                    Run details
   limitless logs <run> [-f]               Print (and follow) the run's event log
@@ -126,7 +128,9 @@ async function serve(): Promise<void> {
   const { startHttp } = await import("../server/http.ts");
   const { mountIntegrations } = await import("../integrations/index.ts");
   const cfg = loadConfig();
-  const factory = new Factory(cfg);
+  const factory = new Factory(cfg, {
+    policyPath: join(import.meta.dir, "../../routing/policy.json"),
+  });
   const ui = (await import("../../ui/index.html")).default;
   const integrations = await mountIntegrations(factory);
   const server = startHttp(factory, { ui, routes: integrations.routes });
@@ -153,6 +157,7 @@ async function main(): Promise<void> {
     args: Bun.argv.slice(2),
     allowPositionals: true,
     options: {
+      evals: { type: "string" },
       models: { type: "string" },
       k: { type: "string" },
       cases: { type: "string" },

@@ -4,7 +4,6 @@ import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
 import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeStats } from "../db/stats.ts";
-import { DEFAULT_POLICY, MODELS } from "../router/catalog.ts";
 
 export interface HttpExtras {
   /** Extra routes contributed by integrations (webhooks, MCP). */
@@ -197,8 +196,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       POST: handle(async (req) => json({ id: factory.evals.submit(await body<unknown>(req)).id }, 202)),
       GET: handle(() => json(store.listEvalRuns())),
     },
+    "/api/evals/policy": handle((req) => {
+      const ids = new URL(req.url).searchParams.get("evals");
+      return json(factory.evalPolicy(ids === null ? undefined : ids.split(",")));
+    }),
     "/api/evals/:id": handle((req) => {
-      const report = factory.evals.report(req.params.id ?? "");
+      const report = factory.evals.report(req.params.id ?? "", { delta: factory.evalSettings.delta });
       return report ? json(report) : error("eval not found", 404);
     }),
     "/api/runs": {
@@ -306,7 +309,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       factory.tracker.refreshAlerts();
       return json(store.listAlerts(factory.tracker.now()));
     }),
-    "/api/models": handle(() => json({ models: MODELS, policy: DEFAULT_POLICY })),
+    "/api/models": handle(() => json({ models: factory.models, policy: factory.policy })),
     "/api/stats": handle((req) => {
       const days = Number(new URL(req.url).searchParams.get("days") ?? 14);
       return json(computeStats(store, days));
