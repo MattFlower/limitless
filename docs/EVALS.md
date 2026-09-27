@@ -1,5 +1,8 @@
 # Evals and routing calibration (M4 design)
 
+Proposed extension: [reasoning effort as a routing dimension](REASONING_EFFORT.md).
+That specification covers `model@effort` routing and eval targets; it is not implemented yet.
+
 The routing table (`DEFAULT_POLICY` in `src/router/catalog.ts`) was written from vendor claims and
 intuition. M4 replaces intuition with evidence: a small, cheap, repeatable eval suite that runs each
 candidate model **inside our own harness adapters and prompts**, and a deterministic generator that
