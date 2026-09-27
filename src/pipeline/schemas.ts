@@ -105,6 +105,11 @@ export const VerifySchema = z.object({
       id: z.string(),
       status: z.enum(["met", "unmet", "unclear", "blocked"]),
       evidence: z.string().trim().min(1).describe("Command + observed output, or file:line references"),
+      publicSummary: z
+        .string()
+        .describe(
+          "For H-ids, short observed behavior without private inputs or expected values; empty for public criteria",
+        ),
     }),
   ),
   overall: z.enum(["pass", "fail"]),

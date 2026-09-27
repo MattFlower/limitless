@@ -132,8 +132,13 @@ const holdout = {
 };
 const pass = {
   criteria: [
-    { id: "AC-1", status: "met", evidence: "cat shows goodbye" },
-    ...holdout.scenarios.map((s) => ({ id: s.id, status: "met", evidence: "observed expected result" })),
+    { id: "AC-1", status: "met", evidence: "cat shows goodbye", publicSummary: "" },
+    ...holdout.scenarios.map((s) => ({
+      id: s.id,
+      status: "met",
+      evidence: "observed expected result",
+      publicSummary: "",
+    })),
   ],
   overall: "pass",
   notes: "",
@@ -776,6 +781,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
         if (role === "review") return { structured: approve };
         if (role === "verify") return { structured: pass };
         implementStarted = true;
+        expect(
+          s.prompt.includes(
+            "A separate verifier will check private scenarios derived from the request, including edge and failure cases",
+          ),
+        ).toBe(profile !== "quick");
         return {
           files: { "farewell.txt": "goodbye\n", "implementation-marker.txt": "implementation marker" },
         };
@@ -833,6 +843,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
                         ...c,
                         status: "unmet",
                         evidence: `Observed failure: ${secret} returned an empty response`,
+                        publicSummary: "returns an empty response for an invalid request",
                       }
                     : c,
                 ),
@@ -842,7 +853,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
       }
       implementCalls++;
       if (implementCalls === 2) {
-        expect(s.prompt).toContain("Observed failure");
+        expect(s.prompt).toContain(
+          "private scenario (unmet): returns an empty response for an invalid request",
+        );
+        expect(s.prompt).not.toContain("Observed failure");
         expect(s.prompt).not.toContain(secret);
         expect(s.prompt).not.toContain(privateHoldout.scenarios[1]?.steps);
         expect(f.store.getRunState<RunState>(runId)?.feedback).not.toContain(secret);
@@ -892,7 +906,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
       ...pass,
       criteria: pass.criteria.map((criterion) =>
         criterion.id === "H-2"
-          ? { ...criterion, status: "unmet", evidence: `Observed empty output for ${secret}` }
+          ? {
+              ...criterion,
+              status: "unmet",
+              evidence: `Observed empty output for ${secret}`,
+              publicSummary: "",
+            }
           : criterion,
       ),
     };
@@ -1473,12 +1492,18 @@ for (const path of [
             overall: "fail",
             criteria: pass.criteria.map((c) =>
               c.id === "AC-1"
-                ? { ...c, status: "blocked", evidence: "Ran bun test: EPERM creating fixture directory" }
+                ? {
+                    ...c,
+                    status: "blocked",
+                    evidence: "Ran bun test: EPERM creating fixture directory",
+                    publicSummary: "",
+                  }
                 : c.id === "H-1" && actionable
                   ? {
                       ...c,
                       status: path === "unclear" ? "unclear" : "unmet",
                       evidence: "Observed wrong output",
+                      publicSummary: "",
                     }
                   : c,
             ),
@@ -1578,7 +1603,9 @@ test("completed environment retry stays consumed after persisted-state restart",
         structured: {
           ...pass,
           criteria: pass.criteria.map((c) =>
-            c.id === "AC-1" ? { ...c, status: "blocked", evidence: "bun test failed: EPERM mkdir" } : c,
+            c.id === "AC-1"
+              ? { ...c, status: "blocked", evidence: "bun test failed: EPERM mkdir", publicSummary: "" }
+              : c,
           ),
         },
       };
@@ -1624,7 +1651,9 @@ test("environment retry prefers another cross-vendor model over same-vendor fall
             structured: {
               ...pass,
               criteria: pass.criteria.map((c) =>
-                c.id === "AC-1" ? { ...c, status: "blocked", evidence: "bun test failed: EPERM mkdir" } : c,
+                c.id === "AC-1"
+                  ? { ...c, status: "blocked", evidence: "bun test failed: EPERM mkdir", publicSummary: "" }
+                  : c,
               ),
             },
           };

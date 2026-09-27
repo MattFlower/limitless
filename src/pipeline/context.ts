@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ZodType } from "zod";
@@ -27,6 +28,7 @@ import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
+import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
   cfg: Config;
@@ -149,6 +151,7 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
 };
 
 export class RunContext {
+  private holdoutPublicSources?: string;
   readonly runDir: string;
   state: RunState;
 
@@ -177,6 +180,41 @@ export class RunContext {
 
   get complexity(): Complexity {
     return this.state.triage?.complexity ?? this.run.complexity ?? "small";
+  }
+
+  publicHoldoutSources(): string {
+    if (this.holdoutPublicSources !== undefined) return this.holdoutPublicSources;
+    const identifiers = new Set<string>();
+    const cwd = this.state.worktreePath;
+    if (cwd) {
+      try {
+        const files = execFileSync("git", ["ls-files", "-z"], { cwd, maxBuffer: 16 * 1024 * 1024 })
+          .toString()
+          .split("\0")
+          .filter(Boolean);
+        for (const file of files) {
+          try {
+            const path = join(cwd, file);
+            const stat = lstatSync(path);
+            if (!stat.isFile() || stat.size > 256_000) continue;
+            const content = readFileSync(path, "utf8");
+            if (content.includes("\0")) continue;
+            for (const identifier of `${file} ${content}`.match(/[A-Za-z_$][\w$]*/g) ?? [])
+              identifiers.add(identifier);
+          } catch {
+            // A tracked path can disappear while the verifier is running.
+          }
+        }
+      } catch {
+        // Request and specification still provide the public-source exemption.
+      }
+    }
+    this.holdoutPublicSources = [
+      this.run.prompt,
+      this.state.spec ? renderSpec(this.state.spec) : "",
+      ...identifiers,
+    ].join("\n");
+    return this.holdoutPublicSources;
   }
 
   save(): void {
@@ -270,7 +308,8 @@ export class RunContext {
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
       const redact =
         opts.redactHoldout && this.state.holdout
-          ? (value: string) => redactHoldoutText(value, this.state.holdout as Holdout)
+          ? (value: string) =>
+              redactHoldoutText(value, this.state.holdout as Holdout, this.publicHoldoutSources())
           : undefined;
       try {
         const spec: AgentSpec = {

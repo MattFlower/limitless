@@ -435,6 +435,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           baseSha,
           round,
           feedback: ctx.state.feedback,
+          hasHoldout: profile(ctx) !== "quick",
         }),
       });
       ctx.state.implementer = {
@@ -672,7 +673,9 @@ async function oneRound(
           JSON.stringify(
             { ...v, modelId: target.modelId, round, attempt },
             (_key, value: unknown) =>
-              typeof value === "string" ? redactHoldoutText(value, ctx.state.holdout as Holdout) : value,
+              typeof value === "string"
+                ? redactHoldoutText(value, ctx.state.holdout as Holdout, ctx.publicHoldoutSources())
+                : value,
             2,
           ),
         );
@@ -695,6 +698,7 @@ async function oneRound(
       const detail = redactHoldoutText(
         `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`,
         ctx.state.holdout as Holdout,
+        ctx.publicHoldoutSources(),
       );
       ctx.state.terminalReason = detail;
       ctx.save();
@@ -713,7 +717,12 @@ async function oneRound(
     if (blockedOnly(verify)) stop();
   }
   if (verify.overall !== "pass") {
-    ctx.state.feedback = formatVerifyFeedback(verify, ctx.state.spec ?? null, ctx.state.holdout);
+    ctx.state.feedback = formatVerifyFeedback(
+      verify,
+      ctx.state.spec ?? null,
+      ctx.state.holdout,
+      ctx.publicHoldoutSources(),
+    );
     ctx.save();
     return false;
   }

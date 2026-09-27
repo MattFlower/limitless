@@ -10,7 +10,12 @@ export function normalizeVerify(verify: Verify, spec: Spec, holdout: Holdout): V
   const criteria = [...verify.criteria];
   for (const id of [...spec.acceptance_criteria.map((ac) => ac.id), ...holdout.scenarios.map((s) => s.id)]) {
     if (!criteria.some((c) => c.id === id))
-      criteria.push({ id, status: "unclear", evidence: "The verifier did not report on this criterion." });
+      criteria.push({
+        id,
+        status: "unclear",
+        evidence: "The verifier did not report on this criterion.",
+        publicSummary: "",
+      });
   }
   const unique = new Set(criteria.map((c) => c.id)).size === criteria.length;
   return {

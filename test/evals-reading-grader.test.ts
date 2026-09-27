@@ -69,8 +69,8 @@ test("verify truth table treats absent, unclear and duplicate IDs as inconclusiv
             overall,
             notes: "",
             criteria: [
-              ...statuses.map((status) => ({ id: "AC-1", status, evidence: "checked" })),
-              { id: "EXTRA", status: "met", evidence: "ignored" },
+              ...statuses.map((status) => ({ id: "AC-1", status, evidence: "checked", publicSummary: "" })),
+              { id: "EXTRA", status: "met", evidence: "ignored", publicSummary: "" },
             ],
           },
         );
@@ -87,7 +87,12 @@ test("verify truth table treats absent, unclear and duplicate IDs as inconclusiv
       gradeVerify(c, {
         overall: "fail",
         notes: "",
-        criteria: Object.entries(c.gold).map(([id, status]) => ({ id, status, evidence: "checked" })),
+        criteria: Object.entries(c.gold).map(([id, status]) => ({
+          id,
+          status,
+          evidence: "checked",
+          publicSummary: "",
+        })),
       }).pass,
     ).toBe(true);
 });

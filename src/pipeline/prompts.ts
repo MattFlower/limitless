@@ -89,6 +89,7 @@ export function implementPrompt(input: {
   baseSha: string;
   round: number;
   feedback: string | null;
+  hasHoldout: boolean;
 }): string {
   const specText = input.spec
     ? renderSpec(input.spec)
@@ -97,11 +98,16 @@ export function implementPrompt(input: {
     input.round > 0
       ? `\n## Previous attempt\nThe branch already contains a previous attempt (see \`git diff ${input.baseSha}..HEAD\`). It was rejected by the factory's checks. Fix every item below, keeping what was good.\n\n${input.feedback ?? ""}\n`
       : "";
+  const privateNotice =
+    input.round === 0 && input.hasHoldout
+      ? "\nA separate verifier will check private scenarios derived from the request, including edge and failure cases. Implement the request's intent robustly, beyond only the listed criteria.\n"
+      : "";
   return `# Task
 ${quoteRequest(input.prompt)}
 
 # Specification
 ${specText}
+${privateNotice}
 ${previous}
 # Repository checks
 ${checksSection(input.gates, input.baseline)}
@@ -147,30 +153,52 @@ export function formatReviewFeedback(review: Review): string {
     .join("\n")}`;
 }
 
-export function redactHoldoutText(value: string, holdout: Holdout): string {
+export function redactHoldoutText(value: string, holdout: Holdout, publicSources = ""): string {
   let safe = value;
-  const remove = (value: string, replacement: string) => {
-    const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    safe = safe.replace(new RegExp(escaped, "gi"), replacement);
+  let removed = 0;
+  const remove = (detail: string) => {
+    if (!detail) return;
+    const escaped = detail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, "giu");
+    if (pattern.test(publicSources)) return;
+    safe = safe.replace(pattern, () => {
+      removed++;
+      return "[private detail]";
+    });
   };
   for (const scenario of holdout.scenarios) {
     for (const source of [scenario.description, scenario.steps, scenario.expected]) {
-      remove(source, "[private check]");
-      for (const token of source.match(/[A-Za-z0-9_-]{6,}/g) ?? []) remove(token, "[private input]");
+      // Whole phrases cover prose; only syntax-shaped literals are removed in isolation.
+      if (source.trim().split(/\s+/).length > 1) remove(source.trim());
+      for (const sentence of source.match(/[^.!?\n]+[.!?]/g) ?? [])
+        if (sentence.trim().split(/\s+/).length > 1) remove(sentence.trim());
+      for (const literal of source.match(
+        /(["'`])(?:(?!\1)[^\n])*?\1|(?:\.{0,2}\/)?[\w.-]+(?:\/[\w.-]+)+|--?[A-Za-z][\w-]*|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*(?:[A-Z][\w$]*|\d[\w$]*|_[\w$]+)\b/g,
+      ) ?? []) {
+        const detail = /^["'`]/u.test(literal) ? literal.slice(1, -1) : literal;
+        remove(detail);
+      }
     }
   }
-  return safe;
+  return removed ? `${safe} [${removed} private details withheld]` : safe;
 }
 
-export function formatVerifyFeedback(verify: Verify, spec: Spec | null, holdout?: Holdout): string {
+export function formatVerifyFeedback(
+  verify: Verify,
+  spec: Spec | null,
+  holdout?: Holdout,
+  publicSources = "",
+): string {
   const unmet = verify.criteria.filter((c) => c.status !== "met" && c.status !== "blocked");
   if (!unmet.length) return "";
   const text = (id: string) => spec?.acceptance_criteria.find((a) => a.id === id)?.criterion ?? "";
   return `### Checks not met\n${unmet
     .map((c) => {
-      const scenario = holdout?.scenarios.find((s) => s.id === c.id);
-      return scenario
-        ? `- **${c.id}** (${c.status}) Observed failure: ${redactHoldoutText(c.evidence, holdout as Holdout)}`
+      const privateScenario = /^H-\d+$/i.test(c.id);
+      const summary =
+        privateScenario && holdout ? redactHoldoutText(c.publicSummary.trim(), holdout, publicSources) : "";
+      return privateScenario
+        ? `- **${c.id}** private scenario (${c.status}): ${summary && !/^\[private detail\](?: \[\d+ private details withheld\])?$/.test(summary) ? summary : "The verifier could not confirm this private scenario."}`
         : `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
     })
     .join("\n")}`;
@@ -247,5 +275,5 @@ ${input.spec.acceptance_criteria.map((a) => `- **${a.id}** ${a.criterion}\n  - h
 ${input.holdout.scenarios.map((s) => `- **${s.id}** ${s.description}\n  - steps: ${s.steps}\n  - expected: ${s.expected}`).join("\n")}
 
 The change is \`git diff ${input.baseSha}..HEAD\`. Do not modify repository files (create temporary fixtures and redirect supported build/test outputs under TMPDIR only, also supplied as TMP and TEMP).
-For each acceptance criterion and holdout scenario return met / unmet / unclear / blocked with concrete evidence (the command you ran and what you observed, or file:line references). Use blocked only when an attempted check cannot execute because of an environmental permission or sandbox error; include the attempted command and observed error in nonempty evidence. Expected permission-denial tests and genuine assertion failures are not environment blocks. For unmet holdouts, describe the observed failure in evidence without repeating the scenario text or private inputs. overall = "pass" only if every entry is met.`;
+For each acceptance criterion and holdout scenario return met / unmet / unclear / blocked with concrete evidence (the command you ran and what you observed, or file:line references) and publicSummary. For each H-id, publicSummary must be a short description of observed behavior without private inputs, expected values, or scenario text; use an empty string for public criteria. Use blocked only when an attempted check cannot execute because of an environmental permission or sandbox error; include the attempted command and observed error in nonempty evidence. Expected permission-denial tests and genuine assertion failures are not environment blocks. For unmet holdouts, describe the observed failure in evidence without repeating the scenario text or private inputs. overall = "pass" only if every entry is met.`;
 }

@@ -133,7 +133,11 @@ test("review and verify API reports preserve role grades and text/JSON metrics",
         structured:
           role === "review"
             ? reviewOutput()
-            : { overall: "fail", notes: "", criteria: [{ id: "AC-1", status: "met", evidence: "checked" }] },
+            : {
+                overall: "fail",
+                notes: "",
+                criteria: [{ id: "AC-1", status: "met", evidence: "checked", publicSummary: "" }],
+              },
       }));
       const report = await f.run({ role, models: ["candidate-a"], k: 2 });
       const route = createHttpRoutes(f.factory)["/api/evals/:id"] as Route;

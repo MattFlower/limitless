@@ -421,14 +421,18 @@ describe("pipeline hardening", () => {
             return {
               structured:
                 verifies === 1
-                  ? { criteria: [{ id: "AC-1", status: "met", evidence: "e" }], overall: "pass", notes: "" }
+                  ? {
+                      criteria: [{ id: "AC-1", status: "met", evidence: "e", publicSummary: "" }],
+                      overall: "pass",
+                      notes: "",
+                    }
                   : {
                       criteria: [
-                        { id: "AC-1", status: "met", evidence: "e" },
-                        { id: "AC-2", status: "met", evidence: "e" },
-                        { id: "H-1", status: "met", evidence: "e" },
-                        { id: "H-2", status: "met", evidence: "e" },
-                        { id: "H-3", status: "met", evidence: "e" },
+                        { id: "AC-1", status: "met", evidence: "e", publicSummary: "" },
+                        { id: "AC-2", status: "met", evidence: "e", publicSummary: "" },
+                        { id: "H-1", status: "met", evidence: "e", publicSummary: "" },
+                        { id: "H-2", status: "met", evidence: "e", publicSummary: "" },
+                        { id: "H-3", status: "met", evidence: "e", publicSummary: "" },
                       ],
                       overall: "pass",
                       notes: "",
