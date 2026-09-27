@@ -183,3 +183,29 @@ test("policy CLI reports no-op proposals and unchanged all-ineligible evidence",
   expect(printed.join("\n")).toContain("Overlay unchanged");
   expect(printed.join("\n")).toContain("triage unchanged");
 });
+
+test("policy CLI preview names the specific rejection when a role has no eligible model", async () => {
+  const { evidence, response, local } = await import("./evals-policy-support.ts");
+  const record = evidence("triage", [local]);
+  const first = record.trials[0];
+  if (first?.details.grade) first.details.grade.riskUnderCall = true;
+  const data = response([record]);
+  const printed: string[] = [];
+  const writes: string[] = [];
+  await evalCommand(
+    ["policy"],
+    {},
+    {
+      api: async <T>() => data as T,
+      print: (s) => printed.push(s),
+      wait: async () => {},
+      files: { read: async () => null, write: async (path) => void writes.push(path) },
+    },
+  );
+  expect(writes).toEqual([]);
+  const output = printed.join("\n");
+  expect(output).toContain("No effective policy changes.");
+  expect(output).toContain(
+    `triage unchanged: no eligible models (${local}: risk under-call upper bound 0.1288 exceeds ceiling 0.1)`,
+  );
+});

@@ -133,7 +133,11 @@ export function generatePolicy(input: PolicyInput) {
         for (const m of metrics) {
           if (!m.ci) reasons.push(`insufficient evidence: ${m.name} has no observations`);
           else if (m.direction === "lower" ? m.ci[0] < m.floor : m.ci[1] > m.floor)
-            reasons.push(`${m.name} ${m.direction} bound does not clear ${m.floor}`);
+            reasons.push(
+              m.direction === "lower"
+                ? `${m.name} lower bound ${m.ci[0].toFixed(4)} is below floor ${m.floor}`
+                : `${m.name} upper bound ${m.ci[1].toFixed(4)} exceeds ceiling ${m.floor}`,
+            );
         }
         const attempts = rows.filter(
           (t) => ["ok", "error"].includes(t.status) && !t.details.preparationFailed,
@@ -219,7 +223,9 @@ export function generatePolicy(input: PolicyInput) {
       order,
       decision: order.length
         ? `Update ${role}.default: ${order.join(" → ")}`
-        : `${role} unchanged: ${candidates.length ? "no eligible models" : "no completed evidence"}`,
+        : candidates.length
+          ? `${role} unchanged: no eligible models (${candidates.map((c) => `${c.modelId}: ${c.reasons.join("; ")}`).join(" | ")})`
+          : `${role} unchanged: no completed evidence`,
     };
   });
   const generated: PolicyOverlay = {};

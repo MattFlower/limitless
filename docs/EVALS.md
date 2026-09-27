@@ -229,7 +229,9 @@ it does not change existing runtime escalation or unrelated routing cells.
 Eligible models clear every required floor, establish non-inferiority, and have catalog/provider
 metadata and applicable cost estimates. They sort by routing cost/case, then p50 latency, then model
 ID. Each becomes a singleton preference group: the first is preferred and later entries are fallbacks.
-A role with no eligible candidate is left unchanged with an explanation. Only supported **default**
+A role with no eligible candidate is left unchanged with an explanation that lists each
+candidate's rejection reasons (e.g. `risk under-call upper bound 0.1050 exceeds ceiling 0.1`, the
+Wilson upper bound for 1 under-call in 50 observations). Only supported **default**
 cells are generated: current evidence does not justify replacing review.large, verify.large or other
 complexity-specific cells.
 

@@ -31,7 +31,7 @@ Update review.default: openrouter/gpt-6-luna
 
 ## verify
 
-verify unchanged: no eligible models
+verify unchanged: no eligible models (codex/luna: insufficient evidence: false-accept has no observations; insufficient evidence: no attempted cases to cost; insufficient evidence: no complete paired cases)
 
 | Model / source | Metrics: rate (numerator/denominator), Wilson 95% CI | Comparison | Cost/case | p50 latency | Eligibility / reasons |
 |---|---|---|---|---|---|
