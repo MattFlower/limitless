@@ -11,6 +11,6 @@ export function formatCost(
   return {
     primary: paid === 0 && equivalent === 0 ? "—" : `≈$${equivalent.toFixed(2)}`,
     paid: paid >= 0.005 ? `$${(Math.round(paid * 100) / 100).toFixed(2)}` : null,
-    title: `API-equivalent $${equivalent} · paid $${paid}`,
+    title: `API-equivalent $${Number(equivalent.toFixed(6))} · paid $${Number(paid.toFixed(6))}`,
   };
 }

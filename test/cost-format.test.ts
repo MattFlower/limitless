@@ -12,3 +12,10 @@ test("cost display leads with API-equivalent work and preserves tiny paid amount
   expect(formatCost(0, 0).primary).toBe("—");
   expect(formatCost(0, 0.001)).toMatchObject({ primary: "≈$0.00", paid: null });
 });
+
+test("cost title removes floating-point noise while retaining fractional cents", () => {
+  expect(formatCost(0.059081999999999996, 19.990099999999998).title).toBe(
+    "API-equivalent $19.9901 · paid $0.059082",
+  );
+  expect(formatCost(0.0002, 4.34).title).toBe("API-equivalent $4.34 · paid $0.0002");
+});
