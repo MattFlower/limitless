@@ -69,13 +69,21 @@ test("both review schemas require every object property for strict structured ou
   ).toBe(false);
 });
 
-test("an unaddressed claim must match a prior blocking finding", () => {
-  const review: Review = {
-    verdict: "request_changes",
-    summary: "",
-    findings: [{ ...finding("major"), label: "unaddressed" }],
-  };
-  expect(reviewVerdict(review, [])).toBe("approve");
-  expect(reviewVerdict(review, [{ ...finding("major"), title: "Different issue" }])).toBe("approve");
-  expect(reviewVerdict(review, [{ ...finding("major"), line: 99 }])).toBe("request_changes");
-});
+for (const severity of ["blocker", "major", "minor", "nit"] as const) {
+  test(`an unmatched unaddressed ${severity} finding fails closed`, () => {
+    const review: Review = {
+      verdict: "approve",
+      summary: "",
+      findings: [{ ...finding(severity), label: "unaddressed" }],
+    };
+    for (const prior of [
+      [],
+      [{ ...finding("major"), title: "Different issue" }],
+      [{ ...finding("major"), file: "src/old.ts" }],
+      [{ ...finding("major"), line: 99 }],
+    ]) {
+      expect(reviewVerdict(review, prior)).toBe("request_changes");
+      expect(blockingReviewFindings(review, prior)).toEqual(review.findings);
+    }
+  });
+}

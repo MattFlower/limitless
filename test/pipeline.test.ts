@@ -1284,8 +1284,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
     );
   });
 
-  for (const label of ["unaddressed", "regression"] as const) {
-    test(`${label} later finding sends only blocking feedback to implementation`, async () => {
+  for (const [label, laterTitle] of [
+    ["unaddressed", "Prior bug"],
+    ["unaddressed", "Prior bug still unfixed"],
+    ["regression", "Still broken"],
+  ] as const) {
+    test(`${label} later finding (${laterTitle}) sends only blocking feedback to implementation`, async () => {
       let reviews = 0;
       const prompts: string[] = [];
       const f = start((s) => {
@@ -1293,7 +1297,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
         if (role === "review") {
           reviews++;
-          const title = reviews === 1 || label === "unaddressed" ? "Prior bug" : "Still broken";
+          const title = reviews === 1 ? "Prior bug" : laterTitle;
           return {
             structured:
               reviews < 3
@@ -1336,8 +1340,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
       const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
       expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       expect(prompts).toHaveLength(3);
-      expect(prompts[2]).toContain(label === "unaddressed" ? "Prior bug" : "Still broken");
+      expect(prompts[2]).toContain(laterTitle);
       expect(prompts[2]).not.toContain("Future cleanup");
+      expect(f.store.getArtifact(run.id, "review-1.json")).toContain('"verdict": "request_changes"');
       expect(f.store.getArtifact(run.id, "report.md")).toContain("Future cleanup");
     });
   }
@@ -1409,6 +1414,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (role === "review") {
         reviews++;
         prompts.push(s.prompt);
+        if (reviews > 3) return { structured: approve };
         return {
           structured:
             reviews === 1
@@ -1494,7 +1500,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(prompts[2]).toContain(before?.reviewedSha ?? "missing SHA");
     expect(prompts[2]).toContain("Regression");
     expect(prompts[2]).not.toContain("Backlog idea");
-    expect(implementsCount).toBe(4); // Includes the interrupted third implementation.
+    expect(prompts[3]).toContain("Backlog idea");
+    expect(implementsCount).toBe(5); // Includes the interrupted implementation and the unmatched claim fix.
+    expect(restarted.store.getArtifact(run.id, "review-2.json")).toContain('"verdict": "request_changes"');
     expect(restarted.store.getRunState<RunState>(run.id)?.reviewFollowUps).toHaveLength(1);
     expect(restarted.store.getArtifact(run.id, "report.md")).toContain("Backlog idea");
   });

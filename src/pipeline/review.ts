@@ -11,13 +11,8 @@ export function blockingReviewFindings(
 ): Review["findings"] {
   return review.findings.filter((finding) => {
     if (!priorBlocking) return finding.severity === "blocker" || finding.severity === "major";
-    if (finding.label === "regression") return true;
-    if (
-      finding.label === "unaddressed" &&
-      priorBlocking.some((prior) => reviewFindingKey(prior) === reviewFindingKey(finding))
-    )
-      return true;
-    // An unmatched "unaddressed" claim is a new finding, not permission to revive a follow-up.
+    // Fail closed on unmatched "unaddressed" claims: rewording must not approve an unresolved issue.
+    if (finding.label === "unaddressed" || finding.label === "regression") return true;
     return finding.severity === "blocker" || finding.security;
   });
 }
