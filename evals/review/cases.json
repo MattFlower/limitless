@@ -1,7 +1,7 @@
 {
   "role": "review",
   "version": 1,
-  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range \u00b15 (file-level findings with line 0 match on file alone only for completeness defects).",
+  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range \u00b15 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases.",
   "cases": [
     {
       "id": "review-001",
@@ -1588,11 +1588,11 @@
     },
     {
       "id": "review-013",
-      "kind": "clean",
+      "kind": "real",
       "repo": "MattFlower/limitless",
       "base": "86b73f771bbe1cb0f0f9fa309468ceeb8fc13e34",
       "head": "9b1dda04c3316699d7b7b58a5fe0a05e9d74492a",
-      "source": "muiuv8l2ryvx round 0",
+      "source": "muiuv8l2ryvx round 0 (relabelled: not clean)",
       "input": {
         "prompt": "Retention and cleanup\n\n- Remove worktrees of finished runs after N days (default 3; failed runs 7), prune `git worktree`\n  metadata, delete per-run log files after 30 days, and cap the `events` table by deleting debug\n  events older than 14 days. Run hourly in the daemon; `limitless gc [--dry-run]` on demand.\n- Tests on temp directories and a temp DB.\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). Keep changes consistent with the existing architecture and code style, and make `bun run check` pass.",
         "spec": {
@@ -1707,15 +1707,34 @@
           }
         ]
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/gc.ts",
+          "lines": [25, 31],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "canonical() calls realpathSync on each worktree's parent; a stale entry whose parent was deleted throws and blocks cleanup for the whole repository",
+          "required": true,
+          "foundBy": "review eval (codex/sol), verified by orchestrator"
+        },
+        {
+          "file": "src/gc.ts",
+          "lines": [90, 96],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "GC removes a registered worktree at paths.work/<run-id> without checking it is still on the run's branch",
+          "required": false,
+          "foundBy": "review eval (codex/sol), unverified"
+        }
+      ]
     },
     {
       "id": "review-014",
-      "kind": "clean",
+      "kind": "real",
       "repo": "MattFlower/limitless",
       "base": "1f63b3e8cb729febd8251b1a5971edaba258c855",
       "head": "253ff180980488fc9f1a1792ce7155bcdb793cb7",
-      "source": "muishhw85816 round 0",
+      "source": "muishhw85816 round 0 (relabelled: not clean)",
       "input": {
         "prompt": "Add a Discord bot so runs can be started and followed from Discord.\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). discord.js is already a dependency and works on Bun. Keep changes consistent with the existing architecture and code style, and make `bun run check` pass.\n\nConfiguration (already provisioned by the operator):\n- Secrets in cfg.secrets: DISCORD_BOT_TOKEN, DISCORD_APP_ID, DISCORD_GUILD_ID.\n- config.toml: `[owners] discord = \"<user id>\"` (already parsed as cfg.discordOwnerId) and `[discord] channel_id = \"<channel id>\"` (add parsing in src/config.ts, e.g. cfg.discordChannelId).\n- The integration is enabled only when token, app id, guild id and channel id are all present; otherwise startup notes say why it's disabled. It must never crash the daemon (log and keep running if Discord is unreachable; discord.js reconnects on its own).\n- Use the gateway connection only. Do not use an HTTP interactions endpoint (nothing may be exposed publicly). Intents: Guilds, GuildMessages, MessageContent.\n\nBehavior:\n- New module src/integrations/discord.ts, started from mountIntegrations in src/integrations/index.ts and stopped on shutdown.\n- Register guild-scoped slash commands on startup (idempotent): `/build repo:<string> prompt:<string> [profile: auto|quick|standard|deep]`, `/runs [status]`, `/run id:<string>`, `/cancel id:<string>`. Only the owner may use /build and /cancel; everyone else gets an ephemeral refusal. /runs and /run are also owner-only (runs contain repo details).\n- /build creates the run through Factory.createRun with source \"discord\", requestedBy the Discord user id, and sourceRef { kind: \"discord\", channelId, threadId }. It replies with a short confirmation and creates a public thread in the configured channel named after the run (title, trimmed to Discord's limit), then posts updates into that thread.\n- Thread updates (subscribe to store events; only for runs whose sourceRef is a Discord thread): one message per stage transition at most, batched/rate-limited so a run posts no more than ~10 messages total; a message when a question is asked (with the question text); a final message with status, PR link, total cost (real $ and subscription-equivalent) and the UI link (cfg.uiUrl + /runs/<id>). Keep messages concise; use embeds for the final summary.\n- Replies in a run thread by the owner answer that run's open questions (Factory.answer with by = \"discord:<user id>\"). Replies when no question is open get a short hint. Ignore bots and non-owners.\n- Optional: when config `[discord] notify_all = true`, also post a one-line notice in the channel when any non-Discord run finishes.\n- Keep every Discord API interaction behind a small interface (e.g. DiscordPort with sendMessage/createThread/reply) so the logic is unit-testable with a fake. Tests must not touch the network: command \u2192 CreateRunRequest mapping, owner checks, message batching limit, thread reply \u2192 answer, disabled-when-unconfigured.\n- Document setup and usage in README (bot settings: private bot, Message Content intent, invite via OAuth2 URL generator with scopes bot+applications.commands; commands; thread behavior).",
         "spec": {
@@ -1824,15 +1843,43 @@
           }
         ]
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/integrations/discord.ts",
+          "lines": [93, 106],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "The discord.js Client has no 'error' listener; an emitted error event can crash the daemon",
+          "required": true,
+          "foundBy": "review eval (codex/sol), verified by orchestrator"
+        },
+        {
+          "file": "src/integrations/discord.ts",
+          "lines": [300, 312],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "The run can emit events before its Discord thread id is persisted, so early events are dropped",
+          "required": false,
+          "foundBy": "review eval (codex/sol), unverified"
+        },
+        {
+          "file": "src/integrations/discord.ts",
+          "lines": [220, 228],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "The terminal summary is marked delivered before the send succeeds, so a failed send is never retried",
+          "required": false,
+          "foundBy": "review eval (codex/sol), unverified"
+        }
+      ]
     },
     {
       "id": "review-015",
-      "kind": "clean",
+      "kind": "real",
       "repo": "MattFlower/limitless",
       "base": "86b73f771bbe1cb0f0f9fa309468ceeb8fc13e34",
       "head": "5c5c07edd6dd6f8c6ce70ec1e8ae52224d7cbab5",
-      "source": "muiuv8kp8140 round 3",
+      "source": "muiuv8kp8140 round 3 (relabelled: not clean)",
       "input": {
         "prompt": "Quota alerts\n\nTell the operator when a subscription reaches its reserve, so banked resets can be applied in time.\n\n- When a provider transitions into `exhausted` (quota reserve reached, or a hard limit hit), or\n  crosses 75% of its reserve for the first time in a window, emit one alert per provider per window:\n  a Discord message in the configured channel (when Discord is enabled) and a banner on the UI\n  dashboard (a new `alerts` field on `/api/providers` or a small `/api/alerts` endpoint).\n- Include the provider, which window, utilization, when it resets, and what the router will do\n  meanwhile (which providers it falls back to).\n- Tests with a fake Discord port and a fake clock: one alert per window, no alert storms on\n  flapping, reset clears it.\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). Keep changes consistent with the existing architecture and code style, and make `bun run check` pass.",
         "spec": {
@@ -1940,7 +1987,26 @@
           }
         ]
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/router/providers.ts",
+          "lines": [270, 284],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "A quota rejection is attributed to the earliest-resetting known window, not the exhausted one, mislabeling alerts and allowing a duplicate alert later",
+          "required": true,
+          "foundBy": "review eval (codex/sol), verified by orchestrator"
+        },
+        {
+          "file": "src/router/router.ts",
+          "lines": [60, 75],
+          "severity": "minor",
+          "category": "correctness",
+          "summary": "describeFallback mixes candidates from unrelated roles before a route is selected",
+          "required": false,
+          "foundBy": "review eval (codex/sol), unverified"
+        }
+      ]
     }
   ]
 }
