@@ -128,6 +128,16 @@ export function generatePolicy(input: PolicyInput) {
             model.baseOrigin === "unknown");
         const reasons: string[] = [];
         if (!model || !provider) reasons.push("catalog/provider metadata unavailable");
+        const mismatchedProviders = [
+          ...new Set(
+            rows
+              .map((t) => t.details.provider)
+              .filter((id) => id !== undefined && model && id !== model.provider),
+          ),
+        ];
+        for (const id of mismatchedProviders)
+          reasons.push(`recorded provider ${id} differs from catalog provider ${model?.provider}`);
+        const providerMismatch = mismatchedProviders.length > 0;
         if (excluded) reasons.push(`origin excluded (${model?.origin}; baseOrigin=${model?.baseOrigin})`);
         // Without trials only the saved reference exists, and metrics already mark it insufficient.
         const recordedEffort = rows.length
@@ -148,7 +158,9 @@ export function generatePolicy(input: PolicyInput) {
                     provider,
                   );
         if (effortProblem) reasons.push(effortProblem);
-        const referenceAllowed = Boolean(model && provider && !excluded && !effortProblem);
+        const referenceAllowed = Boolean(
+          model && provider && !providerMismatch && !excluded && !effortProblem,
+        );
         const f = settings.floors;
         const passMetric = metric(
           "pass rate",
@@ -202,6 +214,7 @@ export function generatePolicy(input: PolicyInput) {
           (t) => ["ok", "error"].includes(t.status) && !t.details.preparationFailed,
         );
         const costs = attempts.map((t) => {
+          if (providerMismatch) return null;
           if (provider?.billing === "free") return 0;
           const source = t.details.cache ?? t;
           const value =
@@ -226,7 +239,7 @@ export function generatePolicy(input: PolicyInput) {
           referenceAllowed,
           costPerCase,
           costDenominator: attempts.length,
-          billing: provider?.billing ?? null,
+          billing: providerMismatch ? null : (provider?.billing ?? null),
           complete: completeCases(rows, entry.run.k),
         };
       });
@@ -248,8 +261,8 @@ export function generatePolicy(input: PolicyInput) {
         bestCompleteCases: best?.complete.size ?? 0,
         ...pairedBootstrap(differences, { delta: settings.delta }),
       };
-      // Only metadata-less or origin-excluded candidates are barred from being the reference; when
-      // every candidate is barred there is no reference, and that says nothing about paired coverage.
+      // Incompatible metadata bars a candidate from being the reference. When every candidate is
+      // barred there is no reference, and that says nothing about paired coverage.
       if (comparison.nonInferior === null) {
         if (referenceAllowed || best) entry.reasons.push("insufficient evidence: no complete paired cases");
       } else if (!comparison.nonInferior) entry.reasons.push("non-inferiority not established");

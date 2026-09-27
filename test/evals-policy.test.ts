@@ -627,6 +627,44 @@ test("implement sparse or unpaired evidence never replaces an existing cell", ()
   );
 });
 
+test.each(["triage", "implement"] as const)(
+  "%s rejects provider drift for eligibility, references, costs, and availability",
+  (role) => {
+    for (const failures of [0, 8]) {
+      for (const mixed of [false, true]) {
+        const row = evidence(role, [subscription, metered]);
+        for (const t of row.trials) {
+          t.details.complexity = "small";
+          t.details.provider = t.modelId === metered ? "openrouter" : "codex";
+          if (t.modelId === metered && Number(t.caseId.slice(-2)) < failures) t.pass = false;
+          if (recordedTarget(t) === subscription && t.caseId === "case-00") t.pass = false;
+        }
+        const cell = role === "implement" ? "small" : "default";
+        const matching = generatePolicy(input([row]));
+        expect(matching.generated[role]?.[cell]).toEqual([subscription, metered]);
+        const models = MODELS.map((m) => (m.id === metered ? { ...m, provider: "twilight" } : m));
+        // Even one mismatching row must reject a target whose other rows match the new provider.
+        if (mixed)
+          for (const t of row.trials)
+            if (t.modelId === metered && t.caseId !== "case-39") t.details.provider = "twilight";
+        const result = generatePolicy(input([row], { models }));
+        const decision = result.roles.find((r) => r.role === role && r.cell === cell);
+        const rejected = decision?.candidates.find((c) => c.modelId === metered);
+        expect(result.generated[role]?.[cell]).toEqual([subscription]);
+        expect(decision?.availabilityFallbacks).toEqual([]);
+        expect(decision?.candidates.every((c) => c.comparison.bestModel === subscription)).toBe(true);
+        expect(rejected?.state).toBe("ineligible");
+        expect(rejected?.costPerCase).toBeNull();
+        expect(rejected?.billing).toBeNull();
+        expect(rejected?.summary.costUsd).toBeCloseTo(16);
+        const reason = "recorded provider openrouter differs from catalog provider twilight";
+        expect(rejected?.reasons).toContain(reason);
+        expect(renderEvidence(result)).toContain(reason);
+      }
+    }
+  },
+);
+
 test("implement rejects the exact non-inferiority margin and limits provider fallbacks", () => {
   const twilight = "twilight/qwen-27b";
   const otherSubscription = "codex/luna@low";
