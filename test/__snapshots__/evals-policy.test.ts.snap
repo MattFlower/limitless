@@ -22,7 +22,7 @@ Update triage.default: codex/luna@medium
 
 ## review
 
-Update review.default: openrouter/gpt-6-luna
+Update review.default: openrouter/gpt-6-luna → codex/luna@medium (codex/luna@medium is an availability fallback on another provider: clears every floor, not non-inferior)
 
 | Model / source | Metrics: rate (numerator/denominator), Wilson 95% CI | Comparison | Cost/case | p50 latency | Eligibility / reasons |
 |---|---|---|---|---|---|
