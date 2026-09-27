@@ -288,7 +288,7 @@ test("a no-tools Claude call returning StructuredOutput is not stopped by a zero
   }
 });
 
-test("CLI arguments use the selected effort and reject unsupported Claude transport", async () => {
+test("CLI arguments transmit the selected effort verbatim and reject backend Claude transport", async () => {
   const { buildClaudeArgs } = await import("../src/harness/claude.ts");
   const spec: AgentSpec = {
     cwd: "/tmp",
@@ -310,10 +310,11 @@ test("CLI arguments use the selected effort and reject unsupported Claude transp
       harness: "claude",
     },
   };
-  for (const effort of ["low", "high", undefined] as const) {
+  // Whether a value is supported is decided by the catalog; the harness passes the selection through.
+  for (const effort of ["none", "low", "high", "max", undefined] as const) {
     spec.target.effort = effort;
     const args = buildClaudeArgs(spec, "session");
-    expect(args.includes("--effort")).toBe(effort !== undefined);
+    expect(args.filter((a) => a === "--effort")).toHaveLength(effort === undefined ? 0 : 1);
     if (effort) expect(args[args.indexOf("--effort") + 1]).toBe(effort);
   }
   for (const effort of ["none", "low", "high", undefined] as const) {
@@ -323,9 +324,9 @@ test("CLI arguments use the selected effort and reject unsupported Claude transp
       effort ? [`model_reasoning_effort="${effort}"`] : [],
     );
   }
-  spec.target.effort = "none";
-  expect(() => buildClaudeArgs(spec, "session")).toThrow("Unsupported effort");
-  spec.target.effort = "high";
   spec.target.backend = { baseUrl: "http://unused", authToken: "" };
-  expect(() => buildClaudeArgs(spec, "session")).toThrow("transport");
+  spec.target.effort = undefined;
+  expect(buildClaudeArgs(spec, "session")).not.toContain("--effort");
+  spec.target.effort = "high";
+  expect(() => buildClaudeArgs(spec, "session")).toThrow("cannot set effort for the claude backend");
 });

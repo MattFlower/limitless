@@ -182,6 +182,16 @@ test("eval validation resolves defaults, explicit none and rejects malformed or 
     enableEfforts(f);
     for (const models of invalidTargets)
       expect(() => validateRequest({ role: "triage", models }, f.dataset, f.factory.router)).toThrow();
+    // Every problem is reported in one pass, not just the first one encountered.
+    expect(() =>
+      validateRequest(
+        { role: "triage", models: ["unknown@low", "candidate-a@max", "candidate-a", "candidate-a@low"] },
+        f.dataset,
+        f.factory.router,
+      ),
+    ).toThrow(
+      /Invalid eval models: "unknown@low": unknown model ID "unknown"; "candidate-a@max": Unsupported effort "max" for candidate-a.*; duplicate resolved model target candidate-a@low/,
+    );
     const { request } = validateRequest(
       { role: "triage", models: ["candidate-a", "candidate-a@high", "candidate-a@none"] },
       f.dataset,

@@ -182,10 +182,23 @@ export type EvalRequest = z.infer<typeof EvalRequestSchema>;
 export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<Router, "resolveFor">) {
   const request = EvalRequestSchema.parse(input);
   if (request.role !== file.role) throw new Error("dataset role does not match request");
-  const role = request.role;
-  request.models = request.models.map((id) => router.resolveFor(role, id).targetId);
-  if (new Set(request.models).size !== request.models.length)
-    throw new Error("duplicate resolved model targets");
+  // Report every bad reference at once so the operator fixes the whole list in one round trip.
+  const problems: string[] = [];
+  const resolved: string[] = [];
+  for (const id of request.models) {
+    try {
+      resolved.push(router.resolveFor(request.role, id).targetId);
+    } catch (error) {
+      problems.push(`${JSON.stringify(id)}: ${(error as Error).message}`);
+    }
+  }
+  const seen = new Set<string>();
+  for (const target of resolved) {
+    if (seen.has(target)) problems.push(`duplicate resolved model target ${target}`);
+    seen.add(target);
+  }
+  if (problems.length > 0) throw new Error(`Invalid eval models: ${problems.join("; ")}`);
+  request.models = resolved;
   for (const id of request.caseIds ?? [])
     if (!file.cases.some((c) => c.id === id)) throw new Error(`Unknown case ID: ${id}`);
   const cases = file.cases.filter((c) => !request.caseIds || request.caseIds.includes(c.id));

@@ -34,7 +34,8 @@ remain Astra high, Sol medium, Luna medium and Sol 5.6 medium. Models without a 
 default leave the backend setting unset.
 
 A bare ID and its explicit catalog default are the same target. Routing deduplicates
-them; eval submissions reject duplicate resolved targets before scheduling.
+them; eval submissions reject duplicate resolved targets before scheduling, and report
+every invalid reference in the list in a single error rather than only the first.
 Explicit `none` is distinct from unset effort. No automatic effort sweep is performed.
 
 ## Execution and fallback
@@ -44,8 +45,10 @@ defaults. Exclusions, preference, implementer state and fallback diagnostics ret
 pair. Quota, health, concurrency, model blocking, vendor and tier checks still apply to
 the underlying provider/model. Tier escalation adds remaining catalog defaults.
 
-Native Claude uses `--effort VALUE`; Codex uses `-c model_reasoning_effort="VALUE"`.
-Direct HTTP chooses exactly one mapping:
+Native Claude uses `--effort VALUE`; Codex uses `-c model_reasoning_effort="VALUE"`. Both
+CLI harnesses transmit the resolved value verbatim (including `none`); which values a model
+accepts is decided solely by its catalog `supportedEfforts`. Direct HTTP chooses exactly one
+mapping:
 
 | Transport | Request field |
 |---|---|

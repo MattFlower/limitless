@@ -181,9 +181,13 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
     );
   }
   args.push("--disallowedTools", ...denied);
+  // Which values a model accepts is the catalog's business (supportedEfforts); the harness only
+  // transmits the resolved selection. Non-Anthropic backends behind the CLI cannot receive one.
   if (t.effort !== undefined) {
-    if (t.backend || !["low", "medium", "high", "max"].includes(t.effort))
-      throw new Error("Unsupported effort for Claude CLI transport; use a supported native Claude target");
+    if (t.backend)
+      throw new Error(
+        `Claude CLI cannot set effort for the ${t.provider} backend; use ${t.modelId} without @effort`,
+      );
     args.push("--effort", t.effort);
   }
   if (spec.systemAppend) args.push("--append-system-prompt", spec.systemAppend);
