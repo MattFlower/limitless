@@ -27,7 +27,7 @@ const row: EvalTrial = {
   createdAt: 10,
 };
 
-test("v5 upgrade preserves data and adds eval columns, cache index, FK and tuple uniqueness", () => {
+test("upgrade to the eval migration preserves data and adds eval columns, cache index, FK and tuple uniqueness", () => {
   const home = mkdtempSync(join(tmpdir(), "eval-store-"));
   const path = join(home, "db.sqlite");
   let store: Store | undefined;
@@ -36,7 +36,8 @@ test("v5 upgrade preserves data and adds eval columns, cache index, FK and tuple
     old.exec(
       "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
     );
-    for (const migration of MIGRATIONS.filter((m) => m.version <= 5)) {
+    const evalVersion = MIGRATIONS.find((m) => m.name === "triage_evals")?.version ?? 0;
+    for (const migration of MIGRATIONS.filter((m) => m.version < evalVersion)) {
       old.exec(migration.sql);
       old.query("INSERT INTO schema_migrations VALUES (?, ?, 1)").run(migration.version, migration.name);
     }
@@ -47,7 +48,7 @@ test("v5 upgrade preserves data and adds eval columns, cache index, FK and tuple
       value: "unchanged",
     });
     expect(store.db.query("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({
-      version: 6,
+      version: Math.max(...MIGRATIONS.map((m) => m.version)),
     });
     const columns = (store.db.query("PRAGMA table_info(eval_trials)").all() as { name: string }[]).map(
       (c) => c.name,
