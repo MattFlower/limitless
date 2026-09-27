@@ -49,6 +49,7 @@ import {
   verifyPrompt,
 } from "./prompts.ts";
 import { buildReport } from "./report.ts";
+import { blockingReviewFindings, reviewVerdict } from "./review.ts";
 import {
   type Holdout,
   HoldoutSchema,
@@ -63,7 +64,6 @@ import {
   type Verify,
   VerifySchema,
 } from "./schemas.ts";
-import { blockingReviewFindings, reviewVerdict } from "./review.ts";
 import { blockedOnly, ENVIRONMENT_BLOCKED, normalizeVerify } from "./verification.ts";
 
 const ROUNDS_PER_IMPLEMENTER = 2;
@@ -570,9 +570,12 @@ async function oneRound(
   }
 
   // --- review (a different vendor than the implementer)
-  const previousReview = ctx.state.lastReview && ctx.state.reviewedSha
-    ? { sha: ctx.state.reviewedSha, findings: ctx.state.lastReview.findings }
-    : undefined;
+  if (ctx.state.lastReview && !ctx.state.reviewedSha)
+    throw new NeedsHumanError("Previous review has no reviewed commit; cannot classify later findings");
+  const previousReview =
+    ctx.state.lastReview && ctx.state.reviewedSha
+      ? { sha: ctx.state.reviewedSha, findings: ctx.state.lastReview.findings }
+      : undefined;
   const reviewedSha = await headSha(cwd);
   const review: Review = await ctx.stage(
     "review",
@@ -627,8 +630,10 @@ async function oneRound(
     round,
   );
 
-  const reviewFeedback = review.verdict === "request_changes"
-    ? formatReviewFeedback(blockingReviewFindings(review, !!previousReview)) : "";
+  const reviewFeedback =
+    review.verdict === "request_changes"
+      ? formatReviewFeedback(blockingReviewFindings(review, !!previousReview))
+      : "";
   if (review.verdict === "request_changes") {
     ctx.state.feedback = reviewFeedback || `### Code review requested changes\n${review.summary}`;
     ctx.save();

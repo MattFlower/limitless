@@ -139,7 +139,10 @@ export function renderReport(input: ReportInput): string {
     blocks.push(
       "## Review follow-ups",
       state.reviewFollowUps
-        .map((f) => `- ${f.severity}${f.security ? " (security)" : ""}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title} — ${f.detail}`)
+        .map(
+          (f) =>
+            `- ${f.severity}${f.security ? " (security)" : ""}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title} — ${f.detail}`,
+        )
         .join("\n"),
     );
   }

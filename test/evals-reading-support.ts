@@ -38,6 +38,8 @@ export function reviewOutput(
   return {
     verdict: "request_changes",
     summary: "reviewed",
-    findings: [{ line, severity, file, title: "Bug", detail: "Observed", suggestion: "Fix" }],
+    findings: [
+      { line, severity, security: false, file, title: "Bug", detail: "Observed", suggestion: "Fix" },
+    ],
   };
 }

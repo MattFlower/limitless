@@ -472,11 +472,24 @@ describe("pipeline (fake agents, real git + gates)", () => {
         if (role === "review") {
           reviews++;
           if (reviews < normalRounds || (outcome === "review" && reviews > normalRounds))
-            return { structured: { verdict: "request_changes", summary: "Fix the feature", findings: [{
-              severity: "blocker", security: false,
-              ...(reviews > 1 ? { label: reviews > normalRounds ? "regression" : "unaddressed" } : {}),
-              file: "farewell.txt", line: 1, title: "Fix the feature", detail: "Incorrect output", suggestion: "Fix it",
-            }] } };
+            return {
+              structured: {
+                verdict: "request_changes",
+                summary: "Fix the feature",
+                findings: [
+                  {
+                    severity: "blocker",
+                    security: false,
+                    ...(reviews > 1 ? { label: reviews > normalRounds ? "regression" : "unaddressed" } : {}),
+                    file: "farewell.txt",
+                    line: 1,
+                    title: "Fix the feature",
+                    detail: "Incorrect output",
+                    suggestion: "Fix it",
+                  },
+                ],
+              },
+            };
           if (reviews === normalRounds) baseTip = await advanceBase(bare, "greeting.txt", "new base\n");
           expect(s.prompt).toContain(reviews > normalRounds ? baseTip : "Add a farewell");
           return { structured: approve };
@@ -1220,19 +1233,32 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const prompts: string[] = [];
     const implementPrompts: string[] = [];
     const finding = (title: string, label?: "unaddressed" | "regression" | "new") => ({
-      severity: "major", security: false, ...(label ? { label } : {}),
-      file: "farewell.txt", line: 1, title, detail: title, suggestion: "Fix it",
+      severity: "major",
+      security: false,
+      ...(label ? { label } : {}),
+      file: "farewell.txt",
+      line: 1,
+      title,
+      detail: title,
+      suggestion: "Fix it",
     });
     const f = start((s) => {
       const role = roleOf(s);
       if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
       if (role === "review") {
         prompts.push(s.prompt);
-        return { structured: prompts.length === 1
-          ? { verdict: "approve", summary: "first", findings: [finding("Prior bug")] }
-          : prompts.length === 2
-            ? { verdict: "approve", summary: "second", findings: [finding("Prior bug", "unaddressed")] }
-            : { verdict: "request_changes", summary: "follow up", findings: [finding("Later edge case", "new")] } };
+        return {
+          structured:
+            prompts.length === 1
+              ? { verdict: "approve", summary: "first", findings: [finding("Prior bug")] }
+              : prompts.length === 2
+                ? { verdict: "approve", summary: "second", findings: [finding("Prior bug", "unaddressed")] }
+                : {
+                    verdict: "request_changes",
+                    summary: "follow up",
+                    findings: [finding("Later edge case", "new")],
+                  },
+        };
       }
       implementPrompts.push(s.prompt);
       return { files: { "farewell.txt": `goodbye ${implementPrompts.length}\n` } };
@@ -1246,10 +1272,15 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(first.verdict).toBe("request_changes");
     expect(third.verdict).toBe("approve");
     expect(prompts[1]).toContain("Prior bug");
-    expect(prompts[1]).toMatch(/Reviewed commit: [a-f0-9]{40}\. Current HEAD: [a-f0-9]{40}/);
+    const reviewed = prompts[1]?.match(/Reviewed commit: ([a-f0-9]{40})\. Current HEAD: ([a-f0-9]{40})/);
+    expect(reviewed).not.toBeNull();
+    expect(reviewed?.[1]).not.toBe(reviewed?.[2]);
+    expect(prompts[1]).toContain(`git diff ${reviewed?.[1]}..${reviewed?.[2]}`);
     expect(prompts[1]).toContain("git diff ");
     expect(prompts[1]).toContain("latest-change diff");
-    expect(f.store.getArtifact(run.id, "report.md")).toContain("## Review follow-ups\n\n- major: `farewell.txt:1` Later edge case");
+    expect(f.store.getArtifact(run.id, "report.md")).toContain(
+      "## Review follow-ups\n\n- major: `farewell.txt:1` Later edge case",
+    );
   });
 
   for (const label of ["unaddressed", "regression"] as const) {
@@ -1262,14 +1293,41 @@ describe("pipeline (fake agents, real git + gates)", () => {
         if (role === "review") {
           reviews++;
           const title = reviews === 1 ? "Prior bug" : "Still broken";
-          return { structured: reviews < 3
-            ? { verdict: "approve", summary: "review", findings: [{
-                severity: reviews === 2 ? "minor" : "major", security: false,
-                ...(reviews === 2 ? { label } : {}),
-                file: "farewell.txt", line: 1, title, detail: title, suggestion: "Fix it",
-              }, ...(reviews === 2 ? [{ severity: "minor", security: false, label: "new",
-                file: "farewell.txt", line: 1, title: "Future cleanup", detail: "Optional", suggestion: "Later" }] : [])] }
-            : { ...approve, verdict: "request_changes" } };
+          return {
+            structured:
+              reviews < 3
+                ? {
+                    verdict: "approve",
+                    summary: "review",
+                    findings: [
+                      {
+                        severity: reviews === 2 ? "minor" : "major",
+                        security: false,
+                        ...(reviews === 2 ? { label } : {}),
+                        file: "farewell.txt",
+                        line: 1,
+                        title,
+                        detail: title,
+                        suggestion: "Fix it",
+                      },
+                      ...(reviews === 2
+                        ? [
+                            {
+                              severity: "minor",
+                              security: false,
+                              label: "new",
+                              file: "farewell.txt",
+                              line: 1,
+                              title: "Future cleanup",
+                              detail: "Optional",
+                              suggestion: "Later",
+                            },
+                          ]
+                        : []),
+                    ],
+                  }
+                : { ...approve, verdict: "request_changes" },
+          };
         }
         prompts.push(s.prompt);
         return { files: { "farewell.txt": `goodbye ${prompts.length}\n` } };
@@ -1291,13 +1349,43 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
       if (role === "review") {
         reviews++;
-        return { structured: reviews === 1
-          ? { verdict: "approve", summary: "initial", findings: [{ severity: "major", security: false,
-              file: "farewell.txt", line: 1, title: "Prior bug", detail: "bug", suggestion: "fix" }] }
-          : reviews === 2
-            ? { verdict: "approve", summary: "security", findings: [{ severity: "minor", security: true,
-                label: "new", file: "farewell.txt", line: 1, title: "Secret leak", detail: "leak", suggestion: "fix" }] }
-            : approve };
+        return {
+          structured:
+            reviews === 1
+              ? {
+                  verdict: "approve",
+                  summary: "initial",
+                  findings: [
+                    {
+                      severity: "major",
+                      security: false,
+                      file: "farewell.txt",
+                      line: 1,
+                      title: "Prior bug",
+                      detail: "bug",
+                      suggestion: "fix",
+                    },
+                  ],
+                }
+              : reviews === 2
+                ? {
+                    verdict: "approve",
+                    summary: "security",
+                    findings: [
+                      {
+                        severity: "minor",
+                        security: true,
+                        label: "new",
+                        file: "farewell.txt",
+                        line: 1,
+                        title: "Secret leak",
+                        detail: "leak",
+                        suggestion: "fix",
+                      },
+                    ],
+                  }
+                : approve,
+        };
       }
       implementsCount++;
       if (implementsCount === 3) expect(s.prompt).toContain("Secret leak");
@@ -1320,17 +1408,51 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (role === "review") {
         reviews++;
         prompts.push(s.prompt);
-        return { structured: reviews === 1
-          ? { ...approve, findings: [{ severity: "major", security: false, file: "farewell.txt",
-              line: 1, title: "Prior bug", detail: "bug", suggestion: "fix" }] }
-          : reviews === 2
-            ? { ...approve, findings: [
-                { severity: "minor", security: false, label: "regression", file: "farewell.txt",
-                  line: 1, title: "Regression", detail: "regressed", suggestion: "fix" },
-                { severity: "major", security: false, label: "new", file: "farewell.txt",
-                  line: 1, title: "Backlog idea", detail: "later", suggestion: "later" },
-              ] }
-            : approve };
+        return {
+          structured:
+            reviews === 1
+              ? {
+                  ...approve,
+                  findings: [
+                    {
+                      severity: "major",
+                      security: false,
+                      file: "farewell.txt",
+                      line: 1,
+                      title: "Prior bug",
+                      detail: "bug",
+                      suggestion: "fix",
+                    },
+                  ],
+                }
+              : reviews === 2
+                ? {
+                    ...approve,
+                    findings: [
+                      {
+                        severity: "minor",
+                        security: false,
+                        label: "regression",
+                        file: "farewell.txt",
+                        line: 1,
+                        title: "Regression",
+                        detail: "regressed",
+                        suggestion: "fix",
+                      },
+                      {
+                        severity: "major",
+                        security: false,
+                        label: "new",
+                        file: "farewell.txt",
+                        line: 1,
+                        title: "Backlog idea",
+                        detail: "later",
+                        suggestion: "later",
+                      },
+                    ],
+                  }
+                : approve,
+        };
       }
       implementsCount++;
       return slow && implementsCount === 3
@@ -1340,7 +1462,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const f = start(handler);
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
     const deadline = Date.now() + 10_000;
-    while ((f.store.getRunState<RunState>(run.id)?.round !== 2 || f.store.getRun(run.id)?.stage !== "implement") && Date.now() < deadline)
+    while (
+      (f.store.getRunState<RunState>(run.id)?.round !== 2 || f.store.getRun(run.id)?.stage !== "implement") &&
+      Date.now() < deadline
+    )
       await Bun.sleep(10);
     const before = f.store.getRunState<RunState>(run.id);
     expect(before?.reviewedSha).toMatch(/^[a-f0-9]{40}$/);
