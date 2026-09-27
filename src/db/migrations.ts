@@ -275,4 +275,9 @@ CREATE TABLE eval_trials (
 CREATE INDEX eval_trials_cache_key ON eval_trials(cache_key);
 `,
   },
+  {
+    version: 9,
+    name: "quota_window_observations",
+    sql: "ALTER TABLE provider_state ADD COLUMN window_observed_at_json TEXT;",
+  },
 ];

@@ -153,6 +153,7 @@ test("list uses newest-first filtering and providers preserve telemetry and abse
     windows: { five_hour: { utilization: 0.4 } },
   });
   expect(providers[0]?.windows.five_hour?.resetsAt).toBeGreaterThan(Date.now());
+  expect(providers[0]?.windows.five_hour?.observedAt).toBeGreaterThan(0);
   release();
 });
 

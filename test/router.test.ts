@@ -86,7 +86,138 @@ function setup(secrets: Record<string, string> = {}) {
   return { tracker, router: new Router(tracker, policy, models) };
 }
 
+test("quota windows keep independent observation times and reject older boundaries", () => {
+  let now = 1_000_000;
+  const tracker = new ProviderTracker(providers, store, reserves, {}, {}, () => now);
+  tracker.observeWindows("claude", {
+    five_hour: { utilization: 0.721, resetsAt: 2_000_000 },
+    seven_day: { utilization: 0.2, resetsAt: 9_000_000 },
+  });
+  now += 12 * 60_000;
+  tracker.observeWindows("claude", { five_hour: { utilization: 0.75, resetsAt: 2_000_000 } });
+  expect(tracker.status("claude")?.windows).toMatchObject({
+    five_hour: { utilization: 0.75, observedAt: now },
+    seven_day: { utilization: 0.2, observedAt: 1_000_000 },
+  });
+  now += 60_000;
+  tracker.observeWindows("claude", { five_hour: { utilization: 0.1, resetsAt: 1_900_000 } });
+  expect(tracker.status("claude")?.windows.five_hour).toMatchObject({
+    utilization: 0.75,
+    observedAt: 1_720_000,
+  });
+});
+
+test("quota observation times survive reload and legacy windows remain unknown", () => {
+  let now = 1_000_000;
+  const dbPath = join(dir, "db.sqlite");
+  const tracker = new ProviderTracker(providers, store, reserves, {}, {}, () => now);
+  tracker.observeWindows("claude", { five_hour: { utilization: 0.721, resetsAt: 2_000_000 } });
+  // A pre-migration row has windows_json but no observation timestamps.
+  store.putProviderRow({
+    provider: "codex",
+    state: "ok",
+    reason: null,
+    until: null,
+    windows: { seven_day: { utilization: 0.3, resetsAt: null } },
+    windowObservedAt: {},
+    consecutiveFailures: 0,
+  });
+  store.db.query("UPDATE provider_state SET window_observed_at_json = NULL WHERE provider = 'codex'").run();
+  store.close();
+  store = new Store(dbPath);
+  now += 12 * 60_000;
+  const reloaded = new ProviderTracker(providers, store, reserves, {}, {}, () => now);
+  expect(reloaded.status("claude")?.windows.five_hour).toEqual({
+    utilization: 0.721,
+    resetsAt: 2_000_000,
+    observedAt: 1_000_000,
+  });
+  expect(reloaded.status("codex")?.windows.seven_day).toEqual({
+    utilization: 0.3,
+    resetsAt: null,
+    observedAt: null,
+  });
+});
+
 describe("Router", () => {
+  test("disabled providers are skipped on ordinary, preferred, and escalation routes", () => {
+    const { tracker, router } = setup();
+    tracker.setEnabled("claude", false);
+    for (const constraints of [{}, { prefer: "claude/sonnet" }, { minTier: 5 }]) {
+      const decision = router.route("implement", "small", constraints);
+      expect(decision.candidates.every((candidate) => candidate.provider !== "claude")).toBe(true);
+      expect(decision.skipped).toContainEqual({
+        modelId: constraints.minTier ? "claude/opus" : "claude/sonnet",
+        reason: "disabled",
+      });
+    }
+    tracker.setEnabled("claude", true);
+    expect(
+      router.route("implement", "small").candidates.some((candidate) => candidate.provider === "claude"),
+    ).toBe(true);
+  });
+
+  test("enablement overrides survive restart and cannot replace credentials", () => {
+    let tracker = setup().tracker;
+    tracker.setEnabled("claude", false);
+    tracker.setEnabled("codex", true);
+    tracker.setEnabled("openrouter", true);
+    expect(tracker.status("openrouter")).toMatchObject({
+      enabled: false,
+      reason: "missing OPENROUTER_API_KEY",
+    });
+    expect(() => tracker.setEnabled("unknown", false)).toThrow("unknown provider unknown");
+    expect(store.getProviderEnabledOverride("unknown")).toBeNull();
+    store.close();
+    store = new Store(join(dir, "db.sqlite"));
+    tracker = setup().tracker;
+    expect(tracker.status("claude")).toMatchObject({ enabled: false, reason: "disabled" });
+    expect(tracker.status("codex")?.enabled).toBe(true);
+    expect(tracker.status("openrouter")?.enabled).toBe(false);
+    expect(store.getProviderEnabledOverride("claude")).toBe(false);
+    expect(store.getProviderEnabledOverride("codex")).toBe(true);
+  });
+
+  test("disabled local providers receive no startup or tick probes and resume on enable", async () => {
+    const defs: ProviderDef[] = [
+      {
+        id: "local",
+        label: "Local",
+        harness: "claude",
+        billing: "free",
+        maxConcurrent: 1,
+        healthUrl: "http://local/health",
+      },
+    ];
+    store.setProviderEnabledOverride("local", false);
+    let calls = 0;
+    const fetchHealth = (async () => {
+      calls++;
+      return Response.json({});
+    }) as unknown as typeof fetch;
+    const tracker = new ProviderTracker(
+      defs,
+      store,
+      reserves,
+      {},
+      {},
+      Date.now,
+      fetch,
+      undefined,
+      fetchHealth,
+    );
+    tracker.start();
+    await tracker.probe();
+    expect(calls).toBe(0);
+    tracker.setEnabled("local", true);
+    await Bun.sleep(0);
+    expect(calls).toBe(1);
+    expect(tracker.status("local")?.state).toBe("ok");
+    tracker.setEnabled("local", false);
+    await tracker.probe();
+    expect(calls).toBe(1);
+    tracker.stop();
+  });
   test("OpenAI URLs are distinct from agentic backends and protected providers need keys", () => {
     const targets = new Router(
       new ProviderTracker(PROVIDERS, store, reserves, { OPENROUTER_API_KEY: "or", TWILIGHT_API_KEY: "tw" }),
@@ -332,6 +463,22 @@ describe("OpenRouter reconciliation", () => {
     expect(calls).toBe(3);
     tracker.stop();
     expect(tick).toBeNull();
+  });
+
+  test("override stops key polling and re-enable resumes it", async () => {
+    store.setProviderEnabledOverride("openrouter", false);
+    const tracker = make();
+    tracker.start();
+    expect(calls).toBe(0);
+    expect(tick).toBeNull();
+    tracker.setEnabled("openrouter", true);
+    await Bun.sleep(0);
+    expect(calls).toBe(1);
+    tracker.setEnabled("openrouter", false);
+    expect(tick).toBeNull();
+    expect(await tracker.refreshOpenRouter()).toBe(false);
+    expect(calls).toBe(1);
+    tracker.stop();
   });
 
   test("persists reading across restart and failed refresh", async () => {

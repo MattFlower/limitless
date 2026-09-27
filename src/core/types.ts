@@ -224,7 +224,7 @@ export interface ProviderStatus {
   state: "ok" | "degraded" | "down" | "exhausted" | "disabled";
   reason: string | null;
   until: number | null;
-  windows: Record<string, QuotaWindow>;
+  windows: Record<string, QuotaWindow & { observedAt: number | null }>;
   spendUsd: number | null; // metered providers
   budgetUsd: number | null;
   reportedUsageUsd?: number | null;

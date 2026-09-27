@@ -19,6 +19,7 @@ export interface LocalOptions {
   /** Secrets for provider API keys, so the health probe authenticates like the router does. */
   secrets?: Record<string, string>;
   probe?: (url: string, token?: string) => Promise<boolean>;
+  setEnabled?: (id: string, enabled: boolean) => Promise<void>;
 }
 
 function systemdQuote(value: string): string {
@@ -138,8 +139,22 @@ export async function manageLocal(
   const twilightUrl = `http://${host}:8080/v1/models`;
   const healthy = async (url: string, id: string) =>
     (await probe(url, token(id))) ? "healthy" : "unreachable";
-  return {
-    mtplx: { service: localService, endpoint: await healthy(mtplxUrl, "mtplx") },
-    twilight: { service: remoteService, endpoint: await healthy(twilightUrl, "twilight") },
+  const endpoint = async (service: string, url: string, id: string) =>
+    action === "down" || (action === "up" && service !== "active" && service !== "loaded")
+      ? "unreachable"
+      : await healthy(url, id);
+  const report = {
+    mtplx: { service: localService, endpoint: await endpoint(localService, mtplxUrl, "mtplx") },
+    twilight: { service: remoteService, endpoint: await endpoint(remoteService, twilightUrl, "twilight") },
   };
+  if (action === "down") {
+    if (localService === "stopped") await opts.setEnabled?.("mtplx", false);
+    if (remoteService === "stopped") await opts.setEnabled?.("twilight", false);
+  } else if (action === "up") {
+    if (localService === "loaded" && report.mtplx.endpoint === "healthy")
+      await opts.setEnabled?.("mtplx", true);
+    if (remoteService === "active" && report.twilight.endpoint === "healthy" && token("twilight"))
+      await opts.setEnabled?.("twilight", true);
+  }
+  return report;
 }

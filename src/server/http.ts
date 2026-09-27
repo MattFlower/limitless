@@ -296,6 +296,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle(() => json(store.listRepos())),
     },
     "/api/providers": handle(() => json(factory.tracker.all())),
+    "/api/providers/:id/enable": {
+      POST: handle((req) => json(factory.tracker.setEnabled(req.params.id ?? "", true))),
+    },
+    "/api/providers/:id/disable": {
+      POST: handle((req) => json(factory.tracker.setEnabled(req.params.id ?? "", false))),
+    },
     "/api/alerts": handle(() => {
       factory.tracker.refreshAlerts();
       return json(store.listAlerts(factory.tracker.now()));

@@ -59,7 +59,14 @@ const providersSchema = z.array(
     state: z.enum(["ok", "degraded", "down", "exhausted", "disabled"]),
     reason: z.string().nullable(),
     until: z.number().nullable(),
-    windows: z.record(z.string(), z.object({ utilization: z.number(), resetsAt: z.number().nullable() })),
+    windows: z.record(
+      z.string(),
+      z.object({
+        utilization: z.number(),
+        resetsAt: z.number().nullable(),
+        observedAt: z.number().nullable().optional(),
+      }),
+    ),
     spendUsd: z.number().nullable(),
     budgetUsd: z.number().nullable(),
     inFlight: z.number(),
