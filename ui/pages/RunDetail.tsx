@@ -8,6 +8,7 @@ import { answerRun, cancelRun, getRunDetail, openRunStream, retryRun } from "../
 import { ArtifactsPanel } from "../components/ArtifactsPanel.tsx";
 import { EventLog } from "../components/EventLog.tsx";
 import { InvocationsTable } from "../components/InvocationsTable.tsx";
+import { OriginalPrompt } from "../components/OriginalPrompt.tsx";
 import { StageTimeline } from "../components/StageTimeline.tsx";
 import { RunStatusPill } from "../components/StatusPill.tsx";
 import { compactNumber, duration, equivMoney, money, relativeTime } from "../lib/format.ts";
@@ -326,6 +327,8 @@ export const RunDetail: Component = () => {
             </div>
 
             <For each={openQuestions()}>{(q) => <QuestionCard runId={params.id} question={q} />}</For>
+
+            <OriginalPrompt prompt={r().prompt} />
 
             <div>
               <div class="section-label">Stage timeline</div>
