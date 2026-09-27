@@ -249,11 +249,17 @@ export async function deploy(
     const running = validateHealth(await race(bounded(clock, (signal) => client.health(signal))));
     drainAttempted = running.draining;
     log(`daemon before: ${running.sha}`);
+    previous = running.sha === "unknown" ? "" : running.sha;
     const checkout = (await run(["git", "rev-parse", "HEAD"], { cwd: dir })).stdout.trim();
-    // Older daemons have no boot SHA; only the checkout can identify their rollback commit.
-    previous = running.sha === "unknown" ? checkout : running.sha;
     await run(["git", "fetch", "origin", "--prune"], { cwd: dir, timeoutMs: 300_000 });
     const target = (await run(["git", "rev-parse", ref], { cwd: dir })).stdout.trim();
+    if (running.sha === "unknown" && checkout === target) {
+      throw new Error(
+        "daemon boot SHA is unknown and checkout already matches target; cannot determine whether deployment completed or safely recover an interrupted deploy",
+      );
+    }
+    // Legacy upgrades can use the checkout for rollback, but never as proof of completion.
+    previous ||= checkout;
     if (target === previous) {
       if (running.draining) {
         log(`daemon ${previous} is draining; resuming scheduler`);

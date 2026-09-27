@@ -412,16 +412,27 @@ test("a pre-upgrade daemon without a boot SHA deploys using the checkout commit"
   }
 });
 
-test("a pre-upgrade daemon at the target uses the checkout as its completion check", async () => {
-  const f = setup();
-  f.setSelected("next");
-  const health = f.client.health;
-  f.client.health = async (signal) =>
-    ({ ...(await health(signal)), sha: undefined }) as unknown as HealthResponse;
-  await deploy(7400, "feature", false, f.opts);
-  expect(f.calls).not.toContain("restart");
-  expect(f.calls).not.toContain("drain");
-  expect(f.logs.at(-1)).toBe("already deployed next");
+test("an unknown daemon SHA cannot use the target checkout as proof of deployment", async () => {
+  for (const sha of [undefined, null, "", " \n", "unknown", " unknown ", 123]) {
+    for (const draining of [false, true]) {
+      const f = setup();
+      f.setSelected("next");
+      f.setDraining(draining);
+      const health = f.client.health;
+      f.client.health = async (signal) => ({ ...(await health(signal)), sha }) as unknown as HealthResponse;
+      const listeners = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
+      await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("daemon boot SHA is unknown");
+      expect(f.calls).toEqual([
+        "health",
+        "git rev-parse HEAD",
+        "git fetch origin --prune",
+        "git rev-parse feature",
+      ]);
+      expect(f.selected()).toBe("next");
+      expect(f.logs.some((line) => line.includes("already deployed"))).toBe(false);
+      expect([process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")]).toEqual(listeners);
+    }
+  }
 });
 
 test("boot SHA resolution degrades when Git fails or returns an empty result", async () => {
