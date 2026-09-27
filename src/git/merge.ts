@@ -60,17 +60,30 @@ export async function prepareMerge(cwd: string, head: string, base: string): Pro
 /** Never use commitAll: even a resolution identical to the first parent needs a merge commit. */
 export async function completeMerge(cwd: string, head: string, base: string): Promise<string> {
   await requireMerge(cwd, head, base);
-  // The file-only resolver leaves the unmerged index intact, including across restarts.
-  // Clean merges have no such paths; unrelated docs and marker fixtures need no scan.
-  const paths = (await mergeGit(cwd, ["diff", "--name-only", "--diff-filter=U", "-z"])).stdout
-    .split("\0")
-    .filter(Boolean);
-  const markers = [...new Set(paths)].filter((path) => {
+  // The file-only resolver leaves the unmerged index intact, including across restarts, so the
+  // worktree-vs-index diff is exactly the resolver's edits. Only markers it introduced block;
+  // unrelated docs and marker fixtures already in either parent do not.
+  const list = async (args: string[]) => (await mergeGit(cwd, args)).stdout.split("\0").filter(Boolean);
+  const unmerged = new Set(await list(["diff", "--name-only", "--diff-filter=U", "-z"]));
+  const whole = [...unmerged, ...(await list(["ls-files", "-z", "--others", "--exclude-standard"]))];
+  const edited = await list(["diff", "--name-only", "--diff-filter=MT", "-z"]);
+  const markers = whole.filter((path) => {
     const file = join(cwd, path);
     if (!existsSync(file) || !lstatSync(file).isFile()) return false;
     const contents = readFileSync(file);
     return !contents.includes(0) && /^<{7,} .*\n[\s\S]*^>{7,} /m.test(contents.toString("utf8"));
   });
+  for (const path of edited.filter((p) => !unmerged.has(p))) {
+    const diff = await mergeGit(cwd, [
+      "diff",
+      "-U0",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--",
+      `:(literal)${path}`,
+    ]);
+    if (/^\+(<{7,}|>{7,})( |$)/m.test(diff.stdout)) markers.push(path);
+  }
   if (markers.length) throw new Error(`Unresolved conflict markers: ${markers.join(", ")}`);
   await mergeGit(cwd, ["add", "-A"]);
   if ((await mergeGit(cwd, ["ls-files", "-u"])).stdout)

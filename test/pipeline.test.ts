@@ -727,13 +727,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
   }
 
-  for (const fault of ["missing", "single-parent", "markers", "same-tree", "setext"] as const) {
+  for (const fault of ["missing", "single-parent", "markers", "stray", "same-tree", "setext"] as const) {
     test(`factory merge resolution: ${fault}`, async () => {
       const bare = await githubFixture();
       let calls = 0;
       let before = "";
       let base = "";
-      const f = start(async (s) => {
+      const f = start(async (s): Promise<FakeReply> => {
         if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
         if (roleOf(s) === "review") {
           if (!base) base = await advanceBase(bare, "greeting.txt", "base intent\n");
@@ -753,6 +753,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
             await mergeGit(s.cwd, ["commit", "-qm", "lost merge parent"]);
           }
         }
+        if (fault === "stray")
+          return {
+            files: {
+              "greeting.txt": "feature intent\nbase intent\n",
+              "README.md": "Project\n=======\n<<<<<<< HEAD\nours\n",
+              "new.txt": "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> base\n",
+            },
+          };
         if (fault === "setext")
           return { files: { "greeting.txt": "Greeting\n========\nfeature intent\nbase intent\n" } };
         return fault === "same-tree" ? { files: { "greeting.txt": "feature intent\n" } } : {};
@@ -779,7 +787,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
           );
       } else {
         expect(result?.error).toContain(
-          fault === "markers" ? "Unresolved conflict markers: greeting.txt" : "MERGE_HEAD",
+          fault === "markers"
+            ? "Unresolved conflict markers: greeting.txt"
+            : fault === "stray"
+              ? "Unresolved conflict markers: new.txt, README.md"
+              : "MERGE_HEAD",
         );
         await assertUnpublished(bare);
       }
