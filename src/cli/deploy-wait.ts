@@ -47,7 +47,7 @@ function validDrain(value: unknown): value is DrainState {
   );
 }
 
-function validateHealth(value: unknown): HealthResponse {
+export function validateHealth(value: unknown): HealthResponse {
   if (
     !validDrain(value) ||
     !("ok" in value) ||
@@ -55,7 +55,11 @@ function validateHealth(value: unknown): HealthResponse {
     !("uptimeMs" in value) ||
     typeof value.uptimeMs !== "number" ||
     !Number.isFinite(value.uptimeMs) ||
-    value.uptimeMs < 0
+    value.uptimeMs < 0 ||
+    !("sha" in value) ||
+    typeof value.sha !== "string" ||
+    !value.sha.trim() ||
+    value.sha === "unknown"
   ) {
     throw new Error("invalid or unhealthy daemon health response");
   }
@@ -184,7 +188,11 @@ export async function waitForDrain(
   }
 }
 
-export async function waitForHealthy(client: DeployClient, clock: DeployClock): Promise<void> {
+export async function waitForHealthy(
+  client: DeployClient,
+  clock: DeployClock,
+  target: string,
+): Promise<HealthResponse> {
   const start = clock.now();
   let lastError: unknown;
   while (clock.now() - start < 45_000) {
@@ -196,8 +204,10 @@ export async function waitForHealthy(client: DeployClient, clock: DeployClock): 
           Math.min(2000, 45_000 - (clock.now() - start)),
         ),
       );
-      if (!state.draining) return;
-      lastError = new Error("replacement daemon is still draining");
+      if (state.sha !== target) {
+        lastError = new Error(`replacement daemon runs ${state.sha}, expected ${target}`);
+      } else if (!state.draining) return state;
+      else lastError = new Error("replacement daemon is still draining");
     } catch (error) {
       lastError = error;
     }

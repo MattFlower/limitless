@@ -123,12 +123,17 @@ async function follow(runId: string, after = 0): Promise<void> {
 }
 
 async function serve(): Promise<void> {
+  const { sh } = await import("../util/proc.ts");
   const { loadConfig } = await import("../config.ts");
   const { Factory } = await import("../app.ts");
   const { startHttp } = await import("../server/http.ts");
   const { mountIntegrations } = await import("../integrations/index.ts");
   const cfg = loadConfig();
+  const bootSha = (
+    await sh(["git", "rev-parse", "HEAD"], { cwd: join(import.meta.dir, "../..") })
+  ).stdout.trim();
   const factory = new Factory(cfg, {
+    bootSha,
     policyPath: join(import.meta.dir, "../../routing/policy.json"),
   });
   const ui = (await import("../../ui/index.html")).default;

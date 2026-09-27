@@ -64,7 +64,13 @@ function setup() {
     },
     async health() {
       calls.push("health");
-      return { ok: true, uptimeMs: 1, draining, active: restarted || time >= 10_000 ? [] : ["run-a"] };
+      return {
+        ok: true,
+        uptimeMs: 1,
+        sha: restarted ? "next" : "previous",
+        draining,
+        active: restarted || time >= 10_000 ? [] : ["run-a"],
+      };
     },
     async run(id) {
       calls.push(`run ${id}`);
@@ -85,14 +91,25 @@ function setup() {
     client,
     clock,
     selected: () => selected,
+    setSelected: (sha: string) => {
+      selected = sha;
+    },
+    setDraining: (value: boolean) => {
+      draining = value;
+    },
     opts: { releaseDir: dir, command, client, clock, restart, log: (s: string) => logs.push(s) },
   };
 }
 
 test("deploy gates, drains, refreshes stages and restarts once after completion", async () => {
   const f = setup();
+  const intListeners = process.listenerCount("SIGINT");
+  const termListeners = process.listenerCount("SIGTERM");
   await deploy(7400, "feature", true, f.opts);
+  expect(process.listenerCount("SIGINT")).toBe(intListeners);
+  expect(process.listenerCount("SIGTERM")).toBe(termListeners);
   expect(f.calls.slice(0, 8)).toEqual([
+    "health",
     "git rev-parse HEAD",
     "git fetch origin --prune",
     "git rev-parse feature",
@@ -100,8 +117,8 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
     "bun install --frozen-lockfile",
     "bun run check",
     "bun run smoke",
-    "drain",
   ]);
+  expect(f.calls[8]).toBe("drain");
   expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
   expect(f.sleeps).toEqual([5000, 5000]);
   expect(f.logs.join("\n")).toContain("run-a (implement)");
@@ -118,7 +135,12 @@ test("initially empty and unchanged ref do not wait", async () => {
   expect(f.sleeps).toEqual([]);
   f.calls.length = 0;
   await deploy(7400, "feature", false, f.opts);
-  expect(f.calls).toEqual(["git rev-parse HEAD", "git fetch origin --prune", "git rev-parse feature"]);
+  expect(f.calls).toEqual([
+    "health",
+    "git rev-parse HEAD",
+    "git fetch origin --prune",
+    "git rev-parse feature",
+  ]);
   f.calls.length = 0;
   await deploy(7400, "feature", true, f.opts);
   expect(f.calls.slice(-2)).toEqual(["bun run check", "bun run smoke"]);
@@ -170,10 +192,14 @@ test("failure after a possible drain restores release and resumes, retaining cle
         return command(args, opts);
       };
     }
-    if (failure === "health")
-      f.client.health = async () => {
-        throw new Error("bad health");
+    if (failure === "health") {
+      const health = f.client.health;
+      let reads = 0;
+      f.client.health = async (signal) => {
+        if (++reads > 1) throw new Error("bad health");
+        return health(signal);
       };
+    }
     if (failure === "restart")
       f.opts.restart = async () => {
         f.calls.push("restart");
@@ -209,7 +235,7 @@ test("malformed health fails closed and never restarts", async () => {
   f.client.health = async () => ({ ok: true }) as HealthResponse;
   await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("invalid or unhealthy");
   expect(f.calls).not.toContain("restart");
-  expect(f.calls.at(-1)).toBe("resume");
+  expect(f.calls).not.toContain("resume");
 });
 
 test("requests are bounded even if a client ignores abort", async () => {
@@ -233,7 +259,7 @@ test("requests are bounded even if a client ignores abort", async () => {
 test("wait request budgets shrink to the remaining deadline", async () => {
   const f = setup();
   await deploy(7400, "feature", false, { ...f.opts, maxWaitMs: 700 });
-  expect(f.timeouts.slice(0, 3)).toEqual([5000, 700, 700]);
+  expect(f.timeouts.slice(0, 4)).toEqual([5000, 5000, 700, 700]);
   expect(f.sleeps).toEqual([700]);
 });
 
@@ -256,7 +282,7 @@ test("polling failures after progress resume scheduling without restarting", asy
   const health = f.client.health;
   let reads = 0;
   f.client.health = async (signal) => {
-    if (++reads === 2) throw new Error("poll connection lost");
+    if (++reads === 3) throw new Error("poll connection lost");
     return health(signal);
   };
   await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("poll connection lost");
@@ -273,7 +299,10 @@ test("a stalled deployment health request is bounded and cleans up", async () =>
   const inHealth = new Promise<void>((resolve) => {
     entered = resolve;
   });
+  const health = f.client.health;
+  let reads = 0;
   f.client.health = async (s) => {
+    if (++reads === 1) return health(s);
     signal = s;
     entered();
     return new Promise<HealthResponse>(() => {});
@@ -294,7 +323,7 @@ test("progress tracks changing active membership and post-restart rejects unheal
   let reads = 0;
   f.client.health = async (signal) => {
     const state = await health(signal);
-    if (++reads === 2) return { ...state, active: ["run-b"] };
+    if (++reads === 3) return { ...state, active: ["run-b"] };
     return state;
   };
   await deploy(7400, "feature", false, f.opts);
@@ -317,8 +346,11 @@ test("release restoration failure does not prevent the bounded resume attempt", 
     if (args[1] === "checkout" && args[4] === "previous") throw new Error("restore failed");
     return command(args, opts);
   };
-  f.client.health = async () => {
-    throw new Error("original health failure");
+  const health = f.client.health;
+  let reads = 0;
+  f.client.health = async (signal) => {
+    if (++reads > 1) throw new Error("original health failure");
+    return health(signal);
   };
   await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow(
     /original health failure[\s\S]*restore failed/,
@@ -347,4 +379,115 @@ test("a daemon without the drain endpoint is restarted only with --now", async (
   expect(now.calls).not.toContain("resume");
   expect(now.selected()).toBe("next");
   expect(now.logs.some((l) => l.includes("no drain endpoint"))).toBe(true);
+});
+
+test("checkout already at target continues from drain without rerunning gates", async () => {
+  const f = setup();
+  f.setSelected("next");
+  await deploy(7400, "feature", false, f.opts);
+  expect(f.calls).not.toContain("bun install --frozen-lockfile");
+  expect(f.calls).not.toContain("bun run check");
+  expect(f.calls).not.toContain("git checkout -q --detach next");
+  expect(f.calls.indexOf("drain")).toBeLessThan(f.calls.indexOf("restart"));
+  expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
+  expect(f.logs).toContain("daemon before: previous");
+  expect(f.logs).toContain("daemon after: next");
+});
+
+test("running target is already deployed and a stranded drain is resumed", async () => {
+  for (const draining of [false, true]) {
+    const f = setup();
+    f.setSelected("next");
+    f.setDraining(draining);
+    const health = f.client.health;
+    f.client.health = async (signal) => ({ ...(await health(signal)), sha: "next" });
+    await deploy(7400, "feature", false, f.opts);
+    expect(f.calls).not.toContain("restart");
+    expect(f.calls.filter((c) => c === "resume")).toHaveLength(draining ? 1 : 0);
+    expect(f.logs.at(-1)).toContain("already deployed next");
+  }
+});
+
+test("an already draining old daemon completes a pending deploy", async () => {
+  const f = setup();
+  f.setSelected("next");
+  f.setDraining(true);
+  await deploy(7400, "feature", false, f.opts);
+  expect(f.calls).not.toContain("drain");
+  expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
+  expect(f.logs.join("\n")).toContain("already draining");
+});
+
+test("a gate failure resumes a daemon that was draining on entry", async () => {
+  const f = setup();
+  f.setDraining(true);
+  const command = f.opts.command;
+  f.opts.command = async (args, opts) => {
+    if (args.join(" ") === "bun run check") throw new Error("bad gate");
+    return command(args, opts);
+  };
+  await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("bad gate");
+  expect(f.calls.at(-1)).toBe("resume");
+  expect(f.calls).not.toContain("restart");
+});
+
+test("signals during drain wait restore the daemon checkout and resume", async () => {
+  for (const name of ["SIGINT", "SIGTERM"] as const) {
+    const f = setup();
+    f.setSelected("next");
+    const before = process.listenerCount(name);
+    f.clock.sleep = async () => {
+      process.emit(name);
+      return new Promise<void>(() => {});
+    };
+    await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow(name);
+    expect(f.calls).toContain("git checkout -q --detach previous");
+    expect(f.calls).toContain("bun install --frozen-lockfile");
+    expect(f.calls.at(-1)).toBe("resume");
+    expect(f.calls).not.toContain("restart");
+    expect(process.listenerCount(name)).toBe(before);
+  }
+});
+
+test("a signal during gates cancels the command before restoring the checkout", async () => {
+  const f = setup();
+  const command = f.opts.command;
+  f.opts.command = async (args, options) => {
+    if (args.join(" ") !== "bun run check") return command(args, options);
+    f.calls.push("gate started");
+    process.emit("SIGINT");
+    expect(options.signal?.aborted).toBe(true);
+    f.calls.push("gate stopped");
+    throw new Error("gate cancelled");
+  };
+  await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("gate cancelled");
+  expect(f.calls.indexOf("gate stopped")).toBeLessThan(f.calls.indexOf("git checkout -q --detach previous"));
+  expect(f.calls).not.toContain("restart");
+});
+
+test("a signal after restart starts exits without rollback or resume", async () => {
+  const f = setup();
+  const before = process.listenerCount("SIGTERM");
+  f.opts.restart = async () => {
+    f.calls.push("restart");
+    process.emit("SIGTERM");
+    return new Promise<void>(() => {});
+  };
+  await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("SIGTERM");
+  expect(f.calls).not.toContain("git checkout -q --detach previous");
+  expect(f.calls).not.toContain("resume");
+  expect(process.listenerCount("SIGTERM")).toBe(before);
+});
+
+test("replacement with the wrong commit fails and restores the old release", async () => {
+  const f = setup();
+  const health = f.client.health;
+  f.client.health = async (signal) => ({
+    ...(await health(signal)),
+    sha: f.calls.includes("restart") ? "other" : "previous",
+  });
+  await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("expected next");
+  expect(f.selected()).toBe("previous");
+  expect(f.calls.at(-1)).toBe("resume");
+  expect(f.logs).not.toContain("daemon after: next");
 });
