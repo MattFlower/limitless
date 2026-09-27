@@ -26,9 +26,7 @@ describe("wrap", () => {
 
   test("defaults to 80 columns", () => {
     const words = Array.from({ length: 20 }, () => "word");
-    expect(wrap(words.join(" "))).toBe(
-      `${words.slice(0, 16).join(" ")}\n${words.slice(16).join(" ")}`,
-    );
+    expect(wrap(words.join(" "))).toBe(`${words.slice(0, 16).join(" ")}\n${words.slice(16).join(" ")}`);
   });
 
   test("returns an empty string for empty or whitespace-only text", () => {
