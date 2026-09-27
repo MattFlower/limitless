@@ -607,7 +607,19 @@ async function oneRound(
       const modelVerdict = parsed.verdict;
       const r: Review = { ...parsed, verdict: reviewVerdict(parsed, previousReview?.findings) };
       const blocking = blockingReviewFindings(r, previousReview?.findings);
-      const followUps = previousReview ? r.findings.filter((f) => !blocking.includes(f)) : [];
+      // A replay on the same commit (e.g. after a restart) keeps follow-ups it may not repeat.
+      const replayed = (ctx.state.reviewHistory ?? []).find(
+        (e) => e.round === round && e.sha === reviewedSha,
+      );
+      const followUps = previousReview
+        ? [
+            ...new Map(
+              [...(replayed?.followUps ?? []), ...r.findings.filter((f) => !blocking.includes(f))].map(
+                (f) => [reviewFindingKey(f), f] as const,
+              ),
+            ).values(),
+          ]
+        : [];
       ctx.state.reviewHistory = [...earlierReviews, { round, sha: reviewedSha, blocking, followUps }];
       ctx.state.reviewFollowUps = [
         ...new Map(

@@ -107,6 +107,11 @@ export const LaterReviewSchema = ReviewSchema.extend({
         .describe(
           "unaddressed: prior blocking finding unresolved; regression: introduced by latest changes; new: first discovered now",
         ),
+      prior: z
+        .string()
+        .describe(
+          "For unaddressed: the id of the previous blocking finding it repeats (e.g. P2); otherwise an empty string",
+        ),
     }),
   ),
 });
@@ -114,6 +119,7 @@ export const LaterReviewSchema = ReviewSchema.extend({
 export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
   findings: (z.infer<typeof ReviewSchema>["findings"][number] & {
     label?: z.infer<typeof LaterReviewSchema>["findings"][number]["label"];
+    prior?: string;
   })[];
 };
 

@@ -6,6 +6,7 @@ const finding = (severity: Review["findings"][number]["severity"], security = fa
   severity,
   security,
   label: "new" as const,
+  prior: "",
   file: "src/example.ts",
   line: 1,
   title: "Observed issue",
@@ -27,7 +28,7 @@ describe("deterministic review decision", () => {
       const review: Review = {
         verdict: "approve",
         summary: "model assessment",
-        findings: [{ ...finding(severity, security), label }],
+        findings: [{ ...finding(severity, security), label, prior: label === "unaddressed" ? "P1" : "" }],
       };
       expect(blockingReviewFindings(review).length > 0).toBe(firstRound);
       expect(blockingReviewFindings(review, [finding("major")]).length > 0).toBe(laterRound);
@@ -45,6 +46,7 @@ describe("deterministic review decision", () => {
       { ...finding("major"), label: undefined },
       { ...finding("major"), label: "unknown" },
       { ...finding("major"), security: undefined },
+      { ...finding("major"), prior: undefined },
     ]) {
       expect(LaterReviewSchema.safeParse({ ...review, findings: [invalid] }).success).toBe(false);
     }
@@ -70,20 +72,20 @@ test("both review schemas require every object property for strict structured ou
 });
 
 for (const severity of ["blocker", "major", "minor", "nit"] as const) {
-  test(`an unmatched unaddressed ${severity} finding fails closed`, () => {
-    const review: Review = {
+  test(`an unaddressed ${severity} finding blocks only when it cites a previous blocking finding`, () => {
+    const priorBlocking = [{ ...finding("major"), title: "Earlier issue" }];
+    const review = (prior: string): Review => ({
       verdict: "approve",
       summary: "",
-      findings: [{ ...finding(severity), label: "unaddressed" }],
-    };
-    for (const prior of [
-      [],
-      [{ ...finding("major"), title: "Different issue" }],
-      [{ ...finding("major"), file: "src/old.ts" }],
-      [{ ...finding("major"), line: 99 }],
-    ]) {
-      expect(reviewVerdict(review, prior)).toBe("request_changes");
-      expect(blockingReviewFindings(review, prior)).toEqual(review.findings);
-    }
+      findings: [{ ...finding(severity), label: "unaddressed", prior, title: "Reworded title" }],
+    });
+    // A valid citation blocks whatever the wording or severity.
+    expect(reviewVerdict(review("P1"), priorBlocking)).toBe("request_changes");
+    expect(reviewVerdict(review(" p1 "), priorBlocking)).toBe("request_changes");
+    // Without one it is treated as new: only blockers (or security findings) block.
+    for (const prior of ["", "P2", "P0", "earlier"])
+      expect(reviewVerdict(review(prior), priorBlocking)).toBe(
+        severity === "blocker" ? "request_changes" : "approve",
+      );
   });
 }

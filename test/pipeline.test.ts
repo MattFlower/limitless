@@ -480,7 +480,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
                   {
                     severity: "blocker",
                     security: false,
-                    ...(reviews > 1 ? { label: reviews > normalRounds ? "regression" : "unaddressed" } : {}),
+                    ...(reviews > 1
+                      ? reviews > normalRounds
+                        ? { label: "regression", prior: "" }
+                        : { label: "unaddressed", prior: "P1" }
+                      : {}),
                     file: "farewell.txt",
                     line: 1,
                     title: "Fix the feature",
@@ -1236,7 +1240,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const finding = (title: string, label?: "unaddressed" | "regression" | "new") => ({
       severity: "major",
       security: false,
-      ...(label ? { label } : {}),
+      ...(label ? { label, prior: label === "unaddressed" ? "P1" : "" } : {}),
       file: "farewell.txt",
       line: 1,
       title,
@@ -1309,7 +1313,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
                       {
                         severity: reviews === 2 ? "minor" : "major",
                         security: false,
-                        ...(reviews === 2 ? { label } : {}),
+                        ...(reviews === 2 ? { label, prior: label === "unaddressed" ? "P1" : "" } : {}),
                         file: "farewell.txt",
                         line: 1,
                         title,
@@ -1322,6 +1326,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
                               severity: "minor",
                               security: false,
                               label: "new",
+                              prior: "",
                               file: "farewell.txt",
                               line: 1,
                               title: "Future cleanup",
@@ -1386,6 +1391,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
                         severity: "minor",
                         security: true,
                         label: "new",
+                        prior: "",
                         file: "farewell.txt",
                         line: 1,
                         title: "Secret leak",
@@ -1444,6 +1450,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
                         severity: "minor",
                         security: false,
                         label: "regression",
+                        prior: "",
                         file: "farewell.txt",
                         line: 1,
                         title: "Regression",
@@ -1454,6 +1461,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
                         severity: "major",
                         security: false,
                         label: "new",
+                        prior: "",
                         file: "farewell.txt",
                         line: 1,
                         title: "Backlog idea",
@@ -1469,6 +1477,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
                         severity: "major",
                         security: false,
                         label: "unaddressed",
+                        // Cites no previous blocking finding: a relabelled follow-up can't become mandatory.
+                        prior: "",
                         file: "farewell.txt",
                         line: 1,
                         title: "Backlog idea",
@@ -1504,15 +1514,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(prompts[2]).toContain(before?.reviewedSha ?? "missing SHA");
     expect(prompts[2]).toContain("Regression");
     expect(prompts[2]).not.toContain("Backlog idea");
-    expect(prompts[3]).toContain("Backlog idea");
-    expect(implementsCount).toBe(5); // Includes the interrupted implementation and the unmatched claim fix.
-    expect(restarted.store.getArtifact(run.id, "review-2.json")).toContain('"verdict": "request_changes"');
+    expect(implementsCount).toBe(4); // Includes the interrupted implementation; the follow-up stays one.
+    expect(restarted.store.getArtifact(run.id, "review-2.json")).toContain('"verdict": "approve"');
     expect(restarted.store.getRunState<RunState>(run.id)?.reviewFollowUps).toHaveLength(1);
     expect(restarted.store.getArtifact(run.id, "report.md")).toContain("Backlog idea");
   });
 
   for (const restartRound of [0, 1]) {
-    test(`restart during verify preserves review policy and replaces round ${restartRound} follow-ups`, async () => {
+    test(`restart during verify preserves review policy and keeps round ${restartRound} follow-ups`, async () => {
       let implementations = 0;
       let slow = true;
       let verifyStarted = false;
@@ -1522,6 +1531,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         severity: "major",
         security: false,
         label,
+        prior: "",
         file: "farewell.txt",
         line: 1,
         title,
@@ -1587,10 +1597,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(resumed.store.getArtifact(run.id, "review-0.json")).toContain('"verdict": "request_changes"');
         expect(state?.reviewFollowUps).toEqual([]);
       } else {
-        expect(state?.reviewFollowUps?.map((f) => f.title)).toEqual(["Backlog idea"]);
+        // The replay on the same commit omitted "Obsolete follow-up"; omission is not resolution.
+        expect(state?.reviewFollowUps?.map((f) => f.title)).toEqual(["Backlog idea", "Obsolete follow-up"]);
         const followUps = resumed.store.getArtifact(run.id, "report.md")?.split("## Review follow-ups")[1];
         expect(followUps?.match(/^- major: `farewell\.txt:1` Backlog idea/gm)).toHaveLength(1);
-        expect(followUps).not.toContain("Obsolete follow-up");
+        expect(followUps?.match(/^- major: `farewell\.txt:1` Obsolete follow-up/gm)).toHaveLength(1);
       }
     });
   }
