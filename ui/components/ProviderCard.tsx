@@ -2,8 +2,9 @@ import type { Component } from "solid-js";
 import { createSignal, For, Show } from "solid-js";
 import { observationAge } from "../../src/core/quota-format.ts";
 import type { ProviderStatus } from "../../src/core/types.ts";
+import type { ProviderWorkload, WorkloadTotals } from "../../src/db/stats.ts";
 import { setProviderEnabled } from "../api.ts";
-import { money, pct, resetsIn } from "../lib/format.ts";
+import { compactNumber, duration, money, pct, resetsIn } from "../lib/format.ts";
 import { now } from "../lib/ticker.ts";
 import { ProviderStatePill } from "./StatusPill.tsx";
 
@@ -18,7 +19,7 @@ function gaugeClass(util: number): string {
   return "";
 }
 
-export const ProviderCard: Component<{ provider: ProviderStatus }> = (props) => {
+export const ProviderCard: Component<{ provider: ProviderStatus; workload?: ProviderWorkload }> = (props) => {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
   const toggle = async () => {
@@ -54,6 +55,35 @@ export const ProviderCard: Component<{ provider: ProviderStatus }> = (props) => 
           in-flight <span class="mono">{props.provider.inFlight}</span>/{props.provider.maxConcurrent}
         </span>
         <span class="text-faint">{props.provider.billing}</span>
+      </div>
+      <div class="provider-workload">
+        <div class="provider-workload-head">
+          <span>Workload</span>
+          <span>Today</span>
+          <span>Last 7 days</span>
+        </div>
+        <For
+          each={
+            [
+              ["Invocations", (w: WorkloadTotals) => String(w.invocations)],
+              ["Tokens in", (w: WorkloadTotals) => compactNumber(w.tokensIn)],
+              ["Tokens out", (w: WorkloadTotals) => compactNumber(w.tokensOut)],
+              ["Wall time", (w: WorkloadTotals) => duration(w.wallTimeMs)],
+              [
+                props.provider.billing === "free" ? "≈$ saved" : "API-equivalent",
+                (w: WorkloadTotals) => money(w.costEquivUsd),
+              ],
+            ] as const
+          }
+        >
+          {([label, format]) => (
+            <div class="provider-workload-row">
+              <span>{label}</span>
+              <span>{format(props.workload?.today ?? ZERO_WORKLOAD)}</span>
+              <span>{format(props.workload?.sevenDays ?? ZERO_WORKLOAD)}</span>
+            </div>
+          )}
+        </For>
       </div>
       <For each={Object.entries(props.provider.windows)}>
         {([name, w]) => (
@@ -125,4 +155,12 @@ export const ProviderCard: Component<{ provider: ProviderStatus }> = (props) => 
       </Show>
     </div>
   );
+};
+
+const ZERO_WORKLOAD: WorkloadTotals = {
+  invocations: 0,
+  tokensIn: 0,
+  tokensOut: 0,
+  wallTimeMs: 0,
+  costEquivUsd: 0,
 };

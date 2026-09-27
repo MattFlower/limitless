@@ -13,7 +13,7 @@ import type {
   RunStatus,
   StreamMessage,
 } from "../src/core/types.ts";
-import type { Stats } from "../src/db/stats.ts";
+import type { ProviderWorkload, Stats } from "../src/db/stats.ts";
 import type { ModelDef, Policy } from "../src/router/catalog.ts";
 
 export type { StreamMessage };
@@ -101,6 +101,10 @@ export function listEvents(
 
 export function getProviders(): Promise<ProviderStatus[]> {
   return request<ProviderStatus[]>("/api/providers");
+}
+
+export function getProviderWorkload(): Promise<ProviderWorkload[]> {
+  return request<ProviderWorkload[]>("/api/stats/providers");
 }
 
 export function setProviderEnabled(id: string, enabled: boolean): Promise<ProviderStatus> {
