@@ -30,7 +30,7 @@ import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from ".
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
-import { FaultInjector, type FaultPlan, SimulatedTermination } from "./faults.ts";
+import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
@@ -200,7 +200,7 @@ export class RunContext {
     signal: AbortSignal,
   ) {
     this.signal = AbortSignal.any([signal, this.interruption.signal]);
-    this.faults = new FaultInjector(deps.faults);
+    this.faults = injectorFor(deps.faults);
     this.runDir = join(deps.cfg.paths.runs, run.id);
     mkdirSync(this.runDir, { recursive: true });
     this.state = deps.store.getRunState<RunState>(run.id) ?? {

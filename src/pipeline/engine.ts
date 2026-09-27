@@ -35,7 +35,7 @@ import {
   RunContext,
   type RunState,
 } from "./context.ts";
-import { SimulatedTermination } from "./faults.ts";
+import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -127,6 +127,12 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
     return "succeeded";
   } catch (e) {
     if (e instanceof SimulatedTermination || ctx.termination) return "running";
+    if (e instanceof InjectedFault && !signal.aborted) {
+      // Test-only crash stand-in: resume from the last checkpoint as a restart would, never fail.
+      ctx.log(`Run interrupted: ${e.message}; re-queued to resume`, "warn");
+      deps.store.updateRun(runId, { status: "queued", stage: null });
+      return "queued";
+    }
     if (e instanceof CancelledError || signal.aborted) {
       deps.store.updateRun(runId, { status: "cancelled", finishedAt: Date.now() });
       ctx.log("Run cancelled", "warn");

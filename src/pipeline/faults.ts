@@ -22,15 +22,31 @@ export interface Fault {
   onHit?: (context: FaultContext) => void;
 }
 /**
- * Test-only script; each entry fires once per RunContext, counting only matching occurrences.
+ * Test-only script; each entry fires once per plan, counting only matching occurrences.
  * Stage before/after bracket the callback, inside the attempt row but before its final status.
  * Harness points follow slot acquisition and invocation creation, before calling the adapter.
  * Stream actions feed synthetic input through CLI parsers instead of invoking an adapter.
  * Store save fires immediately before setRunState; throwing leaves the durable checkpoint intact.
- * Kill unwinds active resources and leaves the run running for a fresh scheduler to recover.
+ * Throw escaping a stage re-queues the run so it resumes like a daemon restart would.
+ * Kill at a harness point is an unexpected harness process kill: a failed attempt, routed per policy.
+ * Kill elsewhere unwinds active resources and leaves the run running for a fresh scheduler to recover.
  */
 export type FaultPlan = Partial<Record<FaultPoint, Fault | Fault[]>>;
 export class SimulatedTermination extends Error {}
+export class InjectedFault extends Error {}
+export const HARNESS_KILLED = "harness process killed unexpectedly (SIGKILL)";
+
+const injectors = new WeakMap<FaultPlan, FaultInjector>();
+/** Shares occurrence counts across RunContexts so a resumed run does not replay a one-shot fault. */
+export function injectorFor(plan?: FaultPlan): FaultInjector {
+  if (!plan) return new FaultInjector();
+  let injector = injectors.get(plan);
+  if (!injector) {
+    injector = new FaultInjector(plan);
+    injectors.set(plan, injector);
+  }
+  return injector;
+}
 
 export function untilAborted(signal: AbortSignal, ms?: number): Promise<void> {
   return new Promise((resolve) => {
@@ -64,8 +80,10 @@ export class FaultInjector {
       if (count !== (fault.occurrence ?? 1)) continue;
       fault.onHit?.(context);
       if (fault.action === "hang") await untilAborted(signal);
+      else if (fault.action === "kill" && point.startsWith("harness:"))
+        throw new InjectedFault(HARNESS_KILLED);
       else if (fault.action === "kill") throw new SimulatedTermination(`terminated at ${point}`);
-      else if (fault.action === "throw") throw new Error(`injected failure at ${point}`);
+      else if (fault.action === "throw") throw new InjectedFault(`injected failure at ${point}`);
       else return fault.action;
     }
     return undefined;

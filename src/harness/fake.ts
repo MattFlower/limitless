@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { InvocationStatus } from "../core/types.ts";
-import { type StreamFault, untilAborted } from "../pipeline/faults.ts";
+import { HARNESS_KILLED, type StreamFault, untilAborted } from "../pipeline/faults.ts";
 import { ClaudeStreamParser } from "./claude.ts";
 import { CodexStreamParser } from "./codex.ts";
 import { type AgentEvent, type AgentResult, type AgentSpec, extractJson, type Harness } from "./types.ts";
@@ -40,7 +40,7 @@ export function fakeHarness(handler: (spec: AgentSpec) => FakeReply | Promise<Fa
     if (reply.fault)
       return baseResult({
         status: reply.fault === "timeout" ? "timeout" : "error",
-        error: reply.error ?? `harness ${reply.fault}`,
+        error: reply.error ?? (reply.fault === "kill" ? HARNESS_KILLED : `harness ${reply.fault}`),
       });
     for (const [path, content] of Object.entries(reply.files ?? {})) {
       const abs = join(spec.cwd, path);

@@ -8,7 +8,13 @@ import { Store } from "../src/db/store.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { NoCapacityError, RunContext, type RunState } from "../src/pipeline/context.ts";
-import { type FaultContext, FaultInjector, type FaultPlan, untilAborted } from "../src/pipeline/faults.ts";
+import {
+  type FaultContext,
+  FaultInjector,
+  type FaultPlan,
+  HARNESS_KILLED,
+  untilAborted,
+} from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { runProcess, sh } from "../src/util/proc.ts";
 
@@ -476,32 +482,50 @@ test("failed checkpoint leaves durable state usable after SQLite reopen", async 
   }
 });
 
-for (const checkpoint of ["implementation-committed", "stage:implement:after"] as const)
-  test(`commit window ${checkpoint} does not duplicate work`, async () => {
+for (const [checkpoint, action] of [
+  ["implementation-committed", "kill"],
+  ["stage:implement:after", "kill"],
+  ["stage:implement:after", "throw"],
+] as const)
+  test(`commit window ${checkpoint} ${action} does not duplicate work`, async () => {
     const fault = {
-      action: "kill" as const,
+      action,
       when: (c: { checkpoint?: string }) => c.checkpoint === checkpoint,
     };
     const f = factory(
-      checkpoint === "stage:implement:after" ? { [checkpoint]: { action: "kill" } } : { "store:save": fault },
+      checkpoint === "stage:implement:after" ? { [checkpoint]: { action } } : { "store:save": fault },
     );
     const id = await run(f);
     await settled(f, id);
-    expect(f.store.getRun(id)?.status).toBe("running");
+    // A thrown fault re-queues and resumes in place; a kill waits for a fresh Factory.
+    expect(f.store.getRun(id)?.status).toBe(action === "throw" ? "succeeded" : "running");
+    const failed = f.store.listStages(id).find((s) => s.status === "failed");
+    if (action === "throw")
+      expect(failed).toMatchObject({ name: "implement", summary: expect.stringContaining("injected") });
     const state = f.store.getRunState<RunState>(id);
     const cwd = state?.worktreePath ?? "";
     const head = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout;
     const next = await reopen(f);
     await settled(next, id);
-    expect(next.store.getRun(id)?.status).toBe("succeeded");
+    expect(next.store.getRun(id)).toMatchObject({ status: "succeeded", error: null });
     expect((await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout).toBe(head);
     expect((await sh(["git", "rev-list", "--count", "HEAD"], { cwd })).stdout.trim()).toBe("2");
     expect(next.store.listInvocations(id).filter((i) => i.role === "implement")).toHaveLength(1);
     history(next, id);
   });
 
-for (const point of ["harness:invoke", "harness:stream"] as const)
-  for (const action of ["hang", "kill"] as const)
+for (const point of ["harness:invoke", "harness:stream"] as const) {
+  test(`${point} kill is a recorded harness failure routed by task policy`, async () => {
+    const f = factory({ [point]: { action: "kill", when: (c: FaultContext) => c.role === "implement" } });
+    const id = await run(f);
+    await settled(f, id);
+    expect(f.store.getRun(id)).toMatchObject({ status: "succeeded", error: null });
+    const inv = f.store.listInvocations(id).filter((i) => i.role === "implement");
+    expect(inv[0]).toMatchObject({ modelId: "a", status: "error", error: HARNESS_KILLED });
+    expect(f.store.listStages(id).find((s) => s.name === "implement")?.status).toBe("succeeded");
+    history(f, id);
+  });
+  for (const action of ["hang"] as const)
     test(`${point} ${action} targets implement without background holdout consuming it`, async () => {
       let reached = false;
       const f = factory({
@@ -515,7 +539,6 @@ for (const point of ["harness:invoke", "harness:stream"] as const)
       });
       const id = await run(f);
       await wait(() => reached);
-      if (action === "kill") await settled(f, id);
       await f.stop();
       const selection = f.store.getRunState<RunState>(id)?.implementer;
       expect(selection).toMatchObject({ modelId: "a", effort: "high" });
@@ -532,6 +555,7 @@ for (const point of ["harness:invoke", "harness:stream"] as const)
       ).toEqual(["cancelled", "ok"]);
       history(next, id);
     });
+}
 
 test("stream seam feeds parser bytes and recovers through routing", async () => {
   const f = factory({
