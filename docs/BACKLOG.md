@@ -24,6 +24,8 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 21 | M5 | Verify stage gets a writable scratch TMPDIR (tests needing temp dirs were "unclear") | todo |
 | 22 | M5 | A merged needs-human PR marks its run resolved in the UI | todo |
 | 23 | M5 | Deploy drain progress: one line per poll, not two | todo |
+| 24 | M4 | Reasoning effort as a routing dimension | todo |
+| 25 | M4 | External benchmark priors (Artificial Analysis, Terminal-Bench 4.0) | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
@@ -277,3 +279,40 @@ session) spend the same subscription in between, and the UI rounds to the neares
   merging (or leaves merging to the human).
 - **20 Packaging** — compiled binaries on GitHub releases, a formula in `MattFlower/homebrew-recipes`,
   and a curl installer (private-repo access needs a token; decide public vs private first).
+
+## 24. Reasoning effort as a routing dimension
+
+Owner feedback: effort is barely set and never surfaced, yet it is one of the largest cost/quality
+levers (e.g. gpt-6-luna scores ~18 on the AA index at effort none vs ~32 at high).
+
+- Today: `ModelDef.effort` exists on four catalog models and the claude (`--effort`) and codex
+  (`model_reasoning_effort`) harnesses pass it; the direct-HTTP harness ignores it; invocations,
+  reports, the UI and eval runs don't record it; policy can't pick an effort per role.
+- A routing target becomes (model, effort): catalog models declare supported efforts; policy cells
+  and eval `--models` accept `model@effort` (e.g. `codex/luna@low`, `claude/opus@high`), with the
+  model's default when omitted.
+- Harnesses: claude `--effort`, codex `model_reasoning_effort`, direct HTTP sends
+  `reasoning: { effort }` (OpenRouter) / `reasoning_effort`, and local Qwen maps effort to thinking
+  on/off (`chat_template_kwargs.enable_thinking`).
+- Record effort on invocations and eval trials (migration); show it in run details, reports, the
+  Models page and eval matrices; the policy generator treats each (model, effort) as a candidate.
+- Tests: parsing/validation of `model@effort`, each harness's argument/body mapping, persistence.
+
+## 25. External benchmark priors (Artificial Analysis, Terminal-Bench 4.0)
+
+Public benchmarks as priors, our own evals as the check (harness effects move scores by up to ~30
+points, and public leaderboards disagree with each other).
+
+- `limitless models sync` (and daily in the daemon): fetch the Artificial Analysis free API
+  (`x-api-key`, 1,000 requests/day, attribution required) for each catalog model via an explicit
+  `externalIds.artificialAnalysis` mapping; store intelligence/coding indices, per-benchmark scores
+  (incl. Terminal-Bench 4.0 when available), prices and speeds with a fetched-at time.
+- Show them on the Models page with attribution; show the public number next to our eval result
+  and flag large disagreements (often a harness problem worth investigating).
+- Use them (a) to shortlist which models are worth evaluating, (b) as the cold-start routing prior
+  for roles/models without local eval data (the policy generator marks such cells "prior only"),
+  and (c) Terminal-Bench 4.0 as the public baseline for the implement role until our agentic
+  implement evals exist.
+- Needs an Artificial Analysis account and API key (the owner creates it; stored in secrets.env as
+  ARTIFICIAL_ANALYSIS_API_KEY).
+- Tests with a stubbed fetch; no network in tests.
