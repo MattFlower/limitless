@@ -130,7 +130,7 @@ Use catalog IDs shown by the daemon's `/api/models` endpoint. `triage`, `review`
 are `k=1`, `maxUsd=1.00`, all cases, and caching enabled. Case selections retain dataset order and
 trial indices start at zero. The daemon resolves `evals/<role>/cases.json` from its application
 checkout, validates it before scheduling, and reads the exact pinned commits from locked bare repo
-caches (cloning/fetching when needed). Triage reads the pinned tree listing; review and verify create detached disposable worktrees at head, apply any review seed patch locally, and remove worktrees on every exit. Each model runs sequentially;
+caches (cloning/fetching when needed). Triage reads the pinned tree listing; review and verify create disposable standalone checkouts detached at head (containing only history reachable from base and head, no refs or remotes), apply any review seed patch locally, and remove them on every exit. Each model runs sequentially;
 provider groups may overlap within shared capacity limits. The runner never falls back or retries; normal adapter-level structured-output repair remains the
 same as in the pipeline and its cost is included in the trial.
 Unavailable providers, reserves, provider budgets, circuit breakers, blocked models and missing

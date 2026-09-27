@@ -178,10 +178,19 @@ test("verify uses pipeline schema, prompt, private session and head content, ret
 test("fetches missing branch and PR-only pins and invalidates same-stat repository changes", async () => {
   const f = await fixture();
   try {
-    f.respond((s) => ({
-      structured: reviewOutput(),
-      finalText: readFileSync(join(s.cwd, "CURRENT.txt"), "utf8"),
-    }));
+    const hidden: string[] = [];
+    f.respond(async (s) => {
+      // The candidate sees only history reachable from the pins: no refs, remotes or later commits.
+      const git = (...args: string[]) => sh(["git", ...args], { cwd: s.cwd, allowFail: true });
+      expect((await git("for-each-ref")).stdout).toBe("");
+      expect((await git("remote")).stdout).toBe("");
+      expect((await git("log", "--all", "--reflog", "--format=%H")).stdout).toBe(
+        (await git("rev-list", "HEAD")).stdout,
+      );
+      expect((await git("worktree", "list", "--porcelain")).stdout.match(/^worktree /gm)).toHaveLength(1);
+      for (const sha of hidden) expect((await git("cat-file", "-e", `${sha}^{commit}`)).exitCode).not.toBe(0);
+      return { structured: reviewOutput(), finalText: readFileSync(join(s.cwd, "CURRENT.txt"), "utf8") };
+    });
     await f.run();
     const original = f.item.head;
     for (const pr of [false, true]) {
@@ -203,8 +212,16 @@ test("fetches missing branch and PR-only pins and invalidates same-stat reposito
         (await sh(["git", "cat-file", "-e", `${f.item.head}^{commit}`], { cwd: f.cache })).exitCode,
       ).toBe(0);
       await f.clean();
+      hidden.push(f.item.head);
     }
     expect(f.calls).toHaveLength(3);
+    // Later commits now sit in the shared cache but stay invisible to an earlier pin.
+    f.item.head = original;
+    f.item.input.prompt = "rerun without cache";
+    f.save();
+    expect((await f.run()).trials[0]?.status).toBe("ok");
+    expect(f.calls).toHaveLength(4);
+    await f.clean();
   } finally {
     await f.close();
   }

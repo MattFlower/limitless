@@ -409,7 +409,7 @@ export async function pinnedTree(paths: Paths, store: Store, slug: string, sha: 
   });
 }
 
-/** Disposable pinned eval checkout; never creates or moves a source branch. */
+/** Disposable, isolated pinned eval checkout; never creates or moves a source branch. */
 export async function createEvalWorktree(
   paths: Paths,
   store: Store,
@@ -435,12 +435,7 @@ export async function createEvalWorktree(
   const cache = cachePath(paths, repo);
   signal.throwIfAborted();
   if (!existsSync(cache)) await ensureCache(paths, repo, signal);
-  const cleanup = () =>
-    withRepoLock(cache, async () => {
-      await sh(["git", "worktree", "remove", "--force", path], { cwd: cache, allowFail: true });
-      rmSync(path, { recursive: true, force: true });
-      await sh(["git", "worktree", "prune"], { cwd: cache });
-    });
+  const cleanup = async () => rmSync(path, { recursive: true, force: true });
   try {
     await withRepoLock(cache, async () => {
       signal.throwIfAborted();
@@ -464,8 +459,16 @@ export async function createEvalWorktree(
       for (const sha of [base, head])
         if (!(await exists(sha))) throw new Error(`pinned commit ${sha} missing in ${slug}`);
       signal.throwIfAborted();
-      await sh(["git", "worktree", "add", "--detach", path, head], opts);
+      // A standalone repo holding only history reachable from the pins: a linked worktree
+      // would share the cache's refs and objects, exposing later fixes and labeled datasets.
+      mkdirSync(path, { recursive: true });
+      await sh(["git", "init", "-q", path], opts);
+      await sh(["git", "push", "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
     });
+    const opts = { cwd: path, signal };
+    await sh(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", head], opts);
+    for (const ref of ["refs/eval/base", "refs/eval/head"]) await sh(["git", "update-ref", "-d", ref], opts);
+    await sh(["git", "reflog", "expire", "--expire=now", "--all"], opts);
     return cleanup;
   } catch (error) {
     await cleanup();

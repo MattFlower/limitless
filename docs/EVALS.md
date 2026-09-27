@@ -101,13 +101,15 @@ Gold is a nonempty map of criterion ID to `met` or `unmet`. Criterion IDs must b
 spec and holdout; gold may label a subset but cannot introduce unknown IDs. Gates are validated
 and retained, but the shared verify prompt does not accept them. Omitted holdout means no scenarios.
 
-Each invocation reads a detached disposable worktree at the exact head, using the shared bare
-cache and repository lock. Missing pins trigger a fetch of branch heads and
+Each invocation reads a disposable checkout detached at the exact head, prepared from the shared
+bare cache under the repository lock. Missing pins trigger a fetch of branch heads and
 `+refs/pull/*/head:refs/pull/*/head`; unavailable pins fail without substituting another commit.
-Seed patch content is applied from stdin and committed only in the detached worktree. The
-resulting HEAD is the diff endpoint; the original base remains unchanged. Worktrees and their
-Git registrations are removed on success, preparation failure, invalid output, harness failure,
-and cancellation. No delivery operations run.
+The checkout is a standalone repository (not a linked worktree) that receives only the objects
+reachable from base and head, with no refs, remotes or reflog: later commits in the cache (such as
+the fix for a real defect, or the committed labels themselves) stay invisible to the candidate.
+Seed patch content is applied from stdin and committed only in that checkout. The resulting HEAD
+is the diff endpoint; the original base remains unchanged. Checkouts are removed on success,
+preparation failure, invalid output, harness failure, and cancellation. No delivery operations run.
 
 The candidate receives the pipeline prompt, FACTORY_PREAMBLE, role schema, read-only agent
 harness, and normal inputs only: labels, source/foundBy annotations and patch files are never
