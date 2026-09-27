@@ -1,17 +1,78 @@
 import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { sh } from "../util/proc.ts";
 import type { GhRunner } from "./github.ts";
+
+export interface GitHubPrState {
+  url: string;
+  state: string;
+  mergedAt: string | null;
+  mergedBy: { login: string } | null;
+}
+
+export type GitHubPrClient = (url: string) => Promise<GitHubPrState | null>;
+
+export const getGitHubPr: GitHubPrClient = async (url) => {
+  const { stdout } = await sh(["gh", "pr", "view", url, "--json", "url,state,mergedAt,mergedBy"], {
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+  });
+  return JSON.parse(stdout) as GitHubPrState;
+};
+
+export async function reconcileMergedRuns(
+  store: Store,
+  client: GitHubPrClient,
+  log: (message: string) => void = console.warn,
+): Promise<void> {
+  for (const run of store.listRuns({ status: ["needs_human"], limit: Number.MAX_SAFE_INTEGER })) {
+    if (!run.prUrl) continue;
+    try {
+      const pr = await client(run.prUrl);
+      const mergedAt = pr?.mergedAt ? Date.parse(pr.mergedAt) : NaN;
+      if (pr?.url === run.prUrl && pr.state === "MERGED" && Number.isFinite(mergedAt)) {
+        store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
+      }
+    } catch (error) {
+      log(`GitHub PR check failed for ${run.id}: ${String(error)}`);
+    }
+  }
+}
 
 /** Factory-side comments for GitHub-originated runs. */
 export function startGitHubNotifier(
   store: Store,
   gh: GhRunner,
   log: (message: string) => void = console.warn,
+  client: GitHubPrClient = getGitHubPr,
 ): () => void {
   const seen = new Set<string>();
-  return store.subscribe((msg) => {
+  let stopped = false;
+  let checking = false;
+  let pending = false;
+  const check = async () => {
+    if (stopped) return;
+    if (checking) {
+      pending = true;
+      return;
+    }
+    checking = true;
+    try {
+      await reconcileMergedRuns(store, client, log);
+    } finally {
+      checking = false;
+      if (pending) {
+        pending = false;
+        void check();
+      }
+    }
+  };
+  const timer = setInterval(() => void check(), 5 * 60_000);
+  void check();
+  const unsubscribe = store.subscribe((msg) => {
     if (msg.kind !== "run") return;
     const run = msg.run;
+    if (run.status === "needs_human" && run.prUrl) void check();
     const ref = run.sourceRef;
     if (
       run.source !== "github" ||
@@ -39,4 +100,9 @@ export function startGitHubNotifier(
       body,
     ]).catch((error: unknown) => log(`GitHub comment failed for ${run.id}: ${String(error)}`));
   });
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+    unsubscribe();
+  };
 }
