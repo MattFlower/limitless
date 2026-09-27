@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { EvalRun, EvalTrial } from "../src/core/types.ts";
+import { formatEvalReport } from "../src/evals/format.ts";
 import { pairedBootstrap, statsOptions, summarize, wilson } from "../src/evals/stats.ts";
 
 export const run: EvalRun = {
@@ -215,4 +216,71 @@ test("legacy unknown effort and backend-default rows are summarized separately",
     ["a", "default", 1, 1],
     ["a (unknown effort)", null, 2, 0],
   ]);
+});
+
+test("implement reports complexity, failure reasons, executed costs and median time with empty groups", () => {
+  const impl = { ...run, role: "implement" as const };
+  const rows = [trial("a", "one", 0, true), trial("a", "one", 1, false)];
+  for (const row of rows) row.details.complexity = "small";
+  const failed = rows[1];
+  if (!failed) throw new Error("fixture");
+  failed.status = "error";
+  failed.details.grade = {
+    pass: false,
+    score: 0,
+    fields: {},
+    riskUnderCall: null,
+    implement: { reason: "timeout", commit: null, gates: [], auditBlocks: [], hidden: null },
+  };
+  rows.push({
+    ...trial("a", "cached", 0, true),
+    costUsd: 0,
+    costEquivUsd: 0,
+    durationMs: 0,
+    details: {
+      complexity: "trivial",
+      cache: {
+        evalRunId: "source",
+        caseId: "one",
+        costUsd: 0.1,
+        costEquivUsd: 0.2,
+        tokensIn: 1,
+        tokensOut: 2,
+        durationMs: 10,
+      },
+    },
+  });
+  rows.push(
+    { ...trial("a", "skipped", 0, false), status: "skipped", pass: null },
+    { ...trial("a", "queued", 0, false), status: "queued", pass: null },
+  );
+  const summaries = summarize(impl, rows);
+  const result = summaries[0];
+  expect(result).toMatchObject({
+    passes: 2,
+    evaluatedTrials: 3,
+    ci: wilson(2, 3),
+    p50LatencyMs: 20,
+    implement: {
+      executedTrials: 2,
+      costPerTrialUsd: 0.1,
+      costEquivPerTrialUsd: 0.2,
+      failureReasons: { timeout: 1, error: 0, gates: 0, audit: 0, hidden_tests: 0 },
+      byComplexity: [
+        { complexity: "trivial", passes: 1, evaluatedTrials: 1, ci: wilson(1, 1) },
+        { complexity: "small", passes: 1, evaluatedTrials: 2, ci: wilson(1, 2) },
+        { complexity: "medium", passes: 0, evaluatedTrials: 0, passRate: null, ci: null },
+      ],
+    },
+  });
+  expect(summaries[1]?.implement?.costPerTrialUsd).toBeNull();
+  const text = formatEvalReport({ run: impl, trials: rows, summaries });
+  for (const fragment of [
+    "small pass 50.0%",
+    "medium pass n/a",
+    "timeout=1",
+    "p50 trial 20.000",
+    "cost per executed trial",
+  ])
+    expect(text).toContain(fragment);
 });

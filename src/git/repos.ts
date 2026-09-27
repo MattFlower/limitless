@@ -414,7 +414,7 @@ export interface EvalLabels {
   /** Repository paths (files or directory prefixes) holding eval datasets. */
   paths: string[];
   /** Exact file contents (dataset, seed patches) that must not appear as any blob. */
-  contents: string[];
+  contents: (string | Uint8Array)[];
 }
 
 /** Disposable, isolated pinned eval checkout; never creates or moves a source branch. */
@@ -505,8 +505,9 @@ async function rejectContamination(path: string, labels: EvalLabels, signal: Abo
       );
   }
   for (const content of labels.contents) {
-    if (!content.trim()) continue;
-    const oid = (await sh(["git", "hash-object", "--stdin"], { ...opts, stdin: content })).stdout.trim();
+    if (typeof content === "string" && !content.trim()) continue;
+    const bytes = typeof content === "string" ? Buffer.from(content) : content;
+    const oid = new Bun.CryptoHasher("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
     const found = await sh(["git", "cat-file", "-e", oid], { ...opts, allowFail: true });
     if (found.exitCode === 0)
       throw new Error("pinned history contains an eval dataset or seed patch; choose earlier pins");

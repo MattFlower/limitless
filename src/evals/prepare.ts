@@ -7,7 +7,7 @@ import { readingTimeout } from "../pipeline/engine.ts";
 import { reviewPrompt, triagePrompt, verifyPrompt } from "../pipeline/prompts.ts";
 import { ReviewSchema, TriageSchema, VerifySchema } from "../pipeline/schemas.ts";
 import { sh } from "../util/proc.ts";
-import type { EvalCase, ReviewCase } from "./cases.ts";
+import type { EvalCase, ImplementCase, ReviewCase } from "./cases.ts";
 import { gradeReview } from "./graders/review.ts";
 import { gradeTriage } from "./graders/triage.ts";
 import { gradeVerify } from "./graders/verify.ts";
@@ -52,7 +52,7 @@ export async function gatesAt(cwd: string, revision: string, signal: AbortSignal
 }
 
 export async function prepareCase(
-  item: EvalCase,
+  item: Exclude<EvalCase, ImplementCase>,
   cwd: string,
   tree: string,
   patch: string | undefined,
@@ -112,10 +112,10 @@ export async function prepareCase(
     timeoutMs: readingTimeout(diff.added + diff.removed, 25),
   };
 }
-export function schemaFor(item: EvalCase) {
+export function schemaFor(item: Exclude<EvalCase, ImplementCase>) {
   return "prompt" in item ? TriageSchema : "defects" in item ? ReviewSchema : VerifySchema;
 }
-export function gradeCase(item: EvalCase, output: unknown) {
+export function gradeCase(item: Exclude<EvalCase, ImplementCase>, output: unknown) {
   if ("prompt" in item) return gradeTriage(item, TriageSchema.parse(output));
   if ("defects" in item) return gradeReview(item, ReviewSchema.parse(output));
   return gradeVerify(item, VerifySchema.parse(output));

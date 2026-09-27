@@ -293,6 +293,7 @@ export function generatePolicy(input: PolicyInput) {
 export type PolicyEvaluation = ReturnType<typeof generatePolicy>;
 export interface EvalPolicyResponse {
   evaluation: PolicyEvaluation;
+  implement?: { run: EvalRun; summary: ReturnType<typeof summarize>[number] }[];
   models: ModelDef[];
   /** Absent from older daemons; validation then falls back to the built-in providers. */
   providers?: ProviderDef[];

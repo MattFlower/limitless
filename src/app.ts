@@ -2,9 +2,10 @@ import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
 import type { CreateRunRequest, Question, Run } from "./core/types.ts";
 import { Store } from "./db/store.ts";
-import { type EvalPolicyResponse, generatePolicy } from "./evals/policy.ts";
+import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
 import { evalSettings } from "./evals/settings.ts";
+import { summarize } from "./evals/stats.ts";
 import { collectGarbage, type GcResult } from "./gc.ts";
 import { resolveRepo } from "./git/repos.ts";
 import { runClaude } from "./harness/claude.ts";
@@ -120,6 +121,13 @@ export class Factory {
         settings: this.evalSettings,
         evalIds,
       }),
+      implement: selectEvidence(evidence, evalIds)
+        .filter((e) => e.run.role === "implement")
+        .flatMap((e) =>
+          summarize(e.run, e.trials)
+            .filter((s) => s.modelId === e.modelId)
+            .map((summary) => ({ run: e.run, summary })),
+        ),
       policy: this.policy,
       models: this.models,
       providers: this.providerDefs,
