@@ -22,7 +22,9 @@ export function renderEvidence(evaluation: PolicyEvaluation): string {
     "",
   ];
   for (const role of evaluation.roles) {
-    lines.push(`## ${role.role}`, "", role.decision, "");
+    lines.push(`## ${role.role}${role.cell === "default" ? "" : `.${role.cell}`}`, "", role.decision, "");
+    if (role.role === "implement" && !role.escalation.length)
+      lines.push("Effort-before-switch preference unchanged: no qualifying B1 paired recovery evidence.", "");
     if (!role.candidates.length) continue;
     lines.push(
       "| Model / source | Metrics: rate (numerator/denominator), Wilson 95% CI | Comparison | Cost/case | p50 latency | Eligibility / reasons |",
@@ -58,7 +60,7 @@ export function renderEvidence(evaluation: PolicyEvaluation): string {
 export function proposedOverlay(existing: PolicyOverlay, evaluation: PolicyEvaluation): PolicyOverlay {
   const next = structuredClone(existing);
   for (const r of evaluation.roles)
-    if (r.order.length) next[r.role] = { ...next[r.role], default: [...r.order] };
+    if (r.order.length) next[r.role] = { ...next[r.role], [r.cell]: [...r.order] };
   return next;
 }
 export function policyDiff(current: Policy, proposed: Policy, evaluation: PolicyEvaluation): string {

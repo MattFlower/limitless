@@ -542,6 +542,105 @@ test("an availability fallback from another provider is appended only when it fa
   expect(sameProvider?.availabilityFallbacks).toEqual([]);
 });
 
+test("implement cells use separate complexity evidence, preserve defaults, and explain rejections", () => {
+  const rows = (["trivial", "small", "medium"] as const).map((complexity, index) => {
+    const row = evidence("implement", [local, subscription, metered], {
+      id: complexity,
+      finishedAt: 2000 + index,
+    });
+    for (const t of row.trials) t.details.complexity = complexity;
+    if (complexity === "small")
+      for (const t of row.trials.filter((t) => recordedTarget(t) === local).slice(0, 20)) t.pass = false;
+    if (complexity === "medium")
+      for (const t of row.trials.filter((t) => recordedTarget(t) === subscription).slice(0, 8))
+        t.pass = false;
+    return row;
+  });
+  const result = generatePolicy(input(rows));
+  expect(result.generated.implement).toEqual({
+    trivial: [local, subscription, metered],
+    small: [subscription, metered],
+    medium: [local, metered, subscription],
+  });
+  const markdown = renderEvidence(result);
+  expect(markdown).toContain("## implement.small");
+  expect(markdown).toContain("pass rate lower bound");
+  expect(markdown).toContain("non-inferiority not established");
+  expect(markdown).toContain("availability fallbacks");
+  expect(markdown).toContain("run=medium");
+  const current = { implement: { default: [subscription], large: [metered] }, chat: { small: [local] } };
+  const overlay = proposedOverlay(current, result);
+  expect(overlay.implement?.large).toEqual([metered]);
+  expect(overlay.implement?.default).toEqual([subscription]);
+  expect(overlay.chat).toEqual(current.chat);
+  expect(validatePolicy(overlay, MODELS)).toEqual(overlay);
+});
+
+test("implement sparse or unpaired evidence never replaces an existing cell", () => {
+  const good = evidence("implement", [subscription], { id: "good" });
+  good.trials.forEach((t) => {
+    t.details.complexity = "trivial";
+  });
+  const sparse = evidence("implement", [local], { id: "sparse", k: 2 });
+  sparse.trials.forEach((t) => {
+    t.details.complexity = "small";
+  });
+  sparse.trials = sparse.trials.filter((t) => t.trial === 0);
+  const result = generatePolicy(input([good, sparse]));
+  expect(result.generated.implement).toEqual({ trivial: [subscription] });
+  const current = { implement: { small: [metered] } };
+  expect(proposedOverlay(current, result).implement?.small).toEqual([metered]);
+  expect(overlayPolicy(DEFAULT_POLICY, proposedOverlay(current, result)).implement.medium).toEqual(
+    DEFAULT_POLICY.implement.medium,
+  );
+});
+
+test("implement rejects the exact non-inferiority margin and limits provider fallbacks", () => {
+  const twilight = "twilight/qwen-27b";
+  const otherSubscription = "codex/luna@low";
+  const row = evidence("implement", [metered, subscription, local, otherSubscription, twilight], { k: 10 });
+  for (const t of row.trials) {
+    t.details.complexity = "medium";
+    if (recordedTarget(t) !== metered && t.trial === 0) t.pass = false;
+  }
+  const result = generatePolicy(input([row]));
+  const cell = result.roles.find((r) => r.role === "implement" && r.cell === "medium");
+  expect(cell?.candidates.find((c) => c.modelId === local)?.comparison.lowerBound).toBeCloseTo(-0.1);
+  expect(cell?.order).toEqual([metered, local, twilight, otherSubscription]);
+  expect(cell?.availabilityFallbacks).toEqual([local, twilight, otherSubscription]);
+  expect(cell?.order).not.toContain(subscription);
+  expect(renderEvidence(result)).toContain("lower=-0.1000");
+});
+
+test("implement effort recovery needs significant paired B1 evidence at no greater cost", () => {
+  const low = "codex/luna@low";
+  const high = "codex/luna@high";
+  const row = evidence("implement", [low, high, metered]);
+  for (const t of row.trials) {
+    t.details.complexity = "small";
+    if (recordedTarget(t) === high) t.costEquivUsd = 4;
+  }
+  const base = {
+    complexity: "small" as const,
+    low,
+    high,
+    switch: metered,
+    pairedCases: 40,
+    lowerBound: 0.05,
+    effortCost: 0.2,
+    switchCost: 0.2,
+  };
+  const ordinary = generatePolicy(input([row]));
+  expect(ordinary.generated.implement?.small).toEqual([low, metered, high]);
+  const recovered = generatePolicy(input([row], { escalation: [base] }));
+  expect(recovered.generated.implement?.small).toEqual([low, high, metered]);
+  expect(renderEvidence(recovered)).toContain("B1 recovery lower=0.0500");
+  for (const change of [{ lowerBound: 0 }, { pairedCases: 0 }, { effortCost: 0.21 }])
+    expect(
+      generatePolicy(input([row], { escalation: [{ ...base, ...change }] })).generated.implement?.small,
+    ).toEqual(ordinary.generated.implement?.small);
+});
+
 test("each uncovered provider contributes at most one availability fallback", () => {
   const twilight = "twilight/qwen-27b@none";
   const mtplx = "mtplx/qwen-27b@none";

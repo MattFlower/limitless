@@ -12,19 +12,21 @@ export function evalMatrix(data: EvalPolicyResponse) {
   return {
     models,
     rows: [
-      ...data.evaluation.roles.map((r) => ({
-        role: r.role,
-        cells: models.map((modelId) => {
-          const candidate = r.candidates.find((c) => c.modelId === modelId);
-          return {
-            modelId,
-            state: candidate?.state ?? "no result",
-            reasons: candidate?.reasons ?? [],
-            href: candidate ? `/evals/${encodeURIComponent(candidate.run.id)}` : null,
-            candidate,
-          };
-        }),
-      })),
+      ...data.evaluation.roles
+        .filter((r) => r.role !== "implement")
+        .map((r) => ({
+          role: r.role,
+          cells: models.map((modelId) => {
+            const candidate = r.candidates.find((c) => c.modelId === modelId);
+            return {
+              modelId,
+              state: candidate?.state ?? "no result",
+              reasons: candidate?.reasons ?? [],
+              href: candidate ? `/evals/${encodeURIComponent(candidate.run.id)}` : null,
+              candidate,
+            };
+          }),
+        })),
       {
         role: "implement",
         cells: models.map((modelId) => {
