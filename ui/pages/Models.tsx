@@ -54,6 +54,7 @@ export const Models: Component = () => {
                 <th>ID</th>
                 <th>Provider</th>
                 <th>Vendor</th>
+                <th>Supported efforts (default)</th>
                 <th>Origin</th>
                 <th>Base origin</th>
                 <th class="num">Tier</th>
@@ -70,7 +71,7 @@ export const Models: Component = () => {
                 when={catalog()}
                 fallback={
                   <tr class="empty-row">
-                    <td colspan={12}>loading…</td>
+                    <td colspan={13}>loading…</td>
                   </tr>
                 }
               >
@@ -91,6 +92,10 @@ export const Models: Component = () => {
                           <td class="mono text-accent">{m.id}</td>
                           <td class="mono text-dim">{m.provider}</td>
                           <td class="mono text-faint">{m.vendor}</td>
+                          <td>
+                            {m.supportedEfforts.join(", ") || "unsupported"} (default:{" "}
+                            {m.effort ?? "backend default"})
+                          </td>
                           <td class="mono">{m.origin}</td>
                           <td class="mono">{m.baseOrigin}</td>
                           <td class="num mono">{m.tier}</td>

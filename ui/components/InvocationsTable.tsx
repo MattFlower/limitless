@@ -1,5 +1,6 @@
 import type { Component } from "solid-js";
 import { For, Show } from "solid-js";
+import { effortLabel } from "../../src/core/effort-format.ts";
 import type { Invocation } from "../../src/core/types.ts";
 import { compactNumber, duration, equivMoney, money, truncate } from "../lib/format.ts";
 import { now } from "../lib/ticker.ts";
@@ -25,6 +26,7 @@ export const InvocationsTable: Component<{
       <tr>
         <th>Role</th>
         <th>Model</th>
+        <th>Effort</th>
         <th>Provider</th>
         <th>Status</th>
         <th class="num">In</th>
@@ -40,7 +42,7 @@ export const InvocationsTable: Component<{
         when={props.invocations.length > 0}
         fallback={
           <tr class="empty-row">
-            <td colspan={10}>No invocations yet.</td>
+            <td colspan={11}>No invocations yet.</td>
           </tr>
         }
       >
@@ -56,6 +58,7 @@ export const InvocationsTable: Component<{
             >
               <td class="mono">{inv.role}</td>
               <td class="mono text-accent">{inv.modelId}</td>
+              <td>{effortLabel(inv.effort)}</td>
               <td class="mono text-faint">{inv.provider}</td>
               <td>
                 <span class={`badge badge-${STATUS_BADGE[inv.status] ?? "info"}`}>{inv.status}</span>

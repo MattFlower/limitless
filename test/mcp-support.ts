@@ -34,6 +34,7 @@ export async function fixture() {
         vendor: "other",
         origin: "unknown",
         baseOrigin: "unknown",
+        supportedEfforts: [],
         tier: 4,
         price: { input: 1, output: 1 },
       },

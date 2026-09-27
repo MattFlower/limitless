@@ -1,3 +1,4 @@
+import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation } from "../core/types.ts";
 import type { RunContext, RunState } from "./context.ts";
 
@@ -136,10 +137,11 @@ export function renderReport(input: ReportInput): string {
     blocks.push(
       "## Work log",
       table(
-        ["Role", "Model", "Status", "Tokens in / out", "Cost", "Duration"],
+        ["Role", "Model", "Effort", "Status", "Tokens in / out", "Cost", "Duration"],
         input.invocations.map((inv) => [
           inv.role,
           `\`${inv.modelId}\``,
+          effortLabel(inv.effort),
           inv.status,
           `${(inv.inputTokens + inv.cacheReadTokens).toLocaleString("en-US")} / ${inv.outputTokens.toLocaleString("en-US")}`,
           inv.costUsd > 0 ? money(inv.costUsd) : `${money(inv.costEquivUsd)} equiv.`,

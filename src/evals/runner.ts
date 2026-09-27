@@ -7,6 +7,7 @@ import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
 import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
 import { toStrictJsonSchema } from "../pipeline/schemas.ts";
+import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
 import { cacheKey } from "./cache.ts";
 import {
   type AnyCaseFile,
@@ -47,7 +48,8 @@ export class EvalRunner {
           trials.push({
             evalRunId: "",
             caseId: item.id,
-            modelId,
+            modelId: parseTarget(modelId).modelId,
+            effort: recordEffort(this.deps.router.resolve(modelId).effort),
             trial,
             cacheKey: "",
             harness: "",
@@ -119,7 +121,7 @@ export class EvalRunner {
       };
       const groups = new Map<string, string[]>();
       for (const modelId of run.models) {
-        const provider = router.model(modelId)?.provider ?? "unknown";
+        const provider = router.model(parseTarget(modelId).modelId)?.provider ?? "unknown";
         const group = groups.get(provider) ?? [];
         group.push(modelId);
         groups.set(provider, group);
@@ -131,7 +133,7 @@ export class EvalRunner {
             for (const item of cases) {
               for (const trial of store
                 .listEvalTrials(run.id)
-                .filter((t) => t.modelId === modelId && t.caseId === item.id)) {
+                .filter((t) => recordedTarget(t) === modelId && t.caseId === item.id)) {
                 await this.trial(run, trial, item, treeFor, labels, cache, signal);
               }
             }
@@ -173,7 +175,17 @@ export class EvalRunner {
     };
     if (budget()) return skip("eval budget exhausted");
     if (!tracker.def(model.provider)) return skip("unknown provider");
-    const target = router.toTarget(model);
+    // Legacy queued trials (null) and "default" both leave the backend effort unset.
+    const effort = trial.effort === null || trial.effort === "default" ? undefined : trial.effort;
+    if (effort !== undefined && !model.supportedEfforts.includes(effort))
+      return skip("saved effort no longer supported by catalog");
+    const transport = effortTransportError(
+      run.role,
+      { model, effort, targetId: recordedTarget(trial) },
+      tracker.def(model.provider),
+    );
+    if (transport) return skip(transport);
+    const target = router.toTarget(model, effort ?? null);
     const { harnessName, noTools } = selectHarness(run.role, target);
     trial.harness = harnessName;
     const tree = "prompt" in item ? await treeFor(item.repo) : "";
@@ -221,6 +233,7 @@ export class EvalRunner {
         jsonSchema,
         trial.trial,
         repository,
+        trial.effort,
       );
       if (signal.aborted) return skip("daemon shutdown");
       if (budget()) return skip("eval budget exhausted");

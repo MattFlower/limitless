@@ -31,7 +31,7 @@ test("Models table renders checkpoint origins with aligned loaded and loading ro
                 if (loaded && args.path.endsWith("/pages/Models.tsx"))
                   source = source.replace(
                     "createSignal<{ models: ModelDef[]; policy: Policy } | null>(null)",
-                    `createSignal<{ models: ModelDef[]; policy: Policy } | null>(${JSON.stringify({ models: MODELS, policy: DEFAULT_POLICY })})`,
+                    `createSignal<{ models: ModelDef[]; policy: Policy } | null>(${JSON.stringify({ models: MODELS, policy: { ...DEFAULT_POLICY, triage: { default: ["codex/luna@low|claude/opus@high"] } } })})`,
                   );
                 const result = await transformAsync(source, {
                   filename: args.path,
@@ -53,15 +53,21 @@ test("Models table renders checkpoint origins with aligned loaded and loading ro
       const { Models } = (await import(output.path)) as typeof import("../ui/pages/Models.tsx");
       const html = renderToString(() => Models({}));
       const table = html.match(/<table[^>]*>([\s\S]*?)<\/table>/)?.[1] ?? "";
-      expect(table.match(/<th[ >]/g)).toHaveLength(12);
+      expect(table.match(/<th[ >]/g)).toHaveLength(13);
       if (loaded) {
         const rows = table.match(/<tr>[\s\S]*?<\/tr>/g)?.slice(1) ?? [];
         expect(rows).toHaveLength(MODELS.length);
-        for (const row of rows) expect(row.match(/<td[ >]/g)).toHaveLength(12);
+        for (const row of rows) expect(row.match(/<td[ >]/g)).toHaveLength(13);
         expect(rows.find((row) => row.includes("ministral-14b-2512"))).toContain(">FR</td>");
         expect(rows.find((row) => row.includes("gpt-6-luna"))).toContain(">US</td>");
         expect(rows.find((row) => row.includes("qwen-27b"))).toContain(">CN</td>");
-      } else expect(table).toContain('colspan="12"');
+        expect(html).toContain("codex/luna@low|claude/opus@high");
+        expect(table).toContain("Supported efforts");
+        expect(table).toContain("default: medium");
+        expect(table).toContain("backend default");
+        expect(table).toContain("none, low, medium, high");
+        expect(table).toContain("unsupported");
+      } else expect(table).toContain('colspan="13"');
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });

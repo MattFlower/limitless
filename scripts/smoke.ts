@@ -8,6 +8,7 @@ import { runClaude } from "../src/harness/claude.ts";
 import { runCodex } from "../src/harness/codex.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
+import { resolveTarget } from "../src/router/targets.ts";
 import { sh } from "../src/util/proc.ts";
 
 export type CheckResult = { status: "pass" | "fail" | "skip"; reason?: string };
@@ -243,6 +244,25 @@ async function providerAvailability(
 }
 
 export async function main(): Promise<number> {
+  const index = process.argv.indexOf("--models");
+  if (index >= 0) {
+    const references = process.argv[index + 1];
+    if (!references) throw new Error("--models requires model@effort references");
+    const checks: SmokeCheck[] = references.split(",").map((reference) => {
+      const resolved = resolveTarget(reference, (id) => MODELS.find((m) => m.id === id));
+      const provider = PROVIDERS.find((p) => p.id === resolved.model.provider);
+      if (!provider || !["claude", "codex"].includes(provider.id))
+        throw new Error("Explicit effort smoke checks require native Claude or Codex");
+      const target = { ...targetFor(provider, resolved.model), effort: resolved.effort };
+      return {
+        name: `${resolved.targetId} structured`,
+        run: () => liveCheck(provider.id === "claude" ? runClaude : runCodex, target, "structured"),
+      };
+    });
+    const rows = await runChecks(checks);
+    console.log(formatReport(rows));
+    return exitCode(rows);
+  }
   const { secrets } = loadConfig();
   const checks: SmokeCheck[] = [];
   for (const id of ["claude", "codex"]) {

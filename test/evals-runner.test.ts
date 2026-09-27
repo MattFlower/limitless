@@ -431,3 +431,56 @@ test("live and final quota telemetry stop later calls; cache replay does not upd
     await f.close();
   }
 });
+
+test("two efforts execute independently, cache only equivalent targets, and freeze submitted defaults", async () => {
+  const { enableEfforts } = await import("./evals-support.ts");
+  const f = await evalFixture();
+  try {
+    const model = enableEfforts(f);
+    const request = { role: "triage", models: ["candidate-a", "candidate-a@high"], k: 1, caseIds: ["a"] };
+    const run = f.factory.evals.submit(request);
+    // Submission is synchronous; execution starts on the next microtask.
+    model.effort = "none";
+    await f.factory.evals.wait(run.id);
+    expect(f.calls.map((s) => s.target.effort)).toEqual(["low", "high"]);
+    const report = f.factory.evals.report(run.id);
+    expect(report?.trials.map((t) => [t.modelId, t.effort])).toEqual([
+      ["candidate-a", "low"],
+      ["candidate-a", "high"],
+    ]);
+    expect(report?.summaries.map((s) => [s.modelId, s.evaluatedTrials])).toEqual([
+      ["candidate-a@low", 1],
+      ["candidate-a@high", 1],
+    ]);
+    const reuse = await f.run({ ...request, models: ["candidate-a@low", "candidate-a@high"] });
+    expect(f.calls).toHaveLength(2);
+    expect(reuse.summaries.every((s) => s.cached === 1)).toBe(true);
+    const different = await f.run({ ...request, models: ["candidate-a"] });
+    expect(f.calls.at(-1)?.target.effort).toBe("none");
+    expect(different.summaries[0]?.cached).toBe(0);
+    model.effort = "low";
+    const alias = await f.run({ ...request, models: ["candidate-a"] });
+    expect(alias.summaries[0]?.cached).toBe(1);
+    const key = (effort?: string | null) =>
+      cacheKey("candidate-a", "fake", "prompt", "system", {}, 0, { repo: "pin" }, effort);
+    // Legacy (unknown) and deliberately unset ("default") entries never share a key.
+    expect(key(null)).toBe(key());
+    expect(new Set([key(), key("default"), key("none"), key("low"), key("high")]).size).toBe(5);
+  } finally {
+    await f.close();
+  }
+});
+
+test("saved unset effort remains unset after the catalog gains a default", async () => {
+  const { enableEfforts } = await import("./evals-support.ts");
+  const f = await evalFixture();
+  try {
+    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 1, caseIds: ["a"] });
+    enableEfforts(f);
+    await f.factory.evals.wait(run.id);
+    expect(f.calls[0]?.target.effort).toBeUndefined();
+    expect(f.factory.evals.report(run.id)?.trials[0]?.effort).toBe("default");
+  } finally {
+    await f.close();
+  }
+});

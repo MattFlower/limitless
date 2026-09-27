@@ -74,6 +74,7 @@ const toEvalTrial = (r: Row): EvalTrial => ({
   evalRunId: r.eval_run_id as string,
   caseId: r.case_id as string,
   modelId: r.model_id as string,
+  effort: r.effort as EvalTrial["effort"],
   trial: r.trial as number,
   cacheKey: r.cache_key as string,
   harness: r.harness as string,
@@ -155,6 +156,7 @@ const toInvocation = (r: Row): Invocation => ({
   provider: r.provider as string,
   model: r.model as string,
   modelId: r.model_id as string,
+  effort: r.effort as Invocation["effort"],
   status: r.status as InvocationStatus,
   costUsd: r.cost_usd as number,
   costEquivUsd: r.cost_equiv_usd as number,
@@ -349,8 +351,8 @@ export class Store {
 
   recordEvalTrial(t: EvalTrial): void {
     this.db
-      .query(`INSERT INTO eval_trials VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(eval_run_id, case_id, model_id, trial) DO UPDATE SET
+      .query(`INSERT INTO eval_trials VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT DO UPDATE SET
       cache_key=excluded.cache_key, harness=excluded.harness, status=excluded.status,
       output_json=excluded.output_json, pass=excluded.pass, score=excluded.score, details_json=excluded.details_json,
       cost_usd=excluded.cost_usd, cost_equiv_usd=excluded.cost_equiv_usd, tokens_in=excluded.tokens_in,
@@ -373,6 +375,7 @@ export class Store {
         t.tokensOut,
         t.durationMs,
         t.createdAt,
+        t.effort ?? null,
       );
   }
 
@@ -900,13 +903,24 @@ export class Store {
     provider: string;
     model: string;
     modelId: string;
+    effort?: Invocation["effort"];
   }): Invocation {
     const res = this.db
       .query(
-        `INSERT INTO invocations (run_id, stage_id, role, harness, provider, model, model_id, status, started_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+        `INSERT INTO invocations (run_id, stage_id, role, harness, provider, model, model_id, status, started_at, effort)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)`,
       )
-      .run(inv.runId, inv.stageId, inv.role, inv.harness, inv.provider, inv.model, inv.modelId, Date.now());
+      .run(
+        inv.runId,
+        inv.stageId,
+        inv.role,
+        inv.harness,
+        inv.provider,
+        inv.model,
+        inv.modelId,
+        Date.now(),
+        inv.effort ?? null,
+      );
     const invocation = this.getInvocation(Number(res.lastInsertRowid)) as Invocation;
     this.publish({ kind: "invocation", invocation });
     return invocation;

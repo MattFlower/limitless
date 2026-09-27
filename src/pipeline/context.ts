@@ -3,7 +3,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ZodType } from "zod";
 import type { Config } from "../config.ts";
-import type { Complexity, Invocation, Repo, Role, Run, RunEvent, Stage, StageName } from "../core/types.ts";
+import type {
+  Complexity,
+  Invocation,
+  ModelSelection,
+  Repo,
+  Role,
+  Run,
+  RunEvent,
+  Stage,
+  StageName,
+} from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
@@ -12,6 +22,7 @@ import { selectHarness } from "../harness/select.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../harness/types.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
+import { recordEffort } from "../router/targets.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
 
@@ -40,9 +51,15 @@ export interface RunState {
   holdoutSameVendor?: boolean;
   answers: string[];
   round: number;
-  implementer?: { modelId: string; tier: number; vendor: string };
+  implementer?: {
+    targetId?: string;
+    effort?: ModelSelection["effort"];
+    modelId: string;
+    tier: number;
+    vendor: string;
+  };
   roundsOnImplementer: number;
-  triedImplementers: string[];
+  triedImplementers: (string | ModelSelection)[];
   implementerReport?: string;
   /** Why the last implementer session ended badly (timeout, loop, error), fed back next round. */
   implementerIssue?: string | null;
@@ -205,7 +222,7 @@ export class RunContext {
    */
   async invoke(opts: InvokeOptions): Promise<InvokeOutcome> {
     const { router, tracker, store, harnesses } = this.deps;
-    const tried: string[] = [...(opts.constraints?.exclude ?? [])];
+    const tried: (string | ModelSelection)[] = [...(opts.constraints?.exclude ?? [])];
     let lastFailure: string | null = null;
 
     for (let attempt = 0; attempt < 6; attempt++) {
@@ -219,15 +236,15 @@ export class RunContext {
           `No model available for ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}. Skipped: ${why || "none configured"}`,
         );
       }
-      tried.push(target.modelId);
+      tried.push({ modelId: target.modelId, effort: target.effort ?? null });
       const { harnessName, noTools } = selectHarness(opts.role, target, opts.noTools);
       const harness = harnesses[harnessName];
       if (!harness) throw new Error(`No harness registered for ${harnessName}`);
 
       const release = await tracker.acquire(target.provider, this.signal);
-      if (!(await tracker.preflight(target.provider))) {
+      if (!(await tracker.preflight(target.provider)) || tracker.modelUnavailableReason(target.modelId)) {
         release();
-        lastFailure = `${target.modelId}: no capacity after provider refresh`;
+        lastFailure = `${target.targetId ?? target.modelId}: no capacity after provider refresh`;
         continue;
       }
       const invocation = store.createInvocation({
@@ -238,8 +255,9 @@ export class RunContext {
         provider: target.provider,
         model: target.model,
         modelId: target.modelId,
+        effort: recordEffort(target.effort),
       });
-      this.log(`${opts.role}: using ${target.modelId}`, "info", {
+      this.log(`${opts.role}: using ${target.targetId ?? target.modelId}`, "info", {
         invocationId: invocation.id,
         skipped: decision.skipped,
       });
@@ -337,29 +355,36 @@ export class RunContext {
             ? "private invocation rejected"
             : (redact?.(result.error ?? "rejected") ?? result.error ?? "rejected"),
         );
-        lastFailure = `${target.modelId}: ${redact?.(result.error ?? "") ?? result.error ?? ""}`.slice(
-          0,
-          300,
+        lastFailure =
+          `${target.targetId ?? target.modelId}: ${redact?.(result.error ?? "") ?? result.error ?? ""}`.slice(
+            0,
+            300,
+          );
+        this.log(
+          `${target.targetId ?? target.modelId} rejected by provider; blocking it for 24h and falling back`,
+          "warn",
         );
-        this.log(`${target.modelId} rejected by provider; blocking it for 24h and falling back`, "warn");
         continue;
       }
       if (result.status === "quota" || result.status === "unavailable") {
         lastFailure =
-          `${target.modelId}: ${result.status} (${redact?.(result.error ?? "") ?? result.error ?? ""})`.slice(
+          `${target.targetId ?? target.modelId}: ${result.status} (${redact?.(result.error ?? "") ?? result.error ?? ""})`.slice(
             0,
             300,
           );
-        this.log(`${target.modelId} ${result.status}; falling back`, "warn");
+        this.log(`${target.targetId ?? target.modelId} ${result.status}; falling back`, "warn");
         continue;
       }
       if (opts.requireStructured && (result.status !== "ok" || result.structured === null)) {
         lastFailure =
-          `${target.modelId}: ${redact?.(result.error ?? "no structured output") ?? result.error ?? "no structured output"}`.slice(
+          `${target.targetId ?? target.modelId}: ${redact?.(result.error ?? "no structured output") ?? result.error ?? "no structured output"}`.slice(
             0,
             300,
           );
-        this.log(`${target.modelId} failed to produce structured output; trying next model`, "warn");
+        this.log(
+          `${target.targetId ?? target.modelId} failed to produce structured output; trying next model`,
+          "warn",
+        );
         continue;
       }
       return { result, target, invocation: updated };

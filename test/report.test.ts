@@ -10,6 +10,7 @@ const inv: Invocation = {
   harness: "codex",
   provider: "codex",
   model: "gpt-6-astra",
+  effort: null,
   modelId: "codex/astra",
   status: "ok",
   costUsd: 0,
@@ -60,7 +61,9 @@ test("markdown tables are contiguous blocks", () => {
   expect(md).toContain(
     "|  | Criterion | Evidence |\n|---|---|---|\n| ✅ AC-1 | works \\| fully | ok |\n| ✅ AC-2 | edge | ok |",
   );
-  expect(md).toContain("| implement | `codex/astra` | ok | 4,000 / 200 | $1.50 equiv. | 42s |");
+  expect(md).toContain(
+    "| implement | `codex/astra` | unknown (legacy) | ok | 4,000 / 200 | $1.50 equiv. | 42s |",
+  );
   expect(md).toContain("No automated checks were detected");
   expect(md.startsWith("Built by **Limitless**")).toBe(true);
 });
@@ -90,4 +93,18 @@ test("reports for runs started from an issue close it", () => {
     closesIssue: 3,
   });
   expect(md).toContain("Closes #3");
+});
+
+test("report rows show low, high, none and unknown effort independently", () => {
+  const md = renderReport({
+    success: true,
+    runId: "r1",
+    prompt: "test",
+    state: {},
+    invocations: (["low", "high", "none", "default", null] as const).map((effort) => ({ ...inv, effort })),
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "u",
+  });
+  for (const effort of ["low", "high", "none", "backend default", "unknown (legacy)"])
+    expect(md).toContain(`| \`codex/astra\` | ${effort} | ok |`);
 });

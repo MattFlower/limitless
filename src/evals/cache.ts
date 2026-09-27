@@ -17,8 +17,23 @@ export function cacheKey(
   schema: Record<string, unknown>,
   trial: number,
   repository?: unknown,
+  /** Resolved at submission; null/undefined marks legacy trials whose effort is unknown. */
+  effort?: string | null,
 ): string {
   return new Bun.CryptoHasher("sha256")
-    .update(JSON.stringify(canonical({ modelId, harness, prompt, systemAppend, schema, trial, repository })))
+    .update(
+      JSON.stringify(
+        canonical({
+          modelId,
+          harness,
+          prompt,
+          systemAppend,
+          schema,
+          trial,
+          repository,
+          effort: effort ?? "legacy-unknown",
+        }),
+      ),
+    )
     .digest("hex");
 }

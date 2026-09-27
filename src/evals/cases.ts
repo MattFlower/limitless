@@ -172,17 +172,33 @@ const unique = z
   .refine((ids) => new Set(ids).size === ids.length, "duplicate IDs");
 export const EvalRequestSchema = z.strictObject({
   role: z.enum(["triage", "review", "verify"]),
-  models: unique,
+  models: z.array(z.string().min(1)).min(1),
   k: z.number().int().positive().default(1),
   maxUsd: z.number().finite().nonnegative().default(1),
   caseIds: unique.optional(),
   cache: z.boolean().default(true),
 });
 export type EvalRequest = z.infer<typeof EvalRequestSchema>;
-export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<Router, "model">) {
+export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<Router, "resolveFor">) {
   const request = EvalRequestSchema.parse(input);
   if (request.role !== file.role) throw new Error("dataset role does not match request");
-  for (const id of request.models) if (!router.model(id)) throw new Error(`Unknown model ID: ${id}`);
+  // Report every bad reference at once so the operator fixes the whole list in one round trip.
+  const problems: string[] = [];
+  const resolved: string[] = [];
+  for (const id of request.models) {
+    try {
+      resolved.push(router.resolveFor(request.role, id).targetId);
+    } catch (error) {
+      problems.push(`${JSON.stringify(id)}: ${(error as Error).message}`);
+    }
+  }
+  const seen = new Set<string>();
+  for (const target of resolved) {
+    if (seen.has(target)) problems.push(`duplicate resolved model target ${target}`);
+    seen.add(target);
+  }
+  if (problems.length > 0) throw new Error(`Invalid eval models: ${problems.join("; ")}`);
+  request.models = resolved;
   for (const id of request.caseIds ?? [])
     if (!file.cases.some((c) => c.id === id)) throw new Error(`Unknown case ID: ${id}`);
   const cases = file.cases.filter((c) => !request.caseIds || request.caseIds.includes(c.id));

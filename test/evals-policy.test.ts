@@ -4,7 +4,8 @@ import { EVAL_ROLES, generatePolicy, selectEvidence } from "../src/evals/policy.
 import { evalSettings } from "../src/evals/settings.ts";
 import { pairedBootstrap, wilson } from "../src/evals/stats.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
-import { overlayPolicy } from "../src/router/policy.ts";
+import { overlayPolicy, validatePolicy } from "../src/router/policy.ts";
+import { parseTarget, recordedTarget } from "../src/router/targets.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
 import { evidence, input, local, metered, response, subscription } from "./evals-policy-support.ts";
 
@@ -135,7 +136,7 @@ test("non-inferiority is strict at -delta, including the self-comparison when de
   expect(first(input(undefined, { settings: evalSettings({ evals: { delta: 0 } }) })).eligible).toBe(false);
   const row = evidence("triage", [local, subscription]);
   row.trials
-    .filter((t) => t.modelId === subscription)
+    .filter((t) => recordedTarget(t) === subscription)
     .slice(0, 20)
     .forEach((t) => {
       t.pass = false;
@@ -213,13 +214,13 @@ test("ordering resolves equal cost by latency, known before null, then ID", () =
   });
   expect(generatePolicy(input([row])).generated.triage?.default).toEqual([subscription, local, metered]);
   row.trials
-    .filter((t) => t.modelId === metered)
+    .filter((t) => recordedTarget(t) === metered)
     .forEach((t) => {
       t.durationMs = 1;
     });
   expect(generatePolicy(input([row])).generated.triage?.default?.[0]).toBe(metered);
   row.trials
-    .filter((t) => t.modelId === subscription)
+    .filter((t) => recordedTarget(t) === subscription)
     .forEach((t) => {
       t.details.cache = {
         evalRunId: "cached",
@@ -242,7 +243,9 @@ for (const [origin, baseOrigin, exclusions, eligible] of [
   ["US", "US", ["CN"], true],
 ] as const)
   test(`origin=${origin}, base=${baseOrigin}, exclusions=${exclusions}`, () => {
-    const models = MODELS.map((m) => (m.id === local ? { ...m, origin, baseOrigin } : m));
+    const models = MODELS.map((m) =>
+      m.id === parseTarget(local).modelId ? { ...m, origin, baseOrigin } : m,
+    );
     const settings = evalSettings({
       routing: exclusions === undefined ? {} : { exclude_origins: exclusions },
     });
@@ -303,12 +306,12 @@ test("evidence rendering is reproducible and documents selected runs, missing me
   const verify = evidence("verify", [subscription]);
   verify.trials = [];
   review.trials
-    .filter((t) => t.modelId === subscription)
+    .filter((t) => recordedTarget(t) === subscription)
     .forEach((t) => {
       t.pass = false;
     });
   triage.trials
-    .filter((t) => t.modelId === subscription)
+    .filter((t) => recordedTarget(t) === subscription)
     .forEach((t) => {
       t.details.cache = {
         evalRunId: "cached",
@@ -404,4 +407,103 @@ test("a ceiling the dataset is too small to establish is insufficient evidence, 
   expect(result.eligible).toBe(false);
   expect(result.state).toBe("insufficient evidence");
   expect(result.reasons.join()).toContain("cannot establish");
+});
+
+test("policy selects latest evidence per effort, costs them independently and rejects unknown history", async () => {
+  const { validatePolicy } = await import("../src/router/policy.ts");
+  const low = evidence("triage", ["codex/luna@low"], { id: "low-old" });
+  const high = evidence("triage", ["codex/luna@high"], { id: "high", finishedAt: 4000 });
+  const newerLow = evidence("triage", ["codex/luna@low"], { id: "low-new", finishedAt: 3000 });
+  const legacy = evidence("triage", ["codex/luna"], { id: "legacy", finishedAt: 5000 });
+  for (const t of legacy.trials) t.effort = null;
+  const unsupported = evidence("triage", ["codex/luna@max"], { id: "unsupported" });
+  for (const t of high.trials) t.costEquivUsd = 10;
+  for (const t of low.trials) t.pass = false;
+  const data = input([high, low, newerLow, legacy, unsupported]);
+  // max is intentionally not a declared Luna setting.
+  const result = generatePolicy(data);
+  const candidates = result.roles[0]?.candidates ?? [];
+  expect(candidates.find((c) => c.modelId === "codex/luna@low")?.run.id).toBe("low-new");
+  expect(candidates.find((c) => c.modelId === "codex/luna@high")?.run.id).toBe("high");
+  expect(result.generated.triage?.default).toEqual(["codex/luna@low", "codex/luna@high"]);
+  expect(candidates.find((c) => c.modelId === "codex/luna (unknown effort)")?.reasons).toContain(
+    "legacy evidence with unknown effort",
+  );
+  expect(candidates.find((c) => c.modelId === "codex/luna@max")?.reasons).toContain(
+    "unsupported recorded effort max",
+  );
+  expect(validatePolicy(result.generated, MODELS)).toEqual(result.generated);
+  expect(generatePolicy({ ...data, evidence: [...data.evidence].reverse() }).generated).toEqual(
+    result.generated,
+  );
+  const matrix = evalMatrix(response(data.evidence));
+  expect(matrix.rows[0]?.cells.find((c) => c.modelId === "codex/luna@low")?.href).toBe("/evals/low-new");
+  expect(matrix.rows[0]?.cells.find((c) => c.modelId === "codex/luna@high")?.href).toBe("/evals/high");
+});
+
+test("fresh bare evals of models without a default effort qualify; legacy unknown effort does not", () => {
+  const fresh = evidence("triage", ["claude/opus", "codex/luna@medium"], { id: "fresh", finishedAt: 3000 });
+  const legacy = evidence("triage", ["claude/sonnet"], { id: "legacy" });
+  for (const t of legacy.trials) t.effort = null;
+  const result = generatePolicy(input([fresh, legacy]));
+  const candidates = result.roles[0]?.candidates ?? [];
+  expect(fresh.trials.find((t) => t.modelId === "claude/opus")?.effort).toBe("default");
+  expect(candidates.find((c) => c.modelId === "claude/opus")?.eligible).toBe(true);
+  expect(candidates.find((c) => c.modelId === "claude/sonnet (unknown effort)")?.reasons).toContain(
+    "legacy evidence with unknown effort",
+  );
+  expect(result.generated.triage?.default).toContain("claude/opus");
+  expect(result.generated.triage?.default).not.toContain("claude/sonnet");
+  // A saved "default" is not reinterpreted once the catalog gains a default effort.
+  const models = MODELS.map((m) => (m.id === "claude/opus" ? { ...m, effort: "high" as const } : m));
+  const changed = generatePolicy({ ...input([fresh]), models });
+  expect(changed.roles[0]?.candidates.find((c) => c.modelId === "claude/opus")?.eligible).toBe(false);
+});
+
+test("legacy unknown-effort rows never pool with or displace backend-default evidence", async () => {
+  const { validatePolicy } = await import("../src/router/policy.ts");
+  // One run holding one backend-default trial and 39 legacy unknown-effort trials.
+  const mixed = evidence("triage", ["claude/opus"], { id: "mixed" });
+  for (const t of mixed.trials.slice(1)) t.effort = null;
+  const result = generatePolicy(input([mixed]));
+  const candidates = result.roles[0]?.candidates ?? [];
+  const known = candidates.find((c) => c.modelId === "claude/opus");
+  const unknown = candidates.find((c) => c.modelId === "claude/opus (unknown effort)");
+  expect(known?.summary.evaluatedTrials).toBe(1);
+  expect(known?.summary.effort).toBe("default");
+  expect(known?.eligible).toBe(false);
+  expect(unknown?.summary.evaluatedTrials).toBe(39);
+  expect(unknown?.summary.effort).toBeNull();
+  expect(unknown?.state).toBe("ineligible");
+  expect(unknown?.reasons).toContain("legacy evidence with unknown effort");
+  expect(result.generated.triage).toBeUndefined();
+
+  // Newer unknown-effort evidence cannot displace older backend-default evidence.
+  const known40 = evidence("triage", ["claude/opus"], { id: "known", finishedAt: 2000 });
+  const legacy = evidence("triage", ["claude/opus"], { id: "legacy", finishedAt: 5000 });
+  for (const t of legacy.trials) t.effort = null;
+  expect(selectEvidence([legacy, known40]).map((e) => [e.modelId, e.run.id])).toEqual([
+    ["claude/opus", "known"],
+    ["claude/opus (unknown effort)", "legacy"],
+  ]);
+  const later = generatePolicy(input([legacy, known40]));
+  const selected = later.roles[0]?.candidates.find((c) => c.modelId === "claude/opus");
+  expect(selected?.run.id).toBe("known");
+  expect(selected?.summary.evaluatedTrials).toBe(40);
+  expect(later.generated.triage?.default).toEqual(["claude/opus"]);
+  expect(validatePolicy(later.generated, MODELS)).toEqual(later.generated);
+});
+
+test("effort a role's transport cannot deliver is never emitted", () => {
+  const review = evidence("review", ["openrouter/gpt-6-luna@low", "openrouter/gpt-6-luna"]);
+  const triage = evidence("triage", ["openrouter/gpt-6-luna@low"]);
+  const result = generatePolicy(input([review, triage]));
+  const reviewRole = result.roles.find((r) => r.role === "review");
+  expect(
+    reviewRole?.candidates.find((c) => c.modelId === "openrouter/gpt-6-luna@low")?.reasons.join(),
+  ).toContain("cannot carry effort in the review role");
+  expect(result.generated.review?.default).toEqual(["openrouter/gpt-6-luna"]);
+  // Tool-less triage runs over HTTP, which carries OpenRouter reasoning effort.
+  expect(result.generated.triage?.default).toEqual(["openrouter/gpt-6-luna@low"]);
+  expect(validatePolicy(result.generated, MODELS)).toEqual(result.generated);
 });

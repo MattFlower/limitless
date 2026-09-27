@@ -36,6 +36,23 @@ function object(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+export function effortFields(target: ModelTarget): Record<string, unknown> {
+  if (target.effort === undefined) return {};
+  if (!target.openai) throw new Error("Effort requires an HTTP endpoint");
+  switch (target.effortMapping) {
+    case "openrouter":
+      return { reasoning: { effort: target.effort } };
+    case "generic":
+      return { reasoning_effort: target.effort };
+    case "qwen":
+      if (target.vendor !== "qwen" || target.billing !== "free")
+        throw new Error("Qwen thinking mapping requires a local Qwen target");
+      return { chat_template_kwargs: { enable_thinking: target.effort !== "none" } };
+    default:
+      throw new Error("Unsupported effort transport: configure an explicit HTTP effort mapping");
+  }
+}
+
 /** One structured completion, with one bounded repair attempt for unsupported/invalid JSON. */
 export const runLlm: Harness = async (spec) => {
   const endpoint = spec.target.openai;
@@ -57,6 +74,12 @@ export const runLlm: Harness = async (spec) => {
   if (!endpoint || !spec.jsonSchema || !spec.schema)
     return finish(failure("error", "HTTP completion requires an endpoint and a schema", usage, spec.target));
 
+  let reasoning: Record<string, unknown>;
+  try {
+    reasoning = effortFields(spec.target);
+  } catch (error) {
+    return finish(failure("error", String(error), usage, spec.target));
+  }
   const timeout = AbortSignal.timeout(spec.timeoutMs);
   const signal = AbortSignal.any([spec.signal, timeout]);
   const messages: { role: "system" | "user"; content: string }[] = [];
@@ -72,6 +95,7 @@ export const runLlm: Harness = async (spec) => {
       model: spec.target.model,
       messages,
       stream: false,
+      ...reasoning,
     };
     if (attempt === 0)
       body.response_format = {

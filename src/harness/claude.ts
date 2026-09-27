@@ -140,7 +140,7 @@ export class ClaudeStreamParser {
   }
 }
 
-function buildArgs(spec: AgentSpec, sessionId: string): string[] {
+export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
   const t = spec.target;
   const args = [
     "claude",
@@ -181,7 +181,15 @@ function buildArgs(spec: AgentSpec, sessionId: string): string[] {
     );
   }
   args.push("--disallowedTools", ...denied);
-  if (t.effort) args.push("--effort", t.effort);
+  // Which values a model accepts is the catalog's business (supportedEfforts); the harness only
+  // transmits the resolved selection. Non-Anthropic backends behind the CLI cannot receive one.
+  if (t.effort !== undefined) {
+    if (t.backend)
+      throw new Error(
+        `Claude CLI cannot set effort for the ${t.provider} backend; use ${t.modelId} without @effort`,
+      );
+    args.push("--effort", t.effort);
+  }
   if (spec.systemAppend) args.push("--append-system-prompt", spec.systemAppend);
   if (spec.jsonSchema) args.push("--json-schema", JSON.stringify(spec.jsonSchema));
   for (const dir of spec.addDirs ?? []) args.push("--add-dir", dir);
@@ -240,7 +248,7 @@ export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
 
   appendFileSync(spec.logPath, `# claude ${t.model} ${new Date().toISOString()}\n`);
   const proc = await runProcess({
-    cmd: buildArgs(spec, sessionId),
+    cmd: buildClaudeArgs(spec, sessionId),
     cwd: spec.cwd,
     env: agentEnv(envExtra),
     stdin: spec.prompt,

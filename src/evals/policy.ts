@@ -1,6 +1,7 @@
-import type { EvalRun, EvalTrial } from "../core/types.ts";
+import type { Effort, EvalRun, EvalTrial } from "../core/types.ts";
 import type { ModelDef, Policy, ProviderDef } from "../router/catalog.ts";
 import type { PolicyOverlay } from "../router/policy.ts";
+import { effortTransportError, evidenceTarget, parseTarget, recordedTarget } from "../router/targets.ts";
 import type { EvalSettings } from "./settings.ts";
 import { completeCases, pairedBootstrap, summarize, wilson } from "./stats.ts";
 
@@ -37,7 +38,12 @@ export function selectEvidence(evidence: Evidence[], ids?: string[]) {
         compareId(b.run.id, a.run.id),
     );
   for (const entry of ordered)
-    for (const modelId of entry.run.models) {
+    for (const modelId of [
+      ...new Set([
+        ...entry.trials.map(evidenceTarget),
+        ...entry.run.models.filter((id) => !entry.trials.some((t) => recordedTarget(t) === id)),
+      ]),
+    ]) {
       const key = `${entry.run.role}:${modelId}`;
       if (!selected.has(key)) selected.set(key, { ...entry, modelId });
     }
@@ -81,10 +87,11 @@ export function generatePolicy(input: PolicyInput) {
     const entries = selected
       .filter((e) => e.run.role === role)
       .map((entry) => {
-        const rows = entry.trials.filter((t) => t.modelId === entry.modelId);
+        const rows = entry.trials.filter((t) => evidenceTarget(t) === entry.modelId);
         const summary = summarize({ ...entry.run, models: [entry.modelId] }, rows)[0];
         if (!summary) throw new Error("Missing model summary");
-        const model = models.find((m) => m.id === entry.modelId);
+        const baseId = rows[0]?.modelId ?? parseTarget(entry.modelId).modelId;
+        const model = models.find((m) => m.id === baseId);
         const provider = providers.find((p) => p.id === model?.provider);
         const excluded =
           model &&
@@ -95,7 +102,26 @@ export function generatePolicy(input: PolicyInput) {
         const reasons: string[] = [];
         if (!model || !provider) reasons.push("catalog/provider metadata unavailable");
         if (excluded) reasons.push(`origin excluded (${model?.origin}; baseOrigin=${model?.baseOrigin})`);
-        const referenceAllowed = Boolean(model && provider && !excluded);
+        // Without trials only the saved reference exists, and metrics already mark it insufficient.
+        const recordedEffort = rows.length
+          ? (rows[0]?.effort ?? null)
+          : ((parseTarget(entry.modelId).effort as Effort | undefined) ?? "default");
+        const effortProblem =
+          recordedEffort === null
+            ? "legacy evidence with unknown effort"
+            : recordedEffort === "default"
+              ? model?.effort !== undefined
+                ? `recorded with backend-default effort, but ${model.id} now defaults to ${model.effort}`
+                : null
+              : !model || !model.supportedEfforts.includes(recordedEffort)
+                ? `unsupported recorded effort ${recordedEffort}`
+                : effortTransportError(
+                    role,
+                    { model, effort: recordedEffort, targetId: entry.modelId },
+                    provider,
+                  );
+        if (effortProblem) reasons.push(effortProblem);
+        const referenceAllowed = Boolean(model && provider && !excluded && !effortProblem);
         const f = settings.floors;
         const passMetric = metric(
           "pass rate",
@@ -241,6 +267,8 @@ export type PolicyEvaluation = ReturnType<typeof generatePolicy>;
 export interface EvalPolicyResponse {
   evaluation: PolicyEvaluation;
   models: ModelDef[];
+  /** Absent from older daemons; validation then falls back to the built-in providers. */
+  providers?: ProviderDef[];
   policy: Policy;
   runs: (EvalRun & { costUsd: number; costEquivUsd: number })[];
 }

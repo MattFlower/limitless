@@ -49,8 +49,8 @@ export async function evalCommand(
     };
     const path = "routing/policy.json";
     const old = await files.read(path);
-    const existing = old === null ? {} : parsePolicy(old, data.models, path);
-    const proposed = validatePolicy(proposedOverlay(existing, data.evaluation), data.models);
+    const existing = old === null ? {} : parsePolicy(old, data.models, path, data.providers);
+    const proposed = validatePolicy(proposedOverlay(existing, data.evaluation), data.models, data.providers);
     const document = `${JSON.stringify(proposed, null, 2)}\n`;
     const evidence = renderEvidence(data.evaluation);
     io.print(policyDiff(data.policy, overlayPolicy(DEFAULT_POLICY, proposed), data.evaluation));
@@ -68,13 +68,16 @@ export async function evalCommand(
     return;
   }
   if (args.length !== 2 || !value || !["run", "report"].includes(action ?? ""))
-    throw new Error("usage: limitless eval run <role> --models a,b | eval report <eval-id> [--json]");
+    throw new Error(
+      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval report <eval-id> [--json]",
+    );
   if (action === "report") {
     const report = await io.api<EvalReport>(`/api/evals/${encodeURIComponent(value)}`);
     io.print(flags.json ? JSON.stringify(report) : formatEvalReport(report));
     return;
   }
-  if (typeof flags.models !== "string" || !flags.models.trim()) throw new Error("--models a,b is required");
+  if (typeof flags.models !== "string" || !flags.models.trim())
+    throw new Error("--models model[@effort],model[@effort] is required");
   const numeric = (key: string) => {
     const raw = flags[key];
     if (raw === undefined) return undefined;

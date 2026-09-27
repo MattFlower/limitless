@@ -11,7 +11,7 @@ Usage:
   limitless serve                         Start the daemon (API, UI, scheduler)
   limitless run "<prompt>" --repo <repo>  Queue a run (repo: owner/name or a local path)
         [--profile auto|quick|standard|deep] [--title <t>] [-f|--follow]
-  limitless eval run <role> --models a,b [--k N] [--cases id,id] [--max-usd X] [--no-cache] [--follow]
+  limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--no-cache] [--follow]
   limitless eval report <eval-id> [--json]
   limitless eval policy [--evals id,id] [--write]
   limitless ls [--status s1,s2] [-n 20]   List runs

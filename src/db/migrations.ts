@@ -280,4 +280,37 @@ CREATE INDEX eval_trials_cache_key ON eval_trials(cache_key);
     name: "quota_window_observations",
     sql: "ALTER TABLE provider_state ADD COLUMN window_observed_at_json TEXT;",
   },
+  {
+    version: 10,
+    name: "reasoning_effort",
+    sql: `
+ALTER TABLE invocations ADD COLUMN effort TEXT;
+CREATE TABLE eval_trials_effort (
+  eval_run_id TEXT NOT NULL REFERENCES eval_runs(id),
+  case_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  trial INTEGER NOT NULL,
+  cache_key TEXT NOT NULL,
+  harness TEXT NOT NULL,
+  status TEXT NOT NULL,
+  output_json TEXT,
+  pass INTEGER,
+  score REAL,
+  details_json TEXT NOT NULL,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  cost_equiv_usd REAL NOT NULL DEFAULT 0,
+  tokens_in INTEGER NOT NULL DEFAULT 0,
+  tokens_out INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  effort TEXT
+);
+
+INSERT INTO eval_trials_effort SELECT *, NULL FROM eval_trials;
+DROP TABLE eval_trials;
+ALTER TABLE eval_trials_effort RENAME TO eval_trials;
+CREATE UNIQUE INDEX eval_trials_identity ON eval_trials(eval_run_id, case_id, model_id, trial, COALESCE(effort, ''));
+CREATE INDEX eval_trials_cache_key ON eval_trials(cache_key);
+`,
+  },
 ];

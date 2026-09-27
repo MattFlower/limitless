@@ -287,3 +287,46 @@ test("a no-tools Claude call returning StructuredOutput is not stopped by a zero
     process.env.PATH = oldPath;
   }
 });
+
+test("CLI arguments transmit the selected effort verbatim and reject backend Claude transport", async () => {
+  const { buildClaudeArgs } = await import("../src/harness/claude.ts");
+  const spec: AgentSpec = {
+    cwd: "/tmp",
+    prompt: "test",
+    mode: "readonly",
+    timeoutMs: 1000,
+    idleTimeoutMs: 1000,
+    maxToolCalls: 0,
+    signal: new AbortController().signal,
+    logPath: "/tmp/unused",
+    onEvent: () => {},
+    target: {
+      modelId: "claude/opus",
+      model: "opus",
+      provider: "claude",
+      vendor: "anthropic",
+      tier: 5,
+      billing: "subscription",
+      harness: "claude",
+    },
+  };
+  // Whether a value is supported is decided by the catalog; the harness passes the selection through.
+  for (const effort of ["none", "low", "high", "max", undefined] as const) {
+    spec.target.effort = effort;
+    const args = buildClaudeArgs(spec, "session");
+    expect(args.filter((a) => a === "--effort")).toHaveLength(effort === undefined ? 0 : 1);
+    if (effort) expect(args[args.indexOf("--effort") + 1]).toBe(effort);
+  }
+  for (const effort of ["none", "low", "high", undefined] as const) {
+    spec.target.effort = effort;
+    const args = buildCodexArgs(spec);
+    expect(args.filter((a) => a.startsWith("model_reasoning_effort="))).toEqual(
+      effort ? [`model_reasoning_effort="${effort}"`] : [],
+    );
+  }
+  spec.target.backend = { baseUrl: "http://unused", authToken: "" };
+  spec.target.effort = undefined;
+  expect(buildClaudeArgs(spec, "session")).not.toContain("--effort");
+  spec.target.effort = "high";
+  expect(() => buildClaudeArgs(spec, "session")).toThrow("cannot set effort for the claude backend");
+});

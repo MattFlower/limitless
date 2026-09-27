@@ -174,3 +174,56 @@ test("seed symlinks escaping the dataset fail before scheduling", async () => {
     await f.close();
   }
 });
+
+test("eval validation resolves defaults, explicit none and rejects malformed or duplicate targets", async () => {
+  const { enableEfforts, invalidTargets } = await import("./evals-support.ts");
+  const f = await evalFixture();
+  try {
+    enableEfforts(f);
+    for (const models of invalidTargets)
+      expect(() => validateRequest({ role: "triage", models }, f.dataset, f.factory.router)).toThrow();
+    // Every problem is reported in one pass, not just the first one encountered.
+    expect(() =>
+      validateRequest(
+        { role: "triage", models: ["unknown@low", "candidate-a@max", "candidate-a", "candidate-a@low"] },
+        f.dataset,
+        f.factory.router,
+      ),
+    ).toThrow(
+      /Invalid eval models: "unknown@low": unknown model ID "unknown"; "candidate-a@max": Unsupported effort "max" for candidate-a.*; duplicate resolved model target candidate-a@low/,
+    );
+    const { request } = validateRequest(
+      { role: "triage", models: ["candidate-a", "candidate-a@high", "candidate-a@none"] },
+      f.dataset,
+      f.factory.router,
+    );
+    expect(request.models).toEqual(["candidate-a@low", "candidate-a@high", "candidate-a@none"]);
+    expect(f.factory.store.listEvalRuns()).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("eval validation rejects efforts the role's harness cannot deliver", async () => {
+  const { enableEfforts } = await import("./evals-support.ts");
+  const f = await evalFixture();
+  try {
+    enableEfforts(f);
+    // Model candidate-a's provider as a Claude-CLI backend (like OpenRouter or mtplx).
+    const provider = f.factory.tracker.def("openrouter");
+    if (!provider) throw new Error("missing provider");
+    provider.harness = "claude";
+    provider.baseUrl = "http://unused.invalid";
+    const review = { ...f.dataset, role: "review" } as unknown as Parameters<typeof validateRequest>[1];
+    expect(() =>
+      validateRequest({ role: "review", models: ["candidate-a@high"] }, review, f.factory.router),
+    ).toThrow("cannot carry effort in the review role");
+    // Triage is tool-less and reaches the provider over HTTP, which carries effort.
+    expect(
+      validateRequest({ role: "triage", models: ["candidate-a@high"] }, f.dataset, f.factory.router).request
+        .models,
+    ).toEqual(["candidate-a@high"]);
+  } finally {
+    await f.close();
+  }
+});

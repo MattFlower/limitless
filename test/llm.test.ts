@@ -171,6 +171,7 @@ test("normal invocation records failed HTTP candidate and falls back", async () 
         vendor: "qwen",
         origin: "CN",
         baseOrigin: "CN",
+        supportedEfforts: [],
         tier: 2,
         price: { input: 0, output: 0 },
       },
@@ -181,6 +182,7 @@ test("normal invocation records failed HTTP candidate and falls back", async () 
         vendor: "other",
         origin: "unknown",
         baseOrigin: "unknown",
+        supportedEfforts: [],
         tier: 2,
         price: { input: 0, output: 0 },
       },
@@ -246,4 +248,37 @@ test("normal invocation records failed HTTP candidate and falls back", async () 
   } finally {
     store.close();
   }
+});
+
+test("HTTP effort mappings are exclusive and survive structured-output repair", async () => {
+  for (const mapping of ["openrouter", "generic", "qwen"] as const)
+    for (const effort of ["none", "high", undefined] as const) {
+      requests.length = 0;
+      reply = (_body, n) =>
+        n === 1
+          ? new Response("retry", { status: 400 })
+          : Response.json({ choices: [{ message: { content: '{"answer":"ok"}' } }] });
+      const input = spec();
+      input.target.effortMapping = mapping;
+      input.target.effort = effort;
+      expect((await runLlm(input)).status).toBe("ok");
+      expect(requests).toHaveLength(2);
+      for (const body of requests) {
+        expect(body.reasoning).toEqual(effort && mapping === "openrouter" ? { effort } : undefined);
+        expect(body.reasoning_effort).toBe(mapping === "generic" ? effort : undefined);
+        expect(body.chat_template_kwargs).toEqual(
+          effort && mapping === "qwen" ? { enable_thinking: effort !== "none" } : undefined,
+        );
+      }
+    }
+});
+
+test("HTTP rejects selected effort without a compatible explicit mapping before fetching", async () => {
+  const input = spec();
+  input.target.effort = "high";
+  expect((await runLlm(input)).error).toContain("Unsupported effort transport");
+  input.target.effortMapping = "qwen";
+  input.target.vendor = "other";
+  expect((await runLlm(input)).error).toContain("local Qwen");
+  expect(requests).toHaveLength(0);
 });

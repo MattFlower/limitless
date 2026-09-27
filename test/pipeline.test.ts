@@ -26,6 +26,7 @@ const models: ModelDef[] = [
     vendor: "anthropic",
     origin: "unknown",
     baseOrigin: "unknown",
+    supportedEfforts: [],
     tier: 4,
     price: { input: 1, output: 1 },
   },
@@ -36,6 +37,7 @@ const models: ModelDef[] = [
     vendor: "openai",
     origin: "unknown",
     baseOrigin: "unknown",
+    supportedEfforts: [],
     tier: 4,
     price: { input: 1, output: 1 },
   },
@@ -137,13 +139,15 @@ const pass = {
   notes: "",
 };
 
-function start(handler: Handler): Factory {
+function start(handler: Handler, effortRouting = false): Factory {
   const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
   factory = new Factory(cfg, {
     harnesses: { fake: fakeHarness(handler) },
     providers,
-    models,
-    policy,
+    models: effortRouting
+      ? models.map((m): ModelDef => ({ ...m, supportedEfforts: ["low", "high"], effort: "low" }))
+      : models,
+    policy: effortRouting ? { ...policy, implement: { default: ["alpha/m@high", "alpha/m@low"] } } : policy,
   });
   factory.start();
   return factory;
@@ -1148,6 +1152,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const invs = f.store.listInvocations(run.id);
     expect(invs[0]).toMatchObject({ provider: "alpha", status: "quota" });
     expect(invs.filter((i) => i.status === "ok").every((i) => i.provider === "beta")).toBe(true);
+    // Unset effort is recorded as the backend default, never as legacy-unknown (null).
+    expect(invs.every((i) => i.effort === "default")).toBe(true);
     expect(f.tracker.status("alpha")?.state).toBe("exhausted");
   });
 
@@ -1312,4 +1318,110 @@ test("drain blocks queued starts across ticks and completion without pausing act
   } finally {
     release();
   }
+});
+
+test("pipeline fallback records each effort and reloads the exact implementer preference", async () => {
+  const { evalFixture, enableEfforts, answer } = await import("./evals-support.ts");
+  const { RunContext } = await import("../src/pipeline/context.ts");
+  const { Router } = await import("../src/router/router.ts");
+  const { createHttpRoutes } = await import("../src/server/http.ts");
+  const { requestWithParams } = await import("./mcp-support.ts");
+  const f = await evalFixture();
+  try {
+    const model = enableEfforts(f);
+    model.provider = "provider-b";
+    const router = new Router(
+      f.factory.tracker,
+      {
+        ...policy,
+        implement: { default: ["candidate-a@low", "candidate-a@high"] },
+      },
+      [model],
+    );
+    const deps = { ...f.factory.deps, router };
+    const repo = f.factory.store.upsertRepo({
+      slug: "fixture/repo",
+      kind: "local",
+      localPath: f.source,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = f.factory.store.createRun(repo, { repo: repo.slug, prompt: "test" });
+    const context = new RunContext(deps, run, repo, new AbortController().signal);
+    const stage = f.factory.store.startStage(run.id, "implement", 0);
+    f.respond((s) =>
+      s.target.effort === "low"
+        ? { structured: null, status: "error", error: "invalid output" }
+        : { structured: answer },
+    );
+    const outcome = await context.invoke({
+      role: "implement",
+      stage,
+      prompt: "test",
+      mode: "readonly",
+      complexity: "small",
+      requireStructured: true,
+    });
+    expect(outcome.target.effort).toBe("high");
+    expect(f.calls.map((s) => s.target.effort)).toEqual(["low", "high"]);
+    context.state.implementer = {
+      modelId: outcome.target.modelId,
+      targetId: outcome.target.targetId,
+      tier: outcome.target.tier,
+      vendor: outcome.target.vendor,
+    };
+    context.save();
+    const loaded = new RunContext(deps, run, repo, new AbortController().signal);
+    expect(
+      router.route("implement", "small", { prefer: loaded.state.implementer?.targetId }).candidates[0]
+        ?.effort,
+    ).toBe("high");
+    expect(model.effort).toBe("low");
+    expect(f.factory.store.listInvocations(run.id).map((i) => [i.effort, i.status])).toEqual([
+      ["low", "error"],
+      ["high", "ok"],
+    ]);
+    const routes = createHttpRoutes(f.factory);
+    const route = routes["/api/runs/:id"] as import("./mcp-support.ts").Route;
+    const response = await route(
+      requestWithParams(`http://localhost/api/runs/${run.id}`, {}, { id: run.id }),
+      {} as import("bun").Server<undefined>,
+    );
+    expect(await response.json()).toMatchObject({ invocations: [{ effort: "low" }, { effort: "high" }] });
+    // Old run state without a targetId still loads and resolves its bare preference.
+    loaded.state.implementer = { modelId: model.id, tier: model.tier, vendor: model.vendor };
+    loaded.save();
+    const old = new RunContext(deps, run, repo, new AbortController().signal);
+    expect(
+      router.route("implement", "small", { prefer: old.state.implementer?.modelId }).candidates[0]?.effort,
+    ).toBe("low");
+  } finally {
+    await f.close();
+  }
+});
+
+test("engine persists selected effort through a feedback round without changing other roles", async () => {
+  const seen: AgentSpec[] = [];
+  let implementations = 0;
+  const f = start((s) => {
+    seen.push(s);
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review") return { structured: approve };
+    if (role === "verify") return { structured: pass };
+    implementations++;
+    return { files: { "farewell.txt": "goodbye\n", "bad.txt": implementations === 1 ? "BAD\n" : "fixed\n" } };
+  }, true);
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(implementations).toBe(2);
+  expect(seen.filter((s) => roleOf(s) === "implement").map((s) => s.target.effort)).toEqual(["high", "high"]);
+  expect(seen.filter((s) => roleOf(s) !== "implement").every((s) => s.target.effort === "low")).toBe(true);
+  expect(f.store.getRunState<RunState>(run.id)?.implementer).toMatchObject({
+    modelId: "alpha/m",
+    targetId: "alpha/m@high",
+    effort: "high",
+  });
+  expect(f.router.model("alpha/m")?.effort).toBe("low");
 });

@@ -42,6 +42,7 @@ const models: ModelDef[] = [
     vendor: "anthropic",
     origin: "unknown",
     baseOrigin: "unknown",
+    supportedEfforts: [],
     tier: 4,
     price: { input: 0, output: 0 },
   },
@@ -52,6 +53,7 @@ const models: ModelDef[] = [
     vendor: "openai",
     origin: "unknown",
     baseOrigin: "unknown",
+    supportedEfforts: [],
     tier: 4,
     price: { input: 0, output: 0 },
   },
@@ -379,6 +381,7 @@ test("fallback description respects the selected route constraints", () => {
     vendor: id === "A" ? "anthropic" : "openai",
     origin: "unknown",
     baseOrigin: "unknown",
+    supportedEfforts: [],
     tier: 4,
     price: { input: 0, output: 0 },
   }));
@@ -414,6 +417,7 @@ for (const discord of ["enabled", "disabled", "failing"] as const) {
       vendor: "anthropic",
       origin: "unknown",
       baseOrigin: "unknown",
+      supportedEfforts: [],
       tier: 4,
       price: { input: 0, output: 0 },
     }));
