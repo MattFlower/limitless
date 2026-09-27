@@ -33,6 +33,7 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 30 | M5 | Later-round reviews don't move the goalposts | todo |
 | 31 | M5 | Verify artifacts: redact only private scenarios | todo |
 | 32 | M4 | Jev decisions harness: triage as typed questions | todo |
+| 33 | M5 | UI changes can be verified | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
@@ -503,3 +504,20 @@ fast, 32K-token context, available with our OpenRouter key.
 - Later: routing questions for item 26 (e.g. task difficulty as a score), concierge intent.
 - Live smoke check for the alpha endpoint.
 - Tests with a fake decisions server (no network).
+
+## 33. UI changes can be verified
+
+Seen on the owner's first UI run (2026-09-27): most acceptance criteria and holdout scenarios needed
+a real browser (rendered line counts at two widths, toggles, no horizontal scroll, keyboard
+operation), and verify's sandbox can't bind a local port or install a browser, so they were
+correctly reported `blocked`. A UI run can therefore only end "verification blocked" today.
+
+- Spec guidance for UI work: state criteria so they are checkable through tests where possible
+  (render the component — SSR/DOM-level tests, computed classes and attributes, ARIA state) and
+  keep genuinely visual checks (layout at widths, overflow) as a short, explicit list.
+- Verify capability: an optional sandboxed browser check — the pipeline (not the model) starts the
+  built UI on an ephemeral loopback port inside the run's scratch area and exposes a headless
+  browser command the verifier can call (screenshot + DOM query at given viewport sizes). Network
+  stays limited to that loopback port.
+- Until then, "blocked" UI checks go to the orchestrator, who verifies them in a browser before
+  merging.
