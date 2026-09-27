@@ -94,16 +94,42 @@ export const DISCORD_COMMANDS: readonly ApplicationCommandDataResolvable[] = [
 
 /** Gateway transport; all discord.js calls stay here. */
 export class GatewayDiscordPort implements DiscordPort {
-  private readonly client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
-  });
+  private readonly client: Client;
 
-  constructor(private readonly token: string) {}
+  constructor(
+    private readonly token: string,
+    options: { client?: Client; onWarning?: (message: string) => void } = {},
+  ) {
+    this.onWarning = options.onWarning;
+    this.client =
+      options.client ??
+      new Client({
+        intents: [
+          GatewayIntentBits.Guilds,
+          GatewayIntentBits.GuildMessages,
+          GatewayIntentBits.MessageContent,
+        ],
+      });
+  }
+
+  private readonly onWarning: ((message: string) => void) | undefined;
+
+  private warn(context: string, error: Error): void {
+    const message = `${context}: ${error.message}`;
+    console.warn(`[discord] ${message}`);
+    try {
+      this.onWarning?.(message);
+    } catch (logError) {
+      console.error("[discord] warning persistence:", logError);
+    }
+  }
 
   async start(
     onCommand: (command: DiscordCommand) => Promise<void>,
     onMessage: (message: DiscordMessage) => Promise<void>,
   ): Promise<void> {
+    this.client.on(Events.Error, (error) => this.warn("client error", error));
+    this.client.on(Events.ShardError, (error, shardId) => this.warn(`shard ${shardId} error`, error));
     this.client.on("interactionCreate", (interaction) => {
       if (!interaction.isChatInputCommand()) return;
       const command = interaction as ChatInputCommandInteraction;
@@ -196,8 +222,10 @@ export class DiscordIntegration {
   private readonly progressCount = new Map<string, number>();
   private readonly lastProgressAt = new Map<string, number>();
   private readonly finalSent = new Set<string>();
+  private readonly finalPending = new Set<string>();
+  private readonly pendingThreadPosts = new Map<string, string[]>();
   private readonly noticeSent = new Set<string>();
-  private readonly queues = new Map<string, Promise<void>>();
+  private readonly queues = new Map<string, Promise<boolean>>();
   private readonly mentionQueues = new Map<string, Promise<void>>();
 
   constructor(
@@ -240,8 +268,8 @@ export class DiscordIntegration {
       } else if (msg.kind === "run" && TERMINAL_STATUSES.includes(msg.run.status)) {
         const run = msg.run;
         const thread = this.threadId(run);
-        if (thread && !this.finalSent.has(run.id)) {
-          this.finalSent.add(run.id);
+        if (thread && !this.finalSent.has(run.id) && !this.finalPending.has(run.id)) {
+          this.finalPending.add(run.id);
           const url = this.runUrl(run.id);
           const description = [
             `Status: ${run.status}`,
@@ -251,7 +279,10 @@ export class DiscordIntegration {
           ]
             .filter(Boolean)
             .join("\n");
-          this.enqueue(thread, "", { title: run.title.slice(0, 256), description });
+          void this.enqueue(thread, "", { title: run.title.slice(0, 256), description }).then((sent) => {
+            this.finalPending.delete(run.id);
+            if (sent) this.finalSent.add(run.id);
+          });
         } else if (
           run.source !== "discord" &&
           this.factory.cfg.discordNotifyAll &&
@@ -290,19 +321,33 @@ export class DiscordIntegration {
       ? run.sourceRef.threadId
       : null;
   }
-  private enqueue(channel: string, content: string, embed?: { title: string; description: string }): void {
+  private enqueue(
+    channel: string,
+    content: string,
+    embed?: { title: string; description: string },
+  ): Promise<boolean> {
     const previous = this.queues.get(channel) ?? Promise.resolve();
     const next = previous
       .then(() => this.port.sendMessage(channel, content, embed))
-      .catch((error) => console.error("[discord] send:", error));
+      .then(() => true)
+      .catch((error) => {
+        console.error("[discord] send:", error);
+        return false;
+      });
     this.queues.set(channel, next);
     void next.then(() => {
       if (this.queues.get(channel) === next) this.queues.delete(channel);
     });
+    return next;
   }
   private toThread(run: Run, content: string): void {
     const thread = this.threadId(run);
     if (thread) this.enqueue(thread, content);
+    else if (run.source === "discord") {
+      const pending = this.pendingThreadPosts.get(run.id) ?? [];
+      pending.push(content);
+      this.pendingThreadPosts.set(run.id, pending);
+    }
   }
 
   async command(command: DiscordCommand): Promise<void> {
@@ -405,7 +450,10 @@ export class DiscordIntegration {
         threadId,
       });
       this.enqueue(threadId, `Run ${run.id} started. Reply here to answer questions.`);
+      for (const content of this.pendingThreadPosts.get(run.id) ?? []) this.enqueue(threadId, content);
+      this.pendingThreadPosts.delete(run.id);
     } catch (error) {
+      this.pendingThreadPosts.delete(run.id);
       console.error("[discord] create thread:", error);
     }
   }
@@ -492,7 +540,12 @@ export function mountDiscord(
     return { note: `Discord disabled: missing ${missing.join(", ")}`, stop: async () => {} };
   const integration = new DiscordIntegration(
     factory,
-    port ?? new GatewayDiscordPort(factory.cfg.secrets.DISCORD_BOT_TOKEN ?? ""),
+    port ??
+      new GatewayDiscordPort(factory.cfg.secrets.DISCORD_BOT_TOKEN ?? "", {
+        onWarning: (message) => {
+          factory.store.addEvent({ runId: "integration:discord", type: "log", level: "warn", message });
+        },
+      }),
   );
   integration.start();
   return { note: "Discord enabled", stop: () => integration.stop(), integration };

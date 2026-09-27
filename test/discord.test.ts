@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,8 @@ import {
   type ApplicationCommandDataResolvable,
   ApplicationCommandOptionType,
   ApplicationCommandType,
+  type Client,
+  Events,
 } from "discord.js";
 import type { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
@@ -15,6 +18,7 @@ import {
   type DiscordCommand,
   type DiscordMessage,
   type DiscordPort,
+  GatewayDiscordPort,
   mountDiscord,
 } from "../src/integrations/discord.ts";
 import { chatFixture, proposalFields } from "./chat-support.ts";
@@ -27,6 +31,9 @@ class FakePort implements DiscordPort {
   definitions: readonly ApplicationCommandDataResolvable[] = [];
   posts: { channel: string; content: string; embed?: { title: string; description: string } }[] = [];
   threadNames: string[] = [];
+  threadDelay: Promise<void> | null = null;
+  sendAttempts: { channel: string; content: string; embed?: { title: string; description: string } }[] = [];
+  failFirstSummary = false;
   stopped = false;
   failStart = false;
   failThread = false;
@@ -45,6 +52,7 @@ class FakePort implements DiscordPort {
   }
   async createThread(_channel: string, name: string): Promise<string> {
     this.threadNames.push(name);
+    if (this.threadDelay) await this.threadDelay;
     if (this.failThread) throw new Error("thread unavailable");
     return "thread-1";
   }
@@ -53,6 +61,11 @@ class FakePort implements DiscordPort {
     content: string,
     embed?: { title: string; description: string },
   ): Promise<void> {
+    this.sendAttempts.push({ channel, content, ...(embed ? { embed } : {}) });
+    if (embed && this.failFirstSummary) {
+      this.failFirstSummary = false;
+      throw new Error("summary send failed");
+    }
     this.posts.push({ channel, content, ...(embed ? { embed } : {}) });
   }
   async stop(): Promise<void> {
@@ -148,6 +161,53 @@ test("missing settings disable Discord and startup failure does not stop the fac
   expect(port.stopped).toBe(true);
 });
 
+test("gateway client and shard errors warn and later messages still arrive", async () => {
+  const emitter = Object.assign(new EventEmitter(), {
+    login: async () => "token",
+    isReady: () => true,
+    destroy: () => {},
+  });
+  const client = emitter as unknown as Client;
+  const gateway = new GatewayDiscordPort("token", {
+    client,
+    onWarning: (message) => {
+      store.addEvent({ runId: "integration:discord", type: "log", level: "warn", message });
+    },
+  });
+  const warnings = spyOn(console, "warn").mockImplementation(() => {});
+  const messages: DiscordMessage[] = [];
+  try {
+    await gateway.start(
+      async () => {},
+      async (message) => {
+        messages.push(message);
+      },
+    );
+    expect(() => client.emit(Events.Error, new Error("socket lost"))).not.toThrow();
+    expect(() => client.emit(Events.ShardError, new Error("gateway lost"), 3)).not.toThrow();
+    emitter.emit(Events.MessageCreate, {
+      id: "message-1",
+      guildId: "guild",
+      channelId: "channel",
+      author: { id: "owner", bot: false },
+      content: "still connected",
+    });
+    await Bun.sleep(0);
+    expect(warnings.mock.calls).toEqual([
+      ["[discord] client error: socket lost"],
+      ["[discord] shard 3 error: gateway lost"],
+    ]);
+    expect(store.listEvents("integration:discord")).toMatchObject([
+      { level: "warn", message: "client error: socket lost" },
+      { level: "warn", message: "shard 3 error: gateway lost" },
+    ]);
+    expect(messages).toMatchObject([{ content: "still connected" }]);
+  } finally {
+    warnings.mockRestore();
+    await gateway.stop();
+  }
+});
+
 test("registers guild commands and owner gate protects all commands", async () => {
   const mounted = mountDiscord(factory, port);
   await Bun.sleep(0);
@@ -213,6 +273,43 @@ test("stage and question updates route to the recorded thread, with bounded prog
   expect(posts.find((post) => post.embed)?.embed?.description).toContain("https://example.test/pr/1");
   expect(posts.find((post) => post.embed)?.embed?.description).toContain("subscription-equivalent");
   expect(port.posts.some((post) => post.channel === "channel")).toBe(false);
+  await mounted.stop();
+});
+
+test("stage and question events during thread creation reach the new thread once", async () => {
+  const mounted = mountDiscord(factory, port);
+  let releaseThread: (() => void) | undefined;
+  port.threadDelay = new Promise<void>((resolve) => {
+    releaseThread = resolve;
+  });
+  const building = command("build", { repo: "local/test", prompt: "early events" });
+  await Bun.sleep(0);
+  const run = store.listRuns()[0];
+  if (!run) throw new Error("run missing");
+  expect(store.getRun(run.id)?.sourceRef?.threadId).toBeUndefined();
+  store.startStage(run.id, "prepare");
+  store.askQuestion(run.id, "Early question?");
+  releaseThread?.();
+  await building;
+  await Bun.sleep(0);
+  expect(port.posts.filter((post) => post.content === "Stage: prepare")).toHaveLength(1);
+  expect(port.posts.filter((post) => post.content === "Question: Early question?")).toHaveLength(1);
+  await mounted.stop();
+});
+
+test("failed terminal summary send retries on a later terminal update", async () => {
+  const mounted = mountDiscord(factory, port);
+  const run = await build();
+  port.failFirstSummary = true;
+  store.updateRun(run.id, { status: "succeeded" });
+  await Bun.sleep(0);
+  store.updateRun(run.id, { title: "Updated title" });
+  await Bun.sleep(0);
+  expect(port.sendAttempts.filter((post) => post.embed)).toHaveLength(2);
+  expect(port.posts.filter((post) => post.embed)).toHaveLength(1);
+  store.updateRun(run.id, { title: "Again" });
+  await Bun.sleep(0);
+  expect(port.posts.filter((post) => post.embed)).toHaveLength(1);
   await mounted.stop();
 });
 

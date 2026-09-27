@@ -25,7 +25,13 @@ function child(root: string, id: string): string {
 }
 
 function canonical(path: string): string {
-  return join(realpathSync(dirname(path)), basename(path));
+  try {
+    return join(realpathSync(dirname(path)), basename(path));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      return join(canonical(dirname(path)), basename(path));
+    throw error;
+  }
 }
 
 function worktreePaths(porcelain: string): Set<string> {
