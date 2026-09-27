@@ -1,7 +1,7 @@
 import type { Effort, EvalRun, EvalTrial } from "../core/types.ts";
 import type { ModelDef, Policy, ProviderDef } from "../router/catalog.ts";
 import type { PolicyOverlay } from "../router/policy.ts";
-import { effortTransportError, parseTarget, recordedTarget } from "../router/targets.ts";
+import { effortTransportError, evidenceTarget, parseTarget, recordedTarget } from "../router/targets.ts";
 import type { EvalSettings } from "./settings.ts";
 import { completeCases, pairedBootstrap, summarize, wilson } from "./stats.ts";
 
@@ -40,10 +40,8 @@ export function selectEvidence(evidence: Evidence[], ids?: string[]) {
   for (const entry of ordered)
     for (const modelId of [
       ...new Set([
-        ...entry.trials.map(recordedTarget),
-        ...entry.run.models.filter(
-          (id) => !entry.trials.some((t) => t.modelId === id || recordedTarget(t) === id),
-        ),
+        ...entry.trials.map(evidenceTarget),
+        ...entry.run.models.filter((id) => !entry.trials.some((t) => recordedTarget(t) === id)),
       ]),
     ]) {
       const key = `${entry.run.role}:${modelId}`;
@@ -89,7 +87,7 @@ export function generatePolicy(input: PolicyInput) {
     const entries = selected
       .filter((e) => e.run.role === role)
       .map((entry) => {
-        const rows = entry.trials.filter((t) => recordedTarget(t) === entry.modelId);
+        const rows = entry.trials.filter((t) => evidenceTarget(t) === entry.modelId);
         const summary = summarize({ ...entry.run, models: [entry.modelId] }, rows)[0];
         if (!summary) throw new Error("Missing model summary");
         const baseId = rows[0]?.modelId ?? parseTarget(entry.modelId).modelId;

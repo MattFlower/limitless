@@ -426,7 +426,7 @@ test("policy selects latest evidence per effort, costs them independently and re
   expect(candidates.find((c) => c.modelId === "codex/luna@low")?.run.id).toBe("low-new");
   expect(candidates.find((c) => c.modelId === "codex/luna@high")?.run.id).toBe("high");
   expect(result.generated.triage?.default).toEqual(["codex/luna@low", "codex/luna@high"]);
-  expect(candidates.find((c) => c.modelId === "codex/luna")?.reasons).toContain(
+  expect(candidates.find((c) => c.modelId === "codex/luna (unknown effort)")?.reasons).toContain(
     "legacy evidence with unknown effort",
   );
   expect(candidates.find((c) => c.modelId === "codex/luna@max")?.reasons).toContain(
@@ -449,7 +449,7 @@ test("fresh bare evals of models without a default effort qualify; legacy unknow
   const candidates = result.roles[0]?.candidates ?? [];
   expect(fresh.trials.find((t) => t.modelId === "claude/opus")?.effort).toBe("default");
   expect(candidates.find((c) => c.modelId === "claude/opus")?.eligible).toBe(true);
-  expect(candidates.find((c) => c.modelId === "claude/sonnet")?.reasons).toContain(
+  expect(candidates.find((c) => c.modelId === "claude/sonnet (unknown effort)")?.reasons).toContain(
     "legacy evidence with unknown effort",
   );
   expect(result.generated.triage?.default).toContain("claude/opus");
@@ -458,6 +458,40 @@ test("fresh bare evals of models without a default effort qualify; legacy unknow
   const models = MODELS.map((m) => (m.id === "claude/opus" ? { ...m, effort: "high" as const } : m));
   const changed = generatePolicy({ ...input([fresh]), models });
   expect(changed.roles[0]?.candidates.find((c) => c.modelId === "claude/opus")?.eligible).toBe(false);
+});
+
+test("legacy unknown-effort rows never pool with or displace backend-default evidence", async () => {
+  const { validatePolicy } = await import("../src/router/policy.ts");
+  // One run holding one backend-default trial and 39 legacy unknown-effort trials.
+  const mixed = evidence("triage", ["claude/opus"], { id: "mixed" });
+  for (const t of mixed.trials.slice(1)) t.effort = null;
+  const result = generatePolicy(input([mixed]));
+  const candidates = result.roles[0]?.candidates ?? [];
+  const known = candidates.find((c) => c.modelId === "claude/opus");
+  const unknown = candidates.find((c) => c.modelId === "claude/opus (unknown effort)");
+  expect(known?.summary.evaluatedTrials).toBe(1);
+  expect(known?.summary.effort).toBe("default");
+  expect(known?.eligible).toBe(false);
+  expect(unknown?.summary.evaluatedTrials).toBe(39);
+  expect(unknown?.summary.effort).toBeNull();
+  expect(unknown?.state).toBe("ineligible");
+  expect(unknown?.reasons).toContain("legacy evidence with unknown effort");
+  expect(result.generated.triage).toBeUndefined();
+
+  // Newer unknown-effort evidence cannot displace older backend-default evidence.
+  const known40 = evidence("triage", ["claude/opus"], { id: "known", finishedAt: 2000 });
+  const legacy = evidence("triage", ["claude/opus"], { id: "legacy", finishedAt: 5000 });
+  for (const t of legacy.trials) t.effort = null;
+  expect(selectEvidence([legacy, known40]).map((e) => [e.modelId, e.run.id])).toEqual([
+    ["claude/opus", "known"],
+    ["claude/opus (unknown effort)", "legacy"],
+  ]);
+  const later = generatePolicy(input([legacy, known40]));
+  const selected = later.roles[0]?.candidates.find((c) => c.modelId === "claude/opus");
+  expect(selected?.run.id).toBe("known");
+  expect(selected?.summary.evaluatedTrials).toBe(40);
+  expect(later.generated.triage?.default).toEqual(["claude/opus"]);
+  expect(validatePolicy(later.generated, MODELS)).toEqual(later.generated);
 });
 
 test("effort a role's transport cannot deliver is never emitted", () => {

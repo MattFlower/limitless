@@ -59,3 +59,11 @@ export function recordEffort(effort: Effort | undefined): RecordedEffort {
 export function recordedTarget(target: { modelId: string; effort?: string | null }): string {
   return formatTarget(target.modelId, target.effort);
 }
+/**
+ * Evidence identity for statistics and policy generation. Unlike the policy reference, it keeps
+ * legacy unknown effort (null) apart from backend-default ("default") evidence, so the two are
+ * never pooled or allowed to displace each other. It is not a valid policy reference.
+ */
+export function evidenceTarget(target: { modelId: string; effort?: string | null }): string {
+  return target.effort === null ? `${target.modelId} (unknown effort)` : recordedTarget(target);
+}

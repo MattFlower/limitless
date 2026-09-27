@@ -1,5 +1,5 @@
 import type { EvalRun, EvalTrial } from "../core/types.ts";
-import { recordedTarget } from "../router/targets.ts";
+import { evidenceTarget, recordedTarget } from "../router/targets.ts";
 
 export interface StatsOptions {
   delta?: number;
@@ -124,12 +124,12 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
   const settings = statsOptions(options);
   const targets = [
     ...new Set([
-      ...trials.map(recordedTarget),
-      ...run.models.filter((id) => !trials.some((t) => t.modelId === id || recordedTarget(t) === id)),
+      ...trials.map(evidenceTarget),
+      ...run.models.filter((id) => !trials.some((t) => recordedTarget(t) === id)),
     ]),
   ];
   const summaries = targets.map((modelId) => {
-    const rows = trials.filter((t) => recordedTarget(t) === modelId);
+    const rows = trials.filter((t) => evidenceTarget(t) === modelId);
     const evaluated = rows.filter((t) => t.pass !== null && ["ok", "error"].includes(t.status));
     const passes = evaluated.filter((t) => t.pass).length;
     const risk = rows.flatMap((t) =>
@@ -184,12 +184,12 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
         (b.passRate ?? 0) - (a.passRate ?? 0) || (a.modelId < b.modelId ? -1 : a.modelId > b.modelId ? 1 : 0),
     )[0];
   const bestCases = completeCases(
-    trials.filter((t) => recordedTarget(t) === best?.modelId),
+    trials.filter((t) => evidenceTarget(t) === best?.modelId),
     run.k,
   );
   return summaries.map((summary) => {
     const candidate = completeCases(
-      trials.filter((t) => recordedTarget(t) === summary.modelId),
+      trials.filter((t) => evidenceTarget(t) === summary.modelId),
       run.k,
     );
     const differences: number[] = [];

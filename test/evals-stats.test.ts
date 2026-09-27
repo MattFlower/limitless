@@ -15,7 +15,7 @@ export const run: EvalRun = {
 };
 export function trial(modelId: string, caseId: string, index: number, pass: boolean): EvalTrial {
   return {
-    effort: null,
+    effort: "default",
     evalRunId: run.id,
     modelId,
     caseId,
@@ -198,8 +198,21 @@ test("summaries and paired comparisons separate efforts of the same base model",
     ["a@low", 0],
     ["a@high", 1],
     ["a@none", 1],
-    ["a", 0],
+    ["a (unknown effort)", 0],
   ]);
   expect(rows.every((s) => s.evaluatedTrials === 1 && s.comparison.pairedCases === 1)).toBe(true);
-  expect(rows.find((s) => s.modelId === "a")?.effort).toBeNull();
+  expect(rows.find((s) => s.modelId === "a (unknown effort)")?.effort).toBeNull();
+});
+
+test("legacy unknown effort and backend-default rows are summarized separately", () => {
+  const trials = [
+    trial("a", "case", 0, true),
+    { ...trial("a", "other", 0, false), effort: null },
+    { ...trial("a", "third", 0, false), effort: null },
+  ];
+  const rows = summarize({ ...run, models: ["a"], k: 1 }, trials);
+  expect(rows.map((s) => [s.modelId, s.effort, s.evaluatedTrials, s.passRate])).toEqual([
+    ["a", "default", 1, 1],
+    ["a (unknown effort)", null, 2, 0],
+  ]);
 });
