@@ -52,18 +52,34 @@ for (const [role, field, bound] of [
   ["review", "review_clean_false_block_rate", "upper"],
   ["verify", "verify_false_accept_rate", "upper"],
 ] as const)
-  test(`${field}: inclusive Wilson boundary and rejection beyond it`, () => {
+  test(`${field}: inclusive boundary (Wilson lower bound for floors, observed rate for ceilings)`, () => {
     const rows = [evidence(role)];
+    // Two error events so the ceiling boundary is a real nonzero rate.
+    for (const t of rows[0]?.trials.filter((t) => t.details.grade?.review?.falseBlock !== null).slice(0, 2) ??
+      []) {
+      const grade = t.details.grade;
+      if (!grade) throw new Error("missing grade");
+      if (grade.riskUnderCall !== null) grade.riskUnderCall = true;
+      if (grade.review) grade.review.falseBlock = true;
+      if (grade.verify) grade.verify.falseAccepts = 1;
+    }
     const initial = first(input(rows));
     const index =
       field === "triage_risk_under_call_rate" || field === "review_clean_false_block_rate" ? 1 : 0;
-    const ci = initial.metrics[index]?.ci;
-    if (!ci) throw new Error("missing interval");
-    const threshold = ci[bound === "lower" ? 0 : 1];
+    const metric = initial.metrics[index];
+    if (!metric?.ci || metric.rate === null) throw new Error("missing interval");
+    const threshold = bound === "lower" ? metric.ci[0] : metric.rate;
+    if (bound === "upper") {
+      expect(metric.rate).toBeGreaterThan(0);
+      // The Wilson upper bound sits above the ceiling; it is reported, not enforced.
+      expect(metric.ci[1]).toBeGreaterThan(threshold);
+    }
     const settings = evalSettings({ evals: { floors: { [field]: threshold } } });
     expect(first(input(rows, { settings })).eligible).toBe(true);
     settings.floors[field] = threshold + (bound === "lower" ? 0.0001 : -0.0001);
-    expect(first(input(rows, { settings })).eligible).toBe(false);
+    const rejected = first(input(rows, { settings }));
+    expect(rejected.eligible).toBe(false);
+    expect(rejected.reasons.join()).toContain(bound === "lower" ? "is below floor" : "exceeds ceiling");
   });
 
 test("missing required observations and incomplete pairs cannot become eligible", () => {

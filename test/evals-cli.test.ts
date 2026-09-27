@@ -187,8 +187,7 @@ test("policy CLI reports no-op proposals and unchanged all-ineligible evidence",
 test("policy CLI preview names the specific rejection when a role has no eligible model", async () => {
   const { evidence, response, local } = await import("./evals-policy-support.ts");
   const record = evidence("triage", [local]);
-  const first = record.trials[0];
-  if (first?.details.grade) first.details.grade.riskUnderCall = true;
+  for (const t of record.trials.slice(0, 5)) if (t.details.grade) t.details.grade.riskUnderCall = true;
   const data = response([record]);
   const printed: string[] = [];
   const writes: string[] = [];
@@ -206,6 +205,61 @@ test("policy CLI preview names the specific rejection when a role has no eligibl
   const output = printed.join("\n");
   expect(output).toContain("No effective policy changes.");
   expect(output).toContain(
-    `triage unchanged: no eligible models (${local}: risk under-call upper bound 0.1288 exceeds ceiling 0.1)`,
+    `triage unchanged: no eligible models (${local}: risk under-call rate 0.1250 exceeds ceiling 0.1)`,
   );
+});
+
+test("policy CLI turns a small fake-harness eval into a written overlay through the real routes", async () => {
+  const f = await evalFixture();
+  try {
+    const routes = createHttpRoutes(f.factory);
+    const files = new Map<string, string>();
+    const printed: string[] = [];
+    const io = {
+      async api<T>(path: string, init?: RequestInit): Promise<T> {
+        const pathname = new URL(path, "http://localhost:7400").pathname;
+        const id = pathname.split("/").at(-1) ?? "";
+        const route =
+          pathname === "/api/evals"
+            ? (routes[pathname] as { POST: Route }).POST
+            : pathname === "/api/evals/policy"
+              ? (routes[pathname] as Route)
+              : (routes["/api/evals/:id"] as Route);
+        const response = await route(
+          requestWithParams(
+            `http://localhost:7400${path}`,
+            { ...init, headers: { "content-type": "application/json" } },
+            { id },
+          ),
+          {} as Server<undefined>,
+        );
+        const result = await response.json();
+        if (!response.ok) throw new Error((result as { error: string }).error);
+        return result as T;
+      },
+      print: (text: string) => printed.push(text),
+      wait: async () => {},
+      files: {
+        read: async (path: string) => files.get(path) ?? null,
+        write: async (path: string, text: string) => void files.set(path, text),
+      },
+    };
+    await f.run();
+    await evalCommand(["policy"], {}, io);
+    expect(files.size).toBe(0);
+    expect(printed[0]).toContain("@@ triage.default @@");
+    expect(printed[0]).toContain('+ ["candidate-a","candidate-b"]');
+    expect(printed[0]).not.toContain("No effective policy changes");
+    await evalCommand(["policy"], { write: true }, io);
+    expect(JSON.parse(files.get("routing/policy.json") ?? "")).toEqual({
+      triage: { default: ["candidate-a", "candidate-b"] },
+    });
+    const evidence = files.get("routing/EVIDENCE.md") ?? "";
+    expect(evidence).toContain("Update triage.default: candidate-a → candidate-b");
+    expect(evidence).toContain("risk under-call: 0.0000 (0/6)");
+    await evalCommand(["policy"], { write: true }, io);
+    expect(files.get("routing/EVIDENCE.md")).toBe(evidence);
+  } finally {
+    await f.close();
+  }
 });

@@ -14,7 +14,7 @@ export function renderEvidence(evaluation: PolicyEvaluation): string {
     "",
     "Policy changes land through reviewed PRs; the diff is the approval. Deploy/restart to activate.",
     "",
-    `Floors (inclusive Wilson 95% bounds): ${JSON.stringify(settings.floors)}`,
+    `Floors (inclusive; pass rate and defect recall use the Wilson 95% lower bound, error-rate ceilings cap the observed rate): ${JSON.stringify(settings.floors)}`,
     `Paired bootstrap: delta=${settings.delta}; seed=${DEFAULT_STATS.seed}; resamples=${DEFAULT_STATS.resamples}; one-sided 95% lower bound must be strictly > -delta.`,
     `Subscription weight=${settings.subscription_weight}; origin exclusions=${JSON.stringify(settings.excludeOrigins ?? null)} (when configured, unknown baseOrigin is excluded).`,
     "Cost/case averages case attempts over repetitions, including attempted failures, excluding skips and preparation failures. Local=0; metered=recorded dollars; subscription=API-equivalent dollars × weight. Cache replays use original cost provenance for estimates only; recorded spend stays unchanged.",

@@ -43,7 +43,8 @@ evals/<role>/*.json ──► runner ──► role fn (same prompts/schemas) �
 - **Stats**: Wilson intervals for pass and role metrics; seeded paired bootstrap against
   the best selected model in the role.
 - **Policy generator** (pure): for each supported role default cell, choose the cheapest model whose
-  required Wilson 95% bounds clear the role's floors **and** that is non-inferior to the best model
+  Wilson 95% lower bound clears the role's quality floor, whose observed error rates stay under the
+  role's ceilings **and** that is non-inferior to the best model
   within δ = 0.10; the fallback chain lists other eligible models by ascending cost. Complexity-specific
   cells remain unchanged. Output is `routing/policy.json` (loaded over `DEFAULT_POLICY`)
   plus `routing/EVIDENCE.md` with the numbers behind every cell. **Policy changes land as a PR**,
@@ -55,9 +56,9 @@ evals/<role>/*.json ──► runner ──► role fn (same prompts/schemas) �
 
 | Role | Cases | Source | Grader | Primary metric (floor) |
 |---|---|---|---|---|
-| triage | 40 | own run prompts + boundary cases | exact match per field, cost-weighted | pass-rate lower bound ≥0.60; risk under-call upper bound ≤0.10 |
-| review | 30 | 12 seeded defects, 8 real defects our gates caught, 10 clean merged diffs | file + line-window match on the JSON verdict | defect-recall lower bound ≥0.50; clean false-block upper bound ≤0.34 |
-| verify | 20 | labeled (criteria, diff, test output) triples, incl. "tests pass, criterion unmet" | per-criterion match | false-accept upper bound ≤0.10 |
+| triage | 40 | own run prompts + boundary cases | exact match per field, cost-weighted | pass-rate Wilson lower bound ≥0.60; risk under-call rate ≤0.10 |
+| review | 30 | 12 seeded defects, 8 real defects our gates caught, 10 clean merged diffs | file + line-window match on the JSON verdict | defect-recall Wilson lower bound ≥0.50; clean false-block rate ≤0.34 |
+| verify | 20 | labeled (criteria, diff, test output) triples, incl. "tests pass, criterion unmet" | per-criterion match | false-accept rate ≤0.10 |
 | holdout | 8 | sandbox tasks with reference solution + 3 mutants | execution | valid-on-reference × mutant kill rate |
 | implement | 12 | 8 sandbox replays + 4 small Limitless commits, stratified trivial/small/medium | hidden tests + gates + audit | resolve rate; $ and quota per task; wall time |
 | spec, chat | — | deferred (structure lint only) | — | — |
@@ -192,12 +193,17 @@ exclude_origins = ["CN"] # Optional; omit to apply no origin filter
 
 These are the implemented defaults, replacing earlier proposed suite floors. Floors and delta
 must be finite numbers in [0,1]; subscription_weight must be finite and nonnegative. Malformed
-supplied values fail validation. Triage requires the pass-rate **lower** Wilson 95% bound at least
-0.60 and risk-under-call **upper** bound at most 0.10. Review requires defect-recall lower bound at
-least 0.50 and clean false-block upper bound at most 0.34. Verify requires false-accept upper bound
-at most 0.10. Floor comparisons are inclusive. Missing denominators are insufficient evidence,
-never zero error. Role metrics retain pooled persisted labels across repetitions and disclose
-prediction coverage; failed/invalid calls contribute pass failures without prediction observations.
+supplied values fail validation. Floors on quality metrics use the Wilson 95% **lower** bound:
+triage requires the pass-rate lower bound at least 0.60 and review requires the defect-recall
+lower bound at least 0.50. Ceilings on error metrics cap the **observed pooled rate**: triage
+risk under-call at most 0.10, review clean false-block at most 0.34, verify false-accept at most
+0.10. Ceilings deliberately do not use the Wilson upper bound: clearing 0.10 with that bound needs
+35+ zero-error observations, so the suite's 20-40 case datasets (six clean review diffs) could never
+establish a low error rate. The interval is still reported beside every rate so reviewers can
+judge its precision. All comparisons are inclusive. Missing denominators are insufficient
+evidence, never zero error. Role metrics retain pooled persisted labels across repetitions and
+disclose prediction coverage; failed/invalid calls contribute pass failures without prediction
+observations.
 
 Comparisons are recomputed across the selected evidence. The reference has the highest observed
 pass rate among models with known catalog/provider metadata that are not origin-excluded (model-ID
@@ -205,11 +211,13 @@ ascending tie-break), before floors and cost ordering. Matching role and case ID
 each model must have all k scored ok/error observations for a case, though models can have different
 k. The existing paired bootstrap uses per-case mean pass differences, seed 20260926 and 10,000
 resamples. Non-inferiority requires the one-sided 95% lower bound **strictly greater than -delta**;
-no complete paired cases is insufficient evidence. A candidate with any hard rejection (failed floor,
-failed non-inferiority, origin exclusion, missing catalog/provider metadata or an invalid recorded
-cost) is **ineligible**; it is labelled insufficient evidence only when every reason is missing
-evidence. Hard-rejected candidates cannot be the reference, so when no allowed reference exists
-they are not additionally flagged for missing paired cases. Reusing a case ID after substantive dataset
+no complete paired cases is insufficient evidence. A candidate with any hard rejection (failed floor
+or ceiling, failed non-inferiority, origin exclusion, missing catalog/provider metadata or an invalid
+recorded cost) is **ineligible**; it is labelled insufficient evidence only when every reason is
+missing evidence. Only missing catalog/provider metadata or an origin exclusion bars a candidate
+from being the reference; a candidate that fails a floor, ceiling or cost check can still be the
+reference. When every candidate is barred there is no reference, and candidates are not additionally
+flagged for missing paired cases. Reusing a case ID after substantive dataset
 changes can invalidate historical comparisons; dataset fingerprints are not backfilled.
 
 Routing cost per case is averaged over **case attempts**, including attempted failures, excluding
@@ -230,8 +238,9 @@ Eligible models clear every required floor, establish non-inferiority, and have 
 metadata and applicable cost estimates. They sort by routing cost/case, then p50 latency, then model
 ID. Each becomes a singleton preference group: the first is preferred and later entries are fallbacks.
 A role with no eligible candidate is left unchanged with an explanation that lists each
-candidate's rejection reasons (e.g. `risk under-call upper bound 0.1050 exceeds ceiling 0.1`, the
-Wilson upper bound for 1 under-call in 50 observations). Only supported **default**
+candidate's rejection reasons (e.g. `risk under-call rate 0.1250 exceeds ceiling 0.1` for 5
+under-calls in 40 observations, or `pass rate lower bound 0.5981 is below floor 0.6` for 30 passes
+in 40 trials). Only supported **default**
 cells are generated: current evidence does not justify replacing review.large, verify.large or other
 complexity-specific cells.
 

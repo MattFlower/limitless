@@ -45,6 +45,11 @@ export function selectEvidence(evidence: Evidence[], ids?: string[]) {
     (a, b) => compareId(a.run.role, b.run.role) || compareId(a.modelId, b.modelId),
   );
 }
+/**
+ * Floors ("lower") require the Wilson 95% lower bound; ceilings ("upper") cap the observed rate.
+ * A ceiling on the Wilson upper bound would need 35+ zero-error observations to clear 0.10, so the
+ * suite's 20-40 case datasets could never establish an error rate below it.
+ */
 function metric(
   name: string,
   numerator: number,
@@ -52,15 +57,19 @@ function metric(
   direction: "lower" | "upper",
   floor: number,
 ) {
-  return {
-    name,
-    numerator,
-    denominator,
-    rate: denominator ? numerator / denominator : null,
-    ci: wilson(numerator, denominator),
-    direction,
-    floor,
-  };
+  const rate = denominator ? numerator / denominator : null;
+  const ci = wilson(numerator, denominator);
+  const reason =
+    rate === null || !ci
+      ? `insufficient evidence: ${name} has no observations`
+      : direction === "lower"
+        ? ci[0] < floor
+          ? `${name} lower bound ${ci[0].toFixed(4)} is below floor ${floor}`
+          : null
+        : rate > floor
+          ? `${name} rate ${rate.toFixed(4)} exceeds ceiling ${floor}`
+          : null;
+  return { name, numerator, denominator, rate, ci, direction, floor, reason };
 }
 export function generatePolicy(input: PolicyInput) {
   const { models, providers, settings } = input;
@@ -130,15 +139,7 @@ export function generatePolicy(input: PolicyInput) {
                     f.verify_false_accept_rate,
                   ),
                 ];
-        for (const m of metrics) {
-          if (!m.ci) reasons.push(`insufficient evidence: ${m.name} has no observations`);
-          else if (m.direction === "lower" ? m.ci[0] < m.floor : m.ci[1] > m.floor)
-            reasons.push(
-              m.direction === "lower"
-                ? `${m.name} lower bound ${m.ci[0].toFixed(4)} is below floor ${m.floor}`
-                : `${m.name} upper bound ${m.ci[1].toFixed(4)} exceeds ceiling ${m.floor}`,
-            );
-        }
+        for (const m of metrics) if (m.reason) reasons.push(m.reason);
         const attempts = rows.filter(
           (t) => ["ok", "error"].includes(t.status) && !t.details.preparationFailed,
         );
@@ -189,7 +190,8 @@ export function generatePolicy(input: PolicyInput) {
         bestCompleteCases: best?.complete.size ?? 0,
         ...pairedBootstrap(differences, { delta: settings.delta }),
       };
-      // A hard-rejected candidate cannot be the reference, so a missing reference says nothing about it.
+      // Only metadata-less or origin-excluded candidates are barred from being the reference; when
+      // every candidate is barred there is no reference, and that says nothing about paired coverage.
       if (comparison.nonInferior === null) {
         if (referenceAllowed || best) entry.reasons.push("insufficient evidence: no complete paired cases");
       } else if (!comparison.nonInferior) entry.reasons.push("non-inferiority not established");

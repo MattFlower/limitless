@@ -195,7 +195,9 @@ Line 0 matches only file-level completeness defects. Verify missing/unclear/dupl
 neither binary label and count as false rejects for gold-met criteria. Overall is not used to grade.
 
 Models API/UI origin and base-origin metadata identify checkpoint organizations, not hosting
-providers. US/FR/CN values and `unknown` ancestry are descriptive only; enforcement comes later.
+providers. US/FR/CN values and `unknown` ancestry do not affect runtime routing or escalation; when
+`[routing].exclude_origins` is configured, the policy generator and the Evals matrix exclude models
+whose origin or baseOrigin is listed or whose baseOrigin is `unknown` (see below).
 
 
 ### Generate a routing policy from evals
@@ -216,7 +218,9 @@ changes can therefore also appear in the diff. Roles without eligible results re
 change. `routing/EVIDENCE.md` contains the reproducible evidence and unchanged-role explanations.
 
 The [policy configuration and formulas](EVALS.md#policy-generation-and-review) specify inclusive Wilson
-floors, strict paired non-inferiority, optional origin exclusions, and subscription_weight (default 0.25).
+lower-bound floors on pass rate and defect recall, inclusive observed-rate ceilings on risk under-call,
+clean false-block and false-accept, strict paired non-inferiority, optional origin exclusions, and
+subscription_weight (default 0.25).
 Cost/case averages attempts over repetitions; local is zero, metered is recorded dollars, subscriptions
 use weighted API-equivalent dollars, and cache estimates use original provenance without increasing
 recorded spend. Prediction and latency coverage and unavailable values are disclosed.
