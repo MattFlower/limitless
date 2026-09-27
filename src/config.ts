@@ -37,6 +37,7 @@ export interface Config {
   reserves: Reserves;
   /** Providers to try first among interchangeable models (e.g. use up a subscription). */
   preferProviders: string[];
+  dependabotRouting: "free_first" | "policy";
   githubOwner: string | null; // allowlisted GitHub login for triggers
   discordOwnerId: string | null;
   discordChannelId: string | null;
@@ -120,6 +121,12 @@ export function loadConfig(
   const owners = (raw.owners ?? {}) as Record<string, unknown>;
   const discord = (raw.discord ?? {}) as Record<string, unknown>;
   const routing = (raw.routing ?? {}) as Record<string, unknown>;
+  if (
+    routing.dependabot !== undefined &&
+    routing.dependabot !== "free_first" &&
+    routing.dependabot !== "policy"
+  )
+    throw new Error('routing.dependabot must be "free_first" or "policy"');
   const retention = (raw.retention ?? {}) as Record<string, unknown>;
   const port = overrides.port ?? num(Number(process.env.LIMITLESS_PORT) || server.port, 7400);
   const host = str(server.host, "127.0.0.1") as string;
@@ -159,6 +166,7 @@ export function loadConfig(
     preferProviders: Array.isArray(routing.prefer)
       ? routing.prefer.filter((p): p is string => typeof p === "string")
       : [],
+    dependabotRouting: routing.dependabot === "policy" ? "policy" : "free_first",
     githubOwner: str(owners.github, "MattFlower"),
     discordOwnerId: str(owners.discord, null),
     discordChannelId: str(discord.channel_id, null),

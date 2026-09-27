@@ -144,14 +144,29 @@ const pass = {
   notes: "",
 };
 
-function start(handler: Handler, effortRouting = false): Factory {
+function start(handler: Handler, effortRouting = false, freeProviders = false): Factory {
+  const alpha = models[0];
+  const beta = models[1];
+  if (!alpha || !beta) throw new Error("missing fixture models");
   const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
   factory = new Factory(cfg, {
     harnesses: { fake: fakeHarness(handler) },
-    providers,
+    providers: freeProviders
+      ? [
+          ...providers,
+          { id: "gamma", label: "Gamma", harness: "fake", billing: "free", maxConcurrent: 2 },
+          { id: "delta", label: "Delta", harness: "fake", billing: "free", maxConcurrent: 2 },
+        ]
+      : providers,
     models: effortRouting
       ? models.map((m): ModelDef => ({ ...m, supportedEfforts: ["low", "high"], effort: "low" }))
-      : models,
+      : freeProviders
+        ? [
+            ...models,
+            { ...alpha, id: "gamma/m", provider: "gamma", vendor: "anthropic", tier: 3 },
+            { ...beta, id: "delta/m", provider: "delta", vendor: "openai", tier: 5 },
+          ]
+        : models,
     policy: effortRouting ? { ...policy, implement: { default: ["alpha/m@high", "alpha/m@low"] } } : policy,
   });
   factory.start();
@@ -187,6 +202,113 @@ afterEach(async () => {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("Dependabot uses free models across quick stages and keeps them on feedback rounds", async () => {
+    const seen: { role: string; provider: string }[] = [];
+    let implementations = 0;
+    const f = start(
+      (s) => {
+        const role = roleOf(s);
+        seen.push({ role, provider: s.target.provider });
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        implementations++;
+        return { files: { "farewell.txt": implementations === 1 ? "BAD goodbye\n" : "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "quick",
+      requestedBy: "dependabot[bot]",
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(seen).toEqual([
+      { role: "triage", provider: "gamma" },
+      { role: "implement", provider: "gamma" },
+      { role: "implement", provider: "gamma" },
+      { role: "review", provider: "delta" },
+    ]);
+    expect(f.store.getArtifact(run.id, "report.md")).toContain("Routing: free-first (Dependabot)");
+  });
+
+  test("Dependabot falls back when free providers are unavailable; owner keeps policy routing", async () => {
+    const f = start(
+      (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    f.tracker.setEnabled("gamma", false);
+    f.tracker.setHealthy("delta", false);
+    for (const requestedBy of ["dependabot[bot]", "owner"]) {
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick", requestedBy });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(f.store.listInvocations(run.id).map((i) => [i.role, i.provider])).toEqual([
+        ["triage", "alpha"],
+        ["implement", "alpha"],
+        ["review", "beta"],
+      ]);
+      expect(f.store.getArtifact(run.id, "report.md")?.includes("Routing: free-first (Dependabot)")).toBe(
+        requestedBy === "dependabot[bot]",
+      );
+    }
+  });
+
+  test("Dependabot escalation keeps free-first routing with a minimum tier", async () => {
+    let implementations = 0;
+    const f = start(
+      (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        implementations++;
+        return { files: { "farewell.txt": implementations < 3 ? "BAD goodbye\n" : "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "quick",
+      requestedBy: "dependabot[bot]",
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.provider),
+    ).toEqual(["gamma", "gamma", "delta"]);
+  });
+
+  test("owner and policy opt-out ignore eligible free models", async () => {
+    mkdirSync(join(home, "cfg"));
+    writeFileSync(join(home, "cfg", "config.toml"), '[routing]\ndependabot = "policy"\n');
+    const f = start(
+      (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    for (const requestedBy of ["owner", "dependabot[bot]"]) {
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick", requestedBy });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(f.store.listInvocations(run.id).map((i) => i.provider)).toEqual(["alpha", "alpha", "beta"]);
+      expect(f.store.getArtifact(run.id, "report.md")).not.toContain("Routing: free-first");
+    }
+  });
+
   async function githubFixture(): Promise<string> {
     const bare = join(home, "github.git");
     await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
