@@ -4,7 +4,6 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   realpathSync,
   rmSync,
   statSync,
@@ -202,13 +201,15 @@ export async function gradeImplement(
     if (snapshot) {
       try {
         if (snapshotReady && evidence.reason !== null && !signal.aborted) {
-          for (const name of readdirSync(cwd)) rmSync(join(cwd, name), { recursive: true, force: true });
+          // Preserve ignored dependencies/build outputs across recovery rounds.
+          rmSync(join(cwd, ".git"), { recursive: true, force: true });
           cpSync(join(snapshot, ".git"), join(cwd, ".git"), { recursive: true, verbatimSymlinks: true });
           await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "HEAD"], {
             cwd,
             env,
             signal,
           });
+          await sh(["git", "clean", "-fd"], { cwd, env, signal });
           for (const [path, mode] of modes) chmodSync(join(cwd, path), mode);
         }
       } finally {

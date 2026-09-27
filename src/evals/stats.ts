@@ -134,7 +134,7 @@ function implementMetrics(rows: EvalTrial[]) {
     (t) => first(t).pass === false && ["gates", "audit", "hidden_tests"].includes(first(t).reason ?? ""),
   );
   const attempted = initialFailures.filter((t) =>
-    t.details.rounds?.slice(1).some((r) => r.status === "ok" && r.pass !== null),
+    t.details.rounds?.slice(1).some((r) => ["ok", "timeout"].includes(r.status) && r.pass !== null),
   );
   const recoveryExecutions = attempted.filter((t) => !t.details.cache);
   const recovered = initialFailures.filter((t) => t.pass).length;

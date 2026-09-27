@@ -220,8 +220,8 @@ export class EvalRunner {
         Object.assign(last, { status: signal.aborted ? "cancelled" : "error", reason, durationMs: elapsed });
       }
     };
-    const skip = (reason: string) => {
-      interruptRound(reason);
+    const skip = (reason: string, preserveRound = false) => {
+      if (!preserveRound) interruptRound(reason);
       const interrupted = rounds > 1 && (trial.details.roundsUsed ?? 0) > 0;
       store.recordEvalTrial({
         ...trial,
@@ -514,12 +514,21 @@ export class EvalRunner {
             : ok && output?.success && !("hidden" in item)
               ? gradeCase(item, output.data)
               : undefined;
-        if (grade?.implement?.reason === "error" || grade?.implement?.reason === "timeout")
+        if (
+          result.status === "ok" &&
+          (grade?.implement?.reason === "error" || grade?.implement?.reason === "timeout")
+        )
           roundEvidence.status = grade.implement.reason;
-        if (round > 0 && roundEvidence.status !== "ok") return skip("operational failure");
-        roundEvidence.pass = grade?.pass ?? false;
-        roundEvidence.reason = grade?.implement?.reason ?? result.error;
+        roundEvidence.reason =
+          (roundEvidence.status !== "ok" ? (grade?.implement?.error ?? result.error) : null) ??
+          grade?.implement?.reason ??
+          result.error;
         roundEvidence.durationMs = Date.now() - roundStarted;
+        if (round > 0 && roundEvidence.status !== "ok" && roundEvidence.status !== "timeout") {
+          trial.durationMs = Date.now() - trial.createdAt + preparationMs;
+          return skip("operational failure", true);
+        }
+        roundEvidence.pass = grade?.pass ?? false;
         trial = {
           ...trial,
           status:

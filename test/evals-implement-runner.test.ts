@@ -767,6 +767,7 @@ for (const succeeds of [true, false])
       expect(report.trials[0]?.details.rounds?.[1]).toMatchObject({
         resumeFailed: true,
         pass: succeeds ? true : null,
+        ...(!succeeds ? { status: "error", reason: "session unavailable" } : {}),
       });
       expect(report.trials[0]?.details.rounds?.[1]?.costUsd).toBeCloseTo(0.2);
       expect(report.trials[0]?.costUsd).toBeCloseTo(0.3);
@@ -775,6 +776,82 @@ for (const succeeds of [true, false])
         notAttempted: succeeds ? 0 : 1,
       });
       if (!succeeds) expect(report.trials[0]?.details.grade?.implement?.reason).toBe("hidden_tests");
+    } finally {
+      await f.close();
+    }
+  });
+
+test("failed grading preserves ignored baseline dependencies and build outputs for recovery", async () => {
+  const f = await fixture("sh setup.sh", () => ({
+    ".gitignore": "node_modules/\nbuild/\n",
+    "setup.sh":
+      "test -f answer || { mkdir -p node_modules build; echo installed > node_modules/dependency; echo compiled > build/output; }\n",
+  }));
+  try {
+    f.respond((s) => {
+      expect(readFileSync(join(s.cwd, "node_modules/dependency"), "utf8")).toBe("installed\n");
+      expect(readFileSync(join(s.cwd, "build/output"), "utf8")).toBe("compiled\n");
+      return { files: { answer: f.calls.length === 1 ? "wrong" : "correct" } };
+    });
+    expect((await f.run({ rounds: 2 })).trials[0]?.pass).toBe(true);
+    expect(f.calls).toHaveLength(2);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const failure of ["harness-timeout", "hidden-timeout", "gate-timeout", "error"])
+  test(`recovery preserves evidence and accounts for ${failure}`, async () => {
+    const f = await fixture();
+    try {
+      if (failure === "hidden-timeout") {
+        f.item.hidden.command = 'test "$(cat answer)" != hangs || sleep 10; sh hidden/check.sh';
+        f.item.hidden.timeoutSec = 0.05;
+        f.save();
+      }
+      if (failure === "gate-timeout") {
+        writeFileSync(
+          join(f.source, ".limitless.toml"),
+          '[gates]\nchecks = [{ name = "test", run = "test ! -f hangs || sleep 10", timeoutSec = 0.05 }]\n',
+        );
+        await pinBase(f);
+      }
+      f.respond((): FakeReply => {
+        const recovery = f.calls.length > 1;
+        return {
+          files: recovery ? { answer: "hangs", hangs: "yes" } : { answer: "wrong" },
+          status: recovery
+            ? failure === "harness-timeout"
+              ? "timeout"
+              : failure === "error"
+                ? "error"
+                : "ok"
+            : "ok",
+          error:
+            recovery && ["harness-timeout", "error"].includes(failure)
+              ? "original harness failure"
+              : undefined,
+          sessionId: null,
+          costUsd: 0.1,
+        };
+      });
+      const report = await f.run({ rounds: 3 });
+      const trial = report.trials[0];
+      expect(f.calls).toHaveLength(2);
+      expect(trial?.details.rounds?.[0]).toMatchObject({ pass: false, reason: "hidden_tests" });
+      expect(trial?.details.rounds?.[1]).toMatchObject({
+        status: failure === "error" ? "error" : "timeout",
+        pass: failure === "error" ? null : false,
+        reason: ["harness-timeout", "error"].includes(failure) ? "original harness failure" : "timeout",
+      });
+      expect(trial?.details.grade?.implement?.reason).toBe(failure === "error" ? "hidden_tests" : "timeout");
+      expect(trial?.costUsd).toBeCloseTo(0.2);
+      expect(report.summaries[0]?.implement?.recovery).toMatchObject({
+        numerator: 0,
+        denominator: failure === "error" ? 0 : 1,
+        notAttempted: failure === "error" ? 1 : 0,
+      });
+      expect(f.factory.store.cachedEvalTrials(trial?.cacheKey ?? "")).toEqual([]);
     } finally {
       await f.close();
     }

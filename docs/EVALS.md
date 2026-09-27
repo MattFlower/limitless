@@ -212,16 +212,19 @@ Each round records its harness; the trial harness follows the last invocation.
 Reports show pass@1 (initial passes), and for multi-round trials pass@R (passes by the final
 allowed round), recovery (later passes / initially failed trials with a graded recovery), and
 recovery **not attempted** separately. Budget/cancel stops and operational failures before any
-recovery grade preserve the initial grade and do not count as failed recoveries. Incremental
-cost per recovery divides post-initial-round spend across attempted recoveries by successful
-recoveries, excluding cached trials; empty denominators are n/a. Cached grades still contribute
+recovery grade preserve the initial grade and do not count as failed recoveries.
+Candidate and grading timeouts during recovery count as attempted, failed recoveries and retain
+their timeout evidence. Incremental cost per recovery divides post-initial-round spend across
+attempted recoveries by successful recoveries, excluding cached trials; empty denominators are
+n/a. Cached grades still contribute
 to pass/recovery rates. Single-round reports omit strategy, pass@R and recovery lines.
 
 Hidden commands run with a disposable per-grade HOME/TMPDIR, deleted on every exit. Grading
 keeps a private Git checkpoint only when another round is possible, avoiding full worktree
 copies. After a failed grade it rebuilds candidate files and modes from that checkpoint, removing
-hidden files, commits and artifacts; generated/ignored files may need rebuilding. Passing and
-final rounds need no restoration. Hidden output is never included in recovery feedback.
+untracked hidden files, commits and artifacts while preserving ignored dependencies and build
+outputs. Passing and final rounds need no restoration. Hidden output is never included in
+recovery feedback.
 
 ## Policy generation and review
 
