@@ -966,6 +966,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           ctx.state.verdictCommentPosted = true;
           ctx.save();
         }
+        await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
         return { summary: `Verified existing PR: ${ctx.run.prUrl}`, value: undefined };
       }
       if (!ctx.run.deliveryBranch)

@@ -1043,6 +1043,7 @@ protected_paths = ["protected.txt"]
         expect(implementations).toBe(0);
         expect(f.store.listStages(runId).some((stage) => stage.name === "implement")).toBe(false);
         expect(f.store.getRun(runId)?.headSha).toBe(head);
+        expect(existsSync(state?.worktreePath ?? "missing")).toBe(false);
         expect(calls).toHaveLength(2); // Created + evidence; notifier must not post a second verdict.
         for (const text of [
           "Flow: verify-change",
