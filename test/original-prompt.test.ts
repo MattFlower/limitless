@@ -38,7 +38,7 @@ test("original prompt renders plain multiline text and a copy control", async ()
     expect(build.success).toBe(true);
     const output = build.outputs[0];
     if (!output) throw new Error("No prompt build output");
-    const { OriginalPrompt, copyPrompt } = (await import(
+    const { OriginalPrompt, copyPrompt, promptNeedsExpansion } = (await import(
       output.path
     )) as typeof import("../ui/components/OriginalPrompt.tsx");
 
@@ -59,6 +59,26 @@ test("original prompt renders plain multiline text and a copy control", async ()
     expect(html).toContain("collapsed");
     expect(html).toContain("  Indented third line  \n\nFifth line");
     expect(html).toContain("Final line\r\n");
+
+    // Use rendered heights: the same text can need a toggle only at narrow widths.
+    const lineHeight = 19.5;
+    const wrappedPrompt = "unbroken".repeat(100);
+    expect(promptNeedsExpansion(wrappedPrompt, lineHeight * 4, lineHeight)).toBe(false);
+    expect(promptNeedsExpansion(wrappedPrompt, lineHeight * 5, lineHeight)).toBe(true);
+    expect(promptNeedsExpansion("One\nTwo\nThree\nFour", lineHeight * 4, lineHeight)).toBe(false);
+    expect(promptNeedsExpansion("One\nTwo\nThree\nFour\nFive", lineHeight * 5, lineHeight)).toBe(true);
+    for (const blankPrompt of ["", " ", "\n\n\n\n\n\n", " \t\r\n \n\t\n\n\n\n"]) {
+      expect(promptNeedsExpansion(blankPrompt, lineHeight * 7, lineHeight)).toBe(false);
+      let blankCopied: string | undefined;
+      expect(
+        await copyPrompt(blankPrompt, {
+          writeText: async (text) => {
+            blankCopied = text;
+          },
+        }),
+      ).toBe("Prompt copied");
+      expect(blankCopied).toBe(blankPrompt);
+    }
 
     let copied = "";
     expect(

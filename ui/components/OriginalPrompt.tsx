@@ -1,6 +1,10 @@
 import type { Component } from "solid-js";
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 
+export function promptNeedsExpansion(prompt: string, height: number, lineHeight: number): boolean {
+  return prompt.trim().length > 0 && height > lineHeight * 4 + 1;
+}
+
 export async function copyPrompt(prompt: string, clipboard: Pick<Clipboard, "writeText"> | undefined) {
   try {
     if (!clipboard) throw new Error("Clipboard unavailable");
@@ -23,7 +27,7 @@ export const OriginalPrompt: Component<{ prompt: string }> = (props) => {
     const text = promptText;
     const measure = () => {
       const lineHeight = Number.parseFloat(getComputedStyle(text).lineHeight);
-      setOverflows(text.getBoundingClientRect().height > lineHeight * 4 + 1);
+      setOverflows(promptNeedsExpansion(props.prompt, text.getBoundingClientRect().height, lineHeight));
     };
     measure();
     const observer = new ResizeObserver(measure);
