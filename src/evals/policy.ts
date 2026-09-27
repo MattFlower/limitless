@@ -167,7 +167,7 @@ export function generatePolicy(input: PolicyInput) {
           summary.passes,
           summary.evaluatedTrials,
           "lower",
-          f.triage_pass_rate,
+          role === "implement" ? f.implement_pass_rate : f.triage_pass_rate,
         );
         const metrics =
           role === "implement"

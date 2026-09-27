@@ -5,7 +5,7 @@ exports[`evidence rendering is reproducible and documents selected runs, missing
 
 Policy changes land through reviewed PRs; the diff is the approval. Deploy/restart to activate.
 
-Floors (inclusive; pass rate and defect recall use the Wilson 95% lower bound, error-rate ceilings use the Wilson 95% upper bound): {"triage_pass_rate":0.6,"triage_risk_under_call_rate":0.1,"review_defect_recall":0.5,"review_clean_false_block_rate":0.5,"verify_false_accept_rate":0.25}
+Floors (inclusive; pass rate and defect recall use the Wilson 95% lower bound, error-rate ceilings use the Wilson 95% upper bound): {"triage_pass_rate":0.6,"implement_pass_rate":0.6,"triage_risk_under_call_rate":0.1,"review_defect_recall":0.5,"review_clean_false_block_rate":0.5,"verify_false_accept_rate":0.25}
 Paired bootstrap: delta=0.1; seed=20260926; resamples=10000; one-sided 95% lower bound must be strictly > -delta.
 Subscription weight=0.25; origin exclusions=["CN"] (when configured, unknown baseOrigin is excluded).
 Cost/case averages case attempts over repetitions, including attempted failures, excluding skips and preparation failures. Local=0; metered=recorded dollars; subscription=API-equivalent dollars × weight. Cache replays use original cost provenance for estimates only; recorded spend stays unchanged.

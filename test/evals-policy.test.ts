@@ -737,3 +737,11 @@ test("each uncovered provider contributes at most one availability fallback", ()
   expect(new Set(role?.availabilityFallbacks)).toEqual(new Set([twilight, mtplx]));
   expect(role?.order.slice(1)).toEqual(role?.availabilityFallbacks);
 });
+
+test("implement cells use their own pass-rate floor", async () => {
+  const { evalSettings } = await import("../src/evals/settings.ts");
+  const settings = evalSettings({ evals: { floors: { implement_pass_rate: 0.9 } } });
+  expect(settings.floors.implement_pass_rate).toBe(0.9);
+  expect(settings.floors.triage_pass_rate).toBe(0.6);
+  expect(evalSettings({}).floors.implement_pass_rate).toBe(0.6);
+});
