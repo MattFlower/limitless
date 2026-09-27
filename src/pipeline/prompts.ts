@@ -142,10 +142,9 @@ export function formatAuditFeedback(findings: AuditFinding[]): string {
   return `### Policy violations\n${block.map((f) => `- [${f.rule}] ${f.file ? `${f.file}: ` : ""}${f.detail}`).join("\n")}`;
 }
 
-export function formatReviewFeedback(review: Review): string {
-  const serious = review.findings.filter((f) => f.severity === "blocker" || f.severity === "major");
-  if (!serious.length) return "";
-  return `### Code review findings (must fix)\n${serious
+export function formatReviewFeedback(findings: Review["findings"]): string {
+  if (!findings.length) return "";
+  return `### Code review findings (must fix)\n${findings
     .map(
       (f) =>
         `- **${f.severity}** ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""} — ` : ""}${f.title}\n  ${f.detail}${f.suggestion ? `\n  Suggestion: ${f.suggestion}` : ""}`,
@@ -236,6 +235,8 @@ export function reviewPrompt(input: {
   gates: GateComparison[];
   audit: AuditFinding[];
   implementerReport: string;
+  previous?: { sha: string; findings: Review["findings"] };
+  headSha?: string;
 }): string {
   const warnings = input.audit.length
     ? input.audit
@@ -253,6 +254,14 @@ ${input.spec ? renderSpec(input.spec) : "(no separate spec; judge against the re
 # Change under review
 Base commit: ${input.baseSha}. Inspect it with \`git diff ${input.baseSha}..HEAD\`, \`git log ${input.baseSha}..HEAD\`, and by reading the surrounding code.
 ${fence(input.stat.trim() || "(empty diff)")}
+${input.previous ? `
+# Previous review
+Reviewed commit: ${input.previous.sha}. Current HEAD: ${input.headSha ?? "HEAD"}.
+Previous findings:
+${fence(JSON.stringify(input.previous.findings, null, 2))}
+Inspect the latest-change diff with \`git diff ${input.previous.sha}..${input.headSha ?? "HEAD"}\`. Compare it with the full base-to-HEAD change above.
+For every finding, set exactly one label: unaddressed = a previous blocking finding remains unfixed; regression = introduced by the latest changes; new = first found now and not introduced by the latest changes. Mark security findings with security: true (otherwise false). Newly found major/minor/nit findings that are not security issues become follow-ups. Recheck the previous findings before raising new ones.
+` : ""}
 
 # Implementer's own report (treat claims as unverified)
 ${fence(input.implementerReport.slice(0, 4000) || "(none)")}
@@ -273,7 +282,7 @@ ${warnings}
 
 Severity: blocker = must fix (bug, unmet requirement, security issue, test gaming); major = should fix before merge; minor/nit = optional polish.
 Do not modify files. You may run read-only commands and the test suite. Create temporary fixtures and redirect supported build/test outputs only under TMPDIR (also TMP and TEMP); the worktree is read-only.
-Return verdict "request_changes" if there is any blocker or major finding, otherwise "approve".`;
+Explicitly mark security findings with security: true (otherwise false). Return your assessment in verdict; the pipeline derives its decision from findings.`;
 }
 
 export function verifyPrompt(input: {

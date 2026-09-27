@@ -89,6 +89,8 @@ export const ReviewSchema = z.object({
   findings: z.array(
     z.object({
       severity: z.enum(["blocker", "major", "minor", "nit"]),
+      security: z.boolean().optional().describe("True for a security finding"),
+      label: z.enum(["unaddressed", "regression", "new"]).optional(),
       file: z.string().describe("Path, or empty string for general findings"),
       line: z.number().int().describe("Line number, or 0 if not applicable"),
       title: z.string(),
@@ -98,6 +100,15 @@ export const ReviewSchema = z.object({
   ),
 });
 export type Review = z.infer<typeof ReviewSchema>;
+
+export const LaterReviewSchema = ReviewSchema.extend({
+  findings: z.array(
+    ReviewSchema.shape.findings.element.extend({
+      security: z.boolean(),
+      label: z.enum(["unaddressed", "regression", "new"]),
+    }),
+  ),
+});
 
 export const VerifySchema = z.object({
   criteria: z.array(
