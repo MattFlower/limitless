@@ -156,7 +156,7 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
 };
 
 export class RunContext {
-  private holdoutPublicSources?: Promise<string>;
+  private holdoutPublicSources?: { round: number; sources: Promise<string> };
   readonly runDir: string;
   state: RunState;
 
@@ -188,9 +188,14 @@ export class RunContext {
   }
 
   publicHoldoutSources(): Promise<string> {
-    if (this.holdoutPublicSources !== undefined) return this.holdoutPublicSources;
-    this.holdoutPublicSources = this.readPublicHoldoutSources();
-    return this.holdoutPublicSources;
+    // Each implementation round may add identifiers that are now safe to show in feedback.
+    if (this.holdoutPublicSources?.round !== this.state.round) {
+      this.holdoutPublicSources = {
+        round: this.state.round,
+        sources: this.readPublicHoldoutSources(),
+      };
+    }
+    return this.holdoutPublicSources.sources;
   }
 
   private async readPublicHoldoutSources(): Promise<string> {

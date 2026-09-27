@@ -817,7 +817,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         s.id === "H-2"
           ? {
               ...s,
-              steps: `run ${secret} with sharedIdentifier`,
+              steps: `run ${secret} with sharedIdentifier and retryIdentifier`,
               description: `secret ${secret} check`,
               expected: `result ${secret}`,
             }
@@ -826,6 +826,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     };
     let implementCalls = 0;
     let verifies = 0;
+    let retryFeedbackChecked = false;
+    const redactedOutputs: (string | undefined)[] = [];
     let runId = "";
     const f = start((s) => {
       const role = roleOf(s);
@@ -836,9 +838,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (role === "verify") {
         expect(s.prompt).toContain(secret);
         verifies++;
-        return verifies === 1
+        redactedOutputs.push(s.redactOutput?.(`retryIdentifier ${secret}`));
+        return verifies <= 2
           ? {
-              text: `ordinary verifier diagnostic; private input ${secret}`,
+              text: `ordinary verifier diagnostic; retryIdentifier; private input ${secret}`,
               error: `verifier diagnostic included ${secret}`,
               structured: {
                 ...pass,
@@ -846,9 +849,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
                   c.id === "H-2"
                     ? {
                         ...c,
-                        status: "unmet",
+                        status: verifies === 1 ? "unmet" : "unclear",
                         evidence: `Observed failure: ${secret} returned an empty response`,
-                        publicSummary: "sharedIdentifier returns an empty response for an invalid request",
+                        publicSummary: `${verifies === 1 ? "sharedIdentifier" : "retryIdentifier"} returns an empty response for an invalid request`,
                       }
                     : c,
                 ),
@@ -868,16 +871,40 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(f.store.listArtifacts(runId).map((a) => a.name)).not.toContain("holdout-scenarios.json");
         expect(f.store.getArtifact(runId, "verify-0.json")).toContain("Observed failure");
         expect(f.store.getArtifact(runId, "verify-0.json")).not.toContain(secret);
+        expect(JSON.stringify(f.store.listEvents(runId))).not.toContain("retryIdentifier");
         expect(existsSync(join(s.cwd, "holdout-scenarios.json"))).toBe(false);
         for (const artifact of f.store.listArtifacts(runId))
           expect(f.store.getArtifact(runId, artifact.name)).not.toContain(secret);
       }
-      return { files: { "farewell.txt": "goodbye\n" } };
+      if (implementCalls === 3) {
+        const summary = "retryIdentifier returns an empty response for an invalid request";
+        expect(s.prompt).toContain(`private scenario (unclear): ${summary}`);
+        expect(s.prompt).not.toContain("Observed failure");
+        expect(s.prompt).not.toContain(secret);
+        expect(s.prompt).not.toContain(privateHoldout.scenarios[1]?.steps);
+        expect(f.store.getRunState<RunState>(runId)?.feedback).toContain(summary);
+        expect(f.store.getArtifact(runId, "holdout-scenarios.json")).toBeNull();
+        expect(f.store.getArtifact(runId, "verify-1.json")).toContain(summary);
+        expect(f.store.getArtifact(runId, "verify-1.json")).not.toContain(secret);
+        expect(JSON.stringify(f.store.listEvents(runId))).toContain(
+          "ordinary verifier diagnostic; retryIdentifier; private input [private detail]",
+        );
+        retryFeedbackChecked = true;
+      }
+      return {
+        files: {
+          "farewell.txt": "goodbye\n",
+          ...(implementCalls === 2 ? { "retry.ts": "export const retryIdentifier = true;\n" } : {}),
+        },
+      };
     });
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
     runId = run.id;
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-    expect(implementCalls).toBe(2);
+    expect(implementCalls).toBe(3);
+    expect(retryFeedbackChecked).toBe(true);
+    expect(redactedOutputs[0]).toBe("[private detail] [private detail] [2 private details withheld]");
+    expect(redactedOutputs[1]).toBe("retryIdentifier [private detail] [1 private details withheld]");
     expect(f.store.getArtifact(run.id, "holdout-scenarios.json")).toContain(secret);
     const report = f.store.getArtifact(run.id, "report.md") ?? "";
     expect(report).toContain("## Holdout scenarios");
