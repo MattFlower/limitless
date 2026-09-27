@@ -1,0 +1,112 @@
+diff --git a/README.md b/README.md
+index 27f0d8d..1f3a41d 100644
+--- a/README.md
++++ b/README.md
+@@ -7,6 +7,9 @@ Small text utilities and a CLI. This repository is a playground for the
+ bun install
+ bun src/cli.ts slugify "Hello, World!"   # hello-world
+ bun src/cli.ts strip-punctuation "Hi, world! #1 @home + 2"   # Hi world 1 home 2
++bun src/cli.ts wrap --width 10 "The quick brown fox"
++# The quick
++# brown fox
+ bun src/cli.ts reading-time "Hello, World!"   # 1 minute (default 200 wpm; override with --wpm N)
+ bun src/cli.ts stats "Hello world!"
+ # Characters    12
+diff --git a/src/cli.ts b/src/cli.ts
+index c8363d3..db29d4f 100644
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -7,6 +7,7 @@ import {
+   titleCase,
+   truncate,
+   wordCount,
++  wrap,
+ } from "./text.ts";
+ 
+ const USAGE = `textkit <command> <text>
+@@ -18,7 +19,8 @@ Commands:
+   stats [--json] <text>           Text statistics
+   truncate <max> <text>           Shorten text
+   title <text>                    Title Case
+-  strip-punctuation <text>        Remove punctuation and normalize whitespace`;
++  strip-punctuation <text>        Remove punctuation and normalize whitespace
++  wrap [--width N] <text>         Wrap text to N columns (default 80)`;
+ 
+ function formatStats(text: string, json: boolean): string {
+   const stats = textStats(text);
+@@ -61,6 +63,13 @@ export function run(argv: string[]): string {
+       return titleCase(rest.join(" "));
+     case "strip-punctuation":
+       return stripPunctuation(rest.join(" "));
++    case "wrap": {
++      if (rest[0] === "--width") {
++        const [, width, ...words] = rest;
++        return wrap(words.join(" "), Number(width));
++      }
++      return wrap(rest.join(" "));
++    }
+     default:
+       return USAGE;
+   }
+diff --git a/src/text.ts b/src/text.ts
+index f750a49..714bc1d 100644
+--- a/src/text.ts
++++ b/src/text.ts
+@@ -72,3 +72,24 @@ export function stripPunctuation(text: string): string {
+     .replace(/\s+/g, " ")
+     .trim();
+ }
++
++/**
++ * Greedily wrap text into lines of at most `width` characters. Any whitespace separates words;
++ * a word longer than `width` is kept whole on its own line.
++ */
++export function wrap(text: string, width = 80): string {
++  if (!Number.isInteger(width) || width < 1)
++    throw new RangeError("width must be a positive integer");
++  const lines: string[] = [];
++  let line = "";
++  for (const word of text.split(/\s+/)) {
++    if (!word) continue;
++    if (line && line.length + 1 + word.length <= width) line += ` ${word}`;
++    else {
++      if (line) lines.push(line);
++      line = word;
++    }
++  }
++  if (line) lines.push(line);
++  return lines.join("\n");
++}
+diff --git a/test/text.test.ts b/test/text.test.ts
+index dfa1625..ae4a008 100644
+--- a/test/text.test.ts
++++ b/test/text.test.ts
+@@ -8,6 +8,7 @@ import {
+   titleCase,
+   truncate,
+   wordCount,
++  wrap,
+ } from "../src/text.ts";
+ 
+ describe("slugify", () => {
+@@ -162,3 +163,20 @@ describe("cli", () => {
+   test("strip-punctuation usage", () => expect(run([])).toContain("strip-punctuation <text>"));
+   test("usage", () => expect(run([])).toContain("Commands:"));
+ });
++
++describe("wrap", () => {
++  test("greedy lines within the width", () => {
++    expect(wrap("The quick brown fox jumps", 10)).toBe("The quick\nbrown fox\njumps");
++  });
++  test("long words stay whole", () => expect(wrap("a abcdefgh b", 4)).toBe("a\nabcdefgh\nb"));
++  test("empty text", () => expect(wrap("  \n ")).toBe(""));
++  test("rejects bad widths", () => {
++    for (const width of [0, -1, 1.5, NaN]) expect(() => wrap("x", width)).toThrow(RangeError);
++  });
++  test("wrap command", () => {
++    expect(run(["wrap", "--width", "3", "a", "b", "c"])).toBe("a b\nc");
++    expect(run(["wrap", "a", "b"])).toBe("a b");
++    expect(() => run(["wrap", "--width", "x", "a"])).toThrow(RangeError);
++  });
++  test("wrap usage", () => expect(run([])).toContain("wrap [--width N] <text>"));
++});

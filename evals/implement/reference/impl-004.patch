@@ -1,0 +1,36 @@
+diff --git a/src/text.ts b/src/text.ts
+index f750a49..b3abbe7 100644
+--- a/src/text.ts
++++ b/src/text.ts
+@@ -60,9 +60,12 @@ export function truncate(text: string, max: number): string {
+   return `${text.slice(0, max - 1).trimEnd()}…`;
+ }
+ 
+-/** Capitalize the first letter of every word. */
++/**
++ * Capitalize the first letter of every word. A letter starts a word unless it follows a letter,
++ * combining mark, digit or apostrophe: "café" and "don't" stay one word, "well-known" is two.
++ */
+ export function titleCase(text: string): string {
+-  return text.replace(/\b\p{L}/gu, (c) => c.toUpperCase());
++  return text.replace(/(?<![\p{L}\p{M}\p{N}'’])\p{L}/gu, (c) => c.toUpperCase());
+ }
+ 
+ /** Remove punctuation and normalize whitespace while preserving other characters. */
+diff --git a/test/text.test.ts b/test/text.test.ts
+index dfa1625..029ecde 100644
+--- a/test/text.test.ts
++++ b/test/text.test.ts
+@@ -162,3 +162,12 @@ describe("cli", () => {
+   test("strip-punctuation usage", () => expect(run([])).toContain("strip-punctuation <text>"));
+   test("usage", () => expect(run([])).toContain("Commands:"));
+ });
++
++describe("titleCase word boundaries", () => {
++  test("accented letters, apostrophes and hyphens", () => {
++    expect(titleCase("café au lait")).toBe("Café Au Lait");
++    expect(titleCase("élan vital")).toBe("Élan Vital");
++    expect(titleCase("don't stop")).toBe("Don't Stop");
++    expect(titleCase("well-known facts")).toBe("Well-Known Facts");
++  });
++});
