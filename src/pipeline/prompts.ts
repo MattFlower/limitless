@@ -259,10 +259,10 @@ ${
     ? `
 # Previous review
 Reviewed commit: ${input.previous.sha}. Current HEAD: ${input.headSha ?? "HEAD"}.
-Previous findings:
+Previous blocking findings (the only findings sent back for implementation):
 ${fence(JSON.stringify(input.previous.findings, null, 2))}
 Inspect the latest-change diff with \`git diff ${input.previous.sha}..${input.headSha ?? "HEAD"}\`. Compare it with the full base-to-HEAD change above.
-For every finding, set exactly one label: unaddressed = a previous blocking finding remains unfixed; regression = introduced by the latest changes; new = first found now and not introduced by the latest changes. Mark security findings with security: true (otherwise false). Newly found major/minor/nit findings that are not security issues become follow-ups. Recheck the previous findings before raising new ones. Report resolved prior findings by omitting them from findings.
+For every finding, set exactly one label: unaddressed = a previous blocking finding remains unfixed; regression = introduced by the latest changes; new = first found now and not introduced by the latest changes. Mark security findings with security: true (otherwise false). Newly found major/minor/nit findings that are not security issues become follow-ups. Recheck the previous findings before raising new ones. Preserve the file and title when labelling a prior finding unaddressed, even if its line moves. Prior nonblocking findings are already recorded follow-ups; do not relabel them unaddressed. Report resolved prior findings by omitting them from findings.
 `
     : ""
 }

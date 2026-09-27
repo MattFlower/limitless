@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { blockingReviewFindings, reviewVerdict } from "../src/pipeline/review.ts";
-import { LaterReviewSchema, type Review } from "../src/pipeline/schemas.ts";
+import { LaterReviewSchema, type Review, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 
 const finding = (severity: Review["findings"][number]["severity"], security = false) => ({
   severity,
@@ -29,10 +29,10 @@ describe("deterministic review decision", () => {
         summary: "model assessment",
         findings: [{ ...finding(severity, security), label }],
       };
-      expect(blockingReviewFindings(review, false).length > 0).toBe(firstRound);
-      expect(blockingReviewFindings(review, true).length > 0).toBe(laterRound);
-      expect(reviewVerdict(review, true)).toBe(laterRound ? "request_changes" : "approve");
-      expect(reviewVerdict({ ...review, verdict: "request_changes" }, true)).toBe(
+      expect(blockingReviewFindings(review).length > 0).toBe(firstRound);
+      expect(blockingReviewFindings(review, [finding("major")]).length > 0).toBe(laterRound);
+      expect(reviewVerdict(review, [finding("major")])).toBe(laterRound ? "request_changes" : "approve");
+      expect(reviewVerdict({ ...review, verdict: "request_changes" }, [finding("major")])).toBe(
         laterRound ? "request_changes" : "approve",
       );
     });
@@ -49,4 +49,33 @@ describe("deterministic review decision", () => {
       expect(LaterReviewSchema.safeParse({ ...review, findings: [invalid] }).success).toBe(false);
     }
   });
+});
+
+test("both review schemas require every object property for strict structured output", () => {
+  const check = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    if ("properties" in node && node.properties && typeof node.properties === "object") {
+      expect("required" in node ? node.required : []).toEqual(Object.keys(node.properties));
+    }
+    for (const value of Object.values(node)) check(value);
+  };
+  for (const schema of [ReviewSchema, LaterReviewSchema]) check(toStrictJsonSchema(schema));
+  expect(
+    ReviewSchema.safeParse({
+      verdict: "approve",
+      summary: "",
+      findings: [{ ...finding("minor"), security: undefined }],
+    }).success,
+  ).toBe(false);
+});
+
+test("an unaddressed claim must match a prior blocking finding", () => {
+  const review: Review = {
+    verdict: "request_changes",
+    summary: "",
+    findings: [{ ...finding("major"), label: "unaddressed" }],
+  };
+  expect(reviewVerdict(review, [])).toBe("approve");
+  expect(reviewVerdict(review, [{ ...finding("major"), title: "Different issue" }])).toBe("approve");
+  expect(reviewVerdict(review, [{ ...finding("major"), line: 99 }])).toBe("request_changes");
 });

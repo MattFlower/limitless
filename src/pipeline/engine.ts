@@ -49,7 +49,7 @@ import {
   verifyPrompt,
 } from "./prompts.ts";
 import { buildReport } from "./report.ts";
-import { blockingReviewFindings, reviewVerdict } from "./review.ts";
+import { blockingReviewFindings, reviewFindingKey, reviewVerdict } from "./review.ts";
 import {
   type Holdout,
   HoldoutSchema,
@@ -570,12 +570,11 @@ async function oneRound(
   }
 
   // --- review (a different vendor than the implementer)
-  if (ctx.state.lastReview && !ctx.state.reviewedSha)
-    throw new NeedsHumanError("Previous review has no reviewed commit; cannot classify later findings");
-  const previousReview =
-    ctx.state.lastReview && ctx.state.reviewedSha
-      ? { sha: ctx.state.reviewedSha, findings: ctx.state.lastReview.findings }
-      : undefined;
+  if (ctx.state.lastReview && !ctx.state.reviewHistory?.length)
+    throw new NeedsHumanError("Previous review has no round history; cannot classify later findings");
+  const earlierReviews = (ctx.state.reviewHistory ?? []).filter((entry) => entry.round < round);
+  const priorReview = earlierReviews.at(-1);
+  const previousReview = priorReview ? { sha: priorReview.sha, findings: priorReview.blocking } : undefined;
   const reviewedSha = await headSha(cwd);
   const review: Review = await ctx.stage(
     "review",
@@ -603,13 +602,18 @@ async function oneRound(
         requireStructured: true,
       });
       await discardChanges(cwd);
-      const r = (previousReview ? LaterReviewSchema : ReviewSchema).parse(result.structured);
-      r.verdict = reviewVerdict(r, !!previousReview);
-      const blocking = blockingReviewFindings(r, !!previousReview);
-      if (previousReview) {
-        const followUps = r.findings.filter((f) => f.label === "new" && !blocking.includes(f));
-        ctx.state.reviewFollowUps = [...(ctx.state.reviewFollowUps ?? []), ...followUps];
-      }
+      const r: Review = (previousReview ? LaterReviewSchema : ReviewSchema).parse(result.structured);
+      r.verdict = reviewVerdict(r, previousReview?.findings);
+      const blocking = blockingReviewFindings(r, previousReview?.findings);
+      const followUps = previousReview ? r.findings.filter((f) => !blocking.includes(f)) : [];
+      ctx.state.reviewHistory = [...earlierReviews, { round, sha: reviewedSha, blocking, followUps }];
+      ctx.state.reviewFollowUps = [
+        ...new Map(
+          ctx.state.reviewHistory.flatMap((entry) =>
+            entry.followUps.map((f) => [reviewFindingKey(f), f] as const),
+          ),
+        ).values(),
+      ];
       const sameVendor = target.vendor === ctx.state.implementer?.vendor;
       if (sameVendor) ctx.log("Review done by the implementer's vendor (no other vendor available)", "warn");
       ctx.state.lastReview = { ...r, modelId: target.modelId };
@@ -619,11 +623,11 @@ async function oneRound(
         ctx.run.id,
         `review-${round}.json`,
         "review",
-        JSON.stringify({ ...r, model: target.modelId }, null, 2),
+        JSON.stringify({ ...r, model: target.modelId, round, reviewedSha, blocking }, null, 2),
       );
       const serious = blocking.length;
       return {
-        summary: `${r.verdict} by ${target.modelId}: ${serious} blocking, ${r.findings.length - serious} minor`,
+        summary: `${r.verdict} by ${target.modelId}: ${serious} blocking, ${r.findings.length - serious} nonblocking`,
         value: r,
       };
     },
@@ -632,7 +636,7 @@ async function oneRound(
 
   const reviewFeedback =
     review.verdict === "request_changes"
-      ? formatReviewFeedback(blockingReviewFindings(review, !!previousReview))
+      ? formatReviewFeedback(blockingReviewFindings(review, previousReview?.findings))
       : "";
   if (review.verdict === "request_changes") {
     ctx.state.feedback = reviewFeedback || `### Code review requested changes\n${review.summary}`;
