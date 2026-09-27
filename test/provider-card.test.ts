@@ -8,6 +8,7 @@ import ts from "@babel/preset-typescript";
 import { renderToString } from "solid-js/web";
 import type { ProviderStatus } from "../src/core/types.ts";
 import { workloadFor } from "../ui/lib/provider-workload.ts";
+import { windowLabel } from "../ui/lib/window-label.ts";
 
 const solid = createRequire(import.meta.url)("babel-preset-solid") as PresetTarget<object>;
 
@@ -18,7 +19,16 @@ afterEach(() => {
   dir = null;
 });
 
-test("OpenRouter card renders reported and estimated spend and missing reading", async () => {
+test("window labels are compact and readable", () => {
+  expect(windowLabel("five_hour")).toBe("5h");
+  expect(windowLabel("seven_day")).toBe("7d");
+  expect(windowLabel("seven_day_overage_included")).toBe("7d overage included");
+  expect(windowLabel("seven_day_opus")).toBe("7d opus");
+  expect(windowLabel("five_hour_sonnet")).toBe("5h sonnet");
+  expect(windowLabel("other_window_name")).toBe("other window name");
+});
+
+test("OpenRouter card keeps one budget gauge and reports only material differences", async () => {
   dir = mkdtempSync(join(tmpdir(), "limitless-card-"));
   const build = await Bun.build({
     entrypoints: [join(import.meta.dir, "../ui/components/ProviderCard.tsx")],
@@ -56,9 +66,9 @@ test("OpenRouter card renders reported and estimated spend and missing reading",
     reason: null,
     until: null,
     windows: {},
-    spendUsd: 12,
+    spendUsd: 10,
     budgetUsd: 50,
-    reportedUsageUsd: 18,
+    reportedUsageUsd: 10.5,
     reportedAt: 1_000_000,
     limit: 100,
     limitRemaining: 82,
@@ -68,11 +78,34 @@ test("OpenRouter card renders reported and estimated spend and missing reading",
     updatedAt: 1_000_000,
   };
   const html = renderToString(() => ProviderCard({ provider: status }));
-  expect(html).toContain("estimated (30d)");
-  expect(html).toContain("reported (monthly)");
-  expect(html).toContain("$12.00");
-  expect(html).toContain("$18.00");
-  expect(html).toContain("daily");
+  expect(html).toContain("30-day spend");
+  expect(html).toContain("$10.00 / $50.00");
+  expect(html).toContain("key $82.00 left of $100.00 · resets daily");
+  expect(html).not.toContain("reported this month");
+  expect(html).not.toContain("Last 7 days");
+  expect(html.match(/class="gauge-details"/g)).toHaveLength(1);
+  expect(html).toMatch(
+    /class="gauge-label"[^>]*>.*30-day spend.*\$10\.00 \/ \$50\.00.*<\/div><div class="gauge-track"/,
+  );
+  expect(html).toMatch(/title="reading [^"]+"/);
+  const reading = new Date(status.reportedAt ?? 0).toLocaleString();
+  expect(html.replace(/title="[^"]*"/g, "")).not.toContain(reading);
+
+  const atThreshold = renderToString(() => ProviderCard({ provider: { ...status, reportedUsageUsd: 11 } }));
+  expect(atThreshold).not.toContain("reported this month");
+  const aboveThreshold = renderToString(() =>
+    ProviderCard({ provider: { ...status, reportedUsageUsd: 11.01 } }),
+  );
+  expect(aboveThreshold).toContain("key $82.00 left of $100.00 · resets daily · reported this month $11.01");
+  expect(aboveThreshold.match(/class="gauge-details"/g)).toHaveLength(1);
+  const belowFloor = renderToString(() =>
+    ProviderCard({ provider: { ...status, spendUsd: 2, reportedUsageUsd: 2.5 } }),
+  );
+  expect(belowFloor).not.toContain("reported this month");
+  const aboveFloor = renderToString(() =>
+    ProviderCard({ provider: { ...status, spendUsd: 2, reportedUsageUsd: 2.51 } }),
+  );
+  expect(aboveFloor).toContain("reported this month $2.51");
   const missing = renderToString(() =>
     ProviderCard({
       provider: {
@@ -85,7 +118,9 @@ test("OpenRouter card renders reported and estimated spend and missing reading",
       },
     }),
   );
-  expect(missing).toContain("unavailable");
+  expect(missing).toContain("key unavailable left of unavailable · resets unavailable");
+  expect(missing).not.toContain("reading");
+  expect(missing.match(/class="gauge-details"/g)).toHaveLength(1);
   const workload = workloadFor("openrouter", [
     {
       provider: "openrouter",
@@ -94,7 +129,7 @@ test("OpenRouter card renders reported and estimated spend and missing reading",
     },
   ]);
   const metered = renderToString(() => ProviderCard({ provider: status, workload }));
-  expect(metered).toContain("Last 7 days");
+  expect(metered).toContain("7 days");
   expect(metered).toContain("API-equivalent");
   expect(metered).toContain("1m 2s");
   expect(metered).toContain("$1.20");
@@ -112,7 +147,7 @@ test("OpenRouter card renders reported and estimated spend and missing reading",
   expect(empty).toContain("$0.00");
 });
 
-test("provider card shows rounded utilization and each window's live reading age", async () => {
+test("provider card renders each window's label, bar, and full-width details in order", async () => {
   const now = 1_000_000;
   setSystemTime(now);
   dir = mkdtempSync(join(tmpdir(), "limitless-card-"));
@@ -159,12 +194,26 @@ test("provider card shows rounded utilization and each window's live reading age
     windows: {
       five_hour: { utilization: 0.721, resetsAt: now + 60_000, observedAt: now - 12 * 60_000 },
       seven_day: { utilization: 0, resetsAt: null, observedAt: null },
-      other: { utilization: 1, resetsAt: null, observedAt: now + 60_000 },
+      seven_day_overage_included: { utilization: 1, resetsAt: null, observedAt: now + 60_000 },
     },
   };
   const html = renderToString(() => ProviderCard({ provider: status }));
-  expect(html).toContain("73% · as of 12 min ago");
-  expect(html).toContain("0% · as of unknown");
-  expect(html).toContain("100% · as of just now");
-  expect(html).not.toContain("·  ·");
+  expect(html).not.toContain("seven_day_overage_included");
+  expect(html).not.toContain("Last 7 days");
+  expect(html).toContain("resets in 1m · updated 12 min ago");
+  expect(html).toContain("updated unknown");
+  expect(html).toContain("updated just now");
+  for (const [label, value] of [
+    ["5h", "73%"],
+    ["7d", "0%"],
+    ["7d overage included", "100%"],
+  ] as const) {
+    const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    expect(html).toMatch(
+      new RegExp(
+        `class="gauge-label"[^>]*><span>${escapedLabel}</span><span class="gauge-value">${value}</span></div><div class="gauge-track"`,
+      ),
+    );
+  }
+  expect(html.match(/class="gauge-details"/g)).toHaveLength(3);
 });
