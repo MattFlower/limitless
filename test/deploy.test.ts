@@ -10,6 +10,7 @@ import {
   type DeployClock,
   DrainUnsupportedError,
   parseMaxWait,
+  waitForDrain,
 } from "../src/cli/deploy-wait.ts";
 import { deploy } from "../src/cli/service.ts";
 import type { HealthResponse } from "../src/core/types.ts";
@@ -134,6 +135,114 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
   expect(f.logs.join("\n")).toContain("run-a (review)");
   expect(f.logs.join("\n")).toContain("Drain complete");
   expect(f.calls.slice(-3)).toEqual(["health", "restart", "health"]);
+});
+
+test("drain progress includes every stage once per changed poll, regardless of health order", async () => {
+  const f = setup();
+  f.client.health = async () => {
+    const time = f.clock.now();
+    const active =
+      time >= 25_000
+        ? []
+        : time >= 20_000
+          ? ["run-b"]
+          : time >= 5000 && time < 15_000
+            ? ["run-b", "run-a"]
+            : ["run-a", "run-b"];
+    return { ok: true, uptimeMs: 1, sha: "previous", draining: true, active };
+  };
+  f.client.run = async (id) => {
+    f.calls.push(`run ${id} at ${f.clock.now()}`);
+    return { stage: id === "run-a" && f.clock.now() >= 15_000 ? "review" : "implement" };
+  };
+
+  await waitForDrain(f.client, f.clock, 60_000, false, (line) => f.logs.push(line));
+
+  expect(f.logs).toEqual([
+    "Draining (60s remaining); active runs: run-a (implement), run-b (implement)",
+    "Draining (45s remaining); active runs: run-a (review), run-b (implement)",
+    "Draining (40s remaining); active runs: run-b (implement)",
+    "Drain complete: no active runs (25s elapsed)",
+  ]);
+  expect(f.calls).toEqual([
+    "run run-a at 0",
+    "run run-b at 0",
+    "run run-a at 5000",
+    "run run-b at 5000",
+    "run run-a at 10000",
+    "run run-b at 10000",
+    "run run-a at 15000",
+    "run run-b at 15000",
+    "run run-b at 20000",
+  ]);
+  expect(f.sleeps).toEqual([5000, 5000, 5000, 5000, 5000]);
+});
+
+test("unchanged drain progress repeats only after 30 seconds", async () => {
+  const f = setup();
+  f.client.health = async () => ({
+    ok: true,
+    uptimeMs: 1,
+    sha: "previous",
+    draining: true,
+    active: f.clock.now() >= 35_000 ? [] : ["held"],
+  });
+  f.client.run = async () => ({ stage: "verify" });
+  const progressTimes: number[] = [];
+  await waitForDrain(f.client, f.clock, 40_000, false, (line) => {
+    f.logs.push(line);
+    if (line.startsWith("Draining")) progressTimes.push(f.clock.now());
+  });
+  expect(progressTimes).toEqual([0, 30_000]);
+  expect(f.logs).toEqual([
+    "Draining (40s remaining); active runs: held (verify)",
+    "Draining (10s remaining); active runs: held (verify)",
+    "Drain complete: no active runs (35s elapsed)",
+  ]);
+  expect(f.sleeps).toEqual(Array(7).fill(5000));
+});
+
+test("unknown stages and terminal drain outcomes have no extra progress line", async () => {
+  for (const missing of [false, true]) {
+    const f = setup();
+    f.client.health = async () => ({
+      ok: true,
+      uptimeMs: 1,
+      sha: "previous",
+      draining: true,
+      active: f.clock.now() >= 5000 ? [] : ["gone", "missing"],
+    });
+    f.client.run = async (id) => {
+      if (id === "gone") throw new Error("gone");
+      if (missing) return {} as Awaited<ReturnType<DeployClient["run"]>>;
+      return { stage: "review" };
+    };
+    await waitForDrain(f.client, f.clock, 10_000, false, (line) => f.logs.push(line));
+    expect(f.logs).toEqual([
+      `Draining (10s remaining); active runs: gone (unknown stage), missing (${missing ? "unknown stage" : "review"})`,
+      "Drain complete: no active runs (5s elapsed)",
+    ]);
+  }
+
+  for (const now of [false, true]) {
+    const f = setup();
+    f.client.health = async () => ({
+      ok: true,
+      uptimeMs: 1,
+      sha: "previous",
+      draining: true,
+      active: ["held"],
+    });
+    await waitForDrain(f.client, f.clock, 5000, now, (line) => f.logs.push(line));
+    expect(f.logs).toEqual(
+      now
+        ? ["--now: restarting immediately; active runs: held (unknown stage)"]
+        : [
+            "Draining (5s remaining); active runs: held (implement)",
+            "Drain timeout after 5s; restarting with active runs: held (implement)",
+          ],
+    );
+  }
 });
 
 test("initially empty and unchanged ref do not wait", async () => {

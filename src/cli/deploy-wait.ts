@@ -138,6 +138,8 @@ export async function waitForDrain(
   const budget = () =>
     now || maxWaitMs === 0 ? REQUEST_TIMEOUT_MS : Math.min(REQUEST_TIMEOUT_MS, remaining());
   let health = validateHealth(await bounded(clock, (signal) => client.health(signal), budget()));
+  let lastProgress: string | undefined;
+  let lastProgressAt = 0;
   for (;;) {
     if (!health.draining) throw new Error("daemon resumed unexpectedly while deploying");
     if (!health.active.length) {
@@ -146,23 +148,18 @@ export async function waitForDrain(
       );
       return;
     }
-    if (!now && remaining() > 0) {
-      log(
-        `Draining (${Math.ceil(remaining() / 1000)}s remaining); active run IDs: ${health.active.join(", ")}`,
-      );
-    }
     const stages = await Promise.all(
-      health.active.map(async (id) => {
-        if (now || remaining() === 0) return `${id} (unknown stage)`;
+      [...health.active].sort().map(async (id) => {
+        if (now || remaining() === 0) return [id, "unknown stage"] as const;
         try {
           const run = await bounded(clock, (signal) => client.run(id, signal), budget());
-          return `${id} (${run.stage ?? "unknown stage"})`;
+          return [id, run.stage || "unknown stage"] as const;
         } catch {
-          return `${id} (unknown stage)`;
+          return [id, "unknown stage"] as const;
         }
       }),
     );
-    const active = stages.join(", ");
+    const active = stages.map(([id, stage]) => `${id} (${stage})`).join(", ");
     if (now) {
       log(`--now: restarting immediately; active runs: ${active}`);
       return;
@@ -173,7 +170,12 @@ export async function waitForDrain(
       );
       return;
     }
-    log(`Draining (${Math.ceil(remaining() / 1000)}s remaining); active runs: ${active}`);
+    const progress = JSON.stringify(stages);
+    if (progress !== lastProgress || clock.now() - lastProgressAt >= 30_000) {
+      log(`Draining (${Math.ceil(remaining() / 1000)}s remaining); active runs: ${active}`);
+      lastProgress = progress;
+      lastProgressAt = clock.now();
+    }
     await clock.sleep(Math.min(5000, remaining()));
     if (remaining() === 0) {
       log(
