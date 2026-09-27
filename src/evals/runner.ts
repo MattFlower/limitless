@@ -1,7 +1,7 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { EvalRun, EvalTrial } from "../core/types.ts";
-import { createEvalWorktree, pinnedTree } from "../git/repos.ts";
+import { createEvalWorktree, type EvalLabels, pinnedTree } from "../git/repos.ts";
 import { selectHarness } from "../harness/select.ts";
 import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
 import type { EngineDeps } from "../pipeline/context.ts";
@@ -18,6 +18,9 @@ import {
 } from "./cases.ts";
 import { gradeCase, prepareCase, schemaFor, seedContent } from "./prepare.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
+
+/** Where Limitless keeps eval datasets; pins whose history touches these are rejected. */
+const LABEL_PATHS = ["evals/triage", "evals/review", "evals/verify"];
 
 export class EvalRunner {
   private readonly active = new Map<string, { controller: AbortController; done: Promise<void> }>();
@@ -106,6 +109,14 @@ export class EvalRunner {
       return tree;
     };
     try {
+      const casePath = this.casePath ?? defaultCasePath(run.role);
+      const labels: EvalLabels = {
+        paths: LABEL_PATHS,
+        contents: [
+          readFileSync(casePath, "utf8"),
+          ...file.cases.flatMap((item) => ("defects" in item ? (seedContent(item, casePath) ?? []) : [])),
+        ],
+      };
       const groups = new Map<string, string[]>();
       for (const modelId of run.models) {
         const provider = router.model(modelId)?.provider ?? "unknown";
@@ -121,7 +132,7 @@ export class EvalRunner {
               for (const trial of store
                 .listEvalTrials(run.id)
                 .filter((t) => t.modelId === modelId && t.caseId === item.id)) {
-                await this.trial(run, trial, item, treeFor, cache, signal);
+                await this.trial(run, trial, item, treeFor, labels, cache, signal);
               }
             }
         }),
@@ -140,6 +151,7 @@ export class EvalRunner {
     trial: EvalTrial,
     item: EvalCase,
     treeFor: (slug: string) => Promise<string>,
+    labels: EvalLabels,
     cache: boolean,
     signal: AbortSignal,
   ): Promise<void> {
@@ -175,7 +187,16 @@ export class EvalRunner {
       const patch =
         "defects" in item ? seedContent(item, this.casePath ?? defaultCasePath(run.role)) : undefined;
       if (!("prompt" in item))
-        cleanup = await createEvalWorktree(cfg.paths, store, item.repo, item.base, item.head, cwd, signal);
+        cleanup = await createEvalWorktree(
+          cfg.paths,
+          store,
+          item.repo,
+          item.base,
+          item.head,
+          cwd,
+          signal,
+          labels,
+        );
       const { prompt, timeoutMs } = await prepareCase(item, cwd, tree, patch, signal);
       const schema = schemaFor(item);
       const jsonSchema = toStrictJsonSchema(schema);

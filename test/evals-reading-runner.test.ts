@@ -1,9 +1,10 @@
 import { expect, spyOn, test } from "bun:test";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadRoleCases, VerifyCaseFileSchema } from "../src/evals/cases.ts";
+import { gatesAt } from "../src/evals/prepare.ts";
 import { auditDiff } from "../src/gates/audit.ts";
-import { detectGates, gateScriptNames, pickScripts } from "../src/gates/detect.ts";
+import { gateScriptNames, pickScripts } from "../src/gates/detect.ts";
 import { diffSince, readFileAt } from "../src/git/repos.ts";
 import { readingTimeout } from "../src/pipeline/engine.ts";
 import { FACTORY_PREAMBLE, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
@@ -72,7 +73,7 @@ test("review uses the pipeline prompt, recomputed audit, detached seeded HEAD an
         (await sh(["git", "symbolic-ref", "-q", "HEAD"], { cwd: s.cwd, allowFail: true })).exitCode,
       ).not.toBe(0);
       const diff = await diffSince(s.cwd, f.sha);
-      const gates = detectGates(s.cwd);
+      const gates = await gatesAt(s.cwd, f.sha, s.signal);
       const names = gateScriptNames(gates);
       const audit = auditDiff(diff, {
         taskClass: null,
@@ -172,6 +173,81 @@ test("verify uses pipeline schema, prompt, private session and head content, ret
     await f.clean();
   } finally {
     await f.close();
+  }
+});
+
+test("audit uses gate configuration from base, so a change cannot disable its own findings", async () => {
+  const f = await fixture();
+  try {
+    const commit = async (files: Record<string, string | null>) => {
+      for (const [name, content] of Object.entries(files))
+        if (content === null) rmSync(join(f.source, name));
+        else writeFileSync(join(f.source, name), content);
+      await sh(["git", "add", "-A"], { cwd: f.source });
+      await sh(["git", "commit", "-qm", "step"], { cwd: f.source });
+      return (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+    };
+    const scriptBase = await commit({
+      "package.json": JSON.stringify({ scripts: { test: "bun test" } }),
+      "bun.lock": "",
+    });
+    const scriptHead = await commit({ "package.json": JSON.stringify({ scripts: {} }) });
+    const tomlBase = await commit({
+      ".limitless.toml": '[policy]\nprotected_paths = ["guard.txt"]\n',
+      "guard.txt": "keep",
+    });
+    const tomlHead = await commit({ ".limitless.toml": "", "guard.txt": "tampered" });
+    writeFileSync(
+      f.casePath,
+      JSON.stringify({
+        role: "review",
+        version: 1,
+        cases: [
+          { ...f.item, id: "script", base: scriptBase, head: scriptHead },
+          { ...f.item, id: "protected", base: tomlBase, head: tomlHead },
+        ],
+      }),
+    );
+    f.respond(() => ({ structured: reviewOutput() }));
+    const report = await f.run();
+    expect(report.trials.map((t) => t.status)).toEqual(["ok", "ok"]);
+    expect(f.calls[0]?.prompt).toContain('Removed the "test" script');
+    expect(f.calls[1]?.prompt).toContain("Edited a protected path.");
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("rejects pins whose reachable history exposes eval labels or seed patches", async () => {
+  for (const leak of ["dataset", "seed"] as const) {
+    const f = await fixture();
+    try {
+      const patch =
+        "diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+n\n";
+      writeFileSync(join(f.home, "seed.patch"), patch);
+      f.item.seedPatch = "seed.patch";
+      f.save();
+      mkdirSync(join(f.source, leak === "dataset" ? "evals/review" : "notes"), { recursive: true });
+      if (leak === "dataset") writeFileSync(join(f.source, "evals/review/cases.json"), "{}");
+      else writeFileSync(join(f.source, "notes/copy.patch"), patch);
+      await sh(["git", "add", "-A"], { cwd: f.source });
+      await sh(["git", "commit", "-qm", "labels"], { cwd: f.source });
+      // Labels committed before the head and deleted again stay readable through history.
+      await sh(["git", "rm", "-rq", leak === "dataset" ? "evals" : "notes"], { cwd: f.source });
+      await sh(["git", "commit", "-qm", "later"], { cwd: f.source });
+      f.item.head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+      f.save();
+      const report = await f.run();
+      expect(report.trials[0]).toMatchObject({ status: "error", pass: false });
+      expect(String(report.trials[0]?.details.reason)).toContain(
+        leak === "dataset" ? "eval labels" : "seed patch",
+      );
+      expect(f.calls).toHaveLength(0);
+      await f.clean();
+    } finally {
+      await f.close();
+    }
   }
 });
 

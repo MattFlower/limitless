@@ -1,7 +1,7 @@
-import { readFileSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { auditDiff } from "../gates/audit.ts";
-import { detectGates, gateScriptNames, pickScripts } from "../gates/detect.ts";
+import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { diffSince, readFileAt } from "../git/repos.ts";
 import { readingTimeout } from "../pipeline/engine.ts";
 import { reviewPrompt, triagePrompt, verifyPrompt } from "../pipeline/prompts.ts";
@@ -20,6 +20,35 @@ export function seedContent(item: ReviewCase, casePath: string): string | undefi
   if (rel === ".." || rel.startsWith("../") || isAbsolute(rel))
     throw new Error("seed path escapes dataset directory");
   return readFileSync(path, "utf8");
+}
+
+/** Top-level files whose contents gate detection reads; other entries only need to exist. */
+const GATE_FILES = new Set([".limitless.toml", "package.json", "pyproject.toml", "Makefile"]);
+
+/**
+ * Gate configuration as of `revision`. The pipeline detects gates (protected paths, gate script
+ * names) before implementation, so a change cannot weaken the audit by editing them.
+ */
+export async function gatesAt(cwd: string, revision: string, signal: AbortSignal): Promise<GateConfig> {
+  const dir = join(dirname(cwd), "base-gates");
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir);
+  try {
+    const tree = await sh(["git", "ls-tree", "-z", revision], { cwd, signal });
+    for (const entry of tree.stdout.split("\0").filter(Boolean)) {
+      const [meta = "", name = ""] = entry.split("\t");
+      const [, type, oid = ""] = meta.split(" ");
+      if (type === "tree") mkdirSync(join(dir, name));
+      else if (type === "blob")
+        writeFileSync(
+          join(dir, name),
+          GATE_FILES.has(name) ? (await sh(["git", "cat-file", "blob", oid], { cwd, signal })).stdout : "",
+        );
+    }
+    return detectGates(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 export async function prepareCase(
@@ -58,7 +87,7 @@ export async function prepareCase(
   signal.throwIfAborted();
   const diff = await diffSince(cwd, item.base);
   if ("defects" in item) {
-    const gates = detectGates(cwd);
+    const gates = await gatesAt(cwd, item.base, signal);
     const names = gateScriptNames(gates);
     const audit = auditDiff(diff, {
       taskClass: null,

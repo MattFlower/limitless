@@ -409,6 +409,14 @@ export async function pinnedTree(paths: Paths, store: Store, slug: string, sha: 
   });
 }
 
+/** Eval labels that must not be readable anywhere in a pinned checkout's history. */
+export interface EvalLabels {
+  /** Repository paths (files or directory prefixes) holding eval datasets. */
+  paths: string[];
+  /** Exact file contents (dataset, seed patches) that must not appear as any blob. */
+  contents: string[];
+}
+
 /** Disposable, isolated pinned eval checkout; never creates or moves a source branch. */
 export async function createEvalWorktree(
   paths: Paths,
@@ -418,6 +426,7 @@ export async function createEvalWorktree(
   head: string,
   path: string,
   signal: AbortSignal,
+  labels: EvalLabels = { paths: [], contents: [] },
 ): Promise<() => Promise<void>> {
   if (!/^[\w.-]+\/[\w.-]+$/.test(slug) || ![base, head].every((sha) => /^[a-fA-F0-9]{40}$/.test(sha)))
     throw new Error("invalid repository pin");
@@ -466,6 +475,7 @@ export async function createEvalWorktree(
       await sh(["git", "push", "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
     });
     const opts = { cwd: path, signal };
+    await rejectContamination(path, labels, signal);
     await sh(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", head], opts);
     for (const ref of ["refs/eval/base", "refs/eval/head"]) await sh(["git", "update-ref", "-d", ref], opts);
     await sh(["git", "reflog", "expire", "--expire=now", "--all"], opts);
@@ -473,5 +483,30 @@ export async function createEvalWorktree(
   } catch (error) {
     await cleanup();
     throw error;
+  }
+}
+
+/**
+ * Refuse pins whose reachable history contains eval labels: removing the files from the
+ * checkout would still leave them readable through `git show`/`git log`.
+ */
+async function rejectContamination(path: string, labels: EvalLabels, signal: AbortSignal): Promise<void> {
+  const opts = { cwd: path, signal };
+  if (labels.paths.length) {
+    const touched = await sh(
+      ["git", "rev-list", "-1", "refs/eval/base", "refs/eval/head", "--", ...labels.paths],
+      opts,
+    );
+    if (touched.stdout.trim())
+      throw new Error(
+        `pinned history contains eval labels (${labels.paths.join(", ")}); choose earlier pins`,
+      );
+  }
+  for (const content of labels.contents) {
+    if (!content.trim()) continue;
+    const oid = (await sh(["git", "hash-object", "--stdin"], { ...opts, stdin: content })).stdout.trim();
+    const found = await sh(["git", "cat-file", "-e", oid], { ...opts, allowFail: true });
+    if (found.exitCode === 0)
+      throw new Error("pinned history contains an eval dataset or seed patch; choose earlier pins");
   }
 }

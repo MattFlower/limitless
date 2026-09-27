@@ -110,11 +110,16 @@ the fix for a real defect, or the committed labels themselves) stay invisible to
 Seed patch content is applied from stdin and committed only in that checkout. The resulting HEAD
 is the diff endpoint; the original base remains unchanged. Checkouts are removed on success,
 preparation failure, invalid output, harness failure, and cancellation. No delivery operations run.
+Pins whose reachable history itself contains labels are rejected as a preparation error: any
+commit touching `evals/triage`, `evals/review` or `evals/verify`, or any blob identical to the
+dataset file or one of its seed patches. Deleting such files from the checkout would not help,
+since `git show` would still read them; pick pins from before the datasets were committed.
 
 The candidate receives the pipeline prompt, FACTORY_PREAMBLE, role schema, read-only agent
 harness, and normal inputs only: labels, source/foundBy annotations and patch files are never
 copied into the worktree or prompt. Review recomputes diff statistics and audit findings using
-repository gate configuration, null task class and no historical commands. Blocking gates or
+the gate configuration (protected paths, gate script names) detected at base, as the pipeline
+does before implementation, compared against the scripts at the effective HEAD; null task class and no historical commands. Blocking gates or
 audit flags do not bypass the eval invocation. Review and verify retain the pipeline's scaled
 20/25-minute reading timeouts, 10-minute idle timeout, 150-tool limit and verify private sessions.
 
