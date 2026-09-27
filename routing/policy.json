@@ -1,0 +1,13 @@
+{
+  "triage": {
+    "default": [
+      "openrouter/gpt-6-luna@none",
+      "openrouter/gpt-6-luna@low",
+      "openrouter/gpt-6-luna@medium",
+      "twilight/qwen-27b@none",
+      "mtplx/qwen-27b@high",
+      "codex/luna@none",
+      "claude/sonnet@low"
+    ]
+  }
+}
