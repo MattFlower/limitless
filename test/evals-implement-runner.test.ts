@@ -1,10 +1,13 @@
 import { expect, test } from "bun:test";
 import {
+  chmodSync,
+  cpSync,
   existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -73,11 +76,98 @@ async function fixture(
   };
 }
 
+async function pinBase(f: Awaited<ReturnType<typeof fixture>>) {
+  await sh(["git", "add", "-A"], { cwd: f.source });
+  await sh(["git", "commit", "-qm", "updated base"], { cwd: f.source });
+  f.item.base = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+  await sh(["git", "push", f.cache, "HEAD:refs/heads/eval-base"], { cwd: f.source });
+  f.save();
+}
+
+for (const failure of ["setup", "timeout"] as const)
+  test(`baseline ${failure} fails preparation without invoking or caching a candidate`, async () => {
+    const f = await fixture();
+    try {
+      writeFileSync(
+        join(f.source, ".limitless.toml"),
+        failure === "setup"
+          ? '[gates]\nsetup = ["false"]\nchecks = [{ name = "test", run = "true" }]\n'
+          : '[gates]\nchecks = [{ name = "test", run = "sleep 10", timeoutSec = 0.05 }]\n',
+      );
+      await pinBase(f);
+      for (let run = 0; run < 2; run++) {
+        const report = await f.run({ models: ["candidate-a", "candidate-b"], k: 2 });
+        expect(report.trials).toHaveLength(4);
+        for (const trial of report.trials) {
+          expect(trial).toMatchObject({
+            status: "error",
+            pass: false,
+            costUsd: 0,
+            costEquivUsd: 0,
+            tokensIn: 0,
+            tokensOut: 0,
+            details: { preparationFailed: true, grade: { implement: { reason: "error" } } },
+          });
+          expect(trial.details.reason).toContain(failure === "setup" ? "setup failed" : "check timed out");
+          expect(trial.details.cache).toBeUndefined();
+          expect(f.factory.store.cachedEvalTrials(trial.cacheKey)).toEqual([]);
+        }
+      }
+      expect(f.calls).toHaveLength(0);
+      expect(readdirSync(f.cfg.paths.runs).filter((p) => p.startsWith("eval-"))).toEqual([]);
+    } finally {
+      await f.close();
+    }
+  });
+
+test("baseline gates are shared across repetitions and providers per case within each run", async () => {
+  const f = await fixture("sh count-gates.sh", (home) => ({
+    "count-gates.sh": `if test -f answer; then echo candidate >> '${home}/gate-runs'; else echo baseline >> '${home}/gate-runs'; fi\n`,
+  }));
+  try {
+    const second = { ...f.item, id: "two" };
+    cpSync(f.hiddenDir, join(f.home, "hidden", second.id), { recursive: true });
+    writeFileSync(f.casePath, JSON.stringify({ role: "implement", version: 1, cases: [f.item, second] }));
+    for (let run = 1; run <= 2; run++) {
+      const report = await f.run({ models: ["candidate-a", "candidate-b"], k: 2, cache: false });
+      expect(report.trials).toHaveLength(8);
+      expect(report.trials.every((trial) => trial.pass)).toBe(true);
+      const lines = readFileSync(join(f.home, "gate-runs"), "utf8").trim().split("\n");
+      expect(lines.filter((line) => line === "baseline")).toHaveLength(2 * run);
+      expect(lines.filter((line) => line === "candidate")).toHaveLength(8 * run);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+for (const role of ["triage", "review", "verify", "implement"])
+  test(`implement contamination checks scope ${role} labels in base history`, async () => {
+    const f = await fixture();
+    try {
+      const dir = join(f.source, "evals", role);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "cases.json"), '{"labels":"unrelated bytes"}');
+      await pinBase(f);
+      const trial = (await f.run()).trials[0];
+      if (role === "implement") {
+        expect(trial?.details.reason).toContain("pinned history contains");
+        expect(f.calls).toHaveLength(0);
+      } else {
+        expect(trial).toMatchObject({ status: "ok", pass: true });
+        expect(f.calls).toHaveLength(1);
+      }
+    } finally {
+      await f.close();
+    }
+  });
+
 test("implement invokes once in edit mode with shared prompt, isolates head/hidden bytes, caches complete evidence", async () => {
   const f = await fixture("test ! -f broken && test ! -f hidden/check.sh");
   try {
     f.respond(async (s) => {
       expect(s.mode).toBe("edit");
+      expect(s.maxToolCalls).toBe(400);
       expect(s.schema).toBeUndefined();
       expect(s.jsonSchema).toBeUndefined();
       expect(s.noTools).toBe(false);
@@ -217,15 +307,6 @@ for (const [kind, files, gate, reason] of [
         ]);
         expect((await f.run()).trials[0]?.details.grade).toEqual(t?.details.grade);
         expect(f.calls).toHaveLength(1);
-        // Both the original and cached legacy grades are ineligible once warnings are unknown.
-        for (const run of f.factory.store.listEvalRuns()) {
-          for (const row of f.factory.store.listEvalTrials(run.id)) {
-            if (row.details.grade?.implement) row.details.grade.implement.auditWarnings = null;
-            f.factory.store.recordEvalTrial(row);
-          }
-        }
-        expect((await f.run()).trials[0]?.details.grade?.implement?.auditWarnings).toHaveLength(1);
-        expect(f.calls).toHaveLength(2);
       }
     } finally {
       await f.close();
@@ -234,7 +315,7 @@ for (const [kind, files, gate, reason] of [
 
 // Exit codes such as 126/127 can be caused by the candidate (a deleted or non-executable script),
 // so they are graded hidden_tests failures and the evidence is cached like any other grade.
-for (const command of ["./hidden/missing-script.sh", "sh hidden/missing-script.sh", "./overwrite", "exit 2"])
+for (const command of ["./hidden/missing-script.sh", "sh hidden/missing-script.sh", "exit 2"])
   test(`hidden command classification: ${command}`, async () => {
     const f = await fixture();
     try {
@@ -254,6 +335,40 @@ for (const command of ["./hidden/missing-script.sh", "sh hidden/missing-script.s
       await f.close();
     }
   });
+
+test("hidden scripts retain mode bits and mode changes invalidate cached grades", async () => {
+  const f = await fixture();
+  try {
+    const script = join(f.hiddenDir, "hidden/check.sh");
+    writeFileSync(script, `#!/bin/sh\n${readFileSync(script, "utf8")}test -x overwrite\n`);
+    chmodSync(script, 0o751);
+    chmodSync(join(f.hiddenDir, "overwrite"), 0o751);
+    f.item.hidden.command = "./hidden/check.sh";
+    f.save();
+    f.respond((s) => {
+      expect(statSync(join(s.cwd, "overwrite")).mode & 0o777).toBe(0o644);
+      return { files: { answer: "correct" } };
+    });
+    const passed = (await f.run()).trials[0];
+    expect(passed).toMatchObject({
+      status: "ok",
+      pass: true,
+      details: { grade: { implement: { hidden: { exitCode: 0 } } } },
+    });
+    expect((await f.run()).summaries[0]?.cached).toBe(1);
+    chmodSync(script, 0o644);
+    const failed = (await f.run()).trials[0];
+    expect(failed).toMatchObject({
+      status: "ok",
+      pass: false,
+      details: { grade: { implement: { reason: "hidden_tests", hidden: { exitCode: 126 } } } },
+    });
+    expect(failed?.cacheKey).not.toBe(passed?.cacheKey);
+    expect(f.calls).toHaveLength(2);
+  } finally {
+    await f.close();
+  }
+});
 
 test("hidden grading scrubs secrets, bounds output, times out, and rejects destination symlinks", async () => {
   const f = await fixture();

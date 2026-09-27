@@ -326,13 +326,4 @@ WHERE state_json IS NOT NULL AND json_type(state_json, '$.environmentRetryRound'
     name: "chat_call_duration",
     sql: "ALTER TABLE chat_calls ADD COLUMN duration_ms INTEGER;",
   },
-  {
-    version: 13,
-    name: "implement_eval_audit_warnings",
-    sql: `
-UPDATE eval_trials SET details_json = json_set(details_json, '$.grade.implement.auditWarnings', NULL)
-WHERE json_type(details_json, '$.grade.implement') = 'object'
-  AND json_type(details_json, '$.grade.implement.auditWarnings') IS NULL;
-`,
-  },
 ];

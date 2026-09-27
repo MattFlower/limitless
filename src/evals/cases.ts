@@ -179,7 +179,7 @@ export function hiddenContents(item: ImplementCase, casePath: string) {
     const rel = relative(root, source);
     if (rel === ".." || rel.startsWith("../") || isAbsolute(rel) || !statSync(source).isFile())
       throw new Error(`invalid hidden file: ${path}`);
-    return { path, content: readFileSync(source) };
+    return { path, content: readFileSync(source), mode: statSync(source).mode & 0o777 };
   });
 }
 export const ReviewCaseFileSchema = envelope("review", ReviewCaseSchema);
