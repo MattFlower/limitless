@@ -267,7 +267,8 @@ test("all-ineligible roles preserve current policy and unrelated overrides; chai
   for (const role of generatePolicy(input([evidence("triage", [local, subscription])])).roles)
     expect(
       role.order.every(
-        (id) => role.candidates.find((c) => c.modelId === id)?.eligible || id === role.availabilityFallback,
+        (id) =>
+          role.candidates.find((c) => c.modelId === id)?.eligible || role.availabilityFallbacks.includes(id),
       ),
     ).toBe(true);
 });
@@ -528,15 +529,34 @@ test("an availability fallback from another provider is appended only when it fa
   // 32/40: clears the 0.60 floor (Wilson lower ~0.65) but is not within 0.10 of a perfect model.
   const fallback = triage(degrade(evidence("triage", [metered, local]), local, 8));
   expect(fallback?.order).toEqual([metered, local]);
-  expect(fallback?.availabilityFallback).toBe(local);
+  expect(fallback?.availabilityFallbacks).toEqual([local]);
   expect(fallback?.decision).toContain("availability fallback");
   // 20/40 fails the floor itself, so it is never added.
   const floorFail = triage(degrade(evidence("triage", [metered, local]), local, 20));
   expect(floorFail?.order).toEqual([metered]);
-  expect(floorFail?.availabilityFallback).toBeNull();
+  expect(floorFail?.availabilityFallbacks).toEqual([]);
   // A candidate on a provider the chain already uses adds no availability.
   const gemma = "openrouter/gemma-4-31b-it";
   const sameProvider = triage(degrade(evidence("triage", [metered, gemma]), gemma, 8));
   expect(sameProvider?.order).toEqual([metered]);
-  expect(sameProvider?.availabilityFallback).toBeNull();
+  expect(sameProvider?.availabilityFallbacks).toEqual([]);
+});
+
+test("each uncovered provider contributes at most one availability fallback", () => {
+  const twilight = "twilight/qwen-27b@none";
+  const mtplx = "mtplx/qwen-27b@none";
+  const row = evidence("triage", [metered, twilight, mtplx]);
+  for (const id of [twilight, mtplx].map((m) => parseTarget(m).modelId))
+    for (const t of row.trials.filter((t) => t.modelId === id).slice(0, 8)) {
+      t.pass = false;
+      if (t.details.grade) {
+        t.details.grade.pass = false;
+        t.details.grade.score = 0;
+      }
+    }
+  const role = generatePolicy(input([row])).roles[0];
+  // Both local providers are uncovered by the eligible chain, so each adds one fallback after it.
+  expect(role?.order[0]).toBe(metered);
+  expect(new Set(role?.availabilityFallbacks)).toEqual(new Set([twilight, mtplx]));
+  expect(role?.order.slice(1)).toEqual(role?.availabilityFallbacks);
 });

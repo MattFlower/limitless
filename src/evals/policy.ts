@@ -248,35 +248,39 @@ export function generatePolicy(input: PolicyInput) {
           compareId(a.modelId, b.modelId),
       )
       .map((c) => c.modelId);
-    // Availability: when every eligible candidate shares a provider, one outage takes the whole cell
-    // down. Append the cheapest candidate from another provider that clears every floor and ceiling
-    // and fails only non-inferiority — worse is better than no capacity.
+    // Availability: eligible candidates often share a provider, so one outage takes the whole cell
+    // down. For each provider the chain doesn't use yet, append its cheapest candidate that clears
+    // every floor and ceiling and fails only non-inferiority — worse beats no capacity.
     const providerOf = (id: string) => models.find((m) => m.id === id.split("@")[0])?.provider ?? null;
     const covered = new Set(order.map(providerOf));
-    const availability = order.length
-      ? candidates
-          .filter(
-            (c) =>
-              !c.eligible &&
-              c.reasons.length > 0 &&
-              c.reasons.every((r) => r === "non-inferiority not established") &&
-              !covered.has(providerOf(c.modelId)),
-          )
-          .sort(
-            (a, b) =>
-              (a.costPerCase ?? Infinity) - (b.costPerCase ?? Infinity) ||
-              (a.summary.p50LatencyMs ?? Infinity) - (b.summary.p50LatencyMs ?? Infinity) ||
-              compareId(a.modelId, b.modelId),
-          )[0]
-      : undefined;
-    if (availability) order.push(availability.modelId);
+    const availability: string[] = [];
+    if (order.length)
+      for (const c of candidates
+        .filter(
+          (c) =>
+            !c.eligible &&
+            c.reasons.length > 0 &&
+            c.reasons.every((r) => r === "non-inferiority not established"),
+        )
+        .sort(
+          (a, b) =>
+            (a.costPerCase ?? Infinity) - (b.costPerCase ?? Infinity) ||
+            (a.summary.p50LatencyMs ?? Infinity) - (b.summary.p50LatencyMs ?? Infinity) ||
+            compareId(a.modelId, b.modelId),
+        )) {
+        const provider = providerOf(c.modelId);
+        if (covered.has(provider)) continue;
+        covered.add(provider);
+        availability.push(c.modelId);
+      }
+    order.push(...availability);
     return {
       role,
       candidates,
       order,
-      availabilityFallback: availability?.modelId ?? null,
+      availabilityFallbacks: availability,
       decision: order.length
-        ? `Update ${role}.default: ${order.join(" → ")}${availability ? ` (${availability.modelId} is an availability fallback on another provider: clears every floor, not non-inferior)` : ""}`
+        ? `Update ${role}.default: ${order.join(" → ")}${availability.length ? ` (availability fallbacks on other providers, clearing every floor but not non-inferior: ${availability.join(", ")})` : ""}`
         : candidates.length
           ? `${role} unchanged: no eligible models (${candidates.map((c) => `${c.modelId}: ${c.reasons.join("; ")}`).join(" | ")})`
           : `${role} unchanged: no completed evidence`,
