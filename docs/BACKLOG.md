@@ -29,7 +29,7 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 26 | M4 | Capability-and-cost routing (monotonic escalation) | todo |
 | 27 | M4 | New-model intake pipeline | todo |
 | 28 | M4 | Aggregator providers: per-model rate limits and concurrency | todo |
-| 29 | M5 | Holdout redaction that keeps feedback readable | todo |
+| 29 | M5 | Holdout feedback that is actionable but still blind | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
@@ -409,17 +409,26 @@ fallbacks) for up to an hour because of one upstream model's rate limit.
 - Tests with a fake OpenAI-compatible server: a 429 on model A leaves model B routable; Retry-After
   honored; 402/401 still mark the provider.
 
-## 29. Holdout redaction that keeps feedback readable
+## 29. Holdout feedback that is actionable but still blind
 
-`redactHoldoutText` (src/pipeline/prompts.ts) replaces every 6+ character token that appears anywhere in
-the holdout scenarios, case-insensitively and inside other words. Common vocabulary ("effort",
-"harness", "builder", role and file names) is masked in verify feedback, identifiers are mangled
-mid-word ("build[private input]Args"), and the implementer (and the orchestrator) get feedback they
-can't act on — which makes runs burn rounds and end as needs-human (seen on the effort run).
+The holdout's value comes from its *content* being secret, not from surprising the implementer.
+Hiding its existence buys nothing and costs quality and rounds, and today's token-stripping
+redaction makes verify feedback unreadable (`redactHoldoutText` in src/pipeline/prompts.ts replaces
+every 6+ character token from the scenarios, case-insensitively and mid-word: "build[private
+input]Args"), which helped push runs to needs-human.
 
-- Redact what would leak the scenario, not the shared vocabulary: whole scenario sentences and
-  distinctive literals (quoted strings, numbers, paths, flags, identifiers) that do NOT appear in the
-  request, the spec, or the repository's own identifiers; match on word boundaries only.
-- Keep the redacted fraction visible (e.g. "3 private details withheld") so a reader knows.
-- Tests: common words and repo identifiers survive; scenario-specific literals don't; no mid-word
-  replacement; the existing leak tests still pass.
+1. Round 0: the implement prompt says a separate verifier will also check private scenarios derived
+   from the request, including edge and failure cases, so implement the request's intent robustly
+   rather than only the listed criteria. (Standard, non-leaking practice.)
+2. Retries: label H-ids as "private scenario". Instead of token-stripping the verifier's evidence,
+   the verify schema gains a per-scenario `publicSummary`: a short behavior description that does
+   not reveal the scenario's inputs or expected values (e.g. "rejects valid input when the list is
+   empty"). Feedback for unmet private scenarios uses only that summary.
+3. Backstop: redact the summaries with a precise filter — whole scenario sentences and distinctive
+   literals (quoted strings, numbers, paths, flags, identifiers) that do not appear in the request,
+   the spec, or the repository's identifiers; word boundaries only; show "n private details
+   withheld" when anything was removed.
+- Tests: the round-0 notice is present only when holdout scenarios exist; feedback for private
+  scenarios contains the summary and never the scenario text; common words and repo identifiers
+  survive the backstop while scenario-specific literals don't; no mid-word replacement; existing
+  leak tests still pass.
