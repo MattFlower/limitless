@@ -23,7 +23,8 @@ export function renderEvidence(evaluation: PolicyEvaluation): string {
   ];
   for (const role of evaluation.roles) {
     lines.push(`## ${role.role}${role.cell === "default" ? "" : `.${role.cell}`}`, "", role.decision, "");
-    if (role.role === "implement" && !role.escalation.length)
+    for (const reason of role.escalationRejections ?? []) lines.push(reason, "");
+    if (role.role === "implement" && !role.escalation.length && !role.escalationRejections?.length)
       lines.push("Effort-before-switch preference unchanged: no qualifying B1 paired recovery evidence.", "");
     if (!role.candidates.length) continue;
     lines.push(

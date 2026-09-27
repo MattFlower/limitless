@@ -667,6 +667,14 @@ test("implement effort recovery needs significant paired B1 evidence at no great
   const recovered = generatePolicy(input([row], { escalation: [base] }));
   expect(recovered.generated.implement?.small).toEqual([low, high, metered]);
   expect(renderEvidence(recovered)).toContain("B1 recovery lower=0.0500");
+  const costlier = generatePolicy(input([row], { escalation: [{ ...base, effortCost: 0.21 }] }));
+  expect(costlier.generated.implement?.small).toEqual([low, metered, high]);
+  const smallEvidence = renderEvidence(costlier).split("## implement.small")[1]?.split("## ")[0];
+  expect(smallEvidence).toContain(
+    `${low} → ${high} before ${metered} withheld: effort cost=0.2100 exceeds switch cost=0.2000`,
+  );
+  expect(smallEvidence).toContain("despite significant B1 recovery (lower=0.0500, paired=40)");
+  expect(smallEvidence).not.toContain("no qualifying B1 paired recovery evidence");
   for (const change of [{ lowerBound: 0 }, { pairedCases: 0 }, { effortCost: 0.21 }])
     expect(
       generatePolicy(input([row], { escalation: [{ ...base, ...change }] })).generated.implement?.small,

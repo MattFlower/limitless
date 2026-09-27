@@ -278,6 +278,7 @@ export function generatePolicy(input: PolicyInput) {
       )
       .map((c) => c.modelId);
     const escalation: string[] = [];
+    const escalationRejections: string[] = [];
     if (role === "implement")
       for (const result of input.escalation ?? []) {
         if (
@@ -286,8 +287,7 @@ export function generatePolicy(input: PolicyInput) {
           !Number.isFinite(result.lowerBound) ||
           result.lowerBound <= 0 ||
           !Number.isFinite(result.effortCost) ||
-          !Number.isFinite(result.switchCost) ||
-          result.effortCost > result.switchCost
+          !Number.isFinite(result.switchCost)
         )
           continue;
         const low = order.indexOf(result.low);
@@ -308,6 +308,12 @@ export function generatePolicy(input: PolicyInput) {
           result.low.split("@")[0] !== result.high.split("@")[0]
         )
           continue;
+        if (result.effortCost > result.switchCost) {
+          escalationRejections.push(
+            `${result.low} → ${result.high} before ${result.switch} withheld: effort cost=${result.effortCost.toFixed(4)} exceeds switch cost=${result.switchCost.toFixed(4)} despite significant B1 recovery (lower=${result.lowerBound.toFixed(4)}, paired=${result.pairedCases}).`,
+          );
+          continue;
+        }
         if (low > next) {
           order.splice(low, 1);
           order.splice(order.indexOf(result.switch), 0, result.low);
@@ -351,6 +357,7 @@ export function generatePolicy(input: PolicyInput) {
       order,
       availabilityFallbacks: availability,
       escalation,
+      escalationRejections,
       decision: order.length
         ? `Update ${role}.${cell}: ${order.join(" → ")}${availability.length ? ` (availability fallbacks on other providers, clearing every floor but not non-inferior: ${availability.join(", ")})` : ""}${escalation.length ? ` (effort recovery: ${escalation.join("; ")})` : ""}`
         : candidates.length
