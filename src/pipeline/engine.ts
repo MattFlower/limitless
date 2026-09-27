@@ -5,8 +5,8 @@ import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateHooks, retryRegressions, runGates } from "../gates/run.ts";
+import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
-  clearInterruptedRebase,
   commitAll,
   createPullRequest,
   createWorktree,
@@ -21,9 +21,7 @@ import {
   pushBranch,
   pushExistingBranch,
   readFileAt,
-  rebaseOnto,
   removeWorktree,
-  resetTo,
 } from "../git/repos.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
@@ -435,6 +433,19 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.run.baseSha as string;
+  const merge = ctx.state.conflictRound === round;
+  const previousHead = ctx.state.preRebaseHead;
+  if (merge) {
+    if (!previousHead || ctx.state.pendingRebaseSha !== baseSha)
+      throw new Error("Missing expected merge state for resolution round");
+    if ((await headSha(cwd)) !== previousHead) {
+      const sha = await validateMerge(cwd, previousHead, baseSha);
+      ctx.state.implementedRound = round;
+      ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha }, ctx.state);
+      return;
+    }
+    await requireMerge(cwd, previousHead, baseSha);
+  }
   await ctx.stage(
     "implement",
     async (stage) => {
@@ -478,6 +489,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           round,
           feedback: ctx.state.feedback,
           hasHoldout: profile(ctx) !== "quick",
+          resolution: merge,
         }),
       });
       ctx.state.implementer = {
@@ -497,10 +509,11 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
         ctx.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
       ctx.state.implementerReport = result.finalText;
       ctx.store.putArtifact(ctx.run.id, `implement-${round}.md`, "report", result.finalText || "(no report)");
-      const sha = await commitAll(
-        cwd,
-        `limitless: ${ctx.run.title} (round ${round + 1})\n\nRun: ${ctx.run.id}`,
-      );
+      ctx.checkCancelled();
+      const sha =
+        merge && previousHead
+          ? await completeMerge(cwd, previousHead, baseSha)
+          : await commitAll(cwd, `limitless: ${ctx.run.title} (round ${round + 1})\n\nRun: ${ctx.run.id}`);
       if (sha) ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha });
       ctx.save();
       ctx.state.implementerIssue =
@@ -533,6 +546,11 @@ async function oneRound(
 
   // --- implement (skipped when resuming a round whose implementation already landed)
   if (ctx.state.implementedRound !== round) await implementStage(ctx, round);
+  if (ctx.state.conflictRound === round) {
+    if (!ctx.state.preRebaseHead || ctx.state.pendingRebaseSha !== baseSha)
+      throw new Error("Missing expected merge state for resolution checks");
+    await validateMerge(cwd, ctx.state.preRebaseHead, baseSha);
+  }
 
   // --- gates
   const comparison = await ctx.stage(
@@ -653,6 +671,7 @@ async function oneRound(
           implementerReport: ctx.state.implementerReport ?? "",
           previous: previousReview,
           headSha: reviewedSha,
+          resolution: ctx.state.conflictRound === round,
         }),
         jsonSchema: toStrictJsonSchema(previousReview ? LaterReviewSchema : ReviewSchema),
         schema: previousReview ? LaterReviewSchema : ReviewSchema,
@@ -856,25 +875,26 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     throw new Error("PR delivery base does not match the verified webhook head");
   await ctx.stage("deliver", async () => {
     const cwd = ctx.state.worktreePath as string;
-    await clearInterruptedRebase(cwd, Boolean(ctx.state.pendingRebaseSha));
-    // A stopped post-rebase check may have left generated files or formatter edits behind.
-    if (ctx.state.pendingRebaseSha) await discardChanges(cwd);
-    const sha = await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
+    if (ctx.state.conflictRound !== undefined) {
+      if (!ctx.state.preRebaseHead) throw new Error("Missing pre-merge HEAD at delivery");
+      await validateMerge(cwd, ctx.state.preRebaseHead, ctx.run.baseSha as string);
+      ctx.state.pendingRebaseSha = undefined;
+      ctx.state.preRebaseGates = undefined;
+      ctx.save();
+    }
+    // Pending clean merges must be validated before any cleanup or generic commit.
+    const sha =
+      ctx.state.pendingRebaseSha || ctx.state.conflictRound !== undefined
+        ? null
+        : await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
     const head = sha ?? (await headSha(cwd));
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch) {
       const baseBranch = ctx.run.baseBranch as string;
       const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch);
       const recorded = ctx.run.baseSha as string;
-      // A restart can find the base moved again mid-rebase; retarget the newest tip.
-      if (ctx.state.pendingRebaseSha && ctx.state.pendingRebaseSha !== fetched) {
-        ctx.state.pendingRebaseSha = fetched;
-        ctx.save();
-      }
-      // Rebasing is best-effort: it avoids conflicting PRs, but never blocks delivering work that
-      // passed every gate on its recorded base.
       const note = (why: string) => {
-        ctx.state.rebaseNote = `Not rebased onto the latest ${baseBranch}: ${why}. Delivered on ${(ctx.run.baseSha as string).slice(0, 8)}.`;
+        ctx.state.rebaseNote = `Not merged with the latest ${baseBranch}: ${why}. Delivered on ${(ctx.run.baseSha as string).slice(0, 8)}.`;
         ctx.store.addEvent({
           runId: ctx.run.id,
           type: "status",
@@ -887,8 +907,10 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           note("the base advanced again after the conflict-resolution round");
         else if (!ctx.state.pendingRebaseSha && !(await isAncestor(cwd, recorded, fetched)))
           note("the base branch no longer descends from the recorded base");
-        else if ((await rebaseForDelivery(ctx, cwd, baseBranch, fetched, head, note)) === "conflict")
-          return { summary: `rebase conflicted; resolution round ${ctx.state.round}`, value: undefined };
+        else if (
+          (await mergeForDelivery(ctx, cwd, ctx.state.pendingRebaseSha ?? fetched, head, note)) === "conflict"
+        )
+          return { summary: `merge conflicted; resolution round ${ctx.state.round}`, value: undefined };
       }
       if (!ctx.state.rebaseNote && !(await isAncestor(cwd, ctx.run.baseSha as string, await headSha(cwd))))
         note("the branch does not contain the recorded base");
@@ -979,17 +1001,12 @@ function readPackageJson(dir: string): string | null {
 
 export type { RunState };
 
-class RebaseRegressedError extends Error {}
+class MergeRegressedError extends Error {}
 
-/**
- * Rebase the run branch onto the base's new tip and re-run the gates. A conflict schedules one
- * resolution round ("conflict"); a regression restores the pre-rebase head, which passed every gate
- * on its recorded base, and notes why it was not rebased.
- */
-async function rebaseForDelivery(
+/** Merge the pinned base, retaining the previously gated head for regression fallback. */
+async function mergeForDelivery(
   ctx: RunContext,
   cwd: string,
-  baseBranch: string,
   fetched: string,
   head: string,
   note: (why: string) => void,
@@ -1005,20 +1022,21 @@ async function rebaseForDelivery(
     ctx.state.preRebaseHead = head;
     ctx.save();
   }
-  if (!(await isAncestor(cwd, fetched, await headSha(cwd)))) {
-    const outcome = await rebaseOnto(cwd, fetched);
-    if (outcome === "conflict") {
-      ctx.state.preRebaseHead = undefined;
-      ctx.state.pendingRebaseSha = undefined;
-      ctx.state.preRebaseGates = undefined;
-      ctx.state.round++;
-      ctx.state.conflictRound = ctx.state.round;
-      ctx.state.feedback = `The base branch advanced. Merge origin/${baseBranch} into this branch with \`git merge origin/${baseBranch}\`, resolve conflicts preserving both intents, and rerun the repository checks.`;
-      ctx.state.phase = "loop";
-      ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: await headSha(cwd) }, ctx.state);
-      return "conflict";
-    }
+  const before = ctx.state.preRebaseHead;
+  if (!before) throw new Error("Missing pre-merge HEAD");
+  const conflicts = await prepareMerge(cwd, before, fetched);
+  if (conflicts.length) {
+    ctx.state.round++;
+    ctx.state.conflictRound = ctx.state.round;
+    ctx.state.feedback = `The factory started a merge of base ${fetched}. Resolve the conflict markers in these files, preserving both intents; do not run Git (including staging or committing):\n${conflicts.map((p) => `- ${p}`).join("\n")}`;
+    ctx.state.phase = "loop";
+    ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
+    return "conflict";
   }
+  if ((await headSha(cwd)) === before) await completeMerge(cwd, before, fetched);
+  await validateMerge(cwd, before, fetched);
+  await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
+  await mergeGit(cwd, ["clean", "-fdq"]);
   const previous = ctx.state.preRebaseGates ?? [];
   try {
     await ctx.stage(
@@ -1026,8 +1044,9 @@ async function rebaseForDelivery(
       async () => {
         const after = await runGates(cwd, ctx.state.gatesConfig as GateConfig, ctx.signal, gateEvents(ctx));
         ctx.checkCancelled();
-        await discardChanges(cwd);
-        // A check fixed by the implementation must stay fixed after rebasing, even when
+        await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
+        await mergeGit(cwd, ["clean", "-fdq"]);
+        // A check fixed by the implementation must stay fixed after merging, even when
         // it failed on the original base. Persist that regression in the evidence too.
         const comparison = compareGates(
           previous.length
@@ -1047,23 +1066,25 @@ async function rebaseForDelivery(
           !after.setupOk ||
           comparison.some((c) => c.blocking) ||
           previous.some((c) => c.result.ok && !after.checks.find((r) => r.name === c.name)?.ok);
-        if (regressed) throw new RebaseRegressedError("post-rebase gates regressed");
-        return { summary: `${comparison.length} post-rebase checks ok`, value: undefined };
+        if (regressed) throw new MergeRegressedError("post-merge gates regressed");
+        return { summary: `${comparison.length} post-merge checks ok`, value: undefined };
       },
       ctx.state.round,
     );
   } catch (error) {
-    if (!(error instanceof RebaseRegressedError)) throw error;
-    await resetTo(cwd, ctx.state.preRebaseHead ?? head);
+    if (!(error instanceof MergeRegressedError)) throw error;
+    await mergeGit(cwd, ["reset", "--hard", before]);
+    await mergeGit(cwd, ["clean", "-fdq"]);
     ctx.state.lastGates = previous;
     ctx.state.pendingRebaseSha = undefined;
     ctx.state.preRebaseGates = undefined;
     ctx.state.preRebaseHead = undefined;
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: await headSha(cwd) }, ctx.state);
-    note(`checks regressed after rebasing onto ${fetched.slice(0, 8)}`);
+    note(`checks regressed after merging onto ${fetched.slice(0, 8)}`);
     ctx.save();
     return "done";
   }
+  await validateMerge(cwd, before, fetched);
   ctx.state.pendingRebaseSha = undefined;
   ctx.state.preRebaseGates = undefined;
   ctx.state.preRebaseHead = undefined;
