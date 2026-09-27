@@ -2,9 +2,10 @@ import type { Component } from "solid-js";
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { roleDescription } from "../../src/core/role-descriptions.ts";
 import type { Invocation, Role } from "../../src/core/types.ts";
-import { compactNumber, duration, equivMoney, money, truncate } from "../lib/format.ts";
+import { compactNumber, duration, truncate } from "../lib/format.ts";
 import { invocationModelLabel } from "../lib/invocation-model.ts";
 import { now } from "../lib/ticker.ts";
+import { CostCell } from "./CostCell.tsx";
 
 const STATUS_BADGE: Record<string, string> = {
   ok: "pass",
@@ -129,14 +130,7 @@ export const InvocationsTable: Component<{
               </td>
               <td class="num mono">{compactNumber(inv.inputTokens)}</td>
               <td class="num mono">{compactNumber(inv.outputTokens)}</td>
-              <td class="num mono">
-                <Show
-                  when={inv.costUsd > 0}
-                  fallback={<span class="text-faint">{equivMoney(inv.costEquivUsd)}</span>}
-                >
-                  <span class="bold">{money(inv.costUsd)}</span>
-                </Show>
-              </td>
+              <CostCell costUsd={inv.costUsd} costEquivUsd={inv.costEquivUsd} />
               <td class="num mono">{inv.numTurns}</td>
               <td class="num mono">{duration((inv.finishedAt ?? now()) - inv.startedAt)}</td>
               <td class="text-danger" title={inv.error ?? ""}>

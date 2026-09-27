@@ -3,8 +3,9 @@ import { createMemo, createSignal, For, onMount, Show } from "solid-js";
 import type { ProviderWorkload, Stats } from "../../src/db/stats.ts";
 import type { ModelDef, Policy } from "../../src/router/catalog.ts";
 import { getModels, getProviderWorkload, getStats } from "../api.ts";
+import { CostCell } from "../components/CostCell.tsx";
 import { ProviderCard } from "../components/ProviderCard.tsx";
-import { duration, money } from "../lib/format.ts";
+import { duration } from "../lib/format.ts";
 import { workloadFor } from "../lib/provider-workload.ts";
 import { ensureLiveStore, live } from "../store.ts";
 
@@ -116,13 +117,7 @@ export const Models: Component = () => {
                             </Show>
                           </td>
                           <td class="num mono">{avgMs ? duration(avgMs) : "—"}</td>
-                          <td class="num mono">
-                            {costUsd > 0
-                              ? money(costUsd)
-                              : costEquivUsd > 0
-                                ? `≈${money(costEquivUsd)}`
-                                : "—"}
-                          </td>
+                          <CostCell costUsd={costUsd} costEquivUsd={costEquivUsd} />
                         </tr>
                       );
                     }}
