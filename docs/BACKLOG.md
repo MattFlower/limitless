@@ -331,7 +331,12 @@ points, and public leaderboards disagree with each other).
   harnesses), so it is the best public prior for the implement role. No JSON API (the table is in
   the Next.js page payload): import it with a tolerant parser of the rendered leaderboard rows,
   run on demand (it changes roughly monthly), tested against a saved fixture of the page text;
-  map rows to catalog (model, effort, harness). Don't run Terminal-Bench ourselves: the leaderboard's
+  map rows to catalog (model, effort, harness). Each row carries a single effort, almost always the
+  top one, so Terminal-Bench gives each pair's ceiling, not its effort curve. Take the curve from
+  Artificial Analysis (every effort is its own entry) and measure it ourselves for cheap roles via
+  item 24; for implement, a rough prior for a lower effort is the Terminal-Bench top-effort score
+  scaled by Artificial Analysis's index ratio (effort ÷ top effort), marked "prior only".
+  Don't run Terminal-Bench ourselves: the leaderboard's
   own cost column puts a full 4.0 run at $300–$9,600 per model.
 - The repository is public: never commit Artificial Analysis data (no redistribution). Snapshots
   stay in the local database; the UI shows them with attribution; committed files (e.g.
