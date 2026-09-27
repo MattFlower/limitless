@@ -1426,15 +1426,18 @@ test("engine persists selected effort through a feedback round without changing 
   expect(f.router.model("alpha/m")?.effort).toBe("low");
 });
 
-for (const path of [
-  "blocked",
-  "passes",
-  "retry-unmet",
-  "initial-unmet",
-  "unclear",
-  "no-alternative",
+for (const [path, command] of [
+  ["blocked", "bun test"],
+  ["passes", "bun test"],
+  ["retry-unmet", "bun test"],
+  ["initial-unmet", "bun test"],
+  ["unclear", "bun test"],
+  ["no-alternative", "bun test"],
+  ["blocked", "TMPDIR=/tmp/scratch bun test"],
+  ["blocked", "env TMPDIR=/tmp/scratch bun test"],
+  ["blocked", "/bin/zsh -lc 'cd /repo && bun test'"],
 ] as const) {
-  test(`environment verification retry: ${path}`, async () => {
+  test(`environment verification retry: ${path} (${command})`, async () => {
     const verifierModels: string[] = [];
     const scratchPaths: string[] = [];
     const implementationPrompts: string[] = [];
@@ -1457,7 +1460,7 @@ for (const path of [
       if (role === "verify") {
         verifierModels.push(s.target.modelId);
         const n = verifierModels.length;
-        s.onEvent({ type: "tool_call", id: "check", name: "Bash", input: { command: "bun test" } });
+        s.onEvent({ type: "tool_call", id: "check", name: "Bash", input: { command } });
         s.onEvent({
           type: "tool_result",
           id: "check",
