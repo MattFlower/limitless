@@ -230,7 +230,14 @@ test("implement reports complexity, failure reasons, executed costs and median t
     score: 0,
     fields: {},
     riskUnderCall: null,
-    implement: { reason: "timeout", commit: null, gates: [], auditBlocks: [], hidden: null },
+    implement: {
+      reason: "timeout",
+      commit: null,
+      gates: [],
+      auditBlocks: [],
+      auditWarnings: [],
+      hidden: null,
+    },
   };
   rows.push({
     ...trial("a", "cached", 0, true),

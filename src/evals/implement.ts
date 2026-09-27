@@ -59,7 +59,7 @@ export function failedImplement(reason: "timeout" | "error", error?: string): Ev
     score: 0,
     fields: {},
     riskUnderCall: null,
-    implement: { reason, error, commit: null, gates: [], auditBlocks: [], hidden: null },
+    implement: { reason, error, commit: null, gates: [], auditBlocks: [], auditWarnings: [], hidden: null },
   };
 }
 
@@ -76,6 +76,7 @@ export async function gradeImplement(
     commit: null,
     gates: [],
     auditBlocks: [],
+    auditWarnings: [],
     hidden: null,
   };
   try {
@@ -112,7 +113,7 @@ export async function gradeImplement(
     ].some((g) => g.output.startsWith("[timed out]"));
     if (gateTimeout) evidence.reason = "timeout";
     const names = gateScriptNames(prepared.gates);
-    evidence.auditBlocks = auditDiff(await diffSince(cwd, item.base), {
+    const findings = auditDiff(await diffSince(cwd, item.base), {
       taskClass: null,
       protectedPaths: prepared.gates.protectedPaths,
       toolCommands,
@@ -120,7 +121,9 @@ export async function gradeImplement(
         before: pickScripts(await readFileAt(cwd, item.base, "package.json"), names),
         after: pickScripts(await readFileAt(cwd, "HEAD", "package.json"), names),
       },
-    }).filter((finding) => finding.severity === "block");
+    });
+    evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");
+    evidence.auditWarnings = findings.filter((finding) => finding.severity === "warn");
     inject(cwd, files);
     const hidden = await runProcess({
       cmd: ["/bin/sh", "-c", item.hidden.command],
@@ -136,10 +139,17 @@ export async function gradeImplement(
       timedOut: hidden.timedOut,
       output: `${hidden.stdout}\n${hidden.stderr}`.trim().slice(-6000),
     };
+    // Shells reserve 126/127 for commands that cannot execute. Dash uses 2 for an unreadable script.
+    const launchFailed =
+      hidden.exitCode === null ||
+      hidden.exitCode === 126 ||
+      hidden.exitCode === 127 ||
+      (hidden.exitCode === 2 &&
+        /^.*\bsh: .*cannot open .*: (No such file|Permission denied)/m.test(hidden.stderr));
     evidence.reason =
       hidden.timedOut || gateTimeout
         ? "timeout"
-        : hidden.exitCode === null
+        : launchFailed
           ? "error"
           : evidence.gates.some((g) => g.blocking)
             ? "gates"

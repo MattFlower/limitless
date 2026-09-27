@@ -269,7 +269,7 @@ export class EvalRunner {
             "hidden" in item ? { success: true, data: source.output } : schema?.safeParse(source.output);
           if (!output?.success) continue;
           const grade = "hidden" in item ? source.details.grade : gradeCase(item, output.data);
-          if (!grade || ("hidden" in item && !grade.implement)) continue;
+          if (!grade || ("hidden" in item && !Array.isArray(grade.implement?.auditWarnings))) continue;
           store.recordEvalTrial({
             ...trial,
             status: "ok",

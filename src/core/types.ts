@@ -376,6 +376,8 @@ export interface EvalGrade {
     commit: string | null;
     gates: import("../gates/run.ts").GateComparison[];
     auditBlocks: import("../gates/audit.ts").AuditFinding[];
+    /** Null for legacy evidence whose warnings were discarded. */
+    auditWarnings: import("../gates/audit.ts").AuditFinding[] | null;
     hidden: { exitCode: number | null; timedOut: boolean; output: string } | null;
   };
   review?: {

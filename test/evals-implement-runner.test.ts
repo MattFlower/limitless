@@ -200,6 +200,58 @@ for (const [kind, files, gate, reason] of [
       expect(t?.details.grade?.implement?.reason).toBe(reason);
       if (kind === "baseline") expect(t?.details.grade?.implement?.gates[0]?.verdict).toBe("still_failing");
       if (kind === "gates") expect(t?.details.grade?.implement?.auditBlocks).not.toHaveLength(0);
+      if (kind === "warning") {
+        expect(t?.details.grade?.implement?.auditBlocks).toEqual([]);
+        expect(t?.details.grade?.implement?.auditWarnings).toEqual([
+          {
+            rule: "lockfile",
+            severity: "warn",
+            file: "package-lock.json",
+            detail: "Lockfile changed in a task that is not a dependency update.",
+          },
+        ]);
+        expect((await f.run()).trials[0]?.details.grade).toEqual(t?.details.grade);
+        expect(f.calls).toHaveLength(1);
+        // Both the original and cached legacy grades are ineligible once warnings are unknown.
+        for (const run of f.factory.store.listEvalRuns()) {
+          for (const row of f.factory.store.listEvalTrials(run.id)) {
+            if (row.details.grade?.implement) row.details.grade.implement.auditWarnings = null;
+            f.factory.store.recordEvalTrial(row);
+          }
+        }
+        expect((await f.run()).trials[0]?.details.grade?.implement?.auditWarnings).toHaveLength(1);
+        expect(f.calls).toHaveLength(2);
+      }
+    } finally {
+      await f.close();
+    }
+  });
+
+for (const [command, reason] of [
+  ["./hidden/missing-script.sh", "error"],
+  ["sh hidden/missing-script.sh", "error"],
+  ["./overwrite", "error"],
+  ["exit 2", "hidden_tests"],
+] as const)
+  test(`hidden command classification: ${command}`, async () => {
+    const f = await fixture();
+    try {
+      f.item.hidden.command = command;
+      f.save();
+      const trial = (await f.run()).trials[0];
+      expect(trial).toMatchObject({ pass: false, score: 0, status: reason === "error" ? "error" : "ok" });
+      expect(trial?.details.grade?.implement).toMatchObject({ reason, hidden: { timedOut: false } });
+      expect(trial?.details.grade?.implement?.hidden?.exitCode).toBeGreaterThan(0);
+      if (reason === "error") {
+        expect(trial?.details.grade?.implement?.hidden?.output).toBeTruthy();
+        f.respond(() => ({ files: { answer: "correct", broken: "yes", protected: "changed" } }));
+        const overlap = (await f.run({ cache: false })).trials[0]?.details.grade?.implement;
+        expect(overlap?.reason).toBe("error");
+        expect(overlap?.gates.some((g) => g.blocking)).toBe(true);
+        expect(overlap?.auditBlocks.length).toBeGreaterThan(0);
+      }
+      expect(f.calls).toHaveLength(reason === "error" ? 2 : 1);
+      expect(f.calls.every((s) => !existsSync(s.cwd))).toBe(true);
     } finally {
       await f.close();
     }

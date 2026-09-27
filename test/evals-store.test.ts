@@ -28,6 +28,32 @@ const row: EvalTrial = {
   createdAt: 10,
 };
 
+test("audit warning migration marks discarded evidence unknown and preserves other grades", () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec("CREATE TABLE eval_trials (details_json TEXT NOT NULL)");
+    const legacy = { grade: { implement: { auditBlocks: [], reason: null } } };
+    const current = { grade: { implement: { auditBlocks: [], auditWarnings: [] } } };
+    const unrelated = { grade: { review: { recall: 1 } } };
+    for (const details of [legacy, current, unrelated])
+      db.query("INSERT INTO eval_trials VALUES (?)").run(JSON.stringify(details));
+    const migration = MIGRATIONS.find((m) => m.name === "implement_eval_audit_warnings");
+    if (!migration) throw new Error("missing migration");
+    db.exec(migration.sql);
+    expect(
+      (
+        db.query("SELECT details_json FROM eval_trials ORDER BY rowid").all() as { details_json: string }[]
+      ).map((r) => JSON.parse(r.details_json)),
+    ).toEqual([
+      { grade: { implement: { ...legacy.grade.implement, auditWarnings: null } } },
+      current,
+      unrelated,
+    ]);
+  } finally {
+    db.close();
+  }
+});
+
 test("upgrade to the eval migration preserves data and adds eval columns, cache index, FK and tuple uniqueness", () => {
   const home = mkdtempSync(join(tmpdir(), "eval-store-"));
   const path = join(home, "db.sqlite");
