@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   rmSync,
   statSync,
@@ -73,6 +74,25 @@ function inject(cwd: string, files: ReturnType<typeof hiddenContents>) {
   }
 }
 
+async function ignoredPaths(cwd: string, env: Record<string, string>, signal: AbortSignal) {
+  const out = await sh(["git", "ls-files", "-z", "-o", "-i", "--exclude-standard"], { cwd, env, signal });
+  return new Set(out.stdout.split("\0").filter(Boolean));
+}
+
+/** Remove a path without following symlinked parents, then prune directories it left empty. */
+function removeWithin(root: string, path: string) {
+  const parts = path.split("/");
+  let current = root;
+  for (const part of parts.slice(0, -1)) {
+    current = join(current, part);
+    const stat = lstatSync(current, { throwIfNoEntry: false });
+    if (!stat?.isDirectory()) return;
+  }
+  rmSync(join(root, path), { recursive: true, force: true });
+  for (let dir = dirname(join(root, path)); dir !== root && readdirSync(dir).length === 0; dir = dirname(dir))
+    rmSync(dir, { recursive: true });
+}
+
 export function failedImplement(reason: "timeout" | "error", error?: string): EvalGrade {
   return {
     pass: false,
@@ -104,6 +124,7 @@ export async function gradeImplement(
   };
   const snapshot = restore ? mkdtempSync(join(dirname(cwd), "grade-")) : undefined;
   let snapshotReady = false;
+  let ignoredBefore: Set<string> | undefined;
   const modes = new Map<string, number>();
   try {
     signal.throwIfAborted();
@@ -160,6 +181,7 @@ export async function gradeImplement(
     });
     evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");
     evidence.auditWarnings = findings.filter((finding) => finding.severity === "warn");
+    if (snapshot) ignoredBefore = await ignoredPaths(cwd, env, signal);
     inject(cwd, files);
     const hidden = await withScratch(cwd, (scratch) =>
       runProcess({
@@ -210,6 +232,18 @@ export async function gradeImplement(
             signal,
           });
           await sh(["git", "clean", "-fd"], { cwd, env, signal });
+          // Ignore rules are candidate-controlled: drop hidden files and grader outputs they would keep.
+          if (ignoredBefore) {
+            const root = realpathSync(cwd);
+            for (const file of files) removeWithin(root, file.path);
+            for (const path of await ignoredPaths(cwd, env, signal))
+              if (!ignoredBefore.has(path)) removeWithin(root, path);
+            await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "HEAD"], {
+              cwd,
+              env,
+              signal,
+            });
+          }
           for (const [path, mode] of modes) chmodSync(join(cwd, path), mode);
         }
       } finally {

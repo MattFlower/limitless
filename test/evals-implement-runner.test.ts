@@ -800,6 +800,27 @@ test("failed grading preserves ignored baseline dependencies and build outputs f
   }
 });
 
+test("recovery rounds never see ignored hidden files or grader outputs", async () => {
+  const f = await fixture();
+  try {
+    f.item.hidden.command += "; result=$?; mkdir -p dist; cp hidden/check.sh dist/compiled; exit $result";
+    f.save();
+    f.respond((s): FakeReply => {
+      if (f.calls.length === 1)
+        return { files: { answer: "wrong", ".gitignore": "hidden/\ndist/\n", "dist/own": "kept" } };
+      expect(existsSync(join(s.cwd, "hidden"))).toBe(false);
+      expect(existsSync(join(s.cwd, "dist/compiled"))).toBe(false);
+      expect(readFileSync(join(s.cwd, "dist/own"), "utf8")).toBe("kept");
+      expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
+      return { files: { answer: "correct" } };
+    });
+    expect((await f.run({ rounds: 2 })).trials[0]?.pass).toBe(true);
+    expect(f.calls).toHaveLength(2);
+  } finally {
+    await f.close();
+  }
+});
+
 for (const failure of ["harness-timeout", "hidden-timeout", "gate-timeout", "error"])
   test(`recovery preserves evidence and accounts for ${failure}`, async () => {
     const f = await fixture();
