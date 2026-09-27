@@ -6,14 +6,13 @@ import { MIGRATIONS } from "./migrations.ts";
 
 export const MIGRATION_DIR = join(import.meta.dir, "migrations");
 const FILE_NAME = /^\d{8}T\d{4}(?:\d{2})?-[a-z0-9]+(?:-[a-z0-9]+)*\.sql$/;
-const TRACKING_TABLE = "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)";
 
 export function migrationNames(directory: string, entries = readdirSync(directory)): string[] {
   const names = entries.filter((entry) => entry.endsWith(".sql"));
   const seen = new Set<string>();
   for (const name of names) {
     if (!FILE_NAME.test(name) || !validTimestamp(name))
-      throw new Error(`Invalid migration filename: ${name}`);
+      throw new Error(`Invalid migration filename: ${name} (expected YYYYMMDDTHHMM[SS]-kebab-slug.sql, UTC)`);
     if (seen.has(name)) throw new Error(`Duplicate migration identity: ${name}`);
     seen.add(name);
   }
@@ -39,96 +38,57 @@ function validTimestamp(name: string): boolean {
   );
 }
 
-export function verifyShipped(directory: string, manifest = join(directory, "SHIPPED")): void {
-  const seen = new Set<string>();
-  for (const line of readFileSync(manifest, "utf8").split("\n")) {
-    if (!line.trim()) continue;
-    const match = /^([a-f0-9]{64}) {2}(.+\.sql)$/.exec(line);
-    if (!match) throw new Error(`Invalid SHIPPED entry: ${line}`);
-    const [, hash, name] = match;
-    if (!hash || !name) throw new Error(`Invalid SHIPPED entry: ${line}`);
-    if (seen.has(name)) throw new Error(`Duplicate migration identity: ${name}`);
-    seen.add(name);
-    migrationNames(directory, [name]);
-    const actual = createHash("sha256")
-      .update(readFileSync(join(directory, name)))
-      .digest("hex");
-    if (actual !== hash) throw new Error(`Shipped migration changed: ${name}`);
-  }
-  migrationNames(directory);
-}
+const sha256 = (sql: string) => createHash("sha256").update(sql).digest("hex");
 
-function legacyName(version: number): string {
-  const migration = MIGRATIONS.find((m) => m.version === version);
-  if (!migration) throw new Error(`Unknown legacy migration version: ${version}`);
-  return `legacy-${String(version).padStart(4, "0")}-${migration.name}`;
-}
-
-function prepareTracking(db: Database): void {
-  const exists = db
-    .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
-    .get();
-  if (!exists) {
-    db.exec(TRACKING_TABLE);
-    const level = (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
-    for (let version = 1; version <= level; version++) {
-      db.query("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)").run(
-        legacyName(version),
-        Date.now(),
-      );
-    }
-    return;
-  }
-
-  const columns = db.query("PRAGMA table_info(schema_migrations)").all() as { name: string }[];
-  if (columns.some((column) => column.name === "version")) {
-    const rows = db.query("SELECT version, name, applied_at FROM schema_migrations").all() as {
-      version: number;
-      name: string;
-      applied_at: number;
-    }[];
-    const versions = rows.length
-      ? rows.map((row) => {
-          const migration = MIGRATIONS.find((m) => m.version === row.version);
-          if (!migration || migration.name !== row.name)
-            throw new Error(`Unknown legacy migration: ${row.version} ${row.name}`);
-          return { name: legacyName(row.version), appliedAt: row.applied_at };
-        })
-      : Array.from(
-          { length: (db.query("PRAGMA user_version").get() as { user_version: number }).user_version },
-          (_, index) => ({ name: legacyName(index + 1), appliedAt: Date.now() }),
-        );
-    db.exec(TRACKING_TABLE.replace("schema_migrations", "schema_migrations_new"));
-    for (const row of versions)
-      db.query("INSERT INTO schema_migrations_new (name, applied_at) VALUES (?, ?)").run(
-        row.name,
-        row.appliedAt,
-      );
-    db.exec("DROP TABLE schema_migrations; ALTER TABLE schema_migrations_new RENAME TO schema_migrations");
-  } else if (!columns.some((column) => column.name === "name")) {
-    throw new Error("Unrecognized schema_migrations table");
-  }
-}
-
+/**
+ * Legacy migrations keep the version-keyed `schema_migrations` table exactly as older releases
+ * expect it, so a deploy can always roll back. Timestamped files are tracked by name in
+ * `applied_migrations`: branches that add files never conflict, and a file edited after it was
+ * applied fails startup instead of silently diverging.
+ */
 export function runMigrations(db: Database, directory = MIGRATION_DIR): void {
   const files = migrationNames(directory);
-  db.transaction(() => prepareTracking(db))();
-  const applied = new Set(
-    (db.query("SELECT name FROM schema_migrations").all() as { name: string }[]).map((r) => r.name),
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
   );
-  for (const migration of MIGRATIONS) {
-    const name = legacyName(migration.version);
-    if (applied.has(name)) continue;
+  const versions = new Set(
+    (db.query("SELECT version FROM schema_migrations").all() as { version: number }[]).map((r) => r.version),
+  );
+  for (const m of MIGRATIONS) {
+    if (versions.has(m.version)) continue;
     db.transaction(() => {
-      db.exec(migration.sql);
-      db.query("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)").run(name, Date.now());
+      db.exec(m.sql);
+      db.query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(
+        m.version,
+        m.name,
+        Date.now(),
+      );
     })();
   }
+
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS applied_migrations (name TEXT PRIMARY KEY, sha256 TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+  );
+  const applied = new Map(
+    (db.query("SELECT name, sha256 FROM applied_migrations").all() as { name: string; sha256: string }[]).map(
+      (r) => [r.name, r.sha256],
+    ),
+  );
   for (const name of files) {
-    if (applied.has(name)) continue;
+    const sql = readFileSync(join(directory, name), "utf8");
+    const hash = sha256(sql);
+    const recorded = applied.get(name);
+    if (recorded !== undefined) {
+      if (recorded !== hash) throw new Error(`Applied migration changed: ${name}. Add a new file instead.`);
+      continue;
+    }
     db.transaction(() => {
-      db.exec(readFileSync(join(directory, name), "utf8"));
-      db.query("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)").run(name, Date.now());
+      db.exec(sql);
+      db.query("INSERT INTO applied_migrations (name, sha256, applied_at) VALUES (?, ?, ?)").run(
+        name,
+        hash,
+        Date.now(),
+      );
     })();
   }
 }

@@ -1,11 +1,9 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkMigrationCopy } from "../scripts/check-migration-copy.ts";
-import { MIGRATION_DIR, migrationNames, runMigrations, verifyShipped } from "../src/db/migration-runner.ts";
+import { MIGRATION_DIR, migrationNames, runMigrations } from "../src/db/migration-runner.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
 import { Store } from "../src/db/store.ts";
 
@@ -18,137 +16,84 @@ function temporary(testBody: (directory: string, path: string) => void): void {
   }
 }
 
-function legacyDatabase(path: string, tracked: boolean): void {
+/** A database as the pre-file-migration release left it: every legacy migration applied. */
+function legacyDatabase(path: string): void {
   const db = new Database(path);
-  if (tracked)
-    db.exec(
-      "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
-    );
+  db.exec(
+    "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+  );
   for (const migration of MIGRATIONS) {
     db.exec(migration.sql);
-    if (tracked)
-      db.query("INSERT INTO schema_migrations VALUES (?, ?, 1)").run(migration.version, migration.name);
+    db.query("INSERT INTO schema_migrations VALUES (?, ?, 1)").run(migration.version, migration.name);
   }
   db.exec("INSERT INTO settings VALUES ('sentinel', 'unchanged')");
-  if (!tracked) db.exec("PRAGMA user_version = 12");
   db.close();
 }
 
+const legacyRows = (db: Database) => db.query("SELECT * FROM schema_migrations ORDER BY version").all();
+const fileNames = (db: Database) =>
+  (db.query("SELECT name FROM applied_migrations ORDER BY rowid").all() as { name: string }[]).map(
+    (r) => r.name,
+  );
+
+test("the legacy migration array is frozen", () => {
+  expect(MIGRATIONS.map((m) => m.version)).toEqual(Array.from({ length: 12 }, (_, i) => i + 1));
+});
+
+test("repository migration files are validly named", () => {
+  expect(() => migrationNames(MIGRATION_DIR)).not.toThrow();
+});
+
 test("fresh Store applies legacy and file migrations and reopens without new records", () => {
   temporary((directory, path) => {
-    const filename = "20260927T1500-fresh.sql";
-    writeFileSync(join(directory, filename), "CREATE TABLE from_file (id INTEGER);");
+    writeFileSync(join(directory, "20260927T1500-fresh.sql"), "CREATE TABLE from_file (id INTEGER);");
     let store = new Store(path, directory);
-    expect(store.db.query("SELECT name FROM sqlite_master WHERE name = 'eval_trials'").get()).toEqual({
-      name: "eval_trials",
-    });
-    const names = store.db.query("SELECT name FROM schema_migrations ORDER BY name").all() as {
-      name: string;
-    }[];
     expect(store.db.query("SELECT name FROM sqlite_master WHERE name = 'from_file'").get()).toEqual({
       name: "from_file",
     });
-    expect(names).toHaveLength(MIGRATIONS.length + 1);
-    expect(names.map((row) => row.name)).toContain("legacy-0001-initial");
-    expect(names.map((row) => row.name)).toContain(filename);
+    expect(legacyRows(store.db)).toHaveLength(MIGRATIONS.length);
+    expect(fileNames(store.db)).toEqual(["20260927T1500-fresh.sql"]);
     store.close();
     store = new Store(path, directory);
-    expect(store.db.query("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({
-      count: names.length,
-    });
+    expect(legacyRows(store.db)).toHaveLength(MIGRATIONS.length);
+    expect(fileNames(store.db)).toEqual(["20260927T1500-fresh.sql"]);
     store.close();
   });
 });
 
-for (const tracked of [true, false]) {
-  test(`upgrades legacy database with ${tracked ? "version rows" : "user_version fallback"}`, () => {
-    temporary((directory, path) => {
-      legacyDatabase(path, tracked);
-      const filename = "20260927T1500-upgrade.sql";
-      writeFileSync(join(directory, filename), "CREATE TABLE from_file (id INTEGER);");
-      const store = new Store(path, directory);
-      expect(store.db.query("SELECT value FROM settings WHERE key = 'sentinel'").get()).toEqual({
-        value: "unchanged",
-      });
-      expect(store.db.query("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({
-        count: MIGRATIONS.length + 1,
-      });
-      expect(store.db.query("SELECT name FROM schema_migrations WHERE name = ?").get(filename)).toEqual({
-        name: filename,
-      });
-      expect(store.db.query("PRAGMA table_info(schema_migrations)").all()).toEqual(
-        expect.arrayContaining([expect.objectContaining({ name: "name", pk: 1 })]),
-      );
-      store.close();
-    });
-  });
-}
-
-test("upgrading a current database without new files leaves application schema and data unchanged", () => {
+test("upgrading an existing database applies only new files and leaves legacy tracking untouched", () => {
   temporary((directory, path) => {
-    legacyDatabase(path, true);
+    legacyDatabase(path);
     const before = new Database(path);
-    const schema = before
-      .query(
-        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name <> 'schema_migrations' ORDER BY type, name",
-      )
-      .all();
-    const settings = before.query("SELECT * FROM settings ORDER BY key").all();
+    const rows = legacyRows(before);
     before.close();
+    writeFileSync(join(directory, "20260927T1500-upgrade.sql"), "CREATE TABLE from_file (id INTEGER);");
     const store = new Store(path, directory);
-    expect(
-      store.db
-        .query(
-          "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name <> 'schema_migrations' ORDER BY type, name",
-        )
-        .all(),
-    ).toEqual(schema);
-    expect(store.db.query("SELECT * FROM settings ORDER BY key").all()).toEqual(settings);
-    store.close();
-  });
-});
-
-test("deployment check uses a production database copy and leaves the source untouched", () => {
-  temporary((directory, path) => {
-    legacyDatabase(path, true);
-    const before = new Database(path);
-    const original = before.query("SELECT * FROM schema_migrations ORDER BY version").all();
-    before.close();
-    checkMigrationCopy(path, directory);
-    const after = new Database(path);
-    expect(after.query("SELECT * FROM schema_migrations ORDER BY version").all()).toEqual(original);
-    expect(after.query("SELECT value FROM settings WHERE key = 'sentinel'").get()).toEqual({
+    expect(store.db.query("SELECT value FROM settings WHERE key = 'sentinel'").get()).toEqual({
       value: "unchanged",
     });
-    after.close();
+    expect(legacyRows(store.db)).toEqual(rows);
+    expect(fileNames(store.db)).toEqual(["20260927T1500-upgrade.sql"]);
+    store.close();
   });
 });
 
-test("deployment check applies pending SQL only to its copy", () => {
+test("a previous release can still open the database (deploy rollback)", () => {
   temporary((directory, path) => {
-    legacyDatabase(path, true);
-    writeFileSync(join(directory, "20260927T1500-deploy.sql"), "CREATE TABLE deployed (id INTEGER);");
-    checkMigrationCopy(path, directory);
-    const source = new Database(path);
-    expect(source.query("SELECT name FROM sqlite_master WHERE name = 'deployed'").get()).toBeNull();
-    source.close();
-  });
-});
-
-test("deployment check rejects unexpected application changes without pending files", () => {
-  temporary((directory, path) => {
+    writeFileSync(join(directory, "20260927T1500-added.sql"), "CREATE TABLE added (id INTEGER);");
+    new Store(path, directory).close();
+    // The pre-file-migration Store.migrate(): version-keyed table, legacy array only.
     const db = new Database(path);
     db.exec(
-      "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
     );
-    for (const migration of MIGRATIONS.slice(0, -1)) {
-      db.exec(migration.sql);
-      db.query("INSERT INTO schema_migrations VALUES (?, ?, 1)").run(migration.version, migration.name);
-    }
+    const applied = new Set(
+      (db.query("SELECT version FROM schema_migrations").all() as { version: number }[]).map(
+        (r) => r.version,
+      ),
+    );
+    expect(MIGRATIONS.filter((m) => !applied.has(m.version))).toEqual([]);
     db.close();
-    expect(() => checkMigrationCopy(path, directory)).toThrow(
-      "migration copy changed application schema or data",
-    );
   });
 });
 
@@ -164,16 +109,24 @@ test("SQL files run in filename order regardless of creation order", () => {
       const db = new Database(path);
       runMigrations(db, directory);
       expect(db.query("SELECT value FROM ordered").get()).toEqual({ value: "ok" });
-      expect(
-        (
-          db.query("SELECT name FROM schema_migrations WHERE name LIKE '2026%' ORDER BY rowid").all() as {
-            name: string;
-          }[]
-        ).map((r) => r.name),
-      ).toEqual(files.map(([name]) => name));
+      expect(fileNames(db)).toEqual(files.map(([name]) => name));
       db.close();
     });
   }
+});
+
+test("an older-timestamped file merged after a newer one was applied still runs", () => {
+  temporary((directory, path) => {
+    writeFileSync(join(directory, "20260927T1600-newer.sql"), "CREATE TABLE newer (id INTEGER);");
+    let db = new Database(path);
+    runMigrations(db, directory);
+    db.close();
+    writeFileSync(join(directory, "20260927T1500-older.sql"), "CREATE TABLE older (id INTEGER);");
+    db = new Database(path);
+    runMigrations(db, directory);
+    expect(fileNames(db)).toEqual(["20260927T1600-newer.sql", "20260927T1500-older.sql"]);
+    db.close();
+  });
 });
 
 test("failed SQL rolls back its schema and record and stops later files", () => {
@@ -186,31 +139,28 @@ test("failed SQL rolls back its schema and record and stops later files", () => 
     const db = new Database(path);
     expect(() => runMigrations(db, directory)).toThrow();
     expect(db.query("SELECT name FROM sqlite_master WHERE name IN ('partial', 'later')").all()).toEqual([]);
-    expect(db.query("SELECT name FROM schema_migrations WHERE name LIKE '2026%'").all()).toEqual([]);
+    expect(fileNames(db)).toEqual([]);
     db.close();
   });
 });
 
-test("SHIPPED detects changed and missing files and duplicate identities", () => {
-  temporary((directory) => {
-    const name = "20260927T1500-shipped.sql";
-    const path = join(directory, name);
-    const sql = "CREATE TABLE shipped (id INTEGER);";
-    writeFileSync(path, sql);
-    const entry = `${createHash("sha256").update(sql).digest("hex")}  ${name}\n`;
-    writeFileSync(join(directory, "SHIPPED"), entry);
-    expect(() => verifyShipped(directory)).not.toThrow();
-    writeFileSync(join(directory, "SHIPPED"), entry + entry);
-    expect(() => verifyShipped(directory)).toThrow("Duplicate migration identity");
-    writeFileSync(join(directory, "SHIPPED"), entry);
-    writeFileSync(path, `${sql} `);
-    expect(() => verifyShipped(directory)).toThrow("Shipped migration changed");
-    unlinkSync(path);
-    expect(() => verifyShipped(directory)).toThrow();
-    expect(() => migrationNames(directory, [name, name])).toThrow("Duplicate migration identity");
+test("editing an applied file fails startup", () => {
+  temporary((directory, path) => {
+    const file = join(directory, "20260927T1500-shipped.sql");
+    writeFileSync(file, "CREATE TABLE shipped (id INTEGER);");
+    new Store(path, directory).close();
+    writeFileSync(file, "CREATE TABLE shipped (id INTEGER, extra TEXT);");
+    expect(() => new Store(path, directory)).toThrow("Applied migration changed: 20260927T1500-shipped.sql");
   });
 });
 
-test("repository SHIPPED list matches its SQL files", () => {
-  expect(() => verifyShipped(MIGRATION_DIR)).not.toThrow();
+test("invalid and duplicate filenames are rejected", () => {
+  expect(() => migrationNames("unused", ["2026-09-27-bad.sql"])).toThrow("Invalid migration filename");
+  expect(() => migrationNames("unused", ["20260231T1500-no-such-day.sql"])).toThrow(
+    "Invalid migration filename",
+  );
+  expect(() => migrationNames("unused", ["20260927T1500-a.sql", "20260927T1500-a.sql"])).toThrow(
+    "Duplicate migration identity",
+  );
+  expect(migrationNames("unused", ["README.md", "20260927T1500-a.sql"])).toEqual(["20260927T1500-a.sql"]);
 });

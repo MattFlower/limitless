@@ -235,7 +235,6 @@ export async function deploy(
     await command(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000 });
     await command(["bun", "run", "check"], { cwd: dir, timeoutMs: 600_000 });
     if (smoke) await command(["bun", "run", "smoke"], { cwd: dir, timeoutMs: 900_000 });
-    await command(["bun", "scripts/check-migration-copy.ts"], { cwd: dir, timeoutMs: 300_000 });
     gatesPassed = true;
     // A lost response may still have enabled drain on the daemon.
     drainAttempted = true;

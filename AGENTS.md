@@ -6,7 +6,7 @@ Read `docs/ARCHITECTURE.md` before changing anything structural.
 
 ## Layout
 - `src/core/types.ts` — domain types shared by daemon, CLI and UI (no runtime imports here).
-- `src/db/` — `Store` (all persistence + pub/sub), frozen legacy migrations and timestamped SQL files.
+- `src/db/` — `Store` (all persistence + pub/sub); schema changes are timestamped SQL files in `src/db/migrations/` (never edit a shipped one; see its README).
 - `src/pipeline/` — `engine.ts` (stage state machine), `context.ts` (invoke/routing/fallback), `prompts.ts`, `schemas.ts` (zod → strict JSON schema), `report.ts`.
 - `src/harness/` — CLI adapters. Parsers are pure classes tested against captured fixtures in `test/fixtures/`.
 - `src/router/` — model catalog + policy, provider quota/health tracking, routing.
@@ -21,6 +21,6 @@ Read `docs/ARCHITECTURE.md` before changing anything structural.
 - Anything that talks to a paid model must be testable with the fake harness (`src/harness/fake.ts`).
   Tests must never call real LLMs, the network, or `gh`.
 - Keep types strict: no `any`, no non-null assertions where a check is cheap.
-- New persisted fields need a new file in `src/db/migrations/`.
+- New persisted fields need a new `src/db/migrations/YYYYMMDDTHHMM-slug.sql` (UTC), additive so the previous release still runs.
 - Match the surrounding style: small focused modules, comments only where the *why* isn't obvious.
 - Never commit secrets. Configuration lives in `~/.config/limitless/{config.toml,secrets.env}`.
