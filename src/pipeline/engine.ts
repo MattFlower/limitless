@@ -4,7 +4,7 @@ import { assertExistingBranchDelivery } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
-import { compareGates, runGates } from "../gates/run.ts";
+import { compareGates, type GateHooks, retryRegressions, runGates } from "../gates/run.ts";
 import {
   clearInterruptedRebase,
   commitAll,
@@ -146,6 +146,25 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
 // ---------------------------------------------------------------------------
 // prepare: repo cache, worktree, gate detection, baseline
 
+function gateEvents(ctx: RunContext): Required<GateHooks> {
+  return {
+    onResult: (r) =>
+      ctx.store.addEvent({
+        runId: ctx.run.id,
+        type: "gate",
+        level: r.ok ? "info" : "warn",
+        message: `${r.name}: ${r.ok ? "pass" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
+        data: r,
+      }),
+    onWait: (slots) =>
+      ctx.store.addEvent({
+        runId: ctx.run.id,
+        type: "gate",
+        message: `Waiting for a gate slot (all ${slots} in use; limits.max_concurrent_gates)`,
+      }),
+  };
+}
+
 async function prepare(ctx: RunContext): Promise<void> {
   assertExistingBranchDelivery(ctx.repo, ctx.run);
   await ctx.stage("prepare", async () => {
@@ -165,7 +184,9 @@ async function prepare(ctx: RunContext): Promise<void> {
       `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
     );
     ctx.state.baseline =
-      gates.setup.length || gates.checks.length ? await runGates(wt.path, gates, ctx.signal) : null;
+      gates.setup.length || gates.checks.length
+        ? await runGates(wt.path, gates, ctx.signal, { onWait: gateEvents(ctx).onWait })
+        : null;
     ctx.checkCancelled();
     const baseline = ctx.state.baseline;
     if (baseline) {
@@ -512,24 +533,41 @@ async function oneRound(
   const comparison = await ctx.stage(
     "gates",
     async () => {
-      const after = await runGates(cwd, gates, ctx.signal, (r) =>
-        ctx.store.addEvent({
-          runId: ctx.run.id,
-          type: "gate",
-          level: r.ok ? "info" : "warn",
-          message: `${r.name}: ${r.ok ? "pass" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
-          data: r,
-        }),
+      const events = gateEvents(ctx);
+      const after = await runGates(cwd, gates, ctx.signal, events);
+      ctx.checkCancelled();
+      const changed = (await diffSince(cwd, baseSha)).files.flatMap((f) =>
+        f.from ? [f.path, f.from] : [f.path],
+      );
+      // Retry before discarding, so a check sees the same build output as its first attempt.
+      const cmp = await retryRegressions(
+        compareGates(ctx.state.baseline ?? null, after),
+        cwd,
+        gates,
+        changed,
+        ctx.signal,
+        events.onWait,
       );
       ctx.checkCancelled();
       // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
       await discardChanges(cwd);
-      const cmp = compareGates(ctx.state.baseline ?? null, after);
+      for (const c of cmp.filter((c) => c.firstAttempt)) {
+        ctx.store.addEvent({
+          runId: ctx.run.id,
+          type: "gate",
+          level: "warn",
+          message: `${c.name} retry: ${c.result.ok ? "pass (flaky, not blocking)" : "FAIL again"}`,
+          data: { flaky: c.result.ok, firstAttempt: c.firstAttempt, retry: c.result },
+        });
+      }
       ctx.state.lastGates = cmp;
       ctx.store.putArtifact(ctx.run.id, `gates-${round}.json`, "gates", JSON.stringify(cmp, null, 2));
       const blocking = cmp.filter((c) => c.blocking).map((c) => c.name);
+      const flaky = cmp.filter((c) => c.verdict === "flaky").map((c) => c.name);
       return {
-        summary: blocking.length ? `blocking: ${blocking.join(", ")}` : `${cmp.length} checks ok`,
+        summary: blocking.length
+          ? `blocking: ${blocking.join(", ")}`
+          : `${cmp.length} checks ok${flaky.length ? `, flaky: ${flaky.join(", ")}` : ""}`,
         value: cmp,
       };
     },
@@ -983,15 +1021,7 @@ async function rebaseForDelivery(
     await ctx.stage(
       "gates",
       async () => {
-        const after = await runGates(cwd, ctx.state.gatesConfig as GateConfig, ctx.signal, (r) =>
-          ctx.store.addEvent({
-            runId: ctx.run.id,
-            type: "gate",
-            level: r.ok ? "info" : "warn",
-            message: `${r.name}: ${r.ok ? "pass" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
-            data: r,
-          }),
-        );
+        const after = await runGates(cwd, ctx.state.gatesConfig as GateConfig, ctx.signal, gateEvents(ctx));
         ctx.checkCancelled();
         await discardChanges(cwd);
         // A check fixed by the implementation must stay fixed after rebasing, even when

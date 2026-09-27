@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { evalSettings } from "./evals/settings.ts";
+import { defaultGateSlots } from "./gates/slots.ts";
 import { isLanAddress, isLoopback, publicOrigin } from "./server/access.ts";
 
 export interface Paths {
@@ -37,6 +38,8 @@ export interface Config {
   publicUrl: string | null; // e.g. https://limitless.mattflower.cc (webhooks only)
   uiUrl: string; // where the UI is reachable locally, used in PR bodies
   maxConcurrentRuns: number;
+  /** Gate suites (setup + checks) allowed to run at once across the whole process. */
+  maxConcurrentGates: number;
   maxRounds: number; // implement ⇄ feedback rounds before escalation
   openrouterBudgetUsd: number;
   reserves: Reserves;
@@ -168,6 +171,7 @@ export function loadConfig(
     publicUrl: str(server.public_url, null),
     uiUrl: str(server.ui_url, `http://localhost:${port}`) as string,
     maxConcurrentRuns: num(limits.max_concurrent_runs, 3),
+    maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
     maxRounds: num(limits.max_rounds, 3),
     openrouterBudgetUsd: num(limits.openrouter_budget_usd, 50),
     reserves: {
