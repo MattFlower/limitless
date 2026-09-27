@@ -77,19 +77,35 @@ function inject(cwd: string, files: ReturnType<typeof hiddenContents>) {
   }
 }
 
-async function ignoredPaths(cwd: string, env: Record<string, string>, signal: AbortSignal) {
+/**
+ * Every ignored entry, descending into directories Git reports unexpanded (nested repositories) so
+ * each file beneath them is tracked on its own. Symlinks are never followed.
+ */
+async function* ignoredEntries(cwd: string, env: Record<string, string>, signal: AbortSignal) {
+  const root = realpathSync(cwd);
   const out = await sh(["git", "ls-files", "-z", "-o", "-i", "--exclude-standard"], { cwd, env, signal });
-  return new Set(out.stdout.split("\0").filter(Boolean));
+  const pending = out.stdout
+    .split("\0")
+    .filter(Boolean)
+    .map((path) => path.replace(/\/$/, ""));
+  for (let path = pending.shift(); path !== undefined; path = pending.shift()) {
+    yield path;
+    const stat = lstatSync(join(root, path), { throwIfNoEntry: false });
+    if (stat?.isDirectory())
+      pending.unshift(...readdirSync(join(root, path)).map((entry) => `${path}/${entry}`));
+  }
 }
 
 /**
  * Identify an ignored file's exact pre-grade state. ctime can't be forged by the grader, but coarse
  * filesystem clocks can hide a same-tick rewrite, so recently changed files also carry their contents.
+ * Directories are compared by their entries, not their metadata: overwriting a child leaves it unchanged.
  */
 function fingerprint(root: string, path: string, since: bigint) {
   const file = join(root, path);
   const stat = lstatSync(file, { bigint: true, throwIfNoEntry: false });
   if (!stat) return null;
+  if (stat.isDirectory()) return "directory";
   const meta = `${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
   if (stat.ctimeNs < since) return meta;
   const body = stat.isSymbolicLink() ? readlinkSync(file) : stat.isFile() ? readFileSync(file) : "";
@@ -100,7 +116,7 @@ async function ignoredState(cwd: string, env: Record<string, string>, signal: Ab
   const root = realpathSync(cwd);
   const since = BigInt(Date.now() - 5_000) * 1_000_000n;
   const state = new Map<string, string | null>();
-  for (const path of await ignoredPaths(cwd, env, signal)) state.set(path, fingerprint(root, path, since));
+  for await (const path of ignoredEntries(cwd, env, signal)) state.set(path, fingerprint(root, path, since));
   return { since, state };
 }
 
@@ -262,7 +278,7 @@ export async function gradeImplement(
           if (ignoredBefore) {
             const root = realpathSync(cwd);
             for (const file of files) removeWithin(root, file.path);
-            for (const path of await ignoredPaths(cwd, env, signal)) {
+            for await (const path of ignoredEntries(cwd, env, signal)) {
               const before = ignoredBefore.state.get(path);
               if (before === undefined || before !== fingerprint(root, path, ignoredBefore.since))
                 removeWithin(root, path);

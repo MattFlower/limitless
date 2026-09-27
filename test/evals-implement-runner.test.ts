@@ -848,6 +848,31 @@ test("recovery rounds never see hidden tests copied onto pre-existing ignored ou
   }
 });
 
+// Git lists a nested repository as one unexpanded directory, whose metadata an overwritten child leaves untouched.
+test("recovery rounds never see hidden tests copied into ignored nested repositories", async () => {
+  const f = await fixture();
+  try {
+    f.item.hidden.command += "; result=$?; cp hidden/check.sh dist/nested/compiled; exit $result";
+    f.save();
+    f.respond(async (s): Promise<FakeReply> => {
+      if (f.calls.length === 1) {
+        await sh(["git", "init", "-q", "dist/nested"], { cwd: s.cwd });
+        writeFileSync(join(s.cwd, "dist/nested/compiled"), "built");
+        writeFileSync(join(s.cwd, "dist/nested/own"), "kept");
+        return { files: { answer: "wrong", ".gitignore": "hidden/\ndist/\n" } };
+      }
+      const compiled = join(s.cwd, "dist/nested/compiled");
+      expect(existsSync(compiled) ? readFileSync(compiled, "utf8") : "").not.toContain("answer");
+      expect(readFileSync(join(s.cwd, "dist/nested/own"), "utf8")).toBe("kept");
+      return { files: { answer: "correct" } };
+    });
+    expect((await f.run({ rounds: 2 })).trials[0]?.pass).toBe(true);
+    expect(f.calls).toHaveLength(2);
+  } finally {
+    await f.close();
+  }
+});
+
 for (const failure of ["harness-timeout", "hidden-timeout", "gate-timeout", "error"])
   test(`recovery preserves evidence and accounts for ${failure}`, async () => {
     const f = await fixture();
