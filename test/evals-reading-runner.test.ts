@@ -1,7 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { loadRoleCases, VerifyCaseFileSchema } from "../src/evals/cases.ts";
+import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema } from "../src/evals/cases.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { auditDiff } from "../src/gates/audit.ts";
 import { gateScriptNames, pickScripts } from "../src/gates/detect.ts";
@@ -16,7 +16,7 @@ import { deferred, evalFixture } from "./evals-support.ts";
 async function fixture(role: "review" | "verify" = "review") {
   const f = await evalFixture();
   const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
-  const item = { ...reviewCase, base: f.sha, head };
+  const item: ReviewCase = structuredClone({ ...reviewCase, base: f.sha, head });
   const verify = VerifyCaseFileSchema.parse(
     loadRoleCases("verify", new URL("./data/evals-verify.json", import.meta.url).pathname),
   ).cases[2];

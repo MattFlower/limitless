@@ -1,7 +1,16 @@
 import type { ReviewCase } from "../src/evals/cases.ts";
 import type { Review } from "../src/pipeline/schemas.ts";
 
-export const reviewCase: ReviewCase = {
+/** Deep-frozen so a test that mutates the shared fixture fails at once instead of leaking into other files. */
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object") {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+export const reviewCase: ReviewCase = deepFreeze({
   id: "review-one",
   repo: "fixture/repo",
   base: "a".repeat(40),
@@ -20,7 +29,7 @@ export const reviewCase: ReviewCase = {
       foundBy: "SECRET_AUTHOR",
     },
   ],
-};
+});
 export function reviewOutput(
   line = 10,
   severity: Review["findings"][number]["severity"] = "minor",
