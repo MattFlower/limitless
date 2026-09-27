@@ -104,7 +104,13 @@ export const ProviderCard: Component<{ provider: ProviderStatus; workload?: Prov
                 ["Tokens out", (w: WorkloadTotals) => compactNumber(w.tokensOut)],
                 ["Wall time", (w: WorkloadTotals) => duration(w.wallTimeMs)],
                 [
-                  props.provider.billing === "free" ? "Saved (API-equiv.)" : "API-equivalent",
+                  props.provider.billing === "free" ? (
+                    <>
+                      Saved <span class="nowrap">(API-equiv.)</span>
+                    </>
+                  ) : (
+                    <span class="nowrap">API-equivalent</span>
+                  ),
                   (w: WorkloadTotals) => money(w.costEquivUsd),
                 ],
               ] as const

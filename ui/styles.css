@@ -746,7 +746,7 @@ p {
 .provider-workload-head,
 .provider-workload-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 55px 66px;
+  grid-template-columns: minmax(0, 1fr) 48px 60px;
   gap: 4px;
   padding: 3px 0;
 }
@@ -760,6 +760,9 @@ p {
 .provider-workload-head span:not(:first-child),
 .provider-workload-row span:not(:first-child) {
   text-align: right;
+  white-space: nowrap;
+}
+.provider-workload-row .nowrap {
   white-space: nowrap;
 }
 .provider-gauges {
