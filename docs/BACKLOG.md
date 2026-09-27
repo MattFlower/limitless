@@ -131,7 +131,7 @@ that conflicts.
 and `DISCORD_GUILD_ID` are set).
 
 - Guild slash commands: `/build repo:<string> prompt:<string> [profile]`, `/runs [status]`,
-  `/run id:<string>`, `/cancel id:<string>`. Only the owner (`cfg.discordOwnerId`, configurable)
+  `/show id:<string>`, `/cancel id:<string>`. Only the owner (`cfg.discordOwnerId`, configurable)
   may create or cancel runs; others get an ephemeral refusal.
 - Each run started from Discord gets a thread; post concise progress updates (stage transitions,
   questions, final status with PR link and cost) — rate-limited and batched so a run posts at most

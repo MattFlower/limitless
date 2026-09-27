@@ -111,3 +111,71 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 
 Every agent session's raw event stream is kept in `~/.limitless/runs/<run>/inv-<n>.log`, and the UI
 shows the same events live, so failures can be diagnosed without re-running.
+
+## Triage evaluations
+
+Evaluations run in the daemon using its catalog, harness adapters, triage prompt/schema and shared
+provider tracker. Start the daemon first; the CLI only submits and reads HTTP requests:
+
+```sh
+limitless eval run triage --models mtplx/qwen-27b,claude/haiku --k 2 --max-usd 1 --follow
+limitless eval run triage --models claude/haiku --cases triage-001,triage-002 --no-cache
+limitless eval report <eval-id>
+limitless eval report <eval-id> --json
+```
+
+Use catalog IDs shown by the daemon's `/api/models` endpoint. Only `triage` is supported. Defaults
+are `k=1`, `maxUsd=1.00`, all cases, and caching enabled. Case selections retain dataset order and
+trial indices start at zero. The daemon resolves `evals/triage/cases.json` from its application
+checkout, validates it before scheduling, and reads the exact pinned commits from locked bare repo
+caches (cloning/fetching when needed). It never creates an eval worktree. Each model runs sequentially;
+provider groups may overlap within shared capacity limits. The runner never falls back or retries; normal adapter-level structured-output repair remains the
+same as in the pipeline and its cost is included in the trial.
+Unavailable providers, reserves, provider budgets, circuit breakers, blocked models and missing
+harnesses produce explicit skipped trials. Actual eval spend counts toward provider-wide budgets.
+
+`maxUsd` is a scheduling threshold for **recorded metered spend**, not a billing ceiling. Once
+reached, remaining trials are skipped and the run becomes `budget_exhausted`. Zero prevents new
+trials. Already-started calls finish and retain their full costs, so concurrent calls may exceed the
+threshold. Failed calls also consume metered budget; API-equivalent subscription costs do not.
+
+The SHA-256 cache identity includes model ID, selected harness, prompt and system additions, strict
+JSON schema and trial index. Only schema-valid `ok` outputs are reusable, even when they failed
+grading. Cache replay re-grades current gold, adds zero new cost/tokens, and leaves provider quota and
+health untouched (cached outputs remain usable when the provider is unavailable). Original cost, tokens and latency are retained in trial cache provenance. Gold-only
+changes do not invalidate the cache; `--no-cache` forces fresh calls. Historical reports use their
+persisted grades, so later label edits do not rewrite past results.
+
+Reports include distinct evaluated cases, evaluated trials, skips/errors/cache hits/pending/unscored
+counts, pass rate with Wilson 95% intervals, mean weighted score, risk under-call rate, flip rate,
+metered and API-equivalent dollars, p50 invocation latency, and paired comparisons against the best
+model. Denominators and comparison coverage are included in both text and JSON:
+
+- Pass requires all non-null gold fields to match; alternatives accept any listed value.
+  `needs_questions` means nonempty `blocking_questions`. Risk has weight 2; other fields have weight 1.
+  All-null gold is unscored. Attempted failed calls or invalid outputs count as pass failures with
+  score 0; unattempted skips are excluded.
+- Wilson intervals use evaluated trials and z=1.959963984540054. Risk under-call means predicted risk
+  is below every accepted gold risk; null gold risk and calls without a valid prediction have no risk
+  observation. Flip rate is the fraction of cases with all k evaluated trials whose pass/fail values
+  differ; it is unavailable for k=1. Latency excludes cache replays and skips.
+- Best means highest observed trial pass rate, breaking ties by model ID. Comparisons use per-case
+  mean pass outcomes for cases with all k observations for both models. A paired bootstrap resamples
+  cases together, reports candidate-minus-best mean difference, and uses the nearest-rank fifth
+  percentile as the one-sided 95% lower bound. `nonInferior` requires that bound strictly above
+  `-delta`. Defaults: delta=0.10, 10,000 resamples, seed=20260926 (Mulberry32 RNG). These settings can be
+  configured through typed report/statistics options. Empty denominators and absent pairs are `null`
+  in JSON and `n/a` in text.
+
+The API provides `POST /api/evals` with `{role, models, k?, maxUsd?, caseIds?, cache?}` (202 with `{id}`),
+`GET /api/evals` to list runs, and `GET /api/evals/:id` for the run, summaries and trials. Mutations use
+the usual local Origin and JSON content-type rules; Cloudflare tunnel requests are refused.
+
+Runs progress from `queued` to `running`, then `completed`, `budget_exhausted` or `failed`. Completed
+means execution ended, not that candidates passed. Trial errors and skips remain visible in partial
+reports. Daemon shutdown aborts active calls and releases slots; startup marks interrupted evals
+failed, retaining completed trials for cache reuse on a new submission. In-flight trials interrupted
+by a crash are errors with unknown final usage/latency; queued trials are skipped. Unknown latency is
+excluded from the p50. `--follow` polls until any
+terminal state and prints a final report. Other role graders, the Evals UI and policy generation are
+not implemented yet.

@@ -333,3 +333,59 @@ export interface ChatConversation {
 }
 
 export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
+
+export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed";
+export interface EvalRun {
+  id: string;
+  role: "triage";
+  models: string[];
+  k: number;
+  maxUsd: number;
+  status: EvalStatus;
+  createdAt: number;
+  finishedAt: number | null;
+  error: string | null;
+}
+export interface EvalGrade {
+  pass: boolean | null;
+  score: number | null;
+  fields: Record<
+    string,
+    { predicted: string | boolean; accepted: (string | boolean)[]; match: boolean; weight: number }
+  >;
+  riskUnderCall: boolean | null;
+}
+export interface EvalTrial {
+  evalRunId: string;
+  caseId: string;
+  modelId: string;
+  trial: number;
+  cacheKey: string;
+  harness: string;
+  status: "queued" | "running" | "ok" | "error" | "skipped";
+  output: unknown;
+  pass: boolean | null;
+  score: number | null;
+  details: {
+    provider?: string;
+    reason?: string;
+    grade?: EvalGrade;
+    invocationStatus?: InvocationStatus;
+    interrupted?: boolean;
+    cache?: {
+      evalRunId: string;
+      caseId: string;
+      costUsd: number;
+      costEquivUsd: number;
+      tokensIn: number;
+      tokensOut: number;
+      durationMs: number;
+    };
+  };
+  costUsd: number;
+  costEquivUsd: number;
+  tokensIn: number;
+  tokensOut: number;
+  durationMs: number;
+  createdAt: number;
+}
