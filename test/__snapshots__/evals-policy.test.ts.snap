@@ -35,7 +35,7 @@ verify unchanged: no eligible models
 
 | Model / source | Metrics: rate (numerator/denominator), Wilson 95% CI | Comparison | Cost/case | p50 latency | Eligibility / reasons |
 |---|---|---|---|---|---|
-| codex/luna; run=verify-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: n/a (0/0), CI n/a; false-accept: n/a (0/0), CI n/a; false-reject: n/a (0/0), CI n/a; criterion accuracy: n/a (0/0), CI n/a; prediction coverage=0/0 (n/a); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs n/a; nonInferior=n/a; difference=n/a; lower=n/a; paired=0; complete candidate/reference=0/0 | n/a (subscription; attempts=0); recorded metered=$0.0000; API-equivalent=$0.0000 | n/a ms (n=0) | insufficient evidence: insufficient evidence: false-accept has no observations; applicable cost estimate unavailable; insufficient evidence: no complete paired cases |
+| codex/luna; run=verify-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: n/a (0/0), CI n/a; false-accept: n/a (0/0), CI n/a; false-reject: n/a (0/0), CI n/a; criterion accuracy: n/a (0/0), CI n/a; prediction coverage=0/0 (n/a); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs n/a; nonInferior=n/a; difference=n/a; lower=n/a; paired=0; complete candidate/reference=0/0 | n/a (subscription; attempts=0); recorded metered=$0.0000; API-equivalent=$0.0000 | n/a ms (n=0) | insufficient evidence: insufficient evidence: false-accept has no observations; insufficient evidence: no attempted cases to cost; insufficient evidence: no complete paired cases |
 
 "
 `;

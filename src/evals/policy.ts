@@ -151,7 +151,8 @@ export function generatePolicy(input: PolicyInput) {
           !provider || !attempts.length || costs.includes(null)
             ? null
             : costs.reduce<number>((sum, cost) => sum + (cost ?? 0), 0) / attempts.length;
-        if (costPerCase === null) reasons.push("applicable cost estimate unavailable");
+        if (provider && !attempts.length) reasons.push("insufficient evidence: no attempted cases to cost");
+        else if (costPerCase === null) reasons.push("applicable cost estimate unavailable");
         return {
           modelId: entry.modelId,
           run: entry.run,
@@ -171,7 +172,7 @@ export function generatePolicy(input: PolicyInput) {
       .sort(
         (a, b) => (b.summary.passRate ?? 0) - (a.summary.passRate ?? 0) || compareId(a.modelId, b.modelId),
       )[0];
-    const candidates = entries.map(({ complete, referenceAllowed: _allowed, ...entry }) => {
+    const candidates = entries.map(({ complete, referenceAllowed, ...entry }) => {
       const differences: number[] = [];
       const mean = (rows: EvalTrial[]) => rows.reduce((n, t) => n + Number(t.pass), 0) / rows.length;
       for (const [id, rows] of [...complete].sort(([a], [b]) => compareId(a, b))) {
@@ -184,13 +185,15 @@ export function generatePolicy(input: PolicyInput) {
         bestCompleteCases: best?.complete.size ?? 0,
         ...pairedBootstrap(differences, { delta: settings.delta }),
       };
-      if (comparison.nonInferior === null)
-        entry.reasons.push("insufficient evidence: no complete paired cases");
-      else if (!comparison.nonInferior) entry.reasons.push("non-inferiority not established");
+      // A hard-rejected candidate cannot be the reference, so a missing reference says nothing about it.
+      if (comparison.nonInferior === null) {
+        if (referenceAllowed || best) entry.reasons.push("insufficient evidence: no complete paired cases");
+      } else if (!comparison.nonInferior) entry.reasons.push("non-inferiority not established");
+      // Hard rejections are decisive: more evidence could not make the candidate eligible.
       const state =
         entry.reasons.length === 0
           ? "eligible"
-          : entry.reasons.some((r) => r.startsWith("insufficient evidence"))
+          : entry.reasons.every((r) => r.startsWith("insufficient evidence"))
             ? "insufficient evidence"
             : "ineligible";
       return {

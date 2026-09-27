@@ -47,6 +47,10 @@ test("policy files: absent, empty, partial, pipe groups, complexity preservation
       writeFileSync(path, invalid);
       expect(() => loadPolicy(path, MODELS)).toThrow(path);
     }
+    writeFileSync(path, '{"triage":{"default":["codex/luna|no/model"]}}');
+    expect(() => loadPolicy(path, MODELS)).toThrow('unknown model ID \\"no/model\\"');
+    writeFileSync(path, '{"triage":{"default":["codex/luna||mtplx/qwen-27b"]}}');
+    expect(() => loadPolicy(path, MODELS)).toThrow("empty model ID");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

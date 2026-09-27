@@ -205,7 +205,11 @@ ascending tie-break), before floors and cost ordering. Matching role and case ID
 each model must have all k scored ok/error observations for a case, though models can have different
 k. The existing paired bootstrap uses per-case mean pass differences, seed 20260926 and 10,000
 resamples. Non-inferiority requires the one-sided 95% lower bound **strictly greater than -delta**;
-no complete paired cases is insufficient evidence. Reusing a case ID after substantive dataset
+no complete paired cases is insufficient evidence. A candidate with any hard rejection (failed floor,
+failed non-inferiority, origin exclusion, missing catalog/provider metadata or an invalid recorded
+cost) is **ineligible**; it is labelled insufficient evidence only when every reason is missing
+evidence. Hard-rejected candidates cannot be the reference, so when no allowed reference exists
+they are not additionally flagged for missing paired cases. Reusing a case ID after substantive dataset
 changes can invalidate historical comparisons; dataset fingerprints are not backfilled.
 
 Routing cost per case is averaged over **case attempts**, including attempted failures, excluding

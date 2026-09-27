@@ -6,12 +6,20 @@ import { DEFAULT_POLICY, type ModelDef, type Policy } from "./catalog.ts";
 export type PolicyOverlay = Partial<Policy>;
 export function validatePolicy(value: unknown, models: ModelDef[]): PolicyOverlay {
   const ids = new Set(models.map((m) => m.id));
-  const group = z
-    .string()
-    .refine(
-      (s) => s.split("|").every((id) => id.length > 0 && id.trim() === id && ids.has(id)),
-      "expected known model IDs separated by | (no empty members or whitespace)",
-    );
+  const group = z.string().superRefine((s, ctx) => {
+    for (const id of s.split("|")) {
+      const problem =
+        id.length === 0
+          ? `empty model ID in group "${s}"`
+          : id.trim() !== id
+            ? `model ID "${id}" in group "${s}" has surrounding whitespace`
+            : ids.has(id)
+              ? null
+              : `unknown model ID "${id}" in group "${s}"`;
+      if (problem)
+        ctx.addIssue({ code: "custom", message: `${problem} (expected known model IDs separated by |)` });
+    }
+  });
   const cell = z.array(group).min(1);
   const cells = z.strictObject({
     default: cell.optional(),

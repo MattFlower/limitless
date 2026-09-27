@@ -352,3 +352,27 @@ test("missing provider metadata and absent applicable cache estimates are inelig
   };
   expect(first(input([row])).costPerCase).toBeNull();
 });
+
+test("hard rejections are ineligible, not insufficient evidence, even without an allowed reference", () => {
+  const lone = generatePolicy(input([evidence("review", [metered])], { providers: [] })).roles[1];
+  expect(lone?.order).toEqual([]);
+  expect(lone?.candidates[0]?.state).toBe("ineligible");
+  expect(lone?.candidates[0]?.reasons).toEqual([
+    "catalog/provider metadata unavailable",
+    "applicable cost estimate unavailable",
+  ]);
+  const origins = [...new Set(MODELS.flatMap((m) => [m.origin, m.baseOrigin]))];
+  const excluded = generatePolicy(
+    input([evidence("triage", [local, subscription])], {
+      settings: evalSettings({ routing: { exclude_origins: origins } }),
+    }),
+  ).roles[0];
+  expect(excluded?.order).toEqual([]);
+  expect(excluded?.decision).toContain("unchanged");
+  for (const c of excluded?.candidates ?? []) {
+    expect(c.state).toBe("ineligible");
+    expect(c.reasons.some((r) => r.startsWith("origin excluded"))).toBe(true);
+    expect(c.reasons.some((r) => r.startsWith("insufficient evidence"))).toBe(false);
+  }
+  expect(excluded?.candidates).toHaveLength(2);
+});
