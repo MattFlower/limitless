@@ -341,10 +341,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(f.store.getArtifact(run.id, "report.md")).toContain("Flaky: `check` failed, then passed");
   });
 
+  // Same text git generates, so a fixture line can never stand in for a real marker.
+  const fixture = "<<<<<<< HEAD\nexample\n=======\n>>>>>>> theirs\n";
+
   async function githubFixture(): Promise<string> {
     // Ordinary headings and intentional marker fixtures must not block any base merge.
     writeFileSync(join(repoDir, "README.md"), "Project\n=======\n");
-    writeFileSync(join(repoDir, "markers.fixture"), "<<<<<<< ours\nexample\n=======\n>>>>>>> theirs\n");
+    writeFileSync(join(repoDir, "markers.fixture"), fixture);
     writeFileSync(join(repoDir, "binary.fixture"), Buffer.from([0, 255, 10]));
     await mergeGit(repoDir, ["add", "-A"]);
     await mergeGit(repoDir, ["commit", "-qm", "merge scan fixtures"]);
@@ -732,6 +735,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "single-parent",
     "markers",
     "partial",
+    "fixture",
     "stray",
     "same-tree",
     "setext",
@@ -743,13 +747,21 @@ describe("pipeline (fake agents, real git + gates)", () => {
       let base = "";
       const f = start(async (s): Promise<FakeReply> => {
         if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        // "fixture" conflicts right after a pre-existing marker line identical to git's own.
+        const [file, prefix] = fault === "fixture" ? ["markers.fixture", fixture] : ["greeting.txt", ""];
         if (roleOf(s) === "review") {
-          if (!base) base = await advanceBase(bare, "greeting.txt", "base intent\n");
+          if (!base) base = await advanceBase(bare, file, `${prefix}base intent\n`);
           return { structured: approve };
         }
         calls++;
-        if (calls === 1) return { files: { "greeting.txt": "feature intent\n" } };
+        if (calls === 1) return { files: { [file]: `${prefix}feature intent\n` } };
         before = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+        if (fault === "fixture") {
+          expect(readFileSync(join(s.cwd, file), "utf8")).toBe(
+            `${fixture}<<<<<<< HEAD\nfeature intent\n=======\nbase intent\n>>>>>>> ${base}\n`,
+          );
+          return { files: { [file]: `${fixture}<<<<<<< HEAD\nfeature intent\n=======\nbase intent\n` } };
+        }
         if (fault === "missing" || fault === "single-parent") {
           const path = (
             await sh(["git", "rev-parse", "--git-path", "MERGE_HEAD"], { cwd: s.cwd })
@@ -799,9 +811,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(result?.error).toContain(
           fault === "markers" || fault === "partial"
             ? "Unresolved conflict markers: greeting.txt"
-            : fault === "stray"
-              ? "Unresolved conflict markers: new.txt, README.md"
-              : "MERGE_HEAD",
+            : fault === "fixture"
+              ? "Unresolved conflict markers: markers.fixture"
+              : fault === "stray"
+                ? "Unresolved conflict markers: new.txt, README.md"
+                : "MERGE_HEAD",
         );
         await assertUnpublished(bare);
       }

@@ -62,30 +62,17 @@ export async function completeMerge(cwd: string, head: string, base: string): Pr
   await requireMerge(cwd, head, base);
   // The file-only resolver leaves the unmerged index intact, including across restarts, so the
   // worktree-vs-index diff is exactly the resolver's edits. Only markers it introduced block;
-  // unrelated docs and marker fixtures already in either parent do not. Each opening, ancestor or
-  // closing line counts on its own so a partially removed block is still caught; bare `=======`
-  // is ignored because it is also a setext heading.
+  // unrelated docs and marker fixtures already in either parent do not. For an unmerged path git
+  // emits a combined diff whose `++` lines occur in neither parent, so a fixture line is attributed
+  // by position and cannot vouch for an identical marker git generated elsewhere. Each opening,
+  // ancestor or closing line counts on its own so a partially removed block is still caught; bare
+  // `=======` is ignored because it is also a setext heading.
   const list = async (args: string[]) => (await mergeGit(cwd, args)).stdout.split("\0").filter(Boolean);
   const marker = /^(<{7,}|\|{7,}|>{7,})( |$)/;
-  const markerLines = (text: string) => text.split("\n").filter((line) => marker.test(line));
   const unmerged = new Set(await list(["diff", "--name-only", "--diff-filter=U", "-z"]));
   const untracked = await list(["ls-files", "-z", "--others", "--exclude-standard"]);
   const edited = await list(["diff", "--name-only", "--diff-filter=MT", "-z"]);
-  const markers: string[] = [];
-  for (const path of [...unmerged, ...untracked]) {
-    const file = join(cwd, path);
-    if (!existsSync(file) || !lstatSync(file).isFile()) continue;
-    const contents = readFileSync(file);
-    if (contents.includes(0)) continue;
-    const known = new Set<string>();
-    if (unmerged.has(path))
-      for (const stage of [2, 3]) {
-        const side = await mergeGit(cwd, ["show", `:${stage}:${path}`], true);
-        if (side.exitCode === 0) for (const line of markerLines(side.stdout)) known.add(line);
-      }
-    if (markerLines(contents.toString("utf8")).some((line) => !known.has(line))) markers.push(path);
-  }
-  for (const path of edited.filter((p) => !unmerged.has(p))) {
+  const introduced = async (path: string, added: string) => {
     const diff = await mergeGit(cwd, [
       "diff",
       "-U0",
@@ -94,8 +81,29 @@ export async function completeMerge(cwd: string, head: string, base: string): Pr
       "--",
       `:(literal)${path}`,
     ]);
-    if (/^\+(<{7,}|\|{7,}|>{7,})( |$)/m.test(diff.stdout)) markers.push(path);
+    const hunks = diff.stdout.indexOf("\n@@");
+    if (hunks < 0) return false;
+    return diff.stdout
+      .slice(hunks)
+      .split("\n")
+      .some((line) => line.startsWith(added) && marker.test(line.slice(added.length)));
+  };
+  const markers: string[] = [];
+  for (const path of untracked) {
+    const file = join(cwd, path);
+    if (!existsSync(file) || !lstatSync(file).isFile()) continue;
+    const contents = readFileSync(file);
+    if (
+      !contents.includes(0) &&
+      contents
+        .toString("utf8")
+        .split("\n")
+        .some((line) => marker.test(line))
+    )
+      markers.push(path);
   }
+  for (const path of unmerged) if (await introduced(path, "++")) markers.push(path);
+  for (const path of edited) if (!unmerged.has(path) && (await introduced(path, "+"))) markers.push(path);
   if (markers.length) throw new Error(`Unresolved conflict markers: ${markers.join(", ")}`);
   await mergeGit(cwd, ["add", "-A"]);
   if ((await mergeGit(cwd, ["ls-files", "-u"])).stdout)
