@@ -117,3 +117,65 @@ test("down is idempotent and unreachable twilight is reported", async () => {
   expect(calls.some((c) => c.includes("bootout"))).toBe(false);
   expect((await manageLocal("status", opts)).twilight.service).toBe("unreachable");
 });
+
+test("down updates only stopped providers without probing; up requires service and authenticated health", async () => {
+  const updates: [string, boolean][] = [];
+  const probed: string[] = [];
+  let localLoaded = true;
+  let localStopFails = false;
+  let remoteReachable = true;
+  let remoteHealthy = true;
+  const command: typeof sh = async (args) => {
+    if (args.includes("print")) return { stdout: "", stderr: "", exitCode: localLoaded ? 0 : 1 };
+    if (args.includes("bootout")) {
+      if (!localStopFails) localLoaded = false;
+      return { stdout: "", stderr: "", exitCode: localStopFails ? 1 : 0 };
+    }
+    if (args[0] === "ssh" && !remoteReachable) return { stdout: "", stderr: "", exitCode: 255 };
+    if (args.includes("bootstrap")) localLoaded = true;
+    return { stdout: "", stderr: "", exitCode: 0 };
+  };
+  const opts = {
+    modelPath: "",
+    mtplxPlistPath: join(dir, "agent.plist"),
+    command,
+    secrets: { TWILIGHT_API_KEY: "key" },
+    probe: async (url: string, token?: string) => {
+      probed.push(`${url}:${token}`);
+      return url.includes("twilight") ? remoteHealthy : true;
+    },
+    setEnabled: async (id: string, enabled: boolean) => {
+      updates.push([id, enabled]);
+    },
+  };
+  localStopFails = true;
+  remoteReachable = false;
+  await manageLocal("down", opts);
+  expect(updates).toEqual([]);
+  expect(probed).toEqual([]);
+  localStopFails = false;
+  remoteReachable = true;
+  await manageLocal("down", opts);
+  await manageLocal("down", opts);
+  expect(updates).toEqual([
+    ["mtplx", false],
+    ["twilight", false],
+    ["mtplx", false],
+    ["twilight", false],
+  ]);
+  expect(probed).toEqual([]);
+  updates.length = 0;
+  remoteHealthy = false;
+  await manageLocal("up", opts);
+  expect(updates).toEqual([["mtplx", true]]);
+  remoteHealthy = true;
+  updates.length = 0;
+  await manageLocal("up", opts);
+  expect(updates).toEqual([
+    ["mtplx", true],
+    ["twilight", true],
+  ]);
+  updates.length = 0;
+  await manageLocal("status", opts);
+  expect(updates).toEqual([]);
+});
