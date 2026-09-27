@@ -30,6 +30,9 @@ export const NavBar: Component = () => {
         <A href="/models" class="nav-link" classList={{ active: isActive(location.pathname, "/models") }}>
           Models
         </A>
+        <A href="/evals" class="nav-link" classList={{ active: isActive(location.pathname, "/evals") }}>
+          Evals
+        </A>
         <A href="/chat" class="nav-link" classList={{ active: isActive(location.pathname, "/chat") }}>
           Chat
         </A>

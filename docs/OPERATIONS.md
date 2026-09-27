@@ -179,8 +179,8 @@ reports. Daemon shutdown aborts active calls and releases slots; startup marks i
 failed, retaining completed trials for cache reuse on a new submission. In-flight trials interrupted
 by a crash are errors with unknown final usage/latency; queued trials are skipped. Unknown latency is
 excluded from the p50. `--follow` polls until any
-terminal state and prints a final report. Other role graders, the Evals UI and policy generation are
-not implemented yet.
+terminal state and prints a final report. The Evals UI lists runs, displays per-trial reports, and
+compares latest completed evidence in a roles-by-models eligibility matrix. Other role graders remain pending.
 
 Review/verify dataset contracts and formulas are detailed in [EVALS.md](EVALS.md#implemented-repository-reading-evaluations).
 The real verify dataset is separately curated; the three-case test fixture is never a fallback.
@@ -196,3 +196,33 @@ neither binary label and count as false rejects for gold-met criteria. Overall i
 
 Models API/UI origin and base-origin metadata identify checkpoint organizations, not hosting
 providers. US/FR/CN values and `unknown` ancestry are descriptive only; enforcement comes later.
+
+
+### Generate a routing policy from evals
+
+```sh
+limitless eval policy                       # Preview only; no writes or model calls
+limitless eval policy --evals eval-a,eval-b  # Restrict to completed evidence IDs
+limitless eval policy --write               # Write both reviewable files in this checkout
+```
+
+The CLI obtains evidence and current settings from `GET /api/evals/policy` (optional `?evals=id,id`),
+then validates and preserves the checkout's existing partial `routing/policy.json`. It updates only
+eligible triage/review/verify default cells; unrelated and complexity-specific overrides survive.
+Empty/unknown/non-completed explicit IDs or invalid existing files fail before writing. Missing
+files and no-op proposals are reported explicitly. The preview compares the effective policy that
+would result from the exact proposed file against the daemon's active policy; pre-existing checkout
+changes can therefore also appear in the diff. Roles without eligible results receive no generated
+change. `routing/EVIDENCE.md` contains the reproducible evidence and unchanged-role explanations.
+
+The [policy configuration and formulas](EVALS.md#policy-generation-and-review) specify inclusive Wilson
+floors, strict paired non-inferiority, optional origin exclusions, and subscription_weight (default 0.25).
+Cost/case averages attempts over repetitions; local is zero, metered is recorded dollars, subscriptions
+use weighted API-equivalent dollars, and cache estimates use original provenance without increasing
+recorded spend. Prediction and latency coverage and unavailable values are disclosed.
+
+Review generated changes through a PR: the diff is approval. Deployment/restart loads the validated
+partial overlay from the daemon's application checkout over DEFAULT_POLICY; writing a worker checkout
+does not hot-reload a running daemon. Invalid overlay files fail startup loudly with their path.
+The generator does not push, create PRs or deploy. Browse **Evals** in the UI for current eligibility,
+source run links, metrics with intervals, comparisons, and error/skip/cache trial details.

@@ -1,50 +1,22 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { policyDiff, proposedOverlay, renderEvidence } from "../evals/evidence.ts";
+import { formatEvalReport } from "../evals/format.ts";
+import type { EvalPolicyResponse } from "../evals/policy.ts";
 import type { EvalReport } from "../evals/stats.ts";
+import { DEFAULT_POLICY } from "../router/catalog.ts";
+import { overlayPolicy, parsePolicy, validatePolicy } from "../router/policy.ts";
+
+export { formatEvalReport } from "../evals/format.ts";
 
 export interface EvalCliIO {
+  files?: {
+    read: (path: string) => Promise<string | null>;
+    write: (path: string, text: string) => Promise<void>;
+  };
   api: <T>(path: string, init?: RequestInit) => Promise<T>;
   print: (text: string) => void;
   wait: (ms: number) => Promise<unknown>;
-}
-export function formatEvalReport(report: EvalReport): string {
-  const number = (n: number | null) => (n === null ? "n/a" : n.toFixed(3));
-  const pct = (n: number | null) => (n === null ? "n/a" : `${(n * 100).toFixed(1)}%`);
-  const lines = [
-    `${report.run.id}: ${report.run.status} (role=${report.run.role}, k=${report.run.k}, maxUsd=${report.run.maxUsd})`,
-  ];
-  if (report.run.error) lines.push(report.run.error);
-  for (const m of report.summaries) {
-    const c = m.comparison;
-    const metric = (name: string, value: { numerator: number; denominator: number; rate: number | null }) =>
-      `  ${name} ${pct(value.rate)} (${value.numerator}/${value.denominator})`;
-    const roleLines: string[] = [];
-    if (m.review) {
-      const { defectRecall, falseBlock, verdictAccuracy } = m.review;
-      roleLines.push(
-        metric("defect recall", defectRecall) +
-          `, Wilson 95% CI ${defectRecall.ci ? `[${pct(defectRecall.ci[0])}, ${pct(defectRecall.ci[1])}]` : "n/a"}`,
-        metric("clean false-block", falseBlock),
-        metric("verdict accuracy", verdictAccuracy),
-      );
-    }
-    if (m.verify)
-      roleLines.push(
-        metric("false-accept", m.verify.falseAccept),
-        metric("false-reject", m.verify.falseReject),
-        metric("criterion accuracy", m.verify.criterionAccuracy),
-      );
-    lines.push(
-      `${m.modelId}: ${m.cases} cases, ${m.evaluatedTrials} evaluated trials; skipped=${m.skipped}, errors=${m.errors}, cached=${m.cached}, pending=${m.pending}, unscored=${m.unscored}`,
-      `  pass ${pct(m.passRate)} (${m.passes}/${m.evaluatedTrials}), Wilson 95% CI ${m.ci ? `[${pct(m.ci[0])}, ${pct(m.ci[1])}]` : "n/a"}; mean score ${number(m.meanScore)}`,
-      ...roleLines,
-      `  prediction coverage ${m.predictionTrials}/${m.scheduledTrials} (${pct(m.predictionCoverage)}); flip ${pct(m.flipRate)} (n=${m.flipDenominator})`,
-      ...(report.run.role === "triage"
-        ? [`  risk under-call ${pct(m.riskUnderCallRate)} (n=${m.riskDenominator})`]
-        : []),
-      `  metered $${m.costUsd.toFixed(4)}; API-equivalent $${m.costEquivUsd.toFixed(4)}; p50 invocation ${number(m.p50LatencyMs)} ms (n=${m.latencyDenominator})`,
-      `  vs ${c.bestModel ?? "n/a"}: difference ${number(c.meanDifference)}, one-sided 95% lower ${number(c.lowerBound)}, nonInferior=${c.nonInferior ?? "n/a"}; paired cases=${c.pairedCases} (candidate complete=${c.candidateCompleteCases}, best complete=${c.bestCompleteCases}), delta=${c.delta}, resamples=${c.resamples}, seed=${c.seed}`,
-    );
-  }
-  return lines.join("\n");
 }
 export async function evalCommand(
   args: string[],
@@ -52,6 +24,49 @@ export async function evalCommand(
   io: EvalCliIO,
 ): Promise<void> {
   const [action, value] = args;
+  if (action === "policy") {
+    if (args.length !== 1) throw new Error("usage: limitless eval policy [--evals id,id] [--write]");
+    if (
+      flags.evals !== undefined &&
+      (typeof flags.evals !== "string" || flags.evals.split(",").some((id) => !id.trim()))
+    )
+      throw new Error("--evals requires nonempty eval IDs");
+    const query = typeof flags.evals === "string" ? `?evals=${encodeURIComponent(flags.evals)}` : "";
+    const data = await io.api<EvalPolicyResponse>(`/api/evals/policy${query}`);
+    const files = io.files ?? {
+      async read(path: string) {
+        try {
+          return await readFile(join(process.cwd(), path), "utf8");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+          throw error;
+        }
+      },
+      async write(path: string, text: string) {
+        await mkdir(join(process.cwd(), "routing"), { recursive: true });
+        await writeFile(join(process.cwd(), path), text);
+      },
+    };
+    const path = "routing/policy.json";
+    const old = await files.read(path);
+    const existing = old === null ? {} : parsePolicy(old, data.models, path);
+    const proposed = validatePolicy(proposedOverlay(existing, data.evaluation), data.models);
+    const document = `${JSON.stringify(proposed, null, 2)}\n`;
+    const evidence = renderEvidence(data.evaluation);
+    io.print(policyDiff(data.policy, overlayPolicy(DEFAULT_POLICY, proposed), data.evaluation));
+    if (old === null)
+      io.print("routing/policy.json is absent; --write creates the overlay and evidence files.");
+    else if (JSON.stringify(existing) === JSON.stringify(proposed))
+      io.print("Overlay unchanged; --write refreshes evidence.");
+    if (flags.write) {
+      await files.write(path, document);
+      await files.write("routing/EVIDENCE.md", evidence);
+      io.print(
+        "Wrote routing/policy.json and routing/EVIDENCE.md. Review the diff; deploy/restart to activate.",
+      );
+    }
+    return;
+  }
   if (args.length !== 2 || !value || !["run", "report"].includes(action ?? ""))
     throw new Error("usage: limitless eval run <role> --models a,b | eval report <eval-id> [--json]");
   if (action === "report") {

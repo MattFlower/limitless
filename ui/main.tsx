@@ -6,6 +6,7 @@ import { render } from "solid-js/web";
 import { NavBar } from "./components/NavBar.tsx";
 import { Chat } from "./pages/Chat.tsx";
 import { Dashboard } from "./pages/Dashboard.tsx";
+import { EvalDetail, Evals } from "./pages/Evals.tsx";
 import { Models } from "./pages/Models.tsx";
 import { NewRun } from "./pages/NewRun.tsx";
 import { RunDetail } from "./pages/RunDetail.tsx";
@@ -29,6 +30,8 @@ render(
       <Route path="/" component={Dashboard} />
       <Route path="/runs/:id" component={RunDetail} />
       <Route path="/new" component={NewRun} />
+      <Route path="/evals" component={Evals} />
+      <Route path="/evals/:id" component={EvalDetail} />
       <Route path="/models" component={Models} />
       <Route path="/chat" component={Chat} />
     </Router>

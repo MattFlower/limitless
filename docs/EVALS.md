@@ -40,12 +40,12 @@ evals/<role>/*.json ──► runner ──► role fn (same prompts/schemas) �
   `eval_runs` / `eval_trials` (new migration).
 - **Graders** are pure functions `(case, output) → {pass, score, details}` tested like any other
   code.
-- **Stats**: Wilson intervals for pass rates; paired bootstrap (or McNemar mid-p for k=1) against
-  the best model in the cell.
-- **Policy generator** (pure): for each (role × complexity) cell, choose the cheapest model whose
-  lower 95% bound clears the role's absolute floor **and** that is non-inferior to the best model
-  within δ = 0.10; the fallback chain lists other passing models by ascending cost; high-risk work
-  keeps the top tier regardless. Output is `routing/policy.json` (loaded over `DEFAULT_POLICY`)
+- **Stats**: Wilson intervals for pass and role metrics; seeded paired bootstrap against
+  the best selected model in the role.
+- **Policy generator** (pure): for each supported role default cell, choose the cheapest model whose
+  required Wilson 95% bounds clear the role's floors **and** that is non-inferior to the best model
+  within δ = 0.10; the fallback chain lists other eligible models by ascending cost. Complexity-specific
+  cells remain unchanged. Output is `routing/policy.json` (loaded over `DEFAULT_POLICY`)
   plus `routing/EVIDENCE.md` with the numbers behind every cell. **Policy changes land as a PR**,
   so the diff is the approval step and git is the version history.
 - **Cost of evals** is tracked like any run's: subscription-equivalent and metered dollars per
@@ -55,9 +55,9 @@ evals/<role>/*.json ──► runner ──► role fn (same prompts/schemas) �
 
 | Role | Cases | Source | Grader | Primary metric (floor) |
 |---|---|---|---|---|
-| triage | 40 | own run prompts + boundary cases | exact match per field, cost-weighted | weighted accuracy; risk under-call rate (≤5%) |
-| review | 30 | 12 seeded defects, 8 real defects our gates caught, 10 clean merged diffs | file + line-window match on the JSON verdict | recall (≥0.6) and false-block rate on clean diffs (≤0.2) |
-| verify | 20 | labeled (criteria, diff, test output) triples, incl. "tests pass, criterion unmet" | per-criterion match | false-accept rate (≤0.1) |
+| triage | 40 | own run prompts + boundary cases | exact match per field, cost-weighted | pass-rate lower bound ≥0.60; risk under-call upper bound ≤0.10 |
+| review | 30 | 12 seeded defects, 8 real defects our gates caught, 10 clean merged diffs | file + line-window match on the JSON verdict | defect-recall lower bound ≥0.50; clean false-block upper bound ≤0.34 |
+| verify | 20 | labeled (criteria, diff, test output) triples, incl. "tests pass, criterion unmet" | per-criterion match | false-accept upper bound ≤0.10 |
 | holdout | 8 | sandbox tasks with reference solution + 3 mutants | execution | valid-on-reference × mutant kill rate |
 | implement | 12 | 8 sandbox replays + 4 small Limitless commits, stratified trivial/small/medium | hidden tests + gates + audit | resolve rate; $ and quota per task; wall time |
 | spec, chat | — | deferred (structure lint only) | — | — |
@@ -72,8 +72,8 @@ only for grading (the same isolation as the holdout stage).
    `limitless eval run|report` are implemented and covered with fake harness/local repo tests.
    See [operations](OPERATIONS.md#evaluations) for commands and metric/accounting semantics.
    Review and verify runners and graders are also implemented (contracts below).
-   **Pending:** other role graders and the UI "Evals" matrix. Policy
-   generation and real-model sweeps remain follow-up work; this does not complete all of step 1.
+   The deterministic policy generator, validated startup overlays, and UI Evals list, matrix
+   and run details are implemented. Other role graders and real-model sweeps remain pending.
 2. **Agentic evals** (factory run): implement and holdout cases in worktrees; early stopping.
 3. **Datasets** (orchestrator-curated, factory-assisted): gold labels are written or checked by the
    orchestrator, never by a candidate model alone.
@@ -155,10 +155,96 @@ All catalog IDs are eligible for `--models`, including candidates absent from DE
 The catalog and Models page expose `origin` (checkpoint organization ISO alpha-2 country) and
 `baseOrigin` (root base-model organization, or `unknown` for uncertain ancestry). Hosting and
 quantization location do not determine origin. Candidate tiers remain provisional; no origin
-restriction or routing-policy change is implemented.
+restriction is applied to runtime escalation; generated candidates respect the exclusions below.
 
 ```sh
 limitless eval run review --models openrouter/gpt-6-luna --follow
 # After curating the real verify dataset:
 limitless eval run verify --models openrouter/gpt-6-luna --k 2 --max-usd 1 --follow
 ```
+
+
+## Policy generation and review
+
+`limitless eval policy` reads persisted evidence and effective settings through the daemon API;
+it never runs or regrades models. By default it selects the latest **completed** run independently
+for each triage/review/verify model, ordered by finishedAt, createdAt, then run ID (descending).
+Queued, running, failed and budget-exhausted runs are ignored. `--evals id,id` restricts the pool
+before the same selection; empty, unknown or non-completed IDs fail before any files are written.
+
+Configure the daemon in `~/.config/limitless/config.toml`:
+
+```toml
+[evals]
+delta = 0.10
+subscription_weight = 0.25
+
+[evals.floors]
+triage_pass_rate = 0.60
+triage_risk_under_call_rate = 0.10
+review_defect_recall = 0.50
+review_clean_false_block_rate = 0.34
+verify_false_accept_rate = 0.10
+
+[routing]
+exclude_origins = ["CN"] # Optional; omit to apply no origin filter
+```
+
+These are the implemented defaults, replacing earlier proposed suite floors. Floors and delta
+must be finite numbers in [0,1]; subscription_weight must be finite and nonnegative. Malformed
+supplied values fail validation. Triage requires the pass-rate **lower** Wilson 95% bound at least
+0.60 and risk-under-call **upper** bound at most 0.10. Review requires defect-recall lower bound at
+least 0.50 and clean false-block upper bound at most 0.34. Verify requires false-accept upper bound
+at most 0.10. Floor comparisons are inclusive. Missing denominators are insufficient evidence,
+never zero error. Role metrics retain pooled persisted labels across repetitions and disclose
+prediction coverage; failed/invalid calls contribute pass failures without prediction observations.
+
+Comparisons are recomputed across the selected evidence. The reference has the highest observed
+pass rate among models with known catalog/provider metadata that are not origin-excluded (model-ID
+ascending tie-break), before floors and cost ordering. Matching role and case ID identify pairs;
+each model must have all k scored ok/error observations for a case, though models can have different
+k. The existing paired bootstrap uses per-case mean pass differences, seed 20260926 and 10,000
+resamples. Non-inferiority requires the one-sided 95% lower bound **strictly greater than -delta**;
+no complete paired cases is insufficient evidence. Reusing a case ID after substantive dataset
+changes can invalidate historical comparisons; dataset fingerprints are not backfilled.
+
+Routing cost per case is averaged over **case attempts**, including attempted failures, excluding
+unattempted skips and preparation failures. Repetitions count as separate attempts, not one
+production invocation costing k times as much. Provider definitions determine billing: free/local
+costs zero, metered uses recorded dollars, subscription uses recorded API-equivalent dollars times
+subscription_weight. Cache replays use retained original cost provenance for this estimate only;
+actual recorded eval spend is unchanged. Missing applicable estimates make a candidate ineligible.
+p50 invocation latency retains the existing exclusion of cache replays, interrupted calls and
+preparation failures; unavailable latency sorts after known latency at equal cost.
+
+When exclude_origins is configured (even an empty array), a candidate is excluded if its origin or
+baseOrigin is listed, or baseOrigin is `unknown`. The evidence still lists it with its rejection
+reason. Hosting location does not determine origin. This filter affects generation and the matrix;
+it does not change existing runtime escalation or unrelated routing cells.
+
+Eligible models clear every required floor, establish non-inferiority, and have catalog/provider
+metadata and applicable cost estimates. They sort by routing cost/case, then p50 latency, then model
+ID. Each becomes a singleton preference group: the first is preferred and later entries are fallbacks.
+A role with no eligible candidate is left unchanged with an explanation. Only supported **default**
+cells are generated: current evidence does not justify replacing review.large, verify.large or other
+complexity-specific cells.
+
+Without `--write`, the CLI prints a deterministic diff against the daemon's current effective policy.
+With `--write`, it creates/updates `routing/policy.json` and `routing/EVIDENCE.md` in the current checkout.
+Existing unrelated overrides and roles without eligible evidence survive regeneration; the preview
+uses exactly the proposed document. `policy.json` is a partial Policy-shaped object (no evidence
+metadata or expanded defaults). `EVIDENCE.md` records all candidates, source IDs/stored dates,
+metrics/intervals/denominators, paired coverage, settings, costs, latency and rejection reasons.
+
+At startup the daemon reads `routing/policy.json` relative to its application checkout, overlays only
+present cells on DEFAULT_POLICY, and exposes that exact policy through `/api/models`. Missing files
+retain defaults. Strict validation rejects malformed JSON, unknown roles/cells/models, empty groups
+and invalid pipe syntax, reporting the path and diagnostics. Existing `model-a|model-b` interchangeable
+groups are supported. A changed file does not hot-reload the daemon. Policy changes land through
+reviewed PRs: **the diff is the approval**, and deployment/restart activates the overlay.
+
+The UI **Evals** page lists all runs with separate metered/API-equivalent totals and links to model
+metrics and per-case/per-repetition trials. Its matrix uses the same generator under current daemon
+settings, including catalog models absent from DEFAULT_POLICY. It labels eligible, ineligible,
+insufficient evidence and no result, exposes reasons, and links results to source runs. Run detail
+comparisons are within that run; matrix comparisons use selected evidence across runs.

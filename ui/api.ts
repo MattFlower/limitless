@@ -199,3 +199,10 @@ export function openChatStream(
   };
   return () => source.close();
 }
+
+export function getEvalPolicy(): Promise<import("../src/evals/policy.ts").EvalPolicyResponse> {
+  return request("/api/evals/policy");
+}
+export function getEvalReport(id: string): Promise<import("../src/evals/stats.ts").EvalReport> {
+  return request(`/api/evals/${encodeURIComponent(id)}`);
+}

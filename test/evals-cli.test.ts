@@ -85,3 +85,101 @@ test("CLI submits all options through HTTP, follows terminal results, and emits 
     await f.close();
   }
 });
+
+test("policy CLI previews exactly the written overlay, preserves other cells, and never writes on validation failure", async () => {
+  const { evidence, input, local, subscription, response } = await import("./evals-policy-support.ts");
+  const { generatePolicy } = await import("../src/evals/policy.ts");
+  const { overlayPolicy } = await import("../src/router/policy.ts");
+  const { DEFAULT_POLICY } = await import("../src/router/catalog.ts");
+  const records = [
+    evidence("triage", [local, subscription]),
+    evidence("verify", [local], { status: "running", id: "running" }),
+  ];
+  const existing = {
+    chat: { default: [subscription] },
+    review: { large: [local] },
+    verify: { default: [subscription] },
+  };
+  const files = new Map<string, string>([["routing/policy.json", JSON.stringify(existing)]]);
+  const writes: string[] = [];
+  const printed: string[] = [];
+  const queried: string[] = [];
+  const io = {
+    async api<T>(path: string): Promise<T> {
+      queried.push(path);
+      const ids = new URL(path, "http://fixture").searchParams.get("evals");
+      const data = response(records);
+      data.policy = overlayPolicy(DEFAULT_POLICY, existing);
+      data.evaluation = generatePolicy(
+        input(records, { evalIds: ids === null ? undefined : ids.split(",") }),
+      );
+      return data as T;
+    },
+    print: (text: string) => printed.push(text),
+    wait: async () => {},
+    files: {
+      read: async (path: string) => files.get(path) ?? null,
+      write: async (path: string, text: string) => {
+        writes.push(path);
+        files.set(path, text);
+      },
+    },
+  };
+  await evalCommand(["policy"], {}, io);
+  expect(writes).toEqual([]);
+  expect(printed[0]).toContain("@@ triage.default @@");
+  expect(printed[0]).toContain(`+ ["${local}","${subscription}"]`);
+  expect(printed[0]).toContain("verify unchanged: no completed evidence");
+  const preview = printed[0];
+  printed.length = 0;
+  await evalCommand(["policy"], { write: true, evals: "triage-run,triage-run" }, io);
+  expect(printed[0]).toBe(preview);
+  expect(queried.at(-1)).toContain("evals=triage-run%2Ctriage-run");
+  expect(writes).toEqual(["routing/policy.json", "routing/EVIDENCE.md"]);
+  expect(JSON.parse(files.get("routing/policy.json") ?? "{}")).toEqual({
+    ...existing,
+    triage: { default: [local, subscription] },
+  });
+  expect(files.get("routing/EVIDENCE.md")).toContain("run=triage-run");
+  writes.length = 0;
+  for (const evals of ["", ",triage-run", "triage-run,", "missing", "running"]) {
+    await expect(evalCommand(["policy"], { evals, write: true }, io)).rejects.toThrow();
+    expect(writes).toEqual([]);
+  }
+  files.set("routing/policy.json", '{"invalid":{}}');
+  await expect(evalCommand(["policy"], { write: true }, io)).rejects.toThrow("routing/policy.json");
+  expect(writes).toEqual([]);
+  files.delete("routing/policy.json");
+  printed.length = 0;
+  await evalCommand(["policy"], {}, io);
+  expect(printed.join("\n")).toContain("is absent");
+  expect(writes).toEqual([]);
+  await evalCommand(["policy"], { write: true }, io);
+  expect(writes).toEqual(["routing/policy.json", "routing/EVIDENCE.md"]);
+});
+
+test("policy CLI reports no-op proposals and unchanged all-ineligible evidence", async () => {
+  const { response } = await import("./evals-policy-support.ts");
+  const data = response([]);
+  const printed: string[] = [];
+  let writes = 0;
+  await evalCommand(
+    ["policy"],
+    {},
+    {
+      api: async <T>() => data as T,
+      print: (s) => printed.push(s),
+      wait: async () => {},
+      files: {
+        read: async () => "{}",
+        write: async () => {
+          writes++;
+        },
+      },
+    },
+  );
+  expect(writes).toBe(0);
+  expect(printed.join("\n")).toContain("No effective policy changes.");
+  expect(printed.join("\n")).toContain("Overlay unchanged");
+  expect(printed.join("\n")).toContain("triage unchanged");
+});
