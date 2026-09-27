@@ -42,12 +42,23 @@ test("original prompt renders plain multiline text and a copy control", async ()
       output.path
     )) as typeof import("../ui/components/OriginalPrompt.tsx");
 
-    const prompt = "First line\nSecond <script>alert('x')</script> line";
+    const prompt = [
+      "First line",
+      "Second <script>alert('x')</script> line",
+      "  Indented third line  ",
+      "",
+      "Fifth line, hidden while collapsed",
+      "unbroken".repeat(100),
+      "Final line\r\n",
+    ].join("\n");
     const html = renderToString(() => OriginalPrompt({ prompt }));
     expect(html).toContain("Original prompt");
     expect(html).toContain("First line\nSecond &lt;script>");
     expect(html).not.toContain("<script>");
     expect(html).toContain("Copy prompt");
+    expect(html).toContain("collapsed");
+    expect(html).toContain("  Indented third line  \n\nFifth line");
+    expect(html).toContain("Final line\r\n");
 
     let copied = "";
     expect(
@@ -66,6 +77,17 @@ test("original prompt renders plain multiline text and a copy control", async ()
       }),
     ).toBe("Could not copy prompt");
     expect(await copyPrompt(prompt, undefined)).toBe("Could not copy prompt");
+
+    const write = Promise.withResolvers<void>();
+    let feedback: string | undefined;
+    const copying = copyPrompt(prompt, { writeText: () => write.promise }).then((result) => {
+      feedback = result;
+    });
+    await Promise.resolve();
+    expect(feedback).toBeUndefined();
+    write.reject(new Error("Permission denied after awaiting clipboard access"));
+    await copying;
+    expect(feedback).toBe("Could not copy prompt");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
