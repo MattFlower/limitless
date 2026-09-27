@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { sh } from "../util/proc.ts";
@@ -28,6 +37,35 @@ const appDir = process.env.LIMITLESS_APP_DIR ?? join(home, ".limitless", "app");
 const logDir = join(home, ".limitless", "logs");
 const agentsDir = join(home, "Library", "LaunchAgents");
 const uid = userInfo().uid;
+const deployLock = join(home, ".limitless", "deploy.lock");
+
+function acquireDeployLock(path: string): () => void {
+  mkdirSync(join(path, ".."), { recursive: true });
+  for (;;) {
+    try {
+      const fd = openSync(path, "wx", 0o600);
+      try {
+        writeFileSync(fd, `${process.pid}\n`);
+      } finally {
+        closeSync(fd);
+      }
+      return () => unlinkSync(path);
+    } catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+      const pid = Number(readFileSync(path, "utf8").trim());
+      if (!Number.isSafeInteger(pid) || pid <= 0) {
+        throw new Error(`deploy lock has no valid pid: ${path}`);
+      }
+      try {
+        process.kill(pid, 0);
+        throw new Error(`deploy already running (pid ${pid})`);
+      } catch (probe) {
+        if (!(probe instanceof Error) || !("code" in probe) || probe.code !== "ESRCH") throw probe;
+      }
+      unlinkSync(path);
+    }
+  }
+}
 // Same precedence as the operator's shell: Homebrew before ~/.bun/bin, which may hold stale
 // globally-installed npm copies of the agent CLIs.
 const PATH = [
@@ -207,6 +245,8 @@ export async function deploy(
     log?: (message: string) => void;
     maxWaitMs?: number;
     now?: boolean;
+    lockPath?: string;
+    exit?: (code: number) => void;
   } = {},
 ): Promise<void> {
   const dir = opts.releaseDir ?? appDir;
@@ -217,6 +257,7 @@ export async function deploy(
   const clock = opts.clock ?? deployClock;
   const restart = opts.restart ?? (() => launchctl(["kickstart", "-k", `gui/${uid}/${LABEL}`], false));
   const log = opts.log ?? console.log;
+  const unlock = acquireDeployLock(opts.lockPath ?? deployLock);
   let interrupted: Error | null = null;
   const commandAbort = new AbortController();
   let rejectSignal = (_error: Error) => {};
@@ -225,7 +266,12 @@ export async function deploy(
   });
   void signal.catch(() => {});
   const onSignal = (name: string) => {
-    interrupted ??= new Error(`deploy interrupted by ${name}`);
+    if (interrupted) {
+      (opts.exit ?? process.exit)(name === "SIGINT" ? 130 : 143);
+      return;
+    }
+    interrupted = new Error(`deploy interrupted by ${name}`);
+    log("interrupted, rolling back...");
     commandAbort.abort();
     rejectSignal(interrupted);
   };
@@ -252,15 +298,19 @@ export async function deploy(
     previous = running.sha === "unknown" ? "" : running.sha;
     const checkout = (await run(["git", "rev-parse", "HEAD"], { cwd: dir })).stdout.trim();
     await run(["git", "fetch", "origin", "--prune"], { cwd: dir, timeoutMs: 300_000 });
-    const target = (await run(["git", "rev-parse", ref], { cwd: dir })).stdout.trim();
+    const target = (await run(["git", "rev-parse", `${ref}^{commit}`], { cwd: dir })).stdout.trim();
     if (running.sha === "unknown" && checkout === target) {
       throw new Error(
-        "daemon boot SHA is unknown and checkout already matches target; cannot determine whether deployment completed or safely recover an interrupted deploy",
+        `daemon boot SHA is unknown and checkout already matches target; recover with launchctl kickstart -k gui/${uid}/${LABEL} or limitless service install`,
       );
     }
     // Legacy upgrades can use the checkout for rollback, but never as proof of completion.
     previous ||= checkout;
     if (target === previous) {
+      if (checkout !== target) {
+        await run(["git", "checkout", "-q", "--detach", target], { cwd: dir });
+        await run(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000 });
+      }
       if (running.draining) {
         log(`daemon ${previous} is draining; resuming scheduler`);
         await race(requestAdmin(client, clock, "resume"));
@@ -274,12 +324,11 @@ export async function deploy(
       log(`already deployed ${target}`);
       return;
     }
-    if (checkout !== target) {
-      await run(["git", "checkout", "-q", "--detach", target], { cwd: dir });
-      await run(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000 });
-      await run(["bun", "run", "check"], { cwd: dir, timeoutMs: 600_000 });
-      if (smoke) await run(["bun", "run", "smoke"], { cwd: dir, timeoutMs: 900_000 });
-    } else log(`checkout already at ${target}; continuing deployment`);
+    if (checkout !== target) await run(["git", "checkout", "-q", "--detach", target], { cwd: dir });
+    else log(`checkout already at ${target}; continuing deployment`);
+    await run(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000 });
+    await run(["bun", "run", "check"], { cwd: dir, timeoutMs: 600_000 });
+    if (smoke) await run(["bun", "run", "smoke"], { cwd: dir, timeoutMs: 900_000 });
     gatesPassed = true;
     // A lost response may still have enabled drain on the daemon.
     drainAttempted = true;
@@ -300,7 +349,7 @@ export async function deploy(
     if (interrupted) throw interrupted;
     restartAttempted = true;
     await race(restart());
-    const replacement = await race(waitForHealthy(client, clock, target));
+    const replacement = await race(waitForHealthy(client, clock, target, log));
     log(`daemon after: ${replacement.sha}`);
     log(`deployed ${previous.slice(0, 8)} → ${target.slice(0, 8)}`);
   } catch (error) {
@@ -328,6 +377,7 @@ export async function deploy(
   } finally {
     process.off("SIGINT", onInt);
     process.off("SIGTERM", onTerm);
+    unlock();
   }
 }
 

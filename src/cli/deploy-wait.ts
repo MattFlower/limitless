@@ -189,6 +189,7 @@ export async function waitForHealthy(
   client: DeployClient,
   clock: DeployClock,
   target: string,
+  log: (message: string) => void = console.warn,
 ): Promise<HealthResponse> {
   const start = clock.now();
   let lastError: unknown;
@@ -201,10 +202,13 @@ export async function waitForHealthy(
           Math.min(2000, 45_000 - (clock.now() - start)),
         ),
       );
-      if (state.sha !== target) {
+      if (state.sha !== "unknown" && state.sha !== target) {
         lastError = new Error(`replacement daemon runs ${state.sha}, expected ${target}`);
-      } else if (!state.draining) return state;
-      else lastError = new Error("replacement daemon is still draining");
+      } else if (!state.draining) {
+        if (state.sha === "unknown")
+          log("warning: replacement daemon does not report a boot SHA; cannot verify its commit");
+        return state;
+      } else lastError = new Error("replacement daemon is still draining");
     } catch (error) {
       lastError = error;
     }

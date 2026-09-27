@@ -10,7 +10,7 @@ import { createMcpServer, type McpBackend } from "../src/integrations/mcp.ts";
 import type { Policy } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 
-export async function fixture(bootSha?: string) {
+export async function fixture(bootSha?: string | ((repo: string) => Promise<string | undefined>)) {
   const home = mkdtempSync(join(tmpdir(), "limitless-mcp-"));
   const repo = join(home, "local repo");
   mkdirSync(repo);
@@ -21,10 +21,11 @@ export async function fixture(bootSha?: string) {
     ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "init"],
     { cwd: repo },
   );
+  const resolvedBootSha = typeof bootSha === "function" ? await bootSha(repo) : bootSha;
   const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "config"), port: 7400 });
   cfg.secrets = {};
   const factory = new Factory(cfg, {
-    ...(bootSha ? { bootSha } : {}),
+    ...(resolvedBootSha ? { bootSha: resolvedBootSha } : {}),
     harnesses: { fake: fakeHarness(() => ({ delayMs: 30_000 })) },
     providers: [{ id: "fake", label: "Fake", harness: "fake", billing: "subscription", maxConcurrent: 2 }],
     models: [

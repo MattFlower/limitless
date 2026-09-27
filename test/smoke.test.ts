@@ -205,6 +205,7 @@ test("deploy restores the previous checkout when injected smoke fails before res
     await expect(
       deploy(7400, "feature", true, {
         releaseDir: dir,
+        lockPath: join(dir, "deploy.lock"),
         command,
         client: {
           admin: async () => {
@@ -230,7 +231,7 @@ test("deploy restores the previous checkout when injected smoke fails before res
     expect(calls).toEqual([
       "git rev-parse HEAD",
       "git fetch origin --prune",
-      "git rev-parse feature",
+      "git rev-parse feature^{commit}",
       "git checkout -q --detach next-commit",
       "bun install --frozen-lockfile",
       "bun run check",
