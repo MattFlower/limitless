@@ -143,6 +143,62 @@ export async function headSha(cwd: string): Promise<string> {
   return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
 }
 
+export async function fetchBase(paths: Paths, repo: Repo, branch: string): Promise<string> {
+  const cache = cachePath(paths, repo);
+  return withRepoLock(cache, async () => {
+    const ref = `refs/heads/${branch}`;
+    await sh(["git", "fetch", "origin", `+${ref}:refs/remotes/origin/${branch}`], {
+      cwd: cache,
+      timeoutMs: 300_000,
+    });
+    return (await sh(["git", "rev-parse", `refs/remotes/origin/${branch}`], { cwd: cache })).stdout.trim();
+  });
+}
+
+export async function readFileAt(cwd: string, revision: string, path: string): Promise<string | null> {
+  const entry = await sh(["git", "ls-tree", "--name-only", revision, "--", path], { cwd });
+  if (!entry.stdout.trim()) return null;
+  return (await sh(["git", "show", `${revision}:${path}`], { cwd })).stdout;
+}
+
+export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
+  const result = await sh(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
+    cwd,
+    allowFail: true,
+  });
+  return result.exitCode === 0;
+}
+
+export async function rebaseOnto(cwd: string, baseSha: string): Promise<"clean" | "conflict"> {
+  const result = await sh(
+    ["git", "-c", "user.name=Limitless", "-c", "user.email=limitless@localhost", "rebase", baseSha],
+    {
+      cwd,
+      allowFail: true,
+    },
+  );
+  if (result.exitCode === 0) return "clean";
+  const state = await sh(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
+  const apply = await sh(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
+  if (!existsSync(resolve(cwd, state.stdout.trim())) && !existsSync(resolve(cwd, apply.stdout.trim())))
+    throw new Error(`rebase failed: ${result.stderr || result.stdout}`);
+  await sh(["git", "rebase", "--abort"], { cwd });
+  if (existsSync(resolve(cwd, state.stdout.trim())) || existsSync(resolve(cwd, apply.stdout.trim())))
+    throw new Error("rebase abort left worktree in rebase state");
+  return "conflict";
+}
+
+export async function clearInterruptedRebase(cwd: string, expected: boolean): Promise<void> {
+  const state = await sh(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
+  const apply = await sh(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
+  if (!existsSync(resolve(cwd, state.stdout.trim())) && !existsSync(resolve(cwd, apply.stdout.trim())))
+    return;
+  if (!expected) throw new Error("worktree has an unexpected rebase in progress");
+  await sh(["git", "rebase", "--abort"], { cwd });
+  if (existsSync(resolve(cwd, state.stdout.trim())) || existsSync(resolve(cwd, apply.stdout.trim())))
+    throw new Error("interrupted rebase could not be aborted");
+}
+
 /** Commit everything in the worktree. Returns the new sha, or null when there was nothing to commit. */
 export async function commitAll(cwd: string, message: string): Promise<string | null> {
   await sh(["git", "add", "-A"], { cwd });
@@ -150,6 +206,12 @@ export async function commitAll(cwd: string, message: string): Promise<string | 
   if (!status.stdout.trim()) return null;
   await sh(["git", "commit", "--no-verify", "-q", "-m", message], { cwd });
   return headSha(cwd);
+}
+
+/** Move the worktree's branch back to a known commit, discarding everything after it. */
+export async function resetTo(cwd: string, sha: string): Promise<void> {
+  await sh(["git", "reset", "--hard", "-q", sha], { cwd });
+  await sh(["git", "clean", "-fdq"], { cwd });
 }
 
 /** Throw away any uncommitted changes (used after read-only stages). */

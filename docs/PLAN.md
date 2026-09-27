@@ -12,6 +12,7 @@ factory* via PRs against `MattFlower/limitless`, reviewed and merged by the orch
 | M3 | Triggers | GitHub webhooks through `limitless.mattflower.cc`, Discord bot, UI chat concierge, MCP server + skills for Claude Code & Codex | Kick off runs from Discord, GitHub, and a Claude Code session |
 | M4 | Cheap & local models | mtplx + twilight llama.cpp + OpenRouter backends; a factory eval suite to calibrate routing; cost dashboards & budget alerts | Dependabot PR handled end-to-end for $0 on local models; routing table justified by eval data |
 | M5 | Hardening & docs | Failure-injection tests, retention, remote UI access (Cloudflare Access), optional twilight hosting, complete user docs | Final walkthrough |
+| M6 | Portable & work-ready | Providers, models and policy defined in config with a detecting `limitless init` (no machine-specific catalog); model-origin constraints (e.g. no China-origin models) enforced by the router; per-repo discreet mode (no Limitless branding) and approval-gated merges; provider workload analytics; Homebrew tap + curl installer | Fresh install on a second machine with a different provider set, routed by evals |
 
 ## Definition of done (from PROMPT.md)
 1. The factory has completed tasks end-to-end without errors (tracked in the UI's run history).

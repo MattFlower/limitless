@@ -2,13 +2,16 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ApplicationCommandDataResolvable } from "discord.js";
+import {
+  type ApplicationCommandDataResolvable,
+  ApplicationCommandOptionType,
+  ApplicationCommandType,
+} from "discord.js";
 import type { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Run } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import {
-  DISCORD_COMMANDS,
   type DiscordCommand,
   type DiscordMessage,
   type DiscordPort,
@@ -21,6 +24,7 @@ class FakePort implements DiscordPort {
   onMessage: ((message: DiscordMessage) => Promise<void>) | null = null;
   registrations: string[] = [];
   commandNames: string[] = [];
+  definitions: readonly ApplicationCommandDataResolvable[] = [];
   posts: { channel: string; content: string; embed?: { title: string; description: string } }[] = [];
   threadNames: string[] = [];
   stopped = false;
@@ -36,6 +40,7 @@ class FakePort implements DiscordPort {
   }
   async register(guild: string, definitions: readonly ApplicationCommandDataResolvable[]): Promise<void> {
     this.registrations.push(guild);
+    this.definitions = definitions;
     this.commandNames = definitions.map((definition) => ("name" in definition ? definition.name : ""));
   }
   async createThread(_channel: string, name: string): Promise<string> {
@@ -147,10 +152,17 @@ test("registers guild commands and owner gate protects all commands", async () =
   const mounted = mountDiscord(factory, port);
   await Bun.sleep(0);
   expect(port.registrations).toEqual(["guild"]);
-  expect(port.commandNames).toEqual(["build", "runs", "run", "cancel"]);
-  await port.register("guild", DISCORD_COMMANDS);
-  expect(port.commandNames).toEqual(["build", "runs", "run", "cancel"]);
-  for (const name of ["build", "runs", "run", "cancel"]) {
+  expect(port.commandNames).toEqual(["build", "runs", "show", "cancel"]);
+  expect(port.commandNames).not.toContain("run");
+  expect(port.definitions.find((definition) => "name" in definition && definition.name === "show")).toEqual({
+    name: "show",
+    description: "Show a run",
+    type: ApplicationCommandType.ChatInput,
+    options: [
+      { name: "id", description: "Run ID", type: ApplicationCommandOptionType.String, required: true },
+    ],
+  });
+  for (const name of ["build", "runs", "show", "cancel"]) {
     const replies = await command(name, { id: "secret", repo: "local/test", prompt: "hi" }, "intruder");
     expect(replies[0]?.ephemeral).toBe(true);
     expect(replies[0]?.content).toContain("owner");
@@ -218,11 +230,34 @@ test("thread replies answer open questions only for the owner; listing and cance
   expect(port.posts.some((post) => post.content.includes("No question is open"))).toBe(true);
   expect((await command("runs", { status: "bad" }))[0]?.content).toContain("Invalid status");
   expect((await command("runs"))[0]?.content).toContain(run.id);
-  expect((await command("run", { id: "missing" }))[0]?.content).toContain("Unknown");
-  expect((await command("run", { id: run.id }))[0]?.content).toContain(run.title);
   expect((await command("cancel", { id: run.id }))[0]?.content).toContain("Cancellation requested");
   expect((await command("cancel", { id: run.id }))[0]?.content).toContain("already");
   expect(cancellations).toEqual([run.id]);
+  await mounted.stop();
+});
+
+test("show reports run details and unknown IDs without handling the old run command", async () => {
+  const mounted = mountDiscord(factory, port);
+  const run = await build();
+  store.askQuestion(run.id, "Choose?");
+  store.updateRun(run.id, {
+    status: "running",
+    stage: "implement",
+    title: "Updated title",
+    prUrl: "https://example.test/pr/1",
+  });
+  expect((await command("show", { id: run.id }))[0]?.content).toBe(
+    [
+      `${run.id} · running · local/test`,
+      "Stage: implement",
+      "Title: Updated title",
+      "Open questions: 1",
+      "https://example.test/pr/1",
+      `${factory.cfg.uiUrl}/runs/${run.id}`,
+    ].join("\n"),
+  );
+  expect((await command("show", { id: "missing" }))[0]?.content).toBe("Unknown run ID.");
+  expect(await command("run", { id: run.id })).toEqual([]);
   await mounted.stop();
 });
 

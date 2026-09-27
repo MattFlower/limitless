@@ -23,7 +23,14 @@ export interface ReportInput {
   prompt: string;
   state: Pick<
     RunState,
-    "implementerReport" | "spec" | "holdout" | "lastVerify" | "lastGates" | "lastReview" | "lastAudit"
+    | "implementerReport"
+    | "spec"
+    | "holdout"
+    | "lastVerify"
+    | "lastGates"
+    | "lastReview"
+    | "lastAudit"
+    | "rebaseNote"
   >;
   invocations: Invocation[];
   totals: { costUsd: number; costEquivUsd: number };
@@ -39,6 +46,7 @@ export function renderReport(input: ReportInput): string {
     input.success
       ? "Built by **Limitless** — every gate below passed."
       : "⚠️ Built by **Limitless** but it **needs a human**: the checks below did not all pass.",
+    ...(state.rebaseNote ? [`> [!NOTE]\n> ${state.rebaseNote}`] : []),
     "## Request",
     input.prompt
       .split("\n")

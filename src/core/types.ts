@@ -222,6 +222,11 @@ export interface ProviderStatus {
   windows: Record<string, QuotaWindow>;
   spendUsd: number | null; // metered providers
   budgetUsd: number | null;
+  reportedUsageUsd?: number | null;
+  reportedAt?: number | null;
+  limit?: number | null;
+  limitRemaining?: number | null;
+  limitReset?: string | null;
   inFlight: number;
   maxConcurrent: number;
   updatedAt: number;
