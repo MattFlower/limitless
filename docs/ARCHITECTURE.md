@@ -88,6 +88,7 @@ A **run** is one request. It moves through **stages**; each stage makes one or m
 | gates — setup/lint/typecheck/test, compared to baseline | ✓ | ✓ | ✓ | factory (no LLM) |
 | audit — reward-hacking & scope checks on the diff | ✓ | ✓ | ✓ | factory (no LLM) |
 | review — rubric review by a **different vendor** | light | ✓ | ×2 | cross-vendor |
+| preview — build/seed/serve matching UI changes on loopback | – | if configured | if configured | factory (no LLM) |
 | verify — run holdout scenarios, judge each acceptance criterion | – | ✓ | ✓ | different session/vendor |
 | deliver — commit, push, PR with evidence report, merge policy | ✓ | ✓ | ✓ | factory (no LLM) + cheap summary |
 
@@ -95,6 +96,13 @@ Failures in gates/audit/review/verify send **structured feedback** back to imple
 session resumed with the feedback file), bounded by `max_rounds`. After repeated failure the
 implementer is **escalated** one tier (e.g. local → Sonnet → Opus) carrying the failure context,
 before the run is marked `needs_human`.
+
+The optional preview configuration is validated and saved from the base revision during prepare,
+before model calls. A matching committed diff starts an isolated preview immediately before a new
+verify attempt; reused round results do not start one. Build and seed use scratch HOME/TMPDIR,
+reserved environment keys are enforced, and readiness stays on the loopback preview origin. The
+server and scratch are torn down on success, failure or cancellation. Browser/MCP integration is
+a separate step. Runs prepared before configuration snapshots existed must be started anew.
 
 ### Why the holdout author is blind (our twist on StrongDM's scenarios)
 StrongDM keeps scenarios in a directory the agent can't read. We go one better and cheaper: the

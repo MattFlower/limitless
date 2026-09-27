@@ -1135,50 +1135,172 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(verifyCalls).toBe(2);
   });
 
-  test("UI diff starts a seeded preview for fake verification and cleans it afterward", async () => {
+  async function previewFixture(): Promise<void> {
     writeFileSync(
       join(repoDir, ".limitless.toml"),
       `[gates]
 checks = [{ name = "no-bad", run = "! grep -rq BAD --include=*.txt ." }]
 [preview]
 paths = ["ui/"]
-build = "true"
-seed = 'mkdir -p "$LIMITLESS_HOME" && echo seeded > "$LIMITLESS_HOME/seed.txt"'
-serve = "bun serve.ts"
+build = "echo build >> '${join(home, "preview-steps")}'"
+seed = 'echo seed >> "${join(home, "preview-steps")}"; mkdir -p "$LIMITLESS_HOME" && echo seeded > "$LIMITLESS_HOME/seed.txt"'
+serve = "echo serve >> '${join(home, "preview-steps")}'; bun serve.ts"
 ready = "/health"
 env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/config", LIMITLESS_PORT = "{port}" }
 `,
     );
     writeFileSync(
       join(repoDir, "serve.ts"),
-      'Bun.serve({ hostname: "127.0.0.1", port: Number(process.env.LIMITLESS_PORT), fetch: async () => new Response(await Bun.file(process.env.LIMITLESS_HOME + "/seed.txt").text()) });',
+      'Bun.serve({ hostname: "127.0.0.1", port: Number(process.env.LIMITLESS_PORT), fetch: async () => new Response(await Bun.file(process.env.LIMITLESS_HOME + "/seed.txt").text(), {headers: {"x-scratch": process.env.HOME ?? ""}}) });',
     );
     await sh(["git", "add", "."], { cwd: repoDir });
     await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "preview fixture"], {
       cwd: repoDir,
     });
-    let runId = "";
-    let previewUrl = "";
-    const f = start(async (agent) => {
+  }
+
+  test.each(["pass", "unmet", "error"] as const)(
+    "base preview survives config edits and cleans up after verify %s",
+    async (outcome) => {
+      await previewFixture();
+      let runId = "";
+      const previews: { url: string; scratch: string }[] = [];
+      const assertStopped = async () => {
+        for (const { url, scratch } of previews) {
+          expect(existsSync(scratch)).toBe(false);
+          await expect(fetch(`${url}/health`)).rejects.toThrow();
+        }
+      };
+      const handler: Handler = async (agent) => {
+        const role = roleOf(agent);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") {
+          const stage = factory?.store
+            .getRunDetail(runId)
+            ?.stages.filter((entry) => entry.name === "preview")
+            .at(-1);
+          expect(stage?.status).toBe("succeeded");
+          const url = stage?.summary?.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0] ?? "";
+          const response = await fetch(`${url}/health`);
+          expect(await response.text()).toBe("seeded\n");
+          const scratch = response.headers.get("x-scratch") ?? "";
+          expect(existsSync(scratch)).toBe(true);
+          previews.push({ url, scratch });
+          if (outcome === "error") throw new Error("injected verifier failure");
+          if (outcome === "unmet" && previews.length === 1)
+            return {
+              structured: {
+                ...pass,
+                overall: "fail",
+                criteria: pass.criteria.map((c) => (c.id === "AC-1" ? { ...c, status: "unmet" } : c)),
+              },
+            };
+          return { structured: pass };
+        }
+        await assertStopped();
+        return {
+          files: {
+            "ui/change.txt": `visible ${previews.length}\n`,
+            // Removing the table must not disable the trusted base preview.
+            ".limitless.toml":
+              readFileSync(join(repoDir, ".limitless.toml"), "utf8").split("[preview]")[0] ?? "",
+          },
+        };
+      };
+      const f = start(handler);
+      const run = await f.createRun({ repo: repoDir, prompt: "Change the UI" });
+      runId = run.id;
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        outcome === "error" ? "needs_human" : "succeeded",
+      );
+      expect(previews.length).toBeGreaterThan(0);
+      await assertStopped();
+      const state = f.store.getRunState<RunState>(run.id);
+      expect(state?.previewConfig?.paths).toEqual(["ui/"]);
+      if (outcome === "unmet") expect(previews).toHaveLength(2);
+      if (outcome !== "pass" || !state) return;
+      // Replay the persisted round after its verdict was saved, before phase advancement.
+      const steps = readFileSync(join(home, "preview-steps"), "utf8");
+      expect(steps).toBe("build\nseed\nserve\n");
+      await f.stop();
+      f.store.setRunState(run.id, { ...state, phase: "loop" });
+      f.store.updateRun(run.id, { status: "queued", finishedAt: null });
+      f.store.close();
+      factory = null;
+      const resumed = start(handler);
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(previews).toHaveLength(1);
+      expect(readFileSync(join(home, "preview-steps"), "utf8")).toBe(steps);
+      expect(
+        resumed.store.getRunDetail(run.id)?.stages.filter((entry) => entry.name === "preview"),
+      ).toHaveLength(1);
+    },
+  );
+
+  test.each([
+    "paths = []",
+    'paths = ["ui/"]\nbuild="true"\nserve="true"\nready="/health"\nenv={HOME="{scratch}/../escape"}',
+    'paths = ["ui/"]\nbuild="true"\nserve="true"\nready=\'/\\evil.example/x\'\nenv={}',
+  ])("invalid base preview fails prepare without model spend: %s", async (invalid) => {
+    writeFileSync(join(repoDir, ".limitless.toml"), `[preview]\n${invalid}\n`);
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "invalid preview"], {
+      cwd: repoDir,
+    });
+    let calls = 0;
+    const f = start(() => {
+      calls++;
+      return {};
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Change the UI" });
+    expect(await waitFor(f, run.id, ["failed", "succeeded", "needs_human"])).toBe("failed");
+    expect(calls).toBe(0);
+    expect(f.store.listInvocations(run.id)).toHaveLength(0);
+    expect(f.store.getRun(run.id)?.error).toContain("Invalid [preview]");
+    expect(f.store.getRunDetail(run.id)?.stages.map((stage) => [stage.name, stage.status])).toEqual([
+      ["prepare", "failed"],
+    ]);
+  });
+
+  test("absent base preview stays disabled; legacy resumes without a snapshot fail before model calls", async () => {
+    let calls = 0;
+    const handler: Handler = (agent) => {
+      calls++;
       const role = roleOf(agent);
       if (role === "triage") return { structured: triage() };
       if (role === "spec") return { structured: spec };
       if (role === "holdout") return { structured: holdout };
       if (role === "review") return { structured: approve };
-      if (role === "verify") {
-        const stage = f.store.getRunDetail(runId)?.stages.find((entry) => entry.name === "preview");
-        expect(stage?.status).toBe("succeeded");
-        previewUrl = stage?.summary?.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0] ?? "";
-        expect(await (await fetch(`${previewUrl}/health`)).text()).toBe("seeded\n");
-        return { structured: pass };
-      }
-      return { files: { "ui/change.txt": "visible\n" } };
-    });
+      if (role === "verify") return { structured: pass };
+      return {
+        files: {
+          "ui/change.txt": "visible\n",
+          ".limitless.toml": `${readFileSync(join(repoDir, ".limitless.toml"), "utf8")}\n[preview]\npaths=[]\n`,
+        },
+      };
+    };
+    const f = start(handler);
     const run = await f.createRun({ repo: repoDir, prompt: "Change the UI" });
-    runId = run.id;
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-    expect(previewUrl).toStartWith("http://127.0.0.1:");
-    await expect(fetch(`${previewUrl}/health`)).rejects.toThrow();
+    const state = f.store.getRunState<RunState>(run.id);
+    expect(state?.previewConfig).toBeNull();
+    expect(f.store.getRunDetail(run.id)?.stages.some((stage) => stage.name === "preview")).toBe(false);
+    if (!state) throw new Error("Missing state");
+    await f.stop();
+    delete state.previewConfig;
+    state.phase = "loop";
+    f.store.setRunState(run.id, state);
+    f.store.updateRun(run.id, { status: "queued", finishedAt: null });
+    f.store.close();
+    factory = null;
+    const before = calls;
+    const resumed = start(handler);
+    expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("failed");
+    expect(calls).toBe(before);
+    expect(resumed.store.getRun(run.id)?.error).toContain("no base preview configuration snapshot");
   });
 
   test("happy path: triage → spec → implement → gates → review → verify → deliver", async () => {

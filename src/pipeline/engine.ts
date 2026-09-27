@@ -35,7 +35,7 @@ import {
   RunContext,
   type RunState,
 } from "./context.ts";
-import { needsPreview, readPreviewConfig, startPreview } from "./preview.ts";
+import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
   formatGateFeedback,
@@ -89,6 +89,8 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run);
+    if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined)
+      throw new Error("Run has no base preview configuration snapshot; start a new run");
     if (ctx.state.phase === "prepare") await prepare(ctx);
     if (ctx.state.phase === "triage") await triage(ctx);
     if (ctx.state.phase === "clarify") await clarify(ctx);
@@ -148,6 +150,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       throw new Error("PR head moved before preparation");
     ctx.state.worktreePath = wt.path;
     ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha: wt.baseSha, branch: wt.branch });
+    ctx.state.previewConfig = readPreviewConfig(await readFileAt(wt.path, wt.baseSha, ".limitless.toml"));
     const gates = detectGates(wt.path);
     ctx.state.gatesConfig = gates;
     ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
@@ -669,10 +672,15 @@ async function oneRound(
     if (failure) throw failure;
   }
   if (!ctx.state.holdout) throw new NeedsHumanError("Holdout scenarios are unavailable");
-  const previewConfig = readPreviewConfig(cwd);
-  const preview =
-    needsPreview(previewConfig, diff) && previewConfig
-      ? await ctx.stage(
+  const previewConfig = ctx.state.previewConfig ?? null;
+  let preview: Preview | null = null;
+  const stopPreview = async () => {
+    await preview?.stop();
+  };
+  try {
+    const verifyAttempt = async (attempt: number, excludeModels: string[] = []): Promise<Verify> => {
+      if (!preview && previewConfig && needsPreview(previewConfig, diff)) {
+        preview = await ctx.stage(
           "preview",
           async () => {
             const server = await startPreview(cwd, previewConfig, ctx.signal);
@@ -680,12 +688,10 @@ async function oneRound(
             return { summary: `ready at ${server.url}`, value: server };
           },
           round,
-        )
-      : null;
-  ctx.previewUrl = preview?.url;
-  try {
-    const verifyAttempt = async (attempt: number, excludeModels: string[] = []): Promise<Verify> =>
-      ctx.stage(
+        );
+        ctx.previewUrl = preview.url;
+      }
+      return ctx.stage(
         "verify",
         async (stage) => {
           const { result, target } = await ctx.invoke({
@@ -742,6 +748,7 @@ async function oneRound(
         },
         round,
       );
+    };
     const previous = (ctx.state.verifyResults ?? []).filter((v) => v.round === round);
     let verify = previous.at(-1) ?? (await verifyAttempt(0));
     const publicSources = await ctx.publicHoldoutSources();
@@ -785,7 +792,7 @@ async function oneRound(
     return true;
   } finally {
     ctx.previewUrl = undefined;
-    await preview?.stop();
+    await stopPreview();
   }
 }
 
