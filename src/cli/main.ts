@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import type { Profile, Run, RunDetail, RunEvent } from "../core/types.ts";
@@ -127,7 +128,9 @@ async function serve(): Promise<void> {
   const { startHttp } = await import("../server/http.ts");
   const { mountIntegrations } = await import("../integrations/index.ts");
   const cfg = loadConfig();
-  const factory = new Factory(cfg);
+  const factory = new Factory(cfg, {
+    policyPath: join(import.meta.dir, "../../routing/policy.json"),
+  });
   const ui = (await import("../../ui/index.html")).default;
   const integrations = await mountIntegrations(factory);
   const server = startHttp(factory, { ui, routes: integrations.routes });

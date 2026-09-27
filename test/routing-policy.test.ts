@@ -10,6 +10,7 @@ import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
 import { loadPolicy } from "../src/router/policy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { evidence, local, subscription } from "./evals-policy-support.ts";
+import { evalFixture } from "./evals-support.ts";
 import { type Route, requestWithParams } from "./mcp-support.ts";
 
 test("policy files: absent, empty, partial, pipe groups, complexity preservation and immutable defaults", () => {
@@ -77,6 +78,36 @@ test("eval config rejects malformed supplied settings, accepts inclusive endpoin
     }).delta,
   ).toBe(0);
   expect(evalSettings({ evals: { delta: 1, subscription_weight: 2 } }).subscription_weight).toBe(2);
+});
+
+test("explicit application overlays do not affect default or custom-catalog test factories", async () => {
+  const fixture = await evalFixture();
+  const path = join(fixture.home, "routing/policy.json");
+  const factories: Factory[] = [];
+  try {
+    mkdirSync(join(fixture.home, "routing"));
+    writeFileSync(path, JSON.stringify({ triage: { default: [subscription] } }));
+    const application = new Factory(fixture.cfg, { policyPath: path, store: fixture.factory.store });
+    factories.push(application);
+    expect(application.policy.triage.default).toEqual([subscription]);
+
+    const isolated = new Factory(fixture.cfg, { store: fixture.factory.store });
+    factories.push(isolated);
+    expect(isolated.policy).toBe(DEFAULT_POLICY);
+    expect(fixture.factory.policy).toBe(DEFAULT_POLICY);
+    const custom = new Factory(fixture.cfg, {
+      models: fixture.factory.models,
+      store: fixture.factory.store,
+    });
+    factories.push(custom);
+    expect(custom.policy).toBe(DEFAULT_POLICY);
+    // The real catalog overlay is invalid for the eval fixture's synthetic catalog.
+    expect(() => loadPolicy(path, custom.models)).toThrow(path);
+    expect((await fixture.run()).run.status).toBe("completed");
+  } finally {
+    for (const factory of factories) await factory.stop();
+    await fixture.close();
+  }
 });
 
 test("factory/API share the startup policy and current eligibility settings; injected policy bypasses file", async () => {

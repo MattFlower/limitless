@@ -1,4 +1,3 @@
-import { join } from "node:path";
 import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
 import type { CreateRunRequest, Question, Run } from "./core/types.ts";
@@ -13,7 +12,14 @@ import { runCodex } from "./harness/codex.ts";
 import { runLlm } from "./harness/llm.ts";
 import type { Harness } from "./harness/types.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
-import { MODELS, type ModelDef, type Policy, PROVIDERS, type ProviderDef } from "./router/catalog.ts";
+import {
+  DEFAULT_POLICY,
+  MODELS,
+  type ModelDef,
+  type Policy,
+  PROVIDERS,
+  type ProviderDef,
+} from "./router/catalog.ts";
 import { loadPolicy } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
 import { Router } from "./router/router.ts";
@@ -22,6 +28,7 @@ import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
   evalCasePath?: string;
+  /** Explicit overlay location; the daemon supplies its application checkout's path. */
   policyPath?: string;
   harnesses?: Record<string, Harness>;
   providers?: ProviderDef[];
@@ -67,7 +74,7 @@ export class Factory {
     this.evalSettings = evalSettings(cfg.raw);
     this.policy =
       opts.policy ??
-      loadPolicy(opts.policyPath ?? join(import.meta.dir, "../routing/policy.json"), this.models);
+      (opts.policyPath === undefined ? DEFAULT_POLICY : loadPolicy(opts.policyPath, this.models));
     this.store = opts.store ?? new Store(cfg.paths.db);
     this.cleanup = opts.cleanup ?? ((dryRun) => collectGarbage(this.store, cfg, { dryRun }));
     this.gcTimer = opts.gcTimer ?? { set: setInterval, clear: clearInterval };
