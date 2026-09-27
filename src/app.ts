@@ -6,6 +6,7 @@ import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals
 import { EvalRunner } from "./evals/runner.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { summarize } from "./evals/stats.ts";
+import { gateSlots } from "./gates/slots.ts";
 import { collectGarbage, type GcResult } from "./gc.ts";
 import { resolveRepo } from "./git/repos.ts";
 import { runClaude } from "./harness/claude.ts";
@@ -74,6 +75,7 @@ export class Factory {
     opts: FactoryOptions = {},
   ) {
     this.bootSha = opts.bootSha ?? "unknown";
+    gateSlots.setLimit(cfg.maxConcurrentGates);
     this.models = opts.models ?? MODELS;
     this.evalSettings = evalSettings(cfg.raw);
     this.providerDefs = opts.providers ?? PROVIDERS;
