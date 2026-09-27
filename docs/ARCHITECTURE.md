@@ -97,6 +97,11 @@ session resumed with the feedback file), bounded by `max_rounds`. After repeated
 implementer is **escalated** one tier (e.g. local → Sonnet → Opus) carrying the failure context,
 before the run is marked `needs_human`.
 
+Gate suites (baseline, post-change, post-rebase, eval trials) share a process-wide pool of
+`max_concurrent_gates` slots so concurrent suites don't starve each other of CPU. A check that
+passed on the baseline, fails after the change, and whose output names no changed file is re-run
+once; a pass on retry is recorded as `flaky` (a non-blocking warning with both outputs kept).
+
 The optional preview configuration is validated and saved from the base revision during prepare,
 before model calls. A matching committed diff starts an isolated preview immediately before a new
 verify attempt; reused round results do not start one. Build and seed use scratch HOME/TMPDIR,

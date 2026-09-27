@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { auditDiff } from "../src/gates/audit.ts";
-import { detectGates } from "../src/gates/detect.ts";
-import { compareGates, type GateRun, runGates } from "../src/gates/run.ts";
+import { detectGates, type GateConfig } from "../src/gates/detect.ts";
+import { compareGates, type GateRun, retryRegressions, runGates } from "../src/gates/run.ts";
+import { defaultGateSlots, gateSlots, Semaphore } from "../src/gates/slots.ts";
 import type { DiffInfo } from "../src/git/repos.ts";
 
 function tempDir(files: Record<string, string>): string {
@@ -110,6 +111,85 @@ describe("runGates / compareGates", () => {
     expect(compareGates({ setupOk: true, setup: [r("setup", true)], checks: [] }, after)[0]?.blocking).toBe(
       true,
     );
+  });
+});
+
+describe("gate slots and flaky retry", () => {
+  const signal = new AbortController().signal;
+  const config = (run: string): GateConfig => ({
+    setup: [],
+    checks: [{ name: "test", run }],
+    source: "detected",
+    protectedPaths: [],
+  });
+
+  test("the semaphore bounds concurrent gate processes", async () => {
+    const dir = tempDir({});
+    const log = join(dir, "log");
+    const cfg = config(`echo + >> '${log}'; sleep 0.2; echo - >> '${log}'`);
+    const previous = gateSlots.limit;
+    let waits = 0;
+    gateSlots.setLimit(2);
+    try {
+      const runs = Array.from({ length: 5 }, () => runGates(dir, cfg, signal, { onWait: () => waits++ }));
+      expect((await Promise.all(runs)).every((run) => run.checks[0]?.ok)).toBe(true);
+    } finally {
+      gateSlots.setLimit(previous);
+    }
+    let running = 0;
+    let peak = 0;
+    for (const line of readFileSync(log, "utf8").trim().split("\n")) {
+      running += line === "+" ? 1 : -1;
+      peak = Math.max(peak, running);
+    }
+    expect(peak).toBeLessThanOrEqual(2);
+    expect(waits).toBe(3);
+    expect(defaultGateSlots(3)).toBe(1);
+    expect(defaultGateSlots(16)).toBe(4);
+  });
+
+  test("a queued slot request gives up on cancel without taking a slot", async () => {
+    const slots = new Semaphore(1);
+    const release = await slots.acquire(signal);
+    const cancel = new AbortController();
+    const queued = slots.acquire(cancel.signal);
+    cancel.abort();
+    await expect(queued).rejects.toThrow();
+    release();
+    let waited = false;
+    (await slots.acquire(signal, () => (waited = true)))();
+    expect(waited).toBe(false);
+  });
+
+  /** Baseline passed (or not), then the check ran after the change and maybe once more. */
+  async function retried(run: string, baselineOk = true) {
+    const dir = tempDir({});
+    const cfg = config(run);
+    const base = { name: "test", command: run, ok: baselineOk, exitCode: 0, durationMs: 1, output: "" };
+    const cmp = compareGates({ setupOk: true, setup: [], checks: [base] }, await runGates(dir, cfg, signal));
+    const [c] = await retryRegressions(cmp, dir, cfg, ["src/app.ts"], signal);
+    const runs = readFileSync(join(dir, "runs"), "utf8").trim().split("\n").length;
+    return { c, summary: [c?.verdict, c?.blocking, c?.firstAttempt?.ok ?? "not retried", runs] };
+  }
+
+  test("fail → retry → pass is flaky and does not block", async () => {
+    const { c, summary } = await retried(
+      "echo x >> runs; test -f once || { touch once; echo slow; exit 1; }",
+    );
+    expect(summary).toEqual(["flaky", false, false, 2]);
+    expect(c?.result.ok).toBe(true);
+    expect(c?.firstAttempt?.output).toContain("slow");
+  });
+
+  test("fail → retry → fail stays blocking", async () => {
+    expect((await retried("echo x >> runs; exit 1")).summary).toEqual(["regressed", true, false, 2]);
+  });
+
+  test("a check failing on the baseline or pointing at a changed file is not retried", async () => {
+    const failing = await retried("echo x >> runs; exit 1", false);
+    expect(failing.summary).toEqual(["still_failing", false, "not retried", 1]);
+    const pointed = await retried("echo x >> runs; echo 'at /repo/src/app.ts:12:3'; exit 1");
+    expect(pointed.summary).toEqual(["regressed", true, "not retried", 1]);
   });
 });
 

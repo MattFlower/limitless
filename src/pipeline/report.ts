@@ -114,11 +114,17 @@ export function renderReport(input: ReportInput): string {
       table(
         ["Check", "Result", "Command"],
         state.lastGates.map((g) => {
-          const icon = g.blocking ? "❌" : g.verdict === "still_failing" ? "⚠️" : "✅";
+          const warn = g.verdict === "still_failing" || g.verdict === "flaky";
+          const icon = g.blocking ? "❌" : warn ? "⚠️" : "✅";
           return [g.name, `${icon} ${g.verdict.replace("_", " ")}`, `\`${escapeCell(g.result.command)}\``];
         }),
       ),
     );
+    const flaky = state.lastGates.filter((g) => g.verdict === "flaky").map((g) => `\`${g.name}\``);
+    if (flaky.length)
+      blocks.push(
+        `> [!WARNING]\n> Flaky: ${flaky.join(", ")} failed, then passed when re-run. Both outputs are kept in the gates artifact.`,
+      );
   } else {
     blocks.push("No automated checks were detected for this repository.");
   }

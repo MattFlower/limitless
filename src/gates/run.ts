@@ -1,5 +1,7 @@
+import { basename } from "node:path";
 import { agentEnv, runProcess } from "../util/proc.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
+import { gateSlots } from "./slots.ts";
 
 export interface GateResult {
   name: string;
@@ -23,13 +25,22 @@ export type GateVerdict =
   | "still_failing"
   | "new_failure"
   | "new_pass"
-  | "not_run";
+  | "not_run"
+  | "flaky";
 
 export interface GateComparison {
   name: string;
   verdict: GateVerdict;
   blocking: boolean;
   result: GateResult;
+  /** The failing run that triggered a retry; `result` is then the retry. */
+  firstAttempt?: GateResult;
+}
+
+export interface GateHooks {
+  onResult?: (r: GateResult, phase: "setup" | "check") => void;
+  /** Fires once when every gate slot is busy and this call has to queue. */
+  onWait?: (slots: number) => void;
 }
 
 const OUTPUT_TAIL = 6_000;
@@ -54,11 +65,26 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   };
 }
 
+/** Run setup and checks inside one machine-wide gate slot. */
 export async function runGates(
   cwd: string,
   cfg: GateConfig,
   signal: AbortSignal,
-  onResult?: (r: GateResult, phase: "setup" | "check") => void,
+  hooks: GateHooks = {},
+): Promise<GateRun> {
+  const release = await gateSlots.acquire(signal, hooks.onWait);
+  try {
+    return await runAll(cwd, cfg, signal, hooks.onResult);
+  } finally {
+    release();
+  }
+}
+
+async function runAll(
+  cwd: string,
+  cfg: GateConfig,
+  signal: AbortSignal,
+  onResult: GateHooks["onResult"],
 ): Promise<GateRun> {
   const setup: GateResult[] = [];
   for (const [i, run] of cfg.setup.entries()) {
@@ -112,4 +138,54 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     });
   }
   return out;
+}
+
+/** Whether the output names a location (`file:12`, `file(12,`) in one of the changed files. */
+function pointsAt(output: string, changed: string[]): boolean {
+  return changed.some((path) => {
+    const name = basename(path).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`${name}(?::\\d|\\(\\d)`).test(output);
+  });
+}
+
+/**
+ * Re-run once, inside a slot, each check that passed on the baseline but failed after the change
+ * without its output pointing at a changed file. A pass on retry is `flaky` and doesn't block.
+ */
+export async function retryRegressions(
+  cmp: GateComparison[],
+  cwd: string,
+  cfg: GateConfig,
+  changed: string[],
+  signal: AbortSignal,
+  onWait?: GateHooks["onWait"],
+): Promise<GateComparison[]> {
+  // Matching the command too keeps a failed setup step (also "regressed") from being retried.
+  const retryable = (c: GateComparison) =>
+    c.verdict === "regressed" && !pointsAt(c.result.output, changed)
+      ? cfg.checks.find((k) => k.name === c.name && k.run === c.result.command)
+      : undefined;
+  if (!cmp.some(retryable)) return cmp;
+  const release = await gateSlots.acquire(signal, onWait);
+  try {
+    const out: GateComparison[] = [];
+    for (const c of cmp) {
+      const check = retryable(c);
+      if (!check || signal.aborted) {
+        out.push(c);
+        continue;
+      }
+      const retry = await runOne(check, cwd, signal);
+      out.push({
+        ...c,
+        verdict: retry.ok ? "flaky" : c.verdict,
+        blocking: !retry.ok,
+        result: retry,
+        firstAttempt: c.result,
+      });
+    }
+    return out;
+  } finally {
+    release();
+  }
 }
