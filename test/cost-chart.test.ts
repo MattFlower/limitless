@@ -56,5 +56,8 @@ test("cost chart exposes every day to hover and focus and sums displayed days", 
   expect(html).toContain("API-equivalent: $0.00");
   expect(html).toContain("Visible range · Metered");
   expect(html).toContain("$3.00");
-  expect(renderToString(() => CostChart({ days: [] }))).toContain("No cost data in this range.");
+  const empty = renderToString(() => CostChart({ days: [] }));
+  expect(empty).toContain("No cost data in this range.");
+  expect(empty).not.toContain("cost-totals");
+  expect(empty).not.toContain("$0.00");
 });

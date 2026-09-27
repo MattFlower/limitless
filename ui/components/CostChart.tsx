@@ -85,17 +85,19 @@ export const CostChart: Component<{ days: DayStats[] }> = (props) => {
           </For>
         </div>
       </Show>
-      <div class="cost-totals">
-        <span>
-          Visible range · Metered <strong>{money(totals().metered)}</strong>
-        </span>
-        <span>
-          API-equivalent <strong>{money(totals().equivalent)}</strong>
-        </span>
-      </div>
-      <div class="cost-legend">
-        <span class="cost-legend-metered" /> Metered <span class="cost-legend-equivalent" /> API-equivalent
-      </div>
+      <Show when={props.days.length}>
+        <div class="cost-totals">
+          <span>
+            Visible range · Metered <strong>{money(totals().metered)}</strong>
+          </span>
+          <span>
+            API-equivalent <strong>{money(totals().equivalent)}</strong>
+          </span>
+        </div>
+        <div class="cost-legend">
+          <span class="cost-legend-metered" /> Metered <span class="cost-legend-equivalent" /> API-equivalent
+        </div>
+      </Show>
     </div>
   );
 };

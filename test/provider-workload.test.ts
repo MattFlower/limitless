@@ -40,11 +40,21 @@ test("provider workload uses local calendar boundaries and adds chat calls once"
         JSON.stringify({ usage: { input: 3, cacheRead: 0, output: 1 }, costEquivUsd: 0.1 }),
         localDay(-6, 2),
       );
+    store.db
+      .query(`INSERT INTO chat_calls
+      (conversation_id, provider, model_id, result_json, cost_usd, started_at)
+      VALUES ('c', 'mtplx', 'm', ?, 0, ?)`)
+      .run("not valid json {{{", localDay(0, 4));
+    store.db
+      .query(`INSERT INTO chat_calls
+      (conversation_id, provider, model_id, result_json, cost_usd, started_at)
+      VALUES ('c', 'mtplx', 'm', '{}', 0, ?)`)
+      .run(localDay(0, 5));
     const rows = computeProviderWorkload(store, localDay(0, 23));
     expect(workloadFor("mtplx", rows)).toEqual({
       provider: "mtplx",
-      today: { invocations: 2, tokensIn: 17, tokensOut: 7, wallTimeMs: 3_602_500, costEquivUsd: 0.8 },
-      sevenDays: { invocations: 3, tokensIn: 42, tokensOut: 13, wallTimeMs: 7_202_500, costEquivUsd: 1.8 },
+      today: { invocations: 3, tokensIn: 17, tokensOut: 7, wallTimeMs: 3_602_500, costEquivUsd: 0.8 },
+      sevenDays: { invocations: 4, tokensIn: 42, tokensOut: 13, wallTimeMs: 7_202_500, costEquivUsd: 1.8 },
     });
     expect(workloadFor("twilight", rows)).toEqual({
       provider: "twilight",

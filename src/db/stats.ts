@@ -69,7 +69,7 @@ export function computeProviderWorkload(store: Store, now = Date.now()): Provide
              COALESCE(json_extract(result_json, '$.usage.output'), 0),
              COALESCE(duration_ms, 0),
              COALESCE(json_extract(result_json, '$.costEquivUsd'), 0)
-        FROM chat_calls WHERE started_at >= ? AND started_at <= ?
+        FROM chat_calls WHERE started_at >= ? AND started_at <= ? AND json_valid(result_json)
     )
   `)
     .all(sevenDays, now, sevenDays, now) as {
