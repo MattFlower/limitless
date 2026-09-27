@@ -1,20 +1,16 @@
-import { BlockList, isIP } from "node:net";
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
 import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
+import { classifyRequest, publicHost } from "./access.ts";
 
 export interface HttpExtras {
   /** Extra routes contributed by integrations (webhooks, MCP). */
   routes?: Record<string, (req: Request, server: Server<undefined>) => Response | Promise<Response>>;
-  /** HTML entry for the SPA (Bun HTML import). */
-  ui?: unknown;
+  /** Bundled SPA files, served through the same authorization as the API. */
+  ui?: Record<string, Blob>;
 }
-
-const loopback = new BlockList();
-loopback.addSubnet("127.0.0.0", 8, "ipv4");
-loopback.addAddress("::1", "ipv6");
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -99,13 +95,24 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         req: Request & { params: Record<string, string> },
         server: Server<undefined>,
       ) => Response | Promise<Response>,
+      localOnly = false,
     ) =>
     async (req: Request & { params: Record<string, string> }, server: Server<undefined>) => {
       const path = new URL(req.url).pathname;
-      // Anything arriving through the Cloudflare tunnel may only reach /webhooks/*.
-      if (req.headers.has("cf-connecting-ip") && !path.startsWith("/webhooks/")) {
+      const access = classifyRequest(
+        server.requestIP(req)?.address ?? null,
+        req.headers,
+        factory.cfg.trustedProxies,
+      );
+      if (
+        access === "denied" ||
+        (localOnly && access !== "loopback") ||
+        (access === "tunnel" && !path.startsWith("/webhooks/")) ||
+        (access !== "loopback" &&
+          (path === "/mcp" || path === "/api/admin" || path.startsWith("/api/admin/"))) ||
+        (access === "proxy" && !publicHost(req.headers.get("host"), factory.cfg.publicOrigins))
+      )
         return error("forbidden", 403);
-      }
       // Runs execute code, so a web page in the operator's browser must not be able to create or
       // control them (CSRF against localhost): mutations need a local Origin (or none, as from the
       // CLI) and a JSON body type, which cross-origin pages can't send without a CORS preflight.
@@ -117,7 +124,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         !path.startsWith("/webhooks/")
       ) {
         const origin = req.headers.get("origin");
-        if (origin && !allowedOrigins.has(origin)) return error("cross-origin request refused", 403);
+        if (
+          access === "proxy"
+            ? !origin || !factory.cfg.publicOrigins.includes(origin)
+            : origin && !allowedOrigins.has(origin)
+        )
+          return error("cross-origin request refused", 403);
         const type = req.headers.get("content-type") ?? "";
         if (type.split(";")[0]?.trim().toLowerCase() !== "application/json") {
           return error("mutations require content-type: application/json", 415);
@@ -135,14 +147,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     active: factory.scheduler.activeRunIds,
   });
   const admin = (action: "drain" | "resume") => ({
-    POST: handle((req, server) => {
-      const peer = server.requestIP(req)?.address;
-      if (!peer || !isIP(peer) || !loopback.check(peer, isIP(peer) === 6 ? "ipv6" : "ipv4")) {
-        return error("admin endpoints require a loopback peer", 403);
-      }
+    POST: handle(() => {
       factory.scheduler[action]();
       return json(drainState());
-    }),
+    }, true),
   });
 
   const conversation = (req: Request & { params: Record<string, string> }) => {
@@ -322,28 +330,45 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     }),
   };
 
-  for (const [path, fn] of Object.entries(extras.routes ?? {})) routes[path] = handle(fn);
+  for (const [path, fn] of Object.entries(extras.routes ?? {})) routes[path] = handle(fn, path === "/mcp");
   if (extras.ui) {
-    routes["/"] = extras.ui;
-    routes["/runs/*"] = extras.ui;
-    routes["/new"] = extras.ui;
-    routes["/models"] = extras.ui;
-    routes["/chat"] = extras.ui;
+    for (const [path, file] of Object.entries(extras.ui)) routes[path] = handle(() => new Response(file));
+    const index = extras.ui["/index.html"];
+    if (index)
+      for (const path of ["/", "/runs/*", "/new", "/models", "/chat", "/evals", "/evals/*"])
+        routes[path] = handle(() => new Response(index));
   }
-
+  routes["/*"] = handle((req) =>
+    new URL(req.url).pathname.startsWith("/api/")
+      ? error("not found", 404)
+      : new Response("Not found", { status: 404 }),
+  );
   return routes;
 }
 
-export function startHttp(factory: Factory, extras: HttpExtras = {}): Server<undefined> {
-  return Bun.serve({
-    hostname: factory.cfg.host,
-    port: factory.cfg.port,
-    development: process.env.NODE_ENV !== "production" && process.env.LIMITLESS_DEV === "1",
-    routes: createHttpRoutes(factory, extras) as never,
-    fetch(req) {
-      const path = new URL(req.url).pathname;
-      if (path.startsWith("/api/")) return error("not found", 404);
-      return new Response("Not found", { status: 404 });
+export function startHttp(factory: Factory, extras: HttpExtras = {}, serve = Bun.serve<undefined>) {
+  const routes = createHttpRoutes(factory, extras);
+  const bind = (hostname: string) =>
+    serve({
+      hostname,
+      port: factory.cfg.port,
+      development: process.env.NODE_ENV !== "production" && process.env.LIMITLESS_DEV === "1",
+      routes: routes as never,
+      fetch: routes["/*"] as (req: Request, server: Server<undefined>) => Promise<Response>,
+    });
+  const local = bind(factory.cfg.host);
+  let lan: Server<undefined> | undefined;
+  try {
+    if (factory.cfg.listenLan) lan = bind(factory.cfg.listenLan);
+  } catch (error) {
+    void local.stop(true);
+    throw error;
+  }
+  return {
+    port: local.port,
+    url: local.url,
+    stop: async (force?: boolean) => {
+      await Promise.all([local.stop(force), lan?.stop(force)]);
     },
-  });
+  };
 }

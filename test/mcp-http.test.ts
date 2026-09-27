@@ -69,12 +69,16 @@ test("mounted endpoint initializes, discovers and calls tools without sessions",
 });
 
 test("all methods reject tunnel, non-loopback, untrusted origin and rebinding host before dispatch", async () => {
+  f.factory.cfg.trustedProxies = ["192.0.2.10"];
+  f.factory.cfg.publicOrigins = ["https://limitless.mattflower.net"];
   for (const method of ["POST", "GET", "DELETE", "PUT", "OPTIONS", "HEAD"]) {
     for (const extra of [
       { "cf-connecting-ip": "198.51.100.1" },
       { "cf-connecting-ip": "" },
       { origin: "https://evil.example" },
       { origin: "null" },
+      { "x-forwarded-for": "127.0.0.1" },
+      { "x-forwarded-proto": "http" },
     ] as Record<string, string>[]) {
       const req = requestWithParams("http://127.0.0.1:7400/mcp", {
         method,

@@ -1,12 +1,11 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import type { Server } from "bun";
 import { Factory } from "../src/app.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { answer, evalFixture } from "./evals-support.ts";
-import { type Route, requestWithParams } from "./mcp-support.ts";
+import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
 const candidates = [
   ["gpt-6-luna", "openai/gpt-6-luna", 0.1, 0.5, "US"],
@@ -76,7 +75,7 @@ test("catalog candidates absent from policy execute exactly and API exposes orig
     expect(factory.evals.report(run.id)?.trials[0]?.pass).toBe(true);
     const route = createHttpRoutes(factory)["/api/models"] as Route;
     const result = (await (
-      await route(requestWithParams("http://localhost:7400/api/models"), {} as Server<undefined>)
+      await route(requestWithParams("http://localhost:7400/api/models"), localServer)
     ).json()) as { models: typeof MODELS };
     expect(result.models.find((m) => m.id === "openrouter/ministral-14b-2512")?.origin).toBe("FR");
     const ui = readFileSync(new URL("../ui/pages/Models.tsx", import.meta.url), "utf8");

@@ -1,10 +1,9 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import type { Server } from "bun";
 import type { ChatConversation, ChatMessage, ChatRequest, ChatStreamMessage } from "../src/core/types.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { chatProposals, mergeChatMessages } from "../ui/lib/chat.ts";
 import { chatFixture, proposalFields } from "./chat-support.ts";
-import { type Route, requestWithParams } from "./mcp-support.ts";
+import { type Route, requestWithParams, localServer as server } from "./mcp-support.ts";
 
 let f: ReturnType<typeof chatFixture>;
 beforeEach(() => {
@@ -13,7 +12,6 @@ beforeEach(() => {
 afterEach(() => {
   f.close();
 });
-const server = { timeout: () => {} } as unknown as Server<undefined>;
 async function get(conversationId = "one") {
   const routes = createHttpRoutes(f.factory);
   return (routes["/api/chat/:conversationId"] as { GET: Route }).GET(

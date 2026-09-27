@@ -9,7 +9,7 @@ import { fakeHarness } from "../src/harness/fake.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
-import { requestWithParams } from "./mcp-support.ts";
+import { localServer, requestWithParams } from "./mcp-support.ts";
 
 const providers: ProviderDef[] = [
   {
@@ -144,7 +144,7 @@ test("provider API returns usage fields without key or label", async () => {
     req: Request,
     server: Server<undefined>,
   ) => Promise<Response>;
-  const response = await route(requestWithParams("http://localhost/api/providers"), {} as Server<undefined>);
+  const response = await route(requestWithParams("http://localhost/api/providers"), localServer);
   const body = await response.text();
   expect(body).toContain('"reportedUsageUsd":51');
   expect(body).toContain('"reportedAt":1000000');
