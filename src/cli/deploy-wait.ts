@@ -47,7 +47,7 @@ function validDrain(value: unknown): value is DrainState {
   );
 }
 
-function validateHealth(value: unknown): HealthResponse {
+export function validateHealth(value: unknown): HealthResponse {
   if (
     !validDrain(value) ||
     !("ok" in value) ||
@@ -59,7 +59,8 @@ function validateHealth(value: unknown): HealthResponse {
   ) {
     throw new Error("invalid or unhealthy daemon health response");
   }
-  return value as HealthResponse;
+  const sha = "sha" in value && typeof value.sha === "string" ? value.sha.trim() : "";
+  return { ...value, sha: sha || "unknown" } as HealthResponse;
 }
 
 export function localDeployClient(port: number): DeployClient {
@@ -184,7 +185,12 @@ export async function waitForDrain(
   }
 }
 
-export async function waitForHealthy(client: DeployClient, clock: DeployClock): Promise<void> {
+export async function waitForHealthy(
+  client: DeployClient,
+  clock: DeployClock,
+  target: string,
+  log: (message: string) => void = console.warn,
+): Promise<HealthResponse> {
   const start = clock.now();
   let lastError: unknown;
   while (clock.now() - start < 45_000) {
@@ -196,8 +202,13 @@ export async function waitForHealthy(client: DeployClient, clock: DeployClock): 
           Math.min(2000, 45_000 - (clock.now() - start)),
         ),
       );
-      if (!state.draining) return;
-      lastError = new Error("replacement daemon is still draining");
+      if (state.sha !== "unknown" && state.sha !== target) {
+        lastError = new Error(`replacement daemon runs ${state.sha}, expected ${target}`);
+      } else if (!state.draining) {
+        if (state.sha === "unknown")
+          log("warning: replacement daemon does not report a boot SHA; cannot verify its commit");
+        return state;
+      } else lastError = new Error("replacement daemon is still draining");
     } catch (error) {
       lastError = error;
     }

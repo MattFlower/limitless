@@ -14,7 +14,7 @@ test("shared drain state refreshes initially, while connected, and after reconne
     getHealth: async () => {
       reads++;
       if (fail) throw new Error("restarting");
-      return { ok: true, uptimeMs: 1, active: [], draining };
+      return { ok: true, uptimeMs: 1, sha: "boot-commit", active: [], draining };
     },
     openGlobalStream: (_message, connected) => {
       connection = connected;

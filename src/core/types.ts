@@ -292,6 +292,7 @@ export interface DrainState {
 export interface HealthResponse extends DrainState {
   ok: boolean;
   uptimeMs: number;
+  sha: string;
 }
 
 export interface ChatProposalFields {
