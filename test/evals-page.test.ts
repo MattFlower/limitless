@@ -112,11 +112,13 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
       InvocationsTable({ invocations, selectedId: null, onSelect: () => {} }),
     );
     for (const effort of ["low", "high", "none", "backend default", "unknown (legacy)"])
-      expect(invocationHtml).toContain(`>${effort}</td>`);
-    expect(invocationHtml.match(/<th[ >]/g)).toHaveLength(11);
+      expect(invocationHtml).toContain(`codex/luna → gpt-6-luna · ${effort}`);
+    expect(invocationHtml).toContain('aria-label="About implement role"');
+    expect(invocationHtml).toContain("Changes the code and runs checks");
+    expect(invocationHtml.match(/<th[ >]/g)).toHaveLength(10);
     expect(
       renderToString(() => InvocationsTable({ invocations: [], selectedId: null, onSelect: () => {} })),
-    ).toContain('colspan="11"');
+    ).toContain('colspan="10"');
     const rows = [evidence("triage"), evidence("review"), evidence("verify")];
     const html = renderToString(() => EvalsView({ data: response(rows) }));
     for (const text of [

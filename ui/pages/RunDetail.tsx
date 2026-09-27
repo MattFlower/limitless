@@ -68,6 +68,35 @@ export const RunDetail: Component = () => {
   const [selectedInvocation, setSelectedInvocation] = createSignal<number | null>(null);
   const [busyAction, setBusyAction] = createSignal<"cancel" | "retry" | null>(null);
   const [actionError, setActionError] = createSignal<string | null>(null);
+  const [copyFeedback, setCopyFeedback] = createSignal<"Copied" | "Selected — press ⌘C or Ctrl+C" | null>(
+    null,
+  );
+  let runIdText: HTMLSpanElement | undefined;
+  let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const copyRunId = async () => {
+    const id = run()?.id;
+    if (!id) return;
+    if (feedbackTimer) clearTimeout(feedbackTimer);
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(id);
+      setCopyFeedback("Copied");
+    } catch {
+      const selection = window.getSelection();
+      if (selection && runIdText) {
+        const range = document.createRange();
+        range.selectNodeContents(runIdText);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      setCopyFeedback("Selected — press ⌘C or Ctrl+C");
+    }
+    feedbackTimer = setTimeout(() => setCopyFeedback(null), 2500);
+  };
+  onCleanup(() => {
+    if (feedbackTimer) clearTimeout(feedbackTimer);
+  });
 
   const stages = createMemo(() => Object.values(stagesById).sort((a, b) => a.id - b.id));
   const invocations = createMemo(() => Object.values(invocationsById).sort((a, b) => a.id - b.id));
@@ -199,7 +228,17 @@ export const RunDetail: Component = () => {
                     <span class="run-title">{r().title}</span>
                   </div>
                   <div class="run-meta-row">
-                    <span class="mono">{r().id}</span>
+                    <button
+                      type="button"
+                      class="run-id-copy mono"
+                      onClick={copyRunId}
+                      aria-label={`Copy run ID ${r().id}`}
+                    >
+                      <span ref={runIdText}>{r().id}</span>
+                    </button>
+                    <Show when={copyFeedback()}>
+                      <span role="status">{copyFeedback()}</span>
+                    </Show>
                     <span>·</span>
                     <span>{r().repoSlug}</span>
                     <Show when={r().branch}>

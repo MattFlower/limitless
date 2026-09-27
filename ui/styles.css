@@ -794,6 +794,64 @@ p {
   font-size: 11.5px;
   color: var(--text-dim);
 }
+.run-id-copy {
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--accent);
+  font-size: inherit;
+  padding: 2px 3px;
+  cursor: pointer;
+}
+.run-id-copy:hover,
+.run-id-copy:focus-visible {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+.run-id-copy span {
+  user-select: text;
+}
+.role-help {
+  display: inline-block;
+}
+.role-help-button {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid var(--text-dim);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  line-height: 14px;
+  cursor: help;
+}
+.role-help-button:hover,
+.role-help-button:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.role-help-tooltip {
+  position: fixed;
+  z-index: 20;
+  width: min(300px, calc(100vw - 16px));
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: normal;
+  pointer-events: none;
+  visibility: hidden;
+}
+.role-help-tooltip[data-open="true"] {
+  visibility: visible;
+}
 .run-actions {
   display: flex;
   gap: 8px;

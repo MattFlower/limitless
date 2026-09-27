@@ -1,8 +1,9 @@
 import type { Component } from "solid-js";
-import { For, Show } from "solid-js";
-import { effortLabel } from "../../src/core/effort-format.ts";
-import type { Invocation } from "../../src/core/types.ts";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { ROLE_DESCRIPTIONS } from "../../src/core/role-descriptions.ts";
+import type { Invocation, Role } from "../../src/core/types.ts";
 import { compactNumber, duration, equivMoney, money, truncate } from "../lib/format.ts";
+import { invocationModelLabel } from "../lib/invocation-model.ts";
 import { now } from "../lib/ticker.ts";
 
 const STATUS_BADGE: Record<string, string> = {
@@ -16,6 +17,69 @@ const STATUS_BADGE: Record<string, string> = {
   running: "info",
 };
 
+const RoleHelp: Component<{ role: Role; id: number }> = (props) => {
+  const [open, setOpen] = createSignal(false);
+  const [position, setPosition] = createSignal({ top: 0, left: 0 });
+  let button: HTMLButtonElement | undefined;
+  const show = () => {
+    const rect = button?.getBoundingClientRect();
+    if (rect) {
+      setPosition({
+        top: rect.bottom + 100 > window.innerHeight ? rect.top - 100 : rect.bottom + 8,
+        left: Math.max(8, Math.min(rect.left, window.innerWidth - 308)),
+      });
+    }
+    setOpen(true);
+  };
+  onMount(() => {
+    const closeOutside = (event: PointerEvent) => {
+      if (!button?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    onCleanup(() => document.removeEventListener("pointerdown", closeOutside));
+  });
+  return (
+    <span class="role-help">
+      <button
+        ref={button}
+        type="button"
+        class="role-help-button"
+        aria-label={`About ${props.role} role`}
+        aria-describedby={open() ? `role-help-${props.id}` : undefined}
+        aria-expanded={open()}
+        onPointerEnter={show}
+        onPointerLeave={() => {
+          if (document.activeElement !== button) setOpen(false);
+        }}
+        onFocus={show}
+        onBlur={() => setOpen(false)}
+        onClick={(event) => {
+          event.stopPropagation();
+          show();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            setOpen(false);
+            button?.blur();
+          }
+        }}
+      >
+        ?
+      </button>
+      <span
+        id={`role-help-${props.id}`}
+        class="role-help-tooltip"
+        role="tooltip"
+        data-open={open()}
+        aria-hidden={!open()}
+        style={{ top: `${position().top}px`, left: `${position().left}px` }}
+      >
+        {ROLE_DESCRIPTIONS[props.role]}
+      </span>
+    </span>
+  );
+};
+
 export const InvocationsTable: Component<{
   invocations: Invocation[];
   selectedId: number | null;
@@ -26,7 +90,6 @@ export const InvocationsTable: Component<{
       <tr>
         <th>Role</th>
         <th>Model</th>
-        <th>Effort</th>
         <th>Provider</th>
         <th>Status</th>
         <th class="num">In</th>
@@ -42,7 +105,7 @@ export const InvocationsTable: Component<{
         when={props.invocations.length > 0}
         fallback={
           <tr class="empty-row">
-            <td colspan={11}>No invocations yet.</td>
+            <td colspan={10}>No invocations yet.</td>
           </tr>
         }
       >
@@ -56,9 +119,10 @@ export const InvocationsTable: Component<{
               onClick={() => props.onSelect(props.selectedId === inv.id ? null : inv.id)}
               title="Click to filter the event log to this invocation"
             >
-              <td class="mono">{inv.role}</td>
-              <td class="mono text-accent">{inv.modelId}</td>
-              <td>{effortLabel(inv.effort)}</td>
+              <td class="mono">
+                {inv.role} <RoleHelp role={inv.role} id={inv.id} />
+              </td>
+              <td class="mono text-accent">{invocationModelLabel(inv)}</td>
               <td class="mono text-faint">{inv.provider}</td>
               <td>
                 <span class={`badge badge-${STATUS_BADGE[inv.status] ?? "info"}`}>{inv.status}</span>
