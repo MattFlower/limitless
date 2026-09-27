@@ -24,6 +24,10 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 21 | M5 | Verify stage gets a writable scratch TMPDIR (tests needing temp dirs were "unclear") | todo |
 | 22 | M5 | A merged needs-human PR marks its run resolved in the UI | todo |
 | 23 | M5 | Deploy drain progress: one line per poll, not two | todo |
+| 24 | M4 | Reasoning effort as a routing dimension | todo |
+| 25 | M4 | External benchmark priors (Artificial Analysis, Terminal-Bench 4.0) | todo |
+| 26 | M4 | Capability-and-cost routing (monotonic escalation) | todo |
+| 27 | M4 | New-model intake pipeline | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
@@ -277,3 +281,113 @@ session) spend the same subscription in between, and the UI rounds to the neares
   merging (or leaves merging to the human).
 - **20 Packaging** — compiled binaries on GitHub releases, a formula in `MattFlower/homebrew-recipes`,
   and a curl installer (private-repo access needs a token; decide public vs private first).
+
+## 24. Reasoning effort as a routing dimension
+
+Owner feedback: effort is barely set and never surfaced, yet it is one of the largest cost/quality
+levers (e.g. gpt-6-luna scores ~18 on the AA index at effort none vs ~32 at high).
+
+- Today: `ModelDef.effort` exists on four catalog models and the claude (`--effort`) and codex
+  (`model_reasoning_effort`) harnesses pass it; the direct-HTTP harness ignores it; invocations,
+  reports, the UI and eval runs don't record it; policy can't pick an effort per role.
+- A routing target becomes (model, effort): catalog models declare supported efforts; policy cells
+  and eval `--models` accept `model@effort` (e.g. `codex/luna@low`, `claude/opus@high`), with the
+  model's default when omitted.
+- Harnesses: claude `--effort`, codex `model_reasoning_effort`, direct HTTP sends
+  `reasoning: { effort }` (OpenRouter) / `reasoning_effort`, and local Qwen maps effort to thinking
+  on/off (`chat_template_kwargs.enable_thinking`).
+- Record effort on invocations and eval trials (migration); show it in run details, reports, the
+  Models page and eval matrices; the policy generator treats each (model, effort) as a candidate.
+- Tests: parsing/validation of `model@effort`, each harness's argument/body mapping, persistence.
+
+## 25. External benchmark priors (Artificial Analysis, Terminal-Bench 4.0)
+
+Public benchmarks as priors, our own evals as the check (harness effects move scores by up to ~30
+points, and public leaderboards disagree with each other).
+
+- `limitless models sync` (and daily in the daemon): fetch the Artificial Analysis free API
+  (`x-api-key`, 1,000 requests/day, attribution required) for each catalog model via an explicit
+  `externalIds.artificialAnalysis` mapping; store intelligence/coding indices, per-benchmark scores
+  (incl. Terminal-Bench 4.0 when available), prices and speeds with a fetched-at time.
+- Show them on the Models page with attribution; show the public number next to our eval result
+  and flag large disagreements (often a harness problem worth investigating).
+- Use them (a) to shortlist which models are worth evaluating, (b) as the cold-start routing prior
+  for roles/models without local eval data (the policy generator marks such cells "prior only"),
+  and (c) Terminal-Bench 4.0 as the public baseline for the implement role until our agentic
+  implement evals exist.
+- Key: ARTIFICIAL_ANALYSIS_API_KEY in secrets.env (free tier, no commercial license: personal use,
+  attribution required, 1,000 requests/day).
+- Endpoint `GET https://artificialanalysis.ai/api/v2/data/llms/models` returns every model in one
+  response (~670 entries, ~0.6 MB). Each effort variant is its own entry (e.g. `gpt-6-luna-low`,
+  `gpt-6-luna-medium`, `claude-opus-5-5-high`, `qwen3-8-27b-low`), with `evaluations`
+  (artificial_analysis_intelligence_index, artificial_analysis_coding_index, terminalbench_v2_1,
+  terminalbench_hard, gpqa, hle, ifbench, …), `pricing` and speeds. Map each catalog
+  (model, effort) from item 24 to a slug explicitly.
+- Caching: at most one fetch per day (plus on demand), stored as a timestamped snapshot in SQLite
+  (raw payload + normalized rows); keep snapshots so every decision can cite the data it used; the
+  policy generator records the snapshot id. Never fetched from the browser.
+- Terminal-Bench (tbench.ai, 4.0 = 66 tasks) ranks (model @ effort, agent harness) pairs with
+  resolution rate ±95% CI, tokens and cost — e.g. "GPT-6 Astra (max) · Codex 58.2%",
+  "Fable 5.1 (max) · Claude Code 57.9%", "GLM-5.3 (max) · Claude Code 41.8%",
+  "Sonnet 5 (max) · Claude Code 12.4%". That matches how we run models (inside the claude/codex
+  harnesses), so it is the best public prior for the implement role. No JSON API (the table is in
+  the Next.js page payload): import it with a tolerant parser of the rendered leaderboard rows,
+  run on demand (it changes roughly monthly), tested against a saved fixture of the page text;
+  map rows to catalog (model, effort, harness). Each row carries a single effort, almost always the
+  top one, so Terminal-Bench gives each pair's ceiling, not its effort curve. Take the curve from
+  Artificial Analysis (every effort is its own entry) and measure it ourselves for cheap roles via
+  item 24; for implement, a rough prior for a lower effort is the Terminal-Bench top-effort score
+  scaled by Artificial Analysis's index ratio (effort ÷ top effort), marked "prior only".
+  Don't run Terminal-Bench ourselves: the leaderboard's
+  own cost column puts a full 4.0 run at $300–$9,600 per model.
+- The repository is public: never commit Artificial Analysis data (no redistribution). Snapshots
+  stay in the local database; the UI shows them with attribution; committed files (e.g.
+  routing/EVIDENCE.md) cite only the snapshot date and our own eval numbers.
+- Tests with a stubbed fetch; no network in tests.
+
+## 26. Capability-and-cost routing (monotonic escalation)
+
+Owner direction: a repeatedly failed task must never go to a less capable agent, and we should never
+pay more than needed (Artificial Analysis's "Intelligence Index vs. Cost per Task" chart is the mental
+model). Replaces hand-assigned integer tiers. Depends on items 24 (effort) and 25 (priors).
+
+- Candidates are (model @ effort, harness). Each has a per-role **capability** score (prior from
+  public data: AA coding index / Terminal-Bench for implement, AA intelligence index for review and
+  verify; posterior from our evals) and a **cost per task on our axis**: local $0, metered $, and
+  subscription API-equivalent $ weighted by current quota headroom (cheap while plentiful, expensive
+  near the reserve), measured from invocation history per role.
+- Only Pareto-efficient candidates (on our cost axis) are eligible.
+- Per role × task class, fit pass probability vs. capability from eval data (logistic) to get the
+  minimum capability for the target success rate (default 0.8); use the prior when a class has no
+  eval data. Record the fit and its data in routing/EVIDENCE.md.
+- First attempt: the cheapest eligible candidate above the task's minimum capability.
+- Retries (every role, not only implement): the next candidate must have capability strictly above
+  the maximum already tried on this task; cheapest such first; never a model that already failed it.
+- Feedback: repeated failures raise the task's own minimum; production outcomes shift per-class
+  thresholds (the drift loop in docs/EVALS.md).
+- UI: show each candidate on a capability-vs-cost chart with the Pareto line and the thresholds.
+- Tests: Pareto filtering, threshold fitting on synthetic data, monotonic retries (never down,
+  never repeat), quota-weighted cost reacting to headroom.
+
+## 27. New-model intake pipeline
+
+New models arrive constantly (the Artificial Analysis snapshot of 2026-09-26 lists 48 entries released
+since 2026-09-01), so the catalog can't be curated by hand. Depends on items 24–26; pairs with M6
+item 17 (catalog as data, not code).
+
+- The AA free API has indices, per-benchmark scores (incl. terminalbench_v2_1, terminalbench_hard),
+  per-token prices, release dates and (sparse) speeds, per effort variant — but not cost per task
+  (tokens used × price). Estimate cost per task as price × tokens-per-task learned from our own
+  invocations at that effort (tokens scale strongly with effort); replace with measured values once
+  the model has been evaluated.
+- Detect: the daily snapshot diff lists new/removed entries; check availability against what our
+  providers actually serve (OpenRouter's model list; models the claude/codex CLIs accept).
+- Screen: available to us, allowed by origin policy (unknown lineage fails closed), and on or near
+  our cost-capability frontier by its public scores. Everything else is ignored at no cost.
+- Evaluate: survivors run the cheap evals (triage + a review subset) under a per-model budget
+  (default $1); results replace the public prior.
+- Propose: when a newcomer (or a retirement) would change a routing cell, the policy generator
+  opens a PR with the evidence; merging it is the approval.
+- Mapping: AA entries ↔ provider model ids are matched explicitly; unmatched or ambiguous ones go to
+  a "needs mapping" list in the UI for a human to confirm, never guessed.
+- Tests: snapshot diffing, screening rules, budget enforcement, PR proposal content (fakes only).

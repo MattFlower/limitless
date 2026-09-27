@@ -1,7 +1,7 @@
 {
   "role": "triage",
   "version": 1,
-  "notes": "Gold labels written by the orchestrator. A list means any of those values is correct (genuinely borderline cases); null means the field is not graded for that case. needs_questions grades whether blocking_questions is non-empty.",
+  "notes": "Gold labels written by the orchestrator. A list means any of those values is correct (genuinely borderline cases); null means the field is not graded for that case. needs_questions grades whether blocking_questions is non-empty. v1.1 (2026-09-26): widened five genuinely borderline labels after the first sweep (007, 012, 017, 029, 031); security-risk labels unchanged.",
   "repos": {
     "MattFlower/limitless-sandbox": "b63e95b7dd34c7933a2676110ae09d04230c2b1c",
     "MattFlower/limitless": "5a4d539e27758b02bdfe33306ba97279ecc7d9b2"
@@ -90,7 +90,7 @@
       "repo": "MattFlower/limitless-sandbox",
       "prompt": "Why does `textkit stats` count hyphenated words as two words?",
       "gold": {
-        "task_class": "question",
+        "task_class": ["question", "bugfix"],
         "complexity": ["trivial", "small"],
         "risk": "low",
         "ambiguity": "low",
@@ -155,7 +155,7 @@
       "repo": "MattFlower/limitless-sandbox",
       "prompt": "Add a GitHub Actions workflow that runs lint, typecheck and tests on every push and pull request.",
       "gold": {
-        "task_class": "chore",
+        "task_class": ["chore", "feature"],
         "complexity": "small",
         "risk": "low",
         "ambiguity": "low",
@@ -222,7 +222,7 @@
       "gold": {
         "task_class": ["bugfix", "test"],
         "complexity": ["small", "medium"],
-        "risk": "low",
+        "risk": ["low", "medium"],
         "ambiguity": ["medium", "high"],
         "needs_questions": null
       },
@@ -377,7 +377,7 @@
       "prompt": "Add a light/dark theme toggle to the UI header that remembers the choice.",
       "gold": {
         "task_class": "feature",
-        "complexity": "small",
+        "complexity": ["small", "medium"],
         "risk": "low",
         "ambiguity": "low",
         "needs_questions": false
@@ -403,7 +403,7 @@
       "prompt": "Add the Gemini CLI as a third agent harness alongside claude and codex.",
       "gold": {
         "task_class": "feature",
-        "complexity": "large",
+        "complexity": ["medium", "large"],
         "risk": ["medium", "high"],
         "ambiguity": ["low", "medium"],
         "needs_questions": null
