@@ -2,15 +2,17 @@ import { useNavigate, useParams } from "@solidjs/router";
 import type { Component } from "solid-js";
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { createStore, produce } from "solid-js/store";
+import { formatCost } from "../../src/core/cost-format.ts";
 import type { ArtifactMeta, Invocation, Question, Run, RunEvent, Stage } from "../../src/core/types.ts";
 import { TERMINAL_STATUSES } from "../../src/core/types.ts";
 import { answerRun, cancelRun, getRunDetail, openRunStream, retryRun } from "../api.ts";
 import { ArtifactsPanel } from "../components/ArtifactsPanel.tsx";
 import { EventLog } from "../components/EventLog.tsx";
 import { InvocationsTable } from "../components/InvocationsTable.tsx";
+import { OriginalPrompt } from "../components/OriginalPrompt.tsx";
 import { StageTimeline } from "../components/StageTimeline.tsx";
 import { RunStatusPill } from "../components/StatusPill.tsx";
-import { compactNumber, duration, equivMoney, money, relativeTime } from "../lib/format.ts";
+import { compactNumber, duration, relativeTime } from "../lib/format.ts";
 import { now } from "../lib/ticker.ts";
 
 const QuestionCard: Component<{ runId: string; question: Question }> = (props) => {
@@ -294,12 +296,11 @@ export const RunDetail: Component = () => {
               <div class="stat-row">
                 <div class="stat">
                   <span class="stat-label">Cost</span>
-                  <span class="stat-value">
-                    {r().costUsd > 0 ? (
-                      money(r().costUsd)
-                    ) : (
-                      <span class="text-faint">{equivMoney(r().costEquivUsd)}</span>
-                    )}
+                  <span class="stat-value" title={formatCost(r().costUsd, r().costEquivUsd).title}>
+                    <span class="text-faint">{formatCost(r().costUsd, r().costEquivUsd).primary}</span>
+                    <Show when={formatCost(r().costUsd, r().costEquivUsd).paid}>
+                      {(paid) => <span class="bold"> {paid()}</span>}
+                    </Show>
                   </span>
                 </div>
                 <div class="stat">
@@ -326,6 +327,8 @@ export const RunDetail: Component = () => {
             </div>
 
             <For each={openQuestions()}>{(q) => <QuestionCard runId={params.id} question={q} />}</For>
+
+            <OriginalPrompt prompt={r().prompt} />
 
             <div>
               <div class="section-label">Stage timeline</div>

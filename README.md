@@ -137,6 +137,26 @@ protected_paths = ["migrations/**"]
 
 Without it, gates are auto-detected (package.json scripts, Cargo, Go, Python, Makefile).
 
+An optional `[preview]` builds and serves UI changes during acceptance verification:
+
+```toml
+[preview]
+paths = ["ui/"]
+build = "bun run build:ui"
+serve = "bun src/cli/main.ts serve"
+seed = "bun scripts/preview-seed.ts" # optional; seed terminal runs only
+ready = "/api/health"
+env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/config", LIMITLESS_PORT = "{port}" }
+```
+
+`serve` must bind **127.0.0.1:{port}**; the factory supplies a free port but does not configure
+an application's bind address. `ready` must resolve to the same origin as the preview URL.
+Environment values expand `{scratch}` and `{port}` and must not contain `..`. Reserved HOME,
+TMPDIR/TMP/TEMP, GH_TOKEN, GIT_* and LIMITLESS_NO_SCHEDULER values cannot be overridden.
+The factory snapshots `[preview]` from the base revision during prepare, runs build/seed/serve
+only for matching changed paths when a new verify attempt is needed, and removes the process and
+scratch afterward or on cancellation. Browser/MCP verification is not wired yet.
+
 ### Discord bot
 
 Create a **private bot** in the Discord Developer Portal, enable the **Message Content** privileged

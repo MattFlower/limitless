@@ -10,6 +10,7 @@ import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
@@ -144,14 +145,29 @@ const pass = {
   notes: "",
 };
 
-function start(handler: Handler, effortRouting = false): Factory {
+function start(handler: Handler, effortRouting = false, freeProviders = false): Factory {
+  const alpha = models[0];
+  const beta = models[1];
+  if (!alpha || !beta) throw new Error("missing fixture models");
   const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
   factory = new Factory(cfg, {
     harnesses: { fake: fakeHarness(handler) },
-    providers,
+    providers: freeProviders
+      ? [
+          ...providers,
+          { id: "gamma", label: "Gamma", harness: "fake", billing: "free", maxConcurrent: 2 },
+          { id: "delta", label: "Delta", harness: "fake", billing: "free", maxConcurrent: 2 },
+        ]
+      : providers,
     models: effortRouting
       ? models.map((m): ModelDef => ({ ...m, supportedEfforts: ["low", "high"], effort: "low" }))
-      : models,
+      : freeProviders
+        ? [
+            ...models,
+            { ...alpha, id: "gamma/m", provider: "gamma", vendor: "anthropic", tier: 3 },
+            { ...beta, id: "delta/m", provider: "delta", vendor: "openai", tier: 5 },
+          ]
+        : models,
     policy: effortRouting ? { ...policy, implement: { default: ["alpha/m@high", "alpha/m@low"] } } : policy,
   });
   factory.start();
@@ -187,6 +203,113 @@ afterEach(async () => {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test("Dependabot uses free models across quick stages and keeps them on feedback rounds", async () => {
+    const seen: { role: string; provider: string }[] = [];
+    let implementations = 0;
+    const f = start(
+      (s) => {
+        const role = roleOf(s);
+        seen.push({ role, provider: s.target.provider });
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        implementations++;
+        return { files: { "farewell.txt": implementations === 1 ? "BAD goodbye\n" : "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "quick",
+      requestedBy: "dependabot[bot]",
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(seen).toEqual([
+      { role: "triage", provider: "gamma" },
+      { role: "implement", provider: "gamma" },
+      { role: "implement", provider: "gamma" },
+      { role: "review", provider: "delta" },
+    ]);
+    expect(f.store.getArtifact(run.id, "report.md")).toContain("Routing: free-first (Dependabot)");
+  });
+
+  test("Dependabot falls back when free providers are unavailable; owner keeps policy routing", async () => {
+    const f = start(
+      (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    f.tracker.setEnabled("gamma", false);
+    f.tracker.setHealthy("delta", false);
+    for (const requestedBy of ["dependabot[bot]", "owner"]) {
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick", requestedBy });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(f.store.listInvocations(run.id).map((i) => [i.role, i.provider])).toEqual([
+        ["triage", "alpha"],
+        ["implement", "alpha"],
+        ["review", "beta"],
+      ]);
+      expect(f.store.getArtifact(run.id, "report.md")?.includes("Routing: free-first (Dependabot)")).toBe(
+        requestedBy === "dependabot[bot]",
+      );
+    }
+  });
+
+  test("Dependabot escalation keeps free-first routing with a minimum tier", async () => {
+    let implementations = 0;
+    const f = start(
+      (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        implementations++;
+        return { files: { "farewell.txt": implementations < 3 ? "BAD goodbye\n" : "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "quick",
+      requestedBy: "dependabot[bot]",
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.provider),
+    ).toEqual(["gamma", "gamma", "delta"]);
+  });
+
+  test("owner and policy opt-out ignore eligible free models", async () => {
+    mkdirSync(join(home, "cfg"));
+    writeFileSync(join(home, "cfg", "config.toml"), '[routing]\ndependabot = "policy"\n');
+    const f = start(
+      (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    for (const requestedBy of ["owner", "dependabot[bot]"]) {
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick", requestedBy });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(f.store.listInvocations(run.id).map((i) => i.provider)).toEqual(["alpha", "alpha", "beta"]);
+      expect(f.store.getArtifact(run.id, "report.md")).not.toContain("Routing: free-first");
+    }
+  });
+
   async function githubFixture(): Promise<string> {
     const bare = join(home, "github.git");
     await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
@@ -1133,6 +1256,230 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(implementCalls).toBe(2);
     expect(verifyCalls).toBe(2);
+  });
+
+  async function previewFixture(): Promise<void> {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]
+checks = [{ name = "no-bad", run = "! grep -rq BAD --include=*.txt ." }]
+[preview]
+paths = ["ui/"]
+build = "echo build >> '${join(home, "preview-steps")}'"
+seed = 'echo seed >> "${join(home, "preview-steps")}"; mkdir -p "$LIMITLESS_HOME" && echo seeded > "$LIMITLESS_HOME/seed.txt"'
+serve = "echo serve >> '${join(home, "preview-steps")}'; bun serve.ts"
+ready = "/health"
+env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/config", LIMITLESS_PORT = "{port}" }
+`,
+    );
+    writeFileSync(
+      join(repoDir, "serve.ts"),
+      'Bun.serve({ hostname: "127.0.0.1", port: Number(process.env.LIMITLESS_PORT), fetch: async () => new Response(await Bun.file(process.env.LIMITLESS_HOME + "/seed.txt").text(), {headers: {"x-scratch": process.env.HOME ?? ""}}) });',
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "preview fixture"], {
+      cwd: repoDir,
+    });
+  }
+
+  test.each(["pass", "unmet", "error", "legacy"] as const)(
+    "base preview survives config edits and cleans up after verify %s",
+    async (outcome) => {
+      await previewFixture();
+      let runId = "";
+      const previews: { url: string; scratch: string }[] = [];
+      const assertStopped = async () => {
+        for (const { url, scratch } of previews) {
+          expect(existsSync(scratch)).toBe(false);
+          await expect(fetch(`${url}/health`)).rejects.toThrow();
+        }
+      };
+      const handler: Handler = async (agent) => {
+        const role = roleOf(agent);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") {
+          const stage = factory?.store
+            .getRunDetail(runId)
+            ?.stages.filter((entry) => entry.name === "preview")
+            .at(-1);
+          expect(stage?.status).toBe("succeeded");
+          const url = stage?.summary?.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0] ?? "";
+          const response = await fetch(`${url}/health`);
+          expect(await response.text()).toBe("seeded\n");
+          const scratch = response.headers.get("x-scratch") ?? "";
+          expect(existsSync(scratch)).toBe(true);
+          previews.push({ url, scratch });
+          if (outcome === "error") throw new Error("injected verifier failure");
+          if (outcome === "unmet" && previews.length === 1)
+            return {
+              structured: {
+                ...pass,
+                overall: "fail",
+                criteria: pass.criteria.map((c) => (c.id === "AC-1" ? { ...c, status: "unmet" } : c)),
+              },
+            };
+          return { structured: pass };
+        }
+        await assertStopped();
+        return {
+          files: {
+            "ui/change.txt": `visible ${previews.length}\n`,
+            // Removing the table must not disable the trusted base preview.
+            ".limitless.toml":
+              readFileSync(join(repoDir, ".limitless.toml"), "utf8").split("[preview]")[0] ?? "",
+          },
+        };
+      };
+      const f = start(handler);
+      const run = await f.createRun({ repo: repoDir, prompt: "Change the UI" });
+      runId = run.id;
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        outcome === "error" ? "needs_human" : "succeeded",
+      );
+      expect(previews.length).toBeGreaterThan(0);
+      await assertStopped();
+      const state = f.store.getRunState<RunState>(run.id);
+      expect(state?.previewConfig?.paths).toEqual(["ui/"]);
+      if (outcome === "unmet") expect(previews).toHaveLength(2);
+      if ((outcome !== "pass" && outcome !== "legacy") || !state) return;
+      // Replay the persisted round after its verdict was saved, before phase advancement.
+      const steps = readFileSync(join(home, "preview-steps"), "utf8");
+      expect(steps).toBe("build\nseed\nserve\n");
+      await f.stop();
+      // Simulate an older run: restore the enabled config from base despite its removal in HEAD.
+      if (outcome === "legacy") delete state.previewConfig;
+      f.store.setRunState(run.id, { ...state, phase: "loop" });
+      f.store.updateRun(run.id, { status: "queued", finishedAt: null });
+      f.store.close();
+      factory = null;
+      const resumed = start(handler);
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(resumed.store.getRunState<RunState>(run.id)?.previewConfig?.paths).toEqual(["ui/"]);
+      expect(previews).toHaveLength(1);
+      expect(readFileSync(join(home, "preview-steps"), "utf8")).toBe(steps);
+      expect(
+        resumed.store.getRunDetail(run.id)?.stages.filter((entry) => entry.name === "preview"),
+      ).toHaveLength(1);
+    },
+  );
+
+  test.each([
+    "paths = []",
+    'paths = ["ui/"]\nbuild="true"\nserve="true"\nready="/health"\nenv={HOME="{scratch}/../escape"}',
+    'paths = ["ui/"]\nbuild="true"\nserve="true"\nready=\'/\\evil.example/x\'\nenv={}',
+  ])("invalid base preview fails prepare without model spend: %s", async (invalid) => {
+    writeFileSync(join(repoDir, ".limitless.toml"), `[preview]\n${invalid}\n`);
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "invalid preview"], {
+      cwd: repoDir,
+    });
+    let calls = 0;
+    const f = start(() => {
+      calls++;
+      return {};
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Change the UI" });
+    expect(await waitFor(f, run.id, ["failed", "succeeded", "needs_human"])).toBe("failed");
+    expect(calls).toBe(0);
+    expect(f.store.listInvocations(run.id)).toHaveLength(0);
+    expect(f.store.getRun(run.id)?.error).toContain("Invalid [preview]");
+    expect(f.store.getRunDetail(run.id)?.stages.map((stage) => [stage.name, stage.status])).toEqual([
+      ["prepare", "failed"],
+    ]);
+  });
+
+  test.each(["missing base SHA", "missing worktree", "invalid base preview"])(
+    "legacy preview backfill fails before model calls: %s",
+    async (problem) => {
+      if (problem === "invalid base preview") {
+        writeFileSync(join(repoDir, ".limitless.toml"), "[preview]\npaths=[]\n");
+        await sh(["git", "add", "."], { cwd: repoDir });
+        await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "invalid preview"], {
+          cwd: repoDir,
+        });
+        // A repaired worktree must not hide an invalid trusted base.
+        writeFileSync(join(repoDir, ".limitless.toml"), "");
+      }
+      let calls = 0;
+      const f = start(() => {
+        calls++;
+        return {};
+      });
+      await f.stop();
+      const run = await f.createRun({ repo: repoDir, prompt: "Resume an older run" });
+      const baseSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+      if (problem !== "missing base SHA") f.store.updateRun(run.id, { baseSha });
+      const state: RunState = {
+        phase: "triage",
+        worktreePath: problem === "missing worktree" ? undefined : repoDir,
+        answers: [],
+        round: 0,
+        roundsOnImplementer: 0,
+        triedImplementers: [],
+        feedback: null,
+        toolCommands: [],
+      };
+      f.store.setRunState(run.id, state);
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("failed");
+      expect(calls).toBe(0);
+      expect(f.store.listInvocations(run.id)).toHaveLength(0);
+      expect(f.store.getRun(run.id)?.error).toContain(
+        problem === "invalid base preview" ? "Invalid [preview]" : "missing base SHA or worktree",
+      );
+      expect(f.store.getRunState<RunState>(run.id)?.previewConfig).toBeUndefined();
+    },
+  );
+
+  test.each(["gates only", "no config file"])("legacy resume backfills absent preview: %s", async (base) => {
+    const baseConfig = base === "gates only" ? readFileSync(join(repoDir, ".limitless.toml"), "utf8") : "";
+    if (base === "no config file") {
+      await sh(["git", "rm", ".limitless.toml"], { cwd: repoDir });
+      await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "remove config"], {
+        cwd: repoDir,
+      });
+    }
+    const calls: string[] = [];
+    let resumedRunId: string | undefined;
+    const handler: Handler = (agent) => {
+      if (resumedRunId) expect(factory?.store.getRunState<RunState>(resumedRunId)?.previewConfig).toBeNull();
+      const role = roleOf(agent);
+      calls.push(role);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: pass };
+      return {
+        files: {
+          "ui/change.txt": "visible\n",
+          ".limitless.toml": `${baseConfig}\n[preview]\npaths=[]\n`,
+        },
+      };
+    };
+    const f = start(handler);
+    const run = await f.createRun({ repo: repoDir, prompt: "Change the UI" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const state = f.store.getRunState<RunState>(run.id);
+    expect(state?.previewConfig).toBeNull();
+    expect(f.store.getRunDetail(run.id)?.stages.some((stage) => stage.name === "preview")).toBe(false);
+    if (!state) throw new Error("Missing state");
+    await f.stop();
+    delete state.previewConfig;
+    state.phase = "loop";
+    f.store.setRunState(run.id, state);
+    f.store.updateRun(run.id, { status: "queued", finishedAt: null });
+    f.store.close();
+    factory = null;
+    const before = calls.length;
+    resumedRunId = run.id;
+    const resumed = start(handler);
+    expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(calls.slice(before)).toEqual(["review"]);
+    expect(resumed.store.getRunState<RunState>(run.id)?.previewConfig).toBeNull();
+    expect(resumed.store.getRunDetail(run.id)?.stages.some((stage) => stage.name === "preview")).toBe(false);
   });
 
   test("happy path: triage → spec → implement → gates → review → verify → deliver", async () => {
