@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
-import { classifyOutput } from "./diagnostics.ts";
 import { scratchEnv, validateScratch } from "./scratch.ts";
 import {
   type AgentEvent,
@@ -99,7 +98,6 @@ export class CodexStreamParser {
             id,
             output: output.slice(0, 20_000),
             isError: Number(item.exit_code ?? 0) !== 0,
-            diagnostics: classifyOutput(output),
           });
         }
         break;

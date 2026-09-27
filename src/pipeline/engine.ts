@@ -634,7 +634,7 @@ async function oneRound(
     ctx.stage(
       "verify",
       async (stage) => {
-        const { result, target, commandResults } = await ctx.invoke({
+        const { result, target } = await ctx.invoke({
           role: "verify",
           stage,
           mode: "readonly",
@@ -658,7 +658,6 @@ async function oneRound(
           VerifySchema.parse(result.structured),
           ctx.state.spec as Spec,
           ctx.state.holdout as Holdout,
-          commandResults,
         );
         ctx.state.lastVerify = { ...v, modelId: target.modelId };
         ctx.state.verifyResults = [

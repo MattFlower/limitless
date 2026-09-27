@@ -21,14 +21,7 @@ import type { GateComparison, GateRun } from "../gates/run.ts";
 import { discardChanges } from "../git/repos.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
-import type {
-  AgentEvent,
-  AgentResult,
-  AgentSpec,
-  CommandResult,
-  Harness,
-  ModelTarget,
-} from "../harness/types.ts";
+import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
@@ -137,7 +130,6 @@ export interface InvokeOptions {
 }
 
 export interface InvokeOutcome {
-  commandResults: CommandResult[];
   result: AgentResult;
   target: ModelTarget;
   invocation: Invocation;
@@ -275,8 +267,6 @@ export class RunContext {
         skipped: decision.skipped,
       });
       let result: AgentResult;
-      const commandResults: CommandResult[] = [];
-      const commands = new Map<string, string>();
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
       const redact =
         opts.redactHoldout && this.state.holdout
@@ -302,21 +292,6 @@ export class RunContext {
           onEvent: opts.privateOutput
             ? () => {}
             : (ev) => {
-                if (opts.role === "verify") {
-                  if (ev.type === "tool_call" && ["Bash", "shell"].includes(ev.name)) {
-                    const command = (ev.input as { command?: unknown })?.command;
-                    if (typeof command === "string") commands.set(ev.id, command);
-                  } else if (ev.type === "tool_result") {
-                    const command = commands.get(ev.id);
-                    if (command)
-                      commandResults.push({
-                        command,
-                        output: ev.output,
-                        isError: ev.isError,
-                        ...(ev.diagnostics ? { diagnostics: ev.diagnostics } : {}),
-                      });
-                  }
-                }
                 this.onAgentEvent(invocation.id, ev, opts.role, redact);
               },
         };
@@ -424,7 +399,7 @@ export class RunContext {
         );
         continue;
       }
-      return { result, target, invocation: updated, commandResults };
+      return { result, target, invocation: updated };
     }
     throw new NoCapacityError(
       opts.privateOutput
