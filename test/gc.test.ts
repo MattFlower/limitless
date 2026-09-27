@@ -196,6 +196,45 @@ test("uncapped finished-run query and dry-run metadata reporting", async () => {
   expect(await listed()).not.toContain(stale);
 });
 
+test("missing worktree parent is tolerated in dry run and pruned without affecting unrelated entries", async () => {
+  const staleRun = run("succeeded", 4);
+  const otherRun = run("succeeded", 4);
+  const stalePath = await worktree(staleRun.id);
+  const otherPath = await worktree(otherRun.id);
+  rmSync(cfg.paths.work, { recursive: true, force: true });
+  const outside = join(root, "outside", "unrelated");
+  mkdirSync(join(root, "outside"));
+  await sh(["git", "worktree", "add", "--detach", outside], { cwd: repoDir });
+  rmSync(outside, { recursive: true, force: true });
+
+  const dry = await collectGarbage(store, cfg, { now, dryRun: true });
+  expect(dry.errors).toHaveLength(1);
+  expect(dry.errors[0]).toContain("prune would affect unrelated worktrees");
+  expect(dry.errors[0]).toContain("outside/unrelated");
+  expect(await listed()).toContain(stalePath);
+  expect(await listed()).toContain(otherPath);
+  expect(await listed()).toContain(outside);
+
+  await sh(["git", "worktree", "prune", "--expire", "now"], { cwd: repoDir });
+  // Create fresh eligible stale entries after clearing the unrelated entry.
+  const freshA = run("succeeded", 4);
+  const freshB = run("succeeded", 4);
+  mkdirSync(cfg.paths.work, { recursive: true });
+  const freshPathA = await worktree(freshA.id);
+  const freshPathB = await worktree(freshB.id);
+  rmSync(cfg.paths.work, { recursive: true, force: true });
+  const before = await listed();
+  const preview = await collectGarbage(store, cfg, { now, dryRun: true });
+  expect(preview.errors).toEqual([]);
+  expect(preview.metadata).toHaveLength(2);
+  expect(await listed()).toBe(before);
+  const actual = await collectGarbage(store, cfg, { now });
+  expect(actual.errors).toEqual([]);
+  expect(actual.metadata).toHaveLength(2);
+  expect(await listed()).not.toContain(freshPathA);
+  expect(await listed()).not.toContain(freshPathB);
+});
+
 test("startup and hourly passes do not overlap and shutdown clears the timer", async () => {
   let tick: (() => void) | undefined;
   let cleared = false;
