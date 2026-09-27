@@ -360,6 +360,9 @@ model). Replaces hand-assigned integer tiers. Depends on items 24 (effort) and 2
   subscription API-equivalent $ weighted by current quota headroom (cheap while plentiful, expensive
   near the reserve), measured from invocation history per role.
 - Only Pareto-efficient candidates (on our cost axis) are eligible.
+- Latency is a constraint, not just a tie-breaker: each role gets a p50 latency budget from eval data
+  (e.g. review/verify ≤ 10 min); candidates over budget are ineligible. Owner feedback 2026-09-27:
+  DeepSeek V4 Pro (median 14 min/review, up to 33) slowed development with no quality edge.
 - Per role × task class, fit pass probability vs. capability from eval data (logistic) to get the
   minimum capability for the target success rate (default 0.8); use the prior when a class has no
   eval data. Record the fit and its data in routing/EVIDENCE.md.

@@ -394,31 +394,19 @@ export const DEFAULT_POLICY: Policy = {
   },
   plan: { default: ["claude/opus|codex/astra", "claude/fable"] },
   plan_review: { default: ["claude/opus|codex/astra"] },
-  holdout: { default: ["claude/sonnet|codex/sol|codex/sol-5.6", "openrouter/deepseek-v4-pro"] },
+  holdout: { default: ["claude/sonnet|codex/sol|codex/sol-5.6", "claude/opus|codex/astra"] },
   implement: {
     trivial: ["claude/haiku|codex/luna", "claude/sonnet|codex/sol|codex/sol-5.6", "claude/opus|codex/astra"],
-    small: [
-      "claude/sonnet|codex/sol|codex/sol-5.6",
-      "openrouter/deepseek-v4-pro|openrouter/glm-5.3",
-      "claude/opus|codex/astra",
-    ],
+    small: ["claude/sonnet|codex/sol|codex/sol-5.6", "openrouter/glm-5.3", "claude/opus|codex/astra"],
     medium: ["claude/sonnet|codex/sol|codex/sol-5.6", "claude/opus|codex/astra", "openrouter/kimi-code"],
     large: ["claude/opus|codex/astra", "claude/fable"],
   },
   review: {
-    default: [
-      "codex/sol|codex/sol-5.6|claude/sonnet",
-      "openrouter/deepseek-v4-pro|openrouter/glm-5.3",
-      "codex/astra|claude/opus",
-    ],
+    default: ["codex/sol|codex/sol-5.6|claude/sonnet", "openrouter/glm-5.3", "codex/astra|claude/opus"],
     large: ["codex/astra|claude/opus", "codex/sol|codex/sol-5.6|claude/sonnet"],
   },
   verify: {
-    default: [
-      "claude/sonnet|codex/sol|codex/sol-5.6",
-      "openrouter/deepseek-v4-pro",
-      "claude/opus|codex/astra",
-    ],
+    default: ["claude/sonnet|codex/sol|codex/sol-5.6", "claude/opus|codex/astra"],
     large: ["claude/opus|codex/astra", "claude/sonnet|codex/sol|codex/sol-5.6"],
   },
 };
