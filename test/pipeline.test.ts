@@ -807,6 +807,15 @@ describe("pipeline (fake agents, real git + gates)", () => {
 
   test("unmet holdout feedback omits private inputs and publishes scenarios only after delivery", async () => {
     const secret = "PRIVATE_HOLDOUT_TOKEN_729";
+    // These values are observed at runtime, not spelled out by the holdout author.
+    const observed = '/api/v2/widgets --force 48231 "negative-quantity" ERR_RETRY_EXHAUSTED';
+    const observedLiterals = [
+      "/api/v2/widgets",
+      "--force",
+      "48231",
+      "negative-quantity",
+      "ERR_RETRY_EXHAUSTED",
+    ];
     writeFileSync(join(repoDir, "identifiers.ts"), "export const sharedIdentifier = true;\n");
     await sh(["git", "add", "identifiers.ts"], { cwd: repoDir });
     await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "add identifier"], {
@@ -839,10 +848,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(s.prompt).toContain(secret);
         verifies++;
         redactedOutputs.push(s.redactOutput?.(`retryIdentifier ${secret}`));
+        const transcript = s.redactOutput?.(observed);
+        expect(transcript).toContain("5 private details withheld");
+        for (const literal of observedLiterals) expect(transcript).not.toContain(literal);
         return verifies <= 2
           ? {
-              text: `ordinary verifier diagnostic; retryIdentifier; private input ${secret}`,
-              error: `verifier diagnostic included ${secret}`,
+              text: `ordinary verifier diagnostic; retryIdentifier; private input ${secret}; ${observed}`,
+              error: `verifier diagnostic included ${secret}; ${observed}`,
               structured: {
                 ...pass,
                 criteria: pass.criteria.map((c) =>
@@ -850,8 +862,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
                     ? {
                         ...c,
                         status: verifies === 1 ? "unmet" : "unclear",
-                        evidence: `Observed failure: ${secret} returned an empty response`,
-                        publicSummary: `${verifies === 1 ? "sharedIdentifier" : "retryIdentifier"} returns an empty response for an invalid request`,
+                        evidence: `Observed failure: ${secret} returned an empty response; ${observed}`,
+                        publicSummary: `${verifies === 1 ? "sharedIdentifier" : "retryIdentifier"} returns an empty response for an invalid request; ${observed}`,
                       }
                     : c,
                 ),
@@ -860,6 +872,15 @@ describe("pipeline (fake agents, real git + gates)", () => {
           : { structured: pass };
       }
       implementCalls++;
+      if (implementCalls > 1) {
+        for (const literal of observedLiterals) {
+          expect(s.prompt).not.toContain(literal);
+          expect(JSON.stringify(f.store.listEvents(runId))).not.toContain(literal);
+          for (const artifact of f.store.listArtifacts(runId))
+            expect(f.store.getArtifact(runId, artifact.name)).not.toContain(literal);
+        }
+        expect(s.prompt).toContain("5 private details withheld");
+      }
       if (implementCalls === 2) {
         expect(s.prompt).toContain(
           "private scenario (unmet): sharedIdentifier returns an empty response for an invalid request",
@@ -906,6 +927,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(redactedOutputs[0]).toBe("[private detail] [private detail] [2 private details withheld]");
     expect(redactedOutputs[1]).toBe("retryIdentifier [private detail] [1 private details withheld]");
     expect(f.store.getArtifact(run.id, "holdout-scenarios.json")).toContain(secret);
+    expect(f.store.getArtifact(run.id, "verify-0.json")).toContain("ERR_RETRY_EXHAUSTED");
     const report = f.store.getArtifact(run.id, "report.md") ?? "";
     expect(report).toContain("## Holdout scenarios");
     expect(report).toContain("H-3");

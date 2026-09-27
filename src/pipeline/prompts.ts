@@ -154,32 +154,47 @@ export function formatReviewFeedback(review: Review): string {
 }
 
 export function redactHoldoutText(value: string, holdout: Holdout, publicSources = ""): string {
-  let safe = value;
-  let removed = 0;
-  const remove = (detail: string) => {
-    if (!detail) return;
+  if (!holdout.scenarios.length) return value;
+  const details = new Set<string>();
+  const boundaryPattern = (detail: string) => {
     const escaped = detail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const pattern = new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, "giu");
-    if (pattern.test(publicSources)) return;
-    safe = safe.replace(pattern, () => {
-      removed++;
-      return "[private detail]";
-    });
+    return `(?<![\\p{L}\\p{N}_$])${escaped}(?![\\p{L}\\p{N}_$])`;
+  };
+  const collect = (detail: string) => {
+    if (detail && !new RegExp(boundaryPattern(detail), "iu").test(publicSources)) details.add(detail);
+  };
+  const collectLiterals = (source: string) => {
+    for (const literal of source.match(
+      /(?<![\w])(["'`])(?:(?!\1)[^\n])*?\1|(?:\.{0,2}\/)?[\w.-]+(?:\/[\w.-]+)+|--?[A-Za-z][\w-]*|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*(?:[A-Z][\w$]*|\d[\w$]*|_[\w$]+)\b/g,
+    ) ?? []) {
+      collect(/^["'`]/u.test(literal) ? literal.slice(1, -1) : literal);
+    }
   };
   for (const scenario of holdout.scenarios) {
     for (const source of [scenario.description, scenario.steps, scenario.expected]) {
       // Whole phrases cover prose; only syntax-shaped literals are removed in isolation.
-      if (source.trim().split(/\s+/).length > 1) remove(source.trim());
+      if (source.trim().split(/\s+/).length > 1) collect(source.trim());
       for (const sentence of source.match(/[^.!?\n]+[.!?]/g) ?? [])
-        if (sentence.trim().split(/\s+/).length > 1) remove(sentence.trim());
-      for (const literal of source.match(
-        /(["'`])(?:(?!\1)[^\n])*?\1|(?:\.{0,2}\/)?[\w.-]+(?:\/[\w.-]+)+|--?[A-Za-z][\w-]*|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*(?:[A-Z][\w$]*|\d[\w$]*|_[\w$]+)\b/g,
-      ) ?? []) {
-        const detail = /^["'`]/u.test(literal) ? literal.slice(1, -1) : literal;
-        remove(detail);
-      }
+        if (sentence.trim().split(/\s+/).length > 1) collect(sentence.trim());
+      collectLiterals(source);
     }
   }
+  // Observed values and runtime error identifiers need not occur in the authored scenarios.
+  collectLiterals(value);
+  if (!details.size) return value;
+  const pattern = new RegExp(
+    [...details]
+      .sort((a, b) => b.length - a.length)
+      .map(boundaryPattern)
+      .join("|"),
+    "giu",
+  );
+  let removed = 0;
+  // A single pass counts displayed replacements and never scans inserted placeholders.
+  const safe = value.replace(pattern, () => {
+    removed++;
+    return "[private detail]";
+  });
   return removed ? `${safe} [${removed} private details withheld]` : safe;
 }
 
@@ -197,8 +212,12 @@ export function formatVerifyFeedback(
       const privateScenario = /^H-\d+$/i.test(c.id);
       const summary =
         privateScenario && holdout ? redactHoldoutText(c.publicSummary.trim(), holdout, publicSources) : "";
+      const behavior = summary.replace(/\[private detail\]|\[\d+ private details withheld\]/g, "");
+      const safeSummary = /[\p{L}\p{N}]/u.test(behavior)
+        ? summary
+        : `The verifier could not confirm this private scenario.${summary.match(/ \[\d+ private details withheld\]$/)?.[0] ?? ""}`;
       return privateScenario
-        ? `- **${c.id}** private scenario (${c.status}): ${summary && !/^\[private detail\](?: \[\d+ private details withheld\])?$/.test(summary) ? summary : "The verifier could not confirm this private scenario."}`
+        ? `- **${c.id}** private scenario (${c.status}): ${safeSummary}`
         : `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
     })
     .join("\n")}`;

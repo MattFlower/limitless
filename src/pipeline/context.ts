@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ZodType } from "zod";
@@ -199,7 +199,8 @@ export class RunContext {
   }
 
   private async readPublicHoldoutSources(): Promise<string> {
-    const identifiers = new Set<string>();
+    // Platform error names are public diagnostics, including on environment-blocked checks.
+    const identifiers = new Set<string>(Object.keys(constants.errno));
     const cwd = this.state.worktreePath;
     if (cwd) {
       try {

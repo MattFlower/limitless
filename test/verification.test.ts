@@ -176,11 +176,15 @@ test("backstop removes private sentences and literals at word boundaries", () =>
   expect(redacted).toContain("Common list and buildPrivateInputArgs remain");
   expect(redacted).toContain("sharedIdentifier");
   expect(redacted).toMatch(/\d+ private details withheld/);
-  const midword = redactHoldoutText("buildPrivateInputArgs PrivateInput", {
-    scenarios: [
-      { id: "H-1", description: "private", steps: "run PrivateInput", expected: "ok", edge_case: true },
-    ],
-  });
+  const midword = redactHoldoutText(
+    "buildPrivateInputArgs PrivateInput",
+    {
+      scenarios: [
+        { id: "H-1", description: "private", steps: "run PrivateInput", expected: "ok", edge_case: true },
+      ],
+    },
+    "repository identifier: buildPrivateInputArgs",
+  );
   expect(midword).toContain("buildPrivateInputArgs");
   expect(midword).not.toContain("build[private detail]Args");
   expect(midword).not.toContain(" PrivateInput");
@@ -206,4 +210,93 @@ test("actionable feedback excludes blocked checks and redacts holdout inputs", (
   expect(feedback).not.toContain("EPERM");
   expect(feedback).not.toContain("secret input");
   expect(feedback).toContain("H-1");
+});
+
+test("backstop detects observed literals absent from the authored scenario", () => {
+  const input =
+    'The scenario posts to /api/v2/widgets with flag --force and payload id 48231, expecting a validation error for "negative-quantity" input; runtime returned ERR_RETRY_EXHAUSTED from retryPrivateCall.';
+  expect(redactHoldoutText(input, holdout)).toBe(
+    'The scenario posts to [private detail] with flag [private detail] and payload id [private detail], expecting a validation error for "[private detail]" input; runtime returned [private detail] from [private detail]. [6 private details withheld]',
+  );
+  expect(redactHoldoutText(input, holdout, input)).toBe(input);
+  expect(redactHoldoutText(input, { scenarios: [] })).toBe(input);
+});
+
+test("observed literal exemptions are case insensitive and respect identifier boundaries", () => {
+  const publicSources =
+    "request: /api/v2/widgets --force 48231 'negative-quantity'; specification: retryPublicCall; repository: buildPrivateInputArgs ERR_PUBLIC";
+  const input =
+    "Common words remain: /API/v2/WIDGETS --FORCE 48231 'NEGATIVE-QUANTITY' RETRYPUBLICCALL buildPrivateInputArgs err_public; PrivateInput ERR_PRIVATE 93827.";
+  expect(redactHoldoutText(input, holdout, publicSources)).toBe(
+    "Common words remain: /API/v2/WIDGETS --FORCE 48231 'NEGATIVE-QUANTITY' RETRYPUBLICCALL buildPrivateInputArgs err_public; [private detail] [private detail] [private detail]. [3 private details withheld]",
+  );
+});
+
+test("private summaries redact runtime error identifiers on unmet and unclear retries", () => {
+  for (const status of ["unmet", "unclear"] as const) {
+    const feedback = formatVerifyFeedback(
+      {
+        criteria: [
+          {
+            id: "H-1",
+            status,
+            evidence: "secret evidence is never shown",
+            publicSummary:
+              "request fails with ERR_RETRY_EXHAUSTED after 3 attempts; ERR_RETRY_EXHAUSTED recurs on the following call",
+          },
+        ],
+        overall: "fail",
+        notes: "",
+      },
+      spec,
+      holdout,
+    );
+    expect(feedback).toContain(`private scenario (${status}): request fails with [private detail]`);
+    expect(feedback).toContain("recurs on the following call");
+    expect(feedback).toContain("3 private details withheld");
+    expect(feedback).not.toContain("ERR_RETRY_EXHAUSTED");
+    expect(feedback).not.toContain("secret evidence");
+  }
+});
+
+test("overlapping private details are replaced once without rewriting placeholders", () => {
+  const scenarios: Holdout = {
+    scenarios: [
+      {
+        id: "H-1",
+        description: "Private detail is missing.",
+        steps: "use 'private detail' with ERR_PRIVATE",
+        expected: "ok",
+        edge_case: true,
+      },
+    ],
+  };
+  expect(redactHoldoutText("Private detail is missing. ERR_PRIVATE ERR_PRIVATE", scenarios)).toBe(
+    "[private detail] [private detail] [private detail] [3 private details withheld]",
+  );
+});
+
+test("fully withheld summaries retain the removal count alongside the fallback", () => {
+  const feedback = formatVerifyFeedback(
+    {
+      criteria: [{ id: "H-1", status: "unmet", evidence: "private evidence", publicSummary: "secret input" }],
+      overall: "fail",
+      notes: "",
+    },
+    spec,
+    holdout,
+  );
+  expect(feedback).toContain(
+    "The verifier could not confirm this private scenario. [1 private details withheld]",
+  );
+  expect(feedback).not.toContain("secret input");
+});
+
+test("private literals do not match inside longer words or dollar-prefixed identifiers", () => {
+  const scenarios: Holdout = {
+    scenarios: [{ id: "H-1", description: "private", steps: "use 'input'", expected: "ok", edge_case: true }],
+  };
+  expect(redactHoldoutText("inputs reinput $input input", scenarios)).toBe(
+    "inputs reinput $input [private detail] [1 private details withheld]",
+  );
 });
