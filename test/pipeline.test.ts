@@ -1180,9 +1180,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
       "privateSummaryToken_735",
       "privateNotesToken_736",
       "unknownRowToken_737",
+      "retryPrivateEvidenceToken_739",
     ];
-    const [description, steps, expected, evidence, summary, notes, unknown] = privateLiterals;
-    if (!description || !steps || !expected || !evidence || !summary || !notes || !unknown)
+    const [description, steps, expected, evidence, summary, notes, unknown, retryEvidence] = privateLiterals;
+    if (!description || !steps || !expected || !evidence || !summary || !notes || !unknown || !retryEvidence)
       throw new Error("missing private test literals");
     const privateHoldout = {
       scenarios: holdout.scenarios.map((scenario, index) => ({
@@ -1193,17 +1194,24 @@ describe("pipeline (fake agents, real git + gates)", () => {
       })),
     };
     const publicEvidence = "src/pipeline/engine.ts:742 publicIdentifier_738 is handled";
+    const retryPublicEvidence = "src/pipeline/verification.ts:42 retryIdentifier_740 is handled";
     const privateEvidence = `Observed ${description} ${steps} ${expected} ${evidence}`;
+    const retryPrivateEvidence = `Retry observed ${description} ${steps} ${expected} ${retryEvidence}`;
     let verifies = 0;
     let implementations = 0;
     let runId = "";
-    const checkArtifact = (name: string, expectedPublicStatus: string, expectedPrivateStatus: string) => {
+    const checkArtifact = (
+      name: string,
+      expectedPublicStatus: string,
+      expectedPrivateStatus: string,
+      expectedPublicEvidence: string,
+    ) => {
       const raw = f.store.getArtifact(runId, name);
       expect(raw).not.toBeNull();
       const artifact = JSON.parse(raw as string) as typeof pass;
       const publicRow = artifact.criteria.find((criterion) => criterion.id === "AC-1");
       expect(publicRow?.status).toBe(expectedPublicStatus);
-      expect(publicRow?.evidence).toBe(publicEvidence);
+      expect(publicRow?.evidence).toBe(expectedPublicEvidence);
       for (const id of ["H-1", "H-2", "H-3", "X-9"]) {
         const row = artifact.criteria.find((criterion) => criterion.id === id);
         expect(row?.id).toBe(id);
@@ -1233,7 +1241,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (role === "review") return { structured: approve };
       if (role === "verify") {
         verifies++;
-        if (verifies === 2) checkArtifact("verify-0.json", "blocked", "met");
+        if (verifies === 2) checkArtifact("verify-0.json", "blocked", "met", publicEvidence);
         return {
           structured: {
             ...pass,
@@ -1242,24 +1250,34 @@ describe("pipeline (fake agents, real git + gates)", () => {
               {
                 id: "AC-1",
                 status: verifies === 1 ? "blocked" : "met",
-                evidence: publicEvidence,
+                evidence: verifies === 1 ? publicEvidence : retryPublicEvidence,
                 publicSummary: "",
               },
               {
                 id: "H-1",
                 status: verifies === 2 ? "unmet" : "met",
-                evidence: privateEvidence,
+                evidence: verifies === 1 ? privateEvidence : retryPrivateEvidence,
                 publicSummary: `Observed behavior ${summary}`,
               },
-              { id: "H-2", status: "met", evidence: privateEvidence, publicSummary: "" },
-              { id: "H-3", status: "met", evidence: privateEvidence, publicSummary: summary },
+              {
+                id: "H-2",
+                status: "met",
+                evidence: verifies === 1 ? privateEvidence : retryPrivateEvidence,
+                publicSummary: "",
+              },
+              {
+                id: "H-3",
+                status: "met",
+                evidence: verifies === 1 ? privateEvidence : retryPrivateEvidence,
+                publicSummary: summary,
+              },
               { id: "X-9", status: "met", evidence: `Extra ${unknown}`, publicSummary: "" },
             ],
           },
         };
       }
       implementations++;
-      if (implementations === 2) checkArtifact("verify-0-retry.json", "met", "unmet");
+      if (implementations === 2) checkArtifact("verify-0-retry.json", "met", "unmet", retryPublicEvidence);
       return { files: { "farewell.txt": "goodbye\n" } };
     });
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
