@@ -684,6 +684,7 @@ async function oneRound(
             spec: ctx.state.spec as Spec,
             holdout: ctx.state.holdout as Holdout,
             baseSha,
+            checks: ctx.state.lastGates,
           }),
           jsonSchema: toStrictJsonSchema(VerifySchema),
           schema: VerifySchema,

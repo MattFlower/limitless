@@ -300,3 +300,31 @@ test("private literals do not match inside longer words or dollar-prefixed ident
     "inputs reinput $input [private detail] [1 private details withheld]",
   );
 });
+
+test("verifier cites the factory's gate results instead of rerunning whole suites", () => {
+  const result = (name: string, ok: boolean) => ({
+    name,
+    command: `bun run ${name}`,
+    ok,
+    exitCode: ok ? 0 : 1,
+    durationMs: 1,
+    output: "",
+  });
+  const prompt = verifyPrompt({
+    prompt: "make it work",
+    spec,
+    holdout,
+    baseSha: "abc",
+    checks: [
+      { name: "lint", verdict: "pass", blocking: false, result: result("lint", true) },
+      { name: "test", verdict: "still_failing", blocking: false, result: result("test", false) },
+    ],
+  });
+  expect(prompt).toContain("- lint `bun run lint`: pass");
+  expect(prompt).toContain("- test `bun run test`: FAIL (still failing)");
+  expect(prompt).toContain("Do not rerun these full commands as evidence");
+  // Without gate results (evals), the prompt is unchanged so cached eval results stay valid.
+  expect(verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" })).not.toContain(
+    "Repository checks",
+  );
+});

@@ -53,7 +53,7 @@ ${answers}
 Produce:
 - summary: what will be built and why, in 2–4 sentences.
 - requirements: precise, implementation-relevant requirements.
-- acceptance_criteria: 2–8 observable, independently testable criteria (ids AC-1, AC-2, ...). Each needs a concrete how_to_verify (a command to run, a test to add, a behavior to observe). Cover edge cases the requester would expect, not just the happy path.
+- acceptance_criteria: 2–8 observable, independently testable criteria (ids AC-1, AC-2, ...). Each needs a concrete how_to_verify (a command to run, a test to add, a behavior to observe). Cover edge cases the requester would expect, not just the happy path. Do not write criteria that only restate the repository's automated checks (lint, typecheck, the whole test suite): the factory runs those on every round. A criterion may require a specific new test to exist and pass.
 - assumptions: decisions you made where the request was silent.
 - out_of_scope: tempting things that should NOT be done.
 - blocking_questions: only if the task truly cannot proceed sensibly without an answer; otherwise empty.
@@ -300,7 +300,13 @@ export function verifyPrompt(input: {
   spec: Spec;
   holdout: Holdout;
   baseSha: string;
+  checks?: GateComparison[];
 }): string {
+  // The factory's gate results are authoritative: a whole-suite rerun inside the verifier's
+  // sandbox fails for environmental reasons and used to mark such criteria unmet.
+  const checks = input.checks?.length
+    ? `\n# Repository checks (already run by the factory on this HEAD)\n${input.checks.map((c) => `- ${c.name} \`${c.result.command}\`: ${c.result.ok ? "pass" : `FAIL (${c.verdict.replaceAll("_", " ")})`}`).join("\n")}\nThese results are authoritative. Do not rerun these full commands as evidence: your sandbox differs from the factory's environment. A criterion that only requires one of these checks to pass is met or unmet by the result above; cite it. Run targeted tests and commands for behavior.\n`
+    : "";
   return `You are the acceptance verifier for an automated coding pipeline. Decide whether the implementation on this branch actually satisfies each acceptance criterion. Be skeptical: verify by running commands, executing the code, and reading the implementation — never by trusting comments, commit messages, or the implementer's claims.
 
 # Original request
@@ -311,7 +317,7 @@ ${input.spec.acceptance_criteria.map((a) => `- **${a.id}** ${a.criterion}\n  - h
 
 # Blind holdout scenarios
 ${input.holdout.scenarios.map((s) => `- **${s.id}** ${s.description}\n  - steps: ${s.steps}\n  - expected: ${s.expected}`).join("\n")}
-
+${checks}
 The change is \`git diff ${input.baseSha}..HEAD\`. Do not modify repository files (create temporary fixtures and redirect supported build/test outputs under TMPDIR only, also supplied as TMP and TEMP).
 For each acceptance criterion and holdout scenario return met / unmet / unclear / blocked with concrete evidence (the command you ran and what you observed, or file:line references) and publicSummary. For each H-id, publicSummary must be a short description of observed behavior without private inputs, expected values, or scenario text; use an empty string for public criteria. Use blocked only when an attempted check cannot execute because of an environmental permission or sandbox error; include the attempted command and observed error in nonempty evidence. Expected permission-denial tests and genuine assertion failures are not environment blocks. For unmet holdouts, describe the observed failure in evidence without repeating the scenario text or private inputs. overall = "pass" only if every entry is met.`;
 }
