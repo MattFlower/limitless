@@ -40,6 +40,7 @@ export interface ReportInput {
   runUrl: string;
   /** Issue in the same repository this run was started from; the PR closes it on merge. */
   closesIssue?: number;
+  freeFirstRouting?: boolean;
 }
 
 /** Markdown evidence report used as the PR body. Each block is one markdown element. */
@@ -51,6 +52,7 @@ export function renderReport(input: ReportInput): string {
       : "⚠️ Built by **Limitless** but it **needs a human**: the checks below did not all pass.",
     ...(state.rebaseNote ? [`> [!NOTE]\n> ${state.rebaseNote}`] : []),
     ...(state.terminalReason ? [`🚧 ${state.terminalReason}`] : []),
+    ...(input.freeFirstRouting ? ["Routing: free-first (Dependabot)"] : []),
     "## Request",
     input.prompt
       .split("\n")
@@ -189,6 +191,7 @@ export function buildReport(ctx: RunContext, success: boolean): string {
     invocations: ctx.store.listInvocations(ctx.run.id),
     totals: { costUsd: latest.costUsd, costEquivUsd: latest.costEquivUsd },
     runUrl: `${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}`,
+    freeFirstRouting: ctx.freeFirstRouting,
     ...(issueClosedBy(ctx) ? { closesIssue: issueClosedBy(ctx) as number } : {}),
   });
 }
