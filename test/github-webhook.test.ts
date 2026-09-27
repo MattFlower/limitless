@@ -165,6 +165,8 @@ test("maps all Dependabot actions to quick existing-branch delivery", async () =
       repo: "MattFlower/limitless",
       number: 18,
       headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      baseRef: "main",
+      baseSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     });
     expect(r.prompt).toContain("Run the repository gates and fix breakages");
     expect(r.prompt).toContain('"body": "Do not test"');
@@ -251,4 +253,18 @@ test("filters unsupported, unauthorized, wrong label, malformed and fork payload
   expect(
     mapGitHubEvent("issues", { ...issue, repository: { full_name: "some-org/project" } }, "MattFlower"),
   ).toEqual({ note: "repository owner is not configured owner" });
+});
+
+test.each([
+  { ref: "main" },
+  { sha: "b".repeat(40) },
+  { ref: "../main", sha: "b".repeat(40) },
+  { ref: "main", sha: "oops" },
+])("rejects malformed PR base metadata: %j", (base) => {
+  const payload = JSON.parse(fixture("github-pr.json"));
+  payload.pull_request.base = { ...base, repo: { full_name: "MattFlower/limitless" } };
+  expect(mapGitHubEvent("pull_request", payload, "MattFlower")).toEqual({
+    note: "malformed pull request",
+    error: true,
+  });
 });

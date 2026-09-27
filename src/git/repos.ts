@@ -259,12 +259,14 @@ export async function diffSince(
   cwd: string,
   baseSha: string,
   env?: Record<string, string>,
+  threeDot = false,
 ): Promise<DiffInfo> {
+  const range = `${baseSha}${threeDot ? "..." : ".."}HEAD`;
   const [patch, names, stat, numstat] = await Promise.all([
-    sh(["git", "diff", `${baseSha}..HEAD`], { cwd, env }),
-    sh(["git", "diff", "--name-status", `${baseSha}..HEAD`], { cwd, env }),
-    sh(["git", "diff", "--stat", `${baseSha}..HEAD`], { cwd, env }),
-    sh(["git", "diff", "--numstat", `${baseSha}..HEAD`], { cwd, env }),
+    sh(["git", "diff", range], { cwd, env }),
+    sh(["git", "diff", "--name-status", range], { cwd, env }),
+    sh(["git", "diff", "--stat", range], { cwd, env }),
+    sh(["git", "diff", "--numstat", range], { cwd, env }),
   ]);
   let added = 0;
   let removed = 0;

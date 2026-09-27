@@ -25,6 +25,7 @@ import { discardChanges } from "../git/repos.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
+import type { GhRunner } from "../integrations/github.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
@@ -34,6 +35,7 @@ import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
+  gh?: GhRunner;
   cfg: Config;
   store: Store;
   router: Router;
@@ -45,6 +47,9 @@ export type Phase = "prepare" | "triage" | "clarify" | "spec" | "loop" | "delive
 
 /** Everything a run needs to resume after a restart. Persisted as runs.state_json. */
 export interface RunState {
+  flow?: "build" | "verify-change";
+  verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
+  verdictCommentPosted?: boolean;
   phase: Phase;
   worktreePath?: string;
   gatesConfig?: GateConfig;
@@ -189,6 +194,7 @@ export class RunContext {
     this.runDir = join(deps.cfg.paths.runs, run.id);
     mkdirSync(this.runDir, { recursive: true });
     this.state = deps.store.getRunState<RunState>(run.id) ?? {
+      flow: run.sourceRef?.kind === "pull_request" ? "verify-change" : "build",
       phase: "prepare",
       answers: [],
       round: 0,

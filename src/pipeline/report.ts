@@ -24,6 +24,7 @@ export interface ReportInput {
   prompt: string;
   state: Pick<
     RunState,
+    | "flow"
     | "implementerReport"
     | "spec"
     | "holdout"
@@ -48,8 +49,11 @@ export function renderReport(input: ReportInput): string {
   const { state } = input;
   const blocks: string[] = [
     input.success
-      ? "Built by **Limitless** — every gate below passed."
+      ? state.flow === "verify-change"
+        ? "Verified by **Limitless** — checks below have no blocking regressions."
+        : "Built by **Limitless** — every gate below passed."
       : "⚠️ Built by **Limitless** but it **needs a human**: the checks below did not all pass.",
+    `Flow: ${state.flow ?? "build"}`,
     ...(state.rebaseNote ? [`> [!NOTE]\n> ${state.rebaseNote}`] : []),
     ...(state.terminalReason ? [`🚧 ${state.terminalReason}`] : []),
     ...(input.freeFirstRouting ? ["Routing: free-first (Dependabot)"] : []),

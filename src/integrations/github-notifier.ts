@@ -22,6 +22,8 @@ export function startGitHubNotifier(
     )
       return;
     const terminal = TERMINAL_STATUSES.includes(run.status);
+    if (terminal && store.getRunState<{ verdictCommentPosted?: boolean }>(run.id)?.verdictCommentPosted)
+      return;
     if (run.status !== "queued" && !terminal) return;
     const key = `${run.id}:${terminal ? "terminal" : "created"}`;
     if (seen.has(key)) return;

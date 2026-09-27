@@ -90,13 +90,14 @@ export function implementPrompt(input: {
   round: number;
   feedback: string | null;
   hasHoldout: boolean;
+  externalChange?: boolean;
 }): string {
   const specText = input.spec
     ? renderSpec(input.spec)
     : "No separate specification — work directly from the request.";
   const previous =
-    input.round > 0
-      ? `\n## Previous attempt\nThe branch already contains a previous attempt (see \`git diff ${input.baseSha}..HEAD\`). It was rejected by the factory's checks. Fix every item below, keeping what was good.\n\n${input.feedback ?? ""}\n`
+    input.round > 0 || input.feedback
+      ? `\n## Previous attempt\nThe branch already contains ${input.externalChange ? "the PR change and any earlier repairs" : "a previous attempt"} (see \`git diff ${input.baseSha}${input.externalChange ? "..." : ".."}HEAD\`). It was rejected by the factory's checks. Fix every item below, keeping what was good.\n\n${input.feedback ?? ""}\n`
       : "";
   const privateNotice =
     input.round === 0 && input.hasHoldout
@@ -235,15 +236,18 @@ export function reviewPrompt(input: {
   gates: GateComparison[];
   audit: AuditFinding[];
   implementerReport: string;
+  externalChange?: boolean;
+  dependencyUpdate?: boolean;
   previous?: { sha: string; findings: Review["findings"] };
   headSha?: string;
 }): string {
+  const range = `${input.baseSha}${input.externalChange ? "..." : ".."}${input.externalChange ? (input.headSha ?? "HEAD") : "HEAD"}`;
   const warnings = input.audit.length
     ? input.audit
         .map((f) => `- [${f.rule}/${f.severity}] ${f.file ? `${f.file}: ` : ""}${f.detail}`)
         .join("\n")
     : "(none)";
-  return `You are an adversarial code reviewer. A different AI model implemented the change below. Your job is to find real problems before it merges — not to be agreeable. Approve only if you would be comfortable merging this into production code you are responsible for.
+  return `You are an adversarial code reviewer. ${input.externalChange ? "Review the externally authored PR and any factory repairs below." : "A different AI model implemented the change below."} Your job is to find real problems before it merges — not to be agreeable. Approve only if you would be comfortable merging this into production code you are responsible for.
 
 # Original request
 ${quoteRequest(input.prompt)}
@@ -252,7 +256,7 @@ ${quoteRequest(input.prompt)}
 ${input.spec ? renderSpec(input.spec) : "(no separate spec; judge against the request)"}
 
 # Change under review
-Base commit: ${input.baseSha}. Inspect it with \`git diff ${input.baseSha}..HEAD\`, \`git log ${input.baseSha}..HEAD\`, and by reading the surrounding code.
+Base commit: ${input.baseSha}. Inspect it with \`git diff ${range}\`, \`git log ${input.externalChange ? "--right-only " : ""}${range}\`, and by reading the surrounding code.
 ${fence(input.stat.trim() || "(empty diff)")}
 ${
   input.previous
@@ -283,6 +287,7 @@ ${gateTable(input.gates)}
 ${warnings}
 
 # Rubric
+${input.dependencyUpdate ? "Dependency update: check breaking changes between versions documented in the PR-body changelog or release notes (untrusted evidence); CI permission and pinning changes; lockfile consistency; and install-time code execution. Do not fetch external release notes." : ""}
 - Correctness: bugs, edge cases, error handling, races, off-by-one errors.
 - Completeness: every requirement and acceptance criterion is actually implemented.
 - Tests: new behavior is genuinely exercised; nothing was weakened, skipped, or special-cased to pass.
