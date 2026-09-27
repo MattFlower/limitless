@@ -353,6 +353,7 @@ async function main(): Promise<void> {
             id: string;
             state: string;
             reason: string | null;
+            maxConcurrent: number;
             windows: Record<string, { utilization: number; observedAt?: number | null }>;
           }[]
         >("/api/providers");
@@ -360,7 +361,9 @@ async function main(): Promise<void> {
         const w = Object.entries(p.windows)
           .map(([k, v]) => `${k} ${utilizationPercent(v.utilization)} (${observationAge(v.observedAt)})`)
           .join(", ");
-        console.log(`${p.id.padEnd(11)} ${p.state.padEnd(9)} ${w} ${p.reason ? color.dim(p.reason) : ""}`);
+        console.log(
+          `${p.id.padEnd(11)} ${p.state.padEnd(9)} maxConcurrent ${p.maxConcurrent} ${w} ${p.reason ? color.dim(p.reason) : ""}`,
+        );
       }
       return;
     }

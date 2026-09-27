@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { evalSettings } from "./evals/settings.ts";
 import { defaultGateSlots } from "./gates/slots.ts";
+import { PROVIDERS } from "./router/catalog.ts";
 import { isLanAddress, isLoopback, publicOrigin } from "./server/access.ts";
 
 export interface Paths {
@@ -38,6 +39,7 @@ export interface Config {
   publicUrl: string | null; // e.g. https://limitless.mattflower.cc (webhooks only)
   uiUrl: string; // where the UI is reachable locally, used in PR bodies
   maxConcurrentRuns: number;
+  providerMaxConcurrent: Record<string, number>;
   /** Gate suites (setup + checks) allowed to run at once across the whole process. */
   maxConcurrentGates: number;
   maxRounds: number; // implement ⇄ feedback rounds before escalation
@@ -110,6 +112,26 @@ export function loadConfig(
     ? (Bun.TOML.parse(readFileSync(tomlPath, "utf8")) as Record<string, unknown>)
     : {};
   evalSettings(raw);
+  const providerMaxConcurrent: Record<string, number> = {};
+  const configuredProviders = raw.providers === undefined ? {} : raw.providers;
+  if (
+    typeof configuredProviders !== "object" ||
+    configuredProviders === null ||
+    Array.isArray(configuredProviders)
+  )
+    throw new Error("providers must be a table");
+  for (const [id, value] of Object.entries(configuredProviders)) {
+    if (!PROVIDERS.some((provider) => provider.id === id))
+      throw new Error(`providers.${id}: unknown provider`);
+    if (typeof value !== "object" || value === null || Array.isArray(value))
+      throw new Error(`providers.${id} must be a table`);
+    const limit = (value as Record<string, unknown>).max_concurrent;
+    if (limit !== undefined) {
+      if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit <= 0)
+        throw new Error(`providers.${id}.max_concurrent must be a positive safe integer`);
+      providerMaxConcurrent[id] = limit;
+    }
+  }
   const secrets = { ...parseEnvFile(join(configDir, "secrets.env")) };
   // Environment variables win over the secrets file (useful for tests and CI).
   for (const key of [
@@ -171,6 +193,7 @@ export function loadConfig(
     publicUrl: str(server.public_url, null),
     uiUrl: str(server.ui_url, `http://localhost:${port}`) as string,
     maxConcurrentRuns: num(limits.max_concurrent_runs, 3),
+    providerMaxConcurrent,
     maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
     maxRounds: num(limits.max_rounds, 3),
     openrouterBudgetUsd: num(limits.openrouter_budget_usd, 50),

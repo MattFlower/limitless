@@ -13,6 +13,7 @@ test("providers CLI shows rounded utilization and independent reading ages", asy
           id: "claude",
           state: "ok",
           reason: null,
+          maxConcurrent: 5,
           windows: {
             five_hour: { utilization: 0.721, resetsAt: now + 60_000, observedAt: now - 12 * 60_000 },
             seven_day: { utilization: 1, resetsAt: null, observedAt: null },
@@ -41,6 +42,7 @@ test("providers CLI shows rounded utilization and independent reading ages", asy
     expect(stdout).toContain("five_hour 73% (as of 12 min ago)");
     expect(stdout).toContain("seven_day 100% (as of unknown)");
     expect(stdout).toContain("future 0% (as of just now)");
+    expect(stdout).toContain("maxConcurrent 5");
   } finally {
     server.stop();
     rmSync(dir, { recursive: true, force: true });

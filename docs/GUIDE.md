@@ -140,6 +140,7 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[server] host` | `"127.0.0.1"` | Bind address. Keep it on loopback (see [remote UI](#remote-ui)). |
 | `[server] ui_url` | `http://localhost:<port>` | Base URL for run links in PR bodies and Discord. It is also an allowed browser origin. |
 | `[limits] max_concurrent_runs` | `3` | Runs executing at once. Others wait in `queued`. |
+| `[providers.<id>] max_concurrent` | Catalog limit | Concurrent requests for a catalog provider; positive safe integer. For example, `[providers.claude] max_concurrent = 5`. Unknown provider IDs are rejected. |
 | `[limits] max_rounds` | `3` | Base implementation rounds. A run gets `max_rounds + 2` rounds in total. |
 | `[limits] openrouter_budget_usd` | `50` | Rolling 30-day OpenRouter spend cap |
 | `[retention] worktree_days` | `3` | Keep worktrees of succeeded and cancelled runs this long |
@@ -533,10 +534,10 @@ for your own interactive use. Windows reset on schedule and routing resumes by i
 - There is no separate alert for the OpenRouter budget and no per-run budget. The budget gauge on
   the provider card and routing skips are the signals.
 
-Concurrency is limited by `max_concurrent_runs` and by a per-provider cap: 3 for Claude and Codex,
-4 for OpenRouter, and 1 for each local server. `limitless providers` shows each provider's state,
-reason, and quota windows with utilization and observation age. The provider cards also show
-in-flight calls.
+Concurrency is limited by `max_concurrent_runs` and each provider's `max_concurrent` setting.
+Catalog defaults are 3 for Claude and Codex, 4 for OpenRouter, and 1 for each local server.
+`limitless providers` shows each provider's effective limit, state, reason, and quota windows
+with utilization and observation age. The provider cards also show in-flight calls.
 
 ## 7. Operations
 
