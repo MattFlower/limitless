@@ -55,15 +55,12 @@ export function validateHealth(value: unknown): HealthResponse {
     !("uptimeMs" in value) ||
     typeof value.uptimeMs !== "number" ||
     !Number.isFinite(value.uptimeMs) ||
-    value.uptimeMs < 0 ||
-    !("sha" in value) ||
-    typeof value.sha !== "string" ||
-    !value.sha.trim() ||
-    value.sha === "unknown"
+    value.uptimeMs < 0
   ) {
     throw new Error("invalid or unhealthy daemon health response");
   }
-  return value as HealthResponse;
+  const sha = "sha" in value && typeof value.sha === "string" ? value.sha.trim() : "";
+  return { ...value, sha: sha || "unknown" } as HealthResponse;
 }
 
 export function localDeployClient(port: number): DeployClient {

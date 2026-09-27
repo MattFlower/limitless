@@ -247,10 +247,11 @@ export async function deploy(
   try {
     await ensureRelease(dir, run);
     const running = validateHealth(await race(bounded(clock, (signal) => client.health(signal))));
-    previous = running.sha;
     drainAttempted = running.draining;
-    log(`daemon before: ${previous}`);
+    log(`daemon before: ${running.sha}`);
     const checkout = (await run(["git", "rev-parse", "HEAD"], { cwd: dir })).stdout.trim();
+    // Older daemons have no boot SHA; only the checkout can identify their rollback commit.
+    previous = running.sha === "unknown" ? checkout : running.sha;
     await run(["git", "fetch", "origin", "--prune"], { cwd: dir, timeoutMs: 300_000 });
     const target = (await run(["git", "rev-parse", ref], { cwd: dir })).stdout.trim();
     if (target === previous) {

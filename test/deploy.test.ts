@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveBootSha } from "../src/cli/boot-sha.ts";
 import {
   bounded,
   DEFAULT_MAX_WAIT_MS,
@@ -392,6 +393,52 @@ test("checkout already at target continues from drain without rerunning gates", 
   expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
   expect(f.logs).toContain("daemon before: previous");
   expect(f.logs).toContain("daemon after: next");
+});
+
+test("a pre-upgrade daemon without a boot SHA deploys using the checkout commit", async () => {
+  for (const oldSha of [undefined, "", "unknown"]) {
+    const f = setup();
+    const health = f.client.health;
+    f.client.health = async (signal) => {
+      const state = await health(signal);
+      return f.calls.includes("restart") ? state : ({ ...state, sha: oldSha } as HealthResponse);
+    };
+    await deploy(7400, "feature", false, f.opts);
+    expect(f.calls).toContain("git checkout -q --detach next");
+    expect(f.calls).toContain("bun run check");
+    expect(f.calls.filter((call) => call === "restart")).toHaveLength(1);
+    expect(f.logs).toContain("daemon before: unknown");
+    expect(f.logs).toContain("daemon after: next");
+  }
+});
+
+test("a pre-upgrade daemon at the target uses the checkout as its completion check", async () => {
+  const f = setup();
+  f.setSelected("next");
+  const health = f.client.health;
+  f.client.health = async (signal) =>
+    ({ ...(await health(signal)), sha: undefined }) as unknown as HealthResponse;
+  await deploy(7400, "feature", false, f.opts);
+  expect(f.calls).not.toContain("restart");
+  expect(f.calls).not.toContain("drain");
+  expect(f.logs.at(-1)).toBe("already deployed next");
+});
+
+test("boot SHA resolution degrades when Git fails or returns an empty result", async () => {
+  const f = setup();
+  expect(await resolveBootSha("/release", f.opts.command)).toBe("previous");
+  expect(
+    await resolveBootSha("/release", async () => {
+      throw new Error("missing git");
+    }),
+  ).toBeUndefined();
+  expect(
+    await resolveBootSha("/release", async () => ({
+      stdout: " \n",
+      stderr: "",
+      exitCode: 0,
+    })),
+  ).toBeUndefined();
 });
 
 test("running target is already deployed and a stranded drain is resumed", async () => {
