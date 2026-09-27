@@ -295,6 +295,12 @@ export async function pushBranch(repo: Repo, cwd: string, branch: string): Promi
   });
 }
 
+export async function remoteBranchSha(repo: Repo, cwd: string, branch: string): Promise<string | null> {
+  if (repo.kind !== "github" || !repo.url) return null;
+  const remote = await sh(["git", "ls-remote", repo.url, `refs/heads/${branch}`], { cwd });
+  return remote.stdout.split("\t")[0] || null;
+}
+
 /** Update an existing PR head only if it still points at the commit we prepared from. */
 export async function pushExistingBranch(
   repo: Repo,

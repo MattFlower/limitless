@@ -107,7 +107,7 @@ export interface RunState {
   reviewFollowUps?: Review["findings"];
   lastVerify?: (Verify & { modelId: string }) | null;
   verifyResults?: (Verify & { modelId: string; round: number; attempt?: number })[];
-  /** Reserve the retry before invoking; a crash must not grant another attempt. */
+  /** Round whose retry is reserved; a restart resumes it, and a recorded attempt 1 ends retrying. */
   environmentRetryRound?: number;
   terminalReason?: string;
   toolCommands: string[];

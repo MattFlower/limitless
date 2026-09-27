@@ -22,6 +22,7 @@ import {
   pushExistingBranch,
   readFileAt,
   rebaseOnto,
+  remoteBranchSha,
   removeWorktree,
   resetTo,
 } from "../git/repos.ts";
@@ -133,11 +134,13 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
       deps.store.updateRun(runId, { status: "queued", stage: null });
       return "queued";
     }
-    if (e instanceof CancelledError || signal.aborted) {
+    const cancelled = (): RunStatus => {
+      // Keeps any "cancelled by" error so the scheduler can tell cancellation from shutdown.
       deps.store.updateRun(runId, { status: "cancelled", finishedAt: Date.now() });
       ctx.log("Run cancelled", "warn");
       return "cancelled";
-    }
+    };
+    if (e instanceof CancelledError || signal.aborted) return cancelled();
     const needsHuman = e instanceof NeedsHumanError || e instanceof NoCapacityError;
     const message = (e as Error).message;
     ctx.log(`Run ${needsHuman ? "needs a human" : "failed"}: ${message}`, "error", {
@@ -153,6 +156,9 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
       try {
         await deliver(ctx, false);
       } catch (err) {
+        if (err instanceof SimulatedTermination || ctx.termination) return "running";
+        // Cancellation or shutdown during the draft must not be recorded as the original failure.
+        if (err instanceof CancelledError || signal.aborted) return cancelled();
         ctx.log(`Could not open draft PR: ${(err as Error).message}`, "warn");
       }
     }
@@ -835,10 +841,13 @@ async function oneRound(
         await ctx.save();
         throw new NeedsHumanError(detail);
       };
-      if (ctx.state.environmentRetryRound === round || previous.some((v) => v.attempt === 1)) await stop();
+      if (previous.some((v) => v.attempt === 1)) await stop();
+      // A reserved retry that never recorded a result was interrupted; resume it, don't grant another.
+      if (ctx.state.environmentRetryRound === round)
+        ctx.log("Resuming interrupted verification retry", "warn");
       ctx.state.environmentRetryRound = round;
       await ctx.save();
-      const firstModel = ctx.state.lastVerify?.modelId;
+      const firstModel = (previous.find((v) => v.attempt !== 1) ?? ctx.state.lastVerify)?.modelId;
       try {
         verify = await verifyAttempt(1, firstModel ? [firstModel] : []);
       } catch (error) {
@@ -940,7 +949,10 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     if (ctx.run.deliveryBranch) {
       if (!success) return { summary: "PR update needs human review; no push", value: undefined };
       ctx.checkCancelled();
-      await pushExistingBranch(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.run.baseSha as string);
+      // A restart after a completed push finds this run's head already delivered; anything else
+      // still goes through the lease-checked push, which rejects unrelated remote changes.
+      if ((await remoteBranchSha(ctx.repo, cwd, ctx.run.deliveryBranch)) !== head)
+        await pushExistingBranch(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.run.baseSha as string);
       if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number") {
         ctx.run = ctx.store.updateRun(ctx.run.id, {
           prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef.number}`,

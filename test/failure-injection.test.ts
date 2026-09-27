@@ -141,11 +141,11 @@ async function run(f: Factory) {
 async function settled(f: Factory, id: string) {
   await wait(() => !f.scheduler.activeRunIds.includes(id) && f.store.getRun(id)?.status !== "queued");
 }
-async function reopen(f: Factory) {
+async function reopen(f: Factory, handler = answer) {
   await f.stop();
   f.store.close();
   factories = factories.filter((v) => v !== f);
-  const next = factory();
+  const next = factory(undefined, handler);
   next.scheduler.start();
   return next;
 }
@@ -654,10 +654,10 @@ for (const kind of ["harness", "gate", "preview"] as const)
     }
   });
 
-test("PR creation window reconciles a stateful fake after Factory replacement", async () => {
+/** Stateful fake `gh` (one PR per branch) and a `git push` stub on PATH; returns a restore hook. */
+function fakeGh(pr: string) {
   const bin = join(root, "bin");
   mkdirSync(bin);
-  const pr = join(root, "pr");
   writeFileSync(
     join(bin, "gh"),
     `#!${process.execPath}\nimport {existsSync,readFileSync,writeFileSync} from "node:fs";\nconst file=${JSON.stringify(pr)};\nif(process.argv[3]==="list" && existsSync(file)) console.log(readFileSync(file,"utf8"));\nif(process.argv[3]==="create") { if(existsSync(file)) process.exit(9); writeFileSync(file,"https://github.com/test/repo/pull/1"); console.log(readFileSync(file,"utf8")); }\n`,
@@ -670,18 +670,38 @@ test("PR creation window reconciles a stateful fake after Factory replacement", 
   );
   const oldPath = process.env.PATH;
   process.env.PATH = `${bin}:${oldPath}`;
+  return async () => {
+    for (const f of factories) await f.stop();
+    process.env.PATH = oldPath;
+  };
+}
+function githubRun(f: Factory, url = source) {
+  const repo = f.store.upsertRepo({
+    slug: "test/repo",
+    kind: "github",
+    url,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  return repo;
+}
+const blocked = {
+  ...verify,
+  overall: "fail",
+  criteria: verify.criteria.map((c) =>
+    c.id === "AC-1" ? { ...c, status: "blocked", evidence: "EPERM" } : c,
+  ),
+};
+
+test("PR creation window reconciles a stateful fake after Factory replacement", async () => {
+  const pr = join(root, "pr");
+  const restore = fakeGh(pr);
   try {
     const f = factory({
       "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-pr-created" },
     });
-    const repo = f.store.upsertRepo({
-      slug: "test/repo",
-      kind: "github",
-      url: source,
-      localPath: null,
-      defaultBranch: "main",
-      mergePolicy: "pr",
-    });
+    const repo = githubRun(f);
     const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
     f.scheduler.start();
     await settled(f, r.id);
@@ -699,7 +719,120 @@ test("PR creation window reconciles a stateful fake after Factory replacement", 
     expect(existsSync(cwd)).toBe(false);
     history(next, r.id);
   } finally {
-    for (const f of factories) await f.stop();
-    process.env.PATH = oldPath;
+    await restore();
   }
+});
+
+test("restart during the environment verification retry resumes that retry", async () => {
+  let verifies = 0;
+  const handler = (s: AgentSpec): FakeReply =>
+    s.prompt.startsWith("You are the acceptance") && verifies++ === 0 ? { structured: blocked } : answer(s);
+  let reached = false;
+  const f = factory(
+    {
+      "stage:verify:before": {
+        action: "hang",
+        occurrence: 2,
+        onHit: () => {
+          reached = true;
+        },
+      },
+    },
+    handler,
+  );
+  const id = await run(f);
+  await wait(() => reached);
+  const next = await reopen(f, handler);
+  await settled(next, id);
+  expect(next.store.getRun(id)?.status).toBe("succeeded");
+  const verifiers = next.store.listInvocations(id).filter((i) => i.role === "verify");
+  expect(verifiers.map((i) => [i.modelId, i.status])).toEqual([
+    ["b", "ok"],
+    ["a", "ok"],
+  ]);
+  expect(next.store.getRunState<RunState>(id)?.verifyResults?.map((v) => v.attempt)).toEqual([0, 1]);
+  history(next, id);
+});
+
+for (const interrupt of ["cancel", "shutdown"] as const)
+  test(`${interrupt} during draft delivery is not recorded as needs_human`, async () => {
+    const pr = join(root, "pr");
+    const restore = fakeGh(pr);
+    try {
+      let reached = false;
+      const f = factory(
+        {
+          "stage:deliver:before": {
+            action: "hang",
+            onHit: () => {
+              reached = true;
+            },
+          },
+        },
+        (s) => (s.prompt.startsWith("You are the acceptance") ? { structured: blocked } : answer(s)),
+      );
+      const repo = githubRun(f);
+      const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
+      f.scheduler.start();
+      await wait(() => reached);
+      if (interrupt === "cancel") {
+        f.cancelRun(r.id);
+        await settled(f, r.id);
+        expect(f.store.getRun(r.id)).toMatchObject({ status: "cancelled", error: "cancelled by user" });
+        expect(f.store.listStages(r.id).at(-1)).toMatchObject({ name: "deliver", status: "cancelled" });
+        expect(existsSync(f.store.getRunState<RunState>(r.id)?.worktreePath ?? "")).toBe(true);
+        history(f, r.id);
+        const next = await reopen(f);
+        expect(next.store.getRun(r.id)?.status).toBe("cancelled");
+        expect(existsSync(pr)).toBe(false);
+        return;
+      }
+      await f.stop();
+      expect(f.store.getRun(r.id)?.status).toBe("queued");
+      const next = await reopen(f);
+      await settled(next, r.id);
+      expect(next.store.getRun(r.id)).toMatchObject({
+        status: "needs_human",
+        prUrl: "https://github.com/test/repo/pull/1",
+      });
+      expect(next.store.getRun(r.id)?.error).toContain("blocked by the environment");
+      expect(next.store.listInvocations(r.id).filter((i) => i.role === "verify")).toHaveLength(2);
+      history(next, r.id);
+    } finally {
+      await restore();
+    }
+  });
+
+test("existing-branch push interrupted before completion is reconciled on restart", async () => {
+  const remote = join(root, "remote.git");
+  await sh(["git", "clone", "-q", "--bare", source, remote], { cwd: root });
+  const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: source })).stdout.trim();
+  const f = factory({ "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-complete" } });
+  const repo = githubRun(f, remote);
+  const request = {
+    repo: repo.slug,
+    prompt: "Change",
+    profile: "standard" as const,
+    source: "github" as const,
+    requestedBy: "dependabot[bot]",
+    baseBranch: "main",
+    deliveryBranch: "main",
+    sourceRef: { kind: "pull_request", repo: repo.slug, number: 7, headSha },
+  };
+  const r = f.store.createRun(repo, request, true);
+  f.scheduler.start();
+  await settled(f, r.id);
+  expect(f.store.getRun(r.id)?.status).toBe("running");
+  const pushed = (await sh(["git", "rev-parse", "main"], { cwd: remote })).stdout.trim();
+  expect(pushed).not.toBe(headSha);
+  const next = await reopen(f);
+  await settled(next, r.id);
+  expect(next.store.getRun(r.id)).toMatchObject({
+    status: "succeeded",
+    headSha: pushed,
+    prUrl: "https://github.com/test/repo/pull/7",
+  });
+  expect((await sh(["git", "rev-parse", "main"], { cwd: remote })).stdout.trim()).toBe(pushed);
+  expect((await sh(["git", "rev-list", "--count", "main"], { cwd: remote })).stdout.trim()).toBe("2");
+  history(next, r.id);
 });
