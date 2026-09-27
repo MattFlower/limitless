@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CaseFileSchema, loadCases, validateRequest } from "../src/evals/cases.ts";
+import { CaseFileSchema, loadCases, loadRoleCases, validateRequest } from "../src/evals/cases.ts";
 import { evalFixture } from "./evals-support.ts";
 
 test("committed 40 cases load unchanged, including notes and gold alternatives", () => {
@@ -225,5 +225,63 @@ test("eval validation rejects efforts the role's harness cannot deliver", async 
     ).toEqual(["candidate-a@high"]);
   } finally {
     await f.close();
+  }
+});
+
+test("implement dataset validates pins, spec, paths, duplicate IDs, commands and hidden files before scheduling", () => {
+  const home = mkdtempSync(join(tmpdir(), "implement-cases-"));
+  const hiddenDir = join(home, "hidden", "one");
+  const casePath = join(home, "cases.json");
+  mkdirSync(hiddenDir, { recursive: true });
+  writeFileSync(join(hiddenDir, "overwrite"), "hidden bytes");
+  const original = {
+    id: "one",
+    repo: "fixture/repo",
+    base: "a".repeat(40),
+    head: "b".repeat(40),
+    prompt: "Implement",
+    complexity: "small",
+    spec: null,
+    source: "fixture",
+    tags: [],
+    hidden: { files: ["overwrite"], command: "true", timeoutSec: 1 },
+  };
+  const save = (cases: unknown[] = [original]) =>
+    writeFileSync(casePath, JSON.stringify({ role: "implement", version: 1, cases }));
+  save();
+  try {
+    expect(loadRoleCases("implement", casePath).role).toBe("implement");
+    for (const over of [
+      { id: "../one" },
+      { id: "/one" },
+      { base: "abc" },
+      { head: "z".repeat(40) },
+      { repo: "repo" },
+      { complexity: "large" },
+      { spec: {} },
+      { prompt: "  " },
+      ...["../escape", "/absolute", "nul\0", "a/../b", ".git/config", "missing"].map((path) => ({
+        hidden: { ...original.hidden, files: [path] },
+      })),
+      { hidden: { ...original.hidden, command: " " } },
+      { hidden: { ...original.hidden, timeoutSec: 0 } },
+    ]) {
+      writeFileSync(
+        casePath,
+        JSON.stringify({ role: "implement", version: 1, cases: [{ ...original, ...over }] }),
+      );
+      expect(() => loadRoleCases("implement", casePath)).toThrow();
+    }
+    writeFileSync(casePath, JSON.stringify({ role: "implement", version: 1, cases: [original, original] }));
+    expect(() => loadRoleCases("implement", casePath)).toThrow("duplicate");
+    save();
+    rmSync(join(hiddenDir, "overwrite"));
+    mkdirSync(join(hiddenDir, "overwrite"));
+    expect(() => loadRoleCases("implement", casePath)).toThrow("hidden file");
+    rmSync(join(hiddenDir, "overwrite"), { recursive: true });
+    symlinkSync("/etc/hosts", join(hiddenDir, "overwrite"));
+    expect(() => loadRoleCases("implement", casePath)).toThrow("hidden file");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });

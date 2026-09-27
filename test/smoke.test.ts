@@ -205,14 +205,19 @@ test("deploy restores the previous checkout when injected smoke fails before res
     await expect(
       deploy(7400, "feature", true, {
         releaseDir: dir,
+        lockPath: join(dir, "deploy.lock"),
         command,
         client: {
           admin: async () => {
             throw new Error("admin must not be called before smoke passes");
           },
-          health: async () => {
-            throw new Error("health must not be called before smoke passes");
-          },
+          health: async () => ({
+            ok: true,
+            uptimeMs: 0,
+            sha: "previous-commit",
+            draining: false,
+            active: [],
+          }),
           run: async () => {
             throw new Error("run lookup must not be called before smoke passes");
           },
@@ -226,7 +231,7 @@ test("deploy restores the previous checkout when injected smoke fails before res
     expect(calls).toEqual([
       "git rev-parse HEAD",
       "git fetch origin --prune",
-      "git rev-parse feature",
+      "git rev-parse feature^{commit}",
       "git checkout -q --detach next-commit",
       "bun install --frozen-lockfile",
       "bun run check",

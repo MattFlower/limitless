@@ -63,6 +63,18 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
     expect(renderToString(() => EvalsView({ error: "API unavailable" }))).toContain('role="alert"');
     expect(renderToString(() => EvalsView({ error: "API unavailable" }))).not.toContain("Loading evals");
     expect(renderToString(() => EvalsView({ data: response([]) }))).toContain("No eval runs yet");
+    const implementation = evidence("implement", [local]);
+    const summary = summarize(implementation.run, implementation.trials)[0];
+    if (!summary) throw new Error("missing summary");
+    const implementData = {
+      ...response([implementation]),
+      implement: [{ run: implementation.run, summary }],
+    };
+    const implementHtml = renderToString(() => EvalsView({ data: implementData }));
+    expect(implementHtml).toContain('href="/evals/implement-run"');
+    expect(implementHtml).toContain("evaluated");
+    expect(implementHtml).toContain("pass rate:");
+    expect(implementData.evaluation).toEqual(response([]).evaluation);
     const variants = evidence("triage", [
       "codex/luna@low",
       "codex/luna@high",

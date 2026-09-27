@@ -144,6 +144,96 @@ test("quota observation times survive reload and legacy windows remain unknown",
 });
 
 describe("Router", () => {
+  test("free-first orders policy free targets before catalog defaults and partitions vendors within billing", () => {
+    const alpha = models[0];
+    const beta = models[2];
+    if (!alpha || !beta) throw new Error("missing fixture models");
+    const defs: ProviderDef[] = [
+      ...providers,
+      { id: "local-a", label: "A", harness: "claude", billing: "free", maxConcurrent: 1 },
+      { id: "local-b", label: "B", harness: "claude", billing: "free", maxConcurrent: 1 },
+    ];
+    const catalog: ModelDef[] = [
+      ...models,
+      {
+        ...alpha,
+        id: "local-a/policy",
+        provider: "local-a",
+        supportedEfforts: ["low", "high"],
+        effort: "low",
+      },
+      { ...beta, id: "local-b/catalog", provider: "local-b", supportedEfforts: ["low"], effort: "low" },
+      { ...alpha, id: "local-a/catalog", provider: "local-a", supportedEfforts: ["low"], effort: "low" },
+    ];
+    const routing = new Router(
+      new ProviderTracker(defs, store, reserves, {}, {}),
+      {
+        ...policy,
+        implement: { default: ["claude/sonnet", "local-a/policy@high", "codex/sol", "openrouter/ds"] },
+      },
+      catalog,
+    );
+    const ids = (constraints = {}) =>
+      routing.route("implement", "small", constraints).candidates.map((m) => m.targetId);
+    expect(ids()).toEqual(["claude/sonnet", "local-a/policy@high", "codex/sol"]);
+    expect(ids({ billing: "free_first" })).toEqual([
+      "local-a/policy@high",
+      "local-b/catalog@low",
+      "local-a/catalog@low",
+      "claude/sonnet",
+      "codex/sol",
+    ]);
+    expect(ids({ billing: "free_first", prefer: "local-a/catalog@low" })).toEqual([
+      "local-a/catalog@low",
+      "local-a/policy@high",
+      "local-b/catalog@low",
+      "claude/sonnet",
+      "codex/sol",
+    ]);
+    expect(ids({ billing: "free_first", avoidVendor: "anthropic", prefer: "claude/sonnet" })).toEqual([
+      "claude/sonnet",
+      "local-b/catalog@low",
+      "local-a/policy@high",
+      "local-a/catalog@low",
+      "codex/sol",
+    ]);
+  });
+
+  test("free-first filters unavailable and ineligible free models before policy fallback", () => {
+    const alpha = models[0];
+    if (!alpha) throw new Error("missing fixture model");
+    const defs: ProviderDef[] = [
+      ...providers,
+      { id: "local", label: "Local", harness: "claude", billing: "free", maxConcurrent: 1 },
+    ];
+    const catalog: ModelDef[] = [
+      ...models,
+      { ...alpha, id: "local/low", provider: "local", tier: 2 },
+      { ...alpha, id: "local/effort", provider: "local", supportedEfforts: ["high"], effort: "high" },
+      { ...alpha, id: "local/eligible", provider: "local" },
+    ];
+    const tracker = new ProviderTracker(defs, store, reserves, {}, {});
+    const routing = new Router(
+      tracker,
+      { ...policy, implement: { default: ["claude/sonnet", "codex/sol"] } },
+      catalog,
+    );
+    const route = (constraints = {}) =>
+      routing.route("implement", "small", { billing: "free_first", ...constraints });
+    expect(route({ minTier: 4, excludeModels: ["local/eligible"] }).candidates.map((m) => m.modelId)).toEqual(
+      ["local/effort", "claude/sonnet", "codex/sol", "claude/opus"],
+    );
+    tracker.blockModel("local/effort", "unsupported");
+    expect(route({ minTier: 4, excludeModels: ["local/eligible"] }).candidates[0]?.modelId).toBe(
+      "claude/sonnet",
+    );
+    tracker.setEnabled("local", false);
+    expect(route().candidates.map((m) => m.modelId)).toEqual(["claude/sonnet", "codex/sol"]);
+    tracker.setEnabled("local", true);
+    tracker.setHealthy("local", false);
+    expect(route().candidates.map((m) => m.modelId)).toEqual(["claude/sonnet", "codex/sol"]);
+  });
+
   test("disabled providers are skipped on ordinary, preferred, and escalation routes", () => {
     const { tracker, router } = setup();
     tracker.setEnabled("claude", false);

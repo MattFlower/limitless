@@ -120,6 +120,34 @@ function roleMetrics(run: EvalRun, rows: EvalTrial[]) {
         : null,
   };
 }
+function implementMetrics(rows: EvalTrial[]) {
+  const evaluated = rows.filter((t) => t.pass !== null && ["ok", "error"].includes(t.status));
+  const executed = evaluated.filter(
+    (t) => !t.details.cache && !t.details.interrupted && !t.details.preparationFailed,
+  );
+  return {
+    byComplexity: ["trivial", "small", "medium"].map((complexity) => {
+      const group = evaluated.filter((t) => t.details.complexity === complexity);
+      const passes = group.filter((t) => t.pass).length;
+      return {
+        complexity,
+        passes,
+        evaluatedTrials: group.length,
+        passRate: group.length ? passes / group.length : null,
+        ci: wilson(passes, group.length),
+      };
+    }),
+    failureReasons: Object.fromEntries(
+      ["hidden_tests", "gates", "audit", "error", "timeout"].map((reason) => [
+        reason,
+        evaluated.filter((t) => !t.pass && (t.details.grade?.implement?.reason ?? "error") === reason).length,
+      ]),
+    ),
+    costPerTrialUsd: mean(executed.map((t) => t.costUsd)),
+    costEquivPerTrialUsd: mean(executed.map((t) => t.costEquivUsd)),
+    executedTrials: executed.length,
+  };
+}
 export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptions = {}) {
   const settings = statsOptions(options);
   const targets = [
@@ -152,6 +180,7 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
       modelId,
       effort: rows[0]?.effort ?? null,
       ...roleMetrics(run, rows),
+      ...(run.role === "implement" ? { implement: implementMetrics(rows) } : {}),
       cases: new Set(evaluated.map((t) => t.caseId)).size,
       evaluatedTrials: evaluated.length,
       skipped: rows.filter((t) => t.status === "skipped").length,

@@ -1,11 +1,15 @@
 import { expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Server } from "bun";
+import { resolveBootSha } from "../src/cli/boot-sha.ts";
 import type { HealthResponse } from "../src/core/types.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import { sh } from "../src/util/proc.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
 test("admin drain uses real loopback peers and existing mutation protections", async () => {
-  const f = await fixture();
+  const f = await fixture("boot-commit");
   try {
     const routes = createHttpRoutes(f.factory);
     const drain = (routes["/api/admin/drain"] as { POST: Route }).POST;
@@ -20,7 +24,7 @@ test("admin drain uses real loopback peers and existing mutation protections", a
       (await (
         await health(requestWithParams("http://localhost/api/health"), localServer)
       ).json()) as HealthResponse;
-    expect(await read()).toMatchObject({ ok: true, draining: false, active: [] });
+    expect(await read()).toMatchObject({ ok: true, sha: "boot-commit", draining: false, active: [] });
     expect(typeof (await read()).uptimeMs).toBe("number");
     for (const address of [
       "127.0.0.1",
@@ -82,6 +86,29 @@ test("admin drain uses real loopback peers and existing mutation protections", a
     expect((await read()).active).toEqual([run.id]);
     await drain(request(), localServer);
     expect(await read()).toMatchObject({ draining: true, active: [run.id] });
+  } finally {
+    await f.close();
+  }
+});
+
+test("health keeps the injected boot SHA after the checkout advances", async () => {
+  const f = await fixture(resolveBootSha);
+  try {
+    const bootSha = await resolveBootSha(f.repo);
+    if (!bootSha) throw new Error("test checkout has no boot SHA");
+    const route = createHttpRoutes(f.factory)["/api/health"] as Route;
+    const read = async () =>
+      (
+        await route(requestWithParams("http://localhost/api/health"), localServer)
+      ).json() as Promise<HealthResponse>;
+    writeFileSync(join(f.repo, "new.txt"), "new\n");
+    await sh(["git", "add", "."], { cwd: f.repo });
+    await sh(
+      ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "next"],
+      { cwd: f.repo },
+    );
+    expect((await sh(["git", "rev-parse", "HEAD"], { cwd: f.repo })).stdout.trim()).not.toBe(bootSha);
+    expect((await read()).sha).toBe(bootSha);
   } finally {
     await f.close();
   }

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import type { Profile, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
@@ -74,10 +75,6 @@ function statusColor(s: string): string {
   return color.dim(s);
 }
 
-function money(n: number): string {
-  return `$${n.toFixed(n < 1 ? 3 : 2)}`;
-}
-
 function formatEvent(e: RunEvent): string {
   const t = new Date(e.ts).toLocaleTimeString();
   const tag = e.type.padEnd(11);
@@ -123,12 +120,15 @@ async function follow(runId: string, after = 0): Promise<void> {
 }
 
 async function serve(): Promise<void> {
+  const { resolveBootSha } = await import("./boot-sha.ts");
   const { loadConfig } = await import("../config.ts");
   const { Factory } = await import("../app.ts");
   const { startHttp } = await import("../server/http.ts");
   const { mountIntegrations } = await import("../integrations/index.ts");
   const cfg = loadConfig();
+  const bootSha = await resolveBootSha(join(import.meta.dir, "../.."));
   const factory = new Factory(cfg, {
+    bootSha,
     policyPath: join(import.meta.dir, "../../routing/policy.json"),
   });
   const ui = (await import("../../ui/index.html")).default;
@@ -254,7 +254,8 @@ async function main(): Promise<void> {
       if (values.status) qs.set("status", values.status);
       const runs = await api<Run[]>(`/api/runs?${qs}`);
       for (const r of runs) {
-        const cost = r.costUsd > 0 ? money(r.costUsd) : color.dim(`~${money(r.costEquivUsd)}`);
+        const formatted = formatCost(r.costUsd, r.costEquivUsd);
+        const cost = `${formatted.primary}${formatted.paid ? ` ${formatted.paid}` : ""}`;
         console.log(
           `${r.id}  ${statusColor(r.status.padEnd(13))} ${(r.stage ?? "").padEnd(9)} ${cost.padEnd(8)} ${r.repoSlug.padEnd(28)} ${r.title.slice(0, 60)}`,
         );
@@ -270,7 +271,8 @@ async function main(): Promise<void> {
       );
       if (r.prUrl) console.log(`PR ${r.prUrl}`);
       if (r.error) console.log(color.red(r.error));
-      console.log(`cost ${money(r.costUsd)} (+${money(r.costEquivUsd)} subscription-equivalent)`);
+      const cost = formatCost(r.costUsd, r.costEquivUsd);
+      console.log(`cost ${cost.primary}${cost.paid ? ` ${cost.paid} paid` : ""} (${cost.title})`);
       console.log(color.bold("\nStages"));
       for (const s of d.stages)
         console.log(`  ${s.name.padEnd(10)} ${statusColor(s.status).padEnd(18)} ${s.summary ?? ""}`);

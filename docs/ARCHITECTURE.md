@@ -88,6 +88,7 @@ A **run** is one request. It moves through **stages**; each stage makes one or m
 | gates — setup/lint/typecheck/test, compared to baseline | ✓ | ✓ | ✓ | factory (no LLM) |
 | audit — reward-hacking & scope checks on the diff | ✓ | ✓ | ✓ | factory (no LLM) |
 | review — rubric review by a **different vendor** | light | ✓ | ×2 | cross-vendor |
+| preview — build/seed/serve matching UI changes on loopback | – | if configured | if configured | factory (no LLM) |
 | verify — run holdout scenarios, judge each acceptance criterion | – | ✓ | ✓ | different session/vendor |
 | deliver — commit, push, PR with evidence report, merge policy | ✓ | ✓ | ✓ | factory (no LLM) + cheap summary |
 
@@ -95,6 +96,14 @@ Failures in gates/audit/review/verify send **structured feedback** back to imple
 session resumed with the feedback file), bounded by `max_rounds`. After repeated failure the
 implementer is **escalated** one tier (e.g. local → Sonnet → Opus) carrying the failure context,
 before the run is marked `needs_human`.
+
+The optional preview configuration is validated and saved from the base revision during prepare,
+before model calls. A matching committed diff starts an isolated preview immediately before a new
+verify attempt; reused round results do not start one. Build and seed use scratch HOME/TMPDIR,
+reserved environment keys are enforced, and readiness stays on the loopback preview origin. The
+server and scratch are torn down on success, failure or cancellation. Browser/MCP integration is
+a separate step. Older runs without a snapshot restore it once from their recorded base SHA on
+resume, before any model calls; the edited worktree configuration is never used.
 
 ### Why the holdout author is blind (our twist on StrongDM's scenarios)
 StrongDM keeps scenarios in a directory the agent can't read. We go one better and cheaper: the
@@ -175,7 +184,7 @@ detection, per-invocation budget, process-group kill on cancel.
 SQLite (`bun:sqlite`, WAL) at `~/.limitless/limitless.db`; large artifacts (event logs, diffs,
 prompts) as files under `~/.limitless/runs/<run-id>/`. Tables: `repos`, `runs`, `stages`,
 `invocations`, `events`, `artifacts`, `questions`, `provider_state`, `inbox` (webhook dedupe +
-audit), `chat_messages`, `settings`. Migrations are numbered SQL files applied at startup.
+audit), `chat_messages`, `settings`. The frozen legacy migrations and timestamped SQL files are applied at startup.
 
 On startup, runs left `running` by a crash/restart are re-queued and resume at the start of their
 current stage (the worktree is preserved; Claude sessions can be resumed).

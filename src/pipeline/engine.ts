@@ -35,6 +35,7 @@ import {
   RunContext,
   type RunState,
 } from "./context.ts";
+import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
   formatGateFeedback,
@@ -88,6 +89,15 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run);
+    if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined) {
+      if (!ctx.run.baseSha || !ctx.state.worktreePath)
+        throw new Error("Cannot restore base preview configuration: missing base SHA or worktree");
+      // Upgrade older runs using the trusted revision, never the edited worktree config.
+      ctx.state.previewConfig = readPreviewConfig(
+        await readFileAt(ctx.state.worktreePath, ctx.run.baseSha, ".limitless.toml"),
+      );
+      ctx.save();
+    }
     if (ctx.state.phase === "prepare") await prepare(ctx);
     if (ctx.state.phase === "triage") await triage(ctx);
     if (ctx.state.phase === "clarify") await clarify(ctx);
@@ -147,6 +157,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       throw new Error("PR head moved before preparation");
     ctx.state.worktreePath = wt.path;
     ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha: wt.baseSha, branch: wt.branch });
+    ctx.state.previewConfig = readPreviewConfig(await readFileAt(wt.path, wt.baseSha, ".limitless.toml"));
     const gates = detectGates(wt.path);
     ctx.state.gatesConfig = gates;
     ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
@@ -419,7 +430,10 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           {},
         ];
         constraints =
-          options.find((c) => ctx.deps.router.route("implement", ctx.complexity, c).candidates.length) ?? {};
+          options.find(
+            (c) =>
+              ctx.deps.router.route("implement", ctx.complexity, ctx.routingConstraints(c)).candidates.length,
+          ) ?? {};
         ctx.log(`Escalating implementer beyond ${current.modelId}`, "warn", { constraints });
         ctx.state.roundsOnImplementer = 0;
       }
@@ -668,105 +682,128 @@ async function oneRound(
     if (failure) throw failure;
   }
   if (!ctx.state.holdout) throw new NeedsHumanError("Holdout scenarios are unavailable");
-  const verifyAttempt = async (attempt: number, excludeModels: string[] = []): Promise<Verify> =>
-    ctx.stage(
-      "verify",
-      async (stage) => {
-        const { result, target } = await ctx.invoke({
-          role: "verify",
-          stage,
-          mode: "readonly",
-          complexity: ctx.complexity,
-          constraints: { avoidVendor: ctx.state.implementer?.vendor, excludeModels },
-          timeoutMs: readingTimeout(diff.added + diff.removed, 25),
-          prompt: verifyPrompt({
-            prompt: ctx.run.prompt,
-            spec: ctx.state.spec as Spec,
-            holdout: ctx.state.holdout as Holdout,
-            baseSha,
-            checks: ctx.state.lastGates,
-          }),
-          jsonSchema: toStrictJsonSchema(VerifySchema),
-          schema: VerifySchema,
-          requireStructured: true,
-          privateSession: true,
-          redactHoldout: true,
-        });
-        await discardChanges(cwd);
-        const v = normalizeVerify(
-          VerifySchema.parse(result.structured),
-          ctx.state.spec as Spec,
-          ctx.state.holdout as Holdout,
+  const previewConfig = ctx.state.previewConfig ?? null;
+  let preview: Preview | null = null;
+  const stopPreview = async () => {
+    await preview?.stop();
+  };
+  try {
+    const verifyAttempt = async (attempt: number, excludeModels: string[] = []): Promise<Verify> => {
+      if (!preview && previewConfig && needsPreview(previewConfig, diff)) {
+        preview = await ctx.stage(
+          "preview",
+          async () => {
+            const server = await startPreview(cwd, previewConfig, ctx.signal);
+            ctx.log(`Preview ready at ${server.url}`);
+            return { summary: `ready at ${server.url}`, value: server };
+          },
+          round,
         );
-        ctx.state.lastVerify = { ...v, modelId: target.modelId };
-        ctx.state.verifyResults = [
-          ...(ctx.state.verifyResults ?? []),
-          { ...v, modelId: target.modelId, round, attempt },
-        ];
-        ctx.save();
-        const publicSources = await ctx.publicHoldoutSources();
-        ctx.store.putArtifact(
-          ctx.run.id,
-          attempt === 0 ? `verify-${round}.json` : `verify-${round}-retry.json`,
-          "verify",
-          JSON.stringify(
+        ctx.previewUrl = preview.url;
+      }
+      return ctx.stage(
+        "verify",
+        async (stage) => {
+          const { result, target } = await ctx.invoke({
+            role: "verify",
+            stage,
+            mode: "readonly",
+            complexity: ctx.complexity,
+            constraints: { avoidVendor: ctx.state.implementer?.vendor, excludeModels },
+            timeoutMs: readingTimeout(diff.added + diff.removed, 25),
+            prompt: verifyPrompt({
+              prompt: ctx.run.prompt,
+              spec: ctx.state.spec as Spec,
+              holdout: ctx.state.holdout as Holdout,
+              baseSha,
+              checks: ctx.state.lastGates,
+            }),
+            jsonSchema: toStrictJsonSchema(VerifySchema),
+            schema: VerifySchema,
+            requireStructured: true,
+            privateSession: true,
+            redactHoldout: true,
+          });
+          await discardChanges(cwd);
+          const v = normalizeVerify(
+            VerifySchema.parse(result.structured),
+            ctx.state.spec as Spec,
+            ctx.state.holdout as Holdout,
+          );
+          ctx.state.lastVerify = { ...v, modelId: target.modelId };
+          ctx.state.verifyResults = [
+            ...(ctx.state.verifyResults ?? []),
             { ...v, modelId: target.modelId, round, attempt },
-            (_key, value: unknown) =>
-              typeof value === "string"
-                ? redactHoldoutText(value, ctx.state.holdout as Holdout, publicSources)
-                : value,
-            2,
-          ),
+          ];
+          ctx.save();
+          const publicSources = await ctx.publicHoldoutSources();
+          ctx.store.putArtifact(
+            ctx.run.id,
+            attempt === 0 ? `verify-${round}.json` : `verify-${round}-retry.json`,
+            "verify",
+            JSON.stringify(
+              { ...v, modelId: target.modelId, round, attempt },
+              (_key, value: unknown) =>
+                typeof value === "string"
+                  ? redactHoldoutText(value, ctx.state.holdout as Holdout, publicSources)
+                  : value,
+              2,
+            ),
+          );
+          const met = v.criteria.filter((c) => c.status === "met").length;
+          return {
+            summary: `${v.overall}: ${met}/${v.criteria.length} criteria met (${target.modelId})`,
+            value: v,
+          };
+        },
+        round,
+      );
+    };
+    const previous = (ctx.state.verifyResults ?? []).filter((v) => v.round === round);
+    let verify = previous.at(-1) ?? (await verifyAttempt(0));
+    const publicSources = await ctx.publicHoldoutSources();
+    if (blockedOnly(verify)) {
+      const stop = (routing = ""): never => {
+        const evidence = verify.criteria
+          .filter((c) => c.status === "blocked")
+          .map((c) => `${c.id}: ${c.evidence}`)
+          .join("\n");
+        const detail = redactHoldoutText(
+          `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`,
+          ctx.state.holdout as Holdout,
+          publicSources,
         );
-        const met = v.criteria.filter((c) => c.status === "met").length;
-        return {
-          summary: `${v.overall}: ${met}/${v.criteria.length} criteria met (${target.modelId})`,
-          value: v,
-        };
-      },
-      round,
-    );
-  const previous = (ctx.state.verifyResults ?? []).filter((v) => v.round === round);
-  let verify = previous.at(-1) ?? (await verifyAttempt(0));
-  const publicSources = await ctx.publicHoldoutSources();
-  if (blockedOnly(verify)) {
-    const stop = (routing = ""): never => {
-      const evidence = verify.criteria
-        .filter((c) => c.status === "blocked")
-        .map((c) => `${c.id}: ${c.evidence}`)
-        .join("\n");
-      const detail = redactHoldoutText(
-        `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`,
-        ctx.state.holdout as Holdout,
+        ctx.state.terminalReason = detail;
+        ctx.save();
+        throw new NeedsHumanError(detail);
+      };
+      if (ctx.state.environmentRetryRound === round || previous.some((v) => v.attempt === 1)) stop();
+      ctx.state.environmentRetryRound = round;
+      ctx.save();
+      const firstModel = ctx.state.lastVerify?.modelId;
+      try {
+        verify = await verifyAttempt(1, firstModel ? [firstModel] : []);
+      } catch (error) {
+        if (error instanceof NoCapacityError) stop(error.message);
+        throw error;
+      }
+      if (blockedOnly(verify)) stop();
+    }
+    if (verify.overall !== "pass") {
+      ctx.state.feedback = formatVerifyFeedback(
+        verify,
+        ctx.state.spec ?? null,
+        ctx.state.holdout,
         publicSources,
       );
-      ctx.state.terminalReason = detail;
       ctx.save();
-      throw new NeedsHumanError(detail);
-    };
-    if (ctx.state.environmentRetryRound === round || previous.some((v) => v.attempt === 1)) stop();
-    ctx.state.environmentRetryRound = round;
-    ctx.save();
-    const firstModel = ctx.state.lastVerify?.modelId;
-    try {
-      verify = await verifyAttempt(1, firstModel ? [firstModel] : []);
-    } catch (error) {
-      if (error instanceof NoCapacityError) stop(error.message);
-      throw error;
+      return false;
     }
-    if (blockedOnly(verify)) stop();
+    return true;
+  } finally {
+    ctx.previewUrl = undefined;
+    await stopPreview();
   }
-  if (verify.overall !== "pass") {
-    ctx.state.feedback = formatVerifyFeedback(
-      verify,
-      ctx.state.spec ?? null,
-      ctx.state.holdout,
-      publicSources,
-    );
-    ctx.save();
-    return false;
-  }
-  return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,13 +1,42 @@
 import { expect, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Server } from "bun";
 import { evalCommand, formatEvalReport } from "../src/cli/eval.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { evalFixture } from "./evals-support.ts";
 import { type Route, requestWithParams } from "./mcp-support.ts";
 
-test("CLI submits all options through HTTP, follows terminal results, and emits clean JSON", async () => {
+const evalRoles = test.each(["triage", "implement"] as const);
+evalRoles("CLI %s submits options, follows HTTP results and emits JSON", async (role) => {
   const f = await evalFixture();
   try {
+    if (role === "implement") {
+      for (const item of f.dataset.cases) {
+        mkdirSync(join(f.home, "hidden", item.id), { recursive: true });
+        writeFileSync(join(f.home, "hidden", item.id, "check"), "test -f answer");
+      }
+      writeFileSync(
+        f.casePath,
+        JSON.stringify({
+          role,
+          version: 1,
+          cases: f.dataset.cases.map((c) => ({
+            id: c.id,
+            repo: c.repo,
+            prompt: c.prompt,
+            base: f.sha,
+            head: "f".repeat(40),
+            complexity: "small",
+            spec: null,
+            source: "fixture",
+            tags: [],
+            hidden: { files: ["check"], command: "sh check" },
+          })),
+        }),
+      );
+      f.respond(() => ({ files: { answer: "correct" } }));
+    }
     const routes = createHttpRoutes(f.factory);
     const printed: string[] = [];
     const bodies: unknown[] = [];
@@ -37,7 +66,7 @@ test("CLI submits all options through HTTP, follows terminal results, and emits 
       },
     };
     await evalCommand(
-      ["run", "triage"],
+      ["run", role],
       {
         models: "candidate-b,candidate-a",
         k: "2",
@@ -49,7 +78,7 @@ test("CLI submits all options through HTTP, follows terminal results, and emits 
       io,
     );
     expect(bodies[0]).toEqual({
-      role: "triage",
+      role,
       models: ["candidate-b", "candidate-a"],
       k: 2,
       caseIds: ["c", "a"],
@@ -67,12 +96,12 @@ test("CLI submits all options through HTTP, follows terminal results, and emits 
     expect(JSON.parse(printed[0] ?? "{}")).toEqual(f.factory.evals.report(id));
     expect(printed[0]).not.toContain("\x1b");
     await expect(evalCommand(["report", "missing"], {}, io)).rejects.toThrow("eval not found");
-    await expect(evalCommand(["run", "triage"], { models: "candidate-a", k: "bad" }, io)).rejects.toThrow(
+    await expect(evalCommand(["run", role], { models: "candidate-a", k: "bad" }, io)).rejects.toThrow(
       "finite number",
     );
-    await expect(evalCommand(["run", "triage"], {}, io)).rejects.toThrow("--models");
+    await expect(evalCommand(["run", role], {}, io)).rejects.toThrow("--models");
     printed.length = 0;
-    await evalCommand(["run", "triage"], { models: "candidate-a", "max-usd": "0", follow: true }, io);
+    await evalCommand(["run", role], { models: "candidate-a", "max-usd": "0", follow: true }, io);
     expect(printed[1]).toContain("budget_exhausted");
     expect(printed[1]).toContain("pass n/a");
     const report = f.factory.evals.report(id);

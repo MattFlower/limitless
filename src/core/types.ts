@@ -40,6 +40,7 @@ export type StageName =
   | "gates"
   | "audit"
   | "review"
+  | "preview"
   | "verify"
   | "deliver";
 
@@ -292,6 +293,7 @@ export interface DrainState {
 export interface HealthResponse extends DrainState {
   ok: boolean;
   uptimeMs: number;
+  sha: string;
 }
 
 export interface ChatProposalFields {
@@ -353,7 +355,7 @@ export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed";
 export interface EvalRun {
   id: string;
-  role: "triage" | "review" | "verify";
+  role: "triage" | "review" | "verify" | "implement";
   models: string[];
   k: number;
   maxUsd: number;
@@ -370,6 +372,15 @@ export interface EvalGrade {
     { predicted: string | boolean; accepted: (string | boolean)[]; match: boolean; weight: number }
   >;
   riskUnderCall: boolean | null;
+  implement?: {
+    reason: "hidden_tests" | "gates" | "audit" | "error" | "timeout" | null;
+    error?: string;
+    commit: string | null;
+    gates: import("../gates/run.ts").GateComparison[];
+    auditBlocks: import("../gates/audit.ts").AuditFinding[];
+    auditWarnings: import("../gates/audit.ts").AuditFinding[];
+    hidden: { exitCode: number | null; timedOut: boolean; output: string } | null;
+  };
   review?: {
     requiredMatched: number;
     requiredTotal: number;
@@ -411,6 +422,7 @@ export interface EvalTrial {
   pass: boolean | null;
   score: number | null;
   details: {
+    complexity?: "trivial" | "small" | "medium";
     provider?: string;
     reason?: string;
     grade?: EvalGrade;

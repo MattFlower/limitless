@@ -1,0 +1,154 @@
+diff --git a/README.md b/README.md
+index 27f0d8d..b6e2d8c 100644
+--- a/README.md
++++ b/README.md
+@@ -7,6 +7,9 @@ Small text utilities and a CLI. This repository is a playground for the
+ bun install
+ bun src/cli.ts slugify "Hello, World!"   # hello-world
+ bun src/cli.ts strip-punctuation "Hi, world! #1 @home + 2"   # Hi world 1 home 2
++bun src/cli.ts freq --top 2 --ignore-case "The cat and the hat"
++# 2 the
++# 1 cat
+ bun src/cli.ts reading-time "Hello, World!"   # 1 minute (default 200 wpm; override with --wpm N)
+ bun src/cli.ts stats "Hello world!"
+ # Characters    12
+diff --git a/src/cli.ts b/src/cli.ts
+index c8363d3..13a0e9a 100644
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -7,6 +7,7 @@ import {
+   titleCase,
+   truncate,
+   wordCount,
++  wordFrequencies,
+ } from "./text.ts";
+ 
+ const USAGE = `textkit <command> <text>
+@@ -18,7 +19,9 @@ Commands:
+   stats [--json] <text>           Text statistics
+   truncate <max> <text>           Shorten text
+   title <text>                    Title Case
+-  strip-punctuation <text>        Remove punctuation and normalize whitespace`;
++  strip-punctuation <text>        Remove punctuation and normalize whitespace
++  freq [--top N] [--ignore-case] <text>
++                                  Word frequencies, most frequent first`;
+ 
+ function formatStats(text: string, json: boolean): string {
+   const stats = textStats(text);
+@@ -35,6 +38,29 @@ function formatStats(text: string, json: boolean): string {
+   return rows.map(([label, value]) => `${label.padEnd(labelWidth)}  ${value}`).join("\n");
+ }
+ 
++function formatFrequencies(args: string[]): string {
++  let top = Number.POSITIVE_INFINITY;
++  let ignoreCase = false;
++  let rest = args;
++  for (;;) {
++    const [flag, ...tail] = rest;
++    if (flag === "--ignore-case") {
++      ignoreCase = true;
++      rest = tail;
++    } else if (flag === "--top") {
++      const [value, ...words] = tail;
++      top = Number(value);
++      if (!Number.isInteger(top) || top < 1)
++        throw new RangeError("--top must be a positive integer");
++      rest = words;
++    } else break;
++  }
++  return wordFrequencies(rest.join(" "), { ignoreCase })
++    .slice(0, top)
++    .map(({ word, count }) => `${count} ${word}`)
++    .join("\n");
++}
++
+ export function run(argv: string[]): string {
+   const [cmd, ...rest] = argv;
+   switch (cmd) {
+@@ -61,6 +87,8 @@ export function run(argv: string[]): string {
+       return titleCase(rest.join(" "));
+     case "strip-punctuation":
+       return stripPunctuation(rest.join(" "));
++    case "freq":
++      return formatFrequencies(rest);
+     default:
+       return USAGE;
+   }
+diff --git a/src/text.ts b/src/text.ts
+index f750a49..a7bfe23 100644
+--- a/src/text.ts
++++ b/src/text.ts
+@@ -72,3 +72,28 @@ export function stripPunctuation(text: string): string {
+     .replace(/\s+/g, " ")
+     .trim();
+ }
++
++export interface WordFrequency {
++  word: string;
++  count: number;
++}
++
++/**
++ * Count words, most frequent first; ties keep the order in which words first appear.
++ * Leading and trailing punctuation is ignored ("Hello," counts as "Hello"); inner punctuation
++ * such as apostrophes and hyphens is kept.
++ */
++export function wordFrequencies(
++  text: string,
++  options: { ignoreCase?: boolean } = {},
++): WordFrequency[] {
++  const counts = new Map<string, number>();
++  for (const token of text.split(/\s+/)) {
++    let word = token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{M}\p{N}]+$/gu, "");
++    if (!word) continue;
++    if (options.ignoreCase) word = word.toLowerCase();
++    counts.set(word, (counts.get(word) ?? 0) + 1);
++  }
++  // Array.prototype.sort is stable, so equal counts stay in first-appearance order.
++  return [...counts].map(([word, count]) => ({ word, count })).sort((a, b) => b.count - a.count);
++}
+diff --git a/test/text.test.ts b/test/text.test.ts
+index dfa1625..64782ce 100644
+--- a/test/text.test.ts
++++ b/test/text.test.ts
+@@ -8,6 +8,7 @@ import {
+   titleCase,
+   truncate,
+   wordCount,
++  wordFrequencies,
+ } from "../src/text.ts";
+ 
+ describe("slugify", () => {
+@@ -162,3 +163,32 @@ describe("cli", () => {
+   test("strip-punctuation usage", () => expect(run([])).toContain("strip-punctuation <text>"));
+   test("usage", () => expect(run([])).toContain("Commands:"));
+ });
++
++describe("wordFrequencies", () => {
++  test("most frequent first, ties in first-appearance order", () => {
++    expect(wordFrequencies("b a b c a b")).toEqual([
++      { word: "b", count: 3 },
++      { word: "a", count: 2 },
++      { word: "c", count: 1 },
++    ]);
++  });
++  test("strips surrounding punctuation only", () => {
++    expect(wordFrequencies('"Hi," don\'t — well-known.')).toEqual([
++      { word: "Hi", count: 1 },
++      { word: "don't", count: 1 },
++      { word: "well-known", count: 1 },
++    ]);
++  });
++  test("case sensitivity", () => {
++    expect(wordFrequencies("A a").map((f) => f.word)).toEqual(["A", "a"]);
++    expect(wordFrequencies("A a", { ignoreCase: true })).toEqual([{ word: "a", count: 2 }]);
++  });
++  test("empty text", () => expect(wordFrequencies(" ... ")).toEqual([]));
++  test("freq command", () => {
++    expect(run(["freq", "a", "b", "b"])).toBe("2 b\n1 a");
++    expect(run(["freq", "--ignore-case", "--top", "1", "A", "a", "b"])).toBe("2 a");
++    expect(run(["freq"])).toBe("");
++    expect(() => run(["freq", "--top", "0", "a"])).toThrow(RangeError);
++  });
++  test("freq usage", () => expect(run([])).toContain("freq [--top N] [--ignore-case] <text>"));
++});

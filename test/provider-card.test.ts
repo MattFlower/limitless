@@ -136,14 +136,14 @@ test("OpenRouter card keeps one budget gauge and reports only material differenc
   const free = renderToString(() =>
     ProviderCard({ provider: { ...status, id: "mtplx", billing: "free" }, workload }),
   );
-  expect(free.replace(/<[^>]*>/g, "")).toContain("Saved (API-equiv.)");
+  expect(free).toContain("API-equivalent work");
   const empty = renderToString(() =>
     ProviderCard({
       provider: { ...status, id: "twilight", billing: "free" },
       workload: workloadFor("twilight", []),
     }),
   );
-  expect(empty.replace(/<[^>]*>/g, "")).toContain("Saved (API-equiv.)");
+  expect(empty).toContain("API-equivalent work");
   expect(empty).toContain("$0.00");
 });
 

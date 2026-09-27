@@ -28,6 +28,7 @@ import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from ".
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
+import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
@@ -47,6 +48,7 @@ export interface RunState {
   phase: Phase;
   worktreePath?: string;
   gatesConfig?: GateConfig;
+  previewConfig?: PreviewConfig | null;
   baseline?: GateRun | null;
   triage?: Triage;
   spec?: Spec | null;
@@ -167,7 +169,16 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
 export class RunContext {
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
   readonly runDir: string;
+  previewUrl?: string;
   state: RunState;
+
+  get freeFirstRouting(): boolean {
+    return this.run.requestedBy === "dependabot[bot]" && this.deps.cfg.dependabotRouting === "free_first";
+  }
+
+  routingConstraints(constraints: RouteConstraints = {}): RouteConstraints {
+    return this.freeFirstRouting ? { ...constraints, billing: "free_first" } : constraints;
+  }
 
   constructor(
     readonly deps: EngineDeps,
@@ -295,7 +306,11 @@ export class RunContext {
 
     for (let attempt = 0; attempt < 6; attempt++) {
       this.checkCancelled();
-      const decision = router.route(opts.role, opts.complexity, { ...opts.constraints, exclude: tried });
+      const decision = router.route(
+        opts.role,
+        opts.complexity,
+        this.routingConstraints({ ...opts.constraints, exclude: tried }),
+      );
       const target = decision.candidates[0];
       if (!target) {
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");

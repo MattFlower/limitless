@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
@@ -123,7 +123,10 @@ export const VerifyCaseSchema = z
       if (!ids.includes(id))
         ctx.addIssue({ code: "custom", path: ["gold", id], message: "unknown gold criterion ID" });
   });
-function envelope<R extends "review" | "verify", T extends z.ZodType<{ id: string }>>(role: R, item: T) {
+function envelope<R extends "review" | "verify" | "implement", T extends z.ZodType<{ id: string }>>(
+  role: R,
+  item: T,
+) {
   return z
     .strictObject({
       role: z.literal(role),
@@ -140,6 +143,45 @@ function envelope<R extends "review" | "verify", T extends z.ZodType<{ id: strin
       }
     });
 }
+const safePath = z
+  .string()
+  .min(1)
+  .refine(
+    (path) =>
+      !isAbsolute(path) &&
+      !/[\\\0:]/.test(path) &&
+      path
+        .split("/")
+        .every((part) => part !== "" && part !== "." && part !== ".." && part.toLowerCase() !== ".git"),
+    "expected safe repository-relative path",
+  );
+export const ImplementCaseSchema = z.strictObject({
+  ...repositoryCase,
+  id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/),
+  complexity: z.enum(["trivial", "small", "medium"]),
+  prompt: z.string().refine((s) => s.trim().length > 0, "prompt must not be blank"),
+  spec: SpecSchema.nullable(),
+  hidden: z.strictObject({
+    files: z.array(safePath).refine((paths) => new Set(paths).size === paths.length, "duplicate hidden path"),
+    command: nonempty,
+    timeoutSec: z.number().finite().positive().default(900),
+  }),
+  source: nonempty,
+  tags: z.array(nonempty),
+  notes: z.string().optional(),
+});
+export const ImplementCaseFileSchema = envelope("implement", ImplementCaseSchema);
+export type ImplementCase = z.infer<typeof ImplementCaseSchema>;
+export function hiddenContents(item: ImplementCase, casePath: string) {
+  const root = realpathSync(dirname(casePath));
+  return item.hidden.files.map((path) => {
+    const source = realpathSync(resolve(root, "hidden", item.id, path));
+    const rel = relative(root, source);
+    if (rel === ".." || rel.startsWith("../") || isAbsolute(rel) || !statSync(source).isFile())
+      throw new Error(`invalid hidden file: ${path}`);
+    return { path, content: readFileSync(source), mode: statSync(source).mode & 0o777 };
+  });
+}
 export const ReviewCaseFileSchema = envelope("review", ReviewCaseSchema);
 export const VerifyCaseFileSchema = envelope("verify", VerifyCaseSchema);
 export type ReviewCase = z.infer<typeof ReviewCaseSchema>;
@@ -147,19 +189,28 @@ export type VerifyCase = z.infer<typeof VerifyCaseSchema>;
 export type AnyCaseFile =
   | CaseFile
   | z.infer<typeof ReviewCaseFileSchema>
-  | z.infer<typeof VerifyCaseFileSchema>;
-export type EvalCase = TriageCase | ReviewCase | VerifyCase;
-export function defaultCasePath(role: "triage" | "review" | "verify"): string {
+  | z.infer<typeof VerifyCaseFileSchema>
+  | z.infer<typeof ImplementCaseFileSchema>;
+export type EvalCase = TriageCase | ReviewCase | VerifyCase | ImplementCase;
+export function defaultCasePath(role: "triage" | "review" | "verify" | "implement"): string {
   return fileURLToPath(new URL(`../../evals/${role}/cases.json`, import.meta.url));
 }
 export function loadRoleCases(
-  role: "triage" | "review" | "verify",
+  role: "triage" | "review" | "verify" | "implement",
   path = defaultCasePath(role),
 ): AnyCaseFile {
   try {
     const schema =
-      role === "triage" ? CaseFileSchema : role === "review" ? ReviewCaseFileSchema : VerifyCaseFileSchema;
-    return schema.parse(JSON.parse(readFileSync(path, "utf8")));
+      role === "triage"
+        ? CaseFileSchema
+        : role === "review"
+          ? ReviewCaseFileSchema
+          : role === "implement"
+            ? ImplementCaseFileSchema
+            : VerifyCaseFileSchema;
+    const file = schema.parse(JSON.parse(readFileSync(path, "utf8")));
+    if (file.role === "implement") for (const item of file.cases) hiddenContents(item, path);
+    return file;
   } catch (error) {
     throw new Error(
       `Invalid ${role} eval cases ${path}: ${(error as Error).message}${role === "verify" ? "; curate evals/verify/cases.json before running verify evals" : ""}`,
@@ -171,7 +222,7 @@ const unique = z
   .min(1)
   .refine((ids) => new Set(ids).size === ids.length, "duplicate IDs");
 export const EvalRequestSchema = z.strictObject({
-  role: z.enum(["triage", "review", "verify"]),
+  role: z.enum(["triage", "review", "verify", "implement"]),
   models: z.array(z.string().min(1)).min(1),
   k: z.number().int().positive().default(1),
   maxUsd: z.number().finite().nonnegative().default(1),

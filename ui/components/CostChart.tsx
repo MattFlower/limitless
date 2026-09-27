@@ -1,7 +1,10 @@
 import type { Component } from "solid-js";
 import { createMemo, For, Show } from "solid-js";
 import type { DayStats } from "../../src/db/stats.ts";
-import { money } from "../lib/format.ts";
+
+function chartMoney(value: number): string {
+  return `$${value.toFixed(2)}`;
+}
 
 function dayLabel(day: string): string {
   return new Date(`${day}T00:00:00`).toLocaleDateString(undefined, {
@@ -12,11 +15,11 @@ function dayLabel(day: string): string {
 }
 
 export function costBarLabel(day: DayStats): string {
-  return `${dayLabel(day.day)}: metered ${money(day.costUsd)}, API-equivalent ${money(day.costEquivUsd)}, ${day.runs} ${day.runs === 1 ? "run" : "runs"}`;
+  return `${dayLabel(day.day)}: metered ${chartMoney(day.costUsd)}, subscription/local ${chartMoney(Math.max(0, day.costEquivUsd - day.costUsd))}, API-equivalent total ${chartMoney(Math.max(day.costUsd, day.costEquivUsd))}, ${day.runs} ${day.runs === 1 ? "run" : "runs"}`;
 }
 
 export const CostChart: Component<{ days: DayStats[] }> = (props) => {
-  const max = createMemo(() => Math.max(0.01, ...props.days.map((d) => d.costUsd + d.costEquivUsd)));
+  const max = createMemo(() => Math.max(0.01, ...props.days.map((d) => Math.max(d.costUsd, d.costEquivUsd))));
   const totals = createMemo(() =>
     props.days.reduce(
       (sum, d) => ({ metered: sum.metered + d.costUsd, equivalent: sum.equivalent + d.costEquivUsd }),
@@ -30,9 +33,10 @@ export const CostChart: Component<{ days: DayStats[] }> = (props) => {
         <div class="cost-bars">
           <For each={props.days}>
             {(d) => {
-              const height = () => ((d.costUsd + d.costEquivUsd) / max()) * 100;
+              const total = () => Math.max(d.costUsd, d.costEquivUsd);
+              const height = () => (total() / max()) * 100;
               const metered = () => (d.costUsd / max()) * 100;
-              const equivalent = () => (d.costEquivUsd / max()) * 100;
+              const subscription = () => (Math.max(0, d.costEquivUsd - d.costUsd) / max()) * 100;
               return (
                 <div class="cost-column">
                   <div
@@ -44,25 +48,26 @@ export const CostChart: Component<{ days: DayStats[] }> = (props) => {
                   >
                     <span class="cost-tooltip" aria-hidden="true">
                       <strong>{dayLabel(d.day)}</strong>
-                      <span>Metered: {money(d.costUsd)}</span>
-                      <span>API-equivalent: {money(d.costEquivUsd)}</span>
+                      <span>Metered: {chartMoney(d.costUsd)}</span>
+                      <span>Subscription/local: {chartMoney(Math.max(0, d.costEquivUsd - d.costUsd))}</span>
+                      <span>API-equivalent total: {chartMoney(total())}</span>
                       <span>Runs: {d.runs}</span>
                     </span>
                     <Show
                       when={
                         height() >= 18 &&
-                        d.costUsd + d.costEquivUsd > 0 &&
-                        (props.days.length <= 7 || money(d.costUsd + d.costEquivUsd).length <= 6)
+                        total() > 0 &&
+                        (props.days.length <= 7 || chartMoney(total()).length <= 6)
                       }
                     >
                       <span class="cost-value" style={{ bottom: `${height()}%` }}>
-                        {money(d.costUsd + d.costEquivUsd)}
+                        {chartMoney(total())}
                       </span>
                     </Show>
                     <span class="cost-stack" style={{ height: `${height()}%` }}>
                       <span
                         class="cost-equivalent"
-                        style={{ height: `${(equivalent() / (height() || 1)) * 100}%` }}
+                        style={{ height: `${(subscription() / (height() || 1)) * 100}%` }}
                       />
                       <span
                         class="cost-metered"
@@ -88,14 +93,15 @@ export const CostChart: Component<{ days: DayStats[] }> = (props) => {
       <Show when={props.days.length}>
         <div class="cost-totals">
           <span>
-            Visible range · Metered <strong>{money(totals().metered)}</strong>
+            Visible range · Metered <strong>{chartMoney(totals().metered)}</strong>
           </span>
           <span>
-            API-equivalent <strong>{money(totals().equivalent)}</strong>
+            API-equivalent total <strong>{chartMoney(totals().equivalent)}</strong>
           </span>
         </div>
         <div class="cost-legend">
-          <span class="cost-legend-metered" /> Metered <span class="cost-legend-equivalent" /> API-equivalent
+          <span class="cost-legend-metered" /> Metered <span class="cost-legend-equivalent" />{" "}
+          Subscription/local
         </div>
       </Show>
     </div>
