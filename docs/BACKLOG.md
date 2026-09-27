@@ -4,6 +4,8 @@ From M2 on, Limitless builds itself. Each item below is submitted as a run again
 `MattFlower/limitless` (merge policy `pr`); the orchestrator reviews every PR, merges, and deploys
 with `limitless deploy`. Status is tracked here and in the UI.
 
+Open items now live as GitHub issues (label `backlog`, plus `m4`/`m5`/`m6`); this file keeps the history and links. Runs for them are started deliberately by the orchestrator, never picked up automatically. Also open: implement-role evals (issue #41).
+
 | # | Milestone | Task | Status |
 |---|---|---|---|
 | 1 | M3 | GitHub webhook trigger | done — #4 (+ GitHub IP allowlist by orchestrator); live on limitless-sandbox |
@@ -21,24 +23,24 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 13 | M4 | Discord `/run` → `/show` | done — #13 |
 | 14 | M4 | Enable/disable providers at runtime | done — #15 |
 | 15 | M4 | Fresher, Desktop-consistent quota readings | done — #16 (float rounding fix by orchestrator) |
-| 21 | M5 | Verify stage gets a writable scratch TMPDIR (tests needing temp dirs were "unclear") | todo |
-| 22 | M5 | A merged needs-human PR marks its run resolved in the UI | todo |
-| 23 | M5 | Deploy drain progress: one line per poll, not two | todo |
-| 24 | M4 | Reasoning effort as a routing dimension | todo |
-| 25 | M4 | External benchmark priors (Artificial Analysis, Terminal-Bench 4.0) | todo |
-| 26 | M4 | Capability-and-cost routing (monotonic escalation) | todo |
-| 27 | M4 | New-model intake pipeline | todo |
-| 28 | M4 | Aggregator providers: per-model rate limits and concurrency | todo |
-| 29 | M5 | Holdout feedback that is actionable but still blind | todo |
-| 30 | M5 | Later-round reviews don't move the goalposts | todo |
-| 31 | M5 | Verify artifacts: redact only private scenarios | todo |
-| 32 | M4 | Jev decisions harness: triage as typed questions | todo |
-| 33 | M5 | UI changes can be verified | todo |
-| 16 | M6 | Provider workload analytics | todo |
-| 17 | M6 | Config-defined providers + `limitless init` | todo |
-| 18 | M6 | Model-origin constraints | todo |
-| 19 | M6 | Discreet mode + approval-gated merges | todo |
-| 20 | M6 | Packaging: Homebrew tap + curl installer | todo |
+| 21 | M5 | Verify stage gets a writable scratch TMPDIR (tests needing temp dirs were "unclear") | done — #21 (scratch TMPDIR + verifier-declared blocked; heuristic replaced by orchestrator) |
+| 22 | M5 | A merged needs-human PR marks its run resolved in the UI | open — issue #39 |
+| 23 | M5 | Deploy drain progress: one line per poll, not two | open — issue #40 |
+| 24 | M4 | Reasoning effort as a routing dimension | done — #20 |
+| 25 | M4 | External benchmark priors (Artificial Analysis, Terminal-Bench 4.0) | open — issue #27 |
+| 26 | M4 | Capability-and-cost routing (monotonic escalation) | open — issue #28 |
+| 27 | M4 | New-model intake pipeline | open — issue #29 |
+| 28 | M4 | Aggregator providers: per-model rate limits and concurrency | open — issue #30 |
+| 29 | M5 | Holdout feedback that is actionable but still blind | done — #23 |
+| 30 | M5 | Later-round reviews don't move the goalposts | done — #26 (cited prior findings by orchestrator) |
+| 31 | M5 | Verify artifacts: redact only private scenarios | open — issue #31 |
+| 32 | M4 | Jev decisions harness: triage as typed questions | open — issue #32 |
+| 33 | M5 | UI changes can be verified | open — issue #33 |
+| 16 | M6 | Provider workload analytics | open — issue #34 |
+| 17 | M6 | Config-defined providers + `limitless init` | open — issue #35 |
+| 18 | M6 | Model-origin constraints | open — issue #36 |
+| 19 | M6 | Discreet mode + approval-gated merges | open — issue #37 |
+| 20 | M6 | Packaging: Homebrew tap + curl installer | open — issue #38 |
 
 ---
 
@@ -275,18 +277,11 @@ session) spend the same subscription in between, and the UI rounds to the neares
 
 ## 16–20. M6 (after M4/M5)
 
-- **16 Provider workload analytics** — per provider and role over time (day/week): invocations,
-  tokens, wall time, API-equivalent $, share of total; a UI page and `/api/stats/providers`.
-- **17 Config-defined providers + `limitless init`** — providers, models and policy come from config
-  (built-in presets for claude/codex/OpenRouter/OpenAI-compatible local servers); `init` detects
-  installed CLIs, their login type (subscription vs API key), and local servers, then writes config.
-- **18 Model-origin constraints** — catalog models carry an origin; config can exclude origins (the
-  work machine excludes China-origin models); the router enforces it and evals cover allowed models.
-- **19 Discreet mode + approval-gated merges** — per-repo: neutral branch/commit names, PR bodies
-  without Limitless branding or local links; a merge policy that waits for a required approval before
-  merging (or leaves merging to the human).
-- **20 Packaging** — compiled binaries on GitHub releases, a formula in `MattFlower/homebrew-recipes`,
-  and a curl installer (private-repo access needs a token; decide public vs private first).
+- 16: issue #34
+- 17: issue #35
+- 18: issue #36
+- 19: issue #37
+- 20: issue #38
 
 ## 24. Reasoning effort as a routing dimension
 
@@ -308,121 +303,19 @@ levers (e.g. gpt-6-luna scores ~18 on the AA index at effort none vs ~32 at high
 
 ## 25. External benchmark priors (Artificial Analysis, Terminal-Bench 4.0)
 
-Public benchmarks as priors, our own evals as the check (harness effects move scores by up to ~30
-points, and public leaderboards disagree with each other).
-
-- `limitless models sync` (and daily in the daemon): fetch the Artificial Analysis free API
-  (`x-api-key`, 1,000 requests/day, attribution required) for each catalog model via an explicit
-  `externalIds.artificialAnalysis` mapping; store intelligence/coding indices, per-benchmark scores
-  (incl. Terminal-Bench 4.0 when available), prices and speeds with a fetched-at time.
-- Show them on the Models page with attribution; show the public number next to our eval result
-  and flag large disagreements (often a harness problem worth investigating).
-- Use them (a) to shortlist which models are worth evaluating, (b) as the cold-start routing prior
-  for roles/models without local eval data (the policy generator marks such cells "prior only"),
-  and (c) Terminal-Bench 4.0 as the public baseline for the implement role until our agentic
-  implement evals exist.
-- Key: ARTIFICIAL_ANALYSIS_API_KEY in secrets.env (free tier, no commercial license: personal use,
-  attribution required, 1,000 requests/day).
-- Endpoint `GET https://artificialanalysis.ai/api/v2/data/llms/models` returns every model in one
-  response (~670 entries, ~0.6 MB). Each effort variant is its own entry (e.g. `gpt-6-luna-low`,
-  `gpt-6-luna-medium`, `claude-opus-5-5-high`, `qwen3-8-27b-low`), with `evaluations`
-  (artificial_analysis_intelligence_index, artificial_analysis_coding_index, terminalbench_v2_1,
-  terminalbench_hard, gpqa, hle, ifbench, …), `pricing` and speeds. Map each catalog
-  (model, effort) from item 24 to a slug explicitly.
-- Caching: at most one fetch per day (plus on demand), stored as a timestamped snapshot in SQLite
-  (raw payload + normalized rows); keep snapshots so every decision can cite the data it used; the
-  policy generator records the snapshot id. Never fetched from the browser.
-- Terminal-Bench (tbench.ai, 4.0 = 66 tasks) ranks (model @ effort, agent harness) pairs with
-  resolution rate ±95% CI, tokens and cost — e.g. "GPT-6 Astra (max) · Codex 58.2%",
-  "Fable 5.1 (max) · Claude Code 57.9%", "GLM-5.3 (max) · Claude Code 41.8%",
-  "Sonnet 5 (max) · Claude Code 12.4%". That matches how we run models (inside the claude/codex
-  harnesses), so it is the best public prior for the implement role. No JSON API (the table is in
-  the Next.js page payload): import it with a tolerant parser of the rendered leaderboard rows,
-  run on demand (it changes roughly monthly), tested against a saved fixture of the page text;
-  map rows to catalog (model, effort, harness). Each row carries a single effort, almost always the
-  top one, so Terminal-Bench gives each pair's ceiling, not its effort curve. Take the curve from
-  Artificial Analysis (every effort is its own entry) and measure it ourselves for cheap roles via
-  item 24; for implement, a rough prior for a lower effort is the Terminal-Bench top-effort score
-  scaled by Artificial Analysis's index ratio (effort ÷ top effort), marked "prior only".
-  Don't run Terminal-Bench ourselves: the leaderboard's
-  own cost column puts a full 4.0 run at $300–$9,600 per model.
-- The repository is public: never commit Artificial Analysis data (no redistribution). Snapshots
-  stay in the local database; the UI shows them with attribution; committed files (e.g.
-  routing/EVIDENCE.md) cite only the snapshot date and our own eval numbers.
-- Tests with a stubbed fetch; no network in tests.
+Tracked as issue #27.
 
 ## 26. Capability-and-cost routing (monotonic escalation)
 
-Owner direction: a repeatedly failed task must never go to a less capable agent, and we should never
-pay more than needed (Artificial Analysis's "Intelligence Index vs. Cost per Task" chart is the mental
-model). Replaces hand-assigned integer tiers. Depends on items 24 (effort) and 25 (priors).
-
-- Candidates are (model @ effort, harness). Each has a per-role **capability** score (prior from
-  public data: AA coding index / Terminal-Bench for implement, AA intelligence index for review and
-  verify; posterior from our evals) and a **cost per task on our axis**: local $0, metered $, and
-  subscription API-equivalent $ weighted by current quota headroom (cheap while plentiful, expensive
-  near the reserve), measured from invocation history per role.
-- Only Pareto-efficient candidates (on our cost axis) are eligible.
-- Latency is a constraint, not just a tie-breaker: each role gets a p50 latency budget from eval data
-  (e.g. review/verify ≤ 10 min); candidates over budget are ineligible. Owner feedback 2026-09-27:
-  DeepSeek V4 Pro (median 14 min/review, up to 33) slowed development with no quality edge.
-- Per role × task class, fit pass probability vs. capability from eval data (logistic) to get the
-  minimum capability for the target success rate (default 0.8); use the prior when a class has no
-  eval data. Record the fit and its data in routing/EVIDENCE.md.
-- First attempt: the cheapest eligible candidate above the task's minimum capability.
-- Retries (every role, not only implement): the next candidate must have capability strictly above
-  the maximum already tried on this task; cheapest such first; never a model that already failed it.
-- Feedback: repeated failures raise the task's own minimum; production outcomes shift per-class
-  thresholds (the drift loop in docs/EVALS.md).
-- UI: show each candidate on a capability-vs-cost chart with the Pareto line and the thresholds.
-- Tests: Pareto filtering, threshold fitting on synthetic data, monotonic retries (never down,
-  never repeat), quota-weighted cost reacting to headroom.
+Tracked as issue #28.
 
 ## 27. New-model intake pipeline
 
-New models arrive constantly (the Artificial Analysis snapshot of 2026-09-26 lists 48 entries released
-since 2026-09-01), so the catalog can't be curated by hand. Depends on items 24–26; pairs with M6
-item 17 (catalog as data, not code).
-
-- The AA free API has indices, per-benchmark scores (incl. terminalbench_v2_1, terminalbench_hard),
-  per-token prices, release dates and (sparse) speeds, per effort variant — but not cost per task
-  (tokens used × price). Estimate cost per task as price × tokens-per-task learned from our own
-  invocations at that effort (tokens scale strongly with effort); replace with measured values once
-  the model has been evaluated.
-- Detect: the daily snapshot diff lists new/removed entries; check availability against what our
-  providers actually serve (OpenRouter's model list; models the claude/codex CLIs accept).
-- Screen: available to us, allowed by origin policy (unknown lineage fails closed), and on or near
-  our cost-capability frontier by its public scores. Everything else is ignored at no cost.
-- Evaluate: survivors run the cheap evals (triage + a review subset) under a per-model budget
-  (default $1); results replace the public prior.
-- Propose: when a newcomer (or a retirement) would change a routing cell, the policy generator
-  opens a PR with the evidence; merging it is the approval.
-- Mapping: AA entries ↔ provider model ids are matched explicitly; unmatched or ambiguous ones go to
-  a "needs mapping" list in the UI for a human to confirm, never guessed.
-- Tests: snapshot diffing, screening rules, budget enforcement, PR proposal content (fakes only).
+Tracked as issue #29.
 
 ## 28. Aggregator providers: per-model rate limits and concurrency
 
-Found in the 2026-09-26 triage sweep: OpenRouter returned HTTP 429 for one model (Ministral), the
-direct-HTTP harness reported "quota", and the tracker marked the whole OpenRouter provider exhausted,
-skipping every later trial. In production that would block all OpenRouter models (the DeepSeek/GLM
-fallbacks) for up to an hour because of one upstream model's rate limit.
-
-- On aggregator providers (OpenRouter), a 429 is per model: cool down that model only, for the
-  `Retry-After` period when present (else exponential backoff from 30 s, capped at 10 min); only
-  key-level signals (402 payment required, the key limit reached, 401) affect the whole provider.
-- "Model not supported" rejections are sometimes intermittent (Codex returned it for gpt-6-luna/sol
-  in 3 of ~10 smoke runs on 2026-09-27 while direct calls succeeded), yet `blockModel` blocks the
-  model for 24 h. Use short cooldowns that double on repeated rejection (e.g. 15 min → 30 → 60 …,
-  capped at 24 h) and reset after a success, so a transient rejection can't keep a model out of
-  routing for a day.
-- OpenRouter routes a model to different upstream hosts whose quantization can differ (GLM-5.3-flash
-  scored 79% then 67.5% in two identical sweeps): evals and production should pin the upstream
-  provider (OpenRouter `provider.order` / `allow_fallbacks: false`) for evaluated models.
-- Concurrency per upstream model for aggregators (e.g. provider maxConcurrent 4, per-model 1), so an
-  eval sweep across many OpenRouter models doesn't serialize behind one slot.
-- Tests with a fake OpenAI-compatible server: a 429 on model A leaves model B routable; Retry-After
-  honored; 402/401 still mark the provider.
+Tracked as issue #30.
 
 ## 29. Holdout feedback that is actionable but still blind
 
@@ -468,56 +361,13 @@ while converging. Fixing what was asked for should end the loop.
 
 ## 31. Verify artifacts: redact only private scenarios
 
-After #23, implementer feedback is right (public criteria unredacted, private scenarios as
-`publicSummary`), but the stored `verify-N.json` artifact (what the UI shows) still runs every string
-through `redactHoldoutText`, whose literal backstop masks line numbers and identifiers in public
-criteria's evidence ("engine.ts:[private detail]"). Apply the same split as the feedback: public
-criteria stored as-is, private scenarios stored with their publicSummary and redacted evidence.
-Test: a public criterion's `file:line` evidence survives in the artifact; private scenario text never
-appears.
+Tracked as issue #31.
 
 ## 32. Jev decisions harness: triage as typed questions
 
-Owner suggestion (2026-09-27). Jev (TypeSafe, `typesafe/jev-1.13` / `~typesafe/jev-latest`) is a
-decision model, not a chat model: it answers typed questions about a `state` with probabilities
-instead of generating text. Very cheap (input tokens only; the docs' example cost ~$0.00002/call),
-fast, 32K-token context, available with our OpenRouter key.
-
-- API: `POST https://openrouter.ai/api/alpha/decisions` (alpha — may change) with `model`, `state`,
-  and `questions` keyed by id. Question types: `choice` (criteria = option → guidance), `noul`
-  (criteria = {true, false} guidance), `score` (criteria = ordered level descriptions). Answers:
-  choice → `choice`, `confidence`, `probabilities`; noul → `noul` (P(true)); score → `score`,
-  `confidence`, `probabilities`, `legend`. `usage.cost` in USD. Errors 402/429/5xx like OpenRouter.
-- Harness `decisions` (src/harness/decisions.ts): builds the request, maps answers, records usage and
-  cost, classifies errors (402 → provider, 429 → per-model cooldown per item 28).
-- Triage via decisions: task_class (choice, 8 classes with the prompt's guidance), complexity
-  (score trivial→large), risk (score low→high with the blast-radius guidance), ambiguity (score),
-  needs_questions (noul); suggested_profile derived in code; title from the request's first line.
-  Jev can't write text, so: **confidence cascade** — if any answer's confidence is below a
-  threshold, or needs_questions is likely, fall through to the LLM triage (which can also write the
-  blocking questions). Calibrate the threshold on evals/triage (the grader is unchanged).
-- Catalog: `openrouter/jev-1.13` with harness `decisions`, usable only by roles with a decisions
-  mapping; origin "US" (TypeSafe is a US company, per the owner), so it is eligible under the
-  work policy's no-China-origin rule once its evals pass.
-- Evals: sweep Jev on the triage gold set against Luna/Sonnet/local; report the cascade's
-  escalation rate and its combined accuracy/cost.
-- Later: routing questions for item 26 (e.g. task difficulty as a score), concierge intent.
-- Live smoke check for the alpha endpoint.
-- Tests with a fake decisions server (no network).
+Tracked as issue #32.
 
 ## 33. UI changes can be verified
 
-Seen on the owner's first UI run (2026-09-27): most acceptance criteria and holdout scenarios needed
-a real browser (rendered line counts at two widths, toggles, no horizontal scroll, keyboard
-operation), and verify's sandbox can't bind a local port or install a browser, so they were
-correctly reported `blocked`. A UI run can therefore only end "verification blocked" today.
+Tracked as issue #33.
 
-- Spec guidance for UI work: state criteria so they are checkable through tests where possible
-  (render the component — SSR/DOM-level tests, computed classes and attributes, ARIA state) and
-  keep genuinely visual checks (layout at widths, overflow) as a short, explicit list.
-- Verify capability: an optional sandboxed browser check — the pipeline (not the model) starts the
-  built UI on an ephemeral loopback port inside the run's scratch area and exposes a headless
-  browser command the verifier can call (screenshot + DOM query at given viewport sizes). Network
-  stays limited to that loopback port.
-- Until then, "blocked" UI checks go to the orchestrator, who verifies them in a browser before
-  merging.
