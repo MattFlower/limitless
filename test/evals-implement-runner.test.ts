@@ -18,7 +18,10 @@ import { sh } from "../src/util/proc.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
 import { enableEfforts, evalFixture } from "./evals-support.ts";
 
-async function fixture(gate = "test ! -f broken") {
+async function fixture(
+  gate = "test ! -f broken",
+  baseFiles: (home: string) => Record<string, string> = () => ({}),
+) {
   const f = await evalFixture();
   await sh(["git", "checkout", "--detach", f.sha], { cwd: f.source });
   writeFileSync(
@@ -27,6 +30,8 @@ async function fixture(gate = "test ! -f broken") {
   );
   writeFileSync(join(f.source, "overwrite"), "original");
   writeFileSync(join(f.source, "protected"), "original");
+  for (const [path, content] of Object.entries(baseFiles(f.home)))
+    writeFileSync(join(f.source, path), content);
   await sh(["git", "add", "-A"], { cwd: f.source });
   await sh(["git", "commit", "-qm", "gates"], { cwd: f.source });
   const base = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
@@ -313,6 +318,39 @@ test("candidate-configured git filters run without daemon secrets", async () => 
     expect(trial?.pass).toBe(true);
     // The filter did run, so the empty result proves the secret was withheld rather than unused.
     expect(existsSync(leak)).toBe(true);
+    expect(readFileSync(leak, "utf8")).toBe("");
+  } finally {
+    if (previous === undefined) delete process.env.LIMITLESS_EVAL_SECRET;
+    else process.env.LIMITLESS_EVAL_SECRET = previous;
+    await f.close();
+  }
+});
+
+test("baseline-gate-configured git filters run without daemon secrets during cleanup", async () => {
+  // The gate itself runs scrubbed; the leak would come from the Git cleanup after it, which runs
+  // the freshly installed clean filter on the dirtied tracked file while computing status.
+  const f = await fixture("sh baseline-gate.sh", (home) => ({
+    "baseline-gate.sh": [
+      `git config filter.leak.clean "sh -c 'printf %s \\"\\$LIMITLESS_EVAL_SECRET\\" >> ${join(home, "leak")}; cat'"`,
+      "printf 'overwrite filter=leak\\n' > .gitattributes",
+      "echo changed > overwrite",
+    ].join("\n"),
+  }));
+  const previous = process.env.LIMITLESS_EVAL_SECRET;
+  process.env.LIMITLESS_EVAL_SECRET = "daemon-secret";
+  const leak = join(f.home, "leak");
+  try {
+    f.respond((s) => {
+      // The baseline cleanup already ran the filter before the candidate was invoked.
+      expect(existsSync(leak)).toBe(true);
+      expect(readFileSync(leak, "utf8")).toBe("");
+      expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
+      return { files: { answer: "correct" } };
+    });
+    const trial = (await f.run()).trials[0];
+    expect(trial?.status).toBe("ok");
+    expect(trial?.pass).toBe(true);
+    expect(f.calls).toHaveLength(1);
     expect(readFileSync(leak, "utf8")).toBe("");
   } finally {
     if (previous === undefined) delete process.env.LIMITLESS_EVAL_SECRET;

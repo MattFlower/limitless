@@ -14,7 +14,9 @@ export async function prepareImplement(item: ImplementCase, cwd: string, signal:
   const gates = await gatesAt(cwd, item.base, signal);
   const baseline = await runGates(cwd, gates, signal);
   signal.throwIfAborted();
-  await discardChanges(cwd);
+  // Baseline gates already ran repository code that may have configured filters in .git/config
+  // and .gitattributes, so this checkout is no more trustworthy than a candidate's.
+  await discardChanges(cwd, agentEnv());
   return {
     gates,
     baseline,
