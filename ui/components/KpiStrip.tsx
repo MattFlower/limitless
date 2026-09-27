@@ -35,7 +35,7 @@ export const KpiStrip: Component<{ totals: Stats["totals"] }> = (props) => (
       <span class="kpi-sub">metered providers</span>
     </div>
     <div class="kpi">
-      <span class="kpi-label">Subscription-equiv (14d)</span>
+      <span class="kpi-label">API-equivalent work (14d)</span>
       <span class="kpi-value text-faint">{money(props.totals.costEquivUsd)}</span>
       <span class="kpi-sub">what it would've cost at list price</span>
     </div>

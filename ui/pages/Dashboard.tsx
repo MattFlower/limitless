@@ -3,6 +3,7 @@ import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-j
 import type { RunStatus } from "../../src/core/types.ts";
 import type { ProviderWorkload, Stats } from "../../src/db/stats.ts";
 import { getProviderWorkload, getStats } from "../api.ts";
+import { CostCell } from "../components/CostCell.tsx";
 import { CostChart } from "../components/CostChart.tsx";
 import { FilterChips } from "../components/FilterChips.tsx";
 import { KpiStrip } from "../components/KpiStrip.tsx";
@@ -118,9 +119,7 @@ export const Dashboard: Component = () => {
                         <td class="mono text-faint">{m.role}</td>
                         <td class="num mono">{m.invocations}</td>
                         <td class="num mono">{m.ok}</td>
-                        <td class="num mono">
-                          {m.costUsd > 0 ? `$${m.costUsd.toFixed(2)}` : `≈$${m.costEquivUsd.toFixed(2)}`}
-                        </td>
+                        <CostCell costUsd={m.costUsd} costEquivUsd={m.costEquivUsd} />
                       </tr>
                     )}
                   </For>

@@ -34,8 +34,9 @@ limitless deploy --smoke            # also run live CLI contract checks before r
 
 1. The change lands on `main` (normally a factory PR that the orchestrator reviewed and merged).
 2. `limitless deploy` in any checkout:
-   - checks out `origin/main` in `~/.limitless/app`, runs `bun install` and the full `bun run check`
-     there — **a failing check aborts the deploy and keeps the old version**;
+   - checks out `origin/main` in `~/.limitless/app`, runs `bun install --frozen-lockfile` and
+     the full `bun run check` there before draining, even when the checkout is already at that
+     commit — **a failing check aborts the deploy and keeps the old daemon running**;
    - restarts the daemon via launchd and waits for `/api/health`;
    - **rolls back** to the previous commit and restarts again if the new version doesn't come up.
    Add `--smoke` (with or without an explicit ref) to run live CLI contract checks in the release
@@ -46,6 +47,12 @@ limitless deploy --smoke            # also run live CLI contract checks before r
    goes straight to its checks).
 
 Changing the launchd units themselves (PATH, arguments) needs `limitless service install`.
+An interrupted deploy logs `interrupted, rolling back...` and attempts to restore the previous
+checkout and resume the scheduler. If the process was killed during rollback, inspect
+`limitless service status` and the release checkout before retrying `limitless deploy`. If the
+daemon has no boot SHA while the checkout already matches the target, restart it with
+`launchctl kickstart -k gui/$UID/cc.mattflower.limitless` (or `limitless service install`),
+then retry. A second interrupt exits immediately; recovery may then require those manual steps.
 
 ## Live CLI smoke checks
 

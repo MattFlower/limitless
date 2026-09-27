@@ -184,7 +184,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       );
     }),
     "/api/health": handle(() =>
-      json({ ok: true, uptimeMs: Date.now() - factory.startedAt, ...drainState() } satisfies HealthResponse),
+      json({
+        ok: true,
+        uptimeMs: Date.now() - factory.startedAt,
+        sha: factory.bootSha,
+        ...drainState(),
+      } satisfies HealthResponse),
     ),
     "/api/gc": {
       POST: handle(async (req) => {

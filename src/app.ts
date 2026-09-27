@@ -27,6 +27,7 @@ import { Scheduler } from "./scheduler.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
+  bootSha?: string;
   evalCasePath?: string;
   /** Explicit overlay location; the daemon supplies its application checkout's path. */
   policyPath?: string;
@@ -59,6 +60,7 @@ export class Factory {
   readonly scheduler: Scheduler;
   readonly deps: EngineDeps;
   readonly startedAt = Date.now();
+  readonly bootSha: string;
   private readonly tunnels = new SshTunnels((msg) => console.warn(`[tunnel] ${msg}`));
   private readonly providerDefs: ProviderDef[];
   private readonly cleanup: (dryRun: boolean) => Promise<GcResult>;
@@ -70,6 +72,7 @@ export class Factory {
     readonly cfg: Config,
     opts: FactoryOptions = {},
   ) {
+    this.bootSha = opts.bootSha ?? "unknown";
     this.models = opts.models ?? MODELS;
     this.evalSettings = evalSettings(cfg.raw);
     this.providerDefs = opts.providers ?? PROVIDERS;

@@ -2,8 +2,9 @@ import { useNavigate } from "@solidjs/router";
 import type { Component } from "solid-js";
 import { For, Show } from "solid-js";
 import type { Run } from "../../src/core/types.ts";
-import { duration, equivMoney, money, relativeTime, truncate } from "../lib/format.ts";
+import { duration, relativeTime, truncate } from "../lib/format.ts";
 import { now } from "../lib/ticker.ts";
+import { CostCell } from "./CostCell.tsx";
 import { RunStatusPill } from "./StatusPill.tsx";
 
 function runDuration(run: Run, nowMs: number): string {
@@ -49,14 +50,7 @@ export const RunsTable: Component<{ runs: Run[] }> = (props) => {
                 <td class="mono text-faint">{run.stage ?? "—"}</td>
                 <td class="mono text-faint">{run.source}</td>
                 <td class="mono text-faint">{run.resolvedProfile ?? run.profile}</td>
-                <td class="num mono">
-                  <Show
-                    when={run.costUsd > 0}
-                    fallback={<span class="text-faint">{equivMoney(run.costEquivUsd)}</span>}
-                  >
-                    <span class="bold">{money(run.costUsd)}</span>
-                  </Show>
-                </td>
+                <CostCell costUsd={run.costUsd} costEquivUsd={run.costEquivUsd} />
                 <td class="num mono">{runDuration(run, now())}</td>
                 <td class="num mono text-faint" title={new Date(run.createdAt).toLocaleString()}>
                   {relativeTime(run.createdAt, now())}

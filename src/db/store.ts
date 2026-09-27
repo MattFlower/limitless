@@ -25,7 +25,7 @@ import type {
   StageStatus,
   StreamMessage,
 } from "../core/types.ts";
-import { MIGRATIONS } from "./migrations.ts";
+import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
 type Row = Record<string, unknown>;
 type Listener = (msg: StreamMessage) => void;
@@ -272,35 +272,22 @@ export class Store {
   private listeners = new Set<Listener>();
   private pendingPublications: StreamMessage[] | null = null;
 
-  constructor(path: string) {
+  constructor(path: string, migrationDir = MIGRATION_DIR) {
     this.db = new Database(path, { create: true, strict: true });
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA synchronous = NORMAL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec("PRAGMA busy_timeout = 5000");
-    this.migrate();
+    try {
+      runMigrations(this.db, migrationDir);
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   close(): void {
     this.db.close();
-  }
-
-  private migrate(): void {
-    this.db.exec(
-      "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
-    );
-    const applied = new Set(
-      (this.db.query("SELECT version FROM schema_migrations").all() as Row[]).map((r) => r.version as number),
-    );
-    for (const m of MIGRATIONS) {
-      if (applied.has(m.version)) continue;
-      this.db.transaction(() => {
-        this.db.exec(m.sql);
-        this.db
-          .query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
-          .run(m.version, m.name, Date.now());
-      })();
-    }
   }
 
   createEvalRun(input: Pick<EvalRun, "role" | "models" | "k" | "maxUsd">, trials: EvalTrial[]): EvalRun {

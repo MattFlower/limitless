@@ -1,4 +1,4 @@
-// Numbered, append-only schema migrations. Never edit a shipped migration; add a new one.
+// Frozen legacy migrations. Add future migrations as timestamped SQL files in migrations/.
 
 export const MIGRATIONS: { version: number; name: string; sql: string }[] = [
   {

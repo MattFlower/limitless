@@ -184,7 +184,7 @@ detection, per-invocation budget, process-group kill on cancel.
 SQLite (`bun:sqlite`, WAL) at `~/.limitless/limitless.db`; large artifacts (event logs, diffs,
 prompts) as files under `~/.limitless/runs/<run-id>/`. Tables: `repos`, `runs`, `stages`,
 `invocations`, `events`, `artifacts`, `questions`, `provider_state`, `inbox` (webhook dedupe +
-audit), `chat_messages`, `settings`. Migrations are numbered SQL files applied at startup.
+audit), `chat_messages`, `settings`. The frozen legacy migrations and timestamped SQL files are applied at startup.
 
 On startup, runs left `running` by a crash/restart are re-queued and resume at the start of their
 current stage (the worktree is preserved; Claude sessions can be resumed).

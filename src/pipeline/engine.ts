@@ -430,7 +430,10 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           {},
         ];
         constraints =
-          options.find((c) => ctx.deps.router.route("implement", ctx.complexity, c).candidates.length) ?? {};
+          options.find(
+            (c) =>
+              ctx.deps.router.route("implement", ctx.complexity, ctx.routingConstraints(c)).candidates.length,
+          ) ?? {};
         ctx.log(`Escalating implementer beyond ${current.modelId}`, "warn", { constraints });
         ctx.state.roundsOnImplementer = 0;
       }
