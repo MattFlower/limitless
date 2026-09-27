@@ -10,6 +10,7 @@ import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
@@ -1159,7 +1160,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
     });
   }
 
-  test.each(["pass", "unmet", "error"] as const)(
+  test.each(["pass", "unmet", "error", "legacy"] as const)(
     "base preview survives config edits and cleans up after verify %s",
     async (outcome) => {
       await previewFixture();
@@ -1221,17 +1222,20 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
       const state = f.store.getRunState<RunState>(run.id);
       expect(state?.previewConfig?.paths).toEqual(["ui/"]);
       if (outcome === "unmet") expect(previews).toHaveLength(2);
-      if (outcome !== "pass" || !state) return;
+      if ((outcome !== "pass" && outcome !== "legacy") || !state) return;
       // Replay the persisted round after its verdict was saved, before phase advancement.
       const steps = readFileSync(join(home, "preview-steps"), "utf8");
       expect(steps).toBe("build\nseed\nserve\n");
       await f.stop();
+      // Simulate an older run: restore the enabled config from base despite its removal in HEAD.
+      if (outcome === "legacy") delete state.previewConfig;
       f.store.setRunState(run.id, { ...state, phase: "loop" });
       f.store.updateRun(run.id, { status: "queued", finishedAt: null });
       f.store.close();
       factory = null;
       const resumed = start(handler);
       expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(resumed.store.getRunState<RunState>(run.id)?.previewConfig?.paths).toEqual(["ui/"]);
       expect(previews).toHaveLength(1);
       expect(readFileSync(join(home, "preview-steps"), "utf8")).toBe(steps);
       expect(
@@ -1265,11 +1269,62 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
     ]);
   });
 
-  test("absent base preview stays disabled; legacy resumes without a snapshot fail before model calls", async () => {
-    let calls = 0;
+  test.each(["missing base SHA", "missing worktree", "invalid base preview"])(
+    "legacy preview backfill fails before model calls: %s",
+    async (problem) => {
+      if (problem === "invalid base preview") {
+        writeFileSync(join(repoDir, ".limitless.toml"), "[preview]\npaths=[]\n");
+        await sh(["git", "add", "."], { cwd: repoDir });
+        await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "invalid preview"], {
+          cwd: repoDir,
+        });
+        // A repaired worktree must not hide an invalid trusted base.
+        writeFileSync(join(repoDir, ".limitless.toml"), "");
+      }
+      let calls = 0;
+      const f = start(() => {
+        calls++;
+        return {};
+      });
+      await f.stop();
+      const run = await f.createRun({ repo: repoDir, prompt: "Resume an older run" });
+      const baseSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+      if (problem !== "missing base SHA") f.store.updateRun(run.id, { baseSha });
+      const state: RunState = {
+        phase: "triage",
+        worktreePath: problem === "missing worktree" ? undefined : repoDir,
+        answers: [],
+        round: 0,
+        roundsOnImplementer: 0,
+        triedImplementers: [],
+        feedback: null,
+        toolCommands: [],
+      };
+      f.store.setRunState(run.id, state);
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("failed");
+      expect(calls).toBe(0);
+      expect(f.store.listInvocations(run.id)).toHaveLength(0);
+      expect(f.store.getRun(run.id)?.error).toContain(
+        problem === "invalid base preview" ? "Invalid [preview]" : "missing base SHA or worktree",
+      );
+      expect(f.store.getRunState<RunState>(run.id)?.previewConfig).toBeUndefined();
+    },
+  );
+
+  test.each(["gates only", "no config file"])("legacy resume backfills absent preview: %s", async (base) => {
+    const baseConfig = base === "gates only" ? readFileSync(join(repoDir, ".limitless.toml"), "utf8") : "";
+    if (base === "no config file") {
+      await sh(["git", "rm", ".limitless.toml"], { cwd: repoDir });
+      await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "remove config"], {
+        cwd: repoDir,
+      });
+    }
+    const calls: string[] = [];
+    let resumedRunId: string | undefined;
     const handler: Handler = (agent) => {
-      calls++;
+      if (resumedRunId) expect(factory?.store.getRunState<RunState>(resumedRunId)?.previewConfig).toBeNull();
       const role = roleOf(agent);
+      calls.push(role);
       if (role === "triage") return { structured: triage() };
       if (role === "spec") return { structured: spec };
       if (role === "holdout") return { structured: holdout };
@@ -1278,7 +1333,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
       return {
         files: {
           "ui/change.txt": "visible\n",
-          ".limitless.toml": `${readFileSync(join(repoDir, ".limitless.toml"), "utf8")}\n[preview]\npaths=[]\n`,
+          ".limitless.toml": `${baseConfig}\n[preview]\npaths=[]\n`,
         },
       };
     };
@@ -1296,11 +1351,13 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
     f.store.updateRun(run.id, { status: "queued", finishedAt: null });
     f.store.close();
     factory = null;
-    const before = calls;
+    const before = calls.length;
+    resumedRunId = run.id;
     const resumed = start(handler);
-    expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("failed");
-    expect(calls).toBe(before);
-    expect(resumed.store.getRun(run.id)?.error).toContain("no base preview configuration snapshot");
+    expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(calls.slice(before)).toEqual(["review"]);
+    expect(resumed.store.getRunState<RunState>(run.id)?.previewConfig).toBeNull();
+    expect(resumed.store.getRunDetail(run.id)?.stages.some((stage) => stage.name === "preview")).toBe(false);
   });
 
   test("happy path: triage → spec → implement → gates → review → verify → deliver", async () => {

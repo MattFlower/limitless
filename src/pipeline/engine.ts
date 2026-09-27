@@ -89,8 +89,15 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run);
-    if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined)
-      throw new Error("Run has no base preview configuration snapshot; start a new run");
+    if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined) {
+      if (!ctx.run.baseSha || !ctx.state.worktreePath)
+        throw new Error("Cannot restore base preview configuration: missing base SHA or worktree");
+      // Upgrade older runs using the trusted revision, never the edited worktree config.
+      ctx.state.previewConfig = readPreviewConfig(
+        await readFileAt(ctx.state.worktreePath, ctx.run.baseSha, ".limitless.toml"),
+      );
+      ctx.save();
+    }
     if (ctx.state.phase === "prepare") await prepare(ctx);
     if (ctx.state.phase === "triage") await triage(ctx);
     if (ctx.state.phase === "clarify") await clarify(ctx);

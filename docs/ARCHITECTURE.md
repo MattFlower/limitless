@@ -102,7 +102,8 @@ before model calls. A matching committed diff starts an isolated preview immedia
 verify attempt; reused round results do not start one. Build and seed use scratch HOME/TMPDIR,
 reserved environment keys are enforced, and readiness stays on the loopback preview origin. The
 server and scratch are torn down on success, failure or cancellation. Browser/MCP integration is
-a separate step. Runs prepared before configuration snapshots existed must be started anew.
+a separate step. Older runs without a snapshot restore it once from their recorded base SHA on
+resume, before any model calls; the edited worktree configuration is never used.
 
 ### Why the holdout author is blind (our twist on StrongDM's scenarios)
 StrongDM keeps scenarios in a directory the agent can't read. We go one better and cheaper: the
