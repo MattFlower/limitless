@@ -229,6 +229,54 @@ ALTER TABLE provider_state ADD COLUMN limit_reset TEXT;
   },
   {
     version: 7,
+    name: "delivery_rebase_round_checkpoint",
+    sql: `
+UPDATE runs SET state_json = json_set(state_json, '$.conflictRound', json_extract(state_json, '$.round'))
+WHERE json_type(state_json, '$.conflictRound') = 'true';
+UPDATE runs SET state_json = json_remove(state_json, '$.conflictRound')
+WHERE json_type(state_json, '$.conflictRound') = 'false';
+`,
+  },
+  {
+    version: 8,
+    name: "triage_evals",
+    sql: `
+CREATE TABLE eval_runs (
+  id TEXT PRIMARY KEY,
+  role TEXT NOT NULL,
+  models TEXT NOT NULL,
+  k INTEGER NOT NULL,
+  max_usd REAL NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  error TEXT
+);
+CREATE TABLE eval_trials (
+  eval_run_id TEXT NOT NULL REFERENCES eval_runs(id),
+  case_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  trial INTEGER NOT NULL,
+  cache_key TEXT NOT NULL,
+  harness TEXT NOT NULL,
+  status TEXT NOT NULL,
+  output_json TEXT,
+  pass INTEGER,
+  score REAL,
+  details_json TEXT NOT NULL,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  cost_equiv_usd REAL NOT NULL DEFAULT 0,
+  tokens_in INTEGER NOT NULL DEFAULT 0,
+  tokens_out INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (eval_run_id, case_id, model_id, trial)
+);
+CREATE INDEX eval_trials_cache_key ON eval_trials(cache_key);
+`,
+  },
+  {
+    version: 9,
     name: "quota_window_observations",
     sql: "ALTER TABLE provider_state ADD COLUMN window_observed_at_json TEXT;",
   },

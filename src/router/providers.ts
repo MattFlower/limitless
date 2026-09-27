@@ -43,6 +43,7 @@ export class ProviderTracker {
   private reading: KeyReading | null = null;
   private refreshInFlight: Promise<boolean> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private started = false;
 
   constructor(
     defs: ProviderDef[],
@@ -56,10 +57,13 @@ export class ProviderTracker {
       set: setInterval,
       clear: clearInterval,
     },
+    private readonly fetchHealth: typeof fetch = fetch,
   ) {
     for (const def of defs) {
-      let enabled = true;
+      const override = store.getProviderEnabledOverride(def.id);
+      let enabled = override ?? true;
       let disabledReason: string | null = null;
+      if (!enabled) disabledReason = "disabled";
       if (def.apiKeySecret && !secrets[def.apiKeySecret]) {
         enabled = false;
         disabledReason = `missing ${def.apiKeySecret}`;
@@ -107,6 +111,7 @@ export class ProviderTracker {
   }
 
   start(): void {
+    this.started = true;
     if (this.pollTimer || !this.isEnabled("openrouter")) return;
     void this.refreshOpenRouter();
     this.pollTimer = this.timer.set(() => {
@@ -115,6 +120,7 @@ export class ProviderTracker {
   }
 
   stop(): void {
+    this.started = false;
     if (this.pollTimer) this.timer.clear(this.pollTimer);
     this.pollTimer = null;
   }
@@ -223,6 +229,26 @@ export class ProviderTracker {
     return this.providers.get(id)?.enabled ?? false;
   }
 
+  setEnabled(id: string, enabled: boolean): ProviderStatus {
+    const p = this.providers.get(id);
+    if (!p) throw new Error(`unknown provider ${id}`);
+    const wasEnabled = p.enabled;
+    this.store.setProviderEnabledOverride(id, enabled);
+    p.enabled = enabled && (!p.def.apiKeySecret || !!this.secrets[p.def.apiKeySecret]);
+    if (p.enabled && !wasEnabled && p.def.healthUrl) p.healthy = false;
+    p.disabledReason = !enabled ? "disabled" : p.enabled ? null : `missing ${p.def.apiKeySecret}`;
+    if (id === "openrouter") {
+      if (!p.enabled && this.pollTimer) {
+        this.timer.clear(this.pollTimer);
+        this.pollTimer = null;
+      } else if (p.enabled && this.started) this.start();
+    }
+    if (p.enabled && p.def.healthUrl && this.started) void this.probeProvider(p);
+    this.publish(id);
+    this.refreshAlerts();
+    return this.status(id) as ProviderStatus;
+  }
+
   def(id: string): ProviderDef | undefined {
     return this.providers.get(id)?.def;
   }
@@ -283,6 +309,14 @@ export class ProviderTracker {
       return `circuit open after ${p.consecutiveFailures} failures`;
     if (this.headroom(id, now) <= 0) return "at reserve limit";
     return null;
+  }
+
+  budgetUnavailableReason(id: string, now = this.clock()): string | null {
+    const budget = this.budgets[id];
+    return budget !== undefined &&
+      (!(budget > 0) || this.store.providerSpendSince(id, now - MONTH_MS) >= budget)
+      ? "provider budget exhausted"
+      : null;
   }
 
   blockModel(modelId: string, reason: string, ms = 24 * 60 * 60 * 1000): void {
@@ -456,22 +490,25 @@ export class ProviderTracker {
   async probe(): Promise<void> {
     await Promise.all(
       [...this.providers.values()]
-        .filter((p) => p.def.healthUrl)
-        .map(async (p) => {
-          try {
-            const headers: Record<string, string> = {};
-            const token = this.authToken(p.def.id);
-            if (token) headers.authorization = `Bearer ${token}`;
-            const res = await fetch(p.def.healthUrl as string, {
-              signal: AbortSignal.timeout(3000),
-              headers,
-            });
-            this.setHealthy(p.def.id, res.ok);
-          } catch {
-            this.setHealthy(p.def.id, false);
-          }
-        }),
+        .filter((p) => p.enabled && p.def.healthUrl)
+        .map((p) => this.probeProvider(p)),
     );
+  }
+
+  private async probeProvider(p: ProviderRuntime): Promise<void> {
+    if (!p.enabled || !p.def.healthUrl) return;
+    try {
+      const headers: Record<string, string> = {};
+      const token = this.authToken(p.def.id);
+      if (token) headers.authorization = `Bearer ${token}`;
+      const res = await this.fetchHealth(p.def.healthUrl, {
+        signal: AbortSignal.timeout(3000),
+        headers,
+      });
+      if (p.enabled) this.setHealthy(p.def.id, res.ok);
+    } catch {
+      if (p.enabled) this.setHealthy(p.def.id, false);
+    }
   }
 
   status(id: string): ProviderStatus | null {

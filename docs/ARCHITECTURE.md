@@ -188,7 +188,7 @@ current stage (the worktree is preserved; Claude sessions can be resumed).
 | **CLI** `limitless` | `run`, `ls`, `show`, `logs -f`, `cancel`, `answer`, `serve`, `mcp`, `deploy`. |
 | **Chat concierge** | Shared by UI chat and Discord: turns free text into a confirmed run, answers status questions. Runs on a local model when available. |
 | **GitHub** | `POST /webhooks/github` (HMAC-verified): Dependabot PRs → `quick` verify-and-merge; issue labeled `limitless` or `/limitless …` comment by the owner → run; CI failure on a factory PR → fix run. |
-| **Discord** | `/build`, `/runs`, `/cancel`; one thread per run with progress, questions and the final report. |
+| **Discord** | `/build`, `/runs`, `/show`, `/cancel`; one thread per run with progress, questions and the final report. |
 | **MCP + skills** | `limitless mcp` (stdio) and `/mcp` (HTTP) expose create/get/list/cancel/answer tools; `SKILL.md` for Claude Code (plugin) and Codex (`.agents/skills`). |
 | **Generic webhook** | `POST /webhooks/generic/<token>` for anything else (cron, IFTTT, scripts). |
 

@@ -1,6 +1,8 @@
 export function utilizationPercent(fraction: number): string {
   if (!Number.isFinite(fraction)) return "0%";
-  return `${Math.ceil(Math.min(1, Math.max(0, fraction)) * 100)}%`;
+  // Round to 1e-4 % first: 0.07 * 100 is 7.000000000000001 in floating point and must not show 8%.
+  const percent = Math.round(Math.min(1, Math.max(0, fraction)) * 1e6) / 1e4;
+  return `${Math.ceil(percent)}%`;
 }
 
 export function observationAge(observedAt: number | null | undefined, now = Date.now()): string {

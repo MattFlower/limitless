@@ -5,6 +5,10 @@ import type { AgentResult, AgentSpec, Harness } from "./types.ts";
 
 export interface FakeReply {
   status?: InvocationStatus;
+  costUsd?: number;
+  costEquivUsd?: number;
+  usage?: AgentResult["usage"];
+  quota?: AgentResult["quota"];
   text?: string;
   structured?: unknown;
   /** Files to write (relative to the spec cwd) — simulates an implementing agent. */
@@ -42,6 +46,10 @@ export function fakeHarness(handler: (spec: AgentSpec) => FakeReply | Promise<Fa
       finalText: reply.text ?? "",
       structured: reply.structured ?? null,
       error: reply.error ?? null,
+      costUsd: reply.costUsd ?? 0,
+      costEquivUsd: reply.costEquivUsd ?? 0.001,
+      usage: reply.usage ?? { input: 100, output: 50, cacheRead: 0, cacheWrite: 0 },
+      quota: reply.quota ?? null,
     });
   };
 }

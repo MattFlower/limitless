@@ -8,6 +8,7 @@ import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
+import { selectHarness } from "../harness/select.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../harness/types.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
@@ -47,6 +48,15 @@ export interface RunState {
   implementerIssue?: string | null;
   /** Round whose implementation has been committed; resuming skips straight to its checks. */
   implementedRound?: number;
+  /** Delivery rebase target; gates must pass before this becomes run.baseSha. */
+  pendingRebaseSha?: string;
+  preRebaseGates?: GateComparison[];
+  /** Head before the delivery rebase; delivery falls back to it if the rebase regresses checks. */
+  preRebaseHead?: string;
+  /** Why delivery went ahead without rebasing onto the latest base (shown in the report). */
+  rebaseNote?: string;
+  /** The single extra implementation round allowed after a conflicting delivery rebase. */
+  conflictRound?: number;
   /** package.json scripts the gates depend on, as they were on the base branch. */
   baselineScripts?: Record<string, string>;
   feedback: string | null;
@@ -210,8 +220,7 @@ export class RunContext {
         );
       }
       tried.push(target.modelId);
-      const useHttp = ["triage", "chat", "summarize"].includes(opts.role) && !!target.openai;
-      const harnessName = useHttp ? "llm" : target.harness;
+      const { harnessName, noTools } = selectHarness(opts.role, target, opts.noTools);
       const harness = harnesses[harnessName];
       if (!harness) throw new Error(`No harness registered for ${harnessName}`);
 
@@ -252,7 +261,7 @@ export class RunContext {
           timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUTS[opts.role],
           idleTimeoutMs: opts.idleTimeoutMs ?? 10 * 60_000,
           maxToolCalls: opts.maxToolCalls ?? (opts.mode === "edit" ? 400 : 150),
-          noTools: opts.noTools,
+          noTools,
           privateSession: opts.privateOutput || opts.privateSession,
           redactOutput: redact,
           signal: this.signal,

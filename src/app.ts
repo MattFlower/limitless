@@ -2,6 +2,7 @@ import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
 import type { CreateRunRequest, Question, Run } from "./core/types.ts";
 import { Store } from "./db/store.ts";
+import { EvalRunner } from "./evals/runner.ts";
 import { collectGarbage, type GcResult } from "./gc.ts";
 import { resolveRepo } from "./git/repos.ts";
 import { runClaude } from "./harness/claude.ts";
@@ -23,6 +24,7 @@ import { Scheduler } from "./scheduler.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
+  evalCasePath?: string;
   harnesses?: Record<string, Harness>;
   providers?: ProviderDef[];
   models?: ModelDef[];
@@ -36,11 +38,13 @@ export interface FactoryOptions {
   clock?: () => number;
   fetch?: typeof fetch;
   providerTimer?: { set: typeof setInterval; clear: typeof clearInterval };
+  healthFetch?: typeof fetch;
 }
 
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
 export class Factory {
   readonly store: Store;
+  readonly evals: EvalRunner;
   readonly concierge: Concierge;
   readonly tracker: ProviderTracker;
   readonly router: Router;
@@ -71,6 +75,7 @@ export class Factory {
       opts.clock,
       opts.fetch,
       opts.providerTimer,
+      opts.healthFetch,
     );
     this.router = new Router(
       this.tracker,
@@ -88,6 +93,7 @@ export class Factory {
       tracker: this.tracker,
       harnesses: opts.harnesses ?? { claude: runClaude, codex: runCodex, llm: runLlm },
     };
+    this.evals = new EvalRunner(this.deps, opts.evalCasePath);
     this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns);
     this.concierge = new Concierge(this);
   }
@@ -121,7 +127,7 @@ export class Factory {
     this.gcInterval = null;
     await this.gcInFlight;
     this.tunnels.stop();
-    await this.scheduler.stop();
+    await Promise.all([this.scheduler.stop(), this.evals.stop()]);
   }
 
   gc(dryRun = false): Promise<GcResult> {

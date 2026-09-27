@@ -75,7 +75,7 @@ export const DISCORD_COMMANDS: readonly ApplicationCommandDataResolvable[] = [
     options: [{ name: "status", description: "Filter by status", type: ApplicationCommandOptionType.String }],
   },
   {
-    name: "run",
+    name: "show",
     description: "Show a run",
     type: ApplicationCommandType.ChatInput,
     options: [
@@ -352,7 +352,7 @@ export class DiscordIntegration {
                 .slice(0, 1900)
             : "No runs found.",
         );
-      } else if (command.name === "run" || command.name === "cancel") {
+      } else if (command.name === "show" || command.name === "cancel") {
         const run = this.factory.store.getRun(options.id ?? "");
         if (!run) {
           await command.reply("Unknown run ID.");

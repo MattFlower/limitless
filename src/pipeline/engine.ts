@@ -6,17 +6,24 @@ import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, runGates } from "../gates/run.ts";
 import {
+  clearInterruptedRebase,
   commitAll,
   createPullRequest,
   createWorktree,
   diffSince,
   discardChanges,
   ensureCache,
+  fetchBase,
+  formatTopLevel,
   headSha,
+  isAncestor,
   mergePullRequest,
   pushBranch,
   pushExistingBranch,
+  readFileAt,
+  rebaseOnto,
   removeWorktree,
+  resetTo,
 } from "../git/repos.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import {
@@ -81,8 +88,13 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
     if (ctx.state.phase === "triage") await triage(ctx);
     if (ctx.state.phase === "clarify") await clarify(ctx);
     if (ctx.state.phase === "spec") await spec(ctx);
-    if (ctx.state.phase === "loop") await buildLoop(ctx);
-    if (ctx.state.phase === "deliver") await deliver(ctx, true);
+    while (ctx.state.phase === "loop" || ctx.state.phase === "deliver") {
+      if (ctx.state.phase === "loop") await buildLoop(ctx);
+      if (ctx.state.phase === "deliver") {
+        await deliver(ctx, true);
+        if (ctx.state.phase === "deliver") break;
+      }
+    }
     ctx.setPhase("done");
     ctx.run = deps.store.updateRun(runId, { status: "succeeded", stage: null, finishedAt: Date.now() });
     ctx.log("Run succeeded");
@@ -98,7 +110,12 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
     ctx.log(`Run ${needsHuman ? "needs a human" : "failed"}: ${message}`, "error", {
       stack: (e as Error).stack,
     });
-    if (e instanceof NeedsHumanError && ctx.state.worktreePath) {
+    if (
+      e instanceof NeedsHumanError &&
+      ctx.state.worktreePath &&
+      ctx.state.conflictRound === undefined &&
+      !ctx.state.pendingRebaseSha
+    ) {
       // Surface the unfinished work as a draft PR so a human can pick it up.
       try {
         await deliver(ctx, false);
@@ -162,10 +179,7 @@ async function prepare(ctx: RunContext): Promise<void> {
 
 function topLevel(path: string): string {
   try {
-    return readdirSync(path)
-      .filter((f) => f !== ".git")
-      .slice(0, 60)
-      .join("  ");
+    return formatTopLevel(readdirSync(path));
   } catch {
     return "(unavailable)";
   }
@@ -308,7 +322,10 @@ function profile(ctx: RunContext): ResolvedProfile {
 }
 
 async function buildLoop(ctx: RunContext): Promise<void> {
-  const maxRounds = Math.max(1, ctx.deps.cfg.maxRounds) + ROUNDS_PER_IMPLEMENTER;
+  const maxRounds =
+    ctx.state.conflictRound !== undefined
+      ? ctx.state.conflictRound + 1
+      : Math.max(1, ctx.deps.cfg.maxRounds) + ROUNDS_PER_IMPLEMENTER;
   const holdout =
     profile(ctx) === "quick" || ctx.state.holdoutStatus === "complete"
       ? null
@@ -672,9 +689,43 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     throw new Error("PR delivery base does not match the verified webhook head");
   await ctx.stage("deliver", async () => {
     const cwd = ctx.state.worktreePath as string;
+    await clearInterruptedRebase(cwd, Boolean(ctx.state.pendingRebaseSha));
+    // A stopped post-rebase check may have left generated files or formatter edits behind.
+    if (ctx.state.pendingRebaseSha) await discardChanges(cwd);
     const sha = await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
     const head = sha ?? (await headSha(cwd));
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
+    if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch) {
+      const baseBranch = ctx.run.baseBranch as string;
+      const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch);
+      const recorded = ctx.run.baseSha as string;
+      // A restart can find the base moved again mid-rebase; retarget the newest tip.
+      if (ctx.state.pendingRebaseSha && ctx.state.pendingRebaseSha !== fetched) {
+        ctx.state.pendingRebaseSha = fetched;
+        ctx.save();
+      }
+      // Rebasing is best-effort: it avoids conflicting PRs, but never blocks delivering work that
+      // passed every gate on its recorded base.
+      const note = (why: string) => {
+        ctx.state.rebaseNote = `Not rebased onto the latest ${baseBranch}: ${why}. Delivered on ${(ctx.run.baseSha as string).slice(0, 8)}.`;
+        ctx.store.addEvent({
+          runId: ctx.run.id,
+          type: "status",
+          level: "warn",
+          message: ctx.state.rebaseNote,
+        });
+      };
+      if (fetched !== recorded || ctx.state.pendingRebaseSha) {
+        if (ctx.state.conflictRound !== undefined && !ctx.state.pendingRebaseSha)
+          note("the base advanced again after the conflict-resolution round");
+        else if (!ctx.state.pendingRebaseSha && !(await isAncestor(cwd, recorded, fetched)))
+          note("the base branch no longer descends from the recorded base");
+        else if ((await rebaseForDelivery(ctx, cwd, baseBranch, fetched, head, note)) === "conflict")
+          return { summary: `rebase conflicted; resolution round ${ctx.state.round}`, value: undefined };
+      }
+      if (!ctx.state.rebaseNote && !(await isAncestor(cwd, ctx.run.baseSha as string, await headSha(cwd))))
+        note("the branch does not contain the recorded base");
+    }
     const report = buildReport(ctx, success);
 
     const publish = () => {
@@ -760,3 +811,103 @@ function readPackageJson(dir: string): string | null {
 }
 
 export type { RunState };
+
+class RebaseRegressedError extends Error {}
+
+/**
+ * Rebase the run branch onto the base's new tip and re-run the gates. A conflict schedules one
+ * resolution round ("conflict"); a regression restores the pre-rebase head, which passed every gate
+ * on its recorded base, and notes why it was not rebased.
+ */
+async function rebaseForDelivery(
+  ctx: RunContext,
+  cwd: string,
+  baseBranch: string,
+  fetched: string,
+  head: string,
+  note: (why: string) => void,
+): Promise<"conflict" | "done"> {
+  // Audit against the new base's scripts, never the implementer's merged working tree.
+  ctx.state.baselineScripts = pickScripts(
+    await readFileAt(cwd, fetched, "package.json"),
+    gateScriptNames(ctx.state.gatesConfig as GateConfig),
+  );
+  if (!ctx.state.pendingRebaseSha) {
+    ctx.state.pendingRebaseSha = fetched;
+    ctx.state.preRebaseGates = ctx.state.lastGates ?? [];
+    ctx.state.preRebaseHead = head;
+    ctx.save();
+  }
+  if (!(await isAncestor(cwd, fetched, await headSha(cwd)))) {
+    const outcome = await rebaseOnto(cwd, fetched);
+    if (outcome === "conflict") {
+      ctx.state.preRebaseHead = undefined;
+      ctx.state.pendingRebaseSha = undefined;
+      ctx.state.preRebaseGates = undefined;
+      ctx.state.round++;
+      ctx.state.conflictRound = ctx.state.round;
+      ctx.state.feedback = `The base branch advanced. Merge origin/${baseBranch} into this branch with \`git merge origin/${baseBranch}\`, resolve conflicts preserving both intents, and rerun the repository checks.`;
+      ctx.state.phase = "loop";
+      ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: await headSha(cwd) }, ctx.state);
+      return "conflict";
+    }
+  }
+  const previous = ctx.state.preRebaseGates ?? [];
+  try {
+    await ctx.stage(
+      "gates",
+      async () => {
+        const after = await runGates(cwd, ctx.state.gatesConfig as GateConfig, ctx.signal, (r) =>
+          ctx.store.addEvent({
+            runId: ctx.run.id,
+            type: "gate",
+            level: r.ok ? "info" : "warn",
+            message: `${r.name}: ${r.ok ? "pass" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
+            data: r,
+          }),
+        );
+        ctx.checkCancelled();
+        await discardChanges(cwd);
+        // A check fixed by the implementation must stay fixed after rebasing, even when
+        // it failed on the original base. Persist that regression in the evidence too.
+        const comparison = compareGates(
+          previous.length
+            ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
+            : (ctx.state.baseline ?? null),
+          after,
+        );
+        ctx.state.lastGates = comparison;
+        ctx.save();
+        ctx.store.putArtifact(
+          ctx.run.id,
+          `gates-rebase-${ctx.state.round}.json`,
+          "gates",
+          JSON.stringify(comparison, null, 2),
+        );
+        const regressed =
+          !after.setupOk ||
+          comparison.some((c) => c.blocking) ||
+          previous.some((c) => c.result.ok && !after.checks.find((r) => r.name === c.name)?.ok);
+        if (regressed) throw new RebaseRegressedError("post-rebase gates regressed");
+        return { summary: `${comparison.length} post-rebase checks ok`, value: undefined };
+      },
+      ctx.state.round,
+    );
+  } catch (error) {
+    if (!(error instanceof RebaseRegressedError)) throw error;
+    await resetTo(cwd, ctx.state.preRebaseHead ?? head);
+    ctx.state.lastGates = previous;
+    ctx.state.pendingRebaseSha = undefined;
+    ctx.state.preRebaseGates = undefined;
+    ctx.state.preRebaseHead = undefined;
+    ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: await headSha(cwd) }, ctx.state);
+    note(`checks regressed after rebasing onto ${fetched.slice(0, 8)}`);
+    ctx.save();
+    return "done";
+  }
+  ctx.state.pendingRebaseSha = undefined;
+  ctx.state.preRebaseGates = undefined;
+  ctx.state.preRebaseHead = undefined;
+  ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: await headSha(cwd) }, ctx.state);
+  return "done";
+}

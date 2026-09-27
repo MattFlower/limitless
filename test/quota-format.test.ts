@@ -4,6 +4,8 @@ import { pct } from "../ui/lib/format.ts";
 
 test("utilization display rounds upward and stays within 0 to 100 percent", () => {
   expect([0, 0.721, 1, -0.1, 1.1].map(utilizationPercent)).toEqual(["0%", "73%", "100%", "0%", "100%"]);
+  // Exact percentages must not be pushed up by floating-point error.
+  expect([0.07, 0.14, 0.28, 0.57].map(utilizationPercent)).toEqual(["7%", "14%", "28%", "57%"]);
   expect(pct(0.721)).toBe("73%");
 });
 

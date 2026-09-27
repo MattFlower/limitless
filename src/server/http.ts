@@ -193,6 +193,14 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         return json(await factory.gc(input.dryRun === true));
       }),
     },
+    "/api/evals": {
+      POST: handle(async (req) => json({ id: factory.evals.submit(await body<unknown>(req)).id }, 202)),
+      GET: handle(() => json(store.listEvalRuns())),
+    },
+    "/api/evals/:id": handle((req) => {
+      const report = factory.evals.report(req.params.id ?? "");
+      return report ? json(report) : error("eval not found", 404);
+    }),
     "/api/runs": {
       GET: handle((req) => {
         const url = new URL(req.url);
@@ -288,6 +296,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle(() => json(store.listRepos())),
     },
     "/api/providers": handle(() => json(factory.tracker.all())),
+    "/api/providers/:id/enable": {
+      POST: handle((req) => json(factory.tracker.setEnabled(req.params.id ?? "", true))),
+    },
+    "/api/providers/:id/disable": {
+      POST: handle((req) => json(factory.tracker.setEnabled(req.params.id ?? "", false))),
+    },
     "/api/alerts": handle(() => {
       factory.tracker.refreshAlerts();
       return json(store.listAlerts(factory.tracker.now()));
