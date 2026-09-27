@@ -70,9 +70,7 @@ export const OriginalPrompt: Component<{ prompt: string }> = (props) => {
           <button type="button" class="btn" onClick={copy}>
             Copy prompt
           </button>
-          <Show when={feedback()}>
-            <span role="status">{feedback()}</span>
-          </Show>
+          <span role="status">{feedback()}</span>
         </div>
       </div>
     </section>
