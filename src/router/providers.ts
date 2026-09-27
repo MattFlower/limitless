@@ -451,7 +451,10 @@ export class ProviderTracker {
       p.exhaustedReason = (detail?.error ?? "quota exhausted").slice(0, 300);
       if (p.def.billing === "subscription") {
         const known = Object.entries(p.windows)
-          .filter(([, w]) => w.resetsAt === null || w.resetsAt > now)
+          .filter(
+            ([name, w]) =>
+              (w.resetsAt === null || w.resetsAt > now) && w.utilization >= this.reserveFor(id, name),
+          )
           .sort((a, b) => (a[1].resetsAt ?? Infinity) - (b[1].resetsAt ?? Infinity))[0];
         let resetsAt = known ? known[1].resetsAt : (detail?.exhaustedUntil ?? null);
         if (!known) {

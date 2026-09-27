@@ -124,11 +124,56 @@ test("quota rejection alerts, but health failures and metered budgets do not", (
   expect(alerts().find((a) => a.provider === "codex")?.routing).toContain("No eligible fallback");
 });
 
+test("quota rejection names the exhausted seven-day window across five-hour reset", () => {
+  const changes: StreamMessage[] = [];
+  const unsubscribe = store.subscribe((message) => changes.push(message));
+  const fiveReset = now + 100_000;
+  const sevenReset = now + 700_000;
+  factory.tracker.observeWindows("claude", {
+    five_hour: { utilization: 0.4, resetsAt: fiveReset },
+    seven_day: { utilization: 0.85, resetsAt: sevenReset },
+  });
+  factory.tracker.record("claude", "quota", { exhaustedUntil: now + 20_000 });
+  expect(alerts()).toMatchObject([
+    { provider: "claude", window: "seven_day", severity: "exhausted", resetsAt: sevenReset },
+  ]);
+  const created = () => changes.filter((message) => message.kind === "alert" && message.created);
+  expect(created()).toHaveLength(1);
+  now = fiveReset + 1;
+  factory.tracker.record("claude", "quota", { exhaustedUntil: now + 20_000 });
+  expect(alerts()).toMatchObject([{ window: "seven_day", resetsAt: sevenReset }]);
+  expect(created()).toHaveLength(1);
+  unsubscribe();
+});
+
+test("quota rejection with below-reserve windows uses a deduplicated hard limit", () => {
+  const changes: StreamMessage[] = [];
+  const unsubscribe = store.subscribe((message) => changes.push(message));
+  const fiveReset = now + 100_000;
+  const sevenReset = now + 700_000;
+  const exhaustedUntil = now + 300_000;
+  factory.tracker.observeWindows("claude", {
+    five_hour: { utilization: 0.4, resetsAt: fiveReset },
+    seven_day: { utilization: 0.5, resetsAt: sevenReset },
+  });
+  factory.tracker.record("claude", "quota", { exhaustedUntil });
+  const createdAt = alerts()[0]?.createdAt;
+  for (let i = 0; i < 3; i++) {
+    now += 10;
+    factory.tracker.record("claude", "quota", { exhaustedUntil: now + 300_000 });
+  }
+  expect(alerts()).toMatchObject([
+    { provider: "claude", window: "hard_limit", severity: "exhausted", resetsAt: exhaustedUntil, createdAt },
+  ]);
+  expect(changes.filter((message) => message.kind === "alert" && message.created)).toHaveLength(1);
+  unsubscribe();
+});
+
 test("Discord sends once across flapping and restart; failure leaves alert visible", async () => {
   const port = new FakeDiscord();
   let mounted = mountDiscord(factory, port);
   const reset = now + 100_000;
-  factory.tracker.observeWindows("claude", { five_hour: { utilization: 0.6, resetsAt: reset } });
+  factory.tracker.observeWindows("claude", { five_hour: { utilization: 0.8, resetsAt: reset } });
   factory.tracker.record("claude", "quota", { exhaustedUntil: reset });
   factory.tracker.record("claude", "ok");
   factory.tracker.record("claude", "quota", { exhaustedUntil: reset });
@@ -241,7 +286,7 @@ test("an unknown hard-limit reset stays deduplicated when later rejections estim
 test("quota rejection preserves a named window's unknown reset boundary", async () => {
   const port = new FakeDiscord();
   const mounted = mountDiscord(factory, port);
-  factory.tracker.observeWindows("codex", { five_hour: { utilization: 0.7, resetsAt: null } });
+  factory.tracker.observeWindows("codex", { five_hour: { utilization: 0.9, resetsAt: null } });
   for (let i = 0; i < 3; i++) {
     now += 5;
     factory.tracker.record("codex", "quota", { exhaustedUntil: now + 30 * 60 * 1000 });
@@ -462,30 +507,30 @@ test("the SSE endpoint streams exhaustion, fallback changes and timed clearing",
   const response = await stream(new Request("http://localhost/api/stream"), { timeout: () => {} } as never);
   const reader = response.body?.getReader();
   if (!reader) throw new Error("missing SSE body");
-  const nextAlert = async () => {
+  const nextAlert = async (window: string) => {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) throw new Error("SSE ended before alert");
       const text = new TextDecoder().decode(value);
       if (!text.startsWith("data: ")) continue;
       const msg = JSON.parse(text.slice(6)) as StreamMessage;
-      if (msg.kind === "alert" && msg.provider === "claude") return msg;
+      if (msg.kind === "alert" && msg.provider === "claude" && msg.window === window) return msg;
     }
   };
   try {
     const reset = now + 100_000;
     factory.tracker.observeWindows("claude", { five_hour: { utilization: 0.6, resetsAt: reset } });
-    expect(await nextAlert()).toMatchObject({ created: true, alert: { severity: "warning" } });
+    expect(await nextAlert("five_hour")).toMatchObject({ created: true, alert: { severity: "warning" } });
     factory.tracker.record("claude", "quota", { exhaustedUntil: reset });
-    expect(await nextAlert()).toMatchObject({ created: false, alert: { severity: "exhausted" } });
+    expect(await nextAlert("hard_limit")).toMatchObject({ created: true, alert: { severity: "exhausted" } });
     factory.tracker.record("codex", "quota", { exhaustedUntil: reset });
-    expect(await nextAlert()).toMatchObject({
+    expect(await nextAlert("hard_limit")).toMatchObject({
       created: false,
       alert: { routing: "Router skips claude. No eligible fallback providers are available." },
     });
     now = reset + 1;
     factory.scheduler.tick();
-    expect(await nextAlert()).toMatchObject({ created: false, alert: null });
+    expect(await nextAlert("hard_limit")).toMatchObject({ created: false, alert: null });
     expect(alerts()).toEqual([]);
   } finally {
     await reader.cancel();
