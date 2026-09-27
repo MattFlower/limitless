@@ -15,14 +15,17 @@ import {
   defaultCasePath,
   type EvalCase,
   EvalRequestSchema,
+  hiddenContents,
+  type ImplementCase,
   loadRoleCases,
   validateRequest,
 } from "./cases.ts";
+import { failedImplement, gradeImplement, prepareImplement } from "./implement.ts";
 import { gradeCase, prepareCase, schemaFor, seedContent } from "./prepare.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 
 /** Where Limitless keeps eval datasets; pins whose history touches these are rejected. */
-const LABEL_PATHS = ["evals/triage", "evals/review", "evals/verify"];
+const LABEL_PATHS = ["evals/triage", "evals/review", "evals/verify", "evals/implement"];
 
 export class EvalRunner {
   private readonly active = new Map<string, { controller: AbortController; done: Promise<void> }>();
@@ -58,7 +61,7 @@ export class EvalRunner {
             output: null,
             pass: null,
             score: null,
-            details: {},
+            details: "hidden" in item ? { complexity: item.complexity } : {},
             costUsd: 0,
             costEquivUsd: 0,
             tokensIn: 0,
@@ -101,6 +104,16 @@ export class EvalRunner {
     const { store, router } = this.deps;
     store.updateEvalRun(run.id, "running");
     const trees = new Map<string, Promise<string>>();
+    const implementations = new Map<string, ReturnType<typeof prepareImplement>>();
+    const implementFor = (item: ImplementCase, cwd: string) => {
+      const key = JSON.stringify([item.id, item.base]);
+      let prepared = implementations.get(key);
+      if (!prepared) {
+        prepared = prepareImplement(item, cwd, signal);
+        implementations.set(key, prepared);
+      }
+      return prepared;
+    };
     const treeFor = (slug: string) => {
       let tree = trees.get(slug);
       if (!tree) {
@@ -113,10 +126,16 @@ export class EvalRunner {
     };
     try {
       const casePath = this.casePath ?? defaultCasePath(run.role);
+      const hidden = new Map(
+        file.cases.flatMap((item) =>
+          "hidden" in item ? [[item.id, hiddenContents(item, casePath)] as const] : [],
+        ),
+      );
       const labels: EvalLabels = {
-        paths: LABEL_PATHS,
+        paths: run.role === "implement" ? ["evals/implement"] : LABEL_PATHS,
         contents: [
           readFileSync(casePath, "utf8"),
+          ...[...hidden.values()].flatMap((files) => files.map((f) => f.content)),
           ...file.cases.flatMap((item) => ("defects" in item ? (seedContent(item, casePath) ?? []) : [])),
         ],
       };
@@ -135,7 +154,17 @@ export class EvalRunner {
               for (const trial of store
                 .listEvalTrials(run.id)
                 .filter((t) => recordedTarget(t) === modelId && t.caseId === item.id)) {
-                await this.trial(run, trial, item, treeFor, labels, cache, signal);
+                await this.trial(
+                  run,
+                  trial,
+                  item,
+                  treeFor,
+                  implementFor,
+                  labels,
+                  cache,
+                  signal,
+                  hidden.get(item.id),
+                );
               }
             }
         }),
@@ -154,9 +183,11 @@ export class EvalRunner {
     trial: EvalTrial,
     item: EvalCase,
     treeFor: (slug: string) => Promise<string>,
+    implementFor: (item: ImplementCase, cwd: string) => ReturnType<typeof prepareImplement>,
     labels: EvalLabels,
     cache: boolean,
     signal: AbortSignal,
+    hidden: ReturnType<typeof hiddenContents> = [],
   ): Promise<void> {
     const { store, router, tracker, harnesses, cfg } = this.deps;
     const skip = (reason: string) =>
@@ -189,40 +220,57 @@ export class EvalRunner {
     const target = router.toTarget(model, effort ?? null);
     const { harnessName, noTools } = selectHarness(run.role, target);
     trial.harness = harnessName;
-    const tree = "prompt" in item ? await treeFor(item.repo) : "";
+    const tree = "gold" in item && "prompt" in item ? await treeFor(item.repo) : "";
     let release: (() => void) | undefined;
     let directory: string | undefined;
     let cleanup: (() => Promise<void>) | undefined;
     try {
       mkdirSync(cfg.paths.runs, { recursive: true });
       directory = mkdtempSync(join(cfg.paths.runs, "eval-"));
-      const cwd = "prompt" in item ? directory : join(directory, "worktree");
+      const cwd = "gold" in item && "prompt" in item ? directory : join(directory, "worktree");
       const patch =
         "defects" in item ? seedContent(item, this.casePath ?? defaultCasePath(run.role)) : undefined;
-      if (!("prompt" in item))
+      if (!("gold" in item && "prompt" in item))
         cleanup = await createEvalWorktree(
           cfg.paths,
           store,
           item.repo,
           item.base,
-          item.head,
+          "hidden" in item ? item.base : item.head,
           cwd,
           signal,
           labels,
         );
-      const { prompt, timeoutMs } = await prepareCase(item, cwd, tree, patch, signal);
-      const schema = schemaFor(item);
-      const jsonSchema = toStrictJsonSchema(schema);
+      const preparationStarted = Date.now();
+      const implementation = "hidden" in item ? await implementFor(item, cwd) : undefined;
+      const prepared = "hidden" in item ? implementation : await prepareCase(item, cwd, tree, patch, signal);
+      if (!prepared) throw new Error("missing trial preparation");
+      const preparationMs = Date.now() - preparationStarted;
+      const { prompt, timeoutMs } = prepared;
+      const schema = "hidden" in item ? undefined : schemaFor(item);
+      const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
-        "prompt" in item
+        "gold" in item && "prompt" in item
           ? undefined
           : {
               role: run.role,
               repo: item.repo,
               base: item.base,
-              head: item.head,
+              ...("hidden" in item
+                ? {
+                    caseSource: item.source,
+                    prompt: item.prompt,
+                    spec: item.spec,
+                    complexity: item.complexity,
+                    hidden: item.hidden,
+                    files: hidden.map((f) => ({
+                      path: f.path,
+                      mode: f.mode,
+                      hash: new Bun.CryptoHasher("sha256").update(f.content).digest("hex"),
+                    })),
+                  }
+                : { head: item.head, input: item.input }),
               patch,
-              input: item.input,
               source:
                 store.getRepoBySlug(item.repo)?.url ?? store.getRepoBySlug(item.repo)?.localPath ?? item.repo,
             };
@@ -231,7 +279,7 @@ export class EvalRunner {
         harnessName,
         prompt,
         FACTORY_PREAMBLE,
-        jsonSchema,
+        jsonSchema ?? {},
         trial.trial,
         repository,
         trial.effort,
@@ -240,9 +288,11 @@ export class EvalRunner {
       if (budget()) return skip("eval budget exhausted");
       if (cache)
         for (const source of store.cachedEvalTrials(trial.cacheKey)) {
-          const output = schema.safeParse(source.output);
-          if (!output.success) continue;
-          const grade = gradeCase(item, output.data);
+          const output =
+            "hidden" in item ? { success: true, data: source.output } : schema?.safeParse(source.output);
+          if (!output?.success) continue;
+          const grade = "hidden" in item ? source.details.grade : gradeCase(item, output.data);
+          if (!grade) continue;
           store.recordEvalTrial({
             ...trial,
             status: "ok",
@@ -250,6 +300,7 @@ export class EvalRunner {
             pass: grade.pass,
             score: grade.score,
             details: {
+              ...("hidden" in item ? source.details : {}),
               ...trial.details,
               grade,
               cache: source.details.cache ?? {
@@ -277,6 +328,7 @@ export class EvalRunner {
       trial.createdAt = Date.now();
       store.recordEvalTrial({ ...trial, status: "running" });
       let result: AgentResult;
+      const toolCommands: string[] = [];
       try {
         const logPath = join(directory, "trial.log");
         const invoke = (scratchDir?: string) =>
@@ -286,17 +338,25 @@ export class EvalRunner {
             prompt,
             systemAppend: FACTORY_PREAMBLE,
             target,
-            mode: "readonly",
+            mode: "hidden" in item ? "edit" : "readonly",
             noTools,
             jsonSchema,
             schema,
             timeoutMs,
             privateSession: run.role === "verify",
             idleTimeoutMs: 10 * 60_000,
-            maxToolCalls: 150,
+            maxToolCalls: "hidden" in item ? 400 : 150,
             signal,
             logPath,
             onEvent: (event) => {
+              if (
+                event.type === "tool_call" &&
+                event.input &&
+                typeof event.input === "object" &&
+                "command" in event.input &&
+                typeof event.input.command === "string"
+              )
+                toolCommands.push(event.input.command);
               if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
             },
           });
@@ -315,30 +375,12 @@ export class EvalRunner {
           quota: null,
         };
       }
-      const output = schema.safeParse(result.structured ?? extractJson(result.finalText));
-      const ok = result.status === "ok" && output.success;
-      const grade = ok ? gradeCase(item, output.data) : undefined;
-      store.recordEvalTrial({
-        ...trial,
-        status: ok ? "ok" : "error",
-        output: output.success ? output.data : result.structured,
-        pass: grade ? grade.pass : false,
-        score: grade ? grade.score : 0,
-        details: {
-          ...trial.details,
-          grade,
-          invocationStatus: result.status,
-          reason: ok
-            ? undefined
-            : (result.error ??
-              (output.success ? result.status : `Invalid ${run.role} output: ${output.error.message}`)),
-        },
-        costUsd: result.costUsd,
-        costEquivUsd: result.costEquivUsd,
-        tokensIn: result.usage.input + result.usage.cacheRead + result.usage.cacheWrite,
-        tokensOut: result.usage.output,
-        durationMs: Date.now() - trial.createdAt,
-      });
+      trial.costUsd = result.costUsd;
+      trial.costEquivUsd = result.costEquivUsd;
+      trial.tokensIn = result.usage.input + result.usage.cacheRead + result.usage.cacheWrite;
+      trial.tokensOut = result.usage.output;
+      trial.output = "hidden" in item ? result.finalText : result.structured;
+      if ("hidden" in item) store.recordEvalTrial({ ...trial, status: "running" });
       if (result.quota) tracker.observeWindows(target.provider, result.quota.windows);
       tracker.record(target.provider, result.status, {
         error: result.error,
@@ -351,6 +393,43 @@ export class EvalRunner {
         )
       )
         tracker.blockModel(model.id, result.error ?? "model rejected");
+      if (signal.aborted) return skip("daemon shutdown");
+      const output = schema?.safeParse(result.structured ?? extractJson(result.finalText));
+      const ok = result.status === "ok" && ("hidden" in item || output?.success === true);
+      const grade =
+        "hidden" in item && implementation
+          ? result.status === "ok"
+            ? await gradeImplement(item, cwd, hidden, implementation, toolCommands, signal)
+            : failedImplement(result.status === "timeout" ? "timeout" : "error", result.error ?? undefined)
+          : ok && output?.success && !("hidden" in item)
+            ? gradeCase(item, output.data)
+            : undefined;
+      store.recordEvalTrial({
+        ...trial,
+        status:
+          ok && grade?.implement?.reason !== "error" && grade?.implement?.reason !== "timeout"
+            ? "ok"
+            : "error",
+        output: "hidden" in item ? result.finalText : output?.success ? output.data : result.structured,
+        pass: grade ? grade.pass : false,
+        score: grade ? grade.score : 0,
+        details: {
+          ...trial.details,
+          grade,
+          invocationStatus: result.status,
+          reason:
+            grade?.implement?.reason ??
+            (ok
+              ? undefined
+              : (result.error ??
+                (output?.success ? result.status : `Invalid ${run.role} output: ${output?.error.message}`))),
+        },
+        costUsd: result.costUsd,
+        costEquivUsd: result.costEquivUsd,
+        tokensIn: result.usage.input + result.usage.cacheRead + result.usage.cacheWrite,
+        tokensOut: result.usage.output,
+        durationMs: Date.now() - trial.createdAt + ("hidden" in item ? preparationMs : 0),
+      });
     } catch (error) {
       if (signal.aborted) return skip("daemon shutdown");
       store.recordEvalTrial({
@@ -358,7 +437,12 @@ export class EvalRunner {
         status: "error",
         pass: false,
         score: 0,
-        details: { ...trial.details, preparationFailed: true, reason: (error as Error).message },
+        details: {
+          ...trial.details,
+          preparationFailed: true,
+          reason: (error as Error).message,
+          ...("hidden" in item ? { grade: failedImplement("error", (error as Error).message) } : {}),
+        },
       });
     } finally {
       release?.();

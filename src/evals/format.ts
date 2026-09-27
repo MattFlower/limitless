@@ -14,6 +14,22 @@ export function formatEvalReport(report: EvalReport): string {
     const metric = (name: string, value: { numerator: number; denominator: number; rate: number | null }) =>
       `  ${name} ${pct(value.rate)} (${value.numerator}/${value.denominator}), Wilson 95% CI ${wilson(value.numerator, value.denominator)?.map(pct).join(" – ") ?? "n/a"}`;
     const roleLines: string[] = [];
+    if (m.implement) {
+      for (const group of m.implement.byComplexity)
+        roleLines.push(
+          metric(`${group.complexity} pass`, {
+            numerator: group.passes,
+            denominator: group.evaluatedTrials,
+            rate: group.passRate,
+          }),
+        );
+      roleLines.push(
+        `  failures: ${Object.entries(m.implement.failureReasons)
+          .map(([reason, count]) => `${reason}=${count}`)
+          .join(", ")}`,
+        `  cost per executed trial: metered $${number(m.implement.costPerTrialUsd)}; API-equivalent $${number(m.implement.costEquivPerTrialUsd)} (n=${m.implement.executedTrials})`,
+      );
+    }
     if (m.review) {
       const { defectRecall, falseBlock, verdictAccuracy } = m.review;
       roleLines.push(
@@ -42,7 +58,7 @@ export function formatEvalReport(report: EvalReport): string {
             }),
           ]
         : []),
-      `  metered $${m.costUsd.toFixed(4)}; API-equivalent $${m.costEquivUsd.toFixed(4)}; p50 invocation ${number(m.p50LatencyMs)} ms (n=${m.latencyDenominator})`,
+      `  metered $${m.costUsd.toFixed(4)}; API-equivalent $${m.costEquivUsd.toFixed(4)}; p50 ${report.run.role === "implement" ? "trial" : "invocation"} ${number(m.p50LatencyMs)} ms (n=${m.latencyDenominator})`,
       `  vs ${c.bestModel ?? "n/a"}: difference ${number(c.meanDifference)}, one-sided 95% lower ${number(c.lowerBound)}, nonInferior=${c.nonInferior ?? "n/a"}; paired cases=${c.pairedCases} (candidate complete=${c.candidateCompleteCases}, best complete=${c.bestCompleteCases}), delta=${c.delta}, resamples=${c.resamples}, seed=${c.seed}`,
     );
   }
