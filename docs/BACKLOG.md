@@ -26,6 +26,7 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 23 | M5 | Deploy drain progress: one line per poll, not two | todo |
 | 24 | M4 | Reasoning effort as a routing dimension | todo |
 | 25 | M4 | External benchmark priors (Artificial Analysis, Terminal-Bench 4.0) | todo |
+| 26 | M4 | Capability-and-cost routing (monotonic escalation) | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
@@ -342,3 +343,27 @@ points, and public leaderboards disagree with each other).
   stay in the local database; the UI shows them with attribution; committed files (e.g.
   routing/EVIDENCE.md) cite only the snapshot date and our own eval numbers.
 - Tests with a stubbed fetch; no network in tests.
+
+## 26. Capability-and-cost routing (monotonic escalation)
+
+Owner direction: a repeatedly failed task must never go to a less capable agent, and we should never
+pay more than needed (Artificial Analysis's "Intelligence Index vs. Cost per Task" chart is the mental
+model). Replaces hand-assigned integer tiers. Depends on items 24 (effort) and 25 (priors).
+
+- Candidates are (model @ effort, harness). Each has a per-role **capability** score (prior from
+  public data: AA coding index / Terminal-Bench for implement, AA intelligence index for review and
+  verify; posterior from our evals) and a **cost per task on our axis**: local $0, metered $, and
+  subscription API-equivalent $ weighted by current quota headroom (cheap while plentiful, expensive
+  near the reserve), measured from invocation history per role.
+- Only Pareto-efficient candidates (on our cost axis) are eligible.
+- Per role × task class, fit pass probability vs. capability from eval data (logistic) to get the
+  minimum capability for the target success rate (default 0.8); use the prior when a class has no
+  eval data. Record the fit and its data in routing/EVIDENCE.md.
+- First attempt: the cheapest eligible candidate above the task's minimum capability.
+- Retries (every role, not only implement): the next candidate must have capability strictly above
+  the maximum already tried on this task; cheapest such first; never a model that already failed it.
+- Feedback: repeated failures raise the task's own minimum; production outcomes shift per-class
+  thresholds (the drift loop in docs/EVALS.md).
+- UI: show each candidate on a capability-vs-cost chart with the Pareto line and the thresholds.
+- Tests: Pareto filtering, threshold fitting on synthetic data, monotonic retries (never down,
+  never repeat), quota-weighted cost reacting to headroom.
