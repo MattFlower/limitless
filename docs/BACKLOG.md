@@ -21,6 +21,9 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 13 | M4 | Discord `/run` → `/show` | done — #13 |
 | 14 | M4 | Enable/disable providers at runtime | done — #15 |
 | 15 | M4 | Fresher, Desktop-consistent quota readings | done — #16 (float rounding fix by orchestrator) |
+| 21 | M5 | Verify stage gets a writable scratch TMPDIR (tests needing temp dirs were "unclear") | todo |
+| 22 | M5 | A merged needs-human PR marks its run resolved in the UI | todo |
+| 23 | M5 | Deploy drain progress: one line per poll, not two | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
