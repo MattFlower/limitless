@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CaseFileSchema, loadCases, validateRequest } from "../src/evals/cases.ts";
@@ -56,6 +56,7 @@ test("invalid requests do not schedule or invoke; selections retain dataset orde
     const base = { role: "triage", models: ["candidate-a"] };
     for (const over of [
       { role: "review" },
+      { role: "holdout" },
       { models: [] },
       { models: ["candidate-a", "candidate-a"] },
       { models: ["unknown"] },
@@ -97,5 +98,79 @@ test("default dataset resolves from the application checkout, independently of c
     expect(await child.exited).toBe(0);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("review and verify datasets validate pins, nested inputs, labels and unique IDs", async () => {
+  const { ReviewCaseFileSchema, VerifyCaseFileSchema, loadRoleCases } = await import("../src/evals/cases.ts");
+  const review = ReviewCaseFileSchema.parse(loadRoleCases("review"));
+  const verify = VerifyCaseFileSchema.parse(
+    loadRoleCases("verify", new URL("./data/evals-verify.json", import.meta.url).pathname),
+  );
+  expect(review.cases.length).toBeGreaterThan(0);
+  expect(verify.cases).toHaveLength(3);
+  for (const [file, schema] of [
+    [review, ReviewCaseFileSchema],
+    [verify, VerifyCaseFileSchema],
+  ] as const) {
+    const item = file.cases[0];
+    if (!item) throw new Error("missing");
+    for (const over of [
+      { id: " " },
+      { base: "main" },
+      { head: "abc" },
+      { repo: "../oops" },
+      { input: { ...item.input, spec: {} } },
+      { input: { ...item.input, gates: [{ name: "test" }] } },
+    ])
+      expect(schema.safeParse({ ...file, cases: [{ ...item, ...over }] }).success).toBe(false);
+    expect(schema.safeParse({ ...file, cases: [item, item] }).success).toBe(false);
+  }
+  const r = review.cases[0];
+  const v = verify.cases[0];
+  if (!r || !v) throw new Error("missing");
+  for (const seedPatch of ["../x", "/tmp/x", "x/../../y", "x\\y", "x\0y"])
+    expect(ReviewCaseFileSchema.safeParse({ ...review, cases: [{ ...r, seedPatch }] }).success).toBe(false);
+  for (const lines of [[9, 1], [-1, 1], [1.5, 2], [1]])
+    expect(
+      ReviewCaseFileSchema.safeParse({ ...review, cases: [{ ...r, defects: [{ ...r.defects[0], lines }] }] })
+        .success,
+    ).toBe(false);
+  for (const over of [
+    { gold: {} },
+    { gold: { unknown: "met" } },
+    { gold: { "AC-1": "unclear" } },
+    { input: { ...v.input, spec: null } },
+    { input: { ...v.input, holdout: { scenarios: [] } } },
+    {
+      input: {
+        ...v.input,
+        spec: {
+          ...v.input.spec,
+          acceptance_criteria: [...v.input.spec.acceptance_criteria, ...v.input.spec.acceptance_criteria],
+        },
+      },
+    },
+  ])
+    expect(VerifyCaseFileSchema.safeParse({ ...verify, cases: [{ ...v, ...over }] }).success).toBe(false);
+});
+
+test("seed symlinks escaping the dataset fail before scheduling", async () => {
+  const { reviewCase } = await import("./evals-reading-support.ts");
+  const f = await evalFixture();
+  try {
+    symlinkSync(
+      new URL("./evals-reading-support.ts", import.meta.url).pathname,
+      join(f.home, "escape.patch"),
+    );
+    writeFileSync(
+      f.casePath,
+      JSON.stringify({ role: "review", version: 1, cases: [{ ...reviewCase, seedPatch: "escape.patch" }] }),
+    );
+    expect(() => f.factory.evals.submit({ role: "review", models: ["candidate-a"] })).toThrow("escapes");
+    expect(f.factory.store.listEvalRuns()).toHaveLength(0);
+    expect(f.calls).toHaveLength(0);
+  } finally {
+    await f.close();
   }
 });

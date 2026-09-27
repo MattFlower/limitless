@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
@@ -85,21 +85,33 @@ export async function withRepoLock<T>(key: string, fn: () => Promise<T>): Promis
 }
 
 /** Make sure a fresh bare mirror exists (GitHub repos) and is fetched. */
-export async function ensureCache(paths: Paths, repo: Repo): Promise<string> {
+export async function ensureCache(paths: Paths, repo: Repo, signal?: AbortSignal): Promise<string> {
   const cache = cachePath(paths, repo);
   if (repo.kind === "local") return cache;
   return withRepoLock(cache, async () => {
+    signal?.throwIfAborted();
     if (!existsSync(cache)) {
       mkdirSync(paths.repos, { recursive: true });
       // Clone to a temporary path and rename, so a crash never leaves a half-configured cache.
       const tmp = `${cache}.tmp-${process.pid}-${Date.now()}`;
-      await sh(["git", "clone", "--bare", repo.url as string, tmp], { cwd: paths.repos, timeoutMs: 600_000 });
-      await sh(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], { cwd: tmp });
-      renameSync(tmp, cache);
+      try {
+        await sh(["git", "clone", "--bare", repo.url as string, tmp], {
+          cwd: paths.repos,
+          timeoutMs: 600_000,
+          signal,
+        });
+        await sh(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
+          cwd: tmp,
+          signal,
+        });
+        renameSync(tmp, cache);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
     }
     // Agents run inside worktrees of this repo; make any push attempt from them fail.
     await sh(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
-    await sh(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000 });
+    await sh(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
     return cache;
   });
 }
@@ -395,4 +407,68 @@ export async function pinnedTree(paths: Paths, store: Store, slug: string, sha: 
     const tree = await sh(["git", "ls-tree", "--name-only", "-z", sha], { cwd: cache });
     return formatTopLevel(tree.stdout.split("\0").filter(Boolean));
   });
+}
+
+/** Disposable pinned eval checkout; never creates or moves a source branch. */
+export async function createEvalWorktree(
+  paths: Paths,
+  store: Store,
+  slug: string,
+  base: string,
+  head: string,
+  path: string,
+  signal: AbortSignal,
+): Promise<() => Promise<void>> {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(slug) || ![base, head].every((sha) => /^[a-fA-F0-9]{40}$/.test(sha)))
+    throw new Error("invalid repository pin");
+  const registered = store.getRepoBySlug(slug);
+  const repo: Repo = {
+    id: slug,
+    slug,
+    kind: "github",
+    localPath: null,
+    url: registered?.url ?? registered?.localPath ?? `https://github.com/${slug}.git`,
+    defaultBranch: "main",
+    mergePolicy: "none",
+    createdAt: 0,
+  };
+  const cache = cachePath(paths, repo);
+  signal.throwIfAborted();
+  if (!existsSync(cache)) await ensureCache(paths, repo, signal);
+  const cleanup = () =>
+    withRepoLock(cache, async () => {
+      await sh(["git", "worktree", "remove", "--force", path], { cwd: cache, allowFail: true });
+      rmSync(path, { recursive: true, force: true });
+      await sh(["git", "worktree", "prune"], { cwd: cache });
+    });
+  try {
+    await withRepoLock(cache, async () => {
+      signal.throwIfAborted();
+      const opts = { cwd: cache, signal };
+      const bare = await sh(["git", "rev-parse", "--is-bare-repository"], opts);
+      if (bare.stdout.trim() !== "true") throw new Error(`eval repository cache is not bare: ${cache}`);
+      const exists = async (sha: string) =>
+        (await sh(["git", "cat-file", "-e", `${sha}^{commit}`], { ...opts, allowFail: true })).exitCode === 0;
+      if (!(await exists(base)) || !(await exists(head))) {
+        await sh(
+          [
+            "git",
+            "fetch",
+            "origin",
+            "+refs/heads/*:refs/remotes/origin/*",
+            "+refs/pull/*/head:refs/pull/*/head",
+          ],
+          { ...opts, timeoutMs: 300_000 },
+        );
+      }
+      for (const sha of [base, head])
+        if (!(await exists(sha))) throw new Error(`pinned commit ${sha} missing in ${slug}`);
+      signal.throwIfAborted();
+      await sh(["git", "worktree", "add", "--detach", path, head], opts);
+    });
+    return cleanup;
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
 }

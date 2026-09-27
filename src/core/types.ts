@@ -65,6 +65,11 @@ export type Vendor =
   | "moonshot"
   | "zhipu"
   | "minimax"
+  | "google"
+  | "meta"
+  | "ibm"
+  | "nvidia"
+  | "mistral"
   | "other";
 
 export type Billing = "subscription" | "metered" | "free";
@@ -337,7 +342,7 @@ export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed";
 export interface EvalRun {
   id: string;
-  role: "triage";
+  role: "triage" | "review" | "verify";
   models: string[];
   k: number;
   maxUsd: number;
@@ -354,6 +359,33 @@ export interface EvalGrade {
     { predicted: string | boolean; accepted: (string | boolean)[]; match: boolean; weight: number }
   >;
   riskUnderCall: boolean | null;
+  review?: {
+    requiredMatched: number;
+    requiredTotal: number;
+    recall: number | null;
+    requestChanges: boolean;
+    falseBlock: boolean | null;
+    verdictMatch: boolean;
+  };
+  verify?: {
+    matched: number;
+    total: number;
+    falseAccepts: number;
+    unmetTotal: number;
+    falseRejects: number;
+    metTotal: number;
+    criteria: Record<
+      string,
+      {
+        gold: "met" | "unmet";
+        predictions: ("met" | "unmet" | "unclear")[];
+        predicted: "met" | "unmet" | "unclear" | "missing" | "duplicate";
+        match: boolean;
+        falseAccept: boolean;
+        falseReject: boolean;
+      }
+    >;
+  };
 }
 export interface EvalTrial {
   evalRunId: string;
@@ -371,6 +403,7 @@ export interface EvalTrial {
     reason?: string;
     grade?: EvalGrade;
     invocationStatus?: InvocationStatus;
+    preparationFailed?: boolean;
     interrupted?: boolean;
     cache?: {
       evalRunId: string;

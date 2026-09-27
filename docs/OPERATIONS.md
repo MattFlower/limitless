@@ -112,23 +112,25 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 Every agent session's raw event stream is kept in `~/.limitless/runs/<run>/inv-<n>.log`, and the UI
 shows the same events live, so failures can be diagnosed without re-running.
 
-## Triage evaluations
+## Evaluations
 
-Evaluations run in the daemon using its catalog, harness adapters, triage prompt/schema and shared
+Evaluations run in the daemon using its catalog, harness adapters, pipeline role prompts/schemas and shared
 provider tracker. Start the daemon first; the CLI only submits and reads HTTP requests:
 
 ```sh
 limitless eval run triage --models mtplx/qwen-27b,claude/haiku --k 2 --max-usd 1 --follow
 limitless eval run triage --models claude/haiku --cases triage-001,triage-002 --no-cache
+limitless eval run review --models openrouter/gpt-6-luna --follow
+limitless eval run verify --models openrouter/gpt-6-luna --follow
 limitless eval report <eval-id>
 limitless eval report <eval-id> --json
 ```
 
-Use catalog IDs shown by the daemon's `/api/models` endpoint. Only `triage` is supported. Defaults
+Use catalog IDs shown by the daemon's `/api/models` endpoint. `triage`, `review`, and `verify` are supported, including models absent from the routing policy. Defaults
 are `k=1`, `maxUsd=1.00`, all cases, and caching enabled. Case selections retain dataset order and
-trial indices start at zero. The daemon resolves `evals/triage/cases.json` from its application
+trial indices start at zero. The daemon resolves `evals/<role>/cases.json` from its application
 checkout, validates it before scheduling, and reads the exact pinned commits from locked bare repo
-caches (cloning/fetching when needed). It never creates an eval worktree. Each model runs sequentially;
+caches (cloning/fetching when needed). Triage reads the pinned tree listing; review and verify create detached disposable worktrees at head, apply any review seed patch locally, and remove worktrees on every exit. Each model runs sequentially;
 provider groups may overlap within shared capacity limits. The runner never falls back or retries; normal adapter-level structured-output repair remains the
 same as in the pipeline and its cost is included in the trial.
 Unavailable providers, reserves, provider budgets, circuit breakers, blocked models and missing
@@ -179,3 +181,18 @@ by a crash are errors with unknown final usage/latency; queued trials are skippe
 excluded from the p50. `--follow` polls until any
 terminal state and prints a final report. Other role graders, the Evals UI and policy generation are
 not implemented yet.
+
+Review/verify dataset contracts and formulas are detailed in [EVALS.md](EVALS.md#implemented-repository-reading-evaluations).
+The real verify dataset is separately curated; the three-case test fixture is never a fallback.
+Repository-reading cache keys include role, repository identity, base/head pins and seed content;
+same-stat code changes invalidate them, while seed timestamps and temporary paths do not.
+Review reports pooled required-defect recall (Wilson 95%), clean false-block rate and verdict
+accuracy. Verify reports false-accept rate first, false-reject rate and criterion accuracy.
+Every rate includes numerator/denominator; empty denominators are `n/a`/null. Errors remain pass
+failures and are excluded from prediction metrics, with valid prediction coverage disclosed.
+Optional defects are never misses; matching uses file and a ±5-line window, not category equality.
+Line 0 matches only file-level completeness defects. Verify missing/unclear/duplicate IDs match
+neither binary label and count as false rejects for gold-met criteria. Overall is not used to grade.
+
+Models API/UI origin and base-origin metadata identify checkpoint organizations, not hosting
+providers. US/FR/CN values and `unknown` ancestry are descriptive only; enforcement comes later.

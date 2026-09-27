@@ -26,6 +26,8 @@ test("pipeline and concierge use the same role selection with and without an HTT
           provider: "provider",
           model: "test",
           vendor: "other",
+          origin: "unknown",
+          baseOrigin: "unknown",
           tier: 1,
           price: { input: 1, output: 1 },
         },

@@ -54,6 +54,8 @@ export const Models: Component = () => {
                 <th>ID</th>
                 <th>Provider</th>
                 <th>Vendor</th>
+                <th>Origin</th>
+                <th>Base origin</th>
                 <th class="num">Tier</th>
                 <th class="num">$/M in</th>
                 <th class="num">$/M out</th>
@@ -68,7 +70,7 @@ export const Models: Component = () => {
                 when={catalog()}
                 fallback={
                   <tr class="empty-row">
-                    <td colspan={10}>loading…</td>
+                    <td colspan={12}>loading…</td>
                   </tr>
                 }
               >
@@ -89,6 +91,8 @@ export const Models: Component = () => {
                           <td class="mono text-accent">{m.id}</td>
                           <td class="mono text-dim">{m.provider}</td>
                           <td class="mono text-faint">{m.vendor}</td>
+                          <td class="mono">{m.origin}</td>
+                          <td class="mono">{m.baseOrigin}</td>
                           <td class="num mono">{m.tier}</td>
                           <td class="num mono">${m.price.input.toFixed(2)}</td>
                           <td class="num mono">${m.price.output.toFixed(2)}</td>
