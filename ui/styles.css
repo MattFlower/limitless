@@ -1404,3 +1404,8 @@ p {
   overflow-wrap: anywhere;
   padding: 1rem;
 }
+
+.badge-blocked {
+  color: var(--warning);
+  border: 1px solid currentColor;
+}

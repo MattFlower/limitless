@@ -313,4 +313,12 @@ CREATE UNIQUE INDEX eval_trials_identity ON eval_trials(eval_run_id, case_id, mo
 CREATE INDEX eval_trials_cache_key ON eval_trials(cache_key);
 `,
   },
+  {
+    version: 11,
+    name: "verification_environment_retry",
+    sql: `
+UPDATE runs SET state_json = json_set(state_json, '$.environmentRetryRound', -1)
+WHERE state_json IS NOT NULL AND json_type(state_json, '$.environmentRetryRound') IS NULL;
+`,
+  },
 ];

@@ -553,6 +553,7 @@ test("effort pairs preserve order, aliases, preference and underlying eligibilit
   expect(route({ exclude: ["claude/sonnet"] }).map((t) => t.targetId)).not.toContain("claude/sonnet@low");
   expect(route({ prefer: "claude/sonnet@low" })[0]?.targetId).toBe("claude/sonnet@low");
   expect(route({ avoidVendor: "anthropic" })[0]?.provider).toBe("codex");
+  expect(route({ excludeModels: ["claude/sonnet"] }).map((t) => t.modelId)).toEqual(["codex/sol"]);
   expect(route({ minTier: 5 }).map((t) => t.targetId)).toEqual(["claude/opus@low"]);
   expect(catalog.find((m) => m.id === "claude/sonnet")?.effort).toBe("low");
   route();

@@ -62,6 +62,7 @@ import {
   type Verify,
   VerifySchema,
 } from "./schemas.ts";
+import { blockedOnly, ENVIRONMENT_BLOCKED, normalizeVerify } from "./verification.ts";
 
 const ROUNDS_PER_IMPLEMENTER = 2;
 
@@ -629,69 +630,88 @@ async function oneRound(
     if (failure) throw failure;
   }
   if (!ctx.state.holdout) throw new NeedsHumanError("Holdout scenarios are unavailable");
-  const verify: Verify = await ctx.stage(
-    "verify",
-    async (stage) => {
-      const { result, target } = await ctx.invoke({
-        role: "verify",
-        stage,
-        mode: "readonly",
-        complexity: ctx.complexity,
-        constraints: { avoidVendor: ctx.state.implementer?.vendor },
-        timeoutMs: readingTimeout(diff.added + diff.removed, 25),
-        prompt: verifyPrompt({
-          prompt: ctx.run.prompt,
-          spec: ctx.state.spec as Spec,
-          holdout: ctx.state.holdout as Holdout,
-          baseSha,
-        }),
-        jsonSchema: toStrictJsonSchema(VerifySchema),
-        schema: VerifySchema,
-        requireStructured: true,
-        privateSession: true,
-        redactHoldout: true,
-      });
-      await discardChanges(cwd);
-      const v = VerifySchema.parse(result.structured);
-      // Derive the verdict ourselves: every acceptance criterion must be reported, and met.
-      for (const id of [
-        ...(ctx.state.spec as Spec).acceptance_criteria.map((ac) => ac.id),
-        ...(ctx.state.holdout as Holdout).scenarios.map((scenario) => scenario.id),
-      ]) {
-        if (!v.criteria.some((c) => c.id === id)) {
-          v.criteria.push({
-            id,
-            status: "unclear",
-            evidence: "The verifier did not report on this criterion.",
-          });
-        }
-      }
-      v.overall = v.criteria.every((c) => c.status === "met") ? "pass" : "fail";
-      ctx.state.lastVerify = { ...v, modelId: target.modelId };
-      ctx.state.verifyResults = [
-        ...(ctx.state.verifyResults ?? []).filter((previous) => previous.round !== round),
-        { ...v, modelId: target.modelId, round },
-      ];
-      ctx.save();
-      ctx.store.putArtifact(
-        ctx.run.id,
-        `verify-${round}.json`,
-        "verify",
-        JSON.stringify(
-          { ...v, modelId: target.modelId, round },
-          (_key, value: unknown) =>
-            typeof value === "string" ? redactHoldoutText(value, ctx.state.holdout as Holdout) : value,
-          2,
-        ),
+  const verifyAttempt = async (attempt: number, excludeModels: string[] = []): Promise<Verify> =>
+    ctx.stage(
+      "verify",
+      async (stage) => {
+        const { result, target } = await ctx.invoke({
+          role: "verify",
+          stage,
+          mode: "readonly",
+          complexity: ctx.complexity,
+          constraints: { avoidVendor: ctx.state.implementer?.vendor, excludeModels },
+          timeoutMs: readingTimeout(diff.added + diff.removed, 25),
+          prompt: verifyPrompt({
+            prompt: ctx.run.prompt,
+            spec: ctx.state.spec as Spec,
+            holdout: ctx.state.holdout as Holdout,
+            baseSha,
+          }),
+          jsonSchema: toStrictJsonSchema(VerifySchema),
+          schema: VerifySchema,
+          requireStructured: true,
+          privateSession: true,
+          redactHoldout: true,
+        });
+        await discardChanges(cwd);
+        const v = normalizeVerify(
+          VerifySchema.parse(result.structured),
+          ctx.state.spec as Spec,
+          ctx.state.holdout as Holdout,
+        );
+        ctx.state.lastVerify = { ...v, modelId: target.modelId };
+        ctx.state.verifyResults = [
+          ...(ctx.state.verifyResults ?? []),
+          { ...v, modelId: target.modelId, round, attempt },
+        ];
+        ctx.save();
+        ctx.store.putArtifact(
+          ctx.run.id,
+          attempt === 0 ? `verify-${round}.json` : `verify-${round}-retry.json`,
+          "verify",
+          JSON.stringify(
+            { ...v, modelId: target.modelId, round, attempt },
+            (_key, value: unknown) =>
+              typeof value === "string" ? redactHoldoutText(value, ctx.state.holdout as Holdout) : value,
+            2,
+          ),
+        );
+        const met = v.criteria.filter((c) => c.status === "met").length;
+        return {
+          summary: `${v.overall}: ${met}/${v.criteria.length} criteria met (${target.modelId})`,
+          value: v,
+        };
+      },
+      round,
+    );
+  const previous = (ctx.state.verifyResults ?? []).filter((v) => v.round === round);
+  let verify = previous.at(-1) ?? (await verifyAttempt(0));
+  if (blockedOnly(verify)) {
+    const stop = (routing = ""): never => {
+      const evidence = verify.criteria
+        .filter((c) => c.status === "blocked")
+        .map((c) => `${c.id}: ${c.evidence}`)
+        .join("\n");
+      const detail = redactHoldoutText(
+        `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`,
+        ctx.state.holdout as Holdout,
       );
-      const met = v.criteria.filter((c) => c.status === "met").length;
-      return {
-        summary: `${v.overall}: ${met}/${v.criteria.length} criteria met (${target.modelId})`,
-        value: v,
-      };
-    },
-    round,
-  );
+      ctx.state.terminalReason = detail;
+      ctx.save();
+      throw new NeedsHumanError(detail);
+    };
+    if (ctx.state.environmentRetryRound === round || previous.some((v) => v.attempt === 1)) stop();
+    ctx.state.environmentRetryRound = round;
+    ctx.save();
+    const firstModel = ctx.state.lastVerify?.modelId;
+    try {
+      verify = await verifyAttempt(1, firstModel ? [firstModel] : []);
+    } catch (error) {
+      if (error instanceof NoCapacityError) stop(error.message);
+      throw error;
+    }
+    if (blockedOnly(verify)) stop();
+  }
   if (verify.overall !== "pass") {
     ctx.state.feedback = formatVerifyFeedback(verify, ctx.state.spec ?? null, ctx.state.holdout);
     ctx.save();
@@ -760,7 +780,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         for (const result of ctx.state.verifyResults ?? [])
           ctx.store.putArtifact(
             ctx.run.id,
-            `verify-${result.round}.json`,
+            result.attempt === 1 ? `verify-${result.round}-retry.json` : `verify-${result.round}.json`,
             "verify",
             JSON.stringify(result, null, 2),
           );

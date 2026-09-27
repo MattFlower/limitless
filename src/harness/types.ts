@@ -25,13 +25,20 @@ export type AgentEvent =
   | { type: "text"; text: string }
   | { type: "thinking"; text: string }
   | { type: "tool_call"; id: string; name: string; input: unknown }
-  | { type: "tool_result"; id: string; output: string; isError: boolean }
+  | {
+      type: "tool_result";
+      id: string;
+      output: string;
+      isError: boolean;
+    }
   | { type: "rate_limit"; status: string; windows: Record<string, QuotaWindow>; resetsAt: number | null }
   | { type: "stderr"; text: string }
   | { type: "status"; text: string };
 
 export interface AgentSpec {
   cwd: string;
+  /** Disposable write root owned by the invocation lifecycle, outside cwd. */
+  scratchDir?: string;
   prompt: string;
   systemAppend?: string;
   target: ModelTarget;

@@ -32,6 +32,7 @@ export interface ReportInput {
     | "lastReview"
     | "lastAudit"
     | "rebaseNote"
+    | "terminalReason"
   >;
   invocations: Invocation[];
   totals: { costUsd: number; costEquivUsd: number };
@@ -48,6 +49,7 @@ export function renderReport(input: ReportInput): string {
       ? "Built by **Limitless** — every gate below passed."
       : "⚠️ Built by **Limitless** but it **needs a human**: the checks below did not all pass.",
     ...(state.rebaseNote ? [`> [!NOTE]\n> ${state.rebaseNote}`] : []),
+    ...(state.terminalReason ? [`🚧 ${state.terminalReason}`] : []),
     "## Request",
     input.prompt
       .split("\n")
@@ -66,7 +68,15 @@ export function renderReport(input: ReportInput): string {
         ["", "Criterion", "Evidence"],
         state.spec.acceptance_criteria.map((ac) => {
           const v = verify?.criteria.find((c) => c.id === ac.id);
-          const icon = !v ? "·" : v.status === "met" ? "✅" : v.status === "unmet" ? "❌" : "❔";
+          const icon = !v
+            ? "·"
+            : v.status === "met"
+              ? "✅"
+              : v.status === "unmet"
+                ? "❌"
+                : v.status === "blocked"
+                  ? "🚧 blocked"
+                  : "❔";
           return [`${icon} ${ac.id}`, escapeCell(ac.criterion), escapeCell(v?.evidence ?? "not verified")];
         }),
       ),
@@ -87,7 +97,7 @@ export function renderReport(input: ReportInput): string {
           return [
             scenario.id,
             escapeCell(scenario.description),
-            result?.status ?? "unclear",
+            result?.status === "blocked" ? "🚧 blocked" : (result?.status ?? "unclear"),
             escapeCell(result?.evidence ?? "not verified"),
           ];
         }),

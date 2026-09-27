@@ -1425,3 +1425,216 @@ test("engine persists selected effort through a feedback round without changing 
   });
   expect(f.router.model("alpha/m")?.effort).toBe("low");
 });
+
+for (const path of [
+  "blocked",
+  "passes",
+  "retry-unmet",
+  "initial-unmet",
+  "unclear",
+  "no-alternative",
+] as const) {
+  test(`environment verification retry: ${path}`, async () => {
+    const verifierModels: string[] = [];
+    const scratchPaths: string[] = [];
+    const implementationPrompts: string[] = [];
+    const order: string[] = [];
+    const f = start((s) => {
+      const role = roleOf(s);
+      order.push(role);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review" || role === "verify") {
+        expect(s.scratchDir).toBeDefined();
+        const scratch = s.scratchDir as string;
+        expect(existsSync(scratch)).toBe(true);
+        expect(scratch.startsWith(s.cwd)).toBe(false);
+        scratchPaths.push(scratch);
+        writeFileSync(join(scratch, "fixture"), "data");
+      }
+      if (role === "review") return { structured: approve };
+      if (role === "verify") {
+        verifierModels.push(s.target.modelId);
+        const n = verifierModels.length;
+        if (path === "no-alternative") f.tracker.blockModel("alpha/m", "unavailable alternative");
+        if (
+          (path === "passes" && n === 2) ||
+          n === 3 ||
+          ((path === "initial-unmet" || path === "unclear") && n === 2)
+        )
+          return { structured: pass };
+        const actionable =
+          ((path === "initial-unmet" || path === "unclear") && n === 1) ||
+          (path === "retry-unmet" && n === 2);
+        return {
+          structured: {
+            ...pass,
+            overall: "fail",
+            criteria: pass.criteria.map((c) =>
+              c.id === "AC-1"
+                ? { ...c, status: "blocked", evidence: "Ran bun test: EPERM creating fixture directory" }
+                : c.id === "H-1" && actionable
+                  ? {
+                      ...c,
+                      status: path === "unclear" ? "unclear" : "unmet",
+                      evidence: "Observed wrong output",
+                    }
+                  : c,
+            ),
+          },
+        };
+      }
+      implementationPrompts.push(s.prompt);
+      return { files: { "farewell.txt": "goodbye\n" }, text: "implemented" };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file", profile: "standard" });
+    const terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
+    expect(terminal).toBe(path === "blocked" || path === "no-alternative" ? "needs_human" : "succeeded");
+    const state = f.store.getRunState<RunState>(run.id);
+    const actionable = ["retry-unmet", "initial-unmet", "unclear"].includes(path);
+    expect(implementationPrompts).toHaveLength(actionable ? 2 : 1);
+    expect(state?.round).toBe(actionable ? 1 : 0);
+    expect(state?.roundsOnImplementer).toBe(actionable ? 1 : 0);
+    expect(state?.implementer?.modelId).toBe("alpha/m");
+    expect(new Set(scratchPaths).size).toBe(scratchPaths.length);
+    for (const scratch of scratchPaths) expect(existsSync(scratch)).toBe(false);
+    expect(verifierModels[0]).toBe("beta/m");
+    if (["blocked", "passes", "retry-unmet"].includes(path)) {
+      expect(verifierModels[1]).toBe("alpha/m");
+      expect(order.slice(order.indexOf("verify"), order.indexOf("verify") + 2)).toEqual(["verify", "verify"]);
+      expect(state?.verifyResults?.slice(0, 2).map((v) => [v.round, v.attempt, v.modelId])).toEqual([
+        [0, 0, "beta/m"],
+        [0, 1, "alpha/m"],
+      ]);
+      expect(f.store.listArtifacts(run.id).map((a) => a.name)).toContain("verify-0-retry.json");
+    }
+    if (terminal === "needs_human") {
+      expect(f.store.getRun(run.id)?.error).toContain("verification blocked by the environment");
+      expect(state?.terminalReason).toContain("EPERM");
+      if (path === "no-alternative") expect(verifierModels).toHaveLength(1);
+      else expect(verifierModels).toHaveLength(2);
+    }
+    if (actionable) {
+      const feedback = implementationPrompts[1]?.split("### Checks not met")[1] ?? "";
+      expect(feedback).toContain("H-1");
+      expect(feedback).not.toContain("EPERM");
+      expect(feedback).not.toContain("cat farewell.txt");
+    }
+  });
+}
+
+for (const failure of ["throw", "timeout", "quota", "cancelled"] as const) {
+  test(`reader failure cleanup and fallback: ${failure}`, async () => {
+    let reviews = 0;
+    const paths: string[] = [];
+    let cwd = "";
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        reviews++;
+        cwd = s.cwd;
+        expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+        const scratch = s.scratchDir as string;
+        expect(existsSync(scratch)).toBe(true);
+        paths.push(scratch);
+        writeFileSync(join(scratch, "fixture"), "data");
+        if (reviews === 1) {
+          writeFileSync(join(cwd, "greeting.txt"), "incidental change");
+          writeFileSync(join(cwd, "incidental.txt"), "untracked");
+          if (failure === "throw") throw new Error("injected failure");
+          return { status: failure, error: failure };
+        }
+        expect(existsSync(paths[0] as string)).toBe(false);
+        expect(existsSync(join(cwd, "incidental.txt"))).toBe(false);
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human", "cancelled"])).toBe(
+      failure === "cancelled" ? "cancelled" : "succeeded",
+    );
+    expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+    expect(existsSync(join(cwd, "incidental.txt"))).toBe(false);
+    expect(new Set(paths).size).toBe(paths.length);
+    for (const path of paths) expect(existsSync(path)).toBe(false);
+  });
+}
+
+test("completed environment retry stays consumed after persisted-state restart", async () => {
+  let implementations = 0;
+  let verifies = 0;
+  const handler: Handler = (s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review") return { structured: approve };
+    if (role === "verify") {
+      verifies++;
+      return {
+        structured: {
+          ...pass,
+          criteria: pass.criteria.map((c) =>
+            c.id === "AC-1" ? { ...c, status: "blocked", evidence: "bun test failed: EPERM mkdir" } : c,
+          ),
+        },
+      };
+    }
+    implementations++;
+    return { files: { "farewell.txt": "goodbye\n" } };
+  };
+  const f = start(handler);
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+  expect(await waitFor(f, run.id, ["needs_human", "succeeded", "failed"])).toBe("needs_human");
+  expect(verifies).toBe(2);
+  await f.stop();
+  f.store.updateRun(run.id, { status: "queued", finishedAt: null });
+  f.store.close();
+  factory = null;
+  const resumed = start(handler);
+  expect(await waitFor(resumed, run.id, ["needs_human", "succeeded", "failed"])).toBe("needs_human");
+  expect(verifies).toBe(2);
+  expect(implementations).toBe(1);
+  expect(resumed.store.getRunState<RunState>(run.id)?.verifyResults).toHaveLength(2);
+});
+
+test("environment retry prefers another cross-vendor model over same-vendor fallback", async () => {
+  const ids: string[] = [];
+  const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
+  const beta = models.find((m) => m.id === "beta/m");
+  if (!beta) throw new Error("missing fixture model");
+  factory = new Factory(cfg, {
+    providers,
+    models: [...models, { ...beta, id: "beta/other", model: "beta-2" }],
+    policy: { ...policy, verify: { default: ["alpha/m", "beta/m", "beta/other"] } },
+    harnesses: {
+      fake: fakeHarness((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") {
+          ids.push(s.target.modelId);
+          if (ids.length > 1) return { structured: pass };
+          return {
+            structured: {
+              ...pass,
+              criteria: pass.criteria.map((c) =>
+                c.id === "AC-1" ? { ...c, status: "blocked", evidence: "bun test failed: EPERM mkdir" } : c,
+              ),
+            },
+          };
+        }
+        return { files: { "farewell.txt": "goodbye\n" } };
+      }),
+    },
+  });
+  factory.start();
+  const run = await factory.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+  expect(await waitFor(factory, run.id, ["succeeded", "needs_human", "failed"])).toBe("succeeded");
+  expect(ids).toEqual(["beta/m", "beta/other"]);
+});

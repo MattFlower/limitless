@@ -108,3 +108,57 @@ test("report rows show low, high, none and unknown effort independently", () => 
   for (const effort of ["low", "high", "none", "backend default", "unknown (legacy)"])
     expect(md).toContain(`| \`codex/astra\` | ${effort} | ok |`);
 });
+
+test("blocked acceptance and holdout checks have a distinct marker, label, evidence and terminal reason", () => {
+  const report = renderReport({
+    success: false,
+    runId: "blocked",
+    prompt: "test",
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "u",
+    state: {
+      terminalReason: "verification blocked by the environment",
+      spec: {
+        summary: "test",
+        assumptions: [],
+        requirements: [],
+        out_of_scope: [],
+        blocking_questions: [],
+        acceptance_criteria: ["AC-1", "AC-2", "AC-3", "AC-4"].map((id) => ({
+          id,
+          criterion: id,
+          how_to_verify: "test",
+        })),
+      },
+      holdout: {
+        scenarios: [
+          { id: "H-1", description: "check", steps: "bun test", expected: "pass", edge_case: true },
+        ],
+      },
+      lastVerify: {
+        modelId: "test/model",
+        overall: "fail",
+        notes: "",
+        criteria: [
+          { id: "AC-1", status: "blocked", evidence: "bun test failed: EPERM fixture" },
+          { id: "AC-2", status: "met", evidence: "passed" },
+          { id: "AC-3", status: "unmet", evidence: "assertion failure" },
+          { id: "AC-4", status: "unclear", evidence: "not established" },
+          { id: "H-1", status: "blocked", evidence: "build failed: EACCES output" },
+        ],
+      },
+    },
+  });
+  for (const text of [
+    "🚧 blocked AC-1",
+    "🚧 blocked",
+    "EPERM fixture",
+    "EACCES output",
+    "verification blocked by the environment",
+    "✅ AC-2",
+    "❌ AC-3",
+    "❔ AC-4",
+  ])
+    expect(report).toContain(text);
+});
