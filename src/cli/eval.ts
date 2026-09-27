@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { EvalRequestSchema } from "../evals/cases.ts";
 import { policyDiff, proposedOverlay, renderEvidence } from "../evals/evidence.ts";
 import { formatEvalReport } from "../evals/format.ts";
 import type { EvalPolicyResponse } from "../evals/policy.ts";
@@ -85,16 +86,20 @@ export async function evalCommand(
       throw new Error(`--${key} must be a finite number`);
     return Number(raw);
   };
+  const request = {
+    role: value,
+    models: flags.models.split(","),
+    k: numeric("k"),
+    maxUsd: numeric("max-usd"),
+    caseIds: typeof flags.cases === "string" ? flags.cases.split(",") : undefined,
+    cache: !flags["no-cache"],
+    rounds: numeric("rounds"),
+    strategy: flags.strategy,
+  };
+  EvalRequestSchema.parse(request);
   const { id } = await io.api<{ id: string }>("/api/evals", {
     method: "POST",
-    body: JSON.stringify({
-      role: value,
-      models: flags.models.split(","),
-      k: numeric("k"),
-      maxUsd: numeric("max-usd"),
-      caseIds: typeof flags.cases === "string" ? flags.cases.split(",") : undefined,
-      cache: !flags["no-cache"],
-    }),
+    body: JSON.stringify(request),
   });
   io.print(id);
   if (!flags.follow) return;

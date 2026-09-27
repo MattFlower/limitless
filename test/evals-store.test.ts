@@ -231,3 +231,65 @@ test("effort migration preserves v9 rows and pair upserts survive reopening", ()
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("round options and evidence survive reload with provider-specific spend and legacy defaults", () => {
+  const home = mkdtempSync(join(tmpdir(), "eval-round-store-"));
+  const path = join(home, "db.sqlite");
+  let store = new Store(path);
+  try {
+    const run = store.createEvalRun(
+      { role: "implement", models: ["a"], k: 1, maxUsd: 2, rounds: 3, strategy: "switch" },
+      [],
+    );
+    const rounds = ["provider", "other"].map((provider, round) => ({
+      provider,
+      round,
+      modelId: provider,
+      effort: "low" as const,
+      status: "ok" as const,
+      pass: round === 1,
+      reason: round ? null : "hidden_tests",
+      costUsd: round + 1,
+      costEquivUsd: round + 2,
+      tokensIn: 3,
+      tokensOut: 4,
+      durationMs: 5,
+    }));
+    store.recordEvalTrial({
+      ...row,
+      evalRunId: run.id,
+      details: { provider: "provider", rounds, roundsUsed: 2, stopReason: "success" },
+    });
+    store.close();
+    store = new Store(path);
+    expect(store.getEvalRun(run.id)).toMatchObject({ rounds: 3, strategy: "switch" });
+    const t = store.listEvalTrials(run.id)[0];
+    expect(t?.details.rounds).toEqual(rounds);
+    expect(store.providerSpendSince("provider", 0)).toBe(1);
+    expect(store.providerSpendSince("other", 0)).toBe(2);
+    if (!t) throw new Error("missing trial");
+    store.recordEvalTrial({
+      ...t,
+      trial: 1,
+      costUsd: 0,
+      details: {
+        ...t.details,
+        cache: {
+          evalRunId: run.id,
+          caseId: "a",
+          costUsd: 3,
+          costEquivUsd: 5,
+          tokensIn: 6,
+          tokensOut: 8,
+          durationMs: 10,
+        },
+      },
+    });
+    expect(store.providerSpendSince("other", 0)).toBe(2);
+    store.db.query("DELETE FROM eval_run_options WHERE eval_run_id = ?").run(run.id);
+    expect(store.getEvalRun(run.id)).toMatchObject({ rounds: 1, strategy: "retry" });
+  } finally {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});

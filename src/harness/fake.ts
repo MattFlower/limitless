@@ -5,6 +5,7 @@ import type { AgentResult, AgentSpec, Harness } from "./types.ts";
 
 export interface FakeReply {
   status?: InvocationStatus;
+  sessionId?: string | null;
   costUsd?: number;
   costEquivUsd?: number;
   usage?: AgentResult["usage"];
@@ -43,6 +44,7 @@ export function fakeHarness(handler: (spec: AgentSpec) => FakeReply | Promise<Fa
     if (reply.text) spec.onEvent({ type: "text", text: reply.text });
     return baseResult({
       status: reply.status ?? "ok",
+      sessionId: reply.sessionId === undefined ? "fake-session" : reply.sessionId,
       finalText: reply.text ?? "",
       structured: reply.structured ?? null,
       error: reply.error ?? null,

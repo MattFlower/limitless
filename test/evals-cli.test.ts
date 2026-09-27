@@ -323,3 +323,45 @@ test("eval CLI preserves target syntax and rejects invalid inputs through shared
     await f.close();
   }
 });
+
+test("CLI validates implement round options before submitting", async () => {
+  const bodies: unknown[] = [];
+  const io = {
+    api: async <T>(_path: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return { id: "eval" } as T;
+    },
+    print: () => {},
+    wait: async () => {},
+  };
+  for (const rounds of ["0", "-1", "1.5", "Infinity", "NaN", "9007199254740992"])
+    await expect(evalCommand(["run", "implement"], { models: "a", rounds }, io)).rejects.toThrow();
+  await expect(evalCommand(["run", "implement"], { models: "a", strategy: "bad" }, io)).rejects.toThrow();
+  for (const role of ["triage", "review", "verify"])
+    for (const option of [{ rounds: "1" }, { strategy: "retry" }])
+      await expect(evalCommand(["run", role], { models: "a", ...option }, io)).rejects.toThrow(
+        "implement-only",
+      );
+  expect(bodies).toEqual([]);
+  await evalCommand(["run", "implement"], { models: "a", rounds: "3", strategy: "effort", k: "2" }, io);
+  expect(bodies[0]).toMatchObject({ rounds: 3, strategy: "effort", k: 2 });
+});
+
+test("CLI entrypoint recognizes round flags", () => {
+  const child = Bun.spawnSync([
+    process.execPath,
+    join(import.meta.dir, "../src/cli/main.ts"),
+    "eval",
+    "run",
+    "implement",
+    "--models",
+    "a",
+    "--rounds",
+    "3",
+    "--strategy",
+    "effort",
+    "--help",
+  ]);
+  expect(child.exitCode).toBe(0);
+  expect(child.stdout.toString()).toContain("--strategy retry|effort|switch");
+});

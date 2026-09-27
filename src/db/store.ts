@@ -62,6 +62,8 @@ function clampData(data: unknown): string | null {
 const toEvalRun = (r: Row): EvalRun => ({
   id: r.id as string,
   role: r.role as EvalRun["role"],
+  rounds: (r.rounds as number | null) ?? 1,
+  strategy: (r.strategy as EvalRun["strategy"]) ?? "retry",
   models: parse(r.models, []),
   k: r.k as number,
   maxUsd: r.max_usd as number,
@@ -290,9 +292,14 @@ export class Store {
     this.db.close();
   }
 
-  createEvalRun(input: Pick<EvalRun, "role" | "models" | "k" | "maxUsd">, trials: EvalTrial[]): EvalRun {
+  createEvalRun(
+    input: Pick<EvalRun, "role" | "models" | "k" | "maxUsd" | "rounds" | "strategy">,
+    trials: EvalTrial[],
+  ): EvalRun {
     const run: EvalRun = {
       ...input,
+      rounds: input.rounds ?? 1,
+      strategy: input.strategy ?? "retry",
       id: newId("eval-"),
       status: "queued",
       createdAt: Date.now(),
@@ -313,6 +320,9 @@ export class Store {
           null,
           null,
         );
+      this.db
+        .query("INSERT INTO eval_run_options VALUES (?, ?, ?)")
+        .run(run.id, run.rounds ?? 1, run.strategy ?? "retry");
       for (const trial of trials) this.recordEvalTrial({ ...trial, evalRunId: run.id });
     })();
     return run;
@@ -326,14 +336,22 @@ export class Store {
   }
 
   getEvalRun(id: string): EvalRun | null {
-    const row = this.db.query("SELECT * FROM eval_runs WHERE id = ?").get(id) as Row | null;
+    const row = this.db
+      .query(
+        "SELECT eval_runs.*, rounds, strategy FROM eval_runs LEFT JOIN eval_run_options ON eval_run_id = id WHERE id = ?",
+      )
+      .get(id) as Row | null;
     return row ? toEvalRun(row) : null;
   }
 
   listEvalRuns(): EvalRun[] {
-    return (this.db.query("SELECT * FROM eval_runs ORDER BY created_at DESC, id DESC").all() as Row[]).map(
-      toEvalRun,
-    );
+    return (
+      this.db
+        .query(
+          "SELECT eval_runs.*, rounds, strategy FROM eval_runs LEFT JOIN eval_run_options ON eval_run_id = id ORDER BY created_at DESC, id DESC",
+        )
+        .all() as Row[]
+    ).map(toEvalRun);
   }
 
   recordEvalTrial(t: EvalTrial): void {
@@ -951,9 +969,13 @@ export class Store {
       .get(provider, since) as Row;
     const evals = this.db
       .query(
-        "SELECT COALESCE(SUM(cost_usd),0) AS s FROM eval_trials WHERE json_extract(details_json, '$.provider') = ? AND created_at >= ?",
+        `SELECT COALESCE(SUM(CASE WHEN json_extract(details_json, '$.rounds[0].provider') IS NOT NULL
+          THEN (SELECT COALESCE(SUM(json_extract(value, '$.costUsd')), 0)
+            FROM json_each(details_json, '$.rounds') WHERE json_extract(value, '$.provider') = ?)
+          WHEN json_extract(details_json, '$.provider') = ? THEN cost_usd ELSE 0 END), 0) AS s
+         FROM eval_trials WHERE created_at >= ? AND json_extract(details_json, '$.cache') IS NULL`,
       )
-      .get(provider, since) as Row;
+      .get(provider, provider, since) as Row;
     return (r.s as number) + (chat.s as number) + (evals.s as number);
   }
 

@@ -353,7 +353,10 @@ export interface ChatConversation {
 export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 
 export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed";
+export type EvalStrategy = "retry" | "effort" | "switch";
 export interface EvalRun {
+  rounds?: number;
+  strategy?: EvalStrategy;
   id: string;
   role: "triage" | "review" | "verify" | "implement";
   models: string[];
@@ -422,6 +425,9 @@ export interface EvalTrial {
   pass: boolean | null;
   score: number | null;
   details: {
+    rounds?: EvalRound[];
+    roundsUsed?: number;
+    stopReason?: string;
     complexity?: "trivial" | "small" | "medium";
     provider?: string;
     reason?: string;
@@ -445,4 +451,19 @@ export interface EvalTrial {
   tokensOut: number;
   durationMs: number;
   createdAt: number;
+}
+
+export interface EvalRound {
+  provider?: string;
+  round: number;
+  modelId: string;
+  effort: RecordedEffort;
+  status: InvocationStatus;
+  pass: boolean | null;
+  reason: string | null;
+  costUsd: number;
+  costEquivUsd: number;
+  tokensIn: number;
+  tokensOut: number;
+  durationMs: number;
 }

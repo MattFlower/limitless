@@ -1,11 +1,23 @@
-import { chmodSync, lstatSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  cpSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
-import type { EvalGrade } from "../core/types.ts";
+import type { EvalGrade, EvalStrategy } from "../core/types.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
 import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
-import { implementPrompt } from "../pipeline/prompts.ts";
+import type { ModelTarget } from "../harness/types.ts";
+import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../pipeline/prompts.ts";
+import type { Router } from "../router/router.ts";
 import { agentEnv, runProcess, sh } from "../util/proc.ts";
 import type { hiddenContents, ImplementCase } from "./cases.ts";
 import { gatesAt } from "./prepare.ts";
@@ -76,6 +88,7 @@ export async function gradeImplement(
   prepared: { gates: GateConfig; baseline: GateRun },
   toolCommands: string[],
   signal: AbortSignal,
+  restore = false,
 ): Promise<EvalGrade> {
   // The candidate controls .git/config and .gitattributes, so filters and diff drivers are its code.
   const env = agentEnv();
@@ -86,6 +99,12 @@ export async function gradeImplement(
     auditBlocks: [],
     auditWarnings: [],
     hidden: null,
+  };
+  const snapshot = restore ? mkdtempSync(join(dirname(cwd), "grade-")) : undefined;
+  let snapshotReady = false;
+  const copy = (from: string, to: string) => {
+    for (const name of readdirSync(from))
+      cpSync(join(from, name), join(to, name), { recursive: true, verbatimSymlinks: true });
   };
   try {
     signal.throwIfAborted();
@@ -109,6 +128,11 @@ export async function gradeImplement(
       { cwd, env, signal },
     );
     evidence.commit = (await sh(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
+    if (snapshot) {
+      // Restore Git metadata too: grading commands may stage/commit hidden inputs or leave logs.
+      copy(cwd, snapshot);
+      snapshotReady = true;
+    }
     const after = await runGates(cwd, prepared.gates, signal);
     signal.throwIfAborted();
     await discardChanges(cwd, env);
@@ -167,6 +191,17 @@ export async function gradeImplement(
     signal.throwIfAborted();
     evidence.reason ??= "error";
     evidence.error = (error as Error).message;
+  } finally {
+    if (snapshot) {
+      try {
+        if (snapshotReady) {
+          for (const name of readdirSync(cwd)) rmSync(join(cwd, name), { recursive: true, force: true });
+          copy(snapshot, cwd);
+        }
+      } finally {
+        rmSync(snapshot, { recursive: true, force: true });
+      }
+    }
   }
   return {
     pass: evidence.reason === null,
@@ -175,4 +210,67 @@ export async function gradeImplement(
     riskUnderCall: null,
     implement: evidence,
   };
+}
+
+export function nextImplementTarget(
+  router: Router,
+  item: ImplementCase,
+  target: ModelTarget,
+  strategy: EvalStrategy,
+) {
+  if (strategy === "retry") return target;
+  if (strategy === "switch") {
+    const decision = router.route("implement", item.complexity);
+    const next = decision.candidates
+      .filter((candidate) => candidate.tier > target.tier)
+      .sort((a, b) => a.tier - b.tier)[0];
+    if (!next)
+      for (const skipped of decision.skipped) {
+        const model = router.model(skipped.modelId.split("@")[0] ?? "");
+        if (
+          model &&
+          model.tier > target.tier &&
+          (skipped.reason === "disabled" || skipped.reason.startsWith(`${model.provider}:`))
+        )
+          throw new Error(`Stronger policy target unavailable: ${skipped.reason}`);
+      }
+    return next;
+  }
+  const levels: NonNullable<ModelTarget["effort"]>[] = ["none", "low", "medium", "high"];
+  const index = target.effort === undefined ? -1 : levels.indexOf(target.effort);
+  const model = router.model(target.modelId);
+  if (index < 0 || !model) return undefined;
+  const effort = levels.slice(index + 1).find((level) => model.supportedEfforts.includes(level));
+  if (!effort) return undefined;
+  try {
+    const resolved = router.resolveFor("implement", { modelId: model.id, effort });
+    return router.toTarget(model, resolved.effort);
+  } catch {
+    return undefined;
+  }
+}
+
+export function implementRetryPrompt(
+  item: ImplementCase,
+  prepared: Awaited<ReturnType<typeof prepareImplement>>,
+  grade: EvalGrade,
+  round: number,
+) {
+  const evidence = grade.implement;
+  if (!evidence) throw new Error("missing implementation grade");
+  return implementPrompt({
+    ...prepared,
+    prompt: item.prompt,
+    spec: item.spec,
+    baseSha: item.base,
+    round,
+    hasHoldout: false,
+    feedback: [
+      formatGateFeedback(evidence.gates),
+      formatAuditFeedback([...evidence.auditBlocks, ...evidence.auditWarnings]),
+      evidence.hidden && evidence.hidden.exitCode !== 0 ? "1 acceptance tests fail" : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+  });
 }
