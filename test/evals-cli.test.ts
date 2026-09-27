@@ -205,13 +205,15 @@ test("policy CLI preview names the specific rejection when a role has no eligibl
   const output = printed.join("\n");
   expect(output).toContain("No effective policy changes.");
   expect(output).toContain(
-    `triage unchanged: no eligible models (${local}: risk under-call rate 0.1250 exceeds ceiling 0.1)`,
+    `triage unchanged: no eligible models (${local}: risk under-call upper bound 0.2611 exceeds ceiling 0.1)`,
   );
 });
 
 test("policy CLI turns a small fake-harness eval into a written overlay through the real routes", async () => {
   const f = await evalFixture();
   try {
+    // Six observations cannot establish the default 0.10 ceiling; size it to the fixture.
+    f.factory.evalSettings.floors.triage_risk_under_call_rate = 0.5;
     const routes = createHttpRoutes(f.factory);
     const files = new Map<string, string>();
     const printed: string[] = [];

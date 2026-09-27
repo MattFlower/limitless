@@ -46,9 +46,10 @@ export function selectEvidence(evidence: Evidence[], ids?: string[]) {
   );
 }
 /**
- * Floors ("lower") require the Wilson 95% lower bound; ceilings ("upper") cap the observed rate.
- * A ceiling on the Wilson upper bound would need 35+ zero-error observations to clear 0.10, so the
- * suite's 20-40 case datasets could never establish an error rate below it.
+ * Floors ("lower") require the Wilson 95% lower bound; ceilings ("upper") require the Wilson 95%
+ * upper bound. When a dataset is too small to establish a ceiling even with zero errors (e.g. a 0.10
+ * ceiling needs 35+ error-free observations), the metric is "insufficient evidence", not a failure:
+ * routing stays unchanged until more cases exist, and default ceilings are sized to the datasets.
  */
 function metric(
   name: string,
@@ -66,9 +67,11 @@ function metric(
         ? ci[0] < floor
           ? `${name} lower bound ${ci[0].toFixed(4)} is below floor ${floor}`
           : null
-        : rate > floor
-          ? `${name} rate ${rate.toFixed(4)} exceeds ceiling ${floor}`
-          : null;
+        : (wilson(0, denominator)?.[1] ?? 1) > floor
+          ? `insufficient evidence: ${denominator} observations cannot establish ${name} ≤ ${floor}`
+          : ci[1] > floor
+            ? `${name} upper bound ${ci[1].toFixed(4)} exceeds ceiling ${floor}`
+            : null;
   return { name, numerator, denominator, rate, ci, direction, floor, reason };
 }
 export function generatePolicy(input: PolicyInput) {

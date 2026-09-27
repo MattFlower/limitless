@@ -184,8 +184,8 @@ subscription_weight = 0.25
 triage_pass_rate = 0.60
 triage_risk_under_call_rate = 0.10
 review_defect_recall = 0.50
-review_clean_false_block_rate = 0.34
-verify_false_accept_rate = 0.10
+review_clean_false_block_rate = 0.50
+verify_false_accept_rate = 0.25
 
 [routing]
 exclude_origins = ["CN"] # Optional; omit to apply no origin filter

@@ -52,7 +52,7 @@ for (const [role, field, bound] of [
   ["review", "review_clean_false_block_rate", "upper"],
   ["verify", "verify_false_accept_rate", "upper"],
 ] as const)
-  test(`${field}: inclusive boundary (Wilson lower bound for floors, observed rate for ceilings)`, () => {
+  test(`${field}: inclusive boundary (Wilson lower bound for floors, upper bound for ceilings)`, () => {
     const rows = [evidence(role)];
     // Two error events so the ceiling boundary is a real nonzero rate.
     for (const t of rows[0]?.trials.filter((t) => t.details.grade?.review?.falseBlock !== null).slice(0, 2) ??
@@ -68,13 +68,15 @@ for (const [role, field, bound] of [
       field === "triage_risk_under_call_rate" || field === "review_clean_false_block_rate" ? 1 : 0;
     const metric = initial.metrics[index];
     if (!metric?.ci || metric.rate === null) throw new Error("missing interval");
-    const threshold = bound === "lower" ? metric.ci[0] : metric.rate;
-    if (bound === "upper") {
-      expect(metric.rate).toBeGreaterThan(0);
-      // The Wilson upper bound sits above the ceiling; it is reported, not enforced.
-      expect(metric.ci[1]).toBeGreaterThan(threshold);
-    }
-    const settings = evalSettings({ evals: { floors: { [field]: threshold } } });
+    const threshold = bound === "lower" ? metric.ci[0] : metric.ci[1];
+    if (bound === "upper") expect(metric.rate).toBeGreaterThan(0);
+    // Every other ceiling is made achievable so only the metric under test decides eligibility.
+    const permissive = {
+      triage_risk_under_call_rate: 1,
+      review_clean_false_block_rate: 1,
+      verify_false_accept_rate: 1,
+    };
+    const settings = evalSettings({ evals: { floors: { ...permissive, [field]: threshold } } });
     expect(first(input(rows, { settings })).eligible).toBe(true);
     settings.floors[field] = threshold + (bound === "lower" ? 0.0001 : -0.0001);
     const rejected = first(input(rows, { settings }));
@@ -391,4 +393,15 @@ test("hard rejections are ineligible, not insufficient evidence, even without an
     expect(c.reasons.some((r) => r.startsWith("insufficient evidence"))).toBe(false);
   }
   expect(excluded?.candidates).toHaveLength(2);
+});
+
+test("a ceiling the dataset is too small to establish is insufficient evidence, not a pass", () => {
+  const row = evidence("verify");
+  row.trials = row.trials.slice(0, 1);
+  for (const t of row.trials) if (t.details.grade?.verify) t.details.grade.verify.falseAccepts = 0;
+  const settings = evalSettings({ evals: { floors: { verify_false_accept_rate: 0.1 } } });
+  const result = first(input([row], { settings }));
+  expect(result.eligible).toBe(false);
+  expect(result.state).toBe("insufficient evidence");
+  expect(result.reasons.join()).toContain("cannot establish");
 });
