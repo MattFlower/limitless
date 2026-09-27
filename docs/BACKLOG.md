@@ -496,7 +496,8 @@ fast, 32K-token context, available with our OpenRouter key.
   threshold, or needs_questions is likely, fall through to the LLM triage (which can also write the
   blocking questions). Calibrate the threshold on evals/triage (the grader is unchanged).
 - Catalog: `openrouter/jev-1.13` with harness `decisions`, usable only by roles with a decisions
-  mapping; origin `unknown` until verified (so work policy excludes it until then).
+  mapping; origin "US" (TypeSafe is a US company, per the owner), so it is eligible under the
+  work policy's no-China-origin rule once its evals pass.
 - Evals: sweep Jev on the triage gold set against Luna/Sonnet/local; report the cascade's
   escalation rate and its combined accuracy/cost.
 - Later: routing questions for item 26 (e.g. task difficulty as a score), concierge intent.
