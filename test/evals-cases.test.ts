@@ -2,7 +2,13 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CaseFileSchema, loadCases, loadRoleCases, validateRequest } from "../src/evals/cases.ts";
+import {
+  CaseFileSchema,
+  EvalRequestSchema,
+  loadCases,
+  loadRoleCases,
+  validateRequest,
+} from "../src/evals/cases.ts";
 import { evalFixture } from "./evals-support.ts";
 
 test("committed 40 cases load unchanged, including notes and gold alternatives", () => {
@@ -283,5 +289,29 @@ test("implement dataset validates pins, spec, paths, duplicate IDs, commands and
     expect(() => loadRoleCases("implement", casePath)).toThrow("hidden file");
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("round control validates before dataset access and preserves independent k", async () => {
+  const request = { role: "implement", models: ["candidate-a"], k: 4 };
+  expect(EvalRequestSchema.parse(request)).toMatchObject({ rounds: 1, strategy: "retry", k: 4 });
+  for (const strategy of ["retry", "effort", "switch"])
+    expect(EvalRequestSchema.parse({ ...request, rounds: 3, strategy })).toMatchObject({
+      rounds: 3,
+      strategy,
+      k: 4,
+    });
+  const f = await evalFixture();
+  try {
+    for (const rounds of [0, -1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1])
+      expect(() => f.factory.evals.submit({ ...request, rounds })).toThrow();
+    expect(() => f.factory.evals.submit({ ...request, strategy: "unknown" })).toThrow();
+    for (const role of ["triage", "review", "verify"])
+      for (const options of [{ rounds: 1 }, { strategy: "retry" }])
+        expect(() => f.factory.evals.submit({ ...request, role, ...options })).toThrow("implement-only");
+    expect(f.calls).toHaveLength(0);
+    expect(f.factory.store.listEvalRuns()).toHaveLength(0);
+  } finally {
+    await f.close();
   }
 });

@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { EvalRun, EvalTrial } from "../core/types.ts";
 import { createEvalWorktree, type EvalLabels, pinnedTree } from "../git/repos.ts";
-import { withScratch } from "../harness/scratch.ts";
+import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
 import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
 import type { EngineDeps } from "../pipeline/context.ts";
@@ -20,7 +20,13 @@ import {
   loadRoleCases,
   validateRequest,
 } from "./cases.ts";
-import { failedImplement, gradeImplement, prepareImplement } from "./implement.ts";
+import {
+  failedImplement,
+  gradeImplement,
+  implementRetryPrompt,
+  nextImplementTarget,
+  prepareImplement,
+} from "./implement.ts";
 import { gradeCase, prepareCase, schemaFor, seedContent } from "./prepare.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 
@@ -190,19 +196,49 @@ export class EvalRunner {
     hidden: ReturnType<typeof hiddenContents> = [],
   ): Promise<void> {
     const { store, router, tracker, harnesses, cfg } = this.deps;
-    const skip = (reason: string) =>
-      store.recordEvalTrial({ ...trial, status: "skipped", details: { ...trial.details, reason } });
+    const rounds = run.rounds ?? 1;
+    const strategy = run.strategy ?? "retry";
+    let roundStarted = 0;
+    const interruptRound = (reason: string) => {
+      const last = trial.details.rounds?.at(-1);
+      if (last?.pass === null) {
+        const elapsed = Date.now() - roundStarted;
+        trial.durationMs += elapsed - last.durationMs;
+        Object.assign(last, { status: signal.aborted ? "cancelled" : "error", reason, durationMs: elapsed });
+      }
+    };
+    const skip = (reason: string) => {
+      interruptRound(reason);
+      const interrupted = rounds > 1 && (trial.details.roundsUsed ?? 0) > 0;
+      store.recordEvalTrial({
+        ...trial,
+        status: interrupted ? "error" : "skipped",
+        ...(interrupted ? { pass: false, score: 0 } : {}),
+        details: {
+          ...trial.details,
+          ...("hidden" in item ? { roundsUsed: trial.details.roundsUsed ?? 0, stopReason: reason } : {}),
+          reason,
+          ...(interrupted
+            ? {
+                interrupted: true,
+                stopReason: reason,
+                grade: failedImplement("error", reason),
+              }
+            : {}),
+        },
+      });
+    };
     const budget = () => store.evalSpend(run.id) >= run.maxUsd;
     if (signal.aborted) return skip("daemon shutdown");
     const model = router.model(trial.modelId);
     if (!model) return skip("model no longer in catalog");
     trial.details.provider = model.provider;
     const eligible = () => {
-      const reason = tracker.unavailableReason(model.provider);
+      const reason = tracker.unavailableReason(target.provider);
       return (
         (reason === "at reserve limit"
-          ? (tracker.budgetUnavailableReason(model.provider) ?? reason)
-          : reason) ?? tracker.modelUnavailableReason(model.id)
+          ? (tracker.budgetUnavailableReason(target.provider) ?? reason)
+          : reason) ?? tracker.modelUnavailableReason(target.modelId)
       );
     };
     if (budget()) return skip("eval budget exhausted");
@@ -217,12 +253,13 @@ export class EvalRunner {
       tracker.def(model.provider),
     );
     if (transport) return skip(transport);
-    const target = router.toTarget(model, effort ?? null);
-    const { harnessName, noTools } = selectHarness(run.role, target);
+    let target = router.toTarget(model, effort ?? null);
+    let { harnessName, noTools } = selectHarness(run.role, target);
     trial.harness = harnessName;
     const tree = "gold" in item && "prompt" in item ? await treeFor(item.repo) : "";
     let release: (() => void) | undefined;
     let directory: string | undefined;
+    let scratch: string | undefined;
     let cleanup: (() => Promise<void>) | undefined;
     try {
       mkdirSync(cfg.paths.runs, { recursive: true });
@@ -246,7 +283,8 @@ export class EvalRunner {
       const prepared = "hidden" in item ? implementation : await prepareCase(item, cwd, tree, patch, signal);
       if (!prepared) throw new Error("missing trial preparation");
       const preparationMs = Date.now() - preparationStarted;
-      const { prompt, timeoutMs } = prepared;
+      let { prompt } = prepared;
+      const { timeoutMs } = prepared;
       const schema = "hidden" in item ? undefined : schemaFor(item);
       const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
@@ -281,7 +319,7 @@ export class EvalRunner {
         FACTORY_PREAMBLE,
         jsonSchema ?? {},
         trial.trial,
-        repository,
+        rounds > 1 ? { ...repository, rounds, strategy } : repository,
         trial.effort,
       );
       if (signal.aborted) return skip("daemon shutdown");
@@ -316,122 +354,181 @@ export class EvalRunner {
           });
           return;
         }
-      const harness = harnesses[harnessName];
-      if (!harness) return skip(`No harness registered for ${harnessName}`);
-      const reason = eligible();
-      if (reason) return skip(reason);
-      release = await tracker.acquire(target.provider, signal);
-      if (signal.aborted) return skip("daemon shutdown");
-      if (budget()) return skip("eval budget exhausted");
-      const afterWait = eligible();
-      if (afterWait) return skip(afterWait);
-      trial.createdAt = Date.now();
-      store.recordEvalTrial({ ...trial, status: "running" });
-      let result: AgentResult;
       const toolCommands: string[] = [];
-      try {
-        const logPath = join(directory, "trial.log");
-        const invoke = (scratchDir?: string) =>
-          harness({
-            scratchDir,
-            cwd,
-            prompt,
-            systemAppend: FACTORY_PREAMBLE,
-            target,
-            mode: "hidden" in item ? "edit" : "readonly",
-            noTools,
-            jsonSchema,
-            schema,
-            timeoutMs,
-            privateSession: run.role === "verify",
-            idleTimeoutMs: 10 * 60_000,
-            maxToolCalls: "hidden" in item ? 400 : 150,
-            signal,
-            logPath,
-            onEvent: (event) => {
-              if (
-                event.type === "tool_call" &&
-                event.input &&
-                typeof event.input === "object" &&
-                "command" in event.input &&
-                typeof event.input.command === "string"
-              )
-                toolCommands.push(event.input.command);
-              if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
-            },
-          });
-        result = noTools ? await invoke() : await withScratch(cwd, invoke);
-      } catch (error) {
-        result = {
-          status: signal.aborted ? "cancelled" : "error",
-          finalText: "",
-          structured: null,
-          sessionId: null,
-          usage: emptyUsage(),
-          numTurns: 0,
-          costUsd: 0,
-          costEquivUsd: 0,
-          error: (error as Error).message,
-          quota: null,
+      let sessionId: string | undefined;
+      if (rounds > 1) scratch = createScratch(cwd);
+      for (let round = 0; round < rounds; round++) {
+        if (signal.aborted) return skip("daemon shutdown");
+        if (budget()) return skip("eval budget exhausted");
+        ({ harnessName, noTools } = selectHarness(run.role, target));
+        const harness = harnesses[harnessName];
+        if (!harness) return skip(`No harness registered for ${harnessName}`);
+        const reason = eligible();
+        if (reason) return skip(reason);
+        release = await tracker.acquire(target.provider, signal);
+        if (signal.aborted) return skip("daemon shutdown");
+        if (budget()) return skip("eval budget exhausted");
+        const afterWait = eligible();
+        if (afterWait) return skip(afterWait);
+        if (round === 0) trial.createdAt = Date.now();
+        roundStarted = Date.now();
+        store.recordEvalTrial({ ...trial, status: "running" });
+        let result: AgentResult;
+        try {
+          const logPath = join(directory, "trial.log");
+          const invoke = (scratchDir?: string) =>
+            harness({
+              scratchDir,
+              ...(sessionId ? { resumeSessionId: sessionId } : {}),
+              cwd,
+              prompt,
+              systemAppend: FACTORY_PREAMBLE,
+              target,
+              mode: "hidden" in item ? "edit" : "readonly",
+              noTools,
+              jsonSchema,
+              schema,
+              timeoutMs,
+              privateSession: run.role === "verify",
+              idleTimeoutMs: 10 * 60_000,
+              maxToolCalls: "hidden" in item ? 400 : 150,
+              signal,
+              logPath,
+              onEvent: (event) => {
+                if (
+                  event.type === "tool_call" &&
+                  event.input &&
+                  typeof event.input === "object" &&
+                  "command" in event.input &&
+                  typeof event.input.command === "string"
+                )
+                  toolCommands.push(event.input.command);
+                if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
+              },
+            });
+          result = noTools
+            ? await invoke()
+            : scratch
+              ? await invoke(scratch)
+              : await withScratch(cwd, invoke);
+        } catch (error) {
+          result = {
+            status: signal.aborted ? "cancelled" : "error",
+            finalText: "",
+            structured: null,
+            sessionId: null,
+            usage: emptyUsage(),
+            numTurns: 0,
+            costUsd: 0,
+            costEquivUsd: 0,
+            error: (error as Error).message,
+            quota: null,
+          };
+        }
+        release?.();
+        release = undefined;
+        trial.costUsd += result.costUsd;
+        trial.costEquivUsd += result.costEquivUsd;
+        trial.tokensIn += result.usage.input + result.usage.cacheRead + result.usage.cacheWrite;
+        trial.tokensOut += result.usage.output;
+        trial.output = "hidden" in item ? result.finalText : result.structured;
+        const roundEvidence = {
+          round,
+          provider: target.provider,
+          modelId: target.modelId,
+          effort: recordEffort(target.effort),
+          status: result.status,
+          pass: null as boolean | null,
+          reason: result.error,
+          costUsd: result.costUsd,
+          costEquivUsd: result.costEquivUsd,
+          tokensIn: result.usage.input + result.usage.cacheRead + result.usage.cacheWrite,
+          tokensOut: result.usage.output,
+          durationMs: Date.now() - roundStarted,
         };
-      }
-      trial.costUsd = result.costUsd;
-      trial.costEquivUsd = result.costEquivUsd;
-      trial.tokensIn = result.usage.input + result.usage.cacheRead + result.usage.cacheWrite;
-      trial.tokensOut = result.usage.output;
-      trial.output = "hidden" in item ? result.finalText : result.structured;
-      if ("hidden" in item) store.recordEvalTrial({ ...trial, status: "running" });
-      if (result.quota) tracker.observeWindows(target.provider, result.quota.windows);
-      tracker.record(target.provider, result.status, {
-        error: result.error,
-        exhaustedUntil: result.quota?.exhaustedUntil,
-      });
-      if (
-        result.status !== "ok" &&
-        /model[^.]{0,80}(is not supported|not found|does not exist|not available)|unknown model|invalid model|model_not_found/i.test(
-          result.error ?? "",
+        if ("hidden" in item) {
+          trial.details.rounds ??= [];
+          trial.details.rounds.push(roundEvidence);
+          trial.details.roundsUsed = round + 1;
+          trial.durationMs = Date.now() - trial.createdAt + preparationMs;
+          store.recordEvalTrial({ ...trial, status: "running" });
+        }
+        if (result.quota) tracker.observeWindows(target.provider, result.quota.windows);
+        tracker.record(target.provider, result.status, {
+          error: result.error,
+          exhaustedUntil: result.quota?.exhaustedUntil,
+        });
+        if (
+          result.status !== "ok" &&
+          /model[^.]{0,80}(is not supported|not found|does not exist|not available)|unknown model|invalid model|model_not_found/i.test(
+            result.error ?? "",
+          )
         )
-      )
-        tracker.blockModel(model.id, result.error ?? "model rejected");
-      if (signal.aborted) return skip("daemon shutdown");
-      const output = schema?.safeParse(result.structured ?? extractJson(result.finalText));
-      const ok = result.status === "ok" && ("hidden" in item || output?.success === true);
-      const grade =
-        "hidden" in item && implementation
-          ? result.status === "ok"
-            ? await gradeImplement(item, cwd, hidden, implementation, toolCommands, signal)
-            : failedImplement(result.status === "timeout" ? "timeout" : "error", result.error ?? undefined)
-          : ok && output?.success && !("hidden" in item)
-            ? gradeCase(item, output.data)
-            : undefined;
-      store.recordEvalTrial({
-        ...trial,
-        status:
-          ok && grade?.implement?.reason !== "error" && grade?.implement?.reason !== "timeout"
-            ? "ok"
-            : "error",
-        output: "hidden" in item ? result.finalText : output?.success ? output.data : result.structured,
-        pass: grade ? grade.pass : false,
-        score: grade ? grade.score : 0,
-        details: {
-          ...trial.details,
-          grade,
-          invocationStatus: result.status,
-          reason:
-            grade?.implement?.reason ??
-            (ok
-              ? undefined
-              : (result.error ??
-                (output?.success ? result.status : `Invalid ${run.role} output: ${output?.error.message}`))),
-        },
-        costUsd: result.costUsd,
-        costEquivUsd: result.costEquivUsd,
-        tokensIn: result.usage.input + result.usage.cacheRead + result.usage.cacheWrite,
-        tokensOut: result.usage.output,
-        durationMs: Date.now() - trial.createdAt + ("hidden" in item ? preparationMs : 0),
-      });
+          tracker.blockModel(target.modelId, result.error ?? "model rejected");
+        if (signal.aborted) return skip("daemon shutdown");
+        const output = schema?.safeParse(result.structured ?? extractJson(result.finalText));
+        const ok = result.status === "ok" && ("hidden" in item || output?.success === true);
+        const grade =
+          "hidden" in item && implementation
+            ? result.status === "ok"
+              ? await gradeImplement(item, cwd, hidden, implementation, toolCommands, signal, rounds > 1)
+              : failedImplement(result.status === "timeout" ? "timeout" : "error", result.error ?? undefined)
+            : ok && output?.success && !("hidden" in item)
+              ? gradeCase(item, output.data)
+              : undefined;
+        if (grade?.implement?.reason === "error" || grade?.implement?.reason === "timeout")
+          roundEvidence.status = grade.implement.reason;
+        roundEvidence.pass = grade?.pass ?? false;
+        roundEvidence.reason = grade?.implement?.reason ?? result.error;
+        roundEvidence.durationMs = Date.now() - roundStarted;
+        trial = {
+          ...trial,
+          status:
+            ok && grade?.implement?.reason !== "error" && grade?.implement?.reason !== "timeout"
+              ? "ok"
+              : "error",
+          output: "hidden" in item ? result.finalText : output?.success ? output.data : result.structured,
+          pass: grade ? grade.pass : false,
+          score: grade ? grade.score : 0,
+          details: {
+            ...trial.details,
+            grade,
+            invocationStatus: result.status,
+            reason:
+              grade?.implement?.reason ??
+              (ok
+                ? undefined
+                : (result.error ??
+                  (output?.success
+                    ? result.status
+                    : `Invalid ${run.role} output: ${output?.error.message}`))),
+          },
+          durationMs: Date.now() - trial.createdAt + ("hidden" in item ? preparationMs : 0),
+        };
+        const taskFailure =
+          grade?.implement && ["gates", "audit", "hidden_tests"].includes(grade.implement.reason ?? "");
+        trial.details.stopReason = grade?.pass
+          ? "success"
+          : !taskFailure
+            ? "operational failure"
+            : "round limit";
+        if (taskFailure && round + 1 < rounds && "hidden" in item && implementation && grade) {
+          const next = nextImplementTarget(router, item, target, strategy);
+          if (next) {
+            store.recordEvalTrial({ ...trial, status: "running" });
+            prompt = implementRetryPrompt(item, implementation, grade, round + 1);
+            sessionId = strategy === "switch" ? undefined : (result.sessionId ?? undefined);
+            target = next;
+            continue;
+          }
+          trial.details.stopReason = "strategy exhausted";
+        }
+        store.recordEvalTrial(trial);
+        break;
+      }
     } catch (error) {
       if (signal.aborted) return skip("daemon shutdown");
+      interruptRound((error as Error).message);
       store.recordEvalTrial({
         ...trial,
         status: "error",
@@ -439,13 +536,17 @@ export class EvalRunner {
         score: 0,
         details: {
           ...trial.details,
-          preparationFailed: true,
+          preparationFailed: !trial.details.roundsUsed,
+          ...("hidden" in item
+            ? { roundsUsed: trial.details.roundsUsed ?? 0, stopReason: "operational failure" }
+            : {}),
           reason: (error as Error).message,
           ...("hidden" in item ? { grade: failedImplement("error", (error as Error).message) } : {}),
         },
       });
     } finally {
       release?.();
+      if (scratch) removeScratch(scratch);
       try {
         await cleanup?.();
       } finally {

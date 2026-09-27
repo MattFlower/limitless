@@ -232,14 +232,24 @@ const unique = z
   .array(nonempty)
   .min(1)
   .refine((ids) => new Set(ids).size === ids.length, "duplicate IDs");
-export const EvalRequestSchema = z.strictObject({
-  role: z.enum(["triage", "review", "verify", "implement"]),
-  models: z.array(z.string().min(1)).min(1),
-  k: z.number().int().positive().default(1),
-  maxUsd: z.number().finite().nonnegative().default(1),
-  caseIds: unique.optional(),
-  cache: z.boolean().default(true),
-});
+export const EvalRequestSchema = z
+  .strictObject({
+    role: z.enum(["triage", "review", "verify", "implement"]),
+    models: z.array(z.string().min(1)).min(1),
+    k: z.number().int().positive().default(1),
+    maxUsd: z.number().finite().nonnegative().default(1),
+    caseIds: unique.optional(),
+    cache: z.boolean().default(true),
+    rounds: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    strategy: z.enum(["retry", "effort", "switch"]).optional(),
+  })
+  .refine(
+    (r) => r.role === "implement" || (r.rounds === undefined && r.strategy === undefined),
+    "rounds and strategy are implement-only options",
+  )
+  .transform((r) =>
+    r.role === "implement" ? { ...r, rounds: r.rounds ?? 1, strategy: r.strategy ?? "retry" } : r,
+  );
 export type EvalRequest = z.infer<typeof EvalRequestSchema>;
 export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<Router, "resolveFor">) {
   const request = EvalRequestSchema.parse(input);
