@@ -35,6 +35,7 @@ import {
   RunContext,
   type RunState,
 } from "./context.ts";
+import { SimulatedTermination } from "./faults.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -92,6 +93,7 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
   if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
 
   try {
+    if (!deps.store.getRunState(runId)) await ctx.save();
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run);
     if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined) {
@@ -101,7 +103,7 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
       ctx.state.previewConfig = readPreviewConfig(
         await readFileAt(ctx.state.worktreePath, ctx.run.baseSha, ".limitless.toml"),
       );
-      ctx.save();
+      await ctx.save();
     }
     if (ctx.state.phase === "prepare") await prepare(ctx);
     if (ctx.state.phase === "triage") await triage(ctx);
@@ -114,11 +116,17 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
         if (ctx.state.phase === "deliver") break;
       }
     }
-    ctx.setPhase("done");
+    ctx.checkCancelled();
+    await ctx.setPhase("done");
+    ctx.checkCancelled();
+    if (ctx.repo.kind === "github" && ctx.state.worktreePath)
+      await removeWorktree(ctx.deps.cfg.paths, ctx.repo, ctx.state.worktreePath);
+    ctx.checkCancelled();
     ctx.run = deps.store.updateRun(runId, { status: "succeeded", stage: null, finishedAt: Date.now() });
     ctx.log("Run succeeded");
     return "succeeded";
   } catch (e) {
+    if (e instanceof SimulatedTermination || ctx.termination) return "running";
     if (e instanceof CancelledError || signal.aborted) {
       deps.store.updateRun(runId, { status: "cancelled", finishedAt: Date.now() });
       ctx.log("Run cancelled", "warn");
@@ -188,6 +196,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     ctx.log(
       `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
     );
+    await ctx.save();
     ctx.state.baseline =
       gates.setup.length || gates.checks.length
         ? await runGates(wt.path, gates, ctx.signal, { onWait: gateEvents(ctx).onWait })
@@ -206,7 +215,7 @@ async function prepare(ctx: RunContext): Promise<void> {
         });
       }
     }
-    ctx.setPhase("triage");
+    await ctx.setPhase("triage");
     const failing = baseline ? baseline.checks.filter((c) => !c.ok).map((c) => c.name) : [];
     return {
       summary: `worktree ${wt.branch}; ${gates.checks.length} checks${failing.length ? `, failing on base: ${failing.join(", ")}` : ""}`,
@@ -262,9 +271,9 @@ async function triage(ctx: RunContext): Promise<void> {
     const questions = profile !== "quick" && t.ambiguity === "high" ? t.blocking_questions : [];
     if (questions.length) {
       for (const q of questions) ctx.store.askQuestion(ctx.run.id, q);
-      ctx.setPhase("clarify");
+      await ctx.setPhase("clarify");
     } else {
-      ctx.setPhase(profile === "quick" ? "loop" : "spec");
+      await ctx.setPhase(profile === "quick" ? "loop" : "spec");
     }
     return {
       summary: `${t.task_class}, ${t.complexity}, risk ${t.risk} → ${profile} (${target.modelId})`,
@@ -310,7 +319,7 @@ async function clarify(ctx: RunContext): Promise<void> {
     await waitForAnswers(ctx);
     const qs = ctx.store.listQuestions(ctx.run.id);
     ctx.state.answers = qs.map((q) => `Q: ${q.question}\n  A: ${q.answer}`);
-    ctx.setPhase(ctx.run.resolvedProfile === "quick" ? "loop" : "spec");
+    await ctx.setPhase(ctx.run.resolvedProfile === "quick" ? "loop" : "spec");
     return { summary: `${qs.length} question(s) answered`, value: undefined };
   });
 }
@@ -338,7 +347,7 @@ async function spec(ctx: RunContext): Promise<void> {
     if (unanswered.length && ctx.state.answers.length === 0) {
       for (const q of unanswered) ctx.store.askQuestion(ctx.run.id, q);
       ctx.state.spec = s;
-      ctx.save();
+      await ctx.save();
       await waitForAnswers(ctx);
       ctx.state.answers = ctx.store
         .listQuestions(ctx.run.id)
@@ -347,7 +356,7 @@ async function spec(ctx: RunContext): Promise<void> {
     }
     ctx.state.spec = s;
     ctx.state.specAuthorVendor = target.vendor;
-    ctx.setPhase("loop");
+    await ctx.setPhase("loop");
     return {
       summary: `${s.acceptance_criteria.length} acceptance criteria (${target.modelId})`,
       value: undefined,
@@ -380,12 +389,12 @@ async function buildLoop(ctx: RunContext): Promise<void> {
       const round = ctx.state.round;
       const passed = await oneRound(ctx, round, holdout);
       if (passed) {
-        ctx.setPhase("deliver");
+        await ctx.setPhase("deliver");
         return;
       }
       ctx.state.round++;
       ctx.state.roundsOnImplementer++;
-      ctx.save();
+      await ctx.save();
     }
     throw new NeedsHumanError(
       `Still failing after ${ctx.state.round} implementation rounds. Last feedback:\n${ctx.state.feedback ?? ""}`,
@@ -400,7 +409,7 @@ async function authorHoldout(ctx: RunContext): Promise<void> {
     "holdout",
     async (stage) => {
       ctx.state.holdoutStatus = "generating";
-      ctx.save();
+      await ctx.save();
       const { result, target } = await ctx.invoke({
         role: "holdout",
         stage,
@@ -420,7 +429,7 @@ async function authorHoldout(ctx: RunContext): Promise<void> {
       ctx.state.holdoutModelId = target.modelId;
       ctx.state.holdoutSameVendor = target.vendor === ctx.state.specAuthorVendor;
       ctx.state.holdoutStatus = "complete";
-      ctx.save();
+      await ctx.save();
       return {
         summary: `authored ${ctx.state.holdout.scenarios.length} private scenarios (${target.modelId})`,
         value: undefined,
@@ -438,82 +447,83 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
   await ctx.stage(
     "implement",
     async (stage) => {
-      const current = ctx.state.implementer;
-      const escalate = current && ctx.state.roundsOnImplementer >= ROUNDS_PER_IMPLEMENTER;
-      let constraints: RouteConstraints = current
-        ? {
-            prefer:
-              current.effort === undefined
-                ? (current.targetId ?? current.modelId)
-                : { modelId: current.modelId, effort: current.effort },
-          }
-        : {};
-      if (escalate) {
-        // Prefer a stronger model; otherwise any model not tried yet; otherwise keep going as-is.
-        const options: RouteConstraints[] = [
-          { minTier: Math.min(5, current.tier + 1), exclude: ctx.state.triedImplementers },
-          { exclude: ctx.state.triedImplementers },
-          {},
-        ];
-        constraints =
-          options.find(
-            (c) =>
-              ctx.deps.router.route("implement", ctx.complexity, ctx.routingConstraints(c)).candidates.length,
-          ) ?? {};
-        ctx.log(`Escalating implementer beyond ${current.modelId}`, "warn", { constraints });
-        ctx.state.roundsOnImplementer = 0;
-      }
-      const { result, target } = await ctx.invoke({
-        role: "implement",
-        stage,
-        mode: "edit",
-        complexity: ctx.complexity,
-        constraints,
-        prompt: implementPrompt({
-          prompt: ctx.run.prompt,
-          spec: ctx.state.spec ?? null,
-          gates,
-          baseline: ctx.state.baseline ?? null,
-          baseSha,
-          round,
-          feedback: ctx.state.feedback,
-          hasHoldout: profile(ctx) !== "quick",
-        }),
-      });
-      ctx.state.implementer = {
-        modelId: target.modelId,
-        targetId: target.targetId,
-        effort: target.effort ?? null,
-        tier: target.tier,
-        vendor: target.vendor,
-      };
-      if (
-        !ctx.state.triedImplementers.some(
-          (ref) =>
-            (typeof ref === "string" ? ref : formatTarget(ref.modelId, ref.effort)) ===
-            (target.targetId ?? target.modelId),
+      if (ctx.state.implementationReadyRound !== round) {
+        const current = ctx.state.implementer;
+        const escalate = current && ctx.state.roundsOnImplementer >= ROUNDS_PER_IMPLEMENTER;
+        let constraints: RouteConstraints = current
+          ? {
+              prefer:
+                current.effort === undefined
+                  ? (current.targetId ?? current.modelId)
+                  : { modelId: current.modelId, effort: current.effort },
+            }
+          : {};
+        if (escalate) {
+          // Prefer a stronger model; otherwise any model not tried yet; otherwise keep going as-is.
+          const options: RouteConstraints[] = [
+            { minTier: Math.min(5, current.tier + 1), exclude: ctx.state.triedImplementers },
+            { exclude: ctx.state.triedImplementers },
+            {},
+          ];
+          constraints =
+            options.find(
+              (c) =>
+                ctx.deps.router.route("implement", ctx.complexity, ctx.routingConstraints(c)).candidates
+                  .length,
+            ) ?? {};
+          ctx.log(`Escalating implementer beyond ${current.modelId}`, "warn", { constraints });
+          ctx.state.roundsOnImplementer = 0;
+        }
+        const { result, target } = await ctx.invoke({
+          role: "implement",
+          stage,
+          mode: "edit",
+          complexity: ctx.complexity,
+          constraints,
+          prompt: implementPrompt({
+            prompt: ctx.run.prompt,
+            spec: ctx.state.spec ?? null,
+            gates,
+            baseline: ctx.state.baseline ?? null,
+            baseSha,
+            round,
+            feedback: ctx.state.feedback,
+            hasHoldout: profile(ctx) !== "quick",
+          }),
+        });
+        ctx.state.implementer = {
+          modelId: target.modelId,
+          targetId: target.targetId,
+          effort: target.effort ?? null,
+          tier: target.tier,
+          vendor: target.vendor,
+        };
+        if (
+          !ctx.state.triedImplementers.some(
+            (ref) =>
+              (typeof ref === "string" ? ref : formatTarget(ref.modelId, ref.effort)) ===
+              (target.targetId ?? target.modelId),
+          )
         )
-      )
-        ctx.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
-      ctx.state.implementerReport = result.finalText;
-      ctx.store.putArtifact(ctx.run.id, `implement-${round}.md`, "report", result.finalText || "(no report)");
-      const sha = await commitAll(
-        cwd,
-        `limitless: ${ctx.run.title} (round ${round + 1})\n\nRun: ${ctx.run.id}`,
-      );
-      if (sha) ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha });
-      ctx.save();
-      ctx.state.implementerIssue =
-        result.status === "ok"
-          ? null
-          : `${result.status}${result.error ? `: ${result.error}` : ""}`.slice(0, 500);
-      ctx.state.implementedRound = round;
-      ctx.save();
-      if (result.status !== "ok") {
-        ctx.log(`Implementer ended with ${result.status}: ${result.error ?? ""}`, "warn");
+          ctx.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
+        ctx.state.implementerReport = result.finalText;
+        ctx.store.putArtifact(
+          ctx.run.id,
+          `implement-${round}.md`,
+          "report",
+          result.finalText || "(no report)",
+        );
+        ctx.state.implementerIssue =
+          result.status === "ok" ? null : `${result.status}: ${result.error ?? ""}`.slice(0, 500);
+        ctx.state.implementationReadyRound = round;
+        await ctx.save("implementation-ready");
       }
+      await commitAll(cwd, `limitless: ${ctx.run.title} (round ${round + 1})\n\nRun: ${ctx.run.id}`);
+      ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: await headSha(cwd) });
+      ctx.state.implementedRound = round;
+      await ctx.save("implementation-committed");
       return {
-        summary: `${target.modelId}: ${result.status}${sha ? `, committed ${sha.slice(0, 8)}` : ", no changes"}`,
+        summary: `${ctx.state.implementer?.modelId}: ${ctx.state.implementerIssue ?? "ok"}`,
         value: undefined,
       };
     },
@@ -621,7 +631,7 @@ async function oneRound(
       ? `### Your previous session ended early\n${ctx.state.implementerIssue}\nKeep the next attempt focused and finish by running the checks.`
       : "";
     ctx.state.feedback = [issue, gateFeedback, auditFeedback].filter(Boolean).join("\n\n");
-    ctx.save();
+    await ctx.save();
     ctx.log("Deterministic checks failed; sending feedback to implementer", "warn");
     return false;
   }
@@ -689,7 +699,7 @@ async function oneRound(
       if (sameVendor) ctx.log("Review done by the implementer's vendor (no other vendor available)", "warn");
       ctx.state.lastReview = { ...r, modelId: target.modelId };
       ctx.state.reviewedSha = reviewedSha;
-      ctx.save();
+      await ctx.save();
       ctx.store.putArtifact(
         ctx.run.id,
         `review-${round}.json`,
@@ -711,7 +721,7 @@ async function oneRound(
       : "";
   if (review.verdict === "request_changes") {
     ctx.state.feedback = reviewFeedback || `### Code review requested changes\n${review.summary}`;
-    ctx.save();
+    await ctx.save();
     return false;
   }
 
@@ -737,6 +747,7 @@ async function oneRound(
           "preview",
           async () => {
             const server = await startPreview(cwd, previewConfig, ctx.signal);
+            preview = server; // Retain ownership if the stage completion checkpoint is interrupted.
             ctx.log(`Preview ready at ${server.url}`);
             return { summary: `ready at ${server.url}`, value: server };
           },
@@ -778,7 +789,7 @@ async function oneRound(
             ...(ctx.state.verifyResults ?? []),
             { ...v, modelId: target.modelId, round, attempt },
           ];
-          ctx.save();
+          await ctx.save();
           const publicSources = await ctx.publicHoldoutSources();
           ctx.store.putArtifact(
             ctx.run.id,
@@ -804,7 +815,7 @@ async function oneRound(
     let verify = previous.at(-1) ?? (await verifyAttempt(0));
     const publicSources = await ctx.publicHoldoutSources();
     if (blockedOnly(verify)) {
-      const stop = (routing = ""): never => {
+      const stop = async (routing = ""): Promise<never> => {
         const evidence = verify.criteria
           .filter((c) => c.status === "blocked")
           .map((c) => `${c.id}: ${c.evidence}`)
@@ -815,20 +826,20 @@ async function oneRound(
           publicSources,
         );
         ctx.state.terminalReason = detail;
-        ctx.save();
+        await ctx.save();
         throw new NeedsHumanError(detail);
       };
-      if (ctx.state.environmentRetryRound === round || previous.some((v) => v.attempt === 1)) stop();
+      if (ctx.state.environmentRetryRound === round || previous.some((v) => v.attempt === 1)) await stop();
       ctx.state.environmentRetryRound = round;
-      ctx.save();
+      await ctx.save();
       const firstModel = ctx.state.lastVerify?.modelId;
       try {
         verify = await verifyAttempt(1, firstModel ? [firstModel] : []);
       } catch (error) {
-        if (error instanceof NoCapacityError) stop(error.message);
+        if (error instanceof NoCapacityError) await stop(error.message);
         throw error;
       }
-      if (blockedOnly(verify)) stop();
+      if (blockedOnly(verify)) await stop();
     }
     if (verify.overall !== "pass") {
       ctx.state.feedback = formatVerifyFeedback(
@@ -837,7 +848,7 @@ async function oneRound(
         ctx.state.holdout,
         publicSources,
       );
-      ctx.save();
+      await ctx.save();
       return false;
     }
     return true;
@@ -851,6 +862,7 @@ async function oneRound(
 // deliver
 
 async function deliver(ctx: RunContext, success: boolean): Promise<void> {
+  if (ctx.state.deliveryComplete) return;
   assertExistingBranchDelivery(ctx.repo, ctx.run);
   if (ctx.run.deliveryBranch && ctx.run.baseSha !== ctx.run.sourceRef?.headSha)
     throw new Error("PR delivery base does not match the verified webhook head");
@@ -869,7 +881,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       // A restart can find the base moved again mid-rebase; retarget the newest tip.
       if (ctx.state.pendingRebaseSha && ctx.state.pendingRebaseSha !== fetched) {
         ctx.state.pendingRebaseSha = fetched;
-        ctx.save();
+        await ctx.save();
       }
       // Rebasing is best-effort: it avoids conflicting PRs, but never blocks delivering work that
       // passed every gate on its recorded base.
@@ -928,7 +940,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef.number}`,
         });
       }
-      await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
+      ctx.state.deliveryComplete = true;
+      await ctx.save("delivery-complete");
       return { summary: `updated existing PR branch ${ctx.run.deliveryBranch}`, value: undefined };
     }
     ctx.checkCancelled();
@@ -943,6 +956,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       cwd,
       draft: !success,
     });
+    await ctx.save("delivery-pr-created");
     ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
     publish();
     ctx.log(`Pull request: ${url}`);
@@ -959,7 +973,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     } else {
       summary += ` — left open (merge policy: ${policy})`;
     }
-    await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
+    ctx.state.deliveryComplete = true;
+    await ctx.save("delivery-complete");
     return { summary, value: undefined };
   });
 }
@@ -1003,7 +1018,7 @@ async function rebaseForDelivery(
     ctx.state.pendingRebaseSha = fetched;
     ctx.state.preRebaseGates = ctx.state.lastGates ?? [];
     ctx.state.preRebaseHead = head;
-    ctx.save();
+    await ctx.save();
   }
   if (!(await isAncestor(cwd, fetched, await headSha(cwd)))) {
     const outcome = await rebaseOnto(cwd, fetched);
@@ -1036,7 +1051,7 @@ async function rebaseForDelivery(
           after,
         );
         ctx.state.lastGates = comparison;
-        ctx.save();
+        await ctx.save();
         ctx.store.putArtifact(
           ctx.run.id,
           `gates-rebase-${ctx.state.round}.json`,
@@ -1061,7 +1076,7 @@ async function rebaseForDelivery(
     ctx.state.preRebaseHead = undefined;
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: await headSha(cwd) }, ctx.state);
     note(`checks regressed after rebasing onto ${fetched.slice(0, 8)}`);
-    ctx.save();
+    await ctx.save();
     return "done";
   }
   ctx.state.pendingRebaseSha = undefined;

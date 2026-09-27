@@ -2079,18 +2079,17 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
       slow = false;
       const resumed = start(handler);
       expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-      // Replaying checks must use the same earlier round's context, never its own review.
-      expect(prompts[restartRound + 1]).toBe(prompts[restartRound]);
+      // A restart resumes verification; completed reviews and their findings remain durable.
+      expect(prompts).toHaveLength(restartRound === 0 ? 1 : 3);
       const state = resumed.store.getRunState<RunState>(run.id);
-      expect(implementations).toBe(restartRound === 0 ? 2 : 3);
-      expect(state?.reviewHistory?.map((entry) => entry.round)).toEqual(
-        restartRound === 0 ? [0, 1] : [0, 1, 2],
-      );
+      expect(state?.reviewHistory?.slice(0, restartRound + 1)).toEqual(checkpoint?.reviewHistory);
+      expect(implementations).toBe(restartRound === 0 ? 1 : 3);
+      expect(state?.reviewHistory?.map((entry) => entry.round)).toEqual(restartRound === 0 ? [0] : [0, 1, 2]);
       if (restartRound === 0) {
-        expect(resumed.store.getArtifact(run.id, "review-0.json")).toContain('"verdict": "request_changes"');
+        expect(resumed.store.getArtifact(run.id, "review-0.json")).toContain('"verdict": "approve"');
         expect(state?.reviewFollowUps).toEqual([]);
       } else {
-        // The replay on the same commit omitted "Obsolete follow-up"; omission is not resolution.
+        // The later round omitted "Obsolete follow-up"; omission is not resolution.
         expect(state?.reviewFollowUps?.map((f) => f.title)).toEqual(["Backlog idea", "Obsolete follow-up"]);
         const followUps = resumed.store.getArtifact(run.id, "report.md")?.split("## Review follow-ups")[1];
         expect(followUps?.match(/^- major: `farewell\.txt:1` Backlog idea/gm)).toHaveLength(1);

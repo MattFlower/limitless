@@ -10,6 +10,8 @@ export class Scheduler {
   private active = new Map<string, { controller: AbortController; done: Promise<unknown> }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopping = false;
+  private probeDelay: ReturnType<typeof setTimeout> | null = null;
+  private probeTimer: ReturnType<typeof setInterval> | null = null;
   private drainEnabled = false;
   private unsubscribe: (() => void) | null = null;
 
@@ -21,12 +23,29 @@ export class Scheduler {
   start(): void {
     const interrupted = this.deps.store.listRuns({ status: ["running", "waiting_input"], limit: 1000 });
     for (const run of interrupted) {
-      this.deps.store.updateRun(run.id, { status: "queued" });
+      const cancelled = run.error?.startsWith("cancelled by");
+      for (const stage of this.deps.store.listStages(run.id))
+        if (stage.status === "running")
+          this.deps.store.finishStage(stage.id, "cancelled", "Daemon interrupted stage");
+      for (const invocation of this.deps.store.listInvocations(run.id))
+        if (invocation.status === "running")
+          this.deps.store.updateInvocation(invocation.id, {
+            status: cancelled ? "cancelled" : "error",
+            error: "Daemon interrupted invocation; final usage unknown",
+            finishedAt: Date.now(),
+          });
+      this.deps.store.refreshRunTotals(run.id);
+      this.deps.store.updateRun(run.id, {
+        status: cancelled ? "cancelled" : "queued",
+        finishedAt: cancelled ? Date.now() : null,
+      });
       this.deps.store.addEvent({
         runId: run.id,
         type: "log",
         level: "warn",
-        message: "Daemon restarted; run re-queued to resume",
+        message: cancelled
+          ? "Daemon restarted; cancellation preserved"
+          : "Daemon restarted; run re-queued to resume",
       });
     }
     this.unsubscribe = this.deps.store.subscribe((msg) => {
@@ -37,8 +56,10 @@ export class Scheduler {
     // Probe local model servers now and every minute.
     void this.deps.tracker.probe();
     // Re-probe shortly after startup, once ssh forwards to remote model servers are up.
-    setTimeout(() => void this.deps.tracker.probe(), 8_000).unref?.();
-    setInterval(() => void this.deps.tracker.probe(), 60_000).unref?.();
+    this.probeDelay = setTimeout(() => void this.deps.tracker.probe(), 8_000);
+    this.probeDelay.unref?.();
+    this.probeTimer = setInterval(() => void this.deps.tracker.probe(), 60_000);
+    this.probeTimer.unref?.();
   }
 
   get activeRunIds(): string[] {
@@ -110,6 +131,8 @@ export class Scheduler {
   /** Graceful shutdown: interrupt active runs and wait for them to unwind (they are re-queued). */
   async stop(): Promise<void> {
     this.stopping = true;
+    if (this.probeDelay) clearTimeout(this.probeDelay);
+    if (this.probeTimer) clearInterval(this.probeTimer);
     this.unsubscribe?.();
     if (this.timer) clearInterval(this.timer);
     for (const { controller } of this.active.values()) controller.abort();

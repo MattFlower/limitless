@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
@@ -22,18 +23,21 @@ import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import { discardChanges } from "../git/repos.ts";
+import { parseFakeStream } from "../harness/fake.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
+import { FaultInjector, type FaultPlan, SimulatedTermination } from "./faults.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
+  faults?: FaultPlan;
   cfg: Config;
   store: Store;
   router: Router;
@@ -73,6 +77,10 @@ export interface RunState {
   implementerIssue?: string | null;
   /** Round whose implementation has been committed; resuming skips straight to its checks. */
   implementedRound?: number;
+  /** Agent output saved before the idempotent commit operation. */
+  implementationReadyRound?: number;
+  completedChecks?: { round: number; values: Partial<Record<StageName, unknown>> };
+  deliveryComplete?: boolean;
   /** Delivery rebase target; gates must pass before this becomes run.baseSha. */
   pendingRebaseSha?: string;
   preRebaseGates?: GateComparison[];
@@ -167,6 +175,11 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
 };
 
 export class RunContext {
+  private readonly interruption = new AbortController();
+  readonly signal: AbortSignal;
+  termination?: SimulatedTermination;
+  private readonly stageContext = new AsyncLocalStorage<Stage>();
+  private readonly faults: FaultInjector;
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
   readonly runDir: string;
   previewUrl?: string;
@@ -184,8 +197,10 @@ export class RunContext {
     readonly deps: EngineDeps,
     public run: Run,
     readonly repo: Repo,
-    readonly signal: AbortSignal,
+    signal: AbortSignal,
   ) {
+    this.signal = AbortSignal.any([signal, this.interruption.signal]);
+    this.faults = new FaultInjector(deps.faults);
     this.runDir = join(deps.cfg.paths.runs, run.id);
     mkdirSync(this.runDir, { recursive: true });
     this.state = deps.store.getRunState<RunState>(run.id) ?? {
@@ -253,13 +268,23 @@ export class RunContext {
     return [this.run.prompt, this.state.spec ? renderSpec(this.state.spec) : "", ...identifiers].join("\n");
   }
 
-  save(): void {
+  async save(checkpoint?: string): Promise<void> {
+    if (this.deps.faults) {
+      const stage = this.stageContext.getStore();
+      await this.faults.hit(
+        "store:save",
+        { runId: this.run.id, stage: stage?.name, round: this.state.round, checkpoint },
+        this.signal,
+      );
+      this.checkCancelled();
+    }
     this.store.setRunState(this.run.id, this.state);
   }
 
-  setPhase(phase: Phase): void {
+  async setPhase(phase: Phase): Promise<void> {
     this.state.phase = phase;
-    this.save();
+    if (phase === "done") this.state.completedChecks = undefined;
+    await this.save();
   }
 
   log(message: string, level: RunEvent["level"] = "info", data?: unknown): void {
@@ -267,6 +292,7 @@ export class RunContext {
   }
 
   checkCancelled(): void {
+    if (this.termination) throw this.termination;
     if (this.signal.aborted) throw new CancelledError();
   }
 
@@ -278,20 +304,44 @@ export class RunContext {
     background = false,
   ): Promise<T> {
     this.checkCancelled();
+    const cacheable =
+      !background && this.state.phase === "loop" && ["gates", "audit", "review"].includes(name);
+    const cache = this.state.completedChecks;
+    if (cacheable && cache?.round === round && Object.hasOwn(cache.values, name))
+      return cache.values[name] as T;
     if (!background) this.run = this.store.updateRun(this.run.id, { stage: name });
     const stage = this.store.startStage(this.run.id, name, round);
     try {
-      const { summary, value } = await fn(stage);
+      // Before: row exists, callback has not run. After: callback returned, completion not recorded.
+      const context = { runId: this.run.id, stage: name, round };
+      const { summary, value } = await this.stageContext.run(stage, async () => {
+        await this.faults.hit(`stage:${name}:before`, context, this.signal);
+        this.checkCancelled();
+        const output = await fn(stage);
+        await this.faults.hit(`stage:${name}:after`, context, this.signal);
+        this.checkCancelled();
+        if (cacheable) {
+          if (this.state.completedChecks?.round !== round) this.state.completedChecks = { round, values: {} };
+          this.state.completedChecks.values[name] = output.value;
+          await this.save();
+        }
+        return output;
+      });
       this.store.finishStage(stage.id, "succeeded", summary);
       return value;
     } catch (e) {
-      const cancelled = e instanceof CancelledError || this.signal.aborted;
+      if (e instanceof SimulatedTermination) {
+        this.termination = e;
+        this.interruption.abort();
+      }
+      const cancelled =
+        e instanceof CancelledError || e instanceof SimulatedTermination || this.signal.aborted;
       this.store.finishStage(
         stage.id,
         cancelled ? "cancelled" : "failed",
         (e as Error).message.slice(0, 500),
       );
-      throw cancelled ? new CancelledError() : e;
+      throw cancelled && !(e instanceof SimulatedTermination) ? new CancelledError() : e;
     }
   }
 
@@ -329,6 +379,21 @@ export class RunContext {
         release();
         lastFailure = `${target.targetId ?? target.modelId}: no capacity after provider refresh`;
         continue;
+      }
+      if (opts.role === "implement") {
+        this.state.implementer = {
+          modelId: target.modelId,
+          targetId: target.targetId,
+          effort: target.effort ?? null,
+          tier: target.tier,
+          vendor: target.vendor,
+        };
+        try {
+          await this.save();
+        } catch (error) {
+          release();
+          throw error;
+        }
       }
       const invocation = store.createInvocation({
         runId: this.run.id,
@@ -374,10 +439,28 @@ export class RunContext {
                 this.onAgentEvent(invocation.id, ev, opts.role, redact);
               },
         };
-        if (opts.mode === "readonly" && !noTools) {
+        const faultContext = {
+          runId: this.run.id,
+          stage: opts.stage.name,
+          round: opts.stage.round,
+          role: opts.role,
+          modelId: target.modelId,
+          invocationId: invocation.id,
+        };
+        // Invocation row/slot exist; stream faults replace input via the real CLI parsers.
+        await this.faults.hit("harness:invoke", faultContext, this.signal);
+        this.checkCancelled();
+        const stream = await this.faults.hit("harness:stream", faultContext, this.signal);
+        this.checkCancelled();
+        if (stream) result = parseFakeStream(stream, spec.onEvent);
+        else if (opts.mode === "readonly" && !noTools) {
           result = await withScratch(spec.cwd, (scratchDir) => harness({ ...spec, scratchDir }));
         } else result = await harness(spec);
       } catch (e) {
+        if (e instanceof SimulatedTermination) {
+          this.termination = e;
+          this.interruption.abort();
+        }
         result = {
           status: "error",
           finalText: "",
@@ -396,6 +479,9 @@ export class RunContext {
         if ((opts.role === "review" || opts.role === "verify") && this.state.worktreePath)
           await discardChanges(this.state.worktreePath);
       }
+      if (this.signal.aborted) result = { ...result, status: "cancelled", error: "cancelled" };
+      if (opts.requireStructured && result.status === "ok" && result.structured === null)
+        result = { ...result, status: "error", error: "missing structured output" };
       if (opts.schema && result.status === "ok" && result.structured !== null) {
         const parsed = opts.schema.safeParse(result.structured);
         result = parsed.success
@@ -437,6 +523,7 @@ export class RunContext {
       });
       this.run = store.refreshRunTotals(this.run.id);
 
+      if (this.termination) throw this.termination;
       if (result.status === "cancelled" || this.signal.aborted) throw new CancelledError();
       if (result.status !== "ok" && MODEL_REJECTED.test(result.error ?? "")) {
         // A configuration problem with this model (e.g. not on the plan), not a task failure.
@@ -457,7 +544,7 @@ export class RunContext {
         );
         continue;
       }
-      if (result.status === "quota" || result.status === "unavailable") {
+      if (["quota", "unavailable", "timeout", "stuck"].includes(result.status)) {
         lastFailure =
           `${target.targetId ?? target.modelId}: ${result.status} (${redact?.(result.error ?? "") ?? result.error ?? ""})`.slice(
             0,

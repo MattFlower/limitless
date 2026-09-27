@@ -1,9 +1,15 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { InvocationStatus } from "../core/types.ts";
-import type { AgentResult, AgentSpec, Harness } from "./types.ts";
+import { type StreamFault, untilAborted } from "../pipeline/faults.ts";
+import { ClaudeStreamParser } from "./claude.ts";
+import { CodexStreamParser } from "./codex.ts";
+import { type AgentEvent, type AgentResult, type AgentSpec, extractJson, type Harness } from "./types.ts";
 
 export interface FakeReply {
+  fault?: "exit" | "kill" | "timeout" | "throw" | "block";
+  events?: AgentEvent[];
+  stream?: StreamFault;
   status?: InvocationStatus;
   sessionId?: string | null;
   costUsd?: number;
@@ -23,18 +29,19 @@ export function fakeHarness(handler: (spec: AgentSpec) => FakeReply | Promise<Fa
   return async (spec: AgentSpec): Promise<AgentResult> => {
     spec.onEvent({ type: "init", sessionId: "fake-session" });
     const reply = await handler(spec);
-    if (reply.delayMs) {
-      await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, reply.delayMs);
-        spec.signal.addEventListener("abort", () => {
-          clearTimeout(t);
-          resolve();
-        });
-      });
-    }
+    for (const event of reply.events ?? []) spec.onEvent(event);
+    if (reply.fault === "throw") throw new Error(reply.error ?? "injected invocation error");
+    if (reply.delayMs || reply.fault === "block")
+      await untilAborted(spec.signal, reply.fault === "block" ? undefined : reply.delayMs);
     if (spec.signal.aborted) {
       return baseResult({ status: "cancelled", error: "cancelled" });
     }
+    if (reply.stream) return parseFakeStream(reply.stream, spec.onEvent);
+    if (reply.fault)
+      return baseResult({
+        status: reply.fault === "timeout" ? "timeout" : "error",
+        error: reply.error ?? `harness ${reply.fault}`,
+      });
     for (const [path, content] of Object.entries(reply.files ?? {})) {
       const abs = join(spec.cwd, path);
       mkdirSync(dirname(abs), { recursive: true });
@@ -70,4 +77,21 @@ function baseResult(over: Partial<AgentResult>): AgentResult {
     quota: null,
     ...over,
   };
+}
+
+/** Synthetic bytes go through the same parsers and completion markers as the CLI adapters. */
+export function parseFakeStream(stream: StreamFault, emit: (event: AgentEvent) => void): AgentResult {
+  const parser = stream.parser === "claude" ? new ClaudeStreamParser(emit) : new CodexStreamParser(emit);
+  for (const line of stream.lines) parser.feed(line);
+  const complete =
+    parser instanceof ClaudeStreamParser
+      ? parser.gotResult && !parser.isError
+      : parser.completed && !parser.failed;
+  return baseResult({
+    status: complete ? "ok" : "error",
+    error: complete ? null : "malformed or truncated harness stream: missing successful completion",
+    finalText: parser instanceof ClaudeStreamParser ? parser.finalText : parser.lastMessage,
+    structured: parser instanceof ClaudeStreamParser ? parser.structured : extractJson(parser.lastMessage),
+    usage: parser.usage,
+  });
 }

@@ -324,7 +324,21 @@ export async function createPullRequest(
   opts: { branch: string; base: string; title: string; body: string; cwd: string; draft?: boolean },
 ): Promise<string> {
   const existing = await sh(
-    ["gh", "pr", "list", "--repo", repo.slug, "--head", opts.branch, "--json", "url", "--jq", ".[0].url"],
+    [
+      "gh",
+      "pr",
+      "list",
+      "--repo",
+      repo.slug,
+      "--head",
+      opts.branch,
+      "--state",
+      "all",
+      "--json",
+      "url",
+      "--jq",
+      ".[0].url",
+    ],
     { cwd: opts.cwd, allowFail: true },
   );
   if (existing.stdout.trim()) {

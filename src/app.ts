@@ -29,6 +29,7 @@ import { Scheduler } from "./scheduler.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
+  faults?: EngineDeps["faults"];
   bootSha?: string;
   evalCasePath?: string;
   /** Explicit overlay location; the daemon supplies its application checkout's path. */
@@ -104,6 +105,7 @@ export class Factory {
     );
     this.deps = {
       cfg,
+      faults: opts.faults,
       store: this.store,
       router: this.router,
       tracker: this.tracker,
