@@ -31,6 +31,7 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 28 | M4 | Aggregator providers: per-model rate limits and concurrency | todo |
 | 29 | M5 | Holdout feedback that is actionable but still blind | todo |
 | 30 | M5 | Later-round reviews don't move the goalposts | todo |
+| 31 | M5 | Verify artifacts: redact only private scenarios | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
@@ -462,3 +463,13 @@ while converging. Fixing what was asked for should end the loop.
 - Tests with the fake harness: a new major non-security finding in round 3 does not trigger
   another implement round and appears under follow-ups; an unaddressed prior finding or a regression
   still blocks.
+
+## 31. Verify artifacts: redact only private scenarios
+
+After #23, implementer feedback is right (public criteria unredacted, private scenarios as
+`publicSummary`), but the stored `verify-N.json` artifact (what the UI shows) still runs every string
+through `redactHoldoutText`, whose literal backstop masks line numbers and identifiers in public
+criteria's evidence ("engine.ts:[private detail]"). Apply the same split as the feedback: public
+criteria stored as-is, private scenarios stored with their publicSummary and redacted evidence.
+Test: a public criterion's `file:line` evidence survives in the artifact; private scenario text never
+appears.
