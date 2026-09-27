@@ -313,6 +313,7 @@ export class EvalRunner {
       )
         tracker.blockModel(model.id, result.error ?? "model rejected");
     } catch (error) {
+      if (signal.aborted) return skip("daemon shutdown");
       store.recordEvalTrial({
         ...trial,
         status: "error",

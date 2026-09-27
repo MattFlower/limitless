@@ -307,13 +307,41 @@ test("shutdown aborts active and waiting trials, releases slots, and preserves p
     });
     const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"] });
     await entered.promise;
+    const acquiring = deferred<void>();
+    const acquire = f.factory.tracker.acquire.bind(f.factory.tracker);
+    const spy = spyOn(f.factory.tracker, "acquire").mockImplementation((id, signal) => {
+      acquiring.resolve();
+      return acquire(id, signal);
+    });
     const waiting = f.factory.evals.submit({ role: "triage", models: ["candidate-a"] });
+    await acquiring.promise;
+    spy.mockRestore();
     await f.factory.stop();
     expect(f.factory.evals.report(run.id)?.run).toMatchObject({
       status: "failed",
       error: "eval interrupted by daemon shutdown",
     });
     expect(f.factory.evals.report(waiting.id)?.run.status).toBe("failed");
+    const report = f.factory.evals.report(waiting.id);
+    expect(report?.trials).toHaveLength(3);
+    for (const trial of report?.trials ?? []) {
+      expect(trial).toMatchObject({
+        status: "skipped",
+        pass: null,
+        score: null,
+        details: { reason: "daemon shutdown" },
+      });
+      expect(trial.details.preparationFailed).toBeUndefined();
+    }
+    expect(report?.summaries[0]).toMatchObject({
+      evaluatedTrials: 0,
+      errors: 0,
+      skipped: 3,
+      passRate: null,
+      predictionTrials: 0,
+      latencyDenominator: 0,
+    });
+    expect(f.calls).toHaveLength(1);
     expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
     expect(
       f.factory.store.listEvalTrials(run.id).every((t) => !["running", "queued"].includes(t.status)),

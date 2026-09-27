@@ -260,6 +260,23 @@ test("shutdown removes active and capacity-waiting worktrees", async () => {
     spy.mockRestore();
     await f.factory.evals.stop();
     for (const id of [first.id, second.id]) expect(f.factory.evals.report(id)?.run.status).toBe("failed");
+    const report = f.factory.evals.report(second.id);
+    expect(report?.trials[0]).toMatchObject({
+      status: "skipped",
+      pass: null,
+      score: null,
+      details: { reason: "daemon shutdown" },
+    });
+    expect(report?.trials[0]?.details.preparationFailed).toBeUndefined();
+    expect(report?.summaries[0]).toMatchObject({
+      evaluatedTrials: 0,
+      errors: 0,
+      skipped: 1,
+      passRate: null,
+      predictionTrials: 0,
+      latencyDenominator: 0,
+    });
+    expect(f.calls).toHaveLength(1);
     await f.clean();
   } finally {
     await f.close();
