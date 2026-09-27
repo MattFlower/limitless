@@ -493,8 +493,10 @@ export async function createEvalWorktree(
 async function rejectContamination(path: string, labels: EvalLabels, signal: AbortSignal): Promise<void> {
   const opts = { cwd: path, signal };
   if (labels.paths.length) {
+    // Default history simplification skips a side branch whose labels a merge discarded
+    // (e.g. `merge -s ours`), yet its objects are still copied into the checkout.
     const touched = await sh(
-      ["git", "rev-list", "-1", "refs/eval/base", "refs/eval/head", "--", ...labels.paths],
+      ["git", "rev-list", "-1", "--full-history", "refs/eval/base", "refs/eval/head", "--", ...labels.paths],
       opts,
     );
     if (touched.stdout.trim())

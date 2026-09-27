@@ -251,6 +251,38 @@ test("rejects pins whose reachable history exposes eval labels or seed patches",
   }
 });
 
+test("rejects a historical dataset on a merge parent whose merge kept the label-free tree", async () => {
+  const f = await fixture();
+  try {
+    const git = (...args: string[]) => sh(["git", ...args], { cwd: f.source });
+    const branch = (await git("rev-parse", "--abbrev-ref", "HEAD")).stdout.trim();
+    await git("checkout", "-q", "-b", "side");
+    mkdirSync(join(f.source, "evals/review"), { recursive: true });
+    const historical = JSON.stringify({ role: "review", version: 0, notes: "old labels", cases: [] });
+    expect(historical).not.toBe(readFileSync(f.casePath, "utf8"));
+    writeFileSync(join(f.source, "evals/review/cases.json"), historical);
+    await git("add", "-A");
+    await git("commit", "-qm", "historical labels");
+    const side = (await git("rev-parse", "HEAD")).stdout.trim();
+    await git("checkout", "-q", branch);
+    await git("merge", "-q", "-s", "ours", "--no-ff", "-m", "merge side", "side");
+    f.item.head = (await git("rev-parse", "HEAD")).stdout.trim();
+    expect((await git("rev-parse", "HEAD^2")).stdout.trim()).toBe(side);
+    expect((await git("ls-tree", "HEAD", "evals")).stdout).toBe("");
+    // Default simplification follows only the TREESAME first parent and misses the labels.
+    expect((await git("rev-list", "-1", "HEAD", "--", "evals/review")).stdout).toBe("");
+    expect((await git("rev-list", "--full-history", "HEAD", "--", "evals/review")).stdout).toContain(side);
+    f.save();
+    const report = await f.run();
+    expect(report.trials[0]).toMatchObject({ status: "error", pass: false });
+    expect(String(report.trials[0]?.details.reason)).toContain("eval labels");
+    expect(f.calls).toHaveLength(0);
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
 test("fetches missing branch and PR-only pins and invalidates same-stat repository changes", async () => {
   const f = await fixture();
   try {
