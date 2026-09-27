@@ -7,7 +7,7 @@ import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
 import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
 import { toStrictJsonSchema } from "../pipeline/schemas.ts";
-import { parseTarget, recordedTarget } from "../router/targets.ts";
+import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
 import { cacheKey } from "./cache.ts";
 import {
   type AnyCaseFile,
@@ -49,7 +49,7 @@ export class EvalRunner {
             evalRunId: "",
             caseId: item.id,
             modelId: parseTarget(modelId).modelId,
-            effort: this.deps.router.resolve(modelId).effort ?? null,
+            effort: recordEffort(this.deps.router.resolve(modelId).effort),
             trial,
             cacheKey: "",
             harness: "",
@@ -175,9 +175,17 @@ export class EvalRunner {
     };
     if (budget()) return skip("eval budget exhausted");
     if (!tracker.def(model.provider)) return skip("unknown provider");
-    if (trial.effort != null && !model.supportedEfforts.includes(trial.effort))
+    // Legacy queued trials (null) and "default" both leave the backend effort unset.
+    const effort = trial.effort === null || trial.effort === "default" ? undefined : trial.effort;
+    if (effort !== undefined && !model.supportedEfforts.includes(effort))
       return skip("saved effort no longer supported by catalog");
-    const target = router.toTarget(model, trial.effort ?? null);
+    const transport = effortTransportError(
+      run.role,
+      { model, effort, targetId: recordedTarget(trial) },
+      tracker.def(model.provider),
+    );
+    if (transport) return skip(transport);
+    const target = router.toTarget(model, effort ?? null);
     const { harnessName, noTools } = selectHarness(run.role, target);
     trial.harness = harnessName;
     const tree = "prompt" in item ? await treeFor(item.repo) : "";
@@ -225,7 +233,7 @@ export class EvalRunner {
         jsonSchema,
         trial.trial,
         repository,
-        trial.effort ?? null,
+        trial.effort,
       );
       if (signal.aborted) return skip("daemon shutdown");
       if (budget()) return skip("eval budget exhausted");

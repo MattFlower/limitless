@@ -193,10 +193,11 @@ test("effort migration preserves v9 rows and pair upserts survive reopening", ()
     store = new Store(path);
     expect(store.listInvocations("run")[0]?.effort).toBeNull();
     expect(store.listEvalTrials("old")[0]?.effort).toBeNull();
-    for (const effort of ["low", "high", "none", null] as const)
+    for (const effort of ["low", "high", "none", "default", null] as const)
       store.recordEvalTrial({ ...row, evalRunId: "old", effort });
     store.recordEvalTrial({ ...row, evalRunId: "old", effort: "low", score: 0.75 });
-    expect(store.listEvalTrials("old")).toHaveLength(4);
+    // A deliberately unset effort never collides with the legacy (unknown) row.
+    expect(store.listEvalTrials("old")).toHaveLength(5);
     const events: unknown[] = [];
     const unsubscribe = store.subscribe((event) => events.push(event));
     const invocation = store.createInvocation({
@@ -221,7 +222,7 @@ test("effort migration preserves v9 rows and pair upserts survive reopening", ()
         .listEvalTrials("old")
         .map((t) => t.effort)
         .sort(),
-    ).toEqual(([null, "high", "low", "none"] as const).toSorted());
+    ).toEqual(([null, "default", "high", "low", "none"] as const).toSorted());
     expect(store.listEvalTrials("old").find((t) => t.effort === "low")?.score).toBe(0.75);
     expect(store.getInvocation(invocation.id)).toMatchObject({ effort: "none", status: "cancelled" });
     expect(store.getRunDetail("run")?.invocations[0]?.effort).toBeNull();

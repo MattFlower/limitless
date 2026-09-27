@@ -57,16 +57,22 @@ For local Qwen, `none` disables thinking; any other declared effort enables it.
 These values do not represent separate numeric thinking budgets. HTTP structured-output
 repair requests retain the same mapping. Unset effort omits all effort fields.
 
-Explicit effort on Claude's third-party Anthropic-compatible transport is rejected:
-its CLI flag is not a substitute for an HTTP thinking field. Use a supported native
-CLI target or direct HTTP tool-free roles for those selections. HTTP requests with
-selected effort but no explicit mapping are rejected before transport.
+Effort support therefore depends on the role as well as the model. Providers reached
+through the Claude CLI's Anthropic-compatible backend (OpenRouter, mtplx, twilight) only
+carry effort in the tool-free roles (triage, chat, summarize), which run over direct HTTP.
+In every other role an effort-qualified reference for them (e.g. `review:
+openrouter/gpt-6-luna@low`, `implement: mtplx/qwen-27b@none`) is rejected up front:
+`validatePolicy` fails, eval submission fails, the router skips it with a diagnostic, and
+policy generation marks such evidence ineligible. Bare IDs remain valid there. HTTP
+requests with selected effort but no explicit mapping are rejected before transport.
 
 ## Stored evidence and displays
 
 Migration 10 appends nullable invocation effort and rebuilds eval-trial uniqueness as
 `(run, case, base model, repetition, effort)`, including one null-effort row per tuple.
-It preserves legacy rows with null effort. Creation, updates, API responses and invocation
+It preserves legacy rows with null effort, which means "unknown". New rows always record
+the resolved value; a deliberately unset effort is stored as `default` (the backend
+default), so it never collides with legacy rows. Creation, updates, API responses and invocation
 SSE events retain the recorded value, including failures and cancellations.
 
 Eval submission resolves defaults immediately and persists them in both run references
@@ -79,11 +85,14 @@ Statistics and policy generation group evidence by role and recorded pair. Newes
 completed evidence is chosen independently for each pair. Existing statistical floors,
 paired comparisons, origin exclusions, billing weights and cost/latency ordering still
 apply. Generated references include every explicitly recorded effort and validate as
-normal routing policy. Historical unknown effort cannot qualify an explicit effort
-candidate; unsupported historical values are ineligible.
+normal routing policy. Evidence recorded as `default` qualifies the bare ID, unless the
+catalog has since gained a default effort (the bare ID would now mean something else).
+Legacy evidence with unknown (null) effort never qualifies; unsupported historical values
+and efforts the role's transport cannot deliver are ineligible.
 
 Run details, pipeline report rows, Models, eval reports, trial details and eligibility
-matrices show effort. Null records display `unknown / unset`, never today's default.
+matrices show effort. `default` records display `backend default`; legacy null records
+display `unknown (legacy)`, never today's default.
 Separate effort candidates have separate metrics and links to their selected evidence.
 
 Automated tests use fake harnesses and mocked/local HTTP responses. The explicit smoke

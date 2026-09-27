@@ -4,7 +4,7 @@ import { EVAL_ROLES, generatePolicy, selectEvidence } from "../src/evals/policy.
 import { evalSettings } from "../src/evals/settings.ts";
 import { pairedBootstrap, wilson } from "../src/evals/stats.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
-import { overlayPolicy } from "../src/router/policy.ts";
+import { overlayPolicy, validatePolicy } from "../src/router/policy.ts";
 import { parseTarget, recordedTarget } from "../src/router/targets.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
 import { evidence, input, local, metered, response, subscription } from "./evals-policy-support.ts";
@@ -415,6 +415,7 @@ test("policy selects latest evidence per effort, costs them independently and re
   const high = evidence("triage", ["codex/luna@high"], { id: "high", finishedAt: 4000 });
   const newerLow = evidence("triage", ["codex/luna@low"], { id: "low-new", finishedAt: 3000 });
   const legacy = evidence("triage", ["codex/luna"], { id: "legacy", finishedAt: 5000 });
+  for (const t of legacy.trials) t.effort = null;
   const unsupported = evidence("triage", ["codex/luna@max"], { id: "unsupported" });
   for (const t of high.trials) t.costEquivUsd = 10;
   for (const t of low.trials) t.pass = false;
@@ -426,9 +427,11 @@ test("policy selects latest evidence per effort, costs them independently and re
   expect(candidates.find((c) => c.modelId === "codex/luna@high")?.run.id).toBe("high");
   expect(result.generated.triage?.default).toEqual(["codex/luna@low", "codex/luna@high"]);
   expect(candidates.find((c) => c.modelId === "codex/luna")?.reasons).toContain(
-    "unknown or unsupported recorded effort",
+    "legacy evidence with unknown effort",
   );
-  expect(candidates.find((c) => c.modelId === "codex/luna@max")?.eligible).toBe(false);
+  expect(candidates.find((c) => c.modelId === "codex/luna@max")?.reasons).toContain(
+    "unsupported recorded effort max",
+  );
   expect(validatePolicy(result.generated, MODELS)).toEqual(result.generated);
   expect(generatePolicy({ ...data, evidence: [...data.evidence].reverse() }).generated).toEqual(
     result.generated,
@@ -436,4 +439,37 @@ test("policy selects latest evidence per effort, costs them independently and re
   const matrix = evalMatrix(response(data.evidence));
   expect(matrix.rows[0]?.cells.find((c) => c.modelId === "codex/luna@low")?.href).toBe("/evals/low-new");
   expect(matrix.rows[0]?.cells.find((c) => c.modelId === "codex/luna@high")?.href).toBe("/evals/high");
+});
+
+test("fresh bare evals of models without a default effort qualify; legacy unknown effort does not", () => {
+  const fresh = evidence("triage", ["claude/opus", "codex/luna@medium"], { id: "fresh", finishedAt: 3000 });
+  const legacy = evidence("triage", ["claude/sonnet"], { id: "legacy" });
+  for (const t of legacy.trials) t.effort = null;
+  const result = generatePolicy(input([fresh, legacy]));
+  const candidates = result.roles[0]?.candidates ?? [];
+  expect(fresh.trials.find((t) => t.modelId === "claude/opus")?.effort).toBe("default");
+  expect(candidates.find((c) => c.modelId === "claude/opus")?.eligible).toBe(true);
+  expect(candidates.find((c) => c.modelId === "claude/sonnet")?.reasons).toContain(
+    "legacy evidence with unknown effort",
+  );
+  expect(result.generated.triage?.default).toContain("claude/opus");
+  expect(result.generated.triage?.default).not.toContain("claude/sonnet");
+  // A saved "default" is not reinterpreted once the catalog gains a default effort.
+  const models = MODELS.map((m) => (m.id === "claude/opus" ? { ...m, effort: "high" as const } : m));
+  const changed = generatePolicy({ ...input([fresh]), models });
+  expect(changed.roles[0]?.candidates.find((c) => c.modelId === "claude/opus")?.eligible).toBe(false);
+});
+
+test("effort a role's transport cannot deliver is never emitted", () => {
+  const review = evidence("review", ["openrouter/gpt-6-luna@low", "openrouter/gpt-6-luna"]);
+  const triage = evidence("triage", ["openrouter/gpt-6-luna@low"]);
+  const result = generatePolicy(input([review, triage]));
+  const reviewRole = result.roles.find((r) => r.role === "review");
+  expect(
+    reviewRole?.candidates.find((c) => c.modelId === "openrouter/gpt-6-luna@low")?.reasons.join(),
+  ).toContain("cannot carry effort in the review role");
+  expect(result.generated.review?.default).toEqual(["openrouter/gpt-6-luna"]);
+  // Tool-less triage runs over HTTP, which carries OpenRouter reasoning effort.
+  expect(result.generated.triage?.default).toEqual(["openrouter/gpt-6-luna@low"]);
+  expect(validatePolicy(result.generated, MODELS)).toEqual(result.generated);
 });

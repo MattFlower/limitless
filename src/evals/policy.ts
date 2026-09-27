@@ -1,7 +1,7 @@
 import type { Effort, EvalRun, EvalTrial } from "../core/types.ts";
 import type { ModelDef, Policy, ProviderDef } from "../router/catalog.ts";
 import type { PolicyOverlay } from "../router/policy.ts";
-import { parseTarget, recordedTarget } from "../router/targets.ts";
+import { effortTransportError, parseTarget, recordedTarget } from "../router/targets.ts";
 import type { EvalSettings } from "./settings.ts";
 import { completeCases, pairedBootstrap, summarize, wilson } from "./stats.ts";
 
@@ -104,15 +104,26 @@ export function generatePolicy(input: PolicyInput) {
         const reasons: string[] = [];
         if (!model || !provider) reasons.push("catalog/provider metadata unavailable");
         if (excluded) reasons.push(`origin excluded (${model?.origin}; baseOrigin=${model?.baseOrigin})`);
+        // Without trials only the saved reference exists, and metrics already mark it insufficient.
         const recordedEffort = rows.length
-          ? rows[0]?.effort
-          : (parseTarget(entry.modelId).effort as Effort | undefined);
-        const effortAllowed =
-          recordedEffort == null
-            ? model?.supportedEfforts.length === 0
-            : model?.supportedEfforts.includes(recordedEffort);
-        if (!effortAllowed) reasons.push("unknown or unsupported recorded effort");
-        const referenceAllowed = Boolean(model && provider && !excluded && effortAllowed);
+          ? (rows[0]?.effort ?? null)
+          : ((parseTarget(entry.modelId).effort as Effort | undefined) ?? "default");
+        const effortProblem =
+          recordedEffort === null
+            ? "legacy evidence with unknown effort"
+            : recordedEffort === "default"
+              ? model?.effort !== undefined
+                ? `recorded with backend-default effort, but ${model.id} now defaults to ${model.effort}`
+                : null
+              : !model || !model.supportedEfforts.includes(recordedEffort)
+                ? `unsupported recorded effort ${recordedEffort}`
+                : effortTransportError(
+                    role,
+                    { model, effort: recordedEffort, targetId: entry.modelId },
+                    provider,
+                  );
+        if (effortProblem) reasons.push(effortProblem);
+        const referenceAllowed = Boolean(model && provider && !excluded && !effortProblem);
         const f = settings.floors;
         const passMetric = metric(
           "pass rate",
@@ -258,6 +269,8 @@ export type PolicyEvaluation = ReturnType<typeof generatePolicy>;
 export interface EvalPolicyResponse {
   evaluation: PolicyEvaluation;
   models: ModelDef[];
+  /** Absent from older daemons; validation then falls back to the built-in providers. */
+  providers?: ProviderDef[];
   policy: Policy;
   runs: (EvalRun & { costUsd: number; costEquivUsd: number })[];
 }

@@ -72,13 +72,15 @@ export class Factory {
   ) {
     this.models = opts.models ?? MODELS;
     this.evalSettings = evalSettings(cfg.raw);
+    this.providerDefs = opts.providers ?? PROVIDERS;
     this.policy =
       opts.policy ??
-      (opts.policyPath === undefined ? DEFAULT_POLICY : loadPolicy(opts.policyPath, this.models));
+      (opts.policyPath === undefined
+        ? DEFAULT_POLICY
+        : loadPolicy(opts.policyPath, this.models, this.providerDefs));
     this.store = opts.store ?? new Store(cfg.paths.db);
     this.cleanup = opts.cleanup ?? ((dryRun) => collectGarbage(this.store, cfg, { dryRun }));
     this.gcTimer = opts.gcTimer ?? { set: setInterval, clear: clearInterval };
-    this.providerDefs = opts.providers ?? PROVIDERS;
     this.tracker = new ProviderTracker(
       this.providerDefs,
       this.store,
@@ -120,6 +122,7 @@ export class Factory {
       }),
       policy: this.policy,
       models: this.models,
+      providers: this.providerDefs,
       runs: evidence.map(({ run, trials }) => ({
         ...run,
         costUsd: trials.reduce((n, t) => n + t.costUsd, 0),

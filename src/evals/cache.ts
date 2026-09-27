@@ -17,6 +17,7 @@ export function cacheKey(
   schema: Record<string, unknown>,
   trial: number,
   repository?: unknown,
+  /** Resolved at submission; null/undefined marks legacy trials whose effort is unknown. */
   effort?: string | null,
 ): string {
   return new Bun.CryptoHasher("sha256")
@@ -30,7 +31,7 @@ export function cacheKey(
           schema,
           trial,
           repository,
-          effort: effort === undefined ? "legacy-unknown" : effort,
+          effort: effort ?? "legacy-unknown",
         }),
       ),
     )

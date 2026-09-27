@@ -1152,6 +1152,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const invs = f.store.listInvocations(run.id);
     expect(invs[0]).toMatchObject({ provider: "alpha", status: "quota" });
     expect(invs.filter((i) => i.status === "ok").every((i) => i.provider === "beta")).toBe(true);
+    // Unset effort is recorded as the backend default, never as legacy-unknown (null).
+    expect(invs.every((i) => i.effort === "default")).toBe(true);
     expect(f.tracker.status("alpha")?.state).toBe("exhausted");
   });
 

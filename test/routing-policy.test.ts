@@ -193,3 +193,20 @@ test("policy target references share strict resolution and preserve group orderi
   if (!model) throw new Error("missing");
   expect(() => resolveTarget(model.id, () => ({ ...model, supportedEfforts: [] }))).toThrow("default");
 });
+
+test("policy rejects efforts the role's harness cannot deliver", () => {
+  for (const [role, reference] of [
+    ["review", "openrouter/gpt-6-luna@low"],
+    ["implement", "mtplx/qwen-27b@none"],
+    ["verify", "twilight/qwen-27b@high|claude/opus"],
+  ] as const)
+    expect(() => validatePolicy({ [role]: { default: [reference] } }, MODELS)).toThrow("cannot carry effort");
+  // Tool-less roles use the HTTP harness, which maps effort; bare IDs work everywhere.
+  for (const [role, reference] of [
+    ["triage", "openrouter/gpt-6-luna@low"],
+    ["chat", "mtplx/qwen-27b@none"],
+    ["summarize", "twilight/qwen-27b@high"],
+    ["review", "openrouter/gpt-6-luna"],
+  ] as const)
+    expect(validatePolicy({ [role]: { default: [reference] } }, MODELS)[role]?.default).toEqual([reference]);
+});

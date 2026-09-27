@@ -69,19 +69,22 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
       "codex/luna@none",
       "codex/luna",
     ]);
+    // Bare codex/luna rows here predate effort recording.
+    for (const t of variants.trials) if (t.effort === "default") t.effort = null;
     const variantHtml = renderToString(() => EvalsView({ data: response([variants]) }));
     for (const target of variants.run.models) expect(variantHtml).toContain(target);
-    expect(variantHtml).toContain("unknown / unset");
+    expect(variantHtml).toContain("unknown (legacy)");
+    expect(variantHtml).toContain("legacy evidence with unknown effort");
     const detailHtml = renderToString(() =>
       EvalDetailView({ report: { ...variants, summaries: summarize(variants.run, variants.trials) } }),
     );
-    for (const effort of ["low", "high", "none", "unknown / unset"]) expect(detailHtml).toContain(effort);
+    for (const effort of ["low", "high", "none", "unknown (legacy)"]) expect(detailHtml).toContain(effort);
     const invocationOutput = build.outputs.find((o) => o.path.endsWith("InvocationsTable.js"));
     if (!invocationOutput) throw new Error("missing invocation output");
     const { InvocationsTable } = (await import(
       invocationOutput.path
     )) as typeof import("../ui/components/InvocationsTable.tsx");
-    const invocations = (["low", "high", "none", null] as const).map(
+    const invocations = (["low", "high", "none", "default", null] as const).map(
       (effort, id): import("../src/core/types.ts").Invocation => ({
         id,
         effort,
@@ -108,7 +111,7 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
     const invocationHtml = renderToString(() =>
       InvocationsTable({ invocations, selectedId: null, onSelect: () => {} }),
     );
-    for (const effort of ["low", "high", "none", "unknown / unset"])
+    for (const effort of ["low", "high", "none", "backend default", "unknown (legacy)"])
       expect(invocationHtml).toContain(`>${effort}</td>`);
     expect(invocationHtml.match(/<th[ >]/g)).toHaveLength(11);
     expect(

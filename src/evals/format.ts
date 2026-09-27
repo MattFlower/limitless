@@ -1,3 +1,4 @@
+import { effortLabel } from "../core/effort-format.ts";
 import type { EvalReport } from "./stats.ts";
 import { wilson } from "./stats.ts";
 
@@ -28,7 +29,7 @@ export function formatEvalReport(report: EvalReport): string {
         metric("criterion accuracy", m.verify.criterionAccuracy),
       );
     lines.push(
-      `${m.modelId} (effort: ${m.effort ?? "unknown / unset"}): ${m.cases} cases, ${m.evaluatedTrials} evaluated trials; skipped=${m.skipped}, errors=${m.errors}, cached=${m.cached}, pending=${m.pending}, unscored=${m.unscored}`,
+      `${m.modelId} (effort: ${effortLabel(m.effort)}): ${m.cases} cases, ${m.evaluatedTrials} evaluated trials; skipped=${m.skipped}, errors=${m.errors}, cached=${m.cached}, pending=${m.pending}, unscored=${m.unscored}`,
       `  pass ${pct(m.passRate)} (${m.passes}/${m.evaluatedTrials}), Wilson 95% CI ${m.ci ? `[${pct(m.ci[0])}, ${pct(m.ci[1])}]` : "n/a"}; mean score ${number(m.meanScore)}`,
       ...roleLines,
       `  prediction coverage ${m.predictionTrials}/${m.scheduledTrials} (${pct(m.predictionCoverage)}); flip ${pct(m.flipRate)} (n=${m.flipDenominator})`,

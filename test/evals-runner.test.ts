@@ -463,7 +463,9 @@ test("two efforts execute independently, cache only equivalent targets, and free
     expect(alias.summaries[0]?.cached).toBe(1);
     const key = (effort?: string | null) =>
       cacheKey("candidate-a", "fake", "prompt", "system", {}, 0, { repo: "pin" }, effort);
-    expect(new Set([key(), key(null), key("none"), key("low"), key("high")]).size).toBe(5);
+    // Legacy (unknown) and deliberately unset ("default") entries never share a key.
+    expect(key(null)).toBe(key());
+    expect(new Set([key(), key("default"), key("none"), key("low"), key("high")]).size).toBe(5);
   } finally {
     await f.close();
   }
@@ -477,7 +479,7 @@ test("saved unset effort remains unset after the catalog gains a default", async
     enableEfforts(f);
     await f.factory.evals.wait(run.id);
     expect(f.calls[0]?.target.effort).toBeUndefined();
-    expect(f.factory.evals.report(run.id)?.trials[0]?.effort).toBeNull();
+    expect(f.factory.evals.report(run.id)?.trials[0]?.effort).toBe("default");
   } finally {
     await f.close();
   }

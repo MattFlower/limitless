@@ -4,9 +4,9 @@ import { evalSettings } from "../src/evals/settings.ts";
 import { DEFAULT_POLICY, MODELS, PROVIDERS } from "../src/router/catalog.ts";
 import { parseTarget } from "../src/router/targets.ts";
 
-export const local = "mtplx/qwen-27b@high";
+export const local = "mtplx/qwen-27b";
 export const subscription = "codex/luna@medium";
-export const metered = "openrouter/gpt-6-luna@low";
+export const metered = "openrouter/gpt-6-luna";
 export function evidence(
   role: EvalRun["role"] = "triage",
   models = [local],
@@ -30,7 +30,7 @@ export function evidence(
         evalRunId: run.id,
         caseId: `case-${String(i).padStart(2, "0")}`,
         modelId: parseTarget(modelId).modelId,
-        effort: (parseTarget(modelId).effort as Effort | undefined) ?? null,
+        effort: (parseTarget(modelId).effort as Effort | undefined) ?? ("default" as const),
         trial,
         cacheKey: "key",
         harness: "fake",

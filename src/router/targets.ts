@@ -1,5 +1,6 @@
-import type { Effort, ModelSelection } from "../core/types.ts";
-import type { ModelDef } from "./catalog.ts";
+import type { Effort, ModelSelection, RecordedEffort, Role } from "../core/types.ts";
+import { TOOL_LESS_ROLES } from "../harness/select.ts";
+import type { ModelDef, ProviderDef } from "./catalog.ts";
 
 export function parseTarget(reference: string): { modelId: string; effort?: string } {
   if (!reference) throw new Error("empty model ID: expected model or model@effort");
@@ -14,8 +15,9 @@ export function parseTarget(reference: string): { modelId: string; effort?: stri
   return { modelId, effort: parts[1] };
 }
 export function formatTarget(modelId: string, effort?: string | null): string {
-  return effort == null ? modelId : `${modelId}@${effort}`;
+  return effort == null || effort === "default" ? modelId : `${modelId}@${effort}`;
 }
+export type ResolvedTarget = ReturnType<typeof resolveTarget>;
 export function resolveTarget(
   reference: string | ModelSelection,
   lookup: (id: string) => ModelDef | undefined,
@@ -34,6 +36,24 @@ export function resolveTarget(
       `Unsupported effort "${effort}" for ${model.id}; supported: ${model.supportedEfforts.join(", ") || "none (explicit control unavailable)"}`,
     );
   return { model, effort: effort as Effort | undefined, targetId: formatTarget(model.id, effort) };
+}
+/**
+ * Backends reached through the Claude CLI (OpenRouter, mtplx, llama.cpp) cannot receive an effort;
+ * only the tool-less roles run over HTTP there, where the llm harness maps it.
+ */
+export function effortTransportError(
+  role: Role,
+  target: Pick<ResolvedTarget, "model" | "effort" | "targetId">,
+  provider: ProviderDef | undefined,
+): string | null {
+  if (target.effort === undefined || !provider) return null;
+  if (provider.harness !== "claude" || !provider.baseUrl) return null;
+  if (TOOL_LESS_ROLES.includes(role) && provider.openaiBaseUrl) return null;
+  return `${target.targetId} cannot carry effort in the ${role} role: ${provider.id} runs through the Claude CLI there, which cannot set effort (use ${target.model.id} without @effort)`;
+}
+/** Record an unset effort as "default" so it stays distinct from legacy rows (null = unknown). */
+export function recordEffort(effort: Effort | undefined): RecordedEffort {
+  return effort ?? "default";
 }
 /** Recorded values never consult today's defaults. */
 export function recordedTarget(target: { modelId: string; effort?: string | null }): string {

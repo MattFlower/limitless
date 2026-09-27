@@ -49,8 +49,8 @@ export async function evalCommand(
     };
     const path = "routing/policy.json";
     const old = await files.read(path);
-    const existing = old === null ? {} : parsePolicy(old, data.models, path);
-    const proposed = validatePolicy(proposedOverlay(existing, data.evaluation), data.models);
+    const existing = old === null ? {} : parsePolicy(old, data.models, path, data.providers);
+    const proposed = validatePolicy(proposedOverlay(existing, data.evaluation), data.models, data.providers);
     const document = `${JSON.stringify(proposed, null, 2)}\n`;
     const evidence = renderEvidence(data.evaluation);
     io.print(policyDiff(data.policy, overlayPolicy(DEFAULT_POLICY, proposed), data.evaluation));

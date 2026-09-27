@@ -22,6 +22,7 @@ import { selectHarness } from "../harness/select.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../harness/types.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
+import { recordEffort } from "../router/targets.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
 
@@ -254,7 +255,7 @@ export class RunContext {
         provider: target.provider,
         model: target.model,
         modelId: target.modelId,
-        effort: target.effort ?? null,
+        effort: recordEffort(target.effort),
       });
       this.log(`${opts.role}: using ${target.targetId ?? target.modelId}`, "info", {
         invocationId: invocation.id,

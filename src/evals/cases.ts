@@ -4,7 +4,6 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
 import type { Router } from "../router/router.ts";
-import { resolveTarget } from "../router/targets.ts";
 
 const nonempty = z.string().trim().min(1);
 const repoId = z.string().regex(/^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/, "expected owner/name");
@@ -180,10 +179,11 @@ export const EvalRequestSchema = z.strictObject({
   cache: z.boolean().default(true),
 });
 export type EvalRequest = z.infer<typeof EvalRequestSchema>;
-export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<Router, "model">) {
+export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<Router, "resolveFor">) {
   const request = EvalRequestSchema.parse(input);
   if (request.role !== file.role) throw new Error("dataset role does not match request");
-  request.models = request.models.map((id) => resolveTarget(id, (base) => router.model(base)).targetId);
+  const role = request.role;
+  request.models = request.models.map((id) => router.resolveFor(role, id).targetId);
   if (new Set(request.models).size !== request.models.length)
     throw new Error("duplicate resolved model targets");
   for (const id of request.caseIds ?? [])

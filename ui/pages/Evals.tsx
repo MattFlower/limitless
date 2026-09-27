@@ -1,5 +1,6 @@
 import { useParams } from "@solidjs/router";
 import { type Component, createSignal, For, onMount, Show } from "solid-js";
+import { effortLabel } from "../../src/core/effort-format.ts";
 import { formatEvalReport } from "../../src/evals/format.ts";
 import type { EvalPolicyResponse } from "../../src/evals/policy.ts";
 import type { EvalReport } from "../../src/evals/stats.ts";
@@ -46,7 +47,7 @@ export const EvalsView: Component<{ data?: EvalPolicyResponse; error?: string }>
                               </Show>
                             </span>
                             <Show when={cell.candidate}>
-                              <div>Effort: {cell.candidate?.summary.effort ?? "unknown / unset"}</div>
+                              <div>Effort: {effortLabel(cell.candidate?.summary.effort)}</div>
                             </Show>
                             <For each={cell.candidate?.metrics}>
                               {(metric) => (
@@ -153,7 +154,7 @@ export const EvalDetailView: Component<{ report?: EvalReport; error?: string }> 
                       <tr>
                         <td>{t.caseId}</td>
                         <td>{t.modelId}</td>
-                        <td>{t.effort ?? "unknown / unset"}</td>
+                        <td>{effortLabel(t.effort)}</td>
                         <td>{t.trial}</td>
                         <td>{t.status}</td>
                         <td>

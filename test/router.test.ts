@@ -588,3 +588,21 @@ test("saved selections preserve unset effort across catalog changes and exclusio
     routing.route("implement", "small", { prefer: saved }).candidates.every((t) => t.provider !== "claude"),
   ).toBe(true);
 });
+
+test("router skips effort targets whose harness cannot carry effort for the role", () => {
+  const { tracker } = setup();
+  const catalog = models.map((m): ModelDef => ({ ...m, supportedEfforts: ["low", "high"] }));
+  const reference = "openrouter/ds@low";
+  const routing = new Router(
+    tracker,
+    { ...policy, review: { default: [reference, "codex/sol"] }, triage: { default: [reference] } },
+    catalog,
+  );
+  const review = routing.route("review", "medium");
+  expect(review.candidates.map((t) => t.targetId)).toEqual(["codex/sol"]);
+  expect(review.skipped.find((s) => s.modelId === reference)?.reason).toContain("cannot carry effort");
+  expect(() => routing.resolveFor("review", reference)).toThrow("cannot carry effort");
+  expect(routing.resolveFor("review", "openrouter/ds").targetId).toBe("openrouter/ds");
+  // Without an HTTP endpoint even tool-less roles run through the Claude CLI.
+  expect(routing.route("triage", "medium").candidates).toEqual([]);
+});
