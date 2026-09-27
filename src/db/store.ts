@@ -660,9 +660,17 @@ export class Store {
   ): void {
     this.db
       .query(
-        "INSERT INTO chat_calls (conversation_id, provider, model_id, result_json, cost_usd, started_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO chat_calls (conversation_id, provider, model_id, result_json, cost_usd, started_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(conversationId, provider, modelId, JSON.stringify(result), result.costUsd, startedAt);
+      .run(
+        conversationId,
+        provider,
+        modelId,
+        JSON.stringify(result),
+        result.costUsd,
+        startedAt,
+        Math.max(0, Date.now() - startedAt),
+      );
   }
 
   // ---- repos ---------------------------------------------------------------

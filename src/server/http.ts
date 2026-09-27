@@ -3,7 +3,7 @@ import type { Server } from "bun";
 import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
 import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from "../core/types.ts";
-import { computeStats } from "../db/stats.ts";
+import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 
 export interface HttpExtras {
   /** Extra routes contributed by integrations (webhooks, MCP). */
@@ -299,6 +299,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle(() => json(store.listRepos())),
     },
     "/api/providers": handle(() => json(factory.tracker.all())),
+    "/api/stats/providers": handle(() => json(computeProviderWorkload(store))),
     "/api/providers/:id/enable": {
       POST: handle((req) => json(factory.tracker.setEnabled(req.params.id ?? "", true))),
     },

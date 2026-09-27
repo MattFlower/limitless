@@ -321,4 +321,9 @@ UPDATE runs SET state_json = json_set(state_json, '$.environmentRetryRound', -1)
 WHERE state_json IS NOT NULL AND json_type(state_json, '$.environmentRetryRound') IS NULL;
 `,
   },
+  {
+    version: 12,
+    name: "chat_call_duration",
+    sql: "ALTER TABLE chat_calls ADD COLUMN duration_ms INTEGER;",
+  },
 ];

@@ -1,16 +1,18 @@
 import type { Component } from "solid-js";
 import { createMemo, createSignal, For, onMount, Show } from "solid-js";
-import type { Stats } from "../../src/db/stats.ts";
+import type { ProviderWorkload, Stats } from "../../src/db/stats.ts";
 import type { ModelDef, Policy } from "../../src/router/catalog.ts";
-import { getModels, getStats } from "../api.ts";
+import { getModels, getProviderWorkload, getStats } from "../api.ts";
 import { ProviderCard } from "../components/ProviderCard.tsx";
 import { duration, money } from "../lib/format.ts";
+import { workloadFor } from "../lib/provider-workload.ts";
 import { ensureLiveStore, live } from "../store.ts";
 
 export const Models: Component = () => {
   ensureLiveStore();
   const [catalog, setCatalog] = createSignal<{ models: ModelDef[]; policy: Policy } | null>(null);
   const [stats, setStats] = createSignal<Stats | null>(null);
+  const [workload, setWorkload] = createSignal<ProviderWorkload[]>([]);
 
   onMount(() => {
     getModels()
@@ -18,6 +20,9 @@ export const Models: Component = () => {
       .catch(() => {});
     getStats(14)
       .then(setStats)
+      .catch(() => {});
+    getProviderWorkload()
+      .then(setWorkload)
       .catch(() => {});
   });
 
@@ -41,7 +46,9 @@ export const Models: Component = () => {
       <div>
         <div class="section-label">Providers</div>
         <div class="provider-grid">
-          <For each={providers()}>{(p) => <ProviderCard provider={p} />}</For>
+          <For each={providers()}>
+            {(p) => <ProviderCard provider={p} workload={workloadFor(p.id, workload())} />}
+          </For>
         </div>
       </div>
 
