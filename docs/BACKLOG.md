@@ -30,6 +30,7 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 27 | M4 | New-model intake pipeline | todo |
 | 28 | M4 | Aggregator providers: per-model rate limits and concurrency | todo |
 | 29 | M5 | Holdout feedback that is actionable but still blind | todo |
+| 30 | M5 | Later-round reviews don't move the goalposts | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
@@ -432,3 +433,21 @@ input]Args"), which helped push runs to needs-human.
   scenarios contains the summary and never the scenario text; common words and repo identifiers
   survive the backstop while scenario-specific literals don't; no mid-word replacement; existing
   leak tests still pass.
+
+## 30. Later-round reviews don't move the goalposts
+
+From the 2026-09-27 needs-human analysis: on large runs, each review round raised new edge cases
+(eval part 2 had four request-changes rounds, each with fresh findings), so runs ran out of rounds
+while converging. Fixing what was asked for should end the loop.
+
+- From round 2 on, the reviewer receives the previous round's findings and the diff since the last
+  reviewed commit, and must label each finding: `unaddressed` (a prior finding not fixed),
+  `regression` (introduced by the latest changes), or `new`.
+- Only unaddressed, regression, or new *blocker*/security findings can block; other new findings are
+  recorded as follow-ups in the PR report (and can be filed as backlog items) instead of forcing
+  another round.
+- The verdict is derived deterministically from those labels (as with verify), not taken from the
+  model's own verdict field.
+- Tests with the fake harness: a new major non-security finding in round 3 does not trigger
+  another implement round and appears under follow-ups; an unaddressed prior finding or a regression
+  still blocks.
