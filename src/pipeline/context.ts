@@ -308,7 +308,13 @@ export class RunContext {
                     if (typeof command === "string") commands.set(ev.id, command);
                   } else if (ev.type === "tool_result") {
                     const command = commands.get(ev.id);
-                    if (command) commandResults.push({ command, output: ev.output, isError: ev.isError });
+                    if (command)
+                      commandResults.push({
+                        command,
+                        output: ev.output,
+                        isError: ev.isError,
+                        ...(ev.diagnostics ? { diagnostics: ev.diagnostics } : {}),
+                      });
                   }
                 }
                 this.onAgentEvent(invocation.id, ev, opts.role, redact);

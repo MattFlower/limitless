@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
+import { classifyOutput } from "./diagnostics.ts";
 import { scratchEnv, validateScratch } from "./scratch.ts";
 import {
   type AgentEvent,
@@ -92,11 +93,13 @@ export class CodexStreamParser {
         if (phase === "item.started") {
           this.emit({ type: "tool_call", id, name: "shell", input: { command: item.command } });
         } else {
+          const output = String(item.aggregated_output ?? "");
           this.emit({
             type: "tool_result",
             id,
-            output: String(item.aggregated_output ?? "").slice(0, 20_000),
+            output: output.slice(0, 20_000),
             isError: Number(item.exit_code ?? 0) !== 0,
+            diagnostics: classifyOutput(output),
           });
         }
         break;

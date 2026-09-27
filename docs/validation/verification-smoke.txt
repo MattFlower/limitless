@@ -1,19 +1,16 @@
-$ claude --version && codex --version
-2.1.281 (Claude Code)
-codex-cli 0.157.1
 $ bun scripts/smoke.ts
 Check                  Status  Time     Detail
 ---------------------  ------  -------  ------
-claude structured      PASS     1963ms  
-claude noTools         PASS     2252ms  
-claude edit            PASS     4531ms  
-claude quota           PASS     1463ms  
-claude verify          PASS     6025ms  claude-haiku-4-5: observed temp create/read/delete and denied worktree write
-codex structured       PASS     6071ms  model gpt-5.6-sol (gpt-6-luna, gpt-6-sol unsupported)
-codex noTools          PASS     7073ms  
-codex edit             PASS     9537ms  
-codex quota            PASS     3516ms  
-codex verify           PASS     8021ms  gpt-5.6-sol: observed temp create/read/delete and denied worktree write
-mtplx structured       PASS     7691ms  
-twilight structured    PASS     4410ms  
-openrouter structured  PASS    27997ms
+claude structured      PASS     2431ms  
+claude noTools         PASS     4632ms  
+claude edit            PASS     4034ms  
+claude quota           PASS     1565ms  
+claude verify          PASS     5446ms  claude-haiku-4-5: observed temp create/read/delete and denied worktree write
+codex structured       PASS     7003ms  model gpt-5.6-sol (gpt-6-luna, gpt-6-sol unsupported)
+codex noTools          PASS    11247ms  
+codex edit             PASS    15043ms  
+codex quota            PASS     3040ms  
+codex verify           PASS     7916ms  gpt-5.6-sol: observed temp create/read/delete and denied worktree write
+mtplx structured       PASS     8332ms  
+twilight structured    PASS     3629ms  
+openrouter structured  PASS    15883ms  

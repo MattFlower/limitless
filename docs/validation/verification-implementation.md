@@ -1,6 +1,13 @@
 # Verification reliability implementation report
 
-Implemented on 2026-09-27 (date checked with `date -u`). Round 3 re-ran live validation on the factory host outside a nested sandbox: both native verify smoke rows **PASS** (AC-7).
+Implemented on 2026-09-27 (date checked with `date -u`). Round 3 re-ran live validation on the factory host outside a nested sandbox: both native verify smoke rows **PASS** (AC-7). Round 5 (2026-09-27) addressed the code-review findings below and re-ran every check and the live smoke.
+
+## Round 5: review findings fixed
+
+- **Check identity keeps arguments** (`src/pipeline/verification.ts`). A check is now identified by executable, subcommand and positional arguments, so `bun test test/integration.test.ts` and `bun test test/unit.test.ts` are distinct: a successful unit run no longer erases the integration barrier. Only a rerun of the same check supersedes its outcome. Redirections and flag values (`2>&1`, `--timeout 5000`) are not part of the identity; a flag value that looks like a path is. When the evidence names a check's file, runs of other files are treated as other checks. Regression: "a successful unrelated check does not resolve another check's barrier".
+- **Diagnostics computed before display truncation** (`src/harness/diagnostics.ts`, both stream parsers, `AgentEvent`/`CommandResult.diagnostics`). Parsers classify the complete tool output (observed denial, assertion failure) before slicing it to 20,000 characters and attach that to the event; `RunContext.invoke` passes it through and normalization prefers it over re-scanning the truncated text. Regressions cover a late permission error and a late assertion failure past the limit through both `CodexStreamParser` and `ClaudeStreamParser`, asserting the truncated text alone would decide the opposite.
+- **Explicit blocked results are validated too**. A verifier's `blocked` becomes `unmet` when the checks its evidence refers to ended on an assertion failure, or when the evidence itself is an expectation mismatch (`expected EACCES, received success`) rather than an observed denial. A blocked with an observed denial and no contradicting execution evidence stays blocked.
+- **Smoke probe writes at an absolute worktree path** (`scripts/smoke.ts`). The probe derives the worktree from its own resolved script location instead of the working directory. Regression in `test/smoke.test.ts` executes the real probe with `python3` from `/`: against a writable worktree the check fails with "worktree changed: ?? forbidden-write"; against a read-only worktree it passes with the denied-write marker.
 
 ## Changes
 
@@ -36,7 +43,9 @@ Claude Code's sandbox overrides TMPDIR for Bash commands with `$CLAUDE_CODE_TMPD
 
 ## Validation
 
-- `bun run check`: **PASS**: Biome, `tsc --noEmit`, and **392 tests passed, 0 failed**. [Full output](verification-check.txt).
+Re-run in round 5 on 2026-09-27 with codex-cli 0.157.1 and Claude Code 2.1.281 (unchanged configuration):
+
+- `bun run check`: **PASS** (exit 0): Biome, `tsc --noEmit`, and **410 tests passed, 0 failed**. The remaining Biome output is pre-existing warnings outside this change. [Full output](verification-check.txt).
 - `bun run build:ui`: **PASS**. [Full output](verification-build-ui.txt).
 - `bun run smoke`: **PASS**, exit 0, all 13 rows pass and none are skipped. [Full output](verification-smoke.txt).
 
@@ -44,19 +53,19 @@ Claude Code's sandbox overrides TMPDIR for Bash commands with `$CLAUDE_CODE_TMPD
 $ bun scripts/smoke.ts
 Check                  Status  Time     Detail
 ---------------------  ------  -------  ------
-claude structured      PASS     2620ms  
-claude noTools         PASS     3671ms  
-claude edit            PASS     4843ms  
-claude quota           PASS     1728ms  
-claude verify          PASS     5986ms  claude-haiku-4-5: observed temp create/read/delete and denied worktree write
-codex structured       PASS     7385ms  model gpt-5.6-sol (gpt-6-luna, gpt-6-sol unsupported)
-codex noTools          PASS     7981ms  
-codex edit             PASS    16060ms  
-codex quota            PASS     4790ms  
-codex verify           PASS     8472ms  gpt-5.6-sol: observed temp create/read/delete and denied worktree write
-mtplx structured       PASS    12738ms  
-twilight structured    PASS     3892ms  
-openrouter structured  PASS     7164ms
+claude structured      PASS     2431ms  
+claude noTools         PASS     4632ms  
+claude edit            PASS     4034ms  
+claude quota           PASS     1565ms  
+claude verify          PASS     5446ms  claude-haiku-4-5: observed temp create/read/delete and denied worktree write
+codex structured       PASS     7003ms  model gpt-5.6-sol (gpt-6-luna, gpt-6-sol unsupported)
+codex noTools          PASS    11247ms  
+codex edit             PASS    15043ms  
+codex quota            PASS     3040ms  
+codex verify           PASS     7916ms  gpt-5.6-sol: observed temp create/read/delete and denied worktree write
+mtplx structured       PASS     8332ms  
+twilight structured    PASS     3629ms  
+openrouter structured  PASS    15883ms
 ```
 
 ## Assumptions and remaining work
@@ -67,4 +76,4 @@ Permission-error derivation is conservative: a criterion must describe an attemp
 
 A restart after reserving an environment retry cannot grant another retry, including if the process stops during that retry. Reading roles other than review/verify also receive scratch when tool-enabled so the strengthened native contract does not break spec/plan/evaluation callers. No-tools holdout authoring retains its isolation.
 
-Normalization only reclassifies `unmet`/`unclear` criteria as blocked. A `met` criterion whose evidence mentions an EPERM it later worked around stays met. Executed checks are parsed through shell wrappers (`zsh -lc`), environment assignments/`env`, and `cd … &&` sequences, and are correlated with a criterion by executable plus subcommand/script (`bun test` vs `bun run build`). A criterion is blocked only when the latest run of every check its evidence refers to ended on a permission barrier or succeeded, with at least one barrier and no genuine failure; denial diagnostics are judged per output line / evidence sentence, so an unrelated `expected-denial` test name does not veto a real barrier.
+Normalization reclassifies `unmet`/`unclear` criteria as blocked, and demotes an explicit `blocked` to `unmet` when execution evidence or the evidence text shows an assertion mismatch instead of an observed denial. A `met` criterion whose evidence mentions an EPERM it later worked around stays met. Executed checks are parsed through shell wrappers (`zsh -lc`), environment assignments/`env`, and `cd … &&` sequences, and are correlated with a criterion by executable plus subcommand/script (`bun test` vs `bun run build`); distinct positional arguments (test files) are distinct checks. A criterion is blocked only when the latest run of every check its evidence refers to ended on a permission barrier or succeeded, with at least one barrier and no genuine failure; denial diagnostics are judged per output line / evidence sentence on the complete command output, so an unrelated `expected-denial` test name does not veto a real barrier and a diagnostic past the display truncation is not lost.

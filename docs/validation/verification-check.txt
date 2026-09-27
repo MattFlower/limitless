@@ -88,7 +88,7 @@ ui/styles.css:1207:1 lint/style/noDescendingSpecificity ━━━━━━━━
   i Descending specificity selector may not be applied. Consider rearranging the order of the selectors. See MDN web docs for more details.
   
 
-Checked 163 files in 48ms. No fixes applied.
+Checked 164 files in 45ms. No fixes applied.
 Found 3 warnings.
 Found 1 info.
 $ tsc --noEmit -p .
@@ -165,7 +165,7 @@ error: send failed
       at sendMessage (/Users/mflower/.limitless/work/mujuy57pr6mm/test/quota-alerts.test.ts:27:30)
 
 
- 392 pass
+ 410 pass
  0 fail
- 1 snapshots, 4207 expect() calls
-Ran 392 tests across 50 files. [46.61s]
+ 1 snapshots, 4341 expect() calls
+Ran 410 tests across 50 files. [46.98s]

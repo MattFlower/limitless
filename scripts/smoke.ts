@@ -273,6 +273,8 @@ export async function verifyLiveCheck(harness: Harness, target: ModelTarget): Pr
     writeFileSync(
       probe,
       `import os, errno, pathlib
+# The worktree is where this probe lives, whatever directory the agent runs it from.
+worktree = pathlib.Path(__file__).resolve().parent
 scratch = pathlib.Path(os.environ["TMPDIR"])
 assert str(scratch) == os.environ["TMP"] == os.environ["TEMP"]
 f = scratch / "probe-file"
@@ -282,7 +284,7 @@ f.unlink()
 assert not f.exists()
 print("${token}:temp-created-read-deleted", flush=True)
 try:
-    pathlib.Path("forbidden-write").write_text("write succeeded")
+    (worktree / "forbidden-write").write_text("write succeeded")
 except OSError as e:
     if e.errno not in (errno.EPERM, errno.EACCES, errno.EROFS): raise
     print("${token}:worktree-write-denied", flush=True)

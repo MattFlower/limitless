@@ -1,5 +1,6 @@
 import type { ZodType } from "zod";
 import type { Billing, Effort, InvocationStatus, QuotaWindow } from "../core/types.ts";
+import type { ExecutionDiagnostics } from "./diagnostics.ts";
 
 /** A concrete model on a concrete provider, as chosen by the router. */
 export interface ModelTarget {
@@ -25,7 +26,14 @@ export type AgentEvent =
   | { type: "text"; text: string }
   | { type: "thinking"; text: string }
   | { type: "tool_call"; id: string; name: string; input: unknown }
-  | { type: "tool_result"; id: string; output: string; isError: boolean }
+  | {
+      type: "tool_result";
+      id: string;
+      /** May be truncated for display; `diagnostics` reflects the complete output. */
+      output: string;
+      isError: boolean;
+      diagnostics?: ExecutionDiagnostics;
+    }
   | { type: "rate_limit"; status: string; windows: Record<string, QuotaWindow>; resetsAt: number | null }
   | { type: "stderr"; text: string }
   | { type: "status"; text: string };
@@ -34,6 +42,7 @@ export interface CommandResult {
   command: string;
   output: string;
   isError: boolean;
+  diagnostics?: ExecutionDiagnostics;
 }
 
 export interface AgentSpec {

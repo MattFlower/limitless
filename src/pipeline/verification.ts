@@ -1,13 +1,7 @@
+import { assertionFailure, classifyOutput, observedDenial } from "../harness/diagnostics.ts";
 import type { CommandResult } from "../harness/types.ts";
 import type { Holdout, Spec, Verify } from "./schemas.ts";
 
-const DENIAL =
-  /\b(?:EPERM|EACCES|permission denied|operation not permitted)\b|sandbox[^.\n]*(?:denied|denial|blocked)/i;
-// Words that make a diagnostic a quotation or an asserted expectation rather than an observed barrier.
-const NOT_OBSERVED =
-  /\b(?:expect(?:ed|s|ing)?|assert(?:ion|s)?|quoted|documentation|source (?:code|text)|literal|matches|toThrow)\b/i;
-const ASSERTION =
-  /\bexpect\(|^\s*expected:|\bassert(?:ion)?(?:error)?\s*(?:failed|error)\b|\bAssertionError\b|\bexpected\b[^\n]*\breceived\b/im;
 const READERS = new Set(["cat", "rg", "grep", "sed", "head", "tail", "echo", "printf", "less", "awk", "wc"]);
 const PREFIXES = new Set(["env", "time", "command", "exec", "nice", "nohup"]);
 const RUNNERS = new Set([
@@ -25,21 +19,20 @@ const RUNNERS = new Set([
   "just",
 ]);
 const RUNNER_VERBS = new Set(["run", "exec", "x"]);
-
-/** A sentence of the evidence reports a denial as something observed, not quoted or expected. */
-function localDenial(text: string, separators: RegExp): boolean {
-  return text.split(separators).some((part) => DENIAL.test(part) && !NOT_OBSERVED.test(part));
-}
+// `2>&1`, `>out`, `<in`; a bare `>` or `<` also consumes the following file name.
+const REDIRECT = /^\d*(?:>>?|<)/;
 
 function unwrapShell(command: string): string {
   const wrapped = command.trim().match(/^(?:\S*\/)?(?:ba|z|da)?sh\s+-[a-z]+\s+(['"])([\s\S]*)\1$/);
   return wrapped?.[2] ?? command.trim();
 }
 
-interface Check {
+export interface Check {
   executable: string;
   /** The subcommand or script that identifies the check, e.g. `test` for `bun test`. */
   target?: string;
+  /** Remaining positional arguments: `bun test a.test.ts` and `bun test b.test.ts` are distinct checks. */
+  args: string[];
 }
 
 /** The checks a (possibly wrapped, prefixed or chained) shell command executes. */
@@ -61,15 +54,32 @@ export function executedChecks(command: string): Check[] {
     }
     const executable = tokens[i]?.split("/").at(-1);
     if (!executable || executable === "cd" || executable === "export" || READERS.has(executable)) continue;
+    const args: string[] = [];
+    let flag = false;
+    for (let j = i + 1; j < tokens.length; j++) {
+      const token = tokens[j] as string;
+      if (REDIRECT.test(token)) {
+        if (/^\d*(?:>>?|<)$/.test(token)) j++;
+        flag = false;
+      } else if (token.startsWith("-")) flag = !token.includes("=");
+      else {
+        // `--timeout 5000` is a flag value, `--filter test/a.test.ts` a path that names the check.
+        if (!flag || /[/.]/.test(token)) args.push(token);
+        flag = false;
+      }
+    }
     if (!RUNNERS.has(executable)) {
-      checks.push({ executable });
+      checks.push({ executable, args });
       continue;
     }
-    const args = tokens.slice(i + 1).filter((t) => !t.startsWith("-"));
-    const target = RUNNER_VERBS.has(args[0] ?? "") ? args[1] : args[0];
-    checks.push({ executable, target });
+    const verb = RUNNER_VERBS.has(args[0] ?? "") ? 1 : 0;
+    checks.push({ executable, target: args[verb], args: args.slice(verb + 1) });
   }
   return checks;
+}
+
+function identity(check: Check): string {
+  return [check.executable, check.target ?? "", ...check.args].join(" ");
 }
 
 function mentions(text: string, word: string): boolean {
@@ -81,28 +91,49 @@ type Outcome = "ok" | "barrier" | "failed";
 
 function outcome(result: CommandResult): Outcome {
   if (!result.isError) return "ok";
+  const { denied, assertionFailed } = result.diagnostics ?? classifyOutput(result.output);
   // A genuine assertion failure in the same run still needs a code fix, whatever else failed.
-  if (ASSERTION.test(result.output)) return "failed";
-  return localDenial(result.output, /\n/) ? "barrier" : "failed";
+  if (assertionFailed) return "failed";
+  return denied ? "barrier" : "failed";
 }
 
 /**
- * Blocked when the checks this criterion's evidence refers to last ended on an unresolved
- * environment barrier and none of them failed for another reason.
+ * The latest outcome of each distinct check the evidence refers to. A rerun supersedes only the
+ * same check: a successful unit test run leaves an integration test's barrier unresolved.
  */
-function blockedByEnvironment(evidence: string, commands: CommandResult[]): boolean {
-  if (!localDenial(evidence, /[.;\n]/)) return false;
-  const latest = new Map<string, Outcome>();
-  for (const result of commands) {
-    const checks = executedChecks(result.command).filter(
+function referencedOutcomes(evidence: string, commands: CommandResult[]): Outcome[] {
+  const matches = commands.map((result) => ({
+    result,
+    checks: executedChecks(result.command).filter(
       (c) => mentions(evidence, c.executable) && (!c.target || mentions(evidence, c.target)),
-    );
-    if (checks.length === 0) continue;
-    const key = checks.map((c) => `${c.executable} ${c.target ?? ""}`).join(" && ");
-    latest.set(key, outcome(result));
+    ),
+  }));
+  // Evidence naming a check's arguments (a test file) refers to that check, not to others' files.
+  const named = (c: Check) => c.args.some((arg) => mentions(evidence, arg));
+  const specific = matches.some((m) => m.checks.some(named));
+  const latest = new Map<string, Outcome>();
+  for (const { result, checks } of matches) {
+    const relevant = specific ? checks.filter((c) => c.args.length === 0 || named(c)) : checks;
+    if (relevant.length === 0) continue;
+    latest.set(relevant.map(identity).join(" && "), outcome(result));
   }
-  const outcomes = [...latest.values()];
-  return outcomes.includes("barrier") && !outcomes.includes("failed");
+  return [...latest.values()];
+}
+
+type Status = Verify["criteria"][number]["status"];
+
+function normalizeStatus(status: Status, evidence: string, commands: CommandResult[]): Status {
+  // A met criterion stays met: evidence may mention an EPERM the verifier worked around.
+  if (status === "met") return status;
+  const outcomes = referencedOutcomes(evidence, commands);
+  const barrier = outcomes.includes("barrier") && !outcomes.includes("failed");
+  if (status === "blocked") {
+    // An explicit block is still an actionable failure when its checks (or the evidence itself)
+    // report an assertion mismatch rather than an observed denial.
+    if (outcomes.includes("failed")) return "unmet";
+    return !observedDenial(evidence, /[.;\n]/) && assertionFailure(evidence) ? "unmet" : "blocked";
+  }
+  return observedDenial(evidence, /[.;\n]/) && barrier ? "blocked" : status;
 }
 
 export function normalizeVerify(
@@ -113,11 +144,7 @@ export function normalizeVerify(
 ): Verify {
   const criteria = verify.criteria.map((c) => ({
     ...c,
-    // A met criterion stays met: evidence may mention an EPERM the verifier worked around.
-    status:
-      (c.status === "unmet" || c.status === "unclear") && blockedByEnvironment(c.evidence, commands)
-        ? ("blocked" as const)
-        : c.status,
+    status: normalizeStatus(c.status, c.evidence, commands),
   }));
   for (const id of [...spec.acceptance_criteria.map((ac) => ac.id), ...holdout.scenarios.map((s) => s.id)]) {
     if (!criteria.some((c) => c.id === id))

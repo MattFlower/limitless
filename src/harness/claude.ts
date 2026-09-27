@@ -1,6 +1,7 @@
 import { appendFileSync, realpathSync } from "node:fs";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
+import { classifyOutput } from "./diagnostics.ts";
 import { scratchEnv, scratchParent, validateScratch } from "./scratch.ts";
 import {
   type AgentEvent,
@@ -87,11 +88,13 @@ export class ClaudeStreamParser {
       case "user": {
         for (const b of blocks(e.message)) {
           if (b.type === "tool_result") {
+            const output = toolResultText(b.content);
             this.emit({
               type: "tool_result",
               id: String(b.tool_use_id),
-              output: toolResultText(b.content).slice(0, 20_000),
+              output: output.slice(0, 20_000),
               isError: Boolean(b.is_error),
+              diagnostics: classifyOutput(output),
             });
           }
         }

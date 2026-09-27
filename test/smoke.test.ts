@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,7 +14,7 @@ import { deploy } from "../src/cli/service.ts";
 import { CodexStreamParser } from "../src/harness/codex.ts";
 import type { AgentResult, ModelTarget } from "../src/harness/types.ts";
 import { MODELS } from "../src/router/catalog.ts";
-import type { sh } from "../src/util/proc.ts";
+import { sh } from "../src/util/proc.ts";
 
 const result: AgentResult = {
   status: "ok",
@@ -281,5 +281,47 @@ for (const outcome of [
     }, target);
     expect(check.status).toBe(outcome === "pass" ? "pass" : "fail");
     if (outcome === "write-succeeded") expect(check.reason).toContain("worktree changed");
+  });
+}
+
+for (const writable of [true, false]) {
+  test(`verify probe targets the worktree from another working directory (${writable ? "writable" : "read-only"})`, async () => {
+    const { verifyLiveCheck } = await import("../scripts/smoke.ts");
+    const target: ModelTarget = {
+      modelId: "fake/m",
+      provider: "fake",
+      model: "m",
+      vendor: "fake",
+      tier: 4,
+      harness: "fake",
+      billing: "subscription",
+    };
+    const check = await verifyLiveCheck(async (spec) => {
+      const command = `python3 '${join(spec.cwd, "verify-probe.py")}'`;
+      const scratch = spec.scratchDir as string;
+      // An agent may run the exact command from anywhere; only the OS keeps the worktree unwritable.
+      if (!writable) chmodSync(spec.cwd, 0o555);
+      try {
+        const run = await sh(["/bin/sh", "-c", command], {
+          cwd: "/",
+          env: { ...process.env, TMPDIR: scratch, TMP: scratch, TEMP: scratch } as Record<string, string>,
+          allowFail: true,
+        });
+        spec.onEvent({ type: "tool_call", id: "probe", name: "Bash", input: { command } });
+        spec.onEvent({
+          type: "tool_result",
+          id: "probe",
+          output: `${run.stdout}${run.stderr}`,
+          isError: run.exitCode !== 0,
+        });
+      } finally {
+        if (!writable) chmodSync(spec.cwd, 0o755);
+      }
+      return { ...result, finalText: "done" };
+    }, target);
+    expect(check.status).toBe(writable ? "fail" : "pass");
+    expect(check.reason).toContain(
+      writable ? "worktree changed: ?? forbidden-write" : "denied worktree write",
+    );
   });
 }

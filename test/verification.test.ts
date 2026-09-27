@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
-import type { CommandResult } from "../src/harness/types.ts";
+import { ClaudeStreamParser } from "../src/harness/claude.ts";
+import { CodexStreamParser } from "../src/harness/codex.ts";
+import type { AgentEvent, CommandResult } from "../src/harness/types.ts";
 import { formatVerifyFeedback } from "../src/pipeline/prompts.ts";
 import { type Holdout, type Spec, VerifySchema } from "../src/pipeline/schemas.ts";
 import { blockedOnly, executedChecks, normalizeVerify } from "../src/pipeline/verification.ts";
@@ -64,7 +66,7 @@ for (const command of [
   'bash -lc "bun test 2>&1 | tail -40"',
 ]) {
   test(`wrapped check commands are correlated: ${command}`, () => {
-    expect(executedChecks(command)).toContainEqual({ executable: "bun", target: "test" });
+    expect(executedChecks(command)).toContainEqual({ executable: "bun", target: "test", args: [] });
     expect(
       statusOf("Ran bun test: fixture setup failed with EPERM", [{ command, output: eperm, isError: true }]),
     ).toBe("blocked");
@@ -96,6 +98,135 @@ test("a permission error from another check does not mask a genuine failure", ()
   expect(statusOf("bun test could not start: EPERM mkdtemp", [build, failing])).toBe("unmet");
   expect(statusOf("bun run build failed with EPERM writing dist", [build, failing])).toBe("blocked");
 });
+
+test("a successful unrelated check does not resolve another check's barrier", () => {
+  const integration = {
+    command: "bun test test/integration.test.ts",
+    output: eperm,
+    isError: true,
+  };
+  const unit = { command: "bun test test/unit.test.ts", output: "4 pass", isError: false };
+  expect(executedChecks(integration.command)).toEqual([
+    { executable: "bun", target: "test", args: ["test/integration.test.ts"] },
+  ]);
+  expect(executedChecks("bun test test/a.test.ts 2>&1 > out.txt --timeout 5 --bail=1 -t name")).toEqual([
+    { executable: "bun", target: "test", args: ["test/a.test.ts"] },
+  ]);
+  expect(executedChecks("bun test --timeout 5 test/a.test.ts")).toEqual([
+    { executable: "bun", target: "test", args: ["test/a.test.ts"] },
+  ]);
+  const evidence = "bun test test/integration.test.ts failed with EPERM creating a fixture directory";
+  expect(statusOf(evidence, [integration, unit])).toBe("blocked");
+  expect(statusOf("Ran bun test: EPERM creating fixtures", [integration, unit])).toBe("blocked");
+  // Rerunning the same check resolves it; a unit-test assertion failure is not the integration barrier.
+  expect(statusOf(evidence, [integration, { ...integration, output: "2 pass", isError: false }])).toBe(
+    "unmet",
+  );
+  const unitFailed = { ...unit, output: "Expected: 1\nReceived: 2", isError: true };
+  expect(statusOf(evidence, [integration, unitFailed])).toBe("blocked");
+  expect(statusOf("Ran bun test: EPERM creating fixtures", [integration, unitFailed])).toBe("unmet");
+});
+
+test("explicit blocked results are validated against execution evidence", () => {
+  const blocked = (evidence: string, commands: CommandResult[]) =>
+    normalizeVerify(
+      { criteria: [{ id: "AC-1", status: "blocked", evidence }], overall: "fail", notes: "" },
+      spec,
+      holdout,
+      commands,
+    ).criteria[0]?.status;
+  const mismatch = {
+    command: "bun test",
+    output: "(fail) denies writes\nExpected: EACCES\nReceived: undefined",
+    isError: true,
+  };
+  expect(blocked("bun test failed: expected EACCES, received success", [mismatch])).toBe("unmet");
+  expect(blocked("bun test failed: expected EACCES, received success", [])).toBe("unmet");
+  expect(blocked("bun test could not create fixtures: EPERM", [mismatch])).toBe("unmet");
+  expect(blocked("bun test could not create fixtures: EPERM", [])).toBe("blocked");
+  expect(
+    blocked("bun test could not create fixtures: EPERM", [
+      { command: "bun test", output: eperm, isError: true },
+    ]),
+  ).toBe("blocked");
+  expect(blocked("bun test: the sandbox forbids creating fixture directories", [])).toBe("blocked");
+});
+
+const assertion = "(fail) GET /health\nExpected: 200\nReceived: 500";
+for (const [name, output, full, truncated] of [
+  ["permission error", `${"ok ".repeat(7000)}\n${eperm}`, "blocked", "unmet"],
+  ["assertion failure", `${eperm}\n${"ok ".repeat(7000)}\n${assertion}`, "unmet", "blocked"],
+] as const) {
+  test(`a late ${name} beyond the display truncation still counts`, () => {
+    expect(output.length).toBeGreaterThan(20_000);
+    for (const parser of ["codex", "claude"] as const) {
+      const events: AgentEvent[] = [];
+      if (parser === "codex") {
+        const p = new CodexStreamParser((e) => events.push(e));
+        p.feed(
+          JSON.stringify({
+            type: "item.started",
+            item: { id: "c1", type: "command_execution", command: "bun test" },
+          }),
+        );
+        p.feed(
+          JSON.stringify({
+            type: "item.completed",
+            item: {
+              id: "c1",
+              type: "command_execution",
+              command: "bun test",
+              aggregated_output: output,
+              exit_code: 1,
+            },
+          }),
+        );
+      } else {
+        const p = new ClaudeStreamParser((e) => events.push(e));
+        p.feed(
+          JSON.stringify({
+            type: "assistant",
+            message: {
+              content: [{ type: "tool_use", id: "c1", name: "Bash", input: { command: "bun test" } }],
+            },
+          }),
+        );
+        p.feed(
+          JSON.stringify({
+            type: "user",
+            message: {
+              content: [{ type: "tool_result", tool_use_id: "c1", content: output, is_error: true }],
+            },
+          }),
+        );
+      }
+      // Collected the way RunContext.invoke pairs shell calls with their results.
+      const commands = new Map<string, string>();
+      const results: CommandResult[] = [];
+      for (const ev of events) {
+        if (ev.type === "tool_call") commands.set(ev.id, String((ev.input as { command: string }).command));
+        if (ev.type === "tool_result") {
+          const command = commands.get(ev.id);
+          if (command)
+            results.push({
+              command,
+              output: ev.output,
+              isError: ev.isError,
+              ...(ev.diagnostics ? { diagnostics: ev.diagnostics } : {}),
+            });
+        }
+      }
+      expect(results).toHaveLength(1);
+      expect(results[0]?.output.length).toBe(20_000);
+      const evidence = "Ran bun test: failed with EPERM creating fixtures";
+      expect(statusOf(evidence, results)).toBe(full);
+      // The truncated text alone would say the opposite.
+      expect(
+        statusOf(evidence, [{ command: "bun test", output: results[0]?.output ?? "", isError: true }]),
+      ).toBe(truncated);
+    }
+  });
+}
 
 test("an expected-denial diagnostic elsewhere in the output does not veto a real barrier", () => {
   const output = `(pass) expected-denial.test.ts > rejects writes with EACCES as expected\n${eperm}`;
