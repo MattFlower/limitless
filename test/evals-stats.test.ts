@@ -291,3 +291,95 @@ test("implement reports complexity, failure reasons, executed costs and median t
   ])
     expect(text).toContain(fragment);
 });
+
+test("multi-round reports count independent trials, recovery costs, cache evidence and legacy rows", () => {
+  const multi = {
+    ...run,
+    role: "implement" as const,
+    k: 1,
+    models: ["a"],
+    rounds: 3,
+    strategy: "effort" as const,
+  };
+  const rows = [true, true, true, false].map((pass, i) => {
+    const t = trial("a", String(i), 0, pass);
+    t.details.rounds = (i === 0 ? [true] : [false, pass]).map((p, round) => ({
+      round,
+      modelId: "a",
+      effort: "low",
+      status: "ok",
+      pass: p,
+      reason: p ? null : "hidden_tests",
+      costUsd: round ? 2 : 10,
+      costEquivUsd: round ? 4 : 20,
+      tokensIn: 1,
+      tokensOut: 2,
+      durationMs: 3,
+    }));
+    return t;
+  });
+  const summary = () => summarize(multi, rows)[0]?.implement;
+  expect(summary()).toMatchObject({
+    passAt1: { rate: 1 / 4 },
+    passAtR: { rate: 3 / 4 },
+    recovery: {
+      numerator: 2,
+      denominator: 3,
+      rate: 2 / 3,
+      ci: wilson(2, 3),
+      executedTrials: 3,
+      executedRecoveries: 2,
+      costPerRecoveryUsd: 3,
+      costEquivPerRecoveryUsd: 6,
+    },
+  });
+  const cached = rows[1];
+  if (!cached) throw new Error("missing trial");
+  cached.details.cache = {
+    evalRunId: "old",
+    caseId: "1",
+    costUsd: 12,
+    costEquivUsd: 24,
+    tokensIn: 2,
+    tokensOut: 4,
+    durationMs: 6,
+  };
+  expect(summary()?.recovery).toMatchObject({
+    numerator: 2,
+    denominator: 3,
+    executedTrials: 2,
+    executedRecoveries: 1,
+    costPerRecoveryUsd: 4,
+  });
+  const text = formatEvalReport({ run: multi, trials: rows, summaries: summarize(multi, rows) });
+  expect(text).toContain("strategy=effort, rounds=3");
+  expect(text).toContain("pass@1 25.0%");
+  expect(text).toContain("pass@3 75.0%");
+  rows.splice(1);
+  expect(summary()?.recovery).toMatchObject({ rate: null, ci: null, costPerRecoveryUsd: null });
+  const legacy = rows[0];
+  if (!legacy) throw new Error("missing trial");
+  delete legacy.details.rounds;
+  expect(summary()?.passAt1.rate).toBe(1);
+  legacy.pass = false;
+  legacy.details.grade = {
+    pass: false,
+    score: 0,
+    fields: {},
+    riskUnderCall: null,
+    implement: {
+      reason: "hidden_tests",
+      gates: [],
+      auditBlocks: [],
+      auditWarnings: [],
+      commit: null,
+      hidden: null,
+    },
+  };
+  expect(summary()?.recovery).toMatchObject({
+    numerator: 0,
+    denominator: 1,
+    rate: 0,
+    costPerRecoveryUsd: null,
+  });
+});

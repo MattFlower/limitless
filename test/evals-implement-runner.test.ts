@@ -15,7 +15,8 @@ import { join } from "node:path";
 import type { ImplementCase } from "../src/evals/cases.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { runGates } from "../src/gates/run.ts";
-import { implementPrompt } from "../src/pipeline/prompts.ts";
+import type { FakeReply } from "../src/harness/fake.ts";
+import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../src/pipeline/prompts.ts";
 import { SpecSchema } from "../src/pipeline/schemas.ts";
 import { sh } from "../src/util/proc.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
@@ -493,27 +494,221 @@ test("hidden bytes in renamed/deleted reachable history reject before invocation
   }
 });
 
-test("cancellation during hidden grading retains spend and removes trial resources", async () => {
+for (const rounds of [1, 3])
+  test(`cancellation during hidden grading retains spend and removes trial resources (rounds=${rounds})`, async () => {
+    const f = await fixture();
+    try {
+      f.item.hidden.command = 'test "$(cat answer)" = correct || exit 1; touch grading-started; sleep 10';
+      if (rounds > 1)
+        f.respond(() => ({ files: { answer: f.calls.length === 1 ? "wrong" : "correct" }, costUsd: 0.1 }));
+      f.save();
+      const pending = f.run({ rounds });
+      let cwd: string | undefined;
+      for (let i = 0; i < 200; i++) {
+        cwd = f.calls.at(-1)?.cwd;
+        if (cwd && existsSync(join(cwd, "grading-started"))) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(cwd && existsSync(join(cwd, "grading-started"))).toBe(true);
+      expect(f.factory.store.listEvalRuns().map((r) => f.factory.store.evalSpend(r.id))).toEqual([
+        rounds > 1 ? 0.2 : 0.1,
+      ]);
+      await f.factory.evals.stop();
+      const report = await pending;
+      expect(report.run.status).toBe("failed");
+      expect(report.trials[0]).toMatchObject(
+        rounds > 1
+          ? {
+              status: "error",
+              pass: false,
+              costUsd: 0.2,
+              details: {
+                roundsUsed: 2,
+                interrupted: true,
+                rounds: [
+                  { round: 0, pass: false },
+                  { round: 1, pass: null },
+                ],
+              },
+            }
+          : { status: "skipped", pass: null, costUsd: 0.1 },
+      );
+      expect(f.factory.store.cachedEvalTrials(report.trials[0]?.cacheKey ?? "")).toEqual([]);
+      expect(cwd && existsSync(cwd)).toBe(false);
+      expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+    } finally {
+      await f.close();
+    }
+  });
+
+for (const strategy of ["retry", "effort", "switch"] as const)
+  test(`multi-round ${strategy} preserves edits, sanitizes grading, records costs and caches`, async () => {
+    const f = await fixture();
+    const policy = f.factory.policy.implement.small;
+    try {
+      enableEfforts(f);
+      const stronger = f.factory.router.model("candidate-b");
+      if (!stronger) throw new Error("missing model");
+      stronger.tier = 2;
+      f.factory.policy.implement.small = ["candidate-a@low", "candidate-b"];
+      f.item.hidden.command +=
+        "; result=$?; echo SECRET-OUTPUT; echo SECRET-ERR >&2; touch grading-artifact; git add -A; git -c user.name=grader -c user.email=grader@example.invalid -c core.hooksPath=/dev/null -c commit.gpgsign=false commit --allow-empty -qm SECRET-HIDDEN-COMMIT; exit $result";
+      f.save();
+      f.respond(async (s): Promise<FakeReply> => {
+        const second = f.calls.length === 2;
+        expect(f.factory.tracker.status(s.target.provider)?.inFlight).toBe(1);
+        expect(s.prompt).not.toMatch(/secret-hidden|hidden\/check|SECRET-OUTPUT|SECRET-ERR|grading-artifact/);
+        expect(existsSync(join(s.cwd, "hidden/check.sh"))).toBe(false);
+        expect(existsSync(join(s.cwd, "grading-artifact"))).toBe(false);
+        if (second) {
+          expect(s.resumeSessionId).toBe(strategy === "switch" ? undefined : "round-zero");
+          expect(s.target.modelId).toBe(strategy === "switch" ? "candidate-b" : "candidate-a");
+          expect(s.target.effort).toBe(
+            strategy === "switch" ? undefined : strategy === "effort" ? "high" : "low",
+          );
+          expect(s.scratchDir).toBe(f.calls[0]?.scratchDir);
+          expect(readFileSync(join(s.cwd, "answer"), "utf8")).toBe("wrong");
+          expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("candidate");
+          expect(statSync(join(s.cwd, "overwrite")).mode & 0o777).toBe(0o751);
+          expect(s.prompt).toContain("1 acceptance tests fail");
+          const grade = f.factory.store.listEvalTrials(f.factory.store.listEvalRuns()[0]?.id ?? "")[0]
+            ?.details.grade?.implement;
+          if (!grade) throw new Error("missing prior grade");
+          expect(s.prompt).toContain(formatGateFeedback(grade.gates));
+          expect(s.prompt).toContain(formatAuditFeedback(grade.auditBlocks));
+          expect((await sh(["git", "log", "--all", "-p"], { cwd: s.cwd })).stdout).not.toContain(
+            "secret-hidden",
+          );
+          rmSync(join(s.cwd, "broken"));
+          return { files: { answer: "correct", protected: "original" }, costUsd: 0.2, costEquivUsd: 0.4 };
+        }
+        chmodSync(join(s.cwd, "overwrite"), 0o751);
+        return {
+          files: { answer: "wrong", overwrite: "candidate", broken: "yes", protected: "changed" },
+          sessionId: "round-zero",
+          costUsd: 0.1,
+          costEquivUsd: 0.2,
+        };
+      });
+      const report = await f.run({ rounds: 3, strategy });
+      expect(f.calls).toHaveLength(2);
+      const t = report.trials[0];
+      expect(t).toMatchObject({
+        modelId: "candidate-a",
+        effort: "low",
+        pass: true,
+        tokensIn: 200,
+        tokensOut: 100,
+        details: {
+          roundsUsed: 2,
+          stopReason: "success",
+          rounds: [
+            { round: 0, pass: false, reason: "gates" },
+            { round: 1, pass: true },
+          ],
+        },
+      });
+      expect(t?.costUsd).toBeCloseTo(0.3);
+      expect(t?.costEquivUsd).toBeCloseTo(0.6);
+      expect(report.run).toMatchObject({ rounds: 3, strategy });
+      const cached = (await f.run({ rounds: 3, strategy })).trials[0];
+      expect(cached?.details.rounds).toEqual(t?.details.rounds);
+      expect(cached?.costUsd).toBe(0);
+      expect(f.calls).toHaveLength(2);
+      expect(f.calls.every((s) => !existsSync(s.cwd) && !existsSync(s.scratchDir ?? s.cwd))).toBe(true);
+      expect(f.factory.tracker.status("provider-b")?.inFlight).toBe(0);
+      expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+      if (strategy === "switch") {
+        f.factory.tracker.setEnabled("provider-b", false);
+        const stopped = (await f.run({ rounds: 4, strategy })).trials[0];
+        expect(stopped).toMatchObject({ status: "error", details: { roundsUsed: 1 } });
+        expect(stopped?.details.reason).toContain("unavailable");
+        expect(f.factory.store.cachedEvalTrials(stopped?.cacheKey ?? "")).toEqual([]);
+      }
+    } finally {
+      f.factory.policy.implement.small = policy;
+      await f.close();
+    }
+  });
+
+test("single-round strategies share legacy inputs and cache; multi-round identities differ", async () => {
   const f = await fixture();
   try {
-    f.item.hidden.command = "touch grading-started; sleep 10";
-    f.save();
-    const pending = f.run();
-    let cwd: string | undefined;
-    for (let i = 0; i < 200; i++) {
-      cwd = f.calls[0]?.cwd;
-      if (cwd && existsSync(join(cwd, "grading-started"))) break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    const first = (await f.run()).trials[0];
+    for (const strategy of ["retry", "effort", "switch"]) {
+      const cached = (await f.run({ rounds: 1, strategy })).trials[0];
+      expect(cached?.cacheKey).toBe(first?.cacheKey);
+      expect(cached?.details.cache).toBeDefined();
     }
-    expect(cwd && existsSync(join(cwd, "grading-started"))).toBe(true);
-    expect(f.factory.store.listEvalRuns().map((r) => f.factory.store.evalSpend(r.id))).toEqual([0.1]);
-    await f.factory.evals.stop();
-    const report = await pending;
-    expect(report.run.status).toBe("failed");
-    expect(report.trials[0]).toMatchObject({ status: "skipped", pass: null, costUsd: 0.1 });
-    expect(cwd && existsSync(cwd)).toBe(false);
-    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+    expect(f.calls).toHaveLength(1);
+    const keys = new Set([first?.cacheKey]);
+    for (const rounds of [2, 3])
+      for (const strategy of ["retry", "effort", "switch"])
+        keys.add((await f.run({ rounds, strategy })).trials[0]?.cacheKey);
+    expect(keys.size).toBe(7);
+    expect(f.calls.every((s) => s.prompt === f.calls[0]?.prompt && s.resumeSessionId === undefined)).toBe(
+      true,
+    );
   } finally {
     await f.close();
   }
-});
+}, 15000);
+
+for (const kind of [
+  "limit",
+  "effort",
+  "default",
+  "switch",
+  "error",
+  "timeout",
+  "budget",
+  "unavailable",
+  "missing-session",
+])
+  test(`multi-round stops correctly: ${kind}`, async () => {
+    const f = await fixture();
+    try {
+      if (kind === "effort") enableEfforts(f).effort = "high";
+      if (kind === "timeout") {
+        f.item.hidden.command = "sleep 10";
+        f.item.hidden.timeoutSec = 0.05;
+        f.save();
+      }
+      f.respond(() => {
+        if (kind === "unavailable") f.factory.tracker.setEnabled("openrouter", false);
+        return {
+          files: { answer: "wrong" },
+          costUsd: 0.1,
+          sessionId: null,
+          status: kind === "error" ? "error" : "ok",
+        };
+      });
+      const t = (
+        await f.run({
+          rounds: 2,
+          strategy:
+            kind === "effort" || kind === "default" ? "effort" : kind === "switch" ? "switch" : "retry",
+          maxUsd: kind === "budget" ? 0.1 : 1,
+        })
+      ).trials[0];
+      const repeats = kind === "limit" || kind === "missing-session";
+      expect(f.calls).toHaveLength(repeats ? 2 : 1);
+      expect(f.calls.every((s) => s.resumeSessionId === undefined)).toBe(true);
+      expect(t?.details.stopReason).toBe(
+        repeats
+          ? "round limit"
+          : ["error", "timeout"].includes(kind)
+            ? "operational failure"
+            : kind === "budget"
+              ? "eval budget exhausted"
+              : kind === "unavailable"
+                ? "disabled"
+                : "strategy exhausted",
+      );
+      expect(t?.costUsd).toBeCloseTo(repeats ? 0.2 : 0.1);
+      if (["budget", "error", "timeout", "unavailable"].includes(kind))
+        expect(f.factory.store.cachedEvalTrials(t?.cacheKey ?? "")).toEqual([]);
+    } finally {
+      await f.close();
+    }
+  });

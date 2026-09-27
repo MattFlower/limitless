@@ -1,4 +1,33 @@
+import { redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Spec, Verify } from "./schemas.ts";
+
+export function preDeliveryVerifyArtifact(
+  verify: Verify & { modelId: string; round: number; attempt: number },
+  spec: Spec,
+  holdout: Holdout,
+  publicSources: string,
+): string {
+  const publicIds = new Set(spec.acceptance_criteria.map((criterion) => criterion.id));
+  const redact = (value: string) => redactHoldoutText(value, holdout, publicSources);
+  return JSON.stringify(
+    {
+      ...verify,
+      notes: redact(verify.notes),
+      criteria: verify.criteria.map((criterion) =>
+        publicIds.has(criterion.id)
+          ? criterion
+          : {
+              id: criterion.id,
+              status: criterion.status,
+              evidence: redact(criterion.evidence),
+              publicSummary: redact(criterion.publicSummary.trim()),
+            },
+      ),
+    },
+    null,
+    2,
+  );
+}
 
 /**
  * The verifier's own statuses are authoritative, including `blocked` (a check that could not run

@@ -125,7 +125,40 @@ function implementMetrics(rows: EvalTrial[]) {
   const executed = evaluated.filter(
     (t) => !t.details.cache && !t.details.interrupted && !t.details.preparationFailed,
   );
+  const first = (t: EvalTrial) =>
+    t.details.rounds?.[0] ?? {
+      pass: t.pass,
+      reason: t.details.grade?.implement?.reason,
+    };
+  const initialFailures = evaluated.filter(
+    (t) => first(t).pass === false && ["gates", "audit", "hidden_tests"].includes(first(t).reason ?? ""),
+  );
+  const recoveryExecutions = initialFailures.filter((t) => !t.details.cache);
+  const recovered = initialFailures.filter((t) => t.pass).length;
+  const executedRecoveries = recoveryExecutions.filter((t) => t.pass).length;
+  const rate = (numerator: number, denominator: number) => ({
+    numerator,
+    denominator,
+    rate: denominator ? numerator / denominator : null,
+    ci: wilson(numerator, denominator),
+  });
+  const recoveryCost = (key: "costUsd" | "costEquivUsd") =>
+    executedRecoveries
+      ? recoveryExecutions.reduce(
+          (sum, t) => sum + (t.details.rounds ?? []).slice(1).reduce((n, r) => n + r[key], 0),
+          0,
+        ) / executedRecoveries
+      : null;
   return {
+    passAt1: rate(evaluated.filter((t) => first(t).pass).length, evaluated.length),
+    passAtR: rate(evaluated.filter((t) => t.pass).length, evaluated.length),
+    recovery: {
+      ...rate(recovered, initialFailures.length),
+      executedTrials: recoveryExecutions.length,
+      executedRecoveries,
+      costPerRecoveryUsd: recoveryCost("costUsd"),
+      costEquivPerRecoveryUsd: recoveryCost("costEquivUsd"),
+    },
     byComplexity: ["trivial", "small", "medium"].map((complexity) => {
       const group = evaluated.filter((t) => t.details.complexity === complexity);
       const passes = group.filter((t) => t.pass).length;
@@ -180,7 +213,15 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
       modelId,
       effort: rows[0]?.effort ?? null,
       ...roleMetrics(run, rows),
-      ...(run.role === "implement" ? { implement: implementMetrics(rows) } : {}),
+      ...(run.role === "implement"
+        ? {
+            implement: {
+              strategy: run.strategy ?? "retry",
+              rounds: run.rounds ?? 1,
+              ...implementMetrics(rows),
+            },
+          }
+        : {}),
       cases: new Set(evaluated.map((t) => t.caseId)).size,
       evaluatedTrials: evaluated.length,
       skipped: rows.filter((t) => t.status === "skipped").length,
