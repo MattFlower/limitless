@@ -602,8 +602,10 @@ async function oneRound(
         requireStructured: true,
       });
       await discardChanges(cwd);
-      const r: Review = (previousReview ? LaterReviewSchema : ReviewSchema).parse(result.structured);
-      r.verdict = reviewVerdict(r, previousReview?.findings);
+      const parsed: Review = (previousReview ? LaterReviewSchema : ReviewSchema).parse(result.structured);
+      // The model's verdict is kept for inspection only; control flow uses the derived one.
+      const modelVerdict = parsed.verdict;
+      const r: Review = { ...parsed, verdict: reviewVerdict(parsed, previousReview?.findings) };
       const blocking = blockingReviewFindings(r, previousReview?.findings);
       const followUps = previousReview ? r.findings.filter((f) => !blocking.includes(f)) : [];
       ctx.state.reviewHistory = [...earlierReviews, { round, sha: reviewedSha, blocking, followUps }];
@@ -623,7 +625,7 @@ async function oneRound(
         ctx.run.id,
         `review-${round}.json`,
         "review",
-        JSON.stringify({ ...r, model: target.modelId, round, reviewedSha, blocking }, null, 2),
+        JSON.stringify({ ...r, modelVerdict, model: target.modelId, round, reviewedSha, blocking }, null, 2),
       );
       const serious = blocking.length;
       return {

@@ -1268,10 +1268,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(implementPrompts).toHaveLength(3);
     expect(implementPrompts[1]).toContain("Prior bug");
-    const first = JSON.parse(f.store.getArtifact(run.id, "review-0.json") ?? "{}") as { verdict: string };
-    const third = JSON.parse(f.store.getArtifact(run.id, "review-2.json") ?? "{}") as { verdict: string };
-    expect(first.verdict).toBe("request_changes");
-    expect(third.verdict).toBe("approve");
+    type Stored = { verdict: string; modelVerdict: string };
+    const first = JSON.parse(f.store.getArtifact(run.id, "review-0.json") ?? "{}") as Stored;
+    const third = JSON.parse(f.store.getArtifact(run.id, "review-2.json") ?? "{}") as Stored;
+    expect(first).toMatchObject({ verdict: "request_changes", modelVerdict: "approve" });
+    expect(third).toMatchObject({ verdict: "approve", modelVerdict: "request_changes" });
     expect(prompts[1]).toContain("Prior bug");
     const reviewed = prompts[1]?.match(/Reviewed commit: ([a-f0-9]{40})\. Current HEAD: ([a-f0-9]{40})/);
     expect(reviewed).not.toBeNull();
@@ -1342,7 +1343,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(prompts).toHaveLength(3);
       expect(prompts[2]).toContain(laterTitle);
       expect(prompts[2]).not.toContain("Future cleanup");
-      expect(f.store.getArtifact(run.id, "review-1.json")).toContain('"verdict": "request_changes"');
+      expect(JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}")).toMatchObject({
+        verdict: "request_changes",
+        modelVerdict: "approve",
+      });
       expect(f.store.getArtifact(run.id, "report.md")).toContain("Future cleanup");
     });
   }
