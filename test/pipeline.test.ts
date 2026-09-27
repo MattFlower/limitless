@@ -1171,6 +1171,104 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(report).toContain(`Observed empty output for ${secret}`);
   });
 
+  test("pre-delivery verify artifacts preserve public evidence and redact private rows on retry", async () => {
+    const privateLiterals = [
+      "privateDescriptionToken_731",
+      "privateStepsToken_732",
+      "privateExpectedToken_733",
+      "privateEvidenceToken_734",
+      "privateSummaryToken_735",
+      "privateNotesToken_736",
+      "unknownRowToken_737",
+    ];
+    const [description, steps, expected, evidence, summary, notes, unknown] = privateLiterals;
+    if (!description || !steps || !expected || !evidence || !summary || !notes || !unknown)
+      throw new Error("missing private test literals");
+    const privateHoldout = {
+      scenarios: holdout.scenarios.map((scenario, index) => ({
+        ...scenario,
+        description: `Scenario ${description} ${index}`,
+        steps: `Run ${steps} ${index}`,
+        expected: `Returns ${expected} ${index}`,
+      })),
+    };
+    const publicEvidence = "src/pipeline/engine.ts:742 publicIdentifier_738 is handled";
+    const privateEvidence = `Observed ${description} ${steps} ${expected} ${evidence}`;
+    let verifies = 0;
+    let implementations = 0;
+    let runId = "";
+    const checkArtifact = (name: string, expectedPublicStatus: string, expectedPrivateStatus: string) => {
+      const raw = f.store.getArtifact(runId, name);
+      expect(raw).not.toBeNull();
+      const artifact = JSON.parse(raw as string) as typeof pass;
+      const publicRow = artifact.criteria.find((criterion) => criterion.id === "AC-1");
+      expect(publicRow?.status).toBe(expectedPublicStatus);
+      expect(publicRow?.evidence).toBe(publicEvidence);
+      for (const id of ["H-1", "H-2", "H-3", "X-9"]) {
+        const row = artifact.criteria.find((criterion) => criterion.id === id);
+        expect(row?.id).toBe(id);
+        expect(row?.status).toBe(id === "H-1" ? expectedPrivateStatus : "met");
+        expect(row?.evidence).toContain("[private detail]");
+      }
+      expect(artifact.criteria.find((criterion) => criterion.id === "H-1")?.publicSummary).toContain(
+        "Observed behavior",
+      );
+      expect(artifact.criteria.find((criterion) => criterion.id === "H-1")?.publicSummary).toContain(
+        "[private detail]",
+      );
+      expect(artifact.criteria.find((criterion) => criterion.id === "H-2")?.publicSummary).toBe("");
+      expect(artifact.criteria.find((criterion) => criterion.id === "H-3")?.publicSummary).not.toContain(
+        summary,
+      );
+      for (const literal of privateLiterals) expect(raw).not.toContain(literal);
+      expect(raw).not.toContain(`Scenario ${description}`);
+      expect(raw).not.toContain(`Run ${steps}`);
+      expect(raw).not.toContain(`Returns ${expected}`);
+    };
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: privateHoldout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") {
+        verifies++;
+        if (verifies === 2) checkArtifact("verify-0.json", "blocked", "met");
+        return {
+          structured: {
+            ...pass,
+            notes: `Verifier notes ${notes}`,
+            criteria: [
+              {
+                id: "AC-1",
+                status: verifies === 1 ? "blocked" : "met",
+                evidence: publicEvidence,
+                publicSummary: "",
+              },
+              {
+                id: "H-1",
+                status: verifies === 2 ? "unmet" : "met",
+                evidence: privateEvidence,
+                publicSummary: `Observed behavior ${summary}`,
+              },
+              { id: "H-2", status: "met", evidence: privateEvidence, publicSummary: "" },
+              { id: "H-3", status: "met", evidence: privateEvidence, publicSummary: summary },
+              { id: "X-9", status: "met", evidence: `Extra ${unknown}`, publicSummary: "" },
+            ],
+          },
+        };
+      }
+      implementations++;
+      if (implementations === 2) checkArtifact("verify-0-retry.json", "met", "unmet");
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    runId = run.id;
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(verifies).toBe(3);
+    expect(implementations).toBe(2);
+  });
+
   test("completed holdout survives a stopped factory and is reused after restart", async () => {
     let holdoutCalls = 0;
     let blockImplement = true;
