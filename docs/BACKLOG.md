@@ -32,6 +32,7 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 29 | M5 | Holdout feedback that is actionable but still blind | todo |
 | 30 | M5 | Later-round reviews don't move the goalposts | todo |
 | 31 | M5 | Verify artifacts: redact only private scenarios | todo |
+| 32 | M4 | Jev decisions harness: triage as typed questions | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
@@ -473,3 +474,31 @@ criteria's evidence ("engine.ts:[private detail]"). Apply the same split as the 
 criteria stored as-is, private scenarios stored with their publicSummary and redacted evidence.
 Test: a public criterion's `file:line` evidence survives in the artifact; private scenario text never
 appears.
+
+## 32. Jev decisions harness: triage as typed questions
+
+Owner suggestion (2026-09-27). Jev (TypeSafe, `typesafe/jev-1.13` / `~typesafe/jev-latest`) is a
+decision model, not a chat model: it answers typed questions about a `state` with probabilities
+instead of generating text. Very cheap (input tokens only; the docs' example cost ~$0.00002/call),
+fast, 32K-token context, available with our OpenRouter key.
+
+- API: `POST https://openrouter.ai/api/alpha/decisions` (alpha — may change) with `model`, `state`,
+  and `questions` keyed by id. Question types: `choice` (criteria = option → guidance), `noul`
+  (criteria = {true, false} guidance), `score` (criteria = ordered level descriptions). Answers:
+  choice → `choice`, `confidence`, `probabilities`; noul → `noul` (P(true)); score → `score`,
+  `confidence`, `probabilities`, `legend`. `usage.cost` in USD. Errors 402/429/5xx like OpenRouter.
+- Harness `decisions` (src/harness/decisions.ts): builds the request, maps answers, records usage and
+  cost, classifies errors (402 → provider, 429 → per-model cooldown per item 28).
+- Triage via decisions: task_class (choice, 8 classes with the prompt's guidance), complexity
+  (score trivial→large), risk (score low→high with the blast-radius guidance), ambiguity (score),
+  needs_questions (noul); suggested_profile derived in code; title from the request's first line.
+  Jev can't write text, so: **confidence cascade** — if any answer's confidence is below a
+  threshold, or needs_questions is likely, fall through to the LLM triage (which can also write the
+  blocking questions). Calibrate the threshold on evals/triage (the grader is unchanged).
+- Catalog: `openrouter/jev-1.13` with harness `decisions`, usable only by roles with a decisions
+  mapping; origin `unknown` until verified (so work policy excludes it until then).
+- Evals: sweep Jev on the triage gold set against Luna/Sonnet/local; report the cascade's
+  escalation rate and its combined accuracy/cost.
+- Later: routing questions for item 26 (e.g. task difficulty as a score), concierge intent.
+- Live smoke check for the alpha endpoint.
+- Tests with a fake decisions server (no network).
