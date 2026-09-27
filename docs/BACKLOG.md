@@ -9,18 +9,18 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 1 | M3 | GitHub webhook trigger | done — #4 (+ GitHub IP allowlist by orchestrator); live on limitless-sandbox |
 | 2 | M3 | MCP server + skills for Claude Code and Codex | done — #1 |
 | 3 | M2 | Blind holdout scenarios | done — #3 (Codex flags fixed by orchestrator) |
-| 4 | M2 | Rebase onto the moving base branch before delivery | in review |
+| 4 | M2 | Rebase onto the moving base branch before delivery | done — #12 (made best-effort by orchestrator) |
 | 5 | M3 | Discord bot | done — #2 |
 | 6 | M3 | Chat concierge (UI + Discord free text) | done — #8 |
 | 7 | M4 | Direct-HTTP LLM path + local model servers | done — #9 (unit-overwrite and concierge fixes by orchestrator) |
-| 8 | M4 | OpenRouter spend reconciliation | in progress |
+| 8 | M4 | OpenRouter spend reconciliation | done — #11 |
 | 9 | M5 | Retention and cleanup | done — #5 |
 | 10 | M2 | Live CLI contract smoke tests | done — #7 (`limitless deploy --smoke`) |
 | 11 | M3 | Quota alerts (Discord + UI) | done — #6 |
 | 12 | M5 | Graceful (draining) deploys | done — #10 (bootstrap path by orchestrator) |
-| 13 | M4 | Discord `/run` → `/show` | todo |
-| 14 | M4 | Enable/disable providers at runtime | todo |
-| 15 | M4 | Fresher, Desktop-consistent quota readings | todo |
+| 13 | M4 | Discord `/run` → `/show` | done — #13 |
+| 14 | M4 | Enable/disable providers at runtime | done — #15 |
+| 15 | M4 | Fresher, Desktop-consistent quota readings | done — #16 (float rounding fix by orchestrator) |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
