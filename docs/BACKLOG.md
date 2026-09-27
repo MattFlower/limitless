@@ -28,6 +28,7 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 25 | M4 | External benchmark priors (Artificial Analysis, Terminal-Bench 4.0) | todo |
 | 26 | M4 | Capability-and-cost routing (monotonic escalation) | todo |
 | 27 | M4 | New-model intake pipeline | todo |
+| 28 | M4 | Aggregator providers: per-model rate limits and concurrency | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
@@ -391,3 +392,18 @@ item 17 (catalog as data, not code).
 - Mapping: AA entries ↔ provider model ids are matched explicitly; unmatched or ambiguous ones go to
   a "needs mapping" list in the UI for a human to confirm, never guessed.
 - Tests: snapshot diffing, screening rules, budget enforcement, PR proposal content (fakes only).
+
+## 28. Aggregator providers: per-model rate limits and concurrency
+
+Found in the 2026-09-26 triage sweep: OpenRouter returned HTTP 429 for one model (Ministral), the
+direct-HTTP harness reported "quota", and the tracker marked the whole OpenRouter provider exhausted,
+skipping every later trial. In production that would block all OpenRouter models (the DeepSeek/GLM
+fallbacks) for up to an hour because of one upstream model's rate limit.
+
+- On aggregator providers (OpenRouter), a 429 is per model: cool down that model only, for the
+  `Retry-After` period when present (else exponential backoff from 30 s, capped at 10 min); only
+  key-level signals (402 payment required, the key limit reached, 401) affect the whole provider.
+- Concurrency per upstream model for aggregators (e.g. provider maxConcurrent 4, per-model 1), so an
+  eval sweep across many OpenRouter models doesn't serialize behind one slot.
+- Tests with a fake OpenAI-compatible server: a 429 on model A leaves model B routable; Retry-After
+  honored; 402/401 still mark the provider.
