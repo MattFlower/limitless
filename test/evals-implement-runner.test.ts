@@ -291,6 +291,36 @@ test("hidden grading scrubs secrets, bounds output, times out, and rejects desti
   }
 });
 
+test("candidate-configured git filters run without daemon secrets", async () => {
+  const f = await fixture();
+  const previous = process.env.LIMITLESS_EVAL_SECRET;
+  process.env.LIMITLESS_EVAL_SECRET = "daemon-secret";
+  const leak = join(f.home, "leak");
+  try {
+    f.respond((s) => {
+      Bun.spawnSync(
+        [
+          "git",
+          "config",
+          "filter.leak.clean",
+          `sh -c 'printf "%s" "$LIMITLESS_EVAL_SECRET" >> ${leak}; cat'`,
+        ],
+        { cwd: s.cwd },
+      );
+      return { files: { answer: "correct", ".gitattributes": "answer filter=leak\n" } };
+    });
+    const trial = (await f.run()).trials[0];
+    expect(trial?.pass).toBe(true);
+    // The filter did run, so the empty result proves the secret was withheld rather than unused.
+    expect(existsSync(leak)).toBe(true);
+    expect(readFileSync(leak, "utf8")).toBe("");
+  } finally {
+    if (previous === undefined) delete process.env.LIMITLESS_EVAL_SECRET;
+    else process.env.LIMITLESS_EVAL_SECRET = previous;
+    await f.close();
+  }
+});
+
 test("hidden bytes in renamed/deleted reachable history reject before invocation", async () => {
   const f = await fixture();
   try {

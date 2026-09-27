@@ -71,6 +71,8 @@ export async function gradeImplement(
   toolCommands: string[],
   signal: AbortSignal,
 ): Promise<EvalGrade> {
+  // The candidate controls .git/config and .gitattributes, so filters and diff drivers are its code.
+  const env = agentEnv();
   const evidence: NonNullable<EvalGrade["implement"]> = {
     reason: null,
     commit: null,
@@ -81,7 +83,7 @@ export async function gradeImplement(
   };
   try {
     signal.throwIfAborted();
-    await sh(["git", "add", "-A"], { cwd, signal });
+    await sh(["git", "add", "-A"], { cwd, env, signal });
     await sh(
       [
         "git",
@@ -98,12 +100,12 @@ export async function gradeImplement(
         "-qm",
         "Eval implementation",
       ],
-      { cwd, signal },
+      { cwd, env, signal },
     );
-    evidence.commit = (await sh(["git", "rev-parse", "HEAD"], { cwd, signal })).stdout.trim();
+    evidence.commit = (await sh(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
     const after = await runGates(cwd, prepared.gates, signal);
     signal.throwIfAborted();
-    await discardChanges(cwd);
+    await discardChanges(cwd, env);
     evidence.gates = compareGates(prepared.baseline, after);
     const gateTimeout = [
       ...prepared.baseline.setup,
@@ -113,13 +115,13 @@ export async function gradeImplement(
     ].some((g) => g.output.startsWith("[timed out]"));
     if (gateTimeout) evidence.reason = "timeout";
     const names = gateScriptNames(prepared.gates);
-    const findings = auditDiff(await diffSince(cwd, item.base), {
+    const findings = auditDiff(await diffSince(cwd, item.base, env), {
       taskClass: null,
       protectedPaths: prepared.gates.protectedPaths,
       toolCommands,
       gateScripts: {
-        before: pickScripts(await readFileAt(cwd, item.base, "package.json"), names),
-        after: pickScripts(await readFileAt(cwd, "HEAD", "package.json"), names),
+        before: pickScripts(await readFileAt(cwd, item.base, "package.json", env), names),
+        after: pickScripts(await readFileAt(cwd, "HEAD", "package.json", env), names),
       },
     });
     evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");
@@ -128,7 +130,7 @@ export async function gradeImplement(
     const hidden = await runProcess({
       cmd: ["/bin/sh", "-c", item.hidden.command],
       cwd,
-      env: agentEnv(),
+      env,
       signal,
       timeoutMs: item.hidden.timeoutSec * 1000,
       tailLimit: 6000,

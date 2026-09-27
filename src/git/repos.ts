@@ -167,10 +167,15 @@ export async function fetchBase(paths: Paths, repo: Repo, branch: string): Promi
   });
 }
 
-export async function readFileAt(cwd: string, revision: string, path: string): Promise<string | null> {
-  const entry = await sh(["git", "ls-tree", "--name-only", revision, "--", path], { cwd });
+export async function readFileAt(
+  cwd: string,
+  revision: string,
+  path: string,
+  env?: Record<string, string>,
+): Promise<string | null> {
+  const entry = await sh(["git", "ls-tree", "--name-only", revision, "--", path], { cwd, env });
   if (!entry.stdout.trim()) return null;
-  return (await sh(["git", "show", `${revision}:${path}`], { cwd })).stdout;
+  return (await sh(["git", "show", `${revision}:${path}`], { cwd, env })).stdout;
 }
 
 export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
@@ -227,11 +232,12 @@ export async function resetTo(cwd: string, sha: string): Promise<void> {
 }
 
 /** Throw away any uncommitted changes (used after read-only stages). */
-export async function discardChanges(cwd: string): Promise<boolean> {
-  const status = await sh(["git", "status", "--porcelain"], { cwd });
+/** `env` matters when the checkout's git config is untrusted: filters and drivers run with it. */
+export async function discardChanges(cwd: string, env?: Record<string, string>): Promise<boolean> {
+  const status = await sh(["git", "status", "--porcelain"], { cwd, env });
   if (!status.stdout.trim()) return false;
-  await sh(["git", "reset", "--hard", "-q", "HEAD"], { cwd });
-  await sh(["git", "clean", "-fdq"], { cwd });
+  await sh(["git", "reset", "--hard", "-q", "HEAD"], { cwd, env });
+  await sh(["git", "clean", "-fdq"], { cwd, env });
   return true;
 }
 
@@ -249,12 +255,16 @@ export interface DiffInfo {
   removed: number;
 }
 
-export async function diffSince(cwd: string, baseSha: string): Promise<DiffInfo> {
+export async function diffSince(
+  cwd: string,
+  baseSha: string,
+  env?: Record<string, string>,
+): Promise<DiffInfo> {
   const [patch, names, stat, numstat] = await Promise.all([
-    sh(["git", "diff", `${baseSha}..HEAD`], { cwd }),
-    sh(["git", "diff", "--name-status", `${baseSha}..HEAD`], { cwd }),
-    sh(["git", "diff", "--stat", `${baseSha}..HEAD`], { cwd }),
-    sh(["git", "diff", "--numstat", `${baseSha}..HEAD`], { cwd }),
+    sh(["git", "diff", `${baseSha}..HEAD`], { cwd, env }),
+    sh(["git", "diff", "--name-status", `${baseSha}..HEAD`], { cwd, env }),
+    sh(["git", "diff", "--stat", `${baseSha}..HEAD`], { cwd, env }),
+    sh(["git", "diff", "--numstat", `${baseSha}..HEAD`], { cwd, env }),
   ]);
   let added = 0;
   let removed = 0;
