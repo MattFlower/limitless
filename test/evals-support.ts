@@ -102,6 +102,8 @@ export async function evalFixture() {
         model: "a",
         tier: 1,
         vendor: "other",
+        origin: "unknown",
+        baseOrigin: "unknown",
         price: { input: 1, output: 1 },
       },
       {
@@ -110,6 +112,8 @@ export async function evalFixture() {
         model: "b",
         tier: 1,
         vendor: "other",
+        origin: "unknown",
+        baseOrigin: "unknown",
         price: { input: 1, output: 1 },
       },
     ],

@@ -16,8 +16,9 @@ export function cacheKey(
   systemAppend: string,
   schema: Record<string, unknown>,
   trial: number,
+  repository?: unknown,
 ): string {
   return new Bun.CryptoHasher("sha256")
-    .update(JSON.stringify(canonical({ modelId, harness, prompt, systemAppend, schema, trial })))
+    .update(JSON.stringify(canonical({ modelId, harness, prompt, systemAppend, schema, trial, repository })))
     .digest("hex");
 }

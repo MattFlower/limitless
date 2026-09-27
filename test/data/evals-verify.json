@@ -1,0 +1,113 @@
+{
+  "role": "verify",
+  "version": 1,
+  "cases": [
+    {
+      "id": "verify-1",
+      "repo": "fixture/repo",
+      "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "input": {
+        "prompt": "Check behavior",
+        "spec": {
+          "summary": "Check behavior",
+          "assumptions": [],
+          "requirements": ["Handle inputs"],
+          "acceptance_criteria": [
+            {
+              "id": "AC-1",
+              "criterion": "Handles input",
+              "how_to_verify": "Inspect implementation"
+            }
+          ],
+          "out_of_scope": [],
+          "blocking_questions": []
+        },
+        "gates": []
+      },
+      "gold": {
+        "AC-1": "met"
+      }
+    },
+    {
+      "id": "verify-2",
+      "repo": "fixture/repo",
+      "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "input": {
+        "prompt": "Check behavior",
+        "spec": {
+          "summary": "Check behavior",
+          "assumptions": [],
+          "requirements": ["Handle inputs"],
+          "acceptance_criteria": [
+            {
+              "id": "AC-1",
+              "criterion": "Handles input",
+              "how_to_verify": "Inspect implementation"
+            }
+          ],
+          "out_of_scope": [],
+          "blocking_questions": []
+        },
+        "gates": []
+      },
+      "gold": {
+        "AC-1": "unmet"
+      }
+    },
+    {
+      "id": "verify-3",
+      "repo": "fixture/repo",
+      "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "input": {
+        "prompt": "Check behavior",
+        "spec": {
+          "summary": "Check behavior",
+          "assumptions": [],
+          "requirements": ["Handle inputs"],
+          "acceptance_criteria": [
+            {
+              "id": "AC-1",
+              "criterion": "Handles input",
+              "how_to_verify": "Inspect implementation"
+            }
+          ],
+          "out_of_scope": [],
+          "blocking_questions": []
+        },
+        "gates": [],
+        "holdout": {
+          "scenarios": [
+            {
+              "id": "H-1",
+              "description": "Scenario",
+              "steps": "Inspect input",
+              "expected": "Handled",
+              "edge_case": false
+            },
+            {
+              "id": "H-2",
+              "description": "Scenario",
+              "steps": "Inspect input",
+              "expected": "Handled",
+              "edge_case": true
+            },
+            {
+              "id": "H-3",
+              "description": "Scenario",
+              "steps": "Inspect input",
+              "expected": "Handled",
+              "edge_case": true
+            }
+          ]
+        }
+      },
+      "gold": {
+        "AC-1": "unmet",
+        "H-1": "met"
+      }
+    }
+  ]
+}

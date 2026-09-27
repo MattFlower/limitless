@@ -14,10 +14,32 @@ export function formatEvalReport(report: EvalReport): string {
   if (report.run.error) lines.push(report.run.error);
   for (const m of report.summaries) {
     const c = m.comparison;
+    const metric = (name: string, value: { numerator: number; denominator: number; rate: number | null }) =>
+      `  ${name} ${pct(value.rate)} (${value.numerator}/${value.denominator})`;
+    const roleLines: string[] = [];
+    if (m.review) {
+      const { defectRecall, falseBlock, verdictAccuracy } = m.review;
+      roleLines.push(
+        metric("defect recall", defectRecall) +
+          `, Wilson 95% CI ${defectRecall.ci ? `[${pct(defectRecall.ci[0])}, ${pct(defectRecall.ci[1])}]` : "n/a"}`,
+        metric("clean false-block", falseBlock),
+        metric("verdict accuracy", verdictAccuracy),
+      );
+    }
+    if (m.verify)
+      roleLines.push(
+        metric("false-accept", m.verify.falseAccept),
+        metric("false-reject", m.verify.falseReject),
+        metric("criterion accuracy", m.verify.criterionAccuracy),
+      );
     lines.push(
       `${m.modelId}: ${m.cases} cases, ${m.evaluatedTrials} evaluated trials; skipped=${m.skipped}, errors=${m.errors}, cached=${m.cached}, pending=${m.pending}, unscored=${m.unscored}`,
       `  pass ${pct(m.passRate)} (${m.passes}/${m.evaluatedTrials}), Wilson 95% CI ${m.ci ? `[${pct(m.ci[0])}, ${pct(m.ci[1])}]` : "n/a"}; mean score ${number(m.meanScore)}`,
-      `  risk under-call ${pct(m.riskUnderCallRate)} (n=${m.riskDenominator}); flip ${pct(m.flipRate)} (n=${m.flipDenominator})`,
+      ...roleLines,
+      `  prediction coverage ${m.predictionTrials}/${m.scheduledTrials} (${pct(m.predictionCoverage)}); flip ${pct(m.flipRate)} (n=${m.flipDenominator})`,
+      ...(report.run.role === "triage"
+        ? [`  risk under-call ${pct(m.riskUnderCallRate)} (n=${m.riskDenominator})`]
+        : []),
       `  metered $${m.costUsd.toFixed(4)}; API-equivalent $${m.costEquivUsd.toFixed(4)}; p50 invocation ${number(m.p50LatencyMs)} ms (n=${m.latencyDenominator})`,
       `  vs ${c.bestModel ?? "n/a"}: difference ${number(c.meanDifference)}, one-sided 95% lower ${number(c.lowerBound)}, nonInferior=${c.nonInferior ?? "n/a"}; paired cases=${c.pairedCases} (candidate complete=${c.candidateCompleteCases}, best complete=${c.bestCompleteCases}), delta=${c.delta}, resamples=${c.resamples}, seed=${c.seed}`,
     );

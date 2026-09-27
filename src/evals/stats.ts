@@ -75,6 +75,50 @@ function completeCases(trials: EvalTrial[], k: number) {
     [...groups].filter(([, group]) => group.length === k && new Set(group.map((t) => t.trial)).size === k),
   );
 }
+/** Prediction metrics pool labeled observations, excluding failed/invalid invocations. */
+function roleMetrics(run: EvalRun, rows: EvalTrial[]) {
+  const valid = rows.filter((t) => t.status === "ok" && t.details.grade);
+  const review = valid.flatMap((t) => (t.details.grade?.review ? [t.details.grade.review] : []));
+  const verify = valid.flatMap((t) => (t.details.grade?.verify ? [t.details.grade.verify] : []));
+  const rate = (numerator: number, denominator: number) => ({
+    numerator,
+    denominator,
+    rate: denominator ? numerator / denominator : null,
+  });
+  const matched = review.reduce((n, r) => n + r.requiredMatched, 0);
+  const total = review.reduce((n, r) => n + r.requiredTotal, 0);
+  const clean = review.filter((r) => r.falseBlock !== null);
+  return {
+    predictionTrials: valid.length,
+    predictionCoverage: rows.length ? valid.length / rows.length : null,
+    scheduledTrials: rows.length,
+    review:
+      run.role === "review"
+        ? {
+            defectRecall: { ...rate(matched, total), ci: wilson(matched, total) },
+            falseBlock: rate(clean.filter((r) => r.falseBlock).length, clean.length),
+            verdictAccuracy: rate(review.filter((r) => r.verdictMatch).length, review.length),
+          }
+        : null,
+    verify:
+      run.role === "verify"
+        ? {
+            falseAccept: rate(
+              verify.reduce((n, r) => n + r.falseAccepts, 0),
+              verify.reduce((n, r) => n + r.unmetTotal, 0),
+            ),
+            falseReject: rate(
+              verify.reduce((n, r) => n + r.falseRejects, 0),
+              verify.reduce((n, r) => n + r.metTotal, 0),
+            ),
+            criterionAccuracy: rate(
+              verify.reduce((n, r) => n + r.matched, 0),
+              verify.reduce((n, r) => n + r.total, 0),
+            ),
+          }
+        : null,
+  };
+}
 export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptions = {}) {
   const settings = statsOptions(options);
   const summaries = run.models.map((modelId) => {
@@ -87,12 +131,19 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
     const complete = completeCases(rows, run.k);
     const flips = [...complete.values()].filter((g) => new Set(g.map((t) => t.pass)).size > 1).length;
     const latency = rows
-      .filter((t) => !t.details.cache && !t.details.interrupted && ["ok", "error"].includes(t.status))
+      .filter(
+        (t) =>
+          !t.details.cache &&
+          !t.details.interrupted &&
+          !t.details.preparationFailed &&
+          ["ok", "error"].includes(t.status),
+      )
       .map((t) => t.durationMs)
       .sort((a, b) => a - b);
     const middle = Math.floor(latency.length / 2);
     return {
       modelId,
+      ...roleMetrics(run, rows),
       cases: new Set(evaluated.map((t) => t.caseId)).size,
       evaluatedTrials: evaluated.length,
       skipped: rows.filter((t) => t.status === "skipped").length,

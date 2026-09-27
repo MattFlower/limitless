@@ -96,3 +96,91 @@ test("reports use evaluated trials and complete paired cases; flips and latency 
     summarize(run, [trial("a", "one", 0, true), trial("b", "two", 0, true)])[0]?.comparison.pairedCases,
   ).toBe(0);
 });
+
+test("review pools defects across repetitions, preserves empty denominators and excludes errors from prediction metrics", async () => {
+  const { gradeReview } = await import("../src/evals/graders/review.ts");
+  const { reviewCase, reviewOutput } = await import("./evals-reading-support.ts");
+  const one = gradeReview(reviewCase, reviewOutput());
+  const many = gradeReview(
+    {
+      ...reviewCase,
+      defects: [
+        ...reviewCase.defects,
+        ...[1, 2, 3].map((i) => ({
+          ...reviewCase.defects[0],
+          file: `miss${i}`,
+          lines: [1, 2] as [number, number],
+          severity: "major" as const,
+          category: "correctness",
+          summary: "miss",
+          required: true,
+          foundBy: "test",
+        })),
+      ],
+    },
+    reviewOutput(),
+  );
+  const clean = gradeReview(
+    { ...reviewCase, kind: "clean", defects: [] },
+    { ...reviewOutput(), verdict: "approve", findings: [] },
+  );
+  const rows: EvalTrial[] = [one, many, clean, one, many, clean].map((grade, i) => ({
+    ...trial("a", String(i % 3), Math.floor(i / 3), grade.pass === true),
+    details: { grade },
+  }));
+  rows.push({ ...trial("a", "error", 0, false), status: "error", details: {} });
+  const summary = summarize({ ...run, role: "review" }, rows)[0];
+  expect(summary).toMatchObject({
+    predictionTrials: 6,
+    scheduledTrials: 7,
+    errors: 1,
+    review: {
+      defectRecall: { numerator: 4, denominator: 10, rate: 0.4 },
+      falseBlock: { numerator: 0, denominator: 2, rate: 0 },
+      verdictAccuracy: { numerator: 6, denominator: 6, rate: 1 },
+    },
+  });
+  expect(summary?.review?.defectRecall.ci?.[0]).toBeCloseTo(0.16818, 6);
+  expect(summary?.review?.defectRecall.ci?.[1]).toBeCloseTo(0.687326, 6);
+  expect(
+    summarize({ ...run, role: "review" }, [rows[0] as EvalTrial])[0]?.review?.falseBlock.rate,
+  ).toBeNull();
+  expect(summarize({ ...run, role: "review" }, [rows[2] as EvalTrial])[0]?.review?.defectRecall).toEqual({
+    numerator: 0,
+    denominator: 0,
+    rate: null,
+    ci: null,
+  });
+});
+
+test("verify reports pooled confusion counts, accuracy and null rates without labels", async () => {
+  const { gradeVerify } = await import("../src/evals/graders/verify.ts");
+  const { loadRoleCases, VerifyCaseFileSchema } = await import("../src/evals/cases.ts");
+  const item = VerifyCaseFileSchema.parse(
+    loadRoleCases("verify", new URL("./data/evals-verify.json", import.meta.url).pathname),
+  ).cases[2];
+  if (!item) throw new Error("fixture");
+  const grade = gradeVerify(item, {
+    overall: "pass",
+    notes: "",
+    criteria: [
+      { id: "AC-1", status: "met", evidence: "false accept" },
+      { id: "H-1", status: "unclear", evidence: "false reject" },
+    ],
+  });
+  const rows: EvalTrial[] = [0, 1].map((i) => ({ ...trial("a", "mixed", i, false), details: { grade } }));
+  rows.push({ ...trial("a", "error", 0, false), status: "error", details: {} });
+  expect(summarize({ ...run, role: "verify" }, rows)[0]).toMatchObject({
+    predictionTrials: 2,
+    verify: {
+      falseAccept: { numerator: 2, denominator: 2, rate: 1 },
+      falseReject: { numerator: 2, denominator: 2, rate: 1 },
+      criterionAccuracy: { numerator: 0, denominator: 4, rate: 0 },
+    },
+  });
+  expect(summarize({ ...run, role: "verify" }, [])[0]?.verify).toEqual({
+    falseAccept: { numerator: 0, denominator: 0, rate: null },
+    falseReject: { numerator: 0, denominator: 0, rate: null },
+    criterionAccuracy: { numerator: 0, denominator: 0, rate: null },
+  });
+});

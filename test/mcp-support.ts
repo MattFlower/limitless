@@ -32,6 +32,8 @@ export async function fixture() {
         provider: "fake",
         model: "test",
         vendor: "other",
+        origin: "unknown",
+        baseOrigin: "unknown",
         tier: 4,
         price: { input: 1, output: 1 },
       },

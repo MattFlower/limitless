@@ -1,30 +1,33 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { EvalRun, EvalTrial } from "../core/types.ts";
-import { pinnedTree } from "../git/repos.ts";
+import { createEvalWorktree, type EvalLabels, pinnedTree } from "../git/repos.ts";
 import { selectHarness } from "../harness/select.ts";
 import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
 import type { EngineDeps } from "../pipeline/context.ts";
-import { FACTORY_PREAMBLE, triagePrompt } from "../pipeline/prompts.ts";
-import { TriageSchema, toStrictJsonSchema } from "../pipeline/schemas.ts";
+import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
+import { toStrictJsonSchema } from "../pipeline/schemas.ts";
 import { cacheKey } from "./cache.ts";
 import {
-  type CaseFile,
-  DEFAULT_CASE_FILE,
+  type AnyCaseFile,
+  defaultCasePath,
+  type EvalCase,
   EvalRequestSchema,
-  loadCases,
-  type TriageCase,
+  loadRoleCases,
   validateRequest,
 } from "./cases.ts";
-import { gradeTriage } from "./graders/triage.ts";
+import { gradeCase, prepareCase, schemaFor, seedContent } from "./prepare.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
+
+/** Where Limitless keeps eval datasets; pins whose history touches these are rejected. */
+const LABEL_PATHS = ["evals/triage", "evals/review", "evals/verify"];
 
 export class EvalRunner {
   private readonly active = new Map<string, { controller: AbortController; done: Promise<void> }>();
   private stopping = false;
   constructor(
     private readonly deps: EngineDeps,
-    private readonly casePath = DEFAULT_CASE_FILE,
+    private readonly casePath?: string,
   ) {
     deps.store.recoverEvals();
   }
@@ -32,8 +35,10 @@ export class EvalRunner {
   submit(input: unknown): EvalRun {
     if (this.stopping) throw new Error("daemon is stopping");
     // Reject unsupported roles before accessing any dataset or repository.
-    EvalRequestSchema.parse(input);
-    const file = loadCases(this.casePath);
+    const parsed = EvalRequestSchema.parse(input);
+    const file = loadRoleCases(parsed.role, this.casePath);
+    for (const item of file.cases)
+      if ("defects" in item) seedContent(item, this.casePath ?? defaultCasePath(parsed.role));
     const { request, cases } = validateRequest(input, file, this.deps.router);
     const trials: EvalTrial[] = [];
     for (const modelId of request.models)
@@ -85,8 +90,8 @@ export class EvalRunner {
 
   private async execute(
     run: EvalRun,
-    file: CaseFile,
-    cases: TriageCase[],
+    file: AnyCaseFile,
+    cases: EvalCase[],
     cache: boolean,
     signal: AbortSignal,
   ): Promise<void> {
@@ -96,7 +101,7 @@ export class EvalRunner {
     const treeFor = (slug: string) => {
       let tree = trees.get(slug);
       if (!tree) {
-        const sha = file.repos[slug];
+        const sha = file.role === "triage" ? file.repos[slug] : undefined;
         if (!sha) throw new Error(`missing pin: ${slug}`);
         tree = pinnedTree(this.deps.cfg.paths, store, slug, sha);
         trees.set(slug, tree);
@@ -104,6 +109,14 @@ export class EvalRunner {
       return tree;
     };
     try {
+      const casePath = this.casePath ?? defaultCasePath(run.role);
+      const labels: EvalLabels = {
+        paths: LABEL_PATHS,
+        contents: [
+          readFileSync(casePath, "utf8"),
+          ...file.cases.flatMap((item) => ("defects" in item ? (seedContent(item, casePath) ?? []) : [])),
+        ],
+      };
       const groups = new Map<string, string[]>();
       for (const modelId of run.models) {
         const provider = router.model(modelId)?.provider ?? "unknown";
@@ -119,7 +132,7 @@ export class EvalRunner {
               for (const trial of store
                 .listEvalTrials(run.id)
                 .filter((t) => t.modelId === modelId && t.caseId === item.id)) {
-                await this.trial(run, trial, item, treeFor, cache, signal);
+                await this.trial(run, trial, item, treeFor, labels, cache, signal);
               }
             }
         }),
@@ -136,8 +149,9 @@ export class EvalRunner {
   private async trial(
     run: EvalRun,
     trial: EvalTrial,
-    item: TriageCase,
+    item: EvalCase,
     treeFor: (slug: string) => Promise<string>,
+    labels: EvalLabels,
     cache: boolean,
     signal: AbortSignal,
   ): Promise<void> {
@@ -160,45 +174,85 @@ export class EvalRunner {
     if (budget()) return skip("eval budget exhausted");
     if (!tracker.def(model.provider)) return skip("unknown provider");
     const target = router.toTarget(model);
-    const { harnessName, noTools } = selectHarness("triage", target);
+    const { harnessName, noTools } = selectHarness(run.role, target);
     trial.harness = harnessName;
-    const prompt = triagePrompt({ repoSlug: item.repo, prompt: item.prompt, tree: await treeFor(item.repo) });
-    const jsonSchema = toStrictJsonSchema(TriageSchema);
-    trial.cacheKey = cacheKey(model.id, harnessName, prompt, FACTORY_PREAMBLE, jsonSchema, trial.trial);
-    if (signal.aborted) return skip("daemon shutdown");
-    if (budget()) return skip("eval budget exhausted");
-    if (cache)
-      for (const source of store.cachedEvalTrials(trial.cacheKey)) {
-        const output = TriageSchema.safeParse(source.output);
-        if (!output.success) continue;
-        const grade = gradeTriage(item, output.data);
-        store.recordEvalTrial({
-          ...trial,
-          status: "ok",
-          output: output.data,
-          pass: grade.pass,
-          score: grade.score,
-          details: {
-            ...trial.details,
-            grade,
-            cache: source.details.cache ?? {
-              evalRunId: source.evalRunId,
-              caseId: source.caseId,
-              costUsd: source.costUsd,
-              costEquivUsd: source.costEquivUsd,
-              tokensIn: source.tokensIn,
-              tokensOut: source.tokensOut,
-              durationMs: source.durationMs,
-            },
-          },
-        });
-        return;
-      }
-    const harness = harnesses[harnessName];
-    if (!harness) return skip(`No harness registered for ${harnessName}`);
+    const tree = "prompt" in item ? await treeFor(item.repo) : "";
     let release: (() => void) | undefined;
     let directory: string | undefined;
+    let cleanup: (() => Promise<void>) | undefined;
     try {
+      mkdirSync(cfg.paths.runs, { recursive: true });
+      directory = mkdtempSync(join(cfg.paths.runs, "eval-"));
+      const cwd = "prompt" in item ? directory : join(directory, "worktree");
+      const patch =
+        "defects" in item ? seedContent(item, this.casePath ?? defaultCasePath(run.role)) : undefined;
+      if (!("prompt" in item))
+        cleanup = await createEvalWorktree(
+          cfg.paths,
+          store,
+          item.repo,
+          item.base,
+          item.head,
+          cwd,
+          signal,
+          labels,
+        );
+      const { prompt, timeoutMs } = await prepareCase(item, cwd, tree, patch, signal);
+      const schema = schemaFor(item);
+      const jsonSchema = toStrictJsonSchema(schema);
+      const repository =
+        "prompt" in item
+          ? undefined
+          : {
+              role: run.role,
+              repo: item.repo,
+              base: item.base,
+              head: item.head,
+              patch,
+              input: item.input,
+              source:
+                store.getRepoBySlug(item.repo)?.url ?? store.getRepoBySlug(item.repo)?.localPath ?? item.repo,
+            };
+      trial.cacheKey = cacheKey(
+        model.id,
+        harnessName,
+        prompt,
+        FACTORY_PREAMBLE,
+        jsonSchema,
+        trial.trial,
+        repository,
+      );
+      if (signal.aborted) return skip("daemon shutdown");
+      if (budget()) return skip("eval budget exhausted");
+      if (cache)
+        for (const source of store.cachedEvalTrials(trial.cacheKey)) {
+          const output = schema.safeParse(source.output);
+          if (!output.success) continue;
+          const grade = gradeCase(item, output.data);
+          store.recordEvalTrial({
+            ...trial,
+            status: "ok",
+            output: output.data,
+            pass: grade.pass,
+            score: grade.score,
+            details: {
+              ...trial.details,
+              grade,
+              cache: source.details.cache ?? {
+                evalRunId: source.evalRunId,
+                caseId: source.caseId,
+                costUsd: source.costUsd,
+                costEquivUsd: source.costEquivUsd,
+                tokensIn: source.tokensIn,
+                tokensOut: source.tokensOut,
+                durationMs: source.durationMs,
+              },
+            },
+          });
+          return;
+        }
+      const harness = harnesses[harnessName];
+      if (!harness) return skip(`No harness registered for ${harnessName}`);
       const reason = eligible();
       if (reason) return skip(reason);
       release = await tracker.acquire(target.provider, signal);
@@ -206,22 +260,21 @@ export class EvalRunner {
       if (budget()) return skip("eval budget exhausted");
       const afterWait = eligible();
       if (afterWait) return skip(afterWait);
-      mkdirSync(cfg.paths.runs, { recursive: true });
-      directory = mkdtempSync(join(cfg.paths.runs, "eval-"));
       trial.createdAt = Date.now();
       store.recordEvalTrial({ ...trial, status: "running" });
       let result: AgentResult;
       try {
         result = await harness({
-          cwd: directory,
+          cwd,
           prompt,
           systemAppend: FACTORY_PREAMBLE,
           target,
           mode: "readonly",
           noTools,
           jsonSchema,
-          schema: TriageSchema,
-          timeoutMs: 5 * 60_000,
+          schema,
+          timeoutMs,
+          privateSession: run.role === "verify",
           idleTimeoutMs: 10 * 60_000,
           maxToolCalls: 150,
           signal,
@@ -244,9 +297,9 @@ export class EvalRunner {
           quota: null,
         };
       }
-      const output = TriageSchema.safeParse(result.structured ?? extractJson(result.finalText));
+      const output = schema.safeParse(result.structured ?? extractJson(result.finalText));
       const ok = result.status === "ok" && output.success;
-      const grade = ok ? gradeTriage(item, output.data) : undefined;
+      const grade = ok ? gradeCase(item, output.data) : undefined;
       store.recordEvalTrial({
         ...trial,
         status: ok ? "ok" : "error",
@@ -260,7 +313,7 @@ export class EvalRunner {
           reason: ok
             ? undefined
             : (result.error ??
-              (output.success ? result.status : `Invalid triage output: ${output.error.message}`)),
+              (output.success ? result.status : `Invalid ${run.role} output: ${output.error.message}`)),
         },
         costUsd: result.costUsd,
         costEquivUsd: result.costEquivUsd,
@@ -280,9 +333,22 @@ export class EvalRunner {
         )
       )
         tracker.blockModel(model.id, result.error ?? "model rejected");
+    } catch (error) {
+      if (signal.aborted) return skip("daemon shutdown");
+      store.recordEvalTrial({
+        ...trial,
+        status: "error",
+        pass: false,
+        score: 0,
+        details: { ...trial.details, preparationFailed: true, reason: (error as Error).message },
+      });
     } finally {
       release?.();
-      if (directory) rmSync(directory, { recursive: true, force: true });
+      try {
+        await cleanup?.();
+      } finally {
+        if (directory) rmSync(directory, { recursive: true, force: true });
+      }
     }
   }
 }

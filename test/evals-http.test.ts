@@ -1,7 +1,11 @@
 import { expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
 import type { Server } from "bun";
+import { formatEvalReport } from "../src/cli/eval.ts";
+import { loadRoleCases, VerifyCaseFileSchema } from "../src/evals/cases.ts";
 import type { EvalReport } from "../src/evals/stats.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 import { answer, deferred, evalFixture } from "./evals-support.ts";
 import { type Route, requestWithParams } from "./mcp-support.ts";
 
@@ -105,6 +109,53 @@ test("eval API shares JSON, Origin and Cloudflare guards and validates before pe
     ).toBe(403);
     expect(f.factory.store.listEvalRuns()).toHaveLength(0);
     expect(f.calls).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("review and verify API reports preserve role grades and text/JSON metrics", async () => {
+  const f = await evalFixture();
+  try {
+    for (const role of ["review", "verify"] as const) {
+      const item =
+        role === "review"
+          ? { ...reviewCase, base: f.sha, head: f.sha }
+          : {
+              ...VerifyCaseFileSchema.parse(
+                loadRoleCases("verify", new URL("./data/evals-verify.json", import.meta.url).pathname),
+              ).cases[0],
+              base: f.sha,
+              head: f.sha,
+            };
+      writeFileSync(f.casePath, JSON.stringify({ role, version: 1, cases: [item] }));
+      f.respond(() => ({
+        structured:
+          role === "review"
+            ? reviewOutput()
+            : { overall: "fail", notes: "", criteria: [{ id: "AC-1", status: "met", evidence: "checked" }] },
+      }));
+      const report = await f.run({ role, models: ["candidate-a"], k: 2 });
+      const route = createHttpRoutes(f.factory)["/api/evals/:id"] as Route;
+      const response = await route(
+        requestWithParams(`http://localhost:7400/api/evals/${report.run.id}`, {}, { id: report.run.id }),
+        server,
+      );
+      const json = (await response.json()) as EvalReport;
+      expect(json).toEqual(report);
+      expect(json.trials.every((t) => t.details.grade?.[role])).toBe(true);
+      const text = formatEvalReport(json);
+      expect(text).toContain("prediction coverage 2/2");
+      expect(text).not.toContain("risk under-call");
+      if (role === "review") {
+        expect(text).toContain("defect recall 100.0% (2/2)");
+        expect(text).toContain("clean false-block n/a (0/0)");
+      } else {
+        expect(text).toContain("false-accept n/a (0/0)");
+        expect(text).toContain("false-reject 0.0% (0/2)");
+        expect(text.indexOf("false-accept")).toBeLessThan(text.indexOf("false-reject"));
+      }
+    }
   } finally {
     await f.close();
   }

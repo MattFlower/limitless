@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { TriageSchema } from "../pipeline/schemas.ts";
+import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
 import type { Router } from "../router/router.ts";
 
 const nonempty = z.string().trim().min(1);
@@ -53,12 +54,124 @@ export function loadCases(path = DEFAULT_CASE_FILE): CaseFile {
     throw new Error(`Invalid eval cases ${path}: ${(error as Error).message}`);
   }
 }
+const pin = z.string().regex(/^[a-fA-F0-9]{40}$/, "expected full pinned commit SHA");
+export const GateComparisonSchema = z.strictObject({
+  name: nonempty,
+  verdict: z.enum(["pass", "fixed", "regressed", "still_failing", "new_failure", "new_pass", "not_run"]),
+  blocking: z.boolean(),
+  result: z.strictObject({
+    name: nonempty,
+    command: z.string(),
+    ok: z.boolean(),
+    exitCode: z.number().int().nullable(),
+    durationMs: z.number().finite().nonnegative(),
+    output: z.string(),
+  }),
+});
+const repositoryCase = { id: nonempty, repo: repoId, base: pin, head: pin };
+export const ReviewCaseSchema = z.strictObject({
+  ...repositoryCase,
+  kind: z.enum(["real", "clean", "seeded"]),
+  source: z.string(),
+  input: z.strictObject({
+    prompt: nonempty,
+    spec: SpecSchema.nullable(),
+    implementerReport: z.string(),
+    gates: z.array(GateComparisonSchema),
+  }),
+  defects: z.array(
+    z.strictObject({
+      file: nonempty,
+      lines: z
+        .tuple([z.number().int().nonnegative(), z.number().int().nonnegative()])
+        .refine(([start, end]) => start <= end, "invalid defect range"),
+      severity: z.enum(["blocker", "major", "minor", "nit"]),
+      category: nonempty,
+      summary: nonempty,
+      required: z.boolean(),
+      foundBy: z.string(),
+    }),
+  ),
+  seedPatch: nonempty
+    .refine(
+      (path) =>
+        !isAbsolute(path) && !path.includes("\\") && !path.split("/").includes("..") && !path.includes("\0"),
+      "seed path must stay inside dataset directory",
+    )
+    .optional(),
+});
+export const VerifyCaseSchema = z
+  .strictObject({
+    ...repositoryCase,
+    input: z.strictObject({
+      prompt: nonempty,
+      spec: SpecSchema,
+      gates: z.array(GateComparisonSchema),
+      holdout: HoldoutSchema.optional(),
+    }),
+    gold: z
+      .record(nonempty, z.enum(["met", "unmet"]))
+      .refine((gold) => Object.keys(gold).length > 0, "empty gold"),
+  })
+  .superRefine((item, ctx) => {
+    const ids = [...item.input.spec.acceptance_criteria, ...(item.input.holdout?.scenarios ?? [])].map(
+      (c) => c.id,
+    );
+    if (ids.some((id) => !id.trim()) || new Set(ids).size !== ids.length)
+      ctx.addIssue({ code: "custom", path: ["input"], message: "criterion IDs must be nonempty and unique" });
+    for (const id of Object.keys(item.gold))
+      if (!ids.includes(id))
+        ctx.addIssue({ code: "custom", path: ["gold", id], message: "unknown gold criterion ID" });
+  });
+function envelope<R extends "review" | "verify", T extends z.ZodType<{ id: string }>>(role: R, item: T) {
+  return z
+    .strictObject({
+      role: z.literal(role),
+      version: z.literal(1),
+      notes: z.string().optional(),
+      cases: z.array(item).min(1),
+    })
+    .superRefine((file, ctx) => {
+      const ids = new Set<string>();
+      for (const [index, item] of file.cases.entries()) {
+        if (ids.has(item.id))
+          ctx.addIssue({ code: "custom", path: ["cases", index, "id"], message: "duplicate case ID" });
+        ids.add(item.id);
+      }
+    });
+}
+export const ReviewCaseFileSchema = envelope("review", ReviewCaseSchema);
+export const VerifyCaseFileSchema = envelope("verify", VerifyCaseSchema);
+export type ReviewCase = z.infer<typeof ReviewCaseSchema>;
+export type VerifyCase = z.infer<typeof VerifyCaseSchema>;
+export type AnyCaseFile =
+  | CaseFile
+  | z.infer<typeof ReviewCaseFileSchema>
+  | z.infer<typeof VerifyCaseFileSchema>;
+export type EvalCase = TriageCase | ReviewCase | VerifyCase;
+export function defaultCasePath(role: "triage" | "review" | "verify"): string {
+  return fileURLToPath(new URL(`../../evals/${role}/cases.json`, import.meta.url));
+}
+export function loadRoleCases(
+  role: "triage" | "review" | "verify",
+  path = defaultCasePath(role),
+): AnyCaseFile {
+  try {
+    const schema =
+      role === "triage" ? CaseFileSchema : role === "review" ? ReviewCaseFileSchema : VerifyCaseFileSchema;
+    return schema.parse(JSON.parse(readFileSync(path, "utf8")));
+  } catch (error) {
+    throw new Error(
+      `Invalid ${role} eval cases ${path}: ${(error as Error).message}${role === "verify" ? "; curate evals/verify/cases.json before running verify evals" : ""}`,
+    );
+  }
+}
 const unique = z
   .array(nonempty)
   .min(1)
   .refine((ids) => new Set(ids).size === ids.length, "duplicate IDs");
 export const EvalRequestSchema = z.strictObject({
-  role: z.literal("triage"),
+  role: z.enum(["triage", "review", "verify"]),
   models: unique,
   k: z.number().int().positive().default(1),
   maxUsd: z.number().finite().nonnegative().default(1),
@@ -66,8 +179,9 @@ export const EvalRequestSchema = z.strictObject({
   cache: z.boolean().default(true),
 });
 export type EvalRequest = z.infer<typeof EvalRequestSchema>;
-export function validateRequest(input: unknown, file: CaseFile, router: Pick<Router, "model">) {
+export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<Router, "model">) {
   const request = EvalRequestSchema.parse(input);
+  if (request.role !== file.role) throw new Error("dataset role does not match request");
   for (const id of request.models) if (!router.model(id)) throw new Error(`Unknown model ID: ${id}`);
   for (const id of request.caseIds ?? [])
     if (!file.cases.some((c) => c.id === id)) throw new Error(`Unknown case ID: ${id}`);

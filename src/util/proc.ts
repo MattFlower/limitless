@@ -195,11 +195,13 @@ export async function sh(
     timeoutMs?: number;
     allowFail?: boolean;
     stdin?: string;
+    signal?: AbortSignal;
   },
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   const res = await runProcess({
     cmd,
     cwd: opts.cwd,
+    signal: opts.signal,
     env: opts.env ?? (process.env as Record<string, string>),
     timeoutMs: opts.timeoutMs ?? 120_000,
     // Callers parse this output (diffs, JSON); never silently hand them a truncated tail.
