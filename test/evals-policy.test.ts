@@ -576,6 +576,38 @@ test("implement cells use separate complexity evidence, preserve defaults, and e
   expect(validatePolicy(overlay, MODELS)).toEqual(overlay);
 });
 
+test("matrix exposes each implement decision, comparison, cost, and availability fallback", () => {
+  const row = evidence("implement", [metered, local]);
+  for (const trial of row.trials) {
+    trial.details.complexity = "small";
+    if (recordedTarget(trial) === local && Number(trial.caseId.slice(-2)) < 8) trial.pass = false;
+  }
+  const matrix = evalMatrix(response([row]));
+  expect(matrix.rows.filter((r) => r.role.startsWith("implement.")).map((r) => r.role)).toEqual([
+    "implement.trivial",
+    "implement.small",
+    "implement.medium",
+  ]);
+  const small = matrix.rows.find((r) => r.role === "implement.small");
+  expect(small?.decision).toContain("availability fallbacks");
+  const paid = small?.cells.find((c) => c.modelId === metered);
+  expect(paid?.costPerCase).toBeCloseTo(0.4);
+  expect(paid).toMatchObject({
+    state: "eligible",
+    availabilityFallback: false,
+    href: "/evals/implement-run",
+  });
+  expect(small?.cells.find((c) => c.modelId === local)).toMatchObject({
+    state: "ineligible",
+    costPerCase: 0,
+    availabilityFallback: true,
+    comparison: { nonInferior: false, pairedCases: 40 },
+  });
+  expect(matrix.rows.find((r) => r.role === "implement")?.cells.find((c) => c.modelId === local)?.state).toBe(
+    "no result",
+  );
+});
+
 test("implement sparse or unpaired evidence never replaces an existing cell", () => {
   const good = evidence("implement", [subscription], { id: "good" });
   good.trials.forEach((t) => {

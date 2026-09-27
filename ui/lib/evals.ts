@@ -12,23 +12,26 @@ export function evalMatrix(data: EvalPolicyResponse) {
   return {
     models,
     rows: [
-      ...data.evaluation.roles
-        .filter((r) => r.role !== "implement")
-        .map((r) => ({
-          role: r.role,
-          cells: models.map((modelId) => {
-            const candidate = r.candidates.find((c) => c.modelId === modelId);
-            return {
-              modelId,
-              state: candidate?.state ?? "no result",
-              reasons: candidate?.reasons ?? [],
-              href: candidate ? `/evals/${encodeURIComponent(candidate.run.id)}` : null,
-              candidate,
-            };
-          }),
-        })),
+      ...data.evaluation.roles.map((r) => ({
+        role: r.cell === "default" ? r.role : `${r.role}.${r.cell}`,
+        decision: r.role === "implement" ? r.decision : null,
+        cells: models.map((modelId) => {
+          const candidate = r.candidates.find((c) => c.modelId === modelId);
+          return {
+            modelId,
+            state: candidate?.state ?? "no result",
+            reasons: candidate?.reasons ?? [],
+            href: candidate ? `/evals/${encodeURIComponent(candidate.run.id)}` : null,
+            candidate,
+            costPerCase: candidate?.costPerCase ?? null,
+            comparison: candidate?.comparison ?? null,
+            availabilityFallback: r.availabilityFallbacks.includes(modelId),
+          };
+        }),
+      })),
       {
         role: "implement",
+        decision: null,
         cells: models.map((modelId) => {
           const result = data.implement?.find((e) => e.summary.modelId === modelId);
           return {
@@ -36,6 +39,9 @@ export function evalMatrix(data: EvalPolicyResponse) {
             state: result ? "evaluated" : "no result",
             reasons: [],
             href: result ? `/evals/${encodeURIComponent(result.run.id)}` : null,
+            costPerCase: null,
+            comparison: null,
+            availabilityFallback: false,
             candidate: result
               ? {
                   summary: result.summary,

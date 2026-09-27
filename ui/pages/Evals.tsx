@@ -59,6 +59,25 @@ export const EvalsView: Component<{ data?: EvalPolicyResponse; error?: string }>
                                 </div>
                               )}
                             </For>
+                            <Show when={cell.costPerCase !== null}>
+                              <div>Estimated cost/case: ${cell.costPerCase?.toFixed(4)}</div>
+                            </Show>
+                            <Show when={cell.comparison}>
+                              {(comparison) => (
+                                <div>
+                                  vs {comparison().bestModel ?? "n/a"}: paired {comparison().pairedCases},
+                                  lower {comparison().lowerBound?.toFixed(4) ?? "n/a"};{" "}
+                                  {comparison().nonInferior === null
+                                    ? "insufficient pairs"
+                                    : comparison().nonInferior
+                                      ? "non-inferior"
+                                      : "non-inferiority not established"}
+                                </div>
+                              )}
+                            </Show>
+                            <Show when={cell.availabilityFallback}>
+                              <div>Availability fallback</div>
+                            </Show>
                             <Show when={cell.reasons.length}>
                               <details>
                                 <summary>Reasons</summary>
@@ -74,8 +93,13 @@ export const EvalsView: Component<{ data?: EvalPolicyResponse; error?: string }>
               </tbody>
             </table>
           </div>
+          <For each={evalMatrix(data()).rows.filter((r) => r.decision)}>{(r) => <p>{r.decision}</p>}</For>
           <For each={data().evaluation.roles.filter((r) => !r.order.length)}>
-            {(r) => <p>{r.decision}</p>}
+            {(r) => (
+              <Show when={r.role !== "implement"}>
+                <p>{r.decision}</p>
+              </Show>
+            )}
           </For>
           <h2>Eval runs</h2>
           <Show when={data().runs.length} fallback={<p>No eval runs yet.</p>}>
