@@ -78,7 +78,10 @@ export class Factory {
     gateSlots.setLimit(cfg.maxConcurrentGates);
     this.models = opts.models ?? MODELS;
     this.evalSettings = evalSettings(cfg.raw);
-    this.providerDefs = opts.providers ?? PROVIDERS;
+    this.providerDefs = (opts.providers ?? PROVIDERS).map((provider) => ({
+      ...provider,
+      maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
+    }));
     this.policy =
       opts.policy ??
       (opts.policyPath === undefined
