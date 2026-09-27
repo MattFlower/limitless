@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Server } from "bun";
+import { resolveBootSha } from "../src/cli/boot-sha.ts";
 import type { HealthResponse } from "../src/core/types.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
@@ -91,8 +92,10 @@ test("admin drain uses real loopback peers and existing mutation protections", a
 });
 
 test("health keeps the injected boot SHA after the checkout advances", async () => {
-  const f = await fixture("boot-commit");
+  const f = await fixture(resolveBootSha);
   try {
+    const bootSha = await resolveBootSha(f.repo);
+    if (!bootSha) throw new Error("test checkout has no boot SHA");
     const route = createHttpRoutes(f.factory)["/api/health"] as Route;
     const read = async () =>
       (
@@ -104,8 +107,8 @@ test("health keeps the injected boot SHA after the checkout advances", async () 
       ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "next"],
       { cwd: f.repo },
     );
-    expect((await sh(["git", "rev-parse", "HEAD"], { cwd: f.repo })).stdout.trim()).not.toBe("boot-commit");
-    expect((await read()).sha).toBe("boot-commit");
+    expect((await sh(["git", "rev-parse", "HEAD"], { cwd: f.repo })).stdout.trim()).not.toBe(bootSha);
+    expect((await read()).sha).toBe(bootSha);
   } finally {
     await f.close();
   }

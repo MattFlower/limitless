@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveBootSha } from "../src/cli/boot-sha.ts";
@@ -98,7 +98,15 @@ function setup() {
     setDraining: (value: boolean) => {
       draining = value;
     },
-    opts: { releaseDir: dir, command, client, clock, restart, log: (s: string) => logs.push(s) },
+    opts: {
+      releaseDir: dir,
+      lockPath: join(dir, "deploy.lock"),
+      command,
+      client,
+      clock,
+      restart,
+      log: (s: string) => logs.push(s),
+    },
   };
 }
 
@@ -113,7 +121,7 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
     "health",
     "git rev-parse HEAD",
     "git fetch origin --prune",
-    "git rev-parse feature",
+    "git rev-parse feature^{commit}",
     "git checkout -q --detach next",
     "bun install --frozen-lockfile",
     "bun run check",
@@ -140,7 +148,7 @@ test("initially empty and unchanged ref do not wait", async () => {
     "health",
     "git rev-parse HEAD",
     "git fetch origin --prune",
-    "git rev-parse feature",
+    "git rev-parse feature^{commit}",
   ]);
   f.calls.length = 0;
   await deploy(7400, "feature", true, f.opts);
@@ -382,17 +390,39 @@ test("a daemon without the drain endpoint is restarted only with --now", async (
   expect(now.logs.some((l) => l.includes("no drain endpoint"))).toBe(true);
 });
 
-test("checkout already at target continues from drain without rerunning gates", async () => {
+test("checkout already at target reruns gates before drain", async () => {
   const f = setup();
   f.setSelected("next");
   await deploy(7400, "feature", false, f.opts);
-  expect(f.calls).not.toContain("bun install --frozen-lockfile");
-  expect(f.calls).not.toContain("bun run check");
+  expect(f.calls.indexOf("bun install --frozen-lockfile")).toBeLessThan(f.calls.indexOf("bun run check"));
+  expect(f.calls.indexOf("bun run check")).toBeLessThan(f.calls.indexOf("drain"));
   expect(f.calls).not.toContain("git checkout -q --detach next");
   expect(f.calls.indexOf("drain")).toBeLessThan(f.calls.indexOf("restart"));
   expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
   expect(f.logs).toContain("daemon before: previous");
   expect(f.logs).toContain("daemon after: next");
+});
+
+test("a target checkout still aborts on failed gates before draining", async () => {
+  const f = setup();
+  f.setSelected("next");
+  const command = f.opts.command;
+  f.opts.command = async (args, options) => {
+    if (args.join(" ") === "bun run check") throw new Error("failed check");
+    return command(args, options);
+  };
+  await expect(deploy(7400, "feature", true, f.opts)).rejects.toThrow("failed check");
+  expect(f.calls).toContain("bun install --frozen-lockfile");
+  expect(f.calls).not.toContain("drain");
+  expect(f.calls).not.toContain("restart");
+  expect(f.calls).not.toContain("bun run smoke");
+});
+
+test("a target checkout runs requested smoke before draining", async () => {
+  const f = setup();
+  f.setSelected("next");
+  await deploy(7400, "feature", true, f.opts);
+  expect(f.calls.indexOf("bun run smoke")).toBeLessThan(f.calls.indexOf("drain"));
 });
 
 test("a pre-upgrade daemon without a boot SHA deploys using the checkout commit", async () => {
@@ -421,12 +451,14 @@ test("an unknown daemon SHA cannot use the target checkout as proof of deploymen
       const health = f.client.health;
       f.client.health = async (signal) => ({ ...(await health(signal)), sha }) as unknown as HealthResponse;
       const listeners = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
-      await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("daemon boot SHA is unknown");
+      await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow(
+        /daemon boot SHA is unknown.*launchctl kickstart -k gui\/\d+\/cc\.mattflower\.limitless or limitless service install/,
+      );
       expect(f.calls).toEqual([
         "health",
         "git rev-parse HEAD",
         "git fetch origin --prune",
-        "git rev-parse feature",
+        "git rev-parse feature^{commit}",
       ]);
       expect(f.selected()).toBe("next");
       expect(f.logs.some((line) => line.includes("already deployed"))).toBe(false);
@@ -466,6 +498,40 @@ test("running target is already deployed and a stranded drain is resumed", async
   }
 });
 
+test("a running target repairs a different checkout before returning", async () => {
+  const f = setup();
+  const health = f.client.health;
+  f.client.health = async (signal) => ({ ...(await health(signal)), sha: "next" });
+  await deploy(7400, "feature", false, f.opts);
+  expect(f.calls).toContain("git checkout -q --detach next");
+  expect(f.calls).toContain("bun install --frozen-lockfile");
+  expect(f.selected()).toBe("next");
+  expect(f.calls).not.toContain("drain");
+  expect(f.calls).not.toContain("restart");
+});
+
+test("a replacement without boot SHA is accepted with a warning", async () => {
+  const f = setup();
+  const health = f.client.health;
+  f.client.health = async (signal) => ({
+    ...(await health(signal)),
+    sha: f.calls.includes("restart") ? "" : "previous",
+  });
+  await deploy(7400, "feature", false, f.opts);
+  expect(f.logs.join("\n")).toContain("warning: replacement daemon does not report a boot SHA");
+});
+
+test("deploy lock refuses a live holder and removes a stale lock", async () => {
+  const f = setup();
+  const lock = f.opts.lockPath;
+  writeFileSync(lock, `${process.pid}\n`);
+  await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("deploy already running");
+  expect(f.calls).toEqual([]);
+  writeFileSync(lock, "99999999\n");
+  await deploy(7400, "feature", false, f.opts);
+  expect(existsSync(lock)).toBe(false);
+});
+
 test("an already draining old daemon completes a pending deploy", async () => {
   const f = setup();
   f.setSelected("next");
@@ -499,12 +565,36 @@ test("signals during drain wait restore the daemon checkout and resume", async (
       return new Promise<void>(() => {});
     };
     await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow(name);
+    expect(f.logs).toContain("interrupted, rolling back...");
     expect(f.calls).toContain("git checkout -q --detach previous");
     expect(f.calls).toContain("bun install --frozen-lockfile");
     expect(f.calls.at(-1)).toBe("resume");
     expect(f.calls).not.toContain("restart");
     expect(process.listenerCount(name)).toBe(before);
   }
+});
+
+test("a second signal exits immediately during rollback", async () => {
+  const f = setup();
+  const exits: number[] = [];
+  const command = f.opts.command;
+  f.opts.command = async (args, options) => {
+    if (args.join(" ") === "bun run check") process.emit("SIGINT");
+    if (args[1] === "checkout" && args[4] === "previous") {
+      process.emit("SIGTERM");
+      expect(exits).toEqual([143]);
+    }
+    return command(args, options);
+  };
+  await expect(
+    deploy(7400, "feature", false, {
+      ...f.opts,
+      exit: (code) => {
+        exits.push(code);
+      },
+    }),
+  ).rejects.toThrow("SIGINT");
+  expect(f.logs).toContain("interrupted, rolling back...");
 });
 
 test("a signal during gates cancels the command before restoring the checkout", async () => {
