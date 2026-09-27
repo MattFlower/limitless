@@ -184,18 +184,18 @@ describe("Router", () => {
       "codex/sol",
     ]);
     expect(ids({ billing: "free_first", prefer: "local-a/catalog@low" })).toEqual([
-      "local-a/policy@high",
       "local-a/catalog@low",
+      "local-a/policy@high",
       "local-b/catalog@low",
       "claude/sonnet",
       "codex/sol",
     ]);
     expect(ids({ billing: "free_first", avoidVendor: "anthropic", prefer: "claude/sonnet" })).toEqual([
+      "claude/sonnet",
       "local-b/catalog@low",
       "local-a/policy@high",
       "local-a/catalog@low",
       "codex/sol",
-      "claude/sonnet",
     ]);
   });
 

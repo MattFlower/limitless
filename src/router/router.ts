@@ -147,7 +147,6 @@ export class Router {
     const freePreferred: ModelTarget[] = [];
     const freeSameVendor: ModelTarget[] = [];
     const policyFreeModels = new Set<string>();
-    const policyFreeTargets = new Set<string>();
     const seen = new Set<string>();
     // Older run state can reference a model removed from the catalog.
     const identity = (reference: string | ModelSelection) => {
@@ -171,10 +170,7 @@ export class Router {
           continue;
         }
         const { model: m, effort, targetId: id } = resolved;
-        if (fromPolicy && this.tracker.def(m.provider)?.billing === "free") {
-          policyFreeModels.add(m.id);
-          policyFreeTargets.add(id);
-        }
+        if (fromPolicy && this.tracker.def(m.provider)?.billing === "free") policyFreeModels.add(m.id);
         if (seen.has(id)) continue;
         seen.add(id);
         if (excluded.has(id) || c.excludeModels?.includes(m.id)) {
@@ -235,19 +231,10 @@ export class Router {
       c.billing === "free_first"
         ? [freePreferred, freeSameVendor, preferred, sameVendor]
         : [preferred, sameVendor];
-    if (preference && c.billing === "free_first") {
-      for (const partition of partitions) {
-        const pinned = partition.findIndex((m) => m.targetId === preference);
-        if (pinned > 0) {
-          const policyCount = partition.filter((m) => policyFreeTargets.has(m.targetId ?? m.modelId)).length;
-          const insertAt = policyFreeTargets.has(preference) ? 0 : Math.min(policyCount, pinned);
-          partition.splice(insertAt, 0, ...partition.splice(pinned, 1));
-        }
-      }
-    }
     const ordered = partitions.flat();
-    const pinned =
-      preference && c.billing !== "free_first" ? ordered.findIndex((m) => m.targetId === preference) : -1;
+    // The current implementer stays first in every mode: escalation never falls back to a model
+    // that already failed, even a free one.
+    const pinned = preference ? ordered.findIndex((m) => m.targetId === preference) : -1;
     if (pinned > 0) ordered.unshift(...ordered.splice(pinned, 1));
     return { candidates: ordered, skipped };
   }
