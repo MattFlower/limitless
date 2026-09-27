@@ -544,7 +544,7 @@ export class RunContext {
         );
         continue;
       }
-      if (["quota", "unavailable", "timeout", "stuck"].includes(result.status)) {
+      if (result.status === "quota" || result.status === "unavailable") {
         lastFailure =
           `${target.targetId ?? target.modelId}: ${result.status} (${redact?.(result.error ?? "") ?? result.error ?? ""})`.slice(
             0,

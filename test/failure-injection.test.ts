@@ -297,6 +297,51 @@ for (const [name, failure] of Object.entries(failures))
     });
   }
 
+for (const status of ["timeout", "stuck", "error"] as const)
+  test(`implement ${status} preserves partial work and uses task feedback in the next round`, async () => {
+    writeFileSync(
+      join(source, ".limitless.toml"),
+      '[gates]\nchecks = [{name="check",run="! test -f ui/change.txt || grep -qx done ui/change.txt"}]\n',
+    );
+    await sh(["git", "commit", "-qam", "check completed implementation"], { cwd: source });
+    const attempts: { state: RunState | null; prompt: string }[] = [];
+    const diagnostic = status === "error" ? "process exited with code 1" : `session ${status}`;
+    const f = factory(undefined, (s) => {
+      if (s.mode !== "edit") return answer(s);
+      attempts.push({ state: f.store.getRunState<RunState>(id), prompt: s.prompt });
+      return attempts.length === 1
+        ? { status, error: diagnostic, files: { "ui/change.txt": "partial\n" } }
+        : answer(s);
+    });
+    const id = await run(f);
+    await settled(f, id);
+    expect(f.store.getRun(id)).toMatchObject({ status: "succeeded", error: null });
+    expect(attempts.map((a) => a.state?.round)).toEqual([0, 1]);
+    expect(attempts[1]?.state).toMatchObject({
+      implementedRound: 0,
+      roundsOnImplementer: 1,
+      implementerIssue: `${status}: ${diagnostic}`,
+      triedImplementers: [{ modelId: "a", effort: "high" }],
+    });
+    expect(attempts[1]?.prompt).toContain("Your previous session ended early");
+    expect(attempts[1]?.prompt).toContain(`${status}: ${diagnostic}`);
+    const stages = f.store.listStages(id).filter((s) => s.name === "implement");
+    expect(stages.map((s) => s.round)).toEqual([0, 1]);
+    const inv = f.store.listInvocations(id).filter((i) => i.role === "implement");
+    expect(inv.map((i) => i.stageId)).toEqual(stages.map((s) => s.id));
+    expect(inv.map((i) => [i.modelId, i.status, i.error])).toEqual([
+      ["a", status, diagnostic],
+      ["a", "ok", null],
+    ]);
+    const state = f.store.getRunState<RunState>(id);
+    expect(state?.implementerIssue).toBeNull();
+    const cwd = state?.worktreePath ?? "";
+    expect(existsSync(cwd)).toBe(true);
+    expect((await sh(["git", "show", "HEAD~1:ui/change.txt"], { cwd })).stdout).toBe("partial\n");
+    expect(readFileSync(join(cwd, "ui/change.txt"), "utf8")).toBe("done\n");
+    history(f, id);
+  });
+
 test("quota after partial output persists cooldown and falls back without a task round", async () => {
   let now = 100_000;
   const f = factory(
