@@ -7,6 +7,8 @@ import type {
   ChatProposal,
   ChatProposalFields,
   CreateRunRequest,
+  EvalRun,
+  EvalTrial,
   EventType,
   Invocation,
   InvocationStatus,
@@ -56,6 +58,37 @@ function clampData(data: unknown): string | null {
   if (s.length <= MAX_EVENT_DATA) return s;
   return JSON.stringify({ truncated: true, preview: s.slice(0, MAX_EVENT_DATA) });
 }
+
+const toEvalRun = (r: Row): EvalRun => ({
+  id: r.id as string,
+  role: r.role as EvalRun["role"],
+  models: parse(r.models, []),
+  k: r.k as number,
+  maxUsd: r.max_usd as number,
+  status: r.status as EvalRun["status"],
+  createdAt: r.created_at as number,
+  finishedAt: r.finished_at as number | null,
+  error: r.error as string | null,
+});
+const toEvalTrial = (r: Row): EvalTrial => ({
+  evalRunId: r.eval_run_id as string,
+  caseId: r.case_id as string,
+  modelId: r.model_id as string,
+  trial: r.trial as number,
+  cacheKey: r.cache_key as string,
+  harness: r.harness as string,
+  status: r.status as EvalTrial["status"],
+  output: parse(r.output_json, null),
+  pass: r.pass === null ? null : r.pass === 1,
+  score: r.score as number | null,
+  details: parse(r.details_json, {}),
+  costUsd: r.cost_usd as number,
+  costEquivUsd: r.cost_equiv_usd as number,
+  tokensIn: r.tokens_in as number,
+  tokensOut: r.tokens_out as number,
+  durationMs: r.duration_ms as number,
+  createdAt: r.created_at as number,
+});
 
 const toRepo = (r: Row): Repo => ({
   id: r.id as string,
@@ -265,6 +298,135 @@ export class Store {
           .query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
           .run(m.version, m.name, Date.now());
       })();
+    }
+  }
+
+  createEvalRun(input: Pick<EvalRun, "role" | "models" | "k" | "maxUsd">, trials: EvalTrial[]): EvalRun {
+    const run: EvalRun = {
+      ...input,
+      id: newId("eval-"),
+      status: "queued",
+      createdAt: Date.now(),
+      finishedAt: null,
+      error: null,
+    };
+    this.db.transaction(() => {
+      this.db
+        .query("INSERT INTO eval_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(
+          run.id,
+          run.role,
+          JSON.stringify(run.models),
+          run.k,
+          run.maxUsd,
+          run.status,
+          run.createdAt,
+          null,
+          null,
+        );
+      for (const trial of trials) this.recordEvalTrial({ ...trial, evalRunId: run.id });
+    })();
+    return run;
+  }
+
+  updateEvalRun(id: string, status: EvalRun["status"], error: string | null = null): void {
+    const finished = status === "queued" || status === "running" ? null : Date.now();
+    this.db
+      .query("UPDATE eval_runs SET status = ?, finished_at = ?, error = ? WHERE id = ?")
+      .run(status, finished, error, id);
+  }
+
+  getEvalRun(id: string): EvalRun | null {
+    const row = this.db.query("SELECT * FROM eval_runs WHERE id = ?").get(id) as Row | null;
+    return row ? toEvalRun(row) : null;
+  }
+
+  listEvalRuns(): EvalRun[] {
+    return (this.db.query("SELECT * FROM eval_runs ORDER BY created_at DESC, id DESC").all() as Row[]).map(
+      toEvalRun,
+    );
+  }
+
+  recordEvalTrial(t: EvalTrial): void {
+    this.db
+      .query(`INSERT INTO eval_trials VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(eval_run_id, case_id, model_id, trial) DO UPDATE SET
+      cache_key=excluded.cache_key, harness=excluded.harness, status=excluded.status,
+      output_json=excluded.output_json, pass=excluded.pass, score=excluded.score, details_json=excluded.details_json,
+      cost_usd=excluded.cost_usd, cost_equiv_usd=excluded.cost_equiv_usd, tokens_in=excluded.tokens_in,
+      tokens_out=excluded.tokens_out, duration_ms=excluded.duration_ms, created_at=excluded.created_at`)
+      .run(
+        t.evalRunId,
+        t.caseId,
+        t.modelId,
+        t.trial,
+        t.cacheKey,
+        t.harness,
+        t.status,
+        json(t.output),
+        t.pass === null ? null : Number(t.pass),
+        t.score,
+        JSON.stringify(t.details),
+        t.costUsd,
+        t.costEquivUsd,
+        t.tokensIn,
+        t.tokensOut,
+        t.durationMs,
+        t.createdAt,
+      );
+  }
+
+  listEvalTrials(id: string): EvalTrial[] {
+    return (
+      this.db.query("SELECT * FROM eval_trials WHERE eval_run_id = ? ORDER BY rowid").all(id) as Row[]
+    ).map(toEvalTrial);
+  }
+
+  cachedEvalTrials(key: string): EvalTrial[] {
+    return (
+      this.db
+        .query(
+          "SELECT * FROM eval_trials WHERE cache_key = ? AND status = 'ok' ORDER BY created_at DESC, rowid DESC",
+        )
+        .all(key) as Row[]
+    ).map(toEvalTrial);
+  }
+
+  evalSpend(id: string): number {
+    return (
+      this.db
+        .query("SELECT COALESCE(SUM(cost_usd), 0) AS spend FROM eval_trials WHERE eval_run_id = ?")
+        .get(id) as { spend: number }
+    ).spend;
+  }
+
+  interruptEval(id: string, reason: string): void {
+    this.db.transaction(() => {
+      for (const trial of this.listEvalTrials(id)) {
+        if (trial.status === "queued" || trial.status === "running")
+          this.recordEvalTrial({
+            ...trial,
+            status: trial.status === "running" ? "error" : "skipped",
+            pass: trial.status === "running" ? false : null,
+            score: trial.status === "running" ? 0 : null,
+            details: {
+              ...trial.details,
+              interrupted: trial.status === "running",
+              reason: trial.status === "running" ? `${reason}; final usage unknown` : reason,
+            },
+          });
+      }
+      this.updateEvalRun(id, "failed", reason);
+    })();
+  }
+
+  recoverEvals(): void {
+    for (const run of this.listEvalRuns()) {
+      if (run.status === "queued" || run.status === "running")
+        this.interruptEval(
+          run.id,
+          "interrupted by daemon restart; submit a new eval to reuse completed trials",
+        );
     }
   }
 
@@ -778,7 +940,12 @@ export class Store {
     const chat = this.db
       .query("SELECT COALESCE(SUM(cost_usd),0) AS s FROM chat_calls WHERE provider = ? AND started_at >= ?")
       .get(provider, since) as Row;
-    return (r.s as number) + (chat.s as number);
+    const evals = this.db
+      .query(
+        "SELECT COALESCE(SUM(cost_usd),0) AS s FROM eval_trials WHERE json_extract(details_json, '$.provider') = ? AND created_at >= ?",
+      )
+      .get(provider, since) as Row;
+    return (r.s as number) + (chat.s as number) + (evals.s as number);
   }
 
   providerSpendBetween(provider: string, since: number, before: number): number {

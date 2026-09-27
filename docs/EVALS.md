@@ -26,7 +26,7 @@ evals/<role>/*.json ──► runner ──► role fn (same prompts/schemas) �
    (cases + gold)         │                                              │
                           ├── cache (model, adapter, prompt hash, input hash, params)
                           ▼
-                     grader (pure) ──► eval_results (SQLite) ──► stats (CIs, paired tests)
+                     grader (pure) ──► eval_runs / eval_trials (SQLite) ──► stats (CIs, paired tests)
                                                                      │
                                          policy generator (pure) ◄───┘
                                                   │
@@ -66,8 +66,13 @@ Implement cases run in throwaway worktrees at the case's base commit with hidden
 only for grading (the same isolation as the holdout stage).
 
 ## Delivery plan
-1. **Framework** (factory run): runner, cache, graders for triage/review/verify, stats, store
-   migration, `limitless eval run|report`, UI "Evals" matrix.
+1. **Framework** (partially delivered): triage case validation, daemon runner with shared tracker and
+   harness selection, pinned bare-repo inputs, persistent trials/cache, deterministic triage grader,
+   Wilson intervals and seeded paired bootstrap, migration 6, HTTP API and
+   `limitless eval run|report` are implemented and covered with fake harness/local repo tests.
+   See [operations](OPERATIONS.md#triage-evaluations) for commands and metric/accounting semantics.
+   **Pending:** review and verify graders, other role graders, and the UI "Evals" matrix. Policy
+   generation and real-model sweeps remain follow-up work; this does not complete all of step 1.
 2. **Agentic evals** (factory run): implement and holdout cases in worktrees; early stopping.
 3. **Datasets** (orchestrator-curated, factory-assisted): gold labels are written or checked by the
    orchestrator, never by a candidate model alone.

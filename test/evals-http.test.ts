@@ -1,0 +1,111 @@
+import { expect, test } from "bun:test";
+import type { Server } from "bun";
+import type { EvalReport } from "../src/evals/stats.ts";
+import { createHttpRoutes } from "../src/server/http.ts";
+import { answer, deferred, evalFixture } from "./evals-support.ts";
+import { type Route, requestWithParams } from "./mcp-support.ts";
+
+const server = {} as Server<undefined>;
+test("API persists immediately, runs in background, lists and reports trials and partial metrics", async () => {
+  const f = await evalFixture();
+  const release = deferred<void>();
+  try {
+    const entered = deferred<void>();
+    f.respond(async () => {
+      entered.resolve();
+      await release.promise;
+      return { structured: answer };
+    });
+    const routes = createHttpRoutes(f.factory);
+    const collection = routes["/api/evals"] as { POST: Route; GET: Route };
+    const get = routes["/api/evals/:id"] as Route;
+    const res = await collection.POST(
+      requestWithParams("http://localhost:7400/api/evals", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          role: "triage",
+          models: ["candidate-a"],
+          caseIds: ["a"],
+          k: 2,
+          maxUsd: 2,
+          cache: false,
+        }),
+      }),
+      server,
+    );
+    expect(res.status).toBe(202);
+    const { id } = (await res.json()) as { id: string };
+    await entered.promise;
+    const request = requestWithParams(`http://localhost:7400/api/evals/${id}`, {}, { id });
+    const pending = (await (await get(request, server)).json()) as EvalReport;
+    expect(pending.run).toMatchObject({ status: "running", k: 2, maxUsd: 2 });
+    expect(pending.summaries[0]).toMatchObject({ pending: 2, passRate: null, evaluatedTrials: 0 });
+    expect(
+      await (await collection.GET(requestWithParams("http://localhost:7400/api/evals"), server)).json(),
+    ).toHaveLength(1);
+    release.resolve();
+    await f.factory.evals.wait(id);
+    const done = (await (await get(request, server)).json()) as EvalReport;
+    expect(done.run.status).toBe("completed");
+    expect(done.summaries[0]).toMatchObject({
+      cases: 1,
+      evaluatedTrials: 2,
+      passRate: 1,
+      comparison: { bestModel: "candidate-a", pairedCases: 1, resamples: 10000 },
+    });
+    expect(done.trials).toHaveLength(2);
+    expect(
+      (await get(requestWithParams("http://localhost:7400/api/evals/missing", {}, { id: "missing" }), server))
+        .status,
+    ).toBe(404);
+  } finally {
+    release.resolve();
+    await f.close();
+  }
+});
+
+test("eval API shares JSON, Origin and Cloudflare guards and validates before persistence", async () => {
+  const f = await evalFixture();
+  try {
+    const routes = createHttpRoutes(f.factory);
+    const post = (routes["/api/evals"] as { POST: Route }).POST;
+    const request = (input: unknown, headers: Record<string, string> = {}) =>
+      requestWithParams("http://localhost:7400/api/evals", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: typeof input === "string" ? input : JSON.stringify(input),
+      });
+    const valid = { role: "triage", models: ["candidate-a"] };
+    for (const invalid of [
+      null,
+      "{",
+      {},
+      { ...valid, role: "review" },
+      { ...valid, models: ["unknown"] },
+      { ...valid, maxUsd: -1 },
+      { ...valid, caseIds: ["missing"] },
+    ])
+      expect((await post(request(invalid), server)).status).toBe(400);
+    expect((await post(request(valid, { origin: "https://external.invalid" }), server)).status).toBe(403);
+    expect((await post(request(valid, { "content-type": "" }), server)).status).toBe(415);
+    expect((await post(request(valid, { "cf-connecting-ip": "1.2.3.4" }), server)).status).toBe(403);
+    const get = routes["/api/evals/:id"] as Route;
+    expect(
+      (
+        await get(
+          requestWithParams(
+            "http://localhost:7400/api/evals/missing",
+            { headers: { "cf-connecting-ip": "1.2.3.4" } },
+            { id: "missing" },
+          ),
+          server,
+        )
+      ).status,
+    ).toBe(403);
+    expect(f.factory.store.listEvalRuns()).toHaveLength(0);
+    expect(f.calls).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
+});

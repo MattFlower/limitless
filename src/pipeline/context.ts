@@ -8,6 +8,7 @@ import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
+import { selectHarness } from "../harness/select.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../harness/types.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
@@ -219,8 +220,7 @@ export class RunContext {
         );
       }
       tried.push(target.modelId);
-      const useHttp = ["triage", "chat", "summarize"].includes(opts.role) && !!target.openai;
-      const harnessName = useHttp ? "llm" : target.harness;
+      const { harnessName, noTools } = selectHarness(opts.role, target, opts.noTools);
       const harness = harnesses[harnessName];
       if (!harness) throw new Error(`No harness registered for ${harnessName}`);
 
@@ -261,7 +261,7 @@ export class RunContext {
           timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUTS[opts.role],
           idleTimeoutMs: opts.idleTimeoutMs ?? 10 * 60_000,
           maxToolCalls: opts.maxToolCalls ?? (opts.mode === "edit" ? 400 : 150),
-          noTools: opts.noTools,
+          noTools,
           privateSession: opts.privateOutput || opts.privateSession,
           redactOutput: redact,
           signal: this.signal,
