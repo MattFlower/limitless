@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
+import { scratchEnv, validateScratch } from "./scratch.ts";
 import {
   type AgentEvent,
   type AgentResult,
@@ -211,6 +212,8 @@ function findKey(obj: unknown, key: string): unknown {
 
 export function buildCodexArgs(spec: AgentSpec): string[] {
   const t = spec.target;
+  if (spec.mode === "readonly" && spec.addDirs?.length)
+    throw new Error("Reading invocations cannot grant additional directories");
   const args = [
     "codex",
     "exec",
@@ -225,7 +228,7 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
   ];
   if (t.effort) args.push("-c", `model_reasoning_effort="${t.effort}"`);
   if (spec.privateSession) args.push("--ephemeral");
-  if (spec.privateSession || spec.noTools) args.push("--ignore-user-config");
+  if (spec.privateSession || spec.noTools || spec.mode === "readonly") args.push("--ignore-user-config");
   if (spec.noTools) {
     // A read-only sandbox still permits reads, including through MCP tools such as node_repl.
     // Disable MCP discovery as well as built-in file access; retain rollouts unless privateSession
@@ -250,7 +253,31 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
       'web_search="disabled"',
     );
   }
-  if (spec.mode === "readonly") {
+  if (spec.mode === "readonly" && !spec.noTools) {
+    const scratch = validateScratch(spec);
+    // Named filesystem profiles are supported by Codex 0.154.0. Legacy read-only mode
+    // ignores sandbox_workspace_write roots, and workspace-write grants cwd implicitly.
+    args.push(
+      "--strict-config",
+      "--ignore-rules",
+      "-c",
+      'default_permissions="limitless-reader"',
+      "-c",
+      `permissions={limitless-reader={filesystem={"/"="read",${JSON.stringify(scratch)}="write"},network={enabled=false}}}`,
+      "-c",
+      "orchestrator.mcp.enabled=false",
+      "--disable",
+      "apps",
+      "--disable",
+      "plugins",
+      "--disable",
+      "multi_agent",
+      "--disable",
+      "code_mode",
+      "-c",
+      'web_search="disabled"',
+    );
+  } else if (spec.mode === "readonly") {
     args.push("-s", "read-only");
   } else {
     args.push("-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true");
@@ -267,7 +294,7 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
   return args;
 }
 
-export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
+export async function runCodex(spec: AgentSpec, processRunner = runProcess): Promise<AgentResult> {
   const t = spec.target;
   const args = buildCodexArgs(spec);
   const prompt = spec.systemAppend ? `${spec.systemAppend}\n\n---\n\n${spec.prompt}` : spec.prompt;
@@ -289,10 +316,10 @@ export async function runCodex(spec: AgentSpec): Promise<AgentResult> {
   });
 
   appendFileSync(spec.logPath, `# codex ${t.model} ${new Date().toISOString()}\n`);
-  const proc = await runProcess({
+  const proc = await processRunner({
     cmd: args,
     cwd: spec.cwd,
-    env: agentEnv(),
+    env: agentEnv(scratchEnv(spec)),
     stdin: prompt,
     signal,
     timeoutMs: spec.timeoutMs,

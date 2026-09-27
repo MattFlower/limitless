@@ -18,8 +18,17 @@ import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
+import { discardChanges } from "../git/repos.ts";
+import { withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
-import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../harness/types.ts";
+import type {
+  AgentEvent,
+  AgentResult,
+  AgentSpec,
+  CommandResult,
+  Harness,
+  ModelTarget,
+} from "../harness/types.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
@@ -81,7 +90,10 @@ export interface RunState {
   lastAudit?: AuditFinding[];
   lastReview?: Review & { modelId: string };
   lastVerify?: (Verify & { modelId: string }) | null;
-  verifyResults?: (Verify & { modelId: string; round: number })[];
+  verifyResults?: (Verify & { modelId: string; round: number; attempt?: number })[];
+  /** Reserve the retry before invoking; a crash must not grant another attempt. */
+  environmentRetryRound?: number;
+  terminalReason?: string;
   toolCommands: string[];
 }
 
@@ -125,6 +137,7 @@ export interface InvokeOptions {
 }
 
 export interface InvokeOutcome {
+  commandResults: CommandResult[];
   result: AgentResult;
   target: ModelTarget;
   invocation: Invocation;
@@ -262,13 +275,15 @@ export class RunContext {
         skipped: decision.skipped,
       });
       let result: AgentResult;
+      const commandResults: CommandResult[] = [];
+      const commands = new Map<string, string>();
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
       const redact =
         opts.redactHoldout && this.state.holdout
           ? (value: string) => redactHoldoutText(value, this.state.holdout as Holdout)
           : undefined;
       try {
-        result = await harness({
+        const spec: AgentSpec = {
           cwd: opts.isolatedCwd ? (privateDir as string) : (this.state.worktreePath ?? this.runDir),
           prompt: opts.prompt,
           systemAppend: [opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n"),
@@ -286,8 +301,22 @@ export class RunContext {
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
           onEvent: opts.privateOutput
             ? () => {}
-            : (ev) => this.onAgentEvent(invocation.id, ev, opts.role, redact),
-        });
+            : (ev) => {
+                if (opts.role === "verify") {
+                  if (ev.type === "tool_call" && ["Bash", "shell"].includes(ev.name)) {
+                    const command = (ev.input as { command?: unknown })?.command;
+                    if (typeof command === "string") commands.set(ev.id, command);
+                  } else if (ev.type === "tool_result") {
+                    const command = commands.get(ev.id);
+                    if (command) commandResults.push({ command, output: ev.output, isError: ev.isError });
+                  }
+                }
+                this.onAgentEvent(invocation.id, ev, opts.role, redact);
+              },
+        };
+        if (opts.mode === "readonly" && !noTools) {
+          result = await withScratch(spec.cwd, (scratchDir) => harness({ ...spec, scratchDir }));
+        } else result = await harness(spec);
       } catch (e) {
         result = {
           status: "error",
@@ -304,6 +333,8 @@ export class RunContext {
       } finally {
         release();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
+        if ((opts.role === "review" || opts.role === "verify") && this.state.worktreePath)
+          await discardChanges(this.state.worktreePath);
       }
       if (opts.schema && result.status === "ok" && result.structured !== null) {
         const parsed = opts.schema.safeParse(result.structured);
@@ -387,7 +418,7 @@ export class RunContext {
         );
         continue;
       }
-      return { result, target, invocation: updated };
+      return { result, target, invocation: updated, commandResults };
     }
     throw new NoCapacityError(
       opts.privateOutput

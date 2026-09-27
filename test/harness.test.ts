@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ClaudeStreamParser } from "../src/harness/claude.ts";
 import { buildCodexArgs, CodexStreamParser, parseRateLimits } from "../src/harness/codex.ts";
+import { withScratch } from "../src/harness/scratch.ts";
 import {
   type AgentEvent,
   type AgentSpec,
@@ -70,7 +71,7 @@ describe("ClaudeStreamParser", () => {
 });
 
 describe("CodexStreamParser", () => {
-  test("disables default tools for a blind structured call", () => {
+  test("disables default tools for a blind structured call", async () => {
     const spec: AgentSpec = {
       cwd: "/tmp/isolated",
       prompt: "Write scenarios",
@@ -100,7 +101,11 @@ describe("CodexStreamParser", () => {
     expect(args).toContain("--ignore-user-config");
     expect(args).toContain("--ephemeral");
     expect(args).toContain("read-only");
-    expect(buildCodexArgs({ ...spec, noTools: false })).not.toContain("shell_tool");
+    await withScratch(import.meta.dir, async (scratchDir) => {
+      expect(buildCodexArgs({ ...spec, cwd: import.meta.dir, scratchDir, noTools: false })).not.toContain(
+        "shell_tool",
+      );
+    });
 
     // Smoke calls are not private: they must still isolate tools without losing quota rollouts.
     const smokeArgs = buildCodexArgs({ ...spec, privateSession: false });
@@ -290,43 +295,46 @@ test("a no-tools Claude call returning StructuredOutput is not stopped by a zero
 
 test("CLI arguments transmit the selected effort verbatim and reject backend Claude transport", async () => {
   const { buildClaudeArgs } = await import("../src/harness/claude.ts");
-  const spec: AgentSpec = {
-    cwd: "/tmp",
-    prompt: "test",
-    mode: "readonly",
-    timeoutMs: 1000,
-    idleTimeoutMs: 1000,
-    maxToolCalls: 0,
-    signal: new AbortController().signal,
-    logPath: "/tmp/unused",
-    onEvent: () => {},
-    target: {
-      modelId: "claude/opus",
-      model: "opus",
-      provider: "claude",
-      vendor: "anthropic",
-      tier: 5,
-      billing: "subscription",
-      harness: "claude",
-    },
-  };
-  // Whether a value is supported is decided by the catalog; the harness passes the selection through.
-  for (const effort of ["none", "low", "high", "max", undefined] as const) {
-    spec.target.effort = effort;
-    const args = buildClaudeArgs(spec, "session");
-    expect(args.filter((a) => a === "--effort")).toHaveLength(effort === undefined ? 0 : 1);
-    if (effort) expect(args[args.indexOf("--effort") + 1]).toBe(effort);
-  }
-  for (const effort of ["none", "low", "high", undefined] as const) {
-    spec.target.effort = effort;
-    const args = buildCodexArgs(spec);
-    expect(args.filter((a) => a.startsWith("model_reasoning_effort="))).toEqual(
-      effort ? [`model_reasoning_effort="${effort}"`] : [],
-    );
-  }
-  spec.target.backend = { baseUrl: "http://unused", authToken: "" };
-  spec.target.effort = undefined;
-  expect(buildClaudeArgs(spec, "session")).not.toContain("--effort");
-  spec.target.effort = "high";
-  expect(() => buildClaudeArgs(spec, "session")).toThrow("cannot set effort for the claude backend");
+  await withScratch(import.meta.dir, async (scratchDir) => {
+    const spec: AgentSpec = {
+      cwd: import.meta.dir,
+      scratchDir,
+      prompt: "test",
+      mode: "readonly",
+      timeoutMs: 1000,
+      idleTimeoutMs: 1000,
+      maxToolCalls: 0,
+      signal: new AbortController().signal,
+      logPath: "/tmp/unused",
+      onEvent: () => {},
+      target: {
+        modelId: "claude/opus",
+        model: "opus",
+        provider: "claude",
+        vendor: "anthropic",
+        tier: 5,
+        billing: "subscription",
+        harness: "claude",
+      },
+    };
+    // Whether a value is supported is decided by the catalog; the harness passes the selection through.
+    for (const effort of ["none", "low", "high", "max", undefined] as const) {
+      spec.target.effort = effort;
+      const args = buildClaudeArgs(spec, "session");
+      expect(args.filter((a) => a === "--effort")).toHaveLength(effort === undefined ? 0 : 1);
+      if (effort) expect(args[args.indexOf("--effort") + 1]).toBe(effort);
+    }
+    for (const effort of ["none", "low", "high", undefined] as const) {
+      spec.target.effort = effort;
+      const args = buildCodexArgs(spec);
+      expect(args.filter((a) => a.startsWith("model_reasoning_effort="))).toEqual(
+        effort ? [`model_reasoning_effort="${effort}"`] : [],
+      );
+    }
+    spec.target.backend = { baseUrl: "http://unused", authToken: "" };
+    spec.target.effort = undefined;
+    expect(buildClaudeArgs(spec, "session")).not.toContain("--effort");
+    spec.target.effort = "high";
+    expect(() => buildClaudeArgs(spec, "session")).toThrow("cannot set effort for the claude backend");
+  });
 });

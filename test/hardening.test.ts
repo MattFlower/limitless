@@ -1,6 +1,6 @@
 // Regression tests for defects found by the cross-vendor (Codex) review of the M1 core.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -43,6 +43,34 @@ describe("process handling", () => {
     });
     await Bun.sleep(2500);
     expect(await Bun.file(marker).exists()).toBe(false);
+  });
+
+  test("a descendant ignoring SIGTERM cannot recreate removed scratch after return", async () => {
+    const scratch = join(dir, "scratch");
+    const child = join(dir, "child.js");
+    const parent = join(dir, "parent.js");
+    writeFileSync(
+      child,
+      `const fs = require("node:fs"); process.on("SIGTERM", () => {});
+      setInterval(() => { fs.mkdirSync(${JSON.stringify(scratch)}, {recursive:true}); }, 5);`,
+    );
+    writeFileSync(
+      parent,
+      `const {spawn} = require("node:child_process");
+      const fs = require("node:fs");
+      spawn(process.execPath, [${JSON.stringify(child)}], {stdio:"ignore"}).unref();
+      const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(scratch)})) { clearInterval(timer); process.exit(0); } }, 5);`,
+    );
+    await runProcess({
+      cmd: [process.execPath, parent],
+      cwd: dir,
+      env: process.env as Record<string, string>,
+      timeoutMs: 3000,
+    });
+    expect(existsSync(scratch)).toBe(true);
+    rmSync(scratch, { recursive: true, force: true });
+    await Bun.sleep(100);
+    expect(existsSync(scratch)).toBe(false);
   });
 
   test("sh refuses to return truncated output", async () => {

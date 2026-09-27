@@ -7,6 +7,8 @@ import { effortTransportError, formatTarget, parseTarget, resolveTarget } from "
 export interface RouteConstraints {
   /** Skip models from this vendor (cross-vendor review). Falls back to it only if nothing else is available. */
   avoidVendor?: string;
+  /** Exclude model identities regardless of reasoning effort. */
+  excludeModels?: string[];
   /** Only consider models at or above this tier (escalation). */
   minTier?: number;
   /** Resolved targets to skip (already failed in this stage). */
@@ -166,7 +168,7 @@ export class Router {
         const { model: m, effort, targetId: id } = resolved;
         if (seen.has(id)) continue;
         seen.add(id);
-        if (excluded.has(id)) {
+        if (excluded.has(id) || c.excludeModels?.includes(m.id)) {
           skipped.push({ modelId: id, reason: "already tried" });
           continue;
         }

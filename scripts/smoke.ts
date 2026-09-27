@@ -6,6 +6,7 @@ import { loadConfig } from "../src/config.ts";
 import type { QuotaWindow } from "../src/core/types.ts";
 import { runClaude } from "../src/harness/claude.ts";
 import { runCodex } from "../src/harness/codex.ts";
+import { withScratch } from "../src/harness/scratch.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import { resolveTarget } from "../src/router/targets.ts";
@@ -161,8 +162,9 @@ function status(result: AgentResult): CheckResult {
 export async function liveCheck(
   harness: Harness,
   target: ModelTarget,
-  kind: "structured" | "noTools" | "edit" | "quota",
+  kind: "structured" | "noTools" | "edit" | "quota" | "verify",
 ): Promise<CheckResult> {
+  if (kind === "verify") return verifyLiveCheck(harness, target);
   const cwd = mkdtempSync(join(tmpdir(), "limitless-smoke-"));
   try {
     await sh(["git", "init", "-q"], { cwd, timeoutMs: 5000 });
@@ -176,20 +178,23 @@ export async function liveCheck(
       quota: "Reply with the single word ready.",
     };
     const events: AgentEvent[] = [];
-    const result = await harness({
-      cwd,
-      prompt: prompts[kind],
-      target,
-      mode: kind === "edit" ? "edit" : "readonly",
-      ...(kind === "structured" ? { jsonSchema: schema } : {}),
-      ...(kind === "noTools" ? { noTools: true } : {}),
-      timeoutMs: 60_000,
-      idleTimeoutMs: 25_000,
-      maxToolCalls: 8,
-      signal: new AbortController().signal,
-      logPath: join(cwd, "stream.log"),
-      onEvent: (event) => events.push(event),
-    });
+    const result = await withScratch(cwd, (scratchDir) =>
+      harness({
+        scratchDir,
+        cwd,
+        prompt: prompts[kind],
+        target,
+        mode: kind === "edit" ? "edit" : "readonly",
+        ...(kind === "structured" ? { jsonSchema: schema } : {}),
+        ...(kind === "noTools" ? { noTools: true } : {}),
+        timeoutMs: 60_000,
+        idleTimeoutMs: 25_000,
+        maxToolCalls: 8,
+        signal: new AbortController().signal,
+        logPath: join(cwd, "stream.log"),
+        onEvent: (event) => events.push(event),
+      }),
+    );
     if (kind === "noTools" && readFileSync(join(cwd, "stream.log"), "utf8").includes(token)) {
       return { status: "fail", reason: "local file token appeared in raw stream" };
     }
@@ -222,6 +227,109 @@ export async function liveCheck(
     return quotaCheck(result, events, target.provider);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+/** A command result, paired with the actual probe command, is required; prose never counts. */
+export function verifyProbeEvidence(events: AgentEvent[], command: string, token: string): boolean {
+  const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
+  const commands = [
+    command,
+    ...["/bin/zsh", "/bin/bash", "/bin/sh"].flatMap((shell) =>
+      ["-lc", "-c"].flatMap((flag) => [
+        `${shell} ${flag} ${quote(command)}`,
+        `${shell} ${flag} ${JSON.stringify(command)}`,
+      ]),
+    ),
+  ];
+  const ids = new Set(
+    events
+      .filter(
+        (e) =>
+          e.type === "tool_call" &&
+          ["shell", "Bash"].includes(e.name) &&
+          typeof (e.input as { command?: unknown })?.command === "string" &&
+          commands.includes(String((e.input as { command: string }).command).trim()),
+      )
+      .flatMap((e) => (e.type === "tool_call" ? [e.id] : [])),
+  );
+  return events.some(
+    (e) =>
+      e.type === "tool_result" &&
+      ids.has(e.id) &&
+      !e.isError &&
+      e.output.includes(`${token}:temp-created-read-deleted`) &&
+      e.output.includes(`${token}:worktree-write-denied`),
+  );
+}
+
+export async function verifyLiveCheck(harness: Harness, target: ModelTarget): Promise<CheckResult> {
+  const root = mkdtempSync(join(tmpdir(), "limitless-smoke-verify-"));
+  const cwd = join(root, "worktree");
+  try {
+    await sh(["git", "init", "-q", cwd], { cwd: root });
+    const token = crypto.randomUUID();
+    const probe = join(cwd, "verify-probe.py");
+    writeFileSync(
+      probe,
+      `import os, errno, pathlib
+scratch = pathlib.Path(os.environ["TMPDIR"])
+assert str(scratch) == os.environ["TMP"] == os.environ["TEMP"]
+f = scratch / "probe-file"
+f.write_text("${token}")
+assert f.read_text() == "${token}"
+f.unlink()
+assert not f.exists()
+print("${token}:temp-created-read-deleted", flush=True)
+try:
+    pathlib.Path("forbidden-write").write_text("write succeeded")
+except OSError as e:
+    if e.errno not in (errno.EPERM, errno.EACCES, errno.EROFS): raise
+    print("${token}:worktree-write-denied", flush=True)
+else:
+    raise RuntimeError("worktree write succeeded")
+`,
+    );
+    await sh(["git", "add", "."], { cwd });
+    await sh(["git", "-c", "user.name=smoke", "-c", "user.email=smoke@localhost", "commit", "-qm", "probe"], {
+      cwd,
+    });
+    const command = `python3 '${probe.replaceAll("'", "'\\''")}'`;
+    const events: AgentEvent[] = [];
+    return await withScratch(cwd, async (scratchDir) => {
+      const result = await harness({
+        cwd,
+        scratchDir,
+        target,
+        mode: "readonly",
+        prompt: `Verify the sandbox by executing exactly this Bash command:\n${command}\nThe probe intentionally attempts a worktree write which must be denied. Do not edit files or replace the command with a claim. Report the command output.`,
+        timeoutMs: 90_000,
+        idleTimeoutMs: 30_000,
+        maxToolCalls: 8,
+        signal: new AbortController().signal,
+        logPath: join(root, "stream.log"),
+        onEvent: (event) => events.push(event),
+      });
+      // Inspect before scratch removal or worktree cleanup; cleanup cannot conceal a successful write.
+      const dirty = await sh(["git", "status", "--porcelain", "--untracked-files=all"], { cwd });
+      if (dirty.stdout.trim()) return { status: "fail", reason: `worktree changed: ${dirty.stdout.trim()}` };
+      if (result.status !== "ok") return status(result);
+      return verifyProbeEvidence(events, command, token)
+        ? {
+            status: "pass",
+            reason: `${target.model}: observed temp create/read/delete and denied worktree write`,
+          }
+        : {
+            status: "fail",
+            reason: `missing successful probe command evidence (temp operations and denied worktree write): ${events
+              .filter((event) => event.type === "tool_result")
+              .map((event) => (event.type === "tool_result" ? event.output : ""))
+              .join("; ")
+              .slice(0, 2000)}`,
+          };
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 }
 
@@ -270,7 +378,7 @@ export async function main(): Promise<number> {
     if (!provider) throw new Error(`missing provider ${id}`);
     let target = targetFor(provider, cheapestModel(id));
     const harness = id === "claude" ? runClaude : runCodex;
-    for (const kind of ["structured", "noTools", "edit", "quota"] as const) {
+    for (const kind of ["structured", "noTools", "edit", "quota", "verify"] as const) {
       checks.push({
         name: `${id} ${kind}`,
         run: async () => {

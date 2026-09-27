@@ -163,7 +163,7 @@ export function redactHoldoutText(value: string, holdout: Holdout): string {
 }
 
 export function formatVerifyFeedback(verify: Verify, spec: Spec | null, holdout?: Holdout): string {
-  const unmet = verify.criteria.filter((c) => c.status !== "met");
+  const unmet = verify.criteria.filter((c) => c.status !== "met" && c.status !== "blocked");
   if (!unmet.length) return "";
   const text = (id: string) => spec?.acceptance_criteria.find((a) => a.id === id)?.criterion ?? "";
   return `### Checks not met\n${unmet
@@ -225,7 +225,7 @@ ${warnings}
 - Maintainability: clarity and consistency with the codebase.
 
 Severity: blocker = must fix (bug, unmet requirement, security issue, test gaming); major = should fix before merge; minor/nit = optional polish.
-Do not modify files. You may run read-only commands and the test suite.
+Do not modify files. You may run read-only commands and the test suite. Create temporary fixtures and redirect supported build/test outputs only under TMPDIR (also TMP and TEMP); the worktree is read-only.
 Return verdict "request_changes" if there is any blocker or major finding, otherwise "approve".`;
 }
 
@@ -246,6 +246,6 @@ ${input.spec.acceptance_criteria.map((a) => `- **${a.id}** ${a.criterion}\n  - h
 # Blind holdout scenarios
 ${input.holdout.scenarios.map((s) => `- **${s.id}** ${s.description}\n  - steps: ${s.steps}\n  - expected: ${s.expected}`).join("\n")}
 
-The change is \`git diff ${input.baseSha}..HEAD\`. Do not modify repository files (scratch files under /tmp are fine).
-For each acceptance criterion and holdout scenario return met / unmet / unclear with concrete evidence (the command you ran and what you observed, or file:line references). For unmet holdouts, describe the observed failure in evidence without repeating the scenario text or private inputs. overall = "pass" only if every entry is met.`;
+The change is \`git diff ${input.baseSha}..HEAD\`. Do not modify repository files (create temporary fixtures and redirect supported build/test outputs under TMPDIR only, also supplied as TMP and TEMP).
+For each acceptance criterion and holdout scenario return met / unmet / unclear / blocked with concrete evidence (the command you ran and what you observed, or file:line references). Use blocked only when an attempted check cannot execute because of an environmental permission or sandbox error; include the attempted command and observed error in nonempty evidence. Expected permission-denial tests and genuine assertion failures are not environment blocks. For unmet holdouts, describe the observed failure in evidence without repeating the scenario text or private inputs. overall = "pass" only if every entry is met.`;
 }

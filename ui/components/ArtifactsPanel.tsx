@@ -41,7 +41,7 @@ interface ReviewJson {
 }
 interface VerifyCriterionJson {
   id: string;
-  status: "met" | "unmet" | "unclear";
+  status: "met" | "unmet" | "unclear" | "blocked";
   evidence: string;
 }
 interface VerifyJson {
@@ -49,6 +49,7 @@ interface VerifyJson {
   overall: "pass" | "fail";
   notes: string;
   model?: string;
+  modelId?: string;
 }
 
 function isGateResult(v: unknown): v is GateResultJson {
@@ -191,16 +192,16 @@ const ReviewArtifact: Component<{ data: ReviewJson }> = (props) => (
   </div>
 );
 
-const VerifyArtifact: Component<{ data: VerifyJson }> = (props) => (
+export const VerifyArtifact: Component<{ data: VerifyJson }> = (props) => (
   <div class="stack" style={{ gap: "12px" }}>
     <div class="card card-pad" style={{ display: "flex", "align-items": "center", gap: "10px" }}>
       <span class={`pill ${props.data.overall === "pass" ? "pill-succeeded" : "pill-failed"}`}>
         {props.data.overall}
       </span>
       <span class="text-dim">{props.data.notes}</span>
-      <Show when={props.data.model}>
+      <Show when={props.data.modelId ?? props.data.model}>
         <span class="text-faint mono" style={{ "margin-left": "auto" }}>
-          {props.data.model}
+          {props.data.modelId ?? props.data.model}
         </span>
       </Show>
     </div>
@@ -218,7 +219,9 @@ const VerifyArtifact: Component<{ data: VerifyJson }> = (props) => (
             <tr>
               <td class="mono">{c.id}</td>
               <td>
-                <span class={`badge badge-${c.status}`}>{c.status}</span>
+                <span class={`badge badge-${c.status}`}>
+                  {c.status === "blocked" ? "🚧 blocked" : c.status}
+                </span>
               </td>
               <td class="text-dim">{c.evidence}</td>
             </tr>

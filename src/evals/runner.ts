@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { EvalRun, EvalTrial } from "../core/types.ts";
 import { createEvalWorktree, type EvalLabels, pinnedTree } from "../git/repos.ts";
+import { withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
 import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
 import type { EngineDeps } from "../pipeline/context.ts";
@@ -277,25 +278,29 @@ export class EvalRunner {
       store.recordEvalTrial({ ...trial, status: "running" });
       let result: AgentResult;
       try {
-        result = await harness({
-          cwd,
-          prompt,
-          systemAppend: FACTORY_PREAMBLE,
-          target,
-          mode: "readonly",
-          noTools,
-          jsonSchema,
-          schema,
-          timeoutMs,
-          privateSession: run.role === "verify",
-          idleTimeoutMs: 10 * 60_000,
-          maxToolCalls: 150,
-          signal,
-          logPath: join(directory, "trial.log"),
-          onEvent: (event) => {
-            if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
-          },
-        });
+        const logPath = join(directory, "trial.log");
+        const invoke = (scratchDir?: string) =>
+          harness({
+            scratchDir,
+            cwd,
+            prompt,
+            systemAppend: FACTORY_PREAMBLE,
+            target,
+            mode: "readonly",
+            noTools,
+            jsonSchema,
+            schema,
+            timeoutMs,
+            privateSession: run.role === "verify",
+            idleTimeoutMs: 10 * 60_000,
+            maxToolCalls: 150,
+            signal,
+            logPath,
+            onEvent: (event) => {
+              if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
+            },
+          });
+        result = noTools ? await invoke() : await withScratch(cwd, invoke);
       } catch (error) {
         result = {
           status: signal.aborted ? "cancelled" : "error",

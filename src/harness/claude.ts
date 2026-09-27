@@ -1,6 +1,7 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, realpathSync } from "node:fs";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
+import { scratchEnv, validateScratch } from "./scratch.ts";
 import {
   type AgentEvent,
   type AgentResult,
@@ -142,6 +143,8 @@ export class ClaudeStreamParser {
 
 export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
   const t = spec.target;
+  if (spec.mode === "readonly" && spec.addDirs?.length)
+    throw new Error("Reading invocations cannot grant additional directories");
   const args = [
     "claude",
     "-p",
@@ -150,12 +153,32 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
     "--verbose",
     "--model",
     t.model,
-    // Keep the operator's personal hooks/plugins out of factory runs; repo settings still apply.
+    // Readers must not inherit hooks, sandbox exclusions or permissions from project settings.
     "--setting-sources",
-    "project,local",
+    spec.mode === "readonly" ? "" : "project,local",
     "--permission-mode",
     "dontAsk",
   ];
+  if (spec.mode === "readonly" && !spec.noTools) {
+    const scratch = validateScratch(spec);
+    args.push(
+      "--strict-mcp-config",
+      "--mcp-config",
+      '{"mcpServers":{}}',
+      "--settings",
+      JSON.stringify({
+        sandbox: {
+          enabled: true,
+          failIfUnavailable: true,
+          autoAllowBashIfSandboxed: true,
+          allowUnsandboxedCommands: false,
+          excludedCommands: [],
+          filesystem: { allowWrite: [scratch], denyWrite: [realpathSync(spec.cwd)], disabled: false },
+        },
+        disableAllHooks: true,
+      }),
+    );
+  }
   if (spec.privateSession) args.push("--no-session-persistence");
   const denied = ["Bash(git push:*)", "Bash(gh pr merge:*)", "Bash(gh repo delete:*)", "Bash(rm -rf /*)"];
   if (spec.noTools) {
@@ -198,9 +221,11 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
   return args;
 }
 
-export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
+export async function runClaude(spec: AgentSpec, processRunner = runProcess): Promise<AgentResult> {
   const sessionId = crypto.randomUUID();
   const t = spec.target;
+  const args = buildClaudeArgs(spec, sessionId);
+  appendFileSync(spec.logPath, `# claude ${t.model} ${new Date().toISOString()}\n`);
   const envExtra: Record<string, string> = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
   if (t.backend) {
     envExtra.ANTHROPIC_BASE_URL = t.backend.baseUrl;
@@ -246,11 +271,10 @@ export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
     spec.onEvent(ev);
   });
 
-  appendFileSync(spec.logPath, `# claude ${t.model} ${new Date().toISOString()}\n`);
-  const proc = await runProcess({
-    cmd: buildClaudeArgs(spec, sessionId),
+  const proc = await processRunner({
+    cmd: args,
     cwd: spec.cwd,
-    env: agentEnv(envExtra),
+    env: agentEnv({ ...envExtra, ...scratchEnv(spec) }),
     stdin: spec.prompt,
     signal,
     timeoutMs: spec.timeoutMs,
@@ -263,7 +287,7 @@ export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
       appendFileSync(spec.logPath, `[stderr] ${spec.redactOutput?.(line) ?? line}\n`);
       spec.onEvent({ type: "stderr", text: line });
     },
-  });
+  }).finally(() => clearInterval(progressWatch));
 
   const cost = priceOf(parser.usage, t.price);
   const metered = t.billing === "metered";
@@ -281,7 +305,6 @@ export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
         : null,
   };
 
-  clearInterval(progressWatch);
   if (proc.cancelled && stuckReason) return { ...base, status: "stuck", error: stuckReason };
   if (proc.cancelled) return { ...base, status: "cancelled", error: "cancelled" };
   if (proc.timedOut) return { ...base, status: "timeout", error: `timed out after ${spec.timeoutMs}ms` };

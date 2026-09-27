@@ -1,0 +1,17 @@
+$ bun scripts/smoke.ts
+Check                  Status  Time     Detail
+---------------------  ------  -------  ------
+claude structured      PASS     2312ms  
+claude noTools         PASS     4053ms  
+claude edit            PASS     5898ms  
+claude quota           PASS     1355ms  
+claude verify          FAIL     7499ms  missing successful probe command evidence (temp operations and denied worktree write): Exit code 71 sandbox-exec: sandbox_apply: Operation not permitted
+codex structured       FAIL      140ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
+codex noTools          FAIL      125ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
+codex edit             FAIL      127ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
+codex quota            FAIL      141ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
+codex verify           FAIL      151ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
+mtplx structured       PASS     7744ms  
+twilight structured    PASS    14770ms  
+openrouter structured  PASS     5514ms  
+error: script "smoke" exited with code 1

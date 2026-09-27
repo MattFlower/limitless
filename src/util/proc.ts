@@ -160,8 +160,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       for (const t of timers) clearTimeout(t);
       if (idleTimer) clearInterval(idleTimer);
       opts.signal?.removeEventListener("abort", onAbort);
-      // Reap anything the child left running in its process group (servers, watchers).
-      killTree("SIGTERM");
+      // No descendants may keep writing after callers begin scratch/worktree cleanup.
+      killTree("SIGKILL");
       resolve({
         exitCode: code,
         signal: sig,

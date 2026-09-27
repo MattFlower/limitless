@@ -389,8 +389,8 @@ export interface EvalGrade {
       string,
       {
         gold: "met" | "unmet";
-        predictions: ("met" | "unmet" | "unclear")[];
-        predicted: "met" | "unmet" | "unclear" | "missing" | "duplicate";
+        predictions: ("met" | "unmet" | "unclear" | "blocked")[];
+        predicted: "met" | "unmet" | "unclear" | "blocked" | "missing" | "duplicate";
         match: boolean;
         falseAccept: boolean;
         falseReject: boolean;

@@ -30,8 +30,16 @@ export type AgentEvent =
   | { type: "stderr"; text: string }
   | { type: "status"; text: string };
 
+export interface CommandResult {
+  command: string;
+  output: string;
+  isError: boolean;
+}
+
 export interface AgentSpec {
   cwd: string;
+  /** Disposable write root owned by the invocation lifecycle, outside cwd. */
+  scratchDir?: string;
   prompt: string;
   systemAppend?: string;
   target: ModelTarget;

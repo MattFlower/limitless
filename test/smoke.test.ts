@@ -238,3 +238,48 @@ test("deploy restores the previous checkout when injected smoke fails before res
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const outcome of [
+  "pass",
+  "no-command",
+  "temp-failed",
+  "write-succeeded",
+  "claim",
+  "echo",
+  "incomplete",
+] as const) {
+  test(`verify smoke requires execution evidence: ${outcome}`, async () => {
+    const { verifyLiveCheck } = await import("../scripts/smoke.ts");
+    const target: ModelTarget = {
+      modelId: "fake/m",
+      provider: "fake",
+      model: "m",
+      vendor: "fake",
+      tier: 4,
+      harness: "fake",
+      billing: "subscription",
+    };
+    const check = await verifyLiveCheck(async (spec) => {
+      const probe = readFileSync(join(spec.cwd, "verify-probe.py"), "utf8");
+      const token = probe.match(/print\("(.*):temp-created-read-deleted"/)?.[1];
+      const command = `python3 '${join(spec.cwd, "verify-probe.py")}'`;
+      if (outcome !== "no-command" && outcome !== "claim")
+        spec.onEvent({
+          type: "tool_call",
+          id: "probe",
+          name: "Bash",
+          input: { command: outcome === "echo" ? `echo ${command}` : command },
+        });
+      const output =
+        outcome === "incomplete"
+          ? `${token}:worktree-write-denied`
+          : `${token}:temp-created-read-deleted\n${token}:worktree-write-denied`;
+      if (outcome === "claim") spec.onEvent({ type: "text", text: output });
+      else spec.onEvent({ type: "tool_result", id: "probe", output, isError: outcome === "temp-failed" });
+      if (outcome === "write-succeeded") writeFileSync(join(spec.cwd, "forbidden-write"), "oops");
+      return { ...result, finalText: "everything succeeded" };
+    }, target);
+    expect(check.status).toBe(outcome === "pass" ? "pass" : "fail");
+    if (outcome === "write-succeeded") expect(check.reason).toContain("worktree changed");
+  });
+}
