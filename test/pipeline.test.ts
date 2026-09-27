@@ -727,7 +727,15 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
   }
 
-  for (const fault of ["missing", "single-parent", "markers", "stray", "same-tree", "setext"] as const) {
+  for (const fault of [
+    "missing",
+    "single-parent",
+    "markers",
+    "partial",
+    "stray",
+    "same-tree",
+    "setext",
+  ] as const) {
     test(`factory merge resolution: ${fault}`, async () => {
       const bare = await githubFixture();
       let calls = 0;
@@ -761,6 +769,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
               "new.txt": "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> base\n",
             },
           };
+        if (fault === "partial")
+          return { files: { "greeting.txt": `feature intent\n=======\nbase intent\n>>>>>>> ${base}\n` } };
         if (fault === "setext")
           return { files: { "greeting.txt": "Greeting\n========\nfeature intent\nbase intent\n" } };
         return fault === "same-tree" ? { files: { "greeting.txt": "feature intent\n" } } : {};
@@ -787,7 +797,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
           );
       } else {
         expect(result?.error).toContain(
-          fault === "markers"
+          fault === "markers" || fault === "partial"
             ? "Unresolved conflict markers: greeting.txt"
             : fault === "stray"
               ? "Unresolved conflict markers: new.txt, README.md"
