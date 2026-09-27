@@ -28,6 +28,7 @@ import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from ".
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
+import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
@@ -47,6 +48,7 @@ export interface RunState {
   phase: Phase;
   worktreePath?: string;
   gatesConfig?: GateConfig;
+  previewConfig?: PreviewConfig | null;
   baseline?: GateRun | null;
   triage?: Triage;
   spec?: Spec | null;

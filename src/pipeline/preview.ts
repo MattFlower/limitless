@@ -1,7 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { join } from "node:path";
 import type { DiffInfo } from "../git/repos.ts";
 import { createScratch, removeScratch } from "../harness/scratch.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
@@ -21,12 +19,11 @@ function command(value: unknown, key: string): string {
   return value;
 }
 
-export function readPreviewConfig(cwd: string): PreviewConfig | null {
-  const file = join(cwd, ".limitless.toml");
-  if (!existsSync(file)) return null;
+export function readPreviewConfig(contents: string | null): PreviewConfig | null {
+  if (contents === null) return null;
   let raw: Record<string, unknown>;
   try {
-    raw = Bun.TOML.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    raw = Bun.TOML.parse(contents) as Record<string, unknown>;
   } catch (error) {
     throw new Error(`Invalid .limitless.toml: ${(error as Error).message}`);
   }
@@ -45,12 +42,14 @@ export function readPreviewConfig(cwd: string): PreviewConfig | null {
     typeof v.env !== "object" ||
     Array.isArray(v.env) ||
     !Object.entries(v.env).every(
-      ([key, value]) => /^[A-Za-z_][A-Za-z_0-9]*$/.test(key) && typeof value === "string",
+      ([key, value]) =>
+        /^[A-Za-z_][A-Za-z_0-9]*$/.test(key) && typeof value === "string" && !value.includes(".."),
     )
   )
-    throw new Error("Invalid [preview].env: expected string variables");
+    throw new Error('Invalid [preview].env: expected string variables without ".."');
   if (typeof v.ready !== "string" || !v.ready.startsWith("/") || v.ready.startsWith("//"))
     throw new Error("Invalid [preview].ready: expected an absolute URL path");
+  readinessUrl(v.ready, "http://127.0.0.1");
   if (v.seed !== undefined) command(v.seed, "seed");
   return {
     paths: v.paths as string[],
@@ -60,6 +59,13 @@ export function readPreviewConfig(cwd: string): PreviewConfig | null {
     ready: v.ready,
     env: v.env as Record<string, string>,
   };
+}
+
+function readinessUrl(ready: string, previewUrl: string): URL {
+  const url = new URL(ready, previewUrl);
+  if (url.origin !== new URL(previewUrl).origin)
+    throw new Error("Invalid [preview].ready: must have the preview origin");
+  return url;
 }
 
 export function needsPreview(config: PreviewConfig | null, diff: DiffInfo): boolean {
@@ -95,17 +101,22 @@ function stopTree(child: ChildProcess): Promise<void> {
         child.kill(signal);
       }
     };
-    if (exited) {
-      kill("SIGKILL");
-      resolve();
-      return;
-    }
-    const timer = setTimeout(() => kill("SIGKILL"), 2_000);
-    child.once("close", () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
       clearTimeout(timer);
       kill("SIGKILL");
+      // A detached grandchild may retain the pipes after the direct child exits.
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
       resolve();
-    });
+    };
+    if (exited || child.pid === undefined) {
+      finish();
+      return;
+    }
+    timer = setTimeout(() => kill("SIGKILL"), 2_000);
+    child.once("exit", finish);
     kill("SIGTERM");
   });
 }
@@ -121,27 +132,49 @@ export async function startPreview(
   config: PreviewConfig,
   signal: AbortSignal,
   readinessMs = 20_000,
+  commandTimeoutMs = 120_000,
 ): Promise<Preview> {
   const scratch = createScratch(cwd);
   let child: ChildProcess | undefined;
-  let onAbort: (() => void) | undefined;
+  let stopping: Promise<void> | undefined;
+  const stop = (): Promise<void> => {
+    stopping ??= (async () => {
+      signal.removeEventListener("abort", onAbort);
+      if (child) await stopTree(child);
+      removeScratch(scratch);
+    })();
+    return stopping;
+  };
+  const onAbort = () => {
+    void stop();
+  };
   try {
+    if (signal.aborted) throw new Error("Preview cancelled");
     const port = await availablePort();
     const url = `http://127.0.0.1:${port}`;
+    const readyUrl = readinessUrl(config.ready, url);
+    if (Object.values(config.env).some((value) => value.includes("..")))
+      throw new Error('Invalid [preview].env: values must not contain ".."');
     const expanded = Object.fromEntries(
       Object.entries(config.env).map(([key, value]) => [
         key,
         value.replaceAll("{scratch}", scratch).replaceAll("{port}", String(port)),
       ]),
     );
-    const env = agentEnv({
+    const reserved = agentEnv();
+    const env = { ...reserved, ...expanded };
+    for (const key of Object.keys(env)) {
+      if (key === "GH_TOKEN" || key.startsWith("GIT_")) {
+        delete env[key];
+        if (reserved[key] !== undefined) env[key] = reserved[key];
+      }
+    }
+    Object.assign(env, {
       HOME: scratch,
       TMPDIR: scratch,
       TMP: scratch,
       TEMP: scratch,
-      ...expanded,
       LIMITLESS_NO_SCHEDULER: "1",
-      LIMITLESS_HOST: "127.0.0.1",
     });
     for (const [step, commandText] of [
       ["build", config.build],
@@ -153,11 +186,11 @@ export async function startPreview(
         cwd,
         env,
         signal,
-        timeoutMs: 120_000,
+        timeoutMs: commandTimeoutMs,
         tailLimit: 4_000,
       });
       if (signal.aborted) throw new Error("Preview cancelled");
-      if (result.exitCode !== 0)
+      if (result.exitCode !== 0 || result.timedOut)
         throw new Error(
           `Preview ${step} ${result.timedOut ? "timed out" : "failed"}: ${(result.stderr || result.stdout).trim().slice(-4_000)}`,
         );
@@ -179,32 +212,26 @@ export async function startPreview(
     child.on("error", (error) => {
       exit = error.message;
     });
-    child.on("close", (code, sig) => {
+    child.on("exit", (code, sig) => {
       exit = `exit ${code ?? sig}`;
     });
-    onAbort = () => {
-      if (child) void stopTree(child);
-    };
     signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) throw new Error("Preview cancelled");
     const deadline = Date.now() + readinessMs;
     while (Date.now() < deadline) {
       if (signal.aborted) throw new Error("Preview cancelled");
       if (exit) throw new Error(`Preview serve exited early (${exit}): ${output.trim()}`);
       try {
-        const response = await fetch(new URL(config.ready, url), { signal: AbortSignal.timeout(1_000) });
-        if (response.ok) {
-          const server = child;
-          const abortListener = onAbort;
-          return {
-            url,
-            scratch,
-            stop: async () => {
-              signal.removeEventListener("abort", abortListener);
-              await stopTree(server);
-              removeScratch(scratch);
-            },
-          };
-        }
+        const response = await fetch(readyUrl, {
+          signal: AbortSignal.any([
+            signal,
+            AbortSignal.timeout(Math.max(1, Math.min(1_000, deadline - Date.now()))),
+          ]),
+          redirect: "error",
+        });
+        await response.body?.cancel();
+        if (signal.aborted) throw new Error("Preview cancelled");
+        if (response.ok) return { url, scratch, stop };
       } catch {
         /* Retry until the bounded readiness deadline. */
       }
@@ -212,9 +239,7 @@ export async function startPreview(
     }
     throw new Error(`Preview readiness timed out at ${url}${config.ready}: ${output.trim()}`);
   } catch (error) {
-    if (onAbort) signal.removeEventListener("abort", onAbort);
-    if (child) await stopTree(child);
-    removeScratch(scratch);
+    await stop();
     throw error;
   }
 }

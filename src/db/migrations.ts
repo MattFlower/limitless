@@ -326,4 +326,14 @@ WHERE state_json IS NOT NULL AND json_type(state_json, '$.environmentRetryRound'
     name: "chat_call_duration",
     sql: "ALTER TABLE chat_calls ADD COLUMN duration_ms INTEGER;",
   },
+  {
+    version: 13,
+    name: "base_preview_config",
+    // Only prepare can capture a trusted snapshot. Older in-flight runs without one fail closed.
+    sql: `
+UPDATE runs SET state_json = json_set(state_json, '$.previewConfig', NULL)
+WHERE state_json IS NOT NULL AND json_extract(state_json, '$.phase') = 'prepare'
+  AND json_type(state_json, '$.previewConfig') IS NULL;
+`,
+  },
 ];
