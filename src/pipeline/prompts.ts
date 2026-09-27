@@ -34,7 +34,8 @@ ${quoteRequest(input.prompt)}
 
 Guidance:
 - complexity: trivial = mechanical one-liner (e.g. version bump, typo); small = focused change in 1–3 files; medium = feature or fix spanning several files; large = architectural or multi-component work.
-- ambiguity: "high" only if a sensible implementation is impossible without an answer from the requester.
+- risk: judge the blast radius if the change is wrong, not its size. high = authentication or authorization (who may trigger or approve what), secrets or credentials, exposing something publicly, merge/deploy/review policy, deleting data or rewriting history, spending money; medium = behavior that much of the system depends on (core pipeline, persistence, migrations, concurrency); low = self-contained features, docs, tests.
+- ambiguity: "high" only if a sensible implementation is impossible without an answer from the requester — including requests that name no concrete outcome (e.g. "make it better"); then ask what outcome is wanted.
 - blocking_questions: only questions whose answers would substantially change the implementation. Prefer making a reasonable assumption; leave empty when you can.
 - suggested_profile: "quick" for trivial/mechanical work, "standard" for most work, "deep" for large or risky changes.
 Return the JSON object.`;
