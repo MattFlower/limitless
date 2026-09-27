@@ -70,6 +70,10 @@ test("config validates LAN settings; exact binds share routes, stop together and
       'listen_lan = "192.168.1.10"\nhost = "0.0.0.0"',
     ])
       expect(() => config(toml)).toThrow("server.");
+    for (const value of ["192.168.1.0/24", "2001:db8::/32", "host", 42])
+      expect(() => config(`trusted_proxies = ["${proxy}", ${JSON.stringify(value)}]`)).toThrow(
+        `server.trusted_proxies: ${JSON.stringify(value)} must be an individual IP address (no CIDRs or hostnames)`,
+      );
     const stops: ReturnType<typeof mock>[] = [];
     const options: { hostname?: string; port?: string | number; routes?: unknown }[] = [];
     const serve = ((opts: (typeof options)[number]) => {

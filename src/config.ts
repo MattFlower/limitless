@@ -142,11 +142,13 @@ export function loadConfig(
   if (listenLan && !isLoopback(host))
     throw new Error("server.host must be a loopback IP when server.listen_lan is enabled");
   const trustedProxies = server.trusted_proxies ?? [];
-  if (
-    !Array.isArray(trustedProxies) ||
-    trustedProxies.some((ip) => typeof ip !== "string" || !isIP(ip) || ip.includes("%"))
-  )
+  if (!Array.isArray(trustedProxies))
     throw new Error("server.trusted_proxies must be an array of individual IP addresses");
+  for (const ip of trustedProxies)
+    if (typeof ip !== "string" || !isIP(ip) || ip.includes("%"))
+      throw new Error(
+        `server.trusted_proxies: ${JSON.stringify(ip)} must be an individual IP address (no CIDRs or hostnames)`,
+      );
   const origins = server.public_origins ?? [];
   if (!Array.isArray(origins)) throw new Error("server.public_origins must be an array of HTTP(S) origins");
 
