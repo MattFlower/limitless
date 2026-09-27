@@ -40,6 +40,7 @@ export type StageName =
   | "gates"
   | "audit"
   | "review"
+  | "preview"
   | "verify"
   | "deliver";
 

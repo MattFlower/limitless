@@ -167,6 +167,7 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
 export class RunContext {
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
   readonly runDir: string;
+  previewUrl?: string;
   state: RunState;
 
   constructor(

@@ -1135,6 +1135,52 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(verifyCalls).toBe(2);
   });
 
+  test("UI diff starts a seeded preview for fake verification and cleans it afterward", async () => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]
+checks = [{ name = "no-bad", run = "! grep -rq BAD --include=*.txt ." }]
+[preview]
+paths = ["ui/"]
+build = "true"
+seed = 'mkdir -p "$LIMITLESS_HOME" && echo seeded > "$LIMITLESS_HOME/seed.txt"'
+serve = "bun serve.ts"
+ready = "/health"
+env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/config", LIMITLESS_PORT = "{port}" }
+`,
+    );
+    writeFileSync(
+      join(repoDir, "serve.ts"),
+      'Bun.serve({ hostname: "127.0.0.1", port: Number(process.env.LIMITLESS_PORT), fetch: async () => new Response(await Bun.file(process.env.LIMITLESS_HOME + "/seed.txt").text()) });',
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "preview fixture"], {
+      cwd: repoDir,
+    });
+    let runId = "";
+    let previewUrl = "";
+    const f = start(async (agent) => {
+      const role = roleOf(agent);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") {
+        const stage = f.store.getRunDetail(runId)?.stages.find((entry) => entry.name === "preview");
+        expect(stage?.status).toBe("succeeded");
+        previewUrl = stage?.summary?.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0] ?? "";
+        expect(await (await fetch(`${previewUrl}/health`)).text()).toBe("seeded\n");
+        return { structured: pass };
+      }
+      return { files: { "ui/change.txt": "visible\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Change the UI" });
+    runId = run.id;
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(previewUrl).toStartWith("http://127.0.0.1:");
+    await expect(fetch(`${previewUrl}/health`)).rejects.toThrow();
+  });
+
   test("happy path: triage → spec → implement → gates → review → verify → deliver", async () => {
     const seen: string[] = [];
     const f = start((s) => {

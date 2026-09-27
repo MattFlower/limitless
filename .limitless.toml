@@ -11,3 +11,11 @@ checks = [
 # Changes to the factory itself are reviewed by the orchestrator before merging.
 merge = "pr"
 protected_paths = ["test/fixtures/**"]
+
+[preview]
+paths = ["ui/"]
+build = "bun run build:ui"
+serve = "bun src/cli/main.ts serve"
+env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/config", LIMITLESS_PORT = "{port}" }
+seed = "bun scripts/preview-seed.ts"
+ready = "/api/health"
