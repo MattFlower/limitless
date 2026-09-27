@@ -666,6 +666,7 @@ async function oneRound(
           { ...v, modelId: target.modelId, round, attempt },
         ];
         ctx.save();
+        const publicSources = await ctx.publicHoldoutSources();
         ctx.store.putArtifact(
           ctx.run.id,
           attempt === 0 ? `verify-${round}.json` : `verify-${round}-retry.json`,
@@ -674,7 +675,7 @@ async function oneRound(
             { ...v, modelId: target.modelId, round, attempt },
             (_key, value: unknown) =>
               typeof value === "string"
-                ? redactHoldoutText(value, ctx.state.holdout as Holdout, ctx.publicHoldoutSources())
+                ? redactHoldoutText(value, ctx.state.holdout as Holdout, publicSources)
                 : value,
             2,
           ),
@@ -689,6 +690,7 @@ async function oneRound(
     );
   const previous = (ctx.state.verifyResults ?? []).filter((v) => v.round === round);
   let verify = previous.at(-1) ?? (await verifyAttempt(0));
+  const publicSources = await ctx.publicHoldoutSources();
   if (blockedOnly(verify)) {
     const stop = (routing = ""): never => {
       const evidence = verify.criteria
@@ -698,7 +700,7 @@ async function oneRound(
       const detail = redactHoldoutText(
         `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`,
         ctx.state.holdout as Holdout,
-        ctx.publicHoldoutSources(),
+        publicSources,
       );
       ctx.state.terminalReason = detail;
       ctx.save();
@@ -721,7 +723,7 @@ async function oneRound(
       verify,
       ctx.state.spec ?? null,
       ctx.state.holdout,
-      ctx.publicHoldoutSources(),
+      publicSources,
     );
     ctx.save();
     return false;

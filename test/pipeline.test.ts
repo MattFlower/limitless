@@ -807,12 +807,17 @@ describe("pipeline (fake agents, real git + gates)", () => {
 
   test("unmet holdout feedback omits private inputs and publishes scenarios only after delivery", async () => {
     const secret = "PRIVATE_HOLDOUT_TOKEN_729";
+    writeFileSync(join(repoDir, "identifiers.ts"), "export const sharedIdentifier = true;\n");
+    await sh(["git", "add", "identifiers.ts"], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "add identifier"], {
+      cwd: repoDir,
+    });
     const privateHoldout = {
       scenarios: holdout.scenarios.map((s) =>
         s.id === "H-2"
           ? {
               ...s,
-              steps: `run ${secret}`,
+              steps: `run ${secret} with sharedIdentifier`,
               description: `secret ${secret} check`,
               expected: `result ${secret}`,
             }
@@ -843,7 +848,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
                         ...c,
                         status: "unmet",
                         evidence: `Observed failure: ${secret} returned an empty response`,
-                        publicSummary: "returns an empty response for an invalid request",
+                        publicSummary: "sharedIdentifier returns an empty response for an invalid request",
                       }
                     : c,
                 ),
@@ -854,7 +859,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       implementCalls++;
       if (implementCalls === 2) {
         expect(s.prompt).toContain(
-          "private scenario (unmet): returns an empty response for an invalid request",
+          "private scenario (unmet): sharedIdentifier returns an empty response for an invalid request",
         );
         expect(s.prompt).not.toContain("Observed failure");
         expect(s.prompt).not.toContain(secret);

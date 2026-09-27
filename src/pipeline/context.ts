@@ -1,7 +1,9 @@
-import { execFileSync } from "node:child_process";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { lstat, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import type { ZodType } from "zod";
 import type { Config } from "../config.ts";
 import type {
@@ -94,6 +96,9 @@ export interface RunState {
 
 const MODEL_REJECTED =
   /model[^.]{0,80}(is not supported|not found|does not exist|not available)|unknown model|invalid model|model_not_found/i;
+const execFileAsync = promisify(execFile);
+const MAX_PUBLIC_SOURCE_BYTES = 16 * 1024 * 1024;
+const MAX_PUBLIC_SOURCE_FILES = 2_000;
 
 export class CancelledError extends Error {
   constructor() {
@@ -151,7 +156,7 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
 };
 
 export class RunContext {
-  private holdoutPublicSources?: string;
+  private holdoutPublicSources?: Promise<string>;
   readonly runDir: string;
   state: RunState;
 
@@ -182,22 +187,32 @@ export class RunContext {
     return this.state.triage?.complexity ?? this.run.complexity ?? "small";
   }
 
-  publicHoldoutSources(): string {
+  publicHoldoutSources(): Promise<string> {
     if (this.holdoutPublicSources !== undefined) return this.holdoutPublicSources;
+    this.holdoutPublicSources = this.readPublicHoldoutSources();
+    return this.holdoutPublicSources;
+  }
+
+  private async readPublicHoldoutSources(): Promise<string> {
     const identifiers = new Set<string>();
     const cwd = this.state.worktreePath;
     if (cwd) {
       try {
-        const files = execFileSync("git", ["ls-files", "-z"], { cwd, maxBuffer: 16 * 1024 * 1024 })
-          .toString()
-          .split("\0")
-          .filter(Boolean);
-        for (const file of files) {
+        const { stdout } = await execFileAsync("git", ["ls-files", "-z"], {
+          cwd,
+          maxBuffer: 16 * 1024 * 1024,
+          encoding: "utf8",
+        });
+        const files = stdout.split("\0").filter(Boolean);
+        let bytesRead = 0;
+        for (const file of files.slice(0, MAX_PUBLIC_SOURCE_FILES)) {
           try {
             const path = join(cwd, file);
-            const stat = lstatSync(path);
+            const stat = await lstat(path);
             if (!stat.isFile() || stat.size > 256_000) continue;
-            const content = readFileSync(path, "utf8");
+            if (bytesRead + stat.size > MAX_PUBLIC_SOURCE_BYTES) break;
+            bytesRead += stat.size;
+            const content = await readFile(path, "utf8");
             if (content.includes("\0")) continue;
             for (const identifier of `${file} ${content}`.match(/[A-Za-z_$][\w$]*/g) ?? [])
               identifiers.add(identifier);
@@ -209,12 +224,7 @@ export class RunContext {
         // Request and specification still provide the public-source exemption.
       }
     }
-    this.holdoutPublicSources = [
-      this.run.prompt,
-      this.state.spec ? renderSpec(this.state.spec) : "",
-      ...identifiers,
-    ].join("\n");
-    return this.holdoutPublicSources;
+    return [this.run.prompt, this.state.spec ? renderSpec(this.state.spec) : "", ...identifiers].join("\n");
   }
 
   save(): void {
@@ -306,10 +316,10 @@ export class RunContext {
       });
       let result: AgentResult;
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
+      const publicSources = opts.redactHoldout && this.state.holdout ? await this.publicHoldoutSources() : "";
       const redact =
         opts.redactHoldout && this.state.holdout
-          ? (value: string) =>
-              redactHoldoutText(value, this.state.holdout as Holdout, this.publicHoldoutSources())
+          ? (value: string) => redactHoldoutText(value, this.state.holdout as Holdout, publicSources)
           : undefined;
       try {
         const spec: AgentSpec = {
