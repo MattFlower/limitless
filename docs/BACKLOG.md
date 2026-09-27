@@ -324,6 +324,15 @@ points, and public leaderboards disagree with each other).
 - Caching: at most one fetch per day (plus on demand), stored as a timestamped snapshot in SQLite
   (raw payload + normalized rows); keep snapshots so every decision can cite the data it used; the
   policy generator records the snapshot id. Never fetched from the browser.
+- Terminal-Bench (tbench.ai, 4.0 = 66 tasks) ranks (model @ effort, agent harness) pairs with
+  resolution rate ±95% CI, tokens and cost — e.g. "GPT-6 Astra (max) · Codex 58.2%",
+  "Fable 5.1 (max) · Claude Code 57.9%", "GLM-5.3 (max) · Claude Code 41.8%",
+  "Sonnet 5 (max) · Claude Code 12.4%". That matches how we run models (inside the claude/codex
+  harnesses), so it is the best public prior for the implement role. No JSON API (the table is in
+  the Next.js page payload): import it with a tolerant parser of the rendered leaderboard rows,
+  run on demand (it changes roughly monthly), tested against a saved fixture of the page text;
+  map rows to catalog (model, effort, harness). Don't run Terminal-Bench ourselves: the leaderboard's
+  own cost column puts a full 4.0 run at $300–$9,600 per model.
 - The repository is public: never commit Artificial Analysis data (no redistribution). Snapshots
   stay in the local database; the UI shows them with attribution; committed files (e.g.
   routing/EVIDENCE.md) cite only the snapshot date and our own eval numbers.
