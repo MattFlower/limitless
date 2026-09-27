@@ -1,17 +1,16 @@
 $ bun scripts/smoke.ts
 Check                  Status  Time     Detail
 ---------------------  ------  -------  ------
-claude structured      PASS     2312ms  
-claude noTools         PASS     4053ms  
-claude edit            PASS     5898ms  
-claude quota           PASS     1355ms  
-claude verify          FAIL     7499ms  missing successful probe command evidence (temp operations and denied worktree write): Exit code 71 sandbox-exec: sandbox_apply: Operation not permitted
-codex structured       FAIL      140ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
-codex noTools          FAIL      125ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
-codex edit             FAIL      127ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
-codex quota            FAIL      141ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
-codex verify           FAIL      151ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
-mtplx structured       PASS     7744ms  
-twilight structured    PASS    14770ms  
-openrouter structured  PASS     5514ms  
-error: script "smoke" exited with code 1
+claude structured      PASS     2620ms  
+claude noTools         PASS     3671ms  
+claude edit            PASS     4843ms  
+claude quota           PASS     1728ms  
+claude verify          PASS     5986ms  claude-haiku-4-5: observed temp create/read/delete and denied worktree write
+codex structured       PASS     7385ms  model gpt-5.6-sol (gpt-6-luna, gpt-6-sol unsupported)
+codex noTools          PASS     7981ms  
+codex edit             PASS    16060ms  
+codex quota            PASS     4790ms  
+codex verify           PASS     8472ms  gpt-5.6-sol: observed temp create/read/delete and denied worktree write
+mtplx structured       PASS    12738ms  
+twilight structured    PASS     3892ms  
+openrouter structured  PASS     7164ms  

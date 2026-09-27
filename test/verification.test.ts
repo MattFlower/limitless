@@ -54,6 +54,29 @@ for (const [evidence, blocked] of [
   });
 }
 
+test("a met criterion whose evidence mentions a resolved EPERM stays met", () => {
+  const evidence = "Ran bun test; failed with EPERM mkdtemp, reran with TMPDIR and it passed";
+  const result = normalizeVerify(
+    {
+      criteria: [
+        { id: "AC-1", status: "met", evidence },
+        { id: "H-1", status: "met", evidence: "ok" },
+      ],
+      overall: "pass",
+      notes: "",
+    },
+    spec,
+    holdout,
+    [
+      { command: "bun test", output: "EPERM: operation not permitted, mkdtemp", isError: true },
+      { command: "TMPDIR=$TMPDIR bun test", output: "12 pass", isError: false },
+    ],
+  );
+  expect(result.criteria[0]?.status).toBe("met");
+  expect(blockedOnly(result)).toBe(false);
+  expect(result.overall).toBe("pass");
+});
+
 test("explicit blocked needs evidence; complete unique met coverage alone can pass", () => {
   expect(
     VerifySchema.safeParse({

@@ -1,6 +1,6 @@
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import type { AgentSpec } from "./types.ts";
 
 function within(parent: string, path: string): boolean {
@@ -8,14 +8,43 @@ function within(parent: string, path: string): boolean {
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
+/**
+ * Claude Code's sandbox points its commands' TMPDIR at $CLAUDE_CODE_TMPDIR/claude-<uid>, so the
+ * scratch directory carries that name inside a private parent: every process then sees one TMPDIR.
+ * Short bases come first because Claude falls back to a shared directory when the path is too
+ * long for AF_UNIX sockets.
+ */
+export const SCRATCH_NAME = `claude-${process.getuid?.() ?? 0}`;
+
 /** Resolve symlinks before checking: TMPDIR can itself be inside the checkout. */
 export function createScratch(cwd: string): string {
   const root = realpathSync(cwd);
-  for (const candidate of [...new Set([tmpdir(), "/tmp"])]) {
-    const base = realpathSync(candidate);
-    if (!within(root, base)) return mkdtempSync(join(base, "limitless-reader-"));
+  for (const candidate of [...new Set(["/tmp", tmpdir()])]) {
+    let base: string;
+    try {
+      base = realpathSync(candidate);
+    } catch {
+      continue;
+    }
+    if (within(root, base)) continue;
+    const scratch = join(mkdtempSync(join(base, "lr-")), SCRATCH_NAME);
+    mkdirSync(scratch, { mode: 0o700 });
+    return scratch;
   }
   throw new Error("No temporary directory outside the worktree is available");
+}
+
+/** The private parent created by createScratch; Claude derives the scratch path from it. */
+export function scratchParent(scratchDir: string): string {
+  if (basename(scratchDir) !== SCRATCH_NAME) throw new Error(`Scratch must be named ${SCRATCH_NAME}`);
+  return dirname(scratchDir);
+}
+
+export function removeScratch(scratchDir: string): void {
+  rmSync(basename(scratchDir) === SCRATCH_NAME ? dirname(scratchDir) : scratchDir, {
+    recursive: true,
+    force: true,
+  });
 }
 
 export function scratchEnv(spec: AgentSpec): Record<string, string> {
@@ -37,6 +66,6 @@ export async function withScratch<T>(cwd: string, run: (scratchDir: string) => P
   try {
     return await run(scratchDir);
   } finally {
-    rmSync(scratchDir, { recursive: true, force: true });
+    removeScratch(scratchDir);
   }
 }

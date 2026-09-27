@@ -255,7 +255,7 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
   }
   if (spec.mode === "readonly" && !spec.noTools) {
     const scratch = validateScratch(spec);
-    // Named filesystem profiles are supported by Codex 0.154.0. Legacy read-only mode
+    // Named filesystem profiles (verified live on codex-cli 0.157.1). Legacy read-only mode
     // ignores sandbox_workspace_write roots, and workspace-write grants cwd implicitly.
     args.push(
       "--strict-config",

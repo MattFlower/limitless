@@ -1,4 +1,0 @@
-WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)
-Error: `--strict-config` is not supported for `codex sandbox`
-WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)
-sandbox-exec: sandbox_apply: Operation not permitted

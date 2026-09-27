@@ -1,6 +1,8 @@
-WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)
-codex-cli 0.154.0
-WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)
+$ codex --version
+codex-cli 0.157.1
+$ claude --version
+2.1.281 (Claude Code)
+$ codex --help
 Codex CLI
 
 If no subcommand is specified, options will be forwarded to the interactive CLI.
@@ -130,12 +132,15 @@ Options:
           
           Runs the TUI in inline mode, preserving terminal scrollback history.
 
+      --no-daemon
+          Run without the shared background server, even if it is already running
+
   -h, --help
           Print help (see a summary with '-h')
 
   -V, --version
           Print version
-WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)
+$ codex exec --help
 Run Codex non-interactively
 
 Usage: codex exec [OPTIONS] [PROMPT]
@@ -248,4 +253,3 @@ Options:
 
   -V, --version
           Print version
-2.1.281 (Claude Code)

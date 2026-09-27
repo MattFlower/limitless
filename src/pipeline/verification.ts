@@ -42,8 +42,11 @@ export function normalizeVerify(
 ): Verify {
   const criteria = verify.criteria.map((c) => ({
     ...c,
+    // A met criterion stays met: evidence may mention an EPERM the verifier worked around.
     status:
-      environmentBarrier(c.evidence) && commands.some((command) => observedBarrier(command, c.evidence))
+      (c.status === "unmet" || c.status === "unclear") &&
+      environmentBarrier(c.evidence) &&
+      commands.some((command) => observedBarrier(command, c.evidence))
         ? ("blocked" as const)
         : c.status,
   }));

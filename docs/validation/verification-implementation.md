@@ -1,6 +1,6 @@
 # Verification reliability implementation report
 
-Implemented on 2026-09-27 (date checked with `date -u`). Native sandbox validation remains blocked in this worker; AC-7 is **not satisfied** by this run.
+Implemented on 2026-09-27 (date checked with `date -u`). Round 3 re-ran live validation on the factory host outside a nested sandbox: both native verify smoke rows **PASS** (AC-7).
 
 ## Changes
 
@@ -13,7 +13,7 @@ Implemented on 2026-09-27 (date checked with `date -u`). Native sandbox validati
 
 ## CLI configuration inspected
 
-Installed versions: **codex-cli 0.154.0**, **Claude Code 2.1.281**. Version output, `codex --help`, and `codex exec --help` are retained in [verification-cli.txt](verification-cli.txt).
+Installed versions: **codex-cli 0.157.1**, **Claude Code 2.1.281**. Version output, `codex --help`, and `codex exec --help` are retained in [verification-cli.txt](verification-cli.txt).
 
 Codex reading calls use `--ignore-user-config --strict-config --ignore-rules` and this named filesystem profile (the actual scratch path is canonical and unique):
 
@@ -28,38 +28,35 @@ enabled = false
 
 They do not combine this with `-s workspace-write`, `sandbox_workspace_write`, or `--add-dir`. Alternate MCP/app/plugin/code-mode paths are disabled. No-tools calls retain their existing read-only mode and disabled tools.
 
-The [official Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) documents `default_permissions` and named filesystem grants, and prohibits combining them with the legacy sandbox settings. A direct `codex sandbox -P limitless-reader` configuration probe reached sandbox application but failed with `sandbox_apply: Operation not permitted`. Adding `--strict-config` to that *sandbox subcommand* is explicitly unsupported; production uses it on `exec`, where the installed help lists it. Both diagnostics are retained in [codex-profile-probe.txt](codex-profile-probe.txt). This is not proof of effective native isolation.
+The [official Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) documents `default_permissions` and named filesystem grants, and prohibits combining them with the legacy sandbox settings. `codex exec` on 0.157.1 accepts this profile under `--strict-config`; the live `codex verify` smoke row shows scratch writes succeed and worktree writes are denied.
 
 Claude reading calls use explicit sandbox settings: enabled, failIfUnavailable, allowUnsandboxedCommands=false, no excluded commands, scratch allowWrite, canonical worktree denyWrite, no project/local settings or hooks, and no MCP discovery. These settings follow the [official Claude Bash sandbox documentation](https://code.claude.com/docs/en/sandboxing). The native child receives the same scratch environment as Codex.
 
+Claude Code's sandbox overrides TMPDIR for Bash commands with `$CLAUDE_CODE_TMPDIR/claude-<uid>`, or with a shared `/tmp/claude-<uid>` if that is unset or too long for AF_UNIX sockets. The earlier `claude verify` failure came from this: TMPDIR in Bash differed from TMP/TEMP. Scratch is therefore allocated as `<short base>/lr-XXXXXX/claude-<uid>` (with `/tmp` preferred for length), and `CLAUDE_CODE_TMPDIR` points at its private parent. TMPDIR, TMP and TEMP are then identical in the Claude process and its sandboxed commands. Cleanup removes the parent. A misnamed scratch is rejected, so this cannot silently diverge.
+
 ## Validation
 
-- `bun install --frozen-lockfile`: **PASS**, no dependency changes. [Full output](verification-install.txt).
-- `bun run check`: **PASS** — Biome, `tsc --noEmit`, and **391 tests passed, 0 failed**, including one snapshot. Existing lint warnings remain (an optional-chain suggestion, two CSS specificity warnings, and the Biome configuration deprecation notice). [Full output](verification-check.txt).
-- `bun run build:ui`: **PASS**, built three files. [Full output](verification-build-ui.txt).
-- `git diff --check`: **PASS**.
-- `bun run smoke`: **FAIL**, exit 1, no skipped rows. Both native verify rows fail; the native sandbox contract is **not validated**. [Full output](verification-smoke.txt).
-
-The worker cannot start the nested Claude sandbox (`sandbox-exec: sandbox_apply: Operation not permitted`), and Codex cannot initialize its in-process app-server client (`Operation not permitted`). A separate Claude trace shows the command failure followed by an incorrect agent success claim; the probe correctly rejects it. [Diagnostic trace](verification-native-probe.txt). The implementation does not weaken isolation to work around these restrictions.
+- `bun run check`: **PASS**: Biome, `tsc --noEmit`, and **392 tests passed, 0 failed**. [Full output](verification-check.txt).
+- `bun run build:ui`: **PASS**. [Full output](verification-build-ui.txt).
+- `bun run smoke`: **PASS**, exit 0, all 13 rows pass and none are skipped. [Full output](verification-smoke.txt).
 
 ```text
 $ bun scripts/smoke.ts
 Check                  Status  Time     Detail
 ---------------------  ------  -------  ------
-claude structured      PASS     2312ms  
-claude noTools         PASS     4053ms  
-claude edit            PASS     5898ms  
-claude quota           PASS     1355ms  
-claude verify          FAIL     7499ms  missing successful probe command evidence (temp operations and denied worktree write): Exit code 71 sandbox-exec: sandbox_apply: Operation not permitted
-codex structured       FAIL      140ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
-codex noTools          FAIL      125ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
-codex edit             FAIL      127ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
-codex quota            FAIL      141ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
-codex verify           FAIL      151ms  WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1) Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
-mtplx structured       PASS     7744ms  
-twilight structured    PASS    14770ms  
-openrouter structured  PASS     5514ms  
-error: script "smoke" exited with code 1
+claude structured      PASS     2620ms  
+claude noTools         PASS     3671ms  
+claude edit            PASS     4843ms  
+claude quota           PASS     1728ms  
+claude verify          PASS     5986ms  claude-haiku-4-5: observed temp create/read/delete and denied worktree write
+codex structured       PASS     7385ms  model gpt-5.6-sol (gpt-6-luna, gpt-6-sol unsupported)
+codex noTools          PASS     7981ms  
+codex edit             PASS    16060ms  
+codex quota            PASS     4790ms  
+codex verify           PASS     8472ms  gpt-5.6-sol: observed temp create/read/delete and denied worktree write
+mtplx structured       PASS    12738ms  
+twilight structured    PASS     3892ms  
+openrouter structured  PASS     7164ms
 ```
 
 ## Assumptions and remaining work
@@ -70,4 +67,4 @@ Permission-error derivation is conservative: a criterion must describe an attemp
 
 A restart after reserving an environment retry cannot grant another retry, including if the process stops during that retry. Reading roles other than review/verify also receive scratch when tool-enabled so the strengthened native contract does not break spec/plan/evaluation callers. No-tools holdout authoring retains its isolation.
 
-**Remaining:** run `bun run smoke` on the factory host where both native CLIs can initialize their sandboxes. Both native verify rows must report PASS before claiming AC-7 or the complete sandbox contract is validated. Current evidence is insufficient to make that claim.
+Normalization only reclassifies `unmet`/`unclear` criteria as blocked. A `met` criterion whose evidence mentions an EPERM it later worked around stays met.

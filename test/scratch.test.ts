@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import { buildCodexArgs, runCodex } from "../src/harness/codex.ts";
-import { scratchEnv, withScratch } from "../src/harness/scratch.ts";
+import { SCRATCH_NAME, scratchEnv, withScratch } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { ProcOptions, ProcResult } from "../src/util/proc.ts";
 
@@ -61,7 +61,7 @@ test("scratch is outside inherited TMPDIR in checkout, unique concurrently, remo
       ),
     );
     expect(new Set(paths).size).toBe(3);
-    for (const path of paths) expect(existsSync(path)).toBe(false);
+    for (const path of paths) expect(existsSync(dirname(path))).toBe(false);
     expect(process.env.TMP).toBe(inherited.TMP);
     expect(process.env.TEMP).toBe(inherited.TEMP);
   } finally {
@@ -76,9 +76,9 @@ test("scratch is outside inherited TMPDIR in checkout, unique concurrently, remo
 test("native arguments restrict reading writes and preserve no-tools isolation", async () => {
   const root = mkdtempSync(join(tmpdir(), "args with spaces-"));
   const cwd = join(root, "worktree");
-  const scratch = join(root, "scratch space");
+  const scratch = join(root, "scratch space", SCRATCH_NAME);
   mkdirSync(cwd);
-  mkdirSync(scratch);
+  mkdirSync(scratch, { recursive: true });
   try {
     const spec = specFor(cwd, scratch);
     const codex = buildCodexArgs(spec);
@@ -99,6 +99,10 @@ test("native arguments restrict reading writes and preserve no-tools isolation",
       filesystem: { allowWrite: [realpathSync(scratch)], denyWrite: [realpathSync(cwd)] },
     });
     expect(claude[claude.indexOf("--setting-sources") + 1]).toBe("");
+    // Claude derives its sandbox TMPDIR from the parent; another name would silently diverge.
+    const misnamed = join(root, "misnamed");
+    mkdirSync(misnamed);
+    expect(() => buildClaudeArgs({ ...spec, scratchDir: misnamed }, "id")).toThrow(SCRATCH_NAME);
     for (const build of [buildCodexArgs, (s: AgentSpec) => buildClaudeArgs(s, "id")]) {
       expect(() => build({ ...spec, addDirs: [root] })).toThrow("additional directories");
       expect(() => build({ ...spec, scratchDir: cwd })).toThrow("separate");
@@ -127,7 +131,11 @@ for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {
           const runner = async (opts: ProcOptions): Promise<ProcResult> => {
             expect(opts.env).toMatchObject(scratchEnv(spec));
             expect(opts.env.GH_TOKEN).toBe("limitless-agents-have-no-github-access");
-            if (run === runClaude) expect(opts.env.ANTHROPIC_AUTH_TOKEN).toBe("backend-only-token");
+            if (run === runClaude) {
+              expect(opts.env.ANTHROPIC_AUTH_TOKEN).toBe("backend-only-token");
+              expect(opts.env.CLAUDE_CODE_TMPDIR).toBe(dirname(scratchDir));
+              expect(join(opts.env.CLAUDE_CODE_TMPDIR ?? "", SCRATCH_NAME)).toBe(scratchDir);
+            } else expect(opts.env.CLAUDE_CODE_TMPDIR).toBeUndefined();
             expect(existsSync(scratchDir)).toBe(true);
             writeFileSync(join(scratchDir, "fixture"), "ok");
             if (outcome === "error") throw new Error("injected process failure");
@@ -144,7 +152,7 @@ for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {
         });
       }
       expect(paths[0]).not.toBe(paths[1]);
-      for (const path of paths) expect(existsSync(path)).toBe(false);
+      for (const path of paths) expect(existsSync(dirname(path))).toBe(false);
       expect({ TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }).toEqual(parent);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
