@@ -1,6 +1,6 @@
 import type { Component } from "solid-js";
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { ROLE_DESCRIPTIONS } from "../../src/core/role-descriptions.ts";
+import { roleDescription } from "../../src/core/role-descriptions.ts";
 import type { Invocation, Role } from "../../src/core/types.ts";
 import { compactNumber, duration, equivMoney, money, truncate } from "../lib/format.ts";
 import { invocationModelLabel } from "../lib/invocation-model.ts";
@@ -74,7 +74,7 @@ const RoleHelp: Component<{ role: Role; id: number }> = (props) => {
         aria-hidden={!open()}
         style={{ top: `${position().top}px`, left: `${position().left}px` }}
       >
-        {ROLE_DESCRIPTIONS[props.role]}
+        {roleDescription(props.role)}
       </span>
     </span>
   );

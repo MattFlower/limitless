@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ROLE_DESCRIPTIONS } from "../src/core/role-descriptions.ts";
+import { ROLE_DESCRIPTIONS, roleDescription } from "../src/core/role-descriptions.ts";
 import type { Role } from "../src/core/types.ts";
 import { invocationModelLabel } from "../ui/lib/invocation-model.ts";
 
@@ -23,6 +23,11 @@ test("every invocation role explains both its work and purpose", () => {
   }
 });
 
+test("unknown persisted roles receive useful help", () => {
+  expect(roleDescription("synthesis_worker")).toContain("does not recognize");
+  expect(roleDescription("__proto__")).toContain("does not recognize");
+});
+
 test("model labels show the recorded backend model and distinguish effort states", () => {
   const base = { modelId: "claude/opus", model: "claude-opus-5-5" };
   expect(invocationModelLabel({ ...base, effort: "high" })).toBe("claude/opus → claude-opus-5-5 · high");
@@ -31,5 +36,11 @@ test("model labels show the recorded backend model and distinguish effort states
   );
   expect(invocationModelLabel({ ...base, effort: null })).toBe(
     "claude/opus → claude-opus-5-5 · unknown (legacy)",
+  );
+  expect(invocationModelLabel({ ...base, model: null, effort: null })).toBe(
+    "claude/opus → unknown model (legacy) · unknown (legacy)",
+  );
+  expect(invocationModelLabel({ ...base, model: undefined, effort: "default" })).toBe(
+    "claude/opus → unknown model (legacy) · backend default",
   );
 });

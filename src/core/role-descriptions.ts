@@ -15,3 +15,9 @@ export const ROLE_DESCRIPTIONS: Record<Role, string> = {
   summarize: "Summarizes the outcome so the delivery report is clear and concise.",
   chat: "Handles conversation with the user so requests and status questions can be understood.",
 };
+
+export function roleDescription(role: string): string {
+  return Object.hasOwn(ROLE_DESCRIPTIONS, role)
+    ? ROLE_DESCRIPTIONS[role as Role]
+    : "This invocation has a role this version of Limitless does not recognize. Its purpose is unavailable here.";
+}

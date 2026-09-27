@@ -115,6 +115,24 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
       expect(invocationHtml).toContain(`codex/luna → gpt-6-luna · ${effort}`);
     expect(invocationHtml).toContain('aria-label="About implement role"');
     expect(invocationHtml).toContain("Changes the code and runs checks");
+    const firstInvocation = invocations[0];
+    if (!firstInvocation) throw new Error("missing invocation");
+    const legacyHtml = renderToString(() =>
+      InvocationsTable({
+        invocations: [
+          {
+            ...firstInvocation,
+            role: "synthesis_worker" as typeof firstInvocation.role,
+            model: null as unknown as string,
+          },
+        ],
+        selectedId: null,
+        onSelect: () => {},
+      }),
+    );
+    expect(legacyHtml).toContain("does not recognize");
+    expect(legacyHtml).toContain("codex/luna → unknown model (legacy) · low");
+    expect(legacyHtml).not.toContain("→ null");
     expect(invocationHtml.match(/<th[ >]/g)).toHaveLength(10);
     expect(
       renderToString(() => InvocationsTable({ invocations: [], selectedId: null, onSelect: () => {} })),
