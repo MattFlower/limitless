@@ -821,6 +821,33 @@ test("recovery rounds never see ignored hidden files or grader outputs", async (
   }
 });
 
+test("recovery rounds never see hidden tests copied onto pre-existing ignored outputs", async () => {
+  const f = await fixture();
+  try {
+    f.item.hidden.command += "; result=$?; cp hidden/check.sh dist/compiled; exit $result";
+    f.save();
+    f.respond((s): FakeReply => {
+      if (f.calls.length === 1)
+        return {
+          files: {
+            answer: "wrong",
+            ".gitignore": "hidden/\ndist/\n",
+            "dist/compiled": "built",
+            "dist/own": "kept",
+          },
+        };
+      const compiled = join(s.cwd, "dist/compiled");
+      expect(existsSync(compiled) ? readFileSync(compiled, "utf8") : "").not.toContain("answer");
+      expect(readFileSync(join(s.cwd, "dist/own"), "utf8")).toBe("kept");
+      return { files: { answer: "correct" } };
+    });
+    expect((await f.run({ rounds: 2 })).trials[0]?.pass).toBe(true);
+    expect(f.calls).toHaveLength(2);
+  } finally {
+    await f.close();
+  }
+});
+
 for (const failure of ["harness-timeout", "hidden-timeout", "gate-timeout", "error"])
   test(`recovery preserves evidence and accounts for ${failure}`, async () => {
     const f = await fixture();

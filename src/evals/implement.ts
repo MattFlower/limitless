@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -5,6 +6,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   statSync,
@@ -79,6 +82,28 @@ async function ignoredPaths(cwd: string, env: Record<string, string>, signal: Ab
   return new Set(out.stdout.split("\0").filter(Boolean));
 }
 
+/**
+ * Identify an ignored file's exact pre-grade state. ctime can't be forged by the grader, but coarse
+ * filesystem clocks can hide a same-tick rewrite, so recently changed files also carry their contents.
+ */
+function fingerprint(root: string, path: string, since: bigint) {
+  const file = join(root, path);
+  const stat = lstatSync(file, { bigint: true, throwIfNoEntry: false });
+  if (!stat) return null;
+  const meta = `${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  if (stat.ctimeNs < since) return meta;
+  const body = stat.isSymbolicLink() ? readlinkSync(file) : stat.isFile() ? readFileSync(file) : "";
+  return `${meta}:${createHash("sha256").update(body).digest("hex")}`;
+}
+
+async function ignoredState(cwd: string, env: Record<string, string>, signal: AbortSignal) {
+  const root = realpathSync(cwd);
+  const since = BigInt(Date.now() - 5_000) * 1_000_000n;
+  const state = new Map<string, string | null>();
+  for (const path of await ignoredPaths(cwd, env, signal)) state.set(path, fingerprint(root, path, since));
+  return { since, state };
+}
+
 /** Remove a path without following symlinked parents, then prune directories it left empty. */
 function removeWithin(root: string, path: string) {
   const parts = path.split("/");
@@ -124,7 +149,7 @@ export async function gradeImplement(
   };
   const snapshot = restore ? mkdtempSync(join(dirname(cwd), "grade-")) : undefined;
   let snapshotReady = false;
-  let ignoredBefore: Set<string> | undefined;
+  let ignoredBefore: Awaited<ReturnType<typeof ignoredState>> | undefined;
   const modes = new Map<string, number>();
   try {
     signal.throwIfAborted();
@@ -181,7 +206,7 @@ export async function gradeImplement(
     });
     evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");
     evidence.auditWarnings = findings.filter((finding) => finding.severity === "warn");
-    if (snapshot) ignoredBefore = await ignoredPaths(cwd, env, signal);
+    if (snapshot) ignoredBefore = await ignoredState(cwd, env, signal);
     inject(cwd, files);
     const hidden = await withScratch(cwd, (scratch) =>
       runProcess({
@@ -232,12 +257,16 @@ export async function gradeImplement(
             signal,
           });
           await sh(["git", "clean", "-fd"], { cwd, env, signal });
-          // Ignore rules are candidate-controlled: drop hidden files and grader outputs they would keep.
+          // Ignore rules are candidate-controlled: drop hidden files and anything the grader created
+          // or rewrote, since a pre-existing ignored output may now hold hidden test contents.
           if (ignoredBefore) {
             const root = realpathSync(cwd);
             for (const file of files) removeWithin(root, file.path);
-            for (const path of await ignoredPaths(cwd, env, signal))
-              if (!ignoredBefore.has(path)) removeWithin(root, path);
+            for (const path of await ignoredPaths(cwd, env, signal)) {
+              const before = ignoredBefore.state.get(path);
+              if (before === undefined || before !== fingerprint(root, path, ignoredBefore.since))
+                removeWithin(root, path);
+            }
             await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "HEAD"], {
               cwd,
               env,
