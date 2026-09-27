@@ -11,6 +11,7 @@ import type { DiscordCommand, DiscordMessage, DiscordPort } from "../src/integra
 import { mountDiscord } from "../src/integrations/discord.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import { localServer } from "./mcp-support.ts";
 
 class FakeDiscord implements DiscordPort {
   posts: { channel: string; content: string }[] = [];
@@ -214,9 +215,9 @@ test("disabled Discord and unavailable alternatives leave alerts in the API", as
   expect(port.posts).toEqual([]);
   const route = createHttpRoutes(factory)["/api/alerts"] as (
     req: Request,
-    server: never,
+    server: typeof localServer,
   ) => Promise<Response>;
-  const response = await route(new Request("http://localhost/api/alerts"), undefined as never);
+  const response = await route(new Request("http://localhost/api/alerts"), localServer);
   expect((await response.json()) as QuotaAlert[]).toHaveLength(2);
 });
 
@@ -301,12 +302,10 @@ test("quota rejection preserves a named window's unknown reset boundary", async 
 test("alerts API returns current alerts and store publishes dashboard changes", async () => {
   const route = createHttpRoutes(factory)["/api/alerts"] as (
     req: Request,
-    server: never,
+    server: typeof localServer,
   ) => Promise<Response>;
   const read = async () =>
-    (await (
-      await route(new Request("http://localhost/api/alerts"), undefined as never)
-    ).json()) as QuotaAlert[];
+    (await (await route(new Request("http://localhost/api/alerts"), localServer)).json()) as QuotaAlert[];
   const changes: StreamMessage[] = [];
   const unsubscribe = store.subscribe((msg) => changes.push(msg));
   const reset = now + 100_000;
@@ -437,10 +436,10 @@ for (const discord of ["enabled", "disabled", "failing"] as const) {
     const unsubscribe = store.subscribe((msg) => changes.push(msg));
     const route = createHttpRoutes(factory)["/api/alerts"] as (
       req: Request,
-      server: never,
+      server: typeof localServer,
     ) => Promise<Response>;
     const read = async () => {
-      const response = await route(new Request("http://localhost/api/alerts"), undefined as never);
+      const response = await route(new Request("http://localhost/api/alerts"), localServer);
       return ((await response.json()) as QuotaAlert[]).find((alert) => alert.provider === "A");
     };
     try {
@@ -503,8 +502,8 @@ for (const discord of ["enabled", "disabled", "failing"] as const) {
 
 test("the SSE endpoint streams exhaustion, fallback changes and timed clearing", async () => {
   const routes = createHttpRoutes(factory);
-  const stream = routes["/api/stream"] as (req: Request, server: never) => Promise<Response>;
-  const response = await stream(new Request("http://localhost/api/stream"), { timeout: () => {} } as never);
+  const stream = routes["/api/stream"] as (req: Request, server: typeof localServer) => Promise<Response>;
+  const response = await stream(new Request("http://localhost/api/stream"), localServer);
   const reader = response.body?.getReader();
   if (!reader) throw new Error("missing SSE body");
   const nextAlert = async (window: string) => {

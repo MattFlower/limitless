@@ -1,9 +1,11 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { evalSettings } from "./evals/settings.ts";
 import { defaultGateSlots } from "./gates/slots.ts";
+import { isLanAddress, isLoopback, publicOrigin } from "./server/access.ts";
 
 export interface Paths {
   home: string; // ~/.limitless
@@ -30,6 +32,9 @@ export interface Config {
   retention: { worktreeDays: number; failedWorktreeDays: number; logDays: number; debugEventDays: number };
   port: number;
   host: string;
+  listenLan: string | null;
+  trustedProxies: string[];
+  publicOrigins: string[];
   publicUrl: string | null; // e.g. https://limitless.mattflower.cc (webhooks only)
   uiUrl: string; // where the UI is reachable locally, used in PR bodies
   maxConcurrentRuns: number;
@@ -134,8 +139,27 @@ export function loadConfig(
   const port = overrides.port ?? num(Number(process.env.LIMITLESS_PORT) || server.port, 7400);
   const host = str(server.host, "127.0.0.1") as string;
 
+  const listenLan = server.listen_lan ?? null;
+  if (listenLan !== null && (typeof listenLan !== "string" || !isLanAddress(listenLan)))
+    throw new Error("server.listen_lan must be a concrete non-loopback unicast IP (never 0.0.0.0 or ::)");
+  if (listenLan && !isLoopback(host))
+    throw new Error("server.host must be a loopback IP when server.listen_lan is enabled");
+  const trustedProxies = server.trusted_proxies ?? [];
+  if (!Array.isArray(trustedProxies))
+    throw new Error("server.trusted_proxies must be an array of individual IP addresses");
+  for (const ip of trustedProxies)
+    if (typeof ip !== "string" || !isIP(ip) || ip.includes("%"))
+      throw new Error(
+        `server.trusted_proxies: ${JSON.stringify(ip)} must be an individual IP address (no CIDRs or hostnames)`,
+      );
+  const origins = server.public_origins ?? [];
+  if (!Array.isArray(origins)) throw new Error("server.public_origins must be an array of HTTP(S) origins");
+
   return {
     paths,
+    listenLan,
+    trustedProxies,
+    publicOrigins: origins.map(publicOrigin),
     retention: {
       worktreeDays: days(retention.worktree_days, 3),
       failedWorktreeDays: days(retention.failed_worktree_days, 7),

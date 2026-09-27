@@ -1,0 +1,290 @@
+import { expect, mock, test } from "bun:test";
+import { createHmac } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import type { Server } from "bun";
+import { loadConfig } from "../src/config.ts";
+import { githubWebhook } from "../src/integrations/github.ts";
+import { classifyRequest, publicHost } from "../src/server/access.ts";
+import { createHttpRoutes, startHttp } from "../src/server/http.ts";
+import { buildUi } from "../src/server/ui.ts";
+import { fixture, type Route, requestWithParams } from "./mcp-support.ts";
+
+const proxy = "192.168.1.20",
+  origin = "https://limitless.mattflower.net";
+const peer = (address: string | null) =>
+  ({ requestIP: () => (address ? { address } : null), timeout: () => {} }) as unknown as Server<undefined>;
+
+test("classification uses only valid socket peers, with tunnel precedence and normalized IPs", () => {
+  for (const [ip, headers, expected] of [
+    [proxy, {}, "proxy"],
+    ["::ffff:c0a8:114", {}, "proxy"],
+    ["192.168.1.21", {}, "denied"],
+    [null, {}, "denied"],
+    ["garbage", {}, "denied"],
+    ["127.not.an.ip", {}, "denied"],
+    ["127.2.3.4", {}, "loopback"],
+    ["0:0:0:0:0:0:0:1", {}, "loopback"],
+    ["::ffff:7f00:1", {}, "loopback"],
+    ["0:0:0:0:0:ffff:127.0.0.1", {}, "loopback"],
+    ["127.0.0.1", { "X-FoRwArDeD-For": "" }, "denied"],
+    ["::1", { "X-Forwarded-Proto": "https" }, "denied"],
+    ["192.168.1.21", { "x-forwarded-for": proxy }, "denied"],
+    [proxy, { "cf-connecting-ip": "" }, "tunnel"],
+    ["127.0.0.1", { "cf-connecting-ip": "x" }, "tunnel"],
+  ] as [string | null, Record<string, string>, string][])
+    expect(classifyRequest(ip, new Headers(headers), [proxy])).toBe(expected);
+  expect(classifyRequest("2001:db8::1", new Headers(), ["2001:0db8:0:0:0:0:0:1"])).toBe("proxy");
+  expect(publicHost("limitless.mattflower.net:8443", [`${origin}:8443`])).toBe(true);
+  expect(publicHost("limitless.mattflower.net", [`${origin}:8443`])).toBe(false);
+});
+
+test("config validates LAN settings; exact binds share routes, stop together and roll back failure", async () => {
+  const f = await fixture();
+  try {
+    const configDir = join(f.home, "config");
+    mkdirSync(configDir);
+    const config = (toml: string) => {
+      writeFileSync(join(configDir, "config.toml"), `[server]\n${toml}`);
+      return loadConfig({ home: join(f.home, "data"), configDir });
+    };
+    expect(config("")).toMatchObject({ listenLan: null, trustedProxies: [], publicOrigins: [] });
+    for (const value of [
+      "0.0.0.0",
+      "::",
+      "127.0.0.1",
+      "::ffff:127.0.0.2",
+      "224.0.0.1",
+      "ff02::1",
+      "host",
+      "192.168.1.1/24",
+    ])
+      expect(() => config(`listen_lan = "${value}"`)).toThrow("server.listen_lan");
+    for (const toml of [
+      'trusted_proxies = ["host"]',
+      "trusted_proxies = [42]",
+      'public_origins = "x"',
+      ...["ftp://host", "https://u:p@host", "https://host/path", "https://host/?", "https://host/#"].map(
+        (x) => `public_origins = ["${x}"]`,
+      ),
+      'listen_lan = "192.168.1.10"\nhost = "0.0.0.0"',
+    ])
+      expect(() => config(toml)).toThrow("server.");
+    for (const value of ["192.168.1.0/24", "2001:db8::/32", "host", 42])
+      expect(() => config(`trusted_proxies = ["${proxy}", ${JSON.stringify(value)}]`)).toThrow(
+        `server.trusted_proxies: ${JSON.stringify(value)} must be an individual IP address (no CIDRs or hostnames)`,
+      );
+    const stops: ReturnType<typeof mock>[] = [];
+    const options: { hostname?: string; port?: string | number; routes?: unknown }[] = [];
+    const serve = ((opts: (typeof options)[number]) => {
+      options.push(opts);
+      const stop = mock(() => Promise.resolve());
+      stops.push(stop);
+      return { stop, port: opts.port, url: new URL("http://localhost:7400") };
+    }) as unknown as typeof Bun.serve<undefined>;
+    await startHttp(f.factory, {}, serve).stop(true);
+    expect(options.map((o) => [o.hostname, o.port])).toEqual([["127.0.0.1", 7400]]);
+    Object.assign(
+      f.factory.cfg,
+      config(
+        `listen_lan = "192.168.1.10"\nport = 7401\ntrusted_proxies = ["${proxy}"]\npublic_origins = ["HTTPS://LIMITLESS.MATTFLOWER.NET/"]`,
+      ),
+    );
+    const server = startHttp(f.factory, {}, serve);
+    expect(options.slice(1).map((o) => [o.hostname, o.port])).toEqual([
+      ["127.0.0.1", 7401],
+      ["192.168.1.10", 7401],
+    ]);
+    expect(options[1]?.routes).toBe(options[2]?.routes);
+    await server.stop(true);
+    for (const stop of stops) expect(stop).toHaveBeenCalledWith(true);
+    let calls = 0;
+    expect(() =>
+      startHttp(f.factory, {}, ((opts: Parameters<typeof serve>[0]) => {
+        if (++calls === 2) throw new Error("bind failed");
+        return serve(opts);
+      }) as typeof serve),
+    ).toThrow("bind failed");
+    expect(stops.at(-1)).toHaveBeenCalledWith(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("guarded UI/assets, API, SSE, mutations and webhook transports", async () => {
+  const f = await fixture();
+  try {
+    const cfg = f.factory.cfg;
+    cfg.trustedProxies = [proxy];
+    cfg.publicOrigins = [origin];
+    cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
+    const ui = await buildUi();
+    const mcp = mock(() => new Response("dispatch"));
+    const routes = createHttpRoutes(f.factory, {
+      ui,
+      routes: { "/mcp": mcp, "/webhooks/github": githubWebhook(f.factory, async () => ["140.82.112.0/20"]) },
+    });
+    const call = (
+      path: string,
+      address = proxy,
+      headers: Record<string, string> = { host: "limitless.mattflower.net" },
+      method = "GET",
+      body?: string,
+      signal?: AbortSignal,
+    ) => {
+      const entry = routes[path] ?? (path.startsWith("/runs/") ? routes["/runs/*"] : routes["/*"]);
+      const route =
+        typeof entry === "function"
+          ? (entry as Route)
+          : ((entry as Record<string, Route>)[method] ?? (routes["/*"] as Route));
+      return route(
+        requestWithParams(`http://localhost:7400${path}`, { method, headers, body, signal }),
+        peer(address),
+      );
+    };
+    const asset = Object.keys(ui).find((path) => path.endsWith(".js"));
+    if (!asset) throw new Error("missing bundled JS");
+    expect(await ui["/index.html"]?.text()).toContain(`src="${asset}"`);
+    for (const path of [
+      "/",
+      "/runs/deep",
+      asset,
+      "/api/health",
+      "/api/stream",
+      "/unknown",
+      "/api/admin/drain",
+      "/mcp",
+    ])
+      for (const address of [proxy, "127.0.0.1", "192.168.1.21"]) {
+        expect(
+          (await call(path, address, { "cf-connecting-ip": "", host: "limitless.mattflower.net" })).status,
+        ).toBe(403);
+        expect((await call(path, "192.168.1.21", { "x-forwarded-for": proxy })).status).toBe(403);
+      }
+    for (const address of [proxy, "127.0.0.1"]) {
+      for (const path of ["/", "/runs/deep", asset, "/api/health"])
+        expect((await call(path, address)).status).toBe(200);
+      expect((await call("/unknown", address)).status).toBe(404);
+      const abort = new AbortController();
+      const response = await call(
+        "/api/stream",
+        address,
+        { host: "limitless.mattflower.net" },
+        "GET",
+        undefined,
+        abort.signal,
+      );
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("no SSE");
+      try {
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain(": connected");
+        await f.factory.createRun({ repo: f.repo, prompt: "stream" });
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain('"kind":"run"');
+      } finally {
+        abort.abort();
+        await reader.cancel();
+      }
+    }
+    for (const path of ["/api/admin", "/api/admin/drain", "/api/admin/resume", "/api/admin/deploy", "/mcp"])
+      for (const method of ["GET", "HEAD", "POST", "OPTIONS", "DELETE"])
+        for (const address of [proxy, "127.0.0.1"])
+          for (const host of ["localhost", "limitless.mattflower.net"])
+            expect(
+              (
+                await call(
+                  path,
+                  address,
+                  { host, origin, "x-forwarded-proto": "http", "content-type": "application/json" },
+                  method,
+                )
+              ).status,
+            ).toBe(403);
+    expect(f.factory.scheduler.draining).toBe(false);
+    expect(mcp).not.toHaveBeenCalled();
+    const valid = { host: "limitless.mattflower.net", origin, "content-type": "application/json" };
+    const before = f.factory.store.listRuns().length;
+    for (const headers of [
+      { ...valid, host: "foreign.example" },
+      { ...valid, host: "" },
+      { ...valid, host: "limitless.mattflower.net:8443" },
+      { ...valid, host: "limitless.mattflower.net/" },
+      { ...valid, origin: "null" },
+      { ...valid, origin: "" },
+      { ...valid, origin: "https://evil.example" },
+      { origin, "content-type": "application/json", "x-forwarded-host": "limitless.mattflower.net" },
+      { host: "limitless.mattflower.net", "content-type": "application/json" },
+    ] as Record<string, string>[])
+      expect(
+        (await call("/api/runs", proxy, headers, "POST", JSON.stringify({ repo: f.repo, prompt: "blocked" })))
+          .status,
+      ).toBe(403);
+    expect(f.factory.store.listRuns()).toHaveLength(before);
+    expect(
+      (await call("/api/runs", proxy, { ...valid, "content-type": "text/plain" }, "POST", "{}")).status,
+    ).toBe(415);
+    expect(
+      (await call("/api/runs", proxy, valid, "POST", JSON.stringify({ repo: f.repo, prompt: "allowed" })))
+        .status,
+    ).toBe(201);
+    cfg.trustedProxies = [];
+    cfg.publicOrigins = [];
+    for (const headers of [
+      { "content-type": "application/json" },
+      { "content-type": "application/json", origin: "http://localhost:7400" },
+    ] as Record<string, string>[])
+      expect(
+        (
+          await call(
+            "/api/runs",
+            "127.0.0.1",
+            headers,
+            "POST",
+            JSON.stringify({ repo: f.repo, prompt: "local" }),
+          )
+        ).status,
+      ).toBe(201);
+    expect((await call("/api/runs", "127.0.0.1", valid, "POST", "{}")).status).toBe(403);
+    cfg.trustedProxies = [proxy];
+    cfg.publicOrigins = [origin];
+    for (const [address, tunnel] of [
+      [proxy, false],
+      [proxy, true],
+      ["127.0.0.1", false],
+      ["192.168.1.21", true],
+    ] as const) {
+      const body = JSON.stringify({ repository: { full_name: "MattFlower/limitless" } });
+      const headers = {
+        host: "limitless.mattflower.net",
+        "x-github-delivery": `${address}-${tunnel}`,
+        "x-github-event": "ping",
+        "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+        ...(tunnel ? { "cf-connecting-ip": "140.82.112.1" } : {}),
+      };
+      expect((await call("/webhooks/github", address, headers, "POST", body)).status).toBe(200);
+      expect(
+        (
+          await call(
+            "/webhooks/github",
+            address,
+            { ...headers, "x-hub-signature-256": "invalid" },
+            "POST",
+            body,
+          )
+        ).status,
+      ).toBe(401);
+      expect(
+        (
+          await call(
+            "/webhooks/github",
+            address,
+            { ...headers, "cf-connecting-ip": "192.0.2.1" },
+            "POST",
+            body,
+          )
+        ).status,
+      ).toBe(403);
+    }
+  } finally {
+    await f.close();
+  }
+});

@@ -2285,7 +2285,7 @@ test("pipeline fallback records each effort and reloads the exact implementer pr
   const { RunContext } = await import("../src/pipeline/context.ts");
   const { Router } = await import("../src/router/router.ts");
   const { createHttpRoutes } = await import("../src/server/http.ts");
-  const { requestWithParams } = await import("./mcp-support.ts");
+  const { localServer, requestWithParams } = await import("./mcp-support.ts");
   const f = await evalFixture();
   try {
     const model = enableEfforts(f);
@@ -2346,7 +2346,7 @@ test("pipeline fallback records each effort and reloads the exact implementer pr
     const route = routes["/api/runs/:id"] as import("./mcp-support.ts").Route;
     const response = await route(
       requestWithParams(`http://localhost/api/runs/${run.id}`, {}, { id: run.id }),
-      {} as import("bun").Server<undefined>,
+      localServer,
     );
     expect(await response.json()).toMatchObject({ invocations: [{ effort: "low" }, { effort: "high" }] });
     // Old run state without a targetId still loads and resolves its bare preference.

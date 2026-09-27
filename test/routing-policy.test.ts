@@ -2,7 +2,6 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Server } from "bun";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { evalSettings } from "../src/evals/settings.ts";
@@ -11,7 +10,7 @@ import { loadPolicy, validatePolicy } from "../src/router/policy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { evidence, local, subscription } from "./evals-policy-support.ts";
 import { evalFixture } from "./evals-support.ts";
-import { type Route, requestWithParams } from "./mcp-support.ts";
+import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
 test("policy files: absent, empty, partial, pipe groups, complexity preservation and immutable defaults", () => {
   const dir = mkdtempSync(join(tmpdir(), "policy-"));
@@ -129,10 +128,7 @@ test("factory/API share the startup policy and current eligibility settings; inj
     factory = new Factory(cfg, { policyPath: path });
     const routes = createHttpRoutes(factory);
     const call = (route: string, suffix = "") =>
-      (routes[route] as Route)(
-        requestWithParams(`http://localhost${route}${suffix}`, {}, {}),
-        {} as Server<undefined>,
-      );
+      (routes[route] as Route)(requestWithParams(`http://localhost${route}${suffix}`, {}, {}), localServer);
     expect(await (await call("/api/models")).json()).toEqual({ models: MODELS, policy: factory.policy });
     expect(factory.router.route("triage", "small").candidates.map((c) => c.targetId ?? c.modelId)).toEqual([
       subscription,

@@ -237,3 +237,48 @@ partial overlay from the daemon's application checkout over DEFAULT_POLICY; writ
 does not hot-reload a running daemon. Invalid overlay files fail startup loudly with their path.
 The generator does not push, create PRs or deploy. Browse **Evals** in the UI for current eligibility,
 source run links, metrics with intervals, comparisons, and error/skip/cache trial details.
+
+## Remote UI via LAN proxy
+
+Keep local access at `http://127.0.0.1:7400`. For remote access over WireGuard, set
+these keys in `~/.config/limitless/config.toml` (replace the example IPs with the Mac's
+fixed wired LAN IP and NPM's socket source IP):
+
+```toml
+[server]
+listen_lan = "192.168.1.10"
+trusted_proxies = ["192.168.1.20"]
+public_origins = ["https://limitless.mattflower.net"]
+```
+
+Restart the daemon; allow incoming connections for Bun/Limitless if macOS displays its
+firewall prompt. The additional listener binds only `listen_lan`, on the configured
+`server.port` (default 7400); the loopback listener remains. Omit these keys for local-only
+operation. Do not use a wildcard address or change `server.host` to a LAN address.
+
+Create an NPM Proxy Host for `limitless.mattflower.net`, terminating TLS with the wildcard
+certificate and forwarding to `http://<mac>:7400`. Preserve the public `Host` header
+(`proxy_set_header Host $http_host;`), including any configured non-default port. Attach an
+Access List allowing only your LAN and WireGuard source ranges **and** requiring basic
+authentication. Disable NPM's “Satisfy Any” option so both checks are required; deny all
+other sources. This is essential if NPM also faces the internet: an internet client can
+send the expected Host, so hostname routing and the daemon's Host check alone do not
+restrict access. Test that a permitted source without credentials and a forbidden source
+with valid credentials are both rejected.
+
+In the proxy host's custom nginx configuration, disable buffering/caching for SSE and
+allow long-lived streams:
+
+```nginx
+proxy_buffering off;
+proxy_cache off;
+proxy_read_timeout 1h;
+```
+
+The daemon trusts the proxy's socket IP for UI/API access (including SSE), never forwarded
+client-address headers. Proxy mutations require the configured public Origin and JSON.
+Administration (`/api/admin/*`, including drain/resume) and `/mcp` remain loopback-only;
+deploy remains a local CLI operation. Keep browser credentials and access controls at NPM.
+The backend hop is unencrypted HTTP: confine it to the small wired segment, whose hosts
+and the proxy must be trusted. Other LAN peers are refused by the daemon. Tunnel traffic
+remains webhook-only, and all webhook signature/source checks still apply.

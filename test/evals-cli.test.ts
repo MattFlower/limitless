@@ -1,11 +1,10 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Server } from "bun";
 import { evalCommand, formatEvalReport } from "../src/cli/eval.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { evalFixture } from "./evals-support.ts";
-import { type Route, requestWithParams } from "./mcp-support.ts";
+import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
 const evalRoles = test.each(["triage", "implement"] as const);
 evalRoles("CLI %s submits options, follows HTTP results and emits JSON", async (role) => {
@@ -54,7 +53,7 @@ evalRoles("CLI %s submits options, follows HTTP results and emits JSON", async (
             { ...init, headers: { "content-type": "application/json" } },
             { id },
           ),
-          {} as Server<undefined>,
+          localServer,
         );
         const result = await response.json();
         if (!response.ok) throw new Error((result as { error: string }).error);
@@ -262,7 +261,7 @@ test("policy CLI turns a small fake-harness eval into a written overlay through 
             { ...init, headers: { "content-type": "application/json" } },
             { id },
           ),
-          {} as Server<undefined>,
+          localServer,
         );
         const result = await response.json();
         if (!response.ok) throw new Error((result as { error: string }).error);

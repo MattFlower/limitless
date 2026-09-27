@@ -1,15 +1,13 @@
 import { expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
-import type { Server } from "bun";
 import { formatEvalReport } from "../src/cli/eval.ts";
 import { loadRoleCases, VerifyCaseFileSchema } from "../src/evals/cases.ts";
 import type { EvalReport } from "../src/evals/stats.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 import { answer, deferred, evalFixture } from "./evals-support.ts";
-import { type Route, requestWithParams } from "./mcp-support.ts";
+import { type Route, requestWithParams, localServer as server } from "./mcp-support.ts";
 
-const server = {} as Server<undefined>;
 test("API persists immediately, runs in background, lists and reports trials and partial metrics", async () => {
   const f = await evalFixture();
   const release = deferred<void>();

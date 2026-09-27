@@ -132,11 +132,12 @@ async function serve(): Promise<void> {
     bootSha,
     policyPath: join(import.meta.dir, "../../routing/policy.json"),
   });
-  const ui = (await import("../../ui/index.html")).default;
+  const ui = await (await import("../server/ui.ts")).buildUi();
   const integrations = await mountIntegrations(factory);
   const server = startHttp(factory, { ui, routes: integrations.routes });
   factory.start();
   console.log(`Limitless listening on http://${cfg.host}:${server.port}  (data: ${cfg.paths.home})`);
+  if (cfg.listenLan) console.log(`LAN proxy listener: http://${cfg.listenLan}:${cfg.port}`);
   for (const line of integrations.notes) console.log(`  ${line}`);
   let stopping = false;
   const shutdown = async (sig: string) => {

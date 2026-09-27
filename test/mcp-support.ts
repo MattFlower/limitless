@@ -87,5 +87,6 @@ export function requestWithParams(url: string, init?: RequestInit, params: Recor
 }
 
 export const localServer = {
+  timeout: () => {},
   requestIP: () => ({ address: "127.0.0.1", family: "IPv4", port: 40000 }),
 } as unknown as import("bun").Server<undefined>;
