@@ -169,6 +169,14 @@ export class RunContext {
   readonly runDir: string;
   state: RunState;
 
+  get freeFirstRouting(): boolean {
+    return this.run.requestedBy === "dependabot[bot]" && this.deps.cfg.dependabotRouting === "free_first";
+  }
+
+  routingConstraints(constraints: RouteConstraints = {}): RouteConstraints {
+    return this.freeFirstRouting ? { ...constraints, billing: "free_first" } : constraints;
+  }
+
   constructor(
     readonly deps: EngineDeps,
     public run: Run,
@@ -295,7 +303,11 @@ export class RunContext {
 
     for (let attempt = 0; attempt < 6; attempt++) {
       this.checkCancelled();
-      const decision = router.route(opts.role, opts.complexity, { ...opts.constraints, exclude: tried });
+      const decision = router.route(
+        opts.role,
+        opts.complexity,
+        this.routingConstraints({ ...opts.constraints, exclude: tried }),
+      );
       const target = decision.candidates[0];
       if (!target) {
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
