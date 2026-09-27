@@ -8,6 +8,7 @@ import { MIGRATIONS } from "../src/db/migrations.ts";
 import { Store } from "../src/db/store.ts";
 
 const row: EvalTrial = {
+  effort: null,
   evalRunId: "",
   caseId: "a",
   modelId: "opaque-model",
@@ -71,6 +72,7 @@ test("upgrade to the eval migration preserves data and adds eval columns, cache 
       "tokens_out",
       "duration_ms",
       "created_at",
+      "effort",
     ]);
     expect(
       (store.db.query("PRAGMA index_list(eval_trials)").all() as { name: string }[]).some(
@@ -161,6 +163,68 @@ test("upgrade to the eval migration preserves data and adds eval columns, cache 
       expect(store.getEvalRun(terminal.id)).toEqual(before);
       expect(before?.finishedAt).toBeNumber();
     }
+  } finally {
+    store?.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("effort migration preserves v9 rows and pair upserts survive reopening", () => {
+  const home = mkdtempSync(join(tmpdir(), "effort-migration-"));
+  const path = join(home, "db.sqlite");
+  let store: Store | undefined;
+  try {
+    const db = new Database(path);
+    db.exec(
+      "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+    );
+    for (const m of MIGRATIONS.filter((m) => m.version < 10)) {
+      db.exec(m.sql);
+      db.query("INSERT INTO schema_migrations VALUES (?, ?, 1)").run(m.version, m.name);
+    }
+    db.exec(`
+      INSERT INTO repos (id,slug,kind,created_at) VALUES ('repo','local/test','local',1);
+      INSERT INTO runs (id,repo_id,title,prompt,source,status,created_at) VALUES ('run','repo','title','prompt','cli','queued',1);
+      INSERT INTO invocations (run_id,role,harness,provider,model,model_id,status,started_at) VALUES ('run','triage','fake','provider','backend','opaque-model','ok',1);
+      INSERT INTO eval_runs VALUES ('old','triage','["opaque-model"]',1,1,'completed',1,2,NULL);
+      INSERT INTO eval_trials VALUES ('old','a','opaque-model',0,'legacy','fake','ok','{}',1,1,'{}',0,0,0,0,1,1);
+    `);
+    db.close();
+    store = new Store(path);
+    expect(store.listInvocations("run")[0]?.effort).toBeNull();
+    expect(store.listEvalTrials("old")[0]?.effort).toBeNull();
+    for (const effort of ["low", "high", "none", null] as const)
+      store.recordEvalTrial({ ...row, evalRunId: "old", effort });
+    store.recordEvalTrial({ ...row, evalRunId: "old", effort: "low", score: 0.75 });
+    expect(store.listEvalTrials("old")).toHaveLength(4);
+    const events: unknown[] = [];
+    const unsubscribe = store.subscribe((event) => events.push(event));
+    const invocation = store.createInvocation({
+      runId: "run",
+      stageId: null,
+      role: "triage",
+      harness: "fake",
+      provider: "provider",
+      model: "backend",
+      modelId: "opaque-model",
+      effort: "none",
+    });
+    store.updateInvocation(invocation.id, { status: "cancelled", error: "cancelled" });
+    unsubscribe();
+    expect(events).toHaveLength(2);
+    for (const event of events)
+      expect(event).toMatchObject({ kind: "invocation", invocation: { effort: "none" } });
+    store.close();
+    store = new Store(path);
+    expect(
+      store
+        .listEvalTrials("old")
+        .map((t) => t.effort)
+        .sort(),
+    ).toEqual(([null, "high", "low", "none"] as const).toSorted());
+    expect(store.listEvalTrials("old").find((t) => t.effort === "low")?.score).toBe(0.75);
+    expect(store.getInvocation(invocation.id)).toMatchObject({ effort: "none", status: "cancelled" });
+    expect(store.getRunDetail("run")?.invocations[0]?.effort).toBeNull();
   } finally {
     store?.close();
     rmSync(home, { recursive: true, force: true });

@@ -26,6 +26,7 @@ import {
   resetTo,
 } from "../git/repos.ts";
 import type { RouteConstraints } from "../router/router.ts";
+import { formatTarget } from "../router/targets.ts";
 import {
   CancelledError,
   type EngineDeps,
@@ -399,7 +400,14 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
     async (stage) => {
       const current = ctx.state.implementer;
       const escalate = current && ctx.state.roundsOnImplementer >= ROUNDS_PER_IMPLEMENTER;
-      let constraints: RouteConstraints = current ? { prefer: current.modelId } : {};
+      let constraints: RouteConstraints = current
+        ? {
+            prefer:
+              current.effort === undefined
+                ? (current.targetId ?? current.modelId)
+                : { modelId: current.modelId, effort: current.effort },
+          }
+        : {};
       if (escalate) {
         // Prefer a stronger model; otherwise any model not tried yet; otherwise keep going as-is.
         const options: RouteConstraints[] = [
@@ -428,9 +436,21 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           feedback: ctx.state.feedback,
         }),
       });
-      ctx.state.implementer = { modelId: target.modelId, tier: target.tier, vendor: target.vendor };
-      if (!ctx.state.triedImplementers.includes(target.modelId))
-        ctx.state.triedImplementers.push(target.modelId);
+      ctx.state.implementer = {
+        modelId: target.modelId,
+        targetId: target.targetId,
+        effort: target.effort ?? null,
+        tier: target.tier,
+        vendor: target.vendor,
+      };
+      if (
+        !ctx.state.triedImplementers.some(
+          (ref) =>
+            (typeof ref === "string" ? ref : formatTarget(ref.modelId, ref.effort)) ===
+            (target.targetId ?? target.modelId),
+        )
+      )
+        ctx.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
       ctx.state.implementerReport = result.finalText;
       ctx.store.putArtifact(ctx.run.id, `implement-${round}.md`, "report", result.finalText || "(no report)");
       const sha = await commitAll(

@@ -160,3 +160,35 @@ test("review and verify API reports preserve role grades and text/JSON metrics",
     await f.close();
   }
 });
+
+test("POST evals validates targets before scheduling and returns persisted efforts", async () => {
+  const { enableEfforts, invalidTargets } = await import("./evals-support.ts");
+  const f = await evalFixture();
+  try {
+    enableEfforts(f);
+    const routes = createHttpRoutes(f.factory);
+    const post = (routes["/api/evals"] as { POST: Route }).POST;
+    const submit = (models: string[]) =>
+      post(
+        requestWithParams("http://localhost/api/evals", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ role: "triage", models, maxUsd: 0 }),
+        }),
+        server,
+      );
+    for (const models of invalidTargets) expect((await submit(models)).status).toBe(400);
+    expect(f.factory.store.listEvalRuns()).toHaveLength(0);
+    const result = await submit(["candidate-a", "candidate-a@none", "candidate-a@high"]);
+    expect(result.ok).toBe(true);
+    const run = f.factory.store.listEvalRuns()[0];
+    if (!run) throw new Error("missing");
+    expect(run.models).toEqual(["candidate-a@low", "candidate-a@none", "candidate-a@high"]);
+    await f.factory.evals.wait(run.id);
+    expect(new Set(f.factory.evals.report(run.id)?.trials.map((t) => t.effort))).toEqual(
+      new Set(["low", "none", "high"]),
+    );
+  } finally {
+    await f.close();
+  }
+});

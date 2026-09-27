@@ -5,6 +5,7 @@ import { evalSettings } from "../src/evals/settings.ts";
 import { pairedBootstrap, wilson } from "../src/evals/stats.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
 import { overlayPolicy } from "../src/router/policy.ts";
+import { parseTarget, recordedTarget } from "../src/router/targets.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
 import { evidence, input, local, metered, response, subscription } from "./evals-policy-support.ts";
 
@@ -135,7 +136,7 @@ test("non-inferiority is strict at -delta, including the self-comparison when de
   expect(first(input(undefined, { settings: evalSettings({ evals: { delta: 0 } }) })).eligible).toBe(false);
   const row = evidence("triage", [local, subscription]);
   row.trials
-    .filter((t) => t.modelId === subscription)
+    .filter((t) => recordedTarget(t) === subscription)
     .slice(0, 20)
     .forEach((t) => {
       t.pass = false;
@@ -213,13 +214,13 @@ test("ordering resolves equal cost by latency, known before null, then ID", () =
   });
   expect(generatePolicy(input([row])).generated.triage?.default).toEqual([subscription, local, metered]);
   row.trials
-    .filter((t) => t.modelId === metered)
+    .filter((t) => recordedTarget(t) === metered)
     .forEach((t) => {
       t.durationMs = 1;
     });
   expect(generatePolicy(input([row])).generated.triage?.default?.[0]).toBe(metered);
   row.trials
-    .filter((t) => t.modelId === subscription)
+    .filter((t) => recordedTarget(t) === subscription)
     .forEach((t) => {
       t.details.cache = {
         evalRunId: "cached",
@@ -242,7 +243,9 @@ for (const [origin, baseOrigin, exclusions, eligible] of [
   ["US", "US", ["CN"], true],
 ] as const)
   test(`origin=${origin}, base=${baseOrigin}, exclusions=${exclusions}`, () => {
-    const models = MODELS.map((m) => (m.id === local ? { ...m, origin, baseOrigin } : m));
+    const models = MODELS.map((m) =>
+      m.id === parseTarget(local).modelId ? { ...m, origin, baseOrigin } : m,
+    );
     const settings = evalSettings({
       routing: exclusions === undefined ? {} : { exclude_origins: exclusions },
     });
@@ -303,12 +306,12 @@ test("evidence rendering is reproducible and documents selected runs, missing me
   const verify = evidence("verify", [subscription]);
   verify.trials = [];
   review.trials
-    .filter((t) => t.modelId === subscription)
+    .filter((t) => recordedTarget(t) === subscription)
     .forEach((t) => {
       t.pass = false;
     });
   triage.trials
-    .filter((t) => t.modelId === subscription)
+    .filter((t) => recordedTarget(t) === subscription)
     .forEach((t) => {
       t.details.cache = {
         evalRunId: "cached",
@@ -404,4 +407,33 @@ test("a ceiling the dataset is too small to establish is insufficient evidence, 
   expect(result.eligible).toBe(false);
   expect(result.state).toBe("insufficient evidence");
   expect(result.reasons.join()).toContain("cannot establish");
+});
+
+test("policy selects latest evidence per effort, costs them independently and rejects unknown history", async () => {
+  const { validatePolicy } = await import("../src/router/policy.ts");
+  const low = evidence("triage", ["codex/luna@low"], { id: "low-old" });
+  const high = evidence("triage", ["codex/luna@high"], { id: "high", finishedAt: 4000 });
+  const newerLow = evidence("triage", ["codex/luna@low"], { id: "low-new", finishedAt: 3000 });
+  const legacy = evidence("triage", ["codex/luna"], { id: "legacy", finishedAt: 5000 });
+  const unsupported = evidence("triage", ["codex/luna@max"], { id: "unsupported" });
+  for (const t of high.trials) t.costEquivUsd = 10;
+  for (const t of low.trials) t.pass = false;
+  const data = input([high, low, newerLow, legacy, unsupported]);
+  // max is intentionally not a declared Luna setting.
+  const result = generatePolicy(data);
+  const candidates = result.roles[0]?.candidates ?? [];
+  expect(candidates.find((c) => c.modelId === "codex/luna@low")?.run.id).toBe("low-new");
+  expect(candidates.find((c) => c.modelId === "codex/luna@high")?.run.id).toBe("high");
+  expect(result.generated.triage?.default).toEqual(["codex/luna@low", "codex/luna@high"]);
+  expect(candidates.find((c) => c.modelId === "codex/luna")?.reasons).toContain(
+    "unknown or unsupported recorded effort",
+  );
+  expect(candidates.find((c) => c.modelId === "codex/luna@max")?.eligible).toBe(false);
+  expect(validatePolicy(result.generated, MODELS)).toEqual(result.generated);
+  expect(generatePolicy({ ...data, evidence: [...data.evidence].reverse() }).generated).toEqual(
+    result.generated,
+  );
+  const matrix = evalMatrix(response(data.evidence));
+  expect(matrix.rows[0]?.cells.find((c) => c.modelId === "codex/luna@low")?.href).toBe("/evals/low-new");
+  expect(matrix.rows[0]?.cells.find((c) => c.modelId === "codex/luna@high")?.href).toBe("/evals/high");
 });

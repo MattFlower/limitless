@@ -25,6 +25,7 @@ export const InvocationsTable: Component<{
       <tr>
         <th>Role</th>
         <th>Model</th>
+        <th>Effort</th>
         <th>Provider</th>
         <th>Status</th>
         <th class="num">In</th>
@@ -40,7 +41,7 @@ export const InvocationsTable: Component<{
         when={props.invocations.length > 0}
         fallback={
           <tr class="empty-row">
-            <td colspan={10}>No invocations yet.</td>
+            <td colspan={11}>No invocations yet.</td>
           </tr>
         }
       >
@@ -56,6 +57,7 @@ export const InvocationsTable: Component<{
             >
               <td class="mono">{inv.role}</td>
               <td class="mono text-accent">{inv.modelId}</td>
+              <td>{inv.effort ?? "unknown / unset"}</td>
               <td class="mono text-faint">{inv.provider}</td>
               <td>
                 <span class={`badge badge-${STATUS_BADGE[inv.status] ?? "info"}`}>{inv.status}</span>

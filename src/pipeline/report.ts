@@ -136,10 +136,11 @@ export function renderReport(input: ReportInput): string {
     blocks.push(
       "## Work log",
       table(
-        ["Role", "Model", "Status", "Tokens in / out", "Cost", "Duration"],
+        ["Role", "Model", "Effort", "Status", "Tokens in / out", "Cost", "Duration"],
         input.invocations.map((inv) => [
           inv.role,
           `\`${inv.modelId}\``,
+          inv.effort ?? "unknown / unset",
           inv.status,
           `${(inv.inputTokens + inv.cacheReadTokens).toLocaleString("en-US")} / ${inv.outputTokens.toLocaleString("en-US")}`,
           inv.costUsd > 0 ? money(inv.costUsd) : `${money(inv.costEquivUsd)} equiv.`,

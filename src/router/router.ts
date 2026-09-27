@@ -1,17 +1,18 @@
-import type { Complexity, Role } from "../core/types.ts";
+import type { Complexity, Effort, ModelSelection, Role } from "../core/types.ts";
 import type { ModelTarget } from "../harness/types.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy } from "./catalog.ts";
 import type { ProviderTracker } from "./providers.ts";
+import { formatTarget, parseTarget, resolveTarget } from "./targets.ts";
 
 export interface RouteConstraints {
   /** Skip models from this vendor (cross-vendor review). Falls back to it only if nothing else is available. */
   avoidVendor?: string;
   /** Only consider models at or above this tier (escalation). */
   minTier?: number;
-  /** Models to skip entirely (already failed in this stage). */
-  exclude?: string[];
-  /** Put this model first when it is available (stick with the current implementer). */
-  prefer?: string;
+  /** Resolved targets to skip (already failed in this stage). */
+  exclude?: (string | ModelSelection)[];
+  /** Put this target first when it is available (stick with the current implementer). */
+  prefer?: string | ModelSelection;
 }
 
 export interface RouteDecision {
@@ -34,17 +35,25 @@ export class Router {
     private readonly preferProviders: string[] = [],
   ) {
     this.models = new Map(models.map((m) => [m.id, m]));
+    for (const model of models) this.resolve(model.id);
   }
 
   model(id: string): ModelDef | undefined {
     return this.models.get(id);
   }
 
-  toTarget(m: ModelDef): ModelTarget {
+  resolve(reference: string | ModelSelection) {
+    return resolveTarget(reference, (id) => this.models.get(id));
+  }
+
+  toTarget(m: ModelDef, effort: Effort | null | undefined = m.effort): ModelTarget {
+    if (effort != null && !m.supportedEfforts.includes(effort))
+      throw new Error(`Unsupported effort "${effort}" for ${m.id}`);
     const def = this.tracker.def(m.provider);
     if (!def) throw new Error(`model ${m.id} references unknown provider ${m.provider}`);
     const target: ModelTarget = {
       modelId: m.id,
+      targetId: formatTarget(m.id, effort),
       provider: m.provider,
       harness: def.harness,
       model: m.model,
@@ -53,7 +62,14 @@ export class Router {
       billing: def.billing,
       price: m.price,
     };
-    if (m.effort) target.effort = m.effort;
+    if (effort != null) target.effort = effort;
+    if (def.openaiBaseUrl)
+      target.effortMapping =
+        def.id === "openrouter"
+          ? "openrouter"
+          : m.vendor === "qwen" && def.billing === "free"
+            ? "qwen"
+            : "generic";
     if (def.baseUrl)
       target.backend = { baseUrl: def.baseUrl, authToken: this.tracker.authToken(m.provider) ?? "" };
     if (def.openaiBaseUrl)
@@ -63,6 +79,7 @@ export class Router {
 
   describeFallback(provider: string, exhausted: boolean): string {
     const alternatives = new Set<string>();
+    const effortAlternatives = new Set<string>();
     const selected = this.lastRoute.get(provider);
     const routes: { role: Role; complexity: Complexity; constraints: RouteConstraints }[] = selected
       ? [selected]
@@ -71,18 +88,24 @@ export class Router {
       if (selected) break;
       for (const [complexity, groups] of Object.entries(cases) as [Complexity | "default", string[]][]) {
         const ids = groups.flatMap((group) => group.split("|"));
-        if (!ids.some((id) => this.models.get(id)?.provider === provider)) continue;
+        if (!ids.some((id) => this.model(parseTarget(id).modelId)?.provider === provider)) continue;
         routes.push({ role, complexity: complexity === "default" ? "medium" : complexity, constraints: {} });
       }
     }
     for (const route of routes) {
       for (const candidate of this.decideRoute(route.role, route.complexity, route.constraints).candidates) {
-        if (candidate.provider !== provider) alternatives.add(candidate.provider);
+        if (candidate.provider !== provider) {
+          alternatives.add(candidate.provider);
+          if (candidate.effort !== undefined)
+            effortAlternatives.add(formatTarget(candidate.modelId, candidate.effort));
+        }
       }
     }
-    const fallback = alternatives.size
+    let fallback = alternatives.size
       ? `Eligible fallback providers: ${[...alternatives].join(", ")}.`
       : "No eligible fallback providers are available.";
+    if (effortAlternatives.size)
+      fallback += ` Eligible fallback targets: ${[...effortAlternatives].join(", ")}.`;
     if (exhausted) return `Router skips ${provider}. ${fallback}`;
     const reason = this.tracker.unavailableReason(provider);
     return reason
@@ -108,21 +131,34 @@ export class Router {
     const entry = this.policy[role];
     const groups = entry?.[complexity] ?? entry?.default ?? [];
     const skipped: RouteDecision["skipped"] = [];
-    const preferred: ModelDef[] = [];
-    const sameVendor: ModelDef[] = [];
+    const preferred: ModelTarget[] = [];
+    const sameVendor: ModelTarget[] = [];
     const seen = new Set<string>();
+    // Older run state can reference a model removed from the catalog.
+    const identity = (reference: string | ModelSelection) => {
+      try {
+        return this.resolve(reference).targetId;
+      } catch {
+        return typeof reference === "string" ? reference : formatTarget(reference.modelId, reference.effort);
+      }
+    };
+    const excluded = new Set(c.exclude?.map(identity));
+    const preference = c.prefer ? identity(c.prefer) : undefined;
 
-    const consider = (ids: string[]) => {
-      const group: ModelDef[] = [];
-      for (const id of ids) {
-        if (seen.has(id)) continue;
-        seen.add(id);
-        const m = this.models.get(id);
-        if (!m) {
-          skipped.push({ modelId: id, reason: "not in catalog" });
+    const consider = (ids: (string | ModelSelection)[]) => {
+      const group: ModelTarget[] = [];
+      for (const reference of ids) {
+        let resolved: ReturnType<Router["resolve"]>;
+        try {
+          resolved = this.resolve(reference);
+        } catch (error) {
+          skipped.push({ modelId: identity(reference), reason: String(error) });
           continue;
         }
-        if (c.exclude?.includes(id)) {
+        const { model: m, effort, targetId: id } = resolved;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        if (excluded.has(id)) {
           skipped.push({ modelId: id, reason: "already tried" });
           continue;
         }
@@ -135,10 +171,10 @@ export class Router {
           skipped.push({ modelId: id, reason: why === "disabled" ? "disabled" : `${m.provider}: ${why}` });
           continue;
         }
-        group.push(m);
+        group.push(this.toTarget(m, effort ?? null));
       }
       // Interchangeable models: preferred providers first, then most headroom (spreads load).
-      const pref = (m: ModelDef) => (this.preferProviders.includes(m.provider) ? 0 : 1);
+      const pref = (m: ModelTarget) => (this.preferProviders.includes(m.provider) ? 0 : 1);
       group.sort(
         (a, b) => pref(a) - pref(b) || this.tracker.headroom(b.provider) - this.tracker.headroom(a.provider),
       );
@@ -146,18 +182,20 @@ export class Router {
     };
 
     for (const g of groups) consider(g.split("|"));
+    // A persisted implementer can retain an explicit effort after the catalog default changes.
+    if (c.prefer) consider([c.prefer]);
     // Escalation beyond the policy list: any remaining catalog model at a sufficient tier.
     if (c.minTier !== undefined) {
       const rest = [...this.models.values()]
-        .filter((m) => m.tier >= (c.minTier as number) && !seen.has(m.id))
+        .filter((m) => m.tier >= (c.minTier as number) && !seen.has(formatTarget(m.id, m.effort)))
         .sort((a, b) => a.tier - b.tier)
         .map((m) => m.id);
       for (const id of rest) consider([id]);
     }
 
     const ordered = [...preferred, ...sameVendor];
-    const pinned = c.prefer ? ordered.findIndex((m) => m.id === c.prefer) : -1;
+    const pinned = preference ? ordered.findIndex((m) => m.targetId === preference) : -1;
     if (pinned > 0) ordered.unshift(...ordered.splice(pinned, 1));
-    return { candidates: ordered.map((m) => this.toTarget(m)), skipped };
+    return { candidates: ordered, skipped };
   }
 }

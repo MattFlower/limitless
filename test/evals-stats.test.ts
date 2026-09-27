@@ -15,6 +15,7 @@ export const run: EvalRun = {
 };
 export function trial(modelId: string, caseId: string, index: number, pass: boolean): EvalTrial {
   return {
+    effort: null,
     evalRunId: run.id,
     modelId,
     caseId,
@@ -183,4 +184,22 @@ test("verify reports pooled confusion counts, accuracy and null rates without la
     falseReject: { numerator: 0, denominator: 0, rate: null },
     criterionAccuracy: { numerator: 0, denominator: 0, rate: null },
   });
+});
+
+test("summaries and paired comparisons separate efforts of the same base model", () => {
+  const trials = [
+    { ...trial("a", "case", 0, false), effort: "low" as const },
+    { ...trial("a", "case", 0, true), effort: "high" as const },
+    { ...trial("a", "case", 0, true), effort: "none" as const },
+    { ...trial("a", "case", 0, false), effort: null },
+  ];
+  const rows = summarize({ ...run, models: ["a@low", "a@high", "a@none", "a"], k: 1 }, trials);
+  expect(rows.map((s) => [s.modelId, s.passRate])).toEqual([
+    ["a@low", 0],
+    ["a@high", 1],
+    ["a@none", 1],
+    ["a", 0],
+  ]);
+  expect(rows.every((s) => s.evaluatedTrials === 1 && s.comparison.pairedCases === 1)).toBe(true);
+  expect(rows.find((s) => s.modelId === "a")?.effort).toBeNull();
 });

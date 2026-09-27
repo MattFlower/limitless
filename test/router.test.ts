@@ -29,6 +29,7 @@ const models: ModelDef[] = [
     vendor: "anthropic",
     origin: "unknown",
     baseOrigin: "unknown",
+    supportedEfforts: [],
     tier: 4,
     price: { input: 2, output: 10 },
   },
@@ -39,6 +40,7 @@ const models: ModelDef[] = [
     vendor: "anthropic",
     origin: "unknown",
     baseOrigin: "unknown",
+    supportedEfforts: [],
     tier: 5,
     price: { input: 4, output: 20 },
   },
@@ -49,6 +51,7 @@ const models: ModelDef[] = [
     vendor: "openai",
     origin: "unknown",
     baseOrigin: "unknown",
+    supportedEfforts: [],
     tier: 4,
     price: { input: 2, output: 10 },
   },
@@ -59,6 +62,7 @@ const models: ModelDef[] = [
     vendor: "deepseek",
     origin: "unknown",
     baseOrigin: "unknown",
+    supportedEfforts: [],
     tier: 4,
     price: { input: 0.3, output: 0.8 },
   },
@@ -526,4 +530,61 @@ describe("OpenRouter reconciliation", () => {
     await tracker.refreshOpenRouter();
     expect(store.listEvents("provider:openrouter")).toHaveLength(1);
   });
+});
+
+test("effort pairs preserve order, aliases, preference and underlying eligibility", () => {
+  const { tracker } = setup();
+  const catalog = models.map((m): ModelDef => ({ ...m, supportedEfforts: ["low", "high"], effort: "low" }));
+  const routing = new Router(
+    tracker,
+    {
+      ...policy,
+      implement: { default: ["claude/sonnet@high", "claude/sonnet|claude/sonnet@low", "codex/sol@high"] },
+    },
+    catalog,
+  );
+  const route = (constraints = {}) => routing.route("implement", "small", constraints).candidates;
+  expect(route().map((t) => t.targetId)).toEqual([
+    "claude/sonnet@high",
+    "claude/sonnet@low",
+    "codex/sol@high",
+  ]);
+  expect(route({ exclude: ["claude/sonnet@high"] })[0]?.effort).toBe("low");
+  expect(route({ exclude: ["claude/sonnet"] }).map((t) => t.targetId)).not.toContain("claude/sonnet@low");
+  expect(route({ prefer: "claude/sonnet@low" })[0]?.targetId).toBe("claude/sonnet@low");
+  expect(route({ avoidVendor: "anthropic" })[0]?.provider).toBe("codex");
+  expect(route({ minTier: 5 }).map((t) => t.targetId)).toEqual(["claude/opus@low"]);
+  expect(catalog.find((m) => m.id === "claude/sonnet")?.effort).toBe("low");
+  route();
+  expect(routing.describeFallback("claude", true)).toContain("codex/sol@high");
+  tracker.setHealthy("claude", false);
+  expect(route().map((t) => t.targetId)).toEqual(["codex/sol@high"]);
+  tracker.setHealthy("claude", true);
+  tracker.blockModel("claude/sonnet", "blocked");
+  expect(route().map((t) => t.modelId)).toEqual(["codex/sol"]);
+  tracker.setHealthy("codex", false);
+  expect(route()).toEqual([]);
+});
+
+test("saved selections preserve unset effort across catalog changes and exclusions", () => {
+  const { tracker } = setup();
+  const catalog = models.map((m): ModelDef => ({ ...m, supportedEfforts: ["low", "high"], effort: "low" }));
+  const routing = new Router(tracker, policy, catalog);
+  const saved = { modelId: "claude/sonnet", effort: null };
+  const decision = routing.route("implement", "small", { prefer: saved });
+  expect(decision.candidates[0]?.targetId).toBe("claude/sonnet");
+  expect(decision.candidates[0]?.effort).toBeUndefined();
+  expect(decision.candidates.some((t) => t.targetId === "claude/sonnet@low")).toBe(true);
+  expect(
+    routing
+      .route("implement", "small", { prefer: saved, exclude: [saved] })
+      .candidates.map((t) => t.targetId),
+  ).not.toContain("claude/sonnet");
+  expect(routing.route("implement", "small", { prefer: "claude/sonnet@high" }).candidates[0]?.effort).toBe(
+    "high",
+  );
+  tracker.setHealthy("claude", false);
+  expect(
+    routing.route("implement", "small", { prefer: saved }).candidates.every((t) => t.provider !== "claude"),
+  ).toBe(true);
 });

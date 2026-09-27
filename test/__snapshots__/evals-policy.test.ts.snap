@@ -13,29 +13,29 @@ p50 invocation latency excludes cache replays, interrupted calls and preparation
 
 ## triage
 
-Update triage.default: codex/luna
+Update triage.default: codex/luna@medium
 
 | Model / source | Metrics: rate (numerator/denominator), Wilson 95% CI | Comparison | Cost/case | p50 latency | Eligibility / reasons |
 |---|---|---|---|---|---|
-| codex/luna; run=triage-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: 1.0000 (40/40), CI [0.9124, 1.0000]; risk under-call: 0.0000 (0/40), CI [0.0000, 0.0876]; prediction coverage=40/40 (1.0000); errors=0; skips=0; cached=40; pending=0; unscored=0 | vs codex/luna; nonInferior=true; difference=0.0000; lower=0.0000; paired=40; complete candidate/reference=40/40 | 0.2500 (subscription; attempts=40); recorded metered=$0.0000; API-equivalent=$0.0000 | n/a ms (n=0) | eligible |
-| mtplx/qwen-27b; run=triage-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: 1.0000 (40/40), CI [0.9124, 1.0000]; risk under-call: 0.0000 (0/40), CI [0.0000, 0.0876]; prediction coverage=40/40 (1.0000); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs codex/luna; nonInferior=true; difference=0.0000; lower=0.0000; paired=40; complete candidate/reference=40/40 | 0.0000 (free; attempts=40); recorded metered=$16.0000; API-equivalent=$40.0000 | 100.0000 ms (n=40) | ineligible: origin excluded (CN; baseOrigin=CN) |
+| codex/luna@medium; run=triage-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: 1.0000 (40/40), CI [0.9124, 1.0000]; risk under-call: 0.0000 (0/40), CI [0.0000, 0.0876]; prediction coverage=40/40 (1.0000); errors=0; skips=0; cached=40; pending=0; unscored=0 | vs codex/luna@medium; nonInferior=true; difference=0.0000; lower=0.0000; paired=40; complete candidate/reference=40/40 | 0.2500 (subscription; attempts=40); recorded metered=$0.0000; API-equivalent=$0.0000 | n/a ms (n=0) | eligible |
+| mtplx/qwen-27b@high; run=triage-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: 1.0000 (40/40), CI [0.9124, 1.0000]; risk under-call: 0.0000 (0/40), CI [0.0000, 0.0876]; prediction coverage=40/40 (1.0000); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs codex/luna@medium; nonInferior=true; difference=0.0000; lower=0.0000; paired=40; complete candidate/reference=40/40 | 0.0000 (free; attempts=40); recorded metered=$16.0000; API-equivalent=$40.0000 | 100.0000 ms (n=40) | ineligible: origin excluded (CN; baseOrigin=CN) |
 
 ## review
 
-Update review.default: openrouter/gpt-6-luna
+Update review.default: openrouter/gpt-6-luna@low
 
 | Model / source | Metrics: rate (numerator/denominator), Wilson 95% CI | Comparison | Cost/case | p50 latency | Eligibility / reasons |
 |---|---|---|---|---|---|
-| codex/luna; run=review-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: 0.0000 (0/40), CI [0.0000, 0.0876]; defect recall: 1.0000 (20/20), CI [0.8389, 1.0000]; clean false-block: 0.0000 (0/20), CI [0.0000, 0.1611]; verdict accuracy: 1.0000 (40/40), CI [0.9124, 1.0000]; prediction coverage=40/40 (1.0000); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs openrouter/gpt-6-luna; nonInferior=false; difference=-1.0000; lower=-1.0000; paired=40; complete candidate/reference=40/40 | 0.2500 (subscription; attempts=40); recorded metered=$16.0000; API-equivalent=$40.0000 | 100.0000 ms (n=40) | ineligible: non-inferiority not established |
-| openrouter/gpt-6-luna; run=review-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: 1.0000 (40/40), CI [0.9124, 1.0000]; defect recall: 1.0000 (20/20), CI [0.8389, 1.0000]; clean false-block: 0.0000 (0/20), CI [0.0000, 0.1611]; verdict accuracy: 1.0000 (40/40), CI [0.9124, 1.0000]; prediction coverage=40/40 (1.0000); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs openrouter/gpt-6-luna; nonInferior=true; difference=0.0000; lower=0.0000; paired=40; complete candidate/reference=40/40 | 0.4000 (metered; attempts=40); recorded metered=$16.0000; API-equivalent=$40.0000 | 100.0000 ms (n=40) | eligible |
+| codex/luna@medium; run=review-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: 0.0000 (0/40), CI [0.0000, 0.0876]; defect recall: 1.0000 (20/20), CI [0.8389, 1.0000]; clean false-block: 0.0000 (0/20), CI [0.0000, 0.1611]; verdict accuracy: 1.0000 (40/40), CI [0.9124, 1.0000]; prediction coverage=40/40 (1.0000); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs openrouter/gpt-6-luna@low; nonInferior=false; difference=-1.0000; lower=-1.0000; paired=40; complete candidate/reference=40/40 | 0.2500 (subscription; attempts=40); recorded metered=$16.0000; API-equivalent=$40.0000 | 100.0000 ms (n=40) | ineligible: non-inferiority not established |
+| openrouter/gpt-6-luna@low; run=review-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: 1.0000 (40/40), CI [0.9124, 1.0000]; defect recall: 1.0000 (20/20), CI [0.8389, 1.0000]; clean false-block: 0.0000 (0/20), CI [0.0000, 0.1611]; verdict accuracy: 1.0000 (40/40), CI [0.9124, 1.0000]; prediction coverage=40/40 (1.0000); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs openrouter/gpt-6-luna@low; nonInferior=true; difference=0.0000; lower=0.0000; paired=40; complete candidate/reference=40/40 | 0.4000 (metered; attempts=40); recorded metered=$16.0000; API-equivalent=$40.0000 | 100.0000 ms (n=40) | eligible |
 
 ## verify
 
-verify unchanged: no eligible models (codex/luna: insufficient evidence: false-accept has no observations; insufficient evidence: no attempted cases to cost; insufficient evidence: no complete paired cases)
+verify unchanged: no eligible models (codex/luna@medium: insufficient evidence: false-accept has no observations; insufficient evidence: no attempted cases to cost; insufficient evidence: no complete paired cases)
 
 | Model / source | Metrics: rate (numerator/denominator), Wilson 95% CI | Comparison | Cost/case | p50 latency | Eligibility / reasons |
 |---|---|---|---|---|---|
-| codex/luna; run=verify-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: n/a (0/0), CI n/a; false-accept: n/a (0/0), CI n/a; false-reject: n/a (0/0), CI n/a; criterion accuracy: n/a (0/0), CI n/a; prediction coverage=0/0 (n/a); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs n/a; nonInferior=n/a; difference=n/a; lower=n/a; paired=0; complete candidate/reference=0/0 | n/a (subscription; attempts=0); recorded metered=$0.0000; API-equivalent=$0.0000 | n/a ms (n=0) | insufficient evidence: insufficient evidence: false-accept has no observations; insufficient evidence: no attempted cases to cost; insufficient evidence: no complete paired cases |
+| codex/luna@medium; run=verify-run; created=1970-01-01T00:00:01.000Z; finished=1970-01-01T00:00:02.000Z; k=1 | pass rate: n/a (0/0), CI n/a; false-accept: n/a (0/0), CI n/a; false-reject: n/a (0/0), CI n/a; criterion accuracy: n/a (0/0), CI n/a; prediction coverage=0/0 (n/a); errors=0; skips=0; cached=0; pending=0; unscored=0 | vs n/a; nonInferior=n/a; difference=n/a; lower=n/a; paired=0; complete candidate/reference=0/0 | n/a (subscription; attempts=0); recorded metered=$0.0000; API-equivalent=$0.0000 | n/a ms (n=0) | insufficient evidence: insufficient evidence: false-accept has no observations; insufficient evidence: no attempted cases to cost; insufficient evidence: no complete paired cases |
 
 "
 `;

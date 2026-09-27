@@ -140,7 +140,7 @@ export class ClaudeStreamParser {
   }
 }
 
-function buildArgs(spec: AgentSpec, sessionId: string): string[] {
+export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
   const t = spec.target;
   const args = [
     "claude",
@@ -181,7 +181,11 @@ function buildArgs(spec: AgentSpec, sessionId: string): string[] {
     );
   }
   args.push("--disallowedTools", ...denied);
-  if (t.effort) args.push("--effort", t.effort);
+  if (t.effort !== undefined) {
+    if (t.backend || !["low", "medium", "high", "max"].includes(t.effort))
+      throw new Error("Unsupported effort for Claude CLI transport; use a supported native Claude target");
+    args.push("--effort", t.effort);
+  }
   if (spec.systemAppend) args.push("--append-system-prompt", spec.systemAppend);
   if (spec.jsonSchema) args.push("--json-schema", JSON.stringify(spec.jsonSchema));
   for (const dir of spec.addDirs ?? []) args.push("--add-dir", dir);
@@ -240,7 +244,7 @@ export async function runClaude(spec: AgentSpec): Promise<AgentResult> {
 
   appendFileSync(spec.logPath, `# claude ${t.model} ${new Date().toISOString()}\n`);
   const proc = await runProcess({
-    cmd: buildArgs(spec, sessionId),
+    cmd: buildClaudeArgs(spec, sessionId),
     cwd: spec.cwd,
     env: agentEnv(envExtra),
     stdin: spec.prompt,

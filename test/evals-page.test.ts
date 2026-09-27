@@ -17,6 +17,7 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
       entrypoints: [
         join(import.meta.dir, "../ui/pages/Evals.tsx"),
         join(import.meta.dir, "../ui/components/NavBar.tsx"),
+        join(import.meta.dir, "../ui/components/InvocationsTable.tsx"),
       ],
       outdir: dir,
       target: "bun",
@@ -62,6 +63,57 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
     expect(renderToString(() => EvalsView({ error: "API unavailable" }))).toContain('role="alert"');
     expect(renderToString(() => EvalsView({ error: "API unavailable" }))).not.toContain("Loading evals");
     expect(renderToString(() => EvalsView({ data: response([]) }))).toContain("No eval runs yet");
+    const variants = evidence("triage", [
+      "codex/luna@low",
+      "codex/luna@high",
+      "codex/luna@none",
+      "codex/luna",
+    ]);
+    const variantHtml = renderToString(() => EvalsView({ data: response([variants]) }));
+    for (const target of variants.run.models) expect(variantHtml).toContain(target);
+    expect(variantHtml).toContain("unknown / unset");
+    const detailHtml = renderToString(() =>
+      EvalDetailView({ report: { ...variants, summaries: summarize(variants.run, variants.trials) } }),
+    );
+    for (const effort of ["low", "high", "none", "unknown / unset"]) expect(detailHtml).toContain(effort);
+    const invocationOutput = build.outputs.find((o) => o.path.endsWith("InvocationsTable.js"));
+    if (!invocationOutput) throw new Error("missing invocation output");
+    const { InvocationsTable } = (await import(
+      invocationOutput.path
+    )) as typeof import("../ui/components/InvocationsTable.tsx");
+    const invocations = (["low", "high", "none", null] as const).map(
+      (effort, id): import("../src/core/types.ts").Invocation => ({
+        id,
+        effort,
+        runId: "run",
+        stageId: null,
+        role: "implement",
+        harness: "fake",
+        provider: "codex",
+        model: "gpt-6-luna",
+        modelId: "codex/luna",
+        status: "ok",
+        costUsd: 0,
+        costEquivUsd: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        numTurns: 1,
+        sessionId: null,
+        error: null,
+        startedAt: 1,
+        finishedAt: 2,
+      }),
+    );
+    const invocationHtml = renderToString(() =>
+      InvocationsTable({ invocations, selectedId: null, onSelect: () => {} }),
+    );
+    for (const effort of ["low", "high", "none", "unknown / unset"])
+      expect(invocationHtml).toContain(`>${effort}</td>`);
+    expect(invocationHtml.match(/<th[ >]/g)).toHaveLength(11);
+    expect(
+      renderToString(() => InvocationsTable({ invocations: [], selectedId: null, onSelect: () => {} })),
+    ).toContain('colspan="11"');
     const rows = [evidence("triage"), evidence("review"), evidence("verify")];
     const html = renderToString(() => EvalsView({ data: response(rows) }));
     for (const text of [

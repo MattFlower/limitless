@@ -72,6 +72,14 @@ export type Vendor =
   | "mistral"
   | "other";
 
+export type Effort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** A saved routing selection; null explicitly leaves backend effort unset. */
+export interface ModelSelection {
+  modelId: string;
+  effort: Effort | null;
+}
+
 export type Billing = "subscription" | "metered" | "free";
 
 export type InvocationStatus =
@@ -148,6 +156,7 @@ export interface Invocation {
   harness: string;
   provider: string;
   model: string;
+  effort: Effort | null;
   modelId: string; // catalog id, e.g. "claude/sonnet"
   status: InvocationStatus;
   costUsd: number;
@@ -388,6 +397,7 @@ export interface EvalGrade {
   };
 }
 export interface EvalTrial {
+  effort: Effort | null;
   evalRunId: string;
   caseId: string;
   modelId: string;

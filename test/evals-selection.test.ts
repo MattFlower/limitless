@@ -28,6 +28,7 @@ test("pipeline and concierge use the same role selection with and without an HTT
           vendor: "other",
           origin: "unknown",
           baseOrigin: "unknown",
+          supportedEfforts: [],
           tier: 1,
           price: { input: 1, output: 1 },
         },
@@ -76,4 +77,17 @@ test("pipeline and concierge use the same role selection with and without an HTT
       await f.close();
     }
   }
+});
+
+test("evidence selection does not let newer effort variants replace each other", async () => {
+  const { evidence } = await import("./evals-policy-support.ts");
+  const { selectEvidence } = await import("../src/evals/policy.ts");
+  const low = evidence("triage", ["codex/luna@low"], { id: "low", finishedAt: 2000 });
+  const high = evidence("triage", ["codex/luna@high"], { id: "high", finishedAt: 3000 });
+  const unknown = evidence("triage", ["codex/luna"], { id: "unknown", finishedAt: 4000 });
+  expect(selectEvidence([low, high, unknown]).map((e) => [e.modelId, e.run.id])).toEqual([
+    ["codex/luna", "unknown"],
+    ["codex/luna@high", "high"],
+    ["codex/luna@low", "low"],
+  ]);
 });

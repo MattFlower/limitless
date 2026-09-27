@@ -174,3 +174,22 @@ test("seed symlinks escaping the dataset fail before scheduling", async () => {
     await f.close();
   }
 });
+
+test("eval validation resolves defaults, explicit none and rejects malformed or duplicate targets", async () => {
+  const { enableEfforts, invalidTargets } = await import("./evals-support.ts");
+  const f = await evalFixture();
+  try {
+    enableEfforts(f);
+    for (const models of invalidTargets)
+      expect(() => validateRequest({ role: "triage", models }, f.dataset, f.factory.router)).toThrow();
+    const { request } = validateRequest(
+      { role: "triage", models: ["candidate-a", "candidate-a@high", "candidate-a@none"] },
+      f.dataset,
+      f.factory.router,
+    );
+    expect(request.models).toEqual(["candidate-a@low", "candidate-a@high", "candidate-a@none"]);
+    expect(f.factory.store.listEvalRuns()).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
+});

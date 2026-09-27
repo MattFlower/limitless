@@ -1,11 +1,12 @@
-import type { EvalRun, EvalTrial } from "../src/core/types.ts";
+import type { Effort, EvalRun, EvalTrial } from "../src/core/types.ts";
 import { type Evidence, generatePolicy, type PolicyInput } from "../src/evals/policy.ts";
 import { evalSettings } from "../src/evals/settings.ts";
 import { DEFAULT_POLICY, MODELS, PROVIDERS } from "../src/router/catalog.ts";
+import { parseTarget } from "../src/router/targets.ts";
 
-export const local = "mtplx/qwen-27b";
-export const subscription = "codex/luna";
-export const metered = "openrouter/gpt-6-luna";
+export const local = "mtplx/qwen-27b@high";
+export const subscription = "codex/luna@medium";
+export const metered = "openrouter/gpt-6-luna@low";
 export function evidence(
   role: EvalRun["role"] = "triage",
   models = [local],
@@ -28,7 +29,8 @@ export function evidence(
       Array.from({ length: run.k }, (_, trial) => ({
         evalRunId: run.id,
         caseId: `case-${String(i).padStart(2, "0")}`,
-        modelId,
+        modelId: parseTarget(modelId).modelId,
+        effort: (parseTarget(modelId).effort as Effort | undefined) ?? null,
         trial,
         cacheKey: "key",
         harness: "fake",

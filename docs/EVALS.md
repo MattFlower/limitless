@@ -1,7 +1,10 @@
 # Evals and routing calibration (M4 design)
 
-Proposed extension: [reasoning effort as a routing dimension](REASONING_EFFORT.md).
-That specification covers `model@effort` routing and eval targets; it is not implemented yet.
+[Reasoning effort](REASONING_EFFORT.md) is part of routing and eval target identity.
+For example, `limitless eval run triage --models codex/luna@low,codex/luna@high --k 2 --follow`
+compares two efforts independently. Bare IDs resolve to the catalog default at submission;
+the saved effort does not change if the catalog default changes. Unsupported efforts and
+duplicate resolved targets (such as `codex/luna,codex/luna@medium`) are rejected.
 
 The routing table (`DEFAULT_POLICY` in `src/router/catalog.ts`) was written from vendor claims and
 intuition. M4 replaces intuition with evidence: a small, cheap, repeatable eval suite that runs each

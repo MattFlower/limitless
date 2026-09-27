@@ -104,6 +104,7 @@ export async function evalFixture() {
         vendor: "other",
         origin: "unknown",
         baseOrigin: "unknown",
+        supportedEfforts: [],
         price: { input: 1, output: 1 },
       },
       {
@@ -114,6 +115,7 @@ export async function evalFixture() {
         vendor: "other",
         origin: "unknown",
         baseOrigin: "unknown",
+        supportedEfforts: [],
         price: { input: 1, output: 1 },
       },
     ],
@@ -153,3 +155,24 @@ export async function evalFixture() {
     },
   };
 }
+
+export function enableEfforts(f: Awaited<ReturnType<typeof evalFixture>>) {
+  const model = f.factory.router.model("candidate-a");
+  if (!model) throw new Error("missing candidate");
+  model.supportedEfforts = ["none", "low", "high"];
+  model.effort = "low";
+  return model;
+}
+export const invalidTargets = [
+  [""],
+  ["candidate-a@"],
+  ["candidate-a@low@high"],
+  [" candidate-a"],
+  ["candidate-a@low "],
+  ["candidate-a @low"],
+  ["unknown@low"],
+  ["candidate-a@max"],
+  ["candidate-b@low"],
+  ["candidate-a", "candidate-a@low"],
+  ["candidate-a@none", "candidate-a@none"],
+];

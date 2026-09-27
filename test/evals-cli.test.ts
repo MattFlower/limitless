@@ -265,3 +265,32 @@ test("policy CLI turns a small fake-harness eval into a written overlay through 
     await f.close();
   }
 });
+
+test("eval CLI preserves target syntax and rejects invalid inputs through shared submission", async () => {
+  const { enableEfforts, invalidTargets } = await import("./evals-support.ts");
+  const f = await evalFixture();
+  try {
+    enableEfforts(f);
+    const io = {
+      api: async <T>(_path: string, init?: RequestInit) =>
+        f.factory.evals.submit(JSON.parse(String(init?.body))) as T,
+      print: () => {},
+      wait: async () => {},
+    };
+    for (const models of invalidTargets)
+      await expect(evalCommand(["run", "triage"], { models: models.join(",") }, io)).rejects.toThrow();
+    expect(f.factory.store.listEvalRuns()).toHaveLength(0);
+    await evalCommand(
+      ["run", "triage"],
+      { models: "candidate-a,candidate-a@none,candidate-a@high", "max-usd": "0" },
+      io,
+    );
+    expect(f.factory.store.listEvalRuns()[0]?.models).toEqual([
+      "candidate-a@low",
+      "candidate-a@none",
+      "candidate-a@high",
+    ]);
+  } finally {
+    await f.close();
+  }
+});

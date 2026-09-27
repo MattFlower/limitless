@@ -2,22 +2,17 @@ import { readFileSync } from "node:fs";
 import { z } from "zod";
 import type { Role } from "../core/types.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy } from "./catalog.ts";
+import { resolveTarget } from "./targets.ts";
 
 export type PolicyOverlay = Partial<Policy>;
 export function validatePolicy(value: unknown, models: ModelDef[]): PolicyOverlay {
-  const ids = new Set(models.map((m) => m.id));
   const group = z.string().superRefine((s, ctx) => {
     for (const id of s.split("|")) {
-      const problem =
-        id.length === 0
-          ? `empty model ID in group "${s}"`
-          : id.trim() !== id
-            ? `model ID "${id}" in group "${s}" has surrounding whitespace`
-            : ids.has(id)
-              ? null
-              : `unknown model ID "${id}" in group "${s}"`;
-      if (problem)
-        ctx.addIssue({ code: "custom", message: `${problem} (expected known model IDs separated by |)` });
+      try {
+        resolveTarget(id, (id) => models.find((m) => m.id === id));
+      } catch (error) {
+        ctx.addIssue({ code: "custom", message: String(error) });
+      }
     }
   });
   const cell = z.array(group).min(1);

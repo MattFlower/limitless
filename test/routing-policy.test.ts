@@ -7,7 +7,7 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { evalSettings } from "../src/evals/settings.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
-import { loadPolicy } from "../src/router/policy.ts";
+import { loadPolicy, validatePolicy } from "../src/router/policy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { evidence, local, subscription } from "./evals-policy-support.ts";
 import { evalFixture } from "./evals-support.ts";
@@ -134,7 +134,9 @@ test("factory/API share the startup policy and current eligibility settings; inj
         {} as Server<undefined>,
       );
     expect(await (await call("/api/models")).json()).toEqual({ models: MODELS, policy: factory.policy });
-    expect(factory.router.route("triage", "small").candidates.map((c) => c.modelId)).toEqual([subscription]);
+    expect(factory.router.route("triage", "small").candidates.map((c) => c.targetId ?? c.modelId)).toEqual([
+      subscription,
+    ]);
     expect(factory.policy.triage.default).toEqual([subscription]);
     const fixture = evidence();
     const run = factory.store.createEvalRun(fixture.run, fixture.trials);
@@ -156,4 +158,38 @@ test("factory/API share the startup policy and current eligibility settings; inj
     factory?.store.close();
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("policy target references share strict resolution and preserve group ordering", async () => {
+  const { resolveTarget } = await import("../src/router/targets.ts");
+  const lookup = (id: string) => MODELS.find((m) => m.id === id);
+  for (const [reference, effort] of [
+    ["codex/luna", "medium"],
+    ["codex/luna@low", "low"],
+    ["codex/luna@none", "none"],
+    ["claude/opus@high", "high"],
+  ] as const) {
+    expect(resolveTarget(reference, lookup).effort).toBe(effort);
+    expect(validatePolicy({ triage: { default: [reference] } }, MODELS).triage?.default).toEqual([reference]);
+  }
+  for (const reference of [
+    "",
+    "@low",
+    "codex/luna@",
+    "codex/luna@low@high",
+    " codex/luna",
+    "codex/luna@low ",
+    "codex/luna @low",
+    "unknown@low",
+    "codex/luna@bogus",
+    "claude/haiku@high",
+  ]) {
+    expect(() => resolveTarget(reference, lookup)).toThrow();
+    expect(() => validatePolicy({ triage: { default: [reference] } }, MODELS)).toThrow();
+  }
+  const group = "codex/luna@low|claude/opus@high";
+  expect(validatePolicy({ review: { large: [group] } }, MODELS).review?.large).toEqual([group]);
+  const model = lookup("codex/luna");
+  if (!model) throw new Error("missing");
+  expect(() => resolveTarget(model.id, () => ({ ...model, supportedEfforts: [] }))).toThrow("default");
 });

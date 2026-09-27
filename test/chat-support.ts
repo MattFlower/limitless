@@ -48,6 +48,7 @@ export function chatFixture(opts: { openaiBaseUrl?: string } = {}) {
         vendor: "other" as const,
         origin: "unknown",
         baseOrigin: "unknown",
+        supportedEfforts: [],
         tier: 1,
         price: { input: 1, output: 1 },
       },

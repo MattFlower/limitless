@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
 import type { Router } from "../router/router.ts";
+import { resolveTarget } from "../router/targets.ts";
 
 const nonempty = z.string().trim().min(1);
 const repoId = z.string().regex(/^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/, "expected owner/name");
@@ -172,7 +173,7 @@ const unique = z
   .refine((ids) => new Set(ids).size === ids.length, "duplicate IDs");
 export const EvalRequestSchema = z.strictObject({
   role: z.enum(["triage", "review", "verify"]),
-  models: unique,
+  models: z.array(z.string().min(1)).min(1),
   k: z.number().int().positive().default(1),
   maxUsd: z.number().finite().nonnegative().default(1),
   caseIds: unique.optional(),
@@ -182,7 +183,9 @@ export type EvalRequest = z.infer<typeof EvalRequestSchema>;
 export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<Router, "model">) {
   const request = EvalRequestSchema.parse(input);
   if (request.role !== file.role) throw new Error("dataset role does not match request");
-  for (const id of request.models) if (!router.model(id)) throw new Error(`Unknown model ID: ${id}`);
+  request.models = request.models.map((id) => resolveTarget(id, (base) => router.model(base)).targetId);
+  if (new Set(request.models).size !== request.models.length)
+    throw new Error("duplicate resolved model targets");
   for (const id of request.caseIds ?? [])
     if (!file.cases.some((c) => c.id === id)) throw new Error(`Unknown case ID: ${id}`);
   const cases = file.cases.filter((c) => !request.caseIds || request.caseIds.includes(c.id));

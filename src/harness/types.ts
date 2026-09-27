@@ -1,5 +1,5 @@
 import type { ZodType } from "zod";
-import type { Billing, InvocationStatus, QuotaWindow } from "../core/types.ts";
+import type { Billing, Effort, InvocationStatus, QuotaWindow } from "../core/types.ts";
 
 /** A concrete model on a concrete provider, as chosen by the router. */
 export interface ModelTarget {
@@ -10,7 +10,9 @@ export interface ModelTarget {
   vendor: string;
   tier: number;
   billing: Billing;
-  effort?: string;
+  effort?: Effort;
+  targetId?: string;
+  effortMapping?: "openrouter" | "generic" | "qwen";
   /** For the claude harness pointed at a non-Anthropic backend (OpenRouter, mtplx, llama.cpp). */
   backend?: { baseUrl: string; authToken: string };
   openai?: { baseUrl: string; authToken: string };

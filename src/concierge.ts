@@ -2,7 +2,14 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import type { Factory } from "./app.ts";
-import type { ChatAction, ChatConversation, ChatOrigin, ChatRequest, Run } from "./core/types.ts";
+import type {
+  ChatAction,
+  ChatConversation,
+  ChatOrigin,
+  ChatRequest,
+  ModelSelection,
+  Run,
+} from "./core/types.ts";
 import { selectHarness } from "./harness/select.ts";
 import { type AgentResult, emptyUsage, extractJson } from "./harness/types.ts";
 import { toStrictJsonSchema } from "./pipeline/schemas.ts";
@@ -226,13 +233,13 @@ export class Concierge {
 
   private async interpret(conversationId: string, origin: ChatOrigin): Promise<ChatAction> {
     const { router, tracker, harnesses, cfg, store } = this.factory.deps;
-    const tried: string[] = [];
+    const tried: (string | ModelSelection)[] = [];
     const signal = AbortSignal.timeout(120_000);
     let failure = "No model available for chat";
     for (let attempt = 0; attempt < 3; attempt++) {
       const target = router.route("chat", "small", { exclude: tried }).candidates[0];
       if (!target) break;
-      tried.push(target.modelId);
+      tried.push({ modelId: target.modelId, effort: target.effort ?? null });
       // Chat needs no tools, so it skips the agent CLI when the provider speaks plain HTTP.
       const { harnessName, noTools } = selectHarness("chat", target);
       const harness = harnesses[harnessName];
