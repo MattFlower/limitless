@@ -408,6 +408,14 @@ fallbacks) for up to an hour because of one upstream model's rate limit.
 - On aggregator providers (OpenRouter), a 429 is per model: cool down that model only, for the
   `Retry-After` period when present (else exponential backoff from 30 s, capped at 10 min); only
   key-level signals (402 payment required, the key limit reached, 401) affect the whole provider.
+- "Model not supported" rejections are sometimes intermittent (Codex returned it for gpt-6-luna/sol
+  in 3 of ~10 smoke runs on 2026-09-27 while direct calls succeeded), yet `blockModel` blocks the
+  model for 24 h. Use short cooldowns that double on repeated rejection (e.g. 15 min → 30 → 60 …,
+  capped at 24 h) and reset after a success, so a transient rejection can't keep a model out of
+  routing for a day.
+- OpenRouter routes a model to different upstream hosts whose quantization can differ (GLM-5.3-flash
+  scored 79% then 67.5% in two identical sweeps): evals and production should pin the upstream
+  provider (OpenRouter `provider.order` / `allow_fallbacks: false`) for evaluated models.
 - Concurrency per upstream model for aggregators (e.g. provider maxConcurrent 4, per-model 1), so an
   eval sweep across many OpenRouter models doesn't serialize behind one slot.
 - Tests with a fake OpenAI-compatible server: a 429 on model A leaves model B routable; Retry-After
