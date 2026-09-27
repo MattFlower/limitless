@@ -313,6 +313,18 @@ points, and public leaderboards disagree with each other).
   for roles/models without local eval data (the policy generator marks such cells "prior only"),
   and (c) Terminal-Bench 4.0 as the public baseline for the implement role until our agentic
   implement evals exist.
-- Needs an Artificial Analysis account and API key (the owner creates it; stored in secrets.env as
-  ARTIFICIAL_ANALYSIS_API_KEY).
+- Key: ARTIFICIAL_ANALYSIS_API_KEY in secrets.env (free tier, no commercial license: personal use,
+  attribution required, 1,000 requests/day).
+- Endpoint `GET https://artificialanalysis.ai/api/v2/data/llms/models` returns every model in one
+  response (~670 entries, ~0.6 MB). Each effort variant is its own entry (e.g. `gpt-6-luna-low`,
+  `gpt-6-luna-medium`, `claude-opus-5-5-high`, `qwen3-8-27b-low`), with `evaluations`
+  (artificial_analysis_intelligence_index, artificial_analysis_coding_index, terminalbench_v2_1,
+  terminalbench_hard, gpqa, hle, ifbench, …), `pricing` and speeds. Map each catalog
+  (model, effort) from item 24 to a slug explicitly.
+- Caching: at most one fetch per day (plus on demand), stored as a timestamped snapshot in SQLite
+  (raw payload + normalized rows); keep snapshots so every decision can cite the data it used; the
+  policy generator records the snapshot id. Never fetched from the browser.
+- The repository is public: never commit Artificial Analysis data (no redistribution). Snapshots
+  stay in the local database; the UI shows them with attribution; committed files (e.g.
+  routing/EVIDENCE.md) cite only the snapshot date and our own eval numbers.
 - Tests with a stubbed fetch; no network in tests.
