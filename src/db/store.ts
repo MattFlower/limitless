@@ -1028,14 +1028,16 @@ export class Store {
     reason: string | null;
     until: number | null;
     windows: unknown;
+    windowObservedAt: Record<string, number>;
     consecutiveFailures: number;
   }): void {
     this.db
       .query(
-        `INSERT INTO provider_state (provider, state, reason, until, windows_json, consecutive_failures, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO provider_state (provider, state, reason, until, windows_json, window_observed_at_json, consecutive_failures, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(provider) DO UPDATE SET state = excluded.state, reason = excluded.reason, until = excluded.until,
-           windows_json = excluded.windows_json, consecutive_failures = excluded.consecutive_failures,
+           windows_json = excluded.windows_json, window_observed_at_json = excluded.window_observed_at_json,
+           consecutive_failures = excluded.consecutive_failures,
            updated_at = excluded.updated_at`,
       )
       .run(
@@ -1044,6 +1046,7 @@ export class Store {
         row.reason,
         row.until,
         json(row.windows),
+        json(row.windowObservedAt),
         row.consecutiveFailures,
         Date.now(),
       );

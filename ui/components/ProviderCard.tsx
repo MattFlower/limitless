@@ -1,7 +1,9 @@
 import type { Component } from "solid-js";
 import { For, Show } from "solid-js";
+import { observationAge } from "../../src/core/quota-format.ts";
 import type { ProviderStatus } from "../../src/core/types.ts";
 import { money, pct, resetsIn } from "../lib/format.ts";
+import { now } from "../lib/ticker.ts";
 import { ProviderStatePill } from "./StatusPill.tsx";
 
 const WINDOW_LABEL: Record<string, string> = {
@@ -36,14 +38,12 @@ export const ProviderCard: Component<{ provider: ProviderStatus }> = (props) => 
           <div class="gauge-label">
             <span>{WINDOW_LABEL[name] ?? name}</span>
             <span>
-              {pct(w.utilization)} · {resetsIn(w.resetsAt)}
+              {pct(w.utilization)} · {observationAge(w.observedAt, now())}
+              {w.resetsAt === null ? "" : ` · ${resetsIn(w.resetsAt, now())}`}
             </span>
           </div>
           <div class="gauge-track">
-            <div
-              class={`gauge-fill ${gaugeClass(w.utilization)}`}
-              style={{ width: `${Math.min(100, Math.round(w.utilization * 100))}%` }}
-            />
+            <div class={`gauge-fill ${gaugeClass(w.utilization)}`} style={{ width: pct(w.utilization) }} />
           </div>
         </div>
       )}

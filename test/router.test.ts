@@ -78,6 +78,59 @@ function setup(secrets: Record<string, string> = {}) {
   return { tracker, router: new Router(tracker, policy, models) };
 }
 
+test("quota windows keep independent observation times and reject older boundaries", () => {
+  let now = 1_000_000;
+  const tracker = new ProviderTracker(providers, store, reserves, {}, {}, () => now);
+  tracker.observeWindows("claude", {
+    five_hour: { utilization: 0.721, resetsAt: 2_000_000 },
+    seven_day: { utilization: 0.2, resetsAt: 9_000_000 },
+  });
+  now += 12 * 60_000;
+  tracker.observeWindows("claude", { five_hour: { utilization: 0.75, resetsAt: 2_000_000 } });
+  expect(tracker.status("claude")?.windows).toMatchObject({
+    five_hour: { utilization: 0.75, observedAt: now },
+    seven_day: { utilization: 0.2, observedAt: 1_000_000 },
+  });
+  now += 60_000;
+  tracker.observeWindows("claude", { five_hour: { utilization: 0.1, resetsAt: 1_900_000 } });
+  expect(tracker.status("claude")?.windows.five_hour).toMatchObject({
+    utilization: 0.75,
+    observedAt: 1_720_000,
+  });
+});
+
+test("quota observation times survive reload and legacy windows remain unknown", () => {
+  let now = 1_000_000;
+  const dbPath = join(dir, "db.sqlite");
+  const tracker = new ProviderTracker(providers, store, reserves, {}, {}, () => now);
+  tracker.observeWindows("claude", { five_hour: { utilization: 0.721, resetsAt: 2_000_000 } });
+  // A pre-migration row has windows_json but no observation timestamps.
+  store.putProviderRow({
+    provider: "codex",
+    state: "ok",
+    reason: null,
+    until: null,
+    windows: { seven_day: { utilization: 0.3, resetsAt: null } },
+    windowObservedAt: {},
+    consecutiveFailures: 0,
+  });
+  store.db.query("UPDATE provider_state SET window_observed_at_json = NULL WHERE provider = 'codex'").run();
+  store.close();
+  store = new Store(dbPath);
+  now += 12 * 60_000;
+  const reloaded = new ProviderTracker(providers, store, reserves, {}, {}, () => now);
+  expect(reloaded.status("claude")?.windows.five_hour).toEqual({
+    utilization: 0.721,
+    resetsAt: 2_000_000,
+    observedAt: 1_000_000,
+  });
+  expect(reloaded.status("codex")?.windows.seven_day).toEqual({
+    utilization: 0.3,
+    resetsAt: null,
+    observedAt: null,
+  });
+});
+
 describe("Router", () => {
   test("OpenAI URLs are distinct from agentic backends and protected providers need keys", () => {
     const targets = new Router(

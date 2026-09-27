@@ -227,4 +227,9 @@ ALTER TABLE provider_state ADD COLUMN limit_remaining REAL;
 ALTER TABLE provider_state ADD COLUMN limit_reset TEXT;
 `,
   },
+  {
+    version: 7,
+    name: "quota_window_observations",
+    sql: "ALTER TABLE provider_state ADD COLUMN window_observed_at_json TEXT;",
+  },
 ];

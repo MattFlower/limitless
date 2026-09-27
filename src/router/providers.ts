@@ -8,6 +8,7 @@ interface ProviderRuntime {
   enabled: boolean;
   disabledReason: string | null;
   windows: Record<string, QuotaWindow>;
+  windowObservedAt: Record<string, number>;
   exhaustedUntil: number | null;
   exhaustedReason: string | null;
   consecutiveFailures: number;
@@ -80,12 +81,16 @@ export class ProviderTracker {
       const windows = row?.windows_json
         ? (JSON.parse(row.windows_json as string) as Record<string, QuotaWindow>)
         : {};
+      const windowObservedAt = row?.window_observed_at_json
+        ? (JSON.parse(row.window_observed_at_json as string) as Record<string, number>)
+        : {};
       const until = (row?.until as number | null) ?? null;
       this.providers.set(def.id, {
         def,
         enabled,
         disabledReason,
         windows,
+        windowObservedAt,
         exhaustedUntil: row?.state === "exhausted" && until && until > clock() ? until : null,
         exhaustedReason: row?.state === "exhausted" ? ((row.reason as string) ?? null) : null,
         consecutiveFailures: 0,
@@ -349,6 +354,7 @@ export class ProviderTracker {
     );
     if (!Object.keys(current).length) return;
     p.windows = { ...p.windows, ...current };
+    for (const name of Object.keys(current)) p.windowObservedAt[name] = now;
     this.persist(id);
     if (p.def.billing !== "subscription") return;
     for (const [name, window] of Object.entries(current)) {
@@ -489,7 +495,12 @@ export class ProviderTracker {
       state,
       reason,
       until: p.exhaustedUntil ?? p.circuitOpenUntil,
-      windows: p.windows,
+      windows: Object.fromEntries(
+        Object.entries(p.windows).map(([name, window]) => [
+          name,
+          { ...window, observedAt: p.windowObservedAt[name] ?? null },
+        ]),
+      ),
       spendUsd: p.def.billing === "metered" ? this.store.providerSpendSince(id, now - MONTH_MS) : null,
       budgetUsd: budget ?? null,
       ...(id === "openrouter"
@@ -521,6 +532,7 @@ export class ProviderTracker {
       reason: st.reason,
       until: st.until,
       windows: p.windows,
+      windowObservedAt: p.windowObservedAt,
       consecutiveFailures: p.consecutiveFailures,
     });
     this.store.publishProvider({ kind: "provider", provider: st });
