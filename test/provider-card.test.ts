@@ -101,14 +101,14 @@ test("OpenRouter card renders reported and estimated spend and missing reading",
   const free = renderToString(() =>
     ProviderCard({ provider: { ...status, id: "mtplx", billing: "free" }, workload }),
   );
-  expect(free).toContain("≈$ saved");
+  expect(free).toContain("API-equivalent work");
   const empty = renderToString(() =>
     ProviderCard({
       provider: { ...status, id: "twilight", billing: "free" },
       workload: workloadFor("twilight", []),
     }),
   );
-  expect(empty).toContain("≈$ saved");
+  expect(empty).toContain("API-equivalent work");
   expect(empty).toContain("$0.00");
 });
 
