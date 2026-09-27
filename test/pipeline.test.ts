@@ -342,6 +342,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
   });
 
   async function githubFixture(): Promise<string> {
+    // Ordinary headings and intentional marker fixtures must not block any base merge.
+    writeFileSync(join(repoDir, "README.md"), "Project\n=======\n");
+    writeFileSync(join(repoDir, "markers.fixture"), "<<<<<<< ours\nexample\n=======\n>>>>>>> theirs\n");
+    writeFileSync(join(repoDir, "binary.fixture"), Buffer.from([0, 255, 10]));
+    await mergeGit(repoDir, ["add", "-A"]);
+    await mergeGit(repoDir, ["commit", "-qm", "merge scan fixtures"]);
     const bare = join(home, "github.git");
     await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
     const bin = join(home, "bin");
@@ -721,7 +727,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
   }
 
-  for (const fault of ["missing", "single-parent", "markers", "same-tree"] as const) {
+  for (const fault of ["missing", "single-parent", "markers", "same-tree", "setext"] as const) {
     test(`factory merge resolution: ${fault}`, async () => {
       const bare = await githubFixture();
       let calls = 0;
@@ -747,23 +753,30 @@ describe("pipeline (fake agents, real git + gates)", () => {
             await mergeGit(s.cwd, ["commit", "-qm", "lost merge parent"]);
           }
         }
+        if (fault === "setext")
+          return { files: { "greeting.txt": "Greeting\n========\nfeature intent\nbase intent\n" } };
         return fault === "same-tree" ? { files: { "greeting.txt": "feature intent\n" } } : {};
       });
       registerGithub(f, bare);
       const run = await f.createRun({ repo: "test/repo", prompt: "Change greeting", profile: "quick" });
       expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
-        fault === "same-tree" ? "succeeded" : "failed",
+        fault === "same-tree" || fault === "setext" ? "succeeded" : "failed",
       );
       expect(calls).toBe(2);
       const result = f.store.getRun(run.id);
-      if (fault === "same-tree") {
+      if (fault === "same-tree" || fault === "setext") {
         expect(
           (await sh(["git", "rev-list", "--parents", "-n", "1", result?.headSha ?? ""], { cwd: bare })).stdout
             .trim()
             .split(" ")
             .slice(1),
         ).toEqual([before, base]);
-        expect((await sh(["git", "diff", before, result?.headSha ?? ""], { cwd: bare })).stdout).toBe("");
+        if (fault === "same-tree")
+          expect((await sh(["git", "diff", before, result?.headSha ?? ""], { cwd: bare })).stdout).toBe("");
+        else
+          expect((await sh(["git", "show", `${result?.headSha}:greeting.txt`], { cwd: bare })).stdout).toBe(
+            "Greeting\n========\nfeature intent\nbase intent\n",
+          );
       } else {
         expect(result?.error).toContain(
           fault === "markers" ? "Unresolved conflict markers: greeting.txt" : "MERGE_HEAD",

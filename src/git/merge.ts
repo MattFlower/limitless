@@ -60,16 +60,16 @@ export async function prepareMerge(cwd: string, head: string, base: string): Pro
 /** Never use commitAll: even a resolution identical to the first parent needs a merge commit. */
 export async function completeMerge(cwd: string, head: string, base: string): Promise<string> {
   await requireMerge(cwd, head, base);
-  const paths = (await mergeGit(cwd, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"])).stdout
+  // The file-only resolver leaves the unmerged index intact, including across restarts.
+  // Clean merges have no such paths; unrelated docs and marker fixtures need no scan.
+  const paths = (await mergeGit(cwd, ["diff", "--name-only", "--diff-filter=U", "-z"])).stdout
     .split("\0")
     .filter(Boolean);
   const markers = [...new Set(paths)].filter((path) => {
     const file = join(cwd, path);
-    return (
-      existsSync(file) &&
-      lstatSync(file).isFile() &&
-      /^(?:<{7,}|={7,}|>{7,}|\|{7,})(?: |\r?$)/m.test(readFileSync(file, "utf8"))
-    );
+    if (!existsSync(file) || !lstatSync(file).isFile()) return false;
+    const contents = readFileSync(file);
+    return !contents.includes(0) && /^<{7,} .*\n[\s\S]*^>{7,} /m.test(contents.toString("utf8"));
   });
   if (markers.length) throw new Error(`Unresolved conflict markers: ${markers.join(", ")}`);
   await mergeGit(cwd, ["add", "-A"]);
