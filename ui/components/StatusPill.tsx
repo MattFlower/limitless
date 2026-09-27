@@ -9,6 +9,7 @@ const RUN_LABEL: Record<RunStatus, string> = {
   failed: "failed",
   cancelled: "cancelled",
   needs_human: "needs human",
+  resolved: "resolved",
 };
 
 export const RunStatusPill: Component<{ status: RunStatus }> = (props) => (

@@ -6,6 +6,7 @@ const ALL_STATUSES: RunStatus[] = [
   "running",
   "waiting_input",
   "needs_human",
+  "resolved",
   "failed",
   "queued",
   "succeeded",

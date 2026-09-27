@@ -14,6 +14,7 @@ const status = z.enum([
   "failed",
   "cancelled",
   "needs_human",
+  "resolved",
 ]);
 const profile = z.enum(["auto", "quick", "standard", "deep"]);
 const runSchema = z

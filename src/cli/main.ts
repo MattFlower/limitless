@@ -69,10 +69,12 @@ const color = {
 };
 
 function statusColor(s: string): string {
-  if (s === "succeeded") return color.green(s);
-  if (s === "failed" || s === "needs_human") return color.red(s);
-  if (s === "running") return color.cyan(s);
-  if (s === "waiting_input") return color.yellow(s);
+  const status = s.trim();
+  if (status === "succeeded") return color.green(s);
+  if (status === "resolved") return color.cyan(s);
+  if (status === "failed" || status === "needs_human") return color.red(s);
+  if (status === "running") return color.cyan(s);
+  if (status === "waiting_input") return color.yellow(s);
   return color.dim(s);
 }
 
@@ -108,7 +110,7 @@ async function follow(runId: string, after = 0): Promise<void> {
       if (
         msg.kind === "run" &&
         msg.run &&
-        ["succeeded", "failed", "cancelled", "needs_human"].includes(msg.run.status)
+        ["succeeded", "failed", "cancelled", "needs_human", "resolved"].includes(msg.run.status)
       ) {
         console.log(
           `\n${color.bold("Run")} ${runId}: ${statusColor(msg.run.status)}${msg.run.prUrl ? ` — ${msg.run.prUrl}` : ""}`,
