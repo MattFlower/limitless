@@ -1,13 +1,14 @@
 import type { Component } from "solid-js";
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import type { RunStatus } from "../../src/core/types.ts";
-import type { Stats } from "../../src/db/stats.ts";
-import { getStats } from "../api.ts";
+import type { ProviderWorkload, Stats } from "../../src/db/stats.ts";
+import { getProviderWorkload, getStats } from "../api.ts";
 import { CostChart } from "../components/CostChart.tsx";
 import { FilterChips } from "../components/FilterChips.tsx";
 import { KpiStrip } from "../components/KpiStrip.tsx";
 import { ProviderCard } from "../components/ProviderCard.tsx";
 import { RunsTable } from "../components/RunsTable.tsx";
+import { workloadFor } from "../lib/provider-workload.ts";
 import { ensureLiveStore, live } from "../store.ts";
 
 const STATS_REFRESH_MS = 30_000;
@@ -15,13 +16,18 @@ const STATS_REFRESH_MS = 30_000;
 export const Dashboard: Component = () => {
   ensureLiveStore();
   const [stats, setStats] = createSignal<Stats | null>(null);
+  const [workload, setWorkload] = createSignal<ProviderWorkload[]>([]);
   const [now, setNow] = createSignal(Date.now());
   const [statusFilter, setStatusFilter] = createSignal<RunStatus | null>(null);
 
-  const refreshStats = () =>
+  const refreshStats = () => {
     getStats(14)
       .then(setStats)
       .catch(() => {});
+    getProviderWorkload()
+      .then(setWorkload)
+      .catch(() => {});
+  };
   onMount(() => {
     refreshStats();
     const t = setInterval(refreshStats, STATS_REFRESH_MS);
@@ -74,7 +80,9 @@ export const Dashboard: Component = () => {
       <div>
         <div class="section-label">Providers</div>
         <div class="provider-grid">
-          <For each={providers()}>{(p) => <ProviderCard provider={p} />}</For>
+          <For each={providers()}>
+            {(p) => <ProviderCard provider={p} workload={workloadFor(p.id, workload())} />}
+          </For>
           <Show when={providers().length === 0}>
             <div class="hint-banner">No provider telemetry yet.</div>
           </Show>

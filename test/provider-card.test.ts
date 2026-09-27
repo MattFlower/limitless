@@ -7,6 +7,7 @@ import { type PresetTarget, transformAsync } from "@babel/core";
 import ts from "@babel/preset-typescript";
 import { renderToString } from "solid-js/web";
 import type { ProviderStatus } from "../src/core/types.ts";
+import { workloadFor } from "../ui/lib/provider-workload.ts";
 
 const solid = createRequire(import.meta.url)("babel-preset-solid") as PresetTarget<object>;
 
@@ -85,6 +86,30 @@ test("OpenRouter card renders reported and estimated spend and missing reading",
     }),
   );
   expect(missing).toContain("unavailable");
+  const workload = workloadFor("openrouter", [
+    {
+      provider: "openrouter",
+      today: { invocations: 1, tokensIn: 12, tokensOut: 4, wallTimeMs: 62_000, costEquivUsd: 0.4 },
+      sevenDays: { invocations: 3, tokensIn: 120, tokensOut: 40, wallTimeMs: 120_000, costEquivUsd: 1.2 },
+    },
+  ]);
+  const metered = renderToString(() => ProviderCard({ provider: status, workload }));
+  expect(metered).toContain("Last 7 days");
+  expect(metered).toContain("API-equivalent");
+  expect(metered).toContain("1m 2s");
+  expect(metered).toContain("$1.20");
+  const free = renderToString(() =>
+    ProviderCard({ provider: { ...status, id: "mtplx", billing: "free" }, workload }),
+  );
+  expect(free).toContain("≈$ saved");
+  const empty = renderToString(() =>
+    ProviderCard({
+      provider: { ...status, id: "twilight", billing: "free" },
+      workload: workloadFor("twilight", []),
+    }),
+  );
+  expect(empty).toContain("≈$ saved");
+  expect(empty).toContain("$0.00");
 });
 
 test("provider card shows rounded utilization and each window's live reading age", async () => {

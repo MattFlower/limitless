@@ -35,6 +35,84 @@ export interface Stats {
   };
 }
 
+export interface WorkloadTotals {
+  invocations: number;
+  tokensIn: number;
+  tokensOut: number;
+  wallTimeMs: number;
+  costEquivUsd: number;
+}
+
+export interface ProviderWorkload {
+  provider: string;
+  today: WorkloadTotals;
+  sevenDays: WorkloadTotals;
+}
+
+/** Calendar days use the daemon's local timezone, including across DST changes. */
+export function computeProviderWorkload(store: Store, now = Date.now()): ProviderWorkload[] {
+  const current = new Date(now);
+  const today = new Date(current.getFullYear(), current.getMonth(), current.getDate()).getTime();
+  const sevenDays = new Date(current.getFullYear(), current.getMonth(), current.getDate() - 6).getTime();
+  const rows = store.db
+    .query(`
+    SELECT provider, started_at, tokens_in, tokens_out, wall_ms, cost_equiv_usd FROM (
+      SELECT provider, started_at, input_tokens + cache_read_tokens AS tokens_in,
+             output_tokens AS tokens_out,
+             CASE WHEN finished_at IS NULL THEN 0 ELSE MAX(0, finished_at - started_at) END AS wall_ms,
+             cost_equiv_usd
+        FROM invocations WHERE started_at >= ? AND started_at <= ?
+      UNION ALL
+      SELECT provider, started_at,
+             COALESCE(json_extract(result_json, '$.usage.input'), 0) +
+               COALESCE(json_extract(result_json, '$.usage.cacheRead'), 0),
+             COALESCE(json_extract(result_json, '$.usage.output'), 0),
+             COALESCE(duration_ms, 0),
+             COALESCE(json_extract(result_json, '$.costEquivUsd'), 0)
+        FROM chat_calls WHERE started_at >= ? AND started_at <= ? AND json_valid(result_json)
+    )
+  `)
+    .all(sevenDays, now, sevenDays, now) as {
+    provider: string;
+    started_at: number;
+    tokens_in: number;
+    tokens_out: number;
+    wall_ms: number;
+    cost_equiv_usd: number;
+  }[];
+  const result = new Map<string, ProviderWorkload>();
+  for (const row of rows) {
+    let workload = result.get(row.provider);
+    if (!workload) {
+      workload = { provider: row.provider, today: emptyWorkload(), sevenDays: emptyWorkload() };
+      result.set(row.provider, workload);
+    }
+    addWorkload(workload.sevenDays, row);
+    if (row.started_at >= today) addWorkload(workload.today, row);
+  }
+  return [...result.values()];
+}
+
+function emptyWorkload(): WorkloadTotals {
+  return { invocations: 0, tokensIn: 0, tokensOut: 0, wallTimeMs: 0, costEquivUsd: 0 };
+}
+
+function addWorkload(
+  total: WorkloadTotals,
+  row: {
+    tokens_in: number;
+    tokens_out: number;
+    wall_ms: number;
+    cost_equiv_usd: number;
+  },
+): void {
+  total.invocations += 1;
+  total.tokensIn += row.tokens_in;
+  total.tokensOut += row.tokens_out;
+  total.wallTimeMs += row.wall_ms;
+  total.costEquivUsd += row.cost_equiv_usd;
+}
+
 export function computeStats(store: Store, days = 14): Stats {
   const since = Date.now() - days * 86_400_000;
   const dayRows = store.db

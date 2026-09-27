@@ -31,6 +31,8 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 28 | M4 | Aggregator providers: per-model rate limits and concurrency | todo |
 | 29 | M5 | Holdout feedback that is actionable but still blind | todo |
 | 30 | M5 | Later-round reviews don't move the goalposts | todo |
+| 31 | M5 | Verify artifacts: redact only private scenarios | todo |
+| 32 | M4 | Jev decisions harness: triage as typed questions | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
@@ -360,6 +362,9 @@ model). Replaces hand-assigned integer tiers. Depends on items 24 (effort) and 2
   subscription API-equivalent $ weighted by current quota headroom (cheap while plentiful, expensive
   near the reserve), measured from invocation history per role.
 - Only Pareto-efficient candidates (on our cost axis) are eligible.
+- Latency is a constraint, not just a tie-breaker: each role gets a p50 latency budget from eval data
+  (e.g. review/verify ≤ 10 min); candidates over budget are ineligible. Owner feedback 2026-09-27:
+  DeepSeek V4 Pro (median 14 min/review, up to 33) slowed development with no quality edge.
 - Per role × task class, fit pass probability vs. capability from eval data (logistic) to get the
   minimum capability for the target success rate (default 0.8); use the prior when a class has no
   eval data. Record the fit and its data in routing/EVIDENCE.md.
@@ -405,6 +410,14 @@ fallbacks) for up to an hour because of one upstream model's rate limit.
 - On aggregator providers (OpenRouter), a 429 is per model: cool down that model only, for the
   `Retry-After` period when present (else exponential backoff from 30 s, capped at 10 min); only
   key-level signals (402 payment required, the key limit reached, 401) affect the whole provider.
+- "Model not supported" rejections are sometimes intermittent (Codex returned it for gpt-6-luna/sol
+  in 3 of ~10 smoke runs on 2026-09-27 while direct calls succeeded), yet `blockModel` blocks the
+  model for 24 h. Use short cooldowns that double on repeated rejection (e.g. 15 min → 30 → 60 …,
+  capped at 24 h) and reset after a success, so a transient rejection can't keep a model out of
+  routing for a day.
+- OpenRouter routes a model to different upstream hosts whose quantization can differ (GLM-5.3-flash
+  scored 79% then 67.5% in two identical sweeps): evals and production should pin the upstream
+  provider (OpenRouter `provider.order` / `allow_fallbacks: false`) for evaluated models.
 - Concurrency per upstream model for aggregators (e.g. provider maxConcurrent 4, per-model 1), so an
   eval sweep across many OpenRouter models doesn't serialize behind one slot.
 - Tests with a fake OpenAI-compatible server: a 429 on model A leaves model B routable; Retry-After
@@ -451,3 +464,41 @@ while converging. Fixing what was asked for should end the loop.
 - Tests with the fake harness: a new major non-security finding in round 3 does not trigger
   another implement round and appears under follow-ups; an unaddressed prior finding or a regression
   still blocks.
+
+## 31. Verify artifacts: redact only private scenarios
+
+After #23, implementer feedback is right (public criteria unredacted, private scenarios as
+`publicSummary`), but the stored `verify-N.json` artifact (what the UI shows) still runs every string
+through `redactHoldoutText`, whose literal backstop masks line numbers and identifiers in public
+criteria's evidence ("engine.ts:[private detail]"). Apply the same split as the feedback: public
+criteria stored as-is, private scenarios stored with their publicSummary and redacted evidence.
+Test: a public criterion's `file:line` evidence survives in the artifact; private scenario text never
+appears.
+
+## 32. Jev decisions harness: triage as typed questions
+
+Owner suggestion (2026-09-27). Jev (TypeSafe, `typesafe/jev-1.13` / `~typesafe/jev-latest`) is a
+decision model, not a chat model: it answers typed questions about a `state` with probabilities
+instead of generating text. Very cheap (input tokens only; the docs' example cost ~$0.00002/call),
+fast, 32K-token context, available with our OpenRouter key.
+
+- API: `POST https://openrouter.ai/api/alpha/decisions` (alpha — may change) with `model`, `state`,
+  and `questions` keyed by id. Question types: `choice` (criteria = option → guidance), `noul`
+  (criteria = {true, false} guidance), `score` (criteria = ordered level descriptions). Answers:
+  choice → `choice`, `confidence`, `probabilities`; noul → `noul` (P(true)); score → `score`,
+  `confidence`, `probabilities`, `legend`. `usage.cost` in USD. Errors 402/429/5xx like OpenRouter.
+- Harness `decisions` (src/harness/decisions.ts): builds the request, maps answers, records usage and
+  cost, classifies errors (402 → provider, 429 → per-model cooldown per item 28).
+- Triage via decisions: task_class (choice, 8 classes with the prompt's guidance), complexity
+  (score trivial→large), risk (score low→high with the blast-radius guidance), ambiguity (score),
+  needs_questions (noul); suggested_profile derived in code; title from the request's first line.
+  Jev can't write text, so: **confidence cascade** — if any answer's confidence is below a
+  threshold, or needs_questions is likely, fall through to the LLM triage (which can also write the
+  blocking questions). Calibrate the threshold on evals/triage (the grader is unchanged).
+- Catalog: `openrouter/jev-1.13` with harness `decisions`, usable only by roles with a decisions
+  mapping; origin `unknown` until verified (so work policy excludes it until then).
+- Evals: sweep Jev on the triage gold set against Luna/Sonnet/local; report the cascade's
+  escalation rate and its combined accuracy/cost.
+- Later: routing questions for item 26 (e.g. task difficulty as a score), concierge intent.
+- Live smoke check for the alpha endpoint.
+- Tests with a fake decisions server (no network).
