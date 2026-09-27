@@ -48,8 +48,12 @@ test("upgrade to the eval migration preserves data and adds eval columns, cache 
     expect(store.db.query("SELECT value FROM settings WHERE key = 'sentinel'").get()).toEqual({
       value: "unchanged",
     });
-    expect(store.db.query("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({
-      version: Math.max(...MIGRATIONS.map((m) => m.version)),
+    expect(
+      store.db
+        .query("SELECT name FROM schema_migrations WHERE name = ?")
+        .get("legacy-0012-chat_call_duration"),
+    ).toEqual({
+      name: "legacy-0012-chat_call_duration",
     });
     const columns = (store.db.query("PRAGMA table_info(eval_trials)").all() as { name: string }[]).map(
       (c) => c.name,
