@@ -91,7 +91,7 @@ only for grading (the same isolation as the holdout stage).
 
 ## Implemented repository-reading evaluations
 
-The supported roles are `triage`, `review`, and `verify`. Review reads the committed
+The repository-reading roles are `triage`, `review`, and `verify`. Review reads the committed
 `evals/review/cases.json` unchanged. The real `evals/verify/cases.json` is separately curated;
 there is no production fallback to the three-case test fixture. Missing datasets fail before scheduling.
 
@@ -170,6 +170,31 @@ limitless eval run review --models openrouter/gpt-6-luna --follow
 limitless eval run verify --models openrouter/gpt-6-luna --k 2 --max-usd 1 --follow
 ```
 
+
+## Implement evals
+
+Run `limitless eval run implement --models <model> --k 2 --follow` with a version-1
+`evals/implement/cases.json` envelope `{ role: "implement", version: 1, cases: [...] }`.
+Each case has a unique `id`, `repo` (`owner/name`), full 40-character `base` and `head` SHAs,
+`prompt`, nullable pipeline `spec`, `complexity` (`trivial`, `small`, or `medium`), `source`,
+`tags`, optional `notes`, and `hidden: { files, command, timeoutSec? }` (default: 900 seconds).
+`head` is provenance only; candidates edit a disposable checkout at `base`, using the pipeline
+implement prompt and a 400-tool-call budget. Base history containing `evals/implement`, the
+dataset bytes, or hidden-file bytes is rejected; other roles' label paths are allowed.
+
+Store each hidden file at `evals/implement/hidden/<case-id>/<repository-relative-path>` and
+list that relative path in `hidden.files`. Files are injected only after candidate gates and
+audit, preserving permission bits so executable commands such as `./run.sh` work. The command
+runs from the checkout root. Hidden contents and modes participate in cache identity.
+
+Baseline gates run once per case/base within an eval run, shared across repetitions and models.
+A failed baseline setup or timed-out baseline check produces a preparation `error`, invokes no
+candidate, and is not cached. Ordinary baseline check failures remain eligible for comparison.
+A trial passes when hidden tests exit zero, gates have no blocking regression against baseline,
+and the deterministic audit has no blocks; audit warnings are retained without failing the trial.
+Failure reasons are `hidden_tests` (nonzero hidden command), `gates` (blocking gate comparison),
+`audit` (blocking findings), `timeout` (candidate or grading timeout), and `error` (preparation,
+harness, or grading failure). Errors and timeouts are not cached; completed grades are reusable.
 
 ## Policy generation and review
 

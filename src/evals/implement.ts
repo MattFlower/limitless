@@ -1,4 +1,4 @@
-import { lstatSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { EvalGrade } from "../core/types.ts";
 import { auditDiff } from "../gates/audit.ts";
@@ -14,6 +14,9 @@ export async function prepareImplement(item: ImplementCase, cwd: string, signal:
   const gates = await gatesAt(cwd, item.base, signal);
   const baseline = await runGates(cwd, gates, signal);
   signal.throwIfAborted();
+  if (!baseline.setupOk) throw new Error("baseline gate setup failed");
+  if (baseline.checks.some((check) => check.output.startsWith("[timed out]")))
+    throw new Error("baseline gate check timed out");
   // Baseline gates already ran repository code that may have configured filters in .git/config
   // and .gitattributes, so this checkout is no more trustworthy than a candidate's.
   await discardChanges(cwd, agentEnv());
@@ -52,6 +55,7 @@ function inject(cwd: string, files: ReturnType<typeof hiddenContents>) {
     // Unlink rather than truncate: a candidate-created hard link must not redirect a write either.
     rmSync(destination, { force: true });
     writeFileSync(destination, file.content, { flag: "wx" });
+    chmodSync(destination, file.mode);
   }
 }
 

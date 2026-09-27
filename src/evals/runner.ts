@@ -16,6 +16,7 @@ import {
   type EvalCase,
   EvalRequestSchema,
   hiddenContents,
+  type ImplementCase,
   loadRoleCases,
   validateRequest,
 } from "./cases.ts";
@@ -103,6 +104,16 @@ export class EvalRunner {
     const { store, router } = this.deps;
     store.updateEvalRun(run.id, "running");
     const trees = new Map<string, Promise<string>>();
+    const implementations = new Map<string, ReturnType<typeof prepareImplement>>();
+    const implementFor = (item: ImplementCase, cwd: string) => {
+      const key = JSON.stringify([item.id, item.base]);
+      let prepared = implementations.get(key);
+      if (!prepared) {
+        prepared = prepareImplement(item, cwd, signal);
+        implementations.set(key, prepared);
+      }
+      return prepared;
+    };
     const treeFor = (slug: string) => {
       let tree = trees.get(slug);
       if (!tree) {
@@ -121,7 +132,7 @@ export class EvalRunner {
         ),
       );
       const labels: EvalLabels = {
-        paths: LABEL_PATHS,
+        paths: run.role === "implement" ? ["evals/implement"] : LABEL_PATHS,
         contents: [
           readFileSync(casePath, "utf8"),
           ...[...hidden.values()].flatMap((files) => files.map((f) => f.content)),
@@ -143,7 +154,17 @@ export class EvalRunner {
               for (const trial of store
                 .listEvalTrials(run.id)
                 .filter((t) => recordedTarget(t) === modelId && t.caseId === item.id)) {
-                await this.trial(run, trial, item, treeFor, labels, cache, signal, hidden.get(item.id));
+                await this.trial(
+                  run,
+                  trial,
+                  item,
+                  treeFor,
+                  implementFor,
+                  labels,
+                  cache,
+                  signal,
+                  hidden.get(item.id),
+                );
               }
             }
         }),
@@ -162,6 +183,7 @@ export class EvalRunner {
     trial: EvalTrial,
     item: EvalCase,
     treeFor: (slug: string) => Promise<string>,
+    implementFor: (item: ImplementCase, cwd: string) => ReturnType<typeof prepareImplement>,
     labels: EvalLabels,
     cache: boolean,
     signal: AbortSignal,
@@ -220,7 +242,7 @@ export class EvalRunner {
           labels,
         );
       const preparationStarted = Date.now();
-      const implementation = "hidden" in item ? await prepareImplement(item, cwd, signal) : undefined;
+      const implementation = "hidden" in item ? await implementFor(item, cwd) : undefined;
       const prepared = "hidden" in item ? implementation : await prepareCase(item, cwd, tree, patch, signal);
       if (!prepared) throw new Error("missing trial preparation");
       const preparationMs = Date.now() - preparationStarted;
@@ -243,6 +265,7 @@ export class EvalRunner {
                     hidden: item.hidden,
                     files: hidden.map((f) => ({
                       path: f.path,
+                      mode: f.mode,
                       hash: new Bun.CryptoHasher("sha256").update(f.content).digest("hex"),
                     })),
                   }
@@ -269,7 +292,7 @@ export class EvalRunner {
             "hidden" in item ? { success: true, data: source.output } : schema?.safeParse(source.output);
           if (!output?.success) continue;
           const grade = "hidden" in item ? source.details.grade : gradeCase(item, output.data);
-          if (!grade || ("hidden" in item && !Array.isArray(grade.implement?.auditWarnings))) continue;
+          if (!grade) continue;
           store.recordEvalTrial({
             ...trial,
             status: "ok",
@@ -322,7 +345,7 @@ export class EvalRunner {
             timeoutMs,
             privateSession: run.role === "verify",
             idleTimeoutMs: 10 * 60_000,
-            maxToolCalls: 150,
+            maxToolCalls: "hidden" in item ? 400 : 150,
             signal,
             logPath,
             onEvent: (event) => {
