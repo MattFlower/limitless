@@ -27,6 +27,7 @@ with `limitless deploy`. Status is tracked here and in the UI.
 | 24 | M4 | Reasoning effort as a routing dimension | todo |
 | 25 | M4 | External benchmark priors (Artificial Analysis, Terminal-Bench 4.0) | todo |
 | 26 | M4 | Capability-and-cost routing (monotonic escalation) | todo |
+| 27 | M4 | New-model intake pipeline | todo |
 | 16 | M6 | Provider workload analytics | todo |
 | 17 | M6 | Config-defined providers + `limitless init` | todo |
 | 18 | M6 | Model-origin constraints | todo |
@@ -367,3 +368,26 @@ model). Replaces hand-assigned integer tiers. Depends on items 24 (effort) and 2
 - UI: show each candidate on a capability-vs-cost chart with the Pareto line and the thresholds.
 - Tests: Pareto filtering, threshold fitting on synthetic data, monotonic retries (never down,
   never repeat), quota-weighted cost reacting to headroom.
+
+## 27. New-model intake pipeline
+
+New models arrive constantly (the Artificial Analysis snapshot of 2026-09-26 lists 48 entries released
+since 2026-09-01), so the catalog can't be curated by hand. Depends on items 24–26; pairs with M6
+item 17 (catalog as data, not code).
+
+- The AA free API has indices, per-benchmark scores (incl. terminalbench_v2_1, terminalbench_hard),
+  per-token prices, release dates and (sparse) speeds, per effort variant — but not cost per task
+  (tokens used × price). Estimate cost per task as price × tokens-per-task learned from our own
+  invocations at that effort (tokens scale strongly with effort); replace with measured values once
+  the model has been evaluated.
+- Detect: the daily snapshot diff lists new/removed entries; check availability against what our
+  providers actually serve (OpenRouter's model list; models the claude/codex CLIs accept).
+- Screen: available to us, allowed by origin policy (unknown lineage fails closed), and on or near
+  our cost-capability frontier by its public scores. Everything else is ignored at no cost.
+- Evaluate: survivors run the cheap evals (triage + a review subset) under a per-model budget
+  (default $1); results replace the public prior.
+- Propose: when a newcomer (or a retirement) would change a routing cell, the policy generator
+  opens a PR with the evidence; merging it is the approval.
+- Mapping: AA entries ↔ provider model ids are matched explicitly; unmatched or ambiguous ones go to
+  a "needs mapping" list in the UI for a human to confirm, never guessed.
+- Tests: snapshot diffing, screening rules, budget enforcement, PR proposal content (fakes only).
