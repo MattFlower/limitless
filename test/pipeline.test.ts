@@ -310,6 +310,36 @@ describe("pipeline (fake agents, real git + gates)", () => {
     }
   });
 
+  test("a check that fails once after the change is retried, reported flaky, and does not block", async () => {
+    const count = join(home, "gate-runs");
+    // Run 1 is the baseline, run 2 the post-change gates, run 3 the retry.
+    const check = `echo x >> '${count}'; test $(( $(wc -l < '${count}') )) -ne 2`;
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`,
+    );
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "flaky gate"], {
+      cwd: repoDir,
+    });
+    let implementations = 0;
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      implementations++;
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(implementations).toBe(1);
+    const gates = f.store.getRunState<RunState>(run.id)?.lastGates?.[0];
+    expect([gates?.verdict, gates?.blocking, gates?.firstAttempt?.ok]).toEqual(["flaky", false, false]);
+    expect(
+      f.store.listEvents(run.id).some((e) => e.message === "check retry: pass (flaky, not blocking)"),
+    ).toBe(true);
+    expect(f.store.getArtifact(run.id, "report.md")).toContain("Flaky: `check` failed, then passed");
+  });
+
   async function githubFixture(): Promise<string> {
     const bare = join(home, "github.git");
     await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });

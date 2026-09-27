@@ -19,6 +19,7 @@ interface GateComparisonJson {
   verdict: string;
   blocking: boolean;
   result: GateResultJson;
+  firstAttempt?: GateResultJson;
 }
 interface GateRunJson {
   setupOk: boolean;
@@ -145,7 +146,14 @@ const GatesArtifact: Component<{ data: GateRunJson | GateComparisonJson[] }> = (
           }
         >
           <For each={props.data as GateComparisonJson[]}>
-            {(c) => <GateOutputRow r={c.result} label={c.verdict} badgeClass={verdictBadge(c.verdict)} />}
+            {(c) => (
+              <>
+                <GateOutputRow r={c.result} label={c.verdict} badgeClass={verdictBadge(c.verdict)} />
+                <Show when={c.firstAttempt}>
+                  {(first) => <GateOutputRow r={first()} label="first attempt" badgeClass="fail" />}
+                </Show>
+              </>
+            )}
           </For>
         </Show>
       </tbody>

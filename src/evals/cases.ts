@@ -55,18 +55,29 @@ export function loadCases(path = DEFAULT_CASE_FILE): CaseFile {
   }
 }
 const pin = z.string().regex(/^[a-fA-F0-9]{40}$/, "expected full pinned commit SHA");
+const GateResultSchema = z.strictObject({
+  name: nonempty,
+  command: z.string(),
+  ok: z.boolean(),
+  exitCode: z.number().int().nullable(),
+  durationMs: z.number().finite().nonnegative(),
+  output: z.string(),
+});
 export const GateComparisonSchema = z.strictObject({
   name: nonempty,
-  verdict: z.enum(["pass", "fixed", "regressed", "still_failing", "new_failure", "new_pass", "not_run"]),
+  verdict: z.enum([
+    "pass",
+    "fixed",
+    "regressed",
+    "still_failing",
+    "new_failure",
+    "new_pass",
+    "not_run",
+    "flaky",
+  ]),
   blocking: z.boolean(),
-  result: z.strictObject({
-    name: nonempty,
-    command: z.string(),
-    ok: z.boolean(),
-    exitCode: z.number().int().nullable(),
-    durationMs: z.number().finite().nonnegative(),
-    output: z.string(),
-  }),
+  result: GateResultSchema,
+  firstAttempt: GateResultSchema.optional(),
 });
 const repositoryCase = { id: nonempty, repo: repoId, base: pin, head: pin };
 export const ReviewCaseSchema = z.strictObject({
