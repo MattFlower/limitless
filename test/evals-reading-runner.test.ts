@@ -159,6 +159,7 @@ test("verify uses pipeline schema, prompt, private session and head content, ret
             id,
             status,
             evidence: "observed",
+            publicSummary: "",
           })),
         },
       };

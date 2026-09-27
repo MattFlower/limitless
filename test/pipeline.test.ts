@@ -132,8 +132,13 @@ const holdout = {
 };
 const pass = {
   criteria: [
-    { id: "AC-1", status: "met", evidence: "cat shows goodbye" },
-    ...holdout.scenarios.map((s) => ({ id: s.id, status: "met", evidence: "observed expected result" })),
+    { id: "AC-1", status: "met", evidence: "cat shows goodbye", publicSummary: "" },
+    ...holdout.scenarios.map((s) => ({
+      id: s.id,
+      status: "met",
+      evidence: "observed expected result",
+      publicSummary: "",
+    })),
   ],
   overall: "pass",
   notes: "",
@@ -776,6 +781,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
         if (role === "review") return { structured: approve };
         if (role === "verify") return { structured: pass };
         implementStarted = true;
+        expect(
+          s.prompt.includes(
+            "A separate verifier will check private scenarios derived from the request, including edge and failure cases",
+          ),
+        ).toBe(profile !== "quick");
         return {
           files: { "farewell.txt": "goodbye\n", "implementation-marker.txt": "implementation marker" },
         };
@@ -797,12 +807,26 @@ describe("pipeline (fake agents, real git + gates)", () => {
 
   test("unmet holdout feedback omits private inputs and publishes scenarios only after delivery", async () => {
     const secret = "PRIVATE_HOLDOUT_TOKEN_729";
+    // These values are observed at runtime, not spelled out by the holdout author.
+    const observed = '/api/v2/widgets --force 48231 "negative-quantity" ERR_RETRY_EXHAUSTED';
+    const observedLiterals = [
+      "/api/v2/widgets",
+      "--force",
+      "48231",
+      "negative-quantity",
+      "ERR_RETRY_EXHAUSTED",
+    ];
+    writeFileSync(join(repoDir, "identifiers.ts"), "export const sharedIdentifier = true;\n");
+    await sh(["git", "add", "identifiers.ts"], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "add identifier"], {
+      cwd: repoDir,
+    });
     const privateHoldout = {
       scenarios: holdout.scenarios.map((s) =>
         s.id === "H-2"
           ? {
               ...s,
-              steps: `run ${secret}`,
+              steps: `run ${secret} with sharedIdentifier and retryIdentifier`,
               description: `secret ${secret} check`,
               expected: `result ${secret}`,
             }
@@ -811,6 +835,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     };
     let implementCalls = 0;
     let verifies = 0;
+    let retryFeedbackChecked = false;
+    const redactedOutputs: (string | undefined)[] = [];
     let runId = "";
     const f = start((s) => {
       const role = roleOf(s);
@@ -821,18 +847,23 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (role === "verify") {
         expect(s.prompt).toContain(secret);
         verifies++;
-        return verifies === 1
+        redactedOutputs.push(s.redactOutput?.(`retryIdentifier ${secret}`));
+        const transcript = s.redactOutput?.(observed);
+        expect(transcript).toContain("5 private details withheld");
+        for (const literal of observedLiterals) expect(transcript).not.toContain(literal);
+        return verifies <= 2
           ? {
-              text: `ordinary verifier diagnostic; private input ${secret}`,
-              error: `verifier diagnostic included ${secret}`,
+              text: `ordinary verifier diagnostic; retryIdentifier; private input ${secret}; ${observed}`,
+              error: `verifier diagnostic included ${secret}; ${observed}`,
               structured: {
                 ...pass,
                 criteria: pass.criteria.map((c) =>
                   c.id === "H-2"
                     ? {
                         ...c,
-                        status: "unmet",
-                        evidence: `Observed failure: ${secret} returned an empty response`,
+                        status: verifies === 1 ? "unmet" : "unclear",
+                        evidence: `Observed failure: ${secret} returned an empty response; ${observed}`,
+                        publicSummary: `${verifies === 1 ? "sharedIdentifier" : "retryIdentifier"} returns an empty response for an invalid request; ${observed}`,
                       }
                     : c,
                 ),
@@ -841,25 +872,62 @@ describe("pipeline (fake agents, real git + gates)", () => {
           : { structured: pass };
       }
       implementCalls++;
+      if (implementCalls > 1) {
+        for (const literal of observedLiterals) {
+          expect(s.prompt).not.toContain(literal);
+          expect(JSON.stringify(f.store.listEvents(runId))).not.toContain(literal);
+          for (const artifact of f.store.listArtifacts(runId))
+            expect(f.store.getArtifact(runId, artifact.name)).not.toContain(literal);
+        }
+        expect(s.prompt).toContain("5 private details withheld");
+      }
       if (implementCalls === 2) {
-        expect(s.prompt).toContain("Observed failure");
+        expect(s.prompt).toContain(
+          "private scenario (unmet): sharedIdentifier returns an empty response for an invalid request",
+        );
+        expect(s.prompt).not.toContain("Observed failure");
         expect(s.prompt).not.toContain(secret);
         expect(s.prompt).not.toContain(privateHoldout.scenarios[1]?.steps);
         expect(f.store.getRunState<RunState>(runId)?.feedback).not.toContain(secret);
         expect(f.store.listArtifacts(runId).map((a) => a.name)).not.toContain("holdout-scenarios.json");
         expect(f.store.getArtifact(runId, "verify-0.json")).toContain("Observed failure");
         expect(f.store.getArtifact(runId, "verify-0.json")).not.toContain(secret);
+        expect(JSON.stringify(f.store.listEvents(runId))).not.toContain("retryIdentifier");
         expect(existsSync(join(s.cwd, "holdout-scenarios.json"))).toBe(false);
         for (const artifact of f.store.listArtifacts(runId))
           expect(f.store.getArtifact(runId, artifact.name)).not.toContain(secret);
       }
-      return { files: { "farewell.txt": "goodbye\n" } };
+      if (implementCalls === 3) {
+        const summary = "retryIdentifier returns an empty response for an invalid request";
+        expect(s.prompt).toContain(`private scenario (unclear): ${summary}`);
+        expect(s.prompt).not.toContain("Observed failure");
+        expect(s.prompt).not.toContain(secret);
+        expect(s.prompt).not.toContain(privateHoldout.scenarios[1]?.steps);
+        expect(f.store.getRunState<RunState>(runId)?.feedback).toContain(summary);
+        expect(f.store.getArtifact(runId, "holdout-scenarios.json")).toBeNull();
+        expect(f.store.getArtifact(runId, "verify-1.json")).toContain(summary);
+        expect(f.store.getArtifact(runId, "verify-1.json")).not.toContain(secret);
+        expect(JSON.stringify(f.store.listEvents(runId))).toContain(
+          "ordinary verifier diagnostic; retryIdentifier; private input [private detail]",
+        );
+        retryFeedbackChecked = true;
+      }
+      return {
+        files: {
+          "farewell.txt": "goodbye\n",
+          ...(implementCalls === 2 ? { "retry.ts": "export const retryIdentifier = true;\n" } : {}),
+        },
+      };
     });
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
     runId = run.id;
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-    expect(implementCalls).toBe(2);
+    expect(implementCalls).toBe(3);
+    expect(retryFeedbackChecked).toBe(true);
+    expect(redactedOutputs[0]).toBe("[private detail] [private detail] [2 private details withheld]");
+    expect(redactedOutputs[1]).toBe("retryIdentifier [private detail] [1 private details withheld]");
     expect(f.store.getArtifact(run.id, "holdout-scenarios.json")).toContain(secret);
+    expect(f.store.getArtifact(run.id, "verify-0.json")).toContain("ERR_RETRY_EXHAUSTED");
     const report = f.store.getArtifact(run.id, "report.md") ?? "";
     expect(report).toContain("## Holdout scenarios");
     expect(report).toContain("H-3");
@@ -892,7 +960,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
       ...pass,
       criteria: pass.criteria.map((criterion) =>
         criterion.id === "H-2"
-          ? { ...criterion, status: "unmet", evidence: `Observed empty output for ${secret}` }
+          ? {
+              ...criterion,
+              status: "unmet",
+              evidence: `Observed empty output for ${secret}`,
+              publicSummary: "",
+            }
           : criterion,
       ),
     };
@@ -1473,12 +1546,18 @@ for (const path of [
             overall: "fail",
             criteria: pass.criteria.map((c) =>
               c.id === "AC-1"
-                ? { ...c, status: "blocked", evidence: "Ran bun test: EPERM creating fixture directory" }
+                ? {
+                    ...c,
+                    status: "blocked",
+                    evidence: "Ran bun test: EPERM creating fixture directory",
+                    publicSummary: "",
+                  }
                 : c.id === "H-1" && actionable
                   ? {
                       ...c,
                       status: path === "unclear" ? "unclear" : "unmet",
                       evidence: "Observed wrong output",
+                      publicSummary: "",
                     }
                   : c,
             ),
@@ -1578,7 +1657,9 @@ test("completed environment retry stays consumed after persisted-state restart",
         structured: {
           ...pass,
           criteria: pass.criteria.map((c) =>
-            c.id === "AC-1" ? { ...c, status: "blocked", evidence: "bun test failed: EPERM mkdir" } : c,
+            c.id === "AC-1"
+              ? { ...c, status: "blocked", evidence: "bun test failed: EPERM mkdir", publicSummary: "" }
+              : c,
           ),
         },
       };
@@ -1624,7 +1705,9 @@ test("environment retry prefers another cross-vendor model over same-vendor fall
             structured: {
               ...pass,
               criteria: pass.criteria.map((c) =>
-                c.id === "AC-1" ? { ...c, status: "blocked", evidence: "bun test failed: EPERM mkdir" } : c,
+                c.id === "AC-1"
+                  ? { ...c, status: "blocked", evidence: "bun test failed: EPERM mkdir", publicSummary: "" }
+                  : c,
               ),
             },
           };

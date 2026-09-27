@@ -1,6 +1,9 @@
+import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { lstat, readFile } from "node:fs/promises";
+import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import type { ZodType } from "zod";
 import type { Config } from "../config.ts";
 import type {
@@ -27,6 +30,7 @@ import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
+import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
   cfg: Config;
@@ -92,6 +96,9 @@ export interface RunState {
 
 const MODEL_REJECTED =
   /model[^.]{0,80}(is not supported|not found|does not exist|not available)|unknown model|invalid model|model_not_found/i;
+const execFileAsync = promisify(execFile);
+const MAX_PUBLIC_SOURCE_BYTES = 16 * 1024 * 1024;
+const MAX_PUBLIC_SOURCE_FILES = 2_000;
 
 export class CancelledError extends Error {
   constructor() {
@@ -149,6 +156,7 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
 };
 
 export class RunContext {
+  private holdoutPublicSources?: { round: number; sources: Promise<string> };
   readonly runDir: string;
   state: RunState;
 
@@ -177,6 +185,52 @@ export class RunContext {
 
   get complexity(): Complexity {
     return this.state.triage?.complexity ?? this.run.complexity ?? "small";
+  }
+
+  publicHoldoutSources(): Promise<string> {
+    // Each implementation round may add identifiers that are now safe to show in feedback.
+    if (this.holdoutPublicSources?.round !== this.state.round) {
+      this.holdoutPublicSources = {
+        round: this.state.round,
+        sources: this.readPublicHoldoutSources(),
+      };
+    }
+    return this.holdoutPublicSources.sources;
+  }
+
+  private async readPublicHoldoutSources(): Promise<string> {
+    // Platform error names are public diagnostics, including on environment-blocked checks.
+    const identifiers = new Set<string>(Object.keys(constants.errno));
+    const cwd = this.state.worktreePath;
+    if (cwd) {
+      try {
+        const { stdout } = await execFileAsync("git", ["ls-files", "-z"], {
+          cwd,
+          maxBuffer: 16 * 1024 * 1024,
+          encoding: "utf8",
+        });
+        const files = stdout.split("\0").filter(Boolean);
+        let bytesRead = 0;
+        for (const file of files.slice(0, MAX_PUBLIC_SOURCE_FILES)) {
+          try {
+            const path = join(cwd, file);
+            const stat = await lstat(path);
+            if (!stat.isFile() || stat.size > 256_000) continue;
+            if (bytesRead + stat.size > MAX_PUBLIC_SOURCE_BYTES) break;
+            bytesRead += stat.size;
+            const content = await readFile(path, "utf8");
+            if (content.includes("\0")) continue;
+            for (const identifier of `${file} ${content}`.match(/[A-Za-z_$][\w$]*/g) ?? [])
+              identifiers.add(identifier);
+          } catch {
+            // A tracked path can disappear while the verifier is running.
+          }
+        }
+      } catch {
+        // Request and specification still provide the public-source exemption.
+      }
+    }
+    return [this.run.prompt, this.state.spec ? renderSpec(this.state.spec) : "", ...identifiers].join("\n");
   }
 
   save(): void {
@@ -268,9 +322,10 @@ export class RunContext {
       });
       let result: AgentResult;
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
+      const publicSources = opts.redactHoldout && this.state.holdout ? await this.publicHoldoutSources() : "";
       const redact =
         opts.redactHoldout && this.state.holdout
-          ? (value: string) => redactHoldoutText(value, this.state.holdout as Holdout)
+          ? (value: string) => redactHoldoutText(value, this.state.holdout as Holdout, publicSources)
           : undefined;
       try {
         const spec: AgentSpec = {

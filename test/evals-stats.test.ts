@@ -165,8 +165,8 @@ test("verify reports pooled confusion counts, accuracy and null rates without la
     overall: "pass",
     notes: "",
     criteria: [
-      { id: "AC-1", status: "met", evidence: "false accept" },
-      { id: "H-1", status: "unclear", evidence: "false reject" },
+      { id: "AC-1", status: "met", evidence: "false accept", publicSummary: "" },
+      { id: "H-1", status: "unclear", evidence: "false reject", publicSummary: "" },
     ],
   });
   const rows: EvalTrial[] = [0, 1].map((i) => ({ ...trial("a", "mixed", i, false), details: { grade } }));
