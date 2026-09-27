@@ -49,9 +49,11 @@ import {
   verifyPrompt,
 } from "./prompts.ts";
 import { buildReport } from "./report.ts";
+import { blockingReviewFindings, reviewFindingKey, reviewVerdict } from "./review.ts";
 import {
   type Holdout,
   HoldoutSchema,
+  LaterReviewSchema,
   type Review,
   ReviewSchema,
   renderSpec,
@@ -568,6 +570,12 @@ async function oneRound(
   }
 
   // --- review (a different vendor than the implementer)
+  if (ctx.state.lastReview && !ctx.state.reviewHistory?.length)
+    throw new NeedsHumanError("Previous review has no round history; cannot classify later findings");
+  const earlierReviews = (ctx.state.reviewHistory ?? []).filter((entry) => entry.round < round);
+  const priorReview = earlierReviews.at(-1);
+  const previousReview = priorReview ? { sha: priorReview.sha, findings: priorReview.blocking } : undefined;
+  const reviewedSha = await headSha(cwd);
   const review: Review = await ctx.stage(
     "review",
     async (stage) => {
@@ -586,35 +594,64 @@ async function oneRound(
           gates: comparison,
           audit,
           implementerReport: ctx.state.implementerReport ?? "",
+          previous: previousReview,
+          headSha: reviewedSha,
         }),
-        jsonSchema: toStrictJsonSchema(ReviewSchema),
-        schema: ReviewSchema,
+        jsonSchema: toStrictJsonSchema(previousReview ? LaterReviewSchema : ReviewSchema),
+        schema: previousReview ? LaterReviewSchema : ReviewSchema,
         requireStructured: true,
       });
       await discardChanges(cwd);
-      const r = ReviewSchema.parse(result.structured);
-      // The verdict must agree with the findings: any blocker/major means changes are required.
-      if (r.findings.some((f) => f.severity === "blocker" || f.severity === "major"))
-        r.verdict = "request_changes";
+      const parsed: Review = (previousReview ? LaterReviewSchema : ReviewSchema).parse(result.structured);
+      // The model's verdict is kept for inspection only; control flow uses the derived one.
+      const modelVerdict = parsed.verdict;
+      const r: Review = { ...parsed, verdict: reviewVerdict(parsed, previousReview?.findings) };
+      const blocking = blockingReviewFindings(r, previousReview?.findings);
+      // A replay on the same commit (e.g. after a restart) keeps follow-ups it may not repeat.
+      const replayed = (ctx.state.reviewHistory ?? []).find(
+        (e) => e.round === round && e.sha === reviewedSha,
+      );
+      const followUps = previousReview
+        ? [
+            ...new Map(
+              [...(replayed?.followUps ?? []), ...r.findings.filter((f) => !blocking.includes(f))].map(
+                (f) => [reviewFindingKey(f), f] as const,
+              ),
+            ).values(),
+          ]
+        : [];
+      ctx.state.reviewHistory = [...earlierReviews, { round, sha: reviewedSha, blocking, followUps }];
+      ctx.state.reviewFollowUps = [
+        ...new Map(
+          ctx.state.reviewHistory.flatMap((entry) =>
+            entry.followUps.map((f) => [reviewFindingKey(f), f] as const),
+          ),
+        ).values(),
+      ];
       const sameVendor = target.vendor === ctx.state.implementer?.vendor;
       if (sameVendor) ctx.log("Review done by the implementer's vendor (no other vendor available)", "warn");
       ctx.state.lastReview = { ...r, modelId: target.modelId };
+      ctx.state.reviewedSha = reviewedSha;
+      ctx.save();
       ctx.store.putArtifact(
         ctx.run.id,
         `review-${round}.json`,
         "review",
-        JSON.stringify({ ...r, model: target.modelId }, null, 2),
+        JSON.stringify({ ...r, modelVerdict, model: target.modelId, round, reviewedSha, blocking }, null, 2),
       );
-      const serious = r.findings.filter((f) => f.severity === "blocker" || f.severity === "major").length;
+      const serious = blocking.length;
       return {
-        summary: `${r.verdict} by ${target.modelId}: ${serious} blocking, ${r.findings.length - serious} minor`,
+        summary: `${r.verdict} by ${target.modelId}: ${serious} blocking, ${r.findings.length - serious} nonblocking`,
         value: r,
       };
     },
     round,
   );
 
-  const reviewFeedback = review.verdict === "request_changes" ? formatReviewFeedback(review) : "";
+  const reviewFeedback =
+    review.verdict === "request_changes"
+      ? formatReviewFeedback(blockingReviewFindings(review, previousReview?.findings))
+      : "";
   if (review.verdict === "request_changes") {
     ctx.state.feedback = reviewFeedback || `### Code review requested changes\n${review.summary}`;
     ctx.save();

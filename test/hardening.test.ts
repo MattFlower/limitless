@@ -404,6 +404,7 @@ describe("pipeline hardening", () => {
                     ? [
                         {
                           severity: "blocker",
+                          security: false,
                           file: "a.txt",
                           line: 1,
                           title: "broken",

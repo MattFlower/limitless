@@ -86,6 +86,15 @@ export interface RunState {
   lastGates?: GateComparison[];
   lastAudit?: AuditFinding[];
   lastReview?: Review & { modelId: string };
+  reviewedSha?: string;
+  /** Replace a replayed round; earlier entries remain the source of review context. */
+  reviewHistory?: {
+    round: number;
+    sha: string;
+    blocking: Review["findings"];
+    followUps: Review["findings"];
+  }[];
+  reviewFollowUps?: Review["findings"];
   lastVerify?: (Verify & { modelId: string }) | null;
   verifyResults?: (Verify & { modelId: string; round: number; attempt?: number })[];
   /** Reserve the retry before invoking; a crash must not grant another attempt. */

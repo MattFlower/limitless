@@ -472,7 +472,28 @@ describe("pipeline (fake agents, real git + gates)", () => {
         if (role === "review") {
           reviews++;
           if (reviews < normalRounds || (outcome === "review" && reviews > normalRounds))
-            return { structured: { ...approve, verdict: "request_changes", summary: "Fix the feature" } };
+            return {
+              structured: {
+                verdict: "request_changes",
+                summary: "Fix the feature",
+                findings: [
+                  {
+                    severity: "blocker",
+                    security: false,
+                    ...(reviews > 1
+                      ? reviews > normalRounds
+                        ? { label: "regression", prior: "" }
+                        : { label: "unaddressed", prior: "P1" }
+                      : {}),
+                    file: "farewell.txt",
+                    line: 1,
+                    title: "Fix the feature",
+                    detail: "Incorrect output",
+                    suggestion: "Fix it",
+                  },
+                ],
+              },
+            };
           if (reviews === normalRounds) baseTip = await advanceBase(bare, "greeting.txt", "new base\n");
           expect(s.prompt).toContain(reviews > normalRounds ? baseTip : "Add a farewell");
           return { structured: approve };
@@ -1192,6 +1213,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
                 findings: [
                   {
                     severity: "blocker",
+                    security: false,
                     file: "farewell.txt",
                     line: 1,
                     title: "Wrong text",
@@ -1211,6 +1233,378 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(reviews).toBe(2);
     expect(implementPrompts[1]).toContain("Wrong text");
   });
+
+  test("later reviews compare the previous commit and keep new major findings as follow-ups", async () => {
+    const prompts: string[] = [];
+    const implementPrompts: string[] = [];
+    const finding = (title: string, label?: "unaddressed" | "regression" | "new") => ({
+      severity: "major",
+      security: false,
+      ...(label ? { label, prior: label === "unaddressed" ? "P1" : "" } : {}),
+      file: "farewell.txt",
+      line: 1,
+      title,
+      detail: title,
+      suggestion: "Fix it",
+    });
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        prompts.push(s.prompt);
+        return {
+          structured:
+            prompts.length === 1
+              ? { verdict: "approve", summary: "first", findings: [finding("Prior bug")] }
+              : prompts.length === 2
+                ? { verdict: "approve", summary: "second", findings: [finding("Prior bug", "unaddressed")] }
+                : {
+                    verdict: "request_changes",
+                    summary: "follow up",
+                    findings: [finding("Later edge case", "new")],
+                  },
+        };
+      }
+      implementPrompts.push(s.prompt);
+      return { files: { "farewell.txt": `goodbye ${implementPrompts.length}\n` } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(implementPrompts).toHaveLength(3);
+    expect(implementPrompts[1]).toContain("Prior bug");
+    type Stored = { verdict: string; modelVerdict: string };
+    const first = JSON.parse(f.store.getArtifact(run.id, "review-0.json") ?? "{}") as Stored;
+    const third = JSON.parse(f.store.getArtifact(run.id, "review-2.json") ?? "{}") as Stored;
+    expect(first).toMatchObject({ verdict: "request_changes", modelVerdict: "approve" });
+    expect(third).toMatchObject({ verdict: "approve", modelVerdict: "request_changes" });
+    expect(prompts[1]).toContain("Prior bug");
+    const reviewed = prompts[1]?.match(/Reviewed commit: ([a-f0-9]{40})\. Current HEAD: ([a-f0-9]{40})/);
+    expect(reviewed).not.toBeNull();
+    expect(reviewed?.[1]).not.toBe(reviewed?.[2]);
+    expect(prompts[1]).toContain(`git diff ${reviewed?.[1]}..${reviewed?.[2]}`);
+    expect(prompts[1]).toContain("git diff ");
+    expect(prompts[1]).toContain("latest-change diff");
+    expect(f.store.getArtifact(run.id, "report.md")).toContain(
+      "## Review follow-ups\n\n- major: `farewell.txt:1` Later edge case",
+    );
+  });
+
+  for (const [label, laterTitle] of [
+    ["unaddressed", "Prior bug"],
+    ["unaddressed", "Prior bug still unfixed"],
+    ["regression", "Still broken"],
+  ] as const) {
+    test(`${label} later finding (${laterTitle}) sends only blocking feedback to implementation`, async () => {
+      let reviews = 0;
+      const prompts: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") {
+          reviews++;
+          const title = reviews === 1 ? "Prior bug" : laterTitle;
+          return {
+            structured:
+              reviews < 3
+                ? {
+                    verdict: "approve",
+                    summary: "review",
+                    findings: [
+                      {
+                        severity: reviews === 2 ? "minor" : "major",
+                        security: false,
+                        ...(reviews === 2 ? { label, prior: label === "unaddressed" ? "P1" : "" } : {}),
+                        file: "farewell.txt",
+                        line: 1,
+                        title,
+                        detail: title,
+                        suggestion: "Fix it",
+                      },
+                      ...(reviews === 2
+                        ? [
+                            {
+                              severity: "minor",
+                              security: false,
+                              label: "new",
+                              prior: "",
+                              file: "farewell.txt",
+                              line: 1,
+                              title: "Future cleanup",
+                              detail: "Optional",
+                              suggestion: "Later",
+                            },
+                          ]
+                        : []),
+                    ],
+                  }
+                : { ...approve, verdict: "request_changes" },
+          };
+        }
+        prompts.push(s.prompt);
+        return { files: { "farewell.txt": `goodbye ${prompts.length}\n` } };
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(prompts).toHaveLength(3);
+      expect(prompts[2]).toContain(laterTitle);
+      expect(prompts[2]).not.toContain("Future cleanup");
+      expect(JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}")).toMatchObject({
+        verdict: "request_changes",
+        modelVerdict: "approve",
+      });
+      expect(f.store.getArtifact(run.id, "report.md")).toContain("Future cleanup");
+    });
+  }
+
+  test("a new security finding blocks even at minor severity", async () => {
+    let implementsCount = 0;
+    let reviews = 0;
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        reviews++;
+        return {
+          structured:
+            reviews === 1
+              ? {
+                  verdict: "approve",
+                  summary: "initial",
+                  findings: [
+                    {
+                      severity: "major",
+                      security: false,
+                      file: "farewell.txt",
+                      line: 1,
+                      title: "Prior bug",
+                      detail: "bug",
+                      suggestion: "fix",
+                    },
+                  ],
+                }
+              : reviews === 2
+                ? {
+                    verdict: "approve",
+                    summary: "security",
+                    findings: [
+                      {
+                        severity: "minor",
+                        security: true,
+                        label: "new",
+                        prior: "",
+                        file: "farewell.txt",
+                        line: 1,
+                        title: "Secret leak",
+                        detail: "leak",
+                        suggestion: "fix",
+                      },
+                    ],
+                  }
+                : approve,
+        };
+      }
+      implementsCount++;
+      if (implementsCount === 3) expect(s.prompt).toContain("Secret leak");
+      return { files: { "farewell.txt": `goodbye ${implementsCount}\n` } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(implementsCount).toBe(3);
+    expect(f.store.getArtifact(run.id, "review-1.json")).toContain('"verdict": "request_changes"');
+  });
+
+  test("review context and follow-ups survive a factory restart", async () => {
+    let reviews = 0;
+    let implementsCount = 0;
+    let slow = true;
+    const prompts: string[] = [];
+    const handler: Handler = (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        reviews++;
+        prompts.push(s.prompt);
+        if (reviews > 3) return { structured: approve };
+        return {
+          structured:
+            reviews === 1
+              ? {
+                  ...approve,
+                  findings: [
+                    {
+                      severity: "major",
+                      security: false,
+                      file: "farewell.txt",
+                      line: 1,
+                      title: "Prior bug",
+                      detail: "bug",
+                      suggestion: "fix",
+                    },
+                  ],
+                }
+              : reviews === 2
+                ? {
+                    ...approve,
+                    findings: [
+                      {
+                        severity: "minor",
+                        security: false,
+                        label: "regression",
+                        prior: "",
+                        file: "farewell.txt",
+                        line: 1,
+                        title: "Regression",
+                        detail: "regressed",
+                        suggestion: "fix",
+                      },
+                      {
+                        severity: "major",
+                        security: false,
+                        label: "new",
+                        prior: "",
+                        file: "farewell.txt",
+                        line: 1,
+                        title: "Backlog idea",
+                        detail: "later",
+                        suggestion: "later",
+                      },
+                    ],
+                  }
+                : {
+                    ...approve,
+                    findings: [
+                      {
+                        severity: "major",
+                        security: false,
+                        label: "unaddressed",
+                        // Cites no previous blocking finding: a relabelled follow-up can't become mandatory.
+                        prior: "",
+                        file: "farewell.txt",
+                        line: 1,
+                        title: "Backlog idea",
+                        detail: "later",
+                        suggestion: "later",
+                      },
+                    ],
+                  },
+        };
+      }
+      implementsCount++;
+      return slow && implementsCount === 3
+        ? { delayMs: 30_000 }
+        : { files: { "farewell.txt": `goodbye ${implementsCount}\n` } };
+    };
+    const f = start(handler);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    const deadline = Date.now() + 10_000;
+    while (
+      (f.store.getRunState<RunState>(run.id)?.round !== 2 || f.store.getRun(run.id)?.stage !== "implement") &&
+      Date.now() < deadline
+    )
+      await Bun.sleep(10);
+    const before = f.store.getRunState<RunState>(run.id);
+    expect(before?.reviewedSha).toMatch(/^[a-f0-9]{40}$/);
+    expect(before?.lastReview?.findings[0]?.title).toBe("Regression");
+    expect(before?.reviewFollowUps?.[0]?.title).toBe("Backlog idea");
+    await f.stop();
+    f.store.close();
+    slow = false;
+    const restarted = start(handler);
+    expect(await waitFor(restarted, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(prompts[2]).toContain(before?.reviewedSha ?? "missing SHA");
+    expect(prompts[2]).toContain("Regression");
+    expect(prompts[2]).not.toContain("Backlog idea");
+    expect(implementsCount).toBe(4); // Includes the interrupted implementation; the follow-up stays one.
+    expect(restarted.store.getArtifact(run.id, "review-2.json")).toContain('"verdict": "approve"');
+    expect(restarted.store.getRunState<RunState>(run.id)?.reviewFollowUps).toHaveLength(1);
+    expect(restarted.store.getArtifact(run.id, "report.md")).toContain("Backlog idea");
+  });
+
+  for (const restartRound of [0, 1]) {
+    test(`restart during verify preserves review policy and keeps round ${restartRound} follow-ups`, async () => {
+      let implementations = 0;
+      let slow = true;
+      let verifyStarted = false;
+      let resumedVerifies = 0;
+      const prompts: string[] = [];
+      const finding = (title: string, label = "new") => ({
+        severity: "major",
+        security: false,
+        label,
+        prior: "",
+        file: "farewell.txt",
+        line: 1,
+        title,
+        detail: title,
+        suggestion: "Fix",
+      });
+      const handler: Handler = (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") {
+          prompts.push(s.prompt);
+          const findings =
+            restartRound === 0
+              ? prompts.length === 2
+                ? [finding("New major on replay")]
+                : []
+              : prompts.length === 1
+                ? [finding("Initial blocker")]
+                : [finding("Backlog idea"), ...(slow ? [finding("Obsolete follow-up")] : [])];
+          return { structured: { ...approve, findings } };
+        }
+        if (role === "verify") {
+          verifyStarted = true;
+          if (slow) return { delayMs: 30_000 };
+          resumedVerifies++;
+          return {
+            structured:
+              restartRound === 1 && resumedVerifies === 1
+                ? {
+                    ...pass,
+                    criteria: pass.criteria.map((c) => (c.id === "AC-1" ? { ...c, status: "unmet" } : c)),
+                  }
+                : pass,
+          };
+        }
+        implementations++;
+        return { files: { "farewell.txt": `goodbye ${implementations}\n` } };
+      };
+      const f = start(handler);
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+      const deadline = Date.now() + 10_000;
+      while (!verifyStarted && Date.now() < deadline) await Bun.sleep(10);
+      expect(verifyStarted).toBe(true);
+      expect(f.store.getRun(run.id)?.stage).toBe("verify");
+      const checkpoint = f.store.getRunState<RunState>(run.id);
+      expect(checkpoint?.round).toBe(restartRound);
+      expect(checkpoint?.reviewHistory?.at(-1)?.round).toBe(restartRound);
+      await f.stop();
+      f.store.close();
+      slow = false;
+      const resumed = start(handler);
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      // Replaying checks must use the same earlier round's context, never its own review.
+      expect(prompts[restartRound + 1]).toBe(prompts[restartRound]);
+      const state = resumed.store.getRunState<RunState>(run.id);
+      expect(implementations).toBe(restartRound === 0 ? 2 : 3);
+      expect(state?.reviewHistory?.map((entry) => entry.round)).toEqual(
+        restartRound === 0 ? [0, 1] : [0, 1, 2],
+      );
+      if (restartRound === 0) {
+        expect(resumed.store.getArtifact(run.id, "review-0.json")).toContain('"verdict": "request_changes"');
+        expect(state?.reviewFollowUps).toEqual([]);
+      } else {
+        // The replay on the same commit omitted "Obsolete follow-up"; omission is not resolution.
+        expect(state?.reviewFollowUps?.map((f) => f.title)).toEqual(["Backlog idea", "Obsolete follow-up"]);
+        const followUps = resumed.store.getArtifact(run.id, "report.md")?.split("## Review follow-ups")[1];
+        expect(followUps?.match(/^- major: `farewell\.txt:1` Backlog idea/gm)).toHaveLength(1);
+        expect(followUps?.match(/^- major: `farewell\.txt:1` Obsolete follow-up/gm)).toHaveLength(1);
+      }
+    });
+  }
 
   test("falls back to another provider when one is out of quota", async () => {
     const f = start((s) => {

@@ -89,6 +89,7 @@ export const ReviewSchema = z.object({
   findings: z.array(
     z.object({
       severity: z.enum(["blocker", "major", "minor", "nit"]),
+      security: z.boolean().describe("True for a security finding"),
       file: z.string().describe("Path, or empty string for general findings"),
       line: z.number().int().describe("Line number, or 0 if not applicable"),
       title: z.string(),
@@ -97,7 +98,30 @@ export const ReviewSchema = z.object({
     }),
   ),
 });
-export type Review = z.infer<typeof ReviewSchema>;
+
+export const LaterReviewSchema = ReviewSchema.extend({
+  findings: z.array(
+    ReviewSchema.shape.findings.element.extend({
+      label: z
+        .enum(["unaddressed", "regression", "new"])
+        .describe(
+          "unaddressed: prior blocking finding unresolved; regression: introduced by latest changes; new: first discovered now",
+        ),
+      prior: z
+        .string()
+        .describe(
+          "For unaddressed: the id of the previous blocking finding it repeats (e.g. P2); otherwise an empty string",
+        ),
+    }),
+  ),
+});
+
+export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
+  findings: (z.infer<typeof ReviewSchema>["findings"][number] & {
+    label?: z.infer<typeof LaterReviewSchema>["findings"][number]["label"];
+    prior?: string;
+  })[];
+};
 
 export const VerifySchema = z.object({
   criteria: z.array(
