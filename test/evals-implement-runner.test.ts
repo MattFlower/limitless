@@ -227,30 +227,23 @@ for (const [kind, files, gate, reason] of [
     }
   });
 
-for (const [command, reason] of [
-  ["./hidden/missing-script.sh", "error"],
-  ["sh hidden/missing-script.sh", "error"],
-  ["./overwrite", "error"],
-  ["exit 2", "hidden_tests"],
-] as const)
+// Exit codes such as 126/127 can be caused by the candidate (a deleted or non-executable script),
+// so they are graded hidden_tests failures and the evidence is cached like any other grade.
+for (const command of ["./hidden/missing-script.sh", "sh hidden/missing-script.sh", "./overwrite", "exit 2"])
   test(`hidden command classification: ${command}`, async () => {
     const f = await fixture();
     try {
       f.item.hidden.command = command;
       f.save();
       const trial = (await f.run()).trials[0];
-      expect(trial).toMatchObject({ pass: false, score: 0, status: reason === "error" ? "error" : "ok" });
-      expect(trial?.details.grade?.implement).toMatchObject({ reason, hidden: { timedOut: false } });
+      expect(trial).toMatchObject({ pass: false, score: 0, status: "ok" });
+      expect(trial?.details.grade?.implement).toMatchObject({
+        reason: "hidden_tests",
+        hidden: { timedOut: false },
+      });
       expect(trial?.details.grade?.implement?.hidden?.exitCode).toBeGreaterThan(0);
-      if (reason === "error") {
-        expect(trial?.details.grade?.implement?.hidden?.output).toBeTruthy();
-        f.respond(() => ({ files: { answer: "correct", broken: "yes", protected: "changed" } }));
-        const overlap = (await f.run({ cache: false })).trials[0]?.details.grade?.implement;
-        expect(overlap?.reason).toBe("error");
-        expect(overlap?.gates.some((g) => g.blocking)).toBe(true);
-        expect(overlap?.auditBlocks.length).toBeGreaterThan(0);
-      }
-      expect(f.calls).toHaveLength(reason === "error" ? 2 : 1);
+      expect((await f.run()).trials[0]?.details.grade).toEqual(trial?.details.grade);
+      expect(f.calls).toHaveLength(1);
       expect(f.calls.every((s) => !existsSync(s.cwd))).toBe(true);
     } finally {
       await f.close();

@@ -139,13 +139,10 @@ export async function gradeImplement(
       timedOut: hidden.timedOut,
       output: `${hidden.stdout}\n${hidden.stderr}`.trim().slice(-6000),
     };
-    // Shells reserve 126/127 for commands that cannot execute. Dash uses 2 for an unreadable script.
-    const launchFailed =
-      hidden.exitCode === null ||
-      hidden.exitCode === 126 ||
-      hidden.exitCode === 127 ||
-      (hidden.exitCode === 2 &&
-        /^.*\bsh: .*cannot open .*: (No such file|Permission denied)/m.test(hidden.stderr));
+    // Only a shell that never reported an exit status is operational. Exit codes such as 126/127
+    // can come from the candidate deleting or chmod-ing something the command needs, so they grade
+    // as hidden_tests failures and stay cacheable.
+    const launchFailed = hidden.exitCode === null;
     evidence.reason =
       hidden.timedOut || gateTimeout
         ? "timeout"
