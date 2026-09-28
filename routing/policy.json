@@ -11,15 +11,7 @@
     ]
   },
   "implement": {
-    "trivial": [
-      "codex/luna@medium",
-      "codex/sol@medium",
-      "claude/opus"
-    ],
-    "small": [
-      "codex/luna@medium",
-      "codex/sol@medium",
-      "claude/opus"
-    ]
+    "trivial": ["codex/luna@medium", "codex/sol@medium", "claude/opus"],
+    "small": ["codex/luna@medium", "codex/sol@medium", "claude/opus"]
   }
 }
