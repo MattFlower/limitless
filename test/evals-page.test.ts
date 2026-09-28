@@ -231,7 +231,7 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
         "<td>4</td>",
       ])
         expect(detail).toContain(text);
-      if (row.run.role === "review") expect(detail).toContain("defect recall");
+      if (row.run.role === "review") expect(detail).toContain("blocking recall");
       if (row.run.role === "verify") expect(detail).toContain("false-accept");
     }
   } finally {

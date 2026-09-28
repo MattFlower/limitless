@@ -28,11 +28,18 @@ import {
   nextImplementTarget,
   prepareImplement,
 } from "./implement.ts";
-import { gradeCase, prepareCase, schemaFor, seedContent } from "./prepare.ts";
+import { gradeCase, prepareCase, schemaFor, seedContent, storedSchemaFor } from "./prepare.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 
 /** Where Limitless keeps eval datasets; pins whose history touches these are rejected. */
 const LABEL_PATHS = ["evals/triage", "evals/review", "evals/verify", "evals/implement"];
+
+export interface EvalRegradeResult {
+  regraded: number;
+  /** Regraded trials whose grade differs from the stored one. */
+  changed: number;
+  skipped: { caseId: string; modelId: string; trial: number; reason: string }[];
+}
 
 export class EvalRunner {
   private readonly active = new Map<string, { controller: AbortController; done: Promise<void> }>();
@@ -103,6 +110,49 @@ export class EvalRunner {
     if (!run) return null;
     const trials = this.deps.store.listEvalTrials(id);
     return { run, summaries: summarize(run, trials, options), trials };
+  }
+
+  /**
+   * Recomputes a finished review eval's stored grades from its stored outputs against the current
+   * labels. Grading is deterministic, so this needs no model calls, cache hits or spend. Trials
+   * whose case left the dataset or whose output no longer parses keep their stored grade.
+   */
+  regrade(id: string): EvalRegradeResult | null {
+    const run = this.deps.store.getEvalRun(id);
+    if (!run) return null;
+    if (run.role !== "review") throw new Error(`only review evals can be regraded; ${id} is ${run.role}`);
+    if (run.status === "queued" || run.status === "running" || this.active.has(id))
+      throw new Error(`eval ${id} is still ${run.status}; regrade it once it finishes`);
+    const cases = new Map(
+      loadRoleCases("review", this.casePath).cases.flatMap((item) =>
+        "defects" in item ? [[item.id, item] as const] : [],
+      ),
+    );
+    const result: EvalRegradeResult = { regraded: 0, changed: 0, skipped: [] };
+    for (const trial of this.deps.store.listEvalTrials(id)) {
+      if (trial.status !== "ok" || !trial.details.grade?.review) continue;
+      const item = cases.get(trial.caseId);
+      const output = item && storedSchemaFor(item).safeParse(trial.output);
+      if (!item || !output?.success) {
+        result.skipped.push({
+          caseId: trial.caseId,
+          modelId: recordedTarget(trial),
+          trial: trial.trial,
+          reason: item ? "stored output fails the review schema" : "case is no longer in the dataset",
+        });
+        continue;
+      }
+      const grade = gradeCase(item, output.data);
+      result.regraded++;
+      if (JSON.stringify(grade) !== JSON.stringify(trial.details.grade)) result.changed++;
+      this.deps.store.recordEvalTrial({
+        ...trial,
+        pass: grade.pass,
+        score: grade.score,
+        details: { ...trial.details, grade },
+      });
+    }
+    return result;
   }
 
   async wait(id: string): Promise<void> {
@@ -370,7 +420,9 @@ export class EvalRunner {
       if (cache)
         for (const source of store.cachedEvalTrials(trial.cacheKey)) {
           const output =
-            "hidden" in item ? { success: true, data: source.output } : schema?.safeParse(source.output);
+            "hidden" in item
+              ? { success: true, data: source.output }
+              : storedSchemaFor(item).safeParse(source.output);
           if (!output?.success) continue;
           const grade = "hidden" in item ? source.details.grade : gradeCase(item, output.data);
           if (!grade) continue;

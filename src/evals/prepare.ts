@@ -5,7 +5,7 @@ import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../g
 import { diffSince, readFileAt } from "../git/repos.ts";
 import { readingTimeout } from "../pipeline/engine.ts";
 import { reviewPrompt, triagePrompt, verifyPrompt } from "../pipeline/prompts.ts";
-import { ReviewSchema, TriageSchema, VerifySchema } from "../pipeline/schemas.ts";
+import { ReviewSchema, StoredReviewSchema, TriageSchema, VerifySchema } from "../pipeline/schemas.ts";
 import { sh } from "../util/proc.ts";
 import type { EvalCase, ImplementCase, ReviewCase } from "./cases.ts";
 import { gradeReview } from "./graders/review.ts";
@@ -119,11 +119,16 @@ export async function prepareCase(
     timeoutMs: readingTimeout(diff.added + diff.removed, 25),
   };
 }
+/** What a live model call must return; also the strict JSON schema handed to the harness. */
 export function schemaFor(item: Exclude<EvalCase, ImplementCase>) {
   return "prompt" in item ? TriageSchema : "defects" in item ? ReviewSchema : VerifySchema;
 }
+/** What a stored output must satisfy to be regraded from its JSON without a model call. */
+export function storedSchemaFor(item: Exclude<EvalCase, ImplementCase>) {
+  return "defects" in item ? StoredReviewSchema : schemaFor(item);
+}
 export function gradeCase(item: Exclude<EvalCase, ImplementCase>, output: unknown) {
   if ("prompt" in item) return gradeTriage(item, TriageSchema.parse(output));
-  if ("defects" in item) return gradeReview(item, ReviewSchema.parse(output));
+  if ("defects" in item) return gradeReview(item, StoredReviewSchema.parse(output));
   return gradeVerify(item, VerifySchema.parse(output));
 }

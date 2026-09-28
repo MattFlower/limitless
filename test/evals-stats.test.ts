@@ -155,6 +155,99 @@ test("review pools defects across repetitions, preserves empty denominators and 
   });
 });
 
+test("review report leads with blocking recall, splits it by gold severity and lists clean blocking counts", async () => {
+  const { gradeReview } = await import("../src/evals/graders/review.ts");
+  const { reviewCase, reviewOutput } = await import("./evals-reading-support.ts");
+  const defect = reviewCase.defects[0];
+  if (!defect) throw new Error("fixture");
+  const mixed = {
+    ...reviewCase,
+    defects: [
+      { ...defect, severity: "blocker" as const, lines: [10, 10] as [number, number] },
+      { ...defect, severity: "major" as const, lines: [100, 100] as [number, number] },
+      { ...defect, severity: "major" as const, lines: [200, 200] as [number, number] },
+    ],
+  };
+  const output = reviewOutput(10, "blocker");
+  output.findings.push({
+    ...output.findings[0],
+    line: 100,
+    severity: "minor",
+  } as (typeof output.findings)[0]);
+  const clean = { ...reviewCase, kind: "clean" as const, defects: [] };
+  const twoBlocking = reviewOutput(10, "major");
+  twoBlocking.findings.push({ ...twoBlocking.findings[0], line: 50 } as (typeof twoBlocking.findings)[0]);
+  const grades = [
+    ["real", gradeReview(mixed, output)],
+    ["clean-a", gradeReview(clean, twoBlocking)],
+    ["clean-b", gradeReview(clean, reviewOutput(10, "minor"))],
+  ] as const;
+  const rows: EvalTrial[] = grades.map(([caseId, grade]) => ({
+    ...trial("a", caseId, 0, grade.pass === true),
+    details: { grade },
+  }));
+  const reviewRun = { ...run, role: "review" as const, k: 1, models: ["a"] };
+  const summaries = summarize(reviewRun, rows);
+  expect(summaries[0]?.review).toMatchObject({
+    defectRecall: { numerator: 1, denominator: 3 },
+    underRated: { numerator: 1, denominator: 3 },
+    falseBlock: { numerator: 1, denominator: 2 },
+    bySeverity: [
+      { severity: "high", numerator: 1, denominator: 1, rate: 1 },
+      { severity: "medium", numerator: 0, denominator: 2, rate: 0 },
+      { severity: "low", numerator: 0, denominator: 0, rate: null },
+    ],
+    cleanBlocking: [
+      { caseId: "clean-a", blockingFindings: [2] },
+      { caseId: "clean-b", blockingFindings: [0] },
+    ],
+  });
+  const text = formatEvalReport({ run: reviewRun, trials: rows, summaries });
+  expect(text).toContain("  blocking recall 33.3% (1/3)");
+  expect(text).toContain("  high-severity blocking recall 100.0% (1/1)");
+  expect(text).toContain("  medium-severity blocking recall 0.0% (0/2)");
+  expect(text).toContain("  low-severity blocking recall n/a (0/0), Wilson 95% CI n/a");
+  expect(text).toContain("  under-rated (detected, not blocking; diagnostic): 1/3 required defects");
+  expect(text).toContain("  clean false-block 50.0% (1/2)");
+  expect(text).toContain("  clean clean-a: blocking findings per trial 2");
+  expect(text).toContain("  clean clean-b: blocking findings per trial 0");
+  expect(text.indexOf("blocking recall")).toBeLessThan(text.indexOf("under-rated"));
+  expect(text).not.toContain("graded before blocking recall");
+  const stored = grades[0][1].review;
+  if (!stored) throw new Error("expected review grade");
+  const legacyGrade = { ...grades[0][1], review: { ...stored, bySeverity: undefined } };
+  const legacyRows = [...rows, { ...trial("a", "old", 0, true), details: { grade: legacyGrade } }];
+  const legacySummaries = summarize(reviewRun, legacyRows);
+  expect(legacySummaries[0]?.review).toMatchObject({
+    legacyGrades: 1,
+    defectRecall: { numerator: 1, denominator: 3 },
+  });
+  // The legacy pass is excluded from every pass-based number too, not only from recall.
+  expect(legacySummaries[0]).toMatchObject({
+    passes: summaries[0]?.passes,
+    evaluatedTrials: 3,
+    cases: 3,
+    meanScore: summaries[0]?.meanScore,
+    predictionTrials: 3,
+    comparison: { candidateCompleteCases: 3, pairedCases: 3 },
+  });
+  const legacyText = formatEvalReport({ run: reviewRun, trials: legacyRows, summaries: legacySummaries });
+  expect(legacyText).toContain(
+    "  1 trials graded before blocking recall are excluded from pass, recall and comparisons; `limitless eval regrade eval` recomputes them from stored output without model calls",
+  );
+  expect(legacyText).not.toContain("rerun");
+  // A newer CLI renders an older daemon's review summary, which has no blocking-recall breakdown.
+  const older = summaries.map((s) => {
+    if (!s.review) return s;
+    const { bySeverity, underRated, cleanBlocking, legacyGrades, ...review } = s.review;
+    return { ...s, review: review as typeof s.review };
+  });
+  const olderText = formatEvalReport({ run: reviewRun, trials: rows, summaries: older });
+  expect(olderText).toContain("  defect recall (older daemon, not blocking recall) 33.3% (1/3)");
+  expect(olderText).not.toContain("severity blocking recall");
+  expect(olderText).not.toContain("under-rated");
+});
+
 test("verify reports pooled confusion counts, accuracy and null rates without labels", async () => {
   const { gradeVerify } = await import("../src/evals/graders/verify.ts");
   const { loadRoleCases, VerifyCaseFileSchema } = await import("../src/evals/cases.ts");

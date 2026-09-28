@@ -1,35 +1,88 @@
 import type { EvalGrade } from "../../core/types.ts";
-import type { Review } from "../../pipeline/schemas.ts";
+import { blockingReviewFindings, reviewVerdict } from "../../pipeline/review.ts";
+import type { Review, StoredReview } from "../../pipeline/schemas.ts";
 import type { ReviewCase } from "../cases.ts";
 
-export function gradeReview(item: ReviewCase, output: Review): EvalGrade {
+export const DEFECT_SEVERITY_GROUP = { blocker: "high", major: "medium", minor: "low", nit: "low" } as const;
+const SEVERITY_RANK = { blocker: 0, major: 1, minor: 2, nit: 3 } as const;
+
+type Finding = Review["findings"][number];
+type Defect = ReviewCase["defects"][number];
+
+/**
+ * Maximum bipartite matching by augmenting paths, so one finding never credits two defects whose
+ * windows overlap. Returns the matched defect indexes; a matched defect stays matched, so defects
+ * earlier in the list win ties.
+ */
+function assign(defects: Defect[], findings: Finding[], lands: (f: Finding, d: Defect) => boolean) {
+  const owner = new Map<number, number>(); // finding index -> defect index
+  const augment = (d: number, seen: Set<number>): boolean =>
+    findings.some((finding, f) => {
+      const defect = defects[d];
+      if (!defect || seen.has(f) || !lands(finding, defect)) return false;
+      seen.add(f);
+      const current = owner.get(f);
+      if (current !== undefined && !augment(current, seen)) return false;
+      owner.set(f, d);
+      return true;
+    });
+  for (let d = 0; d < defects.length; d++) augment(d, new Set());
+  return new Set(owner.values());
+}
+
+/**
+ * Grades what production would block in round 1: a required defect is caught only by a blocking
+ * finding, and the case verdict is derived from findings exactly as the engine does. The model's
+ * verdict is never graded, so stored output without one is still evidence.
+ */
+export function gradeReview(item: ReviewCase, output: StoredReview): EvalGrade {
   const normalize = (file: string) => file.replace(/^(\.\/)+/, "");
-  const required = item.defects.filter((defect) => defect.required);
-  const matched = required.filter((defect) =>
-    output.findings.some(
-      (finding) =>
-        ["blocker", "major", "minor"].includes(finding.severity) &&
-        normalize(finding.file) === normalize(defect.file) &&
-        (finding.line === 0
-          ? defect.category === "completeness"
-          : finding.line > 0 && finding.line >= defect.lines[0] - 5 && finding.line <= defect.lines[1] + 5),
-    ),
-  ).length;
-  const requestChanges = output.verdict === "request_changes";
-  const falseBlock =
-    item.kind === "clean"
-      ? requestChanges || output.findings.some((f) => f.severity === "blocker" || f.severity === "major")
-      : null;
-  const pass = item.kind === "clean" ? !falseBlock : matched === required.length && requestChanges;
+  const blocking = blockingReviewFindings(output);
+  const lands = (finding: Finding, defect: Defect) =>
+    normalize(finding.file) === normalize(defect.file) &&
+    (finding.line === 0
+      ? defect.category === "completeness"
+      : finding.line > 0 && finding.line >= defect.lines[0] - 5 && finding.line <= defect.lines[1] + 5);
+  // A finding repeated verbatim is still one finding.
+  const distinct = (findings: Finding[]) => [
+    ...new Map(findings.map((f) => [JSON.stringify([normalize(f.file), f.line, f.title]), f])).values(),
+  ];
+  // Most severe first, so an ambiguous assignment credits the defect that matters most.
+  const required = item.defects
+    .filter((defect) => defect.required)
+    .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
+  const caught = assign(required, distinct(blocking), lands);
+  const missed = required.filter((_, index) => !caught.has(index));
+  const underRated = assign(
+    missed,
+    distinct(output.findings.filter((f) => !blocking.includes(f))),
+    lands,
+  ).size;
+  const bySeverity = {
+    high: { caught: 0, total: 0 },
+    medium: { caught: 0, total: 0 },
+    low: { caught: 0, total: 0 },
+  };
+  for (const [index, defect] of required.entries()) {
+    const group = bySeverity[DEFECT_SEVERITY_GROUP[defect.severity]];
+    group.total++;
+    if (caught.has(index)) group.caught++;
+  }
+  const requestChanges = reviewVerdict(output) === "request_changes";
+  const falseBlock = item.kind === "clean" ? requestChanges : null;
+  const pass = item.kind === "clean" ? !falseBlock : caught.size === required.length && requestChanges;
   return {
     pass,
-    score: item.kind === "clean" ? Number(pass) : required.length ? matched / required.length : null,
+    score: item.kind === "clean" ? Number(pass) : required.length ? caught.size / required.length : null,
     fields: {},
     riskUnderCall: null,
     review: {
-      requiredMatched: matched,
+      requiredMatched: caught.size,
       requiredTotal: required.length,
-      recall: required.length ? matched / required.length : null,
+      recall: required.length ? caught.size / required.length : null,
+      underRated,
+      blockingFindings: blocking.length,
+      bySeverity,
       requestChanges,
       falseBlock,
       verdictMatch: requestChanges === (item.kind !== "clean"),

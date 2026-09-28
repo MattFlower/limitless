@@ -1,4 +1,4 @@
-import type { Review } from "./schemas.ts";
+import type { Review, StoredReview } from "./schemas.ts";
 
 export function reviewFindingKey(finding: Review["findings"][number]): string {
   // Lines and explanations can change while fixing the same issue.
@@ -19,7 +19,7 @@ function citesPriorBlocking(finding: Review["findings"][number], priorBlocking: 
  * security issue. Everything else becomes a follow-up.
  */
 export function blockingReviewFindings(
-  review: Review,
+  review: StoredReview,
   priorBlocking?: Review["findings"],
 ): Review["findings"] {
   return review.findings.filter((finding) => {
@@ -30,6 +30,6 @@ export function blockingReviewFindings(
   });
 }
 
-export function reviewVerdict(review: Review, priorBlocking?: Review["findings"]): Review["verdict"] {
+export function reviewVerdict(review: StoredReview, priorBlocking?: Review["findings"]): Review["verdict"] {
   return blockingReviewFindings(review, priorBlocking).length ? "request_changes" : "approve";
 }

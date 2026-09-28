@@ -150,7 +150,7 @@ test("review and verify API reports preserve role grades and text/JSON metrics",
       expect(text).toContain("prediction coverage 2/2");
       expect(text).not.toContain("risk under-call");
       if (role === "review") {
-        expect(text).toContain("defect recall 100.0% (2/2)");
+        expect(text).toContain("blocking recall 100.0% (2/2)");
         expect(text).toContain("clean false-block n/a (0/0)");
       } else {
         expect(text).toContain("false-accept n/a (0/0)");

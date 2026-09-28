@@ -158,8 +158,22 @@ export function generatePolicy(input: PolicyInput) {
                     provider,
                   );
         if (effortProblem) reasons.push(effortProblem);
+        // Stats already leave these trials out; a candidate missing part of its evidence stays
+        // insufficient (and can't be the reference) until they are regraded, which costs nothing.
+        const legacyReview = summary.review?.legacyGrades ?? 0;
+        if (legacyReview)
+          reasons.push(
+            `insufficient evidence: ${legacyReview} review trials graded before blocking recall; run \`limitless eval regrade ${entry.run.id}\` (no model calls)`,
+          );
+        // The reference anchors every paired comparison, so it needs at least one valid prediction.
         const referenceAllowed = Boolean(
-          model && provider && !providerMismatch && !excluded && !effortProblem,
+          model &&
+            provider &&
+            !providerMismatch &&
+            !excluded &&
+            !effortProblem &&
+            !legacyReview &&
+            summary.predictionTrials > 0,
         );
         const f = settings.floors;
         const passMetric = metric(
@@ -186,7 +200,7 @@ export function generatePolicy(input: PolicyInput) {
               : role === "review"
                 ? [
                     metric(
-                      "defect recall",
+                      "blocking recall",
                       summary.review?.defectRecall.numerator ?? 0,
                       summary.review?.defectRecall.denominator ?? 0,
                       "lower",

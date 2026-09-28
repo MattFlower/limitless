@@ -32,7 +32,7 @@ export const reviewCase: ReviewCase = deepFreeze({
 });
 export function reviewOutput(
   line = 10,
-  severity: Review["findings"][number]["severity"] = "minor",
+  severity: Review["findings"][number]["severity"] = "major",
   file = "src/a.ts",
 ): Review {
   return {

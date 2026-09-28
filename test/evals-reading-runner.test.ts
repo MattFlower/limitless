@@ -9,9 +9,11 @@ import { createEvalWorktree, diffSince, readFileAt } from "../src/git/repos.ts";
 import { readingTimeout } from "../src/pipeline/engine.ts";
 import { FACTORY_PREAMBLE, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
 import { ReviewSchema, toStrictJsonSchema, VerifySchema } from "../src/pipeline/schemas.ts";
+import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 import { deferred, evalFixture } from "./evals-support.ts";
+import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
 async function fixture(role: "review" | "verify" = "review") {
   const f = await evalFixture();
@@ -238,6 +240,138 @@ test("audit uses gate configuration from base, so a change cannot disable its ow
     expect(report.trials.map((t) => t.status)).toEqual(["ok", "ok"]);
     expect(f.calls[0]?.prompt).toContain('Removed the "test" script');
     expect(f.calls[1]?.prompt).toContain("Edited a protected path.");
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("cached review outputs graded under the legacy rule regrade to blocking recall without a model call", async () => {
+  const f = await fixture();
+  try {
+    f.respond(() => ({ structured: reviewOutput(10, "minor"), costUsd: 0.1 }));
+    const first = await f.run();
+    const stored = first.trials[0];
+    if (!stored?.details.grade?.review) throw new Error("expected graded trial");
+    expect(stored.details.grade).toMatchObject({
+      pass: false,
+      review: { requiredMatched: 0, underRated: 1 },
+    });
+    // Simulate a trial stored before blocking recall: minor matches counted and the case passed.
+    // Its output lacks the model verdict, which the derived verdict makes irrelevant to regrading.
+    const { underRated, blockingFindings, bySeverity, ...legacy } = stored.details.grade.review;
+    const { verdict, ...outputWithoutVerdict } = ReviewSchema.parse(stored.output);
+    expect(verdict).toBe("request_changes");
+    f.factory.store.recordEvalTrial({
+      ...stored,
+      output: outputWithoutVerdict,
+      pass: true,
+      score: 1,
+      details: {
+        ...stored.details,
+        grade: {
+          ...stored.details.grade,
+          pass: true,
+          score: 1,
+          review: { ...legacy, requiredMatched: 1, recall: 1 },
+        },
+      },
+    });
+    const regraded = await f.run();
+    expect(f.calls).toHaveLength(1);
+    expect(regraded.summaries[0]).toMatchObject({ cached: 1, costUsd: 0, costEquivUsd: 0, passes: 0 });
+    expect(regraded.trials[0]?.details.grade).toMatchObject({
+      pass: false,
+      score: 0,
+      review: { requiredMatched: 0, underRated: 1, blockingFindings: 0, requestChanges: false },
+    });
+    expect(regraded.trials[0]?.output).toEqual(outputWithoutVerdict);
+    expect(regraded.summaries[0]?.review?.defectRecall).toMatchObject({ numerator: 0, denominator: 1 });
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("eval regrade rewrites legacy-shaped stored grades from stored output with no model call or cache hit", async () => {
+  const f = await fixture();
+  try {
+    f.respond(() => ({ structured: reviewOutput(10, "minor"), costUsd: 0.1 }));
+    const first = await f.run();
+    const stored = first.trials[0];
+    const review = stored?.details.grade?.review;
+    if (!stored?.details.grade || !review) throw new Error("expected graded trial");
+    // Stored before `security` existed and before blocking recall, under a cache key nothing matches now.
+    const legacyOutput = {
+      verdict: "request_changes",
+      summary: "Found an off-by-one in the loop bound.",
+      findings: [
+        { severity: "minor", file: "src/a.ts", line: 10, title: "Off by one", detail: "", suggestion: "" },
+      ],
+    };
+    const { underRated, blockingFindings, bySeverity, ...legacyReview } = review;
+    f.factory.store.recordEvalTrial({
+      ...stored,
+      cacheKey: "legacy-prompt-and-schema",
+      output: legacyOutput,
+      pass: true,
+      score: 1,
+      details: {
+        ...stored.details,
+        grade: {
+          ...stored.details.grade,
+          pass: true,
+          score: 1,
+          review: { ...legacyReview, requiredMatched: 1, recall: 1 },
+        },
+      },
+    });
+    const id = first.run.id;
+    const before = f.factory.evals.report(id)?.summaries[0];
+    expect(before).toMatchObject({ evaluatedTrials: 0, passes: 0, review: { legacyGrades: 1 } });
+    const routes = createHttpRoutes(f.factory);
+    const regrade = (routes["/api/evals/:id/regrade"] as { POST: Route }).POST;
+    const post = async (evalId: string) => {
+      const response = await regrade(
+        requestWithParams(
+          `http://localhost:7400/api/evals/${evalId}/regrade`,
+          { method: "POST", body: "{}", headers: { "content-type": "application/json" } },
+          { id: evalId },
+        ),
+        localServer,
+      );
+      return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+    };
+    expect(await post(id)).toEqual({ status: 200, body: { regraded: 1, changed: 1, skipped: [] } });
+    expect(f.calls).toHaveLength(1);
+    expect(f.factory.store.listEvalRuns()).toHaveLength(1);
+    const after = f.factory.evals.report(id);
+    expect(after?.trials[0]).toMatchObject({ output: legacyOutput, pass: false, score: 0 });
+    expect(after?.summaries[0]).toMatchObject({
+      evaluatedTrials: 1,
+      passes: 0,
+      review: {
+        legacyGrades: 0,
+        defectRecall: { numerator: 0, denominator: 1 },
+        underRated: { numerator: 1, denominator: 1 },
+      },
+    });
+    // Idempotent; unfinished evals are refused; a case that left the dataset keeps its stored grade.
+    expect((await post(id)).body).toEqual({ regraded: 1, changed: 0, skipped: [] });
+    f.factory.store.updateEvalRun(id, "running");
+    expect(await post(id)).toEqual({
+      status: 400,
+      body: { error: `eval ${id} is still running; regrade it once it finishes` },
+    });
+    f.factory.store.updateEvalRun(id, "completed");
+    f.item.id = "review-renamed";
+    f.save();
+    expect((await post(id)).body).toMatchObject({
+      regraded: 0,
+      skipped: [{ caseId: "review-one", trial: 0, reason: "case is no longer in the dataset" }],
+    });
+    expect(await post("eval-missing")).toEqual({ status: 404, body: { error: "eval not found" } });
+    expect(f.calls).toHaveLength(1);
     await f.clean();
   } finally {
     await f.close();

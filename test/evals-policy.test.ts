@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { proposedOverlay, renderEvidence } from "../src/evals/evidence.ts";
+import { gradeReview } from "../src/evals/graders/review.ts";
 import { EVAL_ROLES, generatePolicy, selectEvidence } from "../src/evals/policy.ts";
 import { evalSettings } from "../src/evals/settings.ts";
 import { pairedBootstrap, wilson } from "../src/evals/stats.ts";
@@ -8,6 +9,7 @@ import { overlayPolicy, validatePolicy } from "../src/router/policy.ts";
 import { parseTarget, recordedTarget } from "../src/router/targets.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
 import { evidence, input, local, metered, response, subscription } from "./evals-policy-support.ts";
+import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 
 const first = (data: ReturnType<typeof input>) => {
   const candidate = generatePolicy(data).roles.flatMap((r) => r.candidates)[0];
@@ -84,6 +86,98 @@ for (const [role, field, bound] of [
     expect(rejected.eligible).toBe(false);
     expect(rejected.reasons.join()).toContain(bound === "lower" ? "is below floor" : "exceeds ceiling");
   });
+
+test("review_defect_recall uses blocking recall: under-rated detections and legacy grades don't clear the floor", () => {
+  const graded = (severity: "major" | "minor") => {
+    const row = evidence("review", [local]);
+    for (const t of row.trials) {
+      const item = t.caseId < "case-20" ? reviewCase : { ...reviewCase, kind: "clean" as const, defects: [] };
+      const output = t.caseId < "case-20" ? reviewOutput(10, severity) : { ...reviewOutput(), findings: [] };
+      t.output = output;
+      t.details = { grade: gradeReview(item, output) };
+    }
+    return row;
+  };
+  const blocking = first(input([graded("major")]));
+  expect(blocking.metrics[0]).toMatchObject({ name: "blocking recall", numerator: 20, denominator: 20 });
+  expect(blocking.metrics[0]?.reason).toBeNull();
+  const underRated = first(input([graded("minor")]));
+  expect(underRated.metrics[0]).toMatchObject({ numerator: 0, denominator: 20 });
+  expect(underRated.eligible).toBe(false);
+  expect(underRated.reasons.join()).toContain("blocking recall lower bound 0.0000 is below floor 0.5");
+  expect(underRated.summary.review?.underRated).toMatchObject({ numerator: 20, denominator: 20 });
+  // Grades stored before blocking recall counted minor matches; they are not evidence until regraded.
+  const legacy = graded("minor");
+  for (const t of legacy.trials) {
+    const review = t.details.grade?.review;
+    if (!review) continue;
+    delete review.underRated;
+    delete review.blockingFindings;
+    delete review.bySeverity;
+    review.requiredMatched = review.requiredTotal;
+  }
+  expect(first(input([legacy])).metrics[0]).toMatchObject({ numerator: 0, denominator: 0 });
+  expect(first(input([legacy])).state).toBe("insufficient evidence");
+  // A run mixing both grade versions must not hide legacy minor-only matches behind blocking recall.
+  const mixed = graded("major");
+  for (const t of mixed.trials.slice(0, 10)) {
+    const review = t.details.grade?.review;
+    if (!review) continue;
+    t.output = reviewOutput(10, "minor");
+    delete review.underRated;
+    delete review.blockingFindings;
+    delete review.bySeverity;
+  }
+  const mixedCandidate = first(input([mixed]));
+  expect(mixedCandidate.metrics[0]).toMatchObject({ numerator: 10, denominator: 10 });
+  expect(mixedCandidate.state).toBe("insufficient evidence");
+  expect(mixedCandidate.reasons).toContain(
+    "insufficient evidence: 10 review trials graded before blocking recall; run `limitless eval regrade review-run` (no model calls)",
+  );
+});
+
+test("the paired-comparison reference needs current grades and at least one valid prediction", () => {
+  const legacy = (t: (typeof row.trials)[number]) => {
+    const review = t.details.grade?.review;
+    if (review) delete review.bySeverity;
+  };
+  const reference = (data: ReturnType<typeof input>) =>
+    generatePolicy(data)
+      .roles.filter((r) => r.role === "review")
+      .flatMap((r) => r.candidates.map((c) => c.comparison.bestModel));
+  // The local model has the higher current pass rate, but ten of its grades predate blocking recall.
+  const row = evidence("review", [local, subscription]);
+  for (const t of row.trials) {
+    if (t.modelId === parseTarget(local).modelId && t.caseId < "case-10") legacy(t);
+    if (t.modelId === parseTarget(subscription).modelId && t.caseId >= "case-30") t.pass = false;
+  }
+  expect(reference(input([row]))).toEqual([subscription, subscription]);
+  // A model whose every trial errored has pass rate 0, not n/a, yet anchors nothing.
+  const errored = evidence("review", [local, subscription]);
+  for (const t of errored.trials)
+    if (t.modelId === parseTarget(local).modelId)
+      Object.assign(t, { status: "error", pass: false, details: {} });
+    else legacy(t);
+  const candidates = generatePolicy(input([errored])).roles.flatMap((r) => r.candidates);
+  expect(candidates.find((c) => c.modelId === local)?.summary).toMatchObject({
+    passRate: 0,
+    predictionTrials: 0,
+  });
+  expect(reference(input([errored]))).toEqual([null, null]);
+});
+
+test("evidence renders an older daemon's review summary without the blocking-recall breakdown", () => {
+  const evaluation = generatePolicy(input([evidence("review", [local])]));
+  for (const c of evaluation.roles.flatMap((r) => r.candidates))
+    if (c.summary.review) {
+      const { bySeverity, underRated, ...older } = c.summary.review;
+      c.summary.review = older as typeof c.summary.review;
+    }
+  const text = renderEvidence(evaluation);
+  expect(text).toContain("blocking recall: 1.0000 (20/20)");
+  expect(text).not.toContain("severity blocking recall");
+  expect(text).not.toContain("under-rated");
+});
 
 test("missing required observations and incomplete pairs cannot become eligible", () => {
   for (const role of EVAL_ROLES) {

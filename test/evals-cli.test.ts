@@ -495,3 +495,59 @@ test.each([
   await expect(evalCommand(["policy"], {}, io)).rejects.toThrow("routing/overrides.json");
   expect(writes).toEqual([]);
 });
+
+test("eval regrade CLI posts to the regrade route, lists kept grades and prints the regraded report", async () => {
+  const calls: [string, string | undefined][] = [];
+  const printed: string[] = [];
+  const run = {
+    id: "eval-x",
+    role: "review" as const,
+    models: ["candidate-a"],
+    k: 1,
+    maxUsd: 1,
+    status: "completed" as const,
+    createdAt: 0,
+    finishedAt: 1,
+    error: null,
+  };
+  const io = {
+    async api<T>(path: string, init?: RequestInit): Promise<T> {
+      calls.push([path, init?.method]);
+      return (
+        path.endsWith("/regrade")
+          ? { regraded: 3, changed: 2, skipped: [{ caseId: "gone", modelId: "m", trial: 0, reason: "why" }] }
+          : { run, summaries: [], trials: [] }
+      ) as T;
+    },
+    print: (text: string) => printed.push(text),
+    wait: async () => {},
+  };
+  await evalCommand(["regrade", "eval-x"], {}, io);
+  expect(calls).toEqual([
+    ["/api/evals/eval-x/regrade", "POST"],
+    ["/api/evals/eval-x", undefined],
+  ]);
+  expect(printed[0]).toBe("Regraded 3 stored review trials from their outputs (2 changed); no model calls.");
+  expect(printed[1]).toBe("  kept stored grade: gone m #0: why");
+  expect(printed[2]).toContain("eval-x: completed (role=review");
+  await expect(evalCommand(["regrade"], {}, io)).rejects.toThrow("eval regrade <eval-id>");
+  // Through the real route, only review evals regrade.
+  const f = await evalFixture();
+  try {
+    const { id } = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], maxUsd: 0 });
+    await f.factory.evals.wait(id);
+    const routes = createHttpRoutes(f.factory);
+    const response = await (routes["/api/evals/:id/regrade"] as { POST: Route }).POST(
+      requestWithParams(
+        `http://localhost:7400/api/evals/${id}/regrade`,
+        { method: "POST", body: "{}", headers: { "content-type": "application/json" } },
+        { id },
+      ),
+      localServer,
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: `only review evals can be regraded; ${id} is triage` });
+  } finally {
+    await f.close();
+  }
+});
