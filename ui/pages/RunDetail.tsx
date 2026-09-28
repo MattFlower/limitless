@@ -265,6 +265,7 @@ export const RunDetail: Component = () => {
                     </Show>
                   </div>
                   <div class="run-meta-row">
+                    <span class="chip-tag">{r().flow ?? "build"}</span>
                     <span class="chip-tag">{r().resolvedProfile ?? r().profile}</span>
                     <Show when={r().taskClass}>
                       <span class="chip-tag">{r().taskClass}</span>

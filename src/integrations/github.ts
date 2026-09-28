@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Factory } from "../app.ts";
+import { isBranchName } from "../core/delivery.ts";
 import type { CreateRunRequest } from "../core/types.ts";
 import { inAnyCidr } from "../util/cidr.ts";
 import { sh } from "../util/proc.ts";
@@ -96,6 +97,8 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
     const head = object(pr?.head);
     const branch = string(head?.ref);
     const sha = string(head?.sha);
+    const baseRef = string(object(pr?.base)?.ref);
+    const baseSha = string(object(pr?.base)?.sha);
     if (
       !id ||
       title === null ||
@@ -106,7 +109,10 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
       !sha ||
       !/^[a-fA-F0-9]{40}$/.test(sha) ||
       (pr?.body !== null && string(pr?.body) === null) ||
-      !object(pr?.base)
+      !baseRef ||
+      !isBranchName(baseRef) ||
+      !baseSha ||
+      !/^[a-fA-F0-9]{40}$/.test(baseSha)
     )
       return { note: "malformed pull request", error: true };
     if (
@@ -123,7 +129,7 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
         profile: "quick",
         baseBranch: branch,
         deliveryBranch: branch,
-        sourceRef: { kind: "pull_request", repo: fullName, number: id, headSha: sha },
+        sourceRef: { kind: "pull_request", repo: fullName, number: id, headSha: sha, baseRef, baseSha },
         prompt: `Verify this dependency update. Run the repository gates and fix breakages caused by the bump. Do not merge the pull request.\n\n${quoted({ title, body: pr?.body ?? "" })}`,
       },
     };

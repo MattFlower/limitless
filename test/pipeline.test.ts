@@ -6,9 +6,11 @@ import { join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
+import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
+import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { renderReport } from "../src/pipeline/report.ts";
@@ -210,7 +212,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       (s) => {
         const role = roleOf(s);
         seen.push({ role, provider: s.target.provider });
-        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "triage")
+          return { structured: triage({ suggested_profile: "quick", task_class: "dependency_update" }) };
         if (role === "review") return { structured: approve };
         implementations++;
         return { files: { "farewell.txt": implementations === 1 ? "BAD goodbye\n" : "goodbye\n" } };
@@ -232,6 +235,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       { role: "review", provider: "delta" },
     ]);
     expect(f.store.getArtifact(run.id, "report.md")).toContain("Routing: free-first (Dependabot)");
+    expect(f.store.getRunState<RunState>(run.id)?.flow).toBe("build");
   });
 
   test("Dependabot falls back when free providers are unavailable; owner keeps policy routing", async () => {
@@ -340,14 +344,23 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(f.store.getArtifact(run.id, "report.md")).toContain("Flaky: `check` failed, then passed");
   });
 
+  // Same text git generates, so a fixture line can never stand in for a real marker.
+  const fixture = "<<<<<<< HEAD\nexample\n=======\n>>>>>>> theirs\n";
+
   async function githubFixture(): Promise<string> {
+    // Ordinary headings and intentional marker fixtures must not block any base merge.
+    writeFileSync(join(repoDir, "README.md"), "Project\n=======\n");
+    writeFileSync(join(repoDir, "markers.fixture"), fixture);
+    writeFileSync(join(repoDir, "binary.fixture"), Buffer.from([0, 255, 10]));
+    await mergeGit(repoDir, ["add", "-A"]);
+    await mergeGit(repoDir, ["commit", "-qm", "merge scan fixtures"]);
     const bare = join(home, "github.git");
     await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
     const bin = join(home, "bin");
     mkdirSync(bin);
     writeFileSync(
       join(bin, "gh"),
-      `#!/bin/sh\necho "$*" >> '${join(home, "gh-calls")}'\ncase "$2" in\n  list) exit 0 ;;\n  create) echo https://github.com/test/repo/pull/1 ;;\nesac\n`,
+      `#!/bin/sh\necho "$*" >> '${join(home, "gh-calls")}'\ncase "$2" in\n  list) exit 0 ;;\n  create) cat > '${join(home, "gh-body")}'; echo https://github.com/test/repo/pull/1 ;;\nesac\n`,
       { mode: 0o755 },
     );
     process.env.PATH = `${bin}:${originalPath}`;
@@ -391,23 +404,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(existsSync(join(home, "gh-calls"))).toBe(false);
   }
 
-  async function resolveBaseConflict(cwd: string, bare: string): Promise<void> {
-    expect((await sh(["git", "status", "--porcelain"], { cwd })).stdout).toBe("");
-    for (const name of ["rebase-merge", "rebase-apply"]) {
-      const path = (await sh(["git", "rev-parse", "--git-path", name], { cwd })).stdout.trim();
-      expect(existsSync(resolve(cwd, path))).toBe(false);
-    }
+  async function resolveBaseConflict(cwd: string, bare: string): Promise<FakeReply> {
+    expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toContain("<<<<<<<");
+    expect((await sh(["git", "rev-parse", "MERGE_HEAD"], { cwd })).stdout.trim()).toHaveLength(40);
     await assertUnpublished(bare);
-    const merge = await sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "origin/main"], {
-      cwd,
-      allowFail: true,
-    });
-    expect(merge.exitCode).not.toBe(0);
-    writeFileSync(join(cwd, "greeting.txt"), "hello from both intents\nnew base\n");
-    await sh(["git", "add", "greeting.txt"], { cwd });
-    await sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "resolve merge"], {
-      cwd,
-    });
+    return { files: { "greeting.txt": "hello from both intents\nnew base\n" } };
   }
 
   for (const kind of [
@@ -472,6 +473,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       let verifies = 0;
       let mergePrompt = "";
       let checkedHead = "";
+      let preMergeHead = "";
       const f = start(async (s): Promise<FakeReply> => {
         const role = roleOf(s);
         if (role === "triage") return { structured: triage({ suggested_profile: "standard" }) };
@@ -486,6 +488,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
                 JSON.stringify({ scripts: { check: "test -s greeting.txt && test -f package.json" } }),
               );
             }
+            if (conflict) writeFileSync(join(repoDir, "base.txt"), "base only\n");
             baseTip = await advanceBase(
               bare,
               conflict ? "greeting.txt" : "base.txt",
@@ -507,18 +510,25 @@ describe("pipeline (fake agents, real git + gates)", () => {
               await sh(["git", "push", "--force", bare, `${baseTip}:refs/heads/main`], { cwd: repoDir });
             }
           }
+          if (reviews === 2) {
+            expect(s.prompt).toContain(baseTip);
+            expect(s.prompt).not.toContain(`git diff ${preMergeHead}..`);
+            expect(s.prompt).not.toContain("base.txt");
+            expect(s.prompt).not.toContain("package.json");
+          }
           return { structured: approve };
         }
         if (role === "verify") {
           verifies++;
+          if (verifies === 2) expect(s.prompt).toContain(baseTip);
           checkedHead = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+          if (verifies === 1) preMergeHead = checkedHead;
           return { structured: pass };
         }
         implementCalls++;
         if (conflict && implementCalls === 2) {
           mergePrompt = s.prompt;
-          await resolveBaseConflict(s.cwd, bare);
-          return { text: "Resolved base conflict" };
+          return resolveBaseConflict(s.cwd, bare);
         }
         const files: Record<string, string> = { "farewell.txt": "goodbye\n" };
         if (conflict) files["greeting.txt"] = "hello from feature\n";
@@ -531,9 +541,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
         profile: "standard",
       });
       const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
-      // Rebasing is best-effort: these fall back to delivering the gated head on its original base.
       const fallback = kind.endsWith("regressed") || kind === "rewritten";
-      expect(status).toBe("succeeded");
+      expect(status).toBe(kind.endsWith("regressed") ? "needs_human" : "succeeded");
       const finished = f.store.getRun(run.id);
       const stages = f.store.listStages(run.id).map((s) => s.name);
       const gates = stages.filter((s) => s === "gates").length;
@@ -547,14 +556,25 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(reviews).toBe(conflict ? 2 : 1);
       expect(verifies).toBe(conflict ? 2 : 1);
       if (conflict) {
-        expect(mergePrompt).toContain("git merge origin/main");
+        expect(mergePrompt).toContain("do not run Git");
+        expect(mergePrompt).toContain("- greeting.txt");
+        expect(mergePrompt).not.toContain("git diff");
+        expect(mergePrompt).not.toContain("Committing is optional");
         expect(stages.slice(-6)).toEqual(["implement", "gates", "audit", "review", "verify", "deliver"]);
         expect(f.store.getArtifact(run.id, "diff.patch")).not.toContain("+new base");
       }
       if (fallback) {
         expect(finished?.baseSha).toBe(originalBase);
         const state = f.store.getRunState<RunState>(run.id);
-        expect(f.store.getArtifact(run.id, "report.md")).toContain(state?.rebaseNote ?? "missing note");
+        if (kind === "rewritten")
+          expect(f.store.getArtifact(run.id, "report.md")).toContain(state?.rebaseNote ?? "missing note");
+        else {
+          expect(state?.lastVerifiedSha).toBe(preMergeHead);
+          expect(finished?.prUrl).toContain("/pull/1");
+          expect(f.store.getArtifact(run.id, "report.md")).toContain("post-merge gates");
+          expect(f.store.getArtifact(run.id, "report.md")).toContain(preMergeHead);
+          expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
+        }
         expect(
           (
             await sh(["git", "merge-base", "--is-ancestor", baseTip, finished?.headSha ?? ""], {
@@ -564,7 +584,6 @@ describe("pipeline (fake agents, real git + gates)", () => {
           ).exitCode,
         ).not.toBe(0);
         if (kind.endsWith("regressed")) {
-          expect(state?.rebaseNote).toContain("checks regressed");
           expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).toContain("regressed");
           expect(state?.lastGates?.some((g) => g.blocking)).toBe(false);
           expect(
@@ -588,6 +607,20 @@ describe("pipeline (fake agents, real git + gates)", () => {
           (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
         ).toContain(finished?.headSha ?? "missing");
         if (kind === "unchanged") expect(finished?.headSha).toBe(checkedHead);
+        else {
+          expect(
+            (
+              await sh(["git", "rev-list", "--parents", "-n", "1", finished?.headSha ?? ""], { cwd: bare })
+            ).stdout
+              .trim()
+              .split(" ")
+              .slice(1),
+          ).toEqual([preMergeHead, baseTip]);
+          const diff = (await sh(["git", "diff", `${baseTip}...${finished?.headSha}`], { cwd: bare })).stdout;
+          expect(diff).not.toContain("base.txt");
+          expect(diff).not.toContain("package.json");
+          expect(diff).toContain("farewell.txt");
+        }
       }
       if (changedScripts) {
         const state = f.store.getRunState<RunState>(run.id);
@@ -666,12 +699,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
         }
         implementsCount++;
         if (implementsCount > normalRounds) {
-          expect(s.prompt).toContain("git merge origin/main");
+          expect(s.prompt).toContain("do not run Git");
           expect(s.prompt).toContain("preserving both intents");
-          await resolveBaseConflict(s.cwd, bare);
-          if (outcome === "gates") return { files: { "bad.txt": "BAD\n" } };
-          if (outcome === "audit") return { files: { ".limitless.toml": "# removed gates\n" } };
-          return { text: "Merged the base" };
+          const reply = await resolveBaseConflict(s.cwd, bare);
+          if (outcome === "gates") return { files: { ...reply.files, "bad.txt": "BAD\n" } };
+          if (outcome === "audit")
+            return { files: { ...reply.files, ".limitless.toml": "# removed gates\n" } };
+          return reply;
         }
         return { files: { "greeting.txt": "feature\n", "farewell.txt": "goodbye\n" } };
       });
@@ -700,23 +734,216 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(f.store.getRunState<RunState>(run.id)?.rebaseNote).toContain("advanced again");
         await assertPublished(bare);
       } else {
-        await assertUnpublished(bare);
+        const state = f.store.getRunState<RunState>(run.id);
+        const finished = f.store.getRun(run.id);
+        const sha = state?.lastVerifiedSha ?? "missing";
+        expect(sha).toHaveLength(40);
+        expect(finished?.prUrl).toContain("/pull/1");
+        expect(
+          (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
+        ).toContain(sha);
+        const report = f.store.getArtifact(run.id, "report.md") ?? "";
+        expect(report).toContain(`Verified at \`${sha}\``);
+        expect(report).toContain("conflict resolution");
+        expect(report).toContain("The PR may conflict with `main`");
+        expect(report).toContain("Acceptance criteria");
+        expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--title [needs human]");
+        expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
+        expect(readFileSync(join(home, "gh-body"), "utf8")).toBe(report);
       }
     });
   }
 
+  test("quick approval is the verified fallback when post-merge gates fail", async () => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      '[gates]\nchecks = [{ name = "check", run = "test ! -f base.txt" }]\n',
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "quick gate"], {
+      cwd: repoDir,
+    });
+    const bare = await githubFixture();
+    let approvedSha = "";
+    const f = start(async (s): Promise<FakeReply> => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        approvedSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      if (role === "verify" || role === "spec" || role === "holdout") throw new Error(`unexpected ${role}`);
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add a farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+    const finished = f.store.getRun(run.id);
+    expect(f.store.getRunState<RunState>(run.id)?.lastVerifiedSha).toBe(approvedSha);
+    expect(
+      (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
+    ).toContain(approvedSha);
+    expect(f.store.getArtifact(run.id, "report.md")).toContain("post-merge gates");
+  });
+
+  for (const fault of [
+    "missing",
+    "single-parent",
+    "markers",
+    "partial",
+    "fixture",
+    "stray",
+    "same-tree",
+    "setext",
+  ] as const) {
+    test(`factory merge resolution: ${fault}`, async () => {
+      const bare = await githubFixture();
+      let calls = 0;
+      let before = "";
+      let base = "";
+      const f = start(async (s): Promise<FakeReply> => {
+        if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        // "fixture" conflicts right after a pre-existing marker line identical to git's own.
+        const [file, prefix] = fault === "fixture" ? ["markers.fixture", fixture] : ["greeting.txt", ""];
+        if (roleOf(s) === "review") {
+          if (!base) base = await advanceBase(bare, file, `${prefix}base intent\n`);
+          return { structured: approve };
+        }
+        calls++;
+        if (calls === 1) return { files: { [file]: `${prefix}feature intent\n` } };
+        before = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+        if (fault === "fixture") {
+          expect(readFileSync(join(s.cwd, file), "utf8")).toBe(
+            `${fixture}<<<<<<< HEAD\nfeature intent\n=======\nbase intent\n>>>>>>> ${base}\n`,
+          );
+          return { files: { [file]: `${fixture}<<<<<<< HEAD\nfeature intent\n=======\nbase intent\n` } };
+        }
+        if (fault === "missing" || fault === "single-parent") {
+          const path = (
+            await sh(["git", "rev-parse", "--git-path", "MERGE_HEAD"], { cwd: s.cwd })
+          ).stdout.trim();
+          rmSync(resolve(s.cwd, path));
+          if (fault === "single-parent") {
+            writeFileSync(join(s.cwd, "greeting.txt"), "replacement\n");
+            await mergeGit(s.cwd, ["add", "-A"]);
+            await mergeGit(s.cwd, ["commit", "-qm", "lost merge parent"]);
+          }
+        }
+        if (fault === "stray")
+          return {
+            files: {
+              "greeting.txt": "feature intent\nbase intent\n",
+              "README.md": "Project\n=======\n<<<<<<< HEAD\nours\n",
+              "new.txt": "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> base\n",
+            },
+          };
+        if (fault === "partial")
+          return { files: { "greeting.txt": `feature intent\n=======\nbase intent\n>>>>>>> ${base}\n` } };
+        if (fault === "setext")
+          return { files: { "greeting.txt": "Greeting\n========\nfeature intent\nbase intent\n" } };
+        return fault === "same-tree" ? { files: { "greeting.txt": "feature intent\n" } } : {};
+      });
+      registerGithub(f, bare);
+      const run = await f.createRun({ repo: "test/repo", prompt: "Change greeting", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        fault === "same-tree" || fault === "setext" ? "succeeded" : "needs_human",
+      );
+      expect(calls).toBe(2);
+      const result = f.store.getRun(run.id);
+      if (fault === "same-tree" || fault === "setext") {
+        expect(
+          (await sh(["git", "rev-list", "--parents", "-n", "1", result?.headSha ?? ""], { cwd: bare })).stdout
+            .trim()
+            .split(" ")
+            .slice(1),
+        ).toEqual([before, base]);
+        if (fault === "same-tree")
+          expect((await sh(["git", "diff", before, result?.headSha ?? ""], { cwd: bare })).stdout).toBe("");
+        else
+          expect((await sh(["git", "show", `${result?.headSha}:greeting.txt`], { cwd: bare })).stdout).toBe(
+            "Greeting\n========\nfeature intent\nbase intent\n",
+          );
+      } else {
+        expect(result?.error).toContain(
+          fault === "markers" || fault === "partial"
+            ? "Unresolved conflict markers: greeting.txt"
+            : fault === "fixture"
+              ? "Unresolved conflict markers: markers.fixture"
+              : fault === "stray"
+                ? "Unresolved conflict markers: new.txt, README.md"
+                : "MERGE_HEAD",
+        );
+        const verified = f.store.getRunState<RunState>(run.id)?.lastVerifiedSha;
+        expect(verified).toHaveLength(40);
+        expect(
+          (await sh(["git", "ls-remote", bare, `refs/heads/${result?.branch}`], { cwd: repoDir })).stdout,
+        ).toContain(verified ?? "missing");
+      }
+    });
+  }
+
+  test("merge helpers isolate configured code in a linked worktree and reject non-conflict errors", async () => {
+    const cwd = join(home, "linked");
+    await sh(["git", "worktree", "add", "-b", "feature", cwd], { cwd: repoDir });
+    writeFileSync(join(cwd, "greeting.txt"), "feature\n");
+    await mergeGit(cwd, ["add", "-A"]);
+    await mergeGit(cwd, ["commit", "-qm", "feature"]);
+    const before = (await mergeGit(cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    writeFileSync(join(repoDir, ".git", "info", "attributes"), "greeting.txt merge=secret-check\n");
+    writeFileSync(join(repoDir, "greeting.txt"), "base\n");
+    await mergeGit(repoDir, ["add", "-A"]);
+    await mergeGit(repoDir, ["commit", "-qm", "base"]);
+    const base = (await mergeGit(repoDir, ["rev-parse", "HEAD"])).stdout.trim();
+    const sentinel = join(home, "hook-ran");
+    for (const hook of [
+      "pre-merge-commit",
+      "prepare-commit-msg",
+      "commit-msg",
+      "post-commit",
+      "post-merge",
+      "post-index-change",
+    ])
+      writeFileSync(join(repoDir, ".git", "hooks", hook), `#!/bin/sh\ntouch '${sentinel}'\n`, {
+        mode: 0o755,
+      });
+    await sh(
+      [
+        "git",
+        "config",
+        "merge.secret-check.driver",
+        `test -z "$LIMITLESS_MERGE_TEST_SECRET" && touch '${join(home, "driver-ran")}' && exit 1`,
+      ],
+      { cwd },
+    );
+    process.env.LIMITLESS_MERGE_TEST_SECRET = "must not escape";
+    try {
+      await expect(prepareMerge(cwd, before, "invalid-target")).rejects.toThrow("Merge preparation failed");
+      expect(await prepareMerge(cwd, before, base)).toEqual(["greeting.txt"]);
+      expect(existsSync(join(home, "driver-ran"))).toBe(true);
+      writeFileSync(join(cwd, "greeting.txt"), "both intents\n");
+      await completeMerge(cwd, before, base);
+      expect(existsSync(sentinel)).toBe(false);
+    } finally {
+      delete process.env.LIMITLESS_MERGE_TEST_SECRET;
+    }
+  });
+
   for (const checkpoint of [
     "post-rebase-gates",
-    "interrupted-rebase",
+    "post-rebase-gates-fail",
+    "interrupted-merge",
     "base-moved",
     "base-moved-during-gates",
     "conflict-implement",
+    "conflict-committed",
   ] as const) {
     test(`delivery checkpoint ${checkpoint} never publishes unchecked work`, async () => {
+      const conflict = checkpoint.startsWith("conflict-");
       const marker = join(home, "checking");
       const release = join(home, "release");
       if (checkpoint !== "conflict-implement") {
-        const check = `if test -f base.txt && ! test -f '${release}'; then echo dirty > greeting.txt; touch '${marker}'; while ! test -f '${release}'; do sleep 0.05; done; fi; test -f greeting.txt`;
+        const check = `if test -f base.txt && ! test -f '${release}'; then echo dirty > greeting.txt; touch '${marker}'; while ! test -f '${release}'; do sleep 0.05; done; fi; test -f greeting.txt${checkpoint === "post-rebase-gates-fail" ? " && test ! -f base.txt" : ""}`;
         writeFileSync(
           join(repoDir, ".limitless.toml"),
           `[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`,
@@ -739,12 +966,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
         if (role === "holdout") return { structured: holdout };
         if (role === "review") {
           reviews++;
-          if (reviews === 1)
-            baseTip = await advanceBase(
-              bare,
-              checkpoint === "conflict-implement" ? "greeting.txt" : "base.txt",
-              "new base\n",
-            );
+          if (reviews === 1) {
+            writeFileSync(join(repoDir, "base.txt"), "base only\n");
+            baseTip = await advanceBase(bare, conflict ? "greeting.txt" : "base.txt", "new base\n");
+          }
           return { structured: approve };
         }
         if (role === "verify") {
@@ -753,18 +978,21 @@ describe("pipeline (fake agents, real git + gates)", () => {
         }
         implementsCount++;
         if (implementsCount > 1) {
-          expect(s.prompt).toContain("git merge origin/main");
+          expect(s.prompt).toContain("do not run Git");
+          if (checkpoint === "conflict-committed") return resolveBaseConflict(s.cwd, bare);
           if (!restarting) {
+            writeFileSync(join(s.cwd, "greeting.txt"), "partially resolved\n");
             writeFileSync(marker, "implementing");
             return { delayMs: 30_000 };
           }
-          await resolveBaseConflict(s.cwd, bare);
-          return { text: "Merged the base after restart" };
+          expect(readFileSync(join(s.cwd, "greeting.txt"), "utf8")).toBe("partially resolved\n");
+          expect((await sh(["git", "rev-parse", "MERGE_HEAD"], { cwd: s.cwd })).stdout.trim()).toBe(baseTip);
+          return { files: { "greeting.txt": "hello from both intents\nnew base\n" } };
         }
         return {
           files: {
             "farewell.txt": "goodbye\n",
-            ...(checkpoint === "conflict-implement" ? { "greeting.txt": "feature\n" } : {}),
+            ...(conflict ? { "greeting.txt": "feature\n" } : {}),
           },
         };
       };
@@ -795,8 +1023,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
       await f.stop();
       expect(f.store.getRun(run.id)?.status).toBe("queued");
       const state = f.store.getRunState<RunState>(run.id);
-      expect(state?.phase).toBe(checkpoint === "conflict-implement" ? "loop" : "deliver");
-      if (checkpoint === "conflict-implement") {
+      expect(state?.phase).toBe(conflict ? "loop" : "deliver");
+      expect(state?.lastVerifiedSha).toHaveLength(40);
+      if (conflict) {
         expect(f.store.getRun(run.id)?.baseSha).toBe(baseTip);
         expect(state?.conflictRound).toBe(1);
       } else {
@@ -804,32 +1033,43 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(f.store.getRun(run.id)?.baseSha).not.toBe(baseTip);
       }
       await assertUnpublished(bare);
-      if (checkpoint === "interrupted-rebase") {
+      if (checkpoint === "interrupted-merge") {
         const cwd = state?.worktreePath;
-        const originalHead = f.store.getRun(run.id)?.headSha;
-        if (!cwd || !originalHead) throw new Error("missing delivery checkpoint");
-        // Recreate a crash between rebase starting and the post-rebase checks starting.
-        await sh(["git", "reset", "--hard", originalHead], { cwd });
-        const interrupted = await sh(
-          ["git", "-c", "user.name=t", "-c", "user.email=t@t", "rebase", "--exec", "false", baseTip],
-          { cwd, allowFail: true },
+        if (!cwd || !state?.preRebaseHead) throw new Error("missing delivery checkpoint");
+        await sh(["git", "reset", "--hard", state.preRebaseHead], { cwd });
+        await sh(
+          ["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "--no-ff", "--no-commit", baseTip],
+          { cwd },
         );
-        expect(interrupted.exitCode).not.toBe(0);
-        const path = (await sh(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd })).stdout.trim();
-        expect(existsSync(resolve(cwd, path))).toBe(true);
+      }
+      if (checkpoint === "conflict-committed" && state) {
+        // Also exercise the crash window after git commit but before implementedRound is saved.
+        state.implementedRound = undefined;
+        f.store.updateRun(run.id, {}, state);
       }
       f.store.close();
       restarting = true;
-      if (checkpoint === "base-moved") baseTip = await advanceBase(bare, "again.txt", "newer base\n");
+      if (checkpoint === "base-moved" || conflict) await advanceBase(bare, "again.txt", "newer base\n");
       writeFileSync(release, "resume");
       const resumed = start(handler);
+      if (checkpoint === "post-rebase-gates-fail") {
+        expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+        const finished = resumed.store.getRun(run.id);
+        const savedSha = state?.lastVerifiedSha ?? "missing";
+        expect(resumed.store.getRunState<RunState>(run.id)?.lastVerifiedSha).toBe(savedSha);
+        expect(
+          (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
+        ).toContain(savedSha);
+        expect(finished?.prUrl).toContain("/pull/1");
+        return;
+      }
       expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       const finished = resumed.store.getRun(run.id);
       expect(finished?.baseSha).toBe(baseTip);
       expect(resumed.store.getRunState<RunState>(run.id)?.pendingRebaseSha).toBeUndefined();
-      expect(implementsCount).toBe(checkpoint === "conflict-implement" ? 3 : 1);
-      expect(reviews).toBe(checkpoint === "conflict-implement" ? 2 : 1);
-      expect(verifies).toBe(checkpoint === "conflict-implement" ? 2 : 1);
+      expect(implementsCount).toBe(conflict ? (checkpoint === "conflict-implement" ? 3 : 2) : 1);
+      expect(reviews).toBe(conflict ? 2 : 1);
+      expect(verifies).toBe(conflict ? 2 : 1);
       expect(
         (await sh(["git", "merge-base", "--is-ancestor", baseTip, finished?.headSha ?? ""], { cwd: bare }))
           .exitCode,
@@ -837,23 +1077,296 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(
         (await sh(["git", "show", `${finished?.headSha}:greeting.txt`], { cwd: bare })).stdout,
       ).not.toContain("dirty");
+      expect(
+        (
+          await sh(["git", "rev-list", "--count", "--merges", finished?.headSha ?? ""], { cwd: bare })
+        ).stdout.trim(),
+      ).toBe("1");
+      expect(
+        (await sh(["git", "rev-list", "--parents", "-n", "1", finished?.headSha ?? ""], { cwd: bare })).stdout
+          .trim()
+          .split(" ")
+          .slice(1),
+      ).toEqual([state?.preRebaseHead ?? "", baseTip]);
       expect(resumed.store.listStages(run.id).filter((s) => s.name === "gates")).toHaveLength(
         checkpoint === "conflict-implement" ? 2 : 3,
       );
     });
   }
 
+  test.each([
+    ["main", null],
+    ["main", "not-a-sha"],
+    ["main.lock", "b".repeat(40)],
+  ])("PR verification rejects invalid base metadata: %s %s", async (baseRef, baseSha) => {
+    const f = start(() => {
+      throw new Error("No model should run");
+    });
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "verify",
+      sourceRef: { kind: "pull_request", baseRef, baseSha, headSha: "a".repeat(40), number: 1 },
+    });
+    expect(await waitFor(f, run.id, ["failed", "succeeded"])).toBe("failed");
+    expect(f.store.getRun(run.id)?.error).toContain("valid PR baseRef");
+    expect(f.store.listInvocations(run.id)).toHaveLength(0);
+  });
+
+  test.each([
+    "approve",
+    "gates",
+    "review",
+    "persistent",
+    "repair-audit",
+    "baseline",
+    "empty",
+    "restart-initial",
+    "restart-repair",
+  ])(
+    "verify-change: %s",
+    async (scenario) => {
+      const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: repoDir })).stdout.trim();
+      const commit = async () => {
+        await git("add", ".");
+        await git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "fixture");
+        return git("rev-parse", "HEAD");
+      };
+      const records = join(home, "gate-revisions");
+      writeFileSync(
+        join(repoDir, ".limitless.toml"),
+        `[gates]
+checks = [{ name = "test", run = "git rev-parse HEAD >> ${records}; echo generated > generated.txt; ! grep BAD greeting.txt" }]
+[policy]
+protected_paths = ["protected.txt"]
+`,
+      );
+      if (scenario === "baseline") writeFileSync(join(repoDir, "greeting.txt"), "BAD\n");
+      const base = await commit();
+      if (scenario !== "empty") writeFileSync(join(repoDir, "version.txt"), "dependency 2\n");
+      if (scenario === "gates") writeFileSync(join(repoDir, "greeting.txt"), "BAD\n");
+      if (scenario === "repair-audit") writeFileSync(join(repoDir, "protected.txt"), "original\n");
+      const head = scenario === "empty" ? base : await commit();
+      const bare = join(home, "github.git");
+      await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
+      await git("push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2");
+      // The base tip is not an ancestor of the PR head: review must use the merge base.
+      await git("reset", "--hard", base);
+      writeFileSync(join(repoDir, "base-only.txt"), "base advancement\n");
+      const baseTip = await commit();
+      await git("push", "--force", bare, "HEAD:refs/heads/main");
+      const prompts: string[] = [];
+      let implementations = 0;
+      let interrupted = false;
+      let resume: (() => void) | undefined;
+      const blocker = {
+        severity: "major",
+        file: "version.txt",
+        line: 1,
+        title: "Compatibility bug",
+        detail: "Repair compatibility",
+        suggestion: "Fix compatibility",
+        security: false,
+      };
+      const needsReviewRepair = ["review", "persistent", "repair-audit", "restart-repair"].includes(scenario);
+      const handler: Handler = async (agent): Promise<FakeReply> => {
+        const role = roleOf(agent);
+        if (role === "triage") return { structured: triage() }; // PR source overrides feature + standard triage.
+        if (role === "review") {
+          prompts.push(agent.prompt);
+          expect(agent.prompt).toContain(`git diff ${baseTip}...`);
+          for (const topic of [
+            "breaking changes",
+            "permission and pinning",
+            "lockfile consistency",
+            "install-time code",
+          ])
+            expect(agent.prompt).toContain(topic);
+          const patch = (await sh(["git", "diff", `${baseTip}...HEAD`], { cwd: agent.cwd })).stdout;
+          expect(patch).toContain("dependency 2");
+          expect(patch).not.toContain("base-only");
+          expect(patch).not.toContain("generated.txt");
+          expect(agent.prompt).toContain("+dependency 2");
+          expect(agent.prompt).not.toContain("base-only");
+          if (
+            (scenario === "restart-initial" || (scenario === "restart-repair" && implementations > 0)) &&
+            !interrupted
+          ) {
+            interrupted = true;
+            await new Promise<void>((resolve) => {
+              resume = resolve;
+            });
+          }
+          if (needsReviewRepair && (implementations === 0 || scenario === "persistent"))
+            return {
+              structured: {
+                ...approve,
+                findings: [
+                  {
+                    ...blocker,
+                    ...(implementations ? { label: "unaddressed", prior: "P1", security: false } : {}),
+                  },
+                ],
+              },
+            };
+          return { structured: approve };
+        }
+        expect(role).toBe("implement");
+        implementations++;
+        expect(agent.prompt).toContain(
+          scenario === "gates"
+            ? "test"
+            : scenario === "empty"
+              ? "empty-diff"
+              : implementations > 1 && scenario === "repair-audit"
+                ? "Repair:"
+                : "Compatibility bug",
+        );
+        if (scenario === "empty") return { text: "No changes" };
+        return {
+          files:
+            scenario === "repair-audit"
+              ? { "protected.txt": "tampered\n" }
+              : { "greeting.txt": "repaired\n" },
+          text: "Repaired compatibility",
+        };
+      };
+      let f = start(handler);
+      const calls: string[][] = [];
+      const gh = async (args: string[]) => {
+        calls.push(args);
+      };
+      f.deps.gh = gh;
+      let stopNotifier = startGitHubNotifier(f.store, gh);
+      f.store.upsertRepo({
+        slug: "MattFlower/limitless",
+        kind: "github",
+        url: bare,
+        localPath: null,
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      f.cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
+      const payload = JSON.parse(readFileSync(join(import.meta.dir, "data/github-pr.json"), "utf8"));
+      payload.pull_request.base.sha = baseTip;
+      payload.pull_request.head.sha = head;
+      const body = JSON.stringify(payload);
+      const response = await githubWebhook(f)(
+        new Request("http://localhost/webhooks/github", {
+          method: "POST",
+          body,
+          headers: {
+            "x-github-event": "pull_request",
+            "x-github-delivery": scenario,
+            "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+          },
+        }),
+      );
+      expect(response.status).toBe(201);
+      const { runId } = (await response.json()) as { runId: string };
+      if (scenario.startsWith("restart")) {
+        for (let i = 0; !resume && i < 300; i++) await Bun.sleep(20);
+        expect(resume).toBeDefined();
+        const before = f.store.getRunState<RunState>(runId);
+        stopNotifier();
+        const stopping = f.stop();
+        resume?.();
+        await stopping;
+        stopNotifier();
+        f.store.close();
+        f = start(handler);
+        f.deps.gh = gh;
+        stopNotifier = startGitHubNotifier(f.store, gh);
+        expect(before?.verification?.baseSha).toBe(baseTip);
+        expect(before?.verification?.headSha).toBe(head);
+        if (scenario === "restart-repair") expect(before?.implementedRound).toBe(0);
+      }
+      const blocked = ["persistent", "repair-audit", "empty"].includes(scenario);
+      expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human"])).toBe(
+        blocked ? "needs_human" : "succeeded",
+      );
+      stopNotifier();
+      const state = f.store.getRunState<RunState>(runId);
+      expect(state?.flow).toBe("verify-change");
+      expect(f.store.getRunDetail(runId)?.run.flow).toBe("verify-change");
+      const revisions = readFileSync(records, "utf8").trim().split("\n");
+      expect(revisions.slice(0, 2)).toEqual([baseTip, head]);
+      const remote = (await git("ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).split("\t")[0];
+      const unchanged = ["approve", "baseline", "restart-initial"].includes(scenario);
+      expect(remote).toBe(unchanged || blocked ? head : (f.store.getRun(runId)?.headSha ?? "missing"));
+      if (unchanged) {
+        expect(implementations).toBe(0);
+        expect(f.store.listStages(runId).some((stage) => stage.name === "implement")).toBe(false);
+        expect(f.store.getRun(runId)?.headSha).toBe(head);
+        expect(existsSync(state?.worktreePath ?? "missing")).toBe(false);
+        expect(calls).toHaveLength(1); // Evidence only: no creation comment and no second verdict.
+        expect(calls[0]?.slice(0, 3)).toEqual(["pr", "comment", "18"]);
+        expect(calls[0]?.at(-1)).not.toContain("generated.txt");
+        for (const text of [
+          "Flow: verify-change",
+          "| Check |",
+          "LGTM",
+          "Work log",
+          "Total:",
+          "spent",
+          "subscriptions",
+        ])
+          expect(calls[0]?.at(-1)).toContain(text);
+        expect(f.store.getArtifact(runId, "diff.patch")).toBe(
+          (await sh(["git", "diff", `${baseTip}...${head}`], { cwd: repoDir })).stdout,
+        );
+      } else if (!blocked) {
+        expect(implementations).toBe(1);
+        expect(revisions).toContain(remote ?? "missing");
+        if (needsReviewRepair) {
+          expect(prompts.at(-1)).toContain("# Previous review");
+          expect(prompts.at(-1)).toContain("Compatibility bug");
+          expect(f.store.getArtifact(runId, "diff.patch")).toContain("repaired");
+        }
+      } else {
+        expect(implementations).toBe(f.cfg.maxRounds + 2);
+        expect(f.store.getArtifact(runId, "report.md")).toContain("Flow: verify-change");
+        if (scenario === "repair-audit")
+          expect(
+            state?.lastAudit?.some((a) => a.detail.startsWith("Repair:") && a.severity === "block"),
+          ).toBe(true);
+      }
+    },
+    30_000,
+  );
+
   test("Dependabot run delivers to the existing PR head without creating a PR", async () => {
     const bare = join(home, "github.git");
     await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
-    await sh(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir });
     const baseSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    writeFileSync(join(repoDir, "version.txt"), "2\n");
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "bump"], { cwd: repoDir });
+    const originalHead = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    await sh(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir });
+    let reviews = 0;
     let concurrent: string | null = null;
     let content = "verified\n";
     const f = start((s) => {
       const role = roleOf(s);
       if (role === "triage") return { structured: triage({ task_class: "dependency_update" }) };
       if (role === "review") {
+        if (reviews++ === 0)
+          return {
+            structured: {
+              ...approve,
+              findings: [
+                {
+                  severity: "major",
+                  file: "version.txt",
+                  line: 1,
+                  title: "Needs repair",
+                  detail: "Repair the update",
+                  suggestion: "Fix compatibility",
+                  security: false,
+                },
+              ],
+            },
+          };
         if (concurrent) {
           const result = Bun.spawnSync(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], {
             cwd: concurrent,
@@ -876,9 +1389,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
     f.cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
     const trigger = async (sha: string, delivery: string) => {
       const payload = JSON.parse(readFileSync(join(import.meta.dir, "data/github-pr.json"), "utf8")) as {
-        pull_request: { head: { sha: string } };
+        pull_request: { head: { sha: string }; base: { sha: string } };
       };
       payload.pull_request.head.sha = sha;
+      payload.pull_request.base.sha = baseSha;
       const body = JSON.stringify(payload);
       const response = await githubWebhook(f)(
         new Request("http://localhost/webhooks/github", {
@@ -898,7 +1412,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(run.githubWebhookVerified).toBe(true);
       return run;
     };
-    const run = await trigger(baseSha, "initial");
+    const run = await trigger(originalHead, "initial");
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     const finished = f.store.getRun(run.id);
     expect(finished?.prUrl).toBe("https://github.com/MattFlower/limitless/pull/18");
@@ -921,6 +1435,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const competingSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: competitor })).stdout.trim();
     concurrent = competitor;
     content = "verified again\n";
+    reviews = 0;
     if (!finished?.headSha) throw new Error("missing delivered head");
     const stale = await trigger(finished.headSha, "concurrent");
     expect(await waitFor(f, stale.id, ["succeeded", "failed", "needs_human"])).toBe("failed");
@@ -1395,7 +1910,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
         };
       }
       implementCalls++;
-      if (implementCalls === 2) expect(s.prompt).toContain("H-3");
+      if (implementCalls === 2) {
+        expect(s.prompt).toContain("H-3");
+        expect(f.store.getRunState<RunState>(run.id)?.lastVerifiedSha).toBeUndefined();
+      }
       return { files: { "farewell.txt": "goodbye\n" } };
     });
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });

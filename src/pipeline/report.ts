@@ -24,6 +24,7 @@ export interface ReportInput {
   prompt: string;
   state: Pick<
     RunState,
+    | "flow"
     | "implementerReport"
     | "spec"
     | "holdout"
@@ -41,6 +42,7 @@ export interface ReportInput {
   /** Issue in the same repository this run was started from; the PR closes it on merge. */
   closesIssue?: number;
   freeFirstRouting?: boolean;
+  verifiedFailure?: { sha: string; stage: string; reason: string; base: string };
 }
 
 /** Markdown evidence report used as the PR body. Each block is one markdown element. */
@@ -48,10 +50,19 @@ export function renderReport(input: ReportInput): string {
   const { state } = input;
   const blocks: string[] = [
     input.success
-      ? "Built by **Limitless** — every gate below passed."
+      ? state.flow === "verify-change"
+        ? "Verified by **Limitless** — checks below have no blocking regressions."
+        : "Built by **Limitless** — every gate below passed."
       : "⚠️ Built by **Limitless** but it **needs a human**: the checks below did not all pass.",
+    `Flow: ${state.flow ?? "build"}`,
     ...(state.rebaseNote ? [`> [!NOTE]\n> ${state.rebaseNote}`] : []),
     ...(state.terminalReason ? [`🚧 ${state.terminalReason}`] : []),
+    ...(input.verifiedFailure
+      ? [
+          "## Failed after verification",
+          `Verified at \`${input.verifiedFailure.sha}\`; failed after verification at \`${input.verifiedFailure.stage}\`: \`${input.verifiedFailure.reason}\`. The PR may conflict with \`${input.verifiedFailure.base}\`.`,
+        ]
+      : []),
     ...(input.freeFirstRouting ? ["Routing: free-first (Dependabot)"] : []),
     "## Request",
     input.prompt
@@ -110,13 +121,16 @@ export function renderReport(input: ReportInput): string {
 
   blocks.push("## Checks");
   if (state.lastGates?.length) {
+    // PR verdict comments omit commands: they can name local paths and generated outputs.
+    const commands = state.flow !== "verify-change";
     blocks.push(
       table(
-        ["Check", "Result", "Command"],
+        ["Check", "Result", ...(commands ? ["Command"] : [])],
         state.lastGates.map((g) => {
           const warn = g.verdict === "still_failing" || g.verdict === "flaky";
           const icon = g.blocking ? "❌" : warn ? "⚠️" : "✅";
-          return [g.name, `${icon} ${g.verdict.replace("_", " ")}`, `\`${escapeCell(g.result.command)}\``];
+          const row = [g.name, `${icon} ${g.verdict.replace("_", " ")}`];
+          return commands ? [...row, `\`${escapeCell(g.result.command)}\``] : row;
         }),
       ),
     );
@@ -187,13 +201,18 @@ export function renderReport(input: ReportInput): string {
   return `${blocks.join("\n\n")}\n`;
 }
 
-export function buildReport(ctx: RunContext, success: boolean): string {
+export function buildReport(
+  ctx: RunContext,
+  success: boolean,
+  verifiedFailure?: ReportInput["verifiedFailure"],
+): string {
   const latest = ctx.store.getRun(ctx.run.id) ?? ctx.run;
   return renderReport({
     success,
     runId: ctx.run.id,
     prompt: ctx.run.prompt,
-    state: ctx.state,
+    state: verifiedFailure ? { ...ctx.state, ...ctx.state.lastVerifiedEvidence } : ctx.state,
+    verifiedFailure,
     invocations: ctx.store.listInvocations(ctx.run.id),
     totals: { costUsd: latest.costUsd, costEquivUsd: latest.costEquivUsd },
     runUrl: `${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}`,

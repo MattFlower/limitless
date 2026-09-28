@@ -180,26 +180,34 @@ async function health(port: number, timeoutMs = 30_000): Promise<boolean> {
   return false;
 }
 
-export async function install(port: number, opts: { tunnel?: boolean; mtplx?: boolean } = {}): Promise<void> {
-  mkdirSync(logDir, { recursive: true });
-  mkdirSync(agentsDir, { recursive: true });
-  await ensureRelease();
-  await sh(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000 });
+export function installationUnits(
+  opts: { mtplx?: boolean } = {},
+  tunnel: string | null = null,
+): [string, string][] {
   const units: [string, string][] = [
     [LABEL, plist(LABEL, [join(home, ".bun", "bin", "bun"), join(appDir, "src", "cli", "main.ts"), "serve"])],
   ];
-  if (opts.mtplx !== false) {
+  if (opts.mtplx === true) {
     units.push([MTPLX_LABEL, mtplxPlist()]);
   }
-  // The public tunnel is opt-in: only once webhook authentication is in place.
-  const tunnel = opts.tunnel ? tunnelConfig(port) : null;
-  if (opts.tunnel && !tunnel) console.warn("no cloudflared credentials found; skipping tunnel");
   if (tunnel) {
     units.push([
       TUNNEL_LABEL,
       plist(TUNNEL_LABEL, ["/opt/homebrew/bin/cloudflared", "tunnel", "--config", tunnel, "run"]),
     ]);
   }
+  return units;
+}
+
+export async function install(port: number, opts: { tunnel?: boolean; mtplx?: boolean } = {}): Promise<void> {
+  mkdirSync(logDir, { recursive: true });
+  mkdirSync(agentsDir, { recursive: true });
+  await ensureRelease();
+  await sh(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000 });
+  // The public tunnel is opt-in: only once webhook authentication is in place.
+  const tunnel = opts.tunnel ? tunnelConfig(port) : null;
+  if (opts.tunnel && !tunnel) console.warn("no cloudflared credentials found; skipping tunnel");
+  const units = installationUnits(opts, tunnel);
   for (const [label, content] of units) {
     const path = join(agentsDir, `${label}.plist`);
     if (await loaded(label)) {

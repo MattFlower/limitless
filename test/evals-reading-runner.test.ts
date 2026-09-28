@@ -5,7 +5,7 @@ import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema } from "../src/eva
 import { gatesAt } from "../src/evals/prepare.ts";
 import { auditDiff } from "../src/gates/audit.ts";
 import { gateScriptNames, pickScripts } from "../src/gates/detect.ts";
-import { diffSince, readFileAt } from "../src/git/repos.ts";
+import { createEvalWorktree, diffSince, readFileAt } from "../src/git/repos.ts";
 import { readingTimeout } from "../src/pipeline/engine.ts";
 import { FACTORY_PREAMBLE, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
 import { ReviewSchema, toStrictJsonSchema, VerifySchema } from "../src/pipeline/schemas.ts";
@@ -249,6 +249,39 @@ test("rejects pins whose reachable history exposes eval labels or seed patches",
     } finally {
       await f.close();
     }
+  }
+});
+
+test("batched label checks handle absent, blank, text and binary contents", async () => {
+  const f = await evalFixture();
+  const cwd = join(f.home, "label-check");
+  const absent = ["", " \n", "missing label", new Uint8Array([0, 255, 10])];
+  const checkout = (contents: (string | Uint8Array)[]) =>
+    createEvalWorktree(
+      f.cfg.paths,
+      f.factory.store,
+      "fixture/repo",
+      f.sha,
+      f.sha,
+      cwd,
+      new AbortController().signal,
+      { paths: [], contents },
+    );
+  try {
+    for (const contents of [[], absent]) {
+      const cleanup = await checkout(contents);
+      expect(readFileSync(join(cwd, "PINNED.txt"), "utf8")).toBe("old");
+      await cleanup();
+    }
+    for (const label of ["old", new TextEncoder().encode("old")]) {
+      await expect(checkout([...absent, label, "another missing label"])).rejects.toThrow(
+        "pinned history contains an eval dataset or seed patch",
+      );
+      expect(existsSync(cwd)).toBe(false);
+    }
+    expect(f.calls).toHaveLength(0);
+  } finally {
+    await f.close();
   }
 });
 

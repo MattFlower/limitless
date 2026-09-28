@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
 import type { Router } from "../router/router.ts";
+import { EFFORT_LEVELS } from "../router/targets.ts";
 
 const nonempty = z.string().trim().min(1);
 const repoId = z.string().regex(/^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/, "expected owner/name");
@@ -259,7 +260,15 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
   const resolved: string[] = [];
   for (const id of request.models) {
     try {
-      resolved.push(router.resolveFor(request.role, id).targetId);
+      let target = router.resolveFor(request.role, id);
+      if (request.strategy === "effort") {
+        const levels = EFFORT_LEVELS.filter((level) => target.model.supportedEfforts.includes(level));
+        const effort = target.effort ?? levels[0];
+        if (!effort || levels.indexOf(effort) === levels.length - 1)
+          throw new Error("effort strategy requires a higher supported effort than the starting effort");
+        target = router.resolveFor(request.role, { modelId: target.model.id, effort });
+      }
+      resolved.push(target.targetId);
     } catch (error) {
       problems.push(`${JSON.stringify(id)}: ${(error as Error).message}`);
     }

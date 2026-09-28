@@ -113,6 +113,7 @@ const toRun = (r: Row): Run => ({
   source: r.source as Run["source"],
   githubWebhookVerified: r.github_webhook_verified === 1,
   sourceRef: parse(r.source_ref, null),
+  flow: parse<{ flow?: Run["flow"] }>(r.state_json, {}).flow ?? "build",
   requestedBy: (r.requested_by as string) ?? null,
   profile: r.profile as Run["profile"],
   resolvedProfile: (r.resolved_profile as Run["resolvedProfile"]) ?? null,

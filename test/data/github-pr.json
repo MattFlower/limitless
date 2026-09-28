@@ -13,6 +13,10 @@
       "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "repo": { "full_name": "MattFlower/limitless" }
     },
-    "base": { "repo": { "full_name": "MattFlower/limitless" } }
+    "base": {
+      "ref": "main",
+      "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "repo": { "full_name": "MattFlower/limitless" }
+    }
   }
 }

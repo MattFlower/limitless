@@ -1,12 +1,18 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { assertExistingBranchDelivery } from "../core/delivery.ts";
+import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
-import { compareGates, type GateHooks, retryRegressions, runGates } from "../gates/run.ts";
 import {
-  clearInterruptedRebase,
+  compareGates,
+  type GateComparison,
+  type GateHooks,
+  retryRegressions,
+  runGates,
+} from "../gates/run.ts";
+import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
+import {
   commitAll,
   createPullRequest,
   createWorktree,
@@ -21,10 +27,10 @@ import {
   pushBranch,
   pushExistingBranch,
   readFileAt,
-  rebaseOnto,
   removeWorktree,
   resetTo,
 } from "../git/repos.ts";
+import { runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
 import {
@@ -94,12 +100,20 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run);
+    ctx.state.flow ??= "build";
+    ctx.save();
+    if (ctx.state.flow === "verify-change" && ctx.state.phase !== "prepare" && !ctx.state.verification)
+      throw new Error("Verification state is missing its recorded PR revisions");
     if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined) {
       if (!ctx.run.baseSha || !ctx.state.worktreePath)
         throw new Error("Cannot restore base preview configuration: missing base SHA or worktree");
       // Upgrade older runs using the trusted revision, never the edited worktree config.
       ctx.state.previewConfig = readPreviewConfig(
-        await readFileAt(ctx.state.worktreePath, ctx.run.baseSha, ".limitless.toml"),
+        await readFileAt(
+          ctx.state.worktreePath,
+          ctx.state.verification?.baseSha ?? ctx.run.baseSha,
+          ".limitless.toml",
+        ),
       );
       ctx.save();
     }
@@ -124,12 +138,33 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
       ctx.log("Run cancelled", "warn");
       return "cancelled";
     }
-    const needsHuman = e instanceof NeedsHumanError || e instanceof NoCapacityError;
+    const verifiedSha = ctx.state.lastVerifiedSha;
+    const verifiedFailure =
+      verifiedSha &&
+      ctx.repo.kind === "github" &&
+      !ctx.run.deliveryBranch &&
+      !ctx.run.prUrl &&
+      (ctx.state.phase === "deliver" || ctx.state.conflictRound !== undefined);
+    const needsHuman = e instanceof NeedsHumanError || e instanceof NoCapacityError || !!verifiedFailure;
     const message = (e as Error).message;
+    const failureStage =
+      ctx.state.conflictRound !== undefined
+        ? "conflict resolution"
+        : message.includes("post-merge gates")
+          ? "post-merge gates"
+          : ctx.run.stage === "deliver"
+            ? "delivery merge"
+            : (ctx.run.stage ?? "delivery merge");
     ctx.log(`Run ${needsHuman ? "needs a human" : "failed"}: ${message}`, "error", {
       stack: (e as Error).stack,
     });
-    if (
+    if (verifiedFailure) {
+      try {
+        await deliverVerifiedDraft(ctx, verifiedSha, failureStage, message);
+      } catch (err) {
+        ctx.log(`Could not open verified-work draft PR: ${(err as Error).message}`, "warn");
+      }
+    } else if (
       e instanceof NeedsHumanError &&
       ctx.state.worktreePath &&
       ctx.state.conflictRound === undefined &&
@@ -174,6 +209,24 @@ async function prepare(ctx: RunContext): Promise<void> {
   assertExistingBranchDelivery(ctx.repo, ctx.run);
   await ctx.stage("prepare", async () => {
     const { cfg, store } = ctx.deps;
+    if (ctx.state.flow === "verify-change") {
+      const ref = ctx.run.sourceRef;
+      if (
+        typeof ref?.baseRef !== "string" ||
+        !isBranchName(ref.baseRef) ||
+        typeof ref.baseSha !== "string" ||
+        !/^[a-fA-F0-9]{40}$/.test(ref.baseSha) ||
+        typeof ref.headSha !== "string" ||
+        !/^[a-fA-F0-9]{40}$/.test(ref.headSha) ||
+        ref.repo !== ctx.repo.slug ||
+        typeof ref.number !== "number" ||
+        !Number.isSafeInteger(ref.number) ||
+        ref.number <= 0
+      )
+        throw new Error("Verification requires valid PR baseRef, baseSha, headSha and repository metadata");
+      ctx.state.verification = { baseSha: ref.baseSha, headSha: ref.headSha };
+      ctx.save();
+    }
     await ensureCache(cfg.paths, ctx.repo);
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
     const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base);
@@ -181,18 +234,30 @@ async function prepare(ctx: RunContext): Promise<void> {
       throw new Error("PR head moved before preparation");
     ctx.state.worktreePath = wt.path;
     ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha: wt.baseSha, branch: wt.branch });
-    ctx.state.previewConfig = readPreviewConfig(await readFileAt(wt.path, wt.baseSha, ".limitless.toml"));
-    const gates = detectGates(wt.path);
-    ctx.state.gatesConfig = gates;
-    ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
-    ctx.log(
-      `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
-    );
-    ctx.state.baseline =
-      gates.setup.length || gates.checks.length
-        ? await runGates(wt.path, gates, ctx.signal, { onWait: gateEvents(ctx).onWait })
-        : null;
-    ctx.checkCancelled();
+    const verification = ctx.state.verification;
+    if (verification) {
+      ctx.run = store.updateRun(ctx.run.id, { baseSha: verification.headSha });
+      await resetTo(wt.path, verification.baseSha);
+    }
+    let gates: GateConfig;
+    try {
+      ctx.state.previewConfig = readPreviewConfig(
+        await readFileAt(wt.path, verification?.baseSha ?? wt.baseSha, ".limitless.toml"),
+      );
+      gates = detectGates(wt.path);
+      ctx.state.gatesConfig = gates;
+      ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
+      ctx.log(
+        `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
+      );
+      ctx.state.baseline =
+        gates.setup.length || gates.checks.length
+          ? await runGates(wt.path, gates, ctx.signal, { onWait: gateEvents(ctx).onWait })
+          : null;
+      ctx.checkCancelled();
+    } finally {
+      if (verification) await resetTo(wt.path, verification.headSha);
+    }
     const baseline = ctx.state.baseline;
     if (baseline) {
       store.putArtifact(ctx.run.id, "baseline-gates.json", "gates", JSON.stringify(baseline, null, 2));
@@ -259,12 +324,13 @@ async function triage(ctx: RunContext): Promise<void> {
       "triage",
       JSON.stringify({ ...t, model: target.modelId }, null, 2),
     );
-    const questions = profile !== "quick" && t.ambiguity === "high" ? t.blocking_questions : [];
+    const verifying = ctx.state.flow === "verify-change";
+    const questions = !verifying && profile !== "quick" && t.ambiguity === "high" ? t.blocking_questions : [];
     if (questions.length) {
       for (const q of questions) ctx.store.askQuestion(ctx.run.id, q);
       ctx.setPhase("clarify");
     } else {
-      ctx.setPhase(profile === "quick" ? "loop" : "spec");
+      ctx.setPhase(verifying || profile === "quick" ? "loop" : "spec");
     }
     return {
       summary: `${t.task_class}, ${t.complexity}, risk ${t.risk} → ${profile} (${target.modelId})`,
@@ -363,12 +429,20 @@ function profile(ctx: RunContext): ResolvedProfile {
 }
 
 async function buildLoop(ctx: RunContext): Promise<void> {
+  if (ctx.state.verification && !ctx.state.verification.initialComplete) {
+    // Initial verification does not consume an implementation round.
+    const passed = await oneRound(ctx, -1, null);
+    ctx.state.verification.initialComplete = true;
+    if (passed) ctx.setPhase("deliver");
+    else ctx.save();
+    if (passed) return;
+  }
   const maxRounds =
     ctx.state.conflictRound !== undefined
       ? ctx.state.conflictRound + 1
       : Math.max(1, ctx.deps.cfg.maxRounds) + ROUNDS_PER_IMPLEMENTER;
   const holdout =
-    profile(ctx) === "quick" || ctx.state.holdoutStatus === "complete"
+    ctx.state.flow === "verify-change" || profile(ctx) === "quick" || ctx.state.holdoutStatus === "complete"
       ? null
       : authorHoldout(ctx).then(
           () => null,
@@ -435,6 +509,19 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.run.baseSha as string;
+  const merge = ctx.state.conflictRound === round;
+  const previousHead = ctx.state.preRebaseHead;
+  if (merge) {
+    if (!previousHead || ctx.state.pendingRebaseSha !== baseSha)
+      throw new Error("Missing expected merge state for resolution round");
+    if ((await headSha(cwd)) !== previousHead) {
+      const sha = await validateMerge(cwd, previousHead, baseSha);
+      ctx.state.implementedRound = round;
+      ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha }, ctx.state);
+      return;
+    }
+    await requireMerge(cwd, previousHead, baseSha);
+  }
   await ctx.stage(
     "implement",
     async (stage) => {
@@ -474,10 +561,12 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           spec: ctx.state.spec ?? null,
           gates,
           baseline: ctx.state.baseline ?? null,
-          baseSha,
+          baseSha: ctx.state.verification?.baseSha ?? baseSha,
+          externalChange: ctx.state.flow === "verify-change",
           round,
           feedback: ctx.state.feedback,
-          hasHoldout: profile(ctx) !== "quick",
+          hasHoldout: ctx.state.flow !== "verify-change" && profile(ctx) !== "quick",
+          resolution: merge,
         }),
       });
       ctx.state.implementer = {
@@ -497,10 +586,11 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
         ctx.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
       ctx.state.implementerReport = result.finalText;
       ctx.store.putArtifact(ctx.run.id, `implement-${round}.md`, "report", result.finalText || "(no report)");
-      const sha = await commitAll(
-        cwd,
-        `limitless: ${ctx.run.title} (round ${round + 1})\n\nRun: ${ctx.run.id}`,
-      );
+      ctx.checkCancelled();
+      const sha =
+        merge && previousHead
+          ? await completeMerge(cwd, previousHead, baseSha)
+          : await commitAll(cwd, `limitless: ${ctx.run.title} (round ${round + 1})\n\nRun: ${ctx.run.id}`);
       if (sha) ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha });
       ctx.save();
       ctx.state.implementerIssue =
@@ -529,33 +619,41 @@ async function oneRound(
 ): Promise<boolean> {
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
-  const baseSha = ctx.run.baseSha as string;
+  const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
+  const changeDiff = () => diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change");
 
   // --- implement (skipped when resuming a round whose implementation already landed)
-  if (ctx.state.implementedRound !== round) await implementStage(ctx, round);
+  if (round >= 0 && ctx.state.implementedRound !== round) await implementStage(ctx, round);
+  if (ctx.state.conflictRound === round) {
+    if (!ctx.state.preRebaseHead || ctx.state.pendingRebaseSha !== baseSha)
+      throw new Error("Missing expected merge state for resolution checks");
+    await validateMerge(cwd, ctx.state.preRebaseHead, baseSha);
+  }
 
   // --- gates
   const comparison = await ctx.stage(
     "gates",
     async () => {
       const events = gateEvents(ctx);
-      const after = await runGates(cwd, gates, ctx.signal, events);
-      ctx.checkCancelled();
-      const changed = (await diffSince(cwd, baseSha)).files.flatMap((f) =>
-        f.from ? [f.path, f.from] : [f.path],
-      );
-      // Retry before discarding, so a check sees the same build output as its first attempt.
-      const cmp = await retryRegressions(
-        compareGates(ctx.state.baseline ?? null, after),
-        cwd,
-        gates,
-        changed,
-        ctx.signal,
-        events.onWait,
-      );
-      ctx.checkCancelled();
-      // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
-      await discardChanges(cwd);
+      let cmp: GateComparison[];
+      try {
+        const after = await runGates(cwd, gates, ctx.signal, events);
+        ctx.checkCancelled();
+        const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
+        // Retry before discarding, so a check sees the same build output as its first attempt.
+        cmp = await retryRegressions(
+          compareGates(ctx.state.baseline ?? null, after),
+          cwd,
+          gates,
+          changed,
+          ctx.signal,
+          events.onWait,
+        );
+        ctx.checkCancelled();
+        // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
+      } finally {
+        await discardChanges(cwd);
+      }
       for (const c of cmp.filter((c) => c.firstAttempt)) {
         ctx.store.addEvent({
           runId: ctx.run.id,
@@ -580,12 +678,12 @@ async function oneRound(
   );
 
   // --- audit
-  const diff = await diffSince(cwd, baseSha);
+  const diff = await changeDiff();
   const audit: AuditFinding[] = await ctx.stage(
     "audit",
     async () => {
       const findings = auditDiff(diff, {
-        taskClass: ctx.run.taskClass,
+        taskClass: ctx.state.verification && ctx.run.taskClass === "question" ? null : ctx.run.taskClass,
         protectedPaths: gates.protectedPaths,
         toolCommands: ctx.state.toolCommands,
         gateScripts: {
@@ -593,6 +691,23 @@ async function oneRound(
           after: pickScripts(readPackageJson(cwd), gateScriptNames(gates)),
         },
       });
+      if (ctx.state.verification) {
+        const repairs = await diffSince(cwd, ctx.state.verification.headSha);
+        if (repairs.files.length)
+          findings.push(
+            ...auditDiff(repairs, {
+              taskClass: ctx.run.taskClass,
+              protectedPaths: gates.protectedPaths,
+              gateScripts: {
+                before: pickScripts(
+                  await readFileAt(cwd, ctx.state.verification.headSha, "package.json"),
+                  gateScriptNames(gates),
+                ),
+                after: pickScripts(readPackageJson(cwd), gateScriptNames(gates)),
+              },
+            }).map((finding) => ({ ...finding, detail: `Repair: ${finding.detail}` })),
+          );
+      }
       ctx.state.lastAudit = findings;
       for (const f of findings) {
         ctx.store.addEvent({
@@ -648,11 +763,16 @@ async function oneRound(
           spec: ctx.state.spec ?? null,
           baseSha,
           stat: diff.stat,
+          ...(ctx.state.flow === "verify-change" ? { patch: diff.patch } : {}),
           gates: comparison,
           audit,
           implementerReport: ctx.state.implementerReport ?? "",
+          externalChange: ctx.state.flow === "verify-change",
+          dependencyUpdate:
+            ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
           previous: previousReview,
           headSha: reviewedSha,
+          resolution: ctx.state.conflictRound === round,
         }),
         jsonSchema: toStrictJsonSchema(previousReview ? LaterReviewSchema : ReviewSchema),
         schema: previousReview ? LaterReviewSchema : ReviewSchema,
@@ -716,8 +836,9 @@ async function oneRound(
   }
 
   // --- verify acceptance criteria (standard/deep)
-  if (profile(ctx) === "quick") {
+  if (ctx.state.flow === "verify-change" || profile(ctx) === "quick") {
     ctx.state.lastVerify = null;
+    if (ctx.state.flow !== "verify-change") recordVerified(ctx, reviewedSha);
     return true;
   }
   if (holdout) {
@@ -840,6 +961,7 @@ async function oneRound(
       ctx.save();
       return false;
     }
+    recordVerified(ctx, await headSha(cwd));
     return true;
   } finally {
     ctx.previewUrl = undefined;
@@ -850,31 +972,103 @@ async function oneRound(
 // ---------------------------------------------------------------------------
 // deliver
 
+function recordVerified(ctx: RunContext, sha: string): void {
+  ctx.state.lastVerifiedSha = sha;
+  ctx.state.lastVerifiedEvidence = {
+    lastVerify: ctx.state.lastVerify,
+    lastGates: ctx.state.lastGates,
+    lastReview: ctx.state.lastReview,
+    lastAudit: ctx.state.lastAudit,
+  };
+  ctx.save();
+}
+
+async function deliverVerifiedDraft(
+  ctx: RunContext,
+  sha: string,
+  stage: string,
+  reason: string,
+): Promise<void> {
+  const cwd = ctx.state.worktreePath;
+  const branch = ctx.run.branch;
+  const base = ctx.run.baseBranch;
+  if (!cwd || !branch || !base) throw new Error("Missing verified draft delivery details");
+  const report = buildReport(ctx, false, { sha, stage, reason, base });
+  ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+  ctx.checkCancelled();
+  await pushBranch(ctx.repo, cwd, branch, sha);
+  ctx.checkCancelled();
+  const url = await createPullRequest(ctx.repo, {
+    branch,
+    base,
+    title: `[needs human] ${ctx.run.title}`,
+    body: report,
+    cwd,
+    draft: true,
+  });
+  ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
+  ctx.log(`Verified-work draft PR: ${url}`);
+}
+
 async function deliver(ctx: RunContext, success: boolean): Promise<void> {
   assertExistingBranchDelivery(ctx.repo, ctx.run);
   if (ctx.run.deliveryBranch && ctx.run.baseSha !== ctx.run.sourceRef?.headSha)
     throw new Error("PR delivery base does not match the verified webhook head");
   await ctx.stage("deliver", async () => {
     const cwd = ctx.state.worktreePath as string;
-    await clearInterruptedRebase(cwd, Boolean(ctx.state.pendingRebaseSha));
-    // A stopped post-rebase check may have left generated files or formatter edits behind.
-    if (ctx.state.pendingRebaseSha) await discardChanges(cwd);
-    const sha = await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
+    if (ctx.state.conflictRound !== undefined) {
+      if (!ctx.state.preRebaseHead) throw new Error("Missing pre-merge HEAD at delivery");
+      await validateMerge(cwd, ctx.state.preRebaseHead, ctx.run.baseSha as string);
+      ctx.state.pendingRebaseSha = undefined;
+      ctx.state.preRebaseGates = undefined;
+      ctx.save();
+    }
+    if (ctx.state.verification) {
+      await discardChanges(cwd);
+      if (!success) {
+        ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
+        return { summary: "PR verification needs human review; no push", value: undefined };
+      }
+      if (!(await diffSince(cwd, ctx.state.verification.headSha)).files.length) {
+        ctx.run = ctx.store.updateRun(ctx.run.id, {
+          headSha: await headSha(cwd),
+          prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef?.number}`,
+        });
+        const report = buildReport(ctx, true);
+        ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+        if (!ctx.state.verdictCommentPosted) {
+          ctx.checkCancelled();
+          await (ctx.deps.gh ?? runGh)([
+            "pr",
+            "comment",
+            String(ctx.run.sourceRef?.number),
+            "--repo",
+            ctx.repo.slug,
+            "--body",
+            report,
+          ]);
+          ctx.state.verdictCommentPosted = true;
+          ctx.save();
+        }
+        await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
+        return { summary: `Verified existing PR: ${ctx.run.prUrl}`, value: undefined };
+      }
+      if (!ctx.run.deliveryBranch)
+        throw new NeedsHumanError("PR repairs require authorized existing-branch delivery");
+    }
+    // Pending clean merges must be validated before any cleanup or generic commit.
+    const sha =
+      ctx.state.pendingRebaseSha || ctx.state.conflictRound !== undefined
+        ? null
+        : await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
     const head = sha ?? (await headSha(cwd));
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch) {
       const baseBranch = ctx.run.baseBranch as string;
       const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch);
       const recorded = ctx.run.baseSha as string;
-      // A restart can find the base moved again mid-rebase; retarget the newest tip.
-      if (ctx.state.pendingRebaseSha && ctx.state.pendingRebaseSha !== fetched) {
-        ctx.state.pendingRebaseSha = fetched;
-        ctx.save();
-      }
-      // Rebasing is best-effort: it avoids conflicting PRs, but never blocks delivering work that
-      // passed every gate on its recorded base.
       const note = (why: string) => {
-        ctx.state.rebaseNote = `Not rebased onto the latest ${baseBranch}: ${why}. Delivered on ${(ctx.run.baseSha as string).slice(0, 8)}.`;
+        ctx.state.rebaseNote = `Not merged with the latest ${baseBranch}: ${why}. Delivered on ${(ctx.run.baseSha as string).slice(0, 8)}.`;
         ctx.store.addEvent({
           runId: ctx.run.id,
           type: "status",
@@ -887,8 +1081,10 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           note("the base advanced again after the conflict-resolution round");
         else if (!ctx.state.pendingRebaseSha && !(await isAncestor(cwd, recorded, fetched)))
           note("the base branch no longer descends from the recorded base");
-        else if ((await rebaseForDelivery(ctx, cwd, baseBranch, fetched, head, note)) === "conflict")
-          return { summary: `rebase conflicted; resolution round ${ctx.state.round}`, value: undefined };
+        else if (
+          (await mergeForDelivery(ctx, cwd, ctx.state.pendingRebaseSha ?? fetched, head)) === "conflict"
+        )
+          return { summary: `merge conflicted; resolution round ${ctx.state.round}`, value: undefined };
       }
       if (!ctx.state.rebaseNote && !(await isAncestor(cwd, ctx.run.baseSha as string, await headSha(cwd))))
         note("the branch does not contain the recorded base");
@@ -920,6 +1116,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       return { summary: `branch ${ctx.run.branch} ready in ${ctx.repo.localPath}`, value: undefined };
     }
     if (ctx.run.deliveryBranch) {
+      publish();
       if (!success) return { summary: "PR update needs human review; no push", value: undefined };
       ctx.checkCancelled();
       await pushExistingBranch(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.run.baseSha as string);
@@ -979,20 +1176,14 @@ function readPackageJson(dir: string): string | null {
 
 export type { RunState };
 
-class RebaseRegressedError extends Error {}
+class MergeRegressedError extends Error {}
 
-/**
- * Rebase the run branch onto the base's new tip and re-run the gates. A conflict schedules one
- * resolution round ("conflict"); a regression restores the pre-rebase head, which passed every gate
- * on its recorded base, and notes why it was not rebased.
- */
-async function rebaseForDelivery(
+/** Merge the pinned base, retaining the previously gated head for regression fallback. */
+async function mergeForDelivery(
   ctx: RunContext,
   cwd: string,
-  baseBranch: string,
   fetched: string,
   head: string,
-  note: (why: string) => void,
 ): Promise<"conflict" | "done"> {
   // Audit against the new base's scripts, never the implementer's merged working tree.
   ctx.state.baselineScripts = pickScripts(
@@ -1005,20 +1196,21 @@ async function rebaseForDelivery(
     ctx.state.preRebaseHead = head;
     ctx.save();
   }
-  if (!(await isAncestor(cwd, fetched, await headSha(cwd)))) {
-    const outcome = await rebaseOnto(cwd, fetched);
-    if (outcome === "conflict") {
-      ctx.state.preRebaseHead = undefined;
-      ctx.state.pendingRebaseSha = undefined;
-      ctx.state.preRebaseGates = undefined;
-      ctx.state.round++;
-      ctx.state.conflictRound = ctx.state.round;
-      ctx.state.feedback = `The base branch advanced. Merge origin/${baseBranch} into this branch with \`git merge origin/${baseBranch}\`, resolve conflicts preserving both intents, and rerun the repository checks.`;
-      ctx.state.phase = "loop";
-      ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: await headSha(cwd) }, ctx.state);
-      return "conflict";
-    }
+  const before = ctx.state.preRebaseHead;
+  if (!before) throw new Error("Missing pre-merge HEAD");
+  const conflicts = await prepareMerge(cwd, before, fetched);
+  if (conflicts.length) {
+    ctx.state.round++;
+    ctx.state.conflictRound = ctx.state.round;
+    ctx.state.feedback = `The factory started a merge of base ${fetched}. Resolve the conflict markers in these files, preserving both intents; do not run Git (including staging or committing):\n${conflicts.map((p) => `- ${p}`).join("\n")}`;
+    ctx.state.phase = "loop";
+    ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
+    return "conflict";
   }
+  if ((await headSha(cwd)) === before) await completeMerge(cwd, before, fetched);
+  await validateMerge(cwd, before, fetched);
+  await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
+  await mergeGit(cwd, ["clean", "-fdq"]);
   const previous = ctx.state.preRebaseGates ?? [];
   try {
     await ctx.stage(
@@ -1026,8 +1218,9 @@ async function rebaseForDelivery(
       async () => {
         const after = await runGates(cwd, ctx.state.gatesConfig as GateConfig, ctx.signal, gateEvents(ctx));
         ctx.checkCancelled();
-        await discardChanges(cwd);
-        // A check fixed by the implementation must stay fixed after rebasing, even when
+        await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
+        await mergeGit(cwd, ["clean", "-fdq"]);
+        // A check fixed by the implementation must stay fixed after merging, even when
         // it failed on the original base. Persist that regression in the evidence too.
         const comparison = compareGates(
           previous.length
@@ -1047,23 +1240,23 @@ async function rebaseForDelivery(
           !after.setupOk ||
           comparison.some((c) => c.blocking) ||
           previous.some((c) => c.result.ok && !after.checks.find((r) => r.name === c.name)?.ok);
-        if (regressed) throw new RebaseRegressedError("post-rebase gates regressed");
-        return { summary: `${comparison.length} post-rebase checks ok`, value: undefined };
+        if (regressed) throw new MergeRegressedError("post-merge gates regressed");
+        return { summary: `${comparison.length} post-merge checks ok`, value: undefined };
       },
       ctx.state.round,
     );
   } catch (error) {
-    if (!(error instanceof RebaseRegressedError)) throw error;
-    await resetTo(cwd, ctx.state.preRebaseHead ?? head);
+    if (!(error instanceof MergeRegressedError)) throw error;
+    await mergeGit(cwd, ["reset", "--hard", before]);
+    await mergeGit(cwd, ["clean", "-fdq"]);
     ctx.state.lastGates = previous;
     ctx.state.pendingRebaseSha = undefined;
     ctx.state.preRebaseGates = undefined;
     ctx.state.preRebaseHead = undefined;
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: await headSha(cwd) }, ctx.state);
-    note(`checks regressed after rebasing onto ${fetched.slice(0, 8)}`);
-    ctx.save();
-    return "done";
+    throw new NeedsHumanError(`post-merge gates regressed after merging onto ${fetched.slice(0, 8)}`);
   }
+  await validateMerge(cwd, before, fetched);
   ctx.state.pendingRebaseSha = undefined;
   ctx.state.preRebaseGates = undefined;
   ctx.state.preRebaseHead = undefined;

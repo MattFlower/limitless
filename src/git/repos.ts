@@ -259,12 +259,14 @@ export async function diffSince(
   cwd: string,
   baseSha: string,
   env?: Record<string, string>,
+  threeDot = false,
 ): Promise<DiffInfo> {
+  const range = `${baseSha}${threeDot ? "..." : ".."}HEAD`;
   const [patch, names, stat, numstat] = await Promise.all([
-    sh(["git", "diff", `${baseSha}..HEAD`], { cwd, env }),
-    sh(["git", "diff", "--name-status", `${baseSha}..HEAD`], { cwd, env }),
-    sh(["git", "diff", "--stat", `${baseSha}..HEAD`], { cwd, env }),
-    sh(["git", "diff", "--numstat", `${baseSha}..HEAD`], { cwd, env }),
+    sh(["git", "diff", range], { cwd, env }),
+    sh(["git", "diff", "--name-status", range], { cwd, env }),
+    sh(["git", "diff", "--stat", range], { cwd, env }),
+    sh(["git", "diff", "--numstat", range], { cwd, env }),
   ]);
   let added = 0;
   let removed = 0;
@@ -287,9 +289,9 @@ export function parseNameStatus(text: string): DiffFile[] {
     });
 }
 
-export async function pushBranch(repo: Repo, cwd: string, branch: string): Promise<void> {
+export async function pushBranch(repo: Repo, cwd: string, branch: string, sha = "HEAD"): Promise<void> {
   if (repo.kind !== "github" || !repo.url) return;
-  await sh(["git", "push", "--force-with-lease", repo.url, `HEAD:refs/heads/${branch}`], {
+  await sh(["git", "push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
     cwd,
     timeoutMs: 300_000,
   });
@@ -514,12 +516,22 @@ async function rejectContamination(path: string, labels: EvalLabels, signal: Abo
         `pinned history contains eval labels (${labels.paths.join(", ")}); choose earlier pins`,
       );
   }
-  for (const content of labels.contents) {
-    if (typeof content === "string" && !content.trim()) continue;
+  const oids = labels.contents.flatMap((content) => {
+    if (typeof content === "string" && !content.trim()) return [];
     const bytes = typeof content === "string" ? Buffer.from(content) : content;
-    const oid = new Bun.CryptoHasher("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
-    const found = await sh(["git", "cat-file", "-e", oid], { ...opts, allowFail: true });
-    if (found.exitCode === 0)
-      throw new Error("pinned history contains an eval dataset or seed patch; choose earlier pins");
-  }
+    return new Bun.CryptoHasher("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+  });
+  if (!oids.length) return;
+  // Check every label in one process: repeated trials otherwise spawn once per hidden file.
+  const found = await sh(["git", "cat-file", "--batch-check=%(objectname)"], {
+    ...opts,
+    stdin: `${oids.join("\n")}\n`,
+  });
+  if (
+    found.stdout
+      .trim()
+      .split("\n")
+      .some((line) => !line.endsWith(" missing"))
+  )
+    throw new Error("pinned history contains an eval dataset or seed patch; choose earlier pins");
 }

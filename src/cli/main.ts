@@ -26,9 +26,9 @@ Usage:
   limitless gc [--dry-run]                Clean up expired worktrees, logs and debug events
   limitless mcp                           MCP stdio proxy (daemon must be running)
   limitless integrations install [--write] Print setup; --write installs the Codex skill
-  limitless service install [--tunnel] [--no-mtplx]   launchd agents: daemon, mtplx (+ tunnel)
+  limitless service install [--tunnel] [--mtplx]   launchd agents: daemon (+ mtplx, tunnel)
   limitless service uninstall|status
-  limitless local up|down|status          Manage mtplx and twilight model servers
+  limitless local up|down|status          Report oMLX health; manage twilight
   limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]
         Deploy origin/main by default; drain for up to 2700s (45m). --now skips waiting.
 
@@ -181,7 +181,7 @@ async function main(): Promise<void> {
       tunnel: { type: "boolean" },
       write: { type: "boolean" },
       "dry-run": { type: "boolean" },
-      "no-mtplx": { type: "boolean" },
+      mtplx: { type: "boolean" },
       smoke: { type: "boolean" },
       "max-wait": { type: "string" },
       now: { type: "boolean" },
@@ -322,7 +322,7 @@ async function main(): Promise<void> {
       const svc = await import("./service.ts");
       const port = Number(process.env.LIMITLESS_PORT ?? 7400);
       if (rest[0] === "install") {
-        return svc.install(port, { tunnel: values.tunnel === true, mtplx: values["no-mtplx"] !== true });
+        return svc.install(port, { tunnel: values.tunnel === true, mtplx: values.mtplx === true });
       }
       if (rest[0] === "uninstall") return svc.uninstall();
       return svc.status(port);
