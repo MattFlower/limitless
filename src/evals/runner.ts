@@ -292,7 +292,10 @@ export class EvalRunner {
         );
       const preparationStarted = Date.now();
       const implementation = "hidden" in item ? await implementFor(item, cwd) : undefined;
-      const prepared = "hidden" in item ? implementation : await prepareCase(item, cwd, tree, patch, signal);
+      const prepared =
+        "hidden" in item
+          ? implementation
+          : await prepareCase(item, cwd, tree, patch, signal, cfg.reviewImplementerReport);
       if (!prepared) throw new Error("missing trial preparation");
       const preparationMs = Date.now() - preparationStarted;
       let { prompt } = prepared;

@@ -398,7 +398,7 @@ describe("pipeline hardening", () => {
             return {
               structured: {
                 verdict: "approve",
-                summary: "fine",
+                summary: "fine: checked the diff against every requirement",
                 findings:
                   reviews === 1
                     ? [
@@ -486,7 +486,14 @@ describe("pipeline hardening", () => {
                 suggested_profile: "quick",
               },
             };
-          if (r === "review") return { structured: { verdict: "approve", summary: "ok", findings: [] } };
+          if (r === "review")
+            return {
+              structured: {
+                verdict: "approve",
+                summary: "ok: checked the diff against every requirement",
+                findings: [],
+              },
+            };
           rounds++;
           return { files: { "package.json": JSON.stringify({ scripts: { test: "true" } }) } };
         }),
@@ -550,7 +557,14 @@ describe("resume after restart", () => {
           },
         };
       if (s.prompt.startsWith("You are an adversarial"))
-        return { delayMs: reviewDelay, structured: { verdict: "approve", summary: "ok", findings: [] } };
+        return {
+          delayMs: reviewDelay,
+          structured: {
+            verdict: "approve",
+            summary: "ok: checked the diff against every requirement",
+            findings: [],
+          },
+        };
       implementCalls++;
       return { files: { "b.txt": "b\n" } };
     });

@@ -107,7 +107,11 @@ const spec = {
   out_of_scope: [],
   blocking_questions: [],
 };
-const approve = { verdict: "approve", summary: "LGTM", findings: [] };
+const approve = {
+  verdict: "approve",
+  summary: "LGTM: checked the diff against every requirement",
+  findings: [],
+};
 const holdout = {
   scenarios: [
     {
@@ -2196,6 +2200,63 @@ protected_paths = ["protected.txt"]
     ).toEqual(["error", "ok"]);
     expect(f.store.getRunState<RunState>(run.id)?.holdoutSameVendor).toBe(true);
     expect(f.store.getRunState<RunState>(run.id)?.holdoutModelId).toBe("alpha/m");
+  });
+
+  test("degenerate review is a failed invocation and the next routed reviewer completes the stage", async () => {
+    let implementCalls = 0;
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review")
+        return {
+          structured:
+            s.target.provider === "beta" ? { verdict: "approve", summary: "test", findings: [] } : approve,
+        };
+      if (role === "verify") return { structured: pass };
+      implementCalls++;
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const reviews = f.store.listInvocations(run.id).filter((i) => i.role === "review");
+    expect(reviews.map((i) => [i.modelId, i.status])).toEqual([
+      ["beta/m", "error"],
+      ["alpha/m", "ok"],
+    ]);
+    expect(reviews[0]?.error).toContain("structured output failed validation");
+    expect(reviews[0]?.stageId).toBe(reviews[1]?.stageId);
+    expect(f.store.listStages(run.id).filter((s) => s.name === "review")).toHaveLength(1);
+    expect(implementCalls).toBe(1);
+    const artifact = JSON.parse(f.store.getArtifact(run.id, "review-0.json") ?? "{}");
+    expect(artifact).toMatchObject({ model: "alpha/m", summary: approve.summary });
+    expect(f.store.listArtifacts(run.id).filter((a) => a.name.startsWith("review-"))).toHaveLength(1);
+    const state = f.store.getRunState<RunState>(run.id);
+    expect(state?.reviewHistory).toHaveLength(1);
+    expect(state?.lastReview?.modelId).toBe("alpha/m");
+  });
+
+  test("degenerate review from every routed reviewer fails the stage without an approval", async () => {
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review")
+        return { structured: { verdict: "approve", summary: "   LGTM   ", findings: [] } };
+      if (role === "verify") return { structured: pass };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).not.toBe("succeeded");
+    const reviews = f.store.listInvocations(run.id).filter((i) => i.role === "review");
+    expect(reviews.length).toBeGreaterThan(0);
+    expect(reviews.every((i) => i.status === "error")).toBe(true);
+    expect(f.store.listStages(run.id).find((s) => s.name === "review")?.status).toBe("failed");
+    expect(f.store.listArtifacts(run.id).some((a) => a.name.startsWith("review-"))).toBe(false);
+    expect(f.store.getRunState<RunState>(run.id)?.lastReview).toBeUndefined();
+    expect(f.store.listStages(run.id).some((s) => s.name === "verify" || s.name === "deliver")).toBe(false);
   });
 
   test("missing holdout verdict fails despite an overall pass claim", async () => {

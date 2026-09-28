@@ -104,3 +104,96 @@ test("reviewers may not block on verification they could not perform", () => {
   expect(prompt).toContain("Every finding must name a concrete defect in the change");
   expect(prompt).toContain("report it as minor at most, never blocker or major");
 });
+
+describe("degenerate reviews", () => {
+  const exactly = (n: number) => "x".repeat(n);
+  for (const [name, schema, item] of [
+    ["first-round", ReviewSchema, { ...finding("minor"), label: undefined, prior: undefined }],
+    ["later-round", LaterReviewSchema, finding("minor")],
+  ] as const) {
+    test(`${name} schema rejects placeholder summaries without findings`, () => {
+      for (const summary of ["test", "", "      ", exactly(39), `  ${exactly(39)}\n\t `])
+        expect(schema.safeParse({ verdict: "approve", summary, findings: [] }).success).toBe(false);
+    });
+    test(`${name} schema accepts substantive summaries or short summaries with findings`, () => {
+      for (const summary of [exactly(40), `  ${exactly(40)}  `])
+        expect(schema.safeParse({ verdict: "approve", summary, findings: [] }).success).toBe(true);
+      for (const summary of ["test", ""])
+        expect(schema.safeParse({ verdict: "request_changes", summary, findings: [item] }).success).toBe(
+          true,
+        );
+    });
+  }
+});
+
+describe("review prompt", () => {
+  const input = {
+    prompt: "Add a farewell file",
+    spec: {
+      summary: "Farewell spec summary",
+      assumptions: [],
+      requirements: ["Write farewell.txt"],
+      acceptance_criteria: [
+        { id: "AC-1", criterion: "farewell.txt exists", how_to_verify: "cat farewell.txt" },
+      ],
+      out_of_scope: [],
+      blocking_questions: [],
+    },
+    baseSha: "base123",
+    stat: " farewell.txt | 1 +",
+    gates: [
+      {
+        name: "test",
+        verdict: "regressed" as const,
+        blocking: true,
+        result: {
+          name: "test",
+          command: "bun test",
+          ok: false,
+          exitCode: 1,
+          durationMs: 1,
+          output: "failed",
+        },
+      },
+    ],
+    audit: [],
+    implementerReport: "IMPLEMENTER_CLAIMS_ALL_GOOD",
+  };
+
+  test("factory checks are authoritative and failing targeted checks are findings", () => {
+    const prompt = reviewPrompt(input);
+    expect(prompt).toContain("already run by the factory on this HEAD");
+    expect(prompt).toContain("- test `bun test`: FAIL, regressed (BLOCKING)");
+    expect(prompt).toContain("These results are authoritative");
+    expect(prompt).toContain("Do not rerun these full suites as evidence");
+    expect(prompt).toContain(
+      "A targeted check you run that fails is a finding: include the exact command and its output",
+    );
+    expect(prompt).toContain(
+      "Attribute a failure to your environment only if the same command fails identically on the base commit (base123)",
+    );
+    expect(prompt).not.toContain("the test suite");
+  });
+
+  test("implementer report is included by default and dropped in omit mode", () => {
+    for (const mode of [undefined, "include"] as const) {
+      const prompt = reviewPrompt({ ...input, implementerReportMode: mode });
+      expect(prompt).toContain("# Implementer's own report");
+      expect(prompt).toContain("IMPLEMENTER_CLAIMS_ALL_GOOD");
+    }
+    const omitted = reviewPrompt({ ...input, implementerReportMode: "omit" });
+    expect(omitted).not.toContain("Implementer's own report");
+    expect(omitted).not.toContain("IMPLEMENTER_CLAIMS_ALL_GOOD");
+    for (const kept of [
+      "# Original request",
+      "Add a farewell file",
+      "# Specification",
+      "farewell.txt exists",
+      "git diff base123..HEAD",
+      "farewell.txt | 1 +",
+      "# Automated check results",
+      "- test `bun test`: FAIL",
+    ])
+      expect(omitted).toContain(kept);
+  });
+});

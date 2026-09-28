@@ -158,6 +158,7 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
+| `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
 | `[routing] exclude_origins` | unset | For example `["CN"]`. Excludes models by checkpoint origin from eval policy generation and the Evals matrix. Runtime routing is not affected. |
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |
 | `[local] twilight_model_path`, `twilight_host`, `twilight_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
@@ -720,7 +721,7 @@ response body of the delivery in the webhook's delivery log (see [GitHub](#githu
 causes are `[owners].github` not being your login, or a repository outside that account.
 
 **The daemon exits at startup after a config change.**
-`[evals]`, `[evals.floors]`, `[routing] dependabot` and `routing/policy.json` are validated
+`[evals]`, `[evals.floors]`, `[routing] dependabot`, `[review] implementer_report` and `routing/policy.json` are validated
 strictly. The error names the key or file.
 
 **Reloading `/evals` in the browser shows "Not found".**

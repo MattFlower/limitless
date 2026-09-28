@@ -83,9 +83,11 @@ export const HoldoutSchema = z
   });
 export type Holdout = z.infer<typeof HoldoutSchema>;
 
-export const ReviewSchema = z.object({
+const reviewBase = z.object({
   verdict: z.enum(["approve", "request_changes"]),
-  summary: z.string(),
+  summary: z
+    .string()
+    .describe("What you checked and concluded; at least 40 characters when findings is empty"),
   findings: z.array(
     z.object({
       severity: z.enum(["blocker", "major", "minor", "nit"]),
@@ -99,9 +101,9 @@ export const ReviewSchema = z.object({
   ),
 });
 
-export const LaterReviewSchema = ReviewSchema.extend({
+const laterReviewBase = reviewBase.extend({
   findings: z.array(
-    ReviewSchema.shape.findings.element.extend({
+    reviewBase.shape.findings.element.extend({
       label: z
         .enum(["unaddressed", "regression", "new"])
         .describe(
@@ -115,6 +117,25 @@ export const LaterReviewSchema = ReviewSchema.extend({
     }),
   ),
 });
+
+/** Shorter than this (trimmed) with no findings, a summary is a placeholder, not a review. */
+export const MIN_REVIEW_SUMMARY = 40;
+
+// A placeholder like {"summary":"test","findings":[]} would otherwise count as an approval.
+function rejectDegenerate<T extends { summary: string; findings: unknown[] }>(
+  review: T,
+  ctx: z.RefinementCtx,
+) {
+  if (review.findings.length === 0 && review.summary.trim().length < MIN_REVIEW_SUMMARY)
+    ctx.addIssue({
+      code: "custom",
+      path: ["summary"],
+      message: `A review without findings needs a summary of at least ${MIN_REVIEW_SUMMARY} characters describing what was checked`,
+    });
+}
+
+export const ReviewSchema = reviewBase.superRefine(rejectDegenerate);
+export const LaterReviewSchema = laterReviewBase.superRefine(rejectDegenerate);
 
 export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
   findings: (z.infer<typeof ReviewSchema>["findings"][number] & {
