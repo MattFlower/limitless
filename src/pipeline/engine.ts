@@ -1114,7 +1114,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     }
     await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
     return { summary, value: undefined };
-  });
+  }, 0, false, success);
 }
 
 /**

@@ -411,6 +411,63 @@ describe("pipeline (fake agents, real git + gates)", () => {
     return { files: { "greeting.txt": "hello from both intents\nnew base\n" } };
   }
 
+  test("drain during deliver completes its nested post-merge gates", async () => {
+    const bare = await githubFixture();
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    registerGithub(f, bare);
+    const startStage = f.store.startStage.bind(f.store);
+    f.store.startStage = (...args) => {
+      const stage = startStage(...args);
+      if (args[1] === "deliver") f.scheduler.drain();
+      return stage;
+    };
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(f.store.listStages(run.id).filter((stage) => stage.name === "gates")).toHaveLength(2);
+    expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
+    expect(f.store.getRunState<RunState>(run.id)?.pendingRebaseSha).toBeUndefined();
+    expect(f.scheduler.parkedRunIds).toEqual([]);
+  });
+
+  test("needs-human draft delivery continues during drain", async () => {
+    const bare = await githubFixture();
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review")
+        return {
+          structured: {
+            verdict: "request_changes",
+            summary: "Needs work",
+            findings: [{ label: "new", severity: "blocker", security: false, file: "farewell.txt", line: 1,
+              title: "Incorrect output", detail: "Needs work", suggestion: "Fix it" }],
+          },
+        };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    f.cfg.maxRounds = 1;
+    registerGithub(f, bare);
+    const addEvent = f.store.addEvent.bind(f.store);
+    f.store.addEvent = (event) => {
+      if (event.message?.startsWith("Run needs a human")) f.scheduler.drain();
+      return addEvent(event);
+    };
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+    console.log(f.store.listEvents(run.id).slice(-8).map((e) => e.message));
+    expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
+    expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
+    expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+  }, 30_000);
+
   for (const kind of [
     "unchanged",
     "clean",
