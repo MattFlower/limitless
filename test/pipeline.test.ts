@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
-import type { RunStatus } from "../src/core/types.ts";
+import type { RunStatus, StageName } from "../src/core/types.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
@@ -410,6 +410,73 @@ describe("pipeline (fake agents, real git + gates)", () => {
     await assertUnpublished(bare);
     return { files: { "greeting.txt": "hello from both intents\nnew base\n" } };
   }
+
+  test("drain during deliver completes its nested post-merge gates", async () => {
+    const bare = await githubFixture();
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    registerGithub(f, bare);
+    const startStage = f.store.startStage.bind(f.store);
+    f.store.startStage = (...args) => {
+      const stage = startStage(...args);
+      if (args[1] === "deliver") f.scheduler.drain();
+      return stage;
+    };
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(f.store.listStages(run.id).filter((stage) => stage.name === "gates")).toHaveLength(2);
+    expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
+    expect(f.store.getRunState<RunState>(run.id)?.pendingRebaseSha).toBeUndefined();
+    expect(f.scheduler.parkedRunIds).toEqual([]);
+  });
+
+  test("needs-human draft delivery continues during drain", async () => {
+    const bare = await githubFixture();
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review")
+        return {
+          structured: {
+            verdict: "request_changes",
+            summary: "Needs work",
+            findings: [
+              {
+                label: "unaddressed",
+                prior: "P1",
+                severity: "blocker",
+                security: false,
+                file: "farewell.txt",
+                line: 1,
+                title: "Incorrect output",
+                detail: "Needs work",
+                suggestion: "Fix it",
+              },
+            ],
+          },
+        };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    f.cfg.maxRounds = 1;
+    registerGithub(f, bare);
+    const addEvent = f.store.addEvent.bind(f.store);
+    f.store.addEvent = (event) => {
+      if (event.message?.startsWith("Run needs a human")) f.scheduler.drain();
+      return addEvent(event);
+    };
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+    expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
+    expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
+    expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+  }, 30_000);
 
   for (const kind of [
     "unchanged",
@@ -1814,6 +1881,7 @@ protected_paths = ["protected.txt"]
 
   test("completed holdout survives a stopped factory and is reused after restart", async () => {
     let holdoutCalls = 0;
+    let implementations = 0;
     let blockImplement = true;
     const handler: Handler = (s) => {
       const role = roleOf(s);
@@ -1828,6 +1896,7 @@ protected_paths = ["protected.txt"]
         expect(s.prompt).toContain("H-3");
         return { structured: pass };
       }
+      implementations++;
       return blockImplement ? { delayMs: 30_000 } : { files: { "farewell.txt": "goodbye\n" } };
     };
     const f = start(handler);
@@ -1840,12 +1909,19 @@ protected_paths = ["protected.txt"]
     )
       await Bun.sleep(10);
     expect(f.store.getRunState<RunState>(run.id)?.holdoutStatus).toBe("complete");
+    f.scheduler.drain();
+    expect(f.scheduler.activeRunIds).toEqual([run.id]);
+    // Simulate a deploy deadline expiring while implement is still in flight.
     await f.stop();
+    expect(f.store.getRun(run.id)?.status).toBe("queued");
+    expect(f.store.getRunState<RunState>(run.id)?.implementedRound).toBeUndefined();
+    expect(f.store.listStages(run.id).find((s) => s.name === "implement")?.status).toBe("cancelled");
     f.store.close();
     blockImplement = false;
     const restarted = start(handler);
     expect(await waitFor(restarted, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(holdoutCalls).toBe(1);
+    expect(implementations).toBe(2);
     expect(restarted.store.getRunState<RunState>(run.id)?.holdout?.scenarios).toEqual(holdout.scenarios);
   });
 
@@ -2738,7 +2814,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
   });
 });
 
-test("drain blocks queued starts across ticks and completion without pausing active stages", async () => {
+test("drain blocks queued starts and parks the active run at its next boundary", async () => {
   let release = () => {};
   const held = new Promise<void>((resolve) => {
     release = resolve;
@@ -2780,17 +2856,20 @@ test("drain blocks queued starts across ticks and completion without pausing act
     expect(f.store.getRun(queued.id)?.status).toBe("queued");
     expect(f.store.getRun(retry.id)?.status).toBe("queued");
     release();
-    expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-    await Bun.sleep(10);
+    expect(await waitFor(f, first.id, ["queued"])).toBe("queued");
+    while (f.scheduler.activeRunIds.length) await Bun.sleep(10);
     expect(f.scheduler.activeRunIds).toEqual([]);
     expect(calls).toBe(1);
-    expect(f.store.getRunDetail(first.id)?.stages.map((s) => s.name)).toContain("review");
+    expect(f.store.getRunState<RunState>(first.id)?.parked).toBe(true);
+    expect(f.store.getRunDetail(first.id)?.stages.map((s) => s.name)).not.toContain("implement");
+    for (const run of [queued, retry, ...extra]) expect(f.store.listStages(run.id)).toEqual([]);
     f.scheduler.tick();
     expect(f.scheduler.activeRunIds).toEqual([]);
     f.scheduler.resume();
     f.scheduler.resume();
     expect(f.scheduler.activeRunIds.length).toBe(f.cfg.maxConcurrentRuns);
     expect(f.scheduler.activeRunIds.length).toBeLessThanOrEqual(f.cfg.maxConcurrentRuns);
+    expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(await waitFor(f, queued.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(await waitFor(f, retry.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     for (const run of extra) {
@@ -2805,6 +2884,227 @@ test("drain blocks queued starts across ticks and completion without pausing act
     expect(f.store.getRun(stopped.id)?.status).toBe("queued");
   } finally {
     release();
+  }
+});
+
+for (const profile of ["quick", "standard"] as const) {
+  test(`drain after implement preserves the ${profile} checkpoint and resumes at gates after restart`, async () => {
+    const holdoutDone = Promise.withResolvers<void>();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = () => {};
+    const implementing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let implementations = 0;
+    const handler: Handler = async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: profile }) };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") {
+        await holdoutDone.promise;
+        return { structured: holdout };
+      }
+      if (role === "verify") return { structured: pass };
+      if (role === "review") return { structured: approve };
+      if (role === "implement") {
+        implementations++;
+        entered();
+        await held;
+        return { files: { "farewell.txt": "goodbye\n" } };
+      }
+      throw new Error(`unexpected role ${role}`);
+    };
+    const f = start(handler);
+    try {
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile });
+      await implementing;
+      const worktree = f.store.getRunState<RunState>(run.id)?.worktreePath;
+      expect(worktree).toBeDefined();
+      f.scheduler.drain();
+      release();
+      const deadline = Date.now() + 5000;
+      while (
+        !f.store.listStages(run.id).some((s) => s.name === "implement" && s.status === "succeeded") &&
+        Date.now() < deadline
+      )
+        await Bun.sleep(10);
+      expect(f.store.listStages(run.id).find((s) => s.name === "implement")?.status).toBe("succeeded");
+      expect(f.store.listStages(run.id).some((s) => s.name === "gates")).toBe(false);
+      if (profile === "standard") expect(f.scheduler.activeRunIds).toEqual([run.id]);
+      holdoutDone.resolve();
+      expect(await waitFor(f, run.id, ["queued"])).toBe("queued");
+      while (f.scheduler.activeRunIds.length) await Bun.sleep(10);
+      const checkpoint = f.store.getRunState<RunState>(run.id);
+      expect(checkpoint).toMatchObject({ phase: "loop", round: 0, implementedRound: 0, parked: true });
+      expect(f.store.getRun(run.id)).toMatchObject({ status: "queued", stage: null, finishedAt: null });
+      const completed: StageName[] = [
+        "prepare",
+        "triage",
+        ...(profile === "standard" ? (["spec", "holdout"] as const) : []),
+        "implement",
+      ];
+      expect(f.store.listStages(run.id).map((stage) => stage.name)).toEqual(completed);
+      expect(worktree && existsSync(worktree)).toBe(true);
+      await f.stop();
+      f.store.close();
+
+      const resumed = start(handler);
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(implementations).toBe(1);
+      expect(resumed.store.listStages(run.id).map((stage) => stage.name)).toEqual([
+        ...completed,
+        "gates",
+        "audit",
+        "review",
+        ...(profile === "standard" ? (["verify"] as const) : []),
+        "deliver",
+      ]);
+      expect(resumed.store.getRunState<RunState>(run.id)).toMatchObject({
+        round: 0,
+        worktreePath: worktree,
+        parked: false,
+      });
+    } finally {
+      release();
+      holdoutDone.resolve();
+    }
+  });
+}
+
+test("drain during verification parks before delivery", async () => {
+  const f = start((s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review") return { structured: approve };
+    if (role === "verify") {
+      f.scheduler.drain();
+      return { structured: pass };
+    }
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+  expect(await waitFor(f, run.id, ["queued"])).toBe("queued");
+  expect(f.store.getRunState<RunState>(run.id)).toMatchObject({ phase: "deliver", parked: true, round: 0 });
+  expect(f.store.listStages(run.id).at(-1)).toMatchObject({ name: "verify", status: "succeeded" });
+  f.scheduler.resume();
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(f.store.listStages(run.id).filter((s) => s.name === "verify")).toHaveLength(1);
+});
+
+test("drain during review finishes the round (review and verify once) before parking", async () => {
+  let reviews = 0;
+  const f = start((s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review") {
+      reviews++;
+      f.scheduler.drain();
+      return { structured: approve };
+    }
+    if (role === "verify") return { structured: pass };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+  expect(await waitFor(f, run.id, ["queued"])).toBe("queued");
+  expect(f.store.getRunState<RunState>(run.id)).toMatchObject({ phase: "deliver", parked: true, round: 0 });
+  f.scheduler.resume();
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(reviews).toBe(1);
+  for (const name of ["gates", "review", "verify"] as const)
+    expect(f.store.listStages(run.id).filter((s) => s.name === name)).toHaveLength(1);
+});
+
+test("cancellation wins over parking when both are requested during a stage", async () => {
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let entered = () => {};
+  const implementing = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const f = start(async (s) => {
+    if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (roleOf(s) === "implement") {
+      entered();
+      await held;
+      return { files: { "farewell.txt": "goodbye\n" } };
+    }
+    return { structured: approve };
+  });
+  try {
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    await implementing;
+    f.scheduler.drain();
+    expect(f.cancelRun(run.id, "tester")).toBe(true);
+    release();
+    expect(await waitFor(f, run.id, ["cancelled"])).toBe("cancelled");
+    expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+    expect(f.scheduler.parkedRunIds).toEqual([]);
+  } finally {
+    release();
+  }
+});
+
+test("restart dispatches parked runs by priority then creation time", async () => {
+  const started: string[] = [];
+  const handler: Handler = (s) => {
+    const role = roleOf(s);
+    if (role === "triage") {
+      started.push(
+        s.prompt.includes("high old") ? "high old" : s.prompt.includes("high new") ? "high new" : "low",
+      );
+      return { structured: triage({ suggested_profile: "quick" }) };
+    }
+    if (role === "review") return { structured: approve };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  };
+  const f = start(handler);
+  f.scheduler.drain();
+  const low = await f.createRun({ repo: repoDir, prompt: "low", priority: 1, profile: "quick" });
+  await Bun.sleep(2);
+  const highOld = await f.createRun({ repo: repoDir, prompt: "high old", priority: 9, profile: "quick" });
+  await Bun.sleep(2);
+  const highNew = await f.createRun({ repo: repoDir, prompt: "high new", priority: 9, profile: "quick" });
+  for (const [run, round] of [
+    [low, 1],
+    [highOld, 2],
+    [highNew, 3],
+  ] as const) {
+    f.store.updateRun(run.id, { status: "queued" }, {
+      phase: "prepare",
+      round,
+      parked: true,
+      answers: [],
+      roundsOnImplementer: 0,
+      triedImplementers: [],
+      feedback: null,
+      toolCommands: [],
+    } satisfies RunState);
+  }
+  expect(f.scheduler.parkedRunIds).toEqual([highOld.id, highNew.id, low.id]);
+  expect(started).toEqual([]);
+  await f.stop();
+  f.store.close();
+
+  const resumed = start(handler);
+  for (const run of [low, highOld, highNew]) {
+    expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  }
+  expect(started).toEqual(["high old", "high new", "low"]);
+  for (const [run, round] of [
+    [low, 1],
+    [highOld, 2],
+    [highNew, 3],
+  ] as const) {
+    expect(resumed.store.getRunState<RunState>(run.id)).toMatchObject({ round, parked: false });
   }
 });
 

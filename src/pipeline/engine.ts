@@ -38,6 +38,7 @@ import {
   type EngineDeps,
   NeedsHumanError,
   NoCapacityError,
+  ParkedError,
   RunContext,
   type RunState,
 } from "./context.ts";
@@ -81,7 +82,12 @@ import {
 const ROUNDS_PER_IMPLEMENTER = 2;
 
 /** Execute (or resume) one run to completion. Never throws. */
-export async function executeRun(deps: EngineDeps, runId: string, signal: AbortSignal): Promise<RunStatus> {
+export async function executeRun(
+  deps: EngineDeps,
+  runId: string,
+  signal: AbortSignal,
+  isDraining: () => boolean = () => false,
+): Promise<RunStatus> {
   const run = deps.store.getRun(runId);
   if (!run) return "failed";
   const repo = deps.store.getRepo(run.repoId);
@@ -89,12 +95,17 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
     deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  const ctx = new RunContext(deps, run, repo, signal);
-  ctx.run = deps.store.updateRun(runId, {
-    status: "running",
-    error: null,
-    ...(run.startedAt ? {} : { startedAt: Date.now() }),
-  });
+  const ctx = new RunContext(deps, run, repo, signal, isDraining);
+  ctx.state.parked = false;
+  ctx.run = deps.store.updateRun(
+    runId,
+    {
+      status: "running",
+      error: null,
+      ...(run.startedAt ? {} : { startedAt: Date.now() }),
+    },
+    ctx.state,
+  );
   if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
 
   try {
@@ -137,6 +148,12 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
       deps.store.updateRun(runId, { status: "cancelled", finishedAt: Date.now() });
       ctx.log("Run cancelled", "warn");
       return "cancelled";
+    }
+    if (e instanceof ParkedError) {
+      ctx.state.parked = true;
+      ctx.run = deps.store.updateRun(runId, { status: "queued", stage: null }, ctx.state);
+      ctx.log(`Run parked at phase "${ctx.state.phase}" for deploy`);
+      return "queued";
     }
     const verifiedSha = ctx.state.lastVerifiedSha;
     const verifiedFailure =
@@ -1014,7 +1031,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
   assertExistingBranchDelivery(ctx.repo, ctx.run);
   if (ctx.run.deliveryBranch && ctx.run.baseSha !== ctx.run.sourceRef?.headSha)
     throw new Error("PR delivery base does not match the verified webhook head");
-  await ctx.stage("deliver", async () => {
+  const deliverStage = async () => {
     const cwd = ctx.state.worktreePath as string;
     if (ctx.state.conflictRound !== undefined) {
       if (!ctx.state.preRebaseHead) throw new Error("Missing pre-merge HEAD at delivery");
@@ -1158,7 +1175,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     }
     await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
     return { summary, value: undefined };
-  });
+  };
+  await ctx.stage("deliver", deliverStage, 0, false, success);
 }
 
 /**

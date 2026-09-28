@@ -47,6 +47,7 @@ export type Phase = "prepare" | "triage" | "clarify" | "spec" | "loop" | "delive
 
 /** Everything a run needs to resume after a restart. Persisted as runs.state_json. */
 export interface RunState {
+  parked?: boolean;
   flow?: "build" | "verify-change";
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
   verdictCommentPosted?: boolean;
@@ -126,6 +127,15 @@ export class CancelledError extends Error {
   }
 }
 
+/** Stages after gates within a round: a round runs through them before a drain can park it. */
+const UNPARKABLE: ReadonlySet<StageName> = new Set<StageName>(["audit", "review", "preview", "verify"]);
+
+export class ParkedError extends Error {
+  constructor() {
+    super("parked for deploy");
+  }
+}
+
 export class NeedsHumanError extends Error {}
 
 export class NoCapacityError extends Error {}
@@ -177,6 +187,7 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
 
 export class RunContext {
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
+  private foregroundStageDepth = 0;
   readonly runDir: string;
   previewUrl?: string;
   state: RunState;
@@ -194,6 +205,7 @@ export class RunContext {
     public run: Run,
     readonly repo: Repo,
     readonly signal: AbortSignal,
+    readonly isDraining: () => boolean = () => false,
   ) {
     this.runDir = join(deps.cfg.paths.runs, run.id);
     mkdirSync(this.runDir, { recursive: true });
@@ -286,10 +298,17 @@ export class RunContext {
     fn: (stage: Stage) => Promise<{ summary: string; value: T }>,
     round = 0,
     background = false,
+    parkOnDrain = true,
   ): Promise<T> {
     this.checkCancelled();
+    // Resume skips only whole implement rounds, so parking between gates and the end of a round
+    // would re-run gates and a paid review (and spend verify's environment retry).
+    if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
+      throw new ParkedError();
     if (!background) this.run = this.store.updateRun(this.run.id, { stage: name });
     const stage = this.store.startStage(this.run.id, name, round);
+    // Parallel holdout work must not suppress foreground drain boundaries.
+    if (!background) this.foregroundStageDepth++;
     try {
       const { summary, value } = await fn(stage);
       this.store.finishStage(stage.id, "succeeded", summary);
@@ -302,6 +321,8 @@ export class RunContext {
         (e as Error).message.slice(0, 500),
       );
       throw cancelled ? new CancelledError() : e;
+    } finally {
+      if (!background) this.foregroundStageDepth--;
     }
   }
 

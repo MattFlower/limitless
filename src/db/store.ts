@@ -905,6 +905,16 @@ export class Store {
     ).map(toRun);
   }
 
+  parkedRunIds(): string[] {
+    return (
+      this.db
+        .query(
+          "SELECT id FROM runs WHERE status = 'queued' AND json_extract(state_json, '$.parked') = 1 ORDER BY priority DESC, created_at ASC",
+        )
+        .all() as { id: string }[]
+    ).map((row) => row.id);
+  }
+
   /** Optional state is checkpointed atomically with the run's SHAs and other fields. */
   updateRun(id: string, patch: RunPatch, state?: unknown): Run {
     const { sets, values } = buildUpdate(patch, RUN_PATCH_COLUMNS);

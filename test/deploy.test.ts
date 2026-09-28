@@ -137,6 +137,45 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
   expect(f.calls.slice(-3)).toEqual(["health", "restart", "health"]);
 });
 
+test("deploy waits for three current stages, not the queued work after them", async () => {
+  const f = setup();
+  const health = f.client.health;
+  f.client.health = async (signal) => {
+    const elapsed = f.clock.now();
+    const stages = [
+      { id: "a", endsAt: 5000 },
+      { id: "b", endsAt: 10_000 },
+      { id: "c", endsAt: 15_000 },
+    ];
+    return {
+      ...(await health(signal)),
+      active: stages.filter((stage) => elapsed < stage.endsAt).map((stage) => stage.id),
+      parked: stages.filter((stage) => elapsed >= stage.endsAt).map((stage) => stage.id),
+    };
+  };
+  f.client.run = async () => ({ stage: "implement" });
+  await deploy(7400, "feature", false, { ...f.opts, maxWaitMs: 60_000 });
+  expect(f.clock.now()).toBe(15_000);
+  expect(f.logs).toContain("Drain complete: no active runs (15s elapsed)");
+  expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
+  expect(f.sleeps).toEqual([5000, 5000, 5000]);
+});
+
+test("max-wait still restarts with an unfinished current stage", async () => {
+  const f = setup();
+  const health = f.client.health;
+  f.client.health = async (signal) => ({
+    ...(await health(signal)),
+    active: ["slow-stage"],
+    parked: ["completed-stage"],
+  });
+  f.client.run = async () => ({ stage: "implement" });
+  await deploy(7400, "feature", false, { ...f.opts, maxWaitMs: 5000 });
+  expect(f.sleeps).toEqual([5000]);
+  expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
+  expect(f.logs).toContain("Drain timeout after 5s; restarting with active runs: slow-stage (implement)");
+});
+
 test("drain progress includes every stage once per changed poll, regardless of health order", async () => {
   const f = setup();
   f.client.health = async () => {
