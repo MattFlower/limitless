@@ -243,6 +243,7 @@ subscription_weight = 0.25
 
 [evals.floors]
 triage_pass_rate = 0.60
+implement_pass_rate = 0.60   # per complexity cell (trivial/small/medium); needs roughly k>=3 on 12 cases to clear
 triage_risk_under_call_rate = 0.10
 review_defect_recall = 0.50
 review_clean_false_block_rate = 0.50

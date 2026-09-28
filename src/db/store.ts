@@ -127,6 +127,8 @@ const toRun = (r: Row): Run => ({
   headSha: (r.head_sha as string) ?? null,
   prUrl: (r.pr_url as string) ?? null,
   merged: Boolean(r.merged),
+  mergedBy: (r.merged_by as string) ?? null,
+  mergedAt: (r.merged_at as number) ?? null,
   costUsd: r.cost_usd as number,
   costEquivUsd: r.cost_equiv_usd as number,
   tokensIn: r.tokens_in as number,
@@ -208,6 +210,8 @@ export interface RunPatch {
   headSha?: string;
   prUrl?: string;
   merged?: boolean;
+  mergedBy?: string | null;
+  mergedAt?: number | null;
   error?: string | null;
   startedAt?: number;
   finishedAt?: number | null;
@@ -226,6 +230,8 @@ const RUN_PATCH_COLUMNS: Record<keyof RunPatch, string> = {
   headSha: "head_sha",
   prUrl: "pr_url",
   merged: "merged",
+  mergedBy: "merged_by",
+  mergedAt: "merged_at",
   error: "error",
   startedAt: "started_at",
   finishedAt: "finished_at",
@@ -806,7 +812,7 @@ export class Store {
     return (
       this.db
         .query(
-          `${RUN_SELECT} WHERE runs.status IN ('succeeded','failed','cancelled','needs_human') AND runs.finished_at IS NOT NULL ORDER BY runs.finished_at, runs.id`,
+          `${RUN_SELECT} WHERE runs.status IN ('succeeded','failed','cancelled','needs_human','resolved') AND runs.finished_at IS NOT NULL ORDER BY runs.finished_at, runs.id`,
         )
         .all() as Row[]
     ).map(toRun);
@@ -835,6 +841,27 @@ export class Store {
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });
     return run;
+  }
+
+  /** Resolve once after GitHub confirms a merge; keep the original terminal evidence. */
+  resolveMergedRun(id: string, mergedBy: string | null, mergedAt: number): boolean {
+    return this.chatTransaction(() => {
+      const changed = this.db
+        .query(
+          "UPDATE runs SET status = 'resolved', merged = 1, merged_by = ?, merged_at = ? WHERE id = ? AND status = 'needs_human' AND pr_url IS NOT NULL",
+        )
+        .run(mergedBy, mergedAt, id).changes;
+      if (!changed) return false;
+      this.addEvent({
+        runId: id,
+        type: "status",
+        message: `Run moved from needs_human to resolved after PR merged by ${mergedBy ?? "unknown"}`,
+        data: { from: "needs_human", to: "resolved", mergedBy, mergedAt },
+      });
+      const run = this.getRun(id);
+      if (run) this.publish({ kind: "run", run });
+      return true;
+    });
   }
 
   /** Recompute run totals from its invocations. */

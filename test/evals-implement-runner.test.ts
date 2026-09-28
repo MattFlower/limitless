@@ -269,6 +269,11 @@ test("implement invokes once in edit mode with shared prompt, isolates head/hidd
       expect((await f.run({ models: ["candidate-a@high"] })).summaries[0]?.cached).toBe(0);
     }
     const data = f.factory.evalPolicy();
+    const small = data.evaluation.roles.find((r) => r.role === "implement" && r.cell === "small");
+    expect(small?.candidates).toHaveLength(2);
+    expect(small?.candidates.every((c) => c.reasons.some((reason) => reason.includes("below floor")))).toBe(
+      true,
+    );
     expect(data.evaluation.generated.implement).toBeUndefined();
     expect(
       evalMatrix(data)

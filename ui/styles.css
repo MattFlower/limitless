@@ -447,7 +447,8 @@ p {
 .pill-running::before {
   animation: pulse 1.6s ease-in-out infinite;
 }
-.pill-succeeded {
+.pill-succeeded,
+.pill-resolved {
   color: var(--success);
   background: var(--success-bg);
   border-color: var(--success-dim);

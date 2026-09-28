@@ -6,6 +6,8 @@ import type { EvalSettings } from "./settings.ts";
 import { completeCases, pairedBootstrap, summarize, wilson } from "./stats.ts";
 
 export const EVAL_ROLES = ["triage", "review", "verify"] as const;
+const IMPLEMENT_COMPLEXITIES = ["trivial", "small", "medium"] as const;
+type ImplementComplexity = (typeof IMPLEMENT_COMPLEXITIES)[number];
 export interface Evidence {
   run: EvalRun;
   trials: EvalTrial[];
@@ -16,6 +18,17 @@ export interface PolicyInput {
   providers: ProviderDef[];
   settings: EvalSettings;
   evalIds?: string[];
+  /** B1 paired recovery comparison, when available from the escalation eval. */
+  escalation?: {
+    complexity: ImplementComplexity;
+    low: string;
+    high: string;
+    switch: string;
+    pairedCases: number;
+    lowerBound: number;
+    effortCost: number;
+    switchCost: number;
+  }[];
 }
 const compareId = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 /** Newest completed evidence independently for each role/model; explicit IDs are fail-closed. */
@@ -28,7 +41,7 @@ export function selectEvidence(evidence: Evidence[], ids?: string[]) {
       if (entry.run.status !== "completed") throw new Error(`Eval ${id} is not completed`);
     }
   }
-  const selected = new Map<string, Evidence & { modelId: string }>();
+  const selected = new Map<string, Evidence & { modelId: string; complexity?: ImplementComplexity }>();
   const ordered = evidence
     .filter((e) => e.run.status === "completed" && (!ids || ids.includes(e.run.id)))
     .sort(
@@ -37,18 +50,29 @@ export function selectEvidence(evidence: Evidence[], ids?: string[]) {
         b.run.createdAt - a.run.createdAt ||
         compareId(b.run.id, a.run.id),
     );
-  for (const entry of ordered)
-    for (const modelId of [
-      ...new Set([
-        ...entry.trials.map(evidenceTarget),
-        ...entry.run.models.filter((id) => !entry.trials.some((t) => recordedTarget(t) === id)),
-      ]),
-    ]) {
-      const key = `${entry.run.role}:${modelId}`;
-      if (!selected.has(key)) selected.set(key, { ...entry, modelId });
+  for (const entry of ordered) {
+    const scopes = entry.run.role === "implement" ? IMPLEMENT_COMPLEXITIES : [undefined];
+    for (const complexity of scopes) {
+      const trials = complexity
+        ? entry.trials.filter((t) => t.details.complexity === complexity)
+        : entry.trials;
+      const targets = complexity
+        ? trials.map(evidenceTarget)
+        : [
+            ...trials.map(evidenceTarget),
+            ...entry.run.models.filter((id) => !trials.some((t) => recordedTarget(t) === id)),
+          ];
+      for (const modelId of new Set(targets)) {
+        const key = `${entry.run.role}:${complexity ?? "default"}:${modelId}`;
+        if (!selected.has(key)) selected.set(key, { ...entry, trials, modelId, complexity });
+      }
     }
+  }
   return [...selected.values()].sort(
-    (a, b) => compareId(a.run.role, b.run.role) || compareId(a.modelId, b.modelId),
+    (a, b) =>
+      compareId(a.run.role, b.run.role) ||
+      compareId(a.complexity ?? "", b.complexity ?? "") ||
+      compareId(a.modelId, b.modelId),
   );
 }
 /**
@@ -83,9 +107,12 @@ function metric(
 export function generatePolicy(input: PolicyInput) {
   const { models, providers, settings } = input;
   const selected = selectEvidence(input.evidence, input.evalIds);
-  const roles = EVAL_ROLES.map((role) => {
+  const roles = [
+    ...EVAL_ROLES.map((role) => ({ role, cell: "default" as const })),
+    ...IMPLEMENT_COMPLEXITIES.map((cell) => ({ role: "implement" as const, cell })),
+  ].map(({ role, cell }) => {
     const entries = selected
-      .filter((e) => e.run.role === role)
+      .filter((e) => e.run.role === role && (e.complexity ?? "default") === cell)
       .map((entry) => {
         const rows = entry.trials.filter((t) => evidenceTarget(t) === entry.modelId);
         const summary = summarize({ ...entry.run, models: [entry.modelId] }, rows)[0];
@@ -101,6 +128,16 @@ export function generatePolicy(input: PolicyInput) {
             model.baseOrigin === "unknown");
         const reasons: string[] = [];
         if (!model || !provider) reasons.push("catalog/provider metadata unavailable");
+        const mismatchedProviders = [
+          ...new Set(
+            rows
+              .map((t) => t.details.provider)
+              .filter((id) => id !== undefined && model && id !== model.provider),
+          ),
+        ];
+        for (const id of mismatchedProviders)
+          reasons.push(`recorded provider ${id} differs from catalog provider ${model?.provider}`);
+        const providerMismatch = mismatchedProviders.length > 0;
         if (excluded) reasons.push(`origin excluded (${model?.origin}; baseOrigin=${model?.baseOrigin})`);
         // Without trials only the saved reference exists, and metrics already mark it insufficient.
         const recordedEffort = rows.length
@@ -121,58 +158,63 @@ export function generatePolicy(input: PolicyInput) {
                     provider,
                   );
         if (effortProblem) reasons.push(effortProblem);
-        const referenceAllowed = Boolean(model && provider && !excluded && !effortProblem);
+        const referenceAllowed = Boolean(
+          model && provider && !providerMismatch && !excluded && !effortProblem,
+        );
         const f = settings.floors;
         const passMetric = metric(
           "pass rate",
           summary.passes,
           summary.evaluatedTrials,
           "lower",
-          f.triage_pass_rate,
+          role === "implement" ? f.implement_pass_rate : f.triage_pass_rate,
         );
         const metrics =
-          role === "triage"
-            ? [
-                passMetric,
-                metric(
-                  "risk under-call",
-                  rows.filter((t) => t.details.grade?.riskUnderCall === true).length,
-                  summary.riskDenominator,
-                  "upper",
-                  f.triage_risk_under_call_rate,
-                ),
-              ]
-            : role === "review"
+          role === "implement"
+            ? [passMetric]
+            : role === "triage"
               ? [
+                  passMetric,
                   metric(
-                    "defect recall",
-                    summary.review?.defectRecall.numerator ?? 0,
-                    summary.review?.defectRecall.denominator ?? 0,
-                    "lower",
-                    f.review_defect_recall,
-                  ),
-                  metric(
-                    "clean false-block",
-                    summary.review?.falseBlock.numerator ?? 0,
-                    summary.review?.falseBlock.denominator ?? 0,
+                    "risk under-call",
+                    rows.filter((t) => t.details.grade?.riskUnderCall === true).length,
+                    summary.riskDenominator,
                     "upper",
-                    f.review_clean_false_block_rate,
+                    f.triage_risk_under_call_rate,
                   ),
                 ]
-              : [
-                  metric(
-                    "false-accept",
-                    summary.verify?.falseAccept.numerator ?? 0,
-                    summary.verify?.falseAccept.denominator ?? 0,
-                    "upper",
-                    f.verify_false_accept_rate,
-                  ),
-                ];
+              : role === "review"
+                ? [
+                    metric(
+                      "defect recall",
+                      summary.review?.defectRecall.numerator ?? 0,
+                      summary.review?.defectRecall.denominator ?? 0,
+                      "lower",
+                      f.review_defect_recall,
+                    ),
+                    metric(
+                      "clean false-block",
+                      summary.review?.falseBlock.numerator ?? 0,
+                      summary.review?.falseBlock.denominator ?? 0,
+                      "upper",
+                      f.review_clean_false_block_rate,
+                    ),
+                  ]
+                : [
+                    metric(
+                      "false-accept",
+                      summary.verify?.falseAccept.numerator ?? 0,
+                      summary.verify?.falseAccept.denominator ?? 0,
+                      "upper",
+                      f.verify_false_accept_rate,
+                    ),
+                  ];
         for (const m of metrics) if (m.reason) reasons.push(m.reason);
         const attempts = rows.filter(
           (t) => ["ok", "error"].includes(t.status) && !t.details.preparationFailed,
         );
         const costs = attempts.map((t) => {
+          if (providerMismatch) return null;
           if (provider?.billing === "free") return 0;
           const source = t.details.cache ?? t;
           const value =
@@ -197,7 +239,7 @@ export function generatePolicy(input: PolicyInput) {
           referenceAllowed,
           costPerCase,
           costDenominator: attempts.length,
-          billing: provider?.billing ?? null,
+          billing: providerMismatch ? null : (provider?.billing ?? null),
           complete: completeCases(rows, entry.run.k),
         };
       });
@@ -219,8 +261,8 @@ export function generatePolicy(input: PolicyInput) {
         bestCompleteCases: best?.complete.size ?? 0,
         ...pairedBootstrap(differences, { delta: settings.delta }),
       };
-      // Only metadata-less or origin-excluded candidates are barred from being the reference; when
-      // every candidate is barred there is no reference, and that says nothing about paired coverage.
+      // Incompatible metadata bars a candidate from being the reference. When every candidate is
+      // barred there is no reference, and that says nothing about paired coverage.
       if (comparison.nonInferior === null) {
         if (referenceAllowed || best) entry.reasons.push("insufficient evidence: no complete paired cases");
       } else if (!comparison.nonInferior) entry.reasons.push("non-inferiority not established");
@@ -248,6 +290,53 @@ export function generatePolicy(input: PolicyInput) {
           compareId(a.modelId, b.modelId),
       )
       .map((c) => c.modelId);
+    const escalation: string[] = [];
+    const escalationRejections: string[] = [];
+    if (role === "implement")
+      for (const result of input.escalation ?? []) {
+        if (
+          result.complexity !== cell ||
+          result.pairedCases < 1 ||
+          !Number.isFinite(result.lowerBound) ||
+          result.lowerBound <= 0 ||
+          !Number.isFinite(result.effortCost) ||
+          !Number.isFinite(result.switchCost)
+        )
+          continue;
+        const low = order.indexOf(result.low);
+        const high = order.indexOf(result.high);
+        const next = order.indexOf(result.switch);
+        const efforts = ["none", "low", "medium", "high", "xhigh", "max"];
+        const lowEffort = efforts.indexOf(parseTarget(result.low).effort ?? "");
+        const highEffort = efforts.indexOf(parseTarget(result.high).effort ?? "");
+        if (
+          low < 0 ||
+          high < 0 ||
+          next < 0 ||
+          low === high ||
+          result.switch === result.low ||
+          result.switch === result.high ||
+          lowEffort < 0 ||
+          highEffort <= lowEffort ||
+          result.low.split("@")[0] !== result.high.split("@")[0]
+        )
+          continue;
+        if (result.effortCost > result.switchCost) {
+          escalationRejections.push(
+            `${result.low} → ${result.high} before ${result.switch} withheld: effort cost=${result.effortCost.toFixed(4)} exceeds switch cost=${result.switchCost.toFixed(4)} despite significant B1 recovery (lower=${result.lowerBound.toFixed(4)}, paired=${result.pairedCases}).`,
+          );
+          continue;
+        }
+        if (low > next) {
+          order.splice(low, 1);
+          order.splice(order.indexOf(result.switch), 0, result.low);
+        }
+        order.splice(order.indexOf(result.high), 1);
+        order.splice(order.indexOf(result.low) + 1, 0, result.high);
+        escalation.push(
+          `${result.low} → ${result.high} before ${result.switch}: B1 recovery lower=${result.lowerBound.toFixed(4)}, paired=${result.pairedCases}, effort cost=${result.effortCost.toFixed(4)} ≤ switch cost=${result.switchCost.toFixed(4)}`,
+        );
+      }
     // Availability: eligible candidates often share a provider, so one outage takes the whole cell
     // down. For each provider the chain doesn't use yet, append its cheapest candidate that clears
     // every floor and ceiling and fails only non-inferiority — worse beats no capacity.
@@ -276,18 +365,21 @@ export function generatePolicy(input: PolicyInput) {
     order.push(...availability);
     return {
       role,
+      cell,
       candidates,
       order,
       availabilityFallbacks: availability,
+      escalation,
+      escalationRejections,
       decision: order.length
-        ? `Update ${role}.default: ${order.join(" → ")}${availability.length ? ` (availability fallbacks on other providers, clearing every floor but not non-inferior: ${availability.join(", ")})` : ""}`
+        ? `Update ${role}.${cell}: ${order.join(" → ")}${availability.length ? ` (availability fallbacks on other providers, clearing every floor but not non-inferior: ${availability.join(", ")})` : ""}${escalation.length ? ` (effort recovery: ${escalation.join("; ")})` : ""}`
         : candidates.length
-          ? `${role} unchanged: no eligible models (${candidates.map((c) => `${c.modelId}: ${c.reasons.join("; ")}`).join(" | ")})`
-          : `${role} unchanged: no completed evidence`,
+          ? `${role}${cell === "default" ? "" : `.${cell}`} unchanged: no eligible models (${candidates.map((c) => `${c.modelId}: ${c.reasons.join("; ")}`).join(" | ")})`
+          : `${role}${cell === "default" ? "" : `.${cell}`} unchanged: no completed evidence`,
     };
   });
   const generated: PolicyOverlay = {};
-  for (const r of roles) if (r.order.length) generated[r.role] = { default: r.order };
+  for (const r of roles) if (r.order.length) generated[r.role] = { ...generated[r.role], [r.cell]: r.order };
   return { roles, generated, settings };
 }
 export type PolicyEvaluation = ReturnType<typeof generatePolicy>;

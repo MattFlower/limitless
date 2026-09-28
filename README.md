@@ -90,6 +90,10 @@ max_concurrent_gates = 2  # gate suites running at once; default: CPU cores / 4
 max_rounds = 3
 openrouter_budget_usd = 50
 
+# Optional per-provider request slots (defaults remain in the catalog).
+[providers.claude]
+max_concurrent = 5
+
 [retention]
 worktree_days = 3
 failed_worktree_days = 7

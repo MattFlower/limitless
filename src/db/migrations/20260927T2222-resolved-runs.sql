@@ -1,0 +1,2 @@
+ALTER TABLE runs ADD COLUMN merged_by TEXT;
+ALTER TABLE runs ADD COLUMN merged_at INTEGER;
