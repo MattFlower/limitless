@@ -722,3 +722,56 @@ test("router skips effort targets whose harness cannot carry effort for the role
   // Without an HTTP endpoint even tool-less roles run through the Claude CLI.
   expect(routing.route("triage", "medium").candidates).toEqual([]);
 });
+
+test("oMLX catalog targets and authenticated health gate routing", async () => {
+  let calls = 0,
+    status = 200;
+  const probe = (async (url, init) => {
+    calls++;
+    expect(String(url)).toBe("http://127.0.0.1:8989/v1/models");
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer key");
+    if (!status) throw new Error("offline");
+    return new Response("", { status });
+  }) as typeof fetch;
+  const defs = PROVIDERS.filter((p) => ["omlx", "claude", "codex"].includes(p.id));
+  const trackerFor = (secrets: Record<string, string>) =>
+    new ProviderTracker(defs, store, reserves, secrets, {}, Date.now, probe, undefined, probe);
+  const tracker = trackerFor({ OMLX_API_KEY: "key" });
+  const router = new Router(tracker);
+  for (const effort of [undefined, "none", "high"] as const) {
+    const resolved = router.resolve(`omlx/qwen-27b${effort ? `@${effort}` : ""}`);
+    expect(resolved.model).toMatchObject({
+      model: "Swift-1.5-Qwen3.8-27b-oQ8e-mtp",
+      vendor: "qwen",
+      origin: "CN",
+      baseOrigin: "CN",
+      tier: 2,
+      supportedEfforts: ["none", "high"],
+      price: { input: 0, output: 0 },
+    });
+    expect(router.toTarget(resolved.model, resolved.effort)).toMatchObject({
+      provider: "omlx",
+      harness: "claude",
+      effortMapping: "qwen",
+      backend: { baseUrl: "http://127.0.0.1:8989", authToken: "key" },
+      openai: { baseUrl: "http://127.0.0.1:8989/v1", authToken: "key" },
+    });
+    expect(resolved.effort).toBe(effort);
+  }
+  expect(router.resolve("mtplx/qwen-27b").model.provider).toBe("mtplx");
+  expect(() => router.resolve("omlx/qwen-27b@low")).toThrow("Unsupported effort");
+  for (status of [200, 401, 503, 0]) {
+    await tracker.probe();
+    expect(tracker.isAvailable("omlx")).toBe(status === 200);
+    expect(router.route("triage", "small").candidates[0]?.provider === "omlx").toBe(status === 200);
+  }
+  expect(calls).toBe(4);
+  const missing = trackerFor({});
+  await missing.probe();
+  expect(missing.unavailableReason("omlx")).toBe("missing OMLX_API_KEY");
+  store.setProviderEnabledOverride("omlx", false);
+  const disabled = trackerFor({ OMLX_API_KEY: "key" });
+  await disabled.probe();
+  expect(disabled.unavailableReason("omlx")).toBe("disabled");
+  expect(calls).toBe(4);
+});

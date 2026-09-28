@@ -194,6 +194,8 @@ test("policy rejects efforts the role's harness cannot deliver", () => {
   for (const [role, reference] of [
     ["review", "openrouter/gpt-6-luna@low"],
     ["implement", "mtplx/qwen-27b@none"],
+    ["implement", "omlx/qwen-27b@none"],
+    ["review", "omlx/qwen-27b@high"],
     ["verify", "twilight/qwen-27b@high|claude/opus"],
   ] as const)
     expect(() => validatePolicy({ [role]: { default: [reference] } }, MODELS)).toThrow("cannot carry effort");
@@ -201,8 +203,23 @@ test("policy rejects efforts the role's harness cannot deliver", () => {
   for (const [role, reference] of [
     ["triage", "openrouter/gpt-6-luna@low"],
     ["chat", "mtplx/qwen-27b@none"],
+    ["chat", "omlx/qwen-27b@none"],
+    ["triage", "omlx/qwen-27b@high"],
+    ["implement", "omlx/qwen-27b"],
     ["summarize", "twilight/qwen-27b@high"],
     ["review", "openrouter/gpt-6-luna"],
   ] as const)
     expect(validatePolicy({ [role]: { default: [reference] } }, MODELS)[role]?.default).toEqual([reference]);
+});
+
+test("built-in local defaults preserve fallback order", () => {
+  for (const role of ["triage", "summarize", "chat"] as const)
+    expect(DEFAULT_POLICY[role].default).toEqual([
+      "omlx/qwen-27b",
+      "claude/haiku|codex/luna",
+      ...(role === "chat" ? [] : ["openrouter/glm-5.3-flash"]),
+    ]);
+  expect(() => validatePolicy({ triage: { default: ["omlx/qwen-27b@low"] } }, MODELS)).toThrow(
+    "Unsupported effort",
+  );
 });
