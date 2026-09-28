@@ -187,8 +187,9 @@ export async function liveCheck(
         mode: kind === "edit" ? "edit" : "readonly",
         ...(kind === "structured" ? { jsonSchema: schema } : {}),
         ...(kind === "noTools" ? { noTools: true } : {}),
-        timeoutMs: 60_000,
-        idleTimeoutMs: 25_000,
+        // A local model's first agent call prefills the CLI's large system prompt on a cold cache.
+        timeoutMs: target.billing === "free" ? 300_000 : 60_000,
+        idleTimeoutMs: target.billing === "free" ? 120_000 : 25_000,
         maxToolCalls: 8,
         signal: new AbortController().signal,
         logPath: join(cwd, "stream.log"),
