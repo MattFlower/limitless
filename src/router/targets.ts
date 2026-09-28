@@ -2,6 +2,8 @@ import type { Effort, ModelSelection, RecordedEffort, Role } from "../core/types
 import { TOOL_LESS_ROLES } from "../harness/select.ts";
 import type { ModelDef, ProviderDef } from "./catalog.ts";
 
+export const EFFORT_LEVELS: Effort[] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 export function parseTarget(reference: string): { modelId: string; effort?: string } {
   if (!reference) throw new Error("empty model ID: expected model or model@effort");
   if (reference.trim() !== reference)

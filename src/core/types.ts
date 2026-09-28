@@ -434,6 +434,7 @@ export interface EvalTrial {
   pass: boolean | null;
   score: number | null;
   details: {
+    switchChain?: (ModelSelection & { tier: number })[];
     rounds?: EvalRound[];
     roundsUsed?: number;
     stopReason?: string;
@@ -463,6 +464,8 @@ export interface EvalTrial {
 }
 
 export interface EvalRound {
+  harness?: string;
+  resumeFailed?: boolean;
   provider?: string;
   round: number;
   modelId: string;

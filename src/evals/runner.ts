@@ -67,7 +67,20 @@ export class EvalRunner {
             output: null,
             pass: null,
             score: null,
-            details: "hidden" in item ? { complexity: item.complexity } : {},
+            details:
+              "hidden" in item
+                ? {
+                    complexity: item.complexity,
+                    ...(request.strategy === "switch"
+                      ? {
+                          switchChain: this.deps.router
+                            .policyTargets("implement", item.complexity)
+                            .sort((a, b) => a.tier - b.tier)
+                            .filter((target, i, targets) => i === 0 || target.tier !== targets[i - 1]?.tier),
+                        }
+                      : {}),
+                  }
+                : {},
             costUsd: 0,
             costEquivUsd: 0,
             tokensIn: 0,
@@ -207,13 +220,12 @@ export class EvalRunner {
         Object.assign(last, { status: signal.aborted ? "cancelled" : "error", reason, durationMs: elapsed });
       }
     };
-    const skip = (reason: string) => {
-      interruptRound(reason);
+    const skip = (reason: string, preserveRound = false) => {
+      if (!preserveRound) interruptRound(reason);
       const interrupted = rounds > 1 && (trial.details.roundsUsed ?? 0) > 0;
       store.recordEvalTrial({
         ...trial,
         status: interrupted ? "error" : "skipped",
-        ...(interrupted ? { pass: false, score: 0 } : {}),
         details: {
           ...trial.details,
           ...("hidden" in item ? { roundsUsed: trial.details.roundsUsed ?? 0, stopReason: reason } : {}),
@@ -222,7 +234,7 @@ export class EvalRunner {
             ? {
                 interrupted: true,
                 stopReason: reason,
-                grade: failedImplement("error", reason),
+                grade: trial.details.grade ?? failedImplement("error", reason),
               }
             : {}),
         },
@@ -319,7 +331,9 @@ export class EvalRunner {
         FACTORY_PREAMBLE,
         jsonSchema ?? {},
         trial.trial,
-        rounds > 1 ? { ...repository, rounds, strategy } : repository,
+        rounds > 1
+          ? { ...repository, rounds, strategy, version: 2, switchChain: trial.details.switchChain }
+          : repository,
         trial.effort,
       );
       if (signal.aborted) return skip("daemon shutdown");
@@ -334,6 +348,7 @@ export class EvalRunner {
           store.recordEvalTrial({
             ...trial,
             status: "ok",
+            harness: source.harness,
             output: output.data,
             pass: grade.pass,
             score: grade.score,
@@ -364,7 +379,8 @@ export class EvalRunner {
         const harness = harnesses[harnessName];
         if (!harness) return skip(`No harness registered for ${harnessName}`);
         const reason = eligible();
-        if (reason) return skip(reason);
+        if (reason)
+          return skip(strategy === "switch" && round > 0 ? `Switch target unavailable: ${reason}` : reason);
         release = await tracker.acquire(target.provider, signal);
         if (signal.aborted) return skip("daemon shutdown");
         if (budget()) return skip("eval budget exhausted");
@@ -372,78 +388,92 @@ export class EvalRunner {
         if (afterWait) return skip(afterWait);
         if (round === 0) trial.createdAt = Date.now();
         roundStarted = Date.now();
+        trial.harness = harnessName;
         store.recordEvalTrial({ ...trial, status: "running" });
         let result: AgentResult;
-        try {
-          const logPath = join(directory, "trial.log");
-          const invoke = (scratchDir?: string) =>
-            harness({
-              scratchDir,
-              ...(sessionId ? { resumeSessionId: sessionId } : {}),
-              cwd,
-              prompt,
-              systemAppend: FACTORY_PREAMBLE,
-              target,
-              mode: "hidden" in item ? "edit" : "readonly",
-              noTools,
-              jsonSchema,
-              schema,
-              timeoutMs,
-              privateSession: run.role === "verify",
-              idleTimeoutMs: 10 * 60_000,
-              maxToolCalls: "hidden" in item ? 400 : 150,
-              signal,
-              logPath,
-              onEvent: (event) => {
-                if (
-                  event.type === "tool_call" &&
-                  event.input &&
-                  typeof event.input === "object" &&
-                  "command" in event.input &&
-                  typeof event.input.command === "string"
-                )
-                  toolCommands.push(event.input.command);
-                if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
-              },
-            });
-          result = noTools
-            ? await invoke()
-            : scratch
-              ? await invoke(scratch)
-              : await withScratch(cwd, invoke);
-        } catch (error) {
-          result = {
-            status: signal.aborted ? "cancelled" : "error",
-            finalText: "",
-            structured: null,
-            sessionId: null,
-            usage: emptyUsage(),
-            numTurns: 0,
-            costUsd: 0,
-            costEquivUsd: 0,
-            error: (error as Error).message,
-            quota: null,
-          };
+        let resumeFailed = false;
+        const before = { ...trial };
+        for (let attempt = 0; ; attempt++) {
+          try {
+            const logPath = join(directory, "trial.log");
+            const invoke = (scratchDir?: string) =>
+              harness({
+                scratchDir,
+                ...(sessionId ? { resumeSessionId: sessionId } : {}),
+                cwd,
+                prompt,
+                systemAppend: FACTORY_PREAMBLE,
+                target,
+                mode: "hidden" in item ? "edit" : "readonly",
+                noTools,
+                jsonSchema,
+                schema,
+                timeoutMs,
+                privateSession: run.role === "verify",
+                idleTimeoutMs: 10 * 60_000,
+                maxToolCalls: "hidden" in item ? 400 : 150,
+                signal,
+                logPath,
+                onEvent: (event) => {
+                  if (
+                    event.type === "tool_call" &&
+                    event.input &&
+                    typeof event.input === "object" &&
+                    "command" in event.input &&
+                    typeof event.input.command === "string"
+                  )
+                    toolCommands.push(event.input.command);
+                  if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
+                },
+              });
+            result = noTools
+              ? await invoke()
+              : scratch
+                ? await invoke(scratch)
+                : await withScratch(cwd, invoke);
+          } catch (error) {
+            result = {
+              status: signal.aborted ? "cancelled" : "error",
+              finalText: "",
+              structured: null,
+              sessionId: null,
+              usage: emptyUsage(),
+              numTurns: 0,
+              costUsd: 0,
+              costEquivUsd: 0,
+              error: (error as Error).message,
+              quota: null,
+            };
+          }
+          trial.costUsd += result.costUsd;
+          trial.costEquivUsd += result.costEquivUsd;
+          trial.tokensIn += result.usage.input + result.usage.cacheRead + result.usage.cacheWrite;
+          trial.tokensOut += result.usage.output;
+          if (sessionId && attempt === 0 && result.status === "error" && !signal.aborted) {
+            resumeFailed = true;
+            sessionId = undefined;
+            store.recordEvalTrial({ ...trial, status: "running" });
+            if (!budget()) continue;
+          }
+          break;
         }
         release?.();
         release = undefined;
-        trial.costUsd += result.costUsd;
-        trial.costEquivUsd += result.costEquivUsd;
-        trial.tokensIn += result.usage.input + result.usage.cacheRead + result.usage.cacheWrite;
-        trial.tokensOut += result.usage.output;
         trial.output = "hidden" in item ? result.finalText : result.structured;
         const roundEvidence = {
           round,
+          harness: harnessName,
+          resumeFailed,
           provider: target.provider,
           modelId: target.modelId,
           effort: recordEffort(target.effort),
           status: result.status,
           pass: null as boolean | null,
           reason: result.error,
-          costUsd: result.costUsd,
-          costEquivUsd: result.costEquivUsd,
-          tokensIn: result.usage.input + result.usage.cacheRead + result.usage.cacheWrite,
-          tokensOut: result.usage.output,
+          costUsd: trial.costUsd - before.costUsd,
+          costEquivUsd: trial.costEquivUsd - before.costEquivUsd,
+          tokensIn: trial.tokensIn - before.tokensIn,
+          tokensOut: trial.tokensOut - before.tokensOut,
           durationMs: Date.now() - roundStarted,
         };
         if ("hidden" in item) {
@@ -471,16 +501,34 @@ export class EvalRunner {
         const grade =
           "hidden" in item && implementation
             ? result.status === "ok"
-              ? await gradeImplement(item, cwd, hidden, implementation, toolCommands, signal, rounds > 1)
+              ? await gradeImplement(
+                  item,
+                  cwd,
+                  hidden,
+                  implementation,
+                  toolCommands,
+                  signal,
+                  round + 1 < rounds,
+                )
               : failedImplement(result.status === "timeout" ? "timeout" : "error", result.error ?? undefined)
             : ok && output?.success && !("hidden" in item)
               ? gradeCase(item, output.data)
               : undefined;
-        if (grade?.implement?.reason === "error" || grade?.implement?.reason === "timeout")
+        if (
+          result.status === "ok" &&
+          (grade?.implement?.reason === "error" || grade?.implement?.reason === "timeout")
+        )
           roundEvidence.status = grade.implement.reason;
-        roundEvidence.pass = grade?.pass ?? false;
-        roundEvidence.reason = grade?.implement?.reason ?? result.error;
+        roundEvidence.reason =
+          (roundEvidence.status !== "ok" ? (grade?.implement?.error ?? result.error) : null) ??
+          grade?.implement?.reason ??
+          result.error;
         roundEvidence.durationMs = Date.now() - roundStarted;
+        if (round > 0 && roundEvidence.status !== "ok" && roundEvidence.status !== "timeout") {
+          trial.durationMs = Date.now() - trial.createdAt + preparationMs;
+          return skip("operational failure", true);
+        }
+        roundEvidence.pass = grade?.pass ?? false;
         trial = {
           ...trial,
           status:
@@ -513,7 +561,7 @@ export class EvalRunner {
             ? "operational failure"
             : "round limit";
         if (taskFailure && round + 1 < rounds && "hidden" in item && implementation && grade) {
-          const next = nextImplementTarget(router, item, target, strategy);
+          const next = nextImplementTarget(router, trial.details.switchChain, target, strategy);
           if (next) {
             store.recordEvalTrial({ ...trial, status: "running" });
             prompt = implementRetryPrompt(item, implementation, grade, round + 1);
@@ -528,6 +576,7 @@ export class EvalRunner {
       }
     } catch (error) {
       if (signal.aborted) return skip("daemon shutdown");
+      if (trial.details.grade) return skip((error as Error).message);
       interruptRound((error as Error).message);
       store.recordEvalTrial({
         ...trial,
