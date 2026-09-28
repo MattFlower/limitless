@@ -48,6 +48,8 @@ export interface Config {
   /** Providers to try first among interchangeable models (e.g. use up a subscription). */
   preferProviders: string[];
   dependabotRouting: "free_first" | "policy";
+  /** Whether review prompts (production and eval) carry the implementer's self-report. */
+  reviewImplementerReport: "include" | "omit";
   githubOwner: string | null; // allowlisted GitHub login for triggers
   discordOwnerId: string | null;
   discordChannelId: string | null;
@@ -77,6 +79,9 @@ function parseEnvFile(path: string): Record<string, string> {
   }
   return out;
 }
+
+/** `[review]` is validated strictly: a misspelt key would otherwise silently keep the default. */
+const REVIEW_KEYS = ["implementer_report"];
 
 function num(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
@@ -158,6 +163,19 @@ export function loadConfig(
     routing.dependabot !== "policy"
   )
     throw new Error('routing.dependabot must be "free_first" or "policy"');
+  const rawReview = raw.review ?? {};
+  if (typeof rawReview !== "object" || rawReview === null || Array.isArray(rawReview))
+    throw new Error("review must be a table");
+  const review = rawReview as Record<string, unknown>;
+  for (const key of Object.keys(review))
+    if (!REVIEW_KEYS.includes(key))
+      throw new Error(`review.${key}: unknown key (allowed: ${REVIEW_KEYS.join(", ")})`);
+  if (
+    review.implementer_report !== undefined &&
+    review.implementer_report !== "include" &&
+    review.implementer_report !== "omit"
+  )
+    throw new Error('review.implementer_report must be "include" or "omit"');
   const retention = (raw.retention ?? {}) as Record<string, unknown>;
   const port = overrides.port ?? num(Number(process.env.LIMITLESS_PORT) || server.port, 7400);
   const host = str(server.host, "127.0.0.1") as string;
@@ -219,6 +237,7 @@ export function loadConfig(
       ? routing.prefer.filter((p): p is string => typeof p === "string")
       : [],
     dependabotRouting: routing.dependabot === "policy" ? "policy" : "free_first",
+    reviewImplementerReport: review.implementer_report === "omit" ? "omit" : "include",
     githubOwner: str(owners.github, "MattFlower"),
     discordOwnerId: str(owners.discord, null),
     discordChannelId: str(discord.channel_id, null),

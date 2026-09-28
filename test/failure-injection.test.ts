@@ -69,7 +69,11 @@ const holdout = {
     edge_case: i > 1,
   })),
 };
-const review = { verdict: "approve", summary: "ok", findings: [] };
+const review = {
+  verdict: "approve",
+  summary: "ok: checked the diff against every requirement",
+  findings: [],
+};
 const verify = {
   overall: "pass",
   notes: "",

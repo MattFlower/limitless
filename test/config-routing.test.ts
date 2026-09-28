@@ -24,6 +24,33 @@ test("Dependabot routing defaults to free-first and accepts either configured mo
   }
 });
 
+test("review implementer report defaults to include and accepts only include or omit", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-review-config-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  try {
+    expect(config().reviewImplementerReport).toBe("include");
+    writeFileSync(join(configDir, "config.toml"), "[review]\n");
+    expect(config().reviewImplementerReport).toBe("include");
+    for (const value of ["include", "omit"] as const) {
+      writeFileSync(join(configDir, "config.toml"), `[review]\nimplementer_report = "${value}"\n`);
+      expect(config().reviewImplementerReport).toBe(value);
+    }
+    for (const value of ['"Omit"', '"none"', '""', "false"]) {
+      writeFileSync(join(configDir, "config.toml"), `[review]\nimplementer_report = ${value}\n`);
+      expect(config).toThrow('review.implementer_report must be "include" or "omit"');
+    }
+    // A misspelt key would otherwise silently keep the default.
+    writeFileSync(join(configDir, "config.toml"), '[review]\nimplementer-report = "omit"\n');
+    expect(config).toThrow("review.implementer-report: unknown key (allowed: implementer_report)");
+    writeFileSync(join(configDir, "config.toml"), 'review = "omit"\n');
+    expect(config).toThrow("review must be a table");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("provider concurrency overrides reach the tracker without changing catalog defaults", () => {
   const root = mkdtempSync(join(tmpdir(), "limitless-provider-config-"));
   const configDir = join(root, "config");

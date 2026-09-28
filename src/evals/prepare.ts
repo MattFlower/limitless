@@ -57,6 +57,7 @@ export async function prepareCase(
   tree: string,
   patch: string | undefined,
   signal: AbortSignal,
+  implementerReportMode: "include" | "omit" = "include",
 ) {
   if ("prompt" in item)
     return {
@@ -99,7 +100,13 @@ export async function prepareCase(
       },
     });
     return {
-      prompt: reviewPrompt({ ...item.input, baseSha: item.base, stat: diff.stat, audit }),
+      prompt: reviewPrompt({
+        ...item.input,
+        implementerReportMode,
+        baseSha: item.base,
+        stat: diff.stat,
+        audit,
+      }),
       timeoutMs: readingTimeout(diff.added + diff.removed),
     };
   }

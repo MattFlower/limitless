@@ -849,6 +849,7 @@ async function oneRound(
           gates: comparison,
           audit,
           implementerReport: ctx.state.implementerReport ?? "",
+          implementerReportMode: ctx.deps.cfg.reviewImplementerReport,
           externalChange: ctx.state.flow === "verify-change",
           dependencyUpdate:
             ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",

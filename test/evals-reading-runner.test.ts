@@ -123,6 +123,30 @@ test("review uses the pipeline prompt, recomputed audit, detached seeded HEAD an
     );
     expect((await f.run()).summaries[0]?.cached).toBe(0);
     expect(f.calls).toHaveLength(2);
+    // [review] implementer_report reaches eval prompts, and each mode has its own cache entry.
+    f.item.input.implementerReport = "IMPLEMENTER_REPORT_TEXT";
+    f.save();
+    const prompts: string[] = [];
+    f.respond(async (s) => {
+      prompts.push(s.prompt);
+      return { structured: reviewOutput(), costUsd: 0.1 };
+    });
+    expect(f.cfg.reviewImplementerReport).toBe("include");
+    expect((await f.run()).summaries[0]?.cached).toBe(0);
+    f.cfg.reviewImplementerReport = "omit";
+    expect((await f.run()).summaries[0]?.cached).toBe(0);
+    expect((await f.run()).summaries[0]?.cached).toBe(1);
+    expect(f.calls).toHaveLength(4);
+    const [included, omitted] = prompts;
+    expect(prompts).toHaveLength(2);
+    expect(included).toContain("# Implementer's own report");
+    expect(included).toContain("IMPLEMENTER_REPORT_TEXT");
+    expect(omitted).not.toContain("Implementer's own report");
+    expect(omitted).not.toContain("IMPLEMENTER_REPORT_TEXT");
+    for (const kept of ["# Original request", "Fix the bug", "# Specification", `git diff ${f.sha}..HEAD`])
+      expect(omitted).toContain(kept);
+    expect(omitted).toContain("# Automated check results");
+    expect(omitted).toContain("- test `test`: FAIL, regressed (BLOCKING)");
     await f.clean();
   } finally {
     await f.close();
