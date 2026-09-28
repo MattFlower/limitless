@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
@@ -21,7 +22,8 @@ import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
-import { discardChanges } from "../git/repos.ts";
+import { discardChanges, headSha } from "../git/repos.ts";
+import { parseFakeStream } from "../harness/fake.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
@@ -29,12 +31,14 @@ import type { GhRunner } from "../integrations/github.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
+import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
+  faults?: FaultPlan;
   gh?: GhRunner;
   cfg: Config;
   store: Store;
@@ -51,6 +55,7 @@ export interface RunState {
   flow?: "build" | "verify-change";
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
   verdictCommentPosted?: boolean;
+  verdictCommentPending?: boolean;
   phase: Phase;
   worktreePath?: string;
   gatesConfig?: GateConfig;
@@ -79,6 +84,9 @@ export interface RunState {
   implementerIssue?: string | null;
   /** Round whose implementation has been committed; resuming skips straight to its checks. */
   implementedRound?: number;
+  implementationReadyRound?: number;
+  completedChecks?: { round: number; sha?: string; values: Partial<Record<StageName, unknown>> };
+  deliveryComplete?: boolean;
   /** Pinned delivery merge target (legacy field name); gates must pass before this becomes run.baseSha. */
   pendingRebaseSha?: string;
   preRebaseGates?: GateComparison[];
@@ -109,9 +117,11 @@ export interface RunState {
   reviewFollowUps?: Review["findings"];
   lastVerify?: (Verify & { modelId: string }) | null;
   verifyResults?: (Verify & { modelId: string; round: number; attempt?: number })[];
-  /** Reserve the retry before invoking; a crash must not grant another attempt. */
+  /** Round whose retry is reserved; a restart resumes it, and a recorded attempt 1 ends retrying. */
   environmentRetryRound?: number;
   terminalReason?: string;
+  /** Verdict awaiting its draft PR; a restart resumes that delivery instead of re-entering the loop. */
+  needsHumanReason?: string;
   toolCommands: string[];
 }
 
@@ -186,6 +196,11 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
 };
 
 export class RunContext {
+  private readonly interruption = new AbortController();
+  readonly signal: AbortSignal;
+  termination?: SimulatedTermination;
+  private readonly stageContext = new AsyncLocalStorage<Stage>();
+  private readonly faults: FaultInjector;
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
   private foregroundStageDepth = 0;
   readonly runDir: string;
@@ -204,9 +219,11 @@ export class RunContext {
     readonly deps: EngineDeps,
     public run: Run,
     readonly repo: Repo,
-    readonly signal: AbortSignal,
+    signal: AbortSignal,
     readonly isDraining: () => boolean = () => false,
   ) {
+    this.signal = AbortSignal.any([signal, this.interruption.signal]);
+    this.faults = injectorFor(deps.faults);
     this.runDir = join(deps.cfg.paths.runs, run.id);
     mkdirSync(this.runDir, { recursive: true });
     this.state = deps.store.getRunState<RunState>(run.id) ?? {
@@ -275,13 +292,23 @@ export class RunContext {
     return [this.run.prompt, this.state.spec ? renderSpec(this.state.spec) : "", ...identifiers].join("\n");
   }
 
-  save(): void {
+  async save(checkpoint?: string): Promise<void> {
+    if (this.deps.faults) {
+      const stage = this.stageContext.getStore();
+      await this.faults.hit(
+        "store:save",
+        { runId: this.run.id, stage: stage?.name, round: this.state.round, checkpoint },
+        this.signal,
+      );
+      this.checkCancelled();
+    }
     this.store.setRunState(this.run.id, this.state);
   }
 
-  setPhase(phase: Phase): void {
+  async setPhase(phase: Phase): Promise<void> {
     this.state.phase = phase;
-    this.save();
+    if (phase === "done") this.state.completedChecks = undefined;
+    await this.save();
   }
 
   log(message: string, level: RunEvent["level"] = "info", data?: unknown): void {
@@ -289,6 +316,7 @@ export class RunContext {
   }
 
   checkCancelled(): void {
+    if (this.termination) throw this.termination;
     if (this.signal.aborted) throw new CancelledError();
   }
 
@@ -301,8 +329,14 @@ export class RunContext {
     parkOnDrain = true,
   ): Promise<T> {
     this.checkCancelled();
-    // Resume skips only whole implement rounds, so parking between gates and the end of a round
-    // would re-run gates and a paid review (and spend verify's environment retry).
+    const cacheable =
+      !background && this.state.phase === "loop" && ["gates", "audit", "review"].includes(name);
+    const cache = this.state.completedChecks;
+    const checkSha =
+      cacheable && this.state.worktreePath ? await headSha(this.state.worktreePath) : undefined;
+    if (cacheable && cache?.round === round && cache.sha === checkSha && Object.hasOwn(cache.values, name))
+      return cache.values[name] as T;
+    // Keep a round together when draining, even if no check checkpoint exists yet.
     if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
       throw new ParkedError();
     if (!background) this.run = this.store.updateRun(this.run.id, { stage: name });
@@ -310,17 +344,36 @@ export class RunContext {
     // Parallel holdout work must not suppress foreground drain boundaries.
     if (!background) this.foregroundStageDepth++;
     try {
-      const { summary, value } = await fn(stage);
+      const context = { runId: this.run.id, stage: name, round };
+      const { summary, value } = await this.stageContext.run(stage, async () => {
+        await this.faults.hit(`stage:${name}:before`, context, this.signal);
+        this.checkCancelled();
+        const output = await fn(stage);
+        await this.faults.hit(`stage:${name}:after`, context, this.signal);
+        this.checkCancelled();
+        if (cacheable) {
+          if (this.state.completedChecks?.round !== round || this.state.completedChecks.sha !== checkSha)
+            this.state.completedChecks = { round, sha: checkSha, values: {} };
+          this.state.completedChecks.values[name] = output.value;
+          await this.save();
+        }
+        return output;
+      });
       this.store.finishStage(stage.id, "succeeded", summary);
       return value;
     } catch (e) {
-      const cancelled = e instanceof CancelledError || this.signal.aborted;
+      if (e instanceof SimulatedTermination) {
+        this.termination = e;
+        this.interruption.abort();
+      }
+      const cancelled =
+        e instanceof CancelledError || e instanceof SimulatedTermination || this.signal.aborted;
       this.store.finishStage(
         stage.id,
         cancelled ? "cancelled" : "failed",
         (e as Error).message.slice(0, 500),
       );
-      throw cancelled ? new CancelledError() : e;
+      throw cancelled && !(e instanceof SimulatedTermination) ? new CancelledError() : e;
     } finally {
       if (!background) this.foregroundStageDepth--;
     }
@@ -360,6 +413,21 @@ export class RunContext {
         release();
         lastFailure = `${target.targetId ?? target.modelId}: no capacity after provider refresh`;
         continue;
+      }
+      if (opts.role === "implement") {
+        this.state.implementer = {
+          modelId: target.modelId,
+          targetId: target.targetId,
+          effort: target.effort ?? null,
+          tier: target.tier,
+          vendor: target.vendor,
+        };
+        try {
+          await this.save();
+        } catch (error) {
+          release();
+          throw error;
+        }
       }
       const invocation = store.createInvocation({
         runId: this.run.id,
@@ -405,10 +473,28 @@ export class RunContext {
                 this.onAgentEvent(invocation.id, ev, opts.role, redact);
               },
         };
-        if (opts.mode === "readonly" && !noTools) {
+        const faultContext = {
+          runId: this.run.id,
+          stage: opts.stage.name,
+          round: opts.stage.round,
+          role: opts.role,
+          modelId: target.modelId,
+          invocationId: invocation.id,
+        };
+        // Invocation row/slot exist; stream faults replace input via the real CLI parsers.
+        await this.faults.hit("harness:invoke", faultContext, this.signal);
+        this.checkCancelled();
+        const stream = await this.faults.hit("harness:stream", faultContext, this.signal);
+        this.checkCancelled();
+        if (stream) result = parseFakeStream(stream, spec.onEvent);
+        else if (opts.mode === "readonly" && !noTools) {
           result = await withScratch(spec.cwd, (scratchDir) => harness({ ...spec, scratchDir }));
         } else result = await harness(spec);
       } catch (e) {
+        if (e instanceof SimulatedTermination) {
+          this.termination = e;
+          this.interruption.abort();
+        }
         result = {
           status: "error",
           finalText: "",
@@ -427,6 +513,10 @@ export class RunContext {
         if ((opts.role === "review" || opts.role === "verify") && this.state.worktreePath)
           await discardChanges(this.state.worktreePath);
       }
+      if (this.signal.aborted)
+        result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };
+      if (opts.requireStructured && result.status === "ok" && result.structured === null)
+        result = { ...result, status: "error", error: "missing structured output" };
       if (opts.schema && result.status === "ok" && result.structured !== null) {
         const parsed = opts.schema.safeParse(result.structured);
         result = parsed.success
@@ -468,6 +558,7 @@ export class RunContext {
       });
       this.run = store.refreshRunTotals(this.run.id);
 
+      if (this.termination) throw this.termination;
       if (result.status === "cancelled" || this.signal.aborted) throw new CancelledError();
       if (result.status !== "ok" && MODEL_REJECTED.test(result.error ?? "")) {
         // A configuration problem with this model (e.g. not on the plan), not a task failure.

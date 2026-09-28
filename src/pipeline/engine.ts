@@ -27,6 +27,7 @@ import {
   pushBranch,
   pushExistingBranch,
   readFileAt,
+  remoteBranchSha,
   removeWorktree,
   resetTo,
 } from "../git/repos.ts";
@@ -42,6 +43,7 @@ import {
   RunContext,
   type RunState,
 } from "./context.ts";
+import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -111,8 +113,9 @@ export async function executeRun(
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run);
+    if (ctx.state.needsHumanReason) throw new NeedsHumanError(ctx.state.needsHumanReason);
     ctx.state.flow ??= "build";
-    ctx.save();
+    await ctx.save();
     if (ctx.state.flow === "verify-change" && ctx.state.phase !== "prepare" && !ctx.state.verification)
       throw new Error("Verification state is missing its recorded PR revisions");
     if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined) {
@@ -126,7 +129,7 @@ export async function executeRun(
           ".limitless.toml",
         ),
       );
-      ctx.save();
+      await ctx.save();
     }
     if (ctx.state.phase === "prepare") await prepare(ctx);
     if (ctx.state.phase === "triage") await triage(ctx);
@@ -139,16 +142,33 @@ export async function executeRun(
         if (ctx.state.phase === "deliver") break;
       }
     }
-    ctx.setPhase("done");
+    ctx.checkCancelled();
+    await ctx.setPhase("done");
+    ctx.checkCancelled();
     ctx.run = deps.store.updateRun(runId, { status: "succeeded", stage: null, finishedAt: Date.now() });
+    // Terminal success ends the cancellation window before destructive worktree cleanup.
+    if (ctx.repo.kind === "github" && ctx.state.worktreePath) {
+      try {
+        await removeWorktree(ctx.deps.cfg.paths, ctx.repo, ctx.state.worktreePath);
+      } catch (error) {
+        ctx.log(`Worktree cleanup deferred to GC: ${(error as Error).message}`, "warn");
+      }
+    }
     ctx.log("Run succeeded");
     return "succeeded";
   } catch (e) {
-    if (e instanceof CancelledError || signal.aborted) {
+    if (!signal.aborted && (e instanceof SimulatedTermination || ctx.termination)) return "running";
+    if (e instanceof InjectedFault && !signal.aborted) {
+      ctx.log(`Run interrupted: ${e.message}; re-queued to resume`, "warn");
+      deps.store.updateRun(runId, { status: "queued", stage: null });
+      return "queued";
+    }
+    const cancelled = (): RunStatus => {
       deps.store.updateRun(runId, { status: "cancelled", finishedAt: Date.now() });
       ctx.log("Run cancelled", "warn");
       return "cancelled";
-    }
+    };
+    if (e instanceof CancelledError || signal.aborted) return cancelled();
     if (e instanceof ParkedError) {
       ctx.state.parked = true;
       ctx.run = deps.store.updateRun(runId, { status: "queued", stage: null }, ctx.state);
@@ -160,7 +180,7 @@ export async function executeRun(
       verifiedSha &&
       ctx.repo.kind === "github" &&
       !ctx.run.deliveryBranch &&
-      !ctx.run.prUrl &&
+      (!ctx.run.prUrl || !!ctx.state.needsHumanReason) &&
       (ctx.state.phase === "deliver" || ctx.state.conflictRound !== undefined);
     const needsHuman = e instanceof NeedsHumanError || e instanceof NoCapacityError || !!verifiedFailure;
     const message = (e as Error).message;
@@ -177,8 +197,25 @@ export async function executeRun(
     });
     if (verifiedFailure) {
       try {
-        await deliverVerifiedDraft(ctx, verifiedSha, failureStage, message);
+        ctx.state.needsHumanReason = message;
+        await ctx.save("needs-human");
+        await ctx.stage(
+          "deliver",
+          async () => {
+            await deliverVerifiedDraft(ctx, verifiedSha, failureStage, message);
+            return { summary: "verified-work draft delivered", value: undefined };
+          },
+          ctx.state.round,
+          false,
+          false,
+        );
       } catch (err) {
+        if (err instanceof CancelledError || signal.aborted) return cancelled();
+        if (
+          !signal.aborted &&
+          (err instanceof SimulatedTermination || ctx.termination || err instanceof InjectedFault)
+        )
+          return "running";
         ctx.log(`Could not open verified-work draft PR: ${(err as Error).message}`, "warn");
       }
     } else if (
@@ -189,8 +226,19 @@ export async function executeRun(
     ) {
       // Surface the unfinished work as a draft PR so a human can pick it up.
       try {
+        if (ctx.state.needsHumanReason !== message) {
+          ctx.state.needsHumanReason = message;
+          await ctx.save("needs-human");
+        }
         await deliver(ctx, false);
       } catch (err) {
+        if (
+          !signal.aborted &&
+          (err instanceof SimulatedTermination || ctx.termination || err instanceof InjectedFault)
+        )
+          return "running";
+        // Cancellation or shutdown during the draft must not be recorded as the original failure.
+        if (err instanceof CancelledError || signal.aborted) return cancelled();
         ctx.log(`Could not open draft PR: ${(err as Error).message}`, "warn");
       }
     }
@@ -242,7 +290,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       )
         throw new Error("Verification requires valid PR baseRef, baseSha, headSha and repository metadata");
       ctx.state.verification = { baseSha: ref.baseSha, headSha: ref.headSha };
-      ctx.save();
+      await ctx.save();
     }
     await ensureCache(cfg.paths, ctx.repo);
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
@@ -256,6 +304,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       ctx.run = store.updateRun(ctx.run.id, { baseSha: verification.headSha });
       await resetTo(wt.path, verification.baseSha);
     }
+    await discardChanges(wt.path);
     let gates: GateConfig;
     try {
       ctx.state.previewConfig = readPreviewConfig(
@@ -267,6 +316,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       ctx.log(
         `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
       );
+      await ctx.save();
       ctx.state.baseline =
         gates.setup.length || gates.checks.length
           ? await runGates(wt.path, gates, ctx.signal, { onWait: gateEvents(ctx).onWait })
@@ -274,6 +324,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       ctx.checkCancelled();
     } finally {
       if (verification) await resetTo(wt.path, verification.headSha);
+      else await discardChanges(wt.path);
     }
     const baseline = ctx.state.baseline;
     if (baseline) {
@@ -288,7 +339,7 @@ async function prepare(ctx: RunContext): Promise<void> {
         });
       }
     }
-    ctx.setPhase("triage");
+    await ctx.setPhase("triage");
     const failing = baseline ? baseline.checks.filter((c) => !c.ok).map((c) => c.name) : [];
     return {
       summary: `worktree ${wt.branch}; ${gates.checks.length} checks${failing.length ? `, failing on base: ${failing.join(", ")}` : ""}`,
@@ -345,9 +396,9 @@ async function triage(ctx: RunContext): Promise<void> {
     const questions = !verifying && profile !== "quick" && t.ambiguity === "high" ? t.blocking_questions : [];
     if (questions.length) {
       for (const q of questions) ctx.store.askQuestion(ctx.run.id, q);
-      ctx.setPhase("clarify");
+      await ctx.setPhase("clarify");
     } else {
-      ctx.setPhase(verifying || profile === "quick" ? "loop" : "spec");
+      await ctx.setPhase(verifying || profile === "quick" ? "loop" : "spec");
     }
     return {
       summary: `${t.task_class}, ${t.complexity}, risk ${t.risk} → ${profile} (${target.modelId})`,
@@ -393,7 +444,7 @@ async function clarify(ctx: RunContext): Promise<void> {
     await waitForAnswers(ctx);
     const qs = ctx.store.listQuestions(ctx.run.id);
     ctx.state.answers = qs.map((q) => `Q: ${q.question}\n  A: ${q.answer}`);
-    ctx.setPhase(ctx.run.resolvedProfile === "quick" ? "loop" : "spec");
+    await ctx.setPhase(ctx.run.resolvedProfile === "quick" ? "loop" : "spec");
     return { summary: `${qs.length} question(s) answered`, value: undefined };
   });
 }
@@ -421,7 +472,7 @@ async function spec(ctx: RunContext): Promise<void> {
     if (unanswered.length && ctx.state.answers.length === 0) {
       for (const q of unanswered) ctx.store.askQuestion(ctx.run.id, q);
       ctx.state.spec = s;
-      ctx.save();
+      await ctx.save();
       await waitForAnswers(ctx);
       ctx.state.answers = ctx.store
         .listQuestions(ctx.run.id)
@@ -430,7 +481,7 @@ async function spec(ctx: RunContext): Promise<void> {
     }
     ctx.state.spec = s;
     ctx.state.specAuthorVendor = target.vendor;
-    ctx.setPhase("loop");
+    await ctx.setPhase("loop");
     return {
       summary: `${s.acceptance_criteria.length} acceptance criteria (${target.modelId})`,
       value: undefined,
@@ -450,8 +501,8 @@ async function buildLoop(ctx: RunContext): Promise<void> {
     // Initial verification does not consume an implementation round.
     const passed = await oneRound(ctx, -1, null);
     ctx.state.verification.initialComplete = true;
-    if (passed) ctx.setPhase("deliver");
-    else ctx.save();
+    if (passed) await ctx.setPhase("deliver");
+    else await ctx.save();
     if (passed) return;
   }
   const maxRounds =
@@ -471,12 +522,12 @@ async function buildLoop(ctx: RunContext): Promise<void> {
       const round = ctx.state.round;
       const passed = await oneRound(ctx, round, holdout);
       if (passed) {
-        ctx.setPhase("deliver");
+        await ctx.setPhase("deliver");
         return;
       }
       ctx.state.round++;
       ctx.state.roundsOnImplementer++;
-      ctx.save();
+      await ctx.save();
     }
     throw new NeedsHumanError(
       `Still failing after ${ctx.state.round} implementation rounds. Last feedback:\n${ctx.state.feedback ?? ""}`,
@@ -491,7 +542,7 @@ async function authorHoldout(ctx: RunContext): Promise<void> {
     "holdout",
     async (stage) => {
       ctx.state.holdoutStatus = "generating";
-      ctx.save();
+      await ctx.save();
       const { result, target } = await ctx.invoke({
         role: "holdout",
         stage,
@@ -511,7 +562,7 @@ async function authorHoldout(ctx: RunContext): Promise<void> {
       ctx.state.holdoutModelId = target.modelId;
       ctx.state.holdoutSameVendor = target.vendor === ctx.state.specAuthorVendor;
       ctx.state.holdoutStatus = "complete";
-      ctx.save();
+      await ctx.save();
       return {
         summary: `authored ${ctx.state.holdout.scenarios.length} private scenarios (${target.modelId})`,
         value: undefined,
@@ -542,85 +593,90 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
   await ctx.stage(
     "implement",
     async (stage) => {
-      const current = ctx.state.implementer;
-      const escalate = current && ctx.state.roundsOnImplementer >= ROUNDS_PER_IMPLEMENTER;
-      let constraints: RouteConstraints = current
-        ? {
-            prefer:
-              current.effort === undefined
-                ? (current.targetId ?? current.modelId)
-                : { modelId: current.modelId, effort: current.effort },
-          }
-        : {};
-      if (escalate) {
-        // Prefer a stronger model; otherwise any model not tried yet; otherwise keep going as-is.
-        const options: RouteConstraints[] = [
-          { minTier: Math.min(5, current.tier + 1), exclude: ctx.state.triedImplementers },
-          { exclude: ctx.state.triedImplementers },
-          {},
-        ];
-        constraints =
-          options.find(
-            (c) =>
-              ctx.deps.router.route("implement", ctx.complexity, ctx.routingConstraints(c)).candidates.length,
-          ) ?? {};
-        ctx.log(`Escalating implementer beyond ${current.modelId}`, "warn", { constraints });
-        ctx.state.roundsOnImplementer = 0;
-      }
-      const { result, target } = await ctx.invoke({
-        role: "implement",
-        stage,
-        mode: "edit",
-        complexity: ctx.complexity,
-        constraints,
-        prompt: implementPrompt({
-          prompt: ctx.run.prompt,
-          spec: ctx.state.spec ?? null,
-          gates,
-          baseline: ctx.state.baseline ?? null,
-          baseSha: ctx.state.verification?.baseSha ?? baseSha,
-          externalChange: ctx.state.flow === "verify-change",
-          round,
-          feedback: ctx.state.feedback,
-          hasHoldout: ctx.state.flow !== "verify-change" && profile(ctx) !== "quick",
-          resolution: merge,
-        }),
-      });
-      ctx.state.implementer = {
-        modelId: target.modelId,
-        targetId: target.targetId,
-        effort: target.effort ?? null,
-        tier: target.tier,
-        vendor: target.vendor,
-      };
-      if (
-        !ctx.state.triedImplementers.some(
-          (ref) =>
-            (typeof ref === "string" ? ref : formatTarget(ref.modelId, ref.effort)) ===
-            (target.targetId ?? target.modelId),
+      ctx.state.completedChecks = undefined;
+      if (ctx.state.implementationReadyRound !== round) {
+        const current = ctx.state.implementer;
+        const escalate = current && ctx.state.roundsOnImplementer >= ROUNDS_PER_IMPLEMENTER;
+        let constraints: RouteConstraints = current
+          ? {
+              prefer:
+                current.effort === undefined
+                  ? (current.targetId ?? current.modelId)
+                  : { modelId: current.modelId, effort: current.effort },
+            }
+          : {};
+        if (escalate) {
+          // Prefer a stronger model; otherwise any model not tried yet; otherwise keep going as-is.
+          const options: RouteConstraints[] = [
+            { minTier: Math.min(5, current.tier + 1), exclude: ctx.state.triedImplementers },
+            { exclude: ctx.state.triedImplementers },
+            {},
+          ];
+          constraints =
+            options.find(
+              (c) =>
+                ctx.deps.router.route("implement", ctx.complexity, ctx.routingConstraints(c)).candidates
+                  .length,
+            ) ?? {};
+          ctx.log(`Escalating implementer beyond ${current.modelId}`, "warn", { constraints });
+          ctx.state.roundsOnImplementer = 0;
+        }
+        const { result, target } = await ctx.invoke({
+          role: "implement",
+          stage,
+          mode: "edit",
+          complexity: ctx.complexity,
+          constraints,
+          prompt: implementPrompt({
+            prompt: ctx.run.prompt,
+            spec: ctx.state.spec ?? null,
+            gates,
+            baseline: ctx.state.baseline ?? null,
+            baseSha: ctx.state.verification?.baseSha ?? baseSha,
+            externalChange: ctx.state.flow === "verify-change",
+            round,
+            feedback: ctx.state.feedback,
+            hasHoldout: ctx.state.flow !== "verify-change" && profile(ctx) !== "quick",
+            resolution: merge,
+          }),
+        });
+        ctx.state.implementer = {
+          modelId: target.modelId,
+          targetId: target.targetId,
+          effort: target.effort ?? null,
+          tier: target.tier,
+          vendor: target.vendor,
+        };
+        if (
+          !ctx.state.triedImplementers.some(
+            (ref) =>
+              (typeof ref === "string" ? ref : formatTarget(ref.modelId, ref.effort)) ===
+              (target.targetId ?? target.modelId),
+          )
         )
-      )
-        ctx.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
-      ctx.state.implementerReport = result.finalText;
-      ctx.store.putArtifact(ctx.run.id, `implement-${round}.md`, "report", result.finalText || "(no report)");
+          ctx.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
+        ctx.state.implementerReport = result.finalText;
+        ctx.store.putArtifact(
+          ctx.run.id,
+          `implement-${round}.md`,
+          "report",
+          result.finalText || "(no report)",
+        );
+        ctx.state.implementerIssue =
+          result.status === "ok" ? null : `${result.status}: ${result.error ?? ""}`.slice(0, 500);
+        ctx.state.implementationReadyRound = round;
+        await ctx.save("implementation-ready");
+      }
       ctx.checkCancelled();
       const sha =
         merge && previousHead
           ? await completeMerge(cwd, previousHead, baseSha)
           : await commitAll(cwd, `limitless: ${ctx.run.title} (round ${round + 1})\n\nRun: ${ctx.run.id}`);
-      if (sha) ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha });
-      ctx.save();
-      ctx.state.implementerIssue =
-        result.status === "ok"
-          ? null
-          : `${result.status}${result.error ? `: ${result.error}` : ""}`.slice(0, 500);
+      ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha ?? (await headSha(cwd)) });
       ctx.state.implementedRound = round;
-      ctx.save();
-      if (result.status !== "ok") {
-        ctx.log(`Implementer ended with ${result.status}: ${result.error ?? ""}`, "warn");
-      }
+      await ctx.save("implementation-committed");
       return {
-        summary: `${target.modelId}: ${result.status}${sha ? `, committed ${sha.slice(0, 8)}` : ", no changes"}`,
+        summary: `${ctx.state.implementer?.modelId}: ${ctx.state.implementerIssue ?? "ok"}`,
         value: undefined,
       };
     },
@@ -654,6 +710,7 @@ async function oneRound(
       const events = gateEvents(ctx);
       let cmp: GateComparison[];
       try {
+        await discardChanges(cwd);
         const after = await runGates(cwd, gates, ctx.signal, events);
         ctx.checkCancelled();
         const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
@@ -753,7 +810,7 @@ async function oneRound(
       ? `### Your previous session ended early\n${ctx.state.implementerIssue}\nKeep the next attempt focused and finish by running the checks.`
       : "";
     ctx.state.feedback = [issue, gateFeedback, auditFeedback].filter(Boolean).join("\n\n");
-    ctx.save();
+    await ctx.save();
     ctx.log("Deterministic checks failed; sending feedback to implementer", "warn");
     return false;
   }
@@ -826,7 +883,7 @@ async function oneRound(
       if (sameVendor) ctx.log("Review done by the implementer's vendor (no other vendor available)", "warn");
       ctx.state.lastReview = { ...r, modelId: target.modelId };
       ctx.state.reviewedSha = reviewedSha;
-      ctx.save();
+      await ctx.save();
       ctx.store.putArtifact(
         ctx.run.id,
         `review-${round}.json`,
@@ -848,14 +905,14 @@ async function oneRound(
       : "";
   if (review.verdict === "request_changes") {
     ctx.state.feedback = reviewFeedback || `### Code review requested changes\n${review.summary}`;
-    ctx.save();
+    await ctx.save();
     return false;
   }
 
   // --- verify acceptance criteria (standard/deep)
   if (ctx.state.flow === "verify-change" || profile(ctx) === "quick") {
     ctx.state.lastVerify = null;
-    if (ctx.state.flow !== "verify-change") recordVerified(ctx, reviewedSha);
+    if (ctx.state.flow !== "verify-change") await recordVerified(ctx, reviewedSha);
     return true;
   }
   if (holdout) {
@@ -875,6 +932,7 @@ async function oneRound(
           "preview",
           async () => {
             const server = await startPreview(cwd, previewConfig, ctx.signal);
+            preview = server; // Retain ownership if the stage completion checkpoint is interrupted.
             ctx.log(`Preview ready at ${server.url}`);
             return { summary: `ready at ${server.url}`, value: server };
           },
@@ -916,7 +974,7 @@ async function oneRound(
             ...(ctx.state.verifyResults ?? []),
             { ...v, modelId: target.modelId, round, attempt },
           ];
-          ctx.save();
+          await ctx.save();
           const publicSources = await ctx.publicHoldoutSources();
           ctx.store.putArtifact(
             ctx.run.id,
@@ -942,7 +1000,7 @@ async function oneRound(
     let verify = previous.at(-1) ?? (await verifyAttempt(0));
     const publicSources = await ctx.publicHoldoutSources();
     if (blockedOnly(verify)) {
-      const stop = (routing = ""): never => {
+      const stop = async (routing = ""): Promise<never> => {
         const evidence = verify.criteria
           .filter((c) => c.status === "blocked")
           .map((c) => `${c.id}: ${c.evidence}`)
@@ -953,20 +1011,25 @@ async function oneRound(
           publicSources,
         );
         ctx.state.terminalReason = detail;
-        ctx.save();
+        // Recorded apart from the retry reservation: an exhausted retry leaves no attempt row behind.
+        ctx.state.needsHumanReason = detail;
+        await ctx.save();
         throw new NeedsHumanError(detail);
       };
-      if (ctx.state.environmentRetryRound === round || previous.some((v) => v.attempt === 1)) stop();
+      if (previous.some((v) => v.attempt === 1)) await stop();
+      // A reserved retry that never recorded a result was interrupted; resume it, don't grant another.
+      if (ctx.state.environmentRetryRound === round)
+        ctx.log("Resuming interrupted verification retry", "warn");
       ctx.state.environmentRetryRound = round;
-      ctx.save();
-      const firstModel = ctx.state.lastVerify?.modelId;
+      await ctx.save();
+      const firstModel = (previous.find((v) => v.attempt !== 1) ?? ctx.state.lastVerify)?.modelId;
       try {
         verify = await verifyAttempt(1, firstModel ? [firstModel] : []);
       } catch (error) {
-        if (error instanceof NoCapacityError) stop(error.message);
+        if (error instanceof NoCapacityError) await stop(error.message);
         throw error;
       }
-      if (blockedOnly(verify)) stop();
+      if (blockedOnly(verify)) await stop();
     }
     if (verify.overall !== "pass") {
       ctx.state.feedback = formatVerifyFeedback(
@@ -975,10 +1038,10 @@ async function oneRound(
         ctx.state.holdout,
         publicSources,
       );
-      ctx.save();
+      await ctx.save();
       return false;
     }
-    recordVerified(ctx, await headSha(cwd));
+    await recordVerified(ctx, await headSha(cwd));
     return true;
   } finally {
     ctx.previewUrl = undefined;
@@ -989,7 +1052,7 @@ async function oneRound(
 // ---------------------------------------------------------------------------
 // deliver
 
-function recordVerified(ctx: RunContext, sha: string): void {
+async function recordVerified(ctx: RunContext, sha: string): Promise<void> {
   ctx.state.lastVerifiedSha = sha;
   ctx.state.lastVerifiedEvidence = {
     lastVerify: ctx.state.lastVerify,
@@ -997,7 +1060,7 @@ function recordVerified(ctx: RunContext, sha: string): void {
     lastReview: ctx.state.lastReview,
     lastAudit: ctx.state.lastAudit,
   };
-  ctx.save();
+  await ctx.save();
 }
 
 async function deliverVerifiedDraft(
@@ -1006,6 +1069,8 @@ async function deliverVerifiedDraft(
   stage: string,
   reason: string,
 ): Promise<void> {
+  ctx.checkCancelled();
+  if (ctx.state.deliveryComplete) return;
   const cwd = ctx.state.worktreePath;
   const branch = ctx.run.branch;
   const base = ctx.run.baseBranch;
@@ -1023,11 +1088,17 @@ async function deliverVerifiedDraft(
     cwd,
     draft: true,
   });
+  await ctx.save("delivery-pr-created");
+  ctx.checkCancelled();
   ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
+  ctx.state.deliveryComplete = true;
+  await ctx.save("delivery-complete");
   ctx.log(`Verified-work draft PR: ${url}`);
 }
 
 async function deliver(ctx: RunContext, success: boolean): Promise<void> {
+  ctx.checkCancelled();
+  if (ctx.state.deliveryComplete) return;
   assertExistingBranchDelivery(ctx.repo, ctx.run);
   if (ctx.run.deliveryBranch && ctx.run.baseSha !== ctx.run.sourceRef?.headSha)
     throw new Error("PR delivery base does not match the verified webhook head");
@@ -1038,7 +1109,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       await validateMerge(cwd, ctx.state.preRebaseHead, ctx.run.baseSha as string);
       ctx.state.pendingRebaseSha = undefined;
       ctx.state.preRebaseGates = undefined;
-      ctx.save();
+      await ctx.save();
     }
     if (ctx.state.verification) {
       await discardChanges(cwd);
@@ -1054,20 +1125,39 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         const report = buildReport(ctx, true);
         ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
         if (!ctx.state.verdictCommentPosted) {
+          const gh = ctx.deps.gh ?? runGh;
+          const marker = `<!-- limitless-verification:${ctx.run.id} -->`;
           ctx.checkCancelled();
-          await (ctx.deps.gh ?? runGh)([
-            "pr",
-            "comment",
-            String(ctx.run.sourceRef?.number),
-            "--repo",
-            ctx.repo.slug,
-            "--body",
-            report,
-          ]);
+          // A pending post may already exist remotely even when its local checkpoint was lost.
+          const comments = ctx.state.verdictCommentPending
+            ? await gh([
+                "api",
+                `repos/${ctx.repo.slug}/issues/${ctx.run.sourceRef?.number}/comments`,
+                "--paginate",
+                "--jq",
+                ".[].body",
+              ])
+            : "";
+          if (!comments?.includes(marker)) {
+            ctx.state.verdictCommentPending = true;
+            await ctx.save("verification-comment-pending");
+            ctx.checkCancelled();
+            await gh([
+              "pr",
+              "comment",
+              String(ctx.run.sourceRef?.number),
+              "--repo",
+              ctx.repo.slug,
+              "--body",
+              `${marker}\n${report}`,
+            ]);
+          }
+          ctx.checkCancelled();
           ctx.state.verdictCommentPosted = true;
-          ctx.save();
+          await ctx.save("verification-comment-posted");
         }
-        await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
+        ctx.state.deliveryComplete = true;
+        await ctx.save("delivery-complete");
         return { summary: `Verified existing PR: ${ctx.run.prUrl}`, value: undefined };
       }
       if (!ctx.run.deliveryBranch)
@@ -1136,13 +1226,15 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       publish();
       if (!success) return { summary: "PR update needs human review; no push", value: undefined };
       ctx.checkCancelled();
-      await pushExistingBranch(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.run.baseSha as string);
+      if ((await remoteBranchSha(ctx.repo, cwd, ctx.run.deliveryBranch)) !== head)
+        await pushExistingBranch(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.run.baseSha as string);
       if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number") {
         ctx.run = ctx.store.updateRun(ctx.run.id, {
           prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef.number}`,
         });
       }
-      await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
+      ctx.state.deliveryComplete = true;
+      await ctx.save("delivery-complete");
       return { summary: `updated existing PR branch ${ctx.run.deliveryBranch}`, value: undefined };
     }
     ctx.checkCancelled();
@@ -1157,10 +1249,15 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       cwd,
       draft: !success,
     });
+    await ctx.save("delivery-pr-created");
     ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
     publish();
     ctx.log(`Pull request: ${url}`);
-    if (!success) return { summary: `draft for human: ${url}`, value: undefined };
+    if (!success) {
+      ctx.state.deliveryComplete = true;
+      await ctx.save("delivery-complete");
+      return { summary: `draft for human: ${url}`, value: undefined };
+    }
 
     const policy = ctx.state.gatesConfig?.merge ?? ctx.repo.mergePolicy;
     let summary = `PR ${url}`;
@@ -1173,7 +1270,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     } else {
       summary += ` — left open (merge policy: ${policy})`;
     }
-    await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
+    ctx.state.deliveryComplete = true;
+    await ctx.save("delivery-complete");
     return { summary, value: undefined };
   };
   await ctx.stage("deliver", deliverStage, 0, false, success);
@@ -1212,7 +1310,7 @@ async function mergeForDelivery(
     ctx.state.pendingRebaseSha = fetched;
     ctx.state.preRebaseGates = ctx.state.lastGates ?? [];
     ctx.state.preRebaseHead = head;
-    ctx.save();
+    await ctx.save();
   }
   const before = ctx.state.preRebaseHead;
   if (!before) throw new Error("Missing pre-merge HEAD");
@@ -1220,6 +1318,8 @@ async function mergeForDelivery(
   if (conflicts.length) {
     ctx.state.round++;
     ctx.state.conflictRound = ctx.state.round;
+    ctx.state.completedChecks = undefined;
+    ctx.state.implementationReadyRound = undefined;
     ctx.state.feedback = `The factory started a merge of base ${fetched}. Resolve the conflict markers in these files, preserving both intents; do not run Git (including staging or committing):\n${conflicts.map((p) => `- ${p}`).join("\n")}`;
     ctx.state.phase = "loop";
     ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
@@ -1247,7 +1347,7 @@ async function mergeForDelivery(
           after,
         );
         ctx.state.lastGates = comparison;
-        ctx.save();
+        await ctx.save();
         ctx.store.putArtifact(
           ctx.run.id,
           `gates-rebase-${ctx.state.round}.json`,

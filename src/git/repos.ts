@@ -297,6 +297,12 @@ export async function pushBranch(repo: Repo, cwd: string, branch: string, sha = 
   });
 }
 
+export async function remoteBranchSha(repo: Repo, cwd: string, branch: string): Promise<string | null> {
+  if (repo.kind !== "github" || !repo.url) return null;
+  const remote = await sh(["git", "ls-remote", repo.url, `refs/heads/${branch}`], { cwd });
+  return remote.stdout.split("\t")[0] || null;
+}
+
 /** Update an existing PR head only if it still points at the commit we prepared from. */
 export async function pushExistingBranch(
   repo: Repo,
@@ -326,7 +332,21 @@ export async function createPullRequest(
   opts: { branch: string; base: string; title: string; body: string; cwd: string; draft?: boolean },
 ): Promise<string> {
   const existing = await sh(
-    ["gh", "pr", "list", "--repo", repo.slug, "--head", opts.branch, "--json", "url", "--jq", ".[0].url"],
+    [
+      "gh",
+      "pr",
+      "list",
+      "--repo",
+      repo.slug,
+      "--head",
+      opts.branch,
+      "--state",
+      "all",
+      "--json",
+      "url",
+      "--jq",
+      ".[0].url",
+    ],
     { cwd: opts.cwd, allowFail: true },
   );
   if (existing.stdout.trim()) {

@@ -185,3 +185,33 @@ test("dependency migration upgrades existing runs and round-trips waiting runs",
     store.close();
   });
 });
+
+test("recovery checkpoints upgrade older state JSON without changing its evidence", () => {
+  temporary((_directory, path) => {
+    legacyDatabase(path);
+    const db = new Database(path);
+    db.exec("INSERT INTO repos (id, slug, kind, created_at) VALUES ('repo', 'local', 'local', 1)");
+    const states = [
+      null,
+      { phase: "loop", round: 2, implementer: { modelId: "a" } },
+      { phase: "deliver", round: 1, deliveryComplete: true, needsHumanReason: "original" },
+    ];
+    for (const [i, state] of states.entries())
+      db.query(
+        "INSERT INTO runs (id, repo_id, title, prompt, source, status, error, state_json, created_at) VALUES (?, 'repo', 'old', 'old', 'cli', 'needs_human', 'blocked', ?, 1)",
+      ).run(String(i), state === null ? null : JSON.stringify(state));
+    db.close();
+    const store = new Store(path);
+    expect(store.getRunState<unknown>("0")).toBeNull();
+    expect(store.getRunState<unknown>("1")).toEqual({
+      ...states[1],
+      deliveryComplete: false,
+      needsHumanReason: "blocked",
+    });
+    expect(store.getRunState<unknown>("2")).toEqual(states[2]);
+    store.close();
+    const reopened = new Store(path);
+    expect(reopened.getRunState<unknown>("2")).toEqual(states[2]);
+    reopened.close();
+  });
+});
