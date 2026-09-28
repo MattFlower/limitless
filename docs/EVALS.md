@@ -134,7 +134,9 @@ cache's objects, so only objects reachable from the snapshot are copied; trees a
 through Git's index, so filename bytes (including non-UTF-8 names) are preserved exactly. Original commits, refs, remotes and messages are unreachable. All
 other paths, contents and modes are unchanged, so `git diff base..head` equals the original
 diff outside `evals/**`, and graders see the same repository-relative paths. Author, committer
-and dates are fixed, so the same pins always give the same tree and commit hashes.
+and dates are fixed, so the same pins always give the same tree and commit hashes. Missing pins
+are fetched by exact SHA, as for plain triage, so a pin reachable only from a tag still works.
+A snapshot or pin failure fails only that case's preparation; the rest of the run continues.
 
 That snapshot base replaces `base` in prompts, diff statistics, base gate detection, the audit
 and implement retry feedback. The original pins stay in the case as provenance and in the cache
@@ -143,11 +145,18 @@ Seed patches are still committed on top of the snapshot head. The contamination 
 runs, now against the snapshot: label paths cannot appear, but any exact dataset, seed-patch or
 hidden-file blob kept outside `evals/` still fails preparation before the candidate is invoked.
 
+Removing `evals/` is not invisible to code that reads it. A repository whose own checks read
+`evals/` (Limitless's test suite does) can't use snapshot mode for implement: a check already
+failing at the snapshot base is `still_failing` and never blocks, so gates would stop grading.
+Implement preparation therefore fails when any baseline check fails on a snapshot, naming the
+check. Likewise a snapshot review case whose gold defect lies under `evals/` is rejected when
+the cases load, since the candidate could never see that file.
+
 Role differences: implement snapshots build both commits from `base` (its `head` is provenance
 only, so the reference solution never enters the checkout and `Snapshot head` adds no changes),
-and hidden files are injected at
-grading as usual. Triage has one repository pin, which supplies both trees; triage candidates
-still get no checkout, and the top-level listing in their prompt comes from the snapshot.
+and hidden files are injected at grading as usual. Triage has one repository pin, which
+supplies both trees; triage candidates still get no checkout, and the top-level listing in
+their prompt is read from the snapshot with `ls-tree`, without checking it out.
 
 The candidate receives the pipeline prompt, FACTORY_PREAMBLE, role schema, read-only agent
 harness, and normal inputs only: labels, source/foundBy annotations and patch files are never

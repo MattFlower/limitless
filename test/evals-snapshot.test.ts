@@ -121,6 +121,15 @@ test("snapshot commits are deterministic, neutral and preserve the non-eval diff
       );
       expect(await git("diff", checkout.base, "HEAD", "--", "run.sh")).toContain("new mode 100755");
       expect(await git("ls-tree", "--name-only", "HEAD")).toContain('"raw\\377.txt"');
+      // Identity, dates, message and headers are fixed, so each commit hash depends only on its tree.
+      const identity = "Limitless <limitless@localhost> 1000000000 +0000";
+      for (const [rev, message] of [
+        ["HEAD", "Snapshot head"],
+        [checkout.base, "Snapshot base"],
+      ] as const)
+        expect((await git("cat-file", "commit", rev)).replace(/^(tree|parent) [0-9a-f]{40}\n/gm, "")).toBe(
+          `author ${identity}\ncommitter ${identity}\n\n${message}\n`,
+        );
       snapshots.push([
         checkout.base,
         (await git("rev-parse", `${checkout.base}^{tree}`)).trim(),
@@ -313,3 +322,102 @@ test("implement snapshot starts from the sanitized base without the solution or 
     await f.close();
   }
 });
+
+test("implement snapshot fails preparation when a baseline check reads evals/; plain mode is unaffected", async () => {
+  const f = await evalFixture();
+  try {
+    writeFileSync(
+      join(f.source, ".limitless.toml"),
+      '[gates]\nchecks = [{ name = "reads-evals", run = "test -f evals/data.txt" }]\n',
+    );
+    mkdirSync(join(f.source, "evals"));
+    writeFileSync(join(f.source, "evals/data.txt"), "fixture data the test suite reads");
+    await sh(["git", "add", "-A"], { cwd: f.source });
+    await sh(["git", "commit", "-qm", "checks read evals"], { cwd: f.source });
+    const base = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+    await sh(["git", "push", "-q", f.cache, "HEAD:refs/heads/reads-evals"], { cwd: f.source });
+    const item: ImplementCase = {
+      id: "one",
+      repo: "fixture/repo",
+      base,
+      head: base,
+      prompt: "Create answer containing correct",
+      complexity: "small",
+      spec: null,
+      source: "fixture",
+      tags: [],
+      hidden: { files: ["check.sh"], command: "sh check.sh", timeoutSec: 5 },
+    };
+    mkdirSync(join(f.home, "hidden", item.id), { recursive: true });
+    writeFileSync(join(f.home, "hidden", item.id, "check.sh"), 'test "$(cat answer)" = correct\n');
+    f.respond(() => ({ files: { answer: "correct" }, text: "Implemented" }));
+    const run = (snapshot: boolean) => {
+      writeFileSync(
+        f.casePath,
+        JSON.stringify({ role: "implement", version: 1, cases: [{ ...item, snapshot }] }),
+      );
+      return f.run({ role: "implement", models: ["candidate-a"], k: 1 });
+    };
+    expect((await run(false)).trials[0]).toMatchObject({ status: "ok", pass: true });
+    expect(f.calls).toHaveLength(1);
+    const [trial] = (await run(true)).trials;
+    expect(trial).toMatchObject({ status: "error", pass: false, details: { preparationFailed: true } });
+    expect(String(trial?.details.reason)).toContain(
+      "snapshot mode removed evals/ and baseline check reads-evals fails; this case can't use snapshot mode",
+    );
+    expect(f.calls).toHaveLength(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("triage snapshot fetches a pin reachable only from a tag, by exact SHA", async () => {
+  const f = await evalFixture();
+  const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: f.source })).stdout.trim();
+  try {
+    writeFileSync(join(f.source, "tag-only.txt"), "x");
+    await git("add", "-A");
+    await git("commit", "-qm", "tag only");
+    f.dataset.repos["fixture/repo"] = await git("rev-parse", "HEAD");
+    await git("tag", "v1");
+    await git("reset", "-q", "--hard", "HEAD^");
+    for (const item of f.dataset.cases) item.snapshot = true;
+    f.save();
+    const report = await f.run({ models: ["candidate-a"], k: 1 });
+    expect(report.run.status).toBe("completed");
+    expect(report.trials.map((t) => t.status)).toEqual(["ok", "ok", "ok"]);
+    expect(f.calls.every((s) => s.prompt.includes("tag-only.txt"))).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const snapshot of [false, true])
+  test(`triage missing pin fails only its own cases (snapshot: ${snapshot})`, async () => {
+    const f = await evalFixture();
+    try {
+      // A second local cache, so the failed fetch never reaches the network.
+      await sh(["git", "clone", "-q", "--bare", f.source, join(f.cfg.paths.repos, "fixture__other.git")], {
+        cwd: f.home,
+      });
+      const missing = "f".repeat(40);
+      f.dataset.repos["fixture/other"] = missing;
+      f.dataset.cases = f.dataset.cases.map((item) => ({
+        ...item,
+        snapshot,
+        ...(item.id === "c" ? { repo: "fixture/other" } : {}),
+      }));
+      f.save();
+      const report = await f.run({ models: ["candidate-a"], k: 1 });
+      expect(report.run.status).toBe("completed");
+      const byCase = Object.fromEntries(report.trials.map((t) => [t.caseId, t]));
+      expect(byCase.a?.status).toBe("ok");
+      expect(byCase.b?.status).toBe("ok");
+      expect(byCase.c).toMatchObject({ status: "error", pass: false, details: { preparationFailed: true } });
+      expect(String(byCase.c?.details.reason)).toContain(missing);
+      expect(f.calls).toHaveLength(2);
+      expect(readdirSync(f.cfg.paths.runs).filter((p) => p.startsWith("eval-"))).toEqual([]);
+    } finally {
+      await f.close();
+    }
+  });

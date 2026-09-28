@@ -496,6 +496,54 @@ export async function createEvalWorktree(
   labels: EvalLabels = { paths: [], contents: [] },
   snapshot = false,
 ): Promise<(() => Promise<void>) & { base: string }> {
+  const cleanup = async () => rmSync(path, { recursive: true, force: true });
+  try {
+    const pins = await stageEvalRepo(paths, store, slug, base, head, path, signal, labels, snapshot);
+    const opts = { cwd: path, signal };
+    await sh(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", pins[1]], opts);
+    for (const ref of ["refs/eval/base", "refs/eval/head"]) await sh(["git", "update-ref", "-d", ref], opts);
+    await sh(["git", "reflog", "expire", "--expire=now", "--all"], opts);
+    return Object.assign(cleanup, { base: pins[0] });
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}
+
+/** Top-level listing of a checked snapshot of `sha`, read with ls-tree; `path` is removed after. */
+export async function snapshotTopLevel(
+  paths: Paths,
+  store: Store,
+  slug: string,
+  sha: string,
+  path: string,
+  signal: AbortSignal,
+  labels: EvalLabels,
+): Promise<string> {
+  try {
+    const [, head] = await stageEvalRepo(paths, store, slug, sha, sha, path, signal, labels, true);
+    const tree = await sh(["git", "ls-tree", "--name-only", "-z", head], { cwd: path, signal });
+    return formatTopLevel(tree.stdout.split("\0").filter(Boolean));
+  } finally {
+    rmSync(path, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Fill a fresh repository at `path` with the pins (or their snapshot) under refs/eval/{base,head}
+ * and reject contamination; returns the commits the candidate will see.
+ */
+async function stageEvalRepo(
+  paths: Paths,
+  store: Store,
+  slug: string,
+  base: string,
+  head: string,
+  path: string,
+  signal: AbortSignal,
+  labels: EvalLabels,
+  snapshot: boolean,
+): Promise<[string, string]> {
   if (!/^[\w.-]+\/[\w.-]+$/.test(slug) || ![base, head].every((sha) => /^[a-fA-F0-9]{40}$/.test(sha)))
     throw new Error("invalid repository pin");
   const registered = store.getRepoBySlug(slug);
@@ -512,48 +560,49 @@ export async function createEvalWorktree(
   const cache = cachePath(paths, repo);
   signal.throwIfAborted();
   if (!existsSync(cache)) await ensureCache(paths, repo, signal);
-  const cleanup = async () => rmSync(path, { recursive: true, force: true });
   let pins: [string, string] = [base, head];
-  try {
-    await withRepoLock(cache, async () => {
-      signal.throwIfAborted();
-      const opts = { cwd: cache, signal };
-      const bare = await sh(["git", "rev-parse", "--is-bare-repository"], opts);
-      if (bare.stdout.trim() !== "true") throw new Error(`eval repository cache is not bare: ${cache}`);
-      const exists = async (sha: string) =>
-        (await sh(["git", "cat-file", "-e", `${sha}^{commit}`], { ...opts, allowFail: true })).exitCode === 0;
-      if (!(await exists(base)) || !(await exists(head))) {
-        await sh(
-          [
-            "git",
-            "fetch",
-            "origin",
-            "+refs/heads/*:refs/remotes/origin/*",
-            "+refs/pull/*/head:refs/pull/*/head",
-          ],
-          { ...opts, timeoutMs: 300_000 },
-        );
-      }
-      for (const sha of [base, head])
-        if (!(await exists(sha))) throw new Error(`pinned commit ${sha} missing in ${slug}`);
-      signal.throwIfAborted();
-      // A standalone repo holding only history reachable from the pins: a linked worktree
-      // would share the cache's refs and objects, exposing later fixes and labeled datasets.
-      mkdirSync(path, { recursive: true });
-      await sh(["git", "init", "-q", path], opts);
-      if (snapshot) pins = await pushSnapshot(cache, base, head, path, signal);
-      else await sh(["git", "push", "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
-    });
-    const opts = { cwd: path, signal };
-    await rejectContamination(path, labels, signal);
-    await sh(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", pins[1]], opts);
-    for (const ref of ["refs/eval/base", "refs/eval/head"]) await sh(["git", "update-ref", "-d", ref], opts);
-    await sh(["git", "reflog", "expire", "--expire=now", "--all"], opts);
-    return Object.assign(cleanup, { base: pins[0] });
-  } catch (error) {
-    await cleanup();
-    throw error;
-  }
+  await withRepoLock(cache, async () => {
+    signal.throwIfAborted();
+    const opts = { cwd: cache, signal };
+    const bare = await sh(["git", "rev-parse", "--is-bare-repository"], opts);
+    if (bare.stdout.trim() !== "true") throw new Error(`eval repository cache is not bare: ${cache}`);
+    const exists = async (sha: string) =>
+      (await sh(["git", "cat-file", "-e", `${sha}^{commit}`], { ...opts, allowFail: true })).exitCode === 0;
+    const missing = async () => {
+      const absent: string[] = [];
+      for (const sha of new Set([base, head])) if (!(await exists(sha))) absent.push(sha);
+      return absent;
+    };
+    let absent = await missing();
+    if (snapshot && absent.length) {
+      // Like pinnedTree: fetch the exact pins, which may be reachable only from a tag.
+      await sh(["git", "fetch", "origin", ...absent], { ...opts, timeoutMs: 300_000, allowFail: true });
+      absent = await missing();
+    }
+    if (absent.length) {
+      await sh(
+        [
+          "git",
+          "fetch",
+          "origin",
+          "+refs/heads/*:refs/remotes/origin/*",
+          "+refs/pull/*/head:refs/pull/*/head",
+        ],
+        { ...opts, timeoutMs: 300_000 },
+      );
+    }
+    for (const sha of [base, head])
+      if (!(await exists(sha))) throw new Error(`pinned commit ${sha} missing in ${slug}`);
+    signal.throwIfAborted();
+    // A standalone repo holding only history reachable from the pins: a linked worktree
+    // would share the cache's refs and objects, exposing later fixes and labeled datasets.
+    mkdirSync(path, { recursive: true });
+    await sh(["git", "init", "-q", path], opts);
+    if (snapshot) pins = await pushSnapshot(cache, base, head, path, signal);
+    else await sh(["git", "push", "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
+  });
+  await rejectContamination(path, labels, signal);
+  return pins;
 }
 
 /** Fixed identity and dates so the same pins always produce the same snapshot commits. */

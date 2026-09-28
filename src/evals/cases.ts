@@ -83,37 +83,51 @@ export const GateComparisonSchema = z.strictObject({
 });
 /** `snapshot: true` gives the candidate neutral commits of the pinned trees without `evals/`. */
 const repositoryCase = { id: nonempty, repo: repoId, base: pin, head: pin, snapshot: z.boolean().optional() };
-export const ReviewCaseSchema = z.strictObject({
-  ...repositoryCase,
-  kind: z.enum(["real", "clean", "seeded"]),
-  source: z.string(),
-  input: z.strictObject({
-    prompt: nonempty,
-    spec: SpecSchema.nullable(),
-    implementerReport: z.string(),
-    gates: z.array(GateComparisonSchema),
-  }),
-  defects: z.array(
-    z.strictObject({
-      file: nonempty,
-      lines: z
-        .tuple([z.number().int().nonnegative(), z.number().int().nonnegative()])
-        .refine(([start, end]) => start <= end, "invalid defect range"),
-      severity: z.enum(["blocker", "major", "minor", "nit"]),
-      category: nonempty,
-      summary: nonempty,
-      required: z.boolean(),
-      foundBy: z.string(),
+export const ReviewCaseSchema = z
+  .strictObject({
+    ...repositoryCase,
+    kind: z.enum(["real", "clean", "seeded"]),
+    source: z.string(),
+    input: z.strictObject({
+      prompt: nonempty,
+      spec: SpecSchema.nullable(),
+      implementerReport: z.string(),
+      gates: z.array(GateComparisonSchema),
     }),
-  ),
-  seedPatch: nonempty
-    .refine(
-      (path) =>
-        !isAbsolute(path) && !path.includes("\\") && !path.split("/").includes("..") && !path.includes("\0"),
-      "seed path must stay inside dataset directory",
-    )
-    .optional(),
-});
+    defects: z.array(
+      z.strictObject({
+        file: nonempty,
+        lines: z
+          .tuple([z.number().int().nonnegative(), z.number().int().nonnegative()])
+          .refine(([start, end]) => start <= end, "invalid defect range"),
+        severity: z.enum(["blocker", "major", "minor", "nit"]),
+        category: nonempty,
+        summary: nonempty,
+        required: z.boolean(),
+        foundBy: z.string(),
+      }),
+    ),
+    seedPatch: nonempty
+      .refine(
+        (path) =>
+          !isAbsolute(path) &&
+          !path.includes("\\") &&
+          !path.split("/").includes("..") &&
+          !path.includes("\0"),
+        "seed path must stay inside dataset directory",
+      )
+      .optional(),
+  })
+  .superRefine((item, ctx) => {
+    // Snapshot mode strips the top-level evals/ directory, so the candidate could never see these.
+    for (const [index, defect] of item.defects.entries())
+      if (item.snapshot && /^(\.\/)*evals(\/|$)/.test(defect.file))
+        ctx.addIssue({
+          code: "custom",
+          path: ["defects", index, "file"],
+          message: "snapshot mode removes evals/, so a gold defect cannot lie under it",
+        });
+  });
 export const VerifyCaseSchema = z
   .strictObject({
     ...repositoryCase,

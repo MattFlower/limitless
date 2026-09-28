@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { EvalRun, EvalTrial } from "../core/types.ts";
-import { createEvalWorktree, type EvalLabels, formatTopLevel, pinnedTree } from "../git/repos.ts";
+import { createEvalWorktree, type EvalLabels, pinnedTree, snapshotTopLevel } from "../git/repos.ts";
 import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
 import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
@@ -9,7 +9,6 @@ import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
 import { toStrictJsonSchema } from "../pipeline/schemas.ts";
 import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
-import { sh } from "../util/proc.ts";
 import { cacheKey } from "./cache.ts";
 import {
   type AnyCaseFile,
@@ -208,14 +207,7 @@ export class EvalRunner {
     mkdirSync(cfg.paths.runs, { recursive: true });
     const directory = mkdtempSync(join(cfg.paths.runs, "eval-"));
     try {
-      const cwd = join(directory, "snapshot");
-      const cleanup = await createEvalWorktree(cfg.paths, store, slug, sha, sha, cwd, signal, labels, true);
-      try {
-        const tree = await sh(["git", "ls-tree", "--name-only", "-z", "HEAD"], { cwd, signal });
-        return formatTopLevel(tree.stdout.split("\0").filter(Boolean));
-      } finally {
-        await cleanup();
-      }
+      return await snapshotTopLevel(cfg.paths, store, slug, sha, join(directory, "snapshot"), signal, labels);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -292,12 +284,13 @@ export class EvalRunner {
     let target = router.toTarget(model, effort ?? null);
     let { harnessName, noTools } = selectHarness(run.role, target);
     trial.harness = harnessName;
-    const tree = "gold" in item && "prompt" in item ? await treeFor(item, labels) : "";
     let release: (() => void) | undefined;
     let directory: string | undefined;
     let scratch: string | undefined;
     let cleanup: (() => Promise<void>) | undefined;
     try {
+      // Inside the try: a missing pin or failed snapshot fails this case's preparation, not the run.
+      const tree = "gold" in item && "prompt" in item ? await treeFor(item, labels) : "";
       mkdirSync(cfg.paths.runs, { recursive: true });
       directory = mkdtempSync(join(cfg.paths.runs, "eval-"));
       const cwd = "gold" in item && "prompt" in item ? directory : join(directory, "worktree");
