@@ -253,6 +253,13 @@ export const RunDetail: Component = () => {
                         pull request ↗
                       </a>
                     </Show>
+                    <Show when={r().status === "resolved"}>
+                      <span>·</span>
+                      <span>
+                        Merged by {r().mergedBy ?? "unknown"}
+                        {r().mergedAt ? ` on ${new Date(r().mergedAt as number).toLocaleString()}` : ""}
+                      </span>
+                    </Show>
                   </div>
                   <div class="run-meta-row">
                     <span class="chip-tag">{r().resolvedProfile ?? r().profile}</span>

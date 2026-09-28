@@ -403,6 +403,31 @@ describe("Router", () => {
 });
 
 describe("ProviderTracker concurrency", () => {
+  test("uses an overridden limit for admission and status", async () => {
+    const overridden = providers.map((provider) => ({
+      ...provider,
+      maxConcurrent: provider.id === "claude" ? 3 : provider.maxConcurrent,
+    }));
+    const tracker = new ProviderTracker(overridden, store, reserves, {});
+    const signal = new AbortController().signal;
+    const releases = await Promise.all(Array.from({ length: 3 }, () => tracker.acquire("claude", signal)));
+    expect(tracker.status("claude")?.maxConcurrent).toBe(3);
+    expect(tracker.status("claude")?.inFlight).toBe(3);
+    let admitted = false;
+    const waiting = tracker.acquire("claude", signal).then((release) => {
+      admitted = true;
+      return release;
+    });
+    await Bun.sleep(10);
+    expect(admitted).toBe(false);
+    releases[0]?.();
+    const release = await waiting;
+    expect(admitted).toBe(true);
+    expect(tracker.status("claude")?.inFlight).toBe(3);
+    release();
+    for (const done of releases.slice(1)) done();
+  });
+
   test("acquire blocks at maxConcurrent until released", async () => {
     const { tracker } = setup();
     const ac = new AbortController();

@@ -30,6 +30,11 @@ export const KpiStrip: Component<{ totals: Stats["totals"] }> = (props) => (
       </span>
     </div>
     <div class="kpi">
+      <span class="kpi-label">Open needs human (14d)</span>
+      <span class="kpi-value">{props.totals.openNeedsHuman}</span>
+      <span class="kpi-sub">{Math.round(props.totals.openNeedsHumanRate * 100)}% of runs</span>
+    </div>
+    <div class="kpi">
       <span class="kpi-label">Real spend (14d)</span>
       <span class="kpi-value">{money(props.totals.costUsd)}</span>
       <span class="kpi-sub">metered providers</span>
