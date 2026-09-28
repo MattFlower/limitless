@@ -91,6 +91,30 @@ export const MIN_LATER_REVIEW_SUMMARY = 12;
 const summaryField = (min: number) =>
   z.string().describe(`What you checked and concluded; at least ${min} characters when findings is empty`);
 
+export const FindingCategoryEnum = z.enum([
+  "correctness",
+  "security",
+  "reliability",
+  "data",
+  "concurrency",
+  "compatibility",
+  "test-gap",
+  "cleanup",
+  "conventions",
+]);
+
+/** Evidence fields added in finding schema v2; reviews stored before them omit all four. */
+const findingV2 = {
+  failure_scenario: z.string().describe("Concrete inputs or state that lead to the wrong output or crash"),
+  category: FindingCategoryEnum,
+  // Strict JSON schemas drop numeric bounds, so out-of-range values are clamped instead of rejected.
+  confidence: z
+    .number()
+    .overwrite((value) => Math.min(1, Math.max(0, value)))
+    .describe("How sure you are that this is a real defect, from 0 to 1"),
+  introduced_by_diff: z.boolean().describe("True if the change under review introduced the defect"),
+};
+
 const reviewBase = z.object({
   verdict: z.enum(["approve", "request_changes"]),
   summary: summaryField(MIN_REVIEW_SUMMARY),
@@ -103,6 +127,7 @@ const reviewBase = z.object({
       title: z.string(),
       detail: z.string(),
       suggestion: z.string(),
+      ...findingV2,
     }),
   ),
 });
@@ -140,11 +165,16 @@ const rejectDegenerate =
 export const ReviewSchema = reviewBase.superRefine(rejectDegenerate(MIN_REVIEW_SUMMARY));
 export const LaterReviewSchema = laterReviewBase.superRefine(rejectDegenerate(MIN_LATER_REVIEW_SUMMARY));
 
+type LiveFinding = z.infer<typeof ReviewSchema>["findings"][number];
+type FindingV2Field = keyof typeof findingV2;
+
+/** Findings in run state may predate schema v2, so its fields stay optional once stored. */
 export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
-  findings: (z.infer<typeof ReviewSchema>["findings"][number] & {
-    label?: z.infer<typeof LaterReviewSchema>["findings"][number]["label"];
-    prior?: string;
-  })[];
+  findings: (Omit<LiveFinding, FindingV2Field> &
+    Partial<Pick<LiveFinding, FindingV2Field>> & {
+      label?: z.infer<typeof LaterReviewSchema>["findings"][number]["label"];
+      prior?: string;
+    })[];
 };
 
 /**
@@ -162,6 +192,10 @@ export const StoredReviewSchema = reviewBase
         title: z.string().default(""),
         detail: z.string().default(""),
         suggestion: z.string().default(""),
+        failure_scenario: findingV2.failure_scenario.optional(),
+        category: findingV2.category.optional(),
+        confidence: findingV2.confidence.optional(),
+        introduced_by_diff: findingV2.introduced_by_diff.optional(),
       }),
     ),
   })

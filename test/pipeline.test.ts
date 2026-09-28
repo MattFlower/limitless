@@ -12,10 +12,12 @@ import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
 import type { RunState } from "../src/pipeline/context.ts";
-import { executeRun } from "../src/pipeline/engine.ts";
+import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
 import { renderReport } from "../src/pipeline/report.ts";
+import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
+import { findingEvidence } from "./review-support.ts";
 
 const providers: ProviderDef[] = [
   { id: "alpha", label: "Alpha", harness: "fake", billing: "subscription", maxConcurrent: 2 },
@@ -371,6 +373,7 @@ esac
     const finding = (title: string, label?: "new") => ({
       severity: "major" as const,
       security: false,
+      ...findingEvidence,
       ...(label ? { label, prior: "" } : {}),
       file: "farewell.txt",
       line: 1,
@@ -428,6 +431,81 @@ esac
     const followUps = resumed.store.getArtifact(run.id, "report.md")?.split("## Review follow-ups")[1];
     expect(followUps?.match(/^- major: `farewell\.txt:1` Backlog idea/gm)).toHaveLength(1);
   });
+  test("a later round replays a review history recorded before finding schema v2", async () => {
+    const specs: AgentSpec[] = [];
+    const handler: Handler = (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        specs.push(s);
+        const prior = {
+          severity: "major",
+          security: false,
+          ...findingEvidence,
+          file: "farewell.txt",
+          line: 1,
+          title: "Prior bug",
+          detail: "bug",
+          suggestion: "fix",
+        };
+        return { structured: specs.length === 1 ? { ...approve, findings: [prior] } : approve };
+      }
+      return { files: { "farewell.txt": `goodbye ${specs.length}\n` } };
+    };
+    const f = start(handler);
+    const legacy = <T extends object>(finding: T) => {
+      const { failure_scenario, category, confidence, introduced_by_diff, ...rest } = finding as T &
+        Partial<typeof findingEvidence>;
+      return rest;
+    };
+    f.deps.faults = {
+      "stage:review:before": {
+        action: "kill",
+        occurrence: 2,
+        onHit: ({ runId }) => {
+          const state = f.store.getRunState<RunState>(runId);
+          if (!state?.lastReview) throw new Error("missing first review");
+          state.reviewHistory = state.reviewHistory?.map((entry) => ({
+            ...entry,
+            blocking: entry.blocking.map(legacy),
+            followUps: entry.followUps.map(legacy),
+          }));
+          state.lastReview = { ...state.lastReview, findings: state.lastReview.findings.map(legacy) };
+          f.store.setRunState(runId, state);
+        },
+      },
+    };
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    const deadline = Date.now() + 10_000;
+    while (
+      f.store.listStages(run.id).at(-1)?.name !== "review" ||
+      f.store.listStages(run.id).at(-1)?.status !== "cancelled"
+    ) {
+      if (Date.now() > deadline) throw new Error("review interruption timed out");
+      await Bun.sleep(10);
+    }
+    await f.stop();
+    f.store.close();
+    const resumed = start(handler);
+    expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const [first, later] = specs;
+    expect(specs).toHaveLength(2);
+    expect(first?.mode).toBe("readonly");
+    expect(first?.schema).toBe(ReviewSchema);
+    expect(first?.jsonSchema).toEqual(toStrictJsonSchema(ReviewSchema));
+    expect(first?.timeoutMs).toBe(readingTimeout(1));
+    expect(later?.schema).toBe(LaterReviewSchema);
+    expect(later?.jsonSchema).toEqual(toStrictJsonSchema(LaterReviewSchema));
+    // The legacy blocking finding is quoted as P1 without the v2 fields.
+    expect(later?.prompt).toContain('"id": "P1"');
+    expect(later?.prompt).toContain("Prior bug");
+    expect(later?.prompt).not.toContain('"confidence"');
+    const artifact = JSON.parse(resumed.store.getArtifact(run.id, "review-0.json") ?? "{}");
+    expect(artifact).toMatchObject({ verdict: "request_changes", modelVerdict: "approve" });
+    expect(artifact.findings[0]).toMatchObject(findingEvidence);
+    expect(resumed.store.getArtifact(run.id, "review-1.json")).toContain('"verdict": "approve"');
+  });
+
   test("Dependabot uses free models across quick stages and keeps them on feedback rounds", async () => {
     const seen: { role: string; provider: string }[] = [];
     let implementations = 0;
@@ -676,6 +754,7 @@ esac
                 prior: "P1",
                 severity: "blocker",
                 security: false,
+                ...findingEvidence,
                 file: "farewell.txt",
                 line: 1,
                 title: "Incorrect output",
@@ -956,6 +1035,7 @@ esac
                   {
                     severity: "blocker",
                     security: false,
+                    ...findingEvidence,
                     ...(reviews > 1
                       ? reviews > normalRounds
                         ? { label: "regression", prior: "" }
@@ -1456,6 +1536,7 @@ protected_paths = ["protected.txt"]
         detail: "Repair compatibility",
         suggestion: "Fix compatibility",
         security: false,
+        ...findingEvidence,
       };
       const needsReviewRepair = ["review", "persistent", "repair-audit", "restart-repair"].includes(scenario);
       const handler: Handler = async (agent): Promise<FakeReply> => {
@@ -1663,6 +1744,7 @@ protected_paths = ["protected.txt"]
                   detail: "Repair the update",
                   suggestion: "Fix compatibility",
                   security: false,
+                  ...findingEvidence,
                 },
               ],
             },
@@ -2276,6 +2358,7 @@ protected_paths = ["protected.txt"]
                 {
                   severity: "blocker",
                   security: false,
+                  ...findingEvidence,
                   file: "farewell.txt",
                   line: 1,
                   title: "Wrong text",
@@ -2645,6 +2728,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
                   {
                     severity: "blocker",
                     security: false,
+                    ...findingEvidence,
                     file: "farewell.txt",
                     line: 1,
                     title: "Wrong text",
@@ -2671,6 +2755,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
     const finding = (title: string, label?: "unaddressed" | "regression" | "new") => ({
       severity: "major",
       security: false,
+      ...findingEvidence,
       ...(label ? { label, prior: label === "unaddressed" ? "P1" : "" } : {}),
       file: "farewell.txt",
       line: 1,
@@ -2744,6 +2829,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
                       {
                         severity: reviews === 2 ? "minor" : "major",
                         security: false,
+                        ...findingEvidence,
                         ...(reviews === 2 ? { label, prior: label === "unaddressed" ? "P1" : "" } : {}),
                         file: "farewell.txt",
                         line: 1,
@@ -2756,6 +2842,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
                             {
                               severity: "minor",
                               security: false,
+                              ...findingEvidence,
                               label: "new",
                               prior: "",
                               file: "farewell.txt",
@@ -2805,6 +2892,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
                     {
                       severity: "major",
                       security: false,
+                      ...findingEvidence,
                       file: "farewell.txt",
                       line: 1,
                       title: "Prior bug",
@@ -2821,6 +2909,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
                       {
                         severity: "minor",
                         security: true,
+                        ...findingEvidence,
                         label: "new",
                         prior: "",
                         file: "farewell.txt",
@@ -2865,6 +2954,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
                     {
                       severity: "major",
                       security: false,
+                      ...findingEvidence,
                       file: "farewell.txt",
                       line: 1,
                       title: "Prior bug",
@@ -2880,6 +2970,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
                       {
                         severity: "minor",
                         security: false,
+                        ...findingEvidence,
                         label: "regression",
                         prior: "",
                         file: "farewell.txt",
@@ -2891,6 +2982,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
                       {
                         severity: "major",
                         security: false,
+                        ...findingEvidence,
                         label: "new",
                         prior: "",
                         file: "farewell.txt",
@@ -2907,6 +2999,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
                       {
                         severity: "major",
                         security: false,
+                        ...findingEvidence,
                         label: "unaddressed",
                         // Cites no previous blocking finding: a relabelled follow-up can't become mandatory.
                         prior: "",
@@ -2961,6 +3054,7 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
       const finding = (title: string, label = "new") => ({
         severity: "major",
         security: false,
+        ...findingEvidence,
         label,
         prior: "",
         file: "farewell.txt",

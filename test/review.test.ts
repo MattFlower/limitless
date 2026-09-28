@@ -1,7 +1,21 @@
 import { describe, expect, test } from "bun:test";
+import { emptyUsage } from "../src/harness/types.ts";
 import { reviewPrompt } from "../src/pipeline/prompts.ts";
-import { blockingReviewFindings, reviewVerdict } from "../src/pipeline/review.ts";
-import { LaterReviewSchema, type Review, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import {
+  blockingReviewFindings,
+  type ReviewInput,
+  type ReviewRequest,
+  reviewVerdict,
+  runReview,
+} from "../src/pipeline/review.ts";
+import {
+  LaterReviewSchema,
+  type Review,
+  ReviewSchema,
+  StoredReviewSchema,
+  toStrictJsonSchema,
+} from "../src/pipeline/schemas.ts";
+import { findingEvidence } from "./review-support.ts";
 
 const finding = (severity: Review["findings"][number]["severity"], security = false) => ({
   severity,
@@ -13,6 +27,7 @@ const finding = (severity: Review["findings"][number]["severity"], security = fa
   title: "Observed issue",
   detail: "Reproducible issue",
   suggestion: "Fix it",
+  ...findingEvidence,
 });
 
 describe("deterministic review decision", () => {
@@ -255,5 +270,203 @@ describe("review prompt", () => {
       "expected 1 to be 2",
     ])
       expect(omitted).toContain(kept);
+  });
+});
+
+describe("runReview", () => {
+  const promptInput: ReviewInput["prompt"] = {
+    prompt: "Add a farewell file",
+    spec: null,
+    baseSha: "base123",
+    stat: " farewell.txt | 1 +",
+    gates: [],
+    audit: [],
+    implementerReport: "",
+  };
+  const agentResult = (structured: unknown, finalText = "") => ({
+    status: "ok" as const,
+    finalText,
+    structured,
+    sessionId: null,
+    usage: emptyUsage(),
+    numTurns: 1,
+    costUsd: 0,
+    costEquivUsd: 0,
+    error: null,
+    quota: null,
+  });
+  const fake = (structured: unknown, finalText = "") => {
+    const requests: ReviewRequest[] = [];
+    const deps = {
+      invoke: async (request: ReviewRequest) => {
+        requests.push(request);
+        return { result: agentResult(structured, finalText), target: "fake-model" };
+      },
+    };
+    return { deps, requests };
+  };
+  const first = (findings: unknown[], verdict = "approve") => ({
+    verdict,
+    summary: "Checked the farewell change end to end.",
+    findings,
+  });
+  const firstFinding = (overrides: Record<string, unknown> = {}) => ({
+    ...finding("major"),
+    label: undefined,
+    prior: undefined,
+    ...overrides,
+  });
+
+  test("first round sends the pipeline prompt and strict first-round schema, then derives the verdict", async () => {
+    const { deps, requests } = fake(first([firstFinding()]));
+    const out = await runReview(deps, { prompt: promptInput, timeoutMs: 1234 });
+    expect(requests).toEqual([
+      {
+        prompt: reviewPrompt(promptInput),
+        schema: ReviewSchema,
+        jsonSchema: toStrictJsonSchema(ReviewSchema),
+        timeoutMs: 1234,
+      },
+    ]);
+    expect(out.target).toBe("fake-model");
+    if (!out.parsed.success) throw out.parsed.error;
+    // The model said approve; the derived verdict from a major finding blocks.
+    expect(out.parsed.data.verdict).toBe("approve");
+    expect(out.parsed.decision.modelVerdict).toBe("approve");
+    expect(out.parsed.decision.review.verdict).toBe("request_changes");
+    expect(out.parsed.decision.blocking).toHaveLength(1);
+    expect(out.parsed.decision.followUps).toEqual([]);
+  });
+
+  test("later rounds use the labelled schema and classify follow-ups, merging replayed ones", async () => {
+    const prior = [finding("major")];
+    const findings = [
+      { ...finding("minor"), label: "unaddressed", prior: "P1", title: "Still broken" },
+      { ...finding("major"), label: "new", title: "Backlog" },
+      { ...finding("minor", true), label: "new", title: "Leak" },
+      { ...finding("nit"), label: "regression", title: "Regressed" },
+    ];
+    const { deps, requests } = fake({ verdict: "approve", summary: "P1 rechecked.", findings });
+    const replayed = [{ ...finding("minor"), title: "Earlier follow-up" }];
+    const out = await runReview(deps, {
+      prompt: { ...promptInput, previous: { sha: "old", findings: prior }, headSha: "new" },
+      timeoutMs: 1,
+      replayedFollowUps: replayed,
+    });
+    expect(requests[0]?.schema).toBe(LaterReviewSchema);
+    expect(requests[0]?.prompt).toContain("# Previous review");
+    if (!out.parsed.success) throw out.parsed.error;
+    const titles = (list: Review["findings"]) => list.map((f) => f.title);
+    expect(titles(out.parsed.decision.blocking)).toEqual(["Still broken", "Leak", "Regressed"]);
+    expect(titles(out.parsed.decision.followUps)).toEqual(["Earlier follow-up", "Backlog"]);
+    expect(out.parsed.decision.review.verdict).toBe("request_changes");
+  });
+
+  test("confidence is clamped into [0, 1] and must be a finite number", async () => {
+    for (const [given, expected] of [
+      [-0.5, 0],
+      [0, 0],
+      [0.42, 0.42],
+      [1, 1],
+      [7, 1],
+    ] as const) {
+      const out = await runReview(fake(first([firstFinding({ confidence: given })])).deps, {
+        prompt: promptInput,
+        timeoutMs: 1,
+      });
+      if (!out.parsed.success) throw out.parsed.error;
+      expect(out.parsed.data.findings[0]?.confidence).toBe(expected);
+    }
+    for (const confidence of [undefined, "0.9", null, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const out = await runReview(fake(first([firstFinding({ confidence })])).deps, {
+        prompt: promptInput,
+        timeoutMs: 1,
+      });
+      expect(out.parsed.success).toBe(false);
+    }
+  });
+
+  test("falls back to JSON in the final text and reports invalid output without throwing", async () => {
+    const text = `\`\`\`json\n${JSON.stringify(first([firstFinding({ confidence: 2 })]))}\n\`\`\``;
+    const out = await runReview(fake(null, text).deps, { prompt: promptInput, timeoutMs: 1 });
+    if (!out.parsed.success) throw out.parsed.error;
+    expect(out.parsed.data.findings[0]?.confidence).toBe(1);
+    const bad = await runReview(fake({ verdict: "approve", summary: "ok", findings: [] }).deps, {
+      prompt: promptInput,
+      timeoutMs: 1,
+    });
+    expect(bad.parsed.success).toBe(false);
+  });
+});
+
+describe("finding schema v2", () => {
+  const categories = [
+    "correctness",
+    "security",
+    "reliability",
+    "data",
+    "concurrency",
+    "compatibility",
+    "test-gap",
+    "cleanup",
+    "conventions",
+  ];
+  for (const schema of [ReviewSchema, LaterReviewSchema]) {
+    test(`${schema === ReviewSchema ? "first" : "later"}-round schema requires the evidence fields`, () => {
+      const json = toStrictJsonSchema(schema) as {
+        properties: { findings: { items: { required: string[]; properties: Record<string, unknown> } } };
+      };
+      const item = json.properties.findings.items;
+      for (const key of ["failure_scenario", "category", "confidence", "introduced_by_diff"])
+        expect(item.required).toContain(key);
+      expect(item.properties.category).toMatchObject({ enum: categories });
+      expect(item.properties.confidence).toMatchObject({ type: "number" });
+      expect(JSON.stringify(json)).not.toMatch(/"(minimum|maximum|exclusiveMinimum|exclusiveMaximum)"/);
+      const base = {
+        verdict: "approve",
+        summary: "Reviewed the farewell change.",
+        findings: [finding("minor")],
+      };
+      expect(schema.safeParse(base).success).toBe(true);
+      for (const key of Object.keys(findingEvidence)) {
+        const { [key as keyof typeof findingEvidence]: _omitted, ...rest } = finding("minor");
+        expect(schema.safeParse({ ...base, findings: [rest] }).success).toBe(false);
+      }
+      expect(
+        schema.safeParse({ ...base, findings: [{ ...finding("minor"), category: "style" }] }).success,
+      ).toBe(false);
+    });
+  }
+
+  test("the prompt asks for every evidence field", () => {
+    const prompt = reviewPrompt({
+      prompt: "x",
+      spec: null,
+      baseSha: "abc",
+      stat: "",
+      gates: [],
+      audit: [],
+      implementerReport: "",
+    });
+    for (const text of ["failure_scenario", "introduced_by_diff", "confidence (0 to 1", ...categories])
+      expect(prompt).toContain(text);
+  });
+
+  test("stored reviews recorded before v2 still parse, and v2 values are kept", () => {
+    const legacy = {
+      verdict: "request_changes",
+      summary: "Found an off-by-one in the loop bound.",
+      findings: [
+        { severity: "major", security: false, file: "a.ts", line: 3, title: "t", detail: "", suggestion: "" },
+      ],
+    };
+    const parsed = StoredReviewSchema.parse(legacy);
+    expect(parsed.findings[0]).not.toHaveProperty("confidence");
+    expect(reviewVerdict(parsed)).toBe("request_changes");
+    const v2 = StoredReviewSchema.parse({
+      ...legacy,
+      findings: [{ ...legacy.findings[0], ...findingEvidence }],
+    });
+    expect(v2.findings[0]).toMatchObject(findingEvidence);
   });
 });

@@ -293,6 +293,50 @@ test("cached review outputs graded under the legacy rule regrade to blocking rec
   }
 });
 
+test("first-round review trials keep the model's own output when its verdict disagrees with its findings", async () => {
+  const f = await fixture();
+  try {
+    const [finding] = reviewOutput().findings;
+    f.respond(() => ({
+      structured: { ...reviewOutput(), verdict: "approve", findings: [{ ...finding, confidence: 3 }] },
+    }));
+    const report = await f.run();
+    const trial = report.trials[0];
+    expect(trial?.status).toBe("ok");
+    expect(trial?.output).toMatchObject({ verdict: "approve", findings: [{ confidence: 1 }] });
+    expect(trial?.details.grade).toMatchObject({ pass: true, review: { requestChanges: true } });
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("review trials missing a v2 finding field are invalid output, but pre-v2 stored output regrades", async () => {
+  const f = await fixture();
+  try {
+    const [finding] = reviewOutput().findings;
+    if (!finding) throw new Error("fixture");
+    const { confidence, ...incomplete } = finding;
+    f.respond(() => ({ structured: { ...reviewOutput(), findings: [incomplete] } }));
+    const invalid = (await f.run()).trials[0];
+    expect(invalid?.status).toBe("error");
+    expect(invalid?.details.reason).toContain("Invalid review output");
+    f.respond(() => ({ structured: reviewOutput() }));
+    const stored = (await f.run({ k: 1, cache: false })).trials[0];
+    if (!stored?.details.grade) throw new Error("expected graded trial");
+    const { failure_scenario, category, introduced_by_diff, security, ...legacy } = incomplete;
+    f.factory.store.recordEvalTrial({ ...stored, output: { ...reviewOutput(), findings: [legacy] } });
+    const calls = f.calls.length;
+    const regraded = await f.run();
+    expect(f.calls).toHaveLength(calls);
+    expect(regraded.summaries[0]).toMatchObject({ cached: 1 });
+    expect(regraded.trials[0]?.details.grade).toMatchObject({ pass: stored.details.grade.pass });
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
 test("eval regrade rewrites legacy-shaped stored grades from stored output with no model call or cache hit", async () => {
   const f = await fixture();
   try {

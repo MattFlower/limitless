@@ -53,19 +53,16 @@ import {
   holdoutPrompt,
   implementPrompt,
   redactHoldoutText,
-  reviewPrompt,
   specPrompt,
   triagePrompt,
   verifyPrompt,
 } from "./prompts.ts";
 import { buildReport } from "./report.ts";
-import { blockingReviewFindings, reviewFindingKey, reviewVerdict } from "./review.ts";
+import { blockingReviewFindings, reviewFindingKey, runReview } from "./review.ts";
 import {
   type Holdout,
   HoldoutSchema,
-  LaterReviewSchema,
   type Review,
-  ReviewSchema,
   renderSpec,
   type Spec,
   SpecSchema,
@@ -833,53 +830,53 @@ async function oneRound(
   const review: Review = await ctx.stage(
     "review",
     async (stage) => {
-      const { result, target } = await ctx.invoke({
-        role: "review",
-        stage,
-        mode: "readonly",
-        complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
-        constraints: { avoidVendor: ctx.state.implementer?.vendor },
-        timeoutMs: readingTimeout(diff.added + diff.removed),
-        prompt: reviewPrompt({
-          prompt: ctx.run.prompt,
-          spec: ctx.state.spec ?? null,
-          baseSha,
-          stat: diff.stat,
-          ...(ctx.state.flow === "verify-change" ? { patch: diff.patch } : {}),
-          gates: comparison,
-          audit,
-          implementerReport: ctx.state.implementerReport ?? "",
-          implementerReportMode: ctx.deps.cfg.reviewImplementerReport,
-          externalChange: ctx.state.flow === "verify-change",
-          dependencyUpdate:
-            ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
-          previous: previousReview,
-          headSha: reviewedSha,
-          resolution: ctx.state.conflictRound === round,
-        }),
-        jsonSchema: toStrictJsonSchema(previousReview ? LaterReviewSchema : ReviewSchema),
-        schema: previousReview ? LaterReviewSchema : ReviewSchema,
-        requireStructured: true,
-      });
-      await discardChanges(cwd);
-      const parsed: Review = (previousReview ? LaterReviewSchema : ReviewSchema).parse(result.structured);
-      // The model's verdict is kept for inspection only; control flow uses the derived one.
-      const modelVerdict = parsed.verdict;
-      const r: Review = { ...parsed, verdict: reviewVerdict(parsed, previousReview?.findings) };
-      const blocking = blockingReviewFindings(r, previousReview?.findings);
       // A replay on the same commit (e.g. after a restart) keeps follow-ups it may not repeat.
       const replayed = (ctx.state.reviewHistory ?? []).find(
         (e) => e.round === round && e.sha === reviewedSha,
       );
-      const followUps = previousReview
-        ? [
-            ...new Map(
-              [...(replayed?.followUps ?? []), ...r.findings.filter((f) => !blocking.includes(f))].map(
-                (f) => [reviewFindingKey(f), f] as const,
-              ),
-            ).values(),
-          ]
-        : [];
+      const { target, parsed } = await runReview(
+        {
+          invoke: async (request) => {
+            const invoked = await ctx.invoke({
+              role: "review",
+              stage,
+              mode: "readonly",
+              complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
+              constraints: { avoidVendor: ctx.state.implementer?.vendor },
+              timeoutMs: request.timeoutMs,
+              prompt: request.prompt,
+              jsonSchema: request.jsonSchema,
+              schema: request.schema,
+              requireStructured: true,
+            });
+            await discardChanges(cwd);
+            return invoked;
+          },
+        },
+        {
+          prompt: {
+            prompt: ctx.run.prompt,
+            spec: ctx.state.spec ?? null,
+            baseSha,
+            stat: diff.stat,
+            ...(ctx.state.flow === "verify-change" ? { patch: diff.patch } : {}),
+            gates: comparison,
+            audit,
+            implementerReport: ctx.state.implementerReport ?? "",
+            implementerReportMode: ctx.deps.cfg.reviewImplementerReport,
+            externalChange: ctx.state.flow === "verify-change",
+            dependencyUpdate:
+              ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
+            previous: previousReview,
+            headSha: reviewedSha,
+            resolution: ctx.state.conflictRound === round,
+          },
+          timeoutMs: readingTimeout(diff.added + diff.removed),
+          replayedFollowUps: replayed?.followUps,
+        },
+      );
+      if (!parsed.success) throw parsed.error;
+      const { review: r, modelVerdict, blocking, followUps } = parsed.decision;
       ctx.state.reviewHistory = [...earlierReviews, { round, sha: reviewedSha, blocking, followUps }];
       ctx.state.reviewFollowUps = [
         ...new Map(
