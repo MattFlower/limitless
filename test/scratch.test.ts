@@ -1,10 +1,16 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import { buildCodexArgs, runCodex } from "../src/harness/codex.ts";
-import { SCRATCH_NAME, scratchEnv, withScratch } from "../src/harness/scratch.ts";
+import {
+  createScratch,
+  removeScratch,
+  SCRATCH_NAME,
+  scratchEnv,
+  withScratch,
+} from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { ProcOptions, ProcResult } from "../src/util/proc.ts";
 
@@ -159,3 +165,35 @@ for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {
     }
   });
 }
+
+test("scratch falls back to the next base when the preferred one denies writes", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "limitless-scratch-")));
+  const denied = join(dir, "denied");
+  const allowed = join(dir, "allowed");
+  const worktree = join(dir, "worktree");
+  for (const path of [denied, allowed, worktree]) mkdirSync(path);
+  chmodSync(denied, 0o500);
+  try {
+    const scratch = createScratch(worktree, [denied, allowed]);
+    expect(dirname(dirname(scratch))).toBe(allowed);
+    expect(scratch.endsWith(SCRATCH_NAME)).toBe(true);
+    removeScratch(scratch);
+  } finally {
+    chmodSync(denied, 0o700);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("scratch still fails when no base is writable", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "limitless-scratch-")));
+  const denied = join(dir, "denied");
+  const worktree = join(dir, "worktree");
+  for (const path of [denied, worktree]) mkdirSync(path);
+  chmodSync(denied, 0o500);
+  try {
+    expect(() => createScratch(worktree, [denied])).toThrow("No temporary directory");
+  } finally {
+    chmodSync(denied, 0o700);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
