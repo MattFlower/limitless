@@ -198,6 +198,7 @@ export async function sh(
     signal?: AbortSignal;
   },
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+  opts.signal?.throwIfAborted();
   const res = await runProcess({
     cmd,
     cwd: opts.cwd,
@@ -208,6 +209,8 @@ export async function sh(
     tailLimit: SH_OUTPUT_LIMIT,
     ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
   });
+  // Cancellation must stop command sequences even when a nonzero exit is allowed.
+  opts.signal?.throwIfAborted();
   if (res.truncated) {
     throw new Error(`Output of \`${cmd.join(" ")}\` exceeded ${SH_OUTPUT_LIMIT} characters`);
   }

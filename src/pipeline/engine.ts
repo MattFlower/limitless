@@ -1078,7 +1078,7 @@ async function deliverVerifiedDraft(
   const report = buildReport(ctx, false, { sha, stage, reason, base });
   ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
   ctx.checkCancelled();
-  await pushBranch(ctx.repo, cwd, branch, sha);
+  await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
     branch,
@@ -1087,6 +1087,7 @@ async function deliverVerifiedDraft(
     body: report,
     cwd,
     draft: true,
+    signal: ctx.signal,
   });
   await ctx.save("delivery-pr-created");
   ctx.checkCancelled();
@@ -1130,27 +1131,33 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           ctx.checkCancelled();
           // A pending post may already exist remotely even when its local checkpoint was lost.
           const comments = ctx.state.verdictCommentPending
-            ? await gh([
-                "api",
-                `repos/${ctx.repo.slug}/issues/${ctx.run.sourceRef?.number}/comments`,
-                "--paginate",
-                "--jq",
-                ".[].body",
-              ])
+            ? await gh(
+                [
+                  "api",
+                  `repos/${ctx.repo.slug}/issues/${ctx.run.sourceRef?.number}/comments`,
+                  "--paginate",
+                  "--jq",
+                  ".[].body",
+                ],
+                ctx.signal,
+              )
             : "";
           if (!comments?.includes(marker)) {
             ctx.state.verdictCommentPending = true;
             await ctx.save("verification-comment-pending");
             ctx.checkCancelled();
-            await gh([
-              "pr",
-              "comment",
-              String(ctx.run.sourceRef?.number),
-              "--repo",
-              ctx.repo.slug,
-              "--body",
-              `${marker}\n${report}`,
-            ]);
+            await gh(
+              [
+                "pr",
+                "comment",
+                String(ctx.run.sourceRef?.number),
+                "--repo",
+                ctx.repo.slug,
+                "--body",
+                `${marker}\n${report}`,
+              ],
+              ctx.signal,
+            );
           }
           ctx.checkCancelled();
           ctx.state.verdictCommentPosted = true;
@@ -1172,7 +1179,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch) {
       const baseBranch = ctx.run.baseBranch as string;
-      const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch);
+      const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch, ctx.signal);
       const recorded = ctx.run.baseSha as string;
       const note = (why: string) => {
         ctx.state.rebaseNote = `Not merged with the latest ${baseBranch}: ${why}. Delivered on ${(ctx.run.baseSha as string).slice(0, 8)}.`;
@@ -1226,8 +1233,14 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       publish();
       if (!success) return { summary: "PR update needs human review; no push", value: undefined };
       ctx.checkCancelled();
-      if ((await remoteBranchSha(ctx.repo, cwd, ctx.run.deliveryBranch)) !== head)
-        await pushExistingBranch(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.run.baseSha as string);
+      if ((await remoteBranchSha(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.signal)) !== head)
+        await pushExistingBranch(
+          ctx.repo,
+          cwd,
+          ctx.run.deliveryBranch,
+          ctx.run.baseSha as string,
+          ctx.signal,
+        );
       if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number") {
         ctx.run = ctx.store.updateRun(ctx.run.id, {
           prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef.number}`,
@@ -1238,7 +1251,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       return { summary: `updated existing PR branch ${ctx.run.deliveryBranch}`, value: undefined };
     }
     ctx.checkCancelled();
-    await pushBranch(ctx.repo, cwd, ctx.run.branch as string);
+    await pushBranch(ctx.repo, cwd, ctx.run.branch as string, "HEAD", ctx.signal);
     ctx.checkCancelled();
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     const url = await createPullRequest(ctx.repo, {
@@ -1248,6 +1261,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       body: report,
       cwd,
       draft: !success,
+      signal: ctx.signal,
     });
     await ctx.save("delivery-pr-created");
     ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
@@ -1263,7 +1277,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     let summary = `PR ${url}`;
     if (policy === "auto") {
       ctx.checkCancelled();
-      const outcome = await mergePullRequest(url, cwd, ctx.run.title);
+      const outcome = await mergePullRequest(url, cwd, ctx.run.title, ctx.signal);
       if (outcome === "merged") ctx.run = ctx.store.updateRun(ctx.run.id, { merged: true });
       summary += ` — ${outcome === "merged" ? "merged" : outcome === "auto" ? "auto-merge enabled" : "merge failed (left open)"}`;
       ctx.log(summary, outcome === "failed" ? "warn" : "info");

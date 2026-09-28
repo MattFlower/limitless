@@ -155,15 +155,23 @@ export async function headSha(cwd: string): Promise<string> {
   return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
 }
 
-export async function fetchBase(paths: Paths, repo: Repo, branch: string): Promise<string> {
+export async function fetchBase(
+  paths: Paths,
+  repo: Repo,
+  branch: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const cache = cachePath(paths, repo);
   return withRepoLock(cache, async () => {
     const ref = `refs/heads/${branch}`;
     await sh(["git", "fetch", "origin", `+${ref}:refs/remotes/origin/${branch}`], {
       cwd: cache,
       timeoutMs: 300_000,
+      signal,
     });
-    return (await sh(["git", "rev-parse", `refs/remotes/origin/${branch}`], { cwd: cache })).stdout.trim();
+    return (
+      await sh(["git", "rev-parse", `refs/remotes/origin/${branch}`], { cwd: cache, signal })
+    ).stdout.trim();
   });
 }
 
@@ -289,17 +297,29 @@ export function parseNameStatus(text: string): DiffFile[] {
     });
 }
 
-export async function pushBranch(repo: Repo, cwd: string, branch: string, sha = "HEAD"): Promise<void> {
+export async function pushBranch(
+  repo: Repo,
+  cwd: string,
+  branch: string,
+  sha = "HEAD",
+  signal?: AbortSignal,
+): Promise<void> {
   if (repo.kind !== "github" || !repo.url) return;
   await sh(["git", "push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
     cwd,
     timeoutMs: 300_000,
+    signal,
   });
 }
 
-export async function remoteBranchSha(repo: Repo, cwd: string, branch: string): Promise<string | null> {
+export async function remoteBranchSha(
+  repo: Repo,
+  cwd: string,
+  branch: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
   if (repo.kind !== "github" || !repo.url) return null;
-  const remote = await sh(["git", "ls-remote", repo.url, `refs/heads/${branch}`], { cwd });
+  const remote = await sh(["git", "ls-remote", repo.url, `refs/heads/${branch}`], { cwd, signal });
   return remote.stdout.split("\t")[0] || null;
 }
 
@@ -309,27 +329,38 @@ export async function pushExistingBranch(
   cwd: string,
   branch: string,
   baseSha: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   if (repo.kind !== "github" || !repo.url) throw new Error("existing PR delivery requires a GitHub repo");
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") || branch.endsWith("/"))
     throw new Error("invalid PR head branch");
   const ref = `refs/heads/${branch}`;
-  const remote = await sh(["git", "ls-remote", repo.url, ref], { cwd });
+  const remote = await sh(["git", "ls-remote", repo.url, ref], { cwd, signal });
   if (remote.stdout.split("\t")[0] !== baseSha) throw new Error("PR head moved since the run started");
   const ancestor = await sh(["git", "merge-base", "--is-ancestor", baseSha, "HEAD"], {
     cwd,
     allowFail: true,
+    signal,
   });
   if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
   await sh(["git", "push", `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
     cwd,
     timeoutMs: 300_000,
+    signal,
   });
 }
 
 export async function createPullRequest(
   repo: Repo,
-  opts: { branch: string; base: string; title: string; body: string; cwd: string; draft?: boolean },
+  opts: {
+    branch: string;
+    base: string;
+    title: string;
+    body: string;
+    cwd: string;
+    draft?: boolean;
+    signal?: AbortSignal;
+  },
 ): Promise<string> {
   const existing = await sh(
     [
@@ -347,13 +378,14 @@ export async function createPullRequest(
       "--jq",
       ".[0].url",
     ],
-    { cwd: opts.cwd, allowFail: true },
+    { cwd: opts.cwd, allowFail: true, signal: opts.signal },
   );
   if (existing.stdout.trim()) {
     await sh(["gh", "pr", "edit", existing.stdout.trim(), "--body-file", "-"], {
       cwd: opts.cwd,
       stdin: opts.body,
       allowFail: true,
+      signal: opts.signal,
     });
     return existing.stdout.trim();
   }
@@ -374,7 +406,7 @@ export async function createPullRequest(
       "-",
       ...(opts.draft ? ["--draft"] : []),
     ],
-    { cwd: opts.cwd, stdin: opts.body },
+    { cwd: opts.cwd, stdin: opts.body, signal: opts.signal },
   );
   const url = res.stdout.trim().split("\n").pop() ?? "";
   if (!url.startsWith("http")) throw new Error(`gh pr create returned unexpected output: ${res.stdout}`);
@@ -386,6 +418,7 @@ export async function mergePullRequest(
   prUrl: string,
   cwd: string,
   title?: string,
+  signal?: AbortSignal,
 ): Promise<"merged" | "auto" | "failed"> {
   // Squash with the PR title as the subject, not the first round's commit message.
   const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
@@ -393,11 +426,13 @@ export async function mergePullRequest(
   const now = await sh(["gh", "pr", "merge", prUrl, "--squash", "--delete-branch", ...subject], {
     cwd,
     allowFail: true,
+    signal,
   });
   if (now.exitCode === 0) return "merged";
   const auto = await sh(["gh", "pr", "merge", prUrl, "--squash", "--auto", "--delete-branch", ...subject], {
     cwd,
     allowFail: true,
+    signal,
   });
   return auto.exitCode === 0 ? "auto" : "failed";
 }

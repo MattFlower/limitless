@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory, type FactoryOptions } from "../src/app.ts";
@@ -699,6 +699,159 @@ function githubRun(f: Factory, url = source) {
   });
   return repo;
 }
+
+for (const operation of [
+  "fetch",
+  "push",
+  "list",
+  "edit",
+  "create",
+  "merge",
+  "auto-merge",
+  "existing-head",
+  "existing-push",
+  "comment",
+  "comments",
+  "draft",
+] as const)
+  test(`cancel active delivery ${operation} kills descendants and stays cancelled after restart`, async () => {
+    const pr = join(root, "pr");
+    const pidFile = join(root, "delivery-pids");
+    const calls = join(root, "delivery-calls");
+    const restore = fakeGh(pr);
+    let pids: number[] = [];
+    try {
+      const pattern = {
+        fetch: "git fetch origin +refs/heads/*",
+        push: "git push *",
+        list: "gh pr list *",
+        edit: "gh pr edit *",
+        create: "gh pr create *",
+        merge: "gh pr merge *",
+        "auto-merge": "gh pr merge *--auto*",
+        "existing-head": "git ls-remote *",
+        "existing-push": "git push --force-with-lease=*",
+        comment: "gh pr comment *",
+        comments: "gh api *",
+        draft: "gh pr create *--draft*",
+      }[operation];
+      for (const bin of ["gh", "git"]) {
+        const path = join(root, "bin", bin);
+        renameSync(path, `${path}-delegate`);
+        writeFileSync(
+          path,
+          `#!/bin/sh
+printf '%s\\n' "${bin} $*" >> '${calls}'
+case "${bin} $*" in
+  ${pattern
+    .split("*")
+    .map((part) => `'${part}'`)
+    .join("*")}) sleep 60 & child=$!; echo "$$ $child" > '${pidFile}'; wait; exit 1 ;;
+esac
+${operation === "auto-merge" ? 'if [ "$1 $2" = "pr merge" ]; then exit 1; fi' : ""}
+exec '${path}-delegate' "$@"
+`,
+          { mode: 0o755 },
+        );
+      }
+      if (operation === "edit") writeFileSync(pr, "https://github.com/test/repo/pull/1");
+      const existing = operation.startsWith("existing-");
+      let f = factory(
+        operation === "comments"
+          ? { "store:save": { action: "kill", when: (c) => c.checkpoint === "verification-comment-posted" } }
+          : undefined,
+        (s) =>
+          operation === "draft" && s.prompt.startsWith("You are the acceptance")
+            ? { structured: blocked }
+            : answer(s),
+      );
+      let id: string;
+      if (operation === "comment" || operation === "comments") {
+        id = (await externalChange(f)).run.id;
+      } else {
+        const repo = githubRun(f);
+        if (operation === "merge" || operation === "auto-merge")
+          f.store.upsertRepo({ ...repo, mergePolicy: "auto" });
+        const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: source })).stdout.trim();
+        const r = f.store.createRun(
+          repo,
+          {
+            repo: repo.slug,
+            prompt: "Change",
+            profile: "standard",
+            ...(existing
+              ? {
+                  source: "github" as const,
+                  requestedBy: "dependabot[bot]",
+                  baseBranch: "main",
+                  deliveryBranch: "main",
+                  sourceRef: { kind: "pull_request", repo: repo.slug, number: 7, headSha },
+                }
+              : {}),
+          },
+          existing,
+        );
+        id = r.id;
+        if (existing)
+          f.store.setRunState(id, {
+            flow: "build",
+            phase: "prepare",
+            answers: [],
+            round: 0,
+            roundsOnImplementer: 0,
+            triedImplementers: [],
+            feedback: null,
+            toolCommands: [],
+          } satisfies RunState);
+      }
+      f.scheduler.start();
+      if (operation === "comments") {
+        await settled(f, id);
+        expect(f.store.getRun(id)?.status).toBe("running");
+        f = await reopen(f);
+      }
+      await wait(() => existsSync(pidFile));
+      pids = readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number);
+      expect(pids).toHaveLength(2);
+      expect(f.store.getRun(id)).toMatchObject({ status: "running", stage: "deliver" });
+      const beforeCancel = readFileSync(calls, "utf8");
+      f.cancelRun(id);
+      await settled(f, id);
+      for (const pid of pids)
+        await wait(() => {
+          try {
+            process.kill(pid, 0);
+            return false;
+          } catch {
+            return true;
+          }
+        });
+      expect(f.store.getRun(id)?.status).toBe("cancelled");
+      const cwd = f.store.getRunState<RunState>(id)?.worktreePath ?? "";
+      expect(existsSync(cwd)).toBe(true);
+      expect(f.store.listStages(id).at(-1)).toMatchObject({ name: "deliver", status: "cancelled" });
+      history(f, id);
+      const stages = f.store.listStages(id);
+      const invocations = f.store.listInvocations(id);
+      const next = await reopen(f);
+      await settled(next, id);
+      expect(next.store.getRun(id)?.status).toBe("cancelled");
+      expect(next.store.listStages(id)).toEqual(stages);
+      expect(next.store.listInvocations(id)).toEqual(invocations);
+      expect(existsSync(cwd)).toBe(true);
+      // In particular, a cancelled list/merge must not fall through to create/auto-merge.
+      expect(readFileSync(calls, "utf8")).toBe(beforeCancel);
+      history(next, id);
+    } finally {
+      for (const pid of pids) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+      await restore();
+    }
+  }, 20_000);
+
 const blocked = {
   ...verify,
   overall: "fail",
