@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +9,7 @@ import { runLlm } from "../src/harness/llm.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import { triagePrompt } from "../src/pipeline/prompts.ts";
-import type { Policy, ProviderDef } from "../src/router/catalog.ts";
+import { type Policy, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 
@@ -281,4 +281,44 @@ test("HTTP rejects selected effort without a compatible explicit mapping before 
   input.target.vendor = "other";
   expect((await runLlm(input)).error).toContain("local Qwen");
   expect(requests).toHaveLength(0);
+});
+
+test("catalog oMLX thinking and authentication survive HTTP repair", async () => {
+  const store = new Store(join(dir, "omlx.db"));
+  const router = new Router(
+    new ProviderTracker(
+      PROVIDERS,
+      store,
+      { claudeFiveHour: 0.8, claudeSevenDay: 0.85, codexWeekly: 0.9, codexFiveHour: 0.9 },
+      { OMLX_API_KEY: "key" },
+    ),
+  );
+  const bodies: Record<string, unknown>[] = [];
+  const mock = spyOn(globalThis, "fetch").mockImplementation((async (url, init) => {
+    expect(String(url)).toBe("http://127.0.0.1:8989/v1/chat/completions");
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer key");
+    bodies.push(JSON.parse(String(init?.body)));
+    return Response.json({
+      choices: [{ message: { content: bodies.length === 1 ? "{}" : '{"answer":"ok"}' } }],
+    });
+  }) as typeof fetch);
+  try {
+    for (const effort of [undefined, "none", "high"] as const) {
+      bodies.length = 0;
+      const resolved = router.resolve(`omlx/qwen-27b${effort ? `@${effort}` : ""}`);
+      expect(
+        (await runLlm({ ...spec(), target: router.toTarget(resolved.model, resolved.effort) })).status,
+      ).toBe("ok");
+      expect(bodies).toHaveLength(2);
+      for (const body of bodies) {
+        expect(body.model).toBe("Swift-1.5-Qwen3.8-27b-oQ8e-mtp");
+        expect(body.chat_template_kwargs).toEqual(
+          effort ? { enable_thinking: effort === "high" } : undefined,
+        );
+      }
+    }
+  } finally {
+    mock.mockRestore();
+    store.close();
+  }
 });

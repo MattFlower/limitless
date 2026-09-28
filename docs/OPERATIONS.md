@@ -7,7 +7,7 @@ How the factory runs day to day, where to look when something breaks, and how ch
 | Component | Where | Managed by | Logs |
 |---|---|---|---|
 | Daemon (API, UI, scheduler, pipeline) | Mac, `~/.limitless/app` (release checkout of `main`) | launchd `cc.mattflower.limitless` | `~/.limitless/logs/cc.mattflower.limitless.log` |
-| Local model (Qwen 3.8 27B, MLX) | Mac, `127.0.0.1:8000` | launchd `cc.mattflower.limitless-mtplx` | `~/.limitless/logs/cc.mattflower.limitless-mtplx.log` |
+| Local model (Swift-1.5 Qwen3.8 27B MTP) | Mac, `127.0.0.1:8989` | external: oMLX.app / `omlx start` | oMLX server logs |
 | GPU model (Qwen 3.8 27B, CUDA llama.cpp) | twilight, `:8080` (LAN, API key) | systemd user unit `limitless-llama` (linger on) | `journalctl --user -u limitless-llama` on twilight |
 | Public webhook tunnel | Cloudflare → `limitless.mattflower.cc/webhooks/*` | launchd `cc.mattflower.limitless-tunnel` (opt-in) | `~/.limitless/logs/cc.mattflower.limitless-tunnel.log` |
 | Data | `~/.limitless/` — `limitless.db`, `repos/` (bare caches), `work/` (worktrees), `runs/<id>/inv-*.log` (raw agent streams) | the daemon | — |
@@ -67,16 +67,16 @@ sub-agents, image viewing, and web search; they retain session rollouts for quot
 If the ChatGPT account rejects the cheapest Codex model, the runner tries the next catalog model
 in price order and reports which model it used. Other CLI errors fail the check.
 
-The mtplx and twilight checks are skipped when their required key is absent or their health probe
+The oMLX structured / Claude-harness edit and twilight checks are skipped when their required key is absent or their health probe
 fails. OpenRouter is skipped when `OPENROUTER_API_KEY` is absent from the Limitless secrets file or
 environment. An attempted check that fails exits nonzero; skips alone do not. Use
 `limitless deploy [ref] --smoke` to require these checks during deployment.
 
 ## Local models
 
-- `limitless local up|down|status` manages both model servers and reports service state plus
-  `/v1/models` endpoint health separately. `up` creates the mtplx launchd plist if absent and
-  starts `limitless-llama.service` on twilight over SSH. An installed unit is never overwritten
+- `limitless local up|down|status` reports externally managed oMLX authenticated `/v1/models`
+  reachability on every action, including `down`; it never changes Mac processes or enablement.
+  `up` starts `limitless-llama.service` on twilight over SSH. An installed unit is never overwritten
   (it may carry host-specific tuning such as a patched chat template); only when none exists does
   `up` generate one, which needs the installed GGUF path in `~/.config/limitless/config.toml`:
 
@@ -87,18 +87,26 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
   # twilight_llama_binary = "/home/mflower/.local/share/limitless/llama-bin/llama-server"
   ```
 
-  mtplx uses `http://127.0.0.1:8000/v1`; twilight uses `http://twilight:8080/v1`;
+  oMLX uses `http://127.0.0.1:8989/v1`; twilight uses `http://twilight:8080/v1`;
   OpenRouter uses `https://openrouter.ai/api/v1` for direct structured completions. Agentic
   calls retain their Anthropic-compatible Claude CLI endpoints. `limitless service install`
-  installs the daemon and can install the mtplx agent, while `limitless local` controls the
-  model servers independently. SSH access to twilight and an installed model/binary are required.
+  installs the daemon; `--mtplx` explicitly adds the rollback agent. `limitless local` controls
+  only twilight. SSH access to twilight and an installed model/binary are required.
   The generated unit reads its API key from twilight's `~/.config/limitless/llama-api-key` (so it
   never appears in the process list); put the same value in the Mac's `TWILIGHT_API_KEY`.
 
-- **Mac (mtplx):** the launchd agent keeps Qwen 3.8 27B (optimized-quality, ~30 GB, 262K context)
-  loaded. Stop it to free memory: `launchctl bootout gui/$UID/cc.mattflower.limitless-mtplx`;
-  `limitless service install` brings it back. Change the model with `LIMITLESS_MTPLX_MODEL` at
-  install time.
+- **Mac (oMLX):** start the server with oMLX.app / `omlx start`; Limitless does not manage it.
+  Put `OMLX_API_KEY` in `~/.config/limitless/secrets.env` (used by both inference transports and
+  health probes). Select `omlx/qwen-27b`, backend `Swift-1.5-Qwen3.8-27b-oQ8e-mtp`.
+  Limitless allows 4 concurrent requests by default; override with `[providers.omlx]` and
+  `max_concurrent = 8` in `config.toml`. This does not tune oMLX's own scheduler.
+  Use `omlx/qwen-27b@none` or `@high` for tool-free roles (thinking off/on); bare selections
+  preserve server-default thinking and are required for agentic roles such as review/verify.
+  Built-in triage/summarize/chat prefer oMLX, but the committed `routing/policy.json` overlay
+  remains authoritative where present until replaced by eval-backed policy.
+  For rollback, `limitless service install --mtplx` installs the old agent on port 8000;
+  enable `mtplx` explicitly if disabled and select `mtplx/qwen-27b`. Existing agents are not
+  automatically removed; `LIMITLESS_MTPLX_MODEL` still overrides the rollback model at install.
 - **twilight:** `systemctl --user stop limitless-llama` frees the GPU (e.g. for Unsloth Studio);
   `start` brings it back. The factory routes around it while it's down. The binary is a copy of
   Unsloth Studio's CUDA build in `~/.local/share/limitless/llama-bin/`; the chat template is patched
@@ -125,7 +133,7 @@ Evaluations run in the daemon using its catalog, harness adapters, pipeline role
 provider tracker. Start the daemon first; the CLI only submits and reads HTTP requests:
 
 ```sh
-limitless eval run triage --models mtplx/qwen-27b,claude/haiku --k 2 --max-usd 1 --follow
+limitless eval run triage --models omlx/qwen-27b@none,omlx/qwen-27b@high,claude/haiku --k 2 --max-usd 1 --follow
 limitless eval run triage --models claude/haiku --cases triage-001,triage-002 --no-cache
 limitless eval run review --models openrouter/gpt-6-luna --follow
 limitless eval run verify --models openrouter/gpt-6-luna --follow

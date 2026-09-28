@@ -59,7 +59,7 @@ and delivers a pull request — while spending as little of your paid AI capacit
              └──────┬───────┘                                     └───────────────┘
                     ▼
       ┌──────────────────────────── Harness adapters ─────────────────────────────┐
-      │ claude-cli  (Claude subscription; also OpenRouter / mtplx / llama.cpp via  │
+      │ claude-cli  (Claude subscription; also OpenRouter / oMLX / llama.cpp via  │
       │              ANTHROPIC_BASE_URL — one agent harness for every Anthropic-   │
       │              compatible backend)                                           │
       │ codex-cli   (ChatGPT subscription)                                         │
@@ -132,7 +132,7 @@ lockfile edits outside dependency tasks, and files touched outside the planned s
 | 5 | Claude Fable 5.1, Claude Opus 5.5, GPT-6 Astra | (OpenRouter frontier — last resort) |
 | 4 | Claude Sonnet 5, GPT-6 Sol | Kimi / MiniMax / DeepSeek-class via OpenRouter |
 | 3 | GPT-6 Luna, Claude Haiku 4.5 | GLM Flash / DeepSeek Flash via OpenRouter |
-| 2 | — | Qwen 3.8 27B & Flash-Next (mtplx, Mac), twilight llama.cpp models |
+| 2 | — | Swift-1.5 Qwen3.8 27B MTP (`omlx/qwen-27b`, Mac), twilight llama.cpp models |
 
 **Routing** = `route(role, taskClass, complexity, constraints)` → ordered candidates filtered by:
 - **health** — circuit breaker per provider (consecutive failures → cooldown),
@@ -160,7 +160,7 @@ runAgent(spec: AgentSpec): AsyncIterable<AgentEvent> & { result: Promise<AgentRe
 
 - **claude-cli** spawns the official `claude -p --output-format stream-json`. Using the official
   binary with your own login is the supported way to automate a Claude subscription (research/03 §1).
-  The *same adapter* drives OpenRouter, mtplx and llama.cpp by setting `ANTHROPIC_BASE_URL` /
+  The *same adapter* drives OpenRouter, oMLX and llama.cpp by setting `ANTHROPIC_BASE_URL` /
   `ANTHROPIC_AUTH_TOKEN` — all of them speak the Anthropic Messages API. Factory runs use
   `--setting-sources project` + an explicit `--settings` so your personal hooks/plugins don't
   fire inside factory runs.

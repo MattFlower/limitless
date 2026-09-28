@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  backendChecks,
   checkCodexModels,
   exitCode,
   formatReport,
@@ -330,3 +331,42 @@ for (const writable of [true, false]) {
     );
   });
 }
+
+test("oMLX smoke rows skip unavailable providers and fail attempted bad edits", async () => {
+  let probes = 0,
+    invocations = 0,
+    status = 200;
+  const probe = (async (url, init) => {
+    probes++;
+    expect(String(url)).toBe("http://127.0.0.1:8989/v1/models");
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer key");
+    if (!status) throw new Error("offline");
+    return new Response("", { status });
+  }) as typeof fetch;
+  const check: typeof liveCheck = async (_harness, target, kind) => {
+    invocations++;
+    expect(target.model).toBe("Swift-1.5-Qwen3.8-27b-oQ8e-mtp");
+    expect(target.backend).toEqual({ baseUrl: "http://127.0.0.1:8989", authToken: "key" });
+    return liveCheck(async () => ({ ...result, structured: { smoke: "ready" } }), target, kind);
+  };
+  const checks = (secrets: Record<string, string>) =>
+    backendChecks(secrets, probe, check).filter((c) => c.name.startsWith("omlx"));
+  expect(backendChecks({}).map((c) => c.name)).not.toContain("mtplx structured");
+  expect(checks({}).map((c) => c.name)).toEqual(["omlx structured", "omlx claude-harness edit"]);
+  expect((await runChecks(checks({}))).map((r) => r.reason)).toEqual([
+    "missing OMLX_API_KEY",
+    "missing OMLX_API_KEY",
+  ]);
+  expect(probes).toBe(0);
+  for (status of [503, 0])
+    expect((await runChecks(checks({ OMLX_API_KEY: "key" }))).every((r) => r.status === "skip")).toBe(true);
+  expect(invocations).toBe(0);
+  status = 200;
+  const rows = await runChecks(checks({ OMLX_API_KEY: "key" }));
+  expect(rows.map((r) => r.status)).toEqual(["pass", "fail"]);
+  expect(rows[1]?.reason).toBe("edit file was not created");
+  const failed = backendChecks({ OMLX_API_KEY: "key" }, probe, async () => {
+    throw new Error("invocation failed");
+  }).filter((c) => c.name.startsWith("omlx"));
+  expect((await runChecks(failed)).map((r) => r.status)).toEqual(["fail", "fail"]);
+});
