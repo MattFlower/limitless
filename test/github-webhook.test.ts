@@ -260,6 +260,9 @@ test.each([
   { sha: "b".repeat(40) },
   { ref: "../main", sha: "b".repeat(40) },
   { ref: "main", sha: "oops" },
+  ...["main.lock", "-main", "a b", "a..b", "a//b", "a.", "@", "a@{b", ".main", "feat/.x", "a~1", "a:b"].map(
+    (ref) => ({ ref, sha: "b".repeat(40) }),
+  ),
 ])("rejects malformed PR base metadata: %j", (base) => {
   const payload = JSON.parse(fixture("github-pr.json"));
   payload.pull_request.base = { ...base, repo: { full_name: "MattFlower/limitless" } };

@@ -114,13 +114,16 @@ export function renderReport(input: ReportInput): string {
 
   blocks.push("## Checks");
   if (state.lastGates?.length) {
+    // PR verdict comments omit commands: they can name local paths and generated outputs.
+    const commands = state.flow !== "verify-change";
     blocks.push(
       table(
-        ["Check", "Result", "Command"],
+        ["Check", "Result", ...(commands ? ["Command"] : [])],
         state.lastGates.map((g) => {
           const warn = g.verdict === "still_failing" || g.verdict === "flaky";
           const icon = g.blocking ? "❌" : warn ? "⚠️" : "✅";
-          return [g.name, `${icon} ${g.verdict.replace("_", " ")}`, `\`${escapeCell(g.result.command)}\``];
+          const row = [g.name, `${icon} ${g.verdict.replace("_", " ")}`];
+          return commands ? [...row, `\`${escapeCell(g.result.command)}\``] : row;
         }),
       ),
     );

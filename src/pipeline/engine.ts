@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { assertExistingBranchDelivery } from "../core/delivery.ts";
+import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
@@ -193,9 +193,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       const ref = ctx.run.sourceRef;
       if (
         typeof ref?.baseRef !== "string" ||
-        !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref.baseRef) ||
-        ref.baseRef.includes("..") ||
-        ref.baseRef.endsWith("/") ||
+        !isBranchName(ref.baseRef) ||
         typeof ref.baseSha !== "string" ||
         !/^[a-fA-F0-9]{40}$/.test(ref.baseSha) ||
         typeof ref.headSha !== "string" ||
@@ -725,6 +723,7 @@ async function oneRound(
           spec: ctx.state.spec ?? null,
           baseSha,
           stat: diff.stat,
+          ...(ctx.state.flow === "verify-change" ? { patch: diff.patch } : {}),
           gates: comparison,
           audit,
           implementerReport: ctx.state.implementerReport ?? "",

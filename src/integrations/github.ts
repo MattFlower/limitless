@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Factory } from "../app.ts";
+import { isBranchName } from "../core/delivery.ts";
 import type { CreateRunRequest } from "../core/types.ts";
 import { inAnyCidr } from "../util/cidr.ts";
 import { sh } from "../util/proc.ts";
@@ -109,9 +110,7 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
       !/^[a-fA-F0-9]{40}$/.test(sha) ||
       (pr?.body !== null && string(pr?.body) === null) ||
       !baseRef ||
-      !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(baseRef) ||
-      baseRef.includes("..") ||
-      baseRef.endsWith("/") ||
+      !isBranchName(baseRef) ||
       !baseSha ||
       !/^[a-fA-F0-9]{40}$/.test(baseSha)
     )

@@ -26,3 +26,17 @@ export function assertExistingBranchDelivery(
   )
     throw new Error("existing-branch delivery requires a verified GitHub Dependabot webhook");
 }
+
+/** Mirrors `git check-ref-format --branch`, so untrusted payload refs can't name invalid branches. */
+export function isBranchName(name: string): boolean {
+  return (
+    name.length > 0 &&
+    name !== "@" &&
+    !name.startsWith("-") &&
+    !name.endsWith(".") &&
+    !name.includes("..") &&
+    !name.includes("@{") &&
+    ![...name].some((c) => c.charCodeAt(0) <= 0x20 || c.charCodeAt(0) === 0x7f || "~^:?*[\\".includes(c)) &&
+    name.split("/").every((part) => part.length > 0 && !part.startsWith(".") && !part.endsWith(".lock"))
+  );
+}

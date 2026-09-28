@@ -846,14 +846,18 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
   }
 
-  test.each([null, "not-a-sha"])("PR verification rejects invalid base metadata: %s", async (baseSha) => {
+  test.each([
+    ["main", null],
+    ["main", "not-a-sha"],
+    ["main.lock", "b".repeat(40)],
+  ])("PR verification rejects invalid base metadata: %s %s", async (baseRef, baseSha) => {
     const f = start(() => {
       throw new Error("No model should run");
     });
     const run = await f.createRun({
       repo: repoDir,
       prompt: "verify",
-      sourceRef: { kind: "pull_request", baseRef: "main", baseSha, headSha: "a".repeat(40), number: 1 },
+      sourceRef: { kind: "pull_request", baseRef, baseSha, headSha: "a".repeat(40), number: 1 },
     });
     expect(await waitFor(f, run.id, ["failed", "succeeded"])).toBe("failed");
     expect(f.store.getRun(run.id)?.error).toContain("valid PR baseRef");
@@ -933,6 +937,8 @@ protected_paths = ["protected.txt"]
           expect(patch).toContain("dependency 2");
           expect(patch).not.toContain("base-only");
           expect(patch).not.toContain("generated.txt");
+          expect(agent.prompt).toContain("+dependency 2");
+          expect(agent.prompt).not.toContain("base-only");
           if (
             (scenario === "restart-initial" || (scenario === "restart-repair" && implementations > 0)) &&
             !interrupted
@@ -1044,7 +1050,9 @@ protected_paths = ["protected.txt"]
         expect(f.store.listStages(runId).some((stage) => stage.name === "implement")).toBe(false);
         expect(f.store.getRun(runId)?.headSha).toBe(head);
         expect(existsSync(state?.worktreePath ?? "missing")).toBe(false);
-        expect(calls).toHaveLength(2); // Created + evidence; notifier must not post a second verdict.
+        expect(calls).toHaveLength(1); // Evidence only: no creation comment and no second verdict.
+        expect(calls[0]?.slice(0, 3)).toEqual(["pr", "comment", "18"]);
+        expect(calls[0]?.at(-1)).not.toContain("generated.txt");
         for (const text of [
           "Flow: verify-change",
           "| Check |",
@@ -1054,7 +1062,7 @@ protected_paths = ["protected.txt"]
           "spent",
           "subscriptions",
         ])
-          expect(calls[1]?.at(-1)).toContain(text);
+          expect(calls[0]?.at(-1)).toContain(text);
         expect(f.store.getArtifact(runId, "diff.patch")).toBe(
           (await sh(["git", "diff", `${baseTip}...${head}`], { cwd: repoDir })).stdout,
         );
