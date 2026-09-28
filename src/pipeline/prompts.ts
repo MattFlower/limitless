@@ -230,7 +230,7 @@ function gateTable(cmp: GateComparison[]): string {
   return cmp
     .map(
       (c) =>
-        `- ${c.name} \`${c.result.command}\`: ${c.result.ok ? "pass" : "FAIL"}, ${c.verdict}${c.blocking ? " (BLOCKING)" : ""}`,
+        `- ${c.name} \`${c.result.command}\`: ${c.result.ok ? "pass" : "FAIL"}, ${c.verdict}${c.blocking ? " (BLOCKING)" : ""}${c.result.ok ? "" : `\n${fence(c.result.output.slice(-3000))}`}`,
     )
     .join("\n");
 }

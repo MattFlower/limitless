@@ -152,7 +152,20 @@ describe("review prompt", () => {
           ok: false,
           exitCode: 1,
           durationMs: 1,
-          output: "failed",
+          output: "FAIL src/a.test.ts > greets\nexpected 1 to be 2",
+        },
+      },
+      {
+        name: "lint",
+        verdict: "pass" as const,
+        blocking: false,
+        result: {
+          name: "lint",
+          command: "bun run lint",
+          ok: true,
+          exitCode: 0,
+          durationMs: 1,
+          output: "LINT_CLEAN_OUTPUT",
         },
       },
     ],
@@ -164,6 +177,9 @@ describe("review prompt", () => {
     const prompt = reviewPrompt(input);
     expect(prompt).toContain("already run by the factory on this HEAD");
     expect(prompt).toContain("- test `bun test`: FAIL, regressed (BLOCKING)");
+    expect(prompt).toContain("FAIL src/a.test.ts > greets\nexpected 1 to be 2");
+    expect(prompt).toContain("- lint `bun run lint`: pass");
+    expect(prompt).not.toContain("LINT_CLEAN_OUTPUT");
     expect(prompt).toContain("These results are authoritative");
     expect(prompt).toContain("Do not rerun these full suites as evidence");
     expect(prompt).toContain(
@@ -193,6 +209,7 @@ describe("review prompt", () => {
       "farewell.txt | 1 +",
       "# Automated check results",
       "- test `bun test`: FAIL",
+      "expected 1 to be 2",
     ])
       expect(omitted).toContain(kept);
   });
