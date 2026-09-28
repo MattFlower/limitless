@@ -8,6 +8,7 @@ import { gateScriptNames, pickScripts } from "../src/gates/detect.ts";
 import { createEvalWorktree, diffSince, readFileAt } from "../src/git/repos.ts";
 import { readingTimeout } from "../src/pipeline/engine.ts";
 import { FACTORY_PREAMBLE, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
+import * as review from "../src/pipeline/review.ts";
 import { ReviewSchema, toStrictJsonSchema, VerifySchema } from "../src/pipeline/schemas.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
@@ -316,6 +317,23 @@ test("review trials need v2 fields and keep the model's verdict, and pre-v2 stor
     expect(regraded.trials[0]?.details.grade).toMatchObject({ pass: stored.details.grade.pass });
     await f.clean();
   } finally {
+    await f.close();
+  }
+});
+
+test("first-round review trials go through the pipeline's runReview", async () => {
+  const f = await fixture();
+  const run = spyOn(review, "runReview");
+  try {
+    f.respond(() => ({ structured: reviewOutput() }));
+    expect((await f.run({ cache: false })).trials[0]?.status).toBe("ok");
+    expect(run).toHaveBeenCalledTimes(1);
+    const [, input] = run.mock.calls[0] ?? [];
+    if (!input) throw new Error("runReview was not called with an input");
+    expect(f.calls.map((s) => s.prompt)).toEqual([review.reviewRequest(input).prompt]);
+    await f.clean();
+  } finally {
+    run.mockRestore();
     await f.close();
   }
 });

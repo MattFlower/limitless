@@ -284,7 +284,13 @@ Reviewed commit: ${input.previous.sha}. Current HEAD: ${input.headSha ?? "HEAD"}
 Previous blocking findings (the only findings sent back for implementation):
 ${fence(
   JSON.stringify(
-    input.previous.findings.map((f, i) => ({ id: `P${i + 1}`, ...f })),
+    // v2 evidence stays out so a prior confidence score can't anchor the recheck.
+    input.previous.findings.map(
+      ({ failure_scenario, category, confidence, introduced_by_diff, ...f }, i) => ({
+        id: `P${i + 1}`,
+        ...f,
+      }),
+    ),
     null,
     2,
   ),

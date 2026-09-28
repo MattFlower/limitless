@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1814,6 +1814,24 @@ protected_paths = ["protected.txt"]
     }
   });
 
+  test("deep profile routes review as large while other stages keep the triaged complexity", async () => {
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: pass };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const route = spyOn(f.deps.router, "route");
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file", profile: "deep" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const complexity = (role: string) => route.mock.calls.filter(([r]) => r === role).map(([, c]) => c);
+    expect(complexity("review")).toEqual(["large"]);
+    expect(complexity("implement")).toEqual(["small"]);
+  });
+
   test("unmet holdout feedback omits private inputs and publishes scenarios only after delivery", async () => {
     const secret = "PRIVATE_HOLDOUT_TOKEN_729";
     // These values are observed at runtime, not spelled out by the holdout author.
@@ -2741,6 +2759,31 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
     expect(f.store.getArtifact(run.id, "report.md")).toContain(
       "## Review follow-ups\n\n- major: `farewell.txt:1` Later edge case",
     );
+  });
+
+  test("later-round prompts list previous findings without the v2 evidence fields", async () => {
+    const prompts: string[] = [];
+    const prior = { severity: "major", security: false, file: "farewell.txt", line: 1, title: "Prior bug" };
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        prompts.push(s.prompt);
+        const findings = [{ ...prior, ...findingEvidence, detail: "Wrong", suggestion: "Fix it" }];
+        return { structured: prompts.length === 1 ? { ...approve, findings } : approve };
+      }
+      return { files: { "farewell.txt": `goodbye ${prompts.length}\n` } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    // The fresh round-1 finding keeps its v2 fields in run state; only the prompt drops them.
+    const history = f.store.getRunState<RunState>(run.id)?.reviewHistory;
+    expect(history?.[0]?.blocking).toMatchObject([findingEvidence]);
+    const previous = prompts[1]?.match(/Previous blocking findings[^\n]*\n```\n([\s\S]*?)\n```/)?.[1];
+    expect(JSON.parse(previous ?? "null")).toEqual([
+      { id: "P1", ...prior, detail: "Wrong", suggestion: "Fix it" },
+    ]);
+    for (const field of Object.keys(findingEvidence)) expect(prompts[1]).not.toContain(`"${field}"`);
   });
 
   for (const [label, laterTitle] of [
