@@ -23,9 +23,14 @@ afterEach(() => {
 
 test("comments once at creation and terminal status with cost and PR link", async () => {
   const calls: string[][] = [];
-  const stop = startGitHubNotifier(store, async (args) => {
-    calls.push(args);
-  });
+  const stop = startGitHubNotifier(
+    store,
+    async (args) => {
+      calls.push(args);
+    },
+    () => {},
+    async () => null,
+  );
   const repo = store.upsertRepo({
     slug: "MattFlower/limitless",
     kind: "github",
@@ -192,4 +197,124 @@ test("startup pass publishes a resolved run and stats count only open needs huma
   expect(totals.openNeedsHumanRate).toBe(0.5);
   stop();
   unsubscribe();
+});
+
+for (const status of ["succeeded", "needs_human"] as const) {
+  test(`${status} PR merge releases dependents with metadata and preserved evidence`, async () => {
+    const id = needsHuman();
+    store.updateRun(id, { status });
+    const run = store.getRun(id);
+    const repo = run && store.getRepo(run.repoId);
+    if (!repo) throw new Error("missing repo");
+    const dependent = store.createRun(repo, { repo: repo.slug, prompt: "next", dependsOn: [id] });
+    for (const response of [
+      null,
+      { url: prUrl, state: "OPEN" },
+      { url: `${prUrl}0`, state: "CLOSED" },
+      { url: `${prUrl}0`, state: "MERGED" },
+    ]) {
+      await reconcileMergedRuns(
+        store,
+        async () => response && { ...response, mergedAt: "2026-09-27T20:00:00Z", mergedBy: null },
+      );
+      expect(store.getRun(dependent.id)?.status).toBe("waiting");
+    }
+    await reconcileMergedRuns(
+      store,
+      async () => {
+        throw new Error("offline");
+      },
+      () => {},
+    );
+    expect(store.getRun(dependent.id)?.status).toBe("waiting");
+    await reconcileMergedRuns(store, async () => ({
+      url: prUrl,
+      state: "MERGED",
+      mergedAt: "2026-09-27T20:00:00Z",
+      mergedBy: { login: "owner" },
+    }));
+    expect(store.getRun(id)).toMatchObject({
+      status: status === "succeeded" ? status : "resolved",
+      merged: true,
+      mergedBy: "owner",
+      mergedAt: Date.parse("2026-09-27T20:00:00Z"),
+      error: "review required",
+      finishedAt: 123456,
+    });
+    expect(store.getRun(dependent.id)?.status).toBe("queued");
+    await reconcileMergedRuns(
+      store,
+      async () => {
+        throw new Error("must not repoll merged run");
+      },
+      () => {
+        throw new Error("unexpected lookup");
+      },
+    );
+    expect(store.listEvents(dependent.id).filter((event) => event.type === "status")).toHaveLength(1);
+  });
+}
+
+test("confirmed CLOSED PR blocks dependents, persists and applies to later creation", async () => {
+  const id = needsHuman();
+  store.updateRun(id, { status: "succeeded" });
+  const run = store.getRun(id);
+  const repo = run && store.getRepo(run.repoId);
+  if (!repo) throw new Error("missing repo");
+  const dependent = store.createRun(repo, { repo: repo.slug, prompt: "next", dependsOn: [id] });
+  await reconcileMergedRuns(store, async () => ({
+    url: prUrl,
+    state: "CLOSED",
+    mergedAt: null,
+    mergedBy: null,
+  }));
+  store.close();
+  store = new Store(join(dir, "store.db"));
+  const later = store.createRun(repo, { repo: repo.slug, prompt: "later", dependsOn: [id] });
+  for (const blocked of [dependent.id, later.id]) {
+    expect(store.getRun(blocked)).toMatchObject({
+      status: "needs_human",
+      startedAt: null,
+      error: `Dependency ${id}: PR was closed unmerged`,
+    });
+  }
+  await reconcileMergedRuns(store, async () => ({
+    url: prUrl,
+    state: "MERGED",
+    mergedAt: "2026-09-27T20:00:00Z",
+    mergedBy: null,
+  }));
+  expect(store.getRun(dependent.id)?.status).toBe("needs_human");
+});
+
+test("startup polling includes succeeded PRs and never overlaps event-triggered checks", async () => {
+  const id = needsHuman();
+  store.updateRun(id, { status: "succeeded" });
+  let calls = 0;
+  let release = () => {};
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const stop = startGitHubNotifier(
+    store,
+    async () => {},
+    () => {},
+    async () => {
+      calls++;
+      await barrier;
+      return { url: prUrl, state: "MERGED", mergedAt: "2026-09-27T20:00:00Z", mergedBy: null };
+    },
+  );
+  try {
+    store.updateRun(id, { title: "one" });
+    store.updateRun(id, { title: "two" });
+    expect(calls).toBe(1);
+    release();
+    for (let i = 0; i < 20 && !store.getRun(id)?.merged; i++) await Bun.sleep(5);
+    expect(store.getRun(id)).toMatchObject({ status: "succeeded", merged: true });
+    expect(calls).toBe(1);
+  } finally {
+    release();
+    stop();
+  }
 });

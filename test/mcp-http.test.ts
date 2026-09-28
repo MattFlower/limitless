@@ -63,6 +63,18 @@ test("mounted endpoint initializes, discovers and calls tools without sessions",
     localServer,
   );
   expect(JSON.parse((await get.json()).result.content[0].text).id).toBe(run.id);
+  const dependent = await route(
+    rpc("tools/call", {
+      name: "limitless_create_run",
+      arguments: { repo: f.repo, prompt: "next", dependsOn: [run.id] },
+    }),
+    localServer,
+  );
+  expect(JSON.parse((await dependent.json()).result.content[0].text)).toMatchObject({
+    status: "waiting",
+    dependsOn: [run.id],
+  });
+
   await mcp.stop();
   expect((await route(rpc("tools/list"), localServer)).status).toBe(503);
   expect(f.factory.store.getRun(run.id)?.status).toBe("queued");

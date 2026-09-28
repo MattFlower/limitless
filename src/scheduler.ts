@@ -30,7 +30,7 @@ export class Scheduler {
       });
     }
     this.unsubscribe = this.deps.store.subscribe((msg) => {
-      if (msg.kind === "run" && msg.run.status === "queued") queueMicrotask(() => this.tick());
+      if (msg.kind === "run") queueMicrotask(() => this.tick());
     });
     this.timer = setInterval(() => this.tick(), 2000);
     this.tick();
@@ -60,6 +60,7 @@ export class Scheduler {
 
   tick(): void {
     if (this.stopping) return;
+    this.deps.store.reconcileWaitingRuns();
     this.deps.tracker.refreshAlerts();
     if (this.draining) return;
     const capacity = this.maxConcurrent - this.active.size;

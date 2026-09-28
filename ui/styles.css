@@ -459,6 +459,7 @@ p {
   background: var(--danger-bg);
   border-color: var(--danger-dim);
 }
+.pill-waiting,
 .pill-waiting_input {
   color: var(--warning);
   background: var(--warning-bg);
