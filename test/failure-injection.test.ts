@@ -803,6 +803,60 @@ for (const interrupt of ["cancel", "shutdown"] as const)
     }
   });
 
+test("shutdown during the draft after an exhausted verification retry resumes the draft", async () => {
+  const pr = join(root, "pr");
+  const restore = fakeGh(pr);
+  try {
+    // Attempt 0 is environment-blocked; the retry's only candidate returns schema-invalid output, so
+    // routing is exhausted without a recorded attempt 1. Any later verifier call would pass.
+    const replies = [blocked, { invalid: true }];
+    let verifies = 0;
+    const handler = (s: AgentSpec): FakeReply =>
+      s.prompt.startsWith("You are the acceptance")
+        ? { structured: replies[verifies++] ?? verify }
+        : answer(s);
+    let reached = false;
+    const f = factory(
+      {
+        "stage:deliver:before": {
+          action: "hang",
+          onHit: () => {
+            reached = true;
+          },
+        },
+      },
+      handler,
+    );
+    const repo = githubRun(f);
+    const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
+    f.scheduler.start();
+    await wait(() => reached);
+    await f.stop();
+    expect(f.store.getRun(r.id)?.status).toBe("queued");
+    const state = f.store.getRunState<RunState>(r.id);
+    expect(state?.environmentRetryRound).toBe(0);
+    expect(state?.verifyResults?.map((v) => v.attempt)).toEqual([0]);
+    expect(state?.needsHumanReason).toContain("blocked by the environment");
+    const next = await reopen(f, handler);
+    await settled(next, r.id);
+    expect(next.store.getRun(r.id)).toMatchObject({
+      status: "needs_human",
+      prUrl: "https://github.com/test/repo/pull/1",
+    });
+    expect(next.store.getRun(r.id)?.error).toContain("blocked by the environment");
+    expect(next.store.getRun(r.id)?.error).toContain("No model available for verify after");
+    const verifiers = next.store.listInvocations(r.id).filter((i) => i.role === "verify");
+    expect(verifiers.map((i) => [i.modelId, i.status])).toEqual([
+      ["b", "ok"],
+      ["a", "error"],
+    ]);
+    expect(next.store.listStages(r.id).filter((s) => s.name === "verify")).toHaveLength(2);
+    history(next, r.id);
+  } finally {
+    await restore();
+  }
+});
+
 test("existing-branch push interrupted before completion is reconciled on restart", async () => {
   const remote = join(root, "remote.git");
   await sh(["git", "clone", "-q", "--bare", source, remote], { cwd: root });

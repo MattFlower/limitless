@@ -110,6 +110,8 @@ export interface RunState {
   /** Round whose retry is reserved; a restart resumes it, and a recorded attempt 1 ends retrying. */
   environmentRetryRound?: number;
   terminalReason?: string;
+  /** Verdict awaiting its draft PR; a restart resumes that delivery instead of re-entering the loop. */
+  needsHumanReason?: string;
   toolCommands: string[];
 }
 

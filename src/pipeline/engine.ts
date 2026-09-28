@@ -97,6 +97,9 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
     if (!deps.store.getRunState(runId)) await ctx.save();
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run);
+    // A verdict interrupted before its draft PR resumes there; re-entering the loop could retry work
+    // whose failure (e.g. an exhausted verification retry) never recorded an attempt row to stop on.
+    if (ctx.state.needsHumanReason) throw new NeedsHumanError(ctx.state.needsHumanReason);
     if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined) {
       if (!ctx.run.baseSha || !ctx.state.worktreePath)
         throw new Error("Cannot restore base preview configuration: missing base SHA or worktree");
@@ -154,6 +157,10 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
     ) {
       // Surface the unfinished work as a draft PR so a human can pick it up.
       try {
+        if (ctx.state.needsHumanReason !== message) {
+          ctx.state.needsHumanReason = message;
+          await ctx.save("needs-human");
+        }
         await deliver(ctx, false);
       } catch (err) {
         if (err instanceof SimulatedTermination || ctx.termination) return "running";
@@ -838,6 +845,8 @@ async function oneRound(
           publicSources,
         );
         ctx.state.terminalReason = detail;
+        // Recorded apart from the retry reservation: an exhausted retry leaves no attempt row behind.
+        ctx.state.needsHumanReason = detail;
         await ctx.save();
         throw new NeedsHumanError(detail);
       };
