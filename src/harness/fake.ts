@@ -2,9 +2,8 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { InvocationStatus } from "../core/types.ts";
 import { HARNESS_KILLED, type StreamFault, untilAborted } from "../pipeline/faults.ts";
-import { ClaudeStreamParser } from "./claude.ts";
-import { CodexStreamParser } from "./codex.ts";
-import { type AgentEvent, type AgentResult, type AgentSpec, extractJson, type Harness } from "./types.ts";
+import { parseFakeStream } from "./stream-fault.ts";
+import type { AgentEvent, AgentResult, AgentSpec, Harness } from "./types.ts";
 
 export interface FakeReply {
   fault?: "exit" | "kill" | "timeout" | "throw" | "block";
@@ -88,21 +87,4 @@ function baseResult(over: Partial<AgentResult>): AgentResult {
     quota: null,
     ...over,
   };
-}
-
-/** Synthetic bytes go through the same parsers and completion markers as the CLI adapters. */
-export function parseFakeStream(stream: StreamFault, emit: (event: AgentEvent) => void): AgentResult {
-  const parser = stream.parser === "claude" ? new ClaudeStreamParser(emit) : new CodexStreamParser(emit);
-  for (const line of stream.lines) parser.feed(line);
-  const complete =
-    parser instanceof ClaudeStreamParser
-      ? parser.gotResult && !parser.isError
-      : parser.completed && !parser.failed;
-  return baseResult({
-    status: complete ? "ok" : "error",
-    error: complete ? null : "malformed or truncated harness stream: missing successful completion",
-    finalText: parser instanceof ClaudeStreamParser ? parser.finalText : parser.lastMessage,
-    structured: parser instanceof ClaudeStreamParser ? parser.structured : extractJson(parser.lastMessage),
-    usage: parser.usage,
-  });
 }

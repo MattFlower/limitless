@@ -673,7 +673,7 @@ function fakeGh(pr: string) {
   mkdirSync(bin);
   writeFileSync(
     join(bin, "gh"),
-    `#!${process.execPath}\nimport {existsSync,readFileSync,writeFileSync} from "node:fs";\nconst file=${JSON.stringify(pr)};\nif(process.argv[3]==="list" && existsSync(file)) console.log(readFileSync(file,"utf8"));\nif(process.argv[3]==="create") { if(existsSync(file)) process.exit(9); writeFileSync(file,"https://github.com/test/repo/pull/1"); console.log(readFileSync(file,"utf8")); }\n`,
+    `#!${process.execPath}\nimport {existsSync,readFileSync,writeFileSync} from "node:fs";\nconst file=${JSON.stringify(pr)};\nif(process.argv[3]==="list" && existsSync(file)) { const url=readFileSync(file,"utf8"); console.log(process.argv.includes("--jq") ? url : JSON.stringify([{state:"OPEN",url}])); }\nif(process.argv[3]==="create") { if(existsSync(file)) process.exit(9); writeFileSync(file,"https://github.com/test/repo/pull/1"); console.log(readFileSync(file,"utf8")); }\n`,
     { mode: 0o755 },
   );
   writeFileSync(

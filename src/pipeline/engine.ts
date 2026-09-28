@@ -294,11 +294,16 @@ async function prepare(ctx: RunContext): Promise<void> {
     }
     await ensureCache(cfg.paths, ctx.repo);
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
+    const reusingWorktree = existsSync(join(cfg.paths.work, ctx.run.id));
     const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base);
     if (ctx.run.deliveryBranch && ctx.run.sourceRef?.headSha !== wt.baseSha)
       throw new Error("PR head moved before preparation");
     ctx.state.worktreePath = wt.path;
-    ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha: wt.baseSha, branch: wt.branch });
+    const baseSha =
+      reusingWorktree && ctx.state.flow !== "verify-change"
+        ? (ctx.run.baseSha ?? (await headSha(wt.path)))
+        : wt.baseSha;
+    ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha, branch: wt.branch });
     const verification = ctx.state.verification;
     if (verification) {
       ctx.run = store.updateRun(ctx.run.id, { baseSha: verification.headSha });
@@ -308,7 +313,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     let gates: GateConfig;
     try {
       ctx.state.previewConfig = readPreviewConfig(
-        await readFileAt(wt.path, verification?.baseSha ?? wt.baseSha, ".limitless.toml"),
+        await readFileAt(wt.path, verification?.baseSha ?? baseSha, ".limitless.toml"),
       );
       gates = detectGates(wt.path);
       ctx.state.gatesConfig = gates;
@@ -663,7 +668,10 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           result.finalText || "(no report)",
         );
         ctx.state.implementerIssue =
-          result.status === "ok" ? null : `${result.status}: ${result.error ?? ""}`.slice(0, 500);
+          result.status === "ok"
+            ? null
+            : `${result.status}${result.error ? `: ${result.error}` : ""}`.slice(0, 500);
+        if (result.status !== "ok") ctx.log(`Implementer ended with ${result.status}`, "warn");
         ctx.state.implementationReadyRound = round;
         await ctx.save("implementation-ready");
       }
@@ -676,7 +684,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
       ctx.state.implementedRound = round;
       await ctx.save("implementation-committed");
       return {
-        summary: `${ctx.state.implementer?.modelId}: ${ctx.state.implementerIssue ?? "ok"}`,
+        summary: `${ctx.state.implementer?.modelId}: ${ctx.state.implementerIssue ?? "ok"}; ${sha ?? "no changes"}`,
         value: undefined,
       };
     },
@@ -1105,6 +1113,42 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     throw new Error("PR delivery base does not match the verified webhook head");
   const deliverStage = async () => {
     const cwd = ctx.state.worktreePath as string;
+    if (
+      success &&
+      ctx.repo.kind === "github" &&
+      !ctx.run.deliveryBranch &&
+      (ctx.run.prUrl || ctx.store.listStages(ctx.run.id).filter((s) => s.name === "deliver").length > 1)
+    ) {
+      const gh = ctx.deps.gh ?? runGh;
+      const raw = await gh(
+        ctx.run.prUrl
+          ? ["pr", "view", ctx.run.prUrl, "--repo", ctx.repo.slug, "--json", "state,url"]
+          : [
+              "pr",
+              "list",
+              "--repo",
+              ctx.repo.slug,
+              "--head",
+              ctx.run.branch as string,
+              "--state",
+              "all",
+              "--json",
+              "state,url",
+            ],
+        ctx.signal,
+      );
+      const data: unknown = JSON.parse(raw || "null");
+      const pr = Array.isArray(data) ? data[0] : data;
+      if (pr && typeof pr === "object" && "state" in pr && pr.state === "MERGED") {
+        if (!("url" in pr) || typeof pr.url !== "string" || !pr.url)
+          throw new Error("Merged PR lookup did not return a URL");
+        ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: pr.url, merged: true });
+        ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, true));
+        ctx.state.deliveryComplete = true;
+        await ctx.save("delivery-complete");
+        return { summary: `PR ${pr.url} — merged`, value: undefined };
+      }
+    }
     if (ctx.state.conflictRound !== undefined) {
       if (!ctx.state.preRebaseHead) throw new Error("Missing pre-merge HEAD at delivery");
       await validateMerge(cwd, ctx.state.preRebaseHead, ctx.run.baseSha as string);
