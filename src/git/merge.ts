@@ -44,7 +44,12 @@ export async function prepareMerge(cwd: string, head: string, base: string): Pro
     return [];
   }
   if (!(await mergeHead(cwd))) {
-    const result = await mergeGit(cwd, ["merge", "--no-ff", "--no-commit", "--", base], true);
+    // Two-way markers only, so conflicts are labelled exactly `HEAD` and the base sha.
+    const result = await mergeGit(
+      cwd,
+      ["-c", "merge.conflictStyle=merge", "merge", "--no-ff", "--no-commit", "--", base],
+      true,
+    );
     if (result.exitCode !== 0) {
       const unmerged = await mergeGit(cwd, ["ls-files", "-u"]);
       if (!(await mergeHead(cwd)) || !unmerged.stdout)
@@ -57,53 +62,40 @@ export async function prepareMerge(cwd: string, head: string, base: string): Pro
     .filter(Boolean);
 }
 
+const count = (text: string, pattern: RegExp) => text.match(pattern)?.length ?? 0;
+
+/**
+ * Conflict markers git generated and the resolver left behind, found by content rather than diff
+ * output (binary attributes and modify/delete conflicts have no usable diff). `>>>>>>> <base>`
+ * cannot occur in either parent, since a commit never contains its own sha. `<<<<<<< HEAD` lines
+ * are allowed only up to the count already present in a parent, so fixtures and docs that show
+ * markers don't block. Bare `=======` is ignored because it is also a setext heading.
+ */
+async function leftoverMarkers(cwd: string, head: string, base: string, path: string): Promise<boolean> {
+  const file = join(cwd, path);
+  if (!existsSync(file) || !lstatSync(file).isFile()) return false;
+  const text = readFileSync(file).toString("latin1");
+  const theirs = new RegExp(`^>{7} ${base}$`, "m");
+  if (theirs.test(text)) return true;
+  const ours = /^<{7} HEAD$/gm;
+  const inParent = async (rev: string) =>
+    count((await mergeGit(cwd, ["cat-file", "blob", `${rev}:${path}`], true)).stdout, ours);
+  return count(text, ours) > Math.max(await inParent(head), await inParent(base));
+}
+
 /** Never use commitAll: even a resolution identical to the first parent needs a merge commit. */
 export async function completeMerge(cwd: string, head: string, base: string): Promise<string> {
   await requireMerge(cwd, head, base);
-  // The file-only resolver leaves the unmerged index intact, including across restarts, so the
-  // worktree-vs-index diff is exactly the resolver's edits. Only markers it introduced block;
-  // unrelated docs and marker fixtures already in either parent do not. For an unmerged path git
-  // emits a combined diff whose `++` lines occur in neither parent, so a fixture line is attributed
-  // by position and cannot vouch for an identical marker git generated elsewhere. Each opening,
-  // ancestor or closing line counts on its own so a partially removed block is still caught; bare
-  // `=======` is ignored because it is also a setext heading.
   const list = async (args: string[]) => (await mergeGit(cwd, args)).stdout.split("\0").filter(Boolean);
-  const marker = /^(<{7,}|\|{7,}|>{7,})( |$)/;
-  const unmerged = new Set(await list(["diff", "--name-only", "--diff-filter=U", "-z"]));
+  // The file-only resolver leaves the unmerged index intact, including across restarts.
+  const unmerged = await list(["diff", "--name-only", "--diff-filter=U", "-z"]);
   const untracked = await list(["ls-files", "-z", "--others", "--exclude-standard"]);
-  const edited = await list(["diff", "--name-only", "--diff-filter=MT", "-z"]);
-  const introduced = async (path: string, added: string) => {
-    const diff = await mergeGit(cwd, [
-      "diff",
-      "-U0",
-      "--no-ext-diff",
-      "--no-textconv",
-      "--",
-      `:(literal)${path}`,
-    ]);
-    const hunks = diff.stdout.indexOf("\n@@");
-    if (hunks < 0) return false;
-    return diff.stdout
-      .slice(hunks)
-      .split("\n")
-      .some((line) => line.startsWith(added) && marker.test(line.slice(added.length)));
-  };
+  const edited = (await list(["diff", "--name-only", "--diff-filter=MT", "-z"])).filter(
+    (path) => !unmerged.includes(path),
+  );
   const markers: string[] = [];
-  for (const path of untracked) {
-    const file = join(cwd, path);
-    if (!existsSync(file) || !lstatSync(file).isFile()) continue;
-    const contents = readFileSync(file);
-    if (
-      !contents.includes(0) &&
-      contents
-        .toString("utf8")
-        .split("\n")
-        .some((line) => marker.test(line))
-    )
-      markers.push(path);
-  }
-  for (const path of unmerged) if (await introduced(path, "++")) markers.push(path);
-  for (const path of edited) if (!unmerged.has(path) && (await introduced(path, "+"))) markers.push(path);
+  for (const path of [...untracked, ...unmerged, ...edited])
+    if (await leftoverMarkers(cwd, head, base, path)) markers.push(path);
   if (markers.length) throw new Error(`Unresolved conflict markers: ${markers.join(", ")}`);
   await mergeGit(cwd, ["add", "-A"]);
   if ((await mergeGit(cwd, ["ls-files", "-u"])).stdout)
