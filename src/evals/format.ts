@@ -16,13 +16,15 @@ export function formatEvalReport(report: EvalReport): string {
     const roleLines: string[] = [];
     if (m.implement) {
       const { strategy, rounds, passAt1, passAtR, recovery } = m.implement;
-      roleLines.push(
-        `  strategy=${strategy}, rounds=${rounds}`,
-        metric("pass@1", passAt1),
-        metric(`pass@${rounds}`, passAtR),
-        metric("recovery", recovery),
-        `  incremental cost per recovery: metered $${number(recovery.costPerRecoveryUsd)}; API-equivalent $${number(recovery.costEquivPerRecoveryUsd)} (executed trials=${recovery.executedTrials}, recoveries=${recovery.executedRecoveries})`,
-      );
+      roleLines.push(metric("pass@1", passAt1));
+      if (rounds > 1)
+        roleLines.push(
+          `  strategy=${strategy}, rounds=${rounds}`,
+          metric(`pass@${rounds}`, passAtR),
+          metric("recovery", recovery),
+          `  recovery not attempted: ${recovery.notAttempted}`,
+          `  incremental cost per recovery: metered $${number(recovery.costPerRecoveryUsd)}; API-equivalent $${number(recovery.costEquivPerRecoveryUsd)} (executed trials=${recovery.executedTrials}, recoveries=${recovery.executedRecoveries})`,
+        );
 
       for (const group of m.implement.byComplexity)
         roleLines.push(

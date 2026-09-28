@@ -32,6 +32,7 @@ export function isBranchName(name: string): boolean {
   return (
     name.length > 0 &&
     name !== "@" &&
+    name !== "HEAD" &&
     !name.startsWith("-") &&
     !name.endsWith(".") &&
     !name.includes("..") &&

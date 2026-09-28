@@ -97,3 +97,10 @@ test("retry preserves persisted trusted origin without accepting request-supplie
   expect(retry.deliveryBranch).toBe(request.deliveryBranch ?? null);
   expect(retry.sourceRef).toEqual(request.sourceRef ?? null);
 });
+
+test("branch-name validation rejects HEAD like git check-ref-format --branch", async () => {
+  const { isBranchName } = await import("../src/core/delivery.ts");
+  expect(isBranchName("HEAD")).toBe(false);
+  expect(isBranchName("main")).toBe(true);
+  expect(isBranchName("dependabot/github_actions/actions/checkout-7.0.1")).toBe(true);
+});

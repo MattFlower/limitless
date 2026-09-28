@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -5,19 +6,24 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import type { EvalGrade, EvalStrategy } from "../core/types.ts";
+import type { EvalGrade, EvalStrategy, EvalTrial } from "../core/types.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
 import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
+import { withScratch } from "../harness/scratch.ts";
 import type { ModelTarget } from "../harness/types.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../pipeline/prompts.ts";
 import type { Router } from "../router/router.ts";
+import { EFFORT_LEVELS } from "../router/targets.ts";
 import { agentEnv, runProcess, sh } from "../util/proc.ts";
 import type { hiddenContents, ImplementCase } from "./cases.ts";
 import { gatesAt } from "./prepare.ts";
@@ -71,6 +77,63 @@ function inject(cwd: string, files: ReturnType<typeof hiddenContents>) {
   }
 }
 
+/**
+ * Every ignored entry, descending into directories Git reports unexpanded (nested repositories) so
+ * each file beneath them is tracked on its own. Symlinks are never followed.
+ */
+async function* ignoredEntries(cwd: string, env: Record<string, string>, signal: AbortSignal) {
+  const root = realpathSync(cwd);
+  const out = await sh(["git", "ls-files", "-z", "-o", "-i", "--exclude-standard"], { cwd, env, signal });
+  const pending = out.stdout
+    .split("\0")
+    .filter(Boolean)
+    .map((path) => path.replace(/\/$/, ""));
+  for (let path = pending.shift(); path !== undefined; path = pending.shift()) {
+    yield path;
+    const stat = lstatSync(join(root, path), { throwIfNoEntry: false });
+    if (stat?.isDirectory())
+      pending.unshift(...readdirSync(join(root, path)).map((entry) => `${path}/${entry}`));
+  }
+}
+
+/**
+ * Identify an ignored file's exact pre-grade state. ctime can't be forged by the grader, but coarse
+ * filesystem clocks can hide a same-tick rewrite, so recently changed files also carry their contents.
+ * Directories are compared by their entries, not their metadata: overwriting a child leaves it unchanged.
+ */
+function fingerprint(root: string, path: string, since: bigint) {
+  const file = join(root, path);
+  const stat = lstatSync(file, { bigint: true, throwIfNoEntry: false });
+  if (!stat) return null;
+  if (stat.isDirectory()) return "directory";
+  const meta = `${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  if (stat.ctimeNs < since) return meta;
+  const body = stat.isSymbolicLink() ? readlinkSync(file) : stat.isFile() ? readFileSync(file) : "";
+  return `${meta}:${createHash("sha256").update(body).digest("hex")}`;
+}
+
+async function ignoredState(cwd: string, env: Record<string, string>, signal: AbortSignal) {
+  const root = realpathSync(cwd);
+  const since = BigInt(Date.now() - 5_000) * 1_000_000n;
+  const state = new Map<string, string | null>();
+  for await (const path of ignoredEntries(cwd, env, signal)) state.set(path, fingerprint(root, path, since));
+  return { since, state };
+}
+
+/** Remove a path without following symlinked parents, then prune directories it left empty. */
+function removeWithin(root: string, path: string) {
+  const parts = path.split("/");
+  let current = root;
+  for (const part of parts.slice(0, -1)) {
+    current = join(current, part);
+    const stat = lstatSync(current, { throwIfNoEntry: false });
+    if (!stat?.isDirectory()) return;
+  }
+  rmSync(join(root, path), { recursive: true, force: true });
+  for (let dir = dirname(join(root, path)); dir !== root && readdirSync(dir).length === 0; dir = dirname(dir))
+    rmSync(dir, { recursive: true });
+}
+
 export function failedImplement(reason: "timeout" | "error", error?: string): EvalGrade {
   return {
     pass: false,
@@ -102,10 +165,8 @@ export async function gradeImplement(
   };
   const snapshot = restore ? mkdtempSync(join(dirname(cwd), "grade-")) : undefined;
   let snapshotReady = false;
-  const copy = (from: string, to: string) => {
-    for (const name of readdirSync(from))
-      cpSync(join(from, name), join(to, name), { recursive: true, verbatimSymlinks: true });
-  };
+  let ignoredBefore: Awaited<ReturnType<typeof ignoredState>> | undefined;
+  const modes = new Map<string, number>();
   try {
     signal.throwIfAborted();
     await sh(["git", "add", "-A"], { cwd, env, signal });
@@ -129,8 +190,13 @@ export async function gradeImplement(
     );
     evidence.commit = (await sh(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
     if (snapshot) {
-      // Restore Git metadata too: grading commands may stage/commit hidden inputs or leave logs.
-      copy(cwd, snapshot);
+      // Keep candidate Git metadata private: graders may commit hidden inputs.
+      // Reconstruct files only after failure; never copy the worktree (including dependencies).
+      cpSync(join(cwd, ".git"), join(snapshot, ".git"), { recursive: true, verbatimSymlinks: true });
+      for (const path of (await sh(["git", "ls-files", "-z"], { cwd, env, signal })).stdout
+        .split("\0")
+        .filter(Boolean))
+        if (!lstatSync(join(cwd, path)).isSymbolicLink()) modes.set(path, statSync(join(cwd, path)).mode);
       snapshotReady = true;
     }
     const after = await runGates(cwd, prepared.gates, signal);
@@ -156,15 +222,18 @@ export async function gradeImplement(
     });
     evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");
     evidence.auditWarnings = findings.filter((finding) => finding.severity === "warn");
+    if (snapshot) ignoredBefore = await ignoredState(cwd, env, signal);
     inject(cwd, files);
-    const hidden = await runProcess({
-      cmd: ["/bin/sh", "-c", item.hidden.command],
-      cwd,
-      env,
-      signal,
-      timeoutMs: item.hidden.timeoutSec * 1000,
-      tailLimit: 6000,
-    });
+    const hidden = await withScratch(cwd, (scratch) =>
+      runProcess({
+        cmd: ["/bin/sh", "-c", item.hidden.command],
+        cwd,
+        env: agentEnv({ HOME: scratch, TMPDIR: scratch, TMP: scratch, TEMP: scratch }),
+        signal,
+        timeoutMs: item.hidden.timeoutSec * 1000,
+        tailLimit: 6000,
+      }),
+    );
     signal.throwIfAborted();
     evidence.hidden = {
       exitCode: hidden.exitCode,
@@ -194,9 +263,33 @@ export async function gradeImplement(
   } finally {
     if (snapshot) {
       try {
-        if (snapshotReady) {
-          for (const name of readdirSync(cwd)) rmSync(join(cwd, name), { recursive: true, force: true });
-          copy(snapshot, cwd);
+        if (snapshotReady && evidence.reason !== null && !signal.aborted) {
+          // Preserve ignored dependencies/build outputs across recovery rounds.
+          rmSync(join(cwd, ".git"), { recursive: true, force: true });
+          cpSync(join(snapshot, ".git"), join(cwd, ".git"), { recursive: true, verbatimSymlinks: true });
+          await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "HEAD"], {
+            cwd,
+            env,
+            signal,
+          });
+          await sh(["git", "clean", "-fd"], { cwd, env, signal });
+          // Ignore rules are candidate-controlled: drop hidden files and anything the grader created
+          // or rewrote, since a pre-existing ignored output may now hold hidden test contents.
+          if (ignoredBefore) {
+            const root = realpathSync(cwd);
+            for (const file of files) removeWithin(root, file.path);
+            for await (const path of ignoredEntries(cwd, env, signal)) {
+              const before = ignoredBefore.state.get(path);
+              if (before === undefined || before !== fingerprint(root, path, ignoredBefore.since))
+                removeWithin(root, path);
+            }
+            await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "HEAD"], {
+              cwd,
+              env,
+              signal,
+            });
+          }
+          for (const [path, mode] of modes) chmodSync(join(cwd, path), mode);
         }
       } finally {
         rmSync(snapshot, { recursive: true, force: true });
@@ -214,29 +307,19 @@ export async function gradeImplement(
 
 export function nextImplementTarget(
   router: Router,
-  item: ImplementCase,
+  chain: EvalTrial["details"]["switchChain"],
   target: ModelTarget,
   strategy: EvalStrategy,
 ) {
   if (strategy === "retry") return target;
   if (strategy === "switch") {
-    const decision = router.route("implement", item.complexity);
-    const next = decision.candidates
-      .filter((candidate) => candidate.tier > target.tier)
-      .sort((a, b) => a.tier - b.tier)[0];
-    if (!next)
-      for (const skipped of decision.skipped) {
-        const model = router.model(skipped.modelId.split("@")[0] ?? "");
-        if (
-          model &&
-          model.tier > target.tier &&
-          (skipped.reason === "disabled" || skipped.reason.startsWith(`${model.provider}:`))
-        )
-          throw new Error(`Stronger policy target unavailable: ${skipped.reason}`);
-      }
-    return next;
+    const next = chain?.find((candidate) => candidate.tier > target.tier);
+    if (!next) return undefined;
+    const model = router.model(next.modelId);
+    if (!model) throw new Error("Switch target unavailable: model removed");
+    return { ...router.toTarget(model, next.effort), tier: next.tier };
   }
-  const levels: NonNullable<ModelTarget["effort"]>[] = ["none", "low", "medium", "high"];
+  const levels = EFFORT_LEVELS;
   const index = target.effort === undefined ? -1 : levels.indexOf(target.effort);
   const model = router.model(target.modelId);
   if (index < 0 || !model) return undefined;
