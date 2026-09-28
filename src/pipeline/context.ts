@@ -47,6 +47,7 @@ export type Phase = "prepare" | "triage" | "clarify" | "spec" | "loop" | "delive
 
 /** Everything a run needs to resume after a restart. Persisted as runs.state_json. */
 export interface RunState {
+  parked?: boolean;
   flow?: "build" | "verify-change";
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
   verdictCommentPosted?: boolean;
@@ -122,6 +123,12 @@ export class CancelledError extends Error {
   }
 }
 
+export class ParkedError extends Error {
+  constructor() {
+    super("parked for deploy");
+  }
+}
+
 export class NeedsHumanError extends Error {}
 
 export class NoCapacityError extends Error {}
@@ -190,6 +197,7 @@ export class RunContext {
     public run: Run,
     readonly repo: Repo,
     readonly signal: AbortSignal,
+    readonly isDraining: () => boolean = () => false,
   ) {
     this.runDir = join(deps.cfg.paths.runs, run.id);
     mkdirSync(this.runDir, { recursive: true });
@@ -284,6 +292,7 @@ export class RunContext {
     background = false,
   ): Promise<T> {
     this.checkCancelled();
+    if (this.isDraining()) throw new ParkedError();
     if (!background) this.run = this.store.updateRun(this.run.id, { stage: name });
     const stage = this.store.startStage(this.run.id, name, round);
     try {

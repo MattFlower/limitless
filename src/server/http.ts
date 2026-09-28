@@ -145,6 +145,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
   const drainState = () => ({
     draining: factory.scheduler.draining,
     active: factory.scheduler.activeRunIds,
+    parked: factory.scheduler.parkedRunIds,
   });
   const admin = (action: "drain" | "resume") => ({
     POST: handle(() => {

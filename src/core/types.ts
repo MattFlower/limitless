@@ -298,6 +298,7 @@ export type StreamMessage =
 export interface DrainState {
   draining: boolean;
   active: string[];
+  parked?: string[];
 }
 
 export interface HealthResponse extends DrainState {

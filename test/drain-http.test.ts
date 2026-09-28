@@ -24,7 +24,13 @@ test("admin drain uses real loopback peers and existing mutation protections", a
       (await (
         await health(requestWithParams("http://localhost/api/health"), localServer)
       ).json()) as HealthResponse;
-    expect(await read()).toMatchObject({ ok: true, sha: "boot-commit", draining: false, active: [] });
+    expect(await read()).toMatchObject({
+      ok: true,
+      sha: "boot-commit",
+      draining: false,
+      active: [],
+      parked: [],
+    });
     expect(typeof (await read()).uptimeMs).toBe("number");
     for (const address of [
       "127.0.0.1",
@@ -87,7 +93,9 @@ test("admin drain uses real loopback peers and existing mutation protections", a
     f.factory.scheduler.tick();
     expect((await read()).active).toEqual([run.id]);
     await drain(request(), localServer);
-    expect(await read()).toMatchObject({ draining: true, active: [run.id] });
+    const parked = await f.factory.createRun({ repo: f.repo, prompt: "parked" });
+    f.factory.store.updateRun(parked.id, { status: "queued", stage: null }, { phase: "loop", parked: true });
+    expect(await read()).toMatchObject({ draining: true, active: [run.id], parked: [parked.id] });
   } finally {
     await f.close();
   }

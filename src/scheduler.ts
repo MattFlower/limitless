@@ -45,6 +45,10 @@ export class Scheduler {
     return [...this.active.keys()];
   }
 
+  get parkedRunIds(): string[] {
+    return this.deps.store.parkedRunIds();
+  }
+
   get draining(): boolean {
     return this.drainEnabled;
   }
@@ -68,7 +72,7 @@ export class Scheduler {
       if (this.stopping || this.draining) return;
       if (this.active.has(run.id)) continue;
       const controller = new AbortController();
-      const done = executeRun(this.deps, run.id, controller.signal)
+      const done = executeRun(this.deps, run.id, controller.signal, () => this.draining)
         .catch((e) => {
           this.deps.store.updateRun(run.id, {
             status: "failed",
