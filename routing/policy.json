@@ -9,5 +9,9 @@
       "codex/luna@none",
       "claude/sonnet@low"
     ]
+  },
+  "implement": {
+    "trivial": ["codex/luna@medium", "codex/sol@medium", "claude/opus"],
+    "small": ["codex/luna@medium", "codex/sol@medium", "claude/opus"]
   }
 }
