@@ -3,6 +3,13 @@ import { join } from "node:path";
 import { EvalRequestSchema } from "../evals/cases.ts";
 import { policyDiff, proposedOverlay, renderEvidence } from "../evals/evidence.ts";
 import { formatEvalReport } from "../evals/format.ts";
+import {
+  OVERRIDES_PATH,
+  parseOverrides,
+  pinEvaluation,
+  pinMessage,
+  unevaluatedPins,
+} from "../evals/overrides.ts";
 import type { EvalPolicyResponse } from "../evals/policy.ts";
 import type { EvalReport } from "../evals/stats.ts";
 import { DEFAULT_POLICY } from "../router/catalog.ts";
@@ -51,10 +58,19 @@ export async function evalCommand(
     const path = "routing/policy.json";
     const old = await files.read(path);
     const existing = old === null ? {} : parsePolicy(old, data.models, path, data.providers);
-    const proposed = validatePolicy(proposedOverlay(existing, data.evaluation), data.models, data.providers);
+    const pins = parseOverrides(await files.read(OVERRIDES_PATH), existing);
+    const evaluation = pinEvaluation(data.evaluation, pins);
+    const proposed = validatePolicy(proposedOverlay(existing, evaluation), data.models, data.providers);
     const document = `${JSON.stringify(proposed, null, 2)}\n`;
-    const evidence = renderEvidence(data.evaluation);
-    io.print(policyDiff(data.policy, overlayPolicy(DEFAULT_POLICY, proposed), data.evaluation));
+    const unevaluated = unevaluatedPins(evaluation, pins);
+    const evidence = `${renderEvidence(evaluation)}${unevaluated.map(([key, pin]) => `## ${key.replace(/\.default$/, "")}\n\n${pinMessage(pin)}\n\n`).join("")}`;
+    const unpinned = {
+      ...evaluation,
+      roles: evaluation.roles.filter((r) => !pins.has(`${r.role}.${r.cell}`)),
+    };
+    io.print(policyDiff(data.policy, overlayPolicy(DEFAULT_POLICY, proposed), unpinned));
+    for (const [key, pin] of [...pins].sort(([a], [b]) => (a < b ? -1 : 1)))
+      io.print(`${key}: ${pinMessage(pin)}`);
     if (old === null)
       io.print("routing/policy.json is absent; --write creates the overlay and evidence files.");
     else if (JSON.stringify(existing) === JSON.stringify(proposed))
