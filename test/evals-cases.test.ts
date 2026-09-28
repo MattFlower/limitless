@@ -5,8 +5,11 @@ import { join } from "node:path";
 import {
   CaseFileSchema,
   EvalRequestSchema,
+  ImplementCaseFileSchema,
   loadCases,
   loadRoleCases,
+  ReviewCaseFileSchema,
+  VerifyCaseFileSchema,
   validateRequest,
 } from "../src/evals/cases.ts";
 import { evalFixture } from "./evals-support.ts";
@@ -314,4 +317,87 @@ test("round control validates before dataset access and preserves independent k"
   } finally {
     await f.close();
   }
+});
+
+test("every role accepts an optional boolean snapshot flag and defaults to plain mode", () => {
+  const triage = loadCases();
+  const verify = loadRoleCases("verify", new URL("./data/evals-verify.json", import.meta.url).pathname);
+  const item = triage.cases[0];
+  const verifyItem = verify.cases[0];
+  if (!item || !verifyItem) throw new Error("missing case");
+  const pins = { repo: "fixture/repo", base: "a".repeat(40), head: "b".repeat(40) };
+  const review = { ...pins, id: "r", kind: "clean", source: "s", defects: [] };
+  const reviewInput = { prompt: "p", spec: null, implementerReport: "", gates: [] };
+  const implement = {
+    ...pins,
+    id: "i",
+    complexity: "small",
+    prompt: "p",
+    spec: null,
+    hidden: { files: [], command: "true" },
+    source: "s",
+    tags: [],
+  };
+  const files = [
+    [CaseFileSchema, (snapshot?: unknown) => ({ ...triage, cases: [{ ...item, snapshot }] })],
+    [
+      ReviewCaseFileSchema,
+      (snapshot?: unknown) => ({
+        role: "review",
+        version: 1,
+        cases: [{ ...review, input: reviewInput, snapshot }],
+      }),
+    ],
+    [VerifyCaseFileSchema, (snapshot?: unknown) => ({ ...verify, cases: [{ ...verifyItem, snapshot }] })],
+    [
+      ImplementCaseFileSchema,
+      (snapshot?: unknown) => ({ role: "implement", version: 1, cases: [{ ...implement, snapshot }] }),
+    ],
+  ] as const;
+  for (const [schema, file] of files) {
+    expect(schema.parse(file(true)).cases[0]?.snapshot).toBe(true);
+    expect(schema.parse(file(false)).cases[0]?.snapshot).toBe(false);
+    expect(schema.parse(file(undefined)).cases[0]?.snapshot).toBeUndefined();
+    for (const bad of ["true", 1, null]) expect(schema.safeParse(file(bad)).success).toBe(false);
+  }
+});
+
+test("snapshot review cases reject gold defects under the stripped evals/ directory", () => {
+  const defect = {
+    lines: [1, 2],
+    severity: "major",
+    category: "bug",
+    summary: "s",
+    required: true,
+    foundBy: "f",
+  };
+  const file = (snapshot: boolean | undefined, path: string) =>
+    ReviewCaseFileSchema.safeParse({
+      role: "review",
+      version: 1,
+      cases: [
+        {
+          id: "r",
+          repo: "fixture/repo",
+          base: "a".repeat(40),
+          head: "b".repeat(40),
+          kind: "real",
+          source: "s",
+          input: { prompt: "p", spec: null, implementerReport: "", gates: [] },
+          defects: [{ ...defect, file: path }],
+          snapshot,
+        },
+      ],
+    });
+  for (const path of ["evals/review/cases.json", "./evals/x.ts", "evals"]) {
+    const result = file(true, path);
+    expect(result.success).toBe(false);
+    expect(result.error?.message).toContain(
+      "snapshot mode removes evals/, so a gold defect cannot lie under it",
+    );
+    expect(file(false, path).success).toBe(true);
+    expect(file(undefined, path).success).toBe(true);
+  }
+  for (const path of ["src/evals/x.ts", "evals.ts", "Evals/x.ts"])
+    expect(file(true, path).success).toBe(true);
 });

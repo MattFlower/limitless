@@ -396,10 +396,13 @@ test("bare cache clones/fetches exact pins under existing locks, and never subst
     f.dataset.repos["fixture/repo"] = "0".repeat(40);
     f.save();
     const missing = await f.run();
-    expect(missing.run.status).toBe("failed");
-    expect(missing.run.error).toContain("0000000000");
+    // A missing pin fails each of its cases' preparation, never the whole run.
+    expect(missing.run.status).toBe("completed");
     expect(f.calls).toHaveLength(0);
-    expect(missing.trials.every((t) => t.status === "skipped")).toBe(true);
+    for (const trial of missing.trials) {
+      expect(trial).toMatchObject({ status: "error", pass: false, details: { preparationFailed: true } });
+      expect(String(trial.details.reason)).toContain("0000000000");
+    }
     expect(existsSync(join(f.cache, "worktrees"))).toBe(false);
   } finally {
     await f.close();
