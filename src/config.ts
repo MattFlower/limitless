@@ -80,6 +80,9 @@ function parseEnvFile(path: string): Record<string, string> {
   return out;
 }
 
+/** `[review]` is validated strictly: a misspelt key would otherwise silently keep the default. */
+const REVIEW_KEYS = ["implementer_report"];
+
 function num(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
@@ -160,7 +163,13 @@ export function loadConfig(
     routing.dependabot !== "policy"
   )
     throw new Error('routing.dependabot must be "free_first" or "policy"');
-  const review = (raw.review ?? {}) as Record<string, unknown>;
+  const rawReview = raw.review ?? {};
+  if (typeof rawReview !== "object" || rawReview === null || Array.isArray(rawReview))
+    throw new Error("review must be a table");
+  const review = rawReview as Record<string, unknown>;
+  for (const key of Object.keys(review))
+    if (!REVIEW_KEYS.includes(key))
+      throw new Error(`review.${key}: unknown key (allowed: ${REVIEW_KEYS.join(", ")})`);
   if (
     review.implementer_report !== undefined &&
     review.implementer_report !== "include" &&

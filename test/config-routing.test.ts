@@ -41,6 +41,11 @@ test("review implementer report defaults to include and accepts only include or 
       writeFileSync(join(configDir, "config.toml"), `[review]\nimplementer_report = ${value}\n`);
       expect(config).toThrow('review.implementer_report must be "include" or "omit"');
     }
+    // A misspelt key would otherwise silently keep the default.
+    writeFileSync(join(configDir, "config.toml"), '[review]\nimplementer-report = "omit"\n');
+    expect(config).toThrow("review.implementer-report: unknown key (allowed: implementer_report)");
+    writeFileSync(join(configDir, "config.toml"), 'review = "omit"\n');
+    expect(config).toThrow("review must be a table");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

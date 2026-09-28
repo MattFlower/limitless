@@ -2249,14 +2249,68 @@ protected_paths = ["protected.txt"]
       return { files: { "farewell.txt": "goodbye\n" } };
     });
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
-    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).not.toBe("succeeded");
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
     const reviews = f.store.listInvocations(run.id).filter((i) => i.role === "review");
-    expect(reviews.length).toBeGreaterThan(0);
-    expect(reviews.every((i) => i.status === "error")).toBe(true);
+    expect(reviews.map((i) => [i.modelId, i.status])).toEqual([
+      ["beta/m", "error"],
+      ["alpha/m", "error"],
+    ]);
     expect(f.store.listStages(run.id).find((s) => s.name === "review")?.status).toBe("failed");
     expect(f.store.listArtifacts(run.id).some((a) => a.name.startsWith("review-"))).toBe(false);
     expect(f.store.getRunState<RunState>(run.id)?.lastReview).toBeUndefined();
     expect(f.store.listStages(run.id).some((s) => s.name === "verify" || s.name === "deliver")).toBe(false);
+  });
+
+  test("later-round review accepts a short fix confirmation but still rejects a placeholder", async () => {
+    let implementCalls = 0;
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        if (!s.prompt.includes("# Previous review"))
+          return {
+            structured: {
+              verdict: "request_changes",
+              summary: "wrong text",
+              findings: [
+                {
+                  severity: "blocker",
+                  security: false,
+                  file: "farewell.txt",
+                  line: 1,
+                  title: "Wrong text",
+                  detail: "Say goodbye",
+                  suggestion: "Write goodbye",
+                },
+              ],
+            },
+          };
+        return {
+          structured: {
+            verdict: "approve",
+            summary: s.target.provider === "beta" ? "test" : "P1 fixed; no regressions found.",
+            findings: [],
+          },
+        };
+      }
+      implementCalls++;
+      return { files: { "farewell.txt": implementCalls === 1 ? "bye\n" : "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const reviews = f.store.listInvocations(run.id).filter((i) => i.role === "review");
+    expect(reviews.map((i) => [i.modelId, i.status])).toEqual([
+      ["beta/m", "ok"],
+      ["beta/m", "error"],
+      ["alpha/m", "ok"],
+    ]);
+    expect(reviews[1]?.error).toContain("at least 12 characters");
+    expect(implementCalls).toBe(2);
+    expect(JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}")).toMatchObject({
+      model: "alpha/m",
+      verdict: "approve",
+      summary: "P1 fixed; no regressions found.",
+    });
   });
 
   test("missing holdout verdict fails despite an overall pass claim", async () => {

@@ -83,11 +83,17 @@ export const HoldoutSchema = z
   });
 export type Holdout = z.infer<typeof HoldoutSchema>;
 
+/** Shorter than this (trimmed) with no findings, a first review's summary is a placeholder. */
+export const MIN_REVIEW_SUMMARY = 40;
+/** Later rounds may legitimately just confirm fixes ("P1 fixed; no regressions found."). */
+export const MIN_LATER_REVIEW_SUMMARY = 12;
+
+const summaryField = (min: number) =>
+  z.string().describe(`What you checked and concluded; at least ${min} characters when findings is empty`);
+
 const reviewBase = z.object({
   verdict: z.enum(["approve", "request_changes"]),
-  summary: z
-    .string()
-    .describe("What you checked and concluded; at least 40 characters when findings is empty"),
+  summary: summaryField(MIN_REVIEW_SUMMARY),
   findings: z.array(
     z.object({
       severity: z.enum(["blocker", "major", "minor", "nit"]),
@@ -102,6 +108,7 @@ const reviewBase = z.object({
 });
 
 const laterReviewBase = reviewBase.extend({
+  summary: summaryField(MIN_LATER_REVIEW_SUMMARY),
   findings: z.array(
     reviewBase.shape.findings.element.extend({
       label: z
@@ -118,24 +125,20 @@ const laterReviewBase = reviewBase.extend({
   ),
 });
 
-/** Shorter than this (trimmed) with no findings, a summary is a placeholder, not a review. */
-export const MIN_REVIEW_SUMMARY = 40;
-
 // A placeholder like {"summary":"test","findings":[]} would otherwise count as an approval.
-function rejectDegenerate<T extends { summary: string; findings: unknown[] }>(
-  review: T,
-  ctx: z.RefinementCtx,
-) {
-  if (review.findings.length === 0 && review.summary.trim().length < MIN_REVIEW_SUMMARY)
-    ctx.addIssue({
-      code: "custom",
-      path: ["summary"],
-      message: `A review without findings needs a summary of at least ${MIN_REVIEW_SUMMARY} characters describing what was checked`,
-    });
-}
+const rejectDegenerate =
+  (min: number) =>
+  <T extends { summary: string; findings: unknown[] }>(review: T, ctx: z.RefinementCtx) => {
+    if (review.findings.length === 0 && review.summary.trim().length < min)
+      ctx.addIssue({
+        code: "custom",
+        path: ["summary"],
+        message: `A review without findings needs a summary of at least ${min} characters describing what was checked`,
+      });
+  };
 
-export const ReviewSchema = reviewBase.superRefine(rejectDegenerate);
-export const LaterReviewSchema = laterReviewBase.superRefine(rejectDegenerate);
+export const ReviewSchema = reviewBase.superRefine(rejectDegenerate(MIN_REVIEW_SUMMARY));
+export const LaterReviewSchema = laterReviewBase.superRefine(rejectDegenerate(MIN_LATER_REVIEW_SUMMARY));
 
 export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
   findings: (z.infer<typeof ReviewSchema>["findings"][number] & {

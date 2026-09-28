@@ -721,7 +721,7 @@ response body of the delivery in the webhook's delivery log (see [GitHub](#githu
 causes are `[owners].github` not being your login, or a repository outside that account.
 
 **The daemon exits at startup after a config change.**
-`[evals]`, `[evals.floors]`, `[routing] dependabot`, `[review] implementer_report` and `routing/policy.json` are validated
+`[evals]`, `[evals.floors]`, `[routing] dependabot`, `[review]` and `routing/policy.json` are validated
 strictly. The error names the key or file.
 
 **Reloading `/evals` in the browser shows "Not found".**
