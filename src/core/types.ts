@@ -114,6 +114,7 @@ export interface Repo {
 }
 
 export interface Run {
+  flow?: "build" | "verify-change";
   id: string;
   repoId: string;
   repoSlug: string;

@@ -1,10 +1,16 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { assertExistingBranchDelivery } from "../core/delivery.ts";
+import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
-import { compareGates, type GateHooks, retryRegressions, runGates } from "../gates/run.ts";
+import {
+  compareGates,
+  type GateComparison,
+  type GateHooks,
+  retryRegressions,
+  runGates,
+} from "../gates/run.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
   commitAll,
@@ -22,7 +28,9 @@ import {
   pushExistingBranch,
   readFileAt,
   removeWorktree,
+  resetTo,
 } from "../git/repos.ts";
+import { runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
 import {
@@ -92,12 +100,20 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run);
+    ctx.state.flow ??= "build";
+    ctx.save();
+    if (ctx.state.flow === "verify-change" && ctx.state.phase !== "prepare" && !ctx.state.verification)
+      throw new Error("Verification state is missing its recorded PR revisions");
     if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined) {
       if (!ctx.run.baseSha || !ctx.state.worktreePath)
         throw new Error("Cannot restore base preview configuration: missing base SHA or worktree");
       // Upgrade older runs using the trusted revision, never the edited worktree config.
       ctx.state.previewConfig = readPreviewConfig(
-        await readFileAt(ctx.state.worktreePath, ctx.run.baseSha, ".limitless.toml"),
+        await readFileAt(
+          ctx.state.worktreePath,
+          ctx.state.verification?.baseSha ?? ctx.run.baseSha,
+          ".limitless.toml",
+        ),
       );
       ctx.save();
     }
@@ -172,6 +188,24 @@ async function prepare(ctx: RunContext): Promise<void> {
   assertExistingBranchDelivery(ctx.repo, ctx.run);
   await ctx.stage("prepare", async () => {
     const { cfg, store } = ctx.deps;
+    if (ctx.state.flow === "verify-change") {
+      const ref = ctx.run.sourceRef;
+      if (
+        typeof ref?.baseRef !== "string" ||
+        !isBranchName(ref.baseRef) ||
+        typeof ref.baseSha !== "string" ||
+        !/^[a-fA-F0-9]{40}$/.test(ref.baseSha) ||
+        typeof ref.headSha !== "string" ||
+        !/^[a-fA-F0-9]{40}$/.test(ref.headSha) ||
+        ref.repo !== ctx.repo.slug ||
+        typeof ref.number !== "number" ||
+        !Number.isSafeInteger(ref.number) ||
+        ref.number <= 0
+      )
+        throw new Error("Verification requires valid PR baseRef, baseSha, headSha and repository metadata");
+      ctx.state.verification = { baseSha: ref.baseSha, headSha: ref.headSha };
+      ctx.save();
+    }
     await ensureCache(cfg.paths, ctx.repo);
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
     const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base);
@@ -179,18 +213,30 @@ async function prepare(ctx: RunContext): Promise<void> {
       throw new Error("PR head moved before preparation");
     ctx.state.worktreePath = wt.path;
     ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha: wt.baseSha, branch: wt.branch });
-    ctx.state.previewConfig = readPreviewConfig(await readFileAt(wt.path, wt.baseSha, ".limitless.toml"));
-    const gates = detectGates(wt.path);
-    ctx.state.gatesConfig = gates;
-    ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
-    ctx.log(
-      `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
-    );
-    ctx.state.baseline =
-      gates.setup.length || gates.checks.length
-        ? await runGates(wt.path, gates, ctx.signal, { onWait: gateEvents(ctx).onWait })
-        : null;
-    ctx.checkCancelled();
+    const verification = ctx.state.verification;
+    if (verification) {
+      ctx.run = store.updateRun(ctx.run.id, { baseSha: verification.headSha });
+      await resetTo(wt.path, verification.baseSha);
+    }
+    let gates: GateConfig;
+    try {
+      ctx.state.previewConfig = readPreviewConfig(
+        await readFileAt(wt.path, verification?.baseSha ?? wt.baseSha, ".limitless.toml"),
+      );
+      gates = detectGates(wt.path);
+      ctx.state.gatesConfig = gates;
+      ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
+      ctx.log(
+        `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
+      );
+      ctx.state.baseline =
+        gates.setup.length || gates.checks.length
+          ? await runGates(wt.path, gates, ctx.signal, { onWait: gateEvents(ctx).onWait })
+          : null;
+      ctx.checkCancelled();
+    } finally {
+      if (verification) await resetTo(wt.path, verification.headSha);
+    }
     const baseline = ctx.state.baseline;
     if (baseline) {
       store.putArtifact(ctx.run.id, "baseline-gates.json", "gates", JSON.stringify(baseline, null, 2));
@@ -257,12 +303,13 @@ async function triage(ctx: RunContext): Promise<void> {
       "triage",
       JSON.stringify({ ...t, model: target.modelId }, null, 2),
     );
-    const questions = profile !== "quick" && t.ambiguity === "high" ? t.blocking_questions : [];
+    const verifying = ctx.state.flow === "verify-change";
+    const questions = !verifying && profile !== "quick" && t.ambiguity === "high" ? t.blocking_questions : [];
     if (questions.length) {
       for (const q of questions) ctx.store.askQuestion(ctx.run.id, q);
       ctx.setPhase("clarify");
     } else {
-      ctx.setPhase(profile === "quick" ? "loop" : "spec");
+      ctx.setPhase(verifying || profile === "quick" ? "loop" : "spec");
     }
     return {
       summary: `${t.task_class}, ${t.complexity}, risk ${t.risk} → ${profile} (${target.modelId})`,
@@ -361,12 +408,20 @@ function profile(ctx: RunContext): ResolvedProfile {
 }
 
 async function buildLoop(ctx: RunContext): Promise<void> {
+  if (ctx.state.verification && !ctx.state.verification.initialComplete) {
+    // Initial verification does not consume an implementation round.
+    const passed = await oneRound(ctx, -1, null);
+    ctx.state.verification.initialComplete = true;
+    if (passed) ctx.setPhase("deliver");
+    else ctx.save();
+    if (passed) return;
+  }
   const maxRounds =
     ctx.state.conflictRound !== undefined
       ? ctx.state.conflictRound + 1
       : Math.max(1, ctx.deps.cfg.maxRounds) + ROUNDS_PER_IMPLEMENTER;
   const holdout =
-    profile(ctx) === "quick" || ctx.state.holdoutStatus === "complete"
+    ctx.state.flow === "verify-change" || profile(ctx) === "quick" || ctx.state.holdoutStatus === "complete"
       ? null
       : authorHoldout(ctx).then(
           () => null,
@@ -485,10 +540,11 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           spec: ctx.state.spec ?? null,
           gates,
           baseline: ctx.state.baseline ?? null,
-          baseSha,
+          baseSha: ctx.state.verification?.baseSha ?? baseSha,
+          externalChange: ctx.state.flow === "verify-change",
           round,
           feedback: ctx.state.feedback,
-          hasHoldout: profile(ctx) !== "quick",
+          hasHoldout: ctx.state.flow !== "verify-change" && profile(ctx) !== "quick",
           resolution: merge,
         }),
       });
@@ -542,10 +598,11 @@ async function oneRound(
 ): Promise<boolean> {
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
-  const baseSha = ctx.run.baseSha as string;
+  const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
+  const changeDiff = () => diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change");
 
   // --- implement (skipped when resuming a round whose implementation already landed)
-  if (ctx.state.implementedRound !== round) await implementStage(ctx, round);
+  if (round >= 0 && ctx.state.implementedRound !== round) await implementStage(ctx, round);
   if (ctx.state.conflictRound === round) {
     if (!ctx.state.preRebaseHead || ctx.state.pendingRebaseSha !== baseSha)
       throw new Error("Missing expected merge state for resolution checks");
@@ -557,23 +614,25 @@ async function oneRound(
     "gates",
     async () => {
       const events = gateEvents(ctx);
-      const after = await runGates(cwd, gates, ctx.signal, events);
-      ctx.checkCancelled();
-      const changed = (await diffSince(cwd, baseSha)).files.flatMap((f) =>
-        f.from ? [f.path, f.from] : [f.path],
-      );
-      // Retry before discarding, so a check sees the same build output as its first attempt.
-      const cmp = await retryRegressions(
-        compareGates(ctx.state.baseline ?? null, after),
-        cwd,
-        gates,
-        changed,
-        ctx.signal,
-        events.onWait,
-      );
-      ctx.checkCancelled();
-      // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
-      await discardChanges(cwd);
+      let cmp: GateComparison[];
+      try {
+        const after = await runGates(cwd, gates, ctx.signal, events);
+        ctx.checkCancelled();
+        const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
+        // Retry before discarding, so a check sees the same build output as its first attempt.
+        cmp = await retryRegressions(
+          compareGates(ctx.state.baseline ?? null, after),
+          cwd,
+          gates,
+          changed,
+          ctx.signal,
+          events.onWait,
+        );
+        ctx.checkCancelled();
+        // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
+      } finally {
+        await discardChanges(cwd);
+      }
       for (const c of cmp.filter((c) => c.firstAttempt)) {
         ctx.store.addEvent({
           runId: ctx.run.id,
@@ -598,12 +657,12 @@ async function oneRound(
   );
 
   // --- audit
-  const diff = await diffSince(cwd, baseSha);
+  const diff = await changeDiff();
   const audit: AuditFinding[] = await ctx.stage(
     "audit",
     async () => {
       const findings = auditDiff(diff, {
-        taskClass: ctx.run.taskClass,
+        taskClass: ctx.state.verification && ctx.run.taskClass === "question" ? null : ctx.run.taskClass,
         protectedPaths: gates.protectedPaths,
         toolCommands: ctx.state.toolCommands,
         gateScripts: {
@@ -611,6 +670,23 @@ async function oneRound(
           after: pickScripts(readPackageJson(cwd), gateScriptNames(gates)),
         },
       });
+      if (ctx.state.verification) {
+        const repairs = await diffSince(cwd, ctx.state.verification.headSha);
+        if (repairs.files.length)
+          findings.push(
+            ...auditDiff(repairs, {
+              taskClass: ctx.run.taskClass,
+              protectedPaths: gates.protectedPaths,
+              gateScripts: {
+                before: pickScripts(
+                  await readFileAt(cwd, ctx.state.verification.headSha, "package.json"),
+                  gateScriptNames(gates),
+                ),
+                after: pickScripts(readPackageJson(cwd), gateScriptNames(gates)),
+              },
+            }).map((finding) => ({ ...finding, detail: `Repair: ${finding.detail}` })),
+          );
+      }
       ctx.state.lastAudit = findings;
       for (const f of findings) {
         ctx.store.addEvent({
@@ -666,9 +742,13 @@ async function oneRound(
           spec: ctx.state.spec ?? null,
           baseSha,
           stat: diff.stat,
+          ...(ctx.state.flow === "verify-change" ? { patch: diff.patch } : {}),
           gates: comparison,
           audit,
           implementerReport: ctx.state.implementerReport ?? "",
+          externalChange: ctx.state.flow === "verify-change",
+          dependencyUpdate:
+            ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
           previous: previousReview,
           headSha: reviewedSha,
           resolution: ctx.state.conflictRound === round,
@@ -735,7 +815,7 @@ async function oneRound(
   }
 
   // --- verify acceptance criteria (standard/deep)
-  if (profile(ctx) === "quick") {
+  if (ctx.state.flow === "verify-change" || profile(ctx) === "quick") {
     ctx.state.lastVerify = null;
     return true;
   }
@@ -882,6 +962,39 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       ctx.state.preRebaseGates = undefined;
       ctx.save();
     }
+    if (ctx.state.verification) {
+      await discardChanges(cwd);
+      if (!success) {
+        ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
+        return { summary: "PR verification needs human review; no push", value: undefined };
+      }
+      if (!(await diffSince(cwd, ctx.state.verification.headSha)).files.length) {
+        ctx.run = ctx.store.updateRun(ctx.run.id, {
+          headSha: await headSha(cwd),
+          prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef?.number}`,
+        });
+        const report = buildReport(ctx, true);
+        ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+        if (!ctx.state.verdictCommentPosted) {
+          ctx.checkCancelled();
+          await (ctx.deps.gh ?? runGh)([
+            "pr",
+            "comment",
+            String(ctx.run.sourceRef?.number),
+            "--repo",
+            ctx.repo.slug,
+            "--body",
+            report,
+          ]);
+          ctx.state.verdictCommentPosted = true;
+          ctx.save();
+        }
+        await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
+        return { summary: `Verified existing PR: ${ctx.run.prUrl}`, value: undefined };
+      }
+      if (!ctx.run.deliveryBranch)
+        throw new NeedsHumanError("PR repairs require authorized existing-branch delivery");
+    }
     // Pending clean merges must be validated before any cleanup or generic commit.
     const sha =
       ctx.state.pendingRebaseSha || ctx.state.conflictRound !== undefined
@@ -942,6 +1055,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       return { summary: `branch ${ctx.run.branch} ready in ${ctx.repo.localPath}`, value: undefined };
     }
     if (ctx.run.deliveryBranch) {
+      publish();
       if (!success) return { summary: "PR update needs human review; no push", value: undefined };
       ctx.checkCancelled();
       await pushExistingBranch(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.run.baseSha as string);

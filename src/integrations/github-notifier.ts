@@ -83,7 +83,11 @@ export function startGitHubNotifier(
     )
       return;
     const terminal = TERMINAL_STATUSES.includes(run.status);
+    if (terminal && store.getRunState<{ verdictCommentPosted?: boolean }>(run.id)?.verdictCommentPosted)
+      return;
     if (run.status !== "queued" && !terminal) return;
+    // PR verification runs (they carry the PR base) answer with a single evidence comment instead.
+    if (!terminal && ref.kind === "pull_request" && typeof ref.baseSha === "string") return;
     const key = `${run.id}:${terminal ? "terminal" : "created"}`;
     if (seen.has(key)) return;
     seen.add(key);

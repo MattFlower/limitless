@@ -10,6 +10,7 @@ import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
+import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { renderReport } from "../src/pipeline/report.ts";
@@ -211,7 +212,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       (s) => {
         const role = roleOf(s);
         seen.push({ role, provider: s.target.provider });
-        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "triage")
+          return { structured: triage({ suggested_profile: "quick", task_class: "dependency_update" }) };
         if (role === "review") return { structured: approve };
         implementations++;
         return { files: { "farewell.txt": implementations === 1 ? "BAD goodbye\n" : "goodbye\n" } };
@@ -233,6 +235,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       { role: "review", provider: "delta" },
     ]);
     expect(f.store.getArtifact(run.id, "report.md")).toContain("Routing: free-first (Dependabot)");
+    expect(f.store.getRunState<RunState>(run.id)?.flow).toBe("build");
   });
 
   test("Dependabot falls back when free providers are unavailable; owner keeps policy routing", async () => {
@@ -1020,17 +1023,279 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
   }
 
+  test.each([
+    ["main", null],
+    ["main", "not-a-sha"],
+    ["main.lock", "b".repeat(40)],
+  ])("PR verification rejects invalid base metadata: %s %s", async (baseRef, baseSha) => {
+    const f = start(() => {
+      throw new Error("No model should run");
+    });
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "verify",
+      sourceRef: { kind: "pull_request", baseRef, baseSha, headSha: "a".repeat(40), number: 1 },
+    });
+    expect(await waitFor(f, run.id, ["failed", "succeeded"])).toBe("failed");
+    expect(f.store.getRun(run.id)?.error).toContain("valid PR baseRef");
+    expect(f.store.listInvocations(run.id)).toHaveLength(0);
+  });
+
+  test.each([
+    "approve",
+    "gates",
+    "review",
+    "persistent",
+    "repair-audit",
+    "baseline",
+    "empty",
+    "restart-initial",
+    "restart-repair",
+  ])(
+    "verify-change: %s",
+    async (scenario) => {
+      const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: repoDir })).stdout.trim();
+      const commit = async () => {
+        await git("add", ".");
+        await git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "fixture");
+        return git("rev-parse", "HEAD");
+      };
+      const records = join(home, "gate-revisions");
+      writeFileSync(
+        join(repoDir, ".limitless.toml"),
+        `[gates]
+checks = [{ name = "test", run = "git rev-parse HEAD >> ${records}; echo generated > generated.txt; ! grep BAD greeting.txt" }]
+[policy]
+protected_paths = ["protected.txt"]
+`,
+      );
+      if (scenario === "baseline") writeFileSync(join(repoDir, "greeting.txt"), "BAD\n");
+      const base = await commit();
+      if (scenario !== "empty") writeFileSync(join(repoDir, "version.txt"), "dependency 2\n");
+      if (scenario === "gates") writeFileSync(join(repoDir, "greeting.txt"), "BAD\n");
+      if (scenario === "repair-audit") writeFileSync(join(repoDir, "protected.txt"), "original\n");
+      const head = scenario === "empty" ? base : await commit();
+      const bare = join(home, "github.git");
+      await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
+      await git("push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2");
+      // The base tip is not an ancestor of the PR head: review must use the merge base.
+      await git("reset", "--hard", base);
+      writeFileSync(join(repoDir, "base-only.txt"), "base advancement\n");
+      const baseTip = await commit();
+      await git("push", "--force", bare, "HEAD:refs/heads/main");
+      const prompts: string[] = [];
+      let implementations = 0;
+      let interrupted = false;
+      let resume: (() => void) | undefined;
+      const blocker = {
+        severity: "major",
+        file: "version.txt",
+        line: 1,
+        title: "Compatibility bug",
+        detail: "Repair compatibility",
+        suggestion: "Fix compatibility",
+        security: false,
+      };
+      const needsReviewRepair = ["review", "persistent", "repair-audit", "restart-repair"].includes(scenario);
+      const handler: Handler = async (agent): Promise<FakeReply> => {
+        const role = roleOf(agent);
+        if (role === "triage") return { structured: triage() }; // PR source overrides feature + standard triage.
+        if (role === "review") {
+          prompts.push(agent.prompt);
+          expect(agent.prompt).toContain(`git diff ${baseTip}...`);
+          for (const topic of [
+            "breaking changes",
+            "permission and pinning",
+            "lockfile consistency",
+            "install-time code",
+          ])
+            expect(agent.prompt).toContain(topic);
+          const patch = (await sh(["git", "diff", `${baseTip}...HEAD`], { cwd: agent.cwd })).stdout;
+          expect(patch).toContain("dependency 2");
+          expect(patch).not.toContain("base-only");
+          expect(patch).not.toContain("generated.txt");
+          expect(agent.prompt).toContain("+dependency 2");
+          expect(agent.prompt).not.toContain("base-only");
+          if (
+            (scenario === "restart-initial" || (scenario === "restart-repair" && implementations > 0)) &&
+            !interrupted
+          ) {
+            interrupted = true;
+            await new Promise<void>((resolve) => {
+              resume = resolve;
+            });
+          }
+          if (needsReviewRepair && (implementations === 0 || scenario === "persistent"))
+            return {
+              structured: {
+                ...approve,
+                findings: [
+                  {
+                    ...blocker,
+                    ...(implementations ? { label: "unaddressed", prior: "P1", security: false } : {}),
+                  },
+                ],
+              },
+            };
+          return { structured: approve };
+        }
+        expect(role).toBe("implement");
+        implementations++;
+        expect(agent.prompt).toContain(
+          scenario === "gates"
+            ? "test"
+            : scenario === "empty"
+              ? "empty-diff"
+              : implementations > 1 && scenario === "repair-audit"
+                ? "Repair:"
+                : "Compatibility bug",
+        );
+        if (scenario === "empty") return { text: "No changes" };
+        return {
+          files:
+            scenario === "repair-audit"
+              ? { "protected.txt": "tampered\n" }
+              : { "greeting.txt": "repaired\n" },
+          text: "Repaired compatibility",
+        };
+      };
+      let f = start(handler);
+      const calls: string[][] = [];
+      const gh = async (args: string[]) => {
+        calls.push(args);
+      };
+      f.deps.gh = gh;
+      let stopNotifier = startGitHubNotifier(f.store, gh);
+      f.store.upsertRepo({
+        slug: "MattFlower/limitless",
+        kind: "github",
+        url: bare,
+        localPath: null,
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      f.cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
+      const payload = JSON.parse(readFileSync(join(import.meta.dir, "data/github-pr.json"), "utf8"));
+      payload.pull_request.base.sha = baseTip;
+      payload.pull_request.head.sha = head;
+      const body = JSON.stringify(payload);
+      const response = await githubWebhook(f)(
+        new Request("http://localhost/webhooks/github", {
+          method: "POST",
+          body,
+          headers: {
+            "x-github-event": "pull_request",
+            "x-github-delivery": scenario,
+            "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+          },
+        }),
+      );
+      expect(response.status).toBe(201);
+      const { runId } = (await response.json()) as { runId: string };
+      if (scenario.startsWith("restart")) {
+        for (let i = 0; !resume && i < 300; i++) await Bun.sleep(20);
+        expect(resume).toBeDefined();
+        const before = f.store.getRunState<RunState>(runId);
+        stopNotifier();
+        const stopping = f.stop();
+        resume?.();
+        await stopping;
+        stopNotifier();
+        f.store.close();
+        f = start(handler);
+        f.deps.gh = gh;
+        stopNotifier = startGitHubNotifier(f.store, gh);
+        expect(before?.verification?.baseSha).toBe(baseTip);
+        expect(before?.verification?.headSha).toBe(head);
+        if (scenario === "restart-repair") expect(before?.implementedRound).toBe(0);
+      }
+      const blocked = ["persistent", "repair-audit", "empty"].includes(scenario);
+      expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human"])).toBe(
+        blocked ? "needs_human" : "succeeded",
+      );
+      stopNotifier();
+      const state = f.store.getRunState<RunState>(runId);
+      expect(state?.flow).toBe("verify-change");
+      expect(f.store.getRunDetail(runId)?.run.flow).toBe("verify-change");
+      const revisions = readFileSync(records, "utf8").trim().split("\n");
+      expect(revisions.slice(0, 2)).toEqual([baseTip, head]);
+      const remote = (await git("ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).split("\t")[0];
+      const unchanged = ["approve", "baseline", "restart-initial"].includes(scenario);
+      expect(remote).toBe(unchanged || blocked ? head : (f.store.getRun(runId)?.headSha ?? "missing"));
+      if (unchanged) {
+        expect(implementations).toBe(0);
+        expect(f.store.listStages(runId).some((stage) => stage.name === "implement")).toBe(false);
+        expect(f.store.getRun(runId)?.headSha).toBe(head);
+        expect(existsSync(state?.worktreePath ?? "missing")).toBe(false);
+        expect(calls).toHaveLength(1); // Evidence only: no creation comment and no second verdict.
+        expect(calls[0]?.slice(0, 3)).toEqual(["pr", "comment", "18"]);
+        expect(calls[0]?.at(-1)).not.toContain("generated.txt");
+        for (const text of [
+          "Flow: verify-change",
+          "| Check |",
+          "LGTM",
+          "Work log",
+          "Total:",
+          "spent",
+          "subscriptions",
+        ])
+          expect(calls[0]?.at(-1)).toContain(text);
+        expect(f.store.getArtifact(runId, "diff.patch")).toBe(
+          (await sh(["git", "diff", `${baseTip}...${head}`], { cwd: repoDir })).stdout,
+        );
+      } else if (!blocked) {
+        expect(implementations).toBe(1);
+        expect(revisions).toContain(remote ?? "missing");
+        if (needsReviewRepair) {
+          expect(prompts.at(-1)).toContain("# Previous review");
+          expect(prompts.at(-1)).toContain("Compatibility bug");
+          expect(f.store.getArtifact(runId, "diff.patch")).toContain("repaired");
+        }
+      } else {
+        expect(implementations).toBe(f.cfg.maxRounds + 2);
+        expect(f.store.getArtifact(runId, "report.md")).toContain("Flow: verify-change");
+        if (scenario === "repair-audit")
+          expect(
+            state?.lastAudit?.some((a) => a.detail.startsWith("Repair:") && a.severity === "block"),
+          ).toBe(true);
+      }
+    },
+    30_000,
+  );
+
   test("Dependabot run delivers to the existing PR head without creating a PR", async () => {
     const bare = join(home, "github.git");
     await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
-    await sh(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir });
     const baseSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    writeFileSync(join(repoDir, "version.txt"), "2\n");
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "bump"], { cwd: repoDir });
+    const originalHead = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    await sh(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir });
+    let reviews = 0;
     let concurrent: string | null = null;
     let content = "verified\n";
     const f = start((s) => {
       const role = roleOf(s);
       if (role === "triage") return { structured: triage({ task_class: "dependency_update" }) };
       if (role === "review") {
+        if (reviews++ === 0)
+          return {
+            structured: {
+              ...approve,
+              findings: [
+                {
+                  severity: "major",
+                  file: "version.txt",
+                  line: 1,
+                  title: "Needs repair",
+                  detail: "Repair the update",
+                  suggestion: "Fix compatibility",
+                  security: false,
+                },
+              ],
+            },
+          };
         if (concurrent) {
           const result = Bun.spawnSync(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], {
             cwd: concurrent,
@@ -1053,9 +1318,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
     f.cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
     const trigger = async (sha: string, delivery: string) => {
       const payload = JSON.parse(readFileSync(join(import.meta.dir, "data/github-pr.json"), "utf8")) as {
-        pull_request: { head: { sha: string } };
+        pull_request: { head: { sha: string }; base: { sha: string } };
       };
       payload.pull_request.head.sha = sha;
+      payload.pull_request.base.sha = baseSha;
       const body = JSON.stringify(payload);
       const response = await githubWebhook(f)(
         new Request("http://localhost/webhooks/github", {
@@ -1075,7 +1341,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(run.githubWebhookVerified).toBe(true);
       return run;
     };
-    const run = await trigger(baseSha, "initial");
+    const run = await trigger(originalHead, "initial");
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     const finished = f.store.getRun(run.id);
     expect(finished?.prUrl).toBe("https://github.com/MattFlower/limitless/pull/18");
@@ -1098,6 +1364,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const competingSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: competitor })).stdout.trim();
     concurrent = competitor;
     content = "verified again\n";
+    reviews = 0;
     if (!finished?.headSha) throw new Error("missing delivered head");
     const stale = await trigger(finished.headSha, "concurrent");
     expect(await waitFor(f, stale.id, ["succeeded", "failed", "needs_human"])).toBe("failed");

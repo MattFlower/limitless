@@ -65,6 +65,38 @@ test("comments once at creation and terminal status with cost and PR link", asyn
   stop();
 });
 
+test("PR verification runs skip the creation comment", async () => {
+  const calls: string[][] = [];
+  const stop = startGitHubNotifier(store, async (args) => {
+    calls.push(args);
+  });
+  const repo = store.upsertRepo({
+    slug: "MattFlower/limitless",
+    kind: "github",
+    url: "unused",
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  const run = store.createRun(repo, {
+    repo: repo.slug,
+    prompt: "verify",
+    source: "github",
+    sourceRef: {
+      kind: "pull_request",
+      repo: repo.slug,
+      number: 12,
+      baseRef: "main",
+      baseSha: "b".repeat(40),
+    },
+  });
+  store.updateRun(run.id, { status: "failed" });
+  await Bun.sleep(0);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]?.at(-1)).toContain("failed");
+  stop();
+});
+
 const prUrl = "https://github.com/MattFlower/limitless/pull/39";
 
 function needsHuman(pr: string | null = prUrl) {

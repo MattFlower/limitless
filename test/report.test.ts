@@ -66,6 +66,7 @@ test("markdown tables are contiguous blocks", () => {
   );
   expect(md).toContain("No automated checks were detected");
   expect(md.startsWith("Built by **Limitless**")).toBe(true);
+  expect(md).toContain("Flow: build");
 });
 
 test("needs-human report says so", () => {
@@ -161,4 +162,19 @@ test("blocked acceptance and holdout checks have a distinct marker, label, evide
     "❔ AC-4",
   ])
     expect(report).toContain(text);
+});
+
+test("verification report names the flow without an implementer", () => {
+  const md = renderReport({
+    success: true,
+    runId: "verify",
+    prompt: "bump",
+    state: { flow: "verify-change" },
+    invocations: [{ ...inv, role: "review" }],
+    totals: { costUsd: 0, costEquivUsd: 1.5 },
+    runUrl: "u",
+  });
+  expect(md).toContain("Verified by **Limitless**");
+  expect(md).toContain("Flow: verify-change");
+  expect(md).not.toContain("Implementer's summary");
 });
