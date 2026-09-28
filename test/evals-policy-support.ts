@@ -50,6 +50,13 @@ export function evidence(
                     requiredMatched: i < 20 ? 1 : 0,
                     requiredTotal: i < 20 ? 1 : 0,
                     recall: i < 20 ? 1 : null,
+                    underRated: 0,
+                    blockingFindings: i < 20 ? 1 : 0,
+                    bySeverity: {
+                      high: { caught: 0, total: 0 },
+                      medium: { caught: i < 20 ? 1 : 0, total: i < 20 ? 1 : 0 },
+                      low: { caught: 0, total: 0 },
+                    },
                     requestChanges: i < 20,
                     falseBlock: i < 20 ? null : false,
                     verdictMatch: true,

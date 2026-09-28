@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { proposedOverlay, renderEvidence } from "../src/evals/evidence.ts";
+import { gradeReview } from "../src/evals/graders/review.ts";
 import { EVAL_ROLES, generatePolicy, selectEvidence } from "../src/evals/policy.ts";
 import { evalSettings } from "../src/evals/settings.ts";
 import { pairedBootstrap, wilson } from "../src/evals/stats.ts";
@@ -8,6 +9,7 @@ import { overlayPolicy, validatePolicy } from "../src/router/policy.ts";
 import { parseTarget, recordedTarget } from "../src/router/targets.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
 import { evidence, input, local, metered, response, subscription } from "./evals-policy-support.ts";
+import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 
 const first = (data: ReturnType<typeof input>) => {
   const candidate = generatePolicy(data).roles.flatMap((r) => r.candidates)[0];
@@ -84,6 +86,39 @@ for (const [role, field, bound] of [
     expect(rejected.eligible).toBe(false);
     expect(rejected.reasons.join()).toContain(bound === "lower" ? "is below floor" : "exceeds ceiling");
   });
+
+test("review_defect_recall uses blocking recall: under-rated detections and legacy grades don't clear the floor", () => {
+  const graded = (severity: "major" | "minor") => {
+    const row = evidence("review", [local]);
+    for (const t of row.trials) {
+      const item = t.caseId < "case-20" ? reviewCase : { ...reviewCase, kind: "clean" as const, defects: [] };
+      const output = t.caseId < "case-20" ? reviewOutput(10, severity) : { ...reviewOutput(), findings: [] };
+      t.output = output;
+      t.details = { grade: gradeReview(item, output) };
+    }
+    return row;
+  };
+  const blocking = first(input([graded("major")]));
+  expect(blocking.metrics[0]).toMatchObject({ name: "blocking recall", numerator: 20, denominator: 20 });
+  expect(blocking.metrics[0]?.reason).toBeNull();
+  const underRated = first(input([graded("minor")]));
+  expect(underRated.metrics[0]).toMatchObject({ numerator: 0, denominator: 20 });
+  expect(underRated.eligible).toBe(false);
+  expect(underRated.reasons.join()).toContain("blocking recall lower bound 0.0000 is below floor 0.5");
+  expect(underRated.summary.review?.underRated).toMatchObject({ numerator: 20, denominator: 20 });
+  // Grades stored before blocking recall counted minor matches; they are not evidence until regraded.
+  const legacy = graded("minor");
+  for (const t of legacy.trials) {
+    const review = t.details.grade?.review;
+    if (!review) continue;
+    delete review.underRated;
+    delete review.blockingFindings;
+    delete review.bySeverity;
+    review.requiredMatched = review.requiredTotal;
+  }
+  expect(first(input([legacy])).metrics[0]).toMatchObject({ numerator: 0, denominator: 0 });
+  expect(first(input([legacy])).state).toBe("insufficient evidence");
+});
 
 test("missing required observations and incomplete pairs cannot become eligible", () => {
   for (const role of EVAL_ROLES) {

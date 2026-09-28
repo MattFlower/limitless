@@ -244,6 +244,48 @@ test("audit uses gate configuration from base, so a change cannot disable its ow
   }
 });
 
+test("cached review outputs graded under the legacy rule regrade to blocking recall without a model call", async () => {
+  const f = await fixture();
+  try {
+    f.respond(() => ({ structured: reviewOutput(10, "minor"), costUsd: 0.1 }));
+    const first = await f.run();
+    const stored = first.trials[0];
+    if (!stored?.details.grade?.review) throw new Error("expected graded trial");
+    expect(stored.details.grade).toMatchObject({
+      pass: false,
+      review: { requiredMatched: 0, underRated: 1 },
+    });
+    // Simulate a trial stored before blocking recall: minor matches counted and the case passed.
+    const { underRated, blockingFindings, bySeverity, ...legacy } = stored.details.grade.review;
+    f.factory.store.recordEvalTrial({
+      ...stored,
+      pass: true,
+      score: 1,
+      details: {
+        ...stored.details,
+        grade: {
+          ...stored.details.grade,
+          pass: true,
+          score: 1,
+          review: { ...legacy, requiredMatched: 1, recall: 1 },
+        },
+      },
+    });
+    const regraded = await f.run();
+    expect(f.calls).toHaveLength(1);
+    expect(regraded.summaries[0]).toMatchObject({ cached: 1, costUsd: 0, costEquivUsd: 0, passes: 0 });
+    expect(regraded.trials[0]?.details.grade).toMatchObject({
+      pass: false,
+      score: 0,
+      review: { requiredMatched: 0, underRated: 1, blockingFindings: 0, requestChanges: false },
+    });
+    expect(regraded.summaries[0]?.review?.defectRecall).toMatchObject({ numerator: 0, denominator: 1 });
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
 test("rejects pins whose reachable history exposes eval labels or seed patches", async () => {
   for (const leak of ["dataset", "seed"] as const) {
     const f = await fixture();

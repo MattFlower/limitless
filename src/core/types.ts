@@ -400,9 +400,15 @@ export interface EvalGrade {
     hidden: { exitCode: number | null; timedOut: boolean; output: string } | null;
   };
   review?: {
+    /** Required defects caught by a round-1 blocking finding. */
     requiredMatched: number;
     requiredTotal: number;
     recall: number | null;
+    // Absent on grades stored before blocking-recall grading; those don't count as review evidence.
+    underRated?: number;
+    blockingFindings?: number;
+    bySeverity?: Record<"high" | "medium" | "low", { caught: number; total: number }>;
+    /** Production-derived verdict, not the model's. */
     requestChanges: boolean;
     falseBlock: boolean | null;
     verdictMatch: boolean;

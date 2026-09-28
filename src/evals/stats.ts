@@ -79,7 +79,10 @@ export function completeCases(trials: EvalTrial[], k: number) {
 /** Prediction metrics pool labeled observations, excluding failed/invalid invocations. */
 function roleMetrics(run: EvalRun, rows: EvalTrial[]) {
   const valid = rows.filter((t) => t.status === "ok" && t.details.grade);
-  const review = valid.flatMap((t) => (t.details.grade?.review ? [t.details.grade.review] : []));
+  // Legacy review grades counted non-blocking matches; only blocking-rule grades are evidence.
+  const review = valid.flatMap((t) =>
+    t.details.grade?.review?.bySeverity ? [{ caseId: t.caseId, ...t.details.grade.review }] : [],
+  );
   const verify = valid.flatMap((t) => (t.details.grade?.verify ? [t.details.grade.verify] : []));
   const rate = (numerator: number, denominator: number) => ({
     numerator,
@@ -99,6 +102,21 @@ function roleMetrics(run: EvalRun, rows: EvalTrial[]) {
             defectRecall: { ...rate(matched, total), ci: wilson(matched, total) },
             falseBlock: rate(clean.filter((r) => r.falseBlock).length, clean.length),
             verdictAccuracy: rate(review.filter((r) => r.verdictMatch).length, review.length),
+            underRated: rate(
+              review.reduce((n, r) => n + (r.underRated ?? 0), 0),
+              total,
+            ),
+            bySeverity: (["high", "medium", "low"] as const).map((severity) => ({
+              severity,
+              ...rate(
+                review.reduce((n, r) => n + (r.bySeverity?.[severity].caught ?? 0), 0),
+                review.reduce((n, r) => n + (r.bySeverity?.[severity].total ?? 0), 0),
+              ),
+            })),
+            cleanBlocking: [...new Set(clean.map((r) => r.caseId))].sort().map((caseId) => ({
+              caseId,
+              blockingFindings: clean.filter((r) => r.caseId === caseId).map((r) => r.blockingFindings ?? 0),
+            })),
           }
         : null,
     verify:

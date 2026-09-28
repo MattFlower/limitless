@@ -49,8 +49,8 @@ evals/<role>/*.json ──► runner ──► role fn (same prompts/schemas) �
 - **Stats**: Wilson intervals for pass and role metrics; seeded paired bootstrap against
   the best selected model in the role.
 - **Policy generator** (pure): for each supported role default cell, choose the cheapest model whose
-  Wilson 95% lower bound clears the role's quality floor, whose observed error rates stay under the
-  role's ceilings **and** that is non-inferior to the best model
+  Wilson 95% lower bound clears the role's quality floor, whose error-rate Wilson 95% upper bounds
+  stay under the role's ceilings **and** that is non-inferior to the best model
   within δ = 0.10; the fallback chain lists other eligible models by ascending cost. Complexity-specific
   cells remain unchanged. Output is `routing/policy.json` (loaded over `DEFAULT_POLICY`)
   plus `routing/EVIDENCE.md` with the numbers behind every cell. **Policy changes land as a PR**,
@@ -63,7 +63,7 @@ evals/<role>/*.json ──► runner ──► role fn (same prompts/schemas) �
 | Role | Cases | Source | Grader | Primary metric (floor) |
 |---|---|---|---|---|
 | triage | 40 | own run prompts + boundary cases | exact match per field, cost-weighted | pass-rate Wilson lower bound ≥0.60; risk under-call rate ≤0.10 |
-| review | 30 | 12 seeded defects, 8 real defects our gates caught, 10 clean merged diffs | file + line-window match on the JSON verdict | defect-recall Wilson lower bound ≥0.50; clean false-block rate ≤0.34 |
+| review | 15 | 12 real defects, 3 clean merged diffs | round-1 blocking finding + file/line-window match; production-derived verdict | blocking-recall Wilson lower bound ≥0.50; clean false-block Wilson upper bound ≤0.50 |
 | verify | 20 | labeled (criteria, diff, test output) triples, incl. "tests pass, criterion unmet" | per-criterion match | false-accept rate ≤0.10 |
 | holdout | 8 | sandbox tasks with reference solution + 3 mutants | execution | valid-on-reference × mutant kill rate |
 | implement | 12 | 8 sandbox replays + 4 small Limitless commits, stratified trivial/small/medium | hidden tests + gates + audit | resolve rate; $ and quota per task; wall time |
@@ -168,16 +168,24 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
 
 ### Grading and reporting
 
-- Review matches only blocker/major/minor findings on the same file (leading `./` normalized)
-  with positive lines in `[start-5,end+5]`, inclusive. Line 0 matches by file only for completeness
-  defects, even when a numeric window includes zero. Severity equality, category equality and
-  text similarity are not required. Duplicate findings count a required defect only once.
-- Real and seeded cases pass when every required defect matches and the returned verdict is
-  `request_changes`. Clean cases pass when the verdict is `approve` and there are no blocker or
-  major findings. Optional defects never create misses or separate false positives; the clean
-  false-block rule still applies. The production verdict override is deliberately not applied.
-- Review reports pooled matched/required defects with a Wilson 95% interval, false blocks/clean
-  predictions, and correct verdicts/valid predictions. Zero required defects gives null recall.
+- Review grades what production would block in round 1, using the engine's own
+  `blockingReviewFindings`/`reviewVerdict` (`src/pipeline/review.ts`). A finding lands on a defect
+  when it names the same file (leading `./` normalized) with a positive line in `[start-5,end+5]`,
+  inclusive. Line 0 lands by file only for completeness defects, even when a numeric window
+  includes zero. Severity equality, category equality and text similarity are not required.
+  A required defect is **caught** only when a blocking (blocker/major) finding lands on it; when
+  only non-blocking (minor/nit) findings land it is **under-rated** — diagnostic only, never
+  recall. Duplicate findings count a defect once.
+- Real and seeded cases pass when every required defect is caught and the production-derived
+  verdict is `request_changes`; the model's own verdict is ignored. A clean case false-blocks
+  exactly when the derived verdict is `request_changes`, and its grade records the number of
+  blocking findings. Optional defects never create misses or separate false positives.
+- Review reports pooled blocking recall (caught/required) with a Wilson 95% interval as the
+  headline, blocking recall by gold severity (blocker → high, major → medium, minor/nit → low),
+  under-rated required defects, false blocks/clean predictions with blocking findings per clean
+  case and trial, and correct derived verdicts/valid predictions. Zero required defects gives null
+  recall. Grades stored before this rule (no severity breakdown) are not review evidence; rerun
+  the eval to regrade them from cached output without new model calls or spend.
 - Verify scores only gold IDs. A single binary status must match exactly; missing, unclear and
   duplicate entries are inconclusive and match neither label. False accepts are gold unmet with
   predicted met, divided by gold-unmet observations. False rejects are gold met without an
@@ -293,12 +301,11 @@ These are the implemented defaults, replacing earlier proposed suite floors. Flo
 must be finite numbers in [0,1]; subscription_weight must be finite and nonnegative. Malformed
 supplied values fail validation. Floors on quality metrics use the Wilson 95% **lower** bound:
 triage requires the pass-rate lower bound at least 0.60 and review requires the defect-recall
-lower bound at least 0.50. Ceilings on error metrics cap the **observed pooled rate**: triage
-risk under-call at most 0.10, review clean false-block at most 0.34, verify false-accept at most
-0.10. Ceilings deliberately do not use the Wilson upper bound: clearing 0.10 with that bound needs
-35+ zero-error observations, so the suite's 20-40 case datasets (six clean review diffs) could never
-establish a low error rate. The interval is still reported beside every rate so reviewers can
-judge its precision. All comparisons are inclusive. Missing denominators are insufficient
+lower bound at least 0.50. Ceilings on error metrics use the Wilson 95% **upper**
+bound: triage risk under-call at most 0.10, review clean false-block at most 0.50, verify
+false-accept at most 0.25. When even zero errors in the available observations could not clear a
+ceiling (clearing 0.10 needs 35+ zero-error observations), the candidate is insufficient evidence
+rather than ineligible. All comparisons are inclusive. Missing denominators are insufficient
 evidence, never zero error. Role metrics retain pooled persisted labels across repetitions and
 disclose prediction coverage; failed/invalid calls contribute pass failures without prediction
 observations.
@@ -336,7 +343,7 @@ Eligible models clear every required floor, establish non-inferiority, and have 
 metadata and applicable cost estimates. They sort by routing cost/case, then p50 latency, then model
 ID. Each becomes a singleton preference group: the first is preferred and later entries are fallbacks.
 A role with no eligible candidate is left unchanged with an explanation that lists each
-candidate's rejection reasons (e.g. `risk under-call rate 0.1250 exceeds ceiling 0.1` for 5
+candidate's rejection reasons (e.g. `risk under-call upper bound 0.2611 exceeds ceiling 0.1` for 5
 under-calls in 40 observations, or `pass rate lower bound 0.5981 is below floor 0.6` for 30 passes
 in 40 trials). Only supported **default**
 cells are generated: current evidence does not justify replacing review.large, verify.large or other

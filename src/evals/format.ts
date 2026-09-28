@@ -42,10 +42,15 @@ export function formatEvalReport(report: EvalReport): string {
       );
     }
     if (m.review) {
-      const { defectRecall, falseBlock, verdictAccuracy } = m.review;
+      const { defectRecall, underRated, bySeverity, falseBlock, verdictAccuracy, cleanBlocking } = m.review;
       roleLines.push(
-        metric("defect recall", defectRecall),
+        metric("blocking recall", defectRecall),
+        ...bySeverity.map((group) => metric(`${group.severity}-severity blocking recall`, group)),
+        `  under-rated (detected, not blocking; diagnostic): ${underRated.numerator}/${underRated.denominator} required defects`,
         metric("clean false-block", falseBlock),
+        ...cleanBlocking.map(
+          (c) => `  clean ${c.caseId}: blocking findings per trial ${c.blockingFindings.join(", ")}`,
+        ),
         metric("verdict accuracy", verdictAccuracy),
       );
     }

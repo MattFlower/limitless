@@ -201,8 +201,8 @@ Review/verify dataset contracts and formulas are detailed in [EVALS.md](EVALS.md
 The real verify dataset is separately curated; the three-case test fixture is never a fallback.
 Repository-reading cache keys include role, repository identity, base/head pins and seed content;
 same-stat code changes invalidate them, while seed timestamps and temporary paths do not.
-Review reports pooled required-defect recall (Wilson 95%), clean false-block rate and verdict
-accuracy. Verify reports false-accept rate first, false-reject rate and criterion accuracy.
+Review reports pooled blocking recall (Wilson 95%; only round-1 blocking findings catch a defect),
+recall by gold severity, under-rated defects, clean false-block rate and verdict accuracy. Verify reports false-accept rate first, false-reject rate and criterion accuracy.
 Every rate includes numerator/denominator; empty denominators are `n/a`/null. Errors remain pass
 failures and are excluded from prediction metrics, with valid prediction coverage disclosed.
 Optional defects are never misses; matching uses file and a ±5-line window, not category equality.
@@ -233,7 +233,7 @@ changes can therefore also appear in the diff. Roles without eligible results re
 change. `routing/EVIDENCE.md` contains the reproducible evidence and unchanged-role explanations.
 
 The [policy configuration and formulas](EVALS.md#policy-generation-and-review) specify inclusive Wilson
-lower-bound floors on pass rate and defect recall, inclusive observed-rate ceilings on risk under-call,
+lower-bound floors on pass rate and blocking recall, inclusive Wilson upper-bound ceilings on risk under-call,
 clean false-block and false-accept, strict paired non-inferiority, optional origin exclusions, and
 subscription_weight (default 0.25).
 Cost/case averages attempts over repetitions; local is zero, metered is recorded dollars, subscriptions

@@ -14,7 +14,7 @@ export function renderEvidence(evaluation: PolicyEvaluation): string {
     "",
     "Policy changes land through reviewed PRs; the diff is the approval. Deploy/restart to activate.",
     "",
-    `Floors (inclusive; pass rate and defect recall use the Wilson 95% lower bound, error-rate ceilings use the Wilson 95% upper bound): ${JSON.stringify(settings.floors)}`,
+    `Floors (inclusive; pass rate and blocking recall use the Wilson 95% lower bound, error-rate ceilings use the Wilson 95% upper bound): ${JSON.stringify(settings.floors)}`,
     `Paired bootstrap: delta=${settings.delta}; seed=${DEFAULT_STATS.seed}; resamples=${DEFAULT_STATS.resamples}; one-sided 95% lower bound must be strictly > -delta.`,
     `Subscription weight=${settings.subscription_weight}; origin exclusions=${JSON.stringify(settings.excludeOrigins ?? null)} (when configured, unknown baseOrigin is excluded).`,
     "Cost/case averages case attempts over repetitions, including attempted failures, excluding skips and preparation failures. Local=0; metered=recorded dollars; subscription=API-equivalent dollars × weight. Cache replays use original cost provenance for estimates only; recorded spend stays unchanged.",
@@ -34,7 +34,13 @@ export function renderEvidence(evaluation: PolicyEvaluation): string {
     for (const c of role.candidates) {
       const m = c.summary;
       const extra = [
-        ...(m.review ? [{ name: "verdict accuracy", ...m.review.verdictAccuracy }] : []),
+        ...(m.review
+          ? [
+              ...m.review.bySeverity.map((g) => ({ ...g, name: `${g.severity}-severity blocking recall` })),
+              { name: "under-rated (diagnostic)", ...m.review.underRated },
+              { name: "verdict accuracy", ...m.review.verdictAccuracy },
+            ]
+          : []),
         ...(m.verify
           ? [
               { name: "false-reject", ...m.verify.falseReject },

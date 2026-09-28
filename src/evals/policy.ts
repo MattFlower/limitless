@@ -186,7 +186,7 @@ export function generatePolicy(input: PolicyInput) {
               : role === "review"
                 ? [
                     metric(
-                      "defect recall",
+                      "blocking recall",
                       summary.review?.defectRecall.numerator ?? 0,
                       summary.review?.defectRecall.denominator ?? 0,
                       "lower",
