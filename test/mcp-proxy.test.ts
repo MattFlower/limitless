@@ -71,6 +71,29 @@ test("proxy maps all six tools to REST and matches Factory results, including fi
       { id: "fake", enabled: true, windows: {}, spendUsd: null, budgetUsd: null },
     ]);
     expect(requests.at(-1)?.url).toEndWith("/api/providers");
+    const waiting = resultValue<Run>(
+      await call("create_run", { repo: f.repo, prompt: "next", dependsOn: [` ${run.id} `, run.id] }),
+    );
+    expect(waiting).toMatchObject({ status: "waiting", dependsOn: [run.id] });
+    expect(resultValue(await call("get_run", { id: waiting.id }))).toMatchObject({
+      dependsOn: [run.id],
+      status: "waiting",
+    });
+    expect(resultValue<Run[]>(await call("list_runs", { status: "waiting" })).map((r) => r.id)).toEqual([
+      waiting.id,
+    ]);
+    expect((await call("create_run", { repo: f.repo, prompt: "bad", dependsOn: ["unknown"] })).isError).toBe(
+      true,
+    );
+    for (const dependsOn of [null, [""], [false], ["unknown"]]) {
+      const response = await fetcher("http://127.0.0.1:7400/api/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repo: f.repo, prompt: "bad", dependsOn }),
+      });
+      expect(response.status).toBe(400);
+    }
+
     f.factory.store.askQuestion(run.id, "What?");
     const answer = resultValue<Question[]>(await call("answer_question", { id: run.id, answer: "All good" }));
     expect(answer[0]).toMatchObject({ answer: "All good", answeredBy: "mcp" });

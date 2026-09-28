@@ -229,6 +229,9 @@ export const RunDetail: Component = () => {
                     <RunStatusPill status={r().status} />
                     <span class="run-title">{r().title}</span>
                   </div>
+                  <Show when={r().status === "waiting"}>
+                    <p>waiting for {r().dependsOn.join(", ")} to merge</p>
+                  </Show>
                   <div class="run-meta-row">
                     <button
                       type="button"

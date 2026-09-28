@@ -11,7 +11,7 @@ const USAGE = `limitless — personal software factory
 Usage:
   limitless serve                         Start the daemon (API, UI, scheduler)
   limitless run "<prompt>" --repo <repo>  Queue a run (repo: owner/name or a local path)
-        [--profile auto|quick|standard|deep] [--title <t>] [-f|--follow]
+        [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
   limitless eval report <eval-id> [--json]
@@ -74,7 +74,7 @@ function statusColor(s: string): string {
   if (status === "resolved") return color.cyan(s);
   if (status === "failed" || status === "needs_human") return color.red(s);
   if (status === "running") return color.cyan(s);
-  if (status === "waiting_input") return color.yellow(s);
+  if (status === "waiting_input" || status === "waiting") return color.yellow(s);
   return color.dim(s);
 }
 
@@ -170,6 +170,7 @@ async function main(): Promise<void> {
       "max-usd": { type: "string" },
       "no-cache": { type: "boolean" },
       json: { type: "boolean" },
+      after: { type: "string" },
       repo: { type: "string", short: "r" },
       profile: { type: "string", short: "p" },
       title: { type: "string", short: "t" },
@@ -245,13 +246,14 @@ async function main(): Promise<void> {
         body: JSON.stringify({
           repo: values.repo,
           prompt,
+          ...(values.after !== undefined ? { dependsOn: values.after.split(",") } : {}),
           profile: (values.profile as Profile | undefined) ?? "auto",
           ...(values.title ? { title: values.title } : {}),
           source: "cli",
           requestedBy: process.env.USER,
         }),
       });
-      console.log(`Queued run ${color.bold(run.id)} on ${run.repoSlug}`);
+      console.log(`Created run ${color.bold(run.id)} on ${run.repoSlug}: ${run.status}`);
       if (values.follow) await follow(run.id);
       return;
     }

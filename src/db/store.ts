@@ -120,6 +120,8 @@ const toRun = (r: Row): Run => ({
   taskClass: (r.task_class as Run["taskClass"]) ?? null,
   complexity: (r.complexity as Run["complexity"]) ?? null,
   status: r.status as RunStatus,
+  dependsOn: parse(r.depends_on, []),
+  prClosedUnmerged: Boolean(r.pr_closed_unmerged),
   stage: (r.stage as StageName) ?? null,
   baseBranch: (r.base_branch as string) ?? null,
   deliveryBranch: (r.delivery_branch as string) ?? null,
@@ -211,6 +213,7 @@ export interface RunPatch {
   headSha?: string;
   prUrl?: string;
   merged?: boolean;
+  prClosedUnmerged?: boolean;
   mergedBy?: string | null;
   mergedAt?: number | null;
   error?: string | null;
@@ -231,6 +234,7 @@ const RUN_PATCH_COLUMNS: Record<keyof RunPatch, string> = {
   headSha: "head_sha",
   prUrl: "pr_url",
   merged: "merged",
+  prClosedUnmerged: "pr_closed_unmerged",
   mergedBy: "merged_by",
   mergedAt: "merged_at",
   error: "error",
@@ -744,11 +748,13 @@ export class Store {
   createRun(repo: Repo, req: CreateRunRequest, verifiedGitHubWebhook = false): Run {
     assertExistingBranchDelivery(repo, { ...req, githubWebhookVerified: verifiedGitHubWebhook });
     const id = newId();
+    const dependsOn = this.validateDependencies(req.dependsOn, id);
+    const dependency = this.dependencyStatus(dependsOn);
     const title = req.title ?? req.prompt.split("\n")[0]?.slice(0, 80) ?? "Untitled";
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -759,15 +765,84 @@ export class Store {
         json(req.sourceRef),
         req.requestedBy ?? null,
         req.profile ?? "auto",
+        dependency.status,
         req.priority ?? 0,
         req.baseBranch ?? null,
         req.deliveryBranch ?? null,
         verifiedGitHubWebhook ? 1 : 0,
         Date.now(),
+        json(dependsOn),
+        dependency.error ?? null,
+        dependency.finishedAt ?? null,
       );
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });
     return run;
+  }
+
+  private validateDependencies(input: unknown, candidateId: string): string[] {
+    if (input === undefined) return [];
+    if (!Array.isArray(input)) throw new Error("dependsOn must be an array of run IDs");
+    const ids = new Set<string>();
+    for (const value of input) {
+      if (typeof value !== "string" || !value.trim())
+        throw new Error(`Invalid dependency ID: ${JSON.stringify(value)}`);
+      ids.add(value.trim());
+    }
+    const visited = new Set<string>();
+    const active = new Set([candidateId]);
+    const stack = [...ids].map((id) => ({ id, exit: false }));
+    while (stack.length) {
+      const entry = stack.pop();
+      if (!entry) break;
+      const { id, exit } = entry;
+      if (exit) {
+        active.delete(id);
+        visited.add(id);
+        continue;
+      }
+      if (active.has(id)) throw new Error(`Dependency cycle or self-dependency involving ${id}`);
+      if (visited.has(id)) continue;
+      const run = this.getRun(id);
+      if (!run) throw new Error(`Unknown dependency run ${id}`);
+      active.add(id);
+      stack.push({ id, exit: true });
+      for (const dependency of run.dependsOn) stack.push({ id: dependency, exit: false });
+    }
+    return [...ids];
+  }
+
+  private dependencyStatus(ids: string[]): RunPatch & { status: RunStatus } {
+    let waiting = false;
+    for (const id of ids) {
+      const run = this.getRun(id);
+      if (run?.merged) continue;
+      const cause = !run
+        ? "is missing"
+        : run.prClosedUnmerged
+          ? "PR was closed unmerged"
+          : run.status === "failed" || run.status === "cancelled"
+            ? `run ${run.status}`
+            : null;
+      if (cause)
+        return { status: "needs_human", finishedAt: Date.now(), error: `Dependency ${id}: ${cause}` };
+      waiting = true;
+    }
+    return { status: waiting ? "waiting" : "queued" };
+  }
+
+  reconcileWaitingRuns(): void {
+    for (const run of this.listRuns({ status: ["waiting"], limit: Number.MAX_SAFE_INTEGER })) {
+      const patch = this.dependencyStatus(run.dependsOn);
+      if (patch.status === "waiting") continue;
+      this.updateRun(run.id, patch);
+      this.addEvent({
+        runId: run.id,
+        type: "status",
+        message: patch.error ?? "Dependencies merged; run queued",
+        data: { from: "waiting", to: patch.status },
+      });
+    }
   }
 
   getRun(id: string): Run | null {

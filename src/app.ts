@@ -226,6 +226,7 @@ export class Factory {
       {
         repo: run.repoSlug,
         prompt: run.prompt,
+        dependsOn: run.dependsOn,
         title: run.title,
         profile: run.profile,
         source: run.source,

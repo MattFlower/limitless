@@ -25,18 +25,28 @@ export async function reconcileMergedRuns(
   client: GitHubPrClient,
   log: (message: string) => void = console.warn,
 ): Promise<void> {
-  for (const run of store.listRuns({ status: ["needs_human"], limit: Number.MAX_SAFE_INTEGER })) {
-    if (!run.prUrl) continue;
+  for (const run of store.listRuns({
+    status: ["needs_human", "succeeded"],
+    limit: Number.MAX_SAFE_INTEGER,
+  })) {
+    if (!run.prUrl || (run.merged && run.status === "succeeded")) continue;
     try {
       const pr = await client(run.prUrl);
-      const mergedAt = pr?.mergedAt ? Date.parse(pr.mergedAt) : NaN;
-      if (pr?.url === run.prUrl && pr.state === "MERGED" && Number.isFinite(mergedAt)) {
-        store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
+      if (!pr || pr.url !== run.prUrl || store.getRun(run.id)?.prUrl !== pr.url) continue;
+      const mergedAt = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
+      if (pr.state === "MERGED" && Number.isFinite(mergedAt)) {
+        if (run.status === "needs_human")
+          store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
+        else store.updateRun(run.id, { merged: true, mergedBy: pr.mergedBy?.login ?? null, mergedAt });
+      } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
+        const closed = pr.state === "CLOSED";
+        if (run.prClosedUnmerged !== closed) store.updateRun(run.id, { prClosedUnmerged: closed });
       }
     } catch (error) {
       log(`GitHub PR check failed for ${run.id}: ${String(error)}`);
     }
   }
+  store.reconcileWaitingRuns();
 }
 
 /** Factory-side comments for GitHub-originated runs. */
@@ -72,7 +82,8 @@ export function startGitHubNotifier(
   const unsubscribe = store.subscribe((msg) => {
     if (msg.kind !== "run") return;
     const run = msg.run;
-    if (run.status === "needs_human" && run.prUrl) void check();
+    if (run.prUrl && (run.status === "needs_human" || (run.status === "succeeded" && !run.merged)))
+      void check();
     const ref = run.sourceRef;
     if (
       run.source !== "github" ||

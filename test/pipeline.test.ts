@@ -1236,7 +1236,12 @@ protected_paths = ["protected.txt"]
         calls.push(args);
       };
       f.deps.gh = gh;
-      let stopNotifier = startGitHubNotifier(f.store, gh);
+      let stopNotifier = startGitHubNotifier(
+        f.store,
+        gh,
+        () => {},
+        async () => null,
+      );
       f.store.upsertRepo({
         slug: "MattFlower/limitless",
         kind: "github",
@@ -1275,7 +1280,12 @@ protected_paths = ["protected.txt"]
         f.store.close();
         f = start(handler);
         f.deps.gh = gh;
-        stopNotifier = startGitHubNotifier(f.store, gh);
+        stopNotifier = startGitHubNotifier(
+          f.store,
+          gh,
+          () => {},
+          async () => null,
+        );
         expect(before?.verification?.baseSha).toBe(baseTip);
         expect(before?.verification?.headSha).toBe(head);
         if (scenario === "restart-repair") expect(before?.implementedRound).toBe(0);

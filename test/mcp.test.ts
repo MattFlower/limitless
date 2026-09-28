@@ -262,3 +262,21 @@ test("provider health and budget states pass through without secrets", async () 
     await conn.close();
   }
 });
+
+test("dependencies appear in create, get and waiting filters with shared validation", async () => {
+  const first = await create();
+  const second = await create();
+  const run = await create({ dependsOn: [` ${first.id} `, second.id, first.id] });
+  expect(run).toMatchObject({ status: "waiting", dependsOn: [first.id, second.id] });
+  expect(resultValue(await call("get_run", { id: run.id }))).toMatchObject({
+    dependsOn: run.dependsOn,
+    status: "waiting",
+  });
+  expect(resultValue<Run[]>(await call("list_runs", { status: "waiting" })).map((r) => r.id)).toEqual([
+    run.id,
+  ]);
+  const invalid = await call("create_run", { repo: f.repo, prompt: "bad", dependsOn: ["unknown"] });
+  expect(invalid.isError).toBe(true);
+  expect(JSON.stringify(invalid.content)).toContain("unknown");
+  expect((await call("create_run", { repo: f.repo, prompt: "bad", dependsOn: [1] })).isError).toBe(true);
+});
