@@ -136,6 +136,7 @@ provider tracker. Start the daemon first; the CLI only submits and reads HTTP re
 limitless eval run triage --models omlx/qwen-27b@none,omlx/qwen-27b@high,claude/haiku --k 2 --max-usd 1 --follow
 limitless eval run triage --models claude/haiku --cases triage-001,triage-002 --no-cache
 limitless eval run review --models openrouter/gpt-6-luna --follow
+limitless eval run review --systems systems.json --follow   # {"systems": [{name, mode: "single", finders: [{target, prompt: "standard"}], implementerReport}]}
 limitless eval run verify --models openrouter/gpt-6-luna --follow
 limitless eval report <eval-id>
 limitless eval report <eval-id> --json
@@ -185,16 +186,16 @@ model. Denominators and comparison coverage are included in both text and JSON:
   configured through typed report/statistics options. Empty denominators and absent pairs are `null`
   in JSON and `n/a` in text.
 
-The API provides `POST /api/evals` with `{role, models, k?, maxUsd?, caseIds?, cache?}` (202 with `{id}`),
+The API provides `POST /api/evals` with `{role, models | systems, k?, maxUsd?, caseIds?, cache?}` (202 with `{id}`),
 `GET /api/evals` to list runs, and `GET /api/evals/:id` for the run, summaries and trials. Mutations use
 the usual local Origin and JSON content-type rules; Cloudflare tunnel requests are refused.
 
 Runs progress from `queued` to `running`, then `completed`, `budget_exhausted` or `failed`. Completed
 means execution ended, not that candidates passed. Trial errors and skips remain visible in partial
-reports. Daemon shutdown aborts active calls and releases slots; startup marks interrupted evals
-failed, retaining completed trials for cache reuse on a new submission. In-flight trials interrupted
-by a crash are errors with unknown final usage/latency; queued trials are skipped. Unknown latency is
-excluded from the p50. `--follow` polls until any
+reports. Daemon shutdown aborts active calls and releases slots, leaving the run and its unfinished
+trials `queued`; the next start resumes it with its submitted models or systems and `--no-cache`
+setting, rerunning trials that were in flight (their interrupted usage is unknown) and skipping trials
+whose case left the dataset. `--follow` polls until any
 terminal state and prints a final report. The Evals UI lists runs, displays per-trial reports, and
 compares latest completed evidence in a roles-by-models eligibility matrix. Other role graders remain pending.
 

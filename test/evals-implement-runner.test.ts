@@ -523,7 +523,8 @@ for (const rounds of [1, 3])
       ]);
       await f.factory.evals.stop();
       const report = await pending;
-      expect(report.run.status).toBe("failed");
+      // The run stays queued to resume; a single-round trial reruns, a mid-rounds one keeps its evidence.
+      expect(report.run.status).toBe("queued");
       expect(report.trials[0]).toMatchObject(
         rounds > 1
           ? {
@@ -539,7 +540,7 @@ for (const rounds of [1, 3])
                 ],
               },
             }
-          : { status: "skipped", pass: null, costUsd: 0.1 },
+          : { status: "queued", pass: null, costUsd: 0.1 },
       );
       if (rounds > 1) {
         expect(report.trials[0]?.details.grade?.implement?.reason).toBe("hidden_tests");

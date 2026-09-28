@@ -64,6 +64,7 @@ const toEvalRun = (r: Row): EvalRun => ({
   role: r.role as EvalRun["role"],
   rounds: (r.rounds as number | null) ?? 1,
   strategy: (r.strategy as EvalRun["strategy"]) ?? "retry",
+  cache: (r.cache as number | null | undefined) !== 0,
   ...(r.systems_json ? { systems: parse(r.systems_json, []) } : {}),
   models: parse(r.models, []),
   k: r.k as number,
@@ -305,13 +306,14 @@ export class Store {
   }
 
   createEvalRun(
-    input: Pick<EvalRun, "role" | "models" | "k" | "maxUsd" | "rounds" | "strategy" | "systems">,
+    input: Pick<EvalRun, "role" | "models" | "k" | "maxUsd" | "rounds" | "strategy" | "cache" | "systems">,
     trials: EvalTrial[],
   ): EvalRun {
     const run: EvalRun = {
       ...input,
       rounds: input.rounds ?? 1,
       strategy: input.strategy ?? "retry",
+      cache: input.cache ?? true,
       id: newId("eval-"),
       status: "queued",
       createdAt: Date.now(),
@@ -333,8 +335,8 @@ export class Store {
           null,
         );
       this.db
-        .query("INSERT INTO eval_run_options VALUES (?, ?, ?)")
-        .run(run.id, run.rounds ?? 1, run.strategy ?? "retry");
+        .query("INSERT INTO eval_run_options (eval_run_id, rounds, strategy, cache) VALUES (?, ?, ?, ?)")
+        .run(run.id, run.rounds ?? 1, run.strategy ?? "retry", Number(run.cache ?? true));
       if (run.systems)
         this.db.query("INSERT INTO eval_run_systems VALUES (?, ?)").run(run.id, JSON.stringify(run.systems));
       for (const trial of trials) this.recordEvalTrial({ ...trial, evalRunId: run.id });
@@ -352,7 +354,7 @@ export class Store {
   getEvalRun(id: string): EvalRun | null {
     const row = this.db
       .query(
-        "SELECT eval_runs.*, rounds, strategy, systems_json FROM eval_runs LEFT JOIN eval_run_options o ON o.eval_run_id = id LEFT JOIN eval_run_systems s ON s.eval_run_id = id WHERE id = ?",
+        "SELECT eval_runs.*, rounds, strategy, cache, systems_json FROM eval_runs LEFT JOIN eval_run_options o ON o.eval_run_id = id LEFT JOIN eval_run_systems s ON s.eval_run_id = id WHERE id = ?",
       )
       .get(id) as Row | null;
     return row ? toEvalRun(row) : null;
@@ -362,7 +364,7 @@ export class Store {
     return (
       this.db
         .query(
-          "SELECT eval_runs.*, rounds, strategy, systems_json FROM eval_runs LEFT JOIN eval_run_options o ON o.eval_run_id = id LEFT JOIN eval_run_systems s ON s.eval_run_id = id ORDER BY created_at DESC, id DESC",
+          "SELECT eval_runs.*, rounds, strategy, cache, systems_json FROM eval_runs LEFT JOIN eval_run_options o ON o.eval_run_id = id LEFT JOIN eval_run_systems s ON s.eval_run_id = id ORDER BY created_at DESC, id DESC",
         )
         .all() as Row[]
     ).map(toEvalRun);

@@ -634,9 +634,11 @@ test("preparation, patch, harness and output failures remove worktrees and relea
   }
 });
 
-test("shutdown removes active and capacity-waiting worktrees", async () => {
+test("shutdown removes active and capacity-waiting worktrees; a restart resumes the systems", async () => {
   const f = await fixture();
   try {
+    f.item.input.implementerReport = "IMPLEMENTER_REPORT_TEXT";
+    f.save();
     const entered = deferred<void>();
     f.respond(async (s) => {
       entered.resolve();
@@ -645,7 +647,13 @@ test("shutdown removes active and capacity-waiting worktrees", async () => {
       );
       return { status: "cancelled" };
     });
-    const first = f.factory.evals.submit({ role: "review", models: ["candidate-a"] });
+    const systems = ["include", "omit"].map((implementerReport) => ({
+      name: `${implementerReport}-report`,
+      mode: "single",
+      finders: [{ target: "candidate-a", prompt: "standard" }],
+      implementerReport,
+    }));
+    const first = f.factory.evals.submit({ role: "review", systems });
     await entered.promise;
     const waiting = deferred<void>();
     const acquire = f.factory.tracker.acquire.bind(f.factory.tracker);
@@ -657,24 +665,47 @@ test("shutdown removes active and capacity-waiting worktrees", async () => {
     await waiting.promise;
     spy.mockRestore();
     await f.factory.evals.stop();
-    for (const id of [first.id, second.id]) expect(f.factory.evals.report(id)?.run.status).toBe("failed");
+    for (const id of [first.id, second.id]) expect(f.factory.evals.report(id)?.run.status).toBe("queued");
     const report = f.factory.evals.report(second.id);
-    expect(report?.trials[0]).toMatchObject({
-      status: "skipped",
-      pass: null,
-      score: null,
-      details: { reason: "daemon shutdown" },
-    });
+    expect(report?.trials[0]).toMatchObject({ status: "queued", pass: null, score: null });
+    expect(report?.trials[0]?.details.reason).toBeUndefined();
     expect(report?.trials[0]?.details.preparationFailed).toBeUndefined();
     expect(report?.summaries[0]).toMatchObject({
       evaluatedTrials: 0,
       errors: 0,
-      skipped: 1,
+      skipped: 0,
+      pending: 1,
       passRate: null,
       predictionTrials: 0,
       latencyDenominator: 0,
     });
     expect(f.calls).toHaveLength(1);
+    await f.clean();
+    // A restart resumes both evals with their candidates intact; each prompt reflects its system.
+    const prompts: string[] = [];
+    f.respond((s) => {
+      prompts.push(s.prompt);
+      return { structured: reviewOutput(), costUsd: 0.1 };
+    });
+    const restarted = await f.restart();
+    await Promise.all([restarted.evals.wait(first.id), restarted.evals.wait(second.id)]);
+    const resumed = restarted.evals.report(first.id);
+    if (!resumed) throw new Error("missing report");
+    expect(resumed.run).toMatchObject({ status: "completed", error: null, systems });
+    expect(resumed.trials.map((t) => [t.details.system, t.status])).toEqual([
+      ["include-report", "ok"],
+      ["omit-report", "ok"],
+    ]);
+    expect(
+      resumed.summaries.map((s) => [s.candidate, s.modelId, s.system?.implementerReport, s.evaluatedTrials]),
+    ).toEqual([
+      ["include-report", "candidate-a", "include", 1],
+      ["omit-report", "candidate-a", "omit", 1],
+    ]);
+    expect(formatEvalReport(resumed)).toContain("omit-report [candidate-a, implementer report: omit]");
+    expect(restarted.evals.report(second.id)?.run.status).toBe("completed");
+    expect(prompts.filter((p) => p.includes("IMPLEMENTER_REPORT_TEXT")).length).toBeGreaterThanOrEqual(1);
+    expect(prompts.filter((p) => !p.includes("Implementer's own report"))).toHaveLength(1);
     await f.clean();
   } finally {
     await f.close();

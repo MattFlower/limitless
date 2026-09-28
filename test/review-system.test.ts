@@ -184,13 +184,13 @@ test("candidates sharing a target stay distinct after a store reload", () => {
   try {
     let store = new Store(path);
     const run = store.createEvalRun(
-      { role: "review", models: ["candidate-a"], k: 1, maxUsd: 1, systems },
+      { role: "review", models: ["candidate-a"], k: 1, maxUsd: 1, systems, cache: false },
       systems.map((s) => trial(s.name)),
     );
     store.recordEvalTrial({ ...trial("without"), evalRunId: run.id, status: "ok", pass: true });
     store.close();
     store = new Store(path);
-    expect(store.getEvalRun(run.id)?.systems).toEqual(systems);
+    expect(store.getEvalRun(run.id)).toMatchObject({ systems, cache: false });
     expect(store.listEvalRuns()[0]?.systems).toEqual(systems);
     expect(store.listEvalTrials(run.id).map((t) => [t.details.system, t.status])).toEqual([
       ["with-report", "queued"],

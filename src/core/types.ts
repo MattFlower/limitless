@@ -384,6 +384,8 @@ export interface ReviewSystem {
 export interface EvalRun {
   rounds?: number;
   strategy?: EvalStrategy;
+  /** Reuse cached trials (the default); persisted so a resumed run keeps its `--no-cache`. */
+  cache?: boolean;
   /** Review candidates, finder targets resolved at submission. Absent on older and non-review runs. */
   systems?: ReviewSystem[];
   id: string;

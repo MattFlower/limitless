@@ -305,7 +305,7 @@ test("shutdown aborts active and waiting trials, releases slots, and preserves p
       );
       return { structured: answer };
     });
-    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"] });
+    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], cache: false });
     await entered.promise;
     const acquiring = deferred<void>();
     const acquire = f.factory.tracker.acquire.bind(f.factory.tracker);
@@ -317,35 +317,50 @@ test("shutdown aborts active and waiting trials, releases slots, and preserves p
     await acquiring.promise;
     spy.mockRestore();
     await f.factory.stop();
-    expect(f.factory.evals.report(run.id)?.run).toMatchObject({
-      status: "failed",
-      error: "eval interrupted by daemon shutdown",
-    });
-    expect(f.factory.evals.report(waiting.id)?.run.status).toBe("failed");
+    // Shutdown leaves both runs queued to resume, with nothing failed or skipped.
+    for (const id of [run.id, waiting.id])
+      expect(f.factory.evals.report(id)?.run).toMatchObject({ status: "queued", error: null });
     const report = f.factory.evals.report(waiting.id);
     expect(report?.trials).toHaveLength(3);
     for (const trial of report?.trials ?? []) {
-      expect(trial).toMatchObject({
-        status: "skipped",
-        pass: null,
-        score: null,
-        details: { reason: "daemon shutdown" },
-      });
+      expect(trial).toMatchObject({ status: "queued", pass: null, score: null, output: null });
+      expect(trial.details.reason).toBeUndefined();
       expect(trial.details.preparationFailed).toBeUndefined();
     }
     expect(report?.summaries[0]).toMatchObject({
       evaluatedTrials: 0,
       errors: 0,
-      skipped: 3,
+      skipped: 0,
+      pending: 3,
       passRate: null,
       predictionTrials: 0,
       latencyDenominator: 0,
     });
     expect(f.calls).toHaveLength(1);
     expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
-    expect(
-      f.factory.store.listEvalTrials(run.id).every((t) => !["running", "queued"].includes(t.status)),
-    ).toBe(true);
+    expect(f.factory.store.listEvalTrials(run.id).every((t) => t.status === "queued")).toBe(true);
+    // A restart resumes both runs, rerunning the interrupted trial.
+    f.respond(() => ({ structured: answer }));
+    const restarted = await f.restart();
+    await Promise.all([restarted.evals.wait(run.id), restarted.evals.wait(waiting.id)]);
+    for (const id of [run.id, waiting.id]) {
+      const resumed = restarted.evals.report(id);
+      expect(resumed?.run).toMatchObject({ status: "completed", error: null });
+      expect(resumed?.trials.map((t) => t.status)).toEqual(["ok", "ok", "ok"]);
+      expect(resumed?.summaries[0]).toMatchObject({ evaluatedTrials: 3, pending: 0 });
+    }
+    expect(f.calls.length).toBeGreaterThanOrEqual(4);
+    // A crash leaves a run and one trial running; the restart reruns only that trial, still uncached.
+    const calls = f.calls.length;
+    const crashed = restarted.store.listEvalTrials(run.id)[1];
+    if (!crashed) throw new Error("missing trial");
+    restarted.store.recordEvalTrial({ ...crashed, status: "running" });
+    restarted.store.updateEvalRun(run.id, "running");
+    const again = await f.restart();
+    await again.evals.wait(run.id);
+    expect(again.evals.report(run.id)?.run).toMatchObject({ status: "completed", cache: false });
+    expect(again.evals.report(run.id)?.trials.map((t) => t.status)).toEqual(["ok", "ok", "ok"]);
+    expect(f.calls).toHaveLength(calls + 1);
   } finally {
     await f.close();
   }

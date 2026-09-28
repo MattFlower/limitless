@@ -83,50 +83,54 @@ export async function evalFixture(extraModels: ModelDef[] = []) {
       harnessNames.push(name);
       return handler(s);
     });
-  const factory = new Factory(cfg, {
-    evalCasePath: casePath,
-    providers: [
-      {
-        id: "openrouter",
-        label: "A",
-        harness: "fake",
-        billing: "metered",
-        maxConcurrent: 1,
-        openaiBaseUrl: "http://unused.invalid",
-      },
-      { id: "provider-b", label: "B", harness: "fake", billing: "subscription", maxConcurrent: 1 },
-    ],
-    models: [
-      ...extraModels,
-      {
-        id: "candidate-a",
-        provider: "openrouter",
-        model: "a",
-        tier: 1,
-        vendor: "other",
-        origin: "unknown",
-        baseOrigin: "unknown",
-        supportedEfforts: [],
-        price: { input: 1, output: 1 },
-      },
-      {
-        id: "candidate-b",
-        provider: "provider-b",
-        model: "b",
-        tier: 1,
-        vendor: "other",
-        origin: "unknown",
-        baseOrigin: "unknown",
-        supportedEfforts: [],
-        price: { input: 1, output: 1 },
-      },
-    ],
-    harnesses: { fake: harness("fake"), codex: harness("codex"), llm: harness("llm") },
-  });
+  const build = () =>
+    new Factory(cfg, {
+      evalCasePath: casePath,
+      providers: [
+        {
+          id: "openrouter",
+          label: "A",
+          harness: "fake",
+          billing: "metered",
+          maxConcurrent: 1,
+          openaiBaseUrl: "http://unused.invalid",
+        },
+        { id: "provider-b", label: "B", harness: "fake", billing: "subscription", maxConcurrent: 1 },
+      ],
+      models: [
+        ...extraModels,
+        {
+          id: "candidate-a",
+          provider: "openrouter",
+          model: "a",
+          tier: 1,
+          vendor: "other",
+          origin: "unknown",
+          baseOrigin: "unknown",
+          supportedEfforts: [],
+          price: { input: 1, output: 1 },
+        },
+        {
+          id: "candidate-b",
+          provider: "provider-b",
+          model: "b",
+          tier: 1,
+          vendor: "other",
+          origin: "unknown",
+          baseOrigin: "unknown",
+          supportedEfforts: [],
+          price: { input: 1, output: 1 },
+        },
+      ],
+      harnesses: { fake: harness("fake"), codex: harness("codex"), llm: harness("llm") },
+    });
+  let factory = build();
   return {
     home,
     cfg,
-    factory,
+    get factory() {
+      return factory;
+    },
     dataset,
     casePath,
     save,
@@ -149,6 +153,13 @@ export async function evalFixture(extraModels: ModelDef[] = []) {
       const report = factory.evals.report(run.id);
       if (!report) throw new Error("missing report");
       return report;
+    },
+    /** A daemon restart: stop, close the store, and open a new factory on the same home. */
+    async restart() {
+      await factory.stop();
+      factory.store.close();
+      factory = build();
+      return factory;
     },
     async close() {
       await factory.stop();
