@@ -53,6 +53,10 @@ export function formatEvalReport(report: EvalReport): string {
         ),
         metric("verdict accuracy", verdictAccuracy),
       );
+      if (m.review.legacyGrades)
+        roleLines.push(
+          `  ${m.review.legacyGrades} trials graded before blocking recall are excluded; rerun with cache to regrade`,
+        );
     }
     if (m.verify)
       roleLines.push(

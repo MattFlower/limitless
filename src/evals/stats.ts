@@ -113,6 +113,9 @@ function roleMetrics(run: EvalRun, rows: EvalTrial[]) {
                 review.reduce((n, r) => n + (r.bySeverity?.[severity].total ?? 0), 0),
               ),
             })),
+            // Legacy grades counted non-blocking matches and passed on the model's verdict.
+            legacyGrades: valid.filter((t) => t.details.grade?.review && !t.details.grade.review.bySeverity)
+              .length,
             cleanBlocking: [...new Set(clean.map((r) => r.caseId))].sort().map((caseId) => ({
               caseId,
               blockingFindings: clean.filter((r) => r.caseId === caseId).map((r) => r.blockingFindings ?? 0),

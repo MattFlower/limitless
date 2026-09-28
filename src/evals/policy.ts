@@ -158,8 +158,14 @@ export function generatePolicy(input: PolicyInput) {
                     provider,
                   );
         if (effortProblem) reasons.push(effortProblem);
+        // Their stored passes and recall predate blocking-recall grading; a cached rerun regrades them.
+        const legacyReview = summary.review?.legacyGrades ?? 0;
+        if (legacyReview)
+          reasons.push(
+            `insufficient evidence: ${legacyReview} review trials graded before blocking recall; rerun with cache to regrade`,
+          );
         const referenceAllowed = Boolean(
-          model && provider && !providerMismatch && !excluded && !effortProblem,
+          model && provider && !providerMismatch && !excluded && !effortProblem && !legacyReview,
         );
         const f = settings.floors;
         const passMetric = metric(

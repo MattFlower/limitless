@@ -212,6 +212,19 @@ test("review report leads with blocking recall, splits it by gold severity and l
   expect(text).toContain("  clean clean-a: blocking findings per trial 2");
   expect(text).toContain("  clean clean-b: blocking findings per trial 0");
   expect(text.indexOf("blocking recall")).toBeLessThan(text.indexOf("under-rated"));
+  expect(text).not.toContain("graded before blocking recall");
+  const stored = grades[0][1].review;
+  if (!stored) throw new Error("expected review grade");
+  const legacyGrade = { ...grades[0][1], review: { ...stored, bySeverity: undefined } };
+  const legacyRows = [...rows, { ...trial("a", "old", 0, true), details: { grade: legacyGrade } }];
+  const legacySummaries = summarize(reviewRun, legacyRows);
+  expect(legacySummaries[0]?.review).toMatchObject({
+    legacyGrades: 1,
+    defectRecall: { numerator: 1, denominator: 3 },
+  });
+  expect(formatEvalReport({ run: reviewRun, trials: legacyRows, summaries: legacySummaries })).toContain(
+    "  1 trials graded before blocking recall are excluded; rerun with cache to regrade",
+  );
 });
 
 test("verify reports pooled confusion counts, accuracy and null rates without labels", async () => {

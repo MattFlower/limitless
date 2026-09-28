@@ -118,6 +118,22 @@ test("review_defect_recall uses blocking recall: under-rated detections and lega
   }
   expect(first(input([legacy])).metrics[0]).toMatchObject({ numerator: 0, denominator: 0 });
   expect(first(input([legacy])).state).toBe("insufficient evidence");
+  // A run mixing both grade versions must not hide legacy minor-only matches behind blocking recall.
+  const mixed = graded("major");
+  for (const t of mixed.trials.slice(0, 10)) {
+    const review = t.details.grade?.review;
+    if (!review) continue;
+    t.output = reviewOutput(10, "minor");
+    delete review.underRated;
+    delete review.blockingFindings;
+    delete review.bySeverity;
+  }
+  const mixedCandidate = first(input([mixed]));
+  expect(mixedCandidate.metrics[0]).toMatchObject({ numerator: 10, denominator: 10 });
+  expect(mixedCandidate.state).toBe("insufficient evidence");
+  expect(mixedCandidate.reasons).toContain(
+    "insufficient evidence: 10 review trials graded before blocking recall; rerun with cache to regrade",
+  );
 });
 
 test("missing required observations and incomplete pairs cannot become eligible", () => {
