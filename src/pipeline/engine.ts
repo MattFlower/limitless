@@ -300,7 +300,9 @@ async function prepare(ctx: RunContext): Promise<void> {
       throw new Error("PR head moved before preparation");
     ctx.state.worktreePath = wt.path;
     const baseSha =
-      reusingWorktree && ctx.state.flow !== "verify-change" ? (ctx.run.baseSha ?? wt.baseSha) : wt.baseSha;
+      reusingWorktree && ctx.state.flow !== "verify-change"
+        ? (ctx.run.baseSha ?? (await headSha(wt.path)))
+        : wt.baseSha;
     ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha, branch: wt.branch });
     const verification = ctx.state.verification;
     if (verification) {

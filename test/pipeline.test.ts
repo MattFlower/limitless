@@ -206,7 +206,10 @@ afterEach(async () => {
 
 describe("pipeline (fake agents, real git + gates)", () => {
   test("prepare restart retains the reused worktree base after upstream advances", async () => {
-    writeFileSync(join(repoDir, ".limitless.toml"), `${readFileSync(join(repoDir, ".limitless.toml", "utf8")}\n[policy]\nprotected_paths = ["protected.txt"]\n`);
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `${readFileSync(join(repoDir, ".limitless.toml"), "utf8")}\n[policy]\nprotected_paths = ["protected.txt"]\n`,
+    );
     writeFileSync(join(repoDir, "protected.txt"), "original\n");
     const bare = await githubFixture();
     const f = start((s) => {
@@ -325,7 +328,10 @@ esac
       );
     expect(after.some((c) => c.startsWith(scenario === "saved URL" ? "pr view" : "pr list"))).toBe(true);
     if (scenario !== "open PR") {
-      const remote = await sh(["git", "show-ref", "--verify", `refs/heads/${branch}`], { cwd: bare, allowFail: true });
+      const remote = await sh(["git", "show-ref", "--verify", `refs/heads/${branch}`], {
+        cwd: bare,
+        allowFail: true,
+      });
       expect(remote.exitCode).not.toBe(0);
     }
   });
