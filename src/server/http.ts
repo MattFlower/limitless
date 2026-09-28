@@ -214,6 +214,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       const ids = new URL(req.url).searchParams.get("evals");
       return json(factory.evalPolicy(ids === null ? undefined : ids.split(",")));
     }),
+    "/api/evals/:id/regrade": {
+      POST: handle((req) => {
+        const result = factory.evals.regrade(req.params.id ?? "");
+        return result ? json(result) : error("eval not found", 404);
+      }),
+    },
     "/api/evals/:id": handle((req) => {
       const report = factory.evals.report(req.params.id ?? "", { delta: factory.evalSettings.delta });
       return report ? json(report) : error("eval not found", 404);

@@ -158,14 +158,22 @@ export function generatePolicy(input: PolicyInput) {
                     provider,
                   );
         if (effortProblem) reasons.push(effortProblem);
-        // Their stored passes and recall predate blocking-recall grading; a cached rerun regrades them.
+        // Stats already leave these trials out; a candidate missing part of its evidence stays
+        // insufficient (and can't be the reference) until they are regraded, which costs nothing.
         const legacyReview = summary.review?.legacyGrades ?? 0;
         if (legacyReview)
           reasons.push(
-            `insufficient evidence: ${legacyReview} review trials graded before blocking recall; rerun with cache to regrade`,
+            `insufficient evidence: ${legacyReview} review trials graded before blocking recall; run \`limitless eval regrade ${entry.run.id}\` (no model calls)`,
           );
+        // The reference anchors every paired comparison, so it needs at least one valid prediction.
         const referenceAllowed = Boolean(
-          model && provider && !providerMismatch && !excluded && !effortProblem && !legacyReview,
+          model &&
+            provider &&
+            !providerMismatch &&
+            !excluded &&
+            !effortProblem &&
+            !legacyReview &&
+            summary.predictionTrials > 0,
         );
         const f = settings.floors;
         const passMetric = metric(

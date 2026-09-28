@@ -42,20 +42,29 @@ export function formatEvalReport(report: EvalReport): string {
       );
     }
     if (m.review) {
-      const { defectRecall, underRated, bySeverity, falseBlock, verdictAccuracy, cleanBlocking } = m.review;
+      const { defectRecall, underRated, falseBlock, verdictAccuracy, legacyGrades } = m.review;
+      // A daemon older than blocking recall sends none of the breakdown, and its recall counted minor findings.
+      const bySeverity = m.review.bySeverity ?? [];
       roleLines.push(
-        metric("blocking recall", defectRecall),
+        metric(
+          underRated ? "blocking recall" : "defect recall (older daemon, not blocking recall)",
+          defectRecall,
+        ),
         ...bySeverity.map((group) => metric(`${group.severity}-severity blocking recall`, group)),
-        `  under-rated (detected, not blocking; diagnostic): ${underRated.numerator}/${underRated.denominator} required defects`,
+        ...(underRated
+          ? [
+              `  under-rated (detected, not blocking; diagnostic): ${underRated.numerator}/${underRated.denominator} required defects`,
+            ]
+          : []),
         metric("clean false-block", falseBlock),
-        ...cleanBlocking.map(
+        ...(m.review.cleanBlocking ?? []).map(
           (c) => `  clean ${c.caseId}: blocking findings per trial ${c.blockingFindings.join(", ")}`,
         ),
         metric("verdict accuracy", verdictAccuracy),
       );
-      if (m.review.legacyGrades)
+      if (legacyGrades)
         roleLines.push(
-          `  ${m.review.legacyGrades} trials graded before blocking recall are excluded; rerun with cache to regrade`,
+          `  ${legacyGrades} trials graded before blocking recall are excluded from pass, recall and comparisons; \`limitless eval regrade ${report.run.id}\` recomputes them from stored output without model calls`,
         );
     }
     if (m.verify)

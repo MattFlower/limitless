@@ -36,8 +36,12 @@ export function renderEvidence(evaluation: PolicyEvaluation): string {
       const extra = [
         ...(m.review
           ? [
-              ...m.review.bySeverity.map((g) => ({ ...g, name: `${g.severity}-severity blocking recall` })),
-              { name: "under-rated (diagnostic)", ...m.review.underRated },
+              // An older daemon's summary has no blocking-recall breakdown.
+              ...(m.review.bySeverity ?? []).map((g) => ({
+                ...g,
+                name: `${g.severity}-severity blocking recall`,
+              })),
+              ...(m.review.underRated ? [{ name: "under-rated (diagnostic)", ...m.review.underRated }] : []),
               { name: "verdict accuracy", ...m.review.verdictAccuracy },
             ]
           : []),

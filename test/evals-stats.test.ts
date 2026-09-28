@@ -222,9 +222,30 @@ test("review report leads with blocking recall, splits it by gold severity and l
     legacyGrades: 1,
     defectRecall: { numerator: 1, denominator: 3 },
   });
-  expect(formatEvalReport({ run: reviewRun, trials: legacyRows, summaries: legacySummaries })).toContain(
-    "  1 trials graded before blocking recall are excluded; rerun with cache to regrade",
+  // The legacy pass is excluded from every pass-based number too, not only from recall.
+  expect(legacySummaries[0]).toMatchObject({
+    passes: summaries[0]?.passes,
+    evaluatedTrials: 3,
+    cases: 3,
+    meanScore: summaries[0]?.meanScore,
+    predictionTrials: 3,
+    comparison: { candidateCompleteCases: 3, pairedCases: 3 },
+  });
+  const legacyText = formatEvalReport({ run: reviewRun, trials: legacyRows, summaries: legacySummaries });
+  expect(legacyText).toContain(
+    "  1 trials graded before blocking recall are excluded from pass, recall and comparisons; `limitless eval regrade eval` recomputes them from stored output without model calls",
   );
+  expect(legacyText).not.toContain("rerun");
+  // A newer CLI renders an older daemon's review summary, which has no blocking-recall breakdown.
+  const older = summaries.map((s) => {
+    if (!s.review) return s;
+    const { bySeverity, underRated, cleanBlocking, legacyGrades, ...review } = s.review;
+    return { ...s, review: review as typeof s.review };
+  });
+  const olderText = formatEvalReport({ run: reviewRun, trials: rows, summaries: older });
+  expect(olderText).toContain("  defect recall (older daemon, not blocking recall) 33.3% (1/3)");
+  expect(olderText).not.toContain("severity blocking recall");
+  expect(olderText).not.toContain("under-rated");
 });
 
 test("verify reports pooled confusion counts, accuracy and null rates without labels", async () => {

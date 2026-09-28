@@ -132,8 +132,51 @@ test("review_defect_recall uses blocking recall: under-rated detections and lega
   expect(mixedCandidate.metrics[0]).toMatchObject({ numerator: 10, denominator: 10 });
   expect(mixedCandidate.state).toBe("insufficient evidence");
   expect(mixedCandidate.reasons).toContain(
-    "insufficient evidence: 10 review trials graded before blocking recall; rerun with cache to regrade",
+    "insufficient evidence: 10 review trials graded before blocking recall; run `limitless eval regrade review-run` (no model calls)",
   );
+});
+
+test("the paired-comparison reference needs current grades and at least one valid prediction", () => {
+  const legacy = (t: (typeof row.trials)[number]) => {
+    const review = t.details.grade?.review;
+    if (review) delete review.bySeverity;
+  };
+  const reference = (data: ReturnType<typeof input>) =>
+    generatePolicy(data)
+      .roles.filter((r) => r.role === "review")
+      .flatMap((r) => r.candidates.map((c) => c.comparison.bestModel));
+  // The local model has the higher current pass rate, but ten of its grades predate blocking recall.
+  const row = evidence("review", [local, subscription]);
+  for (const t of row.trials) {
+    if (t.modelId === parseTarget(local).modelId && t.caseId < "case-10") legacy(t);
+    if (t.modelId === parseTarget(subscription).modelId && t.caseId >= "case-30") t.pass = false;
+  }
+  expect(reference(input([row]))).toEqual([subscription, subscription]);
+  // A model whose every trial errored has pass rate 0, not n/a, yet anchors nothing.
+  const errored = evidence("review", [local, subscription]);
+  for (const t of errored.trials)
+    if (t.modelId === parseTarget(local).modelId)
+      Object.assign(t, { status: "error", pass: false, details: {} });
+    else legacy(t);
+  const candidates = generatePolicy(input([errored])).roles.flatMap((r) => r.candidates);
+  expect(candidates.find((c) => c.modelId === local)?.summary).toMatchObject({
+    passRate: 0,
+    predictionTrials: 0,
+  });
+  expect(reference(input([errored]))).toEqual([null, null]);
+});
+
+test("evidence renders an older daemon's review summary without the blocking-recall breakdown", () => {
+  const evaluation = generatePolicy(input([evidence("review", [local])]));
+  for (const c of evaluation.roles.flatMap((r) => r.candidates))
+    if (c.summary.review) {
+      const { bySeverity, underRated, ...older } = c.summary.review;
+      c.summary.review = older as typeof c.summary.review;
+    }
+  const text = renderEvidence(evaluation);
+  expect(text).toContain("blocking recall: 1.0000 (20/20)");
+  expect(text).not.toContain("severity blocking recall");
+  expect(text).not.toContain("under-rated");
 });
 
 test("missing required observations and incomplete pairs cannot become eligible", () => {

@@ -148,11 +148,23 @@ export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
 };
 
 /**
- * A review regraded from stored JSON. The verdict is derived from the findings, so the model's own
- * verdict may be absent; the degenerate-summary rule still applies.
+ * A review regraded from stored JSON, possibly written under an older schema. Grading reads only
+ * severity, file and line, and derives the verdict itself, so every other field may be absent
+ * (`security` was added later). The degenerate-summary rule still applies.
  */
 export const StoredReviewSchema = reviewBase
-  .extend({ verdict: reviewBase.shape.verdict.optional() })
+  .extend({
+    verdict: reviewBase.shape.verdict.optional(),
+    summary: z.string().default(""),
+    findings: z.array(
+      reviewBase.shape.findings.element.extend({
+        security: z.boolean().default(false),
+        title: z.string().default(""),
+        detail: z.string().default(""),
+        suggestion: z.string().default(""),
+      }),
+    ),
+  })
   .superRefine(rejectDegenerate(MIN_REVIEW_SUMMARY));
 export type StoredReview = Omit<Review, "verdict"> & Partial<Pick<Review, "verdict">>;
 

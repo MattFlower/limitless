@@ -64,10 +64,21 @@ export function pairedBootstrap(differences: number[], options: StatsOptions = {
     ...settings,
   };
 }
+/**
+ * Review grades stored before blocking recall counted non-blocking matches and passed on the model's
+ * verdict; `limitless eval regrade` recomputes them from stored output. Until then they aren't evidence.
+ */
+export function legacyReviewGrade(trial: EvalTrial): boolean {
+  return Boolean(trial.details.grade?.review && !trial.details.grade.review.bySeverity);
+}
+/** Trials that count toward pass rate, mean score and paired comparisons. */
+export function scoredTrial(trial: EvalTrial): boolean {
+  return trial.pass !== null && ["ok", "error"].includes(trial.status) && !legacyReviewGrade(trial);
+}
 export function completeCases(trials: EvalTrial[], k: number) {
   const groups = new Map<string, EvalTrial[]>();
   for (const trial of trials) {
-    if (trial.pass === null || !["ok", "error"].includes(trial.status)) continue;
+    if (!scoredTrial(trial)) continue;
     const group = groups.get(trial.caseId) ?? [];
     group.push(trial);
     groups.set(trial.caseId, group);
@@ -78,10 +89,10 @@ export function completeCases(trials: EvalTrial[], k: number) {
 }
 /** Prediction metrics pool labeled observations, excluding failed/invalid invocations. */
 function roleMetrics(run: EvalRun, rows: EvalTrial[]) {
-  const valid = rows.filter((t) => t.status === "ok" && t.details.grade);
-  // Legacy review grades counted non-blocking matches; only blocking-rule grades are evidence.
+  const graded = rows.filter((t) => t.status === "ok" && t.details.grade);
+  const valid = graded.filter((t) => !legacyReviewGrade(t));
   const review = valid.flatMap((t) =>
-    t.details.grade?.review?.bySeverity ? [{ caseId: t.caseId, ...t.details.grade.review }] : [],
+    t.details.grade?.review ? [{ caseId: t.caseId, ...t.details.grade.review }] : [],
   );
   const verify = valid.flatMap((t) => (t.details.grade?.verify ? [t.details.grade.verify] : []));
   const rate = (numerator: number, denominator: number) => ({
@@ -113,9 +124,7 @@ function roleMetrics(run: EvalRun, rows: EvalTrial[]) {
                 review.reduce((n, r) => n + (r.bySeverity?.[severity].total ?? 0), 0),
               ),
             })),
-            // Legacy grades counted non-blocking matches and passed on the model's verdict.
-            legacyGrades: valid.filter((t) => t.details.grade?.review && !t.details.grade.review.bySeverity)
-              .length,
+            legacyGrades: graded.length - valid.length,
             cleanBlocking: [...new Set(clean.map((r) => r.caseId))].sort().map((caseId) => ({
               caseId,
               blockingFindings: clean.filter((r) => r.caseId === caseId).map((r) => r.blockingFindings ?? 0),
@@ -216,7 +225,7 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
   ];
   const summaries = targets.map((modelId) => {
     const rows = trials.filter((t) => evidenceTarget(t) === modelId);
-    const evaluated = rows.filter((t) => t.pass !== null && ["ok", "error"].includes(t.status));
+    const evaluated = rows.filter(scoredTrial);
     const passes = evaluated.filter((t) => t.pass).length;
     const risk = rows.flatMap((t) =>
       typeof t.details.grade?.riskUnderCall === "boolean" ? [Number(t.details.grade.riskUnderCall)] : [],

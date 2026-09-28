@@ -139,6 +139,7 @@ limitless eval run review --models openrouter/gpt-6-luna --follow
 limitless eval run verify --models openrouter/gpt-6-luna --follow
 limitless eval report <eval-id>
 limitless eval report <eval-id> --json
+limitless eval regrade <eval-id>   # review: recompute grades from stored outputs, no model calls
 ```
 
 Use catalog IDs shown by the daemon's `/api/models` endpoint. `triage`, `review`, and `verify` are supported, including models absent from the routing policy. Defaults

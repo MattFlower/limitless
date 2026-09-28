@@ -63,7 +63,7 @@ evals/<role>/*.json ──► runner ──► role fn (same prompts/schemas) �
 | Role | Cases | Source | Grader | Primary metric (floor) |
 |---|---|---|---|---|
 | triage | 40 | own run prompts + boundary cases | exact match per field, cost-weighted | pass-rate Wilson lower bound ≥0.60; risk under-call rate ≤0.10 |
-| review | 15 | 12 real defects, 3 clean merged diffs | round-1 blocking finding + file/line-window match; production-derived verdict | blocking-recall Wilson lower bound ≥0.50; clean false-block Wilson upper bound ≤0.50 |
+| review | 34 | 23 real-defect diffs and 11 clean merged diffs (16 in snapshot mode); 42 required and 14 optional defects | round-1 blocking finding + file/line-window match, one finding per defect; production-derived verdict | blocking-recall Wilson lower bound ≥0.50; clean false-block Wilson upper bound ≤0.50 |
 | verify | 20 | labeled (criteria, diff, test output) triples, incl. "tests pass, criterion unmet" | per-criterion match | false-accept rate ≤0.10 |
 | holdout | 8 | sandbox tasks with reference solution + 3 mutants | execution | valid-on-reference × mutant kill rate |
 | implement | 12 | 8 sandbox replays + 4 small Limitless commits, stratified trivial/small/medium | hidden tests + gates + audit | resolve rate; $ and quota per task; wall time |
@@ -173,9 +173,12 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
   when it names the same file (leading `./` normalized) with a positive line in `[start-5,end+5]`,
   inclusive. Line 0 lands by file only for completeness defects, even when a numeric window
   includes zero. Severity equality, category equality and text similarity are not required.
-  A required defect is **caught** only when a blocking (blocker/major) finding lands on it; when
-  only non-blocking (minor/nit) findings land it is **under-rated** — diagnostic only, never
-  recall. Duplicate findings count a defect once.
+  A required defect is **caught** only when a blocking (blocker/major) finding lands on it.
+  Assignment is one-to-one (maximum bipartite matching): a finding credits at most one defect, so
+  a single finding in two overlapping windows catches one of them, not both. Ties go to the more
+  severe defect, and a finding repeated verbatim (same file, line and title) is one finding. A
+  required defect that isn't caught but is matched, in the same one-to-one way, by a non-blocking
+  (minor/nit) finding is **under-rated** — diagnostic only, never recall.
 - Real and seeded cases pass when every required defect is caught and the production-derived
   verdict is `request_changes`; the model's own verdict is ignored. A clean case false-blocks
   exactly when the derived verdict is `request_changes`, and its grade records the number of
@@ -184,9 +187,14 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
   headline, blocking recall by gold severity (blocker → high, major → medium, minor/nit → low),
   under-rated required defects, false blocks/clean predictions with blocking findings per clean
   case and trial, and correct derived verdicts/valid predictions. Zero required defects gives null
-  recall. Grades stored before this rule (no severity breakdown) are not review evidence; rerun
-  the eval to regrade them from cached output without new model calls or spend. Regrading only
-  needs valid findings and summary: a stored output without a model verdict still regrades.
+  recall. Grades stored before this rule (no severity breakdown) are excluded from pass rate,
+  mean score, recall and paired comparisons, and a policy candidate with any of them is
+  insufficient evidence. `limitless eval regrade <eval-id>` rewrites a finished review eval's
+  grades from each trial's stored output against the current labels: no model calls, cache
+  lookups or spend. Stored outputs from older schemas regrade because grading reads only each
+  finding's severity, file and line (a missing `security` counts as false, and a missing model
+  verdict is irrelevant); a degenerate review still fails. Trials whose case has left the dataset
+  or whose output doesn't parse keep their stored grade and stay excluded.
 - Verify scores only gold IDs. A single binary status must match exactly; missing, unclear and
   duplicate entries are inconclusive and match neither label. False accepts are gold unmet with
   predicted met, divided by gold-unmet observations. False rejects are gold met without an
@@ -196,7 +204,7 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
   count as pass failures but have no prediction-dependent observations. Reports disclose valid
   prediction coverage, explicit numerators/denominators, null (`n/a`) for empty denominators,
   skips, errors, cache hits, costs and invocation latency. Grades are persisted in existing trial
-  JSON so label edits cannot rewrite historical reports.
+  JSON so label edits cannot rewrite historical reports; `eval regrade` is the explicit exception.
 
 Repository-reading cache identity additionally includes role, repository identity, pinned base
 and head, normal input and seed content. Same-stat code or patch changes invalidate it; temporary
@@ -320,10 +328,13 @@ resamples. Non-inferiority requires the one-sided 95% lower bound **strictly gre
 no complete paired cases is insufficient evidence. A candidate with any hard rejection (failed floor
 or ceiling, failed non-inferiority, origin exclusion, missing catalog/provider metadata or an invalid
 recorded cost) is **ineligible**; it is labelled insufficient evidence only when every reason is
-missing evidence. Only missing catalog/provider metadata or an origin exclusion bars a candidate
-from being the reference; a candidate that fails a floor, ceiling or cost check can still be the
-reference. When every candidate is barred there is no reference, and candidates are not additionally
-flagged for missing paired cases. Reusing a case ID after substantive dataset
+missing evidence. A candidate is barred from being the reference by missing catalog/provider
+metadata, a recorded provider that differs from the catalog, an origin exclusion, a recorded-effort
+problem (unknown, unsupported, or no longer the model's default), review grades from before
+blocking recall, or having no valid prediction at all (every trial errored, was skipped or is
+unscored); a candidate that fails a floor, ceiling or cost check can still be the reference. When
+every candidate is barred there is no reference, and candidates are not additionally flagged for
+missing paired cases. Reusing a case ID after substantive dataset
 changes can invalidate historical comparisons; dataset fingerprints are not backfilled.
 
 Routing cost per case is averaged over **case attempts**, including attempted failures, excluding

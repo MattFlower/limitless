@@ -484,11 +484,12 @@ pipeline, and pure graders score the output.
 ```bash
 limitless eval run triage --models codex/luna@low,openrouter/gpt-6-luna@medium --k 3 --max-usd 1 --follow
 limitless eval report <eval-id> [--json]
+limitless eval regrade <eval-id>       # review: recompute grades from stored outputs; no model calls
 limitless eval policy                  # preview the policy diff; no writes, no model calls
 limitless eval policy --write          # write routing/policy.json and routing/EVIDENCE.md here
 ```
 
-- The committed datasets are `evals/triage` (40 cases), `evals/review` (15) and
+- The committed datasets are `evals/triage` (40 cases), `evals/review` (34) and
   `evals/implement` (12). There is no `evals/verify/cases.json` yet, so `eval run verify` fails
   before scheduling.
 - The defaults are `--k 1`, `--max-usd 1.00`, all cases, and caching on (`--no-cache` forces fresh

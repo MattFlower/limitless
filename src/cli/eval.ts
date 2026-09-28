@@ -11,6 +11,7 @@ import {
   unevaluatedPins,
 } from "../evals/overrides.ts";
 import type { EvalPolicyResponse } from "../evals/policy.ts";
+import type { EvalRegradeResult } from "../evals/runner.ts";
 import type { EvalReport } from "../evals/stats.ts";
 import { DEFAULT_POLICY } from "../router/catalog.ts";
 import { overlayPolicy, parsePolicy, validatePolicy } from "../router/policy.ts";
@@ -84,10 +85,21 @@ export async function evalCommand(
     }
     return;
   }
-  if (args.length !== 2 || !value || !["run", "report"].includes(action ?? ""))
+  if (args.length !== 2 || !value || !["run", "report", "regrade"].includes(action ?? ""))
     throw new Error(
-      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval report <eval-id> [--json]",
+      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval report <eval-id> [--json] | eval regrade <eval-id>",
     );
+  if (action === "regrade") {
+    const path = `/api/evals/${encodeURIComponent(value)}`;
+    const result = await io.api<EvalRegradeResult>(`${path}/regrade`, { method: "POST", body: "{}" });
+    io.print(
+      `Regraded ${result.regraded} stored review trials from their outputs (${result.changed} changed); no model calls.`,
+    );
+    for (const s of result.skipped)
+      io.print(`  kept stored grade: ${s.caseId} ${s.modelId} #${s.trial}: ${s.reason}`);
+    io.print(formatEvalReport(await io.api<EvalReport>(path)));
+    return;
+  }
   if (action === "report") {
     const report = await io.api<EvalReport>(`/api/evals/${encodeURIComponent(value)}`);
     io.print(flags.json ? JSON.stringify(report) : formatEvalReport(report));

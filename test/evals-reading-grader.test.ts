@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema } from "../src/evals/cases.ts";
 import { gradeReview } from "../src/evals/graders/review.ts";
 import { gradeVerify } from "../src/evals/graders/verify.ts";
-import { type Review, StoredReviewSchema, type Verify } from "../src/pipeline/schemas.ts";
+import { type Review, ReviewSchema, StoredReviewSchema, type Verify } from "../src/pipeline/schemas.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 
 const fixturePath = new URL("./data/evals-verify.json", import.meta.url).pathname;
@@ -128,6 +128,77 @@ test("review recall counts only round-1 blocking findings; minor and nit detecti
       },
     },
   });
+});
+test("each finding credits at most one defect, even where defect windows overlap", () => {
+  // Shaped like review-017: two required defects whose ±5-line windows overlap.
+  const defect = reviewCase.defects[0] as ReviewCase["defects"][number];
+  const overlapping = {
+    ...reviewCase,
+    defects: [
+      { ...defect, file: "src/router/providers.ts", lines: [265, 271] },
+      { ...defect, file: "src/router/providers.ts", lines: [261, 264] },
+    ],
+  } as ReviewCase;
+  const at = (lines: number[], severity: Review["findings"][number]["severity"] = "major"): Review => ({
+    ...reviewOutput(),
+    findings: lines.flatMap((line) => reviewOutput(line, severity, "src/router/providers.ts").findings),
+  });
+  expect(gradeReview(overlapping, at([262]))).toMatchObject({
+    pass: false,
+    score: 0.5,
+    review: { requiredMatched: 1, requiredTotal: 2, underRated: 0 },
+  });
+  expect(gradeReview(overlapping, at([262, 262])).review?.requiredMatched).toBe(1);
+  expect(gradeReview(overlapping, at([262, 269]))).toMatchObject({ pass: true, score: 1 });
+  // One minor finding in both windows under-rates one defect, not two.
+  expect(gradeReview(overlapping, at([262], "minor")).review).toMatchObject({
+    requiredMatched: 0,
+    underRated: 1,
+  });
+  // A blocking finding already credited elsewhere doesn't make the other defect under-rated.
+  expect(
+    gradeReview(overlapping, {
+      ...at([262]),
+      findings: [...at([262]).findings, ...at([240], "minor").findings],
+    }).review,
+  ).toMatchObject({ requiredMatched: 1, underRated: 0 });
+  // Maximum matching, not first-fit: the first defect gives up 262 for 272, which only it reaches.
+  expect(gradeReview(overlapping, at([262, 272])).review?.requiredMatched).toBe(2);
+  // An ambiguous finding credits the more severe defect wherever it sits in the case.
+  const mixed = {
+    ...overlapping,
+    defects: [overlapping.defects[0], { ...overlapping.defects[1], severity: "blocker" }],
+  } as ReviewCase;
+  expect(gradeReview(mixed, at([264])).review?.bySeverity).toEqual({
+    high: { caught: 1, total: 1 },
+    medium: { caught: 0, total: 1 },
+    low: { caught: 0, total: 0 },
+  });
+});
+test("stored reviews from older schemas regrade; only severity, file and line are needed", () => {
+  const legacy = {
+    summary: "Reviewed the change.",
+    findings: [{ severity: "major", file: "src/a.ts", line: 12 }],
+  };
+  expect(ReviewSchema.safeParse(legacy).success).toBe(false);
+  const parsed = StoredReviewSchema.parse(legacy);
+  expect(parsed.findings[0]).toEqual({
+    severity: "major",
+    security: false,
+    file: "src/a.ts",
+    line: 12,
+    title: "",
+    detail: "",
+    suggestion: "",
+  });
+  expect(gradeReview(reviewCase, parsed)).toMatchObject({ pass: true, review: { requiredMatched: 1 } });
+  for (const broken of [
+    { findings: [{ severity: "urgent", file: "src/a.ts", line: 12 }] },
+    { findings: [{ severity: "major", line: 12 }] },
+    { findings: [{ severity: "major", file: "src/a.ts", line: "12" }] },
+    { findings: [] },
+  ])
+    expect(StoredReviewSchema.safeParse(broken).success).toBe(false);
 });
 test("verify truth table treats absent, unclear and duplicate IDs as inconclusive, disregarding overall", () => {
   const item = VerifyCaseFileSchema.parse(loadRoleCases("verify", fixturePath)).cases[0];
