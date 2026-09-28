@@ -2,6 +2,7 @@ import type { Component } from "solid-js";
 import type { ProviderStatus, RunStatus } from "../../src/core/types.ts";
 
 const RUN_LABEL: Record<RunStatus, string> = {
+  waiting: "waiting",
   queued: "queued",
   running: "running",
   waiting_input: "waiting on you",

@@ -3,6 +3,7 @@ import { For } from "solid-js";
 import type { RunStatus } from "../../src/core/types.ts";
 
 const ALL_STATUSES: RunStatus[] = [
+  "waiting",
   "running",
   "waiting_input",
   "needs_human",

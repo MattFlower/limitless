@@ -3,6 +3,7 @@
 
 export type RunStatus =
   | "queued"
+  | "waiting"
   | "running"
   | "waiting_input"
   | "succeeded"
@@ -129,6 +130,8 @@ export interface Run {
   taskClass: TaskClass | null;
   complexity: Complexity | null;
   status: RunStatus;
+  dependsOn: string[];
+  prClosedUnmerged: boolean;
   stage: StageName | null;
   baseBranch: string | null;
   deliveryBranch: string | null;
@@ -270,6 +273,7 @@ export interface QuotaAlert {
 }
 
 export interface CreateRunRequest {
+  dependsOn?: string[];
   repo: string;
   prompt: string;
   title?: string;

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { type PresetTarget, transformAsync } from "@babel/core";
 import ts from "@babel/preset-typescript";
 import { renderToString } from "solid-js/web";
-import type { Run } from "../src/core/types.ts";
+import type { Run, StreamMessage } from "../src/core/types.ts";
 import { computeStats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 
@@ -78,8 +78,22 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
                 );
                 source = source.replace(
                   "createSignal<Run | null>(null)",
-                  `createSignal<Run | null>(${JSON.stringify(resolved)})`,
+                  "createSignal<Run | null>(injectedRun)",
                 );
+                source = source.replace("onMount(() => {", "((mount: () => void) => mount())(() => {");
+                source = source.replace("getRunDetail, openRunStream, ", "");
+                source += `
+                  let injectedRun: Run = ${JSON.stringify(resolved)};
+                  let injectedUpdate: import("../../src/core/types.ts").StreamMessage | undefined;
+                  const getRunDetail = async () => ({run: injectedRun, stages: [], invocations: [], questions: [], artifacts: []});
+                  const openRunStream = (_id: string, _last: number, receive: (message: import("../../src/core/types.ts").StreamMessage) => void) => {
+                    if (injectedUpdate) receive(injectedUpdate);
+                    return () => {};
+                  };
+                  export function withFixture(run: Run, update?: import("../../src/core/types.ts").StreamMessage) {
+                    injectedRun = run; injectedUpdate = update; return RunDetail({});
+                  }
+                `;
               }
               const transformed = await transformAsync(source, {
                 filename: args.path,
@@ -111,7 +125,11 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
     const { RunsTable } = (await import(
       output("RunsTable")
     )) as typeof import("../ui/components/RunsTable.tsx");
-    const { RunDetail } = (await import(output("RunDetail"))) as typeof import("../ui/pages/RunDetail.tsx");
+    const { RunDetail, withFixture } = (await import(
+      output("RunDetail")
+    )) as typeof import("../ui/pages/RunDetail.tsx") & {
+      withFixture: (run: Run, update?: StreamMessage) => ReturnType<typeof RunDetail>;
+    };
 
     expect(renderToString(() => RunStatusPill({ status: resolved.status }))).toContain(
       'class="pill pill-resolved">resolved',
@@ -128,6 +146,32 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
     expect(detail).toContain('class="pill pill-resolved">resolved');
     expect(detail).toContain("Merged by reviewer on ");
     expect(detail).toContain("pull request ↗");
+    const waiting: Run = {
+      ...resolved,
+      status: "waiting",
+      dependsOn: ["prerequisite-one", "prerequisite-two"],
+    };
+    expect(renderToString(() => FilterChips({ active: "waiting", onChange: () => {} }))).toContain(
+      'class="chip active">waiting</button>',
+    );
+    expect(renderToString(() => RunsTable({ runs: [waiting] }))).toContain(
+      "waiting for prerequisite-one, prerequisite-two to merge",
+    );
+    expect(renderToString(() => withFixture(waiting))).toContain(
+      "waiting for prerequisite-one, prerequisite-two to merge",
+    );
+    const blocked: Run = {
+      ...waiting,
+      status: "needs_human",
+      error: "Dependency prerequisite-one: PR was closed unmerged",
+    };
+    const updated = renderToString(() => withFixture(waiting, { kind: "run", run: blocked }));
+    expect(updated).toContain('class="pill pill-needs_human">needs human');
+    expect(updated).toContain(blocked.error as string);
+    expect(updated).not.toContain("waiting for");
+    expect(
+      renderToString(() => withFixture(waiting, { kind: "run", run: { ...waiting, status: "queued" } })),
+    ).toContain('class="pill pill-queued">queued');
   } finally {
     store.close();
   }

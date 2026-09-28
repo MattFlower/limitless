@@ -11,7 +11,7 @@ const USAGE = `limitless — personal software factory
 Usage:
   limitless serve                         Start the daemon (API, UI, scheduler)
   limitless run "<prompt>" --repo <repo>  Queue a run (repo: owner/name or a local path)
-        [--profile auto|quick|standard|deep] [--title <t>] [-f|--follow]
+        [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
   limitless eval report <eval-id> [--json]
@@ -26,9 +26,9 @@ Usage:
   limitless gc [--dry-run]                Clean up expired worktrees, logs and debug events
   limitless mcp                           MCP stdio proxy (daemon must be running)
   limitless integrations install [--write] Print setup; --write installs the Codex skill
-  limitless service install [--tunnel] [--no-mtplx]   launchd agents: daemon, mtplx (+ tunnel)
+  limitless service install [--tunnel] [--mtplx]   launchd agents: daemon (+ mtplx, tunnel)
   limitless service uninstall|status
-  limitless local up|down|status          Manage mtplx and twilight model servers
+  limitless local up|down|status          Report oMLX health; manage twilight
   limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]
         Deploy origin/main by default; drain for up to 2700s (45m). --now skips waiting.
 
@@ -74,7 +74,7 @@ function statusColor(s: string): string {
   if (status === "resolved") return color.cyan(s);
   if (status === "failed" || status === "needs_human") return color.red(s);
   if (status === "running") return color.cyan(s);
-  if (status === "waiting_input") return color.yellow(s);
+  if (status === "waiting_input" || status === "waiting") return color.yellow(s);
   return color.dim(s);
 }
 
@@ -170,6 +170,7 @@ async function main(): Promise<void> {
       "max-usd": { type: "string" },
       "no-cache": { type: "boolean" },
       json: { type: "boolean" },
+      after: { type: "string" },
       repo: { type: "string", short: "r" },
       profile: { type: "string", short: "p" },
       title: { type: "string", short: "t" },
@@ -180,7 +181,7 @@ async function main(): Promise<void> {
       tunnel: { type: "boolean" },
       write: { type: "boolean" },
       "dry-run": { type: "boolean" },
-      "no-mtplx": { type: "boolean" },
+      mtplx: { type: "boolean" },
       smoke: { type: "boolean" },
       "max-wait": { type: "string" },
       now: { type: "boolean" },
@@ -245,13 +246,14 @@ async function main(): Promise<void> {
         body: JSON.stringify({
           repo: values.repo,
           prompt,
+          ...(values.after !== undefined ? { dependsOn: values.after.split(",") } : {}),
           profile: (values.profile as Profile | undefined) ?? "auto",
           ...(values.title ? { title: values.title } : {}),
           source: "cli",
           requestedBy: process.env.USER,
         }),
       });
-      console.log(`Queued run ${color.bold(run.id)} on ${run.repoSlug}`);
+      console.log(`Created run ${color.bold(run.id)} on ${run.repoSlug}: ${run.status}`);
       if (values.follow) await follow(run.id);
       return;
     }
@@ -320,7 +322,7 @@ async function main(): Promise<void> {
       const svc = await import("./service.ts");
       const port = Number(process.env.LIMITLESS_PORT ?? 7400);
       if (rest[0] === "install") {
-        return svc.install(port, { tunnel: values.tunnel === true, mtplx: values["no-mtplx"] !== true });
+        return svc.install(port, { tunnel: values.tunnel === true, mtplx: values.mtplx === true });
       }
       if (rest[0] === "uninstall") return svc.uninstall();
       return svc.status(port);

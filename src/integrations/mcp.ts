@@ -8,6 +8,7 @@ import type { CreateRunRequest, RunStatus } from "../core/types.ts";
 const nonblank = z.string().trim().min(1);
 const status = z.enum([
   "queued",
+  "waiting",
   "running",
   "waiting_input",
   "succeeded",
@@ -23,6 +24,7 @@ const runSchema = z
     repoSlug: nonblank,
     title: z.string(),
     status,
+    dependsOn: z.array(nonblank).default([]),
     profile,
     stage: z.string().nullable(),
     prUrl: z.string().nullable(),
@@ -186,12 +188,13 @@ export function createMcpServer(backend: McpBackend): Server {
   const tools = [
     tool(
       "limitless_create_run",
-      "Delegate asynchronous repository work to the factory. Use for long-running or background tasks. Supply repo (owner/name or absolute path on the daemon machine), a self-contained prompt, optional title and profile (auto by default). Returns the created run with id and current status immediately; completion and a PR are not guaranteed. Repository delivery policy applies.",
+      "Delegate asynchronous repository work to the factory. Use for long-running or background tasks. Supply repo (owner/name or absolute path on the daemon machine), a self-contained prompt, optional title and profile (auto by default), and dependsOn run IDs to wait for their PRs to merge. Returns the created run with id and current status immediately; completion and a PR are not guaranteed. Repository delivery policy applies.",
       z
         .object({
           repo: nonblank,
           prompt: nonblank,
           title: nonblank.optional(),
+          dependsOn: z.array(nonblank).optional(),
           profile: profile.default("auto"),
         })
         .strict(),
@@ -209,6 +212,7 @@ export function createMcpServer(backend: McpBackend): Server {
           repository: run.repoSlug,
           title: run.title,
           status: run.status,
+          dependsOn: run.dependsOn,
           stage: run.stage,
           prUrl: run.prUrl,
           costUsd: run.costUsd,

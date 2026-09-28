@@ -44,6 +44,9 @@ export const RunsTable: Component<{ runs: Run[] }> = (props) => {
               <tr class="clickable" onClick={() => navigate(`/runs/${run.id}`)}>
                 <td>
                   <RunStatusPill status={run.status} />
+                  <Show when={run.status === "waiting"}>
+                    <div>waiting for {run.dependsOn.join(", ")} to merge</div>
+                  </Show>
                 </td>
                 <td title={run.title}>{truncate(run.title, 64)}</td>
                 <td class="mono text-dim">{run.repoSlug}</td>

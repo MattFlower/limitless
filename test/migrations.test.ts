@@ -164,3 +164,24 @@ test("invalid and duplicate filenames are rejected", () => {
   );
   expect(migrationNames("unused", ["README.md", "20260927T1500-a.sql"])).toEqual(["20260927T1500-a.sql"]);
 });
+
+test("dependency migration upgrades existing runs and round-trips waiting runs", () => {
+  temporary((_directory, path) => {
+    legacyDatabase(path);
+    const db = new Database(path);
+    db.exec("INSERT INTO repos (id, slug, kind, created_at) VALUES ('repo', 'local', 'local', 1)");
+    db.exec(
+      "INSERT INTO runs (id, repo_id, title, prompt, source, status, created_at) VALUES ('old', 'repo', 'old', 'old', 'cli', 'queued', 1)",
+    );
+    db.close();
+    let store = new Store(path);
+    expect(store.getRun("old")).toMatchObject({ dependsOn: [], status: "queued", prClosedUnmerged: false });
+    const repo = store.getRepo("repo");
+    if (!repo) throw new Error("missing repo");
+    const run = store.createRun(repo, { repo: "local", prompt: "next", dependsOn: ["old"] });
+    store.close();
+    store = new Store(path);
+    expect(store.getRun(run.id)).toMatchObject({ dependsOn: ["old"], status: "waiting" });
+    store.close();
+  });
+});

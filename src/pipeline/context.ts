@@ -84,6 +84,10 @@ export interface RunState {
   preRebaseGates?: GateComparison[];
   /** Expected first merge parent; also the fallback head if clean-merge gates regress. */
   preRebaseHead?: string;
+  /** Commit that last passed verify, or an approving quick review after deterministic checks. */
+  lastVerifiedSha?: string;
+  /** Passing evidence retained if a later resolution round fails. */
+  lastVerifiedEvidence?: Pick<RunState, "lastVerify" | "lastGates" | "lastReview" | "lastAudit">;
   /** Why delivery went ahead without rebasing onto the latest base (shown in the report). */
   rebaseNote?: string;
   /** The single extra implementation round allowed after a conflicting delivery merge. */
@@ -122,6 +126,9 @@ export class CancelledError extends Error {
     super("cancelled");
   }
 }
+
+/** Stages after gates within a round: a round runs through them before a drain can park it. */
+const UNPARKABLE: ReadonlySet<StageName> = new Set<StageName>(["audit", "review", "preview", "verify"]);
 
 export class ParkedError extends Error {
   constructor() {
@@ -294,7 +301,10 @@ export class RunContext {
     parkOnDrain = true,
   ): Promise<T> {
     this.checkCancelled();
-    if (parkOnDrain && this.foregroundStageDepth === 0 && this.isDraining()) throw new ParkedError();
+    // Resume skips only whole implement rounds, so parking between gates and the end of a round
+    // would re-run gates and a paid review (and spend verify's environment retry).
+    if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
+      throw new ParkedError();
     if (!background) this.run = this.store.updateRun(this.run.id, { stage: name });
     const stage = this.store.startStage(this.run.id, name, round);
     // Parallel holdout work must not suppress foreground drain boundaries.
