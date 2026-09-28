@@ -7,6 +7,7 @@ import { selectHarness } from "../harness/select.ts";
 import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
 import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
+import { type ReviewRequest, runReview } from "../pipeline/review.ts";
 import { toStrictJsonSchema } from "../pipeline/schemas.ts";
 import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
 import { cacheKey } from "./cache.ts";
@@ -373,6 +374,7 @@ export class EvalRunner {
       const preparationMs = Date.now() - preparationStarted;
       let { prompt } = prepared;
       const { timeoutMs } = prepared;
+      const reviewInput = "review" in prepared ? prepared.review : undefined;
       const schema = "hidden" in item ? undefined : schemaFor(item);
       const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
@@ -477,19 +479,16 @@ export class EvalRunner {
         for (let attempt = 0; ; attempt++) {
           try {
             const logPath = join(directory, "trial.log");
-            const invoke = (scratchDir?: string) =>
+            const invoke = (scratchDir?: string, request = { prompt, jsonSchema, schema, timeoutMs }) =>
               harness({
                 scratchDir,
                 ...(sessionId ? { resumeSessionId: sessionId } : {}),
                 cwd,
-                prompt,
+                ...request,
                 systemAppend: FACTORY_PREAMBLE,
                 target,
                 mode: "hidden" in item ? "edit" : "readonly",
                 noTools,
-                jsonSchema,
-                schema,
-                timeoutMs,
                 privateSession: run.role === "verify",
                 idleTimeoutMs: 10 * 60_000,
                 maxToolCalls: "hidden" in item ? 400 : 150,
@@ -507,11 +506,21 @@ export class EvalRunner {
                   if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
                 },
               });
-            result = noTools
-              ? await invoke()
-              : scratch
-                ? await invoke(scratch)
-                : await withScratch(cwd, invoke);
+            const send = (request?: ReviewRequest) =>
+              noTools
+                ? invoke(undefined, request)
+                : scratch
+                  ? invoke(scratch, request)
+                  : withScratch(cwd, (dir) => invoke(dir, request));
+            // First-round review cases go through the pipeline's review entry point.
+            result = reviewInput
+              ? (
+                  await runReview(
+                    { invoke: async (request) => ({ result: await send(request) }) },
+                    reviewInput,
+                  )
+                ).result
+              : await send();
           } catch (error) {
             result = {
               status: signal.aborted ? "cancelled" : "error",

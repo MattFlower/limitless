@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { emptyUsage } from "../src/harness/types.ts";
 import { reviewPrompt } from "../src/pipeline/prompts.ts";
-import { blockingReviewFindings, reviewVerdict } from "../src/pipeline/review.ts";
+import {
+  blockingReviewFindings,
+  type ReviewRequest,
+  reviewVerdict,
+  runReview,
+} from "../src/pipeline/review.ts";
 import { LaterReviewSchema, type Review, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import { findingEvidence } from "./review-support.ts";
 
 const finding = (severity: Review["findings"][number]["severity"], security = false) => ({
   severity,
@@ -13,6 +20,7 @@ const finding = (severity: Review["findings"][number]["severity"], security = fa
   title: "Observed issue",
   detail: "Reproducible issue",
   suggestion: "Fix it",
+  ...findingEvidence,
 });
 
 describe("deterministic review decision", () => {
@@ -256,4 +264,95 @@ describe("review prompt", () => {
     ])
       expect(omitted).toContain(kept);
   });
+});
+
+const prompt = {
+  prompt: "x",
+  spec: null,
+  baseSha: "a",
+  stat: "",
+  gates: [],
+  audit: [],
+  implementerReport: "",
+};
+
+describe("runReview", () => {
+  const review = async (structured: unknown, input: Partial<Parameters<typeof runReview>[1]> = {}) => {
+    const requests: ReviewRequest[] = [];
+    const invoke = async (request: ReviewRequest) => {
+      requests.push(request);
+      const usage = emptyUsage();
+      const result = {
+        status: "ok" as const,
+        finalText: "",
+        structured,
+        sessionId: null,
+        usage,
+        numTurns: 1,
+      };
+      return { result: { ...result, costUsd: 0, costEquivUsd: 0, error: null, quota: null } };
+    };
+    return { requests, ...(await runReview({ invoke }, { prompt, timeoutMs: 1234, ...input })) };
+  };
+  const { label: _label, prior: _prior, ...plain } = finding("major");
+  const reviewed = (findings: unknown[]) => ({
+    verdict: "approve",
+    summary: "Checked the change end to end.",
+    findings,
+  });
+
+  test("a first round sends the prompt and strict schema and derives the verdict", async () => {
+    const out = await review(reviewed([plain]));
+    const request = { prompt: reviewPrompt(prompt), schema: ReviewSchema, timeoutMs: 1234 };
+    expect(out.requests).toEqual([{ ...request, jsonSchema: toStrictJsonSchema(ReviewSchema) }]);
+    expect(out.decision).toMatchObject({ modelVerdict: "approve", review: { verdict: "request_changes" } });
+    expect(out.decision?.blocking).toHaveLength(1);
+    expect(out.decision?.followUps).toEqual([]);
+  });
+
+  test("later rounds block unaddressed, regressed and security findings and keep replayed follow-ups", async () => {
+    const out = await review(
+      reviewed([
+        { ...finding("minor"), label: "unaddressed", prior: "P1", title: "Still broken" },
+        { ...finding("major"), title: "Backlog" },
+        { ...finding("minor", true), title: "Leak" },
+        { ...finding("nit"), label: "regression", title: "Regressed" },
+      ]),
+      {
+        prompt: { ...prompt, previous: { sha: "old", findings: [finding("major")] }, headSha: "new" },
+        replayedFollowUps: [{ ...finding("minor"), title: "Earlier" }],
+      },
+    );
+    expect(out.requests[0]?.schema).toBe(LaterReviewSchema);
+    const titles = (list: Review["findings"] = []) => list.map((f) => f.title);
+    expect(titles(out.decision?.blocking)).toEqual(["Still broken", "Leak", "Regressed"]);
+    expect(titles(out.decision?.followUps)).toEqual(["Earlier", "Backlog"]);
+  });
+
+  test("confidence is clamped into [0, 1] and must be a finite number", async () => {
+    const confidence = async (value: unknown) =>
+      (await review(reviewed([{ ...plain, confidence: value }]))).decision?.review.findings[0]?.confidence;
+    expect(await Promise.all([-0.5, 0.42, 1, 7].map(confidence))).toEqual([0, 0.42, 1, 1]);
+    const invalid = [undefined, "0.9", null, Number.NaN, Number.POSITIVE_INFINITY].map(confidence);
+    expect(await Promise.all(invalid)).toEqual([undefined, undefined, undefined, undefined, undefined]);
+  });
+
+  const categories = "correctness security reliability data concurrency compatibility test-gap cleanup";
+  for (const schema of [ReviewSchema, LaterReviewSchema])
+    test(`${schema === ReviewSchema ? "first" : "later"}-round schema requires the v2 fields`, () => {
+      const json = toStrictJsonSchema(schema);
+      const findings = json.properties as { findings: { items: Record<string, unknown> } };
+      const item = findings.findings.items as { required: string[]; properties: Record<string, unknown> };
+      expect(item.required).toEqual(expect.arrayContaining(Object.keys(findingEvidence)));
+      expect(item.properties.category).toMatchObject({ enum: [...categories.split(" "), "conventions"] });
+      expect(item.properties.confidence).toMatchObject({ type: "number" });
+      expect(JSON.stringify(json)).not.toMatch(/"(minimum|maximum|exclusiveMinimum|exclusiveMaximum)"/);
+      for (const text of [
+        "failure_scenario",
+        "introduced_by_diff",
+        "confidence (0 to",
+        ...categories.split(" "),
+      ])
+        expect(reviewPrompt(prompt)).toContain(text);
+    });
 });

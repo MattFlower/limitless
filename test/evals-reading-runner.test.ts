@@ -8,6 +8,7 @@ import { gateScriptNames, pickScripts } from "../src/gates/detect.ts";
 import { createEvalWorktree, diffSince, readFileAt } from "../src/git/repos.ts";
 import { readingTimeout } from "../src/pipeline/engine.ts";
 import { FACTORY_PREAMBLE, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
+import * as review from "../src/pipeline/review.ts";
 import { ReviewSchema, toStrictJsonSchema, VerifySchema } from "../src/pipeline/schemas.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
@@ -289,6 +290,50 @@ test("cached review outputs graded under the legacy rule regrade to blocking rec
     expect(regraded.summaries[0]?.review?.defectRecall).toMatchObject({ numerator: 0, denominator: 1 });
     await f.clean();
   } finally {
+    await f.close();
+  }
+});
+
+test("review trials need v2 fields and keep the model's verdict, and pre-v2 stored output regrades", async () => {
+  const f = await fixture();
+  try {
+    const [finding] = reviewOutput().findings;
+    if (!finding) throw new Error("fixture");
+    const { confidence, ...incomplete } = finding;
+    f.respond(() => ({ structured: { ...reviewOutput(), findings: [incomplete] } }));
+    expect((await f.run()).trials[0]?.details.reason).toContain("Invalid review output");
+    const conflicting = { ...reviewOutput(), verdict: "approve", findings: [{ ...finding, confidence: 3 }] };
+    f.respond(() => ({ structured: conflicting }));
+    const stored = (await f.run({ k: 1, cache: false })).trials[0];
+    expect(stored?.output).toMatchObject({ verdict: "approve", findings: [{ confidence: 1 }] });
+    expect(stored?.details.grade).toMatchObject({ pass: true, review: { requestChanges: true } });
+    if (!stored?.details.grade) throw new Error("expected graded trial");
+    const { failure_scenario, category, introduced_by_diff, ...legacy } = incomplete;
+    f.factory.store.recordEvalTrial({ ...stored, output: { ...reviewOutput(), findings: [legacy] } });
+    const calls = f.calls.length;
+    const regraded = await f.run();
+    expect(f.calls).toHaveLength(calls);
+    expect(regraded.summaries[0]).toMatchObject({ cached: 1 });
+    expect(regraded.trials[0]?.details.grade).toMatchObject({ pass: stored.details.grade.pass });
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("first-round review trials go through the pipeline's runReview", async () => {
+  const f = await fixture();
+  const run = spyOn(review, "runReview");
+  try {
+    f.respond(() => ({ structured: reviewOutput() }));
+    expect((await f.run({ cache: false })).trials[0]?.status).toBe("ok");
+    expect(run).toHaveBeenCalledTimes(1);
+    const [, input] = run.mock.calls[0] ?? [];
+    if (!input) throw new Error("runReview was not called with an input");
+    expect(f.calls.map((s) => s.prompt)).toEqual([review.reviewRequest(input).prompt]);
+    await f.clean();
+  } finally {
+    run.mockRestore();
     await f.close();
   }
 });

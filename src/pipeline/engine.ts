@@ -53,19 +53,22 @@ import {
   holdoutPrompt,
   implementPrompt,
   redactHoldoutText,
-  reviewPrompt,
   specPrompt,
   triagePrompt,
   verifyPrompt,
 } from "./prompts.ts";
 import { buildReport } from "./report.ts";
-import { blockingReviewFindings, reviewFindingKey, reviewVerdict } from "./review.ts";
+import {
+  blockingReviewFindings,
+  type ReviewInput,
+  type ReviewRequest,
+  reviewFindingKey,
+  runReview,
+} from "./review.ts";
 import {
   type Holdout,
   HoldoutSchema,
-  LaterReviewSchema,
   type Review,
-  ReviewSchema,
   renderSpec,
   type Spec,
   SpecSchema,
@@ -833,14 +836,14 @@ async function oneRound(
   const review: Review = await ctx.stage(
     "review",
     async (stage) => {
-      const { result, target } = await ctx.invoke({
-        role: "review",
-        stage,
-        mode: "readonly",
-        complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
-        constraints: { avoidVendor: ctx.state.implementer?.vendor },
+      // A replay on the same commit (e.g. after a restart) keeps follow-ups it may not repeat.
+      const replayed = (ctx.state.reviewHistory ?? []).find(
+        (e) => e.round === round && e.sha === reviewedSha,
+      );
+      const input: ReviewInput = {
         timeoutMs: readingTimeout(diff.added + diff.removed),
-        prompt: reviewPrompt({
+        replayedFollowUps: replayed?.followUps,
+        prompt: {
           prompt: ctx.run.prompt,
           spec: ctx.state.spec ?? null,
           baseSha,
@@ -856,30 +859,25 @@ async function oneRound(
           previous: previousReview,
           headSha: reviewedSha,
           resolution: ctx.state.conflictRound === round,
-        }),
-        jsonSchema: toStrictJsonSchema(previousReview ? LaterReviewSchema : ReviewSchema),
-        schema: previousReview ? LaterReviewSchema : ReviewSchema,
-        requireStructured: true,
-      });
-      await discardChanges(cwd);
-      const parsed: Review = (previousReview ? LaterReviewSchema : ReviewSchema).parse(result.structured);
+        },
+      };
+      const invoke = async (request: ReviewRequest) => {
+        const invoked = await ctx.invoke({
+          role: "review",
+          stage,
+          mode: "readonly",
+          complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
+          constraints: { avoidVendor: ctx.state.implementer?.vendor },
+          ...request,
+          requireStructured: true,
+        });
+        await discardChanges(cwd);
+        return invoked;
+      };
+      const { target, output, decision } = await runReview({ invoke }, input);
+      if (!decision) throw output.error;
       // The model's verdict is kept for inspection only; control flow uses the derived one.
-      const modelVerdict = parsed.verdict;
-      const r: Review = { ...parsed, verdict: reviewVerdict(parsed, previousReview?.findings) };
-      const blocking = blockingReviewFindings(r, previousReview?.findings);
-      // A replay on the same commit (e.g. after a restart) keeps follow-ups it may not repeat.
-      const replayed = (ctx.state.reviewHistory ?? []).find(
-        (e) => e.round === round && e.sha === reviewedSha,
-      );
-      const followUps = previousReview
-        ? [
-            ...new Map(
-              [...(replayed?.followUps ?? []), ...r.findings.filter((f) => !blocking.includes(f))].map(
-                (f) => [reviewFindingKey(f), f] as const,
-              ),
-            ).values(),
-          ]
-        : [];
+      const { review: r, modelVerdict, blocking, followUps } = decision;
       ctx.state.reviewHistory = [...earlierReviews, { round, sha: reviewedSha, blocking, followUps }];
       ctx.state.reviewFollowUps = [
         ...new Map(

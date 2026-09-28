@@ -1,5 +1,6 @@
 import type { ReviewCase } from "../src/evals/cases.ts";
 import type { Review } from "../src/pipeline/schemas.ts";
+import { findingEvidence } from "./review-support.ts";
 
 /** Deep-frozen so a test that mutates the shared fixture fails at once instead of leaking into other files. */
 function deepFreeze<T>(value: T): T {
@@ -39,7 +40,16 @@ export function reviewOutput(
     verdict: "request_changes",
     summary: "reviewed",
     findings: [
-      { line, severity, security: false, file, title: "Bug", detail: "Observed", suggestion: "Fix" },
+      {
+        line,
+        severity,
+        security: false,
+        file,
+        title: "Bug",
+        detail: "Observed",
+        suggestion: "Fix",
+        ...findingEvidence,
+      },
     ],
   };
 }

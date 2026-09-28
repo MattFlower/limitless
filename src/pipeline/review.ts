@@ -1,4 +1,13 @@
-import type { Review, StoredReview } from "./schemas.ts";
+import type { z } from "zod";
+import { type AgentResult, extractJson } from "../harness/types.ts";
+import { reviewPrompt } from "./prompts.ts";
+import {
+  LaterReviewSchema,
+  type Review,
+  ReviewSchema,
+  type StoredReview,
+  toStrictJsonSchema,
+} from "./schemas.ts";
 
 export function reviewFindingKey(finding: Review["findings"][number]): string {
   // Lines and explanations can change while fixing the same issue.
@@ -32,4 +41,60 @@ export function blockingReviewFindings(
 
 export function reviewVerdict(review: StoredReview, priorBlocking?: Review["findings"]): Review["verdict"] {
   return blockingReviewFindings(review, priorBlocking).length ? "request_changes" : "approve";
+}
+
+export interface ReviewInput {
+  prompt: Parameters<typeof reviewPrompt>[0];
+  timeoutMs: number;
+  /** Follow-ups already recorded for this round and commit, when a review is replayed after a restart. */
+  replayedFollowUps?: Review["findings"];
+}
+
+/** What the invoker sends to the model; later rounds (with previous findings) use the labelled schema. */
+export interface ReviewRequest {
+  prompt: string;
+  schema: typeof ReviewSchema | typeof LaterReviewSchema;
+  jsonSchema: Record<string, unknown>;
+  timeoutMs: number;
+}
+
+export interface ReviewDecision {
+  /** Verdict derived from the findings; the model's own is kept in modelVerdict for inspection only. */
+  review: Review;
+  modelVerdict: Review["verdict"];
+  blocking: Review["findings"];
+  followUps: Review["findings"];
+}
+
+export function reviewRequest(input: ReviewInput): ReviewRequest {
+  const schema = input.prompt.previous ? LaterReviewSchema : ReviewSchema;
+  const jsonSchema = toStrictJsonSchema(schema);
+  return { prompt: reviewPrompt(input.prompt), schema, jsonSchema, timeoutMs: input.timeoutMs };
+}
+
+/**
+ * One review round: prompt, invocation, parsing and the derived decision. `decision` is absent when the
+ * output does not parse; callers keep their own error handling.
+ */
+export async function runReview<T extends { result: AgentResult }>(
+  deps: { invoke: (request: ReviewRequest) => Promise<T> },
+  input: ReviewInput,
+): Promise<T & { output: z.ZodSafeParseResult<Review>; decision?: ReviewDecision }> {
+  const request = reviewRequest(input);
+  const invoked = await deps.invoke(request);
+  const output = request.schema.safeParse(invoked.result.structured ?? extractJson(invoked.result.finalText));
+  if (!output.success) return { ...invoked, output };
+  const prior = input.prompt.previous?.findings;
+  const review: Review = { ...output.data, verdict: reviewVerdict(output.data, prior) };
+  const blocking = blockingReviewFindings(review, prior);
+  const followUps = prior
+    ? [
+        ...new Map(
+          [...(input.replayedFollowUps ?? []), ...review.findings.filter((f) => !blocking.includes(f))].map(
+            (f) => [reviewFindingKey(f), f] as const,
+          ),
+        ).values(),
+      ]
+    : [];
+  return { ...invoked, output, decision: { review, modelVerdict: output.data.verdict, blocking, followUps } };
 }

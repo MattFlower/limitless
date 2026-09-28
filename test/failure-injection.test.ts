@@ -17,6 +17,7 @@ import {
 } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { runProcess, sh } from "../src/util/proc.ts";
+import { findingEvidence } from "./review-support.ts";
 
 const providers: ProviderDef[] = ["a", "b"].map((id) => ({
   id,
@@ -1274,6 +1275,7 @@ for (const moved of [false, true])
                 {
                   severity: "major",
                   security: false,
+                  ...findingEvidence,
                   file: "README.md",
                   line: 1,
                   title: "broken",

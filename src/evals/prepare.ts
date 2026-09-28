@@ -4,7 +4,8 @@ import { auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { diffSince, readFileAt } from "../git/repos.ts";
 import { readingTimeout } from "../pipeline/engine.ts";
-import { reviewPrompt, triagePrompt, verifyPrompt } from "../pipeline/prompts.ts";
+import { triagePrompt, verifyPrompt } from "../pipeline/prompts.ts";
+import { type ReviewInput, reviewRequest } from "../pipeline/review.ts";
 import { ReviewSchema, StoredReviewSchema, TriageSchema, VerifySchema } from "../pipeline/schemas.ts";
 import { sh } from "../util/proc.ts";
 import type { EvalCase, ImplementCase, ReviewCase } from "./cases.ts";
@@ -99,16 +100,11 @@ export async function prepareCase(
         after: pickScripts(await readFileAt(cwd, "HEAD", "package.json"), names),
       },
     });
-    return {
-      prompt: reviewPrompt({
-        ...item.input,
-        implementerReportMode,
-        baseSha: item.base,
-        stat: diff.stat,
-        audit,
-      }),
+    const review: ReviewInput = {
+      prompt: { ...item.input, implementerReportMode, baseSha: item.base, stat: diff.stat, audit },
       timeoutMs: readingTimeout(diff.added + diff.removed),
     };
+    return { prompt: reviewRequest(review).prompt, timeoutMs: review.timeoutMs, review };
   }
   return {
     prompt: verifyPrompt({

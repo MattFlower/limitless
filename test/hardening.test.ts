@@ -14,6 +14,7 @@ import { fakeHarness } from "../src/harness/fake.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { startHttp } from "../src/server/http.ts";
 import { runProcess, sh } from "../src/util/proc.ts";
+import { findingEvidence } from "./review-support.ts";
 
 let dir: string;
 beforeEach(() => {
@@ -405,6 +406,7 @@ describe("pipeline hardening", () => {
                         {
                           severity: "blocker",
                           security: false,
+                          ...findingEvidence,
                           file: "a.txt",
                           line: 1,
                           title: "broken",
