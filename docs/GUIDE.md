@@ -196,7 +196,7 @@ disabled, it says why, for example `Discord disabled: missing DISCORD_BOT_TOKEN`
 As a launchd service:
 
 ```bash
-limitless service install [--no-mtplx] [--tunnel]
+limitless service install [--mtplx] [--tunnel]
 limitless service status
 ```
 
@@ -207,8 +207,9 @@ limitless service status
   fork there first.
 - It runs `bun install --frozen-lockfile` in the release checkout.
 - It writes and loads these launchd agents: `cc.mattflower.limitless` (the daemon, run with
-  `~/.bun/bin/bun`) and, unless you pass `--no-mtplx`, `cc.mattflower.limitless-mtplx` (a local MLX
-  model server expected at `~/.mtplx/bin/mtplx`). Pass `--no-mtplx` if you do not use mtplx.
+  `~/.bun/bin/bun`). Only `--mtplx` adds the rollback agent `cc.mattflower.limitless-mtplx`
+  (server at `~/.mtplx/bin/mtplx`). Existing mtplx installations are not automatically removed.
+  The primary Mac server is externally managed by oMLX.app / `omlx start`.
 - It waits for `/api/health`.
 
 The daemon's PATH is fixed in the plist: `~/.local/bin`, `/opt/homebrew/bin`, `~/.bun/bin`,
@@ -417,7 +418,8 @@ The PR body is the evidence report, also saved as `report.md`. It contains:
 | `claude` | subscription | `claude -p` | a logged-in `claude` CLI |
 | `codex` | subscription | `codex exec` | a logged-in `codex` CLI |
 | `openrouter` | metered | `claude` CLI via an Anthropic-compatible endpoint; direct HTTP for tool-free roles | `OPENROUTER_API_KEY` |
-| `mtplx` | free | same, `http://127.0.0.1:8000` | a local MLX server |
+| `omlx` | free | same, `http://127.0.0.1:8989` | oMLX.app / `omlx start` and `OMLX_API_KEY` |
+| `mtplx` (rollback) | free | same, `http://127.0.0.1:8000` | opt-in `service install --mtplx` |
 | `twilight` | free | same, `http://twilight:8080` | a LAN llama.cpp server and `TWILIGHT_API_KEY` |
 
 The provider and model catalog, including these endpoints, is currently built into
@@ -428,6 +430,19 @@ skips them.
 **Enable or disable** a provider with `limitless providers enable|disable <id>` or the button on
 its provider card (Dashboard or **Models** page). The setting persists across restarts. A provider
 whose API key is missing stays disabled.
+
+For the Mac, select `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`). Put `OMLX_API_KEY`
+in `secrets.env`; inference and health probes authenticate with it. Default concurrency is 4;
+override using `[providers.omlx] max_concurrent = 8` in `config.toml`. Tool-free selections
+`omlx/qwen-27b@none` and `omlx/qwen-27b@high` switch thinking off/on; agentic selections must
+use the bare ID, preserving server-default thinking. Compare them with:
+
+```sh
+limitless eval run triage --models omlx/qwen-27b@none,omlx/qwen-27b@high --follow
+```
+
+The committed `routing/policy.json` overlay remains authoritative over built-in defaults.
+For rollback, install with `--mtplx`, enable the provider if disabled, and select `mtplx/qwen-27b`.
 
 ### How a model is chosen
 
@@ -595,8 +610,8 @@ debug events according to `[retention]`. Run it by hand with `limitless gc --dry
 
 ### Local models
 
-`limitless local up|down|status` manages the mtplx launchd agent and the llama.cpp unit on a LAN
-host. See [OPERATIONS](OPERATIONS.md#local-models). These endpoints are specific to the reference
+`limitless local up|down|status` reports oMLX reachability even on `down`, without managing its
+lifecycle or enablement, and manages the llama.cpp unit on twilight. See [OPERATIONS](OPERATIONS.md#local-models). These endpoints are specific to the reference
 setup until providers become configurable.
 
 <a id="remote-ui"></a>

@@ -62,6 +62,17 @@ export const PROVIDERS: ProviderDef[] = [
     apiKeySecret: "OPENROUTER_API_KEY",
   },
   {
+    id: "omlx",
+    label: "Local MLX (oMLX, this Mac)",
+    harness: "claude",
+    billing: "free",
+    maxConcurrent: 4,
+    baseUrl: "http://127.0.0.1:8989",
+    openaiBaseUrl: "http://127.0.0.1:8989/v1",
+    apiKeySecret: "OMLX_API_KEY",
+    healthUrl: "http://127.0.0.1:8989/v1/models",
+  },
+  {
     id: "mtplx",
     label: "Local MLX (mtplx, this Mac)",
     harness: "claude",
@@ -353,6 +364,18 @@ export const MODELS: ModelDef[] = [
   },
   // Free local models.
   {
+    id: "omlx/qwen-27b",
+    provider: "omlx",
+    model: "Swift-1.5-Qwen3.8-27b-oQ8e-mtp",
+    vendor: "qwen",
+    origin: "CN",
+    baseOrigin: "CN",
+    supportedEfforts: ["none", "high"],
+    tier: 2,
+    price: { input: 0, output: 0 },
+    notes: "Local Swift-1.5 Qwen3.8 27B oQ8e MTP build, served by oMLX on this Mac",
+  },
+  {
     id: "mtplx/qwen-27b",
     provider: "mtplx",
     model: "mtplx-qwen38-27b-optimized-quality",
@@ -385,9 +408,9 @@ export const MODELS: ModelDef[] = [
 export type Policy = Record<Role, Partial<Record<Complexity | "default", string[]>>>;
 
 export const DEFAULT_POLICY: Policy = {
-  triage: { default: ["mtplx/qwen-27b", "claude/haiku|codex/luna", "openrouter/glm-5.3-flash"] },
-  summarize: { default: ["mtplx/qwen-27b", "claude/haiku|codex/luna", "openrouter/glm-5.3-flash"] },
-  chat: { default: ["mtplx/qwen-27b", "claude/haiku|codex/luna"] },
+  triage: { default: ["omlx/qwen-27b", "claude/haiku|codex/luna", "openrouter/glm-5.3-flash"] },
+  summarize: { default: ["omlx/qwen-27b", "claude/haiku|codex/luna", "openrouter/glm-5.3-flash"] },
+  chat: { default: ["omlx/qwen-27b", "claude/haiku|codex/luna"] },
   spec: {
     default: ["claude/sonnet|codex/sol|codex/sol-5.6", "claude/opus|codex/astra"],
     large: ["claude/opus|codex/astra", "claude/sonnet|codex/sol|codex/sol-5.6"],

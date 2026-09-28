@@ -59,7 +59,7 @@ and delivers a pull request — while spending as little of your paid AI capacit
              └──────┬───────┘                                     └───────────────┘
                     ▼
       ┌──────────────────────────── Harness adapters ─────────────────────────────┐
-      │ claude-cli  (Claude subscription; also OpenRouter / mtplx / llama.cpp via  │
+      │ claude-cli  (Claude subscription; also OpenRouter / oMLX / llama.cpp via  │
       │              ANTHROPIC_BASE_URL — one agent harness for every Anthropic-   │
       │              compatible backend)                                           │
       │ codex-cli   (ChatGPT subscription)                                         │
@@ -132,7 +132,28 @@ lockfile edits outside dependency tasks, and files touched outside the planned s
 | 5 | Claude Fable 5.1, Claude Opus 5.5, GPT-6 Astra | (OpenRouter frontier — last resort) |
 | 4 | Claude Sonnet 5, GPT-6 Sol | Kimi / MiniMax / DeepSeek-class via OpenRouter |
 | 3 | GPT-6 Luna, Claude Haiku 4.5 | GLM Flash / DeepSeek Flash via OpenRouter |
-| 2 | — | Qwen 3.8 27B & Flash-Next (mtplx, Mac), twilight llama.cpp models |
+| 2 | — | Swift-1.5 Qwen3.8 27B MTP (`omlx/qwen-27b`, Mac), twilight llama.cpp models |
+
+The primary Mac backend is **oMLX**, managed externally by oMLX.app / `omlx start` at
+`http://127.0.0.1:8989` (port 8989). Set `OMLX_API_KEY` in
+`~/.config/limitless/secrets.env` for inference and authenticated `/v1/models` health probes.
+Limitless defaults to 4 concurrent oMLX requests; override in `config.toml` with:
+
+```toml
+[providers.omlx]
+max_concurrent = 8
+```
+
+Select `omlx/qwen-27b` for backend `Swift-1.5-Qwen3.8-27b-oQ8e-mtp`. Tool-free roles accept
+`omlx/qwen-27b@none` / `omlx/qwen-27b@high` to turn thinking off/on; compare them with
+`limitless eval run triage --models omlx/qwen-27b@none,omlx/qwen-27b@high --follow`.
+Agentic roles require the bare ID, preserving server-default thinking. Built-in triage,
+summarize and chat prefer oMLX; the committed `routing/policy.json` overlay remains authoritative
+where present. `limitless local up|down|status` only reports Mac endpoint reachability, including
+on `down`; it does not manage the Mac server or provider enablement. Twilight retains lifecycle
+controls. For rollback, `limitless service install --mtplx` explicitly installs the old agent;
+enable `mtplx` if disabled and select `mtplx/qwen-27b`. Default installation omits that agent and
+does not remove existing installations.
 
 **Routing** = `route(role, taskClass, complexity, constraints)` → ordered candidates filtered by:
 - **health** — circuit breaker per provider (consecutive failures → cooldown),
@@ -160,7 +181,7 @@ runAgent(spec: AgentSpec): AsyncIterable<AgentEvent> & { result: Promise<AgentRe
 
 - **claude-cli** spawns the official `claude -p --output-format stream-json`. Using the official
   binary with your own login is the supported way to automate a Claude subscription (research/03 §1).
-  The *same adapter* drives OpenRouter, mtplx and llama.cpp by setting `ANTHROPIC_BASE_URL` /
+  The *same adapter* drives OpenRouter, oMLX and llama.cpp by setting `ANTHROPIC_BASE_URL` /
   `ANTHROPIC_AUTH_TOKEN` — all of them speak the Anthropic Messages API. Factory runs use
   `--setting-sources project` + an explicit `--settings` so your personal hooks/plugins don't
   fire inside factory runs.

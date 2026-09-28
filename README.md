@@ -56,7 +56,7 @@ diffs, reviews, quota gauges, cost).
 | `limitless show <run>` / `logs <run> [-f]` | Details / event log |
 | `limitless cancel <run>` / `answer <run> "<text>"` | Cancel / answer an open question |
 | `limitless providers` | Health and quota of every provider |
-| `limitless local up\|down\|status` | Manage mtplx and twilight model servers (see [operations](docs/OPERATIONS.md)) |
+| `limitless local up\|down\|status` | Report oMLX health and manage twilight (see [operations](docs/OPERATIONS.md)) |
 | `limitless gc [--dry-run]` | Clean up expired worktrees, invocation logs and debug events |
 | `limitless service install\|uninstall\|status` | Run the daemon (and Cloudflare tunnel) under launchd |
 | `limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]` | Gate the release, drain active runs, restart, auto-rollback |
@@ -72,11 +72,18 @@ Local operators can also POST `/api/admin/drain` or `/api/admin/resume` with
 checks. `/api/health` reports `draining` and the scheduler's `active` run IDs. Deploy fails
 explicitly if the running daemon does not support drain; failures attempt rollback and resume.
 
+The Mac backend is **oMLX**, managed externally by oMLX.app / `omlx start` on port **8989**.
+Set `OMLX_API_KEY` in `secrets.env` and select `omlx/qwen-27b` (Swift-1.5-Qwen3.8-27b-oQ8e-mtp).
+Tool-free roles accept `@none` / `@high`; agentic roles use the bare ID. The committed
+`routing/policy.json` overlay takes precedence over built-in defaults. For mtplx rollback, use
+`limitless service install --mtplx` and select `mtplx/qwen-27b`; existing agents are not removed.
+See [local operations](docs/OPERATIONS.md#local-models) for eval examples.
+
 ## Configuration
 
 Everything is optional. Files live in `~/.config/limitless/`:
 
-- `secrets.env` — `OPENROUTER_API_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_APP_ID`, `DISCORD_GUILD_ID`,
+- `secrets.env` — `OMLX_API_KEY`, `OPENROUTER_API_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_APP_ID`, `DISCORD_GUILD_ID`,
   `GITHUB_WEBHOOK_SECRET` (chmod 600).
 - `config.toml`:
 
@@ -93,6 +100,9 @@ openrouter_budget_usd = 50
 # Optional per-provider request slots (defaults remain in the catalog).
 [providers.claude]
 max_concurrent = 5
+
+[providers.omlx]
+max_concurrent = 8  # default: 4
 
 [retention]
 worktree_days = 3

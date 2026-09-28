@@ -187,8 +187,9 @@ export async function liveCheck(
         mode: kind === "edit" ? "edit" : "readonly",
         ...(kind === "structured" ? { jsonSchema: schema } : {}),
         ...(kind === "noTools" ? { noTools: true } : {}),
-        timeoutMs: 60_000,
-        idleTimeoutMs: 25_000,
+        // A local model's first agent call prefills the CLI's large system prompt on a cold cache.
+        timeoutMs: target.billing === "free" ? 300_000 : 60_000,
+        idleTimeoutMs: target.billing === "free" ? 120_000 : 25_000,
         maxToolCalls: 8,
         signal: new AbortController().signal,
         logPath: join(cwd, "stream.log"),
@@ -338,12 +339,13 @@ else:
 async function providerAvailability(
   provider: ProviderDef,
   secrets: Record<string, string>,
+  fetchHealth = fetch,
 ): Promise<string | null> {
   if (provider.apiKeySecret && !secrets[provider.apiKeySecret]) return `missing ${provider.apiKeySecret}`;
   if (!provider.healthUrl) return null;
   try {
     const token = provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey;
-    const response = await fetch(provider.healthUrl, {
+    const response = await fetchHealth(provider.healthUrl, {
       signal: AbortSignal.timeout(3000),
       ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
     });
@@ -351,6 +353,36 @@ async function providerAvailability(
   } catch {
     return "health probe failed";
   }
+}
+
+export function backendChecks(
+  secrets: Record<string, string>,
+  fetchHealth = fetch,
+  check = liveCheck,
+): SmokeCheck[] {
+  const checks: SmokeCheck[] = [];
+  for (const id of ["omlx", "twilight", "openrouter"]) {
+    const provider = PROVIDERS.find((p) => p.id === id);
+    if (!provider) throw new Error(`missing provider ${id}`);
+    for (const kind of id === "omlx" ? (["structured", "edit"] as const) : (["structured"] as const))
+      checks.push({
+        name: `${id} ${kind === "edit" ? "claude-harness edit" : kind}`,
+        run: async () => {
+          const reason = await providerAvailability(provider, secrets, fetchHealth);
+          if (reason) return { status: "skip", reason };
+          return check(
+            runClaude,
+            targetFor(
+              provider,
+              cheapestModel(id),
+              provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey,
+            ),
+            kind,
+          );
+        },
+      });
+  }
+  return checks;
 }
 
 export async function main(): Promise<number> {
@@ -396,26 +428,7 @@ export async function main(): Promise<number> {
       });
     }
   }
-  for (const id of ["mtplx", "twilight", "openrouter"]) {
-    const provider = PROVIDERS.find((p) => p.id === id);
-    if (!provider) throw new Error(`missing provider ${id}`);
-    checks.push({
-      name: `${id} structured`,
-      run: async () => {
-        const reason = await providerAvailability(provider, secrets);
-        if (reason) return { status: "skip", reason };
-        return liveCheck(
-          runClaude,
-          targetFor(
-            provider,
-            cheapestModel(id),
-            provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey,
-          ),
-          "structured",
-        );
-      },
-    });
-  }
+  checks.push(...backendChecks(secrets));
   const rows = await runChecks(checks);
   console.log(formatReport(rows));
   return exitCode(rows);

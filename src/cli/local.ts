@@ -1,11 +1,7 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { homedir, userInfo } from "node:os";
-import { join } from "node:path";
+import { homedir } from "node:os";
 import { MODELS, PROVIDERS } from "../router/catalog.ts";
 import { sh } from "../util/proc.ts";
-import { mtplxPlist } from "./service.ts";
 
-const label = "cc.mattflower.limitless-mtplx";
 const unitName = "limitless-llama.service";
 const unitPath = `~/.config/systemd/user/${unitName}`;
 type Runner = typeof sh;
@@ -14,7 +10,6 @@ export interface LocalOptions {
   modelPath: string;
   twilightHost?: string;
   llamaBinary?: string;
-  mtplxPlistPath?: string;
   command?: Runner;
   /** Secrets for provider API keys, so the health probe authenticates like the router does. */
   secrets?: Record<string, string>;
@@ -54,7 +49,7 @@ WantedBy=default.target
 }
 
 export interface LocalReport {
-  mtplx: { service: string; endpoint: string };
+  omlx: { service: string; endpoint: string };
   twilight: { service: string; endpoint: string };
 }
 
@@ -64,8 +59,6 @@ export async function manageLocal(
 ): Promise<LocalReport> {
   const command = opts.command ?? sh;
   const host = opts.twilightHost ?? "twilight";
-  const path = opts.mtplxPlistPath ?? join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
-  const domain = `gui/${userInfo().uid}`;
   const run = (args: string[], stdin?: string) =>
     command(args, { cwd: homedir(), timeoutMs: 10_000, allowFail: true, ...(stdin ? { stdin } : {}) });
   const ssh = (args: string[], stdin?: string) =>
@@ -80,28 +73,6 @@ export async function manageLocal(
         return false;
       }
     });
-
-  let local = await run(["launchctl", "print", `${domain}/${label}`]);
-  const wasLoaded = local.exitCode === 0;
-  if (action === "up" && local.exitCode !== 0) {
-    if (!existsSync(path)) {
-      mkdirSync(join(path, ".."), { recursive: true });
-      writeFileSync(path, mtplxPlist());
-    }
-    local = await run(["launchctl", "bootstrap", domain, path]);
-  } else if (action === "down" && local.exitCode === 0) {
-    local = await run(["launchctl", "bootout", `${domain}/${label}`]);
-  }
-  const localService =
-    action === "up" && local.exitCode !== 0
-      ? "start failed"
-      : action === "down"
-        ? !wasLoaded || local.exitCode === 0
-          ? "stopped"
-          : "stop failed"
-        : local.exitCode === 0
-          ? "loaded"
-          : "not loaded";
 
   // Never overwrite an installed unit: it may carry host-specific tuning (chat template, flags).
   const startTwilight = async (): Promise<string> => {
@@ -135,7 +106,7 @@ export async function manageLocal(
     const provider = PROVIDERS.find((p) => p.id === id);
     return provider?.apiKey ?? (provider?.apiKeySecret ? opts.secrets?.[provider.apiKeySecret] : undefined);
   };
-  const mtplxUrl = PROVIDERS.find((p) => p.id === "mtplx")?.healthUrl ?? "http://127.0.0.1:8000/v1/models";
+  const omlxUrl = PROVIDERS.find((p) => p.id === "omlx")?.healthUrl ?? "http://127.0.0.1:8989/v1/models";
   const twilightUrl = `http://${host}:8080/v1/models`;
   const healthy = async (url: string, id: string) =>
     (await probe(url, token(id))) ? "healthy" : "unreachable";
@@ -144,15 +115,15 @@ export async function manageLocal(
       ? "unreachable"
       : await healthy(url, id);
   const report = {
-    mtplx: { service: localService, endpoint: await endpoint(localService, mtplxUrl, "mtplx") },
+    omlx: {
+      service: "externally managed (oMLX.app / omlx start)",
+      endpoint: token("omlx") ? await healthy(omlxUrl, "omlx") : "unavailable: missing OMLX_API_KEY",
+    },
     twilight: { service: remoteService, endpoint: await endpoint(remoteService, twilightUrl, "twilight") },
   };
   if (action === "down") {
-    if (localService === "stopped") await opts.setEnabled?.("mtplx", false);
     if (remoteService === "stopped") await opts.setEnabled?.("twilight", false);
   } else if (action === "up") {
-    if (localService === "loaded" && report.mtplx.endpoint === "healthy")
-      await opts.setEnabled?.("mtplx", true);
     if (remoteService === "active" && report.twilight.endpoint === "healthy" && token("twilight"))
       await opts.setEnabled?.("twilight", true);
   }

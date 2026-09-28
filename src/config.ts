@@ -136,6 +136,7 @@ export function loadConfig(
   // Environment variables win over the secrets file (useful for tests and CI).
   for (const key of [
     "OPENROUTER_API_KEY",
+    "OMLX_API_KEY",
     "DISCORD_BOT_TOKEN",
     "DISCORD_APP_ID",
     "DISCORD_GUILD_ID",
