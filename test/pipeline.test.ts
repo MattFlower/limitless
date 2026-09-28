@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
-import type { RunStatus } from "../src/core/types.ts";
+import type { RunStatus, StageName } from "../src/core/types.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
@@ -447,8 +447,19 @@ describe("pipeline (fake agents, real git + gates)", () => {
           structured: {
             verdict: "request_changes",
             summary: "Needs work",
-            findings: [{ label: "new", severity: "blocker", security: false, file: "farewell.txt", line: 1,
-              title: "Incorrect output", detail: "Needs work", suggestion: "Fix it" }],
+            findings: [
+              {
+                label: "unaddressed",
+                prior: "P1",
+                severity: "blocker",
+                security: false,
+                file: "farewell.txt",
+                line: 1,
+                title: "Incorrect output",
+                detail: "Needs work",
+                suggestion: "Fix it",
+              },
+            ],
           },
         };
       return { files: { "farewell.txt": "goodbye\n" } };
@@ -462,7 +473,6 @@ describe("pipeline (fake agents, real git + gates)", () => {
     };
     const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
     expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
-    console.log(f.store.listEvents(run.id).slice(-8).map((e) => e.message));
     expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
     expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
     expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
@@ -1790,6 +1800,7 @@ protected_paths = ["protected.txt"]
 
   test("completed holdout survives a stopped factory and is reused after restart", async () => {
     let holdoutCalls = 0;
+    let implementations = 0;
     let blockImplement = true;
     const handler: Handler = (s) => {
       const role = roleOf(s);
@@ -1804,6 +1815,7 @@ protected_paths = ["protected.txt"]
         expect(s.prompt).toContain("H-3");
         return { structured: pass };
       }
+      implementations++;
       return blockImplement ? { delayMs: 30_000 } : { files: { "farewell.txt": "goodbye\n" } };
     };
     const f = start(handler);
@@ -1816,12 +1828,19 @@ protected_paths = ["protected.txt"]
     )
       await Bun.sleep(10);
     expect(f.store.getRunState<RunState>(run.id)?.holdoutStatus).toBe("complete");
+    f.scheduler.drain();
+    expect(f.scheduler.activeRunIds).toEqual([run.id]);
+    // Simulate a deploy deadline expiring while implement is still in flight.
     await f.stop();
+    expect(f.store.getRun(run.id)?.status).toBe("queued");
+    expect(f.store.getRunState<RunState>(run.id)?.implementedRound).toBeUndefined();
+    expect(f.store.listStages(run.id).find((s) => s.name === "implement")?.status).toBe("cancelled");
     f.store.close();
     blockImplement = false;
     const restarted = start(handler);
     expect(await waitFor(restarted, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(holdoutCalls).toBe(1);
+    expect(implementations).toBe(2);
     expect(restarted.store.getRunState<RunState>(run.id)?.holdout?.scenarios).toEqual(holdout.scenarios);
   });
 
@@ -2784,66 +2803,113 @@ test("drain blocks queued starts and parks the active run at its next boundary",
   }
 });
 
-test("drain after implement preserves the checkpoint and resumes at gates after restart", async () => {
-  let release = () => {};
-  const held = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  let entered = () => {};
-  const implementing = new Promise<void>((resolve) => {
-    entered = resolve;
-  });
-  let implementations = 0;
-  const handler: Handler = async (s) => {
-    const role = roleOf(s);
-    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
-    if (role === "review") return { structured: approve };
-    if (role === "implement") {
-      implementations++;
-      entered();
-      await held;
-      return { files: { "farewell.txt": "goodbye\n" } };
-    }
-    throw new Error(`unexpected role ${role}`);
-  };
-  const f = start(handler);
-  try {
-    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
-    await implementing;
-    const worktree = f.store.getRunState<RunState>(run.id)?.worktreePath;
-    expect(worktree).toBeDefined();
-    f.scheduler.drain();
-    release();
-    expect(await waitFor(f, run.id, ["queued"])).toBe("queued");
-    while (f.scheduler.activeRunIds.length) await Bun.sleep(10);
-    const checkpoint = f.store.getRunState<RunState>(run.id);
-    expect(checkpoint).toMatchObject({ phase: "loop", round: 0, implementedRound: 0, parked: true });
-    expect(f.store.getRun(run.id)).toMatchObject({ status: "queued", stage: null, finishedAt: null });
-    expect(f.store.listStages(run.id).map((stage) => stage.name)).toEqual(["prepare", "triage", "implement"]);
-    expect(worktree && existsSync(worktree)).toBe(true);
-    await f.stop();
-    f.store.close();
-
-    const resumed = start(handler);
-    expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-    expect(implementations).toBe(1);
-    expect(resumed.store.listStages(run.id).map((stage) => stage.name)).toEqual([
-      "prepare",
-      "triage",
-      "implement",
-      "gates",
-      "audit",
-      "review",
-      "deliver",
-    ]);
-    expect(resumed.store.getRunState<RunState>(run.id)).toMatchObject({
-      round: 0,
-      worktreePath: worktree,
-      parked: false,
+for (const profile of ["quick", "standard"] as const) {
+  test(`drain after implement preserves the ${profile} checkpoint and resumes at gates after restart`, async () => {
+    const holdoutDone = Promise.withResolvers<void>();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
     });
-  } finally {
-    release();
-  }
+    let entered = () => {};
+    const implementing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let implementations = 0;
+    const handler: Handler = async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: profile }) };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") {
+        await holdoutDone.promise;
+        return { structured: holdout };
+      }
+      if (role === "verify") return { structured: pass };
+      if (role === "review") return { structured: approve };
+      if (role === "implement") {
+        implementations++;
+        entered();
+        await held;
+        return { files: { "farewell.txt": "goodbye\n" } };
+      }
+      throw new Error(`unexpected role ${role}`);
+    };
+    const f = start(handler);
+    try {
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile });
+      await implementing;
+      const worktree = f.store.getRunState<RunState>(run.id)?.worktreePath;
+      expect(worktree).toBeDefined();
+      f.scheduler.drain();
+      release();
+      const deadline = Date.now() + 5000;
+      while (
+        !f.store.listStages(run.id).some((s) => s.name === "implement" && s.status === "succeeded") &&
+        Date.now() < deadline
+      )
+        await Bun.sleep(10);
+      expect(f.store.listStages(run.id).find((s) => s.name === "implement")?.status).toBe("succeeded");
+      expect(f.store.listStages(run.id).some((s) => s.name === "gates")).toBe(false);
+      if (profile === "standard") expect(f.scheduler.activeRunIds).toEqual([run.id]);
+      holdoutDone.resolve();
+      expect(await waitFor(f, run.id, ["queued"])).toBe("queued");
+      while (f.scheduler.activeRunIds.length) await Bun.sleep(10);
+      const checkpoint = f.store.getRunState<RunState>(run.id);
+      expect(checkpoint).toMatchObject({ phase: "loop", round: 0, implementedRound: 0, parked: true });
+      expect(f.store.getRun(run.id)).toMatchObject({ status: "queued", stage: null, finishedAt: null });
+      const completed: StageName[] = [
+        "prepare",
+        "triage",
+        ...(profile === "standard" ? (["spec", "holdout"] as const) : []),
+        "implement",
+      ];
+      expect(f.store.listStages(run.id).map((stage) => stage.name)).toEqual(completed);
+      expect(worktree && existsSync(worktree)).toBe(true);
+      await f.stop();
+      f.store.close();
+
+      const resumed = start(handler);
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(implementations).toBe(1);
+      expect(resumed.store.listStages(run.id).map((stage) => stage.name)).toEqual([
+        ...completed,
+        "gates",
+        "audit",
+        "review",
+        ...(profile === "standard" ? (["verify"] as const) : []),
+        "deliver",
+      ]);
+      expect(resumed.store.getRunState<RunState>(run.id)).toMatchObject({
+        round: 0,
+        worktreePath: worktree,
+        parked: false,
+      });
+    } finally {
+      release();
+      holdoutDone.resolve();
+    }
+  });
+}
+
+test("drain during verification parks before delivery", async () => {
+  const f = start((s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review") return { structured: approve };
+    if (role === "verify") {
+      f.scheduler.drain();
+      return { structured: pass };
+    }
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+  expect(await waitFor(f, run.id, ["queued"])).toBe("queued");
+  expect(f.store.getRunState<RunState>(run.id)).toMatchObject({ phase: "deliver", parked: true, round: 0 });
+  expect(f.store.listStages(run.id).at(-1)).toMatchObject({ name: "verify", status: "succeeded" });
+  f.scheduler.resume();
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(f.store.listStages(run.id).filter((s) => s.name === "verify")).toHaveLength(1);
 });
 
 test("cancellation wins over parking when both are requested during a stage", async () => {

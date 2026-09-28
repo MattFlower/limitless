@@ -180,7 +180,7 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
 
 export class RunContext {
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
-  private stageDepth = 0;
+  private foregroundStageDepth = 0;
   readonly runDir: string;
   previewUrl?: string;
   state: RunState;
@@ -294,10 +294,11 @@ export class RunContext {
     parkOnDrain = true,
   ): Promise<T> {
     this.checkCancelled();
-    if (parkOnDrain && this.stageDepth === 0 && this.isDraining()) throw new ParkedError();
+    if (parkOnDrain && this.foregroundStageDepth === 0 && this.isDraining()) throw new ParkedError();
     if (!background) this.run = this.store.updateRun(this.run.id, { stage: name });
     const stage = this.store.startStage(this.run.id, name, round);
-    this.stageDepth++;
+    // Parallel holdout work must not suppress foreground drain boundaries.
+    if (!background) this.foregroundStageDepth++;
     try {
       const { summary, value } = await fn(stage);
       this.store.finishStage(stage.id, "succeeded", summary);
@@ -311,7 +312,7 @@ export class RunContext {
       );
       throw cancelled ? new CancelledError() : e;
     } finally {
-      this.stageDepth--;
+      if (!background) this.foregroundStageDepth--;
     }
   }
 

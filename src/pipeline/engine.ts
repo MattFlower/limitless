@@ -970,7 +970,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
   assertExistingBranchDelivery(ctx.repo, ctx.run);
   if (ctx.run.deliveryBranch && ctx.run.baseSha !== ctx.run.sourceRef?.headSha)
     throw new Error("PR delivery base does not match the verified webhook head");
-  await ctx.stage("deliver", async () => {
+  const deliverStage = async () => {
     const cwd = ctx.state.worktreePath as string;
     if (ctx.state.conflictRound !== undefined) {
       if (!ctx.state.preRebaseHead) throw new Error("Missing pre-merge HEAD at delivery");
@@ -1114,7 +1114,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     }
     await removeWorktree(ctx.deps.cfg.paths, ctx.repo, cwd);
     return { summary, value: undefined };
-  }, 0, false, success);
+  };
+  await ctx.stage("deliver", deliverStage, 0, false, success);
 }
 
 /**
