@@ -371,3 +371,127 @@ test("CLI entrypoint recognizes round flags", () => {
   expect(child.exitCode).toBe(0);
   expect(child.stdout.toString()).toContain("--strategy retry|effort|switch");
 });
+
+async function pinFixture(extra: [string, string][] = []) {
+  const { evidence, local, subscription, response } = await import("./evals-policy-support.ts");
+  const { readFileSync } = await import("node:fs");
+  const cells = ["trivial", "small", "medium"] as const;
+  const implement = evidence("implement", [subscription], { id: "implement-run" });
+  implement.trials.forEach((t, i) => {
+    t.details.complexity = cells[i % 3];
+  });
+  const { overlayPolicy } = await import("../src/router/policy.ts");
+  const { DEFAULT_POLICY } = await import("../src/router/catalog.ts");
+  const root = join(import.meta.dir, "..");
+  const policy = readFileSync(join(root, "routing/policy.json"), "utf8");
+  const data = response([evidence("triage", [local]), implement]);
+  data.policy = overlayPolicy(DEFAULT_POLICY, JSON.parse(policy));
+  const files = new Map<string, string>([
+    ["routing/policy.json", policy],
+    ["routing/overrides.json", readFileSync(join(root, "routing/overrides.json"), "utf8")],
+    ...extra,
+  ]);
+  const writes: string[] = [];
+  const printed: string[] = [];
+  const io = {
+    api: async <T>() => structuredClone(data) as T,
+    print: (text: string) => printed.push(text),
+    wait: async () => {},
+    files: {
+      read: async (path: string) => files.get(path) ?? null,
+      write: async (path: string, text: string) => {
+        writes.push(path);
+        files.set(path, text);
+      },
+    },
+  };
+  return { io, files, writes, printed, local, subscription };
+}
+
+test("policy CLI keeps committed owner pins for implement while unpinned cells update", async () => {
+  const { io, files, writes, printed, local, subscription } = await pinFixture();
+  const committed = JSON.parse(files.get("routing/policy.json") ?? "{}");
+  const pin = JSON.parse(files.get("routing/overrides.json") ?? "{}")["implement.medium"];
+  const message = `pinned by owner decision (${pin.decided}): ${pin.reason}`;
+  await evalCommand(["policy"], {}, io);
+  const preview = printed.join("\n");
+  expect(writes).toEqual([]);
+  expect(preview).toContain("@@ triage.default @@");
+  expect(preview).not.toContain("@@ implement.");
+  expect(preview).not.toContain(subscription);
+  expect(preview).toContain(`implement.medium: ${message}`);
+  expect(preview).toContain(`implement.large: ${message}`);
+  printed.length = 0;
+  await evalCommand(["policy"], { write: true }, io);
+  expect(printed.slice(0, -1).join("\n")).toBe(preview);
+  expect(writes).toEqual(["routing/policy.json", "routing/EVIDENCE.md"]);
+  const written = JSON.parse(files.get("routing/policy.json") ?? "{}");
+  expect(written).toEqual({ ...committed, triage: { ...committed.triage, default: [local] } });
+  for (const cell of ["trivial", "small", "medium", "large"])
+    expect(written.implement[cell]).toEqual(["claude/opus", "codex/sol@medium"]);
+  const report = files.get("routing/EVIDENCE.md") ?? "";
+  const medium = report.slice(report.indexOf("## implement.medium"));
+  expect(medium).toStartWith(`## implement.medium\n\n${message}\n\n`);
+  expect(medium).toContain("| Model / source");
+  expect(medium).toContain(`| ${subscription}; run=implement-run;`);
+  expect(medium).toContain("pass rate: 1.0000");
+  expect(report).not.toContain("Update implement.");
+  expect(report).toContain("Update triage.default:");
+  expect(report).toContain(`## implement.large\n\n${message}\n`);
+  expect(report.slice(report.indexOf("## implement.large"))).not.toContain("| Model / source");
+});
+
+test("policy CLI without overrides regenerates every evidenced cell", async () => {
+  const { io, files, subscription } = await pinFixture();
+  files.delete("routing/overrides.json");
+  await evalCommand(["policy"], { write: true }, io);
+  const written = JSON.parse(files.get("routing/policy.json") ?? "{}");
+  expect(written.implement.medium[0]).toBe(subscription);
+  expect(written.implement.large).toEqual(["claude/opus", "codex/sol@medium"]);
+  expect(files.get("routing/EVIDENCE.md")).toContain("Update implement.medium:");
+  expect(files.get("routing/EVIDENCE.md")).not.toContain("pinned by owner decision");
+});
+
+test("policy CLI pins a cell with no completed evidence without inventing candidates", async () => {
+  const { io, files, printed } = await pinFixture([
+    [
+      "routing/overrides.json",
+      JSON.stringify({ "review.default": { reason: "keep", decided: "2026-01-02" } }),
+    ],
+  ]);
+  files.set(
+    "routing/policy.json",
+    JSON.stringify({
+      ...JSON.parse(files.get("routing/policy.json") ?? "{}"),
+      review: { default: ["claude/opus"] },
+    }),
+  );
+  await evalCommand(["policy"], { write: true }, io);
+  expect(printed.join("\n")).toContain("review.default: pinned by owner decision (2026-01-02): keep");
+  expect(printed.join("\n")).not.toContain("review unchanged");
+  expect(JSON.parse(files.get("routing/policy.json") ?? "{}").review).toEqual({ default: ["claude/opus"] });
+  const report = files.get("routing/EVIDENCE.md") ?? "";
+  expect(report).toContain("## review\n\npinned by owner decision (2026-01-02): keep\n\n## ");
+});
+
+const valid = { reason: "owner call", decided: "2026-09-28" };
+test.each([
+  ["malformed JSON", "{"],
+  ["non-object", "[]"],
+  ["unknown role", JSON.stringify({ "deploy.default": valid })],
+  ["unknown cell", JSON.stringify({ "implement.huge": valid })],
+  ["missing cell", JSON.stringify({ implement: valid })],
+  ["extra segment", JSON.stringify({ "implement.medium.x": valid })],
+  ["prototype key", JSON.stringify({ "__proto__.default": valid })],
+  ["empty reason", JSON.stringify({ "implement.medium": { ...valid, reason: "  " } })],
+  ["missing decided", JSON.stringify({ "implement.medium": { reason: "x" } })],
+  ["bad date format", JSON.stringify({ "implement.medium": { ...valid, decided: "2026-9-28" } })],
+  ["impossible date", JSON.stringify({ "implement.medium": { ...valid, decided: "2026-02-30" } })],
+  ["extra field", JSON.stringify({ "implement.medium": { ...valid, by: "me" } })],
+  ["no explicit chain", JSON.stringify({ "review.default": valid })],
+])("policy CLI rejects overrides with %s before writing", async (_name, text) => {
+  const { io, writes } = await pinFixture([["routing/overrides.json", text]]);
+  await expect(evalCommand(["policy"], { write: true }, io)).rejects.toThrow("routing/overrides.json");
+  await expect(evalCommand(["policy"], {}, io)).rejects.toThrow("routing/overrides.json");
+  expect(writes).toEqual([]);
+});

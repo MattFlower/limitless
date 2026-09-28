@@ -1,0 +1,18 @@
+{
+  "implement.trivial": {
+    "reason": "Opus first, Sol fallback: the implement eval has a ceiling (every model scored 100%), so Luna led on cost alone; field use shows Opus far stronger on hard, underspecified work. Revisit when the dataset is stratified by difficulty.",
+    "decided": "2026-09-28"
+  },
+  "implement.small": {
+    "reason": "Opus first, Sol fallback: the implement eval has a ceiling (every model scored 100%), so Luna led on cost alone; field use shows Opus far stronger on hard, underspecified work. Revisit when the dataset is stratified by difficulty.",
+    "decided": "2026-09-28"
+  },
+  "implement.medium": {
+    "reason": "Opus first, Sol fallback: the implement eval has a ceiling (every model scored 100%), so Luna led on cost alone; field use shows Opus far stronger on hard, underspecified work. Revisit when the dataset is stratified by difficulty.",
+    "decided": "2026-09-28"
+  },
+  "implement.large": {
+    "reason": "Opus first, Sol fallback: the implement eval has a ceiling (every model scored 100%), so Luna led on cost alone; field use shows Opus far stronger on hard, underspecified work. Revisit when the dataset is stratified by difficulty.",
+    "decided": "2026-09-28"
+  }
+}
