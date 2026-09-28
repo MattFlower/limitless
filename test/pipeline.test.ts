@@ -360,7 +360,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     mkdirSync(bin);
     writeFileSync(
       join(bin, "gh"),
-      `#!/bin/sh\necho "$*" >> '${join(home, "gh-calls")}'\ncase "$2" in\n  list) exit 0 ;;\n  create) echo https://github.com/test/repo/pull/1 ;;\nesac\n`,
+      `#!/bin/sh\necho "$*" >> '${join(home, "gh-calls")}'\ncase "$2" in\n  list) exit 0 ;;\n  create) cat > '${join(home, "gh-body")}'; echo https://github.com/test/repo/pull/1 ;;\nesac\n`,
       { mode: 0o755 },
     );
     process.env.PATH = `${bin}:${originalPath}`;
@@ -541,9 +541,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
         profile: "standard",
       });
       const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
-      // Rebasing is best-effort: these fall back to delivering the gated head on its original base.
       const fallback = kind.endsWith("regressed") || kind === "rewritten";
-      expect(status).toBe("succeeded");
+      expect(status).toBe(kind.endsWith("regressed") ? "needs_human" : "succeeded");
       const finished = f.store.getRun(run.id);
       const stages = f.store.listStages(run.id).map((s) => s.name);
       const gates = stages.filter((s) => s === "gates").length;
@@ -567,7 +566,15 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (fallback) {
         expect(finished?.baseSha).toBe(originalBase);
         const state = f.store.getRunState<RunState>(run.id);
-        expect(f.store.getArtifact(run.id, "report.md")).toContain(state?.rebaseNote ?? "missing note");
+        if (kind === "rewritten")
+          expect(f.store.getArtifact(run.id, "report.md")).toContain(state?.rebaseNote ?? "missing note");
+        else {
+          expect(state?.lastVerifiedSha).toBe(preMergeHead);
+          expect(finished?.prUrl).toContain("/pull/1");
+          expect(f.store.getArtifact(run.id, "report.md")).toContain("post-merge gates");
+          expect(f.store.getArtifact(run.id, "report.md")).toContain(preMergeHead);
+          expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
+        }
         expect(
           (
             await sh(["git", "merge-base", "--is-ancestor", baseTip, finished?.headSha ?? ""], {
@@ -577,7 +584,6 @@ describe("pipeline (fake agents, real git + gates)", () => {
           ).exitCode,
         ).not.toBe(0);
         if (kind.endsWith("regressed")) {
-          expect(state?.rebaseNote).toContain("checks regressed");
           expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).toContain("regressed");
           expect(state?.lastGates?.some((g) => g.blocking)).toBe(false);
           expect(
@@ -728,10 +734,58 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(f.store.getRunState<RunState>(run.id)?.rebaseNote).toContain("advanced again");
         await assertPublished(bare);
       } else {
-        await assertUnpublished(bare);
+        const state = f.store.getRunState<RunState>(run.id);
+        const finished = f.store.getRun(run.id);
+        const sha = state?.lastVerifiedSha ?? "missing";
+        expect(sha).toHaveLength(40);
+        expect(finished?.prUrl).toContain("/pull/1");
+        expect(
+          (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
+        ).toContain(sha);
+        const report = f.store.getArtifact(run.id, "report.md") ?? "";
+        expect(report).toContain(`Verified at \`${sha}\``);
+        expect(report).toContain("conflict resolution");
+        expect(report).toContain("The PR may conflict with `main`");
+        expect(report).toContain("Acceptance criteria");
+        expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--title [needs human]");
+        expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
+        expect(readFileSync(join(home, "gh-body"), "utf8")).toBe(report);
       }
     });
   }
+
+  test("quick approval is the verified fallback when post-merge gates fail", async () => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      '[gates]\nchecks = [{ name = "check", run = "test ! -f base.txt" }]\n',
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "quick gate"], {
+      cwd: repoDir,
+    });
+    const bare = await githubFixture();
+    let approvedSha = "";
+    const f = start(async (s): Promise<FakeReply> => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        approvedSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      if (role === "verify" || role === "spec" || role === "holdout") throw new Error(`unexpected ${role}`);
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add a farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+    const finished = f.store.getRun(run.id);
+    expect(f.store.getRunState<RunState>(run.id)?.lastVerifiedSha).toBe(approvedSha);
+    expect(
+      (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
+    ).toContain(approvedSha);
+    expect(f.store.getArtifact(run.id, "report.md")).toContain("post-merge gates");
+  });
 
   for (const fault of [
     "missing",
@@ -793,7 +847,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       registerGithub(f, bare);
       const run = await f.createRun({ repo: "test/repo", prompt: "Change greeting", profile: "quick" });
       expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
-        fault === "same-tree" || fault === "setext" ? "succeeded" : "failed",
+        fault === "same-tree" || fault === "setext" ? "succeeded" : "needs_human",
       );
       expect(calls).toBe(2);
       const result = f.store.getRun(run.id);
@@ -820,7 +874,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
                 ? "Unresolved conflict markers: new.txt, README.md"
                 : "MERGE_HEAD",
         );
-        await assertUnpublished(bare);
+        const verified = f.store.getRunState<RunState>(run.id)?.lastVerifiedSha;
+        expect(verified).toHaveLength(40);
+        expect(
+          (await sh(["git", "ls-remote", bare, `refs/heads/${result?.branch}`], { cwd: repoDir })).stdout,
+        ).toContain(verified ?? "missing");
       }
     });
   }
@@ -873,6 +931,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
 
   for (const checkpoint of [
     "post-rebase-gates",
+    "post-rebase-gates-fail",
     "interrupted-merge",
     "base-moved",
     "base-moved-during-gates",
@@ -884,7 +943,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       const marker = join(home, "checking");
       const release = join(home, "release");
       if (checkpoint !== "conflict-implement") {
-        const check = `if test -f base.txt && ! test -f '${release}'; then echo dirty > greeting.txt; touch '${marker}'; while ! test -f '${release}'; do sleep 0.05; done; fi; test -f greeting.txt`;
+        const check = `if test -f base.txt && ! test -f '${release}'; then echo dirty > greeting.txt; touch '${marker}'; while ! test -f '${release}'; do sleep 0.05; done; fi; test -f greeting.txt${checkpoint === "post-rebase-gates-fail" ? " && test ! -f base.txt" : ""}`;
         writeFileSync(
           join(repoDir, ".limitless.toml"),
           `[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`,
@@ -965,6 +1024,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(f.store.getRun(run.id)?.status).toBe("queued");
       const state = f.store.getRunState<RunState>(run.id);
       expect(state?.phase).toBe(conflict ? "loop" : "deliver");
+      expect(state?.lastVerifiedSha).toHaveLength(40);
       if (conflict) {
         expect(f.store.getRun(run.id)?.baseSha).toBe(baseTip);
         expect(state?.conflictRound).toBe(1);
@@ -992,6 +1052,17 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (checkpoint === "base-moved" || conflict) await advanceBase(bare, "again.txt", "newer base\n");
       writeFileSync(release, "resume");
       const resumed = start(handler);
+      if (checkpoint === "post-rebase-gates-fail") {
+        expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+        const finished = resumed.store.getRun(run.id);
+        const savedSha = state?.lastVerifiedSha ?? "missing";
+        expect(resumed.store.getRunState<RunState>(run.id)?.lastVerifiedSha).toBe(savedSha);
+        expect(
+          (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
+        ).toContain(savedSha);
+        expect(finished?.prUrl).toContain("/pull/1");
+        return;
+      }
       expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       const finished = resumed.store.getRun(run.id);
       expect(finished?.baseSha).toBe(baseTip);
@@ -1839,7 +1910,10 @@ protected_paths = ["protected.txt"]
         };
       }
       implementCalls++;
-      if (implementCalls === 2) expect(s.prompt).toContain("H-3");
+      if (implementCalls === 2) {
+        expect(s.prompt).toContain("H-3");
+        expect(f.store.getRunState<RunState>(run.id)?.lastVerifiedSha).toBeUndefined();
+      }
       return { files: { "farewell.txt": "goodbye\n" } };
     });
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });

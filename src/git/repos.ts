@@ -289,9 +289,9 @@ export function parseNameStatus(text: string): DiffFile[] {
     });
 }
 
-export async function pushBranch(repo: Repo, cwd: string, branch: string): Promise<void> {
+export async function pushBranch(repo: Repo, cwd: string, branch: string, sha = "HEAD"): Promise<void> {
   if (repo.kind !== "github" || !repo.url) return;
-  await sh(["git", "push", "--force-with-lease", repo.url, `HEAD:refs/heads/${branch}`], {
+  await sh(["git", "push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
     cwd,
     timeoutMs: 300_000,
   });

@@ -138,12 +138,33 @@ export async function executeRun(deps: EngineDeps, runId: string, signal: AbortS
       ctx.log("Run cancelled", "warn");
       return "cancelled";
     }
-    const needsHuman = e instanceof NeedsHumanError || e instanceof NoCapacityError;
+    const verifiedSha = ctx.state.lastVerifiedSha;
+    const verifiedFailure =
+      verifiedSha &&
+      ctx.repo.kind === "github" &&
+      !ctx.run.deliveryBranch &&
+      !ctx.run.prUrl &&
+      (ctx.state.phase === "deliver" || ctx.state.conflictRound !== undefined);
+    const needsHuman = e instanceof NeedsHumanError || e instanceof NoCapacityError || !!verifiedFailure;
     const message = (e as Error).message;
+    const failureStage =
+      ctx.state.conflictRound !== undefined
+        ? "conflict resolution"
+        : message.includes("post-merge gates")
+          ? "post-merge gates"
+          : ctx.run.stage === "deliver"
+            ? "delivery merge"
+            : (ctx.run.stage ?? "delivery merge");
     ctx.log(`Run ${needsHuman ? "needs a human" : "failed"}: ${message}`, "error", {
       stack: (e as Error).stack,
     });
-    if (
+    if (verifiedFailure) {
+      try {
+        await deliverVerifiedDraft(ctx, verifiedSha, failureStage, message);
+      } catch (err) {
+        ctx.log(`Could not open verified-work draft PR: ${(err as Error).message}`, "warn");
+      }
+    } else if (
       e instanceof NeedsHumanError &&
       ctx.state.worktreePath &&
       ctx.state.conflictRound === undefined &&
@@ -817,6 +838,7 @@ async function oneRound(
   // --- verify acceptance criteria (standard/deep)
   if (ctx.state.flow === "verify-change" || profile(ctx) === "quick") {
     ctx.state.lastVerify = null;
+    if (ctx.state.flow !== "verify-change") recordVerified(ctx, reviewedSha);
     return true;
   }
   if (holdout) {
@@ -939,6 +961,7 @@ async function oneRound(
       ctx.save();
       return false;
     }
+    recordVerified(ctx, await headSha(cwd));
     return true;
   } finally {
     ctx.previewUrl = undefined;
@@ -948,6 +971,44 @@ async function oneRound(
 
 // ---------------------------------------------------------------------------
 // deliver
+
+function recordVerified(ctx: RunContext, sha: string): void {
+  ctx.state.lastVerifiedSha = sha;
+  ctx.state.lastVerifiedEvidence = {
+    lastVerify: ctx.state.lastVerify,
+    lastGates: ctx.state.lastGates,
+    lastReview: ctx.state.lastReview,
+    lastAudit: ctx.state.lastAudit,
+  };
+  ctx.save();
+}
+
+async function deliverVerifiedDraft(
+  ctx: RunContext,
+  sha: string,
+  stage: string,
+  reason: string,
+): Promise<void> {
+  const cwd = ctx.state.worktreePath;
+  const branch = ctx.run.branch;
+  const base = ctx.run.baseBranch;
+  if (!cwd || !branch || !base) throw new Error("Missing verified draft delivery details");
+  const report = buildReport(ctx, false, { sha, stage, reason, base });
+  ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+  ctx.checkCancelled();
+  await pushBranch(ctx.repo, cwd, branch, sha);
+  ctx.checkCancelled();
+  const url = await createPullRequest(ctx.repo, {
+    branch,
+    base,
+    title: `[needs human] ${ctx.run.title}`,
+    body: report,
+    cwd,
+    draft: true,
+  });
+  ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
+  ctx.log(`Verified-work draft PR: ${url}`);
+}
 
 async function deliver(ctx: RunContext, success: boolean): Promise<void> {
   assertExistingBranchDelivery(ctx.repo, ctx.run);
@@ -1021,7 +1082,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         else if (!ctx.state.pendingRebaseSha && !(await isAncestor(cwd, recorded, fetched)))
           note("the base branch no longer descends from the recorded base");
         else if (
-          (await mergeForDelivery(ctx, cwd, ctx.state.pendingRebaseSha ?? fetched, head, note)) === "conflict"
+          (await mergeForDelivery(ctx, cwd, ctx.state.pendingRebaseSha ?? fetched, head)) === "conflict"
         )
           return { summary: `merge conflicted; resolution round ${ctx.state.round}`, value: undefined };
       }
@@ -1123,7 +1184,6 @@ async function mergeForDelivery(
   cwd: string,
   fetched: string,
   head: string,
-  note: (why: string) => void,
 ): Promise<"conflict" | "done"> {
   // Audit against the new base's scripts, never the implementer's merged working tree.
   ctx.state.baselineScripts = pickScripts(
@@ -1194,9 +1254,7 @@ async function mergeForDelivery(
     ctx.state.preRebaseGates = undefined;
     ctx.state.preRebaseHead = undefined;
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: await headSha(cwd) }, ctx.state);
-    note(`checks regressed after merging onto ${fetched.slice(0, 8)}`);
-    ctx.save();
-    return "done";
+    throw new NeedsHumanError(`post-merge gates regressed after merging onto ${fetched.slice(0, 8)}`);
   }
   await validateMerge(cwd, before, fetched);
   ctx.state.pendingRebaseSha = undefined;
