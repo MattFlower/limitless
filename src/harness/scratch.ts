@@ -17,9 +17,9 @@ function within(parent: string, path: string): boolean {
 export const SCRATCH_NAME = `claude-${process.getuid?.() ?? 0}`;
 
 /** Resolve symlinks before checking: TMPDIR can itself be inside the checkout. */
-export function createScratch(cwd: string): string {
+export function createScratch(cwd: string, candidates = [...new Set(["/tmp", tmpdir()])]): string {
   const root = realpathSync(cwd);
-  for (const candidate of [...new Set(["/tmp", tmpdir()])]) {
+  for (const candidate of candidates) {
     let base: string;
     try {
       base = realpathSync(candidate);
@@ -27,7 +27,15 @@ export function createScratch(cwd: string): string {
       continue;
     }
     if (within(root, base)) continue;
-    const scratch = join(mkdtempSync(join(base, "lr-")), SCRATCH_NAME);
+    let parent: string;
+    try {
+      parent = mkdtempSync(join(base, "lr-"));
+    } catch (error) {
+      // Sandboxes (e.g. an agent's verify session) may deny /tmp but allow their own TMPDIR.
+      if (["EPERM", "EACCES", "EROFS"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+      throw error;
+    }
+    const scratch = join(parent, SCRATCH_NAME);
     mkdirSync(scratch, { mode: 0o700 });
     return scratch;
   }
