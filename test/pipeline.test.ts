@@ -3427,7 +3427,11 @@ test("restart dispatches parked runs by priority then creation time", async () =
   await f.stop();
   f.store.close();
 
+  // One slot so dispatch order is also triage order; with more, equal-priority runs race.
+  mkdirSync(join(home, "cfg"), { recursive: true });
+  writeFileSync(join(home, "cfg", "config.toml"), "[limits]\nmax_concurrent_runs = 1\n");
   const resumed = start(handler);
+  expect(resumed.cfg.maxConcurrentRuns).toBe(1);
   for (const run of [low, highOld, highNew]) {
     expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
   }
