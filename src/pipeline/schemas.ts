@@ -147,6 +147,15 @@ export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
   })[];
 };
 
+/**
+ * A review regraded from stored JSON. The verdict is derived from the findings, so the model's own
+ * verdict may be absent; the degenerate-summary rule still applies.
+ */
+export const StoredReviewSchema = reviewBase
+  .extend({ verdict: reviewBase.shape.verdict.optional() })
+  .superRefine(rejectDegenerate(MIN_REVIEW_SUMMARY));
+export type StoredReview = Omit<Review, "verdict"> & Partial<Pick<Review, "verdict">>;
+
 export const VerifySchema = z.object({
   criteria: z.array(
     z.object({

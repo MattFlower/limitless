@@ -185,7 +185,8 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
   under-rated required defects, false blocks/clean predictions with blocking findings per clean
   case and trial, and correct derived verdicts/valid predictions. Zero required defects gives null
   recall. Grades stored before this rule (no severity breakdown) are not review evidence; rerun
-  the eval to regrade them from cached output without new model calls or spend.
+  the eval to regrade them from cached output without new model calls or spend. Regrading only
+  needs valid findings and summary: a stored output without a model verdict still regrades.
 - Verify scores only gold IDs. A single binary status must match exactly; missing, unclear and
   duplicate entries are inconclusive and match neither label. False accepts are gold unmet with
   predicted met, divided by gold-unmet observations. False rejects are gold met without an

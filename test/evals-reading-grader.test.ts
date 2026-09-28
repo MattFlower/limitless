@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema } from "../src/evals/cases.ts";
 import { gradeReview } from "../src/evals/graders/review.ts";
 import { gradeVerify } from "../src/evals/graders/verify.ts";
-import type { Review, Verify } from "../src/pipeline/schemas.ts";
+import { type Review, StoredReviewSchema, type Verify } from "../src/pipeline/schemas.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 
 const fixturePath = new URL("./data/evals-verify.json", import.meta.url).pathname;
@@ -42,7 +42,17 @@ test("review optional defects, returned verdict and clean blocking rules", () =>
   for (const kind of ["real", "seeded"] as const) {
     expect(gradeReview({ ...reviewCase, kind }, reviewOutput()).pass).toBe(true);
     expect(gradeReview({ ...reviewCase, kind }, { ...reviewOutput(), verdict: "approve" }).pass).toBe(true);
+    // Stored output without any model verdict regrades on the derived verdict alone.
+    const { verdict: _ignored, ...withoutVerdict } = reviewOutput();
+    expect(StoredReviewSchema.safeParse(withoutVerdict).success).toBe(true);
+    expect(gradeReview({ ...reviewCase, kind }, StoredReviewSchema.parse(withoutVerdict))).toMatchObject({
+      pass: true,
+      review: { requiredMatched: 1, requestChanges: true, verdictMatch: true },
+    });
   }
+  // The stored schema only relaxes the verdict: an invalid verdict or a degenerate review still fails.
+  expect(StoredReviewSchema.safeParse({ ...reviewOutput(), verdict: "maybe" }).success).toBe(false);
+  expect(StoredReviewSchema.safeParse({ summary: "short", findings: [] }).success).toBe(false);
   for (const severity of ["blocker", "major", "minor", "nit"] as const) {
     const clean = { ...optional, kind: "clean" as const };
     const blocks = ["blocker", "major"].includes(severity);

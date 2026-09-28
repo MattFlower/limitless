@@ -256,9 +256,13 @@ test("cached review outputs graded under the legacy rule regrade to blocking rec
       review: { requiredMatched: 0, underRated: 1 },
     });
     // Simulate a trial stored before blocking recall: minor matches counted and the case passed.
+    // Its output lacks the model verdict, which the derived verdict makes irrelevant to regrading.
     const { underRated, blockingFindings, bySeverity, ...legacy } = stored.details.grade.review;
+    const { verdict, ...outputWithoutVerdict } = ReviewSchema.parse(stored.output);
+    expect(verdict).toBe("request_changes");
     f.factory.store.recordEvalTrial({
       ...stored,
+      output: outputWithoutVerdict,
       pass: true,
       score: 1,
       details: {
@@ -279,6 +283,7 @@ test("cached review outputs graded under the legacy rule regrade to blocking rec
       score: 0,
       review: { requiredMatched: 0, underRated: 1, blockingFindings: 0, requestChanges: false },
     });
+    expect(regraded.trials[0]?.output).toEqual(outputWithoutVerdict);
     expect(regraded.summaries[0]?.review?.defectRecall).toMatchObject({ numerator: 0, denominator: 1 });
     await f.clean();
   } finally {

@@ -28,7 +28,7 @@ import {
   nextImplementTarget,
   prepareImplement,
 } from "./implement.ts";
-import { gradeCase, prepareCase, schemaFor, seedContent } from "./prepare.ts";
+import { gradeCase, prepareCase, schemaFor, seedContent, storedSchemaFor } from "./prepare.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 
 /** Where Limitless keeps eval datasets; pins whose history touches these are rejected. */
@@ -370,7 +370,9 @@ export class EvalRunner {
       if (cache)
         for (const source of store.cachedEvalTrials(trial.cacheKey)) {
           const output =
-            "hidden" in item ? { success: true, data: source.output } : schema?.safeParse(source.output);
+            "hidden" in item
+              ? { success: true, data: source.output }
+              : storedSchemaFor(item).safeParse(source.output);
           if (!output?.success) continue;
           const grade = "hidden" in item ? source.details.grade : gradeCase(item, output.data);
           if (!grade) continue;

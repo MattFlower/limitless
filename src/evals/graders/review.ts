@@ -1,15 +1,16 @@
 import type { EvalGrade } from "../../core/types.ts";
 import { blockingReviewFindings, reviewVerdict } from "../../pipeline/review.ts";
-import type { Review } from "../../pipeline/schemas.ts";
+import type { Review, StoredReview } from "../../pipeline/schemas.ts";
 import type { ReviewCase } from "../cases.ts";
 
 export const DEFECT_SEVERITY_GROUP = { blocker: "high", major: "medium", minor: "low", nit: "low" } as const;
 
 /**
  * Grades what production would block in round 1: a required defect is caught only by a blocking
- * finding, and the case verdict is derived from findings exactly as the engine does.
+ * finding, and the case verdict is derived from findings exactly as the engine does. The model's
+ * verdict is never graded, so stored output without one is still evidence.
  */
-export function gradeReview(item: ReviewCase, output: Review): EvalGrade {
+export function gradeReview(item: ReviewCase, output: StoredReview): EvalGrade {
   const normalize = (file: string) => file.replace(/^(\.\/)+/, "");
   const blocking = blockingReviewFindings(output);
   const lands = (finding: Review["findings"][number], defect: ReviewCase["defects"][number]) =>
