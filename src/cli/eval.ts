@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { ReviewSystem } from "../core/types.ts";
 import { EvalRequestSchema } from "../evals/cases.ts";
 import { policyDiff, proposedOverlay, renderEvidence } from "../evals/evidence.ts";
 import { formatEvalReport } from "../evals/format.ts";
@@ -13,6 +14,7 @@ import {
 import type { EvalPolicyResponse } from "../evals/policy.ts";
 import type { EvalRegradeResult } from "../evals/runner.ts";
 import type { EvalReport } from "../evals/stats.ts";
+import { parseEvalReviewSystems } from "../pipeline/review-system.ts";
 import { DEFAULT_POLICY } from "../router/catalog.ts";
 import { overlayPolicy, parsePolicy, validatePolicy } from "../router/policy.ts";
 
@@ -87,7 +89,7 @@ export async function evalCommand(
   }
   if (args.length !== 2 || !value || !["run", "report", "regrade"].includes(action ?? ""))
     throw new Error(
-      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval report <eval-id> [--json] | eval regrade <eval-id>",
+      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval run review --systems <file.json> | eval report <eval-id> [--json] | eval regrade <eval-id>",
     );
   if (action === "regrade") {
     const path = `/api/evals/${encodeURIComponent(value)}`;
@@ -105,8 +107,24 @@ export async function evalCommand(
     io.print(flags.json ? JSON.stringify(report) : formatEvalReport(report));
     return;
   }
-  if (typeof flags.models !== "string" || !flags.models.trim())
-    throw new Error("--models model[@effort],model[@effort] is required");
+  if (flags.systems !== undefined && flags.models !== undefined)
+    throw new Error("--models and --systems are mutually exclusive");
+  let systems: ReviewSystem[] | undefined;
+  if (flags.systems !== undefined) {
+    if (value !== "review") throw new Error("--systems is only supported for review evals");
+    if (typeof flags.systems !== "string" || !flags.systems.trim())
+      throw new Error("--systems requires a JSON file path");
+    let text: string;
+    try {
+      text = await readFile(flags.systems, "utf8");
+    } catch (error) {
+      throw new Error(`cannot read --systems file ${flags.systems}: ${(error as Error).message}`);
+    }
+    systems = parseEvalReviewSystems(text, flags.systems);
+  } else if (typeof flags.models !== "string" || !flags.models.trim())
+    throw new Error(
+      "--models model[@effort],model[@effort] (or, for review, --systems <file.json>) is required",
+    );
   const numeric = (key: string) => {
     const raw = flags[key];
     if (raw === undefined) return undefined;
@@ -116,7 +134,7 @@ export async function evalCommand(
   };
   const request = {
     role: value,
-    models: flags.models.split(","),
+    ...(systems ? { systems } : { models: String(flags.models).split(",") }),
     k: numeric("k"),
     maxUsd: numeric("max-usd"),
     caseIds: typeof flags.cases === "string" ? flags.cases.split(",") : undefined,

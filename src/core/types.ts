@@ -369,9 +369,23 @@ export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 
 export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed";
 export type EvalStrategy = "retry" | "effort" | "switch";
+/** One review finder; production may omit `target` (routed), evals may not. */
+export interface ReviewFinder {
+  target?: string;
+  prompt: "standard";
+}
+/** How a review is performed. Only `mode: "single"` with one standard finder is implemented. */
+export interface ReviewSystem {
+  name: string;
+  mode: "single";
+  finders: ReviewFinder[];
+  implementerReport: "include" | "omit";
+}
 export interface EvalRun {
   rounds?: number;
   strategy?: EvalStrategy;
+  /** Review candidates, finder targets resolved at submission. Absent on older and non-review runs. */
+  systems?: ReviewSystem[];
   id: string;
   role: "triage" | "review" | "verify" | "implement";
   models: string[];
@@ -446,6 +460,8 @@ export interface EvalTrial {
   pass: boolean | null;
   score: number | null;
   details: {
+    /** Review system name; distinguishes candidates that share a target. */
+    system?: string;
     switchChain?: (ModelSelection & { tier: number })[];
     rounds?: EvalRound[];
     roundsUsed?: number;

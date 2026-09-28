@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema } from "../src/evals/cases.ts";
+import { formatEvalReport } from "../src/evals/format.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { auditDiff } from "../src/gates/audit.ts";
 import { gateScriptNames, pickScripts } from "../src/gates/detect.ts";
@@ -126,7 +127,8 @@ test("review uses the pipeline prompt, recomputed audit, detached seeded HEAD an
     );
     expect((await f.run()).summaries[0]?.cached).toBe(0);
     expect(f.calls).toHaveLength(2);
-    // [review] implementer_report reaches eval prompts, and each mode has its own cache entry.
+    // Each system's implementerReport reaches its prompt, independent of the daemon's [review]
+    // setting, and include and omit run side by side on one target with separate cache entries.
     f.item.input.implementerReport = "IMPLEMENTER_REPORT_TEXT";
     f.save();
     const prompts: string[] = [];
@@ -134,10 +136,44 @@ test("review uses the pipeline prompt, recomputed audit, detached seeded HEAD an
       prompts.push(s.prompt);
       return { structured: reviewOutput(), costUsd: 0.1 };
     });
-    expect(f.cfg.reviewImplementerReport).toBe("include");
-    expect((await f.run()).summaries[0]?.cached).toBe(0);
     f.cfg.reviewImplementerReport = "omit";
-    expect((await f.run()).summaries[0]?.cached).toBe(0);
+    const system = (name: string, implementerReport: string) => ({
+      name,
+      mode: "single",
+      finders: [{ target: "candidate-a", prompt: "standard" }],
+      implementerReport,
+    });
+    const systems = [system("with-report", "include"), system("without-report", "omit")];
+    const sideBySide = await f.run({ models: undefined, systems });
+    expect(
+      sideBySide.summaries.map((s) => [s.candidate, s.modelId, s.system?.implementerReport, s.cached]),
+    ).toEqual([
+      ["with-report", "candidate-a", "include", 0],
+      ["without-report", "candidate-a", "omit", 0],
+    ]);
+    expect(sideBySide.trials.map((t) => t.details.system)).toEqual(["with-report", "without-report"]);
+    expect(new Set(sideBySide.trials.map((t) => t.cacheKey)).size).toBe(2);
+    const text = formatEvalReport(sideBySide);
+    expect(text).toContain("with-report [candidate-a, implementer report: include]");
+    expect(text).toContain("without-report [candidate-a, implementer report: omit]");
+    // Renamed systems with reordered keys are the same configuration, so both hit the cache.
+    const renamed = await f.run({
+      models: undefined,
+      systems: [
+        {
+          implementerReport: "omit",
+          finders: [{ prompt: "standard", target: "candidate-a" }],
+          mode: "single",
+          name: "b",
+        },
+        { ...system("a", "include") },
+      ],
+    });
+    expect(renamed.summaries.map((s) => [s.candidate, s.cached])).toEqual([
+      ["b", 1],
+      ["a", 1],
+    ]);
+    // --models means an include-report system, so it reuses the include entry.
     expect((await f.run()).summaries[0]?.cached).toBe(1);
     expect(f.calls).toHaveLength(4);
     const [included, omitted] = prompts;
