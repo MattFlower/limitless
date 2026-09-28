@@ -83,6 +83,10 @@ export interface RunState {
   preRebaseGates?: GateComparison[];
   /** Expected first merge parent; also the fallback head if clean-merge gates regress. */
   preRebaseHead?: string;
+  /** Commit that last passed verify, or an approving quick review after deterministic checks. */
+  lastVerifiedSha?: string;
+  /** Passing evidence retained if a later resolution round fails. */
+  lastVerifiedEvidence?: Pick<RunState, "lastVerify" | "lastGates" | "lastReview" | "lastAudit">;
   /** Why delivery went ahead without rebasing onto the latest base (shown in the report). */
   rebaseNote?: string;
   /** The single extra implementation round allowed after a conflicting delivery merge. */
