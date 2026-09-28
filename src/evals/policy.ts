@@ -51,16 +51,29 @@ export function selectEvidence(evidence: Evidence[], ids?: string[]) {
         compareId(b.run.id, a.run.id),
     );
   for (const entry of ordered) {
+    // Systems sharing a target (e.g. include vs omit report) can't be told apart by routing, so
+    // that target contributes no evidence from this run rather than pooling or picking one.
+    const systems = entry.run.systems ?? [];
+    const shared = new Set(
+      systems
+        .map((s) => s.finders[0]?.target)
+        .filter((target, i, all) => target !== undefined && all.indexOf(target) !== i),
+    );
+    const ambiguous = new Set(
+      systems.filter((s) => shared.has(s.finders[0]?.target ?? "")).map((s) => s.name),
+    );
     const scopes = entry.run.role === "implement" ? IMPLEMENT_COMPLEXITIES : [undefined];
     for (const complexity of scopes) {
       const trials = complexity
         ? entry.trials.filter((t) => t.details.complexity === complexity)
-        : entry.trials;
+        : entry.trials.filter((t) => !ambiguous.has(t.details.system ?? ""));
       const targets = complexity
         ? trials.map(evidenceTarget)
         : [
             ...trials.map(evidenceTarget),
-            ...entry.run.models.filter((id) => !trials.some((t) => recordedTarget(t) === id)),
+            ...entry.run.models.filter(
+              (id) => !shared.has(id) && !trials.some((t) => recordedTarget(t) === id),
+            ),
           ];
       for (const modelId of new Set(targets)) {
         const key = `${entry.run.role}:${complexity ?? "default"}:${modelId}`;
@@ -115,7 +128,11 @@ export function generatePolicy(input: PolicyInput) {
       .filter((e) => e.run.role === role && (e.complexity ?? "default") === cell)
       .map((entry) => {
         const rows = entry.trials.filter((t) => evidenceTarget(t) === entry.modelId);
-        const summary = summarize({ ...entry.run, models: [entry.modelId] }, rows)[0];
+        const systems = entry.run.systems?.filter((s) => s.finders[0]?.target === entry.modelId);
+        const summary = summarize(
+          { ...entry.run, models: [entry.modelId], systems: systems?.length ? systems : undefined },
+          rows,
+        )[0];
         if (!summary) throw new Error("Missing model summary");
         const baseId = rows[0]?.modelId ?? parseTarget(entry.modelId).modelId;
         const model = models.find((m) => m.id === baseId);
