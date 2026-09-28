@@ -128,9 +128,10 @@ use snapshot mode.
 Any case in any role may set `"snapshot": true` (omitted or `false` keeps the plain mode above).
 The candidate then gets a fresh standalone repository instead of the pinned history. It holds
 two commits: `Snapshot base`, which is `base^{tree}` without the top-level `evals` directory, and
-`Snapshot head`, which is `head^{tree}` without it, parented on the first. The commits are built
-in a throwaway staging repository that borrows the cache's objects, so only objects reachable
-from the snapshot are copied. Original commits, refs, remotes and messages are unreachable. All
+`Snapshot head`, which is `head^{tree}` without it, parented on the first even when the two
+trees are identical. The commits are built in a throwaway staging repository that borrows the
+cache's objects, so only objects reachable from the snapshot are copied; trees are filtered
+through Git's index, so filename bytes (including non-UTF-8 names) are preserved exactly. Original commits, refs, remotes and messages are unreachable. All
 other paths, contents and modes are unchanged, so `git diff base..head` equals the original
 diff outside `evals/**`, and graders see the same repository-relative paths. Author, committer
 and dates are fixed, so the same pins always give the same tree and commit hashes.
@@ -142,8 +143,9 @@ Seed patches are still committed on top of the snapshot head. The contamination 
 runs, now against the snapshot: label paths cannot appear, but any exact dataset, seed-patch or
 hidden-file blob kept outside `evals/` still fails preparation before the candidate is invoked.
 
-Role differences: implement snapshots contain only `Snapshot base` (its `head` is provenance
-only, so the reference solution never enters the checkout), and hidden files are injected at
+Role differences: implement snapshots build both commits from `base` (its `head` is provenance
+only, so the reference solution never enters the checkout and `Snapshot head` adds no changes),
+and hidden files are injected at
 grading as usual. Triage has one repository pin, which supplies both trees; triage candidates
 still get no checkout, and the top-level listing in their prompt comes from the snapshot.
 

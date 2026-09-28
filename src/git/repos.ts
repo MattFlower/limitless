@@ -567,9 +567,11 @@ const SNAPSHOT_ENV = {
 };
 
 /**
- * Push neutral commits of the pinned trees minus the top-level `evals` directory into `path`
- * (one commit when base and head coincide). They are built in a staging repository that
- * borrows the cache's objects, so the target receives only objects reachable from the snapshot.
+ * Push two neutral commits of the pinned trees minus the top-level `evals` directory into
+ * `path`, the head parented on the base even when the trees coincide. They are built in a
+ * staging repository that borrows the cache's objects, so the target receives only objects
+ * reachable from the snapshot. Trees go through git's index, never through decoded text, so
+ * filename bytes survive unchanged.
  */
 async function pushSnapshot(
   cache: string,
@@ -581,28 +583,25 @@ async function pushSnapshot(
   const staging = `${path}.snapshot`;
   rmSync(staging, { recursive: true, force: true });
   try {
-    await sh(["git", "init", "-q", "--bare", staging], { cwd: cache, signal });
+    await sh(["git", "init", "-q", staging], { cwd: cache, signal });
     const objects = (
       await sh(["git", "rev-parse", "--git-path", "objects"], { cwd: cache, signal })
     ).stdout.trim();
-    writeFileSync(join(staging, "objects/info/alternates"), `${resolve(cache, objects)}\n`);
+    writeFileSync(join(staging, ".git/objects/info/alternates"), `${resolve(cache, objects)}\n`);
     const opts = {
       cwd: staging,
       signal,
       env: { ...(process.env as Record<string, string>), ...SNAPSHOT_ENV },
     };
     const commit = async (sha: string, message: string, parent?: string) => {
-      const entries = (await sh(["git", "ls-tree", "-z", `${sha}^{tree}`], opts)).stdout
-        .split("\0")
-        .filter((entry) => entry && !/^\d+ tree \w+\tevals$/.test(entry));
-      const tree = (
-        await sh(["git", "mktree", "-z"], { ...opts, stdin: entries.map((e) => `${e}\0`).join("") })
-      ).stdout.trim();
+      await sh(["git", "read-tree", `${sha}^{tree}`], opts);
+      await sh(["git", "rm", "-r", "-f", "-q", "--cached", "--ignore-unmatch", "--", "evals/"], opts);
+      const tree = (await sh(["git", "write-tree"], opts)).stdout.trim();
       const args = ["git", "-c", "i18n.commitEncoding=UTF-8", "commit-tree", "--no-gpg-sign", tree];
       return (await sh([...args, ...(parent ? ["-p", parent] : []), "-m", message], opts)).stdout.trim();
     };
     const snapshotBase = await commit(base, "Snapshot base");
-    const snapshotHead = head === base ? snapshotBase : await commit(head, "Snapshot head", snapshotBase);
+    const snapshotHead = await commit(head, "Snapshot head", snapshotBase);
     await sh(
       ["git", "push", "-q", path, `${snapshotBase}:refs/eval/base`, `${snapshotHead}:refs/eval/head`],
       opts,

@@ -39,6 +39,17 @@ async function fixture(extra: Record<string, string> = {}) {
   rmSync(join(f.source, "CURRENT.txt"));
   chmodSync(join(f.source, "run.sh"), 0o755);
   await git("add", "-A");
+  // A non-UTF-8 filename (unrepresentable on some filesystems, so staged straight into the index).
+  await sh(
+    [
+      "sh",
+      "-c",
+      `git update-index --add --cacheinfo "100644,$(git hash-object -w run.sh),$(printf 'raw\\377.txt')"`,
+    ],
+    {
+      cwd: f.source,
+    },
+  );
   await git("commit", "-qm", "head with labels");
   const head = await git("rev-parse", "HEAD");
   await git("push", "-q", f.cache, "HEAD:refs/heads/snap");
@@ -109,6 +120,7 @@ test("snapshot commits are deterministic, neutral and preserve the non-eval diff
         ).stdout,
       );
       expect(await git("diff", checkout.base, "HEAD", "--", "run.sh")).toContain("new mode 100755");
+      expect(await git("ls-tree", "--name-only", "HEAD")).toContain('"raw\\377.txt"');
       snapshots.push([
         checkout.base,
         (await git("rev-parse", `${checkout.base}^{tree}`)).trim(),
@@ -143,6 +155,7 @@ test("review snapshot: plain mode rejects the pin; snapshot reaches the candidat
       expect(s.prompt).not.toContain(f.base);
       const diff = (await sh(["git", "diff", "--name-only", `${base}..HEAD`], { cwd: s.cwd })).stdout;
       expect(diff.trim().split("\n").sort()).toEqual([
+        '"raw\\377.txt"',
         "CURRENT.txt",
         "bin.dat",
         "run.sh",
@@ -200,6 +213,21 @@ test("triage snapshot lists the sanitized tree and keeps plain and snapshot cach
     expect(f.calls).toHaveLength(2);
     expect(f.calls[1]?.prompt).not.toMatch(/\bevals\b/);
     expect(f.calls[1]?.prompt).toContain("bin.dat");
+    const cwd = join(f.home, "triage");
+    const checkout = await createEvalWorktree(
+      f.cfg.paths,
+      f.factory.store,
+      "fixture/repo",
+      f.head,
+      f.head,
+      cwd,
+      new AbortController().signal,
+      { paths: ["evals/review"], contents: [] },
+      true,
+    );
+    expect(await exposure(cwd, [f.head])).toEqual(["Snapshot head", "Snapshot base"]);
+    expect((await sh(["git", "rev-parse", "HEAD^"], { cwd })).stdout.trim()).toBe(checkout.base);
+    await checkout();
     expect((await run()).summaries[0]?.cached).toBe(1);
     expect(readdirSync(f.cfg.paths.runs).filter((p) => p.startsWith("eval-"))).toEqual([]);
   } finally {
@@ -268,11 +296,13 @@ test("implement snapshot starts from the sanitized base without the solution or 
         expect(s.prompt).toContain(`git diff ${base}..HEAD`);
         return { files: { answer: "correct" }, text: "Implemented" };
       }
-      expect(await exposure(s.cwd, [f.base, f.head])).toEqual(["Snapshot base"]);
+      // Implement pins both trees to base, so the reference head never enters the snapshot.
+      expect(await exposure(s.cwd, [f.base, f.head])).toEqual(["Snapshot head", "Snapshot base"]);
+      expect((await sh(["git", "diff", "HEAD^", "HEAD"], { cwd: s.cwd })).stdout).toBe("");
       for (const path of ["solution", "check.sh", "bin.dat"])
         expect(existsSync(join(s.cwd, path))).toBe(false);
       expect(readFileSync(join(s.cwd, "src/a.ts"), "utf8")).toBe("export const a = 1;\n");
-      base = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+      base = (await sh(["git", "rev-parse", "HEAD^"], { cwd: s.cwd })).stdout.trim();
       return { files: { answer: "wrong" }, text: "Implemented" };
     });
     const report = await f.run({ role: "implement", models: ["candidate-a"], k: 1, rounds: 2 });
