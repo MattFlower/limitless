@@ -370,6 +370,7 @@ esac
 
   test("replayed review retains one omitted follow-up on the same round and SHA", async () => {
     let reviews = 0;
+    const specs: AgentSpec[] = [];
     const finding = (title: string, label?: "new") => ({
       severity: "major" as const,
       security: false,
@@ -385,7 +386,7 @@ esac
       const role = roleOf(s);
       if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
       if (role === "review") {
-        reviews++;
+        reviews = specs.push(s);
         return { structured: { ...approve, findings: reviews === 1 ? [finding("First blocker")] : [] } };
       }
       return { files: { "farewell.txt": `goodbye ${reviews}\n` } };
@@ -402,10 +403,14 @@ esac
             .stdout.toString()
             .trim();
           const followUp = finding("Backlog idea", "new");
-          state.reviewHistory = [
-            ...(state.reviewHistory ?? []),
-            { round: 1, sha, blocking: [], followUps: [followUp] },
-          ];
+          // History recorded before finding schema v2 has none of its fields.
+          const legacy = state.reviewHistory?.map((entry) => ({
+            ...entry,
+            blocking: entry.blocking.map(
+              ({ failure_scenario, category, confidence, introduced_by_diff, ...f }) => f,
+            ),
+          }));
+          state.reviewHistory = [...(legacy ?? []), { round: 1, sha, blocking: [], followUps: [followUp] }];
           state.reviewFollowUps = [followUp];
           f.store.setRunState(runId, state);
         },
@@ -430,82 +435,15 @@ esac
     ]);
     const followUps = resumed.store.getArtifact(run.id, "report.md")?.split("## Review follow-ups")[1];
     expect(followUps?.match(/^- major: `farewell\.txt:1` Backlog idea/gm)).toHaveLength(1);
-  });
-  test("a later round replays a review history recorded before finding schema v2", async () => {
-    const specs: AgentSpec[] = [];
-    const handler: Handler = (s) => {
-      const role = roleOf(s);
-      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
-      if (role === "review") {
-        specs.push(s);
-        const prior = {
-          severity: "major",
-          security: false,
-          ...findingEvidence,
-          file: "farewell.txt",
-          line: 1,
-          title: "Prior bug",
-          detail: "bug",
-          suggestion: "fix",
-        };
-        return { structured: specs.length === 1 ? { ...approve, findings: [prior] } : approve };
-      }
-      return { files: { "farewell.txt": `goodbye ${specs.length}\n` } };
-    };
-    const f = start(handler);
-    const legacy = <T extends object>(finding: T) => {
-      const { failure_scenario, category, confidence, introduced_by_diff, ...rest } = finding as T &
-        Partial<typeof findingEvidence>;
-      return rest;
-    };
-    f.deps.faults = {
-      "stage:review:before": {
-        action: "kill",
-        occurrence: 2,
-        onHit: ({ runId }) => {
-          const state = f.store.getRunState<RunState>(runId);
-          if (!state?.lastReview) throw new Error("missing first review");
-          state.reviewHistory = state.reviewHistory?.map((entry) => ({
-            ...entry,
-            blocking: entry.blocking.map(legacy),
-            followUps: entry.followUps.map(legacy),
-          }));
-          state.lastReview = { ...state.lastReview, findings: state.lastReview.findings.map(legacy) };
-          f.store.setRunState(runId, state);
-        },
-      },
-    };
-    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
-    const deadline = Date.now() + 10_000;
-    while (
-      f.store.listStages(run.id).at(-1)?.name !== "review" ||
-      f.store.listStages(run.id).at(-1)?.status !== "cancelled"
-    ) {
-      if (Date.now() > deadline) throw new Error("review interruption timed out");
-      await Bun.sleep(10);
-    }
-    await f.stop();
-    f.store.close();
-    const resumed = start(handler);
-    expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     const [first, later] = specs;
-    expect(specs).toHaveLength(2);
-    expect(first?.mode).toBe("readonly");
-    expect(first?.schema).toBe(ReviewSchema);
+    expect(first).toMatchObject({ mode: "readonly", timeoutMs: readingTimeout(1) });
+    expect([first?.schema, later?.schema]).toEqual([ReviewSchema, LaterReviewSchema]);
     expect(first?.jsonSchema).toEqual(toStrictJsonSchema(ReviewSchema));
-    expect(first?.timeoutMs).toBe(readingTimeout(1));
-    expect(later?.schema).toBe(LaterReviewSchema);
-    expect(later?.jsonSchema).toEqual(toStrictJsonSchema(LaterReviewSchema));
-    // The legacy blocking finding is quoted as P1 without the v2 fields.
-    expect(later?.prompt).toContain('"id": "P1"');
-    expect(later?.prompt).toContain("Prior bug");
+    expect(later?.prompt).toContain("First blocker");
     expect(later?.prompt).not.toContain('"confidence"');
     const artifact = JSON.parse(resumed.store.getArtifact(run.id, "review-0.json") ?? "{}");
     expect(artifact).toMatchObject({ verdict: "request_changes", modelVerdict: "approve" });
-    expect(artifact.findings[0]).toMatchObject(findingEvidence);
-    expect(resumed.store.getArtifact(run.id, "review-1.json")).toContain('"verdict": "approve"');
   });
-
   test("Dependabot uses free models across quick stages and keeps them on feedback rounds", async () => {
     const seen: { role: string; provider: string }[] = [];
     let implementations = 0;

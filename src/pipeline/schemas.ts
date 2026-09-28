@@ -91,7 +91,7 @@ export const MIN_LATER_REVIEW_SUMMARY = 12;
 const summaryField = (min: number) =>
   z.string().describe(`What you checked and concluded; at least ${min} characters when findings is empty`);
 
-export const FindingCategoryEnum = z.enum([
+const FindingCategoryEnum = z.enum([
   "correctness",
   "security",
   "reliability",
@@ -192,10 +192,7 @@ export const StoredReviewSchema = reviewBase
         title: z.string().default(""),
         detail: z.string().default(""),
         suggestion: z.string().default(""),
-        failure_scenario: findingV2.failure_scenario.optional(),
-        category: findingV2.category.optional(),
-        confidence: findingV2.confidence.optional(),
-        introduced_by_diff: findingV2.introduced_by_diff.optional(),
+        ...z.object(findingV2).partial().shape,
       }),
     ),
   })

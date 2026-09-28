@@ -1,14 +1,7 @@
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
-import {
-  FindingCategoryEnum,
-  type Holdout,
-  type Review,
-  renderSpec,
-  type Spec,
-  type Verify,
-} from "./schemas.ts";
+import { type Holdout, type Review, renderSpec, type Spec, type Verify } from "./schemas.ts";
 
 /** Appended to every factory agent's system prompt. */
 export const FACTORY_PREAMBLE = `You are a worker inside Limitless, an autonomous software factory.
@@ -328,7 +321,7 @@ ${input.dependencyUpdate ? "Dependency update: check breaking changes between ve
 Severity: blocker = must fix (bug, unmet requirement, security issue, test gaming); major = should fix before merge; minor/nit = optional polish.
 Every finding must name a concrete defect in the change: what is wrong, where, and why. A request for verification you could not perform yourself (rendering in a real browser, layout at viewport widths, behaviour against live services) is not a defect: report it as minor at most, never blocker or major, and say what you could and could not check.
 Do not modify files. You may run read-only commands and targeted tests. Create temporary fixtures and redirect supported build/test outputs only under TMPDIR (also TMP and TEMP); the worktree is read-only.
-Explicitly mark security findings with security: true (otherwise false). For every finding also set failure_scenario (the concrete inputs or state that produce the wrong output or crash), category (${FindingCategoryEnum.options.join(", ")}), confidence (0 to 1: how sure you are the defect is real) and introduced_by_diff (true if the change under review introduced it, false if it predates the change).
+Explicitly mark security findings with security: true (otherwise false). For every finding also set failure_scenario (the concrete inputs or state that produce the wrong output or crash), category (one of correctness, security, reliability, data, concurrency, compatibility, test-gap, cleanup, conventions), confidence (0 to 1: how sure you are the defect is real) and introduced_by_diff (true if the change under review introduced it, false if it predates the change).
 Return your assessment in verdict; the pipeline derives its decision from findings.`;
 }
 

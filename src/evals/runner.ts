@@ -1,6 +1,5 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { ZodType } from "zod";
 import type { EvalRun, EvalTrial } from "../core/types.ts";
 import { createEvalWorktree, type EvalLabels, pinnedTree, snapshotTopLevel } from "../git/repos.ts";
 import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
@@ -8,7 +7,7 @@ import { selectHarness } from "../harness/select.ts";
 import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
 import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
-import { runReview } from "../pipeline/review.ts";
+import { type ReviewRequest, runReview } from "../pipeline/review.ts";
 import { toStrictJsonSchema } from "../pipeline/schemas.ts";
 import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
 import { cacheKey } from "./cache.ts";
@@ -474,86 +473,80 @@ export class EvalRunner {
         roundStarted = Date.now();
         trial.harness = harnessName;
         store.recordEvalTrial({ ...trial, status: "running" });
+        let result: AgentResult;
         let resumeFailed = false;
         const before = { ...trial };
-        const logPath = join(directory, "trial.log");
-        const call = async (request: {
-          prompt: string;
-          jsonSchema?: Record<string, unknown>;
-          schema?: ZodType;
-          timeoutMs: number;
-        }): Promise<AgentResult> => {
-          let result: AgentResult;
-          for (let attempt = 0; ; attempt++) {
-            try {
-              const invoke = (scratchDir?: string) =>
-                harness({
-                  scratchDir,
-                  ...(sessionId ? { resumeSessionId: sessionId } : {}),
-                  cwd,
-                  prompt: request.prompt,
-                  systemAppend: FACTORY_PREAMBLE,
-                  target,
-                  mode: "hidden" in item ? "edit" : "readonly",
-                  noTools,
-                  jsonSchema: request.jsonSchema,
-                  schema: request.schema,
-                  timeoutMs: request.timeoutMs,
-                  privateSession: run.role === "verify",
-                  idleTimeoutMs: 10 * 60_000,
-                  maxToolCalls: "hidden" in item ? 400 : 150,
-                  signal,
-                  logPath,
-                  onEvent: (event) => {
-                    if (
-                      event.type === "tool_call" &&
-                      event.input &&
-                      typeof event.input === "object" &&
-                      "command" in event.input &&
-                      typeof event.input.command === "string"
-                    )
-                      toolCommands.push(event.input.command);
-                    if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
-                  },
-                });
-              result = noTools
-                ? await invoke()
+        for (let attempt = 0; ; attempt++) {
+          try {
+            const logPath = join(directory, "trial.log");
+            const invoke = (scratchDir?: string, request = { prompt, jsonSchema, schema, timeoutMs }) =>
+              harness({
+                scratchDir,
+                ...(sessionId ? { resumeSessionId: sessionId } : {}),
+                cwd,
+                ...request,
+                systemAppend: FACTORY_PREAMBLE,
+                target,
+                mode: "hidden" in item ? "edit" : "readonly",
+                noTools,
+                privateSession: run.role === "verify",
+                idleTimeoutMs: 10 * 60_000,
+                maxToolCalls: "hidden" in item ? 400 : 150,
+                signal,
+                logPath,
+                onEvent: (event) => {
+                  if (
+                    event.type === "tool_call" &&
+                    event.input &&
+                    typeof event.input === "object" &&
+                    "command" in event.input &&
+                    typeof event.input.command === "string"
+                  )
+                    toolCommands.push(event.input.command);
+                  if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
+                },
+              });
+            const send = (request?: ReviewRequest) =>
+              noTools
+                ? invoke(undefined, request)
                 : scratch
-                  ? await invoke(scratch)
-                  : await withScratch(cwd, invoke);
-            } catch (error) {
-              result = {
-                status: signal.aborted ? "cancelled" : "error",
-                finalText: "",
-                structured: null,
-                sessionId: null,
-                usage: emptyUsage(),
-                numTurns: 0,
-                costUsd: 0,
-                costEquivUsd: 0,
-                error: (error as Error).message,
-                quota: null,
-              };
-            }
-            trial.costUsd += result.costUsd;
-            trial.costEquivUsd += result.costEquivUsd;
-            trial.tokensIn += result.usage.input + result.usage.cacheRead + result.usage.cacheWrite;
-            trial.tokensOut += result.usage.output;
-            if (sessionId && attempt === 0 && result.status === "error" && !signal.aborted) {
-              resumeFailed = true;
-              sessionId = undefined;
-              store.recordEvalTrial({ ...trial, status: "running" });
-              if (!budget()) continue;
-            }
-            break;
+                  ? invoke(scratch, request)
+                  : withScratch(cwd, (dir) => invoke(dir, request));
+            // First-round review cases go through the pipeline's review entry point.
+            result = reviewInput
+              ? (
+                  await runReview(
+                    { invoke: async (request) => ({ result: await send(request) }) },
+                    reviewInput,
+                  )
+                ).result
+              : await send();
+          } catch (error) {
+            result = {
+              status: signal.aborted ? "cancelled" : "error",
+              finalText: "",
+              structured: null,
+              sessionId: null,
+              usage: emptyUsage(),
+              numTurns: 0,
+              costUsd: 0,
+              costEquivUsd: 0,
+              error: (error as Error).message,
+              quota: null,
+            };
           }
-          return result;
-        };
-        // First-round review cases go through the pipeline's review entry point.
-        const invoked = reviewInput
-          ? await runReview({ invoke: async (request) => ({ result: await call(request) }) }, reviewInput)
-          : { result: await call({ prompt, jsonSchema, schema, timeoutMs }), parsed: undefined };
-        const { result } = invoked;
+          trial.costUsd += result.costUsd;
+          trial.costEquivUsd += result.costEquivUsd;
+          trial.tokensIn += result.usage.input + result.usage.cacheRead + result.usage.cacheWrite;
+          trial.tokensOut += result.usage.output;
+          if (sessionId && attempt === 0 && result.status === "error" && !signal.aborted) {
+            resumeFailed = true;
+            sessionId = undefined;
+            store.recordEvalTrial({ ...trial, status: "running" });
+            if (!budget()) continue;
+          }
+          break;
+        }
         release?.();
         release = undefined;
         trial.output = "hidden" in item ? result.finalText : result.structured;
@@ -593,8 +586,7 @@ export class EvalRunner {
         )
           tracker.blockModel(target.modelId, result.error ?? "model rejected");
         if (signal.aborted) return skip("daemon shutdown");
-        const output =
-          invoked.parsed ?? schema?.safeParse(result.structured ?? extractJson(result.finalText));
+        const output = schema?.safeParse(result.structured ?? extractJson(result.finalText));
         const ok = result.status === "ok" && ("hidden" in item || output?.success === true);
         const grade =
           "hidden" in effective && implementation

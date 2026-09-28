@@ -58,7 +58,13 @@ import {
   verifyPrompt,
 } from "./prompts.ts";
 import { buildReport } from "./report.ts";
-import { blockingReviewFindings, reviewFindingKey, runReview } from "./review.ts";
+import {
+  blockingReviewFindings,
+  type ReviewInput,
+  type ReviewRequest,
+  reviewFindingKey,
+  runReview,
+} from "./review.ts";
 import {
   type Holdout,
   HoldoutSchema,
@@ -834,49 +840,44 @@ async function oneRound(
       const replayed = (ctx.state.reviewHistory ?? []).find(
         (e) => e.round === round && e.sha === reviewedSha,
       );
-      const { target, parsed } = await runReview(
-        {
-          invoke: async (request) => {
-            const invoked = await ctx.invoke({
-              role: "review",
-              stage,
-              mode: "readonly",
-              complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
-              constraints: { avoidVendor: ctx.state.implementer?.vendor },
-              timeoutMs: request.timeoutMs,
-              prompt: request.prompt,
-              jsonSchema: request.jsonSchema,
-              schema: request.schema,
-              requireStructured: true,
-            });
-            await discardChanges(cwd);
-            return invoked;
-          },
+      const input: ReviewInput = {
+        timeoutMs: readingTimeout(diff.added + diff.removed),
+        replayedFollowUps: replayed?.followUps,
+        prompt: {
+          prompt: ctx.run.prompt,
+          spec: ctx.state.spec ?? null,
+          baseSha,
+          stat: diff.stat,
+          ...(ctx.state.flow === "verify-change" ? { patch: diff.patch } : {}),
+          gates: comparison,
+          audit,
+          implementerReport: ctx.state.implementerReport ?? "",
+          implementerReportMode: ctx.deps.cfg.reviewImplementerReport,
+          externalChange: ctx.state.flow === "verify-change",
+          dependencyUpdate:
+            ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
+          previous: previousReview,
+          headSha: reviewedSha,
+          resolution: ctx.state.conflictRound === round,
         },
-        {
-          prompt: {
-            prompt: ctx.run.prompt,
-            spec: ctx.state.spec ?? null,
-            baseSha,
-            stat: diff.stat,
-            ...(ctx.state.flow === "verify-change" ? { patch: diff.patch } : {}),
-            gates: comparison,
-            audit,
-            implementerReport: ctx.state.implementerReport ?? "",
-            implementerReportMode: ctx.deps.cfg.reviewImplementerReport,
-            externalChange: ctx.state.flow === "verify-change",
-            dependencyUpdate:
-              ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
-            previous: previousReview,
-            headSha: reviewedSha,
-            resolution: ctx.state.conflictRound === round,
-          },
-          timeoutMs: readingTimeout(diff.added + diff.removed),
-          replayedFollowUps: replayed?.followUps,
-        },
-      );
-      if (!parsed.success) throw parsed.error;
-      const { review: r, modelVerdict, blocking, followUps } = parsed.decision;
+      };
+      const invoke = async (request: ReviewRequest) => {
+        const invoked = await ctx.invoke({
+          role: "review",
+          stage,
+          mode: "readonly",
+          complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
+          constraints: { avoidVendor: ctx.state.implementer?.vendor },
+          ...request,
+          requireStructured: true,
+        });
+        await discardChanges(cwd);
+        return invoked;
+      };
+      const { target, output, decision } = await runReview({ invoke }, input);
+      if (!decision) throw output.error;
+      // The model's verdict is kept for inspection only; control flow uses the derived one.
+      const { review: r, modelVerdict, blocking, followUps } = decision;
       ctx.state.reviewHistory = [...earlierReviews, { round, sha: reviewedSha, blocking, followUps }];
       ctx.state.reviewFollowUps = [
         ...new Map(

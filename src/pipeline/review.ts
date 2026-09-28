@@ -58,46 +58,32 @@ export interface ReviewRequest {
   timeoutMs: number;
 }
 
-export interface ReviewDeps<T extends { result: AgentResult }> {
-  invoke: (request: ReviewRequest) => Promise<T>;
-}
-
 export interface ReviewDecision {
-  /** The model's output with the verdict derived from its findings; control flow uses this one. */
+  /** Verdict derived from the findings; the model's own is kept in modelVerdict for inspection only. */
   review: Review;
-  /** The model's own verdict, kept for inspection only. */
   modelVerdict: Review["verdict"];
   blocking: Review["findings"];
   followUps: Review["findings"];
 }
 
-/** `data` is the model output as returned (with its own verdict). */
-export type ReviewParse =
-  | { success: true; data: Review; decision: ReviewDecision }
-  | { success: false; error: z.ZodError };
-
 export function reviewRequest(input: ReviewInput): ReviewRequest {
   const schema = input.prompt.previous ? LaterReviewSchema : ReviewSchema;
-  return {
-    prompt: reviewPrompt(input.prompt),
-    schema,
-    jsonSchema: toStrictJsonSchema(schema),
-    timeoutMs: input.timeoutMs,
-  };
+  const jsonSchema = toStrictJsonSchema(schema);
+  return { prompt: reviewPrompt(input.prompt), schema, jsonSchema, timeoutMs: input.timeoutMs };
 }
 
 /**
- * One review round: prompt, invocation, parsing and the derived decision. Parsing runs whatever the
- * invocation status so callers keep their own error handling.
+ * One review round: prompt, invocation, parsing and the derived decision. `decision` is absent when the
+ * output does not parse; callers keep their own error handling.
  */
 export async function runReview<T extends { result: AgentResult }>(
-  deps: ReviewDeps<T>,
+  deps: { invoke: (request: ReviewRequest) => Promise<T> },
   input: ReviewInput,
-): Promise<T & { request: ReviewRequest; parsed: ReviewParse }> {
+): Promise<T & { output: z.ZodSafeParseResult<Review>; decision?: ReviewDecision }> {
   const request = reviewRequest(input);
   const invoked = await deps.invoke(request);
   const output = request.schema.safeParse(invoked.result.structured ?? extractJson(invoked.result.finalText));
-  if (!output.success) return { ...invoked, request, parsed: { success: false, error: output.error } };
+  if (!output.success) return { ...invoked, output };
   const prior = input.prompt.previous?.findings;
   const review: Review = { ...output.data, verdict: reviewVerdict(output.data, prior) };
   const blocking = blockingReviewFindings(review, prior);
@@ -110,6 +96,5 @@ export async function runReview<T extends { result: AgentResult }>(
         ).values(),
       ]
     : [];
-  const decision = { review, modelVerdict: output.data.verdict, blocking, followUps };
-  return { ...invoked, request, parsed: { success: true, data: output.data, decision } };
+  return { ...invoked, output, decision: { review, modelVerdict: output.data.verdict, blocking, followUps } };
 }
