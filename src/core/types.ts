@@ -8,9 +8,16 @@ export type RunStatus =
   | "succeeded"
   | "failed"
   | "cancelled"
-  | "needs_human";
+  | "needs_human"
+  | "resolved";
 
-export const TERMINAL_STATUSES: readonly RunStatus[] = ["succeeded", "failed", "cancelled", "needs_human"];
+export const TERMINAL_STATUSES: readonly RunStatus[] = [
+  "succeeded",
+  "failed",
+  "cancelled",
+  "needs_human",
+  "resolved",
+];
 
 export type Profile = "auto" | "quick" | "standard" | "deep";
 export type ResolvedProfile = Exclude<Profile, "auto">;
@@ -130,6 +137,8 @@ export interface Run {
   headSha: string | null;
   prUrl: string | null;
   merged: boolean;
+  mergedBy: string | null;
+  mergedAt: number | null;
   costUsd: number; // real money (metered providers)
   costEquivUsd: number; // what the work would have cost at API list prices
   tokensIn: number;

@@ -121,8 +121,12 @@ test("policy CLI previews exactly the written overlay, preserves other cells, an
   const { DEFAULT_POLICY } = await import("../src/router/catalog.ts");
   const records = [
     evidence("triage", [local, subscription]),
+    evidence("implement", [subscription], { id: "implement-run" }),
     evidence("verify", [local], { status: "running", id: "running" }),
   ];
+  records[1]?.trials.forEach((t) => {
+    t.details.complexity = "small";
+  });
   const existing = {
     chat: { default: [subscription] },
     review: { large: [local] },
@@ -157,18 +161,21 @@ test("policy CLI previews exactly the written overlay, preserves other cells, an
   expect(writes).toEqual([]);
   expect(printed[0]).toContain("@@ triage.default @@");
   expect(printed[0]).toContain(`+ ["${local}","${subscription}"]`);
+  expect(printed[0]).toContain("@@ implement.small @@");
   expect(printed[0]).toContain("verify unchanged: no completed evidence");
   const preview = printed[0];
   printed.length = 0;
-  await evalCommand(["policy"], { write: true, evals: "triage-run,triage-run" }, io);
+  await evalCommand(["policy"], { write: true, evals: "triage-run,implement-run,triage-run" }, io);
   expect(printed[0]).toBe(preview);
-  expect(queried.at(-1)).toContain("evals=triage-run%2Ctriage-run");
+  expect(queried.at(-1)).toContain("evals=triage-run%2Cimplement-run%2Ctriage-run");
   expect(writes).toEqual(["routing/policy.json", "routing/EVIDENCE.md"]);
   expect(JSON.parse(files.get("routing/policy.json") ?? "{}")).toEqual({
     ...existing,
     triage: { default: [local, subscription] },
+    implement: { small: [subscription] },
   });
   expect(files.get("routing/EVIDENCE.md")).toContain("run=triage-run");
+  expect(files.get("routing/EVIDENCE.md")).toContain("run=implement-run");
   writes.length = 0;
   for (const evals of ["", ",triage-run", "triage-run,", "missing", "running"]) {
     await expect(evalCommand(["policy"], { evals, write: true }, io)).rejects.toThrow();

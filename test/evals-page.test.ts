@@ -75,6 +75,14 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
     expect(implementHtml).toContain("evaluated");
     expect(implementHtml).toContain("pass rate:");
     expect(implementData.evaluation).toEqual(response([]).evaluation);
+    implementation.trials.forEach((trial) => {
+      trial.details.complexity = "small";
+    });
+    const policyHtml = renderToString(() => EvalsView({ data: response([implementation]) }));
+    expect(policyHtml).toContain("implement.small");
+    expect(policyHtml).toContain("Estimated cost/case: $0.0000");
+    expect(policyHtml).toContain("paired 40");
+    expect(policyHtml).toContain("Update implement.small");
     const variants = evidence("triage", [
       "codex/luna@low",
       "codex/luna@high",
