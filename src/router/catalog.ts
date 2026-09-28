@@ -376,6 +376,19 @@ export const MODELS: ModelDef[] = [
     notes: "Local Swift-1.5 Qwen3.8 27B oQ8e MTP build, served by oMLX on this Mac",
   },
   {
+    id: "omlx/qwen-flash",
+    provider: "omlx",
+    model: "Qwen3.8-Flash-Next-REAP-288-MLX-4bit",
+    vendor: "qwen",
+    origin: "CN",
+    baseOrigin: "CN",
+    supportedEfforts: ["none", "high"],
+    tier: 2,
+    price: { input: 0, output: 0 },
+    notes:
+      "Local Qwen3.8 Flash Next (REAP-pruned, 4-bit MLX), served by oMLX on this Mac; on trial against omlx/qwen-27b",
+  },
+  {
     id: "mtplx/qwen-27b",
     provider: "mtplx",
     model: "mtplx-qwen38-27b-optimized-quality",
