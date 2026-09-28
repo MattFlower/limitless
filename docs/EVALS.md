@@ -120,7 +120,32 @@ preparation failure, invalid output, harness failure, and cancellation. No deliv
 Pins whose reachable history itself contains labels are rejected as a preparation error: any
 commit touching `evals/triage`, `evals/review` or `evals/verify`, or any blob identical to the
 dataset file or one of its seed patches. Deleting such files from the checkout would not help,
-since `git show` would still read them; pick pins from before the datasets were committed.
+since `git show` would still read them; pick pins from before the datasets were committed, or
+use snapshot mode.
+
+### Snapshot mode
+
+Any case in any role may set `"snapshot": true` (omitted or `false` keeps the plain mode above).
+The candidate then gets a fresh standalone repository instead of the pinned history. It holds
+two commits: `Snapshot base`, which is `base^{tree}` without the top-level `evals` directory, and
+`Snapshot head`, which is `head^{tree}` without it, parented on the first. The commits are built
+in a throwaway staging repository that borrows the cache's objects, so only objects reachable
+from the snapshot are copied. Original commits, refs, remotes and messages are unreachable. All
+other paths, contents and modes are unchanged, so `git diff base..head` equals the original
+diff outside `evals/**`, and graders see the same repository-relative paths. Author, committer
+and dates are fixed, so the same pins always give the same tree and commit hashes.
+
+That snapshot base replaces `base` in prompts, diff statistics, base gate detection, the audit
+and implement retry feedback. The original pins stay in the case as provenance and in the cache
+identity, which also records `snapshot` so plain and snapshot trials never share a cache entry.
+Seed patches are still committed on top of the snapshot head. The contamination check still
+runs, now against the snapshot: label paths cannot appear, but any exact dataset, seed-patch or
+hidden-file blob kept outside `evals/` still fails preparation before the candidate is invoked.
+
+Role differences: implement snapshots contain only `Snapshot base` (its `head` is provenance
+only, so the reference solution never enters the checkout), and hidden files are injected at
+grading as usual. Triage has one repository pin, which supplies both trees; triage candidates
+still get no checkout, and the top-level listing in their prompt comes from the snapshot.
 
 The candidate receives the pipeline prompt, FACTORY_PREAMBLE, role schema, read-only agent
 harness, and normal inputs only: labels, source/foundBy annotations and patch files are never

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
@@ -494,7 +494,8 @@ export async function createEvalWorktree(
   path: string,
   signal: AbortSignal,
   labels: EvalLabels = { paths: [], contents: [] },
-): Promise<() => Promise<void>> {
+  snapshot = false,
+): Promise<(() => Promise<void>) & { base: string }> {
   if (!/^[\w.-]+\/[\w.-]+$/.test(slug) || ![base, head].every((sha) => /^[a-fA-F0-9]{40}$/.test(sha)))
     throw new Error("invalid repository pin");
   const registered = store.getRepoBySlug(slug);
@@ -512,6 +513,7 @@ export async function createEvalWorktree(
   signal.throwIfAborted();
   if (!existsSync(cache)) await ensureCache(paths, repo, signal);
   const cleanup = async () => rmSync(path, { recursive: true, force: true });
+  let pins: [string, string] = [base, head];
   try {
     await withRepoLock(cache, async () => {
       signal.throwIfAborted();
@@ -539,17 +541,75 @@ export async function createEvalWorktree(
       // would share the cache's refs and objects, exposing later fixes and labeled datasets.
       mkdirSync(path, { recursive: true });
       await sh(["git", "init", "-q", path], opts);
-      await sh(["git", "push", "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
+      if (snapshot) pins = await pushSnapshot(cache, base, head, path, signal);
+      else await sh(["git", "push", "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
     });
     const opts = { cwd: path, signal };
     await rejectContamination(path, labels, signal);
-    await sh(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", head], opts);
+    await sh(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", pins[1]], opts);
     for (const ref of ["refs/eval/base", "refs/eval/head"]) await sh(["git", "update-ref", "-d", ref], opts);
     await sh(["git", "reflog", "expire", "--expire=now", "--all"], opts);
-    return cleanup;
+    return Object.assign(cleanup, { base: pins[0] });
   } catch (error) {
     await cleanup();
     throw error;
+  }
+}
+
+/** Fixed identity and dates so the same pins always produce the same snapshot commits. */
+const SNAPSHOT_ENV = {
+  GIT_AUTHOR_NAME: "Limitless",
+  GIT_AUTHOR_EMAIL: "limitless@localhost",
+  GIT_AUTHOR_DATE: "1000000000 +0000",
+  GIT_COMMITTER_NAME: "Limitless",
+  GIT_COMMITTER_EMAIL: "limitless@localhost",
+  GIT_COMMITTER_DATE: "1000000000 +0000",
+};
+
+/**
+ * Push neutral commits of the pinned trees minus the top-level `evals` directory into `path`
+ * (one commit when base and head coincide). They are built in a staging repository that
+ * borrows the cache's objects, so the target receives only objects reachable from the snapshot.
+ */
+async function pushSnapshot(
+  cache: string,
+  base: string,
+  head: string,
+  path: string,
+  signal: AbortSignal,
+): Promise<[string, string]> {
+  const staging = `${path}.snapshot`;
+  rmSync(staging, { recursive: true, force: true });
+  try {
+    await sh(["git", "init", "-q", "--bare", staging], { cwd: cache, signal });
+    const objects = (
+      await sh(["git", "rev-parse", "--git-path", "objects"], { cwd: cache, signal })
+    ).stdout.trim();
+    writeFileSync(join(staging, "objects/info/alternates"), `${resolve(cache, objects)}\n`);
+    const opts = {
+      cwd: staging,
+      signal,
+      env: { ...(process.env as Record<string, string>), ...SNAPSHOT_ENV },
+    };
+    const commit = async (sha: string, message: string, parent?: string) => {
+      const entries = (await sh(["git", "ls-tree", "-z", `${sha}^{tree}`], opts)).stdout
+        .split("\0")
+        .filter((entry) => entry && !/^\d+ tree \w+\tevals$/.test(entry));
+      const tree = (
+        await sh(["git", "mktree", "-z"], { ...opts, stdin: entries.map((e) => `${e}\0`).join("") })
+      ).stdout.trim();
+      const args = ["git", "-c", "i18n.commitEncoding=UTF-8", "commit-tree", "--no-gpg-sign", tree];
+      return (await sh([...args, ...(parent ? ["-p", parent] : []), "-m", message], opts)).stdout.trim();
+    };
+    const snapshotBase = await commit(base, "Snapshot base");
+    const snapshotHead = head === base ? snapshotBase : await commit(head, "Snapshot head", snapshotBase);
+    await sh(
+      ["git", "push", "-q", path, `${snapshotBase}:refs/eval/base`, `${snapshotHead}:refs/eval/head`],
+      opts,
+    );
+    return [snapshotBase, snapshotHead];
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
   }
 }
 

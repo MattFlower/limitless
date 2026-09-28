@@ -31,6 +31,7 @@ export const CaseFileSchema = z
           gold: GoldSchema,
           tags: z.array(nonempty),
           notes: z.string().optional(),
+          snapshot: z.boolean().optional(),
         }),
       )
       .min(1),
@@ -80,7 +81,8 @@ export const GateComparisonSchema = z.strictObject({
   result: GateResultSchema,
   firstAttempt: GateResultSchema.optional(),
 });
-const repositoryCase = { id: nonempty, repo: repoId, base: pin, head: pin };
+/** `snapshot: true` gives the candidate neutral commits of the pinned trees without `evals/`. */
+const repositoryCase = { id: nonempty, repo: repoId, base: pin, head: pin, snapshot: z.boolean().optional() };
 export const ReviewCaseSchema = z.strictObject({
   ...repositoryCase,
   kind: z.enum(["real", "clean", "seeded"]),

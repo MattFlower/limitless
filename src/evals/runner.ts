@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { EvalRun, EvalTrial } from "../core/types.ts";
-import { createEvalWorktree, type EvalLabels, pinnedTree } from "../git/repos.ts";
+import { createEvalWorktree, type EvalLabels, formatTopLevel, pinnedTree } from "../git/repos.ts";
 import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
 import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
@@ -9,6 +9,7 @@ import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
 import { toStrictJsonSchema } from "../pipeline/schemas.ts";
 import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
+import { sh } from "../util/proc.ts";
 import { cacheKey } from "./cache.ts";
 import {
   type AnyCaseFile,
@@ -18,6 +19,7 @@ import {
   hiddenContents,
   type ImplementCase,
   loadRoleCases,
+  type TriageCase,
   validateRequest,
 } from "./cases.ts";
 import {
@@ -133,13 +135,16 @@ export class EvalRunner {
       }
       return prepared;
     };
-    const treeFor = (slug: string) => {
-      let tree = trees.get(slug);
+    const treeFor = (item: TriageCase, labels: EvalLabels) => {
+      const key = JSON.stringify([item.repo, item.snapshot === true]);
+      let tree = trees.get(key);
       if (!tree) {
-        const sha = file.role === "triage" ? file.repos[slug] : undefined;
-        if (!sha) throw new Error(`missing pin: ${slug}`);
-        tree = pinnedTree(this.deps.cfg.paths, store, slug, sha);
-        trees.set(slug, tree);
+        const sha = file.role === "triage" ? file.repos[item.repo] : undefined;
+        if (!sha) throw new Error(`missing pin: ${item.repo}`);
+        tree = item.snapshot
+          ? this.snapshotTree(item.repo, sha, labels, signal)
+          : pinnedTree(this.deps.cfg.paths, store, item.repo, sha);
+        trees.set(key, tree);
       }
       return tree;
     };
@@ -197,11 +202,30 @@ export class EvalRunner {
     }
   }
 
+  /** Triage reads only a top-level listing; in snapshot mode it comes from a checked snapshot. */
+  private async snapshotTree(slug: string, sha: string, labels: EvalLabels, signal: AbortSignal) {
+    const { cfg, store } = this.deps;
+    mkdirSync(cfg.paths.runs, { recursive: true });
+    const directory = mkdtempSync(join(cfg.paths.runs, "eval-"));
+    try {
+      const cwd = join(directory, "snapshot");
+      const cleanup = await createEvalWorktree(cfg.paths, store, slug, sha, sha, cwd, signal, labels, true);
+      try {
+        const tree = await sh(["git", "ls-tree", "--name-only", "-z", "HEAD"], { cwd, signal });
+        return formatTopLevel(tree.stdout.split("\0").filter(Boolean));
+      } finally {
+        await cleanup();
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+
   private async trial(
     run: EvalRun,
     trial: EvalTrial,
     item: EvalCase,
-    treeFor: (slug: string) => Promise<string>,
+    treeFor: (item: TriageCase, labels: EvalLabels) => Promise<string>,
     implementFor: (item: ImplementCase, cwd: string) => ReturnType<typeof prepareImplement>,
     labels: EvalLabels,
     cache: boolean,
@@ -268,7 +292,7 @@ export class EvalRunner {
     let target = router.toTarget(model, effort ?? null);
     let { harnessName, noTools } = selectHarness(run.role, target);
     trial.harness = harnessName;
-    const tree = "gold" in item && "prompt" in item ? await treeFor(item.repo) : "";
+    const tree = "gold" in item && "prompt" in item ? await treeFor(item, labels) : "";
     let release: (() => void) | undefined;
     let directory: string | undefined;
     let scratch: string | undefined;
@@ -279,8 +303,10 @@ export class EvalRunner {
       const cwd = "gold" in item && "prompt" in item ? directory : join(directory, "worktree");
       const patch =
         "defects" in item ? seedContent(item, this.casePath ?? defaultCasePath(run.role)) : undefined;
-      if (!("gold" in item && "prompt" in item))
-        cleanup = await createEvalWorktree(
+      // Snapshot cases replace the pinned history, so every base-relative step uses its base.
+      let effective = item;
+      if (!("gold" in item && "prompt" in item)) {
+        const checkout = await createEvalWorktree(
           cfg.paths,
           store,
           item.repo,
@@ -289,10 +315,15 @@ export class EvalRunner {
           cwd,
           signal,
           labels,
+          item.snapshot === true,
         );
+        cleanup = checkout;
+        if (item.snapshot) effective = { ...item, base: checkout.base };
+      }
       const preparationStarted = Date.now();
-      const implementation = "hidden" in item ? await implementFor(item, cwd) : undefined;
-      const prepared = "hidden" in item ? implementation : await prepareCase(item, cwd, tree, patch, signal);
+      const implementation = "hidden" in effective ? await implementFor(effective, cwd) : undefined;
+      const prepared =
+        "hidden" in effective ? implementation : await prepareCase(effective, cwd, tree, patch, signal);
       if (!prepared) throw new Error("missing trial preparation");
       const preparationMs = Date.now() - preparationStarted;
       let { prompt } = prepared;
@@ -301,7 +332,9 @@ export class EvalRunner {
       const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
         "gold" in item && "prompt" in item
-          ? undefined
+          ? item.snapshot
+            ? { snapshot: true }
+            : undefined
           : {
               role: run.role,
               repo: item.repo,
@@ -321,6 +354,7 @@ export class EvalRunner {
                   }
                 : { head: item.head, input: item.input }),
               patch,
+              ...(item.snapshot ? { snapshot: true } : {}),
               source:
                 store.getRepoBySlug(item.repo)?.url ?? store.getRepoBySlug(item.repo)?.localPath ?? item.repo,
             };
@@ -499,10 +533,10 @@ export class EvalRunner {
         const output = schema?.safeParse(result.structured ?? extractJson(result.finalText));
         const ok = result.status === "ok" && ("hidden" in item || output?.success === true);
         const grade =
-          "hidden" in item && implementation
+          "hidden" in effective && implementation
             ? result.status === "ok"
               ? await gradeImplement(
-                  item,
+                  effective,
                   cwd,
                   hidden,
                   implementation,
@@ -560,11 +594,11 @@ export class EvalRunner {
           : !taskFailure
             ? "operational failure"
             : "round limit";
-        if (taskFailure && round + 1 < rounds && "hidden" in item && implementation && grade) {
+        if (taskFailure && round + 1 < rounds && "hidden" in effective && implementation && grade) {
           const next = nextImplementTarget(router, trial.details.switchChain, target, strategy);
           if (next) {
             store.recordEvalTrial({ ...trial, status: "running" });
-            prompt = implementRetryPrompt(item, implementation, grade, round + 1);
+            prompt = implementRetryPrompt(effective, implementation, grade, round + 1);
             sessionId = strategy === "switch" ? undefined : (result.sessionId ?? undefined);
             target = next;
             continue;
