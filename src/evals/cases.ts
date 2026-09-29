@@ -67,6 +67,7 @@ const GateResultSchema = z.strictObject({
   exitCode: z.number().int().nullable(),
   durationMs: z.number().finite().nonnegative(),
   output: z.string(),
+  timedOut: z.boolean().optional(),
 });
 export const GateComparisonSchema = z.strictObject({
   name: nonempty,

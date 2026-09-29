@@ -1,10 +1,13 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { evalCommand, formatEvalReport } from "../src/cli/eval.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { evalFixture } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 const evalRoles = test.each(["triage", "implement"] as const);
 evalRoles("CLI %s submits options, follows HTTP results and emits JSON", async (role) => {

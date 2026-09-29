@@ -8,6 +8,7 @@ import {
   compareGates,
   type GateComparison,
   type GateHooks,
+  retryBaselineFailures,
   retryRegressions,
   runGates,
 } from "../gates/run.ts";
@@ -328,10 +329,21 @@ async function prepare(ctx: RunContext): Promise<void> {
         `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
       );
       await ctx.save();
+      const { onWait } = gateEvents(ctx);
       ctx.state.baseline =
         gates.setup.length || gates.checks.length
-          ? await runGates(wt.path, gates, ctx.signal, { onWait: gateEvents(ctx).onWait })
+          ? await runGates(wt.path, gates, ctx.signal, { onWait })
           : null;
+      ctx.checkCancelled();
+      // Retry before resetting, so a check sees the same build output as its first attempt.
+      if (ctx.state.baseline)
+        ctx.state.baseline = await retryBaselineFailures(
+          ctx.state.baseline,
+          wt.path,
+          gates,
+          ctx.signal,
+          onWait,
+        );
       ctx.checkCancelled();
     } finally {
       if (verification) await resetTo(wt.path, verification.headSha);
@@ -347,6 +359,16 @@ async function prepare(ctx: RunContext): Promise<void> {
           level: r.ok ? "info" : "warn",
           message: `baseline ${r.name}: ${r.ok ? "pass" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
           data: r,
+        });
+      }
+      for (const { firstAttempt, ...retry } of baseline.checks) {
+        if (!firstAttempt) continue;
+        store.addEvent({
+          runId: ctx.run.id,
+          type: "gate",
+          level: "warn",
+          message: `baseline ${retry.name}: ${retry.ok ? "flaky" : "retry FAIL again"}`,
+          data: { flaky: retry.ok, firstAttempt, retry },
         });
       }
     }
