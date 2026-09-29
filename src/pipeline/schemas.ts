@@ -198,9 +198,12 @@ export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
     })[];
 };
 
-/** The diff a panel review covered: R1 the full change, R2 and R3 only the fixes since the previous review. */
+/**
+ * The diff a panel review covered: R1 the full change, R2 and R3 only the fixes since the previous
+ * review, a conflict-resolution review (outside R1-R3) the resolved change against the new base.
+ */
 export interface ReviewScope {
-  kind: "full" | "fix";
+  kind: "full" | "fix" | "resolution";
   range: string;
 }
 

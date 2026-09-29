@@ -274,7 +274,8 @@ export function reviewPrompt(input: {
   const range = fix
     ? `${fix}..${input.headSha ?? "HEAD"}`
     : `${input.baseSha}${input.externalChange ? "..." : ".."}${input.externalChange ? (input.headSha ?? "HEAD") : "HEAD"}`;
-  // v2 evidence stays out so a prior confidence score can't anchor the recheck.
+  // v2 evidence stays out so a prior confidence score can't anchor the recheck; a fix-diff review also
+  // drops the earlier review's own label and citation, which its fresh id and status replace.
   const brief = (
     {
       failure_scenario,
@@ -285,7 +286,11 @@ export function reviewPrompt(input: {
       ...f
     }: Review["findings"][number],
     status: string,
-  ) => (fix ? { ...f, status } : f);
+  ) => {
+    if (!fix) return f;
+    const { label: _label, prior: _prior, ...rest } = f;
+    return { ...rest, status };
+  };
   const warnings = input.audit.length
     ? input.audit
         .map((f) => `- [${f.rule}/${f.severity}] ${f.file ? `${f.file}: ` : ""}${f.detail}`)
@@ -339,7 +344,7 @@ ${fence(
 )}
 `
     : ""
-}${input.resolution && !fix ? `For this conflict-resolution round, inspect \`git diff ${input.baseSha}..HEAD\` against the pinned new base for review and regression classification.` : `Inspect the latest-change diff with \`git diff ${input.previous.sha}..${input.headSha ?? "HEAD"}\`. ${fix ? `Only this fix diff is under review; do not re-review the rest of the change.${input.resolution ? " This round resolved merge conflicts against a new base, so the fix diff also carries upstream changes; review the conflict resolution and fixes, not the upstream code." : ""}` : "Compare it with the full base-to-HEAD change above."}`}
+}${input.resolution && !fix ? `For this conflict-resolution round, inspect \`git diff ${input.baseSha}..HEAD\` against the pinned new base for review and regression classification.` : `Inspect the latest-change diff with \`git diff ${input.previous.sha}..${input.headSha ?? "HEAD"}\`. ${fix ? "Only this fix diff is under review; do not re-review the rest of the change." : "Compare it with the full base-to-HEAD change above."}`}
 For every finding, set exactly one label: unaddressed = a previous blocking finding remains unfixed; regression = introduced by the latest changes; new = first found now and not introduced by the latest changes. Mark security findings with security: true (otherwise false). Newly found major/minor/nit findings that are not security issues become follow-ups. Recheck the previous findings before raising new ones. When labelling a finding unaddressed, set prior to the id (P1, P2, ...) of the previous blocking finding it repeats; set prior to "" for every other finding. Prior nonblocking findings are already recorded follow-ups; do not relabel them unaddressed. Report resolved prior findings by omitting them from findings.
 `
     : ""

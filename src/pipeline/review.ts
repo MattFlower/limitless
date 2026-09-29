@@ -36,11 +36,17 @@ export function reviewFindingKey(finding: Review["findings"][number]): string {
   return JSON.stringify([finding.file, finding.title]);
 }
 
-/** Whether an "unaddressed" finding cites one of the previous blocking findings (P1, P2, ...). */
-function citesPriorBlocking(finding: Review["findings"][number], priorBlocking: Review["findings"]): boolean {
+/** The zero-based index an "unaddressed" finding cites among `count` prior blocking findings (P1 = P01). */
+function citedPriorIndex(finding: Finding, count: number): number | undefined {
+  if (finding.label !== "unaddressed") return undefined;
   const match = /^P(\d+)$/i.exec(finding.prior?.trim() ?? "");
   const index = match ? Number(match[1]) : 0;
-  return index >= 1 && index <= priorBlocking.length;
+  return index >= 1 && index <= count ? index - 1 : undefined;
+}
+
+/** Whether an "unaddressed" finding cites one of the previous blocking findings (P1, P2, ...). */
+function citesPriorBlocking(finding: Review["findings"][number], priorBlocking: Review["findings"]): boolean {
+  return citedPriorIndex(finding, priorBlocking.length) !== undefined;
 }
 
 /** Panel reviews per run: a run still blocked after the last one goes to a human. */
@@ -56,26 +62,28 @@ function verifiedAtLeast(finding: Finding, min: Verification["severity"]): boole
 }
 
 /**
- * Panel re-reviews (R2, R3) tighten what blocks, and only verified findings ever block:
+ * Only verified findings ever block, and a verified security finding (the verifier's category, or the
+ * finder's flag) blocks in every review. Otherwise re-reviews tighten what blocks:
  * R2 — a cited unaddressed prior blocking finding, a regression of medium or above, or a new high/critical;
- * R3 — a critical finding (cited prior, regression or new) or a security finding.
+ * R3 — a critical finding (cited prior, regression or new).
  */
-function panelRereviewBlocks(
+function panelBlocks(
   finding: Finding,
-  priorBlocking: Review["findings"],
+  priorBlocking: Review["findings"] | undefined,
   panelReview: number,
 ): boolean {
   if (!panelVerified(finding)) return false;
-  if (panelReview >= PANEL_REVIEWS)
-    return verifiedAtLeast(finding, "critical") || finding.verification?.category === "security";
-  if (finding.label === "unaddressed" && citesPriorBlocking(finding, priorBlocking)) return true;
+  if (finding.verification?.category === "security" || finding.security) return true;
+  if (!priorBlocking || panelReview <= 1) return true;
+  if (panelReview >= PANEL_REVIEWS) return verifiedAtLeast(finding, "critical");
+  if (citesPriorBlocking(finding, priorBlocking)) return true;
   return verifiedAtLeast(finding, finding.label === "regression" ? "medium" : "high");
 }
 
 /**
  * Panel reviews block on the verifier's ruling and never on cleanup or conventions (the verifier's
- * category, else the finder's): in R1 every verified finding; R2 and R3 (`panelReview`, default 2)
- * follow `panelRereviewBlocks`.
+ * category, else the finder's): see `panelBlocks`. `panelReview` defaults to 2, whose rules a
+ * conflict-resolution review (outside the R1-R3 count) also follows.
  *
  * Single reviews, first round: blockers and majors block. Later rounds may not move the goalposts: a finding blocks
  * only if it is a regression from the latest changes, an unaddressed previous *blocking* finding
@@ -90,14 +98,12 @@ export function blockingReviewFindings(
   const panel = review.mode === "panel";
   return review.findings.filter((finding) => {
     if (panel) {
-      if (finding.verification?.verdict === "REFUTED") return false;
       if (UNVERIFIED_CATEGORIES.includes(finding.verification?.category ?? finding.category)) return false;
-      if (!priorBlocking || panelReview <= 1) return panelVerified(finding);
-      return panelRereviewBlocks(finding, priorBlocking, panelReview);
+      return panelBlocks(finding, priorBlocking, panelReview);
     }
     if (!priorBlocking) return finding.severity === "blocker" || finding.severity === "major";
     if (finding.label === "regression") return true;
-    if (finding.label === "unaddressed" && citesPriorBlocking(finding, priorBlocking)) return true;
+    if (citesPriorBlocking(finding, priorBlocking)) return true;
     return finding.severity === "blocker" || finding.security;
   });
 }
@@ -113,11 +119,11 @@ export function resolvedPriorFindings(
   return history.slice(0, -1).flatMap((entry, i) => {
     const next = history[i + 1];
     const cited = new Set(
-      [...(next?.blocking ?? []), ...(next?.followUps ?? [])]
-        .filter((f) => f.label === "unaddressed")
-        .map((f) => f.prior?.trim().toUpperCase()),
+      [...(next?.blocking ?? []), ...(next?.followUps ?? [])].map((f) =>
+        citedPriorIndex(f, entry.blocking.length),
+      ),
     );
-    return entry.blocking.filter((_, k) => !cited.has(`P${k + 1}`));
+    return entry.blocking.filter((_, k) => !cited.has(k));
   });
 }
 
@@ -320,16 +326,23 @@ async function runPanel<T extends Invoked>(
   const first = found[0];
   if (!first) throw new Error('mode "panel" needs at least one finder');
 
-  const raised = found.flatMap(({ invoked, review }, finder) =>
-    review.findings.map((f) => ({ ...f, finder, vendor: invoked.target?.vendor ?? null })),
-  );
   const { fixReview, previous } = input.prompt;
+  const priorBlocking = previous?.findings ?? [];
+  const cited = (c: Finding) => citedPriorIndex(c, priorBlocking.length);
+  // A citation of a prior blocking finding keeps that finding's category, so retagging it cleanup or
+  // conventions can't drop it from verification.
+  const raised = found.flatMap(({ invoked, review }, finder) =>
+    review.findings.map((f) => {
+      const prior = priorBlocking[cited(f) ?? -1];
+      const category = prior ? (prior.verification?.category ?? prior.category ?? f.category) : f.category;
+      return { ...f, ...(category ? { category } : {}), finder, vendor: invoked.target?.vendor ?? null };
+    }),
+  );
   const fix = fixReview && previous ? { review: fixReview, ...previous } : undefined;
-  const cites = (c: Finding, id: string) => c.label === "unaddressed" && c.prior?.trim().toUpperCase() === id;
   // A re-review never assumes a prior blocking finding fixed: whatever no finder repeated, the
   // verifier rechecks as a candidate of its own, outside the cap.
   const rechecks = (fix?.findings ?? []).flatMap(({ verification: _stale, ...f }, i) =>
-    raised.some((c) => cites(c, `P${i + 1}`))
+    raised.some((c) => cited(c) === i)
       ? []
       : [{ ...f, label: "unaddressed" as const, prior: `P${i + 1}`, finder: null, vendor: null }],
   );
@@ -337,18 +350,13 @@ async function runPanel<T extends Invoked>(
     ...c,
     id: `C${i + 1}`,
   }));
+  // A cited prior blocking finding is always verified: the citation replaces the automatic recheck.
+  const exempt = (c: PanelRecord["candidates"][number]) => c.finder === null || cited(c) !== undefined;
   // Stable sort: equal severities keep finder order.
   const ranked = candidates
-    .filter((c) => c.finder !== null && !UNVERIFIED_CATEGORIES.includes(c.category))
+    .filter((c) => !exempt(c) && !UNVERIFIED_CATEGORIES.includes(c.category))
     .sort((a, b) => FINDER_SEVERITY_RANK[a.severity] - FINDER_SEVERITY_RANK[b.severity]);
-  // A finder citation replaces the automatic recheck, so it must also bypass the cap.
-  const selected = [
-    ...ranked.filter(
-      (c, i) =>
-        i < PANEL_VERIFY_CAP || (fix && c.label === "unaddressed" && citesPriorBlocking(c, fix.findings)),
-    ),
-    ...candidates.filter((c) => c.finder === null),
-  ];
+  const selected = [...ranked.slice(0, PANEL_VERIFY_CAP), ...candidates.filter(exempt)];
   // One batch never mixes files or finder vendors, so each call avoids exactly its finder's vendor.
   const groups = new Map<string, typeof selected>();
   for (const c of candidates.filter((c) => selected.includes(c))) {
@@ -366,15 +374,14 @@ async function runPanel<T extends Invoked>(
         review: fix.review,
         sha: fix.sha,
         prior: fix.findings.map(({ file, line, title }, i) => {
-          const id = `P${i + 1}`;
           const [repeated, recheck] = [true, false].map((byFinder) =>
             candidates
-              .filter((c) => (c.finder !== null) === byFinder && cites(c, id))
+              .filter((c) => (c.finder !== null) === byFinder && cited(c) === i)
               .map((c) => c.id)
               .join(", "),
           );
           return {
-            id,
+            id: `P${i + 1}`,
             file,
             line,
             title,

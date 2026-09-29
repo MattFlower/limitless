@@ -98,10 +98,10 @@ export interface RunState {
   preRebaseHead?: string;
   /** Commit that last passed verify, or an approving quick review after deterministic checks. */
   lastVerifiedSha?: string;
-  /** Passing evidence retained if a later resolution round fails; the review history is kept with it. */
+  /** Passing evidence retained if a later resolution round fails; panel runs keep the review history with it. */
   lastVerifiedEvidence?: Pick<
     RunState,
-    "lastVerify" | "lastGates" | "lastReview" | "lastAudit" | "reviewHistory" | "reviewFollowUps"
+    "lastVerify" | "lastGates" | "lastReview" | "lastAudit" | "reviewHistory"
   >;
   /** Why delivery went ahead without rebasing onto the latest base (shown in the report). */
   rebaseNote?: string;
@@ -120,7 +120,7 @@ export interface RunState {
     sha: string;
     blocking: Review["findings"];
     followUps: Review["findings"];
-    /** Panel only: which review (1-3) this was; counted apart from implementation rounds. */
+    /** Panel only: which review (1-3) this was; counted apart from implementation rounds. Absent for a conflict-resolution review. */
     panelReview?: number;
     /** Panel only: the diff this review covered. */
     scope?: ReviewScope;

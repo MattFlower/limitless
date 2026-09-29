@@ -75,6 +75,7 @@ import {
   type Holdout,
   HoldoutSchema,
   type Review,
+  type ReviewScope,
   renderSpec,
   type Spec,
   SpecSchema,
@@ -774,10 +775,27 @@ async function oneRound(
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
   const changeDiff = () => diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change");
+  const system = ctx.deps.reviewSystem ?? productionReviewSystem(ctx.deps.cfg);
+  const resolution = ctx.state.conflictRound === round;
+  // Panel reviews are numbered apart from implementation rounds (a gate-failed round reviews nothing,
+  // a replayed round keeps its number); a conflict-resolution review is outside the count.
+  const panelReview =
+    system.mode === "panel" && !resolution
+      ? Math.max(
+          0,
+          ...(ctx.state.reviewHistory ?? []).filter((e) => e.round < round).map((e) => e.panelReview ?? 0),
+        ) + 1
+      : undefined;
+  // Checked before implementing: work no review can see is not worth paying for. The worktree keeps
+  // the head the last review saw, which the draft delivers.
+  if (panelReview && panelReview > PANEL_REVIEWS)
+    throw new NeedsHumanError(
+      `Panel review limit reached (R${PANEL_REVIEWS}); not implementing again. Last feedback:\n${ctx.state.feedback ?? ""}`,
+    );
 
   // --- implement (skipped when resuming a round whose implementation already landed)
   if (round >= 0 && ctx.state.implementedRound !== round) await implementStage(ctx, round);
-  if (ctx.state.conflictRound === round) {
+  if (resolution) {
     if (!ctx.state.preRebaseHead || ctx.state.pendingRebaseSha !== baseSha)
       throw new Error("Missing expected merge state for resolution checks");
     await validateMerge(cwd, ctx.state.preRebaseHead, baseSha);
@@ -901,21 +919,19 @@ async function oneRound(
   const earlierReviews = (ctx.state.reviewHistory ?? []).filter((entry) => entry.round < round);
   const priorReview = earlierReviews.at(-1);
   const reviewedSha = await headSha(cwd);
-  const system = ctx.deps.reviewSystem ?? productionReviewSystem(ctx.deps.cfg);
-  // Panel reviews are counted apart from implementation rounds; a replayed round keeps its number.
-  const panelReview =
-    system.mode === "panel" ? (priorReview?.panelReview ?? earlierReviews.length) + 1 : undefined;
-  if (panelReview && panelReview > PANEL_REVIEWS)
-    throw new NeedsHumanError(`Panel review limit reached (R${PANEL_REVIEWS}); not starting a fourth review`);
-  // R2 and R3 review only the fixes since the previous review, conflict-resolution rounds included.
+  // R2 and R3 review only the fixes since the previous review. A conflict-resolution review, like a
+  // single one, sees the change against the new base, so upstream-only files never appear.
   const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
   const reviewDiff = fixSha ? await diffSince(cwd, fixSha) : diff;
-  const scope = fixSha
-    ? { kind: "fix" as const, range: `${fixSha}..${reviewedSha}` }
-    : {
-        kind: "full" as const,
-        range: `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`,
-      };
+  const scope: ReviewScope | undefined =
+    system.mode !== "panel"
+      ? undefined
+      : fixSha
+        ? { kind: "fix", range: `${fixSha}..${reviewedSha}` }
+        : {
+            kind: resolution ? "resolution" : "full",
+            range: `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`,
+          };
   const previousReview = priorReview
     ? {
         sha: priorReview.sha,
@@ -931,7 +947,7 @@ async function oneRound(
         (e) => e.round === round && e.sha === reviewedSha,
       );
       const input: ReviewInput = {
-        timeoutMs: readingTimeout(diff.added + diff.removed),
+        timeoutMs: readingTimeout(reviewDiff.added + reviewDiff.removed),
         replayedFollowUps: replayed?.followUps,
         system,
         ...(panelReview ? { panelReview } : {}),
@@ -950,7 +966,7 @@ async function oneRound(
             ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
           previous: previousReview,
           headSha: reviewedSha,
-          resolution: ctx.state.conflictRound === round,
+          resolution,
           ...(fixSha && panelReview ? { fixReview: panelReview } : {}),
         },
       };
@@ -993,7 +1009,14 @@ async function oneRound(
       const { review: r, modelVerdict, blocking, followUps } = decision;
       ctx.state.reviewHistory = [
         ...earlierReviews,
-        { round, sha: reviewedSha, blocking, followUps, ...(panelReview ? { panelReview, scope } : {}) },
+        {
+          round,
+          sha: reviewedSha,
+          blocking,
+          followUps,
+          ...(panelReview ? { panelReview } : {}),
+          ...(scope ? { scope } : {}),
+        },
       ];
       ctx.state.reviewFollowUps = [
         ...new Map(
@@ -1010,7 +1033,7 @@ async function oneRound(
       // Panel artifacts are numbered by review (R1-R3), single ones by implementation round.
       ctx.store.putArtifact(
         ctx.run.id,
-        `review-${panelReview ?? round}.json`,
+        scope?.kind === "resolution" ? "review-resolution.json" : `review-${panelReview ?? round}.json`,
         "review",
         JSON.stringify(
           {
@@ -1018,7 +1041,8 @@ async function oneRound(
             modelVerdict,
             model: target.modelId,
             round,
-            ...(panelReview ? { panelReview, scope } : {}),
+            ...(panelReview ? { panelReview } : {}),
+            ...(scope ? { scope } : {}),
             reviewedSha,
             blocking,
             ...(panel ? { panel } : {}),
@@ -1199,9 +1223,9 @@ async function recordVerified(ctx: RunContext, sha: string): Promise<void> {
     lastGates: ctx.state.lastGates,
     lastReview: ctx.state.lastReview,
     lastAudit: ctx.state.lastAudit,
-    // Later rounds replace (never mutate) these arrays, so the references stay a faithful snapshot.
-    reviewHistory: ctx.state.reviewHistory,
-    reviewFollowUps: ctx.state.reviewFollowUps,
+    // The panel schedule in the report must match the verified review; later rounds replace (never
+    // mutate) the history array, so the reference stays a faithful snapshot.
+    ...(ctx.state.lastReview?.mode === "panel" ? { reviewHistory: ctx.state.reviewHistory } : {}),
   };
   await ctx.save();
 }

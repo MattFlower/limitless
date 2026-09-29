@@ -153,11 +153,13 @@ export function renderReport(input: ReportInput): string {
     const r = state.lastReview;
     blocks.push(`## Code review (\`${r.modelId}\`)`);
     const schedule = (state.reviewHistory ?? []).flatMap((e) =>
-      e.panelReview && e.scope
-        ? [
-            `- Panel review R${e.panelReview} — ${e.scope.kind === "fix" ? "fix diff" : "full change"} \`${e.scope.range}\``,
-          ]
-        : [],
+      e.scope?.kind === "resolution"
+        ? [`- Conflict-resolution review — change against the new base \`${e.scope.range}\``]
+        : e.panelReview && e.scope
+          ? [
+              `- Panel review R${e.panelReview} — ${e.scope.kind === "fix" ? "fix diff" : "full change"} \`${e.scope.range}\``,
+            ]
+          : [],
     );
     if (schedule.length) blocks.push(schedule.join("\n"));
     blocks.push(`**${r.verdict}** — ${r.summary}`);

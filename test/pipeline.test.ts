@@ -987,6 +987,225 @@ esac
     expect(report).toContain(`Panel review R3 — fix diff \`${r2.reviewedSha}..${r3.reviewedSha}\``);
   });
 
+  // R1 and R2 block, R3 approves; the delivery merge then conflicts with a base that also added an
+  // upstream-only file. The resolution review is outside R1-R3 and sees the change against the new base.
+  for (const outcome of ["approves", "blocks"] as const)
+    test(`panel conflict-resolution review after R3 ${outcome}`, async () => {
+      const bare = await githubFixture();
+      const lines = (n: number, tag: string) => Array.from({ length: n }, (_, i) => `${tag} ${i}`).join("\n");
+      const finding = (title: string, label?: "new" | "regression") => ({
+        severity: "major",
+        security: false,
+        ...findingEvidence,
+        ...(label ? { label, prior: "" } : {}),
+        file: "farewell.txt",
+        line: 1,
+        title,
+        detail: `detail ${title}`,
+        suggestion: "fix",
+      });
+      // The resolution finder raises a regression the verifier rates medium: R2's rules block it.
+      const found = [
+        [finding("R1 bug")],
+        [finding("R2 bug", "new")],
+        [],
+        outcome === "blocks" ? [finding("R4 bug", "regression")] : [],
+      ];
+      const finders: AgentSpec[] = [];
+      const verifiers: AgentSpec[][] = [[], [], [], []];
+      let implementations = 0;
+      let baseTip = "";
+      const handler: Handler = async (s) => {
+        if (s.prompt.startsWith("You are a code-review verifier")) {
+          verifiers[finders.length - 1]?.push(s);
+          const cited = [
+            ...s.prompt.matchAll(/"id": "(C\d+)",\s+"file": "[^"]*",\s+"line": \d+,\s+"title": "([^"]*)"/g),
+          ];
+          return {
+            structured: {
+              results: cited.map(([, id, title]) => ({
+                id,
+                // Only the current review's own finding is real; rechecks of earlier ones are fixed.
+                verdict: title === `R${finders.length} bug` ? "CONFIRMED" : "REFUTED",
+                severity: title === "R4 bug" ? "medium" : "high",
+                category: "correctness",
+                evidence: "farewell.txt:1 `bye`",
+                trigger: "reading the file -> wrong farewell",
+              })),
+            },
+          };
+        }
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") {
+          finders.push(s);
+          if (finders.length === 3) {
+            await advanceBase(bare, "upstream-only.txt", `${lines(300, "upstream")}\n`);
+            baseTip = await advanceBase(bare, "greeting.txt", "new base\n");
+          }
+          return { structured: { ...approve, findings: found[finders.length - 1] ?? [] } };
+        }
+        implementations++;
+        if (implementations === 4) return resolveBaseConflict(s.cwd, bare);
+        return {
+          files: {
+            "farewell.txt": `goodbye ${implementations}\n`,
+            ...(implementations === 1
+              ? { "greeting.txt": "feature\n", "first-only.txt": `${lines(500, "first")}\n` }
+              : {}),
+          },
+        };
+      };
+      const f = start(handler);
+      f.deps.reviewSystem = {
+        name: "panel",
+        mode: "panel",
+        finders: [{ prompt: "standard" }],
+        verifier: {},
+        implementerReport: "include",
+      };
+      registerGithub(f, bare);
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        outcome === "approves" ? "succeeded" : "needs_human",
+      );
+      expect(implementations).toBe(4);
+      expect(finders).toHaveLength(4);
+      const state = f.store.getRunState<RunState>(run.id);
+      expect(state?.conflictRound).toBe(3);
+      expect(state?.reviewHistory?.map((e) => [e.round, e.panelReview, e.scope?.kind])).toEqual([
+        [0, 1, "full"],
+        [1, 2, "fix"],
+        [2, 3, "fix"],
+        [3, undefined, "resolution"],
+      ]);
+      expect(f.store.getArtifact(run.id, "review-4.json")).toBeNull();
+      const [r1, r2, r3] = [1, 2, 3].map((n) =>
+        JSON.parse(f.store.getArtifact(run.id, `review-${n}.json`) ?? "{}"),
+      );
+      expect([r1.panelReview, r2.panelReview, r3.panelReview]).toEqual([1, 2, 3]);
+      expect(r3.verdict).toBe("approve");
+      const resolution = JSON.parse(f.store.getArtifact(run.id, "review-resolution.json") ?? "{}");
+      expect(resolution).toMatchObject({
+        round: 3,
+        scope: { kind: "resolution", range: `${baseTip}..${resolution.reviewedSha}` },
+      });
+      expect(resolution).not.toHaveProperty("panelReview");
+
+      // The resolution review: the change against the new base, never the upstream-only file.
+      const resolutionPrompt = finders[3]?.prompt ?? "";
+      expect(resolutionPrompt).toContain(`inspect \`git diff ${baseTip}..HEAD\` against the pinned new base`);
+      expect(resolutionPrompt).not.toContain("the fix diff only");
+      for (const file of ["first-only.txt", "farewell.txt", "greeting.txt"])
+        expect(resolutionPrompt).toContain(file);
+      expect(resolutionPrompt).not.toContain("upstream-only.txt");
+      // R2 sees only its fix diff: never the file only R1's change touched.
+      expect(finders[1]?.prompt).toContain("farewell.txt");
+      expect(finders[1]?.prompt).not.toContain("first-only.txt");
+      // Timeouts follow the diff each reviewer got: 503 changed lines for R1, 2 for R2, and 502
+      // against the new base for the resolution review (the upstream file's 300 would make it 802).
+      expect(finders.map((s) => s.timeoutMs)).toEqual([503, 2, 2, 502].map((n) => readingTimeout(n)));
+      for (const v of verifiers[1] ?? []) expect(v.timeoutMs).toBe(readingTimeout(2));
+
+      if (outcome === "approves") {
+        expect(f.store.getArtifact(run.id, "report.md")).toContain(
+          `- Conflict-resolution review — change against the new base \`${baseTip}..${resolution.reviewedSha}\``,
+        );
+      } else {
+        expect(resolution.verdict).toBe("request_changes");
+        expect(resolution.blocking.map((b: { title: string }) => b.title)).toEqual(["R4 bug"]);
+        for (const v of verifiers[3] ?? []) {
+          expect(v.timeoutMs).toBe(readingTimeout(502));
+          expect(v.prompt).toContain(`git diff ${baseTip}..${resolution.reviewedSha}`);
+          expect(v.prompt).not.toContain("upstream-only.txt");
+        }
+        // No further repair round: the verified R3 head goes out as a draft.
+        expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
+        expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
+      }
+    });
+
+  test("panel: a verify failure after R3 approves goes to a human before a fourth implementation", async () => {
+    const bare = await githubFixture();
+    const blocker = (title: string, label?: "new") => ({
+      severity: "major",
+      security: false,
+      ...findingEvidence,
+      ...(label ? { label, prior: "" } : {}),
+      file: "farewell.txt",
+      line: 1,
+      title,
+      detail: `detail ${title}`,
+      suggestion: "fix",
+    });
+    const found = [[blocker("R1 bug")], [blocker("R2 bug", "new")], []];
+    let finders = 0;
+    let implementations = 0;
+    let verifies = 0;
+    const f = start((s) => {
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        const cited = [
+          ...s.prompt.matchAll(/"id": "(C\d+)",\s+"file": "[^"]*",\s+"line": \d+,\s+"title": "([^"]*)"/g),
+        ];
+        return {
+          structured: {
+            results: cited.map(([, id, title]) => ({
+              id,
+              verdict: title === `R${finders} bug` ? "CONFIRMED" : "REFUTED",
+              severity: "high",
+              category: "correctness",
+              evidence: "farewell.txt:1 `bye`",
+              trigger: "reading the file -> wrong farewell",
+            })),
+          },
+        };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: { ...approve, findings: found[finders++] ?? [] } };
+      if (role === "verify") {
+        verifies++;
+        return {
+          structured: {
+            ...pass,
+            overall: "fail",
+            criteria: pass.criteria.map((c) => ({ ...c, status: "unmet" })),
+          },
+        };
+      }
+      implementations++;
+      return { files: { "farewell.txt": `goodbye ${implementations}\n` } };
+    });
+    f.deps.reviewSystem = {
+      name: "panel",
+      mode: "panel",
+      finders: [{ prompt: "standard" }],
+      verifier: {},
+      implementerReport: "include",
+    };
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add a farewell", profile: "standard" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+    expect(implementations).toBe(3);
+    expect(finders).toBe(3);
+    expect(verifies).toBe(1);
+    expect(f.store.listStages(run.id).filter((stage) => stage.name === "implement")).toHaveLength(3);
+    expect(f.store.getArtifact(run.id, "implement-3.md")).toBeNull();
+    const state = f.store.getRunState<RunState>(run.id);
+    expect(state?.reviewHistory?.map((e) => e.panelReview)).toEqual([1, 2, 3]);
+    expect(state?.needsHumanReason).toContain("Panel review limit reached (R3)");
+    // The draft is the head R3 reviewed.
+    const r3 = JSON.parse(f.store.getArtifact(run.id, "review-3.json") ?? "{}");
+    const finished = f.store.getRun(run.id);
+    expect(finished?.headSha).toBe(r3.reviewedSha);
+    expect(
+      (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
+    ).toContain(r3.reviewedSha);
+    expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
+  });
+
   for (const kind of [
     "unchanged",
     "clean",
@@ -1319,11 +1538,11 @@ esac
         expect(
           (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
         ).toContain(sha);
-        // The saved evidence keeps the reviews up to the verified commit; the conflict round's review is live only.
+        // Single mode saves main's evidence: follow-ups and review history stay live, not snapshotted.
         const evidence = state?.lastVerifiedEvidence;
-        expect(evidence?.reviewHistory?.at(-1)?.sha).toBe(sha);
-        if (outcome === "review" || outcome === "verify")
-          expect(state?.reviewHistory).toHaveLength((evidence?.reviewHistory?.length ?? 0) + 1);
+        expect(evidence?.lastReview?.verdict).toBe("approve");
+        expect(evidence).not.toHaveProperty("reviewFollowUps");
+        expect(evidence).not.toHaveProperty("reviewHistory");
         const report = f.store.getArtifact(run.id, "report.md") ?? "";
         expect(report).toContain(`Verified at \`${sha}\``);
         expect(report).toContain("conflict resolution");
@@ -1928,6 +2147,109 @@ protected_paths = ["protected.txt"]
     },
     30_000,
   );
+
+  test("verify-change panel R2 gets only the fix diff's stat and patch", async () => {
+    const bare = join(home, "github.git");
+    await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
+    const baseSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    writeFileSync(join(repoDir, "version.txt"), "dependency 2\n");
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "bump"], { cwd: repoDir });
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    await sh(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir });
+    const finders: string[] = [];
+    const f = start((s) => {
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        const cited = [
+          ...s.prompt.matchAll(/"id": "(C\d+)",\s+"file": "[^"]*",\s+"line": \d+,\s+"title": "([^"]*)"/g),
+        ];
+        return {
+          structured: {
+            results: cited.map(([, id]) => ({
+              id,
+              // R1's blocker is real; R2's recheck finds it repaired.
+              verdict: finders.length === 1 ? "CONFIRMED" : "REFUTED",
+              severity: "high",
+              category: "compatibility",
+              evidence: "version.txt:1 `dependency 2`",
+              trigger: "installing -> broken",
+            })),
+          },
+        };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ task_class: "dependency_update" }) };
+      if (role === "review") {
+        finders.push(s.prompt);
+        const findings =
+          finders.length === 1
+            ? [
+                {
+                  severity: "major",
+                  file: "version.txt",
+                  line: 1,
+                  title: "Needs repair",
+                  detail: "Repair the update",
+                  suggestion: "Fix compatibility",
+                  security: false,
+                  ...findingEvidence,
+                },
+              ]
+            : [];
+        return { structured: { ...approve, findings } };
+      }
+      return { files: { "repair.txt": "repaired\n" }, text: "Repaired the update" };
+    });
+    f.deps.gh = async () => {};
+    f.deps.reviewSystem = {
+      name: "panel",
+      mode: "panel",
+      finders: [{ prompt: "standard" }],
+      verifier: {},
+      implementerReport: "include",
+    };
+    f.store.upsertRepo({
+      slug: "MattFlower/limitless",
+      kind: "github",
+      url: bare,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    f.cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
+    const payload = JSON.parse(readFileSync(join(import.meta.dir, "data/github-pr.json"), "utf8"));
+    payload.pull_request.base.sha = baseSha;
+    payload.pull_request.head.sha = head;
+    const body = JSON.stringify(payload);
+    const response = await githubWebhook(f)(
+      new Request("http://localhost/webhooks/github", {
+        method: "POST",
+        body,
+        headers: {
+          "x-github-event": "pull_request",
+          "x-github-delivery": "panel-fix-diff",
+          "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+        },
+      }),
+    );
+    expect(response.status).toBe(201);
+    const { runId } = (await response.json()) as { runId: string };
+    expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(finders).toHaveLength(2);
+    // R1 reviews the PR's change inline; R2 only the repair since R1's head.
+    expect(finders[0]).toContain("version.txt");
+    expect(finders[0]).toContain("+dependency 2");
+    const r2 = finders[1] ?? "";
+    expect(r2).toContain("review R2: the fix diff only");
+    expect(r2).toContain("repair.txt");
+    expect(r2).toContain("+repaired");
+    expect(r2).not.toContain("+dependency 2");
+    expect(r2.slice(0, r2.indexOf("# Previous review"))).not.toContain("version.txt");
+    expect(JSON.parse(f.store.getArtifact(runId, "review-2.json") ?? "{}")).toMatchObject({
+      verdict: "approve",
+      scope: { kind: "fix", range: `${head}..${f.store.getRun(runId)?.headSha}` },
+    });
+  });
 
   test("Dependabot run delivers to the existing PR head without creating a PR", async () => {
     const bare = join(home, "github.git");

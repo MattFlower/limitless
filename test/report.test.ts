@@ -108,6 +108,56 @@ test("the code review section lists every panel review and the diff it covered",
     "## Code review (`m`)\n\n- Panel review R1 — full change `base1..head1`\n- Panel review R2 — fix diff `head1..head2`\n- Panel review R3 — fix diff `head2..head3`\n\n**approve** — Checked",
   );
   expect(render([{ ...entry, round: 1 }])).not.toContain("Panel review");
+  // A conflict-resolution review is listed apart from R1-R3, never as a fourth review.
+  const withResolution = render([
+    { ...entry, round: 0, panelReview: 1, scope: { kind: "full", range: "base1..head1" } },
+    { ...entry, round: 1, scope: { kind: "resolution", range: "base2..head2" } },
+  ]);
+  expect(withResolution).toContain(
+    "- Panel review R1 — full change `base1..head1`\n- Conflict-resolution review — change against the new base `base2..head2`\n\n**approve**",
+  );
+  expect(withResolution).not.toContain("R2");
+});
+
+test("single-mode verified-failure reports keep live follow-ups, as on main", () => {
+  const followUp = {
+    severity: "minor" as const,
+    security: false,
+    file: "a.ts",
+    line: 1,
+    title: "Found in the resolution round",
+    detail: "d",
+    suggestion: "s",
+  };
+  const approved = { verdict: "approve" as const, summary: "Verified", findings: [], modelId: "m" };
+  const state: RunState = {
+    phase: "deliver",
+    answers: [],
+    round: 2,
+    roundsOnImplementer: 2,
+    triedImplementers: [],
+    feedback: null,
+    toolCommands: [],
+    lastReview: { ...approved, verdict: "request_changes", summary: "Resolution blocked" },
+    reviewHistory: [{ round: 1, sha: "h1", blocking: [], followUps: [followUp] }],
+    reviewFollowUps: [followUp],
+    lastVerifiedEvidence: { lastReview: approved },
+  };
+  const restored = verifiedFailureState(state);
+  expect(restored.lastReview).toEqual(approved);
+  expect(restored.reviewFollowUps).toEqual([followUp]);
+  const md = renderReport({
+    success: false,
+    runId: "r6",
+    prompt: "x",
+    state: restored,
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "u",
+    verifiedFailure: { sha: "h0", stage: "conflict resolution", reason: "review", base: "main" },
+  });
+  expect(md).toContain("## Code review (`m`)\n\n**approve** — Verified");
+  expect(md).toContain("Found in the resolution round");
 });
 
 test("a verified-failure report lists only the reviews up to the saved approval", () => {
@@ -144,7 +194,7 @@ test("a verified-failure report lists only the reviews up to the saved approval"
     lastReview: { ...approved, verdict: "request_changes" as const, summary: "R2 blocked" },
     reviewHistory: [r1, r2],
     reviewFollowUps: [],
-    lastVerifiedEvidence: { lastReview: approved, reviewHistory: [r1], reviewFollowUps: [] },
+    lastVerifiedEvidence: { lastReview: approved, reviewHistory: [r1] },
   };
   const restored = verifiedFailureState(live);
   expect(restored.lastReview).toEqual(approved);
