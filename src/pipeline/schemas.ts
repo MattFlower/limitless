@@ -204,21 +204,31 @@ export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
  * severity, file and line, and derives the verdict itself, so every other field may be absent
  * (`security` was added later). The degenerate-summary rule still applies.
  */
+const StoredFindingSchema = reviewBase.shape.findings.element.extend({
+  security: z.boolean().default(false),
+  title: z.string().default(""),
+  detail: z.string().default(""),
+  suggestion: z.string().default(""),
+  ...z.object(findingV2).partial().shape,
+  verification: VerificationSchema.optional(),
+});
+/** A panel's candidates and rulings, kept with eval output so refuted candidates stay regradable. */
+const StoredPanelSchema = z.object({
+  candidates: z.array(
+    StoredFindingSchema.extend({ id: z.string(), finder: z.number().int(), vendor: z.string().nullable() }),
+  ),
+  verdicts: z.array(VerificationSchema.extend({ id: z.string() })),
+  refuted: z.array(z.string()),
+  capped: z.array(z.string()),
+  omitted: z.array(z.string()).default([]),
+});
 export const StoredReviewSchema = reviewBase
   .extend({
     verdict: reviewBase.shape.verdict.optional(),
     mode: z.literal("panel").optional(),
     summary: z.string().default(""),
-    findings: z.array(
-      reviewBase.shape.findings.element.extend({
-        security: z.boolean().default(false),
-        title: z.string().default(""),
-        detail: z.string().default(""),
-        suggestion: z.string().default(""),
-        ...z.object(findingV2).partial().shape,
-        verification: VerificationSchema.optional(),
-      }),
-    ),
+    findings: z.array(StoredFindingSchema),
+    panel: StoredPanelSchema.optional(),
   })
   .superRefine(rejectDegenerate(MIN_REVIEW_SUMMARY));
 export type StoredReview = Omit<Review, "verdict"> & Partial<Pick<Review, "verdict">>;

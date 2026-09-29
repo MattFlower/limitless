@@ -337,10 +337,12 @@ export function verifierPrompt(input: {
   spec: Spec | null;
   baseSha: string;
   headSha?: string;
+  /** PR verification: the base may have moved past the fork point, so diff from the merge base as finders do. */
+  externalChange?: boolean;
   stat: string;
   candidates: { id: string; file: string; line: number; title: string; failure_scenario: string }[];
 }): string {
-  const range = `${input.baseSha}..${input.headSha ?? "HEAD"}`;
+  const range = `${input.baseSha}${input.externalChange ? "..." : ".."}${input.headSha ?? "HEAD"}`;
   return `You are a code-review verifier. Other reviewers raised the candidate defects below against a change. Check each one against the repository code and decide whether it is real. Do not look for new defects.
 
 # Original request

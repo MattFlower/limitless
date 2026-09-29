@@ -889,7 +889,16 @@ async function oneRound(
         {
           invoke: (request, finder) =>
             call(request, ctx.state.implementer?.vendor, system.finders[finder]?.target),
-          verify: (request, avoidVendor) => call(request, avoidVendor, system.verifier?.target),
+          verify: async (request, avoidVendor) => {
+            const verified = await call(request, avoidVendor, system.verifier?.target);
+            if (avoidVendor && verified.target.vendor === avoidVendor)
+              ctx.log(
+                `Verifier ${verified.target.modelId} shares vendor ${avoidVendor} with the finder it checks (no cross-vendor verifier available)`,
+                "warn",
+              );
+            return verified;
+          },
+          warn: (message) => ctx.log(message, "warn"),
         },
         input,
       );

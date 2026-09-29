@@ -13,6 +13,7 @@ import {
   LaterReviewSchema,
   type Review,
   ReviewSchema,
+  StoredReviewSchema,
   toStrictJsonSchema,
   type Verification,
   VerifierSchema,
@@ -390,7 +391,7 @@ describe("panel decision", () => {
     ["PLAUSIBLE", "medium", "correctness", false, false],
     ["PLAUSIBLE", "low", "correctness", false, false],
     ["REFUTED", "critical", "correctness", false, false],
-    ["CONFIRMED", "high", "cleanup", false, true],
+    ["CONFIRMED", "high", "cleanup", false, false],
     ["CONFIRMED", "medium", "conventions", false, false],
   ] as const) {
     test(`${verdict} ${severity} ${category}`, () => {
@@ -417,6 +418,21 @@ describe("panel decision", () => {
     const regression = { ...finding("nit"), label: "regression" as const };
     expect(blockingReviewFindings({ ...review, findings: [regression] }, [finding("major")])).toHaveLength(1);
   });
+
+  test("cleanup and conventions never block, in any round, by either category", () => {
+    const prior = [finding("major")];
+    for (const f of [
+      // Unverified: the finder's category decides.
+      { ...finding("blocker", true), category: "cleanup" as const, label: "regression" as const },
+      { ...finding("blocker"), category: "conventions" as const, label: "unaddressed" as const, prior: "P1" },
+      // Verified: the verifier's category decides.
+      { ...verified("CONFIRMED", "critical", "cleanup"), label: "regression" as const },
+    ]) {
+      const review: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [f] };
+      expect(blockingReviewFindings(review)).toEqual([]);
+      expect(blockingReviewFindings(review, prior)).toEqual([]);
+    }
+  });
 });
 
 describe("runReview panel", () => {
@@ -430,7 +446,7 @@ describe("runReview panel", () => {
       numTurns: 1,
       costUsd: 0.5,
       costEquivUsd: 0,
-      error: null,
+      error: null as string | null,
       quota: null,
     },
     target: { vendor },
@@ -561,27 +577,142 @@ describe("runReview panel", () => {
     expect(out.output.success).toBe(false);
   });
 
-  test("a verifier that omits or repeats a candidate id fails the review", async () => {
-    const result = (id: string) => ({ id, category: "correctness", ...confirmed });
-    for (const results of [[], [result("C1")], [result("C1"), result("C1")], [result("C1"), result("C9")]]) {
-      const out = await runReview(
-        {
-          invoke: async () =>
-            ok(
-              {
-                verdict: "request_changes",
-                summary: "Checked everything.",
-                findings: [candidate("src/a.ts", 1, "blocker"), candidate("src/a.ts", 2)],
-              },
-              "anthropic",
-            ),
-          verify: async () => ok({ results }, "google"),
+  const omitting = async (answer: (call: number, sent: string[]) => unknown[]) => {
+    const sent: string[][] = [];
+    const warnings: string[] = [];
+    const out = await runReview(
+      {
+        invoke: async () =>
+          ok(
+            {
+              verdict: "request_changes",
+              summary: "Checked everything.",
+              findings: [candidate("src/a.ts", 1, "blocker"), candidate("src/a.ts", 2)],
+            },
+            "anthropic",
+          ),
+        verify: async (request) => {
+          sent.push(ids(request.prompt));
+          return ok({ results: answer(sent.length, ids(request.prompt)) }, "google");
         },
-        { prompt, timeoutMs: 1, system: { mode: "panel", finders: [{ prompt: "standard" }] } },
-      );
-      expect(out.decision).toBeUndefined();
-      expect(out.output.success).toBe(false);
-      if (!out.output.success) expect(out.output.error.message).toContain("one result for each of C1, C2");
+        warn: (message) => warnings.push(message),
+      },
+      { prompt, timeoutMs: 1, system: { mode: "panel", finders: [{ prompt: "standard" }] } },
+    );
+    return { out, sent, warnings };
+  };
+  const ruling = (id: string, severity: Verification["severity"] = "low") => ({
+    ...confirmed,
+    id,
+    severity,
+    category: "correctness",
+  });
+
+  test("candidates the verifier leaves out get one retry, then stay unverified follow-ups with a warning", async () => {
+    const { out, sent, warnings } = await omitting(() => []);
+    expect(sent).toEqual([
+      ["C1", "C2"],
+      ["C1", "C2"],
+    ]);
+    expect(out.output.success).toBe(true);
+    expect(out.decision?.blocking).toEqual([]);
+    expect(out.decision?.followUps.map((f) => [f.line, f.verification])).toEqual([
+      [1, undefined],
+      [2, undefined],
+    ]);
+    expect(out.panel?.omitted).toEqual(["C1", "C2"]);
+    expect(warnings).toEqual([expect.stringContaining("C1, C2")]);
+    // Every call's spend is kept: one finder and two verifier calls.
+    expect(out.result.costUsd).toBe(1.5);
+  });
+
+  test("a retry asks only for what is missing; repeated and unknown ids are ignored", async () => {
+    const { out, sent, warnings } = await omitting((call) =>
+      call === 1
+        ? [ruling("C1"), ruling("C1", "critical"), ruling("C9", "critical")]
+        : [ruling("C2", "high")],
+    );
+    expect(sent).toEqual([["C1", "C2"], ["C2"]]);
+    expect(out.panel?.omitted).toEqual([]);
+    expect(warnings).toEqual([]);
+    expect(out.panel?.verdicts.map((v) => [v.id, v.severity])).toEqual([
+      ["C1", "low"],
+      ["C2", "high"],
+    ]);
+    expect(out.decision?.blocking.map((f) => f.line)).toEqual([1, 2]);
+  });
+
+  test("an invalid finder fails the panel closed: an error result with no text to re-parse", async () => {
+    const valid = {
+      verdict: "request_changes",
+      summary: "Checked everything.",
+      findings: [candidate("a", 1)],
+    };
+    const { confidence: _confidence, ...partial } = candidate("a", 1);
+    const invalid = { ...valid, findings: [partial] };
+    let verified = 0;
+    const out = await runReview(
+      {
+        invoke: async (_request, index) => {
+          const reply = ok(index === 0 ? valid : null, "anthropic");
+          return index === 0
+            ? reply
+            : { ...reply, result: { ...reply.result, finalText: JSON.stringify(invalid) } };
+        },
+        verify: async () => {
+          verified++;
+          return ok({ results: [] }, "google");
+        },
+      },
+      {
+        prompt,
+        timeoutMs: 1,
+        system: { mode: "panel", finders: [{ prompt: "standard" }, { prompt: "standard" }] },
+      },
+    );
+    expect(verified).toBe(0);
+    expect(out.decision).toBeUndefined();
+    expect(out.output.success).toBe(false);
+    expect(out.result).toMatchObject({ status: "error", finalText: "", structured: null, costUsd: 1 });
+    expect(out.result.error).toContain("Invalid review output from finder 1");
+  });
+
+  test("a refuted candidate leaves same-titled candidates' rulings alone", async () => {
+    const same = (line: number) => ({ ...candidate("src/a.ts", line), title: "Missing null check" });
+    const { out } = await panel([[same(1), same(40)]], (id) =>
+      id === "C1"
+        ? { verdict: "REFUTED", severity: "low", evidence: "src/a.ts:1 `if (!x) return`", trigger: "none" }
+        : {
+            verdict: "PLAUSIBLE",
+            severity: "medium",
+            evidence: "src/a.ts:40 `x.y`",
+            trigger: "null -> crash",
+          },
+    );
+    expect(out.decision?.followUps.map((f) => [f.line, f.verification?.verdict])).toEqual([
+      [40, "PLAUSIBLE"],
+    ]);
+    expect(out.panel?.refuted).toEqual(["C1"]);
+  });
+
+  test("the verifier inspects the same range as the finders", async () => {
+    for (const [externalChange, range] of [
+      [false, "git diff a..head"],
+      [true, "git diff a...head"],
+    ] as const) {
+      const { verifications } = await panel([[candidate("src/a.ts", 1)]], () => confirmed, {
+        prompt: { ...prompt, headSha: "head", externalChange },
+      });
+      expect(verifications[0]?.request.prompt).toContain(range);
     }
+  });
+
+  test("the panel's structured result carries its record for eval output", async () => {
+    const { out } = await panel([[candidate("src/a.ts", 1)]], () => ({ ...confirmed, verdict: "REFUTED" }));
+    const stored = StoredReviewSchema.parse(out.result.structured);
+    expect(stored.mode).toBe("panel");
+    expect(stored.findings).toEqual([]);
+    expect(stored.panel?.refuted).toEqual(["C1"]);
+    expect(stored.panel?.candidates.map((c) => [c.id, c.line])).toEqual([["C1", 1]]);
   });
 });

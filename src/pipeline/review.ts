@@ -44,8 +44,9 @@ function citesPriorBlocking(finding: Review["findings"][number], priorBlocking: 
 }
 
 /**
- * Panel reviews block on the verifier's ruling: in round 1 every verified finding outside cleanup and
- * conventions; later rounds apply the rules below with verified critical/high standing in for blocker.
+ * Panel reviews block on the verifier's ruling and never on cleanup or conventions (the verifier's
+ * category, else the finder's): in round 1 every verified finding; later rounds apply the rules below
+ * with verified critical/high standing in for blocker.
  *
  * Single reviews, first round: blockers and majors block. Later rounds may not move the goalposts: a finding blocks
  * only if it is a regression from the latest changes, an unaddressed previous *blocking* finding
@@ -58,9 +59,11 @@ export function blockingReviewFindings(
 ): Review["findings"] {
   const panel = review.mode === "panel";
   return review.findings.filter((finding) => {
-    if (panel && finding.verification?.verdict === "REFUTED") return false;
-    if (panel && !priorBlocking)
-      return panelVerified(finding) && !UNVERIFIED_CATEGORIES.includes(finding.verification?.category);
+    if (panel) {
+      if (finding.verification?.verdict === "REFUTED") return false;
+      if (UNVERIFIED_CATEGORIES.includes(finding.verification?.category ?? finding.category)) return false;
+      if (!priorBlocking) return panelVerified(finding);
+    }
     if (!priorBlocking) return finding.severity === "blocker" || finding.severity === "major";
     if (finding.label === "regression") return true;
     if (finding.label === "unaddressed" && citesPriorBlocking(finding, priorBlocking)) return true;
@@ -117,6 +120,8 @@ export interface PanelRecord {
   refuted: string[];
   /** Eligible for verification but over the per-review cap: unverified follow-ups. */
   capped: string[];
+  /** Sent to the verifier but left without a ruling after one retry: unverified follow-ups. */
+  omitted: string[];
 }
 
 type Invoked = { result: AgentResult; target?: { vendor: string } };
@@ -126,6 +131,36 @@ export interface ReviewDeps<T extends Invoked> {
   invoke: (request: ReviewRequest, finder: number) => Promise<T>;
   /** Panel only: one read-only verifier batch, routed away from the vendor that raised it. */
   verify?: (request: VerifierRequest, avoidVendor: string | undefined) => Promise<T>;
+  /** Panel only: problems that degrade the review without failing it. */
+  warn?: (message: string) => void;
+}
+
+/** Fixed input that renders the verifier prompt template, for cache identity. */
+const TEMPLATE_INPUT: Parameters<typeof verifierPrompt>[0] = {
+  prompt: "",
+  spec: null,
+  baseSha: "BASE",
+  headSha: "HEAD",
+  stat: "",
+  candidates: [],
+};
+
+/**
+ * What a panel's derived output depends on besides its finders' prompt: the verifier prompt templates,
+ * its schema and the batching policy. Eval caches key panel trials on it.
+ */
+export function panelVerifierIdentity(): string {
+  return new Bun.CryptoHasher("sha256")
+    .update(
+      JSON.stringify([
+        verifierPrompt(TEMPLATE_INPUT),
+        verifierPrompt({ ...TEMPLATE_INPUT, externalChange: true }),
+        toStrictJsonSchema(VerifierSchema),
+        PANEL_VERIFY_CAP,
+        PANEL_BATCH_SIZE,
+      ]),
+    )
+    .digest("hex");
 }
 
 export type ReviewOutcome<T> = T & {
@@ -175,7 +210,7 @@ function decide(input: ReviewInput, found: Review, modelVerdict: Review["verdict
 }
 
 /** Sums spend across a panel's invocations; the eval runner records the panel as one result. */
-function combined(results: AgentResult[], last: AgentResult, structured: unknown): AgentResult {
+export function combined(results: AgentResult[], last: AgentResult, structured: unknown): AgentResult {
   const sum = (pick: (r: AgentResult) => number) => results.reduce((total, r) => total + pick(r), 0);
   return {
     ...last,
@@ -189,6 +224,19 @@ function combined(results: AgentResult[], last: AgentResult, structured: unknown
       cacheRead: sum((r) => r.usage.cacheRead),
       cacheWrite: sum((r) => r.usage.cacheWrite),
     },
+  };
+}
+
+/**
+ * A failed panel: an error result with the spend so far and no text, so no caller can re-parse one
+ * member's raw output as the panel's review.
+ */
+function failedPanel(results: AgentResult[], last: AgentResult, message: string): AgentResult {
+  return {
+    ...combined(results, last, null),
+    status: last.status === "ok" ? "error" : last.status,
+    finalText: "",
+    error: last.status === "ok" ? message : (last.error ?? message),
   };
 }
 
@@ -206,7 +254,16 @@ async function runPanel<T extends Invoked>(
     const output = request.schema.safeParse(
       invoked.result.structured ?? extractJson(invoked.result.finalText),
     );
-    if (!output.success) return { ...invoked, result: combined(results, invoked.result, null), output };
+    if (!output.success)
+      return {
+        ...invoked,
+        result: failedPanel(
+          results,
+          invoked.result,
+          `Invalid review output from finder ${finder}: ${output.error.message}`,
+        ),
+        output,
+      };
     found.push({ invoked, review: output.data });
   }
   const first = found[0];
@@ -234,58 +291,67 @@ async function runPanel<T extends Invoked>(
     ),
   );
   const verdicts = new Map<string, PanelRecord["verdicts"][number]>();
+  const omitted: string[] = [];
   let last = first.invoked.result;
   for (const batch of batches) {
     if (!deps.verify) throw new Error('mode "panel" needs a verifier');
-    const invoked = await deps.verify(
-      {
-        prompt: verifierPrompt({
-          prompt: input.prompt.prompt,
-          spec: input.prompt.spec,
-          baseSha: input.prompt.baseSha,
-          headSha: input.prompt.headSha,
-          stat: input.prompt.stat,
-          candidates: batch.map(({ id, file, line, title, failure_scenario }) => ({
-            id,
-            file,
-            line,
-            title,
-            failure_scenario: failure_scenario ?? "",
-          })),
-        }),
-        schema: VerifierSchema,
-        jsonSchema: toStrictJsonSchema(VerifierSchema),
-        timeoutMs: input.timeoutMs,
-      },
-      batch[0]?.vendor ?? undefined,
-    );
-    results.push(invoked.result);
-    last = invoked.result;
-    const parsed = VerifierSchema.safeParse(
-      invoked.result.structured ?? extractJson(invoked.result.finalText),
-    );
-    // Exactly one result per submitted id: an omitted candidate must not silently become nonblocking.
-    const ids = parsed.success ? parsed.data.results.map((r) => r.id) : [];
-    const complete =
-      ids.length === batch.length &&
-      new Set(ids).size === ids.length &&
-      batch.every((c) => ids.includes(c.id));
-    if (invoked.result.status !== "ok" || !parsed.success || !complete) {
-      const message =
-        invoked.result.status !== "ok"
-          ? `Verifier ${invoked.result.status}: ${invoked.result.error ?? "no output"}`
-          : !parsed.success
-            ? `Invalid verifier output: ${parsed.error.message}`
-            : `Invalid verifier output: expected one result for each of ${batch.map((c) => c.id).join(", ")}, got ${JSON.stringify(ids)}`;
-      return {
-        ...first.invoked,
-        result: combined(results, invoked.result, null),
-        output: z.custom<Review>(() => false, message).safeParse(null),
-      };
+    // Candidates the verifier leaves out get one more call, then stay unverified follow-ups.
+    let pending = batch;
+    for (let attempt = 0; attempt < 2 && pending.length; attempt++) {
+      const invoked = await deps.verify(
+        {
+          prompt: verifierPrompt({
+            prompt: input.prompt.prompt,
+            spec: input.prompt.spec,
+            baseSha: input.prompt.baseSha,
+            headSha: input.prompt.headSha,
+            externalChange: input.prompt.externalChange,
+            stat: input.prompt.stat,
+            candidates: pending.map(({ id, file, line, title, failure_scenario }) => ({
+              id,
+              file,
+              line,
+              title,
+              failure_scenario: failure_scenario ?? "",
+            })),
+          }),
+          schema: VerifierSchema,
+          jsonSchema: toStrictJsonSchema(VerifierSchema),
+          timeoutMs: input.timeoutMs,
+        },
+        pending[0]?.vendor ?? undefined,
+      );
+      results.push(invoked.result);
+      last = invoked.result;
+      const parsed = VerifierSchema.safeParse(
+        invoked.result.structured ?? extractJson(invoked.result.finalText),
+      );
+      if (invoked.result.status !== "ok" || !parsed.success) {
+        const message =
+          invoked.result.status !== "ok"
+            ? `Verifier ${invoked.result.status}: ${invoked.result.error ?? "no output"}`
+            : `Invalid verifier output: ${parsed.error?.message}`;
+        return {
+          ...first.invoked,
+          result: failedPanel(results, invoked.result, message),
+          output: z.custom<Review>(() => false, message).safeParse(null),
+        };
+      }
+      // Only the first ruling per submitted id counts; ids from outside this call are ignored.
+      for (const result of parsed.data.results)
+        if (pending.some((c) => c.id === result.id) && !verdicts.has(result.id))
+          verdicts.set(result.id, result);
+      pending = pending.filter((c) => !verdicts.has(c.id));
     }
-    for (const result of parsed.data.results) verdicts.set(result.id, result);
+    if (pending.length) {
+      omitted.push(...pending.map((c) => c.id));
+      deps.warn?.(
+        `Verifier gave no ruling for ${pending.map((c) => c.id).join(", ")} after a retry; they stay unverified follow-ups`,
+      );
+    }
   }
 
+  // Refuted candidates are dropped here, by id; a same-titled candidate keeps its own ruling.
   const findings: Finding[] = [];
   for (const { id, finder: _finder, vendor: _vendor, ...finding } of candidates) {
     const verdict = verdicts.get(id);
@@ -309,20 +375,19 @@ async function runPanel<T extends Invoked>(
     ? "request_changes"
     : "approve";
   const decision = decide(input, review, modelVerdict);
-  const refutedKeys = new Set(
-    candidates.filter((c) => verdicts.get(c.id)?.verdict === "REFUTED").map(reviewFindingKey),
-  );
-  decision.followUps = decision.followUps.filter((f) => !refutedKeys.has(reviewFindingKey(f)));
+  const panel: PanelRecord = {
+    candidates,
+    verdicts: [...verdicts.values()],
+    refuted: [...verdicts.values()].filter((v) => v.verdict === "REFUTED").map((v) => v.id),
+    capped: ranked.slice(PANEL_VERIFY_CAP).map((c) => c.id),
+    omitted,
+  };
   return {
     ...first.invoked,
-    result: combined(results, last, decision.review),
+    // Evals store the structured result as the trial output; the record lets refuted candidates be regraded.
+    result: combined(results, last, { ...decision.review, panel }),
     output: { success: true, data: decision.review },
     decision,
-    panel: {
-      candidates,
-      verdicts: [...verdicts.values()],
-      refuted: [...verdicts.values()].filter((v) => v.verdict === "REFUTED").map((v) => v.id),
-      capped: ranked.slice(PANEL_VERIFY_CAP).map((c) => c.id),
-    },
+    panel,
   };
 }

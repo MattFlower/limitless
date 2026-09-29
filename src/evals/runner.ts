@@ -13,7 +13,13 @@ import {
 } from "../harness/types.ts";
 import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
-import { type ReviewRequest, runReview, type VerifierRequest } from "../pipeline/review.ts";
+import {
+  combined,
+  panelVerifierIdentity,
+  type ReviewRequest,
+  runReview,
+  type VerifierRequest,
+} from "../pipeline/review.ts";
 import { StoredReviewSchema, toStrictJsonSchema } from "../pipeline/schemas.ts";
 import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
 import { cacheKey, reviewSystemHash } from "./cache.ts";
@@ -445,6 +451,7 @@ export class EvalRunner {
                   }
                 : { head: item.head, input: item.input }),
               ...(system ? { reviewSystem: reviewSystemHash(system) } : {}),
+              ...(system?.mode === "panel" ? { verifier: panelVerifierIdentity() } : {}),
               patch,
               ...(item.snapshot ? { snapshot: true } : {}),
               source:
@@ -543,6 +550,8 @@ export class EvalRunner {
         const before = { ...trial };
         for (let attempt = 0; ; attempt++) {
           own = undefined;
+          // Panel calls that returned, so spend survives a later member's failure.
+          const spent: AgentResult[] = [];
           try {
             const logPath = join(directory, "trial.log");
             const invoke = (
@@ -598,6 +607,7 @@ export class EvalRunner {
               const releaseOther = await tracker.acquire(to.provider, signal);
               try {
                 const sent = await send(request, { target: to, harness: agent, noTools: picked.noTools });
+                spent.push(sent);
                 observe(to, sent);
                 return { result: sent, target: to };
               } finally {
@@ -614,6 +624,7 @@ export class EvalRunner {
                         if (to) return sendTo(request, to);
                         try {
                           own = await send(request);
+                          spent.push(own);
                         } finally {
                           if (panelTargets) {
                             release?.();
@@ -636,7 +647,7 @@ export class EvalRunner {
                 ).result
               : await send();
           } catch (error) {
-            result = {
+            const failure: AgentResult = {
               status: signal.aborted ? "cancelled" : "error",
               finalText: "",
               structured: null,
@@ -648,6 +659,7 @@ export class EvalRunner {
               error: (error as Error).message,
               quota: null,
             };
+            result = spent.length ? combined(spent, failure, null) : failure;
           }
           trial.costUsd += result.costUsd;
           trial.costEquivUsd += result.costEquivUsd;
@@ -690,10 +702,13 @@ export class EvalRunner {
         // A panel's combined result carries its last call's status; the trial's own call is recorded here.
         observe(target, own ?? result);
         if (signal.aborted) return skip("daemon shutdown");
-        // A panel's result is its derived review, whose verification fields only the stored schema keeps.
-        const output = (system?.mode === "panel" ? StoredReviewSchema : schema)?.safeParse(
-          result.structured ?? extractJson(result.finalText),
-        );
+        // A panel's result is its derived review, whose verification fields only the stored schema keeps;
+        // anything without the panel's mark (e.g. one member's raw review) is not a panel result.
+        const output = (
+          system?.mode === "panel"
+            ? StoredReviewSchema.refine((r) => r.mode === "panel", "not a derived panel review")
+            : schema
+        )?.safeParse(result.structured ?? extractJson(result.finalText));
         // A declined decision answer is still graded; details.invocationStatus records the escalation.
         const answered = result.status === "ok" || result.status === "declined";
         const ok = answered && ("hidden" in item || output?.success === true);
