@@ -865,6 +865,42 @@ describe("runReview panel", () => {
     ]);
   });
 
+  for (const [round, severity] of [
+    [2, "medium"],
+    [3, "critical"],
+  ] as const) {
+    test(`R${round} verifies a cited prior blocker ranked below the cap`, async () => {
+      const previous = { sha: "fixbase", findings: [finding("major")] };
+      const found = [
+        ...Array.from({ length: PANEL_VERIFY_CAP + 1 }, (_, i) => ({
+          ...candidate("src/a.ts", i + 1, "major"),
+          label: "new",
+          prior: "",
+        })),
+        { ...candidate("src/a.ts", 100, "nit"), label: "unaddressed", prior: " p1 " },
+        { ...candidate("src/a.ts", 101, "nit"), label: "unaddressed", prior: "P2" },
+      ];
+      const citedId = `C${PANEL_VERIFY_CAP + 2}`;
+      const { out, verifications } = await panel(
+        [found],
+        (id) => ({ ...confirmed, severity: id === citedId ? severity : "low" }),
+        { panelReview: round, prompt: { ...prompt, headSha: "head", previous, fixReview: round } },
+      );
+      const sent = verifications.flatMap((v) => ids(v.request.prompt));
+      expect(sent).toHaveLength(PANEL_VERIFY_CAP + 1);
+      expect(sent).toContain(citedId);
+      expect(verifications.every((v) => v.avoidVendor === "anthropic")).toBe(true);
+      expect(out.panel?.candidates).toHaveLength(found.length);
+      expect(out.panel?.capped).toEqual([`C${PANEL_VERIFY_CAP + 1}`, `C${PANEL_VERIFY_CAP + 3}`]);
+      expect(out.panel?.verdicts.find((v) => v.id === citedId)?.severity).toBe(severity);
+      expect(out.decision?.review.verdict).toBe("request_changes");
+      expect(out.decision?.blocking.map((f) => [f.prior, f.verification?.severity])).toEqual([
+        [" p1 ", severity],
+      ]);
+      expect(out.decision?.followUps.some((f) => f.prior === " p1 ")).toBe(false);
+    });
+  }
+
   test("the panel's structured result carries its record for eval output", async () => {
     const { out } = await panel([[candidate("src/a.ts", 1)]], () => ({ ...confirmed, verdict: "REFUTED" }));
     const stored = StoredReviewSchema.parse(out.result.structured);

@@ -17,7 +17,7 @@ type Finding = Review["findings"][number];
 /** Categories a panel never verifies or blocks on; they go straight to the follow-up ledger. */
 const UNVERIFIED_CATEGORIES: readonly (Finding["category"] | undefined)[] = ["cleanup", "conventions"];
 const FINDER_SEVERITY_RANK = { blocker: 0, major: 1, minor: 2, nit: 3 } as const;
-/** Candidates verified per review; the rest stay unverified follow-ups. */
+/** Finder candidates verified per review; prior blocker rechecks are exempt. */
 export const PANEL_VERIFY_CAP = 20;
 const PANEL_BATCH_SIZE = 5;
 
@@ -341,7 +341,14 @@ async function runPanel<T extends Invoked>(
   const ranked = candidates
     .filter((c) => c.finder !== null && !UNVERIFIED_CATEGORIES.includes(c.category))
     .sort((a, b) => FINDER_SEVERITY_RANK[a.severity] - FINDER_SEVERITY_RANK[b.severity]);
-  const selected = [...ranked.slice(0, PANEL_VERIFY_CAP), ...candidates.filter((c) => c.finder === null)];
+  // A finder citation replaces the automatic recheck, so it must also bypass the cap.
+  const selected = [
+    ...ranked.filter(
+      (c, i) =>
+        i < PANEL_VERIFY_CAP || (fix && c.label === "unaddressed" && citesPriorBlocking(c, fix.findings)),
+    ),
+    ...candidates.filter((c) => c.finder === null),
+  ];
   // One batch never mixes files or finder vendors, so each call avoids exactly its finder's vendor.
   const groups = new Map<string, typeof selected>();
   for (const c of candidates.filter((c) => selected.includes(c))) {
@@ -475,7 +482,7 @@ async function runPanel<T extends Invoked>(
     candidates,
     verdicts: [...verdicts.values()],
     refuted: [...verdicts.values()].filter((v) => v.verdict === "REFUTED").map((v) => v.id),
-    capped: ranked.slice(PANEL_VERIFY_CAP).map((c) => c.id),
+    capped: ranked.filter((c) => !selected.includes(c)).map((c) => c.id),
     omitted,
   };
   return {
