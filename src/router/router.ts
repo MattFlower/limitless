@@ -2,7 +2,7 @@ import type { Complexity, Effort, ModelSelection, Role } from "../core/types.ts"
 import type { ModelTarget } from "../harness/types.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy } from "./catalog.ts";
 import type { ProviderTracker } from "./providers.ts";
-import { effortTransportError, formatTarget, parseTarget, resolveTarget } from "./targets.ts";
+import { formatTarget, parseTarget, resolveTarget, transportError } from "./targets.ts";
 
 export interface RouteConstraints {
   /** Skip models from this vendor (cross-vendor review). Falls back to it only if nothing else is available. */
@@ -52,7 +52,7 @@ export class Router {
   /** Resolve a reference and reject efforts the role's harness cannot deliver. */
   resolveFor(role: Role, reference: string | ModelSelection) {
     const resolved = this.resolve(reference);
-    const problem = effortTransportError(role, resolved, this.tracker.def(resolved.model.provider));
+    const problem = transportError(role, resolved, this.tracker.def(resolved.model.provider));
     if (problem) throw new Error(problem);
     return resolved;
   }
@@ -85,6 +85,11 @@ export class Router {
       target.backend = { baseUrl: def.baseUrl, authToken: this.tracker.authToken(m.provider) ?? "" };
     if (def.openaiBaseUrl)
       target.openai = { baseUrl: def.openaiBaseUrl, authToken: this.tracker.authToken(m.provider) ?? "" };
+    if (def.decisionsBaseUrl)
+      target.decisions = {
+        baseUrl: def.decisionsBaseUrl,
+        authToken: this.tracker.authToken(m.provider) ?? "",
+      };
     return target;
   }
 
@@ -189,7 +194,7 @@ export class Router {
           skipped.push({ modelId: id, reason: "already tried" });
           continue;
         }
-        const transport = effortTransportError(role, resolved, this.tracker.def(m.provider));
+        const transport = transportError(role, resolved, this.tracker.def(m.provider));
         if (transport) {
           skipped.push({ modelId: id, reason: transport });
           continue;

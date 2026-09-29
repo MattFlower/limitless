@@ -23,13 +23,14 @@ test("catalog records checkpoint origins, exact candidate backend prices and lea
   for (const m of MODELS) {
     expect(m.origin).toMatch(/^[A-Z]{2}$|^unknown$/);
     expect(m.baseOrigin).toMatch(/^[A-Z]{2}$|^unknown$/);
-    const origin = ["anthropic", "openai", "google", "meta", "ibm", "nvidia"].includes(m.vendor)
+    const origin = ["anthropic", "openai", "google", "meta", "ibm", "nvidia", "typesafe"].includes(m.vendor)
       ? "US"
       : m.vendor === "mistral"
         ? "FR"
         : "CN";
     expect(m.origin).toBe(origin);
-    expect(m.baseOrigin).toBe(origin);
+    // TypeSafe does not disclose what, if anything, Jev was built on.
+    expect(m.baseOrigin).toBe(m.vendor === "typesafe" ? "unknown" : origin);
   }
   for (const [id, model, input, output, origin] of candidates) {
     expect(MODELS.find((m) => m.id === `openrouter/${id}`)).toMatchObject({

@@ -577,6 +577,9 @@ export class EvalRunner {
         tracker.record(target.provider, result.status, {
           error: result.error,
           exhaustedUntil: result.quota?.exhaustedUntil,
+          ...(result.modelCooldownMs === undefined
+            ? {}
+            : { modelCooldown: { modelId: target.modelId, ms: result.modelCooldownMs } }),
         });
         if (
           result.status !== "ok" &&

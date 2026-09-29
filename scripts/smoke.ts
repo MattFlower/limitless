@@ -6,6 +6,7 @@ import { loadConfig } from "../src/config.ts";
 import type { QuotaWindow } from "../src/core/types.ts";
 import { runClaude } from "../src/harness/claude.ts";
 import { runCodex } from "../src/harness/codex.ts";
+import { type DecisionAnswer, runDecisions } from "../src/harness/decisions.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
@@ -126,6 +127,9 @@ function targetFor(provider: ProviderDef, model: ModelDef, authToken?: string): 
     price: model.price,
     ...(model.effort ? { effort: model.effort } : {}),
     ...(provider.baseUrl ? { backend: { baseUrl: provider.baseUrl, authToken: authToken ?? "" } } : {}),
+    ...(provider.decisionsBaseUrl
+      ? { decisions: { baseUrl: provider.decisionsBaseUrl, authToken: authToken ?? "" } }
+      : {}),
   };
 }
 
@@ -336,6 +340,60 @@ else:
   }
 }
 
+/** One live typed-question call: every question type answers, and usage and cost are recorded. */
+export async function decisionsCheck(
+  target: ModelTarget,
+  harness: Harness = runDecisions,
+): Promise<CheckResult> {
+  const dir = mkdtempSync(join(tmpdir(), "limitless-smoke-decisions-"));
+  try {
+    let served = target.model;
+    const result = await harness({
+      cwd: dir,
+      prompt: "",
+      target,
+      mode: "readonly",
+      decisionTask: {
+        state: "Ticket: since this morning's deploy the login page returns HTTP 500 for every user.",
+        questions: {
+          kind: {
+            type: "choice",
+            instructions: "What kind of ticket is this?",
+            criteria: { bug: "Something that used to work is broken", feature: "A request for new behavior" },
+          },
+          severity: {
+            type: "score",
+            instructions: "How severe is the problem described in the ticket?",
+            criteria: ["Cosmetic only", "Some users are inconvenienced", "Every user is blocked"],
+          },
+          outage: { type: "noul", instructions: "The ticket describes an outage affecting users right now." },
+        },
+        interpret: (answers) => answers,
+      },
+      timeoutMs: 60_000,
+      idleTimeoutMs: 60_000,
+      maxToolCalls: 0,
+      signal: new AbortController().signal,
+      logPath: join(dir, "decisions.log"),
+      onEvent: (event) => {
+        if (event.type === "status") served = event.text;
+      },
+    });
+    if (result.status !== "ok") return { status: "fail", reason: result.error ?? result.status };
+    const kind = (result.structured as Record<string, DecisionAnswer>).kind;
+    if (kind?.type !== "choice" || kind.choice !== "bug")
+      return { status: "fail", reason: `unexpected answers: ${served}` };
+    if (!(result.usage.input > 0 && result.costUsd > 0))
+      return { status: "fail", reason: "response carried no billable usage" };
+    return {
+      status: "pass",
+      reason: `${served}; ${result.usage.input} input tokens, $${result.costUsd.toFixed(6)}`,
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 async function providerAvailability(
   provider: ProviderDef,
   secrets: Record<string, string>,
@@ -359,6 +417,7 @@ export function backendChecks(
   secrets: Record<string, string>,
   fetchHealth = fetch,
   check = liveCheck,
+  decide = decisionsCheck,
 ): SmokeCheck[] {
   const checks: SmokeCheck[] = [];
   for (const id of ["omlx", "twilight", "openrouter"]) {
@@ -382,6 +441,17 @@ export function backendChecks(
         },
       });
   }
+  const typesafe = PROVIDERS.find((p) => p.id === "typesafe");
+  if (!typesafe?.apiKeySecret) throw new Error("missing provider typesafe");
+  const key = typesafe.apiKeySecret;
+  checks.push({
+    name: "typesafe decisions",
+    run: async () => {
+      const reason = await providerAvailability(typesafe, secrets, fetchHealth);
+      if (reason) return { status: "skip", reason };
+      return decide(targetFor(typesafe, cheapestModel("typesafe"), secrets[key]));
+    },
+  });
   return checks;
 }
 

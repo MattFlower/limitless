@@ -1,11 +1,12 @@
 import type { ZodType } from "zod";
 import type { Billing, Effort, InvocationStatus, QuotaWindow } from "../core/types.ts";
+import type { DecisionTask } from "./decisions.ts";
 
 /** A concrete model on a concrete provider, as chosen by the router. */
 export interface ModelTarget {
   modelId: string; // catalog id, e.g. "claude/sonnet"
-  provider: string; // "claude" | "codex" | "openrouter" | "mtplx" | "twilight"
-  harness: "claude" | "codex" | "fake";
+  provider: string; // "claude" | "codex" | "openrouter" | "mtplx" | "twilight" | "typesafe"
+  harness: "claude" | "codex" | "decisions" | "fake";
   model: string; // backend model name passed to the CLI / API
   vendor: string;
   tier: number;
@@ -16,6 +17,8 @@ export interface ModelTarget {
   /** For the claude harness pointed at a non-Anthropic backend (OpenRouter, mtplx, llama.cpp). */
   backend?: { baseUrl: string; authToken: string };
   openai?: { baseUrl: string; authToken: string };
+  /** Typed-question API for decision models (harness/decisions.ts). */
+  decisions?: { baseUrl: string; authToken: string };
   /** $ per million tokens; used for metered cost and subscription cost-equivalence. */
   price?: { input: number; output: number; cacheRead?: number };
 }
@@ -47,6 +50,8 @@ export interface AgentSpec {
   jsonSchema?: Record<string, unknown>;
   /** Runtime validation for HTTP structured completions. */
   schema?: ZodType;
+  /** Typed questions for the decisions harness; only roles with a decisions mapping pass one. */
+  decisionTask?: DecisionTask;
   resumeSessionId?: string;
   addDirs?: string[];
   timeoutMs: number;
@@ -83,6 +88,8 @@ export interface AgentResult {
   error: string | null;
   /** Quota telemetry observed during the run (Claude rate_limit_event / Codex rollout). */
   quota: { windows: Record<string, QuotaWindow>; exhaustedUntil: number | null } | null;
+  /** With status "quota": only this model is rate-limited, so cool it down instead of its provider. */
+  modelCooldownMs?: number;
 }
 
 export type Harness = (spec: AgentSpec) => Promise<AgentResult>;

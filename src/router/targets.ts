@@ -1,5 +1,5 @@
 import type { Effort, ModelSelection, RecordedEffort, Role } from "../core/types.ts";
-import { TOOL_LESS_ROLES } from "../harness/select.ts";
+import { DECISION_ROLES, TOOL_LESS_ROLES } from "../harness/select.ts";
 import type { ModelDef, ProviderDef } from "./catalog.ts";
 
 export const EFFORT_LEVELS: Effort[] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -52,6 +52,16 @@ export function effortTransportError(
   if (provider.harness !== "claude" || !provider.baseUrl) return null;
   if (TOOL_LESS_ROLES.includes(role) && provider.openaiBaseUrl) return null;
   return `${target.targetId} cannot carry effort in the ${role} role: ${provider.id} runs through the Claude CLI there, which cannot set effort (use ${target.model.id} without @effort)`;
+}
+/** Why the role cannot run this target at all: decision models only serve roles with a decisions mapping. */
+export function transportError(
+  role: Role,
+  target: Pick<ResolvedTarget, "model" | "effort" | "targetId">,
+  provider: ProviderDef | undefined,
+): string | null {
+  if (provider?.harness === "decisions" && !DECISION_ROLES.includes(role))
+    return `${target.model.id} is a decision model; the ${role} role has no decisions mapping`;
+  return effortTransportError(role, target, provider);
 }
 /** Record an unset effort as "default" so it stays distinct from legacy rows (null = unknown). */
 export function recordEffort(effort: Effort | undefined): RecordedEffort {

@@ -79,6 +79,7 @@ export type Vendor =
   | "ibm"
   | "nvidia"
   | "mistral"
+  | "typesafe"
   | "other";
 
 export type Effort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";

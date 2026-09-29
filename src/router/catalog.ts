@@ -3,13 +3,15 @@ import type { Billing, Complexity, Effort, Role, Vendor } from "../core/types.ts
 export interface ProviderDef {
   id: string;
   label: string;
-  harness: "claude" | "codex" | "fake";
+  harness: "claude" | "codex" | "decisions" | "fake";
   billing: Billing;
   maxConcurrent: number;
   /** Anthropic-compatible endpoint for the claude harness (OpenRouter, mtplx, llama.cpp). */
   baseUrl?: string;
   /** OpenAI-compatible endpoint for tool-free structured completions. */
   openaiBaseUrl?: string;
+  /** Typed-question API for decision models (harness "decisions"). */
+  decisionsBaseUrl?: string;
   /** Name of the secret holding the API key for baseUrl. */
   apiKeySecret?: string;
   /** Static token for local servers that want one. */
@@ -96,6 +98,16 @@ export const PROVIDERS: ProviderDef[] = [
     openaiBaseUrl: "http://twilight:8080/v1",
     apiKeySecret: "TWILIGHT_API_KEY",
     healthUrl: "http://twilight:8080/v1/models",
+  },
+  {
+    // Decision models answer typed questions instead of writing text (docs/research/09-jev-decisions.md).
+    id: "typesafe",
+    label: "TypeSafe (decisions API)",
+    harness: "decisions",
+    billing: "metered",
+    maxConcurrent: 4,
+    decisionsBaseUrl: "https://api.typesafe.ai",
+    apiKeySecret: "LIMITLESS_API_KEY",
   },
 ];
 
@@ -361,6 +373,19 @@ export const MODELS: ModelDef[] = [
     supportedEfforts: [],
     tier: 3,
     price: { input: 0.2, output: 0.2 },
+  },
+  // Decision model: only roles with a decisions mapping can route to it (DECISION_ROLES).
+  {
+    id: "typesafe/jev-1.13",
+    provider: "typesafe",
+    model: "jev-1.13.0",
+    vendor: "typesafe",
+    origin: "US",
+    baseOrigin: "unknown",
+    supportedEfforts: [],
+    tier: 1,
+    price: { input: 0.042, output: 0 },
+    notes: "Pinned version: confidence thresholds are tuned per version. Base model undisclosed.",
   },
   // Free local models.
   {
