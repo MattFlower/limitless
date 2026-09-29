@@ -303,11 +303,34 @@ export function reviewPrompt(input: {
   implementerReportMode?: "include" | "omit";
   externalChange?: boolean;
   dependencyUpdate?: boolean;
-  previous?: { sha: string; findings: Review["findings"] };
+  /** `resolved`: earlier blocking findings that a later review found fixed. */
+  previous?: { sha: string; findings: Review["findings"]; resolved?: Review["findings"] };
   headSha?: string;
   resolution?: boolean;
+  /** Panel re-review number (2 or 3): only the fix diff since `previous.sha` is under review. */
+  fixReview?: number;
 }): string {
-  const range = `${input.baseSha}${input.externalChange ? "..." : ".."}${input.externalChange ? (input.headSha ?? "HEAD") : "HEAD"}`;
+  const fix = input.fixReview && input.previous ? input.previous.sha : undefined;
+  const range = fix
+    ? `${fix}..${input.headSha ?? "HEAD"}`
+    : `${input.baseSha}${input.externalChange ? "..." : ".."}${input.externalChange ? (input.headSha ?? "HEAD") : "HEAD"}`;
+  // v2 evidence stays out so a prior confidence score can't anchor the recheck; a fix-diff review also
+  // drops the earlier review's own label and citation, which its fresh id and status replace.
+  const brief = (
+    {
+      failure_scenario,
+      category,
+      confidence,
+      introduced_by_diff,
+      verification,
+      ...f
+    }: Review["findings"][number],
+    status: string,
+  ) => {
+    if (!fix) return f;
+    const { label: _label, prior: _prior, ...rest } = f;
+    return { ...rest, status };
+  };
   const warnings = input.audit.length
     ? input.audit
         .map((f) => `- [${f.rule}/${f.severity}] ${f.file ? `${f.file}: ` : ""}${f.detail}`)
@@ -321,8 +344,13 @@ ${quoteRequest(input.prompt)}
 # Specification
 ${input.spec ? renderSpec(input.spec) : "(no separate spec; judge against the request)"}
 
-# Change under review
-Base commit: ${input.baseSha}. Inspect it with \`git diff ${range}\`, \`git log ${input.externalChange ? "--right-only " : ""}${range}\`, and by reading the surrounding code.
+${
+  fix
+    ? `# Change under review (review R${input.fixReview}: the fix diff only)
+The full change was reviewed in R1. Review only the fixes made since the previous review: inspect them with \`git diff ${range}\`, \`git log ${range}\`, and by reading the surrounding code.`
+    : `# Change under review
+Base commit: ${input.baseSha}. Inspect it with \`git diff ${range}\`, \`git log ${input.externalChange ? "--right-only " : ""}${range}\`, and by reading the surrounding code.`
+}
 ${fence(input.stat.trim() || "(empty diff)")}
 ${
   input.patch !== undefined
@@ -336,18 +364,27 @@ Reviewed commit: ${input.previous.sha}. Current HEAD: ${input.headSha ?? "HEAD"}
 Previous blocking findings (the only findings sent back for implementation):
 ${fence(
   JSON.stringify(
-    // v2 evidence stays out so a prior confidence score can't anchor the recheck.
-    input.previous.findings.map(
-      ({ failure_scenario, category, confidence, introduced_by_diff, verification, ...f }, i) => ({
-        id: `P${i + 1}`,
-        ...f,
-      }),
-    ),
+    input.previous.findings.map((f, i) => ({
+      id: `P${i + 1}`,
+      ...brief(f, "unresolved at the previous review; recheck it against the fix diff"),
+    })),
     null,
     2,
   ),
 )}
-${input.resolution ? `For this conflict-resolution round, inspect \`git diff ${input.baseSha}..HEAD\` against the pinned new base for review and regression classification.` : `Inspect the latest-change diff with \`git diff ${input.previous.sha}..${input.headSha ?? "HEAD"}\`. Compare it with the full base-to-HEAD change above.`}
+${
+  fix && input.previous.resolved?.length
+    ? `Earlier blocking findings already resolved (do not raise them again unless the fix diff reintroduces one, as a regression):
+${fence(
+  JSON.stringify(
+    input.previous.resolved.map((f) => brief(f, "resolved")),
+    null,
+    2,
+  ),
+)}
+`
+    : ""
+}${input.resolution && !fix ? `For this conflict-resolution round, inspect \`git diff ${input.baseSha}..HEAD\` against the pinned new base for review and regression classification.` : `Inspect the latest-change diff with \`git diff ${input.previous.sha}..${input.headSha ?? "HEAD"}\`. ${fix ? "Only this fix diff is under review; do not re-review the rest of the change." : "Compare it with the full base-to-HEAD change above."}`}
 For every finding, set exactly one label: unaddressed = a previous blocking finding remains unfixed; regression = introduced by the latest changes; new = first found now and not introduced by the latest changes. Mark security findings with security: true (otherwise false). Newly found major/minor/nit findings that are not security issues become follow-ups. Recheck the previous findings before raising new ones. When labelling a finding unaddressed, set prior to the id (P1, P2, ...) of the previous blocking finding it repeats; set prior to "" for every other finding. Prior nonblocking findings are already recorded follow-ups; do not relabel them unaddressed. Report resolved prior findings by omitting them from findings.
 `
     : ""
@@ -392,9 +429,27 @@ export function verifierPrompt(input: {
   /** PR verification: the base may have moved past the fork point, so diff from the merge base as finders do. */
   externalChange?: boolean;
   stat: string;
-  candidates: { id: string; file: string; line: number; title: string; failure_scenario: string }[];
+  candidates: {
+    id: string;
+    file: string;
+    line: number;
+    title: string;
+    failure_scenario: string;
+    label?: string;
+    prior?: string;
+  }[];
+  /** Panel re-review: the fix diff since `fix.sha` is under review, against the prior blocking findings. */
+  fix?: {
+    review: number;
+    sha: string;
+    prior: { id: string; file: string; line: number; title: string; status: string }[];
+    /** Blocking findings of earlier reviews that a later review found fixed. */
+    resolved?: { file: string; line: number; title: string; status: string }[];
+  };
 }): string {
-  const range = `${input.baseSha}${input.externalChange ? "..." : ".."}${input.headSha ?? "HEAD"}`;
+  const range = input.fix
+    ? `${input.fix.sha}..${input.headSha ?? "HEAD"}`
+    : `${input.baseSha}${input.externalChange ? "..." : ".."}${input.headSha ?? "HEAD"}`;
   return `You are a code-review verifier. Other reviewers raised the candidate defects below against a change. Check each one against the repository code and decide whether it is real. Do not look for new defects.
 
 # Original request
@@ -403,9 +458,19 @@ ${quoteRequest(input.prompt)}
 # Specification
 ${input.spec ? renderSpec(input.spec) : "(no separate spec; judge against the request)"}
 
-# Change under review
-Base: ${input.baseSha}. Head: ${input.headSha ?? "HEAD"}. Inspect it with \`git diff ${range}\` and by reading the surrounding code.
+${
+  input.fix
+    ? `# Change under review (review R${input.fix.review}: the fix diff only)
+Previously reviewed: ${input.fix.sha}. Head: ${input.headSha ?? "HEAD"}. Inspect the fixes with \`git diff ${range}\` and by reading the surrounding code.
 ${fence(input.stat.trim() || "(empty diff)")}
+
+# Prior blocking findings (status from this re-review's finders, not proof)
+${fence(JSON.stringify(input.fix.prior, null, 2))}
+${input.fix.resolved?.length ? `Earlier blocking findings already resolved (a candidate repeating one is a regression only if the fix diff reintroduced it):\n${fence(JSON.stringify(input.fix.resolved, null, 2))}\n` : ""}A candidate with prior set (P1, P2, ...) claims that prior finding is still unaddressed, or asks you to recheck it when no finder repeated it: REFUTE it when the fix diff resolves it, else CONFIRM it. A candidate labelled regression claims the fix diff introduced it: REFUTE it when the defect is not in the code at head.`
+    : `# Change under review
+Base: ${input.baseSha}. Head: ${input.headSha ?? "HEAD"}. Inspect it with \`git diff ${range}\` and by reading the surrounding code.
+${fence(input.stat.trim() || "(empty diff)")}`
+}
 
 # Candidates (claims to check, not facts)
 ${fence(JSON.stringify(input.candidates, null, 2))}

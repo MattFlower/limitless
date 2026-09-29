@@ -422,3 +422,20 @@ test("snapshot review cases reject gold defects under the stripped evals/ direct
   for (const path of ["src/evals/x.ts", "evals.ts", "Evals/x.ts"])
     expect(file(true, path).success).toBe(true);
 });
+
+test("concurrency defaults to 2 and rejects non-positive, fractional and unsafe values", async () => {
+  const request = { role: "triage", models: ["candidate-a"] };
+  expect(EvalRequestSchema.parse(request).concurrency).toBe(2);
+  expect(EvalRequestSchema.parse({ ...request, concurrency: 5 }).concurrency).toBe(5);
+  expect(EvalRequestSchema.parse({ ...request, concurrency: Number.MAX_SAFE_INTEGER }).concurrency).toBe(
+    Number.MAX_SAFE_INTEGER,
+  );
+  const f = await evalFixture();
+  try {
+    for (const concurrency of [0, -1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1, "2"])
+      expect(() => f.factory.evals.submit({ ...request, concurrency })).toThrow();
+    expect(f.factory.store.listEvalRuns()).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
+});

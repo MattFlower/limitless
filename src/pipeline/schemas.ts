@@ -200,6 +200,15 @@ export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
 };
 
 /**
+ * The diff a panel review covered: R1 the full change, R2 and R3 only the fixes since the previous
+ * review, a conflict-resolution review (outside R1-R3) the resolved change against the new base.
+ */
+export interface ReviewScope {
+  kind: "full" | "fix" | "resolution";
+  range: string;
+}
+
+/**
  * A review regraded from stored JSON, possibly written under an older schema. Grading reads only
  * severity, file and line, and derives the verdict itself, so every other field may be absent
  * (`security` was added later). The degenerate-summary rule still applies.
@@ -215,7 +224,12 @@ const StoredFindingSchema = reviewBase.shape.findings.element.extend({
 /** A panel's candidates and rulings, kept with eval output so refuted candidates stay regradable. */
 const StoredPanelSchema = z.object({
   candidates: z.array(
-    StoredFindingSchema.extend({ id: z.string(), finder: z.number().int(), vendor: z.string().nullable() }),
+    StoredFindingSchema.extend({
+      id: z.string(),
+      // Null: a prior blocking finding no finder repeated, rechecked by the verifier.
+      finder: z.number().int().nullable(),
+      vendor: z.string().nullable(),
+    }),
   ),
   verdicts: z.array(VerificationSchema.extend({ id: z.string() })),
   refuted: z.array(z.string()),

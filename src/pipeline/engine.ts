@@ -62,8 +62,10 @@ import {
 import { buildReport } from "./report.ts";
 import {
   blockingReviewFindings,
+  PANEL_REVIEWS,
   type ReviewInput,
   type ReviewRequest,
+  resolvedPriorFindings,
   reviewFindingKey,
   runReview,
   type VerifierRequest,
@@ -73,6 +75,7 @@ import {
   type Holdout,
   HoldoutSchema,
   type Review,
+  type ReviewScope,
   renderSpec,
   type Spec,
   SpecSchema,
@@ -772,10 +775,27 @@ async function oneRound(
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
   const changeDiff = () => diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change");
+  const system = ctx.deps.reviewSystem ?? productionReviewSystem(ctx.deps.cfg);
+  const resolution = ctx.state.conflictRound === round;
+  // Panel reviews are numbered apart from implementation rounds (a gate-failed round reviews nothing,
+  // a replayed round keeps its number); a conflict-resolution review is outside the count.
+  const panelReview =
+    system.mode === "panel" && !resolution
+      ? Math.max(
+          0,
+          ...(ctx.state.reviewHistory ?? []).filter((e) => e.round < round).map((e) => e.panelReview ?? 0),
+        ) + 1
+      : undefined;
+  // Checked before implementing: work no review can see is not worth paying for. The worktree keeps
+  // the head the last review saw, which the draft delivers.
+  if (panelReview && panelReview > PANEL_REVIEWS)
+    throw new NeedsHumanError(
+      `Panel review limit reached (R${PANEL_REVIEWS}); not implementing again. Last feedback:\n${ctx.state.feedback ?? ""}`,
+    );
 
   // --- implement (skipped when resuming a round whose implementation already landed)
   if (round >= 0 && ctx.state.implementedRound !== round) await implementStage(ctx, round);
-  if (ctx.state.conflictRound === round) {
+  if (resolution) {
     if (!ctx.state.preRebaseHead || ctx.state.pendingRebaseSha !== baseSha)
       throw new Error("Missing expected merge state for resolution checks");
     await validateMerge(cwd, ctx.state.preRebaseHead, baseSha);
@@ -898,8 +918,27 @@ async function oneRound(
     throw new NeedsHumanError("Previous review has no round history; cannot classify later findings");
   const earlierReviews = (ctx.state.reviewHistory ?? []).filter((entry) => entry.round < round);
   const priorReview = earlierReviews.at(-1);
-  const previousReview = priorReview ? { sha: priorReview.sha, findings: priorReview.blocking } : undefined;
   const reviewedSha = await headSha(cwd);
+  // R2 and R3 review only the fixes since the previous review. A conflict-resolution review, like a
+  // single one, sees the change against the new base, so upstream-only files never appear.
+  const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
+  const reviewDiff = fixSha ? await diffSince(cwd, fixSha) : diff;
+  const scope: ReviewScope | undefined =
+    system.mode !== "panel"
+      ? undefined
+      : fixSha
+        ? { kind: "fix", range: `${fixSha}..${reviewedSha}` }
+        : {
+            kind: resolution ? "resolution" : "full",
+            range: `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`,
+          };
+  const previousReview = priorReview
+    ? {
+        sha: priorReview.sha,
+        findings: priorReview.blocking,
+        ...(fixSha ? { resolved: resolvedPriorFindings(earlierReviews) } : {}),
+      }
+    : undefined;
   const review: Review = await ctx.stage(
     "review",
     async (stage) => {
@@ -907,17 +946,17 @@ async function oneRound(
       const replayed = (ctx.state.reviewHistory ?? []).find(
         (e) => e.round === round && e.sha === reviewedSha,
       );
-      const system = ctx.deps.reviewSystem ?? productionReviewSystem(ctx.deps.cfg);
       const input: ReviewInput = {
-        timeoutMs: readingTimeout(diff.added + diff.removed),
+        timeoutMs: readingTimeout(reviewDiff.added + reviewDiff.removed),
         replayedFollowUps: replayed?.followUps,
         system,
+        ...(panelReview ? { panelReview } : {}),
         prompt: {
           prompt: ctx.run.prompt,
           spec: ctx.state.spec ?? null,
           baseSha,
-          stat: diff.stat,
-          ...(ctx.state.flow === "verify-change" ? { patch: diff.patch } : {}),
+          stat: reviewDiff.stat,
+          ...(ctx.state.flow === "verify-change" ? { patch: reviewDiff.patch } : {}),
           gates: comparison,
           audit,
           implementerReport: ctx.state.implementerReport ?? "",
@@ -927,7 +966,8 @@ async function oneRound(
             ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
           previous: previousReview,
           headSha: reviewedSha,
-          resolution: ctx.state.conflictRound === round,
+          resolution,
+          ...(fixSha && panelReview ? { fixReview: panelReview } : {}),
         },
       };
       const call = async (
@@ -967,7 +1007,17 @@ async function oneRound(
       if (!decision) throw output.error;
       // The model's verdict is kept for inspection only; control flow uses the derived one.
       const { review: r, modelVerdict, blocking, followUps } = decision;
-      ctx.state.reviewHistory = [...earlierReviews, { round, sha: reviewedSha, blocking, followUps }];
+      ctx.state.reviewHistory = [
+        ...earlierReviews,
+        {
+          round,
+          sha: reviewedSha,
+          blocking,
+          followUps,
+          ...(panelReview ? { panelReview } : {}),
+          ...(scope ? { scope } : {}),
+        },
+      ];
       ctx.state.reviewFollowUps = [
         ...new Map(
           ctx.state.reviewHistory.flatMap((entry) =>
@@ -980,9 +1030,10 @@ async function oneRound(
       ctx.state.lastReview = { ...r, modelId: target.modelId };
       ctx.state.reviewedSha = reviewedSha;
       await ctx.save();
+      // Panel artifacts are numbered by review (R1-R3), single ones by implementation round.
       ctx.store.putArtifact(
         ctx.run.id,
-        `review-${round}.json`,
+        scope?.kind === "resolution" ? "review-resolution.json" : `review-${panelReview ?? round}.json`,
         "review",
         JSON.stringify(
           {
@@ -990,6 +1041,8 @@ async function oneRound(
             modelVerdict,
             model: target.modelId,
             round,
+            ...(panelReview ? { panelReview } : {}),
+            ...(scope ? { scope } : {}),
             reviewedSha,
             blocking,
             ...(panel ? { panel } : {}),
@@ -1009,11 +1062,14 @@ async function oneRound(
 
   const reviewFeedback =
     review.verdict === "request_changes"
-      ? formatReviewFeedback(blockingReviewFindings(review, previousReview?.findings))
+      ? formatReviewFeedback(blockingReviewFindings(review, previousReview?.findings, panelReview))
       : "";
   if (review.verdict === "request_changes") {
     ctx.state.feedback = reviewFeedback || `### Code review requested changes\n${review.summary}`;
     await ctx.save();
+    // Never a fourth panel review: what still blocks goes to a human with a draft PR.
+    if (panelReview && panelReview >= PANEL_REVIEWS)
+      throw new NeedsHumanError(`Still blocking after panel review R${panelReview}:\n${ctx.state.feedback}`);
     return false;
   }
 
@@ -1177,6 +1233,9 @@ async function recordVerified(ctx: RunContext, sha: string): Promise<void> {
     lastGates: ctx.state.lastGates,
     lastReview: ctx.state.lastReview,
     lastAudit: ctx.state.lastAudit,
+    // The panel schedule in the report must match the verified review; later rounds replace (never
+    // mutate) the history array, so the reference stays a faithful snapshot.
+    ...(ctx.state.lastReview?.mode === "panel" ? { reviewHistory: ctx.state.reviewHistory } : {}),
   };
   await ctx.save();
 }

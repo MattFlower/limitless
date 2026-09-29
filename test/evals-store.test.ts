@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { EvalTrial } from "../src/core/types.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
 import { Store } from "../src/db/store.ts";
+import { formatEvalReport } from "../src/evals/format.ts";
 
 const row: EvalTrial = {
   effort: null,
@@ -288,6 +289,36 @@ test("round options and evidence survive reload with provider-specific spend and
     expect(store.providerSpendSince("other", 0)).toBe(2);
     store.db.query("DELETE FROM eval_run_options WHERE eval_run_id = ?").run(run.id);
     expect(store.getEvalRun(run.id)).toMatchObject({ rounds: 1, strategy: "retry" });
+  } finally {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("eval concurrency survives reload and legacy runs omit it", () => {
+  const home = mkdtempSync(join(tmpdir(), "eval-concurrency-store-"));
+  const path = join(home, "db.sqlite");
+  let store = new Store(path);
+  try {
+    const explicit = store.createEvalRun(
+      { role: "triage", models: ["a"], k: 1, maxUsd: 1, concurrency: 7 },
+      [],
+    );
+    const omitted = store.createEvalRun({ role: "triage", models: ["a"], k: 1, maxUsd: 1 }, []);
+    expect(explicit.concurrency).toBe(7);
+    store.close();
+    store = new Store(path);
+    expect(store.getEvalRun(explicit.id)?.concurrency).toBe(7);
+    expect(store.getEvalRun(omitted.id)?.concurrency).toBe(2);
+    // A run written by the previous release has no concurrency row.
+    store.db.query("DELETE FROM eval_run_concurrency WHERE eval_run_id = ?").run(explicit.id);
+    const legacy = store.getEvalRun(explicit.id);
+    expect(legacy?.concurrency).toBeUndefined();
+    expect(JSON.parse(JSON.stringify(legacy))).not.toHaveProperty("concurrency");
+    const listed = new Map(store.listEvalRuns().map((r) => [r.id, r.concurrency]));
+    expect([listed.get(explicit.id), listed.get(omitted.id)]).toEqual([undefined, 2]);
+    if (!legacy) throw new Error("missing run");
+    expect(formatEvalReport({ run: legacy, summaries: [], trials: [] })).toContain("concurrency=1 (legacy)");
   } finally {
     store.close();
     rmSync(home, { recursive: true, force: true });

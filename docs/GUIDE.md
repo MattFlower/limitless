@@ -123,13 +123,13 @@ another directory.
 
 **`secrets.env`** (run `chmod 600` on it). It uses `KEY=value` lines. Quotes, a leading `export`
 and `#` comments are allowed. Environment variables of the same name override the file, except for
-`TWILIGHT_API_KEY` and `LIMITLESS_API_KEY`, which are read only from the file.
+`TWILIGHT_API_KEY` and `TYPESAFE_API_KEY`, which are read only from the file.
 
 | Key | Enables |
 |---|---|
 | `OPENROUTER_API_KEY` | The `openrouter` provider. Without it, the provider shows `missing OPENROUTER_API_KEY`. |
 | `TWILIGHT_API_KEY` | The `twilight` provider (LAN llama.cpp server) |
-| `LIMITLESS_API_KEY` | The `typesafe` provider (TypeSafe decisions API key, for the Jev decision model) |
+| `TYPESAFE_API_KEY` | The `typesafe` provider (TypeSafe decisions API key, for the Jev decision model) |
 | `DISCORD_BOT_TOKEN`, `DISCORD_APP_ID`, `DISCORD_GUILD_ID` | The Discord bot (also needs `[owners].discord` and `[discord].channel_id`) |
 | `GITHUB_WEBHOOK_SECRET` | `POST /webhooks/github`. Without it, the endpoint answers 503. |
 
@@ -424,7 +424,7 @@ The PR body is the evidence report, also saved as `report.md`. It contains:
 | `omlx` | free | same, `http://127.0.0.1:8989` | oMLX.app / `omlx start` and `OMLX_API_KEY` |
 | `mtplx` (rollback) | free | same, `http://127.0.0.1:8000` | opt-in `service install --mtplx` |
 | `twilight` | free | same, `http://twilight:8080` | a LAN llama.cpp server and `TWILIGHT_API_KEY` |
-| `typesafe` | metered | `decisions`: typed questions over HTTP (`https://api.typesafe.ai/v1/systemone`); triage only | `LIMITLESS_API_KEY` |
+| `typesafe` | metered | `decisions`: typed questions over HTTP (`https://api.typesafe.ai/v1/systemone`); triage only | `TYPESAFE_API_KEY` |
 
 The provider and model catalog, including these endpoints, is currently built into
 `src/router/catalog.ts`. Defining providers in config is planned (M6 in [PLAN](PLAN.md)). Local
@@ -498,6 +498,13 @@ limitless eval policy --write          # write routing/policy.json and routing/E
 - The defaults are `--k 1`, `--max-usd 1.00`, all cases, and caching on (`--no-cache` forces fresh
   calls). `--max-usd` stops *scheduling* trials once recorded metered spend reaches the threshold.
   It is not a hard billing ceiling.
+- `--concurrency N` (default 2) runs up to N trials at once per provider, capped at the provider's
+  `max_concurrent` − 1 so production work always keeps a slot (a provider with `max_concurrent = 1`
+  still allows one eval call). All running evals together share that same cap: at most the largest
+  running eval's N, and never more than `max_concurrent` − 1. Every panel finder and verifier call
+  counts against its own provider's cap. Runs recorded before this option show
+  `concurrency=1 (legacy)`. The budget is checked before each trial starts, so trials already in flight can
+  overshoot `--max-usd` by up to N−1 trials per provider.
 - Evals respect reserves, budgets and circuit breakers and share provider concurrency with runs.
   Their metered spend counts toward provider budgets.
 - `eval policy` considers the latest completed eval for each model (`--evals id,id` restricts

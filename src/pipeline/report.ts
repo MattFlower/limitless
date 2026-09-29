@@ -34,6 +34,7 @@ export interface ReportInput {
     | "lastGates"
     | "lastReview"
     | "reviewFollowUps"
+    | "reviewHistory"
     | "lastAudit"
     | "rebaseNote"
     | "terminalReason"
@@ -172,7 +173,18 @@ export function renderReport(input: ReportInput): string {
     (state.lastReview?.mode === "panel" ? `${f.severity} (unverified)` : f.severity);
   if (state.lastReview) {
     const r = state.lastReview;
-    blocks.push(`## Code review (\`${r.modelId}\`)`, `**${r.verdict}** — ${r.summary}`);
+    blocks.push(`## Code review (\`${r.modelId}\`)`);
+    const schedule = (state.reviewHistory ?? []).flatMap((e) =>
+      e.scope?.kind === "resolution"
+        ? [`- Conflict-resolution review — change against the new base \`${e.scope.range}\``]
+        : e.panelReview && e.scope
+          ? [
+              `- Panel review R${e.panelReview} — ${e.scope.kind === "fix" ? "fix diff" : "full change"} \`${e.scope.range}\``,
+            ]
+          : [],
+    );
+    if (schedule.length) blocks.push(schedule.join("\n"));
+    blocks.push(`**${r.verdict}** — ${r.summary}`);
     if (r.findings.length) {
       blocks.push(
         r.findings
@@ -228,6 +240,15 @@ export function renderReport(input: ReportInput): string {
   return `${blocks.join("\n\n")}\n`;
 }
 
+/**
+ * The state a verified-failure report describes: the evidence saved when the run last verified.
+ * Reviews after that point are dropped (evidence saved before it kept the history has none), so the
+ * listed rounds and the shown verdict refer to the same commit.
+ */
+export function verifiedFailureState(state: RunState): ReportInput["state"] {
+  return { ...state, reviewHistory: undefined, ...state.lastVerifiedEvidence };
+}
+
 export function buildReport(
   ctx: RunContext,
   success: boolean,
@@ -238,7 +259,7 @@ export function buildReport(
     success,
     runId: ctx.run.id,
     prompt: ctx.run.prompt,
-    state: verifiedFailure ? { ...ctx.state, ...ctx.state.lastVerifiedEvidence } : ctx.state,
+    state: verifiedFailure ? verifiedFailureState(ctx.state) : ctx.state,
     verifiedFailure,
     invocations: ctx.store.listInvocations(ctx.run.id),
     totals: { costUsd: latest.costUsd, costEquivUsd: latest.costEquivUsd },

@@ -36,7 +36,7 @@ import { recordEffort } from "../router/targets.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
-import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
+import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
@@ -98,8 +98,11 @@ export interface RunState {
   preRebaseHead?: string;
   /** Commit that last passed verify, or an approving quick review after deterministic checks. */
   lastVerifiedSha?: string;
-  /** Passing evidence retained if a later resolution round fails. */
-  lastVerifiedEvidence?: Pick<RunState, "lastVerify" | "lastGates" | "lastReview" | "lastAudit">;
+  /** Passing evidence retained if a later resolution round fails; panel runs keep the review history with it. */
+  lastVerifiedEvidence?: Pick<
+    RunState,
+    "lastVerify" | "lastGates" | "lastReview" | "lastAudit" | "reviewHistory"
+  >;
   /** Why delivery went ahead without rebasing onto the latest base (shown in the report). */
   rebaseNote?: string;
   /** The single extra implementation round allowed after a conflicting delivery merge. */
@@ -117,6 +120,10 @@ export interface RunState {
     sha: string;
     blocking: Review["findings"];
     followUps: Review["findings"];
+    /** Panel only: which review (1-3) this was; counted apart from implementation rounds. Absent for a conflict-resolution review. */
+    panelReview?: number;
+    /** Panel only: the diff this review covered. */
+    scope?: ReviewScope;
   }[];
   reviewFollowUps?: Review["findings"];
   lastVerify?: (Verify & { modelId: string }) | null;

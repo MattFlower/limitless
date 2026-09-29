@@ -381,10 +381,10 @@ test("TypeSafe decisions smoke skips without its key and checks answers, usage a
   const rows = (secrets: Record<string, string>) =>
     runChecks(backendChecks(secrets, fetch, liveCheck, decide).filter((c) => c.name.startsWith("typesafe")));
   expect(await rows({})).toMatchObject([
-    { name: "typesafe decisions", status: "skip", reason: "missing LIMITLESS_API_KEY" },
+    { name: "typesafe decisions", status: "skip", reason: "missing TYPESAFE_API_KEY" },
   ]);
   expect(targets).toEqual([]);
-  expect((await rows({ LIMITLESS_API_KEY: "key" }))[0]?.status).toBe("pass");
+  expect((await rows({ TYPESAFE_API_KEY: "key" }))[0]?.status).toBe("pass");
   expect(targets[0]).toMatchObject({
     model: "jev-1.13.0",
     harness: "decisions",

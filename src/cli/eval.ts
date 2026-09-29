@@ -139,6 +139,7 @@ export async function evalCommand(
     maxUsd: numeric("max-usd"),
     caseIds: typeof flags.cases === "string" ? flags.cases.split(",") : undefined,
     cache: !flags["no-cache"],
+    concurrency: numeric("concurrency"),
     rounds: numeric("rounds"),
     strategy: flags.strategy,
   };
