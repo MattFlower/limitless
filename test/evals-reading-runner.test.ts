@@ -518,6 +518,62 @@ test("a panel member that throws keeps the spend of the calls that ran", async (
   }
 });
 
+test("panel calls count against the run's per-provider cap and release it when a member fails", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    for (const id of ["openrouter", "provider-b"]) {
+      const def = f.factory.tracker.def(id);
+      if (!def) throw new Error(`missing provider ${id}`);
+      def.maxConcurrent = 3;
+    }
+    const active = new Map<string, number>();
+    const peak = new Map<string, number>();
+    f.respond(async (s) => {
+      const provider = s.target.provider;
+      active.set(provider, (active.get(provider) ?? 0) + 1);
+      peak.set(provider, Math.max(peak.get(provider) ?? 0, active.get(provider) ?? 0));
+      // Long enough for panel members and single-b reviews to overlap if uncapped.
+      await Bun.sleep(provider === "provider-b" ? 150 : 10);
+      active.set(provider, (active.get(provider) ?? 0) - 1);
+      return s.prompt.includes("code-review verifier")
+        ? refuteAll(s)
+        : { structured: reviewOutput(), costUsd: 0.1 };
+    });
+    const single = {
+      name: "single-b",
+      mode: "single",
+      finders: [{ target: "candidate-b", prompt: "standard" }],
+      implementerReport: "include",
+    };
+    const report = await f.run({
+      models: undefined,
+      systems: [panelSystem, single],
+      k: 4,
+      concurrency: 1,
+      maxUsd: 100,
+      cache: false,
+    });
+    expect(report.trials.every((t) => t.status === "ok")).toBe(true);
+    // Four panels (finder a, finder b, verifier c) and four single-b reviews.
+    expect(f.calls).toHaveLength(16);
+    expect(peak.get("provider-b")).toBe(1);
+
+    // A panel member that throws after taking its slots leaves nothing held for later evals.
+    f.respond((s) =>
+      s.target.modelId === "candidate-b" ? { fault: "throw" } : { structured: reviewOutput(), costUsd: 0.1 },
+    );
+    const failed = await f.run({ models: undefined, systems: [panelSystem], concurrency: 1, cache: false });
+    expect(failed.trials[0]?.status).toBe("error");
+    expect(f.factory.tracker.status("provider-b")?.inFlight).toBe(0);
+    f.respond(() => ({ structured: reviewOutput(), costUsd: 0.1 }));
+    const after = await f.run({ models: undefined, systems: [single], concurrency: 1, cache: false });
+    expect(after.trials.map((t) => t.status)).toEqual(["ok"]);
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
 test("panel trials keep their record for regrading and key the cache on the verifier", async () => {
   const f = await fixture("review", [verifierModel]);
   try {
@@ -839,8 +895,17 @@ test("shutdown removes active and capacity-waiting worktrees", async () => {
       );
       return { status: "cancelled" };
     });
-    const first = f.factory.evals.submit({ role: "review", models: ["candidate-a"] });
+    // Evals share max - 1 = 2 slots; production work holds the rest so the second eval waits on the tracker.
+    const def = f.factory.tracker.def("openrouter");
+    if (!def) throw new Error("missing provider");
+    def.maxConcurrent = 3;
+    const first = f.factory.evals.submit({ role: "review", models: ["candidate-a"], concurrency: 1 });
     await entered.promise;
+    const held = new AbortController().signal;
+    const production = [
+      await f.factory.tracker.acquire("openrouter", held),
+      await f.factory.tracker.acquire("openrouter", held),
+    ];
     const waiting = deferred<void>();
     const acquire = f.factory.tracker.acquire.bind(f.factory.tracker);
     const spy = spyOn(f.factory.tracker, "acquire").mockImplementation((id, signal) => {
@@ -851,6 +916,7 @@ test("shutdown removes active and capacity-waiting worktrees", async () => {
     await waiting.promise;
     spy.mockRestore();
     await f.factory.evals.stop();
+    for (const release of production) release();
     for (const id of [first.id, second.id]) expect(f.factory.evals.report(id)?.run.status).toBe("failed");
     const report = f.factory.evals.report(second.id);
     expect(report?.trials[0]).toMatchObject({

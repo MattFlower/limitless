@@ -22,7 +22,7 @@ export function formatEvalReport(report: EvalReport): string {
   const number = (n: number | null) => (n === null ? "n/a" : n.toFixed(3));
   const pct = (n: number | null) => (n === null ? "n/a" : `${(n * 100).toFixed(1)}%`);
   const lines = [
-    `${report.run.id}: ${report.run.status} (role=${report.run.role}, k=${report.run.k}, maxUsd=${report.run.maxUsd})`,
+    `${report.run.id}: ${report.run.status} (role=${report.run.role}, k=${report.run.k}, maxUsd=${report.run.maxUsd}, concurrency=${report.run.concurrency ?? "1 (legacy)"})`,
   ];
   if (report.run.error) lines.push(report.run.error);
   for (const m of report.summaries) {

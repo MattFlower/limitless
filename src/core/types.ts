@@ -386,6 +386,8 @@ export interface ReviewSystem {
   verifier?: { target?: string };
   implementerReport: "include" | "omit";
 }
+/** Trials an eval runs at once per provider, before the provider's own `maxConcurrent` cap. */
+export const DEFAULT_EVAL_CONCURRENCY = 2;
 export interface EvalRun {
   rounds?: number;
   strategy?: EvalStrategy;
@@ -396,6 +398,11 @@ export interface EvalRun {
   models: string[];
   k: number;
   maxUsd: number;
+  /**
+   * Most trials run at once per provider (also capped by its maxConcurrent − 1). Absent on runs
+   * recorded before this option existed, which ran one trial at a time.
+   */
+  concurrency?: number;
   status: EvalStatus;
   createdAt: number;
   finishedAt: number | null;

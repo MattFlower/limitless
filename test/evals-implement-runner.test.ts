@@ -972,6 +972,47 @@ test("switch freezes policy order, ignores live headroom, records harness and ke
   }
 });
 
+test("switched retry rounds respect the eval concurrency on their destination provider", async () => {
+  const f = await fixture();
+  const policy = f.factory.policy.implement.small;
+  try {
+    const model = f.factory.router.model("candidate-b");
+    const a = f.factory.tracker.def("openrouter");
+    const b = f.factory.tracker.def("provider-b");
+    if (!model || !a || !b) throw new Error("missing target");
+    model.tier = 2;
+    a.maxConcurrent = 3;
+    b.maxConcurrent = 3;
+    f.factory.policy.implement.small = ["candidate-a", "candidate-b"];
+    const active = new Map<string, number>();
+    let maxB = 0;
+    f.respond(async (s) => {
+      const provider = s.target.provider;
+      active.set(provider, (active.get(provider) ?? 0) + 1);
+      if (provider === "provider-b") maxB = Math.max(maxB, active.get(provider) ?? 0);
+      await Bun.sleep(30);
+      active.set(provider, (active.get(provider) ?? 1) - 1);
+      // Candidate A always fails its first round, so each of its trials switches to provider B.
+      return { files: { answer: provider === "openrouter" ? "wrong" : "correct" } };
+    });
+    const report = await f.run({
+      models: ["candidate-a", "candidate-b"],
+      k: 3,
+      rounds: 2,
+      strategy: "switch",
+      concurrency: 1,
+      cache: false,
+    });
+    expect(f.calls.filter((s) => s.target.provider === "provider-b")).toHaveLength(6);
+    expect(maxB).toBe(1);
+    expect(report.trials.every((t) => t.pass)).toBe(true);
+    expect(f.factory.tracker.status("provider-b")?.inFlight).toBe(0);
+  } finally {
+    f.factory.policy.implement.small = policy;
+    await f.close();
+  }
+});
+
 test("unavailable next tier never skips to a higher available tier", async () => {
   const f = await fixture(undefined, undefined, [
     {
