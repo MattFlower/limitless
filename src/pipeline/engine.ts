@@ -61,8 +61,10 @@ import {
 import { buildReport } from "./report.ts";
 import {
   blockingReviewFindings,
+  PANEL_REVIEWS,
   type ReviewInput,
   type ReviewRequest,
+  resolvedPriorFindings,
   reviewFindingKey,
   runReview,
   type VerifierRequest,
@@ -858,8 +860,30 @@ async function oneRound(
     throw new NeedsHumanError("Previous review has no round history; cannot classify later findings");
   const earlierReviews = (ctx.state.reviewHistory ?? []).filter((entry) => entry.round < round);
   const priorReview = earlierReviews.at(-1);
-  const previousReview = priorReview ? { sha: priorReview.sha, findings: priorReview.blocking } : undefined;
   const reviewedSha = await headSha(cwd);
+  const system = ctx.deps.reviewSystem ?? productionReviewSystem(ctx.deps.cfg);
+  // Panel reviews are counted apart from implementation rounds; a replayed round keeps its number.
+  const panelReview =
+    system.mode === "panel" ? (priorReview?.panelReview ?? earlierReviews.length) + 1 : undefined;
+  if (panelReview && panelReview > PANEL_REVIEWS)
+    throw new NeedsHumanError(`Panel review limit reached (R${PANEL_REVIEWS}); not starting a fourth review`);
+  // R2 and R3 review only the fixes since the previous review (not in a conflict-resolution round).
+  const fixSha =
+    panelReview && panelReview > 1 && ctx.state.conflictRound !== round ? priorReview?.sha : undefined;
+  const reviewDiff = fixSha ? await diffSince(cwd, fixSha) : diff;
+  const scope = fixSha
+    ? { kind: "fix" as const, range: `${fixSha}..${reviewedSha}` }
+    : {
+        kind: "full" as const,
+        range: `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`,
+      };
+  const previousReview = priorReview
+    ? {
+        sha: priorReview.sha,
+        findings: priorReview.blocking,
+        ...(fixSha ? { resolved: resolvedPriorFindings(earlierReviews) } : {}),
+      }
+    : undefined;
   const review: Review = await ctx.stage(
     "review",
     async (stage) => {
@@ -867,17 +891,17 @@ async function oneRound(
       const replayed = (ctx.state.reviewHistory ?? []).find(
         (e) => e.round === round && e.sha === reviewedSha,
       );
-      const system = ctx.deps.reviewSystem ?? productionReviewSystem(ctx.deps.cfg);
       const input: ReviewInput = {
         timeoutMs: readingTimeout(diff.added + diff.removed),
         replayedFollowUps: replayed?.followUps,
         system,
+        ...(panelReview ? { panelReview } : {}),
         prompt: {
           prompt: ctx.run.prompt,
           spec: ctx.state.spec ?? null,
           baseSha,
-          stat: diff.stat,
-          ...(ctx.state.flow === "verify-change" ? { patch: diff.patch } : {}),
+          stat: reviewDiff.stat,
+          ...(ctx.state.flow === "verify-change" ? { patch: reviewDiff.patch } : {}),
           gates: comparison,
           audit,
           implementerReport: ctx.state.implementerReport ?? "",
@@ -888,6 +912,7 @@ async function oneRound(
           previous: previousReview,
           headSha: reviewedSha,
           resolution: ctx.state.conflictRound === round,
+          ...(fixSha && panelReview ? { fixReview: panelReview } : {}),
         },
       };
       const call = async (
@@ -927,7 +952,10 @@ async function oneRound(
       if (!decision) throw output.error;
       // The model's verdict is kept for inspection only; control flow uses the derived one.
       const { review: r, modelVerdict, blocking, followUps } = decision;
-      ctx.state.reviewHistory = [...earlierReviews, { round, sha: reviewedSha, blocking, followUps }];
+      ctx.state.reviewHistory = [
+        ...earlierReviews,
+        { round, sha: reviewedSha, blocking, followUps, ...(panelReview ? { panelReview } : {}) },
+      ];
       ctx.state.reviewFollowUps = [
         ...new Map(
           ctx.state.reviewHistory.flatMap((entry) =>
@@ -937,7 +965,11 @@ async function oneRound(
       ];
       const sameVendor = target.vendor === ctx.state.implementer?.vendor;
       if (sameVendor) ctx.log("Review done by the implementer's vendor (no other vendor available)", "warn");
-      ctx.state.lastReview = { ...r, modelId: target.modelId };
+      ctx.state.lastReview = {
+        ...r,
+        modelId: target.modelId,
+        ...(panelReview ? { panelReview, scope } : {}),
+      };
       ctx.state.reviewedSha = reviewedSha;
       await ctx.save();
       ctx.store.putArtifact(
@@ -950,6 +982,7 @@ async function oneRound(
             modelVerdict,
             model: target.modelId,
             round,
+            ...(panelReview ? { panelReview, scope } : {}),
             reviewedSha,
             blocking,
             ...(panel ? { panel } : {}),
@@ -969,11 +1002,14 @@ async function oneRound(
 
   const reviewFeedback =
     review.verdict === "request_changes"
-      ? formatReviewFeedback(blockingReviewFindings(review, previousReview?.findings))
+      ? formatReviewFeedback(blockingReviewFindings(review, previousReview?.findings, panelReview))
       : "";
   if (review.verdict === "request_changes") {
     ctx.state.feedback = reviewFeedback || `### Code review requested changes\n${review.summary}`;
     await ctx.save();
+    // Never a fourth panel review: what still blocks goes to a human with a draft PR.
+    if (panelReview && panelReview >= PANEL_REVIEWS)
+      throw new NeedsHumanError(`Still blocking after panel review R${panelReview}:\n${ctx.state.feedback}`);
     return false;
   }
 

@@ -150,7 +150,12 @@ export function renderReport(input: ReportInput): string {
     (state.lastReview?.mode === "panel" ? `${f.severity} (unverified)` : f.severity);
   if (state.lastReview) {
     const r = state.lastReview;
-    blocks.push(`## Code review (\`${r.modelId}\`)`, `**${r.verdict}** — ${r.summary}`);
+    blocks.push(`## Code review (\`${r.modelId}\`)`);
+    if (r.panelReview && r.scope)
+      blocks.push(
+        `Panel review R${r.panelReview} — ${r.scope.kind === "fix" ? "fix diff" : "full change"} \`${r.scope.range}\``,
+      );
+    blocks.push(`**${r.verdict}** — ${r.summary}`);
     if (r.findings.length) {
       blocks.push(
         r.findings

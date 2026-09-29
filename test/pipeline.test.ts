@@ -819,6 +819,158 @@ esac
     expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
   });
 
+  test("panel reviews R1-R3: fix-diff scope, tightening blocks, restart, then needs_human with a draft", async () => {
+    const bare = await githubFixture();
+    const finding = (title: string, label = "new", prior = "") => ({
+      severity: "major",
+      security: false,
+      ...findingEvidence,
+      ...(label === "r1" ? {} : { label, prior }),
+      ...(title.endsWith("cleanup") ? { category: "cleanup" } : {}),
+      file: "farewell.txt",
+      line: 1,
+      title,
+      detail: `detail ${title}`,
+      suggestion: "fix",
+    });
+    // Finder output per panel review; the verifier rules on each candidate by its title.
+    const found = [
+      [finding("R1 low", "r1"), finding("R1 cleanup", "r1")],
+      [finding("R1 low", "unaddressed", "P1"), finding("R2 medium"), finding("R2 high")],
+      [finding("R3 high"), finding("R3 critical")],
+    ];
+    const severity: Record<string, string> = {
+      "R1 low": "low",
+      "R2 medium": "medium",
+      "R2 high": "high",
+      "R3 high": "high",
+      "R3 critical": "critical",
+    };
+    const finders: string[] = [];
+    const verifiers: string[] = [];
+    let implementations = 0;
+    let slow = true;
+    const handler: Handler = (s) => {
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        verifiers.push(s.prompt);
+        const cited = [
+          ...s.prompt.matchAll(/"id": "(C\d+)",\s+"file": "[^"]*",\s+"line": \d+,\s+"title": "([^"]*)"/g),
+        ];
+        return {
+          structured: {
+            results: cited.map(([, id, title]) => ({
+              id,
+              verdict: "CONFIRMED",
+              // R2 finds P1 fixed after all.
+              ...(verifiers.length > 1 && title === "R1 low"
+                ? { verdict: "REFUTED", severity: "low" }
+                : { severity: severity[title ?? ""] }),
+              category: "correctness",
+              evidence: "farewell.txt:1 `bye`",
+              trigger: "reading the file -> wrong farewell",
+            })),
+          },
+        };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        finders.push(s.prompt);
+        return { structured: { ...approve, findings: found[finders.length - 1] ?? [] } };
+      }
+      implementations++;
+      // The first implementation fails the gates, so it never reaches a review.
+      if (implementations === 1) return { files: { "farewell.txt": "BAD\n" } };
+      if (slow && implementations === 4) return { delayMs: 30_000 };
+      return { files: { "farewell.txt": `goodbye ${implementations}\n` } };
+    };
+    const panel = {
+      name: "panel",
+      mode: "panel" as const,
+      finders: [{ prompt: "standard" as const }],
+      verifier: {},
+      implementerReport: "include" as const,
+    };
+    const f = start(handler);
+    f.deps.reviewSystem = panel;
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    // Stop the factory between R2 and R3, while the fourth implementation runs.
+    const deadline = Date.now() + 15_000;
+    while (
+      (f.store.getRunState<RunState>(run.id)?.round !== 3 || f.store.getRun(run.id)?.stage !== "implement") &&
+      Date.now() < deadline
+    )
+      await Bun.sleep(10);
+    const before = f.store.getRunState<RunState>(run.id);
+    expect(before?.reviewHistory?.map((e) => [e.round, e.panelReview])).toEqual([
+      [1, 1],
+      [2, 2],
+    ]);
+    await f.stop();
+    f.store.close();
+    slow = false;
+    const restarted = start(handler);
+    restarted.deps.reviewSystem = panel;
+    expect(await waitFor(restarted, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+
+    // Exactly three panel reviews, never a fourth; the gate-failed round 0 did not count.
+    expect(finders).toHaveLength(3);
+    expect(implementations).toBe(5); // Includes the implementation interrupted by the stop.
+    expect(restarted.store.getArtifact(run.id, "review-0.json")).toBeNull();
+    expect(restarted.store.getArtifact(run.id, "review-4.json")).toBeNull();
+    const [r1, r2, r3] = [1, 2, 3].map((n) =>
+      JSON.parse(restarted.store.getArtifact(run.id, `review-${n}.json`) ?? "{}"),
+    );
+    const baseSha = restarted.store.getRun(run.id)?.baseSha ?? "missing";
+    expect(r1).toMatchObject({
+      panelReview: 1,
+      scope: { kind: "full", range: `${baseSha}..${r1.reviewedSha}` },
+    });
+    expect(r2).toMatchObject({
+      panelReview: 2,
+      scope: { kind: "fix", range: `${r1.reviewedSha}..${r2.reviewedSha}` },
+    });
+    expect(r3).toMatchObject({
+      panelReview: 3,
+      scope: { kind: "fix", range: `${r2.reviewedSha}..${r3.reviewedSha}` },
+    });
+    // R1: a verified low blocks, cleanup is a follow-up. R2: new high blocks, new medium is a follow-up.
+    // R3: new high is a follow-up, critical blocks.
+    const titles = (r: { blocking: { title: string }[] }) => r.blocking.map((b) => b.title);
+    expect([titles(r1), titles(r2), titles(r3)]).toEqual([["R1 low"], ["R2 high"], ["R3 critical"]]);
+    const state = restarted.store.getRunState<RunState>(run.id);
+    expect(state?.reviewFollowUps?.map((x) => x.title).sort()).toEqual([
+      "R1 cleanup",
+      "R2 medium",
+      "R3 high",
+    ]);
+
+    // R1 reviews the full change; R2 and R3 finders and verifiers see only the fix diff and P-ids.
+    expect(finders[0]).toContain(`git diff ${baseSha}..HEAD`);
+    for (const [i, prompt] of finders.slice(1).entries()) {
+      const range = `${[r1, r2][i].reviewedSha}..${[r2, r3][i].reviewedSha}`;
+      expect(prompt).toContain(`review R${i + 2}: the fix diff only`);
+      expect(prompt).toContain(`git diff ${range}`);
+      expect(prompt).toContain('"id": "P1"');
+      expect(prompt).toContain('"status": "unresolved at the previous review');
+      expect(prompt).not.toContain(`git diff ${baseSha}..`);
+      expect(prompt).not.toContain("full base-to-HEAD");
+      const verifier = verifiers[i + 1] ?? "";
+      expect(verifier).toContain(`git diff ${range}`);
+      expect(verifier).not.toContain(`git diff ${baseSha}..`);
+      expect(verifier).toContain('"id": "P1"');
+    }
+    expect(finders[1]).toContain("R1 low");
+    expect(verifiers[1]).toContain('"status": "reported unaddressed by C1"');
+    // R1's only blocker was refuted in R2, so R3 is told it is resolved.
+    expect(finders[2]).toMatch(/"title": "R1 low",[\s\S]*"status": "resolved"/);
+
+    expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
+    const report = restarted.store.getArtifact(run.id, "report.md") ?? "";
+    expect(report).toContain(`Panel review R3 — fix diff \`${r2.reviewedSha}..${r3.reviewedSha}\``);
+  });
+
   for (const kind of [
     "unchanged",
     "clean",

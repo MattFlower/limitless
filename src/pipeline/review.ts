@@ -43,10 +43,39 @@ function citesPriorBlocking(finding: Review["findings"][number], priorBlocking: 
   return index >= 1 && index <= priorBlocking.length;
 }
 
+/** Panel reviews per run: a run still blocked after the last one goes to a human. */
+export const PANEL_REVIEWS = 3;
+const VERIFIED_SEVERITY_RANK = { low: 0, medium: 1, high: 2, critical: 3 } as const;
+
+/** Verified by the panel rule, at `min` or above by the verifier's consequence severity. */
+function verifiedAtLeast(finding: Finding, min: Verification["severity"]): boolean {
+  const severity = finding.verification?.severity;
+  return (
+    !!severity && panelVerified(finding) && VERIFIED_SEVERITY_RANK[severity] >= VERIFIED_SEVERITY_RANK[min]
+  );
+}
+
+/**
+ * Panel re-reviews (R2, R3) tighten what blocks, and only verified findings ever block:
+ * R2 — a cited unaddressed prior blocking finding, a regression of medium or above, or a new high/critical;
+ * R3 — a critical finding (cited prior, regression or new) or a security finding.
+ */
+function panelRereviewBlocks(
+  finding: Finding,
+  priorBlocking: Review["findings"],
+  panelReview: number,
+): boolean {
+  if (!panelVerified(finding)) return false;
+  if (panelReview >= PANEL_REVIEWS)
+    return verifiedAtLeast(finding, "critical") || finding.verification?.category === "security";
+  if (finding.label === "unaddressed" && citesPriorBlocking(finding, priorBlocking)) return true;
+  return verifiedAtLeast(finding, finding.label === "regression" ? "medium" : "high");
+}
+
 /**
  * Panel reviews block on the verifier's ruling and never on cleanup or conventions (the verifier's
- * category, else the finder's): in round 1 every verified finding; later rounds apply the rules below
- * with verified critical/high standing in for blocker.
+ * category, else the finder's): in R1 every verified finding; R2 and R3 (`panelReview`, default 2)
+ * follow `panelRereviewBlocks`.
  *
  * Single reviews, first round: blockers and majors block. Later rounds may not move the goalposts: a finding blocks
  * only if it is a regression from the latest changes, an unaddressed previous *blocking* finding
@@ -56,29 +85,47 @@ function citesPriorBlocking(finding: Review["findings"][number], priorBlocking: 
 export function blockingReviewFindings(
   review: StoredReview,
   priorBlocking?: Review["findings"],
+  panelReview = 2,
 ): Review["findings"] {
   const panel = review.mode === "panel";
   return review.findings.filter((finding) => {
     if (panel) {
       if (finding.verification?.verdict === "REFUTED") return false;
       if (UNVERIFIED_CATEGORIES.includes(finding.verification?.category ?? finding.category)) return false;
-      if (!priorBlocking) return panelVerified(finding);
+      if (!priorBlocking || panelReview <= 1) return panelVerified(finding);
+      return panelRereviewBlocks(finding, priorBlocking, panelReview);
     }
     if (!priorBlocking) return finding.severity === "blocker" || finding.severity === "major";
     if (finding.label === "regression") return true;
     if (finding.label === "unaddressed" && citesPriorBlocking(finding, priorBlocking)) return true;
-    if (panel)
-      return (
-        finding.security ||
-        (panelVerified(finding) &&
-          (finding.verification?.severity === "critical" || finding.verification?.severity === "high"))
-      );
     return finding.severity === "blocker" || finding.security;
   });
 }
 
-export function reviewVerdict(review: StoredReview, priorBlocking?: Review["findings"]): Review["verdict"] {
-  return blockingReviewFindings(review, priorBlocking).length ? "request_changes" : "approve";
+/**
+ * Blocking findings of earlier reviews that the following review did not cite as unaddressed: known
+ * resolved, so a re-review is told not to raise them again.
+ */
+export function resolvedPriorFindings(
+  history: { blocking: Review["findings"]; followUps: Review["findings"] }[],
+): Review["findings"] {
+  return history.slice(0, -1).flatMap((entry, i) => {
+    const next = history[i + 1];
+    const cited = new Set(
+      [...(next?.blocking ?? []), ...(next?.followUps ?? [])]
+        .filter((f) => f.label === "unaddressed")
+        .map((f) => f.prior?.trim().toUpperCase()),
+    );
+    return entry.blocking.filter((_, k) => !cited.has(`P${k + 1}`));
+  });
+}
+
+export function reviewVerdict(
+  review: StoredReview,
+  priorBlocking?: Review["findings"],
+  panelReview?: number,
+): Review["verdict"] {
+  return blockingReviewFindings(review, priorBlocking, panelReview).length ? "request_changes" : "approve";
 }
 
 export interface ReviewInput {
@@ -88,6 +135,8 @@ export interface ReviewInput {
   replayedFollowUps?: Review["findings"];
   /** Defaults to one finder (`single`). */
   system?: Pick<ReviewSystem, "mode" | "finders">;
+  /** Panel only: which review this is (1–3); decides what blocks. `prompt.fixReview` scopes the diff. */
+  panelReview?: number;
 }
 
 /** What the invoker sends to the model; later rounds (with previous findings) use the labelled schema. */
@@ -193,8 +242,8 @@ export async function runReview<T extends Invoked>(
 
 function decide(input: ReviewInput, found: Review, modelVerdict: Review["verdict"]): ReviewDecision {
   const prior = input.prompt.previous?.findings;
-  const review: Review = { ...found, verdict: reviewVerdict(found, prior) };
-  const blocking = blockingReviewFindings(review, prior);
+  const review: Review = { ...found, verdict: reviewVerdict(found, prior, input.panelReview) };
+  const blocking = blockingReviewFindings(review, prior, input.panelReview);
   // A panel's first round also has a ledger: whatever it does not block.
   const followUps =
     prior || review.mode === "panel"
@@ -290,6 +339,30 @@ async function runPanel<T extends Invoked>(
       group.slice(i * PANEL_BATCH_SIZE, (i + 1) * PANEL_BATCH_SIZE),
     ),
   );
+  // A re-review's verifier checks the same fix diff, and whether each prior finding is really resolved.
+  const { fixReview, previous } = input.prompt;
+  const fix =
+    fixReview && previous
+      ? {
+          review: fixReview,
+          sha: previous.sha,
+          prior: previous.findings.map(({ file, line, title }, i) => {
+            const id = `P${i + 1}`;
+            const citing = candidates.filter(
+              (c) => c.label === "unaddressed" && c.prior?.trim().toUpperCase() === id,
+            );
+            return {
+              id,
+              file,
+              line,
+              title,
+              status: citing.length
+                ? `reported unaddressed by ${citing.map((c) => c.id).join(", ")}`
+                : "reported resolved: no finder cited it",
+            };
+          }),
+        }
+      : undefined;
   const verdicts = new Map<string, PanelRecord["verdicts"][number]>();
   const omitted: string[] = [];
   let last = first.invoked.result;
@@ -307,13 +380,15 @@ async function runPanel<T extends Invoked>(
             headSha: input.prompt.headSha,
             externalChange: input.prompt.externalChange,
             stat: input.prompt.stat,
-            candidates: pending.map(({ id, file, line, title, failure_scenario }) => ({
+            candidates: pending.map(({ id, file, line, title, failure_scenario, label, prior }) => ({
               id,
               file,
               line,
               title,
               failure_scenario: failure_scenario ?? "",
+              ...(fix ? { label: label ?? "new", prior: prior ?? "" } : {}),
             })),
+            ...(fix ? { fix } : {}),
           }),
           schema: VerifierSchema,
           jsonSchema: toStrictJsonSchema(VerifierSchema),

@@ -36,7 +36,7 @@ import { recordEffort } from "../router/targets.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
-import type { Holdout, Review, Spec, Triage, Verify } from "./schemas.ts";
+import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
@@ -109,7 +109,8 @@ export interface RunState {
   feedback: string | null;
   lastGates?: GateComparison[];
   lastAudit?: AuditFinding[];
-  lastReview?: Review & { modelId: string };
+  /** Panel reviews also record their number (1-3) and the diff they reviewed. */
+  lastReview?: Review & { modelId: string; panelReview?: number; scope?: ReviewScope };
   reviewedSha?: string;
   /** Replace a replayed round; earlier entries remain the source of review context. */
   reviewHistory?: {
@@ -117,6 +118,8 @@ export interface RunState {
     sha: string;
     blocking: Review["findings"];
     followUps: Review["findings"];
+    /** Panel only: which review (1-3) this was; counted apart from implementation rounds. */
+    panelReview?: number;
   }[];
   reviewFollowUps?: Review["findings"];
   lastVerify?: (Verify & { modelId: string }) | null;

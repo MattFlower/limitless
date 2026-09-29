@@ -82,6 +82,29 @@ test("needs-human report says so", () => {
   expect(md).toContain("needs a human");
 });
 
+test("the code review section names the panel review and the diff it covered", () => {
+  const render = (lastReview: NonNullable<Parameters<typeof renderReport>[0]["state"]["lastReview"]>) =>
+    renderReport({
+      success: false,
+      runId: "r4",
+      prompt: "x",
+      state: { lastReview },
+      invocations: [],
+      totals: { costUsd: 0, costEquivUsd: 0 },
+      runUrl: "u",
+    });
+  const review = { verdict: "approve" as const, summary: "Checked", findings: [], modelId: "m" };
+  expect(
+    render({ ...review, mode: "panel", panelReview: 1, scope: { kind: "full", range: "base1..head1" } }),
+  ).toContain(
+    "## Code review (`m`)\n\nPanel review R1 — full change `base1..head1`\n\n**approve** — Checked",
+  );
+  expect(
+    render({ ...review, mode: "panel", panelReview: 3, scope: { kind: "fix", range: "head2..head3" } }),
+  ).toContain("Panel review R3 — fix diff `head2..head3`");
+  expect(render(review)).not.toContain("Panel review");
+});
+
 test("reports for runs started from an issue close it", () => {
   const md = renderReport({
     success: true,

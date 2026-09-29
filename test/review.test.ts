@@ -5,6 +5,8 @@ import {
   blockingReviewFindings,
   PANEL_VERIFY_CAP,
   type ReviewRequest,
+  resolvedPriorFindings,
+  reviewRequest,
   reviewVerdict,
   runReview,
   type VerifierRequest,
@@ -414,9 +416,64 @@ describe("panel decision", () => {
       findings: [finding("blocker")],
     };
     expect(blockingReviewFindings(review)).toEqual([]);
-    // Later rounds keep the label rules.
-    const regression = { ...finding("nit"), label: "regression" as const };
-    expect(blockingReviewFindings({ ...review, findings: [regression] }, [finding("major")])).toHaveLength(1);
+    // Re-reviews block only verified findings, whatever their label.
+    const regression = { ...finding("blocker"), label: "regression" as const };
+    const cited = { ...finding("blocker"), label: "unaddressed" as const, prior: "P1" };
+    for (const round of [2, 3])
+      expect(
+        blockingReviewFindings({ ...review, findings: [regression, cited] }, [finding("major")], round),
+      ).toEqual([]);
+  });
+
+  // R2 and R3 by label and the verifier's ruling; "cited" is unaddressed citing P1.
+  for (const [label, verdict, severity, category, r2, r3] of [
+    ["new", "CONFIRMED", "medium", "correctness", false, false],
+    ["new", "CONFIRMED", "high", "correctness", true, false],
+    ["new", "PLAUSIBLE", "high", "correctness", true, false],
+    ["new", "CONFIRMED", "critical", "correctness", true, true],
+    ["new", "CONFIRMED", "medium", "security", false, true],
+    ["new", "PLAUSIBLE", "medium", "security", false, false],
+    ["regression", "CONFIRMED", "low", "correctness", false, false],
+    ["regression", "CONFIRMED", "medium", "correctness", true, false],
+    ["regression", "PLAUSIBLE", "medium", "correctness", false, false],
+    ["regression", "CONFIRMED", "critical", "correctness", true, true],
+    ["cited", "CONFIRMED", "low", "correctness", true, false],
+    ["cited", "CONFIRMED", "high", "correctness", true, false],
+    ["cited", "PLAUSIBLE", "critical", "correctness", true, true],
+    ["cited", "REFUTED", "critical", "correctness", false, false],
+    ["cited", "CONFIRMED", "critical", "cleanup", false, false],
+  ] as const) {
+    test(`re-review: ${label} ${verdict} ${severity} ${category} blocks R2 ${r2}, R3 ${r3}`, () => {
+      const f = {
+        ...verified(verdict, severity, category),
+        label: label === "cited" ? ("unaddressed" as const) : label,
+        prior: label === "cited" ? "P1" : "",
+      };
+      const review: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [f] };
+      const prior = [finding("major")];
+      expect(blockingReviewFindings(review, prior, 2).length > 0).toBe(r2);
+      expect(blockingReviewFindings(review, prior, 3).length > 0).toBe(r3);
+      expect(reviewVerdict(review, prior, 3)).toBe(r3 ? "request_changes" : "approve");
+    });
+  }
+
+  test("an unaddressed finding that cites no prior blocking finding is judged as new", () => {
+    const f = { ...verified("CONFIRMED", "medium"), label: "unaddressed" as const, prior: "P2" };
+    const review: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [f] };
+    expect(blockingReviewFindings(review, [finding("major")], 2)).toEqual([]);
+  });
+
+  test("resolved prior findings are the blocking ones the next review did not cite", () => {
+    const at = (title: string) => ({ ...finding("major"), title });
+    const cite = (prior: string) => ({ ...at(`still ${prior}`), label: "unaddressed" as const, prior });
+    // R2 still blocks on R1's P1 and defers P3 to a follow-up, so only P2 is known resolved.
+    const r1 = { blocking: [at("a"), at("b"), at("c")], followUps: [] };
+    const r2 = { blocking: [cite("p1")], followUps: [cite("P3")] };
+    expect(resolvedPriorFindings([r1, r2]).map((f) => f.title)).toEqual(["b"]);
+    // R3 no longer cites R2's blocker either.
+    const r3 = { blocking: [at("new")], followUps: [] };
+    expect(resolvedPriorFindings([r1, r2, r3]).map((f) => f.title)).toEqual(["b", "still p1"]);
+    expect(resolvedPriorFindings([r1])).toEqual([]);
   });
 
   test("cleanup and conventions never block, in any round, by either category", () => {
@@ -705,6 +762,42 @@ describe("runReview panel", () => {
       });
       expect(verifications[0]?.request.prompt).toContain(range);
     }
+  });
+
+  test("a re-review sends finders and verifier only the fix diff and the prior findings' status", async () => {
+    const prior = [
+      { ...finding("major"), title: "Still broken" },
+      { ...finding("major"), title: "Now fixed" },
+    ];
+    const previous = {
+      sha: "fixbase",
+      findings: prior,
+      resolved: [{ ...finding("major"), title: "Gone in R2" }],
+    };
+    const found = [{ ...candidate("src/a.ts", 1), label: "unaddressed", prior: "P1" }];
+    const { out, verifications } = await panel([found], () => ({ ...confirmed, severity: "high" }), {
+      panelReview: 3,
+      prompt: { ...prompt, headSha: "head", previous, fixReview: 3 },
+    });
+    const finderPrompt = reviewRequest({
+      prompt: { ...prompt, headSha: "head", previous, fixReview: 3 },
+      timeoutMs: 1,
+    }).prompt;
+    expect(finderPrompt).toContain("review R3: the fix diff only");
+    expect(finderPrompt).toContain("git diff fixbase..head");
+    expect(finderPrompt).toMatch(/"id": "P2",[\s\S]*"status": "unresolved at the previous review/);
+    expect(finderPrompt).toMatch(/"title": "Gone in R2",[\s\S]*"status": "resolved"/);
+    expect(finderPrompt).not.toContain("git diff a..HEAD");
+    expect(finderPrompt).not.toContain("full base-to-HEAD");
+    const verifierText = verifications[0]?.request.prompt ?? "";
+    expect(verifierText).toContain("git diff fixbase..head");
+    expect(verifierText).not.toContain("git diff a..head");
+    expect(verifierText).toContain('"status": "reported unaddressed by C1"');
+    expect(verifierText).toContain('"status": "reported resolved: no finder cited it"');
+    expect(verifierText).toContain('"prior": "P1"');
+    // R3: a cited prior finding the verifier rates high no longer blocks; it goes to the ledger.
+    expect(out.decision?.blocking).toEqual([]);
+    expect(out.decision?.followUps.map((f) => f.title)).toEqual(["Issue src/a.ts 1"]);
   });
 
   test("the panel's structured result carries its record for eval output", async () => {

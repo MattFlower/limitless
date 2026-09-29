@@ -199,6 +199,12 @@ export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
     })[];
 };
 
+/** The diff a panel review covered: R1 the full change, R2 and R3 only the fixes since the previous review. */
+export interface ReviewScope {
+  kind: "full" | "fix";
+  range: string;
+}
+
 /**
  * A review regraded from stored JSON, possibly written under an older schema. Grading reads only
  * severity, file and line, and derives the verdict itself, so every other field may be absent
