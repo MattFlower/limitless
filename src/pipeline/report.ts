@@ -33,6 +33,7 @@ export interface ReportInput {
     | "lastGates"
     | "lastReview"
     | "reviewFollowUps"
+    | "reviewHistory"
     | "lastAudit"
     | "rebaseNote"
     | "terminalReason"
@@ -151,10 +152,14 @@ export function renderReport(input: ReportInput): string {
   if (state.lastReview) {
     const r = state.lastReview;
     blocks.push(`## Code review (\`${r.modelId}\`)`);
-    if (r.panelReview && r.scope)
-      blocks.push(
-        `Panel review R${r.panelReview} — ${r.scope.kind === "fix" ? "fix diff" : "full change"} \`${r.scope.range}\``,
-      );
+    const schedule = (state.reviewHistory ?? []).flatMap((e) =>
+      e.panelReview && e.scope
+        ? [
+            `- Panel review R${e.panelReview} — ${e.scope.kind === "fix" ? "fix diff" : "full change"} \`${e.scope.range}\``,
+          ]
+        : [],
+    );
+    if (schedule.length) blocks.push(schedule.join("\n"));
     blocks.push(`**${r.verdict}** — ${r.summary}`);
     if (r.findings.length) {
       blocks.push(

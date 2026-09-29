@@ -82,27 +82,31 @@ test("needs-human report says so", () => {
   expect(md).toContain("needs a human");
 });
 
-test("the code review section names the panel review and the diff it covered", () => {
-  const render = (lastReview: NonNullable<Parameters<typeof renderReport>[0]["state"]["lastReview"]>) =>
+test("the code review section lists every panel review and the diff it covered", () => {
+  const render = (reviewHistory: NonNullable<Parameters<typeof renderReport>[0]["state"]["reviewHistory"]>) =>
     renderReport({
       success: false,
       runId: "r4",
       prompt: "x",
-      state: { lastReview },
+      state: {
+        lastReview: { verdict: "approve", summary: "Checked", findings: [], modelId: "m", mode: "panel" },
+        reviewHistory,
+      },
       invocations: [],
       totals: { costUsd: 0, costEquivUsd: 0 },
       runUrl: "u",
     });
-  const review = { verdict: "approve" as const, summary: "Checked", findings: [], modelId: "m" };
+  const entry = { sha: "s", blocking: [], followUps: [] };
   expect(
-    render({ ...review, mode: "panel", panelReview: 1, scope: { kind: "full", range: "base1..head1" } }),
+    render([
+      { ...entry, round: 1, panelReview: 1, scope: { kind: "full", range: "base1..head1" } },
+      { ...entry, round: 2, panelReview: 2, scope: { kind: "fix", range: "head1..head2" } },
+      { ...entry, round: 4, panelReview: 3, scope: { kind: "fix", range: "head2..head3" } },
+    ]),
   ).toContain(
-    "## Code review (`m`)\n\nPanel review R1 — full change `base1..head1`\n\n**approve** — Checked",
+    "## Code review (`m`)\n\n- Panel review R1 — full change `base1..head1`\n- Panel review R2 — fix diff `head1..head2`\n- Panel review R3 — fix diff `head2..head3`\n\n**approve** — Checked",
   );
-  expect(
-    render({ ...review, mode: "panel", panelReview: 3, scope: { kind: "fix", range: "head2..head3" } }),
-  ).toContain("Panel review R3 — fix diff `head2..head3`");
-  expect(render(review)).not.toContain("Panel review");
+  expect(render([{ ...entry, round: 1 }])).not.toContain("Panel review");
 });
 
 test("reports for runs started from an issue close it", () => {

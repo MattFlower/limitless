@@ -327,7 +327,7 @@ ${fence(
 )}
 `
     : ""
-}${input.resolution ? `For this conflict-resolution round, inspect \`git diff ${input.baseSha}..HEAD\` against the pinned new base for review and regression classification.` : `Inspect the latest-change diff with \`git diff ${input.previous.sha}..${input.headSha ?? "HEAD"}\`. ${fix ? "Only this fix diff is under review; do not re-review the rest of the change." : "Compare it with the full base-to-HEAD change above."}`}
+}${input.resolution && !fix ? `For this conflict-resolution round, inspect \`git diff ${input.baseSha}..HEAD\` against the pinned new base for review and regression classification.` : `Inspect the latest-change diff with \`git diff ${input.previous.sha}..${input.headSha ?? "HEAD"}\`. ${fix ? `Only this fix diff is under review; do not re-review the rest of the change.${input.resolution ? " This round resolved merge conflicts against a new base, so the fix diff also carries upstream changes; review the conflict resolution and fixes, not the upstream code." : ""}` : "Compare it with the full base-to-HEAD change above."}`}
 For every finding, set exactly one label: unaddressed = a previous blocking finding remains unfixed; regression = introduced by the latest changes; new = first found now and not introduced by the latest changes. Mark security findings with security: true (otherwise false). Newly found major/minor/nit findings that are not security issues become follow-ups. Recheck the previous findings before raising new ones. When labelling a finding unaddressed, set prior to the id (P1, P2, ...) of the previous blocking finding it repeats; set prior to "" for every other finding. Prior nonblocking findings are already recorded follow-ups; do not relabel them unaddressed. Report resolved prior findings by omitting them from findings.
 `
     : ""
@@ -386,6 +386,8 @@ export function verifierPrompt(input: {
     review: number;
     sha: string;
     prior: { id: string; file: string; line: number; title: string; status: string }[];
+    /** Blocking findings of earlier reviews that a later review found fixed. */
+    resolved?: { file: string; line: number; title: string; status: string }[];
   };
 }): string {
   const range = input.fix
@@ -407,7 +409,7 @@ ${fence(input.stat.trim() || "(empty diff)")}
 
 # Prior blocking findings (status from this re-review's finders, not proof)
 ${fence(JSON.stringify(input.fix.prior, null, 2))}
-A candidate with prior set (P1, P2, ...) claims that prior finding is still unaddressed: REFUTE it when the fix diff resolves it. A candidate labelled regression claims the fix diff introduced it: REFUTE it when the defect is not in the code at head.`
+${input.fix.resolved?.length ? `Earlier blocking findings already resolved (a candidate repeating one is a regression only if the fix diff reintroduced it):\n${fence(JSON.stringify(input.fix.resolved, null, 2))}\n` : ""}A candidate with prior set (P1, P2, ...) claims that prior finding is still unaddressed: REFUTE it when the fix diff resolves it. A candidate labelled regression claims the fix diff introduced it: REFUTE it when the defect is not in the code at head.`
     : `# Change under review
 Base: ${input.baseSha}. Head: ${input.headSha ?? "HEAD"}. Inspect it with \`git diff ${range}\` and by reading the surrounding code.
 ${fence(input.stat.trim() || "(empty diff)")}`

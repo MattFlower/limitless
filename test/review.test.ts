@@ -125,6 +125,25 @@ test("reviewers may not block on verification they could not perform", () => {
   expect(prompt).toContain("report it as minor at most, never blocker or major");
 });
 
+test("a panel re-review of a conflict-resolution round keeps the fix-diff scope", () => {
+  const prompt = reviewPrompt({
+    prompt: "x",
+    spec: null,
+    baseSha: "base",
+    stat: "",
+    gates: [],
+    audit: [],
+    implementerReport: "",
+    previous: { sha: "prev", findings: [] },
+    headSha: "head",
+    resolution: true,
+    fixReview: 2,
+  });
+  expect(prompt).toContain("git diff prev..head");
+  expect(prompt).toContain("resolved merge conflicts against a new base");
+  expect(prompt).not.toContain("git diff base..");
+});
+
 describe("degenerate reviews", () => {
   const exactly = (n: number) => "x".repeat(n);
   for (const [name, schema, item, floor] of [

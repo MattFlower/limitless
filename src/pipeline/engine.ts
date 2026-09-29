@@ -867,9 +867,8 @@ async function oneRound(
     system.mode === "panel" ? (priorReview?.panelReview ?? earlierReviews.length) + 1 : undefined;
   if (panelReview && panelReview > PANEL_REVIEWS)
     throw new NeedsHumanError(`Panel review limit reached (R${PANEL_REVIEWS}); not starting a fourth review`);
-  // R2 and R3 review only the fixes since the previous review (not in a conflict-resolution round).
-  const fixSha =
-    panelReview && panelReview > 1 && ctx.state.conflictRound !== round ? priorReview?.sha : undefined;
+  // R2 and R3 review only the fixes since the previous review, conflict-resolution rounds included.
+  const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
   const reviewDiff = fixSha ? await diffSince(cwd, fixSha) : diff;
   const scope = fixSha
     ? { kind: "fix" as const, range: `${fixSha}..${reviewedSha}` }
@@ -954,7 +953,7 @@ async function oneRound(
       const { review: r, modelVerdict, blocking, followUps } = decision;
       ctx.state.reviewHistory = [
         ...earlierReviews,
-        { round, sha: reviewedSha, blocking, followUps, ...(panelReview ? { panelReview } : {}) },
+        { round, sha: reviewedSha, blocking, followUps, ...(panelReview ? { panelReview, scope } : {}) },
       ];
       ctx.state.reviewFollowUps = [
         ...new Map(
@@ -965,11 +964,7 @@ async function oneRound(
       ];
       const sameVendor = target.vendor === ctx.state.implementer?.vendor;
       if (sameVendor) ctx.log("Review done by the implementer's vendor (no other vendor available)", "warn");
-      ctx.state.lastReview = {
-        ...r,
-        modelId: target.modelId,
-        ...(panelReview ? { panelReview, scope } : {}),
-      };
+      ctx.state.lastReview = { ...r, modelId: target.modelId };
       ctx.state.reviewedSha = reviewedSha;
       await ctx.save();
       ctx.store.putArtifact(

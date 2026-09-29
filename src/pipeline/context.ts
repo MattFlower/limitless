@@ -109,8 +109,7 @@ export interface RunState {
   feedback: string | null;
   lastGates?: GateComparison[];
   lastAudit?: AuditFinding[];
-  /** Panel reviews also record their number (1-3) and the diff they reviewed. */
-  lastReview?: Review & { modelId: string; panelReview?: number; scope?: ReviewScope };
+  lastReview?: Review & { modelId: string };
   reviewedSha?: string;
   /** Replace a replayed round; earlier entries remain the source of review context. */
   reviewHistory?: {
@@ -120,6 +119,8 @@ export interface RunState {
     followUps: Review["findings"];
     /** Panel only: which review (1-3) this was; counted apart from implementation rounds. */
     panelReview?: number;
+    /** Panel only: the diff this review covered. */
+    scope?: ReviewScope;
   }[];
   reviewFollowUps?: Review["findings"];
   lastVerify?: (Verify & { modelId: string }) | null;

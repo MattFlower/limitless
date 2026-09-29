@@ -361,6 +361,12 @@ async function runPanel<T extends Invoked>(
                 : "reported resolved: no finder cited it",
             };
           }),
+          resolved: (previous.resolved ?? []).map(({ file, line, title }) => ({
+            file,
+            line,
+            title,
+            status: "resolved at an earlier review",
+          })),
         }
       : undefined;
   const verdicts = new Map<string, PanelRecord["verdicts"][number]>();

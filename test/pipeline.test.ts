@@ -965,6 +965,7 @@ esac
     expect(verifiers[1]).toContain('"status": "reported unaddressed by C1"');
     // R1's only blocker was refuted in R2, so R3 is told it is resolved.
     expect(finders[2]).toMatch(/"title": "R1 low",[\s\S]*"status": "resolved"/);
+    expect(verifiers[2]).toMatch(/"title": "R1 low",[\s\S]*"status": "resolved at an earlier review"/);
 
     expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
     const report = restarted.store.getArtifact(run.id, "report.md") ?? "";
