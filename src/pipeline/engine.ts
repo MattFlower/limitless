@@ -1145,6 +1145,7 @@ async function oneRound(
         ctx.state.spec ?? null,
         ctx.state.holdout,
         publicSources,
+        ctx.run.prompt,
       );
       await ctx.save();
       return false;

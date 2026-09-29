@@ -388,6 +388,15 @@ test("verifier classifies unmet holdouts against the request and spec, citing pu
   expect(item.required).toEqual(expect.arrayContaining(["requirement", "requirementCitation"]));
   expect(JSON.stringify(item.properties.requirement)).toContain("not_required");
   expect(item.properties.requirement).not.toHaveProperty("default");
+  // request/spec must quote the violated text; not_required and legacy unclassified rows need none.
+  for (const requirement of ["request", "spec"] as const)
+    for (const requirementCitation of ["", ' "" '])
+      expect(VerifySchema.safeParse(unmetHoldout({ requirement, requirementCitation })).success).toBe(false);
+  expect(
+    VerifySchema.safeParse(unmetHoldout({ requirement: "spec", requirementCitation: "works" })).success,
+  ).toBe(true);
+  expect(VerifySchema.safeParse(unmetHoldout({ requirement: "not_required" })).success).toBe(true);
+  expect(VerifySchema.safeParse(unmetHoldout({})).success).toBe(true);
 });
 
 test("only unmet holdouts classified request or spec block the verdict", () => {
@@ -431,31 +440,29 @@ test("an environment block still stops or retries alongside a not_required holdo
 });
 
 test("feedback names the violated public requirement and omits not_required holdouts", () => {
-  const publicSources = "make it work\n## Requirements\n- empty lists are accepted";
-  const blocking = formatVerifyFeedback(
-    unmetHoldout({ requirement: "spec", requirementCitation: '"Empty lists are accepted."' }),
-    spec,
-    holdout,
-    publicSources,
-  );
+  const publicSources = "make it work\n## Requirements\n- empty lists are accepted\nparseList";
+  const withRequirement = { ...spec, requirements: ["empty lists are accepted"] };
+  const feedback = (extra: Partial<Verify["criteria"][number]>) =>
+    formatVerifyFeedback(unmetHoldout(extra), withRequirement, holdout, publicSources, "make it work");
+  const blocking = feedback({ requirement: "spec", requirementCitation: '"Empty lists are accepted."' });
   expect(blocking).toContain(
     '**H-1** violates this requirement of the specification: "Empty lists are accepted"',
   );
   expect(blocking).toContain("Observed failure: rejects an empty list");
   expect(blocking).not.toContain("secret input");
   expect(blocking).not.toContain("private detail");
-  // A citation that is not verbatim public text could carry the scenario, so it is withheld.
-  const paraphrase = formatVerifyFeedback(
-    unmetHoldout({ requirement: "request", requirementCitation: "handle secret input" }),
-    spec,
-    holdout,
-    publicSources,
+  expect(feedback({ requirement: "request", requirementCitation: "make it work" })).toContain(
+    'violates this requirement of the original request: "make it work"',
   );
-  expect(paraphrase).toContain(
-    "violates a requirement of the original request (the verifier's citation was not public text)",
-  );
-  expect(paraphrase).not.toContain("secret input");
-  expect(
-    formatVerifyFeedback(unmetHoldout({ requirement: "not_required" }), spec, holdout, publicSources),
-  ).toBe("");
+  // A citation must come from the source it names; a paraphrase could carry the scenario.
+  for (const [requirement, requirementCitation] of [
+    ["request", "handle secret input"],
+    ["request", "empty lists are accepted"],
+    ["spec", "parseList"],
+  ] as const) {
+    const withheld = feedback({ requirement, requirementCitation });
+    expect(withheld).toContain("(the verifier's citation was not found in it)");
+    expect(withheld).not.toContain("secret input");
+  }
+  expect(feedback({ requirement: "not_required" })).toBe("");
 });

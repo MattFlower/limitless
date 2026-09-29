@@ -235,26 +235,36 @@ export type StoredReview = Omit<Review, "verdict"> & Partial<Pick<Review, "verdi
 
 export const VerifySchema = z.object({
   criteria: z.array(
-    z.object({
-      id: z.string(),
-      status: z.enum(["met", "unmet", "unclear", "blocked"]),
-      evidence: z.string().trim().min(1).describe("Command + observed output, or file:line references"),
-      publicSummary: z
-        .string()
-        .describe(
-          "For H-ids, short observed behavior without private inputs or expected values; empty for public criteria",
-        ),
-      // Defaults let output recorded before holdouts were classified parse as unclassified, which blocks.
-      requirement: z
-        .enum(["request", "spec", "not_required"])
-        .nullable()
-        .default(null)
-        .describe("For unmet H-ids, what the failure violates; null for every other entry"),
-      requirementCitation: z
-        .string()
-        .default("")
-        .describe("For request/spec, the exact violated text quoted from the request or spec; else empty"),
-    }),
+    z
+      .object({
+        id: z.string(),
+        status: z.enum(["met", "unmet", "unclear", "blocked"]),
+        evidence: z.string().trim().min(1).describe("Command + observed output, or file:line references"),
+        publicSummary: z
+          .string()
+          .describe(
+            "For H-ids, short observed behavior without private inputs or expected values; empty for public criteria",
+          ),
+        // Defaults let output recorded before holdouts were classified parse as unclassified, which blocks.
+        requirement: z
+          .enum(["request", "spec", "not_required"])
+          .nullable()
+          .default(null)
+          .describe("For unmet H-ids, what the failure violates; null for every other entry"),
+        requirementCitation: z
+          .string()
+          .default("")
+          .describe("For request/spec, the exact violated text quoted from the request or spec; else empty"),
+      })
+      .refine(
+        (c) =>
+          (c.requirement !== "request" && c.requirement !== "spec") ||
+          /[\p{L}\p{N}]/u.test(c.requirementCitation),
+        {
+          message: "request/spec classifications must quote the violated text",
+          path: ["requirementCitation"],
+        },
+      ),
   ),
   overall: z.enum(["pass", "fail"]),
   notes: z.string(),

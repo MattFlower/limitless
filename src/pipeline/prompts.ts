@@ -217,6 +217,7 @@ export function formatVerifyFeedback(
   spec: Spec | null,
   holdout?: Holdout,
   publicSources = "",
+  request = "",
 ): string {
   // Not-required holdouts are follow-up notes for the report; fixing them only adds code.
   const unmet = verify.criteria.filter(
@@ -239,18 +240,19 @@ export function formatVerifyFeedback(
       if (!privateScenario) return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
       if (c.status !== "unmet" || (c.requirement !== "request" && c.requirement !== "spec"))
         return `- **${c.id}** private scenario (${c.status}): ${safeSummary}`;
-      return `- **${c.id}** violates ${violatedRequirement(c.requirement, c.requirementCitation ?? "", holdout, publicSources)}\n  Observed failure: ${safeSummary}`;
+      return `- **${c.id}** violates ${violatedRequirement(c.requirement, c.requirementCitation ?? "", c.requirement === "request" ? request : spec ? renderSpec(spec) : "", holdout, publicSources)}\n  Observed failure: ${safeSummary}`;
     })
     .join("\n")}`;
 }
 
 /**
- * The cited text is shown only when it is a verbatim quote of the public request or spec (which
- * `publicSources` contains) that redaction leaves intact: a paraphrase could carry scenario text.
+ * The cited text is shown only when it is a verbatim quote of the source it names (the request or
+ * the spec) that redaction leaves intact: a paraphrase could carry scenario text.
  */
 function violatedRequirement(
   requirement: "request" | "spec",
   citation: string,
+  sourceText: string,
   holdout: Holdout | undefined,
   publicSources: string,
 ): string {
@@ -260,9 +262,9 @@ function violatedRequirement(
     .trim()
     .replace(/^["'“”`]+|["'“”`.]+$/g, "")
     .replace(/\s+/g, " ");
-  const verbatim = quote.length > 0 && flat(publicSources).includes(flat(quote));
+  const verbatim = quote.length > 0 && flat(sourceText).includes(flat(quote));
   if (!verbatim || !holdout || redactHoldoutText(quote, holdout, publicSources) !== quote)
-    return `a requirement of ${source} (the verifier's citation was not public text)`;
+    return `a requirement of ${source} (the verifier's citation was not found in it)`;
   return `this requirement of ${source}: "${quote}"`;
 }
 
