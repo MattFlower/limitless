@@ -129,7 +129,10 @@ async function serve(): Promise<void> {
   const { Factory } = await import("../app.ts");
   const { startHttp } = await import("../server/http.ts");
   const { mountIntegrations } = await import("../integrations/index.ts");
+  const { sweepOrphanedSnapshots } = await import("../pipeline/snapshots.ts");
   const cfg = loadConfig();
+  const orphans = sweepOrphanedSnapshots();
+  if (orphans.length) console.log(`Removed ${orphans.length} holdout snapshot(s) left by a stopped daemon`);
   const bootSha = await resolveBootSha(join(import.meta.dir, "../.."));
   const factory = new Factory(cfg, {
     bootSha,

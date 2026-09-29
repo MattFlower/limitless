@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus, StageName } from "../src/core/types.ts";
@@ -1785,7 +1785,12 @@ protected_paths = ["protected.txt"]
           expect(s.maxToolCalls).toBeLessThanOrEqual(50);
           expect(s.scratchDir).toBeTruthy();
           expect(s.privateSession).toBe(true);
-          // The cwd alone doesn't confine tools: the implementer's worktree and factory state are denied.
+          // The cwd alone doesn't confine tools: reads are limited to the snapshot and scratch, and
+          // the implementer's worktree and factory state are denied wherever they live.
+          expect(s.confineReads).toBe(true);
+          expect(basename(dirname(s.cwd))).toStartWith(`limitless-holdout-${process.pid}-`);
+          // The private CLI log in the shared temporary directory never holds scenario text.
+          expect(s.redactOutput?.("H-1 private step")).toBe("[private]");
           expect(s.denyRead).toEqual(
             expect.arrayContaining([join(f.cfg.paths.work, runId), f.cfg.paths.home, f.cfg.paths.repos]),
           );

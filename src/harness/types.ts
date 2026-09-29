@@ -56,6 +56,11 @@ export interface AgentSpec {
   addDirs?: string[];
   /** Paths a tool-enabled reader must not read, e.g. a worktree being edited in parallel. */
   denyRead?: string[];
+  /**
+   * A tool-enabled reader may read only its cwd and scratch (plus system files commands need):
+   * not home directories, other temporary directories or `denyRead`.
+   */
+  confineReads?: boolean;
   timeoutMs: number;
   idleTimeoutMs: number;
   maxToolCalls: number;

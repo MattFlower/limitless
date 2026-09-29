@@ -27,6 +27,8 @@ test("holdout prompt reads the base repository and grounds outcomes in the reque
   expect(prompt).toContain("must follow from the request or specification");
   expect(prompt).toContain("Don't dictate exact wording");
   expect(prompt).toContain("1–8 scenarios");
+  expect(prompt).toContain("relative paths; never use this checkout's absolute path");
+  expect(prompt).toContain("Keep scenario text out of files");
   expect(prompt).toContain("Add a --json flag");
   expect(prompt).toContain("AC-1");
   expect(prompt).not.toContain("Do not inspect a repository");

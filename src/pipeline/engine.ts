@@ -1,5 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
@@ -79,6 +78,7 @@ import {
   type Verify,
   VerifySchema,
 } from "./schemas.ts";
+import { createSnapshotParent } from "./snapshots.ts";
 import {
   blockedOnly,
   ENVIRONMENT_BLOCKED,
@@ -558,7 +558,7 @@ async function withBaseSnapshot<T>(ctx: RunContext, fn: (dir: string) => Promise
   const worktree = ctx.state.worktreePath;
   const baseSha = ctx.run.baseSha;
   if (!worktree || !baseSha) throw new Error("Holdout needs the run worktree and recorded base commit");
-  const snapshot = mkdtempSync(join(tmpdir(), "limitless-holdout-"));
+  const snapshot = createSnapshotParent();
   try {
     const base = join(snapshot, "base");
     mkdirSync(base);
@@ -570,8 +570,10 @@ async function withBaseSnapshot<T>(ctx: RunContext, fn: (dir: string) => Promise
 }
 
 /**
- * A cwd doesn't confine reads: keep the holdout's tools out of the parallel implementer's worktree,
- * every run's state and the bare caches its commits land in, and the factory's config and secrets.
+ * The reader is confined to the snapshot and its scratch (`confineReads`), which already excludes
+ * home and temporary directories. Factory paths can live elsewhere (LIMITLESS_HOME), so deny them
+ * too: the parallel implementer's worktree, every run's state, the bare caches its commits land in,
+ * and the factory's config and secrets.
  */
 function holdoutDenyRead(ctx: RunContext): string[] {
   const { home, work, runs, repos, configDir } = ctx.deps.cfg.paths;
@@ -596,7 +598,10 @@ async function authorHoldout(ctx: RunContext): Promise<void> {
           schema: HoldoutSchema,
           requireStructured: true,
           privateOutput: true,
+          // Residual risk (docs/ARCHITECTURE.md): the parallel implementer isn't read-sandboxed, so
+          // the scratch is readable while this runs; the prompt keeps scenario text out of files.
           cwd: base,
+          confineReads: true,
           denyRead: holdoutDenyRead(ctx),
           maxToolCalls: HOLDOUT_TOOL_CALLS,
         }),

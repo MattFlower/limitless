@@ -1,6 +1,16 @@
 import { expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import { buildCodexArgs, runCodex } from "../src/harness/codex.ts";
@@ -12,6 +22,7 @@ import {
   withScratch,
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
+import { withholdText } from "../src/pipeline/context.ts";
 import type { ProcOptions, ProcResult } from "../src/util/proc.ts";
 
 const specFor = (cwd: string, scratchDir: string): AgentSpec => ({
@@ -123,45 +134,193 @@ test("native arguments restrict reading writes and preserve no-tools isolation",
   }
 });
 
-test("denyRead keeps tool-enabled readers out of a parallel worktree", async () => {
+test("denyRead keeps tool-enabled readers out of a parallel worktree", () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "deny-read-")));
   const cwd = join(root, "snapshot");
   const implementer = join(root, "implementer");
   const scratch = join(root, "scratch", SCRATCH_NAME);
   for (const dir of [cwd, implementer, scratch]) mkdirSync(dir, { recursive: true });
-  writeFileSync(join(cwd, "base.txt"), "base\n");
-  writeFileSync(join(implementer, "marker.txt"), "implementation marker\n");
   try {
     const spec = { ...specFor(cwd, scratch), denyRead: [implementer] };
-    const codex = buildCodexArgs(spec);
-    const policy = codex.find((arg) => arg.startsWith("permissions=")) ?? "";
-    expect(policy).toContain(`${JSON.stringify(implementer)}="none"`);
+    expect(codexAccess(buildCodexArgs(spec), join(implementer, "marker.txt"))).toBe("none");
     const claude = buildClaudeArgs(spec, "id");
     const settings = JSON.parse(claude[claude.indexOf("--settings") + 1] ?? "{}");
     expect(settings.sandbox.filesystem.denyRead).toEqual([implementer]);
     expect(claude.slice(claude.indexOf("--disallowedTools"))).toContain(`Read(/${implementer}/**)`);
     for (const build of [buildCodexArgs, (s: AgentSpec) => buildClaudeArgs(s, "id")]) {
       expect(() => build({ ...spec, denyRead: [root] })).toThrow("outside");
+      expect(() => build({ ...spec, confineReads: true, denyRead: [root] })).toThrow("outside");
     }
-
-    // Exercise the generated Codex profile in its real sandbox where one is available (not nested).
-    if (!Bun.which("codex")) return;
-    const sandboxed = async (file: string) => {
-      const proc = Bun.spawn(
-        ["codex", "sandbox", "-c", 'default_permissions="limitless-reader"', "-c", policy, "--", "cat", file],
-        { cwd, stdout: "pipe", stderr: "pipe" },
-      );
-      return { code: await proc.exited, out: await new Response(proc.stdout).text() };
-    };
-    const control = await sandboxed(join(cwd, "base.txt"));
-    if (control.code !== 0) return;
-    expect(control.out).toBe("base\n");
-    const blocked = await sandboxed(join(implementer, "marker.txt"));
-    expect(blocked.code).not.toBe(0);
-    expect(blocked.out).not.toContain("implementation marker");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+/** Access the Codex profile grants `path`: the most specific entry wins; `:minimal` is system files. */
+function codexAccess(args: string[], path: string): string {
+  const policy = args.find((arg) => arg.startsWith("permissions=")) ?? "";
+  let best: [string, string] | null = null;
+  for (const [, key = "", access = ""] of policy.matchAll(/("(?:[^"\\]|\\.)*")="(read|write|none)"/g)) {
+    const entry = JSON.parse(key) as string;
+    if (entry.startsWith(":") || !(path === entry || path.startsWith(entry === "/" ? "/" : `${entry}/`)))
+      continue;
+    if (!best || entry.length > best[0].length) best = [entry, access];
+  }
+  return best?.[1] ?? "none";
+}
+
+/** Whether Claude's sandbox lets Bash read `path`: allowRead wins inside denyRead; reads default on. */
+function claudeSandboxReads(args: string[], path: string): boolean {
+  const { denyRead = [], allowRead = [] } = JSON.parse(args[args.indexOf("--settings") + 1] ?? "{}").sandbox
+    .filesystem as { denyRead?: string[]; allowRead?: string[] };
+  const inside = (root: string) => path === root || path.startsWith(`${root}/`);
+  return allowRead.some(inside) || !denyRead.some(inside);
+}
+
+function confinedFixture() {
+  const parent = mkdtempSync(join(tmpdir(), "limitless-holdout-test-"));
+  const cwd = join(parent, "base");
+  mkdirSync(cwd);
+  writeFileSync(join(cwd, "base.txt"), "base\n");
+  const scratch = createScratch(cwd);
+  return {
+    cwd,
+    scratch,
+    spec: { ...specFor(cwd, scratch), confineReads: true },
+    cleanup: () => {
+      removeScratch(scratch);
+      rmSync(parent, { recursive: true, force: true });
+    },
+  };
+}
+
+test("confined readers are granted reads only in their cwd and scratch", () => {
+  const { cwd, scratch, spec, cleanup } = confinedFixture();
+  const home = homedir();
+  const other = mkdtempSync(join(tmpdir(), "limitless-private-test-"));
+  try {
+    const privatePaths = [
+      home,
+      join(home, ".claude", "projects", "-Users-x--limitless-work-run", "s.jsonl"),
+      join(home, ".codex", "sessions", "2026", "rollout.jsonl"),
+      join(home, ".ssh", "id_ed25519"),
+      join(home, ".limitless", "limitless.db"),
+      join(other, "inv-1.log"),
+      realpathSync(other),
+      "/tmp/lr-other/claude-0/notes.md",
+    ];
+    const codex = buildCodexArgs(spec);
+    const policy = codex.find((arg) => arg.startsWith("permissions=")) ?? "";
+    expect(policy).not.toContain('"/"="read"');
+    expect(policy).toContain('":minimal"="read"');
+    const granted = [...policy.matchAll(/("(?:[^"\\]|\\.)*")="(read|write)"/g)]
+      .map(([, key = ""]) => JSON.parse(key) as string)
+      .filter((path) => path !== ":minimal");
+    const spelled = (path: string) => [...new Set([path, realpathSync(path)])];
+    expect(new Set(granted)).toEqual(new Set([...spelled(cwd), ...spelled(scratch)]));
+    expect(codexAccess(codex, join(realpathSync(cwd), "base.txt"))).toBe("read");
+    expect(codexAccess(codex, join(realpathSync(scratch), "n"))).toBe("write");
+
+    const claude = buildClaudeArgs(spec, "id");
+    const allowed = claude.slice(claude.indexOf("--allowedTools") + 1, claude.indexOf("--disallowedTools"));
+    // A bare Read, Grep or Glob allow would reach every path; Read rules also govern Grep and Glob.
+    expect(allowed).not.toContain("Read");
+    expect(allowed).not.toContain("Grep");
+    expect(allowed).not.toContain("Glob");
+    expect(allowed).toEqual([...[...spelled(cwd), ...spelled(scratch)].map((p) => `Read(/${p}/**)`), "Bash"]);
+    expect(claudeSandboxReads(claude, join(realpathSync(cwd), "base.txt"))).toBe(true);
+    expect(claudeSandboxReads(claude, join(realpathSync(scratch), "n"))).toBe(true);
+
+    for (const path of privatePaths) {
+      expect(codexAccess(codex, path)).toBe("none");
+      expect(claudeSandboxReads(claude, path)).toBe(false);
+      const readRoots = allowed.filter((rule) => rule.startsWith("Read(")).map((rule) => rule.slice(6, -4));
+      expect(readRoots.some((root) => path === root || path.startsWith(`${root}/`))).toBe(false);
+    }
+  } finally {
+    cleanup();
+    rmSync(other, { recursive: true, force: true });
+  }
+});
+
+/** Why the real Codex sandbox can't be exercised here, or null when it can. */
+function codexSandboxUnavailable(): string | null {
+  if (!Bun.which("codex")) return "codex CLI not installed";
+  const probe = Bun.spawnSync(["codex", "sandbox", "--", "true"], { stdout: "ignore", stderr: "ignore" });
+  return probe.exitCode === 0 ? null : `codex sandbox cannot start here (exit ${probe.exitCode})`;
+}
+const codexSkip = codexSandboxUnavailable();
+
+test.skipIf(codexSkip !== null)(
+  `the real Codex sandbox enforces the confined reader profile${codexSkip ? ` (skipped: ${codexSkip})` : ""}`,
+  () => {
+    const { cwd, scratch, spec, cleanup } = confinedFixture();
+    const other = mkdtempSync(join("/tmp", "other-run-"));
+    const factory = realpathSync(mkdtempSync(join(tmpdir(), "factory-home-")));
+    writeFileSync(join(other, "marker.txt"), "implementation marker\n");
+    writeFileSync(join(factory, "secrets.env"), "implementation marker\n");
+    symlinkSync(other, join(cwd, "link"));
+    try {
+      const policy = buildCodexArgs({ ...spec, denyRead: [factory] }).find((arg) =>
+        arg.startsWith("permissions="),
+      );
+      const sandboxed = (command: string) => {
+        const proc = Bun.spawnSync(
+          [
+            "codex",
+            "sandbox",
+            "-c",
+            'default_permissions="limitless-reader"',
+            "-c",
+            policy ?? "",
+            "--",
+            "/bin/sh",
+            "-c",
+            command,
+          ],
+          { cwd, env: { ...process.env, TMPDIR: scratch }, stdout: "pipe", stderr: "pipe" },
+        );
+        return { code: proc.exitCode, out: proc.stdout.toString() };
+      };
+      expect(sandboxed("cat base.txt")).toEqual({ code: 0, out: "base\n" });
+      expect(sandboxed('echo note > "$TMPDIR/n" && cat "$TMPDIR/n"')).toEqual({ code: 0, out: "note\n" });
+      for (const command of [
+        `cat ${other}/marker.txt`,
+        "cat link/marker.txt",
+        `cat ${factory}/secrets.env`,
+        `ls ${homedir()}`,
+        "ls /tmp",
+      ]) {
+        const denied = sandboxed(command);
+        expect(denied.code).not.toBe(0);
+        expect(denied.out).not.toContain("implementation marker");
+      }
+    } finally {
+      cleanup();
+      rmSync(other, { recursive: true, force: true });
+      rmSync(factory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("private logs keep the stream's structure but withhold its text", async () => {
+  const { cwd, scratch, spec, cleanup } = confinedFixture();
+  try {
+    for (const run of [runClaude, runCodex]) {
+      const logPath = join(scratch, `${run.name}.log`);
+      await run({ ...spec, logPath, redactOutput: withholdText }, async (opts: ProcOptions) => {
+        opts.onStdoutLine?.(JSON.stringify({ type: "assistant", text: "H-1 private scenario", n: 3 }));
+        opts.onStderrLine?.("stderr H-1 private scenario");
+        return procResult;
+      });
+      const log = readFileSync(logPath, "utf8");
+      expect(log).not.toContain("private scenario");
+      expect(log).toContain('{"type":"[private]","text":"[private]","n":3}');
+    }
+  } finally {
+    cleanup();
+  }
+  expect(existsSync(cwd)).toBe(false);
 });
 
 for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {

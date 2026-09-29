@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AgentSpec } from "./types.ts";
 
@@ -68,18 +68,49 @@ export function validateScratch(spec: AgentSpec): string {
   return path;
 }
 
+function spellings(paths: string[]): string[] {
+  return [...new Set(paths.flatMap((p) => [resolve(p), ...(existsSync(p) ? [realpathSync(p)] : [])]))];
+}
+
 /** `denyRead` as given and canonical (either spelling reaches it); cwd and scratch must stay readable. */
 export function validateDenyRead(spec: AgentSpec, scratch: string): string[] {
   const cwd = realpathSync(spec.cwd);
-  const paths = [
-    ...new Set(
-      (spec.denyRead ?? []).flatMap((p) => [resolve(p), ...(existsSync(p) ? [realpathSync(p)] : [])]),
-    ),
-  ];
+  const paths = spellings(spec.denyRead ?? []);
   for (const path of paths)
     if (within(path, cwd) || within(path, scratch))
       throw new Error(`Reader cwd and scratch must be outside ${path}`);
   return paths;
+}
+
+/**
+ * Where user, factory and other runs' data live: home directories, temporary directories (other
+ * invocations' scratch and private logs) and mounted volumes. System files stay readable.
+ */
+export function privateReadRoots(): string[] {
+  const platform =
+    process.platform === "darwin"
+      ? ["/Users", "/Volumes", "/var/folders", "/private/var/folders", "/private/tmp", "/private/var/tmp"]
+      : ["/home", "/root", "/mnt", "/media", "/run/user"];
+  return spellings([homedir(), tmpdir(), "/tmp", "/var/tmp", ...platform]);
+}
+
+export interface ReadConfinement {
+  /** The reader's cwd, both spellings: readable. */
+  cwd: string[];
+  /** Its scratch, both spellings: readable and writable. */
+  scratch: string[];
+  /** Private roots plus `denyRead`; cwd and scratch take precedence inside them. */
+  deny: string[];
+}
+
+/** A confined reader sees its cwd and scratch only; `denyRead` must not overlap them either. */
+export function readConfinement(spec: AgentSpec, scratch: string): ReadConfinement {
+  const explicit = validateDenyRead(spec, scratch);
+  return {
+    cwd: spellings([spec.cwd]),
+    scratch: spellings([scratch, ...(spec.scratchDir ? [spec.scratchDir] : [])]),
+    deny: [...new Set([...privateReadRoots(), ...explicit])],
+  };
 }
 
 /** The callback must await process termination; cleanup also covers thrown errors and cancellation. */
