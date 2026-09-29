@@ -836,7 +836,8 @@ esac
     // Finder output per panel review; the verifier rules on each candidate by its title.
     const found = [
       [finding("R1 low", "r1"), finding("R1 cleanup", "r1")],
-      [finding("R1 low", "unaddressed", "P1"), finding("R2 medium"), finding("R2 high")],
+      // No R2 finder repeats P1, so the verifier rechecks it on its own.
+      [finding("R2 medium"), finding("R2 high")],
       [finding("R3 high"), finding("R3 critical")],
     ];
     const severity: Record<string, string> = {
@@ -847,12 +848,13 @@ esac
       "R3 critical": "critical",
     };
     const finders: string[] = [];
-    const verifiers: string[] = [];
+    // Verifier prompts per review; a re-review's recheck of the prior blocker is its own batch.
+    const verifiers: string[][] = [[], [], []];
     let implementations = 0;
     let slow = true;
     const handler: Handler = (s) => {
       if (s.prompt.startsWith("You are a code-review verifier")) {
-        verifiers.push(s.prompt);
+        verifiers[finders.length - 1]?.push(s.prompt);
         const cited = [
           ...s.prompt.matchAll(/"id": "(C\d+)",\s+"file": "[^"]*",\s+"line": \d+,\s+"title": "([^"]*)"/g),
         ];
@@ -861,8 +863,8 @@ esac
             results: cited.map(([, id, title]) => ({
               id,
               verdict: "CONFIRMED",
-              // R2 finds P1 fixed after all.
-              ...(verifiers.length > 1 && title === "R1 low"
+              // Each re-review's recheck finds the previous review's blocker fixed after all.
+              ...(title?.startsWith(`R${finders.length - 1} `)
                 ? { verdict: "REFUTED", severity: "low" }
                 : { severity: severity[title ?? ""] }),
               category: "correctness",
@@ -879,8 +881,8 @@ esac
         return { structured: { ...approve, findings: found[finders.length - 1] ?? [] } };
       }
       implementations++;
-      // The first implementation fails the gates, so it never reaches a review.
-      if (implementations === 1) return { files: { "farewell.txt": "BAD\n" } };
+      // The second implementation fails the gates, so that round never reaches a review.
+      if (implementations === 2) return { files: { "farewell.txt": "BAD\n" } };
       if (slow && implementations === 4) return { delayMs: 30_000 };
       return { files: { "farewell.txt": `goodbye ${implementations}\n` } };
     };
@@ -904,7 +906,7 @@ esac
       await Bun.sleep(10);
     const before = f.store.getRunState<RunState>(run.id);
     expect(before?.reviewHistory?.map((e) => [e.round, e.panelReview])).toEqual([
-      [1, 1],
+      [0, 1],
       [2, 2],
     ]);
     await f.stop();
@@ -914,7 +916,8 @@ esac
     restarted.deps.reviewSystem = panel;
     expect(await waitFor(restarted, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
 
-    // Exactly three panel reviews, never a fourth; the gate-failed round 0 did not count.
+    // Exactly three panel reviews, never a fourth; the gate-failed round 1 did not count. Artifacts
+    // are numbered by review, not by implementation round.
     expect(finders).toHaveLength(3);
     expect(implementations).toBe(5); // Includes the implementation interrupted by the stop.
     expect(restarted.store.getArtifact(run.id, "review-0.json")).toBeNull();
@@ -924,14 +927,17 @@ esac
     );
     const baseSha = restarted.store.getRun(run.id)?.baseSha ?? "missing";
     expect(r1).toMatchObject({
+      round: 0,
       panelReview: 1,
       scope: { kind: "full", range: `${baseSha}..${r1.reviewedSha}` },
     });
     expect(r2).toMatchObject({
+      round: 2,
       panelReview: 2,
       scope: { kind: "fix", range: `${r1.reviewedSha}..${r2.reviewedSha}` },
     });
     expect(r3).toMatchObject({
+      round: 3,
       panelReview: 3,
       scope: { kind: "fix", range: `${r2.reviewedSha}..${r3.reviewedSha}` },
     });
@@ -956,16 +962,25 @@ esac
       expect(prompt).toContain('"status": "unresolved at the previous review');
       expect(prompt).not.toContain(`git diff ${baseSha}..`);
       expect(prompt).not.toContain("full base-to-HEAD");
-      const verifier = verifiers[i + 1] ?? "";
-      expect(verifier).toContain(`git diff ${range}`);
-      expect(verifier).not.toContain(`git diff ${baseSha}..`);
-      expect(verifier).toContain('"id": "P1"');
+      expect(verifiers[i + 1]).toHaveLength(2);
+      for (const verifier of verifiers[i + 1] ?? []) {
+        expect(verifier).toContain(`git diff ${range}`);
+        expect(verifier).not.toContain(`git diff ${baseSha}..`);
+        expect(verifier).toContain('"id": "P1"');
+        expect(verifier).toContain('"status": "not repeated by any finder; recheck it as C3"');
+      }
     }
+    expect(verifiers[0]).toHaveLength(1);
     expect(finders[1]).toContain("R1 low");
-    expect(verifiers[1]).toContain('"status": "reported unaddressed by C1"');
-    // R1's only blocker was refuted in R2, so R3 is told it is resolved.
+    // Each re-review's verifier rechecked P1 as a candidate of its own (after the finders' C1 and C2)
+    // and refuted it: fixed.
+    expect(verifiers[1]?.[1]).toMatch(/"id": "C3",[\s\S]*"title": "R1 low",[\s\S]*"prior": "P1"/);
+    expect(r2.panel.refuted).toEqual(["C3"]);
+    expect(verifiers[2]?.[1]).toMatch(/"id": "C3",[\s\S]*"title": "R2 high",[\s\S]*"prior": "P1"/);
+    expect(r3.panel.refuted).toEqual(["C3"]);
+    // R1's only blocker was refuted by R2's recheck, so R3 is told it is resolved.
     expect(finders[2]).toMatch(/"title": "R1 low",[\s\S]*"status": "resolved"/);
-    expect(verifiers[2]).toMatch(/"title": "R1 low",[\s\S]*"status": "resolved at an earlier review"/);
+    expect(verifiers[2]?.[0]).toMatch(/"title": "R1 low",[\s\S]*"status": "resolved at an earlier review"/);
 
     expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
     const report = restarted.store.getArtifact(run.id, "report.md") ?? "";
@@ -4179,20 +4194,36 @@ test("panel review: a refuted blocker doesn't block, a CONFIRMED low does, and v
       .listInvocations(run.id)
       .filter((i) => i.role === "review")
       .map((i) => i.modelId),
-  ).toEqual(["beta/m", "alpha/m", "beta/m"]);
-  expect(verifiers.map((s) => [s.target.vendor, s.mode])).toEqual([["anthropic", "readonly"]]);
-  expect(verifiers[0]?.prompt).not.toContain("SECRET_DETAIL");
+  ).toEqual(["beta/m", "alpha/m", "beta/m", "beta/m"]);
+  // R2's finder repeated nothing, so the verifier rechecks P1 itself (as C1, refuted: fixed). No
+  // finder raised that candidate, so there is no finder vendor to route away from.
+  expect(verifiers.map((s) => [s.target.vendor, s.mode])).toEqual([
+    ["anthropic", "readonly"],
+    ["openai", "readonly"],
+  ]);
+  expect(verifiers[1]?.prompt).toContain('"status": "not repeated by any finder; recheck it as C1"');
+  expect(verifiers[1]?.prompt).toMatch(/"title": "Confirmed low",[\s\S]*"prior": "P1"/);
+  for (const s of verifiers) expect(s.prompt).not.toContain("SECRET_DETAIL");
   expect(implementPrompts).toHaveLength(2);
   const feedback = implementPrompts[1] ?? "";
   expect(feedback).toContain("**low** farewell.txt:1 — Confirmed low");
   expect(feedback).toContain("farewell.txt:1 `bye` (C2)");
   expect(feedback).toContain("Trigger: reading the file -> wrong farewell (C2)");
   for (const dropped of ["Refuted blocker", "Plausible medium"]) expect(feedback).not.toContain(dropped);
-  const artifact = JSON.parse(f.store.getArtifact(run.id, "review-0.json") ?? "{}");
+  expect(f.store.getArtifact(run.id, "review-0.json")).toBeNull();
+  const artifact = JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}");
   expect(artifact).toMatchObject({
     mode: "panel",
     verdict: "request_changes",
+    round: 0,
+    panelReview: 1,
     panel: { refuted: ["C1"], capped: [] },
+  });
+  expect(JSON.parse(f.store.getArtifact(run.id, "review-2.json") ?? "{}")).toMatchObject({
+    verdict: "approve",
+    round: 1,
+    panelReview: 2,
+    panel: { refuted: ["C1"], candidates: [{ id: "C1", title: "Confirmed low", finder: null, prior: "P1" }] },
   });
   expect(artifact.blocking.map((b: { title: string }) => b.title)).toEqual(["Confirmed low"]);
   expect(artifact.panel.candidates.map((c: { id: string; title: string }) => [c.id, c.title])).toEqual([
@@ -4266,7 +4297,7 @@ test("panel review: a verifier that omits candidates is retried once, then they 
   const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
   expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
   expect(verifierIds).toEqual([["C1", "C2"], ["C2"]]);
-  const artifact = JSON.parse(f.store.getArtifact(run.id, "review-0.json") ?? "{}");
+  const artifact = JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}");
   expect(artifact).toMatchObject({ verdict: "approve", blocking: [], panel: { omitted: ["C2"] } });
   const state = f.store.getRunState<RunState>(run.id);
   expect(state?.reviewFollowUps?.map((x) => [x.title, x.verification?.verdict])).toEqual([

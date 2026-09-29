@@ -794,10 +794,12 @@ describe("runReview panel", () => {
       resolved: [{ ...finding("major"), title: "Gone in R2" }],
     };
     const found = [{ ...candidate("src/a.ts", 1), label: "unaddressed", prior: "P1" }];
-    const { out, verifications } = await panel([found], () => ({ ...confirmed, severity: "high" }), {
-      panelReview: 3,
-      prompt: { ...prompt, headSha: "head", previous, fixReview: 3 },
-    });
+    // C2 is the verifier's recheck of P2, which no finder repeated: refuted, so it is resolved.
+    const { out, verifications } = await panel(
+      [found],
+      (id) => (id === "C2" ? { ...confirmed, verdict: "REFUTED" } : { ...confirmed, severity: "high" }),
+      { panelReview: 3, prompt: { ...prompt, headSha: "head", previous, fixReview: 3 } },
+    );
     const finderPrompt = reviewRequest({
       prompt: { ...prompt, headSha: "head", previous, fixReview: 3 },
       timeoutMs: 1,
@@ -808,15 +810,59 @@ describe("runReview panel", () => {
     expect(finderPrompt).toMatch(/"title": "Gone in R2",[\s\S]*"status": "resolved"/);
     expect(finderPrompt).not.toContain("git diff a..HEAD");
     expect(finderPrompt).not.toContain("full base-to-HEAD");
-    const verifierText = verifications[0]?.request.prompt ?? "";
-    expect(verifierText).toContain("git diff fixbase..head");
-    expect(verifierText).not.toContain("git diff a..head");
-    expect(verifierText).toContain('"status": "reported unaddressed by C1"');
-    expect(verifierText).toContain('"status": "reported resolved: no finder cited it"');
-    expect(verifierText).toContain('"prior": "P1"');
+    // The finder's candidate avoids its vendor; the recheck has no finder vendor to avoid.
+    expect(verifications.map((v) => [v.avoidVendor, ids(v.request.prompt)])).toEqual([
+      ["anthropic", ["C1"]],
+      [undefined, ["C2"]],
+    ]);
+    for (const verifierText of verifications.map((v) => v.request.prompt)) {
+      expect(verifierText).toContain("git diff fixbase..head");
+      expect(verifierText).not.toContain("git diff a..head");
+      expect(verifierText).toContain('"status": "reported unaddressed by C1"');
+      expect(verifierText).toContain('"status": "not repeated by any finder; recheck it as C2"');
+      expect(verifierText).toContain('"status": "resolved at an earlier review"');
+    }
+    expect(verifications[0]?.request.prompt).toContain('"prior": "P1"');
+    expect(verifications[1]?.request.prompt).toMatch(/"title": "Now fixed",[\s\S]*"prior": "P2"/);
+    expect(out.panel?.candidates.map((c) => [c.id, c.title, c.finder, c.prior])).toEqual([
+      ["C1", "Issue src/a.ts 1", 0, "P1"],
+      ["C2", "Now fixed", null, "P2"],
+    ]);
+    expect(out.panel?.refuted).toEqual(["C2"]);
     // R3: a cited prior finding the verifier rates high no longer blocks; it goes to the ledger.
     expect(out.decision?.blocking).toEqual([]);
     expect(out.decision?.followUps.map((f) => f.title)).toEqual(["Issue src/a.ts 1"]);
+  });
+
+  test("a prior blocking finding no finder repeated is rechecked outside the cap and blocks R2 if confirmed", async () => {
+    const stale = {
+      verdict: "CONFIRMED",
+      severity: "low",
+      category: "correctness",
+      evidence: "old",
+      trigger: "old",
+    } as const;
+    const previous = {
+      sha: "fixbase",
+      findings: [{ ...finding("major"), title: "Forgotten", verification: stale }],
+    };
+    const found = Array.from({ length: 21 }, (_, i) => ({
+      ...candidate(`src/f${i}.ts`, i + 1, "nit"),
+      label: "new",
+      prior: "",
+    }));
+    const { out, verifications } = await panel([found], () => ({ ...confirmed, severity: "medium" }), {
+      panelReview: 2,
+      prompt: { ...prompt, headSha: "head", previous, fixReview: 2 },
+    });
+    const sent = verifications.flatMap((v) => ids(v.request.prompt));
+    expect(sent).toHaveLength(PANEL_VERIFY_CAP + 1);
+    expect(sent).toContain("C22");
+    expect(out.panel?.capped).toEqual(["C21"]);
+    // The recheck carries no stale ruling from the earlier review; the verifier's fresh one counts.
+    expect(out.decision?.blocking.map((f) => [f.title, f.label, f.prior, f.verification?.severity])).toEqual([
+      ["Forgotten", "unaddressed", "P1", "medium"],
+    ]);
   });
 
   test("the panel's structured result carries its record for eval output", async () => {

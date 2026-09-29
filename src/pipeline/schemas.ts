@@ -221,7 +221,12 @@ const StoredFindingSchema = reviewBase.shape.findings.element.extend({
 /** A panel's candidates and rulings, kept with eval output so refuted candidates stay regradable. */
 const StoredPanelSchema = z.object({
   candidates: z.array(
-    StoredFindingSchema.extend({ id: z.string(), finder: z.number().int(), vendor: z.string().nullable() }),
+    StoredFindingSchema.extend({
+      id: z.string(),
+      // Null: a prior blocking finding no finder repeated, rechecked by the verifier.
+      finder: z.number().int().nullable(),
+      vendor: z.string().nullable(),
+    }),
   ),
   verdicts: z.array(VerificationSchema.extend({ id: z.string() })),
   refuted: z.array(z.string()),

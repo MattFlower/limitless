@@ -103,8 +103,9 @@ export function blockingReviewFindings(
 }
 
 /**
- * Blocking findings of earlier reviews that the following review did not cite as unaddressed: known
- * resolved, so a re-review is told not to raise them again.
+ * Blocking findings of earlier reviews that the following review did not cite as unaddressed. A panel
+ * re-review rechecks every prior blocking finding (a finder repeats it or the verifier gets it as a
+ * candidate), so an uncited one was refuted at head: known resolved, not to be raised again.
  */
 export function resolvedPriorFindings(
   history: { blocking: Review["findings"]; followUps: Review["findings"] }[],
@@ -164,7 +165,8 @@ export interface VerifierRequest {
 
 /** What `review-N.json` records about a panel beyond the derived review. */
 export interface PanelRecord {
-  candidates: (Finding & { id: string; finder: number; vendor: string | null })[];
+  /** `finder` is null for a prior blocking finding no finder repeated: the verifier rechecks it. */
+  candidates: (Finding & { id: string; finder: number | null; vendor: string | null })[];
   verdicts: (Verification & { id: string })[];
   refuted: string[];
   /** Eligible for verification but over the per-review cap: unverified follow-ups. */
@@ -318,16 +320,28 @@ async function runPanel<T extends Invoked>(
   const first = found[0];
   if (!first) throw new Error('mode "panel" needs at least one finder');
 
-  const candidates: PanelRecord["candidates"] = found
-    .flatMap(({ invoked, review }, finder) =>
-      review.findings.map((f) => ({ ...f, finder, vendor: invoked.target?.vendor ?? null })),
-    )
-    .map((c, i) => ({ ...c, id: `C${i + 1}` }));
+  const raised = found.flatMap(({ invoked, review }, finder) =>
+    review.findings.map((f) => ({ ...f, finder, vendor: invoked.target?.vendor ?? null })),
+  );
+  const { fixReview, previous } = input.prompt;
+  const fix = fixReview && previous ? { review: fixReview, ...previous } : undefined;
+  const cites = (c: Finding, id: string) => c.label === "unaddressed" && c.prior?.trim().toUpperCase() === id;
+  // A re-review never assumes a prior blocking finding fixed: whatever no finder repeated, the
+  // verifier rechecks as a candidate of its own, outside the cap.
+  const rechecks = (fix?.findings ?? []).flatMap(({ verification: _stale, ...f }, i) =>
+    raised.some((c) => cites(c, `P${i + 1}`))
+      ? []
+      : [{ ...f, label: "unaddressed" as const, prior: `P${i + 1}`, finder: null, vendor: null }],
+  );
+  const candidates: PanelRecord["candidates"] = [...raised, ...rechecks].map((c, i) => ({
+    ...c,
+    id: `C${i + 1}`,
+  }));
   // Stable sort: equal severities keep finder order.
   const ranked = candidates
-    .filter((c) => !UNVERIFIED_CATEGORIES.includes(c.category))
+    .filter((c) => c.finder !== null && !UNVERIFIED_CATEGORIES.includes(c.category))
     .sort((a, b) => FINDER_SEVERITY_RANK[a.severity] - FINDER_SEVERITY_RANK[b.severity]);
-  const selected = ranked.slice(0, PANEL_VERIFY_CAP);
+  const selected = [...ranked.slice(0, PANEL_VERIFY_CAP), ...candidates.filter((c) => c.finder === null)];
   // One batch never mixes files or finder vendors, so each call avoids exactly its finder's vendor.
   const groups = new Map<string, typeof selected>();
   for (const c of candidates.filter((c) => selected.includes(c))) {
@@ -340,35 +354,36 @@ async function runPanel<T extends Invoked>(
     ),
   );
   // A re-review's verifier checks the same fix diff, and whether each prior finding is really resolved.
-  const { fixReview, previous } = input.prompt;
-  const fix =
-    fixReview && previous
-      ? {
-          review: fixReview,
-          sha: previous.sha,
-          prior: previous.findings.map(({ file, line, title }, i) => {
-            const id = `P${i + 1}`;
-            const citing = candidates.filter(
-              (c) => c.label === "unaddressed" && c.prior?.trim().toUpperCase() === id,
-            );
-            return {
-              id,
-              file,
-              line,
-              title,
-              status: citing.length
-                ? `reported unaddressed by ${citing.map((c) => c.id).join(", ")}`
-                : "reported resolved: no finder cited it",
-            };
-          }),
-          resolved: (previous.resolved ?? []).map(({ file, line, title }) => ({
+  const verifierFix = fix
+    ? {
+        review: fix.review,
+        sha: fix.sha,
+        prior: fix.findings.map(({ file, line, title }, i) => {
+          const id = `P${i + 1}`;
+          const [repeated, recheck] = [true, false].map((byFinder) =>
+            candidates
+              .filter((c) => (c.finder !== null) === byFinder && cites(c, id))
+              .map((c) => c.id)
+              .join(", "),
+          );
+          return {
+            id,
             file,
             line,
             title,
-            status: "resolved at an earlier review",
-          })),
-        }
-      : undefined;
+            status: repeated
+              ? `reported unaddressed by ${repeated}`
+              : `not repeated by any finder; recheck it as ${recheck}`,
+          };
+        }),
+        resolved: (fix.resolved ?? []).map(({ file, line, title }) => ({
+          file,
+          line,
+          title,
+          status: "resolved at an earlier review",
+        })),
+      }
+    : undefined;
   const verdicts = new Map<string, PanelRecord["verdicts"][number]>();
   const omitted: string[] = [];
   let last = first.invoked.result;
@@ -392,9 +407,9 @@ async function runPanel<T extends Invoked>(
               line,
               title,
               failure_scenario: failure_scenario ?? "",
-              ...(fix ? { label: label ?? "new", prior: prior ?? "" } : {}),
+              ...(verifierFix ? { label: label ?? "new", prior: prior ?? "" } : {}),
             })),
-            ...(fix ? { fix } : {}),
+            ...(verifierFix ? { fix: verifierFix } : {}),
           }),
           schema: VerifierSchema,
           jsonSchema: toStrictJsonSchema(VerifierSchema),

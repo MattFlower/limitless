@@ -409,7 +409,7 @@ ${fence(input.stat.trim() || "(empty diff)")}
 
 # Prior blocking findings (status from this re-review's finders, not proof)
 ${fence(JSON.stringify(input.fix.prior, null, 2))}
-${input.fix.resolved?.length ? `Earlier blocking findings already resolved (a candidate repeating one is a regression only if the fix diff reintroduced it):\n${fence(JSON.stringify(input.fix.resolved, null, 2))}\n` : ""}A candidate with prior set (P1, P2, ...) claims that prior finding is still unaddressed: REFUTE it when the fix diff resolves it. A candidate labelled regression claims the fix diff introduced it: REFUTE it when the defect is not in the code at head.`
+${input.fix.resolved?.length ? `Earlier blocking findings already resolved (a candidate repeating one is a regression only if the fix diff reintroduced it):\n${fence(JSON.stringify(input.fix.resolved, null, 2))}\n` : ""}A candidate with prior set (P1, P2, ...) claims that prior finding is still unaddressed, or asks you to recheck it when no finder repeated it: REFUTE it when the fix diff resolves it, else CONFIRM it. A candidate labelled regression claims the fix diff introduced it: REFUTE it when the defect is not in the code at head.`
     : `# Change under review
 Base: ${input.baseSha}. Head: ${input.headSha ?? "HEAD"}. Inspect it with \`git diff ${range}\` and by reading the surrounding code.
 ${fence(input.stat.trim() || "(empty diff)")}`

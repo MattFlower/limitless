@@ -967,9 +967,10 @@ async function oneRound(
       ctx.state.lastReview = { ...r, modelId: target.modelId };
       ctx.state.reviewedSha = reviewedSha;
       await ctx.save();
+      // Panel artifacts are numbered by review (R1-R3), single ones by implementation round.
       ctx.store.putArtifact(
         ctx.run.id,
-        `review-${round}.json`,
+        `review-${panelReview ?? round}.json`,
         "review",
         JSON.stringify(
           {
