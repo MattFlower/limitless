@@ -173,6 +173,8 @@ export interface InvokeOptions {
   /** Redact holdout content from observable verifier events and transcripts. */
   redactHoldout?: boolean;
   isolatedCwd?: boolean;
+  /** Run in this directory instead of the worktree (e.g. a base-commit snapshot). */
+  cwd?: string;
   noTools?: boolean;
 }
 
@@ -452,7 +454,9 @@ export class RunContext {
           : undefined;
       try {
         const spec: AgentSpec = {
-          cwd: opts.isolatedCwd ? (privateDir as string) : (this.state.worktreePath ?? this.runDir),
+          cwd: opts.isolatedCwd
+            ? (privateDir as string)
+            : (opts.cwd ?? this.state.worktreePath ?? this.runDir),
           prompt: opts.prompt,
           systemAppend: [opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n"),
           target,

@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { formatVerifyFeedback, redactHoldoutText, verifyPrompt } from "../src/pipeline/prompts.ts";
+import {
+  formatVerifyFeedback,
+  holdoutPrompt,
+  redactHoldoutText,
+  verifyPrompt,
+} from "../src/pipeline/prompts.ts";
 import { type Holdout, type Spec, VerifySchema } from "../src/pipeline/schemas.ts";
 import { blockedOnly, normalizeVerify } from "../src/pipeline/verification.ts";
 
@@ -14,6 +19,20 @@ const spec: Spec = {
 const holdout: Holdout = {
   scenarios: [{ id: "H-1", description: "private", steps: "secret input", expected: "ok", edge_case: true }],
 };
+
+test("holdout prompt reads the base repository and grounds outcomes in the request", () => {
+  const prompt = holdoutPrompt({ prompt: "Add a --json flag", spec });
+  expect(prompt).toContain("read-only checkout of the repository at the base commit");
+  expect(prompt).toContain("real commands, real config keys, real entry points");
+  expect(prompt).toContain("must follow from the request or specification");
+  expect(prompt).toContain("Don't dictate exact wording");
+  expect(prompt).toContain("1–8 scenarios");
+  expect(prompt).toContain("Add a --json flag");
+  expect(prompt).toContain("AC-1");
+  expect(prompt).not.toContain("Do not inspect a repository");
+  expect(prompt).not.toContain("at least two");
+  expect(prompt).not.toContain("not literally listed");
+});
 
 test("the verifier's statuses are authoritative, whatever the evidence mentions", () => {
   for (const status of ["met", "unmet", "unclear", "blocked"] as const) {

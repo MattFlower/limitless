@@ -67,15 +67,14 @@ export const HoldoutSchema = z
           description: z.string().trim().min(1),
           steps: z.string().trim().min(1),
           expected: z.string().trim().min(1),
+          // Informational: holdouts include edge cases only when the request or spec implies them.
           edge_case: z.boolean(),
         }),
       )
-      .min(3)
+      .min(1)
       .max(8),
   })
   .superRefine(({ scenarios }, ctx) => {
-    if (scenarios.filter((s) => s.edge_case).length < 2)
-      ctx.addIssue({ code: "custom", message: "At least two edge or failure cases are required" });
     scenarios.forEach((s, i) => {
       if (s.id !== `H-${i + 1}`)
         ctx.addIssue({ code: "custom", path: ["scenarios", i, "id"], message: "IDs must be sequential H-n" });

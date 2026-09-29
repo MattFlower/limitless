@@ -186,6 +186,26 @@ export async function readFileAt(
   return (await sh(["git", "show", `${revision}:${path}`], { cwd, env })).stdout;
 }
 
+/** Extract the files of `sha` (no .git, no history, no working state) into the empty directory `dest`. */
+export async function exportCommit(
+  cwd: string,
+  sha: string,
+  dest: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const archive = `${dest}.tar`;
+  try {
+    await sh(["git", "archive", "--format=tar", "-o", archive, `${sha}^{commit}`], {
+      cwd,
+      signal,
+      timeoutMs: 300_000,
+    });
+    await sh(["tar", "-xf", archive, "-C", dest], { cwd: dest, signal, timeoutMs: 300_000 });
+  } finally {
+    rmSync(archive, { force: true });
+  }
+}
+
 export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
   const result = await sh(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
     cwd,
