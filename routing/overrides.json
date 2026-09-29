@@ -1,4 +1,8 @@
 {
+  "triage.default": {
+    "reason": "Luna at medium effort first: on the 30 held-out triage cases (eval-mump7s7re29l) it passed 78.9% with no risk under-calls, while Luna with no reasoning passed 63.3% and its risk under-call upper bound (13.2%) exceeded the 10% ceiling. The 40-case dev set, used for prompt wording, had flattered the fast settings. The remaining entries are availability fallbacks that the held-out set has not ranked.",
+    "decided": "2026-09-29"
+  },
   "implement.trivial": {
     "reason": "Opus first, Sol fallback: the implement eval has a ceiling (every model scored 100%), so Luna led on cost alone; field use shows Opus far stronger on hard, underspecified work. Revisit when the dataset is stratified by difficulty.",
     "decided": "2026-09-28"

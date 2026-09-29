@@ -1,5 +1,5 @@
 import { expect, setDefaultTimeout, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { evalCommand, formatEvalReport } from "../src/cli/eval.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -375,9 +375,14 @@ test("CLI entrypoint recognizes round flags", () => {
   expect(child.stdout.toString()).toContain("--strategy retry|effort|switch");
 });
 
+/** The committed implement pins only, so triage stays an unpinned cell these tests can update. */
+const implementPins = (text: string) =>
+  JSON.stringify(
+    Object.fromEntries(Object.entries(JSON.parse(text)).filter(([key]) => key.startsWith("implement."))),
+  );
+
 async function pinFixture(extra: [string, string][] = []) {
   const { evidence, local, subscription, response } = await import("./evals-policy-support.ts");
-  const { readFileSync } = await import("node:fs");
   const cells = ["trivial", "small", "medium"] as const;
   const implement = evidence("implement", [subscription], { id: "implement-run" });
   implement.trials.forEach((t, i) => {
@@ -391,7 +396,7 @@ async function pinFixture(extra: [string, string][] = []) {
   data.policy = overlayPolicy(DEFAULT_POLICY, JSON.parse(policy));
   const files = new Map<string, string>([
     ["routing/policy.json", policy],
-    ["routing/overrides.json", readFileSync(join(root, "routing/overrides.json"), "utf8")],
+    ["routing/overrides.json", implementPins(readFileSync(join(root, "routing/overrides.json"), "utf8"))],
     ...extra,
   ]);
   const writes: string[] = [];
@@ -553,4 +558,14 @@ test("eval regrade CLI posts to the regrade route, lists kept grades and prints 
   } finally {
     await f.close();
   }
+});
+
+test("policy CLI keeps the committed triage pin", async () => {
+  const { io, files, printed } = await pinFixture();
+  const root = join(import.meta.dir, "..");
+  files.set("routing/overrides.json", readFileSync(join(root, "routing/overrides.json"), "utf8"));
+  const committed = JSON.parse(files.get("routing/policy.json") ?? "{}");
+  await evalCommand(["policy"], { write: true }, io);
+  expect(printed.join("\n")).toContain("triage.default: pinned by owner decision (2026-09-29)");
+  expect(JSON.parse(files.get("routing/policy.json") ?? "{}")).toEqual(committed);
 });
