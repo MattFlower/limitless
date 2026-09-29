@@ -35,6 +35,51 @@ import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 /** Where Limitless keeps eval datasets; pins whose history touches these are rejected. */
 const LABEL_PATHS = ["evals/triage", "evals/review", "evals/verify", "evals/implement"];
 
+/** A trial may rerun from round zero only while nothing has been spent or recorded for it. */
+const replayable = (trial: EvalTrial): boolean =>
+  trial.costUsd === 0 &&
+  trial.costEquivUsd === 0 &&
+  trial.tokensIn === 0 &&
+  trial.tokensOut === 0 &&
+  !trial.details.roundsUsed &&
+  !trial.details.rounds?.length &&
+  !trial.details.grade;
+
+/** The trial as submitted, so a rerun starts without stale output, spend or round evidence. */
+const requeued = (trial: EvalTrial): EvalTrial => {
+  const { system, complexity, switchChain } = trial.details;
+  return {
+    ...trial,
+    status: "queued",
+    output: null,
+    pass: null,
+    score: null,
+    harness: "",
+    durationMs: 0,
+    details: {
+      ...(system !== undefined ? { system } : {}),
+      ...(complexity !== undefined ? { complexity } : {}),
+      ...(switchChain ? { switchChain } : {}),
+    },
+  };
+};
+
+/** A trial a crash left running with evidence or spend; its final usage is unknown, so it never reruns. */
+const interrupted = (trial: EvalTrial, reason: string): EvalTrial => ({
+  ...trial,
+  status: "error",
+  pass: false,
+  score: 0,
+  details: {
+    ...trial.details,
+    interrupted: true,
+    reason,
+    ...(trial.details.roundsUsed !== undefined
+      ? { stopReason: reason, grade: trial.details.grade ?? failedImplement("error", reason) }
+      : {}),
+  },
+});
+
 export interface EvalRegradeResult {
   regraded: number;
   /** Regraded trials whose grade differs from the stored one. */
@@ -54,7 +99,7 @@ export class EvalRunner {
     else this.resume();
   }
 
-  /** Evals a restart interrupted continue from their queued trials; in-flight trials rerun. */
+  /** Evals a restart interrupted continue from their queued trials; in-flight trials rerun only if nothing was spent. */
   private resume(): void {
     const { store } = this.deps;
     for (const run of store.listEvalRuns()) {
@@ -74,7 +119,13 @@ export class EvalRunner {
             });
             continue;
           }
-          if (trial.status === "running") store.recordEvalTrial({ ...trial, status: "queued", output: null });
+          if (trial.status === "running") {
+            if (!replayable(trial)) {
+              store.recordEvalTrial(interrupted(trial, "interrupted by daemon restart; final usage unknown"));
+              continue;
+            }
+            store.recordEvalTrial(requeued(trial));
+          }
           pending.add(trial.caseId);
         }
         this.launch(
@@ -361,11 +412,9 @@ export class EvalRunner {
         },
       });
     };
-    // Shutdown leaves the trial queued for the next start; mid-rounds it keeps its evidence instead.
+    // Shutdown leaves an unspent trial queued for the next start; one with spend or evidence keeps it.
     const shutdown = () =>
-      rounds > 1 && (trial.details.roundsUsed ?? 0) > 0
-        ? skip("daemon shutdown")
-        : store.recordEvalTrial({ ...trial, status: "queued", output: null });
+      replayable(trial) ? store.recordEvalTrial(requeued(trial)) : skip("daemon shutdown");
     const budget = () => store.evalSpend(run.id) >= run.maxUsd;
     if (signal.aborted) return shutdown();
     const system =

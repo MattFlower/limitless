@@ -350,11 +350,23 @@ test("shutdown aborts active and waiting trials, releases slots, and preserves p
       expect(resumed?.summaries[0]).toMatchObject({ evaluatedTrials: 3, pending: 0 });
     }
     expect(f.calls.length).toBeGreaterThanOrEqual(4);
-    // A crash leaves a run and one trial running; the restart reruns only that trial, still uncached.
+    // A crash leaves a run and one trial running before its call recorded any usage; the restart reruns
+    // only that trial, still uncached.
     const calls = f.calls.length;
     const crashed = restarted.store.listEvalTrials(run.id)[1];
     if (!crashed) throw new Error("missing trial");
-    restarted.store.recordEvalTrial({ ...crashed, status: "running" });
+    restarted.store.recordEvalTrial({
+      ...crashed,
+      status: "running",
+      output: null,
+      pass: null,
+      score: null,
+      costUsd: 0,
+      costEquivUsd: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+      details: {},
+    });
     restarted.store.updateEvalRun(run.id, "running");
     const again = await f.restart();
     await again.evals.wait(run.id);

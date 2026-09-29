@@ -194,8 +194,10 @@ Runs progress from `queued` to `running`, then `completed`, `budget_exhausted` o
 means execution ended, not that candidates passed. Trial errors and skips remain visible in partial
 reports. Daemon shutdown aborts active calls and releases slots, leaving the run and its unfinished
 trials `queued`; the next start resumes it with its submitted models or systems and `--no-cache`
-setting, rerunning trials that were in flight (their interrupted usage is unknown) and skipping trials
-whose case left the dataset. `--follow` polls until any
+setting, rerunning in-flight trials that had not yet spent anything and skipping trials whose case left
+the dataset. An in-flight trial with recorded spend or round evidence never replays: shutdown leaves it
+skipped (or, mid-rounds, an error keeping its evidence), and a crash leaves it an error with unknown
+final usage. `--follow` polls until any
 terminal state and prints a final report. The Evals UI lists runs, displays per-trial reports, and
 compares latest completed evidence in a roles-by-models eligibility matrix. Other role graders remain pending.
 
