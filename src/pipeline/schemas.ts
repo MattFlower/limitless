@@ -3,13 +3,14 @@ import { z } from "zod";
 /** JSON Schema acceptable to both Claude (--json-schema) and OpenAI strict structured outputs. */
 export function toStrictJsonSchema(schema: z.ZodType): Record<string, unknown> {
   const raw = z.toJSONSchema(schema) as Record<string, unknown>;
-  const clean = (node: unknown): unknown => {
-    if (Array.isArray(node)) return node.map(clean);
+  // Keys of a `properties` map are field names, not keywords, and are never dropped.
+  const clean = (node: unknown, properties = false): unknown => {
+    if (Array.isArray(node)) return node.map((item) => clean(item));
     if (!node || typeof node !== "object") return node;
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-      if (k === "$schema" || k === "minimum" || k === "maximum") continue;
-      out[k] = clean(v);
+      if (!properties && ["$schema", "minimum", "maximum", "default"].includes(k)) continue;
+      out[k] = clean(v, !properties && k === "properties");
     }
     return out;
   };
@@ -243,12 +244,23 @@ export const VerifySchema = z.object({
         .describe(
           "For H-ids, short observed behavior without private inputs or expected values; empty for public criteria",
         ),
+      // Defaults let output recorded before holdouts were classified parse as unclassified, which blocks.
+      requirement: z
+        .enum(["request", "spec", "not_required"])
+        .nullable()
+        .default(null)
+        .describe("For unmet H-ids, what the failure violates; null for every other entry"),
+      requirementCitation: z
+        .string()
+        .default("")
+        .describe("For request/spec, the exact violated text quoted from the request or spec; else empty"),
     }),
   ),
   overall: z.enum(["pass", "fail"]),
   notes: z.string(),
 });
-export type Verify = z.infer<typeof VerifySchema>;
+export type Verify = z.input<typeof VerifySchema>;
+export type HoldoutRequirement = NonNullable<Verify["criteria"][number]["requirement"]>;
 
 export function renderSpec(spec: Spec): string {
   const list = (items: string[]) => (items.length ? items.map((i) => `- ${i}`).join("\n") : "- (none)");

@@ -2112,6 +2112,104 @@ protected_paths = ["protected.txt"]
     expect(firstVerify?.error).not.toContain(secret);
   });
 
+  describe("unmet holdout classification", () => {
+    const secret = "PRIVATE_SCENARIO_INPUT_314";
+    const privateHoldout = {
+      scenarios: holdout.scenarios.map((s) => (s.id === "H-2" ? { ...s, steps: `run ${secret}` } : s)),
+    };
+    const unmetH2 = (extra: Record<string, unknown>) => ({
+      ...pass,
+      criteria: pass.criteria.map((c) =>
+        c.id === "H-2"
+          ? {
+              ...c,
+              status: "unmet",
+              evidence: `ran ${secret}: the file keeps a stale greeting line`,
+              publicSummary: "the file keeps a stale greeting line",
+              ...extra,
+            }
+          : c,
+      ),
+    });
+    const drive = (
+      firstVerify: Record<string, unknown>,
+      onImplement: (prompt: string, call: number) => void,
+    ) => {
+      let verifies = 0;
+      let implementCalls = 0;
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: privateHoldout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") return { structured: ++verifies === 1 ? firstVerify : pass };
+        onImplement(s.prompt, ++implementCalls);
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      return { f, implementCalls: () => implementCalls, verifies: () => verifies };
+    };
+
+    test("a not_required holdout passes verify without another round and is a report follow-up", async () => {
+      const { f, implementCalls, verifies } = drive(
+        unmetH2({ requirement: "not_required", requirementCitation: "" }),
+        () => {},
+      );
+      const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(implementCalls()).toBe(1);
+      expect(verifies()).toBe(1);
+      const report = f.store.getArtifact(run.id, "report.md") ?? "";
+      expect(report).toContain("Holdouts not met: 0 blocking, 1 not required.");
+      expect(report).toContain("**Holdout follow-ups**");
+      expect(report).toContain("- H-2: missing input — ran");
+      expect(report).toContain("unmet (not required)");
+    });
+
+    test.each([
+      ["request", "Add a farewell file", "this requirement of the original request"],
+      ["spec", "farewell.txt exists", "this requirement of the specification"],
+    ])(
+      "an unmet %s holdout fails verify and names the violated requirement",
+      async (requirement, citation, source) => {
+        let checked = false;
+        const { f, implementCalls } = drive(
+          unmetH2({ requirement, requirementCitation: citation }),
+          (prompt, call) => {
+            if (call !== 2) return;
+            expect(prompt).toContain(`**H-2** violates ${source}: "${citation}"`);
+            expect(prompt).toContain("Observed failure: the file keeps a stale greeting line");
+            expect(prompt).not.toContain(secret);
+            expect(prompt).not.toContain("missing input");
+            expect(prompt).not.toContain("[private detail]");
+            checked = true;
+          },
+        );
+        const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        expect(implementCalls()).toBe(2);
+        expect(checked).toBe(true);
+      },
+    );
+
+    test("verifier output without a requirement field stays blocking on replay", async () => {
+      let checked = false;
+      const { f, implementCalls } = drive(unmetH2({}), (prompt, call) => {
+        if (call !== 2) return;
+        expect(prompt).toContain("private scenario (unmet): the file keeps a stale greeting line");
+        expect(prompt).not.toContain(secret);
+        checked = true;
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(implementCalls()).toBe(2);
+      expect(checked).toBe(true);
+      const first = f.store.getRunState<RunState>(run.id)?.verifyResults?.[0];
+      expect(first?.overall).toBe("fail");
+      expect(first?.criteria.find((c) => c.id === "H-2")?.requirement).toBeNull();
+    });
+  });
+
   test("needs-human delivery includes failed holdouts and restores full verify evidence", async () => {
     const secret = "PRIVATE_FAILURE_CASE_872";
     const privateHoldout = {

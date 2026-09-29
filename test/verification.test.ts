@@ -5,7 +5,13 @@ import {
   redactHoldoutText,
   verifyPrompt,
 } from "../src/pipeline/prompts.ts";
-import { type Holdout, type Spec, VerifySchema } from "../src/pipeline/schemas.ts";
+import {
+  type Holdout,
+  type Spec,
+  toStrictJsonSchema,
+  type Verify,
+  VerifySchema,
+} from "../src/pipeline/schemas.ts";
 import { blockedOnly, normalizeVerify } from "../src/pipeline/verification.ts";
 
 const spec: Spec = {
@@ -102,7 +108,7 @@ test("explicit blocked needs evidence; complete unique met coverage alone can pa
       notes: "",
     }).success,
   ).toBe(false);
-  const verified = VerifySchema.parse({
+  const verified: Verify = VerifySchema.parse({
     criteria: [
       {
         id: "AC-1",
@@ -348,4 +354,108 @@ test("verifier cites the factory's gate results instead of rerunning whole suite
   expect(verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" })).not.toContain(
     "Repository checks",
   );
+});
+
+const unmetHoldout = (extra: Partial<Verify["criteria"][number]>): Verify => ({
+  criteria: [
+    { id: "AC-1", status: "met", evidence: "ok", publicSummary: "" },
+    {
+      id: "H-1",
+      status: "unmet",
+      evidence: "secret input failed",
+      publicSummary: "rejects an empty list",
+      ...extra,
+    },
+  ],
+  overall: "fail",
+  notes: "",
+});
+
+test("verifier classifies unmet holdouts against the request and spec, citing public text", () => {
+  const prompt = verifyPrompt({
+    prompt: "make it work",
+    spec: { ...spec, requirements: ["empty lists are accepted"] },
+    holdout,
+    baseSha: "abc",
+  });
+  expect(prompt).toContain("# Specification requirements\n- empty lists are accepted");
+  expect(prompt).toContain("For every unmet H-id, set requirement:");
+  for (const value of ["- request:", "- spec:", "- not_required:"]) expect(prompt).toContain(value);
+  expect(prompt).toContain("set requirementCitation to the violated text quoted exactly");
+  expect(prompt).toContain("cite that text in evidence");
+  const item = (toStrictJsonSchema(VerifySchema) as { properties: { criteria: { items: unknown } } })
+    .properties.criteria.items as { required: string[]; properties: Record<string, Record<string, unknown>> };
+  expect(item.required).toEqual(expect.arrayContaining(["requirement", "requirementCitation"]));
+  expect(JSON.stringify(item.properties.requirement)).toContain("not_required");
+  expect(item.properties.requirement).not.toHaveProperty("default");
+});
+
+test("only unmet holdouts classified request or spec block the verdict", () => {
+  expect(normalizeVerify(unmetHoldout({ requirement: "not_required" }), spec, holdout).overall).toBe("pass");
+  for (const requirement of ["request", "spec"] as const)
+    expect(normalizeVerify(unmetHoldout({ requirement }), spec, holdout).overall).toBe("fail");
+  // Output recorded before classification existed parses as unclassified and keeps blocking.
+  const legacy = VerifySchema.parse(unmetHoldout({}));
+  expect(legacy.criteria[1]?.requirement).toBeNull();
+  expect(normalizeVerify(legacy, spec, holdout).overall).toBe("fail");
+  expect(normalizeVerify(unmetHoldout({}), spec, holdout).overall).toBe("fail");
+  // The exemption never applies to acceptance criteria, unclear holdouts, or duplicate rows.
+  const acUnmet = unmetHoldout({ requirement: "not_required" });
+  acUnmet.criteria[0] = {
+    id: "AC-1",
+    status: "unmet",
+    evidence: "x",
+    publicSummary: "",
+    requirement: "not_required",
+  };
+  expect(normalizeVerify(acUnmet, spec, holdout).overall).toBe("fail");
+  expect(normalizeVerify(acUnmet, spec, holdout).criteria[0]?.requirement).toBeNull();
+  expect(
+    normalizeVerify(unmetHoldout({ status: "unclear", requirement: "not_required" }), spec, holdout).overall,
+  ).toBe("fail");
+  const duplicate = unmetHoldout({ requirement: "not_required" });
+  duplicate.criteria.push({ id: "AC-1", status: "met", evidence: "ok", publicSummary: "" });
+  expect(normalizeVerify(duplicate, spec, holdout).overall).toBe("fail");
+  const missing = unmetHoldout({ requirement: "not_required" });
+  missing.criteria.shift();
+  expect(normalizeVerify(missing, spec, holdout).overall).toBe("fail");
+});
+
+test("an environment block still stops or retries alongside a not_required holdout", () => {
+  const verify = unmetHoldout({ requirement: "not_required" });
+  verify.criteria[0] = { id: "AC-1", status: "blocked", evidence: "EPERM mkdir", publicSummary: "" };
+  const normalized = normalizeVerify(verify, spec, holdout);
+  expect(normalized.overall).toBe("fail");
+  expect(blockedOnly(normalized)).toBe(true);
+  expect(blockedOnly(normalizeVerify(unmetHoldout({ requirement: "spec" }), spec, holdout))).toBe(false);
+});
+
+test("feedback names the violated public requirement and omits not_required holdouts", () => {
+  const publicSources = "make it work\n## Requirements\n- empty lists are accepted";
+  const blocking = formatVerifyFeedback(
+    unmetHoldout({ requirement: "spec", requirementCitation: '"Empty lists are accepted."' }),
+    spec,
+    holdout,
+    publicSources,
+  );
+  expect(blocking).toContain(
+    '**H-1** violates this requirement of the specification: "Empty lists are accepted"',
+  );
+  expect(blocking).toContain("Observed failure: rejects an empty list");
+  expect(blocking).not.toContain("secret input");
+  expect(blocking).not.toContain("private detail");
+  // A citation that is not verbatim public text could carry the scenario, so it is withheld.
+  const paraphrase = formatVerifyFeedback(
+    unmetHoldout({ requirement: "request", requirementCitation: "handle secret input" }),
+    spec,
+    holdout,
+    publicSources,
+  );
+  expect(paraphrase).toContain(
+    "violates a requirement of the original request (the verifier's citation was not public text)",
+  );
+  expect(paraphrase).not.toContain("secret input");
+  expect(
+    formatVerifyFeedback(unmetHoldout({ requirement: "not_required" }), spec, holdout, publicSources),
+  ).toBe("");
 });

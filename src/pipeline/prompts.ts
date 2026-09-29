@@ -218,7 +218,13 @@ export function formatVerifyFeedback(
   holdout?: Holdout,
   publicSources = "",
 ): string {
-  const unmet = verify.criteria.filter((c) => c.status !== "met" && c.status !== "blocked");
+  // Not-required holdouts are follow-up notes for the report; fixing them only adds code.
+  const unmet = verify.criteria.filter(
+    (c) =>
+      c.status !== "met" &&
+      c.status !== "blocked" &&
+      !(c.status === "unmet" && c.requirement === "not_required"),
+  );
   if (!unmet.length) return "";
   const text = (id: string) => spec?.acceptance_criteria.find((a) => a.id === id)?.criterion ?? "";
   return `### Checks not met\n${unmet
@@ -230,11 +236,34 @@ export function formatVerifyFeedback(
       const safeSummary = /[\p{L}\p{N}]/u.test(behavior)
         ? summary
         : `The verifier could not confirm this private scenario.${summary.match(/ \[\d+ private details withheld\]$/)?.[0] ?? ""}`;
-      return privateScenario
-        ? `- **${c.id}** private scenario (${c.status}): ${safeSummary}`
-        : `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
+      if (!privateScenario) return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
+      if (c.status !== "unmet" || (c.requirement !== "request" && c.requirement !== "spec"))
+        return `- **${c.id}** private scenario (${c.status}): ${safeSummary}`;
+      return `- **${c.id}** violates ${violatedRequirement(c.requirement, c.requirementCitation ?? "", holdout, publicSources)}\n  Observed failure: ${safeSummary}`;
     })
     .join("\n")}`;
+}
+
+/**
+ * The cited text is shown only when it is a verbatim quote of the public request or spec (which
+ * `publicSources` contains) that redaction leaves intact: a paraphrase could carry scenario text.
+ */
+function violatedRequirement(
+  requirement: "request" | "spec",
+  citation: string,
+  holdout: Holdout | undefined,
+  publicSources: string,
+): string {
+  const source = requirement === "request" ? "the original request" : "the specification";
+  const flat = (s: string) => s.replace(/\s+/g, " ").toLowerCase();
+  const quote = citation
+    .trim()
+    .replace(/^["'“”`]+|["'“”`.]+$/g, "")
+    .replace(/\s+/g, " ");
+  const verbatim = quote.length > 0 && flat(publicSources).includes(flat(quote));
+  if (!verbatim || !holdout || redactHoldoutText(quote, holdout, publicSources) !== quote)
+    return `a requirement of ${source} (the verifier's citation was not public text)`;
+  return `this requirement of ${source}: "${quote}"`;
 }
 
 function gateTable(cmp: GateComparison[]): string {
@@ -402,6 +431,9 @@ export function verifyPrompt(input: {
 # Original request
 ${quoteRequest(input.prompt)}
 
+# Specification requirements
+${input.spec.requirements.length ? input.spec.requirements.map((r) => `- ${r}`).join("\n") : "- (none)"}
+
 # Acceptance criteria
 ${input.spec.acceptance_criteria.map((a) => `- **${a.id}** ${a.criterion}\n  - how to verify: ${a.how_to_verify}`).join("\n")}
 
@@ -409,5 +441,11 @@ ${input.spec.acceptance_criteria.map((a) => `- **${a.id}** ${a.criterion}\n  - h
 ${input.holdout.scenarios.map((s) => `- **${s.id}** ${s.description}\n  - steps: ${s.steps}\n  - expected: ${s.expected}`).join("\n")}
 ${checks}
 The change is \`git diff ${input.baseSha}..HEAD\`. Do not modify repository files (create temporary fixtures and redirect supported build/test outputs under TMPDIR only, also supplied as TMP and TEMP).
-For each acceptance criterion and holdout scenario return met / unmet / unclear / blocked with concrete evidence (the command you ran and what you observed, or file:line references) and publicSummary. For each H-id, publicSummary must be a short description of observed behavior without private inputs, expected values, or scenario text; use an empty string for public criteria. Use blocked only when an attempted check cannot execute because of an environmental permission or sandbox error; include the attempted command and observed error in nonempty evidence. Expected permission-denial tests and genuine assertion failures are not environment blocks. For unmet holdouts, describe the observed failure in evidence without repeating the scenario text or private inputs. overall = "pass" only if every entry is met.`;
+For each acceptance criterion and holdout scenario return met / unmet / unclear / blocked with concrete evidence (the command you ran and what you observed, or file:line references) and publicSummary. For each H-id, publicSummary must be a short description of observed behavior without private inputs, expected values, or scenario text; use an empty string for public criteria. Use blocked only when an attempted check cannot execute because of an environmental permission or sandbox error; include the attempted command and observed error in nonempty evidence. Expected permission-denial tests and genuine assertion failures are not environment blocks. For unmet holdouts, describe the observed failure in evidence without repeating the scenario text or private inputs.
+Holdout scenarios are written by another model and can over-reach. For every unmet H-id, set requirement:
+- request: the observed behavior violates something the original request asks for or clearly implies;
+- spec: it violates a stated specification requirement or acceptance criterion;
+- not_required: the scenario's expectation is implied by neither (invented, over-specified, or contradicting how this codebase already works), or it cannot be run as written in this repository.
+For request or spec, set requirementCitation to the violated text quoted exactly from the original request or the specification above, and cite that text in evidence too. Otherwise use an empty requirementCitation. Use requirement null for every entry that is not an unmet H-id.
+overall = "pass" only if every entry is met, apart from unmet holdouts classified not_required.`;
 }
