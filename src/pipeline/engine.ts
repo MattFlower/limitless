@@ -64,6 +64,7 @@ import {
   type ReviewRequest,
   reviewFindingKey,
   runReview,
+  type VerifierRequest,
 } from "./review.ts";
 import { productionReviewSystem } from "./review-system.ts";
 import {
@@ -841,9 +842,11 @@ async function oneRound(
       const replayed = (ctx.state.reviewHistory ?? []).find(
         (e) => e.round === round && e.sha === reviewedSha,
       );
+      const system = ctx.deps.reviewSystem ?? productionReviewSystem(ctx.deps.cfg);
       const input: ReviewInput = {
         timeoutMs: readingTimeout(diff.added + diff.removed),
         replayedFollowUps: replayed?.followUps,
+        system,
         prompt: {
           prompt: ctx.run.prompt,
           spec: ctx.state.spec ?? null,
@@ -853,7 +856,7 @@ async function oneRound(
           gates: comparison,
           audit,
           implementerReport: ctx.state.implementerReport ?? "",
-          implementerReportMode: productionReviewSystem(ctx.deps.cfg).implementerReport,
+          implementerReportMode: system.implementerReport,
           externalChange: ctx.state.flow === "verify-change",
           dependencyUpdate:
             ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
@@ -862,20 +865,31 @@ async function oneRound(
           resolution: ctx.state.conflictRound === round,
         },
       };
-      const invoke = async (request: ReviewRequest) => {
+      const call = async (
+        request: ReviewRequest | VerifierRequest,
+        avoidVendor: string | undefined,
+        prefer: string | undefined,
+      ) => {
         const invoked = await ctx.invoke({
           role: "review",
           stage,
           mode: "readonly",
           complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
-          constraints: { avoidVendor: ctx.state.implementer?.vendor },
+          constraints: { avoidVendor, ...(prefer ? { prefer } : {}) },
           ...request,
           requireStructured: true,
         });
         await discardChanges(cwd);
         return invoked;
       };
-      const { target, output, decision } = await runReview({ invoke }, input);
+      const { target, output, decision, panel } = await runReview(
+        {
+          invoke: (request, finder) =>
+            call(request, ctx.state.implementer?.vendor, system.finders[finder]?.target),
+          verify: (request, avoidVendor) => call(request, avoidVendor, system.verifier?.target),
+        },
+        input,
+      );
       if (!decision) throw output.error;
       // The model's verdict is kept for inspection only; control flow uses the derived one.
       const { review: r, modelVerdict, blocking, followUps } = decision;
@@ -896,7 +910,19 @@ async function oneRound(
         ctx.run.id,
         `review-${round}.json`,
         "review",
-        JSON.stringify({ ...r, modelVerdict, model: target.modelId, round, reviewedSha, blocking }, null, 2),
+        JSON.stringify(
+          {
+            ...r,
+            modelVerdict,
+            model: target.modelId,
+            round,
+            reviewedSha,
+            blocking,
+            ...(panel ? { panel } : {}),
+          },
+          null,
+          2,
+        ),
       );
       const serious = blocking.length;
       return {

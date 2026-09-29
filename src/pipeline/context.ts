@@ -12,6 +12,7 @@ import type {
   Invocation,
   ModelSelection,
   Repo,
+  ReviewSystem,
   Role,
   Run,
   RunEvent,
@@ -45,6 +46,8 @@ export interface EngineDeps {
   router: Router;
   tracker: ProviderTracker;
   harnesses: Record<string, Harness>;
+  /** Overrides the production review system (`single`, from `[review]`); tests run panels this way. */
+  reviewSystem?: ReviewSystem;
 }
 
 export type Phase = "prepare" | "triage" | "clarify" | "spec" | "loop" | "deliver" | "done";

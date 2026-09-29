@@ -4,11 +4,17 @@ import type { EvalRun, EvalTrial } from "../core/types.ts";
 import { createEvalWorktree, type EvalLabels, pinnedTree, snapshotTopLevel } from "../git/repos.ts";
 import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
-import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
+import {
+  type AgentResult,
+  type AgentSpec,
+  emptyUsage,
+  extractJson,
+  type ModelTarget,
+} from "../harness/types.ts";
 import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
-import { type ReviewRequest, runReview } from "../pipeline/review.ts";
-import { toStrictJsonSchema } from "../pipeline/schemas.ts";
+import { type ReviewRequest, runReview, type VerifierRequest } from "../pipeline/review.ts";
+import { StoredReviewSchema, toStrictJsonSchema } from "../pipeline/schemas.ts";
 import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
 import { cacheKey, reviewSystemHash } from "./cache.ts";
 import {
@@ -386,7 +392,22 @@ export class EvalRunner {
       const preparationMs = Date.now() - preparationStarted;
       let { prompt } = prepared;
       const { timeoutMs } = prepared;
-      const reviewInput = "review" in prepared ? prepared.review : undefined;
+      const reviewInput =
+        "review" in prepared && prepared.review
+          ? { ...prepared.review, ...(system ? { system } : {}) }
+          : undefined;
+      // Panel targets beyond the trial's own (its first finder) are pinned in the system.
+      const pinned = (id: string | undefined) => {
+        const { model: pinnedModel, effort: pinnedEffort } = router.resolve(id ?? "");
+        return router.toTarget(pinnedModel, pinnedEffort);
+      };
+      const panelTargets =
+        system?.mode === "panel"
+          ? {
+              finders: system.finders.slice(1).map((f) => pinned(f.target)),
+              verifier: pinned(system.verifier?.target),
+            }
+          : undefined;
       const schema = "hidden" in item ? undefined : schemaFor(item);
       const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
@@ -492,16 +513,25 @@ export class EvalRunner {
         for (let attempt = 0; ; attempt++) {
           try {
             const logPath = join(directory, "trial.log");
-            const invoke = (scratchDir?: string, request = { prompt, jsonSchema, schema, timeoutMs }) =>
-              harness({
+            const invoke = (
+              scratchDir?: string,
+              request: Pick<AgentSpec, "prompt" | "jsonSchema" | "schema" | "timeoutMs"> = {
+                prompt,
+                jsonSchema,
+                schema,
+                timeoutMs,
+              },
+              to = { target, harness, noTools },
+            ) =>
+              to.harness({
                 scratchDir,
                 ...(sessionId ? { resumeSessionId: sessionId } : {}),
                 cwd,
                 ...request,
                 systemAppend: FACTORY_PREAMBLE,
-                target,
+                target: to.target,
                 mode: "hidden" in item ? "edit" : "readonly",
-                noTools,
+                noTools: to.noTools,
                 privateSession: run.role === "verify",
                 idleTimeoutMs: 10 * 60_000,
                 maxToolCalls: "hidden" in item ? 400 : 150,
@@ -516,20 +546,38 @@ export class EvalRunner {
                     typeof event.input.command === "string"
                   )
                     toolCommands.push(event.input.command);
-                  if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
+                  if (event.type === "rate_limit") tracker.observeWindows(to.target.provider, event.windows);
                 },
               });
-            const send = (request?: ReviewRequest) =>
-              noTools
-                ? invoke(undefined, request)
+            const send = (request?: ReviewRequest | VerifierRequest, to = { target, harness, noTools }) =>
+              to.noTools
+                ? invoke(undefined, request, to)
                 : scratch
-                  ? invoke(scratch, request)
-                  : withScratch(cwd, (dir) => invoke(dir, request));
+                  ? invoke(scratch, request, to)
+                  : withScratch(cwd, (dir) => invoke(dir, request, to));
+            const sendTo = async (request: ReviewRequest | VerifierRequest, to: ModelTarget) => {
+              const picked = selectHarness(run.role, to);
+              const agent = harnesses[picked.harnessName];
+              if (!agent) throw new Error(`No harness registered for ${picked.harnessName}`);
+              return {
+                result: await send(request, { target: to, harness: agent, noTools: picked.noTools }),
+                target: to,
+              };
+            };
             // First-round review cases go through the pipeline's review entry point.
             result = reviewInput
               ? (
                   await runReview(
-                    { invoke: async (request) => ({ result: await send(request) }) },
+                    {
+                      invoke: async (request, finder) => {
+                        const to = finder > 0 ? panelTargets?.finders[finder - 1] : undefined;
+                        return to ? sendTo(request, to) : { result: await send(request), target };
+                      },
+                      verify: async (request) => {
+                        if (!panelTargets) throw new Error("review system has no verifier");
+                        return sendTo(request, panelTargets.verifier);
+                      },
+                    },
                     reviewInput,
                   )
                 ).result
@@ -602,7 +650,10 @@ export class EvalRunner {
         )
           tracker.blockModel(target.modelId, result.error ?? "model rejected");
         if (signal.aborted) return skip("daemon shutdown");
-        const output = schema?.safeParse(result.structured ?? extractJson(result.finalText));
+        // A panel's result is its derived review, whose verification fields only the stored schema keeps.
+        const output = (system?.mode === "panel" ? StoredReviewSchema : schema)?.safeParse(
+          result.structured ?? extractJson(result.finalText),
+        );
         const ok = result.status === "ok" && ("hidden" in item || output?.success === true);
         const grade =
           "hidden" in effective && implementation

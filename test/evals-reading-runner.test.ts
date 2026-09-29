@@ -357,6 +357,74 @@ test("review trials need v2 fields and keep the model's verdict, and pre-v2 stor
   }
 });
 
+test("panel systems run finders and a pinned verifier end to end, grading what the panel blocks", async () => {
+  const f = await fixture();
+  try {
+    const verdict = { current: "CONFIRMED" };
+    f.respond((s) => {
+      if (!s.prompt.includes("code-review verifier")) return { structured: reviewOutput(), costUsd: 0.1 };
+      const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1]);
+      const results = ids.map((id) => ({
+        id,
+        verdict: verdict.current,
+        severity: "low",
+        category: "correctness",
+        evidence: "src/a.ts:10 `bug()`",
+        trigger: "any input -> wrong result",
+      }));
+      return { structured: { results }, costUsd: 0.1 };
+    });
+    const systems = [
+      {
+        name: "panel",
+        mode: "panel",
+        finders: [
+          { target: "candidate-a", prompt: "standard" },
+          { target: "candidate-b", prompt: "standard" },
+        ],
+        verifier: { target: "candidate-b" },
+        implementerReport: "include",
+      },
+      {
+        name: "single",
+        mode: "single",
+        finders: [{ target: "candidate-a", prompt: "standard" }],
+        implementerReport: "include",
+      },
+    ];
+    const report = await f.run({ models: undefined, systems, cache: false });
+    expect(report.trials.map((t) => [t.details.system, t.status, t.pass])).toEqual([
+      ["panel", "ok", true],
+      ["single", "ok", true],
+    ]);
+    // Two finders, one verifier batch (same file and vendor) holding both candidates, then the single system.
+    expect(f.calls.map((s) => [s.target.modelId, s.prompt.includes("code-review verifier"), s.mode])).toEqual(
+      [
+        ["candidate-a", false, "readonly"],
+        ["candidate-b", false, "readonly"],
+        ["candidate-b", true, "readonly"],
+        ["candidate-a", false, "readonly"],
+      ],
+    );
+    expect(f.calls[2]?.prompt).toContain('"id": "C2"');
+    const panel = report.trials[0];
+    expect(panel?.output).toMatchObject({
+      mode: "panel",
+      findings: [{ verification: { verdict: "CONFIRMED" } }, {}],
+    });
+    expect(panel?.costUsd).toBeCloseTo(0.3);
+    // A refuted defect does not block, so the panel misses it.
+    verdict.current = "REFUTED";
+    const refuted = await f.run({ models: undefined, systems: [systems[0]], cache: false });
+    expect(refuted.trials.map((t) => [t.status, t.pass, t.details.grade?.review?.requestChanges])).toEqual([
+      ["ok", false, false],
+    ]);
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
 test("first-round review trials go through the pipeline's runReview", async () => {
   const f = await fixture();
   const run = spyOn(review, "runReview");

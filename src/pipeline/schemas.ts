@@ -165,15 +165,37 @@ const rejectDegenerate =
 export const ReviewSchema = reviewBase.superRefine(rejectDegenerate(MIN_REVIEW_SUMMARY));
 export const LaterReviewSchema = laterReviewBase.superRefine(rejectDegenerate(MIN_LATER_REVIEW_SUMMARY));
 
+/** A panel verifier's ruling on one finder candidate; its severity, not the finder's, is authoritative. */
+const VerificationSchema = z.object({
+  verdict: z.enum(["CONFIRMED", "PLAUSIBLE", "REFUTED"]),
+  evidence: z
+    .string()
+    .trim()
+    .min(1)
+    .describe("Quoted code with file:line that supports or disproves the claim"),
+  trigger: z.string().trim().min(1).describe("Inputs or state -> the wrong outcome"),
+  severity: z.enum(["critical", "high", "medium", "low"]),
+  category: FindingCategoryEnum,
+});
+export type Verification = z.infer<typeof VerificationSchema>;
+
+export const VerifierSchema = z.object({
+  results: z.array(VerificationSchema.extend({ id: z.string().describe("The candidate id, e.g. C3") })),
+});
+
 type LiveFinding = z.infer<typeof ReviewSchema>["findings"][number];
 type FindingV2Field = keyof typeof findingV2;
 
 /** Findings in run state may predate schema v2, so its fields stay optional once stored. */
 export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
+  /** Set by panel reviews, whose findings block by verification instead of finder severity. */
+  mode?: "panel";
   findings: (Omit<LiveFinding, FindingV2Field> &
     Partial<Pick<LiveFinding, FindingV2Field>> & {
       label?: z.infer<typeof LaterReviewSchema>["findings"][number]["label"];
       prior?: string;
+      /** Panel only; absent when the candidate was not verified (capped, cleanup or conventions). */
+      verification?: Verification;
     })[];
 };
 
@@ -185,6 +207,7 @@ export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
 export const StoredReviewSchema = reviewBase
   .extend({
     verdict: reviewBase.shape.verdict.optional(),
+    mode: z.literal("panel").optional(),
     summary: z.string().default(""),
     findings: z.array(
       reviewBase.shape.findings.element.extend({
@@ -193,6 +216,7 @@ export const StoredReviewSchema = reviewBase
         detail: z.string().default(""),
         suggestion: z.string().default(""),
         ...z.object(findingV2).partial().shape,
+        verification: VerificationSchema.optional(),
       }),
     ),
   })

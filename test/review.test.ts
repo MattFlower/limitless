@@ -3,11 +3,20 @@ import { emptyUsage } from "../src/harness/types.ts";
 import { reviewPrompt } from "../src/pipeline/prompts.ts";
 import {
   blockingReviewFindings,
+  PANEL_VERIFY_CAP,
   type ReviewRequest,
   reviewVerdict,
   runReview,
+  type VerifierRequest,
 } from "../src/pipeline/review.ts";
-import { LaterReviewSchema, type Review, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import {
+  LaterReviewSchema,
+  type Review,
+  ReviewSchema,
+  toStrictJsonSchema,
+  type Verification,
+  VerifierSchema,
+} from "../src/pipeline/schemas.ts";
 import { findingEvidence } from "./review-support.ts";
 
 const finding = (severity: Review["findings"][number]["severity"], security = false) => ({
@@ -355,4 +364,200 @@ describe("runReview", () => {
       ])
         expect(reviewPrompt(prompt)).toContain(text);
     });
+});
+
+describe("panel decision", () => {
+  const verified = (
+    verdict: Verification["verdict"],
+    severity: Verification["severity"],
+    category = "correctness",
+  ) =>
+    ({
+      ...finding("minor"),
+      verification: {
+        verdict,
+        severity,
+        category,
+        evidence: "src/example.ts:1 `x()`",
+        trigger: "empty input -> crash",
+      },
+    }) as Review["findings"][number];
+  for (const [verdict, severity, category, firstRound, laterRound] of [
+    ["CONFIRMED", "low", "correctness", true, false],
+    ["CONFIRMED", "high", "correctness", true, true],
+    ["PLAUSIBLE", "high", "correctness", true, true],
+    ["PLAUSIBLE", "critical", "security", true, true],
+    ["PLAUSIBLE", "medium", "correctness", false, false],
+    ["PLAUSIBLE", "low", "correctness", false, false],
+    ["REFUTED", "critical", "correctness", false, false],
+    ["CONFIRMED", "high", "cleanup", false, true],
+    ["CONFIRMED", "medium", "conventions", false, false],
+  ] as const) {
+    test(`${verdict} ${severity} ${category}`, () => {
+      const review: Review = {
+        mode: "panel",
+        verdict: "approve",
+        summary: "s",
+        findings: [verified(verdict, severity, category)],
+      };
+      expect(blockingReviewFindings(review).length > 0).toBe(firstRound);
+      expect(blockingReviewFindings(review, [finding("major")]).length > 0).toBe(laterRound);
+    });
+  }
+
+  test("unverified panel findings never block round 1, whatever the finder's severity", () => {
+    const review: Review = {
+      mode: "panel",
+      verdict: "approve",
+      summary: "s",
+      findings: [finding("blocker")],
+    };
+    expect(blockingReviewFindings(review)).toEqual([]);
+    // Later rounds keep the label rules.
+    const regression = { ...finding("nit"), label: "regression" as const };
+    expect(blockingReviewFindings({ ...review, findings: [regression] }, [finding("major")])).toHaveLength(1);
+  });
+});
+
+describe("runReview panel", () => {
+  const ok = (structured: unknown, vendor: string) => ({
+    result: {
+      status: "ok" as const,
+      finalText: "",
+      structured,
+      sessionId: null,
+      usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
+      numTurns: 1,
+      costUsd: 0.5,
+      costEquivUsd: 0,
+      error: null,
+      quota: null,
+    },
+    target: { vendor },
+  });
+  const candidate = (file: string, n: number, severity: Review["findings"][number]["severity"] = "major") => {
+    const { label: _label, prior: _prior, ...f } = finding(severity);
+    return { ...f, file, line: n, title: `Issue ${file} ${n}`, detail: `SECRET_DETAIL_${n}` };
+  };
+  const ids = (text: string) => [...text.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+  const panel = async (
+    found: unknown[][],
+    rule: (id: string) => Omit<Verification, "category"> & { category?: Verification["category"] },
+    input: Partial<Parameters<typeof runReview>[1]> = {},
+  ) => {
+    const verifications: { request: VerifierRequest; avoidVendor?: string }[] = [];
+    const vendors = ["anthropic", "openai"];
+    const out = await runReview(
+      {
+        invoke: async (_request, index) =>
+          ok(
+            { verdict: "request_changes", summary: "Checked everything.", findings: found[index] },
+            vendors[index] ?? "",
+          ),
+        verify: async (request, avoidVendor) => {
+          verifications.push({ request, avoidVendor });
+          return ok(
+            { results: ids(request.prompt).map((id) => ({ id, category: "correctness", ...rule(id) })) },
+            "google",
+          );
+        },
+      },
+      {
+        prompt: { ...prompt, implementerReport: "SECRET_REPORT", headSha: "head" },
+        timeoutMs: 1,
+        system: { mode: "panel", finders: found.map(() => ({ prompt: "standard" as const })) },
+        ...input,
+      },
+    );
+    return { out, verifications };
+  };
+  const confirmed = {
+    verdict: "CONFIRMED",
+    severity: "low",
+    evidence: "src/a.ts:3 `a()`",
+    trigger: "x -> y",
+  } as const;
+
+  test("batches by file and finder vendor, at most five per call, with only the allowed fields", async () => {
+    const { out, verifications } = await panel(
+      [
+        [...[1, 2, 3, 4, 5, 6].map((n) => candidate("src/a.ts", n)), candidate("src/b.ts", 7)],
+        [candidate("src/a.ts", 8), { ...candidate("src/c.ts", 9), category: "cleanup" }],
+      ],
+      () => confirmed,
+    );
+    expect(verifications.map((v) => [v.avoidVendor, ids(v.request.prompt)])).toEqual([
+      ["anthropic", ["C1", "C2", "C3", "C4", "C5"]],
+      ["anthropic", ["C6"]],
+      ["anthropic", ["C7"]],
+      ["openai", ["C8"]],
+    ]);
+    const [first] = verifications;
+    expect(first?.request.schema).toBe(VerifierSchema);
+    for (const text of ["# Original request", "Base: a. Head: head.", "failure_scenario", "Issue src/a.ts 1"])
+      expect(first?.request.prompt).toContain(text);
+    for (const hidden of ["SECRET_DETAIL", "SECRET_REPORT", "Fix it", '"severity"', "confidence"])
+      expect(verifications.some((v) => v.request.prompt.includes(hidden))).toBe(false);
+    // Cleanup is never verified: an unverified follow-up. CONFIRMED lows all block in round 1.
+    expect(out.decision?.blocking).toHaveLength(8);
+    expect(out.decision?.followUps.map((f) => f.title)).toEqual(["Issue src/c.ts 9"]);
+    expect(out.result.costUsd).toBe(3);
+    expect(out.result.structured).toMatchObject({ mode: "panel", verdict: "request_changes" });
+  });
+
+  test("refuted findings drop out but stay in the record; missing verdicts stay unverified", async () => {
+    const { out } = await panel([[candidate("src/a.ts", 1, "blocker"), candidate("src/a.ts", 2)]], (id) =>
+      id === "C1"
+        ? {
+            verdict: "REFUTED",
+            severity: "critical",
+            evidence: "src/a.ts:1 `if (!x) return`",
+            trigger: "none",
+          }
+        : {
+            verdict: "PLAUSIBLE",
+            severity: "medium",
+            evidence: "src/a.ts:2 `y()`",
+            trigger: "race -> stale read",
+          },
+    );
+    expect(out.decision?.review.verdict).toBe("approve");
+    expect(out.decision?.blocking).toEqual([]);
+    expect(out.decision?.followUps.map((f) => [f.title, f.verification?.verdict])).toEqual([
+      ["Issue src/a.ts 2", "PLAUSIBLE"],
+    ]);
+    expect(out.panel?.refuted).toEqual(["C1"]);
+    expect(out.panel?.candidates.map((c) => [c.id, c.detail])).toEqual([
+      ["C1", "SECRET_DETAIL_1"],
+      ["C2", "SECRET_DETAIL_2"],
+    ]);
+    expect(out.panel?.verdicts.map((v) => [v.id, v.verdict])).toEqual([
+      ["C1", "REFUTED"],
+      ["C2", "PLAUSIBLE"],
+    ]);
+  });
+
+  test("over the cap, the lowest finder severities go unverified to the ledger", async () => {
+    const severities = ["nit", "blocker", "minor", "major"] as const;
+    const found = Array.from({ length: 24 }, (_, i) => candidate(`src/f${i}.ts`, i + 1, severities[i % 4]));
+    const { out, verifications } = await panel([found], () => confirmed);
+    const sent = verifications.flatMap((v) => ids(v.request.prompt));
+    expect(sent).toHaveLength(PANEL_VERIFY_CAP);
+    const nits = found.flatMap((f, i) => (f.severity === "nit" ? [`C${i + 1}`] : []));
+    expect(out.panel?.capped).toEqual(nits.slice(2));
+    expect(sent).not.toEqual(expect.arrayContaining(nits.slice(2)));
+    expect(out.decision?.blocking).toHaveLength(20);
+    expect(out.decision?.followUps.map((f) => f.verification)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+
+  test("an invalid verifier result fails the review instead of approving it", async () => {
+    const { out } = await panel([[candidate("src/a.ts", 1)]], () => ({ ...confirmed, evidence: " " }));
+    expect(out.decision).toBeUndefined();
+    expect(out.output.success).toBe(false);
+  });
 });
