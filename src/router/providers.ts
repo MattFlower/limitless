@@ -319,14 +319,14 @@ export class ProviderTracker {
       : null;
   }
 
-  blockModel(modelId: string, reason: string, ms = 24 * 60 * 60 * 1000): void {
-    this.modelBlocks.set(modelId, { until: this.clock() + ms, reason: reason.slice(0, 200) });
+  blockModel(modelId: string, reason: string, ms = 24 * 60 * 60 * 1000, label = "model rejected"): void {
+    this.modelBlocks.set(modelId, { until: this.clock() + ms, reason: `${label}: ${reason.slice(0, 200)}` });
     this.refreshAlerts();
   }
 
   modelUnavailableReason(modelId: string, now = this.clock()): string | null {
     const block = this.modelBlocks.get(modelId);
-    return block && block.until > now ? `model rejected: ${block.reason}` : null;
+    return block && block.until > now ? block.reason : null;
   }
 
   isAvailable(id: string): boolean {
@@ -441,12 +441,20 @@ export class ProviderTracker {
   record(
     id: string,
     status: InvocationStatus,
-    detail?: { exhaustedUntil?: number | null; error?: string | null },
+    detail?: {
+      exhaustedUntil?: number | null;
+      error?: string | null;
+      /** A per-model rate limit (AgentResult.modelCooldownMs) leaves the provider's other models routable. */
+      modelCooldown?: { modelId: string; ms: number };
+    },
   ): void {
     const p = this.providers.get(id);
     if (!p) return;
     const now = this.clock();
-    if (status === "quota") {
+    if (status === "quota" && detail?.modelCooldown) {
+      const { modelId, ms } = detail.modelCooldown;
+      this.blockModel(modelId, detail.error ?? "rate limited", ms, "model cooling down");
+    } else if (status === "quota") {
       p.exhaustedUntil = detail?.exhaustedUntil ?? now + 60 * 60 * 1000;
       p.exhaustedReason = (detail?.error ?? "quota exhausted").slice(0, 300);
       if (p.def.billing === "subscription") {

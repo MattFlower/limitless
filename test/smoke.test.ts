@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   backendChecks,
   checkCodexModels,
+  decisionsCheck,
   exitCode,
   formatReport,
   liveCheck,
@@ -369,4 +370,45 @@ test("oMLX smoke rows skip unavailable providers and fail attempted bad edits", 
     throw new Error("invocation failed");
   }).filter((c) => c.name.startsWith("omlx"));
   expect((await runChecks(failed)).map((r) => r.status)).toEqual(["fail", "fail"]);
+});
+
+test("TypeSafe decisions smoke skips without its key and checks answers, usage and cost", async () => {
+  const targets: ModelTarget[] = [];
+  const decide: typeof decisionsCheck = async (target) => {
+    targets.push(target);
+    return { status: "pass" };
+  };
+  const rows = (secrets: Record<string, string>) =>
+    runChecks(backendChecks(secrets, fetch, liveCheck, decide).filter((c) => c.name.startsWith("typesafe")));
+  expect(await rows({})).toMatchObject([
+    { name: "typesafe decisions", status: "skip", reason: "missing LIMITLESS_API_KEY" },
+  ]);
+  expect(targets).toEqual([]);
+  expect((await rows({ LIMITLESS_API_KEY: "key" }))[0]?.status).toBe("pass");
+  expect(targets[0]).toMatchObject({
+    model: "jev-1.13.0",
+    harness: "decisions",
+    decisions: { baseUrl: "https://api.typesafe.ai", authToken: "key" },
+  });
+
+  const target = targets[0] as ModelTarget;
+  const answered = (kind: string, input = 400): AgentResult => ({
+    ...result,
+    structured: { kind: { type: "choice", choice: kind, confidence: 1 } },
+    usage: { ...result.usage, input },
+    costUsd: input * 0.042e-6,
+  });
+  expect(await decisionsCheck(target, async () => answered("bug"))).toMatchObject({ status: "pass" });
+  expect(await decisionsCheck(target, async () => answered("feature"))).toMatchObject({ status: "fail" });
+  expect(await decisionsCheck(target, async () => answered("bug", 0))).toMatchObject({
+    status: "fail",
+    reason: "response carried no billable usage",
+  });
+  expect(
+    await decisionsCheck(target, async () => ({
+      ...result,
+      status: "quota",
+      error: "API key rejected (HTTP 401)",
+    })),
+  ).toEqual({ status: "fail", reason: "API key rejected (HTTP 401)" });
 });
