@@ -283,6 +283,7 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
   // Report every bad reference at once so the operator fixes the whole list in one round trip.
   const problems: string[] = [];
   const resolved: string[] = [];
+  const vendors = new Map<string, string>();
   const resolve = (id: string): string => {
     try {
       let target = router.resolveFor(request.role, id);
@@ -294,6 +295,7 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
         target = router.resolveFor(request.role, { modelId: target.model.id, effort });
       }
       resolved.push(target.targetId);
+      vendors.set(target.targetId, target.model.vendor);
       return target.targetId;
     } catch (error) {
       problems.push(`${JSON.stringify(id)}: ${(error as Error).message}`);
@@ -309,6 +311,16 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
       : {}),
   }));
   for (const id of request.systems ? [] : (request.models ?? [])) resolve(id);
+  // A verifier checks candidates from another vendor, as production's avoidVendor routing guarantees.
+  for (const system of resolvedSystems ?? []) {
+    const verifier = system.verifier?.target;
+    const vendor = verifier === undefined ? undefined : vendors.get(verifier);
+    for (const finder of system.finders)
+      if (vendor !== undefined && vendors.get(finder.target) === vendor)
+        problems.push(
+          `review system ${JSON.stringify(system.name)}: verifier ${verifier} shares vendor ${vendor} with finder ${finder.target}`,
+        );
+  }
   const seen = new Set<string>();
   // Systems may share a target (e.g. include vs omit the implementer report); their names differ.
   for (const target of request.systems ? [] : resolved) {

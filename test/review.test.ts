@@ -505,7 +505,7 @@ describe("runReview panel", () => {
     expect(out.result.structured).toMatchObject({ mode: "panel", verdict: "request_changes" });
   });
 
-  test("refuted findings drop out but stay in the record; missing verdicts stay unverified", async () => {
+  test("refuted findings drop out but stay in the record", async () => {
     const { out } = await panel([[candidate("src/a.ts", 1, "blocker"), candidate("src/a.ts", 2)]], (id) =>
       id === "C1"
         ? {
@@ -559,5 +559,29 @@ describe("runReview panel", () => {
     const { out } = await panel([[candidate("src/a.ts", 1)]], () => ({ ...confirmed, evidence: " " }));
     expect(out.decision).toBeUndefined();
     expect(out.output.success).toBe(false);
+  });
+
+  test("a verifier that omits or repeats a candidate id fails the review", async () => {
+    const result = (id: string) => ({ id, category: "correctness", ...confirmed });
+    for (const results of [[], [result("C1")], [result("C1"), result("C1")], [result("C1"), result("C9")]]) {
+      const out = await runReview(
+        {
+          invoke: async () =>
+            ok(
+              {
+                verdict: "request_changes",
+                summary: "Checked everything.",
+                findings: [candidate("src/a.ts", 1, "blocker"), candidate("src/a.ts", 2)],
+              },
+              "anthropic",
+            ),
+          verify: async () => ok({ results }, "google"),
+        },
+        { prompt, timeoutMs: 1, system: { mode: "panel", finders: [{ prompt: "standard" }] } },
+      );
+      expect(out.decision).toBeUndefined();
+      expect(out.output.success).toBe(false);
+      if (!out.output.success) expect(out.output.error.message).toContain("one result for each of C1, C2");
+    }
   });
 });

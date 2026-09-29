@@ -11,14 +11,15 @@ import { readingTimeout } from "../src/pipeline/engine.ts";
 import { FACTORY_PREAMBLE, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
 import * as review from "../src/pipeline/review.ts";
 import { ReviewSchema, toStrictJsonSchema, VerifySchema } from "../src/pipeline/schemas.ts";
+import type { ModelDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
-import { deferred, evalFixture } from "./evals-support.ts";
+import { deferred, evalFixture, verifierModel } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
-async function fixture(role: "review" | "verify" = "review") {
-  const f = await evalFixture();
+async function fixture(role: "review" | "verify" = "review", extraModels: ModelDef[] = []) {
+  const f = await evalFixture(extraModels);
   const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
   const item: ReviewCase = structuredClone({ ...reviewCase, base: f.sha, head });
   const verify = VerifyCaseFileSchema.parse(
@@ -358,7 +359,7 @@ test("review trials need v2 fields and keep the model's verdict, and pre-v2 stor
 });
 
 test("panel systems run finders and a pinned verifier end to end, grading what the panel blocks", async () => {
-  const f = await fixture();
+  const f = await fixture("review", [verifierModel]);
   try {
     const verdict = { current: "CONFIRMED" };
     f.respond((s) => {
@@ -382,7 +383,7 @@ test("panel systems run finders and a pinned verifier end to end, grading what t
           { target: "candidate-a", prompt: "standard" },
           { target: "candidate-b", prompt: "standard" },
         ],
-        verifier: { target: "candidate-b" },
+        verifier: { target: "verifier-c" },
         implementerReport: "include",
       },
       {
@@ -392,17 +393,38 @@ test("panel systems run finders and a pinned verifier end to end, grading what t
         implementerReport: "include",
       },
     ];
+    // The verifier must not share a vendor with any finder it checks.
+    expect(() =>
+      f.run({ models: undefined, systems: [{ ...systems[0], verifier: { target: "candidate-b" } }] }),
+    ).toThrow("verifier candidate-b shares vendor other with finder candidate-a");
+    const acquire = spyOn(f.factory.tracker, "acquire");
+    const record = spyOn(f.factory.tracker, "record");
     const report = await f.run({ models: undefined, systems, cache: false });
     expect(report.trials.map((t) => [t.details.system, t.status, t.pass])).toEqual([
       ["panel", "ok", true],
       ["single", "ok", true],
     ]);
+    // Each panel call holds a slot on its own provider and reports its outcome there.
+    expect(acquire.mock.calls.map(([provider]) => provider)).toEqual([
+      "openrouter",
+      "provider-b",
+      "provider-b",
+      "openrouter",
+    ]);
+    expect(record.mock.calls.map(([provider, status]) => [provider, status])).toEqual([
+      ["provider-b", "ok"],
+      ["provider-b", "ok"],
+      ["openrouter", "ok"],
+      ["openrouter", "ok"],
+    ]);
+    acquire.mockRestore();
+    record.mockRestore();
     // Two finders, one verifier batch (same file and vendor) holding both candidates, then the single system.
     expect(f.calls.map((s) => [s.target.modelId, s.prompt.includes("code-review verifier"), s.mode])).toEqual(
       [
         ["candidate-a", false, "readonly"],
         ["candidate-b", false, "readonly"],
-        ["candidate-b", true, "readonly"],
+        ["verifier-c", true, "readonly"],
         ["candidate-a", false, "readonly"],
       ],
     );

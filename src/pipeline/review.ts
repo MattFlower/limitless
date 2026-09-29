@@ -264,19 +264,26 @@ async function runPanel<T extends Invoked>(
     const parsed = VerifierSchema.safeParse(
       invoked.result.structured ?? extractJson(invoked.result.finalText),
     );
-    if (invoked.result.status !== "ok" || !parsed.success) {
-      const message = parsed.success
-        ? `Verifier ${invoked.result.status}: ${invoked.result.error ?? "no output"}`
-        : `Invalid verifier output: ${parsed.error.message}`;
+    // Exactly one result per submitted id: an omitted candidate must not silently become nonblocking.
+    const ids = parsed.success ? parsed.data.results.map((r) => r.id) : [];
+    const complete =
+      ids.length === batch.length &&
+      new Set(ids).size === ids.length &&
+      batch.every((c) => ids.includes(c.id));
+    if (invoked.result.status !== "ok" || !parsed.success || !complete) {
+      const message =
+        invoked.result.status !== "ok"
+          ? `Verifier ${invoked.result.status}: ${invoked.result.error ?? "no output"}`
+          : !parsed.success
+            ? `Invalid verifier output: ${parsed.error.message}`
+            : `Invalid verifier output: expected one result for each of ${batch.map((c) => c.id).join(", ")}, got ${JSON.stringify(ids)}`;
       return {
         ...first.invoked,
         result: combined(results, invoked.result, null),
         output: z.custom<Review>(() => false, message).safeParse(null),
       };
     }
-    // Only ids from this batch count; a missing id leaves its candidate unverified.
-    for (const result of parsed.data.results)
-      if (batch.some((c) => c.id === result.id) && !verdicts.has(result.id)) verdicts.set(result.id, result);
+    for (const result of parsed.data.results) verdicts.set(result.id, result);
   }
 
   const findings: Finding[] = [];

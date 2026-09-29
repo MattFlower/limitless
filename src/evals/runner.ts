@@ -508,9 +508,29 @@ export class EvalRunner {
         trial.harness = harnessName;
         store.recordEvalTrial({ ...trial, status: "running" });
         let result: AgentResult;
+        // The trial target's own call within a panel review, recorded against its provider.
+        let own: AgentResult | undefined;
+        const observe = (to: ModelTarget, outcome: AgentResult) => {
+          if (outcome.quota) tracker.observeWindows(to.provider, outcome.quota.windows);
+          tracker.record(to.provider, outcome.status, {
+            error: outcome.error,
+            exhaustedUntil: outcome.quota?.exhaustedUntil,
+            ...(outcome.modelCooldownMs === undefined
+              ? {}
+              : { modelCooldown: { modelId: to.modelId, ms: outcome.modelCooldownMs } }),
+          });
+          if (
+            outcome.status !== "ok" &&
+            /model[^.]{0,80}(is not supported|not found|does not exist|not available)|unknown model|invalid model|model_not_found/i.test(
+              outcome.error ?? "",
+            )
+          )
+            tracker.blockModel(to.modelId, outcome.error ?? "model rejected");
+        };
         let resumeFailed = false;
         const before = { ...trial };
         for (let attempt = 0; ; attempt++) {
+          own = undefined;
           try {
             const logPath = join(directory, "trial.log");
             const invoke = (
@@ -555,14 +575,22 @@ export class EvalRunner {
                 : scratch
                   ? invoke(scratch, request, to)
                   : withScratch(cwd, (dir) => invoke(dir, request, to));
+            // Panel calls run one at a time: the trial's slot covers its own provider, others take their own.
             const sendTo = async (request: ReviewRequest | VerifierRequest, to: ModelTarget) => {
               const picked = selectHarness(run.role, to);
               const agent = harnesses[picked.harnessName];
               if (!agent) throw new Error(`No harness registered for ${picked.harnessName}`);
-              return {
-                result: await send(request, { target: to, harness: agent, noTools: picked.noTools }),
-                target: to,
-              };
+              const unavailable = tracker.unavailableReason(to.provider);
+              if (unavailable) throw new Error(`${to.provider} unavailable: ${unavailable}`);
+              const releaseOther =
+                to.provider === target.provider ? undefined : await tracker.acquire(to.provider, signal);
+              try {
+                const sent = await send(request, { target: to, harness: agent, noTools: picked.noTools });
+                observe(to, sent);
+                return { result: sent, target: to };
+              } finally {
+                releaseOther?.();
+              }
             };
             // First-round review cases go through the pipeline's review entry point.
             result = reviewInput
@@ -571,10 +599,16 @@ export class EvalRunner {
                     {
                       invoke: async (request, finder) => {
                         const to = finder > 0 ? panelTargets?.finders[finder - 1] : undefined;
-                        return to ? sendTo(request, to) : { result: await send(request), target };
+                        if (to) return sendTo(request, to);
+                        own = await send(request);
+                        return { result: own, target };
                       },
-                      verify: async (request) => {
+                      verify: async (request, avoidVendor) => {
                         if (!panelTargets) throw new Error("review system has no verifier");
+                        if (panelTargets.verifier.vendor === avoidVendor)
+                          throw new Error(
+                            `verifier ${panelTargets.verifier.modelId} shares vendor ${avoidVendor} with its finder`,
+                          );
                         return sendTo(request, panelTargets.verifier);
                       },
                     },
@@ -634,21 +668,8 @@ export class EvalRunner {
           trial.durationMs = Date.now() - trial.createdAt + preparationMs;
           store.recordEvalTrial({ ...trial, status: "running" });
         }
-        if (result.quota) tracker.observeWindows(target.provider, result.quota.windows);
-        tracker.record(target.provider, result.status, {
-          error: result.error,
-          exhaustedUntil: result.quota?.exhaustedUntil,
-          ...(result.modelCooldownMs === undefined
-            ? {}
-            : { modelCooldown: { modelId: target.modelId, ms: result.modelCooldownMs } }),
-        });
-        if (
-          result.status !== "ok" &&
-          /model[^.]{0,80}(is not supported|not found|does not exist|not available)|unknown model|invalid model|model_not_found/i.test(
-            result.error ?? "",
-          )
-        )
-          tracker.blockModel(target.modelId, result.error ?? "model rejected");
+        // A panel's combined result carries its last call's status; the trial's own call is recorded here.
+        observe(target, own ?? result);
         if (signal.aborted) return skip("daemon shutdown");
         // A panel's result is its derived review, whose verification fields only the stored schema keeps.
         const output = (system?.mode === "panel" ? StoredReviewSchema : schema)?.safeParse(
