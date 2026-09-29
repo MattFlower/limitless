@@ -216,6 +216,15 @@ export function renderReport(input: ReportInput): string {
   return `${blocks.join("\n\n")}\n`;
 }
 
+/**
+ * The state a verified-failure report describes: the evidence saved when the run last verified.
+ * Reviews after that point are dropped (evidence saved before it kept the history has none), so the
+ * listed rounds and the shown verdict refer to the same commit.
+ */
+export function verifiedFailureState(state: RunState): ReportInput["state"] {
+  return { ...state, reviewHistory: undefined, ...state.lastVerifiedEvidence };
+}
+
 export function buildReport(
   ctx: RunContext,
   success: boolean,
@@ -226,7 +235,7 @@ export function buildReport(
     success,
     runId: ctx.run.id,
     prompt: ctx.run.prompt,
-    state: verifiedFailure ? { ...ctx.state, ...ctx.state.lastVerifiedEvidence } : ctx.state,
+    state: verifiedFailure ? verifiedFailureState(ctx.state) : ctx.state,
     verifiedFailure,
     invocations: ctx.store.listInvocations(ctx.run.id),
     totals: { costUsd: latest.costUsd, costEquivUsd: latest.costEquivUsd },

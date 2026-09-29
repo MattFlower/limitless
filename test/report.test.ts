@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import type { Invocation } from "../src/core/types.ts";
-import { renderReport } from "../src/pipeline/report.ts";
+import type { RunState } from "../src/pipeline/context.ts";
+import { renderReport, verifiedFailureState } from "../src/pipeline/report.ts";
 
 const inv: Invocation = {
   id: 1,
@@ -107,6 +108,63 @@ test("the code review section lists every panel review and the diff it covered",
     "## Code review (`m`)\n\n- Panel review R1 — full change `base1..head1`\n- Panel review R2 — fix diff `head1..head2`\n- Panel review R3 — fix diff `head2..head3`\n\n**approve** — Checked",
   );
   expect(render([{ ...entry, round: 1 }])).not.toContain("Panel review");
+});
+
+test("a verified-failure report lists only the reviews up to the saved approval", () => {
+  const entry = { blocking: [], followUps: [] };
+  const approved = {
+    verdict: "approve" as const,
+    summary: "R1 approved",
+    findings: [],
+    modelId: "m",
+    mode: "panel" as const,
+  };
+  const r1 = {
+    ...entry,
+    round: 1,
+    sha: "head1",
+    panelReview: 1,
+    scope: { kind: "full" as const, range: "base..head1" },
+  };
+  const r2 = {
+    ...entry,
+    round: 2,
+    sha: "head2",
+    panelReview: 2,
+    scope: { kind: "fix" as const, range: "head1..head2" },
+  };
+  const live: RunState = {
+    phase: "deliver",
+    answers: [],
+    round: 2,
+    roundsOnImplementer: 2,
+    triedImplementers: [],
+    feedback: null,
+    toolCommands: [],
+    lastReview: { ...approved, verdict: "request_changes" as const, summary: "R2 blocked" },
+    reviewHistory: [r1, r2],
+    reviewFollowUps: [],
+    lastVerifiedEvidence: { lastReview: approved, reviewHistory: [r1], reviewFollowUps: [] },
+  };
+  const restored = verifiedFailureState(live);
+  expect(restored.lastReview).toEqual(approved);
+  expect(restored.reviewHistory).toEqual([r1]);
+  const md = renderReport({
+    success: false,
+    runId: "r5",
+    prompt: "x",
+    state: restored,
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "u",
+    verifiedFailure: { sha: "head1", stage: "conflict resolution", reason: "gates", base: "main" },
+  });
+  expect(md).toContain("- Panel review R1 — full change `base..head1`\n\n**approve** — R1 approved");
+  expect(md).not.toContain("R2");
+  // Evidence saved before the history was kept with it cannot vouch for any round: list none.
+  expect(
+    verifiedFailureState({ ...live, lastVerifiedEvidence: { lastReview: approved } }).reviewHistory,
+  ).toBeUndefined();
 });
 
 test("reports for runs started from an issue close it", () => {

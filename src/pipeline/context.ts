@@ -98,8 +98,11 @@ export interface RunState {
   preRebaseHead?: string;
   /** Commit that last passed verify, or an approving quick review after deterministic checks. */
   lastVerifiedSha?: string;
-  /** Passing evidence retained if a later resolution round fails. */
-  lastVerifiedEvidence?: Pick<RunState, "lastVerify" | "lastGates" | "lastReview" | "lastAudit">;
+  /** Passing evidence retained if a later resolution round fails; the review history is kept with it. */
+  lastVerifiedEvidence?: Pick<
+    RunState,
+    "lastVerify" | "lastGates" | "lastReview" | "lastAudit" | "reviewHistory" | "reviewFollowUps"
+  >;
   /** Why delivery went ahead without rebasing onto the latest base (shown in the report). */
   rebaseNote?: string;
   /** The single extra implementation round allowed after a conflicting delivery merge. */

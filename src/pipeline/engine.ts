@@ -1158,6 +1158,9 @@ async function recordVerified(ctx: RunContext, sha: string): Promise<void> {
     lastGates: ctx.state.lastGates,
     lastReview: ctx.state.lastReview,
     lastAudit: ctx.state.lastAudit,
+    // Later rounds replace (never mutate) these arrays, so the references stay a faithful snapshot.
+    reviewHistory: ctx.state.reviewHistory,
+    reviewFollowUps: ctx.state.reviewFollowUps,
   };
   await ctx.save();
 }

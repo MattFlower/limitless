@@ -1304,6 +1304,11 @@ esac
         expect(
           (await sh(["git", "ls-remote", bare, `refs/heads/${finished?.branch}`], { cwd: repoDir })).stdout,
         ).toContain(sha);
+        // The saved evidence keeps the reviews up to the verified commit; the conflict round's review is live only.
+        const evidence = state?.lastVerifiedEvidence;
+        expect(evidence?.reviewHistory?.at(-1)?.sha).toBe(sha);
+        if (outcome === "review" || outcome === "verify")
+          expect(state?.reviewHistory).toHaveLength((evidence?.reviewHistory?.length ?? 0) + 1);
         const report = f.store.getArtifact(run.id, "report.md") ?? "";
         expect(report).toContain(`Verified at \`${sha}\``);
         expect(report).toContain("conflict resolution");
