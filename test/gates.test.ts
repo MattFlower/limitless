@@ -232,6 +232,15 @@ describe("gate slots and flaky retry", () => {
     });
   });
 
+  test("a failing baseline check whose output merely looks like a timeout is still retried", async () => {
+    const dir = tempDir({});
+    const { run, runs } = await baseline(
+      config("echo x >> runs; test -f once || { touch once; echo '[timed out] from nested tool'; exit 1; }"),
+      dir,
+    );
+    expect([run.checks[0]?.ok, run.checks[0]?.firstAttempt?.timedOut, runs]).toEqual([true, undefined, 2]);
+  });
+
   test("baseline setup failures, timeouts and cancellation are not retried", async () => {
     const setupDir = tempDir({});
     const setupCfg = { ...config("echo x >> runs; exit 1"), setup: ["echo s >> setups; exit 1"] };
@@ -248,9 +257,7 @@ describe("gate slots and flaky retry", () => {
       checks: [{ name: "test", run: "echo x >> runs; sleep 5", timeoutSec: 0.2 }],
     };
     const slow = await baseline(slowCfg, slowDir);
-    expect([slow.run.checks[0]?.ok, slow.run.checks[0]?.output.startsWith("[timed out]"), slow.runs]).toEqual(
-      [false, true, 1],
-    );
+    expect([slow.run.checks[0]?.ok, slow.run.checks[0]?.timedOut, slow.runs]).toEqual([false, true, 1]);
 
     const cancelled = new AbortController();
     cancelled.abort();

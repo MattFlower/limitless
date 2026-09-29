@@ -10,6 +10,8 @@ export interface GateResult {
   exitCode: number | null;
   durationMs: number;
   output: string; // tail
+  /** Set only when the process was killed for exceeding its timeout. */
+  timedOut?: boolean;
   /** Baseline only: the failing attempt of a check that passed when re-run. */
   firstAttempt?: GateResult;
 }
@@ -64,6 +66,7 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     exitCode: res.exitCode,
     durationMs: res.durationMs,
     output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
+    ...(res.timedOut ? { timedOut: true } : {}),
   };
 }
 
@@ -118,9 +121,7 @@ export async function retryBaselineFailures(
   onWait?: GateHooks["onWait"],
 ): Promise<GateRun> {
   const retryable = (r: GateResult) =>
-    !r.ok && !r.output.startsWith("[timed out]")
-      ? cfg.checks.find((k) => k.name === r.name && k.run === r.command)
-      : undefined;
+    !r.ok && !r.timedOut ? cfg.checks.find((k) => k.name === r.name && k.run === r.command) : undefined;
   if (!run.setupOk || signal.aborted || !run.checks.some(retryable)) return run;
   const release = await gateSlots.acquire(signal, onWait);
   try {
