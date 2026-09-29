@@ -477,6 +477,29 @@ esac
     expect(f.store.getRunState<RunState>(run.id)?.flow).toBe("build");
   });
 
+  test.each([undefined, "include", "omit"] as const)(
+    "production review system is one routed finder honoring implementer_report=%s",
+    async (mode) => {
+      const reviews: AgentSpec[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") {
+          reviews.push(s);
+          return { structured: approve };
+        }
+        return { files: { "farewell.txt": "goodbye\n" }, text: "IMPLEMENTER_SAYS_DONE" };
+      });
+      if (mode) f.deps.cfg.reviewImplementerReport = mode;
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(reviews.map((s) => s.target.provider)).toEqual(["beta"]);
+      const included = mode !== "omit";
+      expect(reviews[0]?.prompt.includes("# Implementer's own report")).toBe(included);
+      expect(reviews[0]?.prompt.includes("IMPLEMENTER_SAYS_DONE")).toBe(included);
+    },
+  );
+
   test("Dependabot falls back when free providers are unavailable; owner keeps policy routing", async () => {
     const f = start(
       (s) => {

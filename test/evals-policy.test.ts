@@ -839,3 +839,51 @@ test("implement cells use their own pass-rate floor", async () => {
   expect(settings.floors.triage_pass_rate).toBe(0.6);
   expect(evalSettings({}).floors.implement_pass_rate).toBe(0.6);
 });
+
+test("only review systems matching [review] implementer_report are routing evidence", () => {
+  const system = (name: string, target: string, implementerReport: "include" | "omit" = "include") => ({
+    name,
+    mode: "single" as const,
+    finders: [{ target, prompt: "standard" as const }],
+    implementerReport,
+  });
+  const base = evidence("review", [local, metered]);
+  const withSystems = (systems: ReturnType<typeof system>[]) => {
+    const trials = systems.flatMap((s) =>
+      base.trials
+        .filter((t) => recordedTarget(t) === s.finders[0]?.target)
+        .map((t) => ({
+          ...t,
+          pass: s.implementerReport === "include",
+          details: { ...t.details, system: s.name },
+        })),
+    );
+    return { run: { ...base.run, systems }, trials };
+  };
+  // Include and omit side by side on one target, and an omit-only target.
+  const run = withSystems([system("A", local), system("B", local, "omit"), system("M", metered, "omit")]);
+  const chosen = (mode?: "include" | "omit") =>
+    selectEvidence([run], undefined, mode).map((e) => [
+      e.modelId,
+      [...new Set(e.trials.filter((t) => recordedTarget(t) === e.modelId).map((t) => t.details.system))],
+    ]);
+  expect(chosen()).toEqual([[local, ["A"]]]);
+  expect(chosen("include")).toEqual([[local, ["A"]]]);
+  expect(chosen("omit")).toEqual([
+    [local, ["B"]],
+    [metered, ["M"]],
+  ]);
+  const review = (mode?: "include" | "omit") =>
+    generatePolicy(input([run], mode ? { implementerReport: mode } : {})).roles.find(
+      (r) => r.role === "review",
+    )?.candidates ?? [];
+  expect(review().map((c) => [c.modelId, c.summary.candidate, c.summary.passRate])).toEqual([
+    [local, "A", 1],
+  ]);
+  expect(review("omit").map((c) => [c.modelId, c.summary.candidate, c.summary.passRate])).toEqual([
+    [local, "B", 0],
+    [metered, "M", 0],
+  ]);
+  // Legacy review runs have no systems and still count.
+  expect(selectEvidence([base], undefined, "omit").map((e) => e.modelId)).toEqual([local, metered]);
+});

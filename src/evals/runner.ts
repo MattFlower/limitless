@@ -10,7 +10,7 @@ import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
 import { type ReviewRequest, runReview } from "../pipeline/review.ts";
 import { toStrictJsonSchema } from "../pipeline/schemas.ts";
 import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
-import { cacheKey } from "./cache.ts";
+import { cacheKey, reviewSystemHash } from "./cache.ts";
 import {
   type AnyCaseFile,
   defaultCasePath,
@@ -61,7 +61,10 @@ export class EvalRunner {
       if ("defects" in item) seedContent(item, this.casePath ?? defaultCasePath(parsed.role));
     const { request, cases } = validateRequest(input, file, this.deps.router);
     const trials: EvalTrial[] = [];
-    for (const modelId of request.models)
+    const candidates =
+      request.systems?.map((system) => ({ modelId: system.finders[0]?.target ?? "", system: system.name })) ??
+      request.models.map((modelId) => ({ modelId, system: undefined }));
+    for (const { modelId, system } of candidates)
       for (const item of cases)
         for (let trial = 0; trial < request.k; trial++)
           trials.push({
@@ -77,19 +80,23 @@ export class EvalRunner {
             pass: null,
             score: null,
             details:
-              "hidden" in item
-                ? {
-                    complexity: item.complexity,
-                    ...(request.strategy === "switch"
-                      ? {
-                          switchChain: this.deps.router
-                            .policyTargets("implement", item.complexity)
-                            .sort((a, b) => a.tier - b.tier)
-                            .filter((target, i, targets) => i === 0 || target.tier !== targets[i - 1]?.tier),
-                        }
-                      : {}),
-                  }
-                : {},
+              system !== undefined
+                ? { system }
+                : "hidden" in item
+                  ? {
+                      complexity: item.complexity,
+                      ...(request.strategy === "switch"
+                        ? {
+                            switchChain: this.deps.router
+                              .policyTargets("implement", item.complexity)
+                              .sort((a, b) => a.tier - b.tier)
+                              .filter(
+                                (target, i, targets) => i === 0 || target.tier !== targets[i - 1]?.tier,
+                              ),
+                          }
+                        : {}),
+                    }
+                  : {},
             costUsd: 0,
             costEquivUsd: 0,
             tokensIn: 0,
@@ -310,6 +317,11 @@ export class EvalRunner {
     };
     const budget = () => store.evalSpend(run.id) >= run.maxUsd;
     if (signal.aborted) return skip("daemon shutdown");
+    const system =
+      trial.details.system === undefined
+        ? undefined
+        : run.systems?.find((s) => s.name === trial.details.system);
+    if (trial.details.system !== undefined && !system) return skip("review system missing from eval run");
     const model = router.model(trial.modelId);
     if (!model) return skip("model no longer in catalog");
     trial.details.provider = model.provider;
@@ -377,7 +389,7 @@ export class EvalRunner {
               tree,
               patch,
               signal,
-              cfg.reviewImplementerReport,
+              system?.implementerReport,
               cfg.triageDecisionConfidence,
             );
       if (!prepared) throw new Error("missing trial preparation");
@@ -411,6 +423,7 @@ export class EvalRunner {
                     })),
                   }
                 : { head: item.head, input: item.input }),
+              ...(system ? { reviewSystem: reviewSystemHash(system) } : {}),
               patch,
               ...(item.snapshot ? { snapshot: true } : {}),
               source:

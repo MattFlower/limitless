@@ -1,3 +1,5 @@
+import type { ReviewSystem } from "../core/types.ts";
+
 /** Sort object keys recursively so schema construction order does not change identity. */
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
@@ -36,4 +38,11 @@ export function cacheKey(
       ),
     )
     .digest("hex");
+}
+/**
+ * Behavioural identity of a review system: key order and the display name don't change it, so
+ * renaming a system (or `--models` naming it after its target) still reuses cached trials.
+ */
+export function reviewSystemHash({ name: _name, ...config }: ReviewSystem): string {
+  return new Bun.CryptoHasher("sha256").update(JSON.stringify(canonical(config))).digest("hex");
 }

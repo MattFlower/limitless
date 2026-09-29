@@ -215,6 +215,8 @@ function implementMetrics(rows: EvalTrial[]) {
     executedTrials: executed.length,
   };
 }
+/** A candidate is its review system when it has one, otherwise its evidence target. */
+const candidateOf = (trial: EvalTrial) => trial.details.system ?? evidenceTarget(trial);
 /**
  * How a decision model's trials escalate in production (declined, or any operational failure), and
  * the confidence cascade: each escalated trial replaced by the fallback's trial for the same case
@@ -223,7 +225,7 @@ function implementMetrics(rows: EvalTrial[]) {
  */
 function escalation(trials: EvalTrial[], modelId: string, fallbackModel: string | undefined) {
   const key = (t: EvalTrial) => `${t.caseId}#${t.trial}`;
-  const scored = (id: string) => trials.filter((t) => evidenceTarget(t) === id && scoredTrial(t));
+  const scored = (id: string) => trials.filter((t) => candidateOf(t) === id && scoredTrial(t));
   const cost = (t: EvalTrial) => t.details.cache?.costUsd ?? t.costUsd;
   const latency = (t: EvalTrial) => t.details.cache?.durationMs ?? t.durationMs;
   const own = scored(modelId);
@@ -259,14 +261,17 @@ export function summarize(
   { cascadeFallback, ...options }: StatsOptions & { cascadeFallback?: string } = {},
 ) {
   const settings = statsOptions(options);
-  const targets = [
+  const declared = run.systems?.map((system) => system.name) ?? run.models;
+  const candidates = [
     ...new Set([
-      ...trials.map(evidenceTarget),
-      ...run.models.filter((id) => !trials.some((t) => recordedTarget(t) === id)),
+      ...trials.map(candidateOf),
+      ...declared.filter((id) => !trials.some((t) => (t.details.system ?? recordedTarget(t)) === id)),
     ]),
   ];
-  const summaries = targets.map((modelId) => {
-    const rows = trials.filter((t) => evidenceTarget(t) === modelId);
+  const summaries = candidates.map((candidate) => {
+    const rows = trials.filter((t) => candidateOf(t) === candidate);
+    const system = run.systems?.find((s) => s.name === candidate) ?? null;
+    const first = rows[0];
     const evaluated = rows.filter(scoredTrial);
     const passes = evaluated.filter((t) => t.pass).length;
     const risk = rows.flatMap((t) =>
@@ -286,7 +291,9 @@ export function summarize(
       .sort((a, b) => a - b);
     const middle = Math.floor(latency.length / 2);
     return {
-      modelId,
+      candidate,
+      modelId: first ? evidenceTarget(first) : (system?.finders[0]?.target ?? candidate),
+      system,
       effort: rows[0]?.effort ?? null,
       ...roleMetrics(run, rows),
       ...(run.role === "implement"
@@ -327,17 +334,18 @@ export function summarize(
     .filter((m) => m.passRate !== null)
     .sort(
       (a, b) =>
-        (b.passRate ?? 0) - (a.passRate ?? 0) || (a.modelId < b.modelId ? -1 : a.modelId > b.modelId ? 1 : 0),
+        (b.passRate ?? 0) - (a.passRate ?? 0) ||
+        (a.candidate < b.candidate ? -1 : a.candidate > b.candidate ? 1 : 0),
     )[0];
   const bestCases = completeCases(
-    trials.filter((t) => evidenceTarget(t) === best?.modelId),
+    trials.filter((t) => candidateOf(t) === best?.candidate),
     run.k,
   );
-  const decides = (modelId: string) =>
-    trials.some((t) => evidenceTarget(t) === modelId && t.harness === "decisions");
+  const decides = (candidate: string) =>
+    trials.some((t) => candidateOf(t) === candidate && t.harness === "decisions");
   return summaries.map((summary) => {
     const candidate = completeCases(
-      trials.filter((t) => evidenceTarget(t) === summary.modelId),
+      trials.filter((t) => candidateOf(t) === summary.candidate),
       run.k,
     );
     const differences: number[] = [];
@@ -350,9 +358,9 @@ export function summarize(
     }
     return {
       ...summary,
-      escalation: decides(summary.modelId) ? escalation(trials, summary.modelId, cascadeFallback) : null,
+      escalation: decides(summary.candidate) ? escalation(trials, summary.candidate, cascadeFallback) : null,
       comparison: {
-        bestModel: best?.modelId ?? null,
+        bestModel: best?.candidate ?? null,
         candidateCompleteCases: candidate.size,
         bestCompleteCases: bestCases.size,
         ...pairedBootstrap(differences, settings),

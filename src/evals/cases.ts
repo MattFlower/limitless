@@ -2,9 +2,12 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import type { ReviewSystem } from "../core/types.ts";
+import { EvalReviewSystemsSchema } from "../pipeline/review-system.ts";
 import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
 import type { Router } from "../router/router.ts";
 import { EFFORT_LEVELS } from "../router/targets.ts";
+import { reviewSystemHash } from "./cache.ts";
 
 const nonempty = z.string().trim().min(1);
 const repoId = z.string().regex(/^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/, "expected owner/name");
@@ -252,7 +255,8 @@ const unique = z
 export const EvalRequestSchema = z
   .strictObject({
     role: z.enum(["triage", "review", "verify", "implement"]),
-    models: z.array(z.string().min(1)).min(1),
+    models: z.array(z.string().min(1)).min(1).optional(),
+    systems: EvalReviewSystemsSchema.optional(),
     k: z.number().int().positive().default(1),
     maxUsd: z.number().finite().nonnegative().default(1),
     caseIds: unique.optional(),
@@ -264,6 +268,11 @@ export const EvalRequestSchema = z
     (r) => r.role === "implement" || (r.rounds === undefined && r.strategy === undefined),
     "rounds and strategy are implement-only options",
   )
+  .refine(
+    (r) => (r.models === undefined) !== (r.systems === undefined),
+    "give exactly one of models or systems",
+  )
+  .refine((r) => r.systems === undefined || r.role === "review", "systems are a review-only option")
   .transform((r) =>
     r.role === "implement" ? { ...r, rounds: r.rounds ?? 1, strategy: r.strategy ?? "retry" } : r,
   );
@@ -274,7 +283,8 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
   // Report every bad reference at once so the operator fixes the whole list in one round trip.
   const problems: string[] = [];
   const resolved: string[] = [];
-  for (const id of request.models) {
+  const ids = request.systems?.map((system) => system.finders[0]?.target ?? "") ?? request.models ?? [];
+  for (const id of ids) {
     try {
       let target = router.resolveFor(request.role, id);
       if (request.strategy === "effort") {
@@ -290,14 +300,33 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
     }
   }
   const seen = new Set<string>();
-  for (const target of resolved) {
+  // Systems may share a target (e.g. include vs omit the implementer report); their names differ.
+  for (const target of request.systems ? [] : resolved) {
     if (seen.has(target)) problems.push(`duplicate resolved model target ${target}`);
     seen.add(target);
   }
   if (problems.length > 0) throw new Error(`Invalid eval models: ${problems.join("; ")}`);
-  request.models = resolved;
+  // Review candidates are always systems; `--models` means one include-report system per target.
+  const systems: ReviewSystem[] | undefined =
+    request.role !== "review"
+      ? undefined
+      : resolved.map((target, i) => ({
+          ...(request.systems?.[i] ?? { name: target, mode: "single", implementerReport: "include" }),
+          finders: [{ target, prompt: "standard" }],
+        }));
+  // Two names for one configuration would only measure the cache, so reject them after resolution.
+  const configs = new Map<string, string>();
+  for (const system of request.systems ? (systems ?? []) : []) {
+    const hash = reviewSystemHash(system);
+    const first = configs.get(hash);
+    if (first !== undefined)
+      throw new Error(
+        `Invalid review systems: ${JSON.stringify(system.name)} has the same configuration as ${JSON.stringify(first)} (names aside)`,
+      );
+    configs.set(hash, system.name);
+  }
   for (const id of request.caseIds ?? [])
     if (!file.cases.some((c) => c.id === id)) throw new Error(`Unknown case ID: ${id}`);
   const cases = file.cases.filter((c) => !request.caseIds || request.caseIds.includes(c.id));
-  return { request, cases };
+  return { request: { ...request, models: [...new Set(resolved)], systems }, cases };
 }

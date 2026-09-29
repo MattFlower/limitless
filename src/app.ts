@@ -15,6 +15,7 @@ import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
 import type { Harness } from "./harness/types.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
+import { productionReviewSystem } from "./pipeline/review-system.ts";
 import {
   DEFAULT_POLICY,
   MODELS,
@@ -136,6 +137,7 @@ export class Factory {
         providers: this.providerDefs,
         settings: this.evalSettings,
         evalIds,
+        implementerReport: productionReviewSystem(this.cfg).implementerReport,
       }),
       implement: selectEvidence(evidence, evalIds)
         .filter((e) => e.run.role === "implement")
