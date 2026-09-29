@@ -150,8 +150,10 @@ checkout, validates it before scheduling, and reads the exact pinned commits fro
 caches (cloning/fetching when needed). Triage reads the pinned tree listing; review and verify create disposable standalone checkouts detached at head (containing only history reachable from base and head, no refs or remotes), apply any review seed patch locally, and remove them on every exit. Pins whose history contains eval datasets or seed patches fail with a preparation error. Each provider group starts its
 trials in a fixed order, running up to `min(concurrency, provider maxConcurrent)` at once
 (`--concurrency N`, default 2, recorded on the run); provider groups may overlap, and every call
-still takes a slot from the shared provider tracker. Completion order never changes trial identity,
-cache keys, grades or report order. The runner never falls back or retries; normal adapter-level structured-output repair remains the
+still takes a slot from the shared provider tracker. The cap applies to the provider each call
+actually uses, including switched implement retry rounds. Trials that share a cache key wait for
+earlier queued trials with that key before reusing the cache, so completion order never changes
+trial identity, cache keys, cache sources, grades or report order. The runner never falls back or retries; normal adapter-level structured-output repair remains the
 same as in the pipeline and its cost is included in the trial.
 Unavailable providers, reserves, provider budgets, circuit breakers, blocked models and missing
 harnesses produce explicit skipped trials. Actual eval spend counts toward provider-wide budgets.

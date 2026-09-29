@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_EVAL_CONCURRENCY, type EvalRun, type EvalTrial } from "../core/types.ts";
+import { Semaphore } from "../gates/slots.ts";
 import { createEvalWorktree, type EvalLabels, pinnedTree, snapshotTopLevel } from "../git/repos.ts";
 import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
@@ -40,6 +41,13 @@ export interface EvalRegradeResult {
   /** Regraded trials whose grade differs from the stored one. */
   changed: number;
   skipped: { caseId: string; modelId: string; trial: number; reason: string }[];
+}
+
+interface TrialCoordination {
+  /** This run's per-provider invocation cap, taken before the shared tracker slot. */
+  gate: (provider: string) => Semaphore;
+  /** Publishes the trial's cache key and waits for earlier trials that share it. */
+  keyed: (key: string) => Promise<void>;
 }
 
 export class EvalRunner {
@@ -228,6 +236,20 @@ export class EvalRunner {
         groups.set(provider, group);
       }
       const recorded = store.listEvalTrials(run.id);
+      const concurrency = run.concurrency ?? DEFAULT_EVAL_CONCURRENCY;
+      const providerLimit = (provider: string) =>
+        Math.max(1, Math.min(concurrency, this.deps.tracker.def(provider)?.maxConcurrent ?? 1));
+      // Caps this run's invocations per provider, including switched retry rounds that leave the
+      // trial's starting provider group.
+      const gates = new Map<string, Semaphore>();
+      const gate = (provider: string) => {
+        let semaphore = gates.get(provider);
+        if (!semaphore) {
+          semaphore = new Semaphore(providerLimit(provider));
+          gates.set(provider, semaphore);
+        }
+        return semaphore;
+      };
       // Each provider starts its trials in a fixed order, up to `limit` at once. Every invocation
       // still acquires a slot from the shared tracker, and each trial checks the eval budget before
       // it starts, so trials already in flight can overshoot `maxUsd` by at most limit - 1 trials
@@ -241,19 +263,27 @@ export class EvalRunner {
                 .map((trial) => ({ trial, item })),
             ),
           );
-          const limit = Math.max(
-            1,
-            Math.min(
-              run.concurrency ?? DEFAULT_EVAL_CONCURRENCY,
-              this.deps.tracker.def(provider)?.maxConcurrent ?? 1,
-            ),
-          );
+          const limit = providerLimit(provider);
+          // Resolved with each trial's cache key (null if it never got one) and when it finishes.
+          const keys = queue.map(() => Promise.withResolvers<string | null>());
+          const finished = queue.map(() => Promise.withResolvers<void>());
           let next = 0;
           let failed = false;
           const worker = async () => {
             while (!failed) {
-              const entry = queue[next++];
+              const index = next++;
+              const entry = queue[index];
               if (!entry) return;
+              // A trial waits for every earlier trial with its cache key, so cache reuse sees the
+              // same sources as the sequential order regardless of which trial finishes first.
+              const coordination: TrialCoordination = {
+                gate,
+                keyed: async (key) => {
+                  keys[index]?.resolve(key);
+                  for (let i = 0; i < index; i++)
+                    if ((await keys[i]?.promise) === key) await finished[i]?.promise;
+                },
+              };
               try {
                 await this.trial(
                   run,
@@ -264,12 +294,16 @@ export class EvalRunner {
                   labels,
                   cache,
                   signal,
+                  coordination,
                   hidden.get(entry.item.id),
                 );
               } catch (error) {
                 // Like the sequential stream: an unexpected failure stops this provider's new trials.
                 failed = true;
                 throw error;
+              } finally {
+                keys[index]?.resolve(null);
+                finished[index]?.resolve();
               }
             }
           };
@@ -308,6 +342,7 @@ export class EvalRunner {
     labels: EvalLabels,
     cache: boolean,
     signal: AbortSignal,
+    coordination: TrialCoordination,
     hidden: ReturnType<typeof hiddenContents> = [],
   ): Promise<void> {
     const { store, router, tracker, harnesses, cfg } = this.deps;
@@ -458,6 +493,7 @@ export class EvalRunner {
           : repository,
         trial.effort,
       );
+      if (cache) await coordination.keyed(trial.cacheKey);
       if (signal.aborted) return skip("daemon shutdown");
       if (budget()) return skip("eval budget exhausted");
       if (cache)
@@ -505,7 +541,13 @@ export class EvalRunner {
         const reason = eligible();
         if (reason)
           return skip(strategy === "switch" && round > 0 ? `Switch target unavailable: ${reason}` : reason);
-        release = await tracker.acquire(target.provider, signal);
+        const runSlot = await coordination.gate(target.provider).acquire(signal);
+        release = runSlot;
+        const trackerSlot = await tracker.acquire(target.provider, signal);
+        release = () => {
+          trackerSlot();
+          runSlot();
+        };
         if (signal.aborted) return skip("daemon shutdown");
         if (budget()) return skip("eval budget exhausted");
         const afterWait = eligible();

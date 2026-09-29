@@ -691,3 +691,47 @@ test("completion order never changes cache keys, grades or report order", async 
     await f.close();
   }
 });
+
+test("concurrent trials sharing a cache key reuse the earliest queued trial regardless of completion", async () => {
+  for (const failFirst of [false, true]) {
+    const f = await evalFixture();
+    try {
+      setLimit(f, "openrouter", 3);
+      for (const item of f.dataset.cases) item.prompt = "same";
+      f.save();
+      const held = deferred<void>();
+      f.respond(async () => {
+        const call = f.calls.length;
+        if (call === 1) {
+          await held.promise;
+          return failFirst ? { status: "error" as const, error: "boom" } : { structured: answer };
+        }
+        return { structured: { ...answer, risk: "high" as const } };
+      });
+      const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 1, concurrency: 3 });
+      await until(() => f.calls.length === 1);
+      await Bun.sleep(30);
+      // Later trials with the same key wait for the first instead of racing it.
+      expect(f.calls).toHaveLength(1);
+      held.resolve();
+      await f.factory.evals.wait(run.id);
+      const trials = f.factory.evals.report(run.id)?.trials ?? [];
+      expect(trials.map((t) => [t.caseId, t.status, t.details.cache?.caseId ?? null])).toEqual(
+        failFirst
+          ? [
+              ["a", "error", null],
+              ["b", "ok", null],
+              ["c", "ok", "b"],
+            ]
+          : [
+              ["a", "ok", null],
+              ["b", "ok", "a"],
+              ["c", "ok", "a"],
+            ],
+      );
+      expect(f.calls).toHaveLength(failFirst ? 2 : 1);
+    } finally {
+      await f.close();
+    }
+  }
+});
