@@ -293,3 +293,28 @@ test("round options and evidence survive reload with provider-specific spend and
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("eval concurrency survives reload and legacy runs read as 2", () => {
+  const home = mkdtempSync(join(tmpdir(), "eval-concurrency-store-"));
+  const path = join(home, "db.sqlite");
+  let store = new Store(path);
+  try {
+    const explicit = store.createEvalRun(
+      { role: "triage", models: ["a"], k: 1, maxUsd: 1, concurrency: 7 },
+      [],
+    );
+    const omitted = store.createEvalRun({ role: "triage", models: ["a"], k: 1, maxUsd: 1 }, []);
+    expect(explicit.concurrency).toBe(7);
+    store.close();
+    store = new Store(path);
+    expect(store.getEvalRun(explicit.id)?.concurrency).toBe(7);
+    expect(store.getEvalRun(omitted.id)?.concurrency).toBe(2);
+    // A run written by the previous release has no concurrency row.
+    store.db.query("DELETE FROM eval_run_concurrency WHERE eval_run_id = ?").run(explicit.id);
+    expect(store.getEvalRun(explicit.id)?.concurrency).toBe(2);
+    expect(store.listEvalRuns().map((r) => r.concurrency)).toEqual([2, 2]);
+  } finally {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});

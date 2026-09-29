@@ -144,11 +144,14 @@ limitless eval regrade <eval-id>   # review: recompute grades from stored output
 ```
 
 Use catalog IDs shown by the daemon's `/api/models` endpoint. `triage`, `review`, and `verify` are supported, including models absent from the routing policy. Defaults
-are `k=1`, `maxUsd=1.00`, all cases, and caching enabled. Case selections retain dataset order and
+are `k=1`, `maxUsd=1.00`, `concurrency=2`, all cases, and caching enabled. Case selections retain dataset order and
 trial indices start at zero. The daemon resolves `evals/<role>/cases.json` from its application
 checkout, validates it before scheduling, and reads the exact pinned commits from locked bare repo
-caches (cloning/fetching when needed). Triage reads the pinned tree listing; review and verify create disposable standalone checkouts detached at head (containing only history reachable from base and head, no refs or remotes), apply any review seed patch locally, and remove them on every exit. Pins whose history contains eval datasets or seed patches fail with a preparation error. Each model runs sequentially;
-provider groups may overlap within shared capacity limits. The runner never falls back or retries; normal adapter-level structured-output repair remains the
+caches (cloning/fetching when needed). Triage reads the pinned tree listing; review and verify create disposable standalone checkouts detached at head (containing only history reachable from base and head, no refs or remotes), apply any review seed patch locally, and remove them on every exit. Pins whose history contains eval datasets or seed patches fail with a preparation error. Each provider group starts its
+trials in a fixed order, running up to `min(concurrency, provider maxConcurrent)` at once
+(`--concurrency N`, default 2, recorded on the run); provider groups may overlap, and every call
+still takes a slot from the shared provider tracker. Completion order never changes trial identity,
+cache keys, grades or report order. The runner never falls back or retries; normal adapter-level structured-output repair remains the
 same as in the pipeline and its cost is included in the trial.
 Unavailable providers, reserves, provider budgets, circuit breakers, blocked models and missing
 harnesses produce explicit skipped trials. Actual eval spend counts toward provider-wide budgets.
@@ -156,7 +159,8 @@ harnesses produce explicit skipped trials. Actual eval spend counts toward provi
 `maxUsd` is a scheduling threshold for **recorded metered spend**, not a billing ceiling. Once
 reached, remaining trials are skipped and the run becomes `budget_exhausted`. Zero prevents new
 trials. Already-started calls finish and retain their full costs, so concurrent calls may exceed the
-threshold. Failed calls also consume metered budget; API-equivalent subscription costs do not.
+threshold: by at most N−1 in-flight trials per provider group (N being that group's concurrency),
+plus whatever other provider groups have in flight. Failed calls also consume metered budget; API-equivalent subscription costs do not.
 
 The SHA-256 cache identity includes model ID, selected harness, prompt and system additions, strict
 JSON schema and trial index. Only schema-valid `ok` outputs are reusable, even when they failed
@@ -186,7 +190,7 @@ model. Denominators and comparison coverage are included in both text and JSON:
   configured through typed report/statistics options. Empty denominators and absent pairs are `null`
   in JSON and `n/a` in text.
 
-The API provides `POST /api/evals` with `{role, models | systems, k?, maxUsd?, caseIds?, cache?}` (202 with `{id}`),
+The API provides `POST /api/evals` with `{role, models | systems, k?, maxUsd?, concurrency?, caseIds?, cache?}` (202 with `{id}`),
 `GET /api/evals` to list runs, and `GET /api/evals/:id` for the run, summaries and trials. Mutations use
 the usual local Origin and JSON content-type rules; Cloudflare tunnel requests are refused.
 

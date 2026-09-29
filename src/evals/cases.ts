@@ -2,7 +2,7 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import type { ReviewSystem } from "../core/types.ts";
+import { DEFAULT_EVAL_CONCURRENCY, type ReviewSystem } from "../core/types.ts";
 import { EvalReviewSystemsSchema } from "../pipeline/review-system.ts";
 import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
 import type { Router } from "../router/router.ts";
@@ -261,6 +261,7 @@ export const EvalRequestSchema = z
     maxUsd: z.number().finite().nonnegative().default(1),
     caseIds: unique.optional(),
     cache: z.boolean().default(true),
+    concurrency: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(DEFAULT_EVAL_CONCURRENCY),
     rounds: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
     strategy: z.enum(["retry", "effort", "switch"]).optional(),
   })

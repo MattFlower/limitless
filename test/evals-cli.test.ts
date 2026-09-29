@@ -87,6 +87,8 @@ evalRoles("CLI %s submits options, follows HTTP results and emits JSON", async (
     const id = printed[0];
     if (!id) throw new Error("missing id");
     expect(printed[1]).toContain("completed");
+    expect(printed[1]).toContain("concurrency=2");
+    expect(f.factory.store.getEvalRun(id)?.concurrency).toBe(2);
     expect(printed[1]).toContain("Wilson 95% CI");
     expect(printed[1]).toContain("API-equivalent");
     expect(printed[1]).toContain("paired cases=2");
@@ -353,6 +355,61 @@ test("CLI validates implement round options before submitting", async () => {
   expect(bodies[0]).toMatchObject({ rounds: 3, strategy: "effort", k: 2 });
 });
 
+test("CLI validates --concurrency, records it on the run and shows it in reports", async () => {
+  const bodies: unknown[] = [];
+  const mock = {
+    api: async <T>(_path: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return { id: "eval" } as T;
+    },
+    print: () => {},
+    wait: async () => {},
+  };
+  for (const concurrency of ["0", "-1", "1.5", "Infinity", "NaN", "", "9007199254740992"])
+    await expect(evalCommand(["run", "triage"], { models: "a", concurrency }, mock)).rejects.toThrow();
+  expect(bodies).toEqual([]);
+  const f = await evalFixture();
+  try {
+    const routes = createHttpRoutes(f.factory);
+    const printed: string[] = [];
+    const io = {
+      async api<T>(path: string, init?: RequestInit): Promise<T> {
+        const id = path.split("/").at(-1) ?? "";
+        const route =
+          path === "/api/evals"
+            ? (routes[path] as { POST: Route }).POST
+            : (routes["/api/evals/:id"] as Route);
+        const response = await route(
+          requestWithParams(
+            `http://localhost:7400${path}`,
+            { ...init, headers: { "content-type": "application/json" } },
+            { id },
+          ),
+          localServer,
+        );
+        return (await response.json()) as T;
+      },
+      print: (text: string) => printed.push(text),
+      wait: async () => {
+        for (const run of f.factory.store.listEvalRuns()) await f.factory.evals.wait(run.id);
+      },
+    };
+    await evalCommand(
+      ["run", "triage"],
+      { models: "candidate-a", k: "1", concurrency: "3", follow: true },
+      io,
+    );
+    const id = printed[0] ?? "";
+    expect(printed[1]).toContain("concurrency=3");
+    expect(f.factory.store.getEvalRun(id)?.concurrency).toBe(3);
+    printed.length = 0;
+    await evalCommand(["report", id], { json: true }, io);
+    expect(JSON.parse(printed[0] ?? "{}").run.concurrency).toBe(3);
+  } finally {
+    await f.close();
+  }
+});
+
 test("CLI entrypoint recognizes round flags", () => {
   const child = Bun.spawnSync([
     process.execPath,
@@ -366,10 +423,13 @@ test("CLI entrypoint recognizes round flags", () => {
     "3",
     "--strategy",
     "effort",
+    "--concurrency",
+    "3",
     "--help",
   ]);
   expect(child.exitCode).toBe(0);
   expect(child.stdout.toString()).toContain("--strategy retry|effort|switch");
+  expect(child.stdout.toString()).toContain("[--concurrency N]");
 });
 
 async function pinFixture(extra: [string, string][] = []) {

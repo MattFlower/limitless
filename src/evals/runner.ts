@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { EvalRun, EvalTrial } from "../core/types.ts";
+import { DEFAULT_EVAL_CONCURRENCY, type EvalRun, type EvalTrial } from "../core/types.ts";
 import { createEvalWorktree, type EvalLabels, pinnedTree, snapshotTopLevel } from "../git/repos.ts";
 import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
@@ -227,27 +227,55 @@ export class EvalRunner {
         group.push(modelId);
         groups.set(provider, group);
       }
-      // One deterministic stream per provider; all capacity still comes from the shared tracker.
+      const recorded = store.listEvalTrials(run.id);
+      // Each provider starts its trials in a fixed order, up to `limit` at once. Every invocation
+      // still acquires a slot from the shared tracker, and each trial checks the eval budget before
+      // it starts, so trials already in flight can overshoot `maxUsd` by at most limit - 1 trials
+      // per provider. Trial identity and cache keys never depend on completion order.
       const outcomes = await Promise.allSettled(
-        [...groups.values()].map(async (models) => {
-          for (const modelId of models)
-            for (const item of cases) {
-              for (const trial of store
-                .listEvalTrials(run.id)
-                .filter((t) => recordedTarget(t) === modelId && t.caseId === item.id)) {
+        [...groups.entries()].map(async ([provider, models]) => {
+          const queue = models.flatMap((modelId) =>
+            cases.flatMap((item) =>
+              recorded
+                .filter((t) => recordedTarget(t) === modelId && t.caseId === item.id)
+                .map((trial) => ({ trial, item })),
+            ),
+          );
+          const limit = Math.max(
+            1,
+            Math.min(
+              run.concurrency ?? DEFAULT_EVAL_CONCURRENCY,
+              this.deps.tracker.def(provider)?.maxConcurrent ?? 1,
+            ),
+          );
+          let next = 0;
+          let failed = false;
+          const worker = async () => {
+            while (!failed) {
+              const entry = queue[next++];
+              if (!entry) return;
+              try {
                 await this.trial(
                   run,
-                  trial,
-                  item,
+                  entry.trial,
+                  entry.item,
                   treeFor,
                   implementFor,
                   labels,
                   cache,
                   signal,
-                  hidden.get(item.id),
+                  hidden.get(entry.item.id),
                 );
+              } catch (error) {
+                // Like the sequential stream: an unexpected failure stops this provider's new trials.
+                failed = true;
+                throw error;
               }
             }
+          };
+          const results = await Promise.allSettled(Array.from({ length: limit }, worker));
+          const rejected = results.find((result) => result.status === "rejected");
+          if (rejected?.status === "rejected") throw rejected.reason;
         }),
       );
       const failed = outcomes.find((result) => result.status === "rejected");

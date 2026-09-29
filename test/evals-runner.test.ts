@@ -3,6 +3,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cacheKey } from "../src/evals/cache.ts";
 import { pinnedTree, withRepoLock } from "../src/git/repos.ts";
+import type { FakeReply } from "../src/harness/fake.ts";
 import { selectHarness } from "../src/harness/select.ts";
 import { FACTORY_PREAMBLE, triagePrompt } from "../src/pipeline/prompts.ts";
 import { TriageSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
@@ -483,6 +484,209 @@ test("saved unset effort remains unset after the catalog gains a default", async
     await f.factory.evals.wait(run.id);
     expect(f.calls[0]?.target.effort).toBeUndefined();
     expect(f.factory.evals.report(run.id)?.trials[0]?.effort).toBe("default");
+  } finally {
+    await f.close();
+  }
+});
+
+type Fixture = Awaited<ReturnType<typeof evalFixture>>;
+function setLimit(f: Fixture, provider: string, maxConcurrent: number) {
+  const def = f.factory.tracker.def(provider);
+  if (!def) throw new Error(`missing provider ${provider}`);
+  def.maxConcurrent = maxConcurrent;
+}
+async function until(check: () => boolean) {
+  for (let i = 0; i < 2000 && !check(); i++) await Bun.sleep(1);
+  if (!check()) throw new Error("condition never held");
+}
+/** Holds every fake call until released, tracking how many are active at once. */
+function gate(f: Fixture, reply: () => FakeReply = () => ({ structured: answer })) {
+  const state = { active: 0, max: 0, open: deferred<void>() };
+  f.respond(async () => {
+    state.max = Math.max(state.max, ++state.active);
+    await state.open.promise;
+    state.active--;
+    return reply();
+  });
+  return state;
+}
+
+test("concurrency runs N trials at once per provider when the provider allows more", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 3);
+    const state = gate(f);
+    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 2, concurrency: 2 });
+    expect(run.concurrency).toBe(2);
+    await until(() => state.active === 2);
+    await Bun.sleep(20);
+    expect(f.calls).toHaveLength(2);
+    state.open.resolve();
+    await f.factory.evals.wait(run.id);
+    const report = f.factory.evals.report(run.id);
+    expect(state.max).toBe(2);
+    expect(report?.run).toMatchObject({ status: "completed", concurrency: 2 });
+    expect(report?.trials.every((t) => t.status === "ok")).toBe(true);
+    expect(f.calls).toHaveLength(6);
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("omitted concurrency defaults to 2", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 5);
+    const state = gate(f);
+    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 2 });
+    await until(() => state.active === 2);
+    await Bun.sleep(20);
+    expect(state.active).toBe(2);
+    state.open.resolve();
+    await f.factory.evals.wait(run.id);
+    expect(state.max).toBe(2);
+    expect(f.factory.evals.report(run.id)?.run.concurrency).toBe(2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("provider limits and slots held by other daemon work cap eval concurrency", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 1);
+    let state = gate(f);
+    const first = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 2, concurrency: 3 });
+    await until(() => state.active === 1);
+    await Bun.sleep(20);
+    state.open.resolve();
+    await f.factory.evals.wait(first.id);
+    expect(state.max).toBe(1);
+    expect(f.calls).toHaveLength(6);
+
+    setLimit(f, "openrouter", 2);
+    const release = await f.factory.tracker.acquire("openrouter", new AbortController().signal);
+    state = gate(f);
+    const second = f.factory.evals.submit({
+      role: "triage",
+      models: ["candidate-a"],
+      k: 2,
+      concurrency: 3,
+      cache: false,
+    });
+    await until(() => state.active === 1);
+    await Bun.sleep(20);
+    expect(state.active).toBe(1);
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(2);
+    release();
+    await until(() => state.active === 2);
+    await Bun.sleep(20);
+    state.open.resolve();
+    await f.factory.evals.wait(second.id);
+    expect(state.max).toBe(2);
+    expect(f.factory.evals.report(second.id)?.run.status).toBe("completed");
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("budget stops new trials while concurrent in-flight trials finish and keep their costs", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 3);
+    const state = gate(f, () => ({ structured: answer, costUsd: 0.5 }));
+    const run = f.factory.evals.submit({
+      role: "triage",
+      models: ["candidate-a"],
+      k: 2,
+      concurrency: 3,
+      maxUsd: 0.5,
+    });
+    await until(() => state.active === 3);
+    state.open.resolve();
+    await f.factory.evals.wait(run.id);
+    const report = f.factory.evals.report(run.id);
+    expect(f.calls).toHaveLength(3);
+    expect(f.factory.store.evalSpend(run.id)).toBe(1.5);
+    expect(report?.run.status).toBe("budget_exhausted");
+    expect(report?.trials.filter((t) => t.status === "ok")).toHaveLength(3);
+    const skipped = report?.trials.filter((t) => t.status === "skipped") ?? [];
+    expect(skipped).toHaveLength(3);
+    expect(skipped.every((t) => t.details.reason === "eval budget exhausted")).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("shutdown interrupts concurrent trials, releases slots, and a resubmission reuses cached trials", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 3);
+    let active = 0;
+    f.respond(async (s) => {
+      // The first two calls complete; the rest hold until the daemon stops.
+      if (f.calls.length <= 2) return { structured: answer };
+      active++;
+      await new Promise<void>((resolve) =>
+        s.signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      return { structured: answer };
+    });
+    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 2, concurrency: 2 });
+    await until(() => active === 2);
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(2);
+    await f.factory.stop();
+    const report = f.factory.evals.report(run.id);
+    expect(report?.run).toMatchObject({ status: "failed", error: "eval interrupted by daemon shutdown" });
+    expect(report?.trials.every((t) => !["queued", "running"].includes(t.status))).toBe(true);
+    expect(report?.trials.filter((t) => t.status === "ok")).toHaveLength(2);
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+    expect(f.calls).toHaveLength(4);
+
+    const { EvalRunner } = await import("../src/evals/runner.ts");
+    const runner = new EvalRunner(f.factory.deps, f.casePath);
+    f.respond(() => ({ structured: answer }));
+    const again = runner.submit({ role: "triage", models: ["candidate-a"], k: 2, concurrency: 2 });
+    await runner.wait(again.id);
+    const resumed = runner.report(again.id);
+    expect(resumed?.run.status).toBe("completed");
+    expect(resumed?.trials.filter((t) => t.details.cache?.evalRunId === run.id)).toHaveLength(2);
+    expect(f.calls).toHaveLength(8);
+  } finally {
+    await f.close();
+  }
+});
+
+test("completion order never changes cache keys, grades or report order", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 3);
+    // Case b fails its gold so grades differ across cases.
+    const reply = (s: { prompt: string }) => ({
+      structured: s.prompt.includes("Fix b") ? { ...answer, risk: "high" as const } : answer,
+    });
+    f.respond(reply);
+    const sequential = await f.run({ models: ["candidate-a"], concurrency: 1, cache: false });
+    const pending: (() => void)[] = [];
+    f.respond(async (s) => {
+      const done = deferred<void>();
+      pending.push(() => done.resolve());
+      // Release each batch of three in reverse submission order.
+      if (pending.length === 3)
+        for (const [i, resolve] of pending.splice(0).reverse().entries()) setTimeout(resolve, i * 5);
+      await done.promise;
+      return reply(s);
+    });
+    const reversed = await f.run({ models: ["candidate-a"], concurrency: 3, cache: false });
+    const view = (r: typeof sequential) =>
+      r.trials.map((t) => [t.caseId, t.modelId, t.trial, t.cacheKey, t.status, t.pass, t.score, t.output]);
+    expect(view(reversed)).toEqual(view(sequential));
+    expect(view(sequential).map((t) => t[5])).toEqual([true, true, false, false, true, true]);
+    expect(reversed.summaries.map((s) => [s.passRate, s.evaluatedTrials])).toEqual(
+      sequential.summaries.map((s) => [s.passRate, s.evaluatedTrials]),
+    );
   } finally {
     await f.close();
   }
