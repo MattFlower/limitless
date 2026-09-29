@@ -1372,7 +1372,6 @@ p {
 .tab:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
-  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
 }
 .tab.active {
   color: var(--accent);
