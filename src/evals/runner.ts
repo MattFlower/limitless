@@ -117,7 +117,8 @@ export class EvalRunner {
     const run = this.deps.store.getEvalRun(id);
     if (!run) return null;
     const trials = this.deps.store.listEvalTrials(id);
-    return { run, summaries: summarize(run, trials, options), trials };
+    const cascadeFallback = run.role === "triage" ? this.deps.router.decisionFallback("triage") : undefined;
+    return { run, summaries: summarize(run, trials, { cascadeFallback, ...options }), trials };
   }
 
   /**
@@ -347,6 +348,7 @@ export class EvalRunner {
     let target = router.toTarget(model, effort ?? null);
     let { harnessName, noTools } = selectHarness(run.role, target);
     trial.harness = harnessName;
+    if (harnessName === "decisions") trial.details.decisionConfidence = cfg.triageDecisionConfidence;
     let release: (() => void) | undefined;
     let directory: string | undefined;
     let scratch: string | undefined;
@@ -381,12 +383,21 @@ export class EvalRunner {
       const prepared =
         "hidden" in effective
           ? implementation
-          : await prepareCase(effective, cwd, tree, patch, signal, system?.implementerReport);
+          : await prepareCase(
+              effective,
+              cwd,
+              tree,
+              patch,
+              signal,
+              system?.implementerReport,
+              cfg.triageDecisionConfidence,
+            );
       if (!prepared) throw new Error("missing trial preparation");
       const preparationMs = Date.now() - preparationStarted;
       let { prompt } = prepared;
       const { timeoutMs } = prepared;
       const reviewInput = "review" in prepared ? prepared.review : undefined;
+      const decisionTask = "decisionTask" in prepared ? prepared.decisionTask : undefined;
       const schema = "hidden" in item ? undefined : schemaFor(item);
       const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
@@ -432,7 +443,8 @@ export class EvalRunner {
       );
       if (signal.aborted) return skip("daemon shutdown");
       if (budget()) return skip("eval budget exhausted");
-      if (cache)
+      // Decision calls cost ~$0.0001 and keep their declined status only when executed.
+      if (cache && harnessName !== "decisions")
         for (const source of store.cachedEvalTrials(trial.cacheKey)) {
           const output =
             "hidden" in item
@@ -498,6 +510,7 @@ export class EvalRunner {
                 ...(sessionId ? { resumeSessionId: sessionId } : {}),
                 cwd,
                 ...request,
+                decisionTask,
                 systemAppend: FACTORY_PREAMBLE,
                 target,
                 mode: "hidden" in item ? "edit" : "readonly",
@@ -603,7 +616,9 @@ export class EvalRunner {
           tracker.blockModel(target.modelId, result.error ?? "model rejected");
         if (signal.aborted) return skip("daemon shutdown");
         const output = schema?.safeParse(result.structured ?? extractJson(result.finalText));
-        const ok = result.status === "ok" && ("hidden" in item || output?.success === true);
+        // A declined decision answer is still graded; details.invocationStatus records the escalation.
+        const answered = result.status === "ok" || result.status === "declined";
+        const ok = answered && ("hidden" in item || output?.success === true);
         const grade =
           "hidden" in effective && implementation
             ? result.status === "ok"

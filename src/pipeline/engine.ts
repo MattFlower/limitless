@@ -78,6 +78,7 @@ import {
   type Verify,
   VerifySchema,
 } from "./schemas.ts";
+import { triageDecisions } from "./triage-decisions.ts";
 import {
   blockedOnly,
   ENVIRONMENT_BLOCKED,
@@ -370,16 +371,18 @@ function topLevel(path: string): string {
 
 async function triage(ctx: RunContext): Promise<void> {
   await ctx.stage("triage", async (stage) => {
+    const input = {
+      repoSlug: ctx.repo.slug,
+      prompt: ctx.run.prompt,
+      tree: topLevel(ctx.state.worktreePath as string),
+    };
     const { result, target } = await ctx.invoke({
       role: "triage",
       stage,
       mode: "readonly",
       complexity: "small",
-      prompt: triagePrompt({
-        repoSlug: ctx.repo.slug,
-        prompt: ctx.run.prompt,
-        tree: topLevel(ctx.state.worktreePath as string),
-      }),
+      prompt: triagePrompt(input),
+      decisionTask: triageDecisions(input, ctx.deps.cfg.triageDecisionConfidence),
       jsonSchema: toStrictJsonSchema(TriageSchema),
       schema: TriageSchema,
       requireStructured: true,
