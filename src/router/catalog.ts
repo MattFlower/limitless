@@ -107,7 +107,7 @@ export const PROVIDERS: ProviderDef[] = [
     billing: "metered",
     maxConcurrent: 4,
     decisionsBaseUrl: "https://api.typesafe.ai",
-    apiKeySecret: "LIMITLESS_API_KEY",
+    apiKeySecret: "TYPESAFE_API_KEY",
   },
 ];
 
