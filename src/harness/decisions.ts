@@ -15,13 +15,19 @@ export type DecisionAnswer =
   | { type: "score"; score: number; level: number; confidence: number }
   | { type: "noul"; noul: number };
 
+export interface DecisionDecline {
+  reason: string;
+  /** The answers are sound but unsure: usable as the last resort when no other model can answer. */
+  lastResort: boolean;
+}
+
 export interface DecisionTask {
   state: string | Record<string, unknown>;
   questions: Record<string, DecisionQuestion>;
   /** Maps the answers (keyed like `questions`) to the role's structured output. */
   interpret(answers: Record<string, DecisionAnswer>): unknown;
-  /** A reason to decline the answers (e.g. low confidence), so routing tries the next model. */
-  decline?(answers: Record<string, DecisionAnswer>): string | null;
+  /** Declines the answers so routing tries the next model; see DecisionDecline. */
+  decline?(answers: Record<string, DecisionAnswer>): DecisionDecline | null;
 }
 
 const Probability = z.number().min(0).max(1);
@@ -210,10 +216,11 @@ export const runDecisions: Harness = async (spec) => {
     try {
       // A declined result keeps its structured output so evals can grade what the model answered.
       const structured = task.interpret(answers);
-      const declined = task.decline?.(answers) ?? null;
-      return finish(declined ? "declined" : "ok", declined, {
+      const decline = task.decline?.(answers) ?? null;
+      return finish(decline ? "declined" : "ok", decline?.reason ?? null, {
         structured,
         finalText: JSON.stringify(answers),
+        ...(decline ? { decline } : {}),
       });
     } catch (error) {
       return finish("error", `decision mapping failed: ${(error as Error).message}`);

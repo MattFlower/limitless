@@ -458,6 +458,8 @@ export interface EvalTrial {
     reason?: string;
     grade?: EvalGrade;
     invocationStatus?: InvocationStatus;
+    /** `[triage] decision_confidence` a decision-model trial ran with. */
+    decisionConfidence?: number;
     preparationFailed?: boolean;
     interrupted?: boolean;
     cache?: {

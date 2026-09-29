@@ -390,11 +390,11 @@ export class RunContext {
     const { router, tracker, store, harnesses } = this.deps;
     const tried: (string | ModelSelection)[] = [...(opts.constraints?.exclude ?? [])];
     let lastFailure: string | null = null;
-    let declined: InvokeOutcome | null = null;
-    // With nothing left to fall through to, a declined answer beats failing the stage.
-    const useDeclined = (outcome: InvokeOutcome) => {
+    // An unsure (not question-needing) decline beats failing the stage when nothing else answers.
+    let lastResort: InvokeOutcome | null = null;
+    const useLastResort = (outcome: InvokeOutcome, why: string) => {
       this.log(
-        `No other model for ${opts.role}; using the declined answer from ${outcome.target.targetId ?? outcome.target.modelId}`,
+        `${why}; using the declined answer from ${outcome.target.targetId ?? outcome.target.modelId}`,
         "warn",
       );
       return outcome;
@@ -408,7 +408,7 @@ export class RunContext {
         this.routingConstraints({ ...opts.constraints, exclude: tried }),
       );
       const target = decision.candidates[0];
-      if (!target && declined) return useDeclined(declined);
+      if (!target && lastResort) return useLastResort(lastResort, `No other model for ${opts.role}`);
       if (!target) {
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
         if (opts.privateOutput) throw new NoCapacityError(`No model available for ${opts.role}`);
@@ -582,12 +582,14 @@ export class RunContext {
       if (this.termination) throw this.termination;
       if (result.status === "cancelled" || this.signal.aborted) throw new CancelledError();
       if (result.status === "declined") {
-        // Not a failure: the provider answered, but not confidently enough to use.
-        lastFailure = `${target.targetId ?? target.modelId}: declined (${result.error ?? ""})`.slice(0, 300);
-        this.log(
-          `${target.targetId ?? target.modelId} declined: ${result.error ?? ""}; trying the next model`,
-        );
-        declined = { result, target, invocation: updated };
+        // Not a failure and not a routing attempt: each decision model declines at most once.
+        const reason = opts.privateOutput
+          ? "private invocation declined"
+          : (redact?.(result.error ?? "") ?? result.error ?? "");
+        lastFailure = `${target.targetId ?? target.modelId}: declined (${reason})`.slice(0, 300);
+        this.log(`${target.targetId ?? target.modelId} declined: ${reason}; trying the next model`);
+        if (result.decline?.lastResort) lastResort = { result, target, invocation: updated };
+        attempt--;
         continue;
       }
       if (result.status !== "ok" && MODEL_REJECTED.test(result.error ?? "")) {
@@ -632,7 +634,7 @@ export class RunContext {
       }
       return { result, target, invocation: updated };
     }
-    if (declined) return useDeclined(declined);
+    if (lastResort) return useLastResort(lastResort, `Gave up routing ${opts.role} after 6 failed attempts`);
     throw new NoCapacityError(
       opts.privateOutput
         ? `Gave up routing ${opts.role}`

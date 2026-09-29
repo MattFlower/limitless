@@ -106,17 +106,25 @@ test("triage questions cover the schema and answers map to a valid triage", () =
 test("declines on any low choice or score confidence, or when questions are likely", () => {
   const task = triageDecisions(input, 0.6);
   expect(task.decline?.(answers(0.6))).toBeNull();
-  expect(task.decline?.(answers(0.59))).toBe("confidence below 0.6 (complexity 0.59)");
-  expect(task.decline?.(answers(0.9, 0.5))).toBe("blocking questions likely (P=0.50)");
-  expect(task.decline?.(answers(0.3, 0.8))).toBe(
-    "confidence below 0.6 (complexity 0.30); blocking questions likely (P=0.80)",
-  );
+  // Only a decline for low confidence alone may serve as a last resort.
+  expect(task.decline?.(answers(0.59))).toEqual({
+    reason: "confidence below 0.6 (complexity 0.59)",
+    lastResort: true,
+  });
+  expect(task.decline?.(answers(0.9, 0.5))).toEqual({
+    reason: "blocking questions likely (P=0.50)",
+    lastResort: false,
+  });
+  expect(task.decline?.(answers(0.3, 0.8))).toEqual({
+    reason: "confidence below 0.6 (complexity 0.30); blocking questions likely (P=0.80)",
+    lastResort: false,
+  });
   // Only an LLM can write the blocking questions a confidently ambiguous request needs.
   const unclear = {
     ...answers(0.9),
     ambiguity: { type: "score", score: 2, level: 2, confidence: 0.9 },
   } as const;
-  expect(task.decline?.(unclear)).toBe("ambiguity high");
+  expect(task.decline?.(unclear)).toEqual({ reason: "ambiguity high", lastResort: false });
 });
 
 test("a declined decision falls through to the LLM triage without counting as a provider failure", async () => {
@@ -297,34 +305,45 @@ test("triage evals grade declined decisions, skip the cache for them and report 
         decisionsBaseUrl: "http://unused.invalid",
       },
     ],
+    // Production would fall through from Jev to candidate-b.
+    { triage: { default: ["typesafe/jev", "candidate-b"] } } as unknown as Policy,
   );
   try {
     const wrong = { ...answer, risk: "high" as const };
     f.respond((spec) => {
       const id = spec.prompt.match(/> Fix (\w)/)?.[1];
-      if (spec.target.modelId === "candidate-b") return { structured: id === "a" ? wrong : answer };
+      if (spec.target.modelId === "candidate-b")
+        return { structured: id === "a" ? wrong : answer, costUsd: 0.001 };
       expect(spec.decisionTask?.questions.task_class?.type).toBe("choice");
       // Jev: "a" is right but declined, "b" right, "c" wrong.
-      if (id === "a") return { status: "declined", structured: answer, error: "confidence below 0.6" };
-      return { structured: id === "c" ? wrong : answer };
+      if (id === "a")
+        return { status: "declined", structured: answer, error: "confidence below 0.6", costUsd: 0.00004 };
+      return { structured: id === "c" ? wrong : answer, costUsd: 0.00004 };
     });
     const report = await f.run({ models: ["typesafe/jev", "candidate-b"], k: 1 });
     const jev = report.summaries.find((m) => m.modelId === "typesafe/jev");
-    expect(jev).toMatchObject({ passes: 2, evaluatedTrials: 3, declined: 1 });
-    expect(jev?.cascade).toEqual({
-      fallbackModel: "candidate-b",
-      passes: 1,
+    expect(jev).toMatchObject({ passes: 2, evaluatedTrials: 3 });
+    expect(jev?.escalation).toEqual({
       trials: 3,
-      missing: 0,
-      passRate: 1 / 3,
+      escalated: 1,
+      declined: 1,
+      failed: 0,
+      thresholds: [0.6],
+      cascade: {
+        fallbackModel: "candidate-b",
+        passes: 1,
+        missing: 0,
+        passRate: 1 / 3,
+        costPerTrialUsd: expect.closeTo((3 * 0.00004 + 0.001) / 3, 9),
+        latencyPerTrialMs: expect.any(Number),
+      },
     });
-    expect(report.summaries.find((m) => m.modelId === "candidate-b")).toMatchObject({
-      declined: 0,
-      cascade: null,
-    });
-    expect(formatEvalReport(report)).toContain(
-      "  declined (escalated to the next model): 1/3 (33.3%); cascade via candidate-b: pass 33.3% (1/3)",
+    expect(report.summaries.find((m) => m.modelId === "candidate-b")?.escalation).toBeNull();
+    const text = formatEvalReport(report);
+    expect(text).toContain(
+      "  escalated to the next triage model: 1/3 (33.3%): declined 1 at decision_confidence 0.6, failed 0",
     );
+    expect(text).toContain("  cascade via candidate-b: pass 33.3% (1/3); per request $0.000373, ");
     const before = f.harnessNames.filter((n) => n === "decisions").length;
     await f.run({ models: ["typesafe/jev"], k: 1 });
     expect(f.harnessNames.filter((n) => n === "decisions").length).toBe(before + 3);
@@ -333,7 +352,7 @@ test("triage evals grade declined decisions, skip the cache for them and report 
   }
 });
 
-test("the cascade falls back on every non-ok decision trial, to the model covering them", () => {
+test("the cascade escalates every non-ok decision trial to the policy's next triage model", () => {
   const trial = (
     modelId: string,
     caseId: string,
@@ -351,44 +370,144 @@ test("the cascade falls back on every non-ok decision trial, to the model coveri
     output: null,
     pass,
     score: pass ? 1 : 0,
-    details: { invocationStatus: "ok" },
-    costUsd: 0,
+    details:
+      modelId === "jev" ? { invocationStatus: "ok", decisionConfidence: 0.6 } : { invocationStatus: "ok" },
+    costUsd: modelId === "jev" ? 0.0001 : 0.01,
     costEquivUsd: 0,
     tokensIn: 0,
     tokensOut: 0,
-    durationMs: 1,
+    durationMs: modelId === "jev" ? 100 : 1000,
     createdAt: 0,
     ...over,
   });
   const jev = [
-    trial("jev", "a", true, { details: { invocationStatus: "declined" } }),
+    trial("jev", "a", true, { details: { invocationStatus: "declined", decisionConfidence: 0.6 } }),
     trial("jev", "b", true),
     trial("jev", "c", false, { status: "error", details: { invocationStatus: "unavailable" } }),
     trial("jev", "d", false),
   ];
-  // llm-a has the best pass rate but ran only case "a"; llm-b covers every fall-through.
-  const llmA = [trial("llm-a", "a", true)];
-  const llmB = [
+  const cache = { evalRunId: "old", caseId: "c", costUsd: 0.02, costEquivUsd: 0, tokensIn: 0, tokensOut: 0 };
+  const llm = [
     trial("llm-b", "a", false),
     trial("llm-b", "b", true),
-    trial("llm-b", "c", true),
+    // A cached fallback trial still costs what its source run spent.
+    trial("llm-b", "c", true, { costUsd: 0, details: { cache: { ...cache, durationMs: 2000 } } }),
     trial("llm-b", "d", true),
+    trial("llm-a", "a", true),
   ];
   const run = { id: "e", role: "triage", k: 1, models: [] } as unknown as EvalRun;
-  const cascadeOf = (trials: EvalTrial[]) => summarize(run, trials).find((m) => m.modelId === "jev")?.cascade;
-  expect(cascadeOf([...jev, ...llmA, ...llmB])).toEqual({
-    fallbackModel: "llm-b",
-    passes: 2,
-    trials: 4,
-    missing: 0,
-    passRate: 0.5,
+  const of = (fallback?: string) =>
+    summarize(run, [...jev, ...llm], { cascadeFallback: fallback }).find((m) => m.modelId === "jev")
+      ?.escalation;
+  const counts = { trials: 4, escalated: 2, declined: 1, failed: 1, thresholds: [0.6] };
+  expect(of("llm-b")).toEqual({
+    ...counts,
+    cascade: {
+      fallbackModel: "llm-b",
+      passes: 2,
+      missing: 0,
+      passRate: 0.5,
+      costPerTrialUsd: expect.closeTo((4 * 0.0001 + 0.01 + 0.02) / 4, 9),
+      latencyPerTrialMs: (4 * 100 + 1000 + 2000) / 4,
+    },
   });
-  expect(cascadeOf([...jev, ...llmA])).toEqual({
-    fallbackModel: "llm-a",
-    passes: 2,
-    trials: 4,
-    missing: 1,
-    passRate: 0.5,
+  // A fallback with gaps: the escalated trial it lacks counts as a failure.
+  expect(of("llm-a")?.cascade).toMatchObject({ passes: 2, missing: 1, passRate: 0.5 });
+  expect(of("absent")?.cascade).toEqual({
+    fallbackModel: "absent",
+    passes: null,
+    missing: 2,
+    passRate: null,
+    costPerTrialUsd: null,
+    latencyPerTrialMs: null,
   });
-  expect(summarize(run, llmB)[0]?.cascade).toBeNull();
+  expect(of()).toEqual({ ...counts, cascade: null });
+  expect(summarize(run, llm)[0]?.escalation).toBeNull();
+});
+
+test("declines don't use up routing attempts, and an invalid declined answer is never used", async () => {
+  const cfg = loadConfig({ home: join(dir, "data"), configDir: join(dir, "cfg") });
+  const store = new Store(join(dir, "db.sqlite"));
+  try {
+    const llms = ["m1", "m2", "m3", "m4", "m5", "m6"].map((id) => `p/${id}`);
+    const providers: ProviderDef[] = [
+      { id: "typesafe", label: "decisions", harness: "decisions", billing: "metered", maxConcurrent: 1 },
+      { id: "p", label: "LLMs", harness: "fake", billing: "subscription", maxConcurrent: 1 },
+    ];
+    const model = (id: string): ModelDef => ({
+      id,
+      provider: id.split("/")[0] ?? "",
+      model: id,
+      vendor: "other",
+      origin: "US",
+      baseOrigin: "US",
+      supportedEfforts: [],
+      tier: 1,
+      price: { input: 0, output: 0 },
+    });
+    const tracker = new ProviderTracker(providers, store, cfg.reserves, {});
+    const policy = { triage: { default: ["typesafe/jev", ...llms] } } as Policy;
+    const router = new Router(tracker, policy, ["typesafe/jev", ...llms].map(model));
+    const result = (over: Partial<AgentResult>): AgentResult => ({
+      status: "ok",
+      finalText: "",
+      structured: null,
+      sessionId: null,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      numTurns: 1,
+      costUsd: 0,
+      costEquivUsd: 0,
+      error: null,
+      quota: null,
+      ...over,
+    });
+    let unsure: unknown = TriageSchema.parse(triageDecisions(input, 0.6).interpret(answers(0.3)));
+    const decisions = async (): Promise<AgentResult> =>
+      result({
+        status: "declined",
+        structured: unsure,
+        error: "unsure",
+        decline: { reason: "unsure", lastResort: true },
+      });
+    // Every LLM fails the task (not a provider failure, so no circuit breaker cuts the chain short).
+    const failing = async (): Promise<AgentResult> => result({ status: "error", error: "bad output" });
+    const repo = store.upsertRepo({
+      slug: "local/test",
+      kind: "local",
+      localPath: dir,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: input.prompt });
+    const context = new RunContext(
+      { cfg, store, tracker, router, harnesses: { decisions, fake: failing } },
+      run,
+      repo,
+      new AbortController().signal,
+    );
+    const triage = () =>
+      context.invoke({
+        role: "triage",
+        stage: store.startStage(run.id, "triage"),
+        prompt: "unused",
+        mode: "readonly",
+        complexity: "small",
+        decisionTask: triageDecisions(input, 0.6),
+        schema: TriageSchema,
+        requireStructured: true,
+      });
+    const outcome = await triage();
+    expect(outcome.target.modelId).toBe("typesafe/jev");
+    expect(store.listInvocations(run.id).map((i) => i.modelId)).toEqual(["typesafe/jev", ...llms]);
+    expect(store.listEvents(run.id).map((e) => e.message)).toContain(
+      "Gave up routing triage after 6 failed attempts; using the declined answer from typesafe/jev",
+    );
+
+    unsure = { title: "missing fields" };
+    await expect(triage()).rejects.toThrow("Gave up routing triage: p/m5: bad output");
+    expect(store.listInvocations(run.id).at(7)).toMatchObject({ modelId: "typesafe/jev", status: "error" });
+  } finally {
+    store.close();
+  }
 });

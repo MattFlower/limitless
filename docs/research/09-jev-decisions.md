@@ -75,7 +75,8 @@ triage prompt's guidance, risk with the blast-radius text), `needs_questions` (n
 title from the request's first line, and `blocking_questions: []`. If any choice/score confidence is
 below `[triage] decision_confidence`, P(needs_questions) ≥ 0.5, or ambiguity is high (only an LLM
 can write the blocking questions), the invocation is **declined** and routing falls through to the
-next triage model; with none left, the declined answer is used with a warning.
+next triage model. A decline for low confidence alone may still be used, with a warning, when no other
+model can answer; one that needs questions never is.
 
 ### Calibration (2026-09-28, k=1 on the 40-case `evals/triage` gold set)
 

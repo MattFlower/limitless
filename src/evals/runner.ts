@@ -110,7 +110,8 @@ export class EvalRunner {
     const run = this.deps.store.getEvalRun(id);
     if (!run) return null;
     const trials = this.deps.store.listEvalTrials(id);
-    return { run, summaries: summarize(run, trials, options), trials };
+    const cascadeFallback = run.role === "triage" ? this.deps.router.decisionFallback("triage") : undefined;
+    return { run, summaries: summarize(run, trials, { cascadeFallback, ...options }), trials };
   }
 
   /**
@@ -335,6 +336,7 @@ export class EvalRunner {
     let target = router.toTarget(model, effort ?? null);
     let { harnessName, noTools } = selectHarness(run.role, target);
     trial.harness = harnessName;
+    if (harnessName === "decisions") trial.details.decisionConfidence = cfg.triageDecisionConfidence;
     let release: (() => void) | undefined;
     let directory: string | undefined;
     let scratch: string | undefined;

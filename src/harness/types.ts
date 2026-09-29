@@ -1,6 +1,6 @@
 import type { ZodType } from "zod";
 import type { Billing, Effort, InvocationStatus, QuotaWindow } from "../core/types.ts";
-import type { DecisionTask } from "./decisions.ts";
+import type { DecisionDecline, DecisionTask } from "./decisions.ts";
 
 /** A concrete model on a concrete provider, as chosen by the router. */
 export interface ModelTarget {
@@ -90,6 +90,8 @@ export interface AgentResult {
   quota: { windows: Record<string, QuotaWindow>; exhaustedUntil: number | null } | null;
   /** With status "quota": only this model is rate-limited, so cool it down instead of its provider. */
   modelCooldownMs?: number;
+  /** With status "declined": why, and whether the answer may still serve as a last resort. */
+  decline?: DecisionDecline;
 }
 
 export type Harness = (spec: AgentSpec) => Promise<AgentResult>;

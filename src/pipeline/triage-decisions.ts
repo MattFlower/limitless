@@ -129,12 +129,14 @@ export function triageDecisions(
         a.type !== "noul" && a.confidence < minConfidence ? [`${id} ${a.confidence.toFixed(2)}`] : [],
       );
       const questions = answer(answers, "needs_questions", "noul").noul;
+      const unclear = level(answers, "ambiguity", LEVELS) === "high";
       const reasons = [
         ...(unsure.length ? [`confidence below ${minConfidence} (${unsure.join(", ")})`] : []),
         ...(questions >= 0.5 ? [`blocking questions likely (P=${questions.toFixed(2)})`] : []),
-        ...(level(answers, "ambiguity", LEVELS) === "high" ? ["ambiguity high"] : []),
+        ...(unclear ? ["ambiguity high"] : []),
       ];
-      return reasons.length ? reasons.join("; ") : null;
+      // A request that needs questions must reach a model that can write them, or a human.
+      return reasons.length ? { reason: reasons.join("; "), lastResort: questions < 0.5 && !unclear } : null;
     },
   };
 }

@@ -7,7 +7,7 @@ import type { CaseFile } from "../src/evals/cases.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { Triage } from "../src/pipeline/schemas.ts";
-import type { ModelDef, ProviderDef } from "../src/router/catalog.ts";
+import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 
 export const answer: Triage = {
@@ -36,7 +36,11 @@ export function deferred<T>() {
   });
   return { promise, resolve };
 }
-export async function evalFixture(extraModels: ModelDef[] = [], extraProviders: ProviderDef[] = []) {
+export async function evalFixture(
+  extraModels: ModelDef[] = [],
+  extraProviders: ProviderDef[] = [],
+  policy?: Policy,
+) {
   const home = mkdtempSync(join(tmpdir(), "limitless-eval-"));
   const cfg = loadConfig({ home, configDir: join(home, "config") });
   cfg.secrets = {};
@@ -84,6 +88,7 @@ export async function evalFixture(extraModels: ModelDef[] = [], extraProviders: 
       return handler(s);
     });
   const factory = new Factory(cfg, {
+    ...(policy ? { policy } : {}),
     evalCasePath: casePath,
     providers: [
       {

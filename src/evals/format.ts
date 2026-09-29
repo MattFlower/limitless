@@ -2,6 +2,22 @@ import { effortLabel } from "../core/effort-format.ts";
 import type { EvalReport } from "./stats.ts";
 import { wilson } from "./stats.ts";
 
+type Escalation = NonNullable<EvalReport["summaries"][number]["escalation"]>;
+const percent = (n: number, d: number) => (d ? `${((n / d) * 100).toFixed(1)}%` : "n/a");
+
+function escalationLines(e: Escalation): string[] {
+  const threshold = e.thresholds.length ? ` at decision_confidence ${e.thresholds.join(", ")}` : "";
+  const c = e.cascade;
+  return [
+    `  escalated to the next triage model: ${e.escalated}/${e.trials} (${percent(e.escalated, e.trials)}): declined ${e.declined}${threshold}, failed ${e.failed}`,
+    !c
+      ? "  cascade: n/a (no non-decision triage model in the routing policy)"
+      : c.passes === null
+        ? `  cascade via ${c.fallbackModel}: n/a (no trials for it in this eval)`
+        : `  cascade via ${c.fallbackModel}: pass ${percent(c.passes, e.trials)} (${c.passes}/${e.trials})${c.missing ? `, ${c.missing} escalated without a fallback trial` : ""}; per request $${c.costPerTrialUsd?.toFixed(6) ?? "n/a"}, ${c.latencyPerTrialMs?.toFixed(0) ?? "n/a"} ms`,
+  ];
+}
+
 export function formatEvalReport(report: EvalReport): string {
   const number = (n: number | null) => (n === null ? "n/a" : n.toFixed(3));
   const pct = (n: number | null) => (n === null ? "n/a" : `${(n * 100).toFixed(1)}%`);
@@ -78,11 +94,7 @@ export function formatEvalReport(report: EvalReport): string {
       `  pass ${pct(m.passRate)} (${m.passes}/${m.evaluatedTrials}), Wilson 95% CI ${m.ci ? `[${pct(m.ci[0])}, ${pct(m.ci[1])}]` : "n/a"}; mean score ${number(m.meanScore)}`,
       ...roleLines,
       `  prediction coverage ${m.predictionTrials}/${m.scheduledTrials} (${pct(m.predictionCoverage)}); flip ${pct(m.flipRate)} (n=${m.flipDenominator})`,
-      ...(m.declined || m.cascade
-        ? [
-            `  declined (escalated to the next model): ${m.declined}/${m.evaluatedTrials} (${pct(m.evaluatedTrials ? m.declined / m.evaluatedTrials : null)})${m.cascade ? `; cascade via ${m.cascade.fallbackModel}: pass ${pct(m.cascade.passRate)} (${m.cascade.passes}/${m.cascade.trials})${m.cascade.missing ? `, ${m.cascade.missing} without a fallback trial` : ""}` : ""}`,
-          ]
-        : []),
+      ...(m.escalation ? escalationLines(m.escalation) : []),
       ...(report.run.role === "triage"
         ? [
             metric("risk under-call", {
