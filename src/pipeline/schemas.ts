@@ -235,36 +235,28 @@ export type StoredReview = Omit<Review, "verdict"> & Partial<Pick<Review, "verdi
 
 export const VerifySchema = z.object({
   criteria: z.array(
-    z
-      .object({
-        id: z.string(),
-        status: z.enum(["met", "unmet", "unclear", "blocked"]),
-        evidence: z.string().trim().min(1).describe("Command + observed output, or file:line references"),
-        publicSummary: z
-          .string()
-          .describe(
-            "For H-ids, short observed behavior without private inputs or expected values; empty for public criteria",
-          ),
-        // Defaults let output recorded before holdouts were classified parse as unclassified, which blocks.
-        requirement: z
-          .enum(["request", "spec", "not_required"])
-          .nullable()
-          .default(null)
-          .describe("For unmet H-ids, what the failure violates; null for every other entry"),
-        requirementCitation: z
-          .string()
-          .default("")
-          .describe("For request/spec, the exact violated text quoted from the request or spec; else empty"),
-      })
-      .refine(
-        (c) =>
-          (c.requirement !== "request" && c.requirement !== "spec") ||
-          /[\p{L}\p{N}]/u.test(c.requirementCitation),
-        {
-          message: "request/spec classifications must quote the violated text",
-          path: ["requirementCitation"],
-        },
-      ),
+    z.object({
+      id: z.string(),
+      status: z.enum(["met", "unmet", "unclear", "blocked"]),
+      evidence: z.string().trim().min(1).describe("Command + observed output, or file:line references"),
+      publicSummary: z
+        .string()
+        .describe(
+          "For H-ids, short observed behavior without private inputs or expected values; empty for public criteria",
+        ),
+      // Defaults let output recorded before holdouts were classified parse as unclassified, which blocks.
+      // A malformed classification (missing or ungrounded citation) is not a schema failure either:
+      // it still blocks, and the citation is simply withheld from feedback (see `citedRequirement`).
+      requirement: z
+        .enum(["request", "spec", "not_required"])
+        .nullable()
+        .default(null)
+        .describe("For unmet H-ids, what the failure violates; null for every other entry"),
+      requirementCitation: z
+        .string()
+        .default("")
+        .describe("For request/spec, the exact violated text quoted from the request or spec; else empty"),
+    }),
   ),
   overall: z.enum(["pass", "fail"]),
   notes: z.string(),
@@ -288,31 +280,6 @@ export function citedRequirement(citation: string, source: string): string | nul
 
 export function requirementSource(requirement: "request" | "spec", request: string, spec: Spec): string {
   return requirement === "request" ? request : renderSpec(spec);
-}
-
-/**
- * Verifier output is accepted only when each request/spec classification quotes its named public
- * source and the evidence repeats that quote. The bare `VerifySchema` still parses stored results.
- */
-export function verifySchemaFor(request: string, spec: Spec) {
-  return VerifySchema.superRefine(({ criteria }, ctx) => {
-    criteria.forEach((c, i) => {
-      if (c.requirement !== "request" && c.requirement !== "spec") return;
-      const quote = citedRequirement(c.requirementCitation, requirementSource(c.requirement, request, spec));
-      if (quote === null)
-        ctx.addIssue({
-          code: "custom",
-          path: ["criteria", i, "requirementCitation"],
-          message: `${c.id}: requirementCitation is not quoted from the ${c.requirement}`,
-        });
-      else if (citedRequirement(quote, c.evidence) === null)
-        ctx.addIssue({
-          code: "custom",
-          path: ["criteria", i, "evidence"],
-          message: `${c.id}: evidence must cite the violated ${c.requirement} text`,
-        });
-    });
-  });
 }
 
 export function renderSpec(spec: Spec): string {

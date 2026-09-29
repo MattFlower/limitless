@@ -254,8 +254,9 @@ export function formatVerifyFeedback(
 }
 
 /**
- * Accepted verifier output always carries a verbatim quote (see `verifySchemaFor`); this guard
- * keeps a malformed stored result from repeating anything redaction would withhold.
+ * A request/spec classification blocks whether or not its citation is grounded, so a malformed
+ * live classification still yields a verdict. Only a verbatim quote of the named public source is
+ * repeated to the implementer; anything else (a paraphrase could carry scenario text) is withheld.
  */
 function violatedRequirement(
   requirement: "request" | "spec",

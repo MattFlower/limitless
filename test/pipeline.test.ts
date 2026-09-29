@@ -2192,41 +2192,38 @@ protected_paths = ["protected.txt"]
       },
     );
 
-    test("a fabricated citation is a failed invocation; the next verifier's grounded result is used", async () => {
-      let verifies = 0;
-      let implementCalls = 0;
-      const f = start((s) => {
-        const role = roleOf(s);
-        if (role === "triage") return { structured: triage() };
-        if (role === "spec") return { structured: spec };
-        if (role === "holdout") return { structured: privateHoldout };
-        if (role === "review") return { structured: approve };
-        if (role === "verify") {
-          verifies++;
-          if (verifies === 1)
-            return {
-              structured: unmetH2({ requirement: "spec", requirementCitation: "fabricated requirement" }),
-            };
-          if (verifies === 2)
-            return {
-              structured: unmetH2({ requirement: "spec", requirementCitation: "farewell.txt exists" }),
-            };
-          return { structured: pass };
-        }
-        implementCalls++;
-        return { files: { "farewell.txt": "goodbye\n" } };
-      });
-      const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
-      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-      const invs = f.store.listInvocations(run.id).filter((i) => i.role === "verify");
-      expect(invs.map((i) => i.status)).toEqual(["error", "ok", "ok"]);
-      expect(invs[0]?.error).toContain("structured output failed validation");
-      expect(invs[0]?.error).not.toContain(secret);
-      expect(invs[0]?.modelId).not.toBe(invs[1]?.modelId);
-      expect(implementCalls).toBe(2);
-      const first = f.store.getRunState<RunState>(run.id)?.verifyResults?.[0];
-      expect(first?.criteria.find((c) => c.id === "H-2")?.requirementCitation).toBe("farewell.txt exists");
-    });
+    test.each([
+      ["a fabricated citation", `run ${secret}`],
+      ["a missing citation", ""],
+    ])(
+      "%s is not a failed invocation: the classification still blocks and the citation is withheld",
+      async (_label, citation) => {
+        let checked = false;
+        const { f, implementCalls, verifies } = drive(
+          unmetH2({ requirement: "spec", requirementCitation: citation }),
+          (prompt, call) => {
+            if (call !== 2) return;
+            expect(prompt).toContain(
+              "**H-2** violates a requirement of the specification (the verifier's citation was not found in it)",
+            );
+            expect(prompt).toContain("Observed failure: the file keeps a stale greeting line");
+            expect(prompt).not.toContain(secret);
+            expect(prompt).not.toContain("[private detail]");
+            checked = true;
+          },
+        );
+        const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        const invs = f.store.listInvocations(run.id).filter((i) => i.role === "verify");
+        expect(invs.map((i) => i.status)).toEqual(["ok", "ok"]);
+        expect(verifies()).toBe(2);
+        expect(implementCalls()).toBe(2);
+        expect(checked).toBe(true);
+        const first = f.store.getRunState<RunState>(run.id)?.verifyResults?.[0];
+        expect(first?.overall).toBe("fail");
+        expect(first?.criteria.find((c) => c.id === "H-2")?.requirement).toBe("spec");
+      },
+    );
 
     test("verifier output without a requirement field stays blocking on replay", async () => {
       let checked = false;

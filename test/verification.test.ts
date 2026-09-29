@@ -6,12 +6,13 @@ import {
   verifyPrompt,
 } from "../src/pipeline/prompts.ts";
 import {
+  citedRequirement,
   type Holdout,
+  requirementSource,
   type Spec,
   toStrictJsonSchema,
   type Verify,
   VerifySchema,
-  verifySchemaFor,
 } from "../src/pipeline/schemas.ts";
 import { blockedOnly, normalizeVerify } from "../src/pipeline/verification.ts";
 
@@ -389,44 +390,44 @@ test("verifier classifies unmet holdouts against the request and spec, citing pu
   expect(item.required).toEqual(expect.arrayContaining(["requirement", "requirementCitation"]));
   expect(JSON.stringify(item.properties.requirement)).toContain("not_required");
   expect(item.properties.requirement).not.toHaveProperty("default");
-  // request/spec must quote the violated text; not_required and legacy unclassified rows need none.
-  for (const requirement of ["request", "spec"] as const)
-    for (const requirementCitation of ["", ' "" '])
-      expect(VerifySchema.safeParse(unmetHoldout({ requirement, requirementCitation })).success).toBe(false);
-  expect(
-    VerifySchema.safeParse(unmetHoldout({ requirement: "spec", requirementCitation: "works" })).success,
-  ).toBe(true);
   expect(VerifySchema.safeParse(unmetHoldout({ requirement: "not_required" })).success).toBe(true);
   expect(VerifySchema.safeParse(unmetHoldout({})).success).toBe(true);
 });
 
-test("verifier output is accepted only when request/spec citations are verbatim and repeated in evidence", () => {
-  const schema = verifySchemaFor("make it work", { ...spec, requirements: ["empty lists are accepted"] });
-  const accepted = (extra: Partial<Verify["criteria"][number]>) => schema.safeParse(unmetHoldout(extra));
-  const grounded = accepted({
-    requirement: "spec",
-    requirementCitation: '"Empty lists are  accepted."',
-    evidence: "violates `empty lists are accepted`: [] is rejected",
-  });
-  expect(grounded.success).toBe(true);
-  expect(
-    accepted({ requirement: "request", requirementCitation: "make it work", evidence: "make it work: fails" })
-      .success,
-  ).toBe(true);
-  // Fabricated or paraphrased text, a quote from the other source, and evidence without the quote.
-  for (const [requirement, requirementCitation, evidence] of [
-    ["spec", "fabricated requirement", "fabricated requirement is violated"],
-    ["spec", "empty lists accepted", "empty lists accepted"],
-    ["request", "empty lists are accepted", "empty lists are accepted"],
-    ["spec", "empty lists are accepted", "the secret input fails"],
+test("a malformed live classification is not a schema failure: it still yields a blocking verdict", () => {
+  // A missing, fabricated or paraphrased citation is never grounds to discard the verifier's output;
+  // the classification keeps blocking and only the ungrounded citation is withheld from feedback.
+  for (const [requirement, requirementCitation] of [
+    ["spec", ""],
+    ["request", ' "" '],
+    ["spec", "fabricated requirement"],
+    ["spec", "empty lists accepted"],
+    ["request", "empty lists are accepted"],
   ] as const) {
-    const result = accepted({ requirement, requirementCitation, evidence });
-    expect(result.success).toBe(false);
-    expect(JSON.stringify(result.error?.issues)).toContain("H-1");
+    const parsed = VerifySchema.safeParse(unmetHoldout({ requirement, requirementCitation }));
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) continue;
+    expect(normalizeVerify(parsed.data, spec, holdout).overall).toBe("fail");
+    expect(blockedOnly(normalizeVerify(parsed.data, spec, holdout))).toBe(false);
   }
-  // Unclassified (legacy) and not_required rows still need no citation.
-  expect(accepted({}).success).toBe(true);
-  expect(accepted({ requirement: "not_required" }).success).toBe(true);
+});
+
+test("a citation is grounded only when it is a verbatim quote of the named source", () => {
+  const source = requirementSource("spec", "make it work", {
+    ...spec,
+    requirements: ["empty lists are accepted"],
+  });
+  expect(citedRequirement('"Empty lists are  accepted."', source)).toBe("Empty lists are accepted");
+  expect(citedRequirement("make it work", requirementSource("request", "make it work", spec))).toBe(
+    "make it work",
+  );
+  for (const [citation, text] of [
+    ["fabricated requirement", source],
+    ["empty lists accepted", source],
+    ["empty lists are accepted", "make it work"],
+    ["", source],
+  ] as const)
+    expect(citedRequirement(citation, text)).toBeNull();
 });
 
 test("only unmet holdouts classified request or spec block the verdict", () => {
