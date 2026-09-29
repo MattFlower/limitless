@@ -186,6 +186,30 @@ export async function readFileAt(
   return (await sh(["git", "show", `${revision}:${path}`], { cwd, env })).stdout;
 }
 
+/** Extract the files of `sha` (no .git, no history, no working state) into the empty directory `dest`. */
+export async function exportCommit(
+  cwd: string,
+  sha: string,
+  dest: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  // `git archive` honours export-ignore and would drop committed files; a private index checks out
+  // exactly the commit's tracked files without touching the worktree's own index.
+  const index = `${dest}.index`;
+  const env = { ...(process.env as Record<string, string>), GIT_INDEX_FILE: index };
+  try {
+    await sh(["git", "read-tree", `${sha}^{commit}`], { cwd, env, signal, timeoutMs: 300_000 });
+    await sh(["git", "checkout-index", "--all", `--prefix=${dest}/`], {
+      cwd,
+      env,
+      signal,
+      timeoutMs: 300_000,
+    });
+  } finally {
+    rmSync(index, { force: true });
+  }
+}
+
 export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
   const result = await sh(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
     cwd,

@@ -61,7 +61,19 @@ Return the JSON object.`;
 }
 
 export function holdoutPrompt(input: { prompt: string; spec: Spec }): string {
-  return `Write blind holdout checks for this request. You have only the original request and completed specification. Do not inspect a repository or implementation. Return 3–8 concrete scenarios with sequential IDs H-1, H-2, ... Each needs a short description, exact executable steps or inputs, and an expected observable outcome. Mark edge_case true for at least two edge or failure cases that are not literally listed in the acceptance criteria. Return the JSON object.\n\n# Original request\n${quoteRequest(input.prompt)}\n\n# Specification\n${renderSpec(input.spec)}`;
+  return `Write holdout checks for this request. A separate verifier will run them against the finished change; the implementer never sees them.
+
+Your working directory is a temporary, read-only checkout of the repository at the base commit, before any implementation. Read and search it to learn its real commands, entry points, configuration keys, file formats and test setup. It does not contain the change; don't describe or depend on implementation details. The checks will run later from the root of a different checkout of the finished change, and this one will be gone.
+
+Rules:
+- Test what the request and specification ask for. Every expected outcome must follow from the request or specification; if they don't imply a behaviour, don't test it.
+- Steps must be runnable against this repository as it exists plus the requested change: real commands, real config keys, real entry points. Don't invent fixtures for configuration or states the code can't reach.
+- Don't dictate exact wording, error text or values the request and specification don't specify; describe the observable outcome instead.
+- Write steps from the repository root with relative paths; never use this checkout's absolute path.
+- Return 1–8 scenarios with sequential IDs H-1, H-2, ... Fewer, well-grounded scenarios beat many speculative ones.
+- Include an edge or failure case only when the request or specification implies it, and mark it edge_case true; mark every other scenario edge_case false.
+
+Each scenario needs a short description, concrete steps or inputs, and an expected observable outcome. Keep scenario text out of files, including temporary ones: return it only in the JSON object.\n\n# Original request\n${quoteRequest(input.prompt)}\n\n# Specification\n${renderSpec(input.spec)}`;
 }
 
 function checksSection(cfg: GateConfig, baseline: GateRun | null): string {

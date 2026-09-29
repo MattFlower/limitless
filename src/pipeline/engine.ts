@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
@@ -20,6 +20,7 @@ import {
   diffSince,
   discardChanges,
   ensureCache,
+  exportCommit,
   fetchBase,
   formatTopLevel,
   headSha,
@@ -82,6 +83,7 @@ import {
   type Verify,
   VerifySchema,
 } from "./schemas.ts";
+import { createSnapshotParent } from "./snapshots.ts";
 import { triageDecisions } from "./triage-decisions.ts";
 import {
   blockedOnly,
@@ -574,27 +576,65 @@ async function buildLoop(ctx: RunContext): Promise<void> {
   }
 }
 
+/** Enough to read the entry points and config a scenario needs; holdouts don't explore at length. */
+const HOLDOUT_TOOL_CALLS = 40;
+
+/**
+ * Run `fn` in a private export of the recorded base commit, removed afterwards whatever the outcome.
+ * Holdout runs alongside implement, so it must never see the worktree the implementer is editing.
+ */
+async function withBaseSnapshot<T>(ctx: RunContext, fn: (dir: string) => Promise<T>): Promise<T> {
+  const worktree = ctx.state.worktreePath;
+  const baseSha = ctx.run.baseSha;
+  if (!worktree || !baseSha) throw new Error("Holdout needs the run worktree and recorded base commit");
+  const snapshot = createSnapshotParent();
+  try {
+    const base = join(snapshot, "base");
+    mkdirSync(base);
+    await exportCommit(worktree, baseSha, base, ctx.signal);
+    return await fn(base);
+  } finally {
+    rmSync(snapshot, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The reader is confined to the snapshot and its scratch (`confineReads`), which already excludes
+ * home and temporary directories. Factory paths can live elsewhere (LIMITLESS_HOME), so deny them
+ * too: the parallel implementer's worktree, every run's state, the bare caches its commits land in,
+ * and the factory's config and secrets.
+ */
+function holdoutDenyRead(ctx: RunContext): string[] {
+  const { home, work, runs, repos, configDir } = ctx.deps.cfg.paths;
+  return [ctx.state.worktreePath, home, work, runs, repos, configDir].filter((p): p is string => !!p);
+}
+
 async function authorHoldout(ctx: RunContext): Promise<void> {
   await ctx.stage(
     "holdout",
     async (stage) => {
       ctx.state.holdoutStatus = "generating";
       await ctx.save();
-      const { result, target } = await ctx.invoke({
-        role: "holdout",
-        stage,
-        mode: "readonly",
-        complexity: ctx.complexity,
-        constraints: { avoidVendor: ctx.state.specAuthorVendor },
-        prompt: holdoutPrompt({ prompt: ctx.run.prompt, spec: ctx.state.spec as Spec }),
-        jsonSchema: toStrictJsonSchema(HoldoutSchema),
-        schema: HoldoutSchema,
-        requireStructured: true,
-        privateOutput: true,
-        isolatedCwd: true,
-        noTools: true,
-        maxToolCalls: 0,
-      });
+      const { result, target } = await withBaseSnapshot(ctx, (base) =>
+        ctx.invoke({
+          role: "holdout",
+          stage,
+          mode: "readonly",
+          complexity: ctx.complexity,
+          constraints: { avoidVendor: ctx.state.specAuthorVendor },
+          prompt: holdoutPrompt({ prompt: ctx.run.prompt, spec: ctx.state.spec as Spec }),
+          jsonSchema: toStrictJsonSchema(HoldoutSchema),
+          schema: HoldoutSchema,
+          requireStructured: true,
+          privateOutput: true,
+          // Residual risk (docs/ARCHITECTURE.md): the parallel implementer isn't read-sandboxed, so
+          // the scratch is readable while this runs; the prompt keeps scenario text out of files.
+          cwd: base,
+          confineReads: true,
+          denyRead: holdoutDenyRead(ctx),
+          maxToolCalls: HOLDOUT_TOOL_CALLS,
+        }),
+      );
       ctx.state.holdout = HoldoutSchema.parse(result.structured);
       ctx.state.holdoutModelId = target.modelId;
       ctx.state.holdoutSameVendor = target.vendor === ctx.state.specAuthorVendor;

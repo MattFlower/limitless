@@ -91,7 +91,7 @@ const verify = {
 function answer(s: AgentSpec): FakeReply {
   if (s.prompt.startsWith("Classify")) return { structured: triage };
   if (s.prompt.startsWith("Write the specification")) return { structured: spec };
-  if (s.prompt.startsWith("Write blind")) return { structured: holdout };
+  if (s.prompt.startsWith("Write holdout checks")) return { structured: holdout };
   if (s.prompt.startsWith("You are an adversarial")) return { structured: review };
   if (s.prompt.startsWith("You are the acceptance")) return { structured: verify };
   return { files: { "ui/change.txt": "done\n" }, text: "done" };
@@ -192,7 +192,8 @@ for (const stage of ["implement", "gates", "review", "verify", "deliver"] as con
       },
     });
     const id = await run(f);
-    await wait(() => reached);
+    // Holdout exports a base snapshot in parallel; let it finish so only `stage` is interrupted.
+    await wait(() => reached && f.store.getRunState<RunState>(id)?.holdoutStatus === "complete");
     await f.stop();
     expect(f.store.getRun(id)?.status).toBe("queued");
     history(f, id);

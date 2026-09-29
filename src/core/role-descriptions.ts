@@ -7,7 +7,7 @@ export const ROLE_DESCRIPTIONS: Record<Role, string> = {
   plan: "Plans the work before implementation so complex changes have an ordered approach.",
   plan_review: "Reviews the plan independently so gaps can be found before code changes begin.",
   holdout:
-    "Writes acceptance scenarios without seeing the code so verification can catch implementation blind spots.",
+    "Writes acceptance scenarios from the base code, never the implementation, so verification can catch implementation blind spots.",
   implement: "Changes the code and runs checks so the requested behavior is built.",
   review: "Reviews the implementation independently so defects and scope problems can be caught.",
   verify:
