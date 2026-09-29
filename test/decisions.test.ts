@@ -277,14 +277,7 @@ test("a per-model rate limit cools down only that model, then it is routable aga
   try {
     let now = 1_000_000;
     const reserves = { claudeFiveHour: 0.8, claudeSevenDay: 0.85, codexWeekly: 0.9, codexFiveHour: 0.9 };
-    const tracker = new ProviderTracker(
-      PROVIDERS,
-      store,
-      reserves,
-      { TYPESAFE_API_KEY: "k" },
-      {},
-      () => now,
-    );
+    const tracker = new ProviderTracker(PROVIDERS, store, reserves, { TYPESAFE_API_KEY: "k" }, {}, () => now);
     tracker.record("typesafe", "quota", {
       error: "model rate-limited (HTTP 429)",
       modelCooldown: { modelId: "typesafe/jev-1.13", ms: 12_000 },
