@@ -175,6 +175,8 @@ export interface InvokeOptions {
   isolatedCwd?: boolean;
   /** Run in this directory instead of the worktree (e.g. a base-commit snapshot). */
   cwd?: string;
+  /** Paths a tool-enabled reader must not read (see AgentSpec.denyRead). */
+  denyRead?: string[];
   noTools?: boolean;
 }
 
@@ -466,6 +468,7 @@ export class RunContext {
           timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUTS[opts.role],
           idleTimeoutMs: opts.idleTimeoutMs ?? 10 * 60_000,
           maxToolCalls: opts.maxToolCalls ?? (opts.mode === "edit" ? 400 : 150),
+          ...(opts.denyRead ? { denyRead: opts.denyRead } : {}),
           noTools,
           privateSession: opts.privateOutput || opts.privateSession,
           redactOutput: redact,

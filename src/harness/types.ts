@@ -54,6 +54,8 @@ export interface AgentSpec {
   decisionTask?: DecisionTask;
   resumeSessionId?: string;
   addDirs?: string[];
+  /** Paths a tool-enabled reader must not read, e.g. a worktree being edited in parallel. */
+  denyRead?: string[];
   timeoutMs: number;
   idleTimeoutMs: number;
   maxToolCalls: number;

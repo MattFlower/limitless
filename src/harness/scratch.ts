@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AgentSpec } from "./types.ts";
 
 function within(parent: string, path: string): boolean {
@@ -66,6 +66,20 @@ export function validateScratch(spec: AgentSpec): string {
   if (within(cwd, path) || within(path, cwd)) throw new Error("Scratch must be separate from the worktree");
   if (spec.addDirs?.length) throw new Error("Reading invocations cannot grant additional directories");
   return path;
+}
+
+/** `denyRead` as given and canonical (either spelling reaches it); cwd and scratch must stay readable. */
+export function validateDenyRead(spec: AgentSpec, scratch: string): string[] {
+  const cwd = realpathSync(spec.cwd);
+  const paths = [
+    ...new Set(
+      (spec.denyRead ?? []).flatMap((p) => [resolve(p), ...(existsSync(p) ? [realpathSync(p)] : [])]),
+    ),
+  ];
+  for (const path of paths)
+    if (within(path, cwd) || within(path, scratch))
+      throw new Error(`Reader cwd and scratch must be outside ${path}`);
+  return paths;
 }
 
 /** The callback must await process termination; cleanup also covers thrown errors and cancellation. */

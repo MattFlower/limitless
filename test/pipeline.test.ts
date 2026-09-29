@@ -1771,6 +1771,7 @@ protected_paths = ["protected.txt"]
       let holdoutCalls = 0;
       let holdoutCwd = "";
       let snapshotChecked = false;
+      let runId = "";
       const f = start(async (s) => {
         const role = roleOf(s);
         if (role === "triage") return { structured: triage() };
@@ -1784,6 +1785,10 @@ protected_paths = ["protected.txt"]
           expect(s.maxToolCalls).toBeLessThanOrEqual(50);
           expect(s.scratchDir).toBeTruthy();
           expect(s.privateSession).toBe(true);
+          // The cwd alone doesn't confine tools: the implementer's worktree and factory state are denied.
+          expect(s.denyRead).toEqual(
+            expect.arrayContaining([join(f.cfg.paths.work, runId), f.cfg.paths.home, f.cfg.paths.repos]),
+          );
           expect(s.prompt).toContain("# Original request");
           expect(s.prompt).toContain("# Specification");
           expect(s.prompt).not.toContain("implementation marker");
@@ -1820,6 +1825,7 @@ protected_paths = ["protected.txt"]
         };
       });
       const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file", profile });
+      runId = run.id;
       expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       expect(holdoutCalls).toBe(profile === "quick" ? 0 : 1);
       if (profile !== "quick") {

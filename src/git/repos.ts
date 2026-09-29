@@ -193,16 +193,20 @@ export async function exportCommit(
   dest: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const archive = `${dest}.tar`;
+  // `git archive` honours export-ignore and would drop committed files; a private index checks out
+  // exactly the commit's tracked files without touching the worktree's own index.
+  const index = `${dest}.index`;
+  const env = { ...(process.env as Record<string, string>), GIT_INDEX_FILE: index };
   try {
-    await sh(["git", "archive", "--format=tar", "-o", archive, `${sha}^{commit}`], {
+    await sh(["git", "read-tree", `${sha}^{commit}`], { cwd, env, signal, timeoutMs: 300_000 });
+    await sh(["git", "checkout-index", "--all", `--prefix=${dest}/`], {
       cwd,
+      env,
       signal,
       timeoutMs: 300_000,
     });
-    await sh(["tar", "-xf", archive, "-C", dest], { cwd: dest, signal, timeoutMs: 300_000 });
   } finally {
-    rmSync(archive, { force: true });
+    rmSync(index, { force: true });
   }
 }
 

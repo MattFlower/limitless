@@ -569,6 +569,15 @@ async function withBaseSnapshot<T>(ctx: RunContext, fn: (dir: string) => Promise
   }
 }
 
+/**
+ * A cwd doesn't confine reads: keep the holdout's tools out of the parallel implementer's worktree,
+ * every run's state and the bare caches its commits land in, and the factory's config and secrets.
+ */
+function holdoutDenyRead(ctx: RunContext): string[] {
+  const { home, work, runs, repos, configDir } = ctx.deps.cfg.paths;
+  return [ctx.state.worktreePath, home, work, runs, repos, configDir].filter((p): p is string => !!p);
+}
+
 async function authorHoldout(ctx: RunContext): Promise<void> {
   await ctx.stage(
     "holdout",
@@ -588,6 +597,7 @@ async function authorHoldout(ctx: RunContext): Promise<void> {
           requireStructured: true,
           privateOutput: true,
           cwd: base,
+          denyRead: holdoutDenyRead(ctx),
           maxToolCalls: HOLDOUT_TOOL_CALLS,
         }),
       );

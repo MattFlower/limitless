@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
-import { scratchEnv, validateScratch } from "./scratch.ts";
+import { scratchEnv, validateDenyRead, validateScratch } from "./scratch.ts";
 import {
   type AgentEvent,
   type AgentResult,
@@ -256,6 +256,7 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
   }
   if (spec.mode === "readonly" && !spec.noTools) {
     const scratch = validateScratch(spec);
+    const denied = validateDenyRead(spec, scratch).map((p) => `,${JSON.stringify(p)}="none"`);
     // Named filesystem profiles (verified live on codex-cli 0.157.1). Legacy read-only mode
     // ignores sandbox_workspace_write roots, and workspace-write grants cwd implicitly.
     args.push(
@@ -264,7 +265,7 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
       "-c",
       'default_permissions="limitless-reader"',
       "-c",
-      `permissions={limitless-reader={filesystem={"/"="read",${JSON.stringify(scratch)}="write"},network={enabled=false}}}`,
+      `permissions={limitless-reader={filesystem={"/"="read",${JSON.stringify(scratch)}="write"${denied.join("")}},network={enabled=false}}}`,
       "-c",
       "orchestrator.mcp.enabled=false",
       "--disable",

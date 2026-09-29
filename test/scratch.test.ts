@@ -123,6 +123,47 @@ test("native arguments restrict reading writes and preserve no-tools isolation",
   }
 });
 
+test("denyRead keeps tool-enabled readers out of a parallel worktree", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "deny-read-")));
+  const cwd = join(root, "snapshot");
+  const implementer = join(root, "implementer");
+  const scratch = join(root, "scratch", SCRATCH_NAME);
+  for (const dir of [cwd, implementer, scratch]) mkdirSync(dir, { recursive: true });
+  writeFileSync(join(cwd, "base.txt"), "base\n");
+  writeFileSync(join(implementer, "marker.txt"), "implementation marker\n");
+  try {
+    const spec = { ...specFor(cwd, scratch), denyRead: [implementer] };
+    const codex = buildCodexArgs(spec);
+    const policy = codex.find((arg) => arg.startsWith("permissions=")) ?? "";
+    expect(policy).toContain(`${JSON.stringify(implementer)}="none"`);
+    const claude = buildClaudeArgs(spec, "id");
+    const settings = JSON.parse(claude[claude.indexOf("--settings") + 1] ?? "{}");
+    expect(settings.sandbox.filesystem.denyRead).toEqual([implementer]);
+    expect(claude.slice(claude.indexOf("--disallowedTools"))).toContain(`Read(/${implementer}/**)`);
+    for (const build of [buildCodexArgs, (s: AgentSpec) => buildClaudeArgs(s, "id")]) {
+      expect(() => build({ ...spec, denyRead: [root] })).toThrow("outside");
+    }
+
+    // Exercise the generated Codex profile in its real sandbox where one is available (not nested).
+    if (!Bun.which("codex")) return;
+    const sandboxed = async (file: string) => {
+      const proc = Bun.spawn(
+        ["codex", "sandbox", "-c", 'default_permissions="limitless-reader"', "-c", policy, "--", "cat", file],
+        { cwd, stdout: "pipe", stderr: "pipe" },
+      );
+      return { code: await proc.exited, out: await new Response(proc.stdout).text() };
+    };
+    const control = await sandboxed(join(cwd, "base.txt"));
+    if (control.code !== 0) return;
+    expect(control.out).toBe("base\n");
+    const blocked = await sandboxed(join(implementer, "marker.txt"));
+    expect(blocked.code).not.toBe(0);
+    expect(blocked.out).not.toContain("implementation marker");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 for (const outcome of ["success", "error", "timeout", "cancelled"] as const) {
   test(`native injected process environment and cleanup: ${outcome}`, async () => {
     const cwd = mkdtempSync(join(tmpdir(), "env-test-"));
