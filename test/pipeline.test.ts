@@ -606,6 +606,69 @@ esac
     expect(f.store.getArtifact(run.id, "report.md")).toContain("Flaky: `check` failed, then passed");
   });
 
+  test("a baseline check that fails once is retried and recorded as passing, so a regression blocks", async () => {
+    const count = join(home, "gate-runs");
+    // Run 1 is the baseline, run 2 its retry; every run after the change fails.
+    const check = `echo x >> '${count}'; test $(( $(wc -l < '${count}') )) -eq 2`;
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`,
+    );
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "flaky baseline"], {
+      cwd: repoDir,
+    });
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).not.toBe("succeeded");
+    const baseline = f.store.getRunState<RunState>(run.id)?.baseline?.checks[0];
+    expect([baseline?.ok, baseline?.firstAttempt?.ok]).toEqual([true, false]);
+    const artifact = JSON.parse(f.store.getArtifact(run.id, "baseline-gates.json") ?? "{}");
+    expect([artifact.checks?.[0]?.ok, artifact.checks?.[0]?.firstAttempt?.ok]).toEqual([true, false]);
+    const flaky = f.store.listEvents(run.id).find((e) => e.message === "baseline check: flaky");
+    expect(flaky?.data).toMatchObject({ flaky: true, firstAttempt: { ok: false }, retry: { ok: true } });
+    const gates = f.store.getRunState<RunState>(run.id)?.lastGates?.[0];
+    expect([gates?.verdict, gates?.blocking]).toEqual(["regressed", true]);
+    // Baseline, its retry, then each post-change round and its regression retry.
+    expect(readFileSync(count, "utf8").trim().split("\n").length % 2).toBe(0);
+  });
+
+  test("a baseline check that fails twice stays failing and does not block after the change", async () => {
+    const count = join(home, "gate-runs");
+    const check = `echo x >> '${count}'; exit 1`;
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`,
+    );
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "broken baseline"], {
+      cwd: repoDir,
+    });
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const state = f.store.getRunState<RunState>(run.id);
+    expect([state?.baseline?.checks[0]?.ok, state?.baseline?.checks[0]?.firstAttempt]).toEqual([
+      false,
+      undefined,
+    ]);
+    expect([state?.lastGates?.[0]?.verdict, state?.lastGates?.[0]?.blocking]).toEqual([
+      "still_failing",
+      false,
+    ]);
+    expect(f.store.listEvents(run.id).some((e) => e.message.endsWith(": flaky"))).toBe(false);
+    // Two baseline attempts, one post-change run (still_failing is never retried).
+    expect(readFileSync(count, "utf8").trim().split("\n").length).toBe(3);
+  });
+
   // Same text git generates, so a fixture line can never stand in for a real marker.
   const fixture = "<<<<<<< HEAD\nexample\n=======\n>>>>>>> theirs\n";
 
@@ -1631,7 +1694,9 @@ protected_paths = ["protected.txt"]
       expect(state?.flow).toBe("verify-change");
       expect(f.store.getRunDetail(runId)?.run.flow).toBe("verify-change");
       const revisions = readFileSync(records, "utf8").trim().split("\n");
-      expect(revisions.slice(0, 2)).toEqual([baseTip, head]);
+      // A check failing on base is retried once, still on base, before the head is checked out.
+      const baseRuns = scenario === "baseline" ? [baseTip, baseTip] : [baseTip];
+      expect(revisions.slice(0, baseRuns.length + 1)).toEqual([...baseRuns, head]);
       const remote = (await git("ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).split("\t")[0];
       const unchanged = ["approve", "baseline", "restart-initial"].includes(scenario);
       expect(remote).toBe(unchanged || blocked ? head : (f.store.getRun(runId)?.headSha ?? "missing"));
