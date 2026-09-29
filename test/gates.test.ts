@@ -223,9 +223,14 @@ describe("gate slots and flaky retry", () => {
 
   test("baseline fail → retry → fail stays failing and later failures don't block", async () => {
     const dir = tempDir({});
-    const { run, runs } = await baseline(config("echo x >> runs; exit 1"), dir);
+    const { run, runs } = await baseline(
+      config("echo x >> runs; echo attempt $(( $(wc -l < runs) )); exit 1"),
+      dir,
+    );
     const [c] = run.checks;
-    expect([c?.ok, c?.firstAttempt, runs]).toEqual([false, undefined, 2]);
+    // The failed re-run is the result; the first failure is kept alongside it.
+    expect([c?.ok, c?.firstAttempt?.ok, runs]).toEqual([false, false, 2]);
+    expect([c?.output, c?.firstAttempt?.output]).toEqual(["attempt 2", "attempt 1"]);
     expect(compareGates(run, await runGates(dir, config("exit 1"), signal))[0]).toMatchObject({
       verdict: "still_failing",
       blocking: false,

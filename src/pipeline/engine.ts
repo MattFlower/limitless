@@ -365,8 +365,8 @@ async function prepare(ctx: RunContext): Promise<void> {
           runId: ctx.run.id,
           type: "gate",
           level: "warn",
-          message: `baseline ${retry.name}: flaky`,
-          data: { flaky: true, firstAttempt, retry },
+          message: `baseline ${retry.name}: ${retry.ok ? "flaky" : "retry FAIL again"}`,
+          data: { flaky: retry.ok, firstAttempt, retry },
         });
       }
     }

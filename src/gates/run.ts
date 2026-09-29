@@ -12,7 +12,7 @@ export interface GateResult {
   output: string; // tail
   /** Set only when the process was killed for exceeding its timeout. */
   timedOut?: boolean;
-  /** Baseline only: the failing attempt of a check that passed when re-run. */
+  /** Baseline only: the failed first attempt of a check that was re-run; this result is the re-run. */
   firstAttempt?: GateResult;
 }
 
@@ -111,7 +111,7 @@ async function runAll(
 /**
  * Re-run once, inside a slot, each baseline check that failed without timing out. A check that
  * fails on base never blocks later, so a flaky baseline failure would hide a real regression.
- * A pass on retry is recorded as passing, with the failure kept as `firstAttempt`.
+ * The re-run becomes the result, with the failure kept as `firstAttempt`; only a pass changes the outcome.
  */
 export async function retryBaselineFailures(
   run: GateRun,
@@ -133,7 +133,7 @@ export async function retryBaselineFailures(
         continue;
       }
       const retry = await runOne(check, cwd, signal);
-      checks.push(retry.ok ? { ...retry, firstAttempt: r } : r);
+      checks.push({ ...retry, firstAttempt: r });
     }
     return { ...run, checks };
   } finally {

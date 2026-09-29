@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ImplementCase, ReviewCase } from "../src/evals/cases.ts";
@@ -8,11 +8,11 @@ import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
+
 const SEED =
   "diff --git a/seeded.ts b/seeded.ts\nnew file mode 100644\n--- /dev/null\n+++ b/seeded.ts\n@@ -0,0 +1 @@\n+export const seeded = 1;\n";
-
-/** Implement trials run real gates and grading; under CPU load they outlast Bun's 5s default. */
-const GATE_TEST_TIMEOUT_MS = 30_000;
 
 /** A pin pair whose history (and both trees) carry eval datasets next to ordinary changes. */
 async function fixture(extra: Record<string, string> = {}) {
@@ -282,105 +282,97 @@ test("review snapshot never reuses plain-mode cached output", async () => {
   }
 });
 
-test(
-  "implement snapshot starts from the sanitized base without the solution or hidden files",
-  async () => {
-    const f = await fixture({ solution: "secret solution" });
-    try {
-      const item: ImplementCase = {
-        id: "one",
-        repo: "fixture/repo",
-        base: f.base,
-        head: f.head,
-        snapshot: true,
-        prompt: "Create answer containing correct",
-        complexity: "small",
-        spec: null,
-        source: "fixture",
-        tags: [],
-        hidden: { files: ["check.sh"], command: "sh check.sh", timeoutSec: 5 },
-      };
-      mkdirSync(join(f.home, "hidden", item.id), { recursive: true });
-      writeFileSync(join(f.home, "hidden", item.id, "check.sh"), 'test "$(cat answer)" = correct\n');
-      f.saveCases("implement", [item]);
-      let base = "";
-      f.respond(async (s) => {
-        if (base) {
-          // Recovery prompts point at the snapshot base, never the original pin.
-          expect(s.prompt).toContain(`git diff ${base}..HEAD`);
-          return { files: { answer: "correct" }, text: "Implemented" };
-        }
-        // Implement pins both trees to base, so the reference head never enters the snapshot.
-        expect(await exposure(s.cwd, [f.base, f.head])).toEqual(["Snapshot head", "Snapshot base"]);
-        expect((await sh(["git", "diff", "HEAD^", "HEAD"], { cwd: s.cwd })).stdout).toBe("");
-        for (const path of ["solution", "check.sh", "bin.dat"])
-          expect(existsSync(join(s.cwd, path))).toBe(false);
-        expect(readFileSync(join(s.cwd, "src/a.ts"), "utf8")).toBe("export const a = 1;\n");
-        base = (await sh(["git", "rev-parse", "HEAD^"], { cwd: s.cwd })).stdout.trim();
-        return { files: { answer: "wrong" }, text: "Implemented" };
-      });
-      const report = await f.run({ role: "implement", models: ["candidate-a"], k: 1, rounds: 2 });
-      expect(report.trials[0]).toMatchObject({ status: "ok", pass: true, details: { roundsUsed: 2 } });
-      expect(f.calls).toHaveLength(2);
-      expect(f.calls.every((s) => !s.prompt.includes(f.base))).toBe(true);
-    } finally {
-      await f.close();
-    }
-  },
-  GATE_TEST_TIMEOUT_MS,
-);
+test("implement snapshot starts from the sanitized base without the solution or hidden files", async () => {
+  const f = await fixture({ solution: "secret solution" });
+  try {
+    const item: ImplementCase = {
+      id: "one",
+      repo: "fixture/repo",
+      base: f.base,
+      head: f.head,
+      snapshot: true,
+      prompt: "Create answer containing correct",
+      complexity: "small",
+      spec: null,
+      source: "fixture",
+      tags: [],
+      hidden: { files: ["check.sh"], command: "sh check.sh", timeoutSec: 5 },
+    };
+    mkdirSync(join(f.home, "hidden", item.id), { recursive: true });
+    writeFileSync(join(f.home, "hidden", item.id, "check.sh"), 'test "$(cat answer)" = correct\n');
+    f.saveCases("implement", [item]);
+    let base = "";
+    f.respond(async (s) => {
+      if (base) {
+        // Recovery prompts point at the snapshot base, never the original pin.
+        expect(s.prompt).toContain(`git diff ${base}..HEAD`);
+        return { files: { answer: "correct" }, text: "Implemented" };
+      }
+      // Implement pins both trees to base, so the reference head never enters the snapshot.
+      expect(await exposure(s.cwd, [f.base, f.head])).toEqual(["Snapshot head", "Snapshot base"]);
+      expect((await sh(["git", "diff", "HEAD^", "HEAD"], { cwd: s.cwd })).stdout).toBe("");
+      for (const path of ["solution", "check.sh", "bin.dat"])
+        expect(existsSync(join(s.cwd, path))).toBe(false);
+      expect(readFileSync(join(s.cwd, "src/a.ts"), "utf8")).toBe("export const a = 1;\n");
+      base = (await sh(["git", "rev-parse", "HEAD^"], { cwd: s.cwd })).stdout.trim();
+      return { files: { answer: "wrong" }, text: "Implemented" };
+    });
+    const report = await f.run({ role: "implement", models: ["candidate-a"], k: 1, rounds: 2 });
+    expect(report.trials[0]).toMatchObject({ status: "ok", pass: true, details: { roundsUsed: 2 } });
+    expect(f.calls).toHaveLength(2);
+    expect(f.calls.every((s) => !s.prompt.includes(f.base))).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
 
-test(
-  "implement snapshot fails preparation when a baseline check reads evals/; plain mode is unaffected",
-  async () => {
-    const f = await evalFixture();
-    try {
+test("implement snapshot fails preparation when a baseline check reads evals/; plain mode is unaffected", async () => {
+  const f = await evalFixture();
+  try {
+    writeFileSync(
+      join(f.source, ".limitless.toml"),
+      '[gates]\nchecks = [{ name = "reads-evals", run = "test -f evals/data.txt" }]\n',
+    );
+    mkdirSync(join(f.source, "evals"));
+    writeFileSync(join(f.source, "evals/data.txt"), "fixture data the test suite reads");
+    await sh(["git", "add", "-A"], { cwd: f.source });
+    await sh(["git", "commit", "-qm", "checks read evals"], { cwd: f.source });
+    const base = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+    await sh(["git", "push", "-q", f.cache, "HEAD:refs/heads/reads-evals"], { cwd: f.source });
+    const item: ImplementCase = {
+      id: "one",
+      repo: "fixture/repo",
+      base,
+      head: base,
+      prompt: "Create answer containing correct",
+      complexity: "small",
+      spec: null,
+      source: "fixture",
+      tags: [],
+      hidden: { files: ["check.sh"], command: "sh check.sh", timeoutSec: 5 },
+    };
+    mkdirSync(join(f.home, "hidden", item.id), { recursive: true });
+    writeFileSync(join(f.home, "hidden", item.id, "check.sh"), 'test "$(cat answer)" = correct\n');
+    f.respond(() => ({ files: { answer: "correct" }, text: "Implemented" }));
+    const run = (snapshot: boolean) => {
       writeFileSync(
-        join(f.source, ".limitless.toml"),
-        '[gates]\nchecks = [{ name = "reads-evals", run = "test -f evals/data.txt" }]\n',
+        f.casePath,
+        JSON.stringify({ role: "implement", version: 1, cases: [{ ...item, snapshot }] }),
       );
-      mkdirSync(join(f.source, "evals"));
-      writeFileSync(join(f.source, "evals/data.txt"), "fixture data the test suite reads");
-      await sh(["git", "add", "-A"], { cwd: f.source });
-      await sh(["git", "commit", "-qm", "checks read evals"], { cwd: f.source });
-      const base = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
-      await sh(["git", "push", "-q", f.cache, "HEAD:refs/heads/reads-evals"], { cwd: f.source });
-      const item: ImplementCase = {
-        id: "one",
-        repo: "fixture/repo",
-        base,
-        head: base,
-        prompt: "Create answer containing correct",
-        complexity: "small",
-        spec: null,
-        source: "fixture",
-        tags: [],
-        hidden: { files: ["check.sh"], command: "sh check.sh", timeoutSec: 5 },
-      };
-      mkdirSync(join(f.home, "hidden", item.id), { recursive: true });
-      writeFileSync(join(f.home, "hidden", item.id, "check.sh"), 'test "$(cat answer)" = correct\n');
-      f.respond(() => ({ files: { answer: "correct" }, text: "Implemented" }));
-      const run = (snapshot: boolean) => {
-        writeFileSync(
-          f.casePath,
-          JSON.stringify({ role: "implement", version: 1, cases: [{ ...item, snapshot }] }),
-        );
-        return f.run({ role: "implement", models: ["candidate-a"], k: 1 });
-      };
-      expect((await run(false)).trials[0]).toMatchObject({ status: "ok", pass: true });
-      expect(f.calls).toHaveLength(1);
-      const [trial] = (await run(true)).trials;
-      expect(trial).toMatchObject({ status: "error", pass: false, details: { preparationFailed: true } });
-      expect(String(trial?.details.reason)).toContain(
-        "snapshot mode removed evals/ and baseline check reads-evals fails; this case can't use snapshot mode",
-      );
-      expect(f.calls).toHaveLength(1);
-    } finally {
-      await f.close();
-    }
-  },
-  GATE_TEST_TIMEOUT_MS,
-);
+      return f.run({ role: "implement", models: ["candidate-a"], k: 1 });
+    };
+    expect((await run(false)).trials[0]).toMatchObject({ status: "ok", pass: true });
+    expect(f.calls).toHaveLength(1);
+    const [trial] = (await run(true)).trials;
+    expect(trial).toMatchObject({ status: "error", pass: false, details: { preparationFailed: true } });
+    expect(String(trial?.details.reason)).toContain(
+      "snapshot mode removed evals/ and baseline check reads-evals fails; this case can't use snapshot mode",
+    );
+    expect(f.calls).toHaveLength(1);
+  } finally {
+    await f.close();
+  }
+});
 
 test("triage snapshot fetches a pin reachable only from a tag, by exact SHA", async () => {
   const f = await evalFixture();

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +18,9 @@ import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipe
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 import { findingEvidence } from "./review-support.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 const providers: ProviderDef[] = [
   { id: "alpha", label: "Alpha", harness: "fake", billing: "subscription", maxConcurrent: 2 },
@@ -639,7 +642,7 @@ esac
 
   test("a baseline check that fails twice stays failing and does not block after the change", async () => {
     const count = join(home, "gate-runs");
-    const check = `echo x >> '${count}'; exit 1`;
+    const check = `echo x >> '${count}'; echo attempt $(( $(wc -l < '${count}') )); exit 1`;
     writeFileSync(
       join(repoDir, ".limitless.toml"),
       `[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`,
@@ -656,15 +659,27 @@ esac
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     const state = f.store.getRunState<RunState>(run.id);
-    expect([state?.baseline?.checks[0]?.ok, state?.baseline?.checks[0]?.firstAttempt]).toEqual([
-      false,
-      undefined,
+    const baseline = state?.baseline?.checks[0];
+    expect([
+      baseline?.ok,
+      baseline?.output,
+      baseline?.firstAttempt?.ok,
+      baseline?.firstAttempt?.output,
+    ]).toEqual([false, "attempt 2", false, "attempt 1"]);
+    // Both failed attempts stay in the artifact.
+    const artifact = JSON.parse(f.store.getArtifact(run.id, "baseline-gates.json") ?? "{}");
+    expect([artifact.checks?.[0]?.output, artifact.checks?.[0]?.firstAttempt?.output]).toEqual([
+      "attempt 2",
+      "attempt 1",
     ]);
     expect([state?.lastGates?.[0]?.verdict, state?.lastGates?.[0]?.blocking]).toEqual([
       "still_failing",
       false,
     ]);
-    expect(f.store.listEvents(run.id).some((e) => e.message.endsWith(": flaky"))).toBe(false);
+    const events = f.store.listEvents(run.id);
+    expect(events.some((e) => e.message.endsWith(": flaky"))).toBe(false);
+    const again = events.find((e) => e.message === "baseline check: retry FAIL again");
+    expect(again?.data).toMatchObject({ flaky: false, firstAttempt: { ok: false }, retry: { ok: false } });
     // Two baseline attempts, one post-change run (still_failing is never retried).
     expect(readFileSync(count, "utf8").trim().split("\n").length).toBe(3);
   });
@@ -802,7 +817,7 @@ esac
     expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
     expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
     expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
-  }, 30_000);
+  });
 
   for (const kind of [
     "unchanged",
