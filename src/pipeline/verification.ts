@@ -1,5 +1,5 @@
 import { redactHoldoutText } from "./prompts.ts";
-import type { Holdout, Spec, Verify } from "./schemas.ts";
+import { type Holdout, requirementCitationIssue, type Spec, type Verify } from "./schemas.ts";
 
 export function preDeliveryVerifyArtifact(
   verify: Verify & { modelId: string; round: number; attempt: number },
@@ -37,7 +37,7 @@ export function preDeliveryVerifyArtifact(
  * pipes and test filters kept defeating it. A wrong `blocked` costs one extra verify attempt or an
  * early stop with the evidence attached, never a silently wrong verdict.
  */
-export function normalizeVerify(verify: Verify, spec: Spec, holdout: Holdout): Verify {
+export function normalizeVerify(verify: Verify, spec: Spec, holdout: Holdout, request = ""): Verify {
   const scenarioIds = new Set(holdout.scenarios.map((s) => s.id));
   // A classification only means something on an unmet holdout; anywhere else it is dropped.
   const criteria = verify.criteria.map((c) =>
@@ -57,9 +57,17 @@ export function normalizeVerify(verify: Verify, spec: Spec, holdout: Holdout): V
       });
   }
   const unique = new Set(criteria.map((c) => c.id)).size === criteria.length;
+  let notes = verify.notes;
+  for (const c of criteria) {
+    if (c.status !== "unmet" || !scenarioIds.has(c.id)) continue;
+    const issue = requirementCitationIssue(c, request, spec);
+    const diagnostic = `${c.id}: requirement citation validation failed: ${issue}.`;
+    if (issue && !notes.includes(diagnostic)) notes = [notes, diagnostic].filter(Boolean).join("\n");
+  }
   return {
     ...verify,
     criteria,
+    notes,
     overall: unique && criteria.every((c) => c.status === "met" || notRequired(c)) ? "pass" : "fail",
   };
 }

@@ -2137,17 +2137,17 @@ protected_paths = ["protected.txt"]
     ) => {
       let verifies = 0;
       let implementCalls = 0;
-      const f = start((s) => {
+      const handler: Handler = (s) => {
         const role = roleOf(s);
         if (role === "triage") return { structured: triage() };
-        if (role === "spec") return { structured: spec };
+        if (role === "spec") return { structured: { ...spec, out_of_scope: ["Delete the old parser"] } };
         if (role === "holdout") return { structured: privateHoldout };
         if (role === "review") return { structured: approve };
         if (role === "verify") return { structured: ++verifies === 1 ? firstVerify : pass };
         onImplement(s.prompt, ++implementCalls);
         return { files: { "farewell.txt": "goodbye\n" } };
-      });
-      return { f, implementCalls: () => implementCalls, verifies: () => verifies };
+      };
+      return { f: start(handler), handler, implementCalls: () => implementCalls, verifies: () => verifies };
     };
 
     test("a not_required holdout passes verify without another round and is a report follow-up", async () => {
@@ -2167,14 +2167,16 @@ protected_paths = ["protected.txt"]
     });
 
     test.each([
-      ["request", "Add a farewell file", "this requirement of the original request"],
-      ["spec", "farewell.txt exists", "this requirement of the specification"],
+      ["request", "Add a farewell file", "this requirement of the original request", ""],
+      ["spec", "farewell.txt exists", "this requirement of the specification", ""],
+      ["request", "Add a farewell file", "this requirement of the original request", "uncited evidence"],
+      ["spec", "farewell.txt exists", "this requirement of the specification", "uncited evidence"],
     ])(
       "an unmet %s holdout fails verify and names the violated requirement",
-      async (requirement, citation, source) => {
+      async (requirement, citation, source, evidence) => {
         let checked = false;
         const { f, implementCalls } = drive(
-          unmetH2({ requirement, requirementCitation: citation }),
+          unmetH2({ requirement, requirementCitation: citation, ...(evidence ? { evidence } : {}) }),
           (prompt, call) => {
             if (call !== 2) return;
             expect(prompt).toContain(`**H-2** violates ${source}: "${citation}"`);
@@ -2182,6 +2184,9 @@ protected_paths = ["protected.txt"]
             expect(prompt).not.toContain(secret);
             expect(prompt).not.toContain("missing input");
             expect(prompt).not.toContain("[private detail]");
+            expect(prompt.includes("Citation validation: evidence does not cite the requirement")).toBe(
+              !!evidence,
+            );
             checked = true;
           },
         );
@@ -2189,12 +2194,15 @@ protected_paths = ["protected.txt"]
         expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
         expect(implementCalls()).toBe(2);
         expect(checked).toBe(true);
+        const first = f.store.getRunState<RunState>(run.id)?.verifyResults?.[0];
+        expect(first?.notes.includes("evidence does not cite the requirement")).toBe(!!evidence);
       },
     );
 
     test.each([
       ["a fabricated citation", `run ${secret}`],
       ["a missing citation", ""],
+      ["an out-of-scope citation", "Delete the old parser"],
     ])(
       "%s is not a failed invocation: the classification still blocks and the citation is withheld",
       async (_label, citation) => {
@@ -2209,6 +2217,9 @@ protected_paths = ["protected.txt"]
             expect(prompt).toContain("Observed failure: the file keeps a stale greeting line");
             expect(prompt).not.toContain(secret);
             expect(prompt).not.toContain("[private detail]");
+            const feedback = prompt.split("### Checks not met")[1] ?? "";
+            expect(feedback).not.toContain("Delete the old parser");
+            expect(feedback).toContain("public requirements:\nfarewell.txt exists");
             checked = true;
           },
         );
@@ -2222,22 +2233,48 @@ protected_paths = ["protected.txt"]
         const first = f.store.getRunState<RunState>(run.id)?.verifyResults?.[0];
         expect(first?.overall).toBe("fail");
         expect(first?.criteria.find((c) => c.id === "H-2")?.requirement).toBe("spec");
+        expect(first?.notes).toContain("requirement citation validation failed");
       },
     );
 
     test("verifier output without a requirement field stays blocking on replay", async () => {
       let checked = false;
-      const { f, implementCalls } = drive(unmetH2({}), (prompt, call) => {
+      const { f, handler, implementCalls, verifies } = drive(unmetH2({}), (prompt, call) => {
         if (call !== 2) return;
         expect(prompt).toContain("private scenario (unmet): the file keeps a stale greeting line");
         expect(prompt).not.toContain(secret);
         checked = true;
       });
+      f.deps.faults = {
+        "stage:verify:after": {
+          action: "kill",
+          onHit: ({ runId }) => {
+            const state = f.store.getRunState<RunState>(runId);
+            const stored = state?.verifyResults?.[0];
+            if (!state || !stored) throw new Error("missing stored verification");
+            for (const c of stored.criteria) {
+              delete c.requirement;
+              delete c.requirementCitation;
+            }
+            stored.overall = "pass"; // Replay must recompute even a stale model-supplied verdict.
+            f.store.setRunState(runId, state);
+          },
+        },
+      };
       const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
-      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const deadline = Date.now() + 10_000;
+      while (f.store.listStages(run.id).at(-1)?.status !== "cancelled") {
+        if (Date.now() > deadline) throw new Error("verify interruption timed out");
+        await Bun.sleep(10);
+      }
+      await f.stop();
+      f.store.close();
+      const resumed = start(handler);
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       expect(implementCalls()).toBe(2);
       expect(checked).toBe(true);
-      const first = f.store.getRunState<RunState>(run.id)?.verifyResults?.[0];
+      expect(verifies()).toBe(2);
+      const first = resumed.store.getRunState<RunState>(run.id)?.verifyResults?.[0];
       expect(first?.overall).toBe("fail");
       expect(first?.criteria.find((c) => c.id === "H-2")?.requirement).toBeNull();
     });
@@ -3959,15 +3996,18 @@ test("engine persists selected effort through a feedback round without changing 
   expect(f.router.model("alpha/m")?.effort).toBe("low");
 });
 
-for (const path of [
+for (const scenario of [
   "blocked",
   "passes",
   "retry-unmet",
   "initial-unmet",
   "unclear",
   "no-alternative",
+  "blocked-not-required",
+  "passes-not-required",
 ] as const) {
-  test(`environment verification retry: ${path}`, async () => {
+  test(`environment verification retry: ${scenario}`, async () => {
+    const path = scenario.replace("-not-required", "");
     const verifierModels: string[] = [];
     const scratchPaths: string[] = [];
     const implementationPrompts: string[] = [];
@@ -4019,7 +4059,9 @@ for (const path of [
                       evidence: "Observed wrong output",
                       publicSummary: "",
                     }
-                  : c,
+                  : c.id === "H-2" && scenario.endsWith("-not-required")
+                    ? { ...c, status: "unmet", requirement: "not_required" }
+                    : c,
             ),
           },
         };

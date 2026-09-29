@@ -416,6 +416,8 @@ test("a citation is grounded only when it is a verbatim quote of the named sourc
   const source = requirementSource("spec", "make it work", {
     ...spec,
     requirements: ["empty lists are accepted"],
+    assumptions: ["The caller has administrator access"],
+    out_of_scope: ["Delete the old parser"],
   });
   expect(citedRequirement('"Empty lists are  accepted."', source)).toBe("Empty lists are accepted");
   expect(citedRequirement("make it work", requirementSource("request", "make it work", spec))).toBe(
@@ -426,8 +428,67 @@ test("a citation is grounded only when it is a verbatim quote of the named sourc
     ["empty lists accepted", source],
     ["empty lists are accepted", "make it work"],
     ["", source],
+    ["Delete the old parser", source],
+    ["The caller has administrator access", source],
+    [spec.summary, source],
+    [spec.acceptance_criteria[0]?.how_to_verify ?? "", source],
   ] as const)
     expect(citedRequirement(citation, text)).toBeNull();
+  expect(citedRequirement("works", source)).toBe("works");
+});
+
+test.each(["request", "spec"] as const)(
+  "%s evidence citations are validated after parsing",
+  (requirement) => {
+    const requirementCitation = "Must return 1";
+    const publicSpec = { ...spec, requirements: [requirementCitation] };
+    for (const cites of [false, true]) {
+      const parsed = VerifySchema.parse(
+        unmetHoldout({
+          requirement,
+          requirementCitation,
+          evidence: `Observed failure: command returns 0${cites ? `; violates ${requirementCitation}` : ""}`,
+        }),
+      );
+      const normalized = normalizeVerify(parsed, publicSpec, holdout, requirementCitation);
+      expect(normalized.overall).toBe("fail");
+      expect(normalized.notes.includes("evidence does not cite the requirement")).toBe(!cites);
+      expect(normalizeVerify(normalized, publicSpec, holdout, requirementCitation).notes).toBe(
+        normalized.notes,
+      );
+      const feedback = formatVerifyFeedback(
+        normalized,
+        publicSpec,
+        holdout,
+        requirementCitation,
+        requirementCitation,
+      );
+      expect(feedback).toContain('"Must return 1"');
+      expect(feedback).toContain("Observed failure: rejects an empty list");
+      expect(feedback).not.toContain("command returns 0");
+    }
+  },
+);
+
+test("out-of-scope citations remain blocking but are never attributed as spec requirements", () => {
+  const publicSpec = { ...spec, out_of_scope: ["Delete the old parser"] };
+  const result = normalizeVerify(
+    VerifySchema.parse(
+      unmetHoldout({
+        requirement: "spec",
+        requirementCitation: "Delete the old parser",
+        evidence: "Delete the old parser: parser still exists",
+      }),
+    ),
+    publicSpec,
+    holdout,
+  );
+  expect(result.overall).toBe("fail");
+  expect(result.notes).toContain("citation is not a stated public requirement");
+  const feedback = formatVerifyFeedback(result, publicSpec, holdout);
+  expect(feedback).not.toContain("Delete the old parser");
+  expect(feedback).toContain("This attribution is unvalidated");
+  expect(feedback).toContain("public requirements:\nworks");
 });
 
 test("only unmet holdouts classified request or spec block the verdict", () => {

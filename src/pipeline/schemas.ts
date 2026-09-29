@@ -245,8 +245,7 @@ export const VerifySchema = z.object({
           "For H-ids, short observed behavior without private inputs or expected values; empty for public criteria",
         ),
       // Defaults let output recorded before holdouts were classified parse as unclassified, which blocks.
-      // A malformed classification (missing or ungrounded citation) is not a schema failure either:
-      // it still blocks, and the citation is simply withheld from feedback (see `citedRequirement`).
+      // Citation validation happens after parsing so malformed classifications still yield a verdict.
       requirement: z
         .enum(["request", "spec", "not_required"])
         .nullable()
@@ -279,7 +278,24 @@ export function citedRequirement(citation: string, source: string): string | nul
 }
 
 export function requirementSource(requirement: "request" | "spec", request: string, spec: Spec): string {
-  return requirement === "request" ? request : renderSpec(spec);
+  return requirement === "request"
+    ? request
+    : [...spec.requirements, ...spec.acceptance_criteria.map((ac) => ac.criterion)].join("\n");
+}
+
+/** Diagnostics contain no private evidence and can be persisted and shown in feedback. */
+export function requirementCitationIssue(
+  criterion: Verify["criteria"][number],
+  request: string,
+  spec: Spec,
+): string | null {
+  if (criterion.requirement !== "request" && criterion.requirement !== "spec") return null;
+  const citation = criterion.requirementCitation ?? "";
+  if (!citation.trim()) return "missing requirement citation";
+  if (!citedRequirement(citation, requirementSource(criterion.requirement, request, spec)))
+    return "citation is not a stated public requirement";
+  if (!citedRequirement(citation, criterion.evidence)) return "evidence does not cite the requirement";
+  return null;
 }
 
 export function renderSpec(spec: Spec): string {

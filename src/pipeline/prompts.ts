@@ -6,6 +6,7 @@ import {
   type Holdout,
   type Review,
   renderSpec,
+  requirementCitationIssue,
   requirementSource,
   type Spec,
   type Verify,
@@ -248,7 +249,8 @@ export function formatVerifyFeedback(
       if (!privateScenario) return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
       if (c.status !== "unmet" || (c.requirement !== "request" && c.requirement !== "spec"))
         return `- **${c.id}** private scenario (${c.status}): ${safeSummary}`;
-      return `- **${c.id}** violates ${violatedRequirement(c.requirement, c.requirementCitation ?? "", request, spec, holdout, publicSources)}\n  Observed failure: ${safeSummary}`;
+      const issue = spec ? requirementCitationIssue(c, request, spec) : null;
+      return `- **${c.id}** violates ${violatedRequirement(c.requirement, c.requirementCitation ?? "", request, spec, holdout, publicSources)}\n  Observed failure: ${safeSummary}${issue ? `\n  Citation validation: ${issue}.` : ""}`;
     })
     .join("\n")}`;
 }
@@ -271,7 +273,7 @@ function violatedRequirement(
     requirement === "request" ? request : spec ? requirementSource("spec", request, spec) : "";
   const quote = citedRequirement(citation, sourceText);
   if (quote === null || !holdout || redactHoldoutText(quote, holdout, publicSources) !== quote)
-    return `a requirement of ${source} (the verifier's citation was not found in it)`;
+    return `a requirement of ${source} (the verifier's citation was not found in it). This attribution is unvalidated; check against the public requirements:\n${sourceText}`;
   return `this requirement of ${source}: "${quote}"`;
 }
 
