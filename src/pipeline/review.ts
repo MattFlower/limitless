@@ -17,7 +17,7 @@ type Finding = Review["findings"][number];
 /** Categories a panel never verifies or blocks on; they go straight to the follow-up ledger. */
 const UNVERIFIED_CATEGORIES: readonly (Finding["category"] | undefined)[] = ["cleanup", "conventions"];
 const FINDER_SEVERITY_RANK = { blocker: 0, major: 1, minor: 2, nit: 3 } as const;
-/** Candidates verified per review; the rest stay unverified follow-ups. */
+/** Finder candidates verified per review; prior blocker rechecks are exempt. */
 export const PANEL_VERIFY_CAP = 20;
 const PANEL_BATCH_SIZE = 5;
 
@@ -36,17 +36,54 @@ export function reviewFindingKey(finding: Review["findings"][number]): string {
   return JSON.stringify([finding.file, finding.title]);
 }
 
-/** Whether an "unaddressed" finding cites one of the previous blocking findings (P1, P2, ...). */
-function citesPriorBlocking(finding: Review["findings"][number], priorBlocking: Review["findings"]): boolean {
+/** The zero-based index an "unaddressed" finding cites among `count` prior blocking findings (P1 = P01). */
+function citedPriorIndex(finding: Finding, count: number): number | undefined {
+  if (finding.label !== "unaddressed") return undefined;
   const match = /^P(\d+)$/i.exec(finding.prior?.trim() ?? "");
   const index = match ? Number(match[1]) : 0;
-  return index >= 1 && index <= priorBlocking.length;
+  return index >= 1 && index <= count ? index - 1 : undefined;
+}
+
+/** Whether an "unaddressed" finding cites one of the previous blocking findings (P1, P2, ...). */
+function citesPriorBlocking(finding: Review["findings"][number], priorBlocking: Review["findings"]): boolean {
+  return citedPriorIndex(finding, priorBlocking.length) !== undefined;
+}
+
+/** Panel reviews per run: a run still blocked after the last one goes to a human. */
+export const PANEL_REVIEWS = 3;
+const VERIFIED_SEVERITY_RANK = { low: 0, medium: 1, high: 2, critical: 3 } as const;
+
+/** Verified by the panel rule, at `min` or above by the verifier's consequence severity. */
+function verifiedAtLeast(finding: Finding, min: Verification["severity"]): boolean {
+  const severity = finding.verification?.severity;
+  return (
+    !!severity && panelVerified(finding) && VERIFIED_SEVERITY_RANK[severity] >= VERIFIED_SEVERITY_RANK[min]
+  );
+}
+
+/**
+ * Only verified findings ever block, and a verified security finding (the verifier's category, or the
+ * finder's flag) blocks in every review. Otherwise re-reviews tighten what blocks:
+ * R2 — a cited unaddressed prior blocking finding, a regression of medium or above, or a new high/critical;
+ * R3 — a critical finding (cited prior, regression or new).
+ */
+function panelBlocks(
+  finding: Finding,
+  priorBlocking: Review["findings"] | undefined,
+  panelReview: number,
+): boolean {
+  if (!panelVerified(finding)) return false;
+  if (finding.verification?.category === "security" || finding.security) return true;
+  if (!priorBlocking || panelReview <= 1) return true;
+  if (panelReview >= PANEL_REVIEWS) return verifiedAtLeast(finding, "critical");
+  if (citesPriorBlocking(finding, priorBlocking)) return true;
+  return verifiedAtLeast(finding, finding.label === "regression" ? "medium" : "high");
 }
 
 /**
  * Panel reviews block on the verifier's ruling and never on cleanup or conventions (the verifier's
- * category, else the finder's): in round 1 every verified finding; later rounds apply the rules below
- * with verified critical/high standing in for blocker.
+ * category, else the finder's): see `panelBlocks`. `panelReview` defaults to 2, whose rules a
+ * conflict-resolution review (outside the R1-R3 count) also follows.
  *
  * Single reviews, first round: blockers and majors block. Later rounds may not move the goalposts: a finding blocks
  * only if it is a regression from the latest changes, an unaddressed previous *blocking* finding
@@ -56,29 +93,46 @@ function citesPriorBlocking(finding: Review["findings"][number], priorBlocking: 
 export function blockingReviewFindings(
   review: StoredReview,
   priorBlocking?: Review["findings"],
+  panelReview = 2,
 ): Review["findings"] {
   const panel = review.mode === "panel";
   return review.findings.filter((finding) => {
     if (panel) {
-      if (finding.verification?.verdict === "REFUTED") return false;
       if (UNVERIFIED_CATEGORIES.includes(finding.verification?.category ?? finding.category)) return false;
-      if (!priorBlocking) return panelVerified(finding);
+      return panelBlocks(finding, priorBlocking, panelReview);
     }
     if (!priorBlocking) return finding.severity === "blocker" || finding.severity === "major";
     if (finding.label === "regression") return true;
-    if (finding.label === "unaddressed" && citesPriorBlocking(finding, priorBlocking)) return true;
-    if (panel)
-      return (
-        finding.security ||
-        (panelVerified(finding) &&
-          (finding.verification?.severity === "critical" || finding.verification?.severity === "high"))
-      );
+    if (citesPriorBlocking(finding, priorBlocking)) return true;
     return finding.severity === "blocker" || finding.security;
   });
 }
 
-export function reviewVerdict(review: StoredReview, priorBlocking?: Review["findings"]): Review["verdict"] {
-  return blockingReviewFindings(review, priorBlocking).length ? "request_changes" : "approve";
+/**
+ * Blocking findings of earlier reviews that the following review did not cite as unaddressed. A panel
+ * re-review rechecks every prior blocking finding (a finder repeats it or the verifier gets it as a
+ * candidate), so an uncited one was refuted at head: known resolved, not to be raised again.
+ */
+export function resolvedPriorFindings(
+  history: { blocking: Review["findings"]; followUps: Review["findings"] }[],
+): Review["findings"] {
+  return history.slice(0, -1).flatMap((entry, i) => {
+    const next = history[i + 1];
+    const cited = new Set(
+      [...(next?.blocking ?? []), ...(next?.followUps ?? [])].map((f) =>
+        citedPriorIndex(f, entry.blocking.length),
+      ),
+    );
+    return entry.blocking.filter((_, k) => !cited.has(k));
+  });
+}
+
+export function reviewVerdict(
+  review: StoredReview,
+  priorBlocking?: Review["findings"],
+  panelReview?: number,
+): Review["verdict"] {
+  return blockingReviewFindings(review, priorBlocking, panelReview).length ? "request_changes" : "approve";
 }
 
 export interface ReviewInput {
@@ -88,6 +142,8 @@ export interface ReviewInput {
   replayedFollowUps?: Review["findings"];
   /** Defaults to one finder (`single`). */
   system?: Pick<ReviewSystem, "mode" | "finders">;
+  /** Panel only: which review this is (1–3); decides what blocks. `prompt.fixReview` scopes the diff. */
+  panelReview?: number;
 }
 
 /** What the invoker sends to the model; later rounds (with previous findings) use the labelled schema. */
@@ -115,7 +171,8 @@ export interface VerifierRequest {
 
 /** What `review-N.json` records about a panel beyond the derived review. */
 export interface PanelRecord {
-  candidates: (Finding & { id: string; finder: number; vendor: string | null })[];
+  /** `finder` is null for a prior blocking finding no finder repeated: the verifier rechecks it. */
+  candidates: (Finding & { id: string; finder: number | null; vendor: string | null })[];
   verdicts: (Verification & { id: string })[];
   refuted: string[];
   /** Eligible for verification but over the per-review cap: unverified follow-ups. */
@@ -193,8 +250,8 @@ export async function runReview<T extends Invoked>(
 
 function decide(input: ReviewInput, found: Review, modelVerdict: Review["verdict"]): ReviewDecision {
   const prior = input.prompt.previous?.findings;
-  const review: Review = { ...found, verdict: reviewVerdict(found, prior) };
-  const blocking = blockingReviewFindings(review, prior);
+  const review: Review = { ...found, verdict: reviewVerdict(found, prior, input.panelReview) };
+  const blocking = blockingReviewFindings(review, prior, input.panelReview);
   // A panel's first round also has a ledger: whatever it does not block.
   const followUps =
     prior || review.mode === "panel"
@@ -269,16 +326,37 @@ async function runPanel<T extends Invoked>(
   const first = found[0];
   if (!first) throw new Error('mode "panel" needs at least one finder');
 
-  const candidates: PanelRecord["candidates"] = found
-    .flatMap(({ invoked, review }, finder) =>
-      review.findings.map((f) => ({ ...f, finder, vendor: invoked.target?.vendor ?? null })),
-    )
-    .map((c, i) => ({ ...c, id: `C${i + 1}` }));
+  const { fixReview, previous } = input.prompt;
+  const priorBlocking = previous?.findings ?? [];
+  const cited = (c: Finding) => citedPriorIndex(c, priorBlocking.length);
+  // A citation of a prior blocking finding keeps that finding's category, so retagging it cleanup or
+  // conventions can't drop it from verification.
+  const raised = found.flatMap(({ invoked, review }, finder) =>
+    review.findings.map((f) => {
+      const prior = priorBlocking[cited(f) ?? -1];
+      const category = prior ? (prior.verification?.category ?? prior.category ?? f.category) : f.category;
+      return { ...f, ...(category ? { category } : {}), finder, vendor: invoked.target?.vendor ?? null };
+    }),
+  );
+  const fix = fixReview && previous ? { review: fixReview, ...previous } : undefined;
+  // A re-review never assumes a prior blocking finding fixed: whatever no finder repeated, the
+  // verifier rechecks as a candidate of its own, outside the cap.
+  const rechecks = (fix?.findings ?? []).flatMap(({ verification: _stale, ...f }, i) =>
+    raised.some((c) => cited(c) === i)
+      ? []
+      : [{ ...f, label: "unaddressed" as const, prior: `P${i + 1}`, finder: null, vendor: null }],
+  );
+  const candidates: PanelRecord["candidates"] = [...raised, ...rechecks].map((c, i) => ({
+    ...c,
+    id: `C${i + 1}`,
+  }));
+  // A cited prior blocking finding is always verified: the citation replaces the automatic recheck.
+  const exempt = (c: PanelRecord["candidates"][number]) => c.finder === null || cited(c) !== undefined;
   // Stable sort: equal severities keep finder order.
   const ranked = candidates
-    .filter((c) => !UNVERIFIED_CATEGORIES.includes(c.category))
+    .filter((c) => !exempt(c) && !UNVERIFIED_CATEGORIES.includes(c.category))
     .sort((a, b) => FINDER_SEVERITY_RANK[a.severity] - FINDER_SEVERITY_RANK[b.severity]);
-  const selected = ranked.slice(0, PANEL_VERIFY_CAP);
+  const selected = [...ranked.slice(0, PANEL_VERIFY_CAP), ...candidates.filter(exempt)];
   // One batch never mixes files or finder vendors, so each call avoids exactly its finder's vendor.
   const groups = new Map<string, typeof selected>();
   for (const c of candidates.filter((c) => selected.includes(c))) {
@@ -290,6 +368,36 @@ async function runPanel<T extends Invoked>(
       group.slice(i * PANEL_BATCH_SIZE, (i + 1) * PANEL_BATCH_SIZE),
     ),
   );
+  // A re-review's verifier checks the same fix diff, and whether each prior finding is really resolved.
+  const verifierFix = fix
+    ? {
+        review: fix.review,
+        sha: fix.sha,
+        prior: fix.findings.map(({ file, line, title }, i) => {
+          const [repeated, recheck] = [true, false].map((byFinder) =>
+            candidates
+              .filter((c) => (c.finder !== null) === byFinder && cited(c) === i)
+              .map((c) => c.id)
+              .join(", "),
+          );
+          return {
+            id: `P${i + 1}`,
+            file,
+            line,
+            title,
+            status: repeated
+              ? `reported unaddressed by ${repeated}`
+              : `not repeated by any finder; recheck it as ${recheck}`,
+          };
+        }),
+        resolved: (fix.resolved ?? []).map(({ file, line, title }) => ({
+          file,
+          line,
+          title,
+          status: "resolved at an earlier review",
+        })),
+      }
+    : undefined;
   const verdicts = new Map<string, PanelRecord["verdicts"][number]>();
   const omitted: string[] = [];
   let last = first.invoked.result;
@@ -307,13 +415,15 @@ async function runPanel<T extends Invoked>(
             headSha: input.prompt.headSha,
             externalChange: input.prompt.externalChange,
             stat: input.prompt.stat,
-            candidates: pending.map(({ id, file, line, title, failure_scenario }) => ({
+            candidates: pending.map(({ id, file, line, title, failure_scenario, label, prior }) => ({
               id,
               file,
               line,
               title,
               failure_scenario: failure_scenario ?? "",
+              ...(verifierFix ? { label: label ?? "new", prior: prior ?? "" } : {}),
             })),
+            ...(verifierFix ? { fix: verifierFix } : {}),
           }),
           schema: VerifierSchema,
           jsonSchema: toStrictJsonSchema(VerifierSchema),
@@ -379,7 +489,7 @@ async function runPanel<T extends Invoked>(
     candidates,
     verdicts: [...verdicts.values()],
     refuted: [...verdicts.values()].filter((v) => v.verdict === "REFUTED").map((v) => v.id),
-    capped: ranked.slice(PANEL_VERIFY_CAP).map((c) => c.id),
+    capped: ranked.filter((c) => !selected.includes(c)).map((c) => c.id),
     omitted,
   };
   return {
