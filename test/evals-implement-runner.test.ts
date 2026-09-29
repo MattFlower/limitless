@@ -523,9 +523,7 @@ for (const rounds of [1, 3])
       ]);
       await f.factory.evals.stop();
       const report = await pending;
-      // The run stays queued to resume, but a trial that already spent never reruns: a single-round one
-      // is skipped, a mid-rounds one keeps its evidence.
-      expect(report.run.status).toBe("queued");
+      expect(report.run.status).toBe("failed");
       expect(report.trials[0]).toMatchObject(
         rounds > 1
           ? {
@@ -541,7 +539,7 @@ for (const rounds of [1, 3])
                 ],
               },
             }
-          : { status: "skipped", pass: null, costUsd: 0.1, details: { reason: "daemon shutdown" } },
+          : { status: "skipped", pass: null, costUsd: 0.1 },
       );
       if (rounds > 1) {
         expect(report.trials[0]?.details.grade?.implement?.reason).toBe("hidden_tests");
@@ -554,47 +552,6 @@ for (const rounds of [1, 3])
       await f.close();
     }
   });
-
-test("a crash mid-rounds keeps the trial's evidence and spend instead of replaying it", async () => {
-  const f = await fixture();
-  try {
-    f.respond(() => ({ files: { answer: "wrong" }, costUsd: 0.1 }));
-    const report = await f.run({ rounds: 3 });
-    const finished = report.trials[0];
-    if (!finished?.details.rounds || !finished.details.grade) throw new Error("missing evidence");
-    expect(f.calls).toHaveLength(3);
-    // Rewind the stored trial to how a crash between rounds one and two leaves it.
-    f.factory.store.recordEvalTrial({
-      ...finished,
-      status: "running",
-      costUsd: 0.1,
-      details: { ...finished.details, rounds: finished.details.rounds.slice(0, 1), roundsUsed: 1 },
-    });
-    f.factory.store.updateEvalRun(report.run.id, "running");
-    const restarted = await f.restart();
-    await restarted.evals.wait(report.run.id);
-    expect(restarted.evals.report(report.run.id)?.run).toMatchObject({ status: "completed", error: null });
-    const trial = restarted.store.listEvalTrials(report.run.id)[0];
-    expect(trial).toMatchObject({
-      status: "error",
-      pass: false,
-      score: 0,
-      costUsd: 0.1,
-      details: {
-        interrupted: true,
-        roundsUsed: 1,
-        reason: "interrupted by daemon restart; final usage unknown",
-        stopReason: "interrupted by daemon restart; final usage unknown",
-        grade: finished.details.grade,
-      },
-    });
-    expect(trial?.details.rounds).toEqual(finished.details.rounds.slice(0, 1));
-    expect(f.calls).toHaveLength(3);
-    expect(restarted.store.evalSpend(report.run.id)).toBeCloseTo(0.1);
-  } finally {
-    await f.close();
-  }
-});
 
 for (const strategy of ["retry", "effort", "switch"] as const)
   test(`multi-round ${strategy} preserves edits, sanitizes grading, records costs and caches`, async () => {

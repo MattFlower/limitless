@@ -7,6 +7,7 @@ import { EvalReviewSystemsSchema } from "../pipeline/review-system.ts";
 import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
 import type { Router } from "../router/router.ts";
 import { EFFORT_LEVELS } from "../router/targets.ts";
+import { reviewSystemHash } from "./cache.ts";
 
 const nonempty = z.string().trim().min(1);
 const repoId = z.string().regex(/^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/, "expected owner/name");
@@ -313,6 +314,17 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
           ...(request.systems?.[i] ?? { name: target, mode: "single", implementerReport: "include" }),
           finders: [{ target, prompt: "standard" }],
         }));
+  // Two names for one configuration would only measure the cache, so reject them after resolution.
+  const configs = new Map<string, string>();
+  for (const system of request.systems ? (systems ?? []) : []) {
+    const hash = reviewSystemHash(system);
+    const first = configs.get(hash);
+    if (first !== undefined)
+      throw new Error(
+        `Invalid review systems: ${JSON.stringify(system.name)} has the same configuration as ${JSON.stringify(first)} (names aside)`,
+      );
+    configs.set(hash, system.name);
+  }
   for (const id of request.caseIds ?? [])
     if (!file.cases.some((c) => c.id === id)) throw new Error(`Unknown case ID: ${id}`);
   const cases = file.cases.filter((c) => !request.caseIds || request.caseIds.includes(c.id));

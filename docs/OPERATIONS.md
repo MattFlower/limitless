@@ -192,12 +192,10 @@ the usual local Origin and JSON content-type rules; Cloudflare tunnel requests a
 
 Runs progress from `queued` to `running`, then `completed`, `budget_exhausted` or `failed`. Completed
 means execution ended, not that candidates passed. Trial errors and skips remain visible in partial
-reports. Daemon shutdown aborts active calls and releases slots, leaving the run and its unfinished
-trials `queued`; the next start resumes it with its submitted models or systems and `--no-cache`
-setting, rerunning in-flight trials that had not yet spent anything and skipping trials whose case left
-the dataset. An in-flight trial with recorded spend or round evidence never replays: shutdown leaves it
-skipped (or, mid-rounds, an error keeping its evidence), and a crash leaves it an error with unknown
-final usage. `--follow` polls until any
+reports. Daemon shutdown aborts active calls and releases slots; startup marks interrupted evals
+failed, retaining completed trials for cache reuse on a new submission. In-flight trials interrupted
+by a crash are errors with unknown final usage/latency; queued trials are skipped. Unknown latency is
+excluded from the p50. `--follow` polls until any
 terminal state and prints a final report. The Evals UI lists runs, displays per-trial reports, and
 compares latest completed evidence in a roles-by-models eligibility matrix. Other role graders remain pending.
 
@@ -235,6 +233,8 @@ files and no-op proposals are reported explicitly. The preview compares the effe
 would result from the exact proposed file against the daemon's active policy; pre-existing checkout
 changes can therefore also appear in the diff. Roles without eligible results receive no generated
 change. `routing/EVIDENCE.md` contains the reproducible evidence and unchanged-role explanations.
+Review evidence from `--systems` runs counts only for systems whose `implementerReport` matches the
+daemon's `[review] implementer_report`.
 
 The [policy configuration and formulas](EVALS.md#policy-generation-and-review) specify inclusive Wilson
 lower-bound floors on pass rate and blocking recall, inclusive Wilson upper-bound ceilings on risk under-call,

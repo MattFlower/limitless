@@ -1,9 +1,20 @@
 import { z } from "zod";
 import type { Config } from "../config.ts";
 import type { ReviewSystem } from "../core/types.ts";
+import { parseTarget } from "../router/targets.ts";
 
 const FinderSchema = z.strictObject({
-  target: z.string().trim().min(1, "finder target must not be empty").optional(),
+  // The same reference syntax as `--models` (no trimming); the catalog check happens at submission.
+  target: z
+    .string()
+    .superRefine((target, ctx) => {
+      try {
+        parseTarget(target);
+      } catch (error) {
+        ctx.addIssue({ code: "custom", message: (error as Error).message });
+      }
+    })
+    .optional(),
   prompt: z.literal("standard", { error: 'unsupported finder prompt; only "standard" is implemented' }),
 });
 export const ReviewSystemSchema = z.strictObject({

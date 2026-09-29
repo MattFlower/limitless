@@ -8,7 +8,7 @@ import { Store } from "../src/db/store.ts";
 import { reviewSystemHash } from "../src/evals/cache.ts";
 import { validateRequest } from "../src/evals/cases.ts";
 import { parseEvalReviewSystems, productionReviewSystem } from "../src/pipeline/review-system.ts";
-import { evalFixture } from "./evals-support.ts";
+import { enableEfforts, evalFixture } from "./evals-support.ts";
 
 const system = (over: Record<string, unknown> = {}) => ({
   name: "with-report",
@@ -24,7 +24,16 @@ const invalid: [string, string][] = [
   [JSON.stringify([system()]), "expected object"],
   [file(), "at least one review system"],
   [file(system({ finders: [{ prompt: "standard" }] })), "needs an explicit finder target"],
-  [file(system({ finders: [{ target: " ", prompt: "standard" }] })), "finder target must not be empty"],
+  [file(system({ finders: [{ target: "", prompt: "standard" }] })), "empty model ID"],
+  [file(system({ finders: [{ target: " ", prompt: "standard" }] })), "without surrounding whitespace"],
+  [
+    file(system({ finders: [{ target: " candidate-a", prompt: "standard" }] })),
+    "without surrounding whitespace",
+  ],
+  [
+    file(system({ finders: [{ target: "candidate-a@", prompt: "standard" }] })),
+    "expected model or model@effort",
+  ],
   [file(system({ mode: "panel" })), 'only "single" is implemented'],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
@@ -141,10 +150,32 @@ test("request validation resolves systems, expands --models, and rejects bad sys
         f.factory.router,
       ),
     ).toThrow("Invalid eval models");
+    // Targets follow the --models reference rules on both paths; neither trims.
+    const padded = " candidate-a";
+    expect(() => validateRequest({ role: "review", models: [padded] }, review, f.factory.router)).toThrow(
+      "without surrounding whitespace",
+    );
+    expect(() =>
+      validateRequest(
+        { role: "review", systems: [system({ finders: [{ target: padded, prompt: "standard" }] })] },
+        review,
+        f.factory.router,
+      ),
+    ).toThrow("without surrounding whitespace");
+    // Configurations are compared after resolution, ignoring names.
+    enableEfforts(f);
+    const renamed = [
+      system({ name: "x" }),
+      system({ name: "y", finders: [{ target: "candidate-a@low", prompt: "standard" }] }),
+    ];
+    expect(() => validateRequest({ role: "review", systems: renamed }, review, f.factory.router)).toThrow(
+      'Invalid review systems: "y" has the same configuration as "x" (names aside)',
+    );
     for (const bad of [
       { role: "review", systems: [system({ finders: [{ prompt: "standard" }] })] },
       { role: "review", systems: [system({ mode: "panel" })] },
       { role: "review", systems: [system(), system()] },
+      { role: "review", systems: [system(), system({ name: "copy" })] },
       { role: "review", systems: [system()], models: ["candidate-a"] },
       { role: "review" },
       { role: "triage", systems: [system()] },
@@ -184,13 +215,13 @@ test("candidates sharing a target stay distinct after a store reload", () => {
   try {
     let store = new Store(path);
     const run = store.createEvalRun(
-      { role: "review", models: ["candidate-a"], k: 1, maxUsd: 1, systems, cache: false },
+      { role: "review", models: ["candidate-a"], k: 1, maxUsd: 1, systems },
       systems.map((s) => trial(s.name)),
     );
     store.recordEvalTrial({ ...trial("without"), evalRunId: run.id, status: "ok", pass: true });
     store.close();
     store = new Store(path);
-    expect(store.getEvalRun(run.id)).toMatchObject({ systems, cache: false });
+    expect(store.getEvalRun(run.id)?.systems).toEqual(systems);
     expect(store.listEvalRuns()[0]?.systems).toEqual(systems);
     expect(store.listEvalTrials(run.id).map((t) => [t.details.system, t.status])).toEqual([
       ["with-report", "queued"],
@@ -199,5 +230,47 @@ test("candidates sharing a target stay distinct after a store reload", () => {
     store.close();
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("eval policy counts only systems matching the daemon's [review] implementer_report", async () => {
+  const f = await evalFixture();
+  try {
+    const systems = [system(), system({ name: "without", implementerReport: "omit" })] as ReviewSystem[];
+    const trial = (name: string): EvalTrial => ({
+      effort: "default",
+      evalRunId: "",
+      caseId: "a",
+      modelId: "candidate-a",
+      trial: 0,
+      cacheKey: name,
+      harness: "fake",
+      status: "ok",
+      output: {},
+      pass: name === "with-report",
+      score: name === "with-report" ? 1 : 0,
+      details: { system: name },
+      costUsd: 0,
+      costEquivUsd: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+      durationMs: 1,
+      createdAt: 1,
+    });
+    const run = f.factory.store.createEvalRun(
+      { role: "review", models: ["candidate-a"], k: 1, maxUsd: 1, systems },
+      systems.map((s) => trial(s.name)),
+    );
+    f.factory.store.updateEvalRun(run.id, "completed");
+    const counted = () =>
+      f.factory
+        .evalPolicy([run.id])
+        .evaluation.roles.find((r) => r.role === "review")
+        ?.candidates.map((c) => [c.modelId, c.summary.candidate, c.summary.passRate]);
+    expect(counted()).toEqual([["candidate-a", "with-report", 1]]);
+    f.cfg.reviewImplementerReport = "omit";
+    expect(counted()).toEqual([["candidate-a", "without", 0]]);
+  } finally {
+    await f.close();
   }
 });
