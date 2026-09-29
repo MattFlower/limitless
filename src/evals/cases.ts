@@ -284,8 +284,8 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
   // Report every bad reference at once so the operator fixes the whole list in one round trip.
   const problems: string[] = [];
   const resolved: string[] = [];
-  const ids = request.systems?.map((system) => system.finders[0]?.target ?? "") ?? request.models ?? [];
-  for (const id of ids) {
+  const vendors = new Map<string, string>();
+  const resolve = (id: string): string => {
     try {
       let target = router.resolveFor(request.role, id);
       if (request.strategy === "effort") {
@@ -296,9 +296,31 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
         target = router.resolveFor(request.role, { modelId: target.model.id, effort });
       }
       resolved.push(target.targetId);
+      vendors.set(target.targetId, target.model.vendor);
+      return target.targetId;
     } catch (error) {
       problems.push(`${JSON.stringify(id)}: ${(error as Error).message}`);
+      return id;
     }
+  };
+  // Every finder and verifier target is resolved; a system's first finder names its candidate model.
+  const resolvedSystems = request.systems?.map((system) => ({
+    ...system,
+    finders: system.finders.map((finder) => ({ ...finder, target: resolve(finder.target ?? "") })),
+    ...(system.verifier
+      ? { verifier: { ...system.verifier, target: resolve(system.verifier.target ?? "") } }
+      : {}),
+  }));
+  for (const id of request.systems ? [] : (request.models ?? [])) resolve(id);
+  // A verifier checks candidates from another vendor, as production's avoidVendor routing guarantees.
+  for (const system of resolvedSystems ?? []) {
+    const verifier = system.verifier?.target;
+    const vendor = verifier === undefined ? undefined : vendors.get(verifier);
+    for (const finder of system.finders)
+      if (vendor !== undefined && vendors.get(finder.target) === vendor)
+        problems.push(
+          `review system ${JSON.stringify(system.name)}: verifier ${verifier} shares vendor ${vendor} with finder ${finder.target}`,
+        );
   }
   const seen = new Set<string>();
   // Systems may share a target (e.g. include vs omit the implementer report); their names differ.
@@ -311,10 +333,13 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
   const systems: ReviewSystem[] | undefined =
     request.role !== "review"
       ? undefined
-      : resolved.map((target, i) => ({
-          ...(request.systems?.[i] ?? { name: target, mode: "single", implementerReport: "include" }),
+      : (resolvedSystems ??
+        resolved.map((target) => ({
+          name: target,
+          mode: "single",
           finders: [{ target, prompt: "standard" }],
-        }));
+          implementerReport: "include",
+        })));
   // Two names for one configuration would only measure the cache, so reject them after resolution.
   const configs = new Map<string, string>();
   for (const system of request.systems ? (systems ?? []) : []) {
@@ -329,5 +354,6 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
   for (const id of request.caseIds ?? [])
     if (!file.cases.some((c) => c.id === id)) throw new Error(`Unknown case ID: ${id}`);
   const cases = file.cases.filter((c) => !request.caseIds || request.caseIds.includes(c.id));
-  return { request: { ...request, models: [...new Set(resolved)], systems }, cases };
+  const models = resolvedSystems?.map((system) => system.finders[0]?.target ?? "") ?? resolved;
+  return { request: { ...request, models: [...new Set(models)], systems }, cases };
 }

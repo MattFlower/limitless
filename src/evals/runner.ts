@@ -4,11 +4,23 @@ import type { EvalRun, EvalTrial } from "../core/types.ts";
 import { createEvalWorktree, type EvalLabels, pinnedTree, snapshotTopLevel } from "../git/repos.ts";
 import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
-import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
+import {
+  type AgentResult,
+  type AgentSpec,
+  emptyUsage,
+  extractJson,
+  type ModelTarget,
+} from "../harness/types.ts";
 import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
-import { type ReviewRequest, runReview } from "../pipeline/review.ts";
-import { toStrictJsonSchema } from "../pipeline/schemas.ts";
+import {
+  combined,
+  panelVerifierIdentity,
+  type ReviewRequest,
+  runReview,
+  type VerifierRequest,
+} from "../pipeline/review.ts";
+import { StoredReviewSchema, toStrictJsonSchema } from "../pipeline/schemas.ts";
 import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
 import { cacheKey, reviewSystemHash } from "./cache.ts";
 import {
@@ -396,8 +408,23 @@ export class EvalRunner {
       const preparationMs = Date.now() - preparationStarted;
       let { prompt } = prepared;
       const { timeoutMs } = prepared;
-      const reviewInput = "review" in prepared ? prepared.review : undefined;
+      const reviewInput =
+        "review" in prepared && prepared.review
+          ? { ...prepared.review, ...(system ? { system } : {}) }
+          : undefined;
       const decisionTask = "decisionTask" in prepared ? prepared.decisionTask : undefined;
+      // Panel targets beyond the trial's own (its first finder) are pinned in the system.
+      const pinned = (id: string | undefined) => {
+        const { model: pinnedModel, effort: pinnedEffort } = router.resolve(id ?? "");
+        return router.toTarget(pinnedModel, pinnedEffort);
+      };
+      const panelTargets =
+        system?.mode === "panel"
+          ? {
+              finders: system.finders.slice(1).map((f) => pinned(f.target)),
+              verifier: pinned(system.verifier?.target),
+            }
+          : undefined;
       const schema = "hidden" in item ? undefined : schemaFor(item);
       const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
@@ -424,6 +451,7 @@ export class EvalRunner {
                   }
                 : { head: item.head, input: item.input }),
               ...(system ? { reviewSystem: reviewSystemHash(system) } : {}),
+              ...(system?.mode === "panel" ? { verifier: panelVerifierIdentity() } : {}),
               patch,
               ...(item.snapshot ? { snapshot: true } : {}),
               source:
@@ -499,22 +527,53 @@ export class EvalRunner {
         trial.harness = harnessName;
         store.recordEvalTrial({ ...trial, status: "running" });
         let result: AgentResult;
+        // The trial target's own call within a panel review, recorded against its provider.
+        let own: AgentResult | undefined;
+        const observe = (to: ModelTarget, outcome: AgentResult) => {
+          if (outcome.quota) tracker.observeWindows(to.provider, outcome.quota.windows);
+          tracker.record(to.provider, outcome.status, {
+            error: outcome.error,
+            exhaustedUntil: outcome.quota?.exhaustedUntil,
+            ...(outcome.modelCooldownMs === undefined
+              ? {}
+              : { modelCooldown: { modelId: to.modelId, ms: outcome.modelCooldownMs } }),
+          });
+          if (
+            outcome.status !== "ok" &&
+            /model[^.]{0,80}(is not supported|not found|does not exist|not available)|unknown model|invalid model|model_not_found/i.test(
+              outcome.error ?? "",
+            )
+          )
+            tracker.blockModel(to.modelId, outcome.error ?? "model rejected");
+        };
         let resumeFailed = false;
         const before = { ...trial };
         for (let attempt = 0; ; attempt++) {
+          own = undefined;
+          // Panel calls that returned, so spend survives a later member's failure.
+          const spent: AgentResult[] = [];
           try {
             const logPath = join(directory, "trial.log");
-            const invoke = (scratchDir?: string, request = { prompt, jsonSchema, schema, timeoutMs }) =>
-              harness({
+            const invoke = (
+              scratchDir?: string,
+              request: Pick<AgentSpec, "prompt" | "jsonSchema" | "schema" | "timeoutMs"> = {
+                prompt,
+                jsonSchema,
+                schema,
+                timeoutMs,
+              },
+              to = { target, harness, noTools },
+            ) =>
+              to.harness({
                 scratchDir,
                 ...(sessionId ? { resumeSessionId: sessionId } : {}),
                 cwd,
                 ...request,
                 decisionTask,
                 systemAppend: FACTORY_PREAMBLE,
-                target,
+                target: to.target,
                 mode: "hidden" in item ? "edit" : "readonly",
-                noTools,
+                noTools: to.noTools,
                 privateSession: run.role === "verify",
                 idleTimeoutMs: 10 * 60_000,
                 maxToolCalls: "hidden" in item ? 400 : 150,
@@ -529,26 +588,66 @@ export class EvalRunner {
                     typeof event.input.command === "string"
                   )
                     toolCommands.push(event.input.command);
-                  if (event.type === "rate_limit") tracker.observeWindows(target.provider, event.windows);
+                  if (event.type === "rate_limit") tracker.observeWindows(to.target.provider, event.windows);
                 },
               });
-            const send = (request?: ReviewRequest) =>
-              noTools
-                ? invoke(undefined, request)
+            const send = (request?: ReviewRequest | VerifierRequest, to = { target, harness, noTools }) =>
+              to.noTools
+                ? invoke(undefined, request, to)
                 : scratch
-                  ? invoke(scratch, request)
-                  : withScratch(cwd, (dir) => invoke(dir, request));
+                  ? invoke(scratch, request, to)
+                  : withScratch(cwd, (dir) => invoke(dir, request, to));
+            // Never hold one provider's slot while waiting for another panel member's provider.
+            const sendTo = async (request: ReviewRequest | VerifierRequest, to: ModelTarget) => {
+              const picked = selectHarness(run.role, to);
+              const agent = harnesses[picked.harnessName];
+              if (!agent) throw new Error(`No harness registered for ${picked.harnessName}`);
+              const unavailable = tracker.unavailableReason(to.provider);
+              if (unavailable) throw new Error(`${to.provider} unavailable: ${unavailable}`);
+              const releaseOther = await tracker.acquire(to.provider, signal);
+              try {
+                const sent = await send(request, { target: to, harness: agent, noTools: picked.noTools });
+                spent.push(sent);
+                observe(to, sent);
+                return { result: sent, target: to };
+              } finally {
+                releaseOther();
+              }
+            };
             // First-round review cases go through the pipeline's review entry point.
             result = reviewInput
               ? (
                   await runReview(
-                    { invoke: async (request) => ({ result: await send(request) }) },
+                    {
+                      invoke: async (request, finder) => {
+                        const to = finder > 0 ? panelTargets?.finders[finder - 1] : undefined;
+                        if (to) return sendTo(request, to);
+                        try {
+                          own = await send(request);
+                          spent.push(own);
+                        } finally {
+                          if (panelTargets) {
+                            release?.();
+                            release = undefined;
+                          }
+                        }
+                        return { result: own, target };
+                      },
+                      verify: async (request, avoidVendor) => {
+                        if (!panelTargets) throw new Error("review system has no verifier");
+                        if (panelTargets.verifier.vendor === avoidVendor)
+                          throw new Error(
+                            `verifier ${panelTargets.verifier.modelId} shares vendor ${avoidVendor} with its finder`,
+                          );
+                        return sendTo(request, panelTargets.verifier);
+                      },
+                    },
                     reviewInput,
                   )
                 ).result
               : await send();
           } catch (error) {
-            result = {
+            const failure: AgentResult = {
               status: signal.aborted ? "cancelled" : "error",
               finalText: "",
               structured: null,
@@ -560,6 +659,7 @@ export class EvalRunner {
               error: (error as Error).message,
               quota: null,
             };
+            result = spent.length ? combined(spent, failure, null) : failure;
           }
           trial.costUsd += result.costUsd;
           trial.costEquivUsd += result.costEquivUsd;
@@ -599,23 +699,16 @@ export class EvalRunner {
           trial.durationMs = Date.now() - trial.createdAt + preparationMs;
           store.recordEvalTrial({ ...trial, status: "running" });
         }
-        if (result.quota) tracker.observeWindows(target.provider, result.quota.windows);
-        tracker.record(target.provider, result.status, {
-          error: result.error,
-          exhaustedUntil: result.quota?.exhaustedUntil,
-          ...(result.modelCooldownMs === undefined
-            ? {}
-            : { modelCooldown: { modelId: target.modelId, ms: result.modelCooldownMs } }),
-        });
-        if (
-          result.status !== "ok" &&
-          /model[^.]{0,80}(is not supported|not found|does not exist|not available)|unknown model|invalid model|model_not_found/i.test(
-            result.error ?? "",
-          )
-        )
-          tracker.blockModel(target.modelId, result.error ?? "model rejected");
+        // A panel's combined result carries its last call's status; the trial's own call is recorded here.
+        observe(target, own ?? result);
         if (signal.aborted) return skip("daemon shutdown");
-        const output = schema?.safeParse(result.structured ?? extractJson(result.finalText));
+        // A panel's result is its derived review, whose verification fields only the stored schema keeps;
+        // anything without the panel's mark (e.g. one member's raw review) is not a panel result.
+        const output = (
+          system?.mode === "panel"
+            ? StoredReviewSchema.refine((r) => r.mode === "panel", "not a derived panel review")
+            : schema
+        )?.safeParse(result.structured ?? extractJson(result.finalText));
         // A declined decision answer is still graded; details.invocationStatus records the escalation.
         const answered = result.status === "ok" || result.status === "declined";
         const ok = answered && ("hidden" in item || output?.success === true);
