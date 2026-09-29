@@ -136,6 +136,25 @@ test("review and verify datasets validate pins, nested inputs, labels and unique
     ])
       expect(schema.safeParse({ ...file, cases: [{ ...item, ...over }] }).success).toBe(false);
     expect(schema.safeParse({ ...file, cases: [item, item] }).success).toBe(false);
+    // Gate runs that were killed for exceeding their timeout carry `timedOut` on the result.
+    const timedOut = {
+      name: "test",
+      verdict: "regressed",
+      blocking: true,
+      result: {
+        name: "test",
+        command: "bun test",
+        ok: false,
+        exitCode: null,
+        durationMs: 1,
+        output: "",
+        timedOut: true,
+      },
+    };
+    expect(
+      schema.safeParse({ ...file, cases: [{ ...item, input: { ...item.input, gates: [timedOut] } }] })
+        .success,
+    ).toBe(true);
   }
   const r = review.cases[0];
   const v = verify.cases[0];

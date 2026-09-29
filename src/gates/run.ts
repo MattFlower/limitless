@@ -10,6 +10,10 @@ export interface GateResult {
   exitCode: number | null;
   durationMs: number;
   output: string; // tail
+  /** Set only when the process was killed for exceeding its timeout. */
+  timedOut?: boolean;
+  /** Baseline only: the failed first attempt of a check that was re-run; this result is the re-run. */
+  firstAttempt?: GateResult;
 }
 
 export interface GateRun {
@@ -62,6 +66,7 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
     exitCode: res.exitCode,
     durationMs: res.durationMs,
     output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
+    ...(res.timedOut ? { timedOut: true } : {}),
   };
 }
 
@@ -103,6 +108,39 @@ async function runAll(
   return { setupOk: true, setup, checks };
 }
 
+/**
+ * Re-run once, inside a slot, each baseline check that failed without timing out. A check that
+ * fails on base never blocks later, so a flaky baseline failure would hide a real regression.
+ * The re-run becomes the result, with the failure kept as `firstAttempt`; only a pass changes the outcome.
+ */
+export async function retryBaselineFailures(
+  run: GateRun,
+  cwd: string,
+  cfg: GateConfig,
+  signal: AbortSignal,
+  onWait?: GateHooks["onWait"],
+): Promise<GateRun> {
+  const retryable = (r: GateResult) =>
+    !r.ok && !r.timedOut ? cfg.checks.find((k) => k.name === r.name && k.run === r.command) : undefined;
+  if (!run.setupOk || signal.aborted || !run.checks.some(retryable)) return run;
+  const release = await gateSlots.acquire(signal, onWait);
+  try {
+    const checks: GateResult[] = [];
+    for (const r of run.checks) {
+      const check = retryable(r);
+      if (!check || signal.aborted) {
+        checks.push(r);
+        continue;
+      }
+      const retry = await runOne(check, cwd, signal);
+      checks.push({ ...retry, firstAttempt: r });
+    }
+    return { ...run, checks };
+  } finally {
+    release();
+  }
+}
+
 /** Compare post-change gates with the baseline taken on the untouched base branch. */
 export function compareGates(baseline: GateRun | null, after: GateRun): GateComparison[] {
   const out: GateComparison[] = [];
@@ -117,7 +155,14 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
         name: c.name,
         verdict: "not_run",
         blocking: true,
-        result: { ...c, ok: false, exitCode: null, durationMs: 0, output: "not run: setup failed" },
+        result: {
+          name: c.name,
+          command: c.command,
+          ok: false,
+          exitCode: null,
+          durationMs: 0,
+          output: "not run: setup failed",
+        },
       });
     }
     return out;
