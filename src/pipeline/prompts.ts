@@ -61,7 +61,19 @@ Return the JSON object.`;
 }
 
 export function holdoutPrompt(input: { prompt: string; spec: Spec }): string {
-  return `Write blind holdout checks for this request. You have only the original request and completed specification. Do not inspect a repository or implementation. Return 3–8 concrete scenarios with sequential IDs H-1, H-2, ... Each needs a short description, exact executable steps or inputs, and an expected observable outcome. Mark edge_case true for at least two edge or failure cases that are not literally listed in the acceptance criteria. Return the JSON object.\n\n# Original request\n${quoteRequest(input.prompt)}\n\n# Specification\n${renderSpec(input.spec)}`;
+  return `Write holdout checks for this request. A separate verifier will run them against the finished change; the implementer never sees them.
+
+Your working directory is a temporary, read-only checkout of the repository at the base commit, before any implementation. Read and search it to learn its real commands, entry points, configuration keys, file formats and test setup. It does not contain the change; don't describe or depend on implementation details. The checks will run later from the root of a different checkout of the finished change, and this one will be gone.
+
+Rules:
+- Test what the request and specification ask for. Every expected outcome must follow from the request or specification; if they don't imply a behaviour, don't test it.
+- Steps must be runnable against this repository as it exists plus the requested change: real commands, real config keys, real entry points. Don't invent fixtures for configuration or states the code can't reach.
+- Don't dictate exact wording, error text or values the request and specification don't specify; describe the observable outcome instead.
+- Write steps from the repository root with relative paths; never use this checkout's absolute path.
+- Return 1–8 scenarios with sequential IDs H-1, H-2, ... Fewer, well-grounded scenarios beat many speculative ones.
+- Include an edge or failure case only when the request or specification implies it, and mark it edge_case true; mark every other scenario edge_case false.
+
+Each scenario needs a short description, concrete steps or inputs, and an expected observable outcome. Keep scenario text out of files, including temporary ones: return it only in the JSON object.\n\n# Original request\n${quoteRequest(input.prompt)}\n\n# Specification\n${renderSpec(input.spec)}`;
 }
 
 function checksSection(cfg: GateConfig, baseline: GateRun | null): string {
@@ -150,7 +162,7 @@ export function formatReviewFeedback(findings: Review["findings"]): string {
   return `### Code review findings (must fix)\n${findings
     .map(
       (f) =>
-        `- **${f.severity}** ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""} — ` : ""}${f.title}\n  ${f.detail}${f.suggestion ? `\n  Suggestion: ${f.suggestion}` : ""}`,
+        `- **${f.verification?.severity ?? f.severity}** ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""} — ` : ""}${f.title}\n  ${f.detail}${f.suggestion ? `\n  Suggestion: ${f.suggestion}` : ""}${f.verification ? `\n  Verified (${f.verification.verdict}) evidence: ${f.verification.evidence}\n  Trigger: ${f.verification.trigger}` : ""}`,
     )
     .join("\n")}`;
 }
@@ -286,7 +298,7 @@ ${fence(
   JSON.stringify(
     // v2 evidence stays out so a prior confidence score can't anchor the recheck.
     input.previous.findings.map(
-      ({ failure_scenario, category, confidence, introduced_by_diff, ...f }, i) => ({
+      ({ failure_scenario, category, confidence, introduced_by_diff, verification, ...f }, i) => ({
         id: `P${i + 1}`,
         ...f,
       }),
@@ -329,6 +341,48 @@ Every finding must name a concrete defect in the change: what is wrong, where, a
 Do not modify files. You may run read-only commands and targeted tests. Create temporary fixtures and redirect supported build/test outputs only under TMPDIR (also TMP and TEMP); the worktree is read-only.
 Explicitly mark security findings with security: true (otherwise false). For every finding also set failure_scenario (the concrete inputs or state that produce the wrong output or crash), category (one of correctness, security, reliability, data, concurrency, compatibility, test-gap, cleanup, conventions), confidence (0 to 1: how sure you are the defect is real) and introduced_by_diff (true if the change under review introduced it, false if it predates the change).
 Return your assessment in verdict; the pipeline derives its decision from findings.`;
+}
+
+/** Deliberately without the finders' detail and reasoning or the implementer's report: verify from the code. */
+export function verifierPrompt(input: {
+  prompt: string;
+  spec: Spec | null;
+  baseSha: string;
+  headSha?: string;
+  /** PR verification: the base may have moved past the fork point, so diff from the merge base as finders do. */
+  externalChange?: boolean;
+  stat: string;
+  candidates: { id: string; file: string; line: number; title: string; failure_scenario: string }[];
+}): string {
+  const range = `${input.baseSha}${input.externalChange ? "..." : ".."}${input.headSha ?? "HEAD"}`;
+  return `You are a code-review verifier. Other reviewers raised the candidate defects below against a change. Check each one against the repository code and decide whether it is real. Do not look for new defects.
+
+# Original request
+${quoteRequest(input.prompt)}
+
+# Specification
+${input.spec ? renderSpec(input.spec) : "(no separate spec; judge against the request)"}
+
+# Change under review
+Base: ${input.baseSha}. Head: ${input.headSha ?? "HEAD"}. Inspect it with \`git diff ${range}\` and by reading the surrounding code.
+${fence(input.stat.trim() || "(empty diff)")}
+
+# Candidates (claims to check, not facts)
+${fence(JSON.stringify(input.candidates, null, 2))}
+
+# Verdicts
+- CONFIRMED: the code shows the failure happens.
+- PLAUSIBLE: realistic but not proven, including rare states (races, rare null paths, boundary off-by-ones, retry storms). Rare is not refuted.
+- REFUTED: only when the code shows the claim is false. Quote the guard or invariant that prevents it in evidence.
+
+# Severity by consequence (the reviewer's severity is not an input you must keep)
+- critical: a security boundary is crossed, data is lost or corrupted, or the production/deploy/rollback path breaks.
+- high: wrong result or crash on a realistic path; a resume, restart or compatibility regression; a safety check silently skipped.
+- medium: wrong result on an edge path; paid work wasted; misleading output or metrics.
+- low: minor inaccuracy or cosmetic.
+
+Return exactly one result per candidate id. evidence quotes the relevant code with file:line; trigger states the inputs or state and the wrong outcome they produce; category is one of correctness, security, reliability, data, concurrency, compatibility, test-gap, cleanup, conventions.
+Do not modify files. You may run read-only commands and targeted tests; create temporary files only under TMPDIR.`;
 }
 
 export function verifyPrompt(input: {

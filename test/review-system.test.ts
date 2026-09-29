@@ -8,7 +8,7 @@ import { Store } from "../src/db/store.ts";
 import { reviewSystemHash } from "../src/evals/cache.ts";
 import { validateRequest } from "../src/evals/cases.ts";
 import { parseEvalReviewSystems, productionReviewSystem } from "../src/pipeline/review-system.ts";
-import { enableEfforts, evalFixture } from "./evals-support.ts";
+import { enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
 
 const system = (over: Record<string, unknown> = {}) => ({
   name: "with-report",
@@ -18,6 +18,17 @@ const system = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 const file = (...systems: unknown[]) => JSON.stringify({ systems });
+const panel = (over: Record<string, unknown> = {}) =>
+  system({
+    name: "panel",
+    mode: "panel",
+    finders: [
+      { target: "candidate-a", prompt: "standard" },
+      { target: "candidate-b", prompt: "standard" },
+    ],
+    verifier: { target: "verifier-c" },
+    ...over,
+  });
 
 const invalid: [string, string][] = [
   ["{not json", "malformed JSON"],
@@ -34,7 +45,11 @@ const invalid: [string, string][] = [
     file(system({ finders: [{ target: "candidate-a@", prompt: "standard" }] })),
     "expected model or model@effort",
   ],
-  [file(system({ mode: "panel" })), 'only "single" is implemented'],
+  [file(system({ mode: "panel" })), 'mode "panel" needs a verifier'],
+  [file(system({ mode: "triad" })), 'use "single" or "panel"'],
+  [file(system({ verifier: { target: "candidate-b" } })), 'mode "single" takes no verifier'],
+  [file(system({ mode: "panel", finders: [], verifier: { target: "candidate-b" } })), "at least one finder"],
+  [file(system({ mode: "panel", verifier: {} })), "needs an explicit verifier target"],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
     'only "standard" is implemented',
@@ -116,7 +131,7 @@ test("CLI validates --systems before submitting and keeps --models as one system
 });
 
 test("request validation resolves systems, expands --models, and rejects bad systems before scheduling", async () => {
-  const f = await evalFixture();
+  const f = await evalFixture([verifierModel]);
   try {
     const review = { ...f.dataset, role: "review" } as unknown as Parameters<typeof validateRequest>[1];
     const models = validateRequest(
@@ -162,6 +177,11 @@ test("request validation resolves systems, expands --models, and rejects bad sys
         f.factory.router,
       ),
     ).toThrow("without surrounding whitespace");
+    // Panels resolve every finder and the verifier; the first finder names the candidate model.
+    const panels = validateRequest({ role: "review", systems: [panel()] }, review, f.factory.router);
+    expect(panels.request.systems).toEqual([panel()] as ReviewSystem[]);
+    expect(panels.request.models).toEqual(["candidate-a"]);
+    expect(parseEvalReviewSystems(file(panel()), "s.json")).toEqual([panel()] as ReviewSystem[]);
     // Configurations are compared after resolution, ignoring names.
     enableEfforts(f);
     const renamed = [
@@ -174,6 +194,9 @@ test("request validation resolves systems, expands --models, and rejects bad sys
     for (const bad of [
       { role: "review", systems: [system({ finders: [{ prompt: "standard" }] })] },
       { role: "review", systems: [system({ mode: "panel" })] },
+      { role: "review", systems: [panel({ verifier: { target: "nope" } })] },
+      // A verifier sharing a finder's vendor could not check that finder's candidates cross-vendor.
+      { role: "review", systems: [panel({ verifier: { target: "candidate-b" } })] },
       { role: "review", systems: [system(), system()] },
       { role: "review", systems: [system(), system({ name: "copy" })] },
       { role: "review", systems: [system()], models: ["candidate-a"] },

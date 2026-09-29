@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +18,9 @@ import {
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { runProcess, sh } from "../src/util/proc.ts";
 import { findingEvidence } from "./review-support.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 const providers: ProviderDef[] = ["a", "b"].map((id) => ({
   id,
@@ -88,7 +91,7 @@ const verify = {
 function answer(s: AgentSpec): FakeReply {
   if (s.prompt.startsWith("Classify")) return { structured: triage };
   if (s.prompt.startsWith("Write the specification")) return { structured: spec };
-  if (s.prompt.startsWith("Write blind")) return { structured: holdout };
+  if (s.prompt.startsWith("Write holdout checks")) return { structured: holdout };
   if (s.prompt.startsWith("You are an adversarial")) return { structured: review };
   if (s.prompt.startsWith("You are the acceptance")) return { structured: verify };
   return { files: { "ui/change.txt": "done\n" }, text: "done" };
@@ -189,7 +192,8 @@ for (const stage of ["implement", "gates", "review", "verify", "deliver"] as con
       },
     });
     const id = await run(f);
-    await wait(() => reached);
+    // Holdout exports a base snapshot in parallel; let it finish so only `stage` is interrupted.
+    await wait(() => reached && f.store.getRunState<RunState>(id)?.holdoutStatus === "complete");
     await f.stop();
     expect(f.store.getRun(id)?.status).toBe("queued");
     history(f, id);
@@ -855,7 +859,7 @@ exec '${path}-delegate' "$@"
       }
       await restore();
     }
-  }, 20_000);
+  });
 
 const blocked = {
   ...verify,

@@ -377,11 +377,13 @@ export interface ReviewFinder {
   target?: string;
   prompt: "standard";
 }
-/** How a review is performed. Only `mode: "single"` with one standard finder is implemented. */
+/** How a review is performed: one finder (`single`), or finders whose candidates a verifier checks (`panel`). */
 export interface ReviewSystem {
   name: string;
-  mode: "single";
+  mode: "single" | "panel";
   finders: ReviewFinder[];
+  /** Panel only; production may omit `target` (routed), evals may not. */
+  verifier?: { target?: string };
   implementerReport: "include" | "omit";
 }
 /** Trials an eval runs at once per provider, before the provider's own `maxConcurrent` cap. */

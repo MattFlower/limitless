@@ -3,26 +3,38 @@ import type { Config } from "../config.ts";
 import type { ReviewSystem } from "../core/types.ts";
 import { parseTarget } from "../router/targets.ts";
 
+// The same reference syntax as `--models` (no trimming); the catalog check happens at submission.
+const TargetSchema = z.string().superRefine((target, ctx) => {
+  try {
+    parseTarget(target);
+  } catch (error) {
+    ctx.addIssue({ code: "custom", message: (error as Error).message });
+  }
+});
 const FinderSchema = z.strictObject({
-  // The same reference syntax as `--models` (no trimming); the catalog check happens at submission.
-  target: z
-    .string()
-    .superRefine((target, ctx) => {
-      try {
-        parseTarget(target);
-      } catch (error) {
-        ctx.addIssue({ code: "custom", message: (error as Error).message });
-      }
-    })
-    .optional(),
+  target: TargetSchema.optional(),
   prompt: z.literal("standard", { error: 'unsupported finder prompt; only "standard" is implemented' }),
 });
-export const ReviewSystemSchema = z.strictObject({
-  name: z.string().trim().min(1, "system name must not be empty"),
-  mode: z.literal("single", { error: 'unsupported review system mode; only "single" is implemented' }),
-  finders: z.array(FinderSchema).length(1, 'mode "single" takes exactly one finder'),
-  implementerReport: z.enum(["include", "omit"], { error: 'implementerReport must be "include" or "omit"' }),
-}) satisfies z.ZodType<ReviewSystem>;
+export const ReviewSystemSchema = z
+  .strictObject({
+    name: z.string().trim().min(1, "system name must not be empty"),
+    mode: z.enum(["single", "panel"], { error: 'unsupported review system mode; use "single" or "panel"' }),
+    finders: z.array(FinderSchema),
+    verifier: z.strictObject({ target: TargetSchema.optional() }).optional(),
+    implementerReport: z.enum(["include", "omit"], {
+      error: 'implementerReport must be "include" or "omit"',
+    }),
+  })
+  .superRefine((system, ctx) => {
+    if (system.mode === "single" && system.finders.length !== 1)
+      ctx.addIssue({ code: "custom", path: ["finders"], message: 'mode "single" takes exactly one finder' });
+    if (system.mode === "single" && system.verifier)
+      ctx.addIssue({ code: "custom", path: ["verifier"], message: 'mode "single" takes no verifier' });
+    if (system.mode === "panel" && !system.finders.length)
+      ctx.addIssue({ code: "custom", path: ["finders"], message: 'mode "panel" needs at least one finder' });
+    if (system.mode === "panel" && !system.verifier)
+      ctx.addIssue({ code: "custom", path: ["verifier"], message: 'mode "panel" needs a verifier' });
+  }) satisfies z.ZodType<ReviewSystem>;
 
 /** Eval candidates: uniquely named, and every finder pinned so results never depend on live routing. */
 export const EvalReviewSystemsSchema = z
@@ -45,6 +57,12 @@ export const EvalReviewSystemsSchema = z
             path: [index, "finders", finder, "target"],
             message: `review system ${JSON.stringify(system.name)} needs an explicit finder target; routed finders are not allowed in evals`,
           });
+      if (system.verifier && system.verifier.target === undefined)
+        ctx.addIssue({
+          code: "custom",
+          path: [index, "verifier", "target"],
+          message: `review system ${JSON.stringify(system.name)} needs an explicit verifier target; routed verifiers are not allowed in evals`,
+        });
     }
   });
 

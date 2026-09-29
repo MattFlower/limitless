@@ -36,6 +36,18 @@ export function deferred<T>() {
   });
   return { promise, resolve };
 }
+/** A verifier from another vendor than the fixture's candidates, for panel review systems. */
+export const verifierModel: ModelDef = {
+  id: "verifier-c",
+  provider: "provider-b",
+  model: "c",
+  tier: 1,
+  vendor: "qwen",
+  origin: "unknown",
+  baseOrigin: "unknown",
+  supportedEfforts: [],
+  price: { input: 1, output: 1 },
+};
 export async function evalFixture(
   extraModels: ModelDef[] = [],
   extraProviders: ProviderDef[] = [],

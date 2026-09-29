@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ImplementCase, ReviewCase } from "../src/evals/cases.ts";
@@ -7,6 +7,9 @@ import type { AgentSpec } from "../src/harness/types.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 import { answer, evalFixture } from "./evals-support.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 const SEED =
   "diff --git a/seeded.ts b/seeded.ts\nnew file mode 100644\n--- /dev/null\n+++ b/seeded.ts\n@@ -0,0 +1 @@\n+export const seeded = 1;\n";

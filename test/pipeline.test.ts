@@ -1,8 +1,8 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus, StageName } from "../src/core/types.ts";
@@ -18,6 +18,9 @@ import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipe
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 import { findingEvidence } from "./review-support.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 const providers: ProviderDef[] = [
   { id: "alpha", label: "Alpha", harness: "fake", billing: "subscription", maxConcurrent: 2 },
@@ -82,7 +85,7 @@ function roleOf(spec: AgentSpec): string {
   const p = spec.prompt;
   if (p.startsWith("Classify this software task")) return "triage";
   if (p.startsWith("Write the specification")) return "spec";
-  if (p.startsWith("Write blind holdout checks")) return "holdout";
+  if (p.startsWith("Write holdout checks")) return "holdout";
   if (p.startsWith("You are an adversarial code reviewer")) return "review";
   if (p.startsWith("You are the acceptance verifier")) return "verify";
   return "implement";
@@ -606,6 +609,81 @@ esac
     expect(f.store.getArtifact(run.id, "report.md")).toContain("Flaky: `check` failed, then passed");
   });
 
+  test("a baseline check that fails once is retried and recorded as passing, so a regression blocks", async () => {
+    const count = join(home, "gate-runs");
+    // Run 1 is the baseline, run 2 its retry; every run after the change fails.
+    const check = `echo x >> '${count}'; test $(( $(wc -l < '${count}') )) -eq 2`;
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`,
+    );
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "flaky baseline"], {
+      cwd: repoDir,
+    });
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).not.toBe("succeeded");
+    const baseline = f.store.getRunState<RunState>(run.id)?.baseline?.checks[0];
+    expect([baseline?.ok, baseline?.firstAttempt?.ok]).toEqual([true, false]);
+    const artifact = JSON.parse(f.store.getArtifact(run.id, "baseline-gates.json") ?? "{}");
+    expect([artifact.checks?.[0]?.ok, artifact.checks?.[0]?.firstAttempt?.ok]).toEqual([true, false]);
+    const flaky = f.store.listEvents(run.id).find((e) => e.message === "baseline check: flaky");
+    expect(flaky?.data).toMatchObject({ flaky: true, firstAttempt: { ok: false }, retry: { ok: true } });
+    const gates = f.store.getRunState<RunState>(run.id)?.lastGates?.[0];
+    expect([gates?.verdict, gates?.blocking]).toEqual(["regressed", true]);
+    // Baseline, its retry, then each post-change round and its regression retry.
+    expect(readFileSync(count, "utf8").trim().split("\n").length % 2).toBe(0);
+  });
+
+  test("a baseline check that fails twice stays failing and does not block after the change", async () => {
+    const count = join(home, "gate-runs");
+    const check = `echo x >> '${count}'; echo attempt $(( $(wc -l < '${count}') )); exit 1`;
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`,
+    );
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "broken baseline"], {
+      cwd: repoDir,
+    });
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const state = f.store.getRunState<RunState>(run.id);
+    const baseline = state?.baseline?.checks[0];
+    expect([
+      baseline?.ok,
+      baseline?.output,
+      baseline?.firstAttempt?.ok,
+      baseline?.firstAttempt?.output,
+    ]).toEqual([false, "attempt 2", false, "attempt 1"]);
+    // Both failed attempts stay in the artifact.
+    const artifact = JSON.parse(f.store.getArtifact(run.id, "baseline-gates.json") ?? "{}");
+    expect([artifact.checks?.[0]?.output, artifact.checks?.[0]?.firstAttempt?.output]).toEqual([
+      "attempt 2",
+      "attempt 1",
+    ]);
+    expect([state?.lastGates?.[0]?.verdict, state?.lastGates?.[0]?.blocking]).toEqual([
+      "still_failing",
+      false,
+    ]);
+    const events = f.store.listEvents(run.id);
+    expect(events.some((e) => e.message.endsWith(": flaky"))).toBe(false);
+    const again = events.find((e) => e.message === "baseline check: retry FAIL again");
+    expect(again?.data).toMatchObject({ flaky: false, firstAttempt: { ok: false }, retry: { ok: false } });
+    // Two baseline attempts, one post-change run (still_failing is never retried).
+    expect(readFileSync(count, "utf8").trim().split("\n").length).toBe(3);
+  });
+
   // Same text git generates, so a fixture line can never stand in for a real marker.
   const fixture = "<<<<<<< HEAD\nexample\n=======\n>>>>>>> theirs\n";
 
@@ -739,7 +817,7 @@ esac
     expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
     expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
     expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
-  }, 30_000);
+  });
 
   for (const kind of [
     "unchanged",
@@ -1631,7 +1709,9 @@ protected_paths = ["protected.txt"]
       expect(state?.flow).toBe("verify-change");
       expect(f.store.getRunDetail(runId)?.run.flow).toBe("verify-change");
       const revisions = readFileSync(records, "utf8").trim().split("\n");
-      expect(revisions.slice(0, 2)).toEqual([baseTip, head]);
+      // A check failing on base is retried once, still on base, before the head is checked out.
+      const baseRuns = scenario === "baseline" ? [baseTip, baseTip] : [baseTip];
+      expect(revisions.slice(0, baseRuns.length + 1)).toEqual([...baseRuns, head]);
       const remote = (await git("ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).split("\t")[0];
       const unchanged = ["approve", "baseline", "restart-initial"].includes(scenario);
       expect(remote).toBe(unchanged || blocked ? head : (f.store.getRun(runId)?.headSha ?? "missing"));
@@ -1788,11 +1868,13 @@ protected_paths = ["protected.txt"]
     ).toContain(competingSha);
   });
 
-  test("holdout starts alongside implementation, stays blind, and quick skips it", async () => {
+  test("holdout starts alongside implementation, reads only a base snapshot, and quick skips it", async () => {
     for (const profile of ["standard", "deep", "quick"] as const) {
       let implementStarted = false;
       let holdoutCalls = 0;
       let holdoutCwd = "";
+      let snapshotChecked = false;
+      let runId = "";
       const f = start(async (s) => {
         const role = roleOf(s);
         if (role === "triage") return { structured: triage() };
@@ -1801,17 +1883,41 @@ protected_paths = ["protected.txt"]
           holdoutCalls++;
           holdoutCwd = s.cwd;
           expect(s.mode).toBe("readonly");
-          expect(s.noTools).toBe(true);
-          expect(s.maxToolCalls).toBe(0);
+          expect(s.noTools).toBeFalsy();
+          expect(s.maxToolCalls).toBeGreaterThan(0);
+          expect(s.maxToolCalls).toBeLessThanOrEqual(50);
+          expect(s.scratchDir).toBeTruthy();
+          expect(s.privateSession).toBe(true);
+          // The cwd alone doesn't confine tools: reads are limited to the snapshot and scratch, and
+          // the implementer's worktree and factory state are denied wherever they live.
+          expect(s.confineReads).toBe(true);
+          expect(basename(dirname(s.cwd))).toStartWith(`limitless-holdout-${process.pid}-`);
+          // The private CLI log in the shared temporary directory never holds scenario text.
+          expect(s.redactOutput?.("H-1 private step")).toBe("[private]");
+          expect(s.denyRead).toEqual(
+            expect.arrayContaining([join(f.cfg.paths.work, runId), f.cfg.paths.home, f.cfg.paths.repos]),
+          );
           expect(s.prompt).toContain("# Original request");
           expect(s.prompt).toContain("# Specification");
           expect(s.prompt).not.toContain("implementation marker");
-          expect(existsSync(join(s.cwd, "greeting.txt"))).toBe(false);
+          expect(readFileSync(join(s.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+          expect(existsSync(join(s.cwd, ".limitless.toml"))).toBe(true);
+          expect(existsSync(join(s.cwd, ".git"))).toBe(false);
           while (!implementStarted && !s.signal.aborted) await Bun.sleep(10);
+          // The implementer has now edited its worktree; the snapshot must not follow.
+          await Bun.sleep(50);
+          expect(readFileSync(join(s.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+          expect(existsSync(join(s.cwd, "implementation-marker.txt"))).toBe(false);
+          expect(existsSync(join(s.cwd, "farewell.txt"))).toBe(false);
           return { structured: holdout };
         }
         if (role === "review") return { structured: approve };
-        if (role === "verify") return { structured: pass };
+        if (role === "verify") {
+          expect(existsSync(holdoutCwd)).toBe(false);
+          expect(readFileSync(join(s.cwd, "greeting.txt"), "utf8")).toBe("changed\n");
+          snapshotChecked = true;
+          return { structured: pass };
+        }
         implementStarted = true;
         expect(
           s.prompt.includes(
@@ -1819,13 +1925,20 @@ protected_paths = ["protected.txt"]
           ),
         ).toBe(profile !== "quick");
         return {
-          files: { "farewell.txt": "goodbye\n", "implementation-marker.txt": "implementation marker" },
+          files: {
+            "farewell.txt": "goodbye\n",
+            "greeting.txt": "changed\n",
+            "implementation-marker.txt": "implementation marker",
+          },
         };
       });
       const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file", profile });
+      runId = run.id;
       expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       expect(holdoutCalls).toBe(profile === "quick" ? 0 : 1);
       if (profile !== "quick") {
+        expect(snapshotChecked).toBe(true);
+        expect(existsSync(holdoutCwd)).toBe(false);
         expect(holdoutCwd).not.toBe(join(f.cfg.paths.work, run.id));
         const invs = f.store.listInvocations(run.id);
         expect(invs.find((i) => i.role === "holdout")?.provider).toBe("beta");
@@ -2164,9 +2277,17 @@ protected_paths = ["protected.txt"]
   });
 
   test("completed holdout survives a stopped factory and is reused after restart", async () => {
+    const secret = "OLD_FORMAT_PRIVATE_STEP_518";
+    // Persisted under the former 3–8 scenario, two-edge-case schema.
+    const oldHoldout = {
+      scenarios: holdout.scenarios.map((s) => (s.id === "H-2" ? { ...s, steps: `run ${secret}` } : s)),
+    };
     let holdoutCalls = 0;
     let implementations = 0;
     let blockImplement = true;
+    let runId = "";
+    let restarted: Factory | null = null;
+    let privacyChecked = false;
     const handler: Handler = (s) => {
       const role = roleOf(s);
       if (role === "triage") return { structured: triage() };
@@ -2178,13 +2299,25 @@ protected_paths = ["protected.txt"]
       if (role === "review") return { structured: approve };
       if (role === "verify") {
         expect(s.prompt).toContain("H-3");
+        expect(s.prompt).toContain(secret);
         return { structured: pass };
       }
       implementations++;
+      if (restarted) {
+        const store = restarted.store;
+        expect(s.prompt).not.toContain(secret);
+        expect(existsSync(join(s.cwd, "holdout-scenarios.json"))).toBe(false);
+        expect(store.getArtifact(runId, "holdout-scenarios.json")).toBeNull();
+        for (const artifact of store.listArtifacts(runId))
+          expect(store.getArtifact(runId, artifact.name)).not.toContain(secret);
+        expect(JSON.stringify(store.listEvents(runId))).not.toContain(secret);
+        privacyChecked = true;
+      }
       return blockImplement ? { delayMs: 30_000 } : { files: { "farewell.txt": "goodbye\n" } };
     };
     const f = start(handler);
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    runId = run.id;
     const deadline = Date.now() + 10_000;
     while (
       (f.store.getRunState<RunState>(run.id)?.holdoutStatus !== "complete" ||
@@ -2200,24 +2333,30 @@ protected_paths = ["protected.txt"]
     expect(f.store.getRun(run.id)?.status).toBe("queued");
     expect(f.store.getRunState<RunState>(run.id)?.implementedRound).toBeUndefined();
     expect(f.store.listStages(run.id).find((s) => s.name === "implement")?.status).toBe("cancelled");
+    const stopped = f.store.getRunState<RunState>(run.id);
+    f.store.setRunState(run.id, { ...stopped, holdout: oldHoldout });
     f.store.close();
     blockImplement = false;
-    const restarted = start(handler);
+    restarted = start(handler);
     expect(await waitFor(restarted, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(holdoutCalls).toBe(1);
     expect(implementations).toBe(2);
-    expect(restarted.store.getRunState<RunState>(run.id)?.holdout?.scenarios).toEqual(holdout.scenarios);
+    expect(privacyChecked).toBe(true);
+    expect(restarted.store.getRunState<RunState>(run.id)?.holdout?.scenarios).toEqual(oldHoldout.scenarios);
+    expect(restarted.store.getArtifact(run.id, "holdout-scenarios.json")).toContain(secret);
   });
 
   test("interrupted holdout is retried after restart and remains unpublished while stopped", async () => {
     let holdoutCalls = 0;
     let slow = true;
+    const holdoutCwds: string[] = [];
     const handler: Handler = (s) => {
       const role = roleOf(s);
       if (role === "triage") return { structured: triage() };
       if (role === "spec") return { structured: spec };
       if (role === "holdout") {
         holdoutCalls++;
+        holdoutCwds.push(s.cwd);
         return slow ? { structured: holdout, delayMs: 30_000 } : { structured: holdout };
       }
       if (role === "review") return { structured: approve };
@@ -2227,17 +2366,57 @@ protected_paths = ["protected.txt"]
     const f = start(handler);
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
     const deadline = Date.now() + 10_000;
-    while (f.store.getRunState<RunState>(run.id)?.holdoutStatus !== "generating" && Date.now() < deadline)
+    while (
+      (f.store.getRunState<RunState>(run.id)?.holdoutStatus !== "generating" || !holdoutCwds.length) &&
+      Date.now() < deadline
+    )
       await Bun.sleep(10);
     expect(f.store.getRunState<RunState>(run.id)?.holdoutStatus).toBe("generating");
     await f.stop();
+    // Cancellation removes the snapshot but leaves the implementer's worktree for the restart.
+    expect(holdoutCwds).toHaveLength(1);
+    expect(existsSync(holdoutCwds[0] ?? "")).toBe(false);
+    const worktree = f.store.getRunState<RunState>(run.id)?.worktreePath ?? "";
+    expect(existsSync(join(worktree, "greeting.txt"))).toBe(true);
     expect(f.store.listArtifacts(run.id).map((a) => a.name)).not.toContain("holdout-scenarios.json");
     f.store.close();
     slow = false;
     const restarted = start(handler);
     expect(await waitFor(restarted, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(holdoutCalls).toBe(2);
+    expect(holdoutCwds[1]).not.toBe(holdoutCwds[0]);
+    expect(existsSync(holdoutCwds[1] ?? "")).toBe(false);
     expect(restarted.store.getArtifact(run.id, "holdout-scenarios.json")).toContain("H-3");
+  });
+
+  test("failed holdout removes its base snapshot and keeps the run worktree", async () => {
+    const holdoutCwds: string[] = [];
+    let runId = "";
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") {
+        holdoutCwds.push(s.cwd);
+        return { fault: "throw", error: "holdout exploded" };
+      }
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: pass };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    runId = run.id;
+    const deadline = Date.now() + 10_000;
+    while (f.store.listStages(runId).find((s) => s.name === "holdout")?.status !== "failed") {
+      if (Date.now() > deadline) throw new Error("holdout failure timed out");
+      await Bun.sleep(10);
+    }
+    expect(holdoutCwds.length).toBeGreaterThan(0);
+    for (const cwd of holdoutCwds) expect(existsSync(cwd)).toBe(false);
+    const worktree = f.store.getRunState<RunState>(runId)?.worktreePath ?? "";
+    expect(worktree).not.toBe("");
+    expect(existsSync(join(worktree, "greeting.txt"))).toBe(true);
+    expect(f.store.getRunState<RunState>(runId)?.holdout).toBeUndefined();
   });
 
   test("holdout uses same-vendor fallback and invalid output routes to another model", async () => {
@@ -3870,4 +4049,234 @@ test("environment retry prefers another cross-vendor model over same-vendor fall
   const run = await factory.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
   expect(await waitFor(factory, run.id, ["succeeded", "needs_human", "failed"])).toBe("succeeded");
   expect(ids).toEqual(["beta/m", "beta/other"]);
+});
+
+test("panel review: a refuted blocker doesn't block, a CONFIRMED low does, and verifiers avoid the finder's vendor", async () => {
+  const candidate = (title: string, severity: string) => ({
+    severity,
+    security: false,
+    ...findingEvidence,
+    file: "farewell.txt",
+    line: 1,
+    title,
+    detail: `SECRET_DETAIL ${title}`,
+    suggestion: "Fix it",
+  });
+  const rulings: Record<string, [string, string]> = {
+    C1: ["REFUTED", "critical"],
+    C2: ["CONFIRMED", "low"],
+    C3: ["PLAUSIBLE", "medium"],
+  };
+  const verifiers: AgentSpec[] = [];
+  const implementPrompts: string[] = [];
+  const f = start((s) => {
+    if (s.prompt.startsWith("You are a code-review verifier")) {
+      verifiers.push(s);
+      const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+      return {
+        structured: {
+          results: ids.map((id) => ({
+            id,
+            verdict: rulings[id]?.[0],
+            severity: rulings[id]?.[1],
+            category: "correctness",
+            evidence: `farewell.txt:1 \`bye\` (${id})`,
+            trigger: `reading the file -> wrong farewell (${id})`,
+          })),
+        },
+      };
+    }
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review")
+      return {
+        structured: s.prompt.includes("# Previous review")
+          ? { verdict: "approve", summary: "P1 fixed; no regressions found.", findings: [] }
+          : {
+              verdict: "request_changes",
+              summary: "Found problems in the farewell text.",
+              findings: [
+                candidate("Refuted blocker", "blocker"),
+                candidate("Confirmed low", "minor"),
+                candidate("Plausible medium", "major"),
+              ],
+            },
+      };
+    implementPrompts.push(s.prompt);
+    return { files: { "farewell.txt": `goodbye ${implementPrompts.length}\n` } };
+  });
+  f.deps.reviewSystem = {
+    name: "panel",
+    mode: "panel",
+    finders: [{ prompt: "standard" }],
+    verifier: {},
+    implementerReport: "include",
+  };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  // Implementer alpha (anthropic) -> finder beta (openai) -> verifier routed away from openai.
+  expect(
+    f.store
+      .listInvocations(run.id)
+      .filter((i) => i.role === "review")
+      .map((i) => i.modelId),
+  ).toEqual(["beta/m", "alpha/m", "beta/m"]);
+  expect(verifiers.map((s) => [s.target.vendor, s.mode])).toEqual([["anthropic", "readonly"]]);
+  expect(verifiers[0]?.prompt).not.toContain("SECRET_DETAIL");
+  expect(implementPrompts).toHaveLength(2);
+  const feedback = implementPrompts[1] ?? "";
+  expect(feedback).toContain("**low** farewell.txt:1 — Confirmed low");
+  expect(feedback).toContain("farewell.txt:1 `bye` (C2)");
+  expect(feedback).toContain("Trigger: reading the file -> wrong farewell (C2)");
+  for (const dropped of ["Refuted blocker", "Plausible medium"]) expect(feedback).not.toContain(dropped);
+  const artifact = JSON.parse(f.store.getArtifact(run.id, "review-0.json") ?? "{}");
+  expect(artifact).toMatchObject({
+    mode: "panel",
+    verdict: "request_changes",
+    panel: { refuted: ["C1"], capped: [] },
+  });
+  expect(artifact.blocking.map((b: { title: string }) => b.title)).toEqual(["Confirmed low"]);
+  expect(artifact.panel.candidates.map((c: { id: string; title: string }) => [c.id, c.title])).toEqual([
+    ["C1", "Refuted blocker"],
+    ["C2", "Confirmed low"],
+    ["C3", "Plausible medium"],
+  ]);
+  expect(artifact.panel.verdicts.map((v: { id: string; verdict: string }) => [v.id, v.verdict])).toEqual([
+    ["C1", "REFUTED"],
+    ["C2", "CONFIRMED"],
+    ["C3", "PLAUSIBLE"],
+  ]);
+  const state = f.store.getRunState<RunState>(run.id);
+  expect(state?.reviewFollowUps?.map((x) => x.title)).toEqual(["Plausible medium"]);
+  const report = f.store.getArtifact(run.id, "report.md") ?? "";
+  expect(report).toContain("- medium: `farewell.txt:1` Plausible medium");
+  expect(report).not.toContain("Refuted blocker");
+});
+
+test("panel review: a verifier that omits candidates is retried once, then they stay unverified follow-ups", async () => {
+  const candidate = (title: string) => ({
+    severity: "blocker",
+    security: false,
+    ...findingEvidence,
+    file: "farewell.txt",
+    line: 1,
+    title,
+    detail: `Detail ${title}`,
+    suggestion: "Fix it",
+  });
+  const verifierIds: string[][] = [];
+  const f = start((s) => {
+    if (s.prompt.startsWith("You are a code-review verifier")) {
+      const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+      verifierIds.push(ids);
+      // Rules on C1 only; C2 is never answered.
+      return {
+        structured: {
+          results: ids
+            .filter((id) => id === "C1")
+            .map((id) => ({
+              id,
+              verdict: "PLAUSIBLE",
+              severity: "medium",
+              category: "correctness",
+              evidence: "farewell.txt:1 `bye`",
+              trigger: "reading the file -> wrong farewell",
+            })),
+        },
+      };
+    }
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review")
+      return {
+        structured: {
+          verdict: "request_changes",
+          summary: "Found problems in the farewell text.",
+          findings: [candidate("Answered"), candidate("Omitted")],
+        },
+      };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  f.deps.reviewSystem = {
+    name: "panel",
+    mode: "panel",
+    finders: [{ prompt: "standard" }],
+    verifier: {},
+    implementerReport: "include",
+  };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(verifierIds).toEqual([["C1", "C2"], ["C2"]]);
+  const artifact = JSON.parse(f.store.getArtifact(run.id, "review-0.json") ?? "{}");
+  expect(artifact).toMatchObject({ verdict: "approve", blocking: [], panel: { omitted: ["C2"] } });
+  const state = f.store.getRunState<RunState>(run.id);
+  expect(state?.reviewFollowUps?.map((x) => [x.title, x.verification?.verdict])).toEqual([
+    ["Answered", "PLAUSIBLE"],
+    ["Omitted", undefined],
+  ]);
+  const warnings = f.store
+    .listEvents(run.id)
+    .filter((e) => e.level === "warn")
+    .map((e) => e.message);
+  expect(warnings).toContainEqual(expect.stringContaining("Verifier gave no ruling for C2"));
+});
+
+test("panel review: a verifier left on the finder's vendor is logged as a warning", async () => {
+  const f = start((s) => {
+    if (s.prompt.startsWith("You are a code-review verifier")) {
+      const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+      return {
+        structured: {
+          results: ids.map((id) => ({
+            id,
+            verdict: "PLAUSIBLE",
+            severity: "low",
+            category: "correctness",
+            evidence: "farewell.txt:1 `bye`",
+            trigger: "reading the file -> wrong farewell",
+          })),
+        },
+      };
+    }
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review")
+      return {
+        structured: {
+          verdict: "approve",
+          summary: "One small note on the farewell text.",
+          findings: [
+            {
+              severity: "minor",
+              security: false,
+              ...findingEvidence,
+              file: "farewell.txt",
+              line: 1,
+              title: "Note",
+              detail: "d",
+              suggestion: "s",
+            },
+          ],
+        },
+      };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  // Only one vendor is routable, so the verifier cannot avoid the finder's.
+  f.tracker.record("beta", "quota", { exhaustedUntil: Date.now() + 3_600_000 });
+  f.deps.reviewSystem = {
+    name: "panel",
+    mode: "panel",
+    finders: [{ prompt: "standard" }],
+    verifier: {},
+    implementerReport: "include",
+  };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  const warnings = f.store
+    .listEvents(run.id)
+    .filter((e) => e.level === "warn")
+    .map((e) => e.message);
+  expect(warnings).toContainEqual(
+    expect.stringContaining("Verifier alpha/m shares vendor anthropic with the finder it checks"),
+  );
 });

@@ -12,6 +12,7 @@ import type {
   Invocation,
   ModelSelection,
   Repo,
+  ReviewSystem,
   Role,
   Run,
   RunEvent,
@@ -46,6 +47,8 @@ export interface EngineDeps {
   router: Router;
   tracker: ProviderTracker;
   harnesses: Record<string, Harness>;
+  /** Overrides the production review system (`single`, from `[review]`); tests run panels this way. */
+  reviewSystem?: ReviewSystem;
 }
 
 export type Phase = "prepare" | "triage" | "clarify" | "spec" | "loop" | "deliver" | "done";
@@ -167,13 +170,18 @@ export interface InvokeOptions {
   requireStructured?: boolean;
   /** Validates structured output; invalid output counts as a failed call (next candidate). */
   schema?: ZodType;
-  /** Run without repository access or public/raw event output. */
+  /** No public or raw output: events are dropped and the CLI log keeps only its structure. */
   privateOutput?: boolean;
   /** Prevent the CLI from persisting a private prompt in its own session store. */
   privateSession?: boolean;
   /** Redact holdout content from observable verifier events and transcripts. */
   redactHoldout?: boolean;
-  isolatedCwd?: boolean;
+  /** Run in this directory instead of the worktree (e.g. a base-commit snapshot). */
+  cwd?: string;
+  /** Paths a tool-enabled reader must not read (see AgentSpec.denyRead). */
+  denyRead?: string[];
+  /** Tools read only the cwd and scratch (see AgentSpec.confineReads). */
+  confineReads?: boolean;
   noTools?: boolean;
   /** Typed questions for decision models; a decline falls through to the next candidate. */
   decisionTask?: DecisionTask;
@@ -184,6 +192,9 @@ export interface InvokeOutcome {
   target: ModelTarget;
   invocation: Invocation;
 }
+
+/** Every string in a private CLI log line; numbers, booleans and the JSON shape remain. */
+export const withholdText = (text: string): string => (text ? "[private]" : text);
 
 const DEFAULT_TIMEOUTS: Record<Role, number> = {
   triage: 5 * 60_000,
@@ -465,7 +476,7 @@ export class RunContext {
           : undefined;
       try {
         const spec: AgentSpec = {
-          cwd: opts.isolatedCwd ? (privateDir as string) : (this.state.worktreePath ?? this.runDir),
+          cwd: opts.cwd ?? this.state.worktreePath ?? this.runDir,
           prompt: opts.prompt,
           systemAppend: [opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n"),
           target,
@@ -476,9 +487,13 @@ export class RunContext {
           timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUTS[opts.role],
           idleTimeoutMs: opts.idleTimeoutMs ?? 10 * 60_000,
           maxToolCalls: opts.maxToolCalls ?? (opts.mode === "edit" ? 400 : 150),
+          ...(opts.denyRead ? { denyRead: opts.denyRead } : {}),
+          ...(opts.confineReads ? { confineReads: true } : {}),
           noTools,
           privateSession: opts.privateOutput || opts.privateSession,
-          redactOutput: redact,
+          // The private log sits in the shared temporary directory while a parallel implementer
+          // runs as the same user, so it never holds the private text itself.
+          redactOutput: opts.privateOutput ? withholdText : redact,
           signal: this.signal,
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
           onEvent: opts.privateOutput

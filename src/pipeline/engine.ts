@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
@@ -8,6 +8,7 @@ import {
   compareGates,
   type GateComparison,
   type GateHooks,
+  retryBaselineFailures,
   retryRegressions,
   runGates,
 } from "../gates/run.ts";
@@ -19,6 +20,7 @@ import {
   diffSince,
   discardChanges,
   ensureCache,
+  exportCommit,
   fetchBase,
   formatTopLevel,
   headSha,
@@ -64,6 +66,7 @@ import {
   type ReviewRequest,
   reviewFindingKey,
   runReview,
+  type VerifierRequest,
 } from "./review.ts";
 import { productionReviewSystem } from "./review-system.ts";
 import {
@@ -78,6 +81,7 @@ import {
   type Verify,
   VerifySchema,
 } from "./schemas.ts";
+import { createSnapshotParent } from "./snapshots.ts";
 import { triageDecisions } from "./triage-decisions.ts";
 import {
   blockedOnly,
@@ -327,10 +331,21 @@ async function prepare(ctx: RunContext): Promise<void> {
         `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
       );
       await ctx.save();
+      const { onWait } = gateEvents(ctx);
       ctx.state.baseline =
         gates.setup.length || gates.checks.length
-          ? await runGates(wt.path, gates, ctx.signal, { onWait: gateEvents(ctx).onWait })
+          ? await runGates(wt.path, gates, ctx.signal, { onWait })
           : null;
+      ctx.checkCancelled();
+      // Retry before resetting, so a check sees the same build output as its first attempt.
+      if (ctx.state.baseline)
+        ctx.state.baseline = await retryBaselineFailures(
+          ctx.state.baseline,
+          wt.path,
+          gates,
+          ctx.signal,
+          onWait,
+        );
       ctx.checkCancelled();
     } finally {
       if (verification) await resetTo(wt.path, verification.headSha);
@@ -346,6 +361,16 @@ async function prepare(ctx: RunContext): Promise<void> {
           level: r.ok ? "info" : "warn",
           message: `baseline ${r.name}: ${r.ok ? "pass" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
           data: r,
+        });
+      }
+      for (const { firstAttempt, ...retry } of baseline.checks) {
+        if (!firstAttempt) continue;
+        store.addEvent({
+          runId: ctx.run.id,
+          type: "gate",
+          level: "warn",
+          message: `baseline ${retry.name}: ${retry.ok ? "flaky" : "retry FAIL again"}`,
+          data: { flaky: retry.ok, firstAttempt, retry },
         });
       }
     }
@@ -549,27 +574,65 @@ async function buildLoop(ctx: RunContext): Promise<void> {
   }
 }
 
+/** Enough to read the entry points and config a scenario needs; holdouts don't explore at length. */
+const HOLDOUT_TOOL_CALLS = 40;
+
+/**
+ * Run `fn` in a private export of the recorded base commit, removed afterwards whatever the outcome.
+ * Holdout runs alongside implement, so it must never see the worktree the implementer is editing.
+ */
+async function withBaseSnapshot<T>(ctx: RunContext, fn: (dir: string) => Promise<T>): Promise<T> {
+  const worktree = ctx.state.worktreePath;
+  const baseSha = ctx.run.baseSha;
+  if (!worktree || !baseSha) throw new Error("Holdout needs the run worktree and recorded base commit");
+  const snapshot = createSnapshotParent();
+  try {
+    const base = join(snapshot, "base");
+    mkdirSync(base);
+    await exportCommit(worktree, baseSha, base, ctx.signal);
+    return await fn(base);
+  } finally {
+    rmSync(snapshot, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The reader is confined to the snapshot and its scratch (`confineReads`), which already excludes
+ * home and temporary directories. Factory paths can live elsewhere (LIMITLESS_HOME), so deny them
+ * too: the parallel implementer's worktree, every run's state, the bare caches its commits land in,
+ * and the factory's config and secrets.
+ */
+function holdoutDenyRead(ctx: RunContext): string[] {
+  const { home, work, runs, repos, configDir } = ctx.deps.cfg.paths;
+  return [ctx.state.worktreePath, home, work, runs, repos, configDir].filter((p): p is string => !!p);
+}
+
 async function authorHoldout(ctx: RunContext): Promise<void> {
   await ctx.stage(
     "holdout",
     async (stage) => {
       ctx.state.holdoutStatus = "generating";
       await ctx.save();
-      const { result, target } = await ctx.invoke({
-        role: "holdout",
-        stage,
-        mode: "readonly",
-        complexity: ctx.complexity,
-        constraints: { avoidVendor: ctx.state.specAuthorVendor },
-        prompt: holdoutPrompt({ prompt: ctx.run.prompt, spec: ctx.state.spec as Spec }),
-        jsonSchema: toStrictJsonSchema(HoldoutSchema),
-        schema: HoldoutSchema,
-        requireStructured: true,
-        privateOutput: true,
-        isolatedCwd: true,
-        noTools: true,
-        maxToolCalls: 0,
-      });
+      const { result, target } = await withBaseSnapshot(ctx, (base) =>
+        ctx.invoke({
+          role: "holdout",
+          stage,
+          mode: "readonly",
+          complexity: ctx.complexity,
+          constraints: { avoidVendor: ctx.state.specAuthorVendor },
+          prompt: holdoutPrompt({ prompt: ctx.run.prompt, spec: ctx.state.spec as Spec }),
+          jsonSchema: toStrictJsonSchema(HoldoutSchema),
+          schema: HoldoutSchema,
+          requireStructured: true,
+          privateOutput: true,
+          // Residual risk (docs/ARCHITECTURE.md): the parallel implementer isn't read-sandboxed, so
+          // the scratch is readable while this runs; the prompt keeps scenario text out of files.
+          cwd: base,
+          confineReads: true,
+          denyRead: holdoutDenyRead(ctx),
+          maxToolCalls: HOLDOUT_TOOL_CALLS,
+        }),
+      );
       ctx.state.holdout = HoldoutSchema.parse(result.structured);
       ctx.state.holdoutModelId = target.modelId;
       ctx.state.holdoutSameVendor = target.vendor === ctx.state.specAuthorVendor;
@@ -844,9 +907,11 @@ async function oneRound(
       const replayed = (ctx.state.reviewHistory ?? []).find(
         (e) => e.round === round && e.sha === reviewedSha,
       );
+      const system = ctx.deps.reviewSystem ?? productionReviewSystem(ctx.deps.cfg);
       const input: ReviewInput = {
         timeoutMs: readingTimeout(diff.added + diff.removed),
         replayedFollowUps: replayed?.followUps,
+        system,
         prompt: {
           prompt: ctx.run.prompt,
           spec: ctx.state.spec ?? null,
@@ -856,7 +921,7 @@ async function oneRound(
           gates: comparison,
           audit,
           implementerReport: ctx.state.implementerReport ?? "",
-          implementerReportMode: productionReviewSystem(ctx.deps.cfg).implementerReport,
+          implementerReportMode: system.implementerReport,
           externalChange: ctx.state.flow === "verify-change",
           dependencyUpdate:
             ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",
@@ -865,20 +930,40 @@ async function oneRound(
           resolution: ctx.state.conflictRound === round,
         },
       };
-      const invoke = async (request: ReviewRequest) => {
+      const call = async (
+        request: ReviewRequest | VerifierRequest,
+        avoidVendor: string | undefined,
+        prefer: string | undefined,
+      ) => {
         const invoked = await ctx.invoke({
           role: "review",
           stage,
           mode: "readonly",
           complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
-          constraints: { avoidVendor: ctx.state.implementer?.vendor },
+          constraints: { avoidVendor, ...(prefer ? { prefer } : {}) },
           ...request,
           requireStructured: true,
         });
         await discardChanges(cwd);
         return invoked;
       };
-      const { target, output, decision } = await runReview({ invoke }, input);
+      const { target, output, decision, panel } = await runReview(
+        {
+          invoke: (request, finder) =>
+            call(request, ctx.state.implementer?.vendor, system.finders[finder]?.target),
+          verify: async (request, avoidVendor) => {
+            const verified = await call(request, avoidVendor, system.verifier?.target);
+            if (avoidVendor && verified.target.vendor === avoidVendor)
+              ctx.log(
+                `Verifier ${verified.target.modelId} shares vendor ${avoidVendor} with the finder it checks (no cross-vendor verifier available)`,
+                "warn",
+              );
+            return verified;
+          },
+          warn: (message) => ctx.log(message, "warn"),
+        },
+        input,
+      );
       if (!decision) throw output.error;
       // The model's verdict is kept for inspection only; control flow uses the derived one.
       const { review: r, modelVerdict, blocking, followUps } = decision;
@@ -899,7 +984,19 @@ async function oneRound(
         ctx.run.id,
         `review-${round}.json`,
         "review",
-        JSON.stringify({ ...r, modelVerdict, model: target.modelId, round, reviewedSha, blocking }, null, 2),
+        JSON.stringify(
+          {
+            ...r,
+            modelVerdict,
+            model: target.modelId,
+            round,
+            reviewedSha,
+            blocking,
+            ...(panel ? { panel } : {}),
+          },
+          null,
+          2,
+        ),
       );
       const serious = blocking.length;
       return {

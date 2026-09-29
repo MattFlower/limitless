@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema } from "../src/evals/cases.ts";
@@ -11,14 +11,18 @@ import { readingTimeout } from "../src/pipeline/engine.ts";
 import { FACTORY_PREAMBLE, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
 import * as review from "../src/pipeline/review.ts";
 import { ReviewSchema, toStrictJsonSchema, VerifySchema } from "../src/pipeline/schemas.ts";
+import type { ModelDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
-import { deferred, evalFixture } from "./evals-support.ts";
+import { deferred, evalFixture, verifierModel } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
-async function fixture(role: "review" | "verify" = "review") {
-  const f = await evalFixture();
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
+
+async function fixture(role: "review" | "verify" = "review", extraModels: ModelDef[] = []) {
+  const f = await evalFixture(extraModels);
   const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
   const item: ReviewCase = structuredClone({ ...reviewCase, base: f.sha, head });
   const verify = VerifyCaseFileSchema.parse(
@@ -351,6 +355,196 @@ test("review trials need v2 fields and keep the model's verdict, and pre-v2 stor
     expect(f.calls).toHaveLength(calls);
     expect(regraded.summaries[0]).toMatchObject({ cached: 1 });
     expect(regraded.trials[0]?.details.grade).toMatchObject({ pass: stored.details.grade.pass });
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("panel systems run finders and a pinned verifier end to end, grading what the panel blocks", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    const verdict = { current: "CONFIRMED" };
+    f.respond((s) => {
+      if (!s.prompt.includes("code-review verifier")) return { structured: reviewOutput(), costUsd: 0.1 };
+      const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1]);
+      const results = ids.map((id) => ({
+        id,
+        verdict: verdict.current,
+        severity: "low",
+        category: "correctness",
+        evidence: "src/a.ts:10 `bug()`",
+        trigger: "any input -> wrong result",
+      }));
+      return { structured: { results }, costUsd: 0.1 };
+    });
+    const systems = [
+      {
+        name: "panel",
+        mode: "panel",
+        finders: [
+          { target: "candidate-a", prompt: "standard" },
+          { target: "candidate-b", prompt: "standard" },
+        ],
+        verifier: { target: "verifier-c" },
+        implementerReport: "include",
+      },
+      {
+        name: "single",
+        mode: "single",
+        finders: [{ target: "candidate-a", prompt: "standard" }],
+        implementerReport: "include",
+      },
+    ];
+    // The verifier must not share a vendor with any finder it checks.
+    expect(() =>
+      f.run({ models: undefined, systems: [{ ...systems[0], verifier: { target: "candidate-b" } }] }),
+    ).toThrow("verifier candidate-b shares vendor other with finder candidate-a");
+    const acquire = spyOn(f.factory.tracker, "acquire");
+    const record = spyOn(f.factory.tracker, "record");
+    const report = await f.run({ models: undefined, systems, cache: false });
+    expect(report.trials.map((t) => [t.details.system, t.status, t.pass])).toEqual([
+      ["panel", "ok", true],
+      ["single", "ok", true],
+    ]);
+    // Each panel call holds a slot on its own provider and reports its outcome there.
+    expect(acquire.mock.calls.map(([provider]) => provider)).toEqual([
+      "openrouter",
+      "provider-b",
+      "provider-b",
+      "openrouter",
+    ]);
+    expect(record.mock.calls.map(([provider, status]) => [provider, status])).toEqual([
+      ["provider-b", "ok"],
+      ["provider-b", "ok"],
+      ["openrouter", "ok"],
+      ["openrouter", "ok"],
+    ]);
+    acquire.mockRestore();
+    record.mockRestore();
+    // Two finders, one verifier batch (same file and vendor) holding both candidates, then the single system.
+    expect(f.calls.map((s) => [s.target.modelId, s.prompt.includes("code-review verifier"), s.mode])).toEqual(
+      [
+        ["candidate-a", false, "readonly"],
+        ["candidate-b", false, "readonly"],
+        ["verifier-c", true, "readonly"],
+        ["candidate-a", false, "readonly"],
+      ],
+    );
+    expect(f.calls[2]?.prompt).toContain('"id": "C2"');
+    const panel = report.trials[0];
+    expect(panel?.output).toMatchObject({
+      mode: "panel",
+      findings: [{ verification: { verdict: "CONFIRMED" } }, {}],
+    });
+    expect(panel?.costUsd).toBeCloseTo(0.3);
+    // A refuted defect does not block, so the panel misses it.
+    verdict.current = "REFUTED";
+    const refuted = await f.run({ models: undefined, systems: [systems[0]], cache: false });
+    expect(refuted.trials.map((t) => [t.status, t.pass, t.details.grade?.review?.requestChanges])).toEqual([
+      ["ok", false, false],
+    ]);
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+const panelSystem = {
+  name: "panel",
+  mode: "panel",
+  finders: [
+    { target: "candidate-a", prompt: "standard" },
+    { target: "candidate-b", prompt: "standard" },
+  ],
+  verifier: { target: "verifier-c" },
+  implementerReport: "include",
+};
+const refuteAll = (s: { prompt: string }) => ({
+  structured: {
+    results: [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => ({
+      id: m[1],
+      verdict: "REFUTED",
+      severity: "low",
+      category: "correctness",
+      evidence: "src/a.ts:10 `guard()`",
+      trigger: "none",
+    })),
+  },
+  costUsd: 0.1,
+});
+
+test("a panel whose finder output is invalid is an error trial, never a graded single review", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    const { confidence: _confidence, ...partial } = reviewOutput().findings[0] ?? {};
+    f.respond((s) => {
+      if (s.prompt.includes("code-review verifier")) return refuteAll(s);
+      if (s.target.modelId === "candidate-a") return { structured: reviewOutput(), costUsd: 0.1 };
+      // Fails the live schema but would pass the lenient stored one.
+      return { text: JSON.stringify({ ...reviewOutput(), findings: [partial] }), costUsd: 0.1 };
+    });
+    const report = await f.run({ models: undefined, systems: [panelSystem], cache: false });
+    expect(report.trials.map((t) => [t.status, t.pass, t.details.invocationStatus])).toEqual([
+      ["error", false, "error"],
+    ]);
+    expect(report.trials[0]?.details.reason).toContain("Invalid review output from finder 1");
+    expect(f.calls.some((s) => s.prompt.includes("code-review verifier"))).toBe(false);
+    expect(report.trials[0]?.costUsd).toBeCloseTo(0.2);
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("a panel member that throws keeps the spend of the calls that ran", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    f.respond((s) => {
+      // The verifier's provider runs out after the second finder.
+      if (s.target.modelId === "candidate-b")
+        f.factory.tracker.record("provider-b", "quota", { exhaustedUntil: Date.now() + 3_600_000 });
+      return { structured: reviewOutput(), costUsd: 0.4 };
+    });
+    const report = await f.run({ models: undefined, systems: [panelSystem], cache: false });
+    const [trial] = report.trials;
+    expect(trial?.status).toBe("error");
+    expect(trial?.details.reason).toContain("provider-b unavailable");
+    expect(trial?.costUsd).toBeCloseTo(0.8);
+    expect(trial?.tokensOut).toBe(100);
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("panel trials keep their record for regrading and key the cache on the verifier", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    f.respond((s) =>
+      s.prompt.includes("code-review verifier") ? refuteAll(s) : { structured: reviewOutput(), costUsd: 0.1 },
+    );
+    const first = await f.run({ models: undefined, systems: [panelSystem] });
+    expect(first.trials[0]?.output).toMatchObject({
+      mode: "panel",
+      findings: [],
+      panel: {
+        refuted: ["C1", "C2"],
+        candidates: [
+          { id: "C1", line: 10 },
+          { id: "C2", line: 10 },
+        ],
+      },
+    });
+    const calls = f.calls.length;
+    const cached = await f.run({ models: undefined, systems: [panelSystem] });
+    expect(f.calls.length).toBe(calls);
+    expect(cached.trials[0]?.output).toMatchObject({ panel: { refuted: ["C1", "C2"] } });
+    // A different verifier prompt or schema must not reuse those rulings.
+    const identity = spyOn(review, "panelVerifierIdentity").mockReturnValue("changed");
+    await f.run({ models: undefined, systems: [panelSystem] });
+    identity.mockRestore();
+    expect(f.calls.length).toBe(calls + 3);
     await f.clean();
   } finally {
     await f.close();

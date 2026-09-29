@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import {
   chmodSync,
@@ -23,6 +23,9 @@ import { SpecSchema } from "../src/pipeline/schemas.ts";
 import { sh } from "../src/util/proc.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
 import { enableEfforts, evalFixture } from "./evals-support.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 async function fixture(
   gate = "test ! -f broken",
@@ -665,7 +668,7 @@ test("single-round strategies share legacy inputs and cache; multi-round identit
   } finally {
     await f.close();
   }
-}, 15000);
+});
 
 for (const kind of [
   "limit",
