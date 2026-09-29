@@ -398,7 +398,10 @@ export interface EvalRun {
   models: string[];
   k: number;
   maxUsd: number;
-  /** Most trials run at once per provider (also capped by its maxConcurrent). Older runs read as 2. */
+  /**
+   * Most trials run at once per provider (also capped by its maxConcurrent − 1). Absent on runs
+   * recorded before this option existed, which ran one trial at a time.
+   */
   concurrency?: number;
   status: EvalStatus;
   createdAt: number;

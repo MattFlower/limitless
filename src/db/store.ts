@@ -69,7 +69,7 @@ const toEvalRun = (r: Row): EvalRun => ({
   models: parse(r.models, []),
   k: r.k as number,
   maxUsd: r.max_usd as number,
-  concurrency: (r.concurrency as number | null) ?? DEFAULT_EVAL_CONCURRENCY,
+  ...(r.concurrency == null ? {} : { concurrency: r.concurrency as number }),
   status: r.status as EvalRun["status"],
   createdAt: r.created_at as number,
   finishedAt: r.finished_at as number | null,

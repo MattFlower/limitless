@@ -56,8 +56,8 @@ export interface EvalRegradeResult {
 }
 
 interface TrialCoordination {
-  /** This run's per-provider invocation cap, taken before the shared tracker slot. */
-  gate: (provider: string) => Semaphore;
+  /** Takes this run's and every eval's per-provider cap, before the tracker slot; one release. */
+  slot: (provider: string) => Promise<() => void>;
   /** Publishes the trial's cache key and waits for earlier trials that share it. */
   keyed: (key: string) => Promise<void>;
 }
@@ -65,6 +65,10 @@ interface TrialCoordination {
 export class EvalRunner {
   private readonly active = new Map<string, { controller: AbortController; done: Promise<void> }>();
   private stopping = false;
+  /** Per-provider cap shared by all eval runs, so production work keeps a slot. */
+  private readonly evalSlots = new Map<string, Semaphore>();
+  /** Requested concurrency of each executing run, which sizes `evalSlots`. */
+  private readonly executing = new Map<string, number>();
   constructor(
     private readonly deps: EngineDeps,
     private readonly casePath?: string,
@@ -193,7 +197,43 @@ export class EvalRunner {
     await Promise.all([...this.active.values()].map((entry) => entry.done));
   }
 
+  /** Evals leave one of a provider's slots to production (none to spare when its max is 1). */
+  private evalLimit(provider: string, concurrency: number): number {
+    return Math.max(1, Math.min(concurrency, (this.deps.tracker.def(provider)?.maxConcurrent ?? 1) - 1));
+  }
+
+  private resizeEvalSlots(): void {
+    const largest = Math.max(1, ...this.executing.values());
+    for (const [provider, semaphore] of this.evalSlots) semaphore.setLimit(this.evalLimit(provider, largest));
+  }
+
+  private evalSlot(provider: string): Semaphore {
+    let semaphore = this.evalSlots.get(provider);
+    if (!semaphore) {
+      semaphore = new Semaphore(this.evalLimit(provider, Math.max(1, ...this.executing.values())));
+      this.evalSlots.set(provider, semaphore);
+    }
+    return semaphore;
+  }
+
   private async execute(
+    run: EvalRun,
+    file: AnyCaseFile,
+    cases: EvalCase[],
+    cache: boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
+    this.executing.set(run.id, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY);
+    this.resizeEvalSlots();
+    try {
+      await this.executeRun(run, file, cases, cache, signal);
+    } finally {
+      this.executing.delete(run.id);
+      this.resizeEvalSlots();
+    }
+  }
+
+  private async executeRun(
     run: EvalRun,
     file: AnyCaseFile,
     cases: EvalCase[],
@@ -250,18 +290,27 @@ export class EvalRunner {
       }
       const recorded = store.listEvalTrials(run.id);
       const concurrency = run.concurrency ?? DEFAULT_EVAL_CONCURRENCY;
-      const providerLimit = (provider: string) =>
-        Math.max(1, Math.min(concurrency, this.deps.tracker.def(provider)?.maxConcurrent ?? 1));
-      // Caps this run's invocations per provider, including switched retry rounds that leave the
-      // trial's starting provider group.
+      const providerLimit = (provider: string) => this.evalLimit(provider, concurrency);
+      // Caps this run's invocations per provider, including panel members and switched retry
+      // rounds that leave the trial's starting provider group, then the cap shared by all evals.
       const gates = new Map<string, Semaphore>();
-      const gate = (provider: string) => {
-        let semaphore = gates.get(provider);
-        if (!semaphore) {
-          semaphore = new Semaphore(providerLimit(provider));
-          gates.set(provider, semaphore);
+      const slot = async (provider: string) => {
+        let gate = gates.get(provider);
+        if (!gate) {
+          gate = new Semaphore(providerLimit(provider));
+          gates.set(provider, gate);
         }
-        return semaphore;
+        const own = await gate.acquire(signal);
+        try {
+          const shared = await this.evalSlot(provider).acquire(signal);
+          return () => {
+            shared();
+            own();
+          };
+        } catch (error) {
+          own();
+          throw error;
+        }
       };
       // Each provider starts its trials in a fixed order, up to `limit` at once. Every invocation
       // still acquires a slot from the shared tracker, and each trial checks the eval budget before
@@ -290,7 +339,7 @@ export class EvalRunner {
               // A trial waits for every earlier trial with its cache key, so cache reuse sees the
               // same sources as the sequential order regardless of which trial finishes first.
               const coordination: TrialCoordination = {
-                gate,
+                slot,
                 keyed: async (key) => {
                   keys[index]?.resolve(key);
                   for (let i = 0; i < index; i++)
@@ -581,7 +630,7 @@ export class EvalRunner {
         const reason = eligible();
         if (reason)
           return skip(strategy === "switch" && round > 0 ? `Switch target unavailable: ${reason}` : reason);
-        const runSlot = await coordination.gate(target.provider).acquire(signal);
+        const runSlot = await coordination.slot(target.provider);
         release = runSlot;
         const trackerSlot = await tracker.acquire(target.provider, signal);
         release = () => {
@@ -674,14 +723,19 @@ export class EvalRunner {
               if (!agent) throw new Error(`No harness registered for ${picked.harnessName}`);
               const unavailable = tracker.unavailableReason(to.provider);
               if (unavailable) throw new Error(`${to.provider} unavailable: ${unavailable}`);
-              const releaseOther = await tracker.acquire(to.provider, signal);
+              const releaseEval = await coordination.slot(to.provider);
               try {
-                const sent = await send(request, { target: to, harness: agent, noTools: picked.noTools });
-                spent.push(sent);
-                observe(to, sent);
-                return { result: sent, target: to };
+                const releaseOther = await tracker.acquire(to.provider, signal);
+                try {
+                  const sent = await send(request, { target: to, harness: agent, noTools: picked.noTools });
+                  spent.push(sent);
+                  observe(to, sent);
+                  return { result: sent, target: to };
+                } finally {
+                  releaseOther();
+                }
               } finally {
-                releaseOther();
+                releaseEval();
               }
             };
             // First-round review cases go through the pipeline's review entry point.

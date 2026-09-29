@@ -306,8 +306,15 @@ test("shutdown aborts active and waiting trials, releases slots, and preserves p
       );
       return { structured: answer };
     });
-    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"] });
+    // Evals share max - 1 = 2 slots; production work holds the rest so the second eval waits on the tracker.
+    setLimit(f, "openrouter", 3);
+    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], concurrency: 1 });
     await entered.promise;
+    const held = new AbortController().signal;
+    const production = [
+      await f.factory.tracker.acquire("openrouter", held),
+      await f.factory.tracker.acquire("openrouter", held),
+    ];
     const acquiring = deferred<void>();
     const acquire = f.factory.tracker.acquire.bind(f.factory.tracker);
     const spy = spyOn(f.factory.tracker, "acquire").mockImplementation((id, signal) => {
@@ -318,6 +325,7 @@ test("shutdown aborts active and waiting trials, releases slots, and preserves p
     await acquiring.promise;
     spy.mockRestore();
     await f.factory.stop();
+    for (const release of production) release();
     expect(f.factory.evals.report(run.id)?.run).toMatchObject({
       status: "failed",
       error: "eval interrupted by daemon shutdown",
@@ -565,8 +573,11 @@ test("provider limits and slots held by other daemon work cap eval concurrency",
     expect(state.max).toBe(1);
     expect(f.calls).toHaveLength(6);
 
-    setLimit(f, "openrouter", 2);
-    const release = await f.factory.tracker.acquire("openrouter", new AbortController().signal);
+    // Evals take at most max - 1 = 3 slots; two held by other work leave them 2.
+    setLimit(f, "openrouter", 4);
+    const held = new AbortController().signal;
+    const release = await f.factory.tracker.acquire("openrouter", held);
+    const releaseOther = await f.factory.tracker.acquire("openrouter", held);
     state = gate(f);
     const second = f.factory.evals.submit({
       role: "triage",
@@ -575,16 +586,17 @@ test("provider limits and slots held by other daemon work cap eval concurrency",
       concurrency: 3,
       cache: false,
     });
-    await until(() => state.active === 1);
-    await Bun.sleep(20);
-    expect(state.active).toBe(1);
-    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(2);
-    release();
     await until(() => state.active === 2);
     await Bun.sleep(20);
+    expect(state.active).toBe(2);
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(4);
+    release();
+    await until(() => state.active === 3);
+    await Bun.sleep(20);
+    releaseOther();
     state.open.resolve();
     await f.factory.evals.wait(second.id);
-    expect(state.max).toBe(2);
+    expect(state.max).toBe(3);
     expect(f.factory.evals.report(second.id)?.run.status).toBe("completed");
     expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
   } finally {
@@ -595,7 +607,7 @@ test("provider limits and slots held by other daemon work cap eval concurrency",
 test("budget stops new trials while concurrent in-flight trials finish and keep their costs", async () => {
   const f = await evalFixture();
   try {
-    setLimit(f, "openrouter", 3);
+    setLimit(f, "openrouter", 4);
     const state = gate(f, () => ({ structured: answer, costUsd: 0.5 }));
     const run = f.factory.evals.submit({
       role: "triage",
@@ -662,7 +674,7 @@ test("shutdown interrupts concurrent trials, releases slots, and a resubmission 
 test("completion order never changes cache keys, grades or report order", async () => {
   const f = await evalFixture();
   try {
-    setLimit(f, "openrouter", 3);
+    setLimit(f, "openrouter", 4);
     // Case b fails its gold so grades differ across cases.
     const reply = (s: { prompt: string }) => ({
       structured: s.prompt.includes("Fix b") ? { ...answer, risk: "high" as const } : answer,
@@ -696,7 +708,7 @@ test("concurrent trials sharing a cache key reuse the earliest queued trial rega
   for (const failFirst of [false, true]) {
     const f = await evalFixture();
     try {
-      setLimit(f, "openrouter", 3);
+      setLimit(f, "openrouter", 4);
       for (const item of f.dataset.cases) item.prompt = "same";
       f.save();
       const held = deferred<void>();
@@ -733,5 +745,64 @@ test("concurrent trials sharing a cache key reuse the earliest queued trial rega
     } finally {
       await f.close();
     }
+  }
+});
+
+test("concurrent eval runs share max - 1 provider slots, leaving one for production", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 3);
+    const state = gate(f);
+    const request = { role: "triage", models: ["candidate-a"], k: 2, concurrency: 3, cache: false };
+    const runs = [f.factory.evals.submit(request), f.factory.evals.submit(request)];
+    await until(() => state.active === 2);
+    await Bun.sleep(20);
+    expect(state.active).toBe(2);
+    // Production work still gets the remaining slot while both evals have queued trials.
+    const release = await f.factory.tracker.acquire("openrouter", new AbortController().signal);
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(3);
+    release();
+    state.open.resolve();
+    for (const run of runs) await f.factory.evals.wait(run.id);
+    expect(state.max).toBe(2);
+    expect(runs.map((run) => f.factory.evals.report(run.id)?.run.status)).toEqual(["completed", "completed"]);
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("the shared eval cap follows the largest concurrency among running evals", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 5);
+    let state = gate(f);
+    const submit = (concurrency: number) =>
+      f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 2, concurrency, cache: false });
+    // Own caps of 1 and 2 would allow 3, but the shared cap is the largest request, 2.
+    const runs = [submit(1), submit(2)];
+    await until(() => state.active === 2);
+    await Bun.sleep(20);
+    expect(state.active).toBe(2);
+    // A run asking for 3 raises the shared cap to 3 (still under max - 1 = 4).
+    runs.push(submit(3));
+    await until(() => state.active === 3);
+    await Bun.sleep(20);
+    expect(state.active).toBe(3);
+    state.open.resolve();
+    for (const run of runs) await f.factory.evals.wait(run.id);
+    expect(state.max).toBe(3);
+    // Once they finish the shared cap shrinks back: two concurrency-1 runs share one slot.
+    state = gate(f);
+    const later = [submit(1), submit(1)];
+    await until(() => state.active === 1);
+    await Bun.sleep(20);
+    expect(state.active).toBe(1);
+    state.open.resolve();
+    for (const run of later) await f.factory.evals.wait(run.id);
+    expect(state.max).toBe(1);
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+  } finally {
+    await f.close();
   }
 });

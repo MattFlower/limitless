@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { EvalTrial } from "../src/core/types.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
 import { Store } from "../src/db/store.ts";
+import { formatEvalReport } from "../src/evals/format.ts";
 
 const row: EvalTrial = {
   effort: null,
@@ -294,7 +295,7 @@ test("round options and evidence survive reload with provider-specific spend and
   }
 });
 
-test("eval concurrency survives reload and legacy runs read as 2", () => {
+test("eval concurrency survives reload and legacy runs omit it", () => {
   const home = mkdtempSync(join(tmpdir(), "eval-concurrency-store-"));
   const path = join(home, "db.sqlite");
   let store = new Store(path);
@@ -311,8 +312,13 @@ test("eval concurrency survives reload and legacy runs read as 2", () => {
     expect(store.getEvalRun(omitted.id)?.concurrency).toBe(2);
     // A run written by the previous release has no concurrency row.
     store.db.query("DELETE FROM eval_run_concurrency WHERE eval_run_id = ?").run(explicit.id);
-    expect(store.getEvalRun(explicit.id)?.concurrency).toBe(2);
-    expect(store.listEvalRuns().map((r) => r.concurrency)).toEqual([2, 2]);
+    const legacy = store.getEvalRun(explicit.id);
+    expect(legacy?.concurrency).toBeUndefined();
+    expect(JSON.parse(JSON.stringify(legacy))).not.toHaveProperty("concurrency");
+    const listed = new Map(store.listEvalRuns().map((r) => [r.id, r.concurrency]));
+    expect([listed.get(explicit.id), listed.get(omitted.id)]).toEqual([undefined, 2]);
+    if (!legacy) throw new Error("missing run");
+    expect(formatEvalReport({ run: legacy, summaries: [], trials: [] })).toContain("concurrency=1 (legacy)");
   } finally {
     store.close();
     rmSync(home, { recursive: true, force: true });
