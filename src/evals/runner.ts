@@ -575,21 +575,20 @@ export class EvalRunner {
                 : scratch
                   ? invoke(scratch, request, to)
                   : withScratch(cwd, (dir) => invoke(dir, request, to));
-            // Panel calls run one at a time: the trial's slot covers its own provider, others take their own.
+            // Never hold one provider's slot while waiting for another panel member's provider.
             const sendTo = async (request: ReviewRequest | VerifierRequest, to: ModelTarget) => {
               const picked = selectHarness(run.role, to);
               const agent = harnesses[picked.harnessName];
               if (!agent) throw new Error(`No harness registered for ${picked.harnessName}`);
               const unavailable = tracker.unavailableReason(to.provider);
               if (unavailable) throw new Error(`${to.provider} unavailable: ${unavailable}`);
-              const releaseOther =
-                to.provider === target.provider ? undefined : await tracker.acquire(to.provider, signal);
+              const releaseOther = await tracker.acquire(to.provider, signal);
               try {
                 const sent = await send(request, { target: to, harness: agent, noTools: picked.noTools });
                 observe(to, sent);
                 return { result: sent, target: to };
               } finally {
-                releaseOther?.();
+                releaseOther();
               }
             };
             // First-round review cases go through the pipeline's review entry point.
@@ -600,7 +599,14 @@ export class EvalRunner {
                       invoke: async (request, finder) => {
                         const to = finder > 0 ? panelTargets?.finders[finder - 1] : undefined;
                         if (to) return sendTo(request, to);
-                        own = await send(request);
+                        try {
+                          own = await send(request);
+                        } finally {
+                          if (panelTargets) {
+                            release?.();
+                            release = undefined;
+                          }
+                        }
                         return { result: own, target };
                       },
                       verify: async (request, avoidVendor) => {

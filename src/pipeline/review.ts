@@ -309,6 +309,10 @@ async function runPanel<T extends Invoked>(
     ? "request_changes"
     : "approve";
   const decision = decide(input, review, modelVerdict);
+  const refutedKeys = new Set(
+    candidates.filter((c) => verdicts.get(c.id)?.verdict === "REFUTED").map(reviewFindingKey),
+  );
+  decision.followUps = decision.followUps.filter((f) => !refutedKeys.has(reviewFindingKey(f)));
   return {
     ...first.invoked,
     result: combined(results, last, decision.review),
