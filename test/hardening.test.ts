@@ -318,7 +318,7 @@ describe("pipeline hardening", () => {
       ? "triage"
       : prompt.startsWith("Write the specification")
         ? "spec"
-        : prompt.startsWith("Write blind holdout checks")
+        : prompt.startsWith("Write holdout checks")
           ? "holdout"
           : prompt.startsWith("You are an adversarial")
             ? "review"

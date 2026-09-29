@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test
 import { createHmac } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus, StageName } from "../src/core/types.ts";
@@ -85,7 +85,7 @@ function roleOf(spec: AgentSpec): string {
   const p = spec.prompt;
   if (p.startsWith("Classify this software task")) return "triage";
   if (p.startsWith("Write the specification")) return "spec";
-  if (p.startsWith("Write blind holdout checks")) return "holdout";
+  if (p.startsWith("Write holdout checks")) return "holdout";
   if (p.startsWith("You are an adversarial code reviewer")) return "review";
   if (p.startsWith("You are the acceptance verifier")) return "verify";
   return "implement";
@@ -1868,11 +1868,13 @@ protected_paths = ["protected.txt"]
     ).toContain(competingSha);
   });
 
-  test("holdout starts alongside implementation, stays blind, and quick skips it", async () => {
+  test("holdout starts alongside implementation, reads only a base snapshot, and quick skips it", async () => {
     for (const profile of ["standard", "deep", "quick"] as const) {
       let implementStarted = false;
       let holdoutCalls = 0;
       let holdoutCwd = "";
+      let snapshotChecked = false;
+      let runId = "";
       const f = start(async (s) => {
         const role = roleOf(s);
         if (role === "triage") return { structured: triage() };
@@ -1881,17 +1883,41 @@ protected_paths = ["protected.txt"]
           holdoutCalls++;
           holdoutCwd = s.cwd;
           expect(s.mode).toBe("readonly");
-          expect(s.noTools).toBe(true);
-          expect(s.maxToolCalls).toBe(0);
+          expect(s.noTools).toBeFalsy();
+          expect(s.maxToolCalls).toBeGreaterThan(0);
+          expect(s.maxToolCalls).toBeLessThanOrEqual(50);
+          expect(s.scratchDir).toBeTruthy();
+          expect(s.privateSession).toBe(true);
+          // The cwd alone doesn't confine tools: reads are limited to the snapshot and scratch, and
+          // the implementer's worktree and factory state are denied wherever they live.
+          expect(s.confineReads).toBe(true);
+          expect(basename(dirname(s.cwd))).toStartWith(`limitless-holdout-${process.pid}-`);
+          // The private CLI log in the shared temporary directory never holds scenario text.
+          expect(s.redactOutput?.("H-1 private step")).toBe("[private]");
+          expect(s.denyRead).toEqual(
+            expect.arrayContaining([join(f.cfg.paths.work, runId), f.cfg.paths.home, f.cfg.paths.repos]),
+          );
           expect(s.prompt).toContain("# Original request");
           expect(s.prompt).toContain("# Specification");
           expect(s.prompt).not.toContain("implementation marker");
-          expect(existsSync(join(s.cwd, "greeting.txt"))).toBe(false);
+          expect(readFileSync(join(s.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+          expect(existsSync(join(s.cwd, ".limitless.toml"))).toBe(true);
+          expect(existsSync(join(s.cwd, ".git"))).toBe(false);
           while (!implementStarted && !s.signal.aborted) await Bun.sleep(10);
+          // The implementer has now edited its worktree; the snapshot must not follow.
+          await Bun.sleep(50);
+          expect(readFileSync(join(s.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+          expect(existsSync(join(s.cwd, "implementation-marker.txt"))).toBe(false);
+          expect(existsSync(join(s.cwd, "farewell.txt"))).toBe(false);
           return { structured: holdout };
         }
         if (role === "review") return { structured: approve };
-        if (role === "verify") return { structured: pass };
+        if (role === "verify") {
+          expect(existsSync(holdoutCwd)).toBe(false);
+          expect(readFileSync(join(s.cwd, "greeting.txt"), "utf8")).toBe("changed\n");
+          snapshotChecked = true;
+          return { structured: pass };
+        }
         implementStarted = true;
         expect(
           s.prompt.includes(
@@ -1899,13 +1925,20 @@ protected_paths = ["protected.txt"]
           ),
         ).toBe(profile !== "quick");
         return {
-          files: { "farewell.txt": "goodbye\n", "implementation-marker.txt": "implementation marker" },
+          files: {
+            "farewell.txt": "goodbye\n",
+            "greeting.txt": "changed\n",
+            "implementation-marker.txt": "implementation marker",
+          },
         };
       });
       const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file", profile });
+      runId = run.id;
       expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       expect(holdoutCalls).toBe(profile === "quick" ? 0 : 1);
       if (profile !== "quick") {
+        expect(snapshotChecked).toBe(true);
+        expect(existsSync(holdoutCwd)).toBe(false);
         expect(holdoutCwd).not.toBe(join(f.cfg.paths.work, run.id));
         const invs = f.store.listInvocations(run.id);
         expect(invs.find((i) => i.role === "holdout")?.provider).toBe("beta");
@@ -2244,9 +2277,17 @@ protected_paths = ["protected.txt"]
   });
 
   test("completed holdout survives a stopped factory and is reused after restart", async () => {
+    const secret = "OLD_FORMAT_PRIVATE_STEP_518";
+    // Persisted under the former 3–8 scenario, two-edge-case schema.
+    const oldHoldout = {
+      scenarios: holdout.scenarios.map((s) => (s.id === "H-2" ? { ...s, steps: `run ${secret}` } : s)),
+    };
     let holdoutCalls = 0;
     let implementations = 0;
     let blockImplement = true;
+    let runId = "";
+    let restarted: Factory | null = null;
+    let privacyChecked = false;
     const handler: Handler = (s) => {
       const role = roleOf(s);
       if (role === "triage") return { structured: triage() };
@@ -2258,13 +2299,25 @@ protected_paths = ["protected.txt"]
       if (role === "review") return { structured: approve };
       if (role === "verify") {
         expect(s.prompt).toContain("H-3");
+        expect(s.prompt).toContain(secret);
         return { structured: pass };
       }
       implementations++;
+      if (restarted) {
+        const store = restarted.store;
+        expect(s.prompt).not.toContain(secret);
+        expect(existsSync(join(s.cwd, "holdout-scenarios.json"))).toBe(false);
+        expect(store.getArtifact(runId, "holdout-scenarios.json")).toBeNull();
+        for (const artifact of store.listArtifacts(runId))
+          expect(store.getArtifact(runId, artifact.name)).not.toContain(secret);
+        expect(JSON.stringify(store.listEvents(runId))).not.toContain(secret);
+        privacyChecked = true;
+      }
       return blockImplement ? { delayMs: 30_000 } : { files: { "farewell.txt": "goodbye\n" } };
     };
     const f = start(handler);
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    runId = run.id;
     const deadline = Date.now() + 10_000;
     while (
       (f.store.getRunState<RunState>(run.id)?.holdoutStatus !== "complete" ||
@@ -2280,24 +2333,30 @@ protected_paths = ["protected.txt"]
     expect(f.store.getRun(run.id)?.status).toBe("queued");
     expect(f.store.getRunState<RunState>(run.id)?.implementedRound).toBeUndefined();
     expect(f.store.listStages(run.id).find((s) => s.name === "implement")?.status).toBe("cancelled");
+    const stopped = f.store.getRunState<RunState>(run.id);
+    f.store.setRunState(run.id, { ...stopped, holdout: oldHoldout });
     f.store.close();
     blockImplement = false;
-    const restarted = start(handler);
+    restarted = start(handler);
     expect(await waitFor(restarted, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(holdoutCalls).toBe(1);
     expect(implementations).toBe(2);
-    expect(restarted.store.getRunState<RunState>(run.id)?.holdout?.scenarios).toEqual(holdout.scenarios);
+    expect(privacyChecked).toBe(true);
+    expect(restarted.store.getRunState<RunState>(run.id)?.holdout?.scenarios).toEqual(oldHoldout.scenarios);
+    expect(restarted.store.getArtifact(run.id, "holdout-scenarios.json")).toContain(secret);
   });
 
   test("interrupted holdout is retried after restart and remains unpublished while stopped", async () => {
     let holdoutCalls = 0;
     let slow = true;
+    const holdoutCwds: string[] = [];
     const handler: Handler = (s) => {
       const role = roleOf(s);
       if (role === "triage") return { structured: triage() };
       if (role === "spec") return { structured: spec };
       if (role === "holdout") {
         holdoutCalls++;
+        holdoutCwds.push(s.cwd);
         return slow ? { structured: holdout, delayMs: 30_000 } : { structured: holdout };
       }
       if (role === "review") return { structured: approve };
@@ -2307,17 +2366,57 @@ protected_paths = ["protected.txt"]
     const f = start(handler);
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
     const deadline = Date.now() + 10_000;
-    while (f.store.getRunState<RunState>(run.id)?.holdoutStatus !== "generating" && Date.now() < deadline)
+    while (
+      (f.store.getRunState<RunState>(run.id)?.holdoutStatus !== "generating" || !holdoutCwds.length) &&
+      Date.now() < deadline
+    )
       await Bun.sleep(10);
     expect(f.store.getRunState<RunState>(run.id)?.holdoutStatus).toBe("generating");
     await f.stop();
+    // Cancellation removes the snapshot but leaves the implementer's worktree for the restart.
+    expect(holdoutCwds).toHaveLength(1);
+    expect(existsSync(holdoutCwds[0] ?? "")).toBe(false);
+    const worktree = f.store.getRunState<RunState>(run.id)?.worktreePath ?? "";
+    expect(existsSync(join(worktree, "greeting.txt"))).toBe(true);
     expect(f.store.listArtifacts(run.id).map((a) => a.name)).not.toContain("holdout-scenarios.json");
     f.store.close();
     slow = false;
     const restarted = start(handler);
     expect(await waitFor(restarted, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(holdoutCalls).toBe(2);
+    expect(holdoutCwds[1]).not.toBe(holdoutCwds[0]);
+    expect(existsSync(holdoutCwds[1] ?? "")).toBe(false);
     expect(restarted.store.getArtifact(run.id, "holdout-scenarios.json")).toContain("H-3");
+  });
+
+  test("failed holdout removes its base snapshot and keeps the run worktree", async () => {
+    const holdoutCwds: string[] = [];
+    let runId = "";
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") {
+        holdoutCwds.push(s.cwd);
+        return { fault: "throw", error: "holdout exploded" };
+      }
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: pass };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+    runId = run.id;
+    const deadline = Date.now() + 10_000;
+    while (f.store.listStages(runId).find((s) => s.name === "holdout")?.status !== "failed") {
+      if (Date.now() > deadline) throw new Error("holdout failure timed out");
+      await Bun.sleep(10);
+    }
+    expect(holdoutCwds.length).toBeGreaterThan(0);
+    for (const cwd of holdoutCwds) expect(existsSync(cwd)).toBe(false);
+    const worktree = f.store.getRunState<RunState>(runId)?.worktreePath ?? "";
+    expect(worktree).not.toBe("");
+    expect(existsSync(join(worktree, "greeting.txt"))).toBe(true);
+    expect(f.store.getRunState<RunState>(runId)?.holdout).toBeUndefined();
   });
 
   test("holdout uses same-vendor fallback and invalid output routes to another model", async () => {

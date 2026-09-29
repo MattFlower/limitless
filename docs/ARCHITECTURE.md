@@ -112,10 +112,21 @@ resume, before any model calls; the edited worktree configuration is never used.
 
 ### Why the holdout author is blind (our twist on StrongDM's scenarios)
 StrongDM keeps scenarios in a directory the agent can't read. We go one better and cheaper: the
-scenarios **don't exist yet** while the implementer works. The holdout author sees only the
-original prompt + spec, writes concrete checks (commands to run, inputs/outputs, edge cases) into
-the database, and the verifier executes them against the finished worktree. The implementer can't
-special-case tests it has never seen, and there's no hidden file to go looking for.
+scenarios **don't exist yet** while the implementer works. The holdout author gets the original
+prompt + spec and a private, read-only export of the **base** commit (no `.git`, removed afterwards;
+the daemon sweeps snapshots orphaned by a crash at start). Its tools are confined to that snapshot
+and its scratch: home directories, temporary directories (other invocations' scratch and logs, CLI
+transcripts under `~/.claude`/`~/.codex`) and the factory's paths are denied, so it can ground
+steps in real commands and config without seeing the implementer's working state. It writes
+concrete checks (commands to run, inputs/outputs, and edge cases only where the request implies
+them) into the database, and the verifier executes them against the finished worktree. The
+implementer can't special-case tests it has never seen.
+
+Residual risk: the implementer's harness has no read sandbox, and the holdout runs in parallel as
+the same user. While it runs, its scratch and CLI log are in the shared temporary directory. The
+log keeps only JSON structure (every string is withheld), CLI sessions aren't persisted, and the
+prompt tells the author to return scenario text only in its answer, but a scratch file the author
+writes anyway is readable until the invocation ends.
 
 ### Reward-hacking audit (deterministic)
 Flags (fed to the reviewer; some are blocking): deleted/renamed test files, net loss of

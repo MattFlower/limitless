@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
-import { scratchEnv, validateScratch } from "./scratch.ts";
+import { readConfinement, scratchEnv, validateDenyRead, validateScratch } from "./scratch.ts";
 import {
   type AgentEvent,
   type AgentResult,
@@ -211,6 +211,29 @@ function findKey(obj: unknown, key: string): unknown {
   return null;
 }
 
+/**
+ * Codex filesystem profile entries; the most specific path wins. A confined reader gets no "/"
+ * grant: `:minimal` is the platform's system files (enough to run commands), the private roots are
+ * denied explicitly (`:minimal` includes /tmp, where other invocations' scratch lives), then cwd
+ * and scratch are granted inside them.
+ */
+function readerFilesystem(spec: AgentSpec, scratch: string): string {
+  const entries: [string, string][] = [];
+  if (spec.confineReads) {
+    const { cwd, scratch: writable, deny } = readConfinement(spec, scratch);
+    entries.push([":minimal", "read"]);
+    for (const path of deny) entries.push([path, "none"]);
+    for (const path of cwd) entries.push([path, "read"]);
+    for (const path of writable) entries.push([path, "write"]);
+  } else {
+    entries.push(["/", "read"]);
+    for (const path of validateDenyRead(spec, scratch)) entries.push([path, "none"]);
+    entries.push([scratch, "write"]);
+  }
+  const unique = new Map(entries);
+  return [...unique].map(([path, access]) => `${JSON.stringify(path)}="${access}"`).join(",");
+}
+
 export function buildCodexArgs(spec: AgentSpec): string[] {
   const t = spec.target;
   if (spec.mode === "readonly" && spec.addDirs?.length)
@@ -264,7 +287,7 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
       "-c",
       'default_permissions="limitless-reader"',
       "-c",
-      `permissions={limitless-reader={filesystem={"/"="read",${JSON.stringify(scratch)}="write"},network={enabled=false}}}`,
+      `permissions={limitless-reader={filesystem={${readerFilesystem(spec, scratch)}},network={enabled=false}}}`,
       "-c",
       "orchestrator.mcp.enabled=false",
       "--disable",
