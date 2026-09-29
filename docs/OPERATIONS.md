@@ -136,6 +136,7 @@ provider tracker. Start the daemon first; the CLI only submits and reads HTTP re
 limitless eval run triage --models omlx/qwen-27b@none,omlx/qwen-27b@high,claude/haiku --k 2 --max-usd 1 --follow
 limitless eval run triage --models claude/haiku --cases triage-001,triage-002 --no-cache
 limitless eval run review --models openrouter/gpt-6-luna --follow
+limitless eval run review --systems systems.json --follow   # {"systems": [{name, mode: "single", finders: [{target, prompt: "standard"}], implementerReport}]}
 limitless eval run verify --models openrouter/gpt-6-luna --follow
 limitless eval report <eval-id>
 limitless eval report <eval-id> --json
@@ -185,7 +186,7 @@ model. Denominators and comparison coverage are included in both text and JSON:
   configured through typed report/statistics options. Empty denominators and absent pairs are `null`
   in JSON and `n/a` in text.
 
-The API provides `POST /api/evals` with `{role, models, k?, maxUsd?, caseIds?, cache?}` (202 with `{id}`),
+The API provides `POST /api/evals` with `{role, models | systems, k?, maxUsd?, caseIds?, cache?}` (202 with `{id}`),
 `GET /api/evals` to list runs, and `GET /api/evals/:id` for the run, summaries and trials. Mutations use
 the usual local Origin and JSON content-type rules; Cloudflare tunnel requests are refused.
 
@@ -232,6 +233,8 @@ files and no-op proposals are reported explicitly. The preview compares the effe
 would result from the exact proposed file against the daemon's active policy; pre-existing checkout
 changes can therefore also appear in the diff. Roles without eligible results receive no generated
 change. `routing/EVIDENCE.md` contains the reproducible evidence and unchanged-role explanations.
+Review evidence from `--systems` runs counts only for systems whose `implementerReport` matches the
+daemon's `[review] implementer_report`.
 
 The [policy configuration and formulas](EVALS.md#policy-generation-and-review) specify inclusive Wilson
 lower-bound floors on pass rate and blocking recall, inclusive Wilson upper-bound ceilings on risk under-call,

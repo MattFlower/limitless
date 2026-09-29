@@ -65,6 +65,7 @@ import {
   reviewFindingKey,
   runReview,
 } from "./review.ts";
+import { productionReviewSystem } from "./review-system.ts";
 import {
   type Holdout,
   HoldoutSchema,
@@ -852,7 +853,7 @@ async function oneRound(
           gates: comparison,
           audit,
           implementerReport: ctx.state.implementerReport ?? "",
-          implementerReportMode: ctx.deps.cfg.reviewImplementerReport,
+          implementerReportMode: productionReviewSystem(ctx.deps.cfg).implementerReport,
           externalChange: ctx.state.flow === "verify-change",
           dependencyUpdate:
             ctx.run.taskClass === "dependency_update" || ctx.run.requestedBy === "dependabot[bot]",

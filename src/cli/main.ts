@@ -14,6 +14,7 @@ Usage:
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
+        review only: --systems <file.json> instead of --models ({"systems": [ReviewSystem, ...]})
   limitless eval report <eval-id> [--json]
   limitless eval regrade <eval-id>        Recompute a review eval's grades from stored outputs (no model calls)
   limitless eval policy [--evals id,id] [--write]
@@ -164,6 +165,7 @@ async function main(): Promise<void> {
     options: {
       evals: { type: "string" },
       models: { type: "string" },
+      systems: { type: "string" },
       k: { type: "string" },
       rounds: { type: "string" },
       strategy: { type: "string" },

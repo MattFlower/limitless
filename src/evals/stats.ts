@@ -215,16 +215,21 @@ function implementMetrics(rows: EvalTrial[]) {
     executedTrials: executed.length,
   };
 }
+/** A candidate is its review system when it has one, otherwise its evidence target. */
+const candidateOf = (trial: EvalTrial) => trial.details.system ?? evidenceTarget(trial);
 export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptions = {}) {
   const settings = statsOptions(options);
-  const targets = [
+  const declared = run.systems?.map((system) => system.name) ?? run.models;
+  const candidates = [
     ...new Set([
-      ...trials.map(evidenceTarget),
-      ...run.models.filter((id) => !trials.some((t) => recordedTarget(t) === id)),
+      ...trials.map(candidateOf),
+      ...declared.filter((id) => !trials.some((t) => (t.details.system ?? recordedTarget(t)) === id)),
     ]),
   ];
-  const summaries = targets.map((modelId) => {
-    const rows = trials.filter((t) => evidenceTarget(t) === modelId);
+  const summaries = candidates.map((candidate) => {
+    const rows = trials.filter((t) => candidateOf(t) === candidate);
+    const system = run.systems?.find((s) => s.name === candidate) ?? null;
+    const first = rows[0];
     const evaluated = rows.filter(scoredTrial);
     const passes = evaluated.filter((t) => t.pass).length;
     const risk = rows.flatMap((t) =>
@@ -244,7 +249,9 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
       .sort((a, b) => a - b);
     const middle = Math.floor(latency.length / 2);
     return {
-      modelId,
+      candidate,
+      modelId: first ? evidenceTarget(first) : (system?.finders[0]?.target ?? candidate),
+      system,
       effort: rows[0]?.effort ?? null,
       ...roleMetrics(run, rows),
       ...(run.role === "implement"
@@ -285,15 +292,16 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
     .filter((m) => m.passRate !== null)
     .sort(
       (a, b) =>
-        (b.passRate ?? 0) - (a.passRate ?? 0) || (a.modelId < b.modelId ? -1 : a.modelId > b.modelId ? 1 : 0),
+        (b.passRate ?? 0) - (a.passRate ?? 0) ||
+        (a.candidate < b.candidate ? -1 : a.candidate > b.candidate ? 1 : 0),
     )[0];
   const bestCases = completeCases(
-    trials.filter((t) => evidenceTarget(t) === best?.modelId),
+    trials.filter((t) => candidateOf(t) === best?.candidate),
     run.k,
   );
   return summaries.map((summary) => {
     const candidate = completeCases(
-      trials.filter((t) => evidenceTarget(t) === summary.modelId),
+      trials.filter((t) => candidateOf(t) === summary.candidate),
       run.k,
     );
     const differences: number[] = [];
@@ -307,7 +315,7 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
     return {
       ...summary,
       comparison: {
-        bestModel: best?.modelId ?? null,
+        bestModel: best?.candidate ?? null,
         candidateCompleteCases: candidate.size,
         bestCompleteCases: bestCases.size,
         ...pairedBootstrap(differences, settings),
