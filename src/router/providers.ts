@@ -481,8 +481,8 @@ export class ProviderTracker {
         const backoff = Math.min(60, 2 ** (p.consecutiveFailures - CIRCUIT_THRESHOLD)) * 60_000;
         p.circuitOpenUntil = now + backoff;
       }
-    } else if (status === "ok" || status === "error") {
-      // "error" is a task-level failure, not a provider failure.
+    } else if (status === "ok" || status === "error" || status === "declined") {
+      // "error" is a task-level failure; "declined" is an answer the caller chose not to use.
       p.consecutiveFailures = 0;
       p.circuitOpenUntil = null;
       if (p.exhaustedUntil && p.exhaustedUntil < now) p.exhaustedUntil = null;
