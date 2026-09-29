@@ -2124,7 +2124,7 @@ protected_paths = ["protected.txt"]
           ? {
               ...c,
               status: "unmet",
-              evidence: `ran ${secret}: the file keeps a stale greeting line`,
+              evidence: `ran ${secret}: the file keeps a stale greeting line, violating "${extra.requirementCitation ?? ""}"`,
               publicSummary: "the file keeps a stale greeting line",
               ...extra,
             }
@@ -2191,6 +2191,42 @@ protected_paths = ["protected.txt"]
         expect(checked).toBe(true);
       },
     );
+
+    test("a fabricated citation is a failed invocation; the next verifier's grounded result is used", async () => {
+      let verifies = 0;
+      let implementCalls = 0;
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: privateHoldout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") {
+          verifies++;
+          if (verifies === 1)
+            return {
+              structured: unmetH2({ requirement: "spec", requirementCitation: "fabricated requirement" }),
+            };
+          if (verifies === 2)
+            return {
+              structured: unmetH2({ requirement: "spec", requirementCitation: "farewell.txt exists" }),
+            };
+          return { structured: pass };
+        }
+        implementCalls++;
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const invs = f.store.listInvocations(run.id).filter((i) => i.role === "verify");
+      expect(invs.map((i) => i.status)).toEqual(["error", "ok", "ok"]);
+      expect(invs[0]?.error).toContain("structured output failed validation");
+      expect(invs[0]?.error).not.toContain(secret);
+      expect(invs[0]?.modelId).not.toBe(invs[1]?.modelId);
+      expect(implementCalls).toBe(2);
+      const first = f.store.getRunState<RunState>(run.id)?.verifyResults?.[0];
+      expect(first?.criteria.find((c) => c.id === "H-2")?.requirementCitation).toBe("farewell.txt exists");
+    });
 
     test("verifier output without a requirement field stays blocking on replay", async () => {
       let checked = false;

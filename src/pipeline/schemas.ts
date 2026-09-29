@@ -272,6 +272,49 @@ export const VerifySchema = z.object({
 export type Verify = z.input<typeof VerifySchema>;
 export type HoldoutRequirement = NonNullable<Verify["criteria"][number]["requirement"]>;
 
+/**
+ * The cited requirement as it will be shown, or null unless it is a verbatim quote of `source`
+ * (ignoring case, spacing, markdown emphasis and surrounding quotes). Only verbatim public text is
+ * ever repeated to the implementer: a paraphrase could carry scenario text.
+ */
+export function citedRequirement(citation: string, source: string): string | null {
+  const flat = (s: string) => s.replace(/[*`]/g, "").replace(/\s+/g, " ").toLowerCase();
+  const quote = citation
+    .trim()
+    .replace(/^[-*\s"'“”`]+|["'“”`.\s]+$/g, "")
+    .replace(/\s+/g, " ");
+  return /[\p{L}\p{N}]/u.test(quote) && flat(source).includes(flat(quote)) ? quote : null;
+}
+
+export function requirementSource(requirement: "request" | "spec", request: string, spec: Spec): string {
+  return requirement === "request" ? request : renderSpec(spec);
+}
+
+/**
+ * Verifier output is accepted only when each request/spec classification quotes its named public
+ * source and the evidence repeats that quote. The bare `VerifySchema` still parses stored results.
+ */
+export function verifySchemaFor(request: string, spec: Spec) {
+  return VerifySchema.superRefine(({ criteria }, ctx) => {
+    criteria.forEach((c, i) => {
+      if (c.requirement !== "request" && c.requirement !== "spec") return;
+      const quote = citedRequirement(c.requirementCitation, requirementSource(c.requirement, request, spec));
+      if (quote === null)
+        ctx.addIssue({
+          code: "custom",
+          path: ["criteria", i, "requirementCitation"],
+          message: `${c.id}: requirementCitation is not quoted from the ${c.requirement}`,
+        });
+      else if (citedRequirement(quote, c.evidence) === null)
+        ctx.addIssue({
+          code: "custom",
+          path: ["criteria", i, "evidence"],
+          message: `${c.id}: evidence must cite the violated ${c.requirement} text`,
+        });
+    });
+  });
+}
+
 export function renderSpec(spec: Spec): string {
   const list = (items: string[]) => (items.length ? items.map((i) => `- ${i}`).join("\n") : "- (none)");
   return [

@@ -80,6 +80,7 @@ import {
   toStrictJsonSchema,
   type Verify,
   VerifySchema,
+  verifySchemaFor,
 } from "./schemas.ts";
 import { createSnapshotParent } from "./snapshots.ts";
 import { triageDecisions } from "./triage-decisions.ts";
@@ -1066,7 +1067,7 @@ async function oneRound(
               checks: ctx.state.lastGates,
             }),
             jsonSchema: toStrictJsonSchema(VerifySchema),
-            schema: VerifySchema,
+            schema: verifySchemaFor(ctx.run.prompt, ctx.state.spec as Spec),
             requireStructured: true,
             privateSession: true,
             redactHoldout: true,

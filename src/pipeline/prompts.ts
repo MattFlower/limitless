@@ -1,7 +1,15 @@
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
-import { type Holdout, type Review, renderSpec, type Spec, type Verify } from "./schemas.ts";
+import {
+  citedRequirement,
+  type Holdout,
+  type Review,
+  renderSpec,
+  requirementSource,
+  type Spec,
+  type Verify,
+} from "./schemas.ts";
 
 /** Appended to every factory agent's system prompt. */
 export const FACTORY_PREAMBLE = `You are a worker inside Limitless, an autonomous software factory.
@@ -240,30 +248,28 @@ export function formatVerifyFeedback(
       if (!privateScenario) return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
       if (c.status !== "unmet" || (c.requirement !== "request" && c.requirement !== "spec"))
         return `- **${c.id}** private scenario (${c.status}): ${safeSummary}`;
-      return `- **${c.id}** violates ${violatedRequirement(c.requirement, c.requirementCitation ?? "", c.requirement === "request" ? request : spec ? renderSpec(spec) : "", holdout, publicSources)}\n  Observed failure: ${safeSummary}`;
+      return `- **${c.id}** violates ${violatedRequirement(c.requirement, c.requirementCitation ?? "", request, spec, holdout, publicSources)}\n  Observed failure: ${safeSummary}`;
     })
     .join("\n")}`;
 }
 
 /**
- * The cited text is shown only when it is a verbatim quote of the source it names (the request or
- * the spec) that redaction leaves intact: a paraphrase could carry scenario text.
+ * Accepted verifier output always carries a verbatim quote (see `verifySchemaFor`); this guard
+ * keeps a malformed stored result from repeating anything redaction would withhold.
  */
 function violatedRequirement(
   requirement: "request" | "spec",
   citation: string,
-  sourceText: string,
+  request: string,
+  spec: Spec | null,
   holdout: Holdout | undefined,
   publicSources: string,
 ): string {
   const source = requirement === "request" ? "the original request" : "the specification";
-  const flat = (s: string) => s.replace(/\s+/g, " ").toLowerCase();
-  const quote = citation
-    .trim()
-    .replace(/^["'“”`]+|["'“”`.]+$/g, "")
-    .replace(/\s+/g, " ");
-  const verbatim = quote.length > 0 && flat(sourceText).includes(flat(quote));
-  if (!verbatim || !holdout || redactHoldoutText(quote, holdout, publicSources) !== quote)
+  const sourceText =
+    requirement === "request" ? request : spec ? requirementSource("spec", request, spec) : "";
+  const quote = citedRequirement(citation, sourceText);
+  if (quote === null || !holdout || redactHoldoutText(quote, holdout, publicSources) !== quote)
     return `a requirement of ${source} (the verifier's citation was not found in it)`;
   return `this requirement of ${source}: "${quote}"`;
 }
