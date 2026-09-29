@@ -190,6 +190,9 @@ runAgent(spec: AgentSpec): AsyncIterable<AgentEvent> & { result: Promise<AgentRe
 - **llm** does single structured calls (triage, judging, summaries): OpenAI-compatible HTTP for
   local/OpenRouter models, or `claude -p --json-schema --tools ""` / `codex exec --output-schema`
   for subscription models.
+- **decisions** asks a decision model (TypeSafe Jev) typed questions — choice, score, yes/no — and
+  maps the answer probabilities to a role's output in code. Only roles with a decisions mapping
+  (triage) can route to it (research/09).
 
 Safety rails in every adapter: wall-clock timeout, inactivity timeout, identical-tool-call loop
 detection, per-invocation budget, process-group kill on cancel.

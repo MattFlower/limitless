@@ -549,6 +549,9 @@ export class RunContext {
       if (result.quota?.windows) tracker.observeWindows(target.provider, result.quota.windows);
       tracker.record(target.provider, result.status, {
         exhaustedUntil: result.quota?.exhaustedUntil ?? null,
+        ...(result.modelCooldownMs === undefined
+          ? {}
+          : { modelCooldown: { modelId: target.modelId, ms: result.modelCooldownMs } }),
         error:
           opts.privateOutput && result.error
             ? "private invocation failed"

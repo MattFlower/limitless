@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { z } from "zod";
 import type { Role } from "../core/types.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy, PROVIDERS, type ProviderDef } from "./catalog.ts";
-import { effortTransportError, resolveTarget } from "./targets.ts";
+import { resolveTarget, transportError } from "./targets.ts";
 
 export type PolicyOverlay = Partial<Policy>;
 export function validatePolicy(
@@ -15,7 +15,7 @@ export function validatePolicy(
       for (const id of s.split("|")) {
         try {
           const target = resolveTarget(id, (id) => models.find((m) => m.id === id));
-          const problem = effortTransportError(
+          const problem = transportError(
             role,
             target,
             providers.find((p) => p.id === target.model.provider),
