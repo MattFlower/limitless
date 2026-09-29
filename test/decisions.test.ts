@@ -120,12 +120,28 @@ test("retries one transient failure, then reports the provider unavailable", asy
   expect(requests).toHaveLength(2);
 
   requests = [];
-  reply = () => Response.json({ detail: "boom" }, { status: 503 });
+  reply = () => Response.json({ detail: "boom for secret-key" }, { status: 503 });
   const failed = await runDecisions(spec());
   expect(requests).toHaveLength(2);
   expect(failed).toMatchObject({
     status: "unavailable",
-    error: "decision service unavailable (HTTP 503): boom",
+    error: "decision service unavailable (HTTP 503): boom for [redacted]",
+  });
+
+  // A body that stalls past the deadline is a timeout, not a malformed response.
+  reply = () =>
+    new Response(
+      new ReadableStream({
+        async start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"model":'));
+          await Bun.sleep(1_000);
+          controller.close();
+        },
+      }),
+    );
+  expect(await runDecisions(spec({ timeoutMs: 200 }))).toMatchObject({
+    status: "timeout",
+    error: "decision call timed out",
   });
 });
 
@@ -138,7 +154,7 @@ test("classifies credit, key, rate-limit and request errors", async () => {
         { status: 403 },
       ),
       "quota",
-      "API key rejected (HTTP 403): Must supply an API key!",
+      "API key rejected (HTTP 403)",
       undefined,
     ],
     [

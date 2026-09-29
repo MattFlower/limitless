@@ -169,7 +169,12 @@ export const runDecisions: Harness = async (spec) => {
     log({ event: "response", attempt, httpStatus: response.status });
     if (!response.ok) {
       const code = response.status;
-      const detail = errorDetail(await response.text().catch(() => ""));
+      // Key errors keep no server text (it could echo the key); other bodies are untrusted, so redact it.
+      if (code === 401 || code === 403) return finish("quota", `API key rejected (HTTP ${code})`);
+      const text = await response.text().catch(() => "");
+      const detail = errorDetail(
+        endpoint.authToken ? text.replaceAll(endpoint.authToken, "[redacted]") : text,
+      );
       if (code >= 500 || code === 408) {
         failure = { status: "unavailable", error: `decision service unavailable (HTTP ${code})${detail}` };
         continue;
@@ -179,13 +184,18 @@ export const runDecisions: Harness = async (spec) => {
           modelCooldownMs: cooldownMs(response.headers),
         });
       if (code === 402) return finish("quota", `provider out of credit (HTTP 402)${detail}`);
-      if (code === 401 || code === 403) return finish("quota", `API key rejected (HTTP ${code})${detail}`);
       return finish("error", `decision request rejected (HTTP ${code})${detail}`);
     }
     let parsed: ReturnType<typeof ResponseSchema.safeParse>;
     try {
       parsed = ResponseSchema.safeParse(await response.json());
     } catch {
+      // Reading the body can also be cut short by cancellation or a timeout.
+      if (spec.signal.aborted) return finish("cancelled", "decision call cancelled");
+      if (deadline.aborted || attemptTimeout.aborted) {
+        failure = { status: "timeout", error: "decision call timed out" };
+        continue;
+      }
       return finish("unavailable", "malformed decisions response");
     }
     if (!parsed.success) return finish("unavailable", "malformed decisions response");
