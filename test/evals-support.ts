@@ -7,7 +7,7 @@ import type { CaseFile } from "../src/evals/cases.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { Triage } from "../src/pipeline/schemas.ts";
-import type { ModelDef } from "../src/router/catalog.ts";
+import type { ModelDef, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 
 export const answer: Triage = {
@@ -36,7 +36,7 @@ export function deferred<T>() {
   });
   return { promise, resolve };
 }
-export async function evalFixture(extraModels: ModelDef[] = []) {
+export async function evalFixture(extraModels: ModelDef[] = [], extraProviders: ProviderDef[] = []) {
   const home = mkdtempSync(join(tmpdir(), "limitless-eval-"));
   const cfg = loadConfig({ home, configDir: join(home, "config") });
   cfg.secrets = {};
@@ -95,6 +95,7 @@ export async function evalFixture(extraModels: ModelDef[] = []) {
         openaiBaseUrl: "http://unused.invalid",
       },
       { id: "provider-b", label: "B", harness: "fake", billing: "subscription", maxConcurrent: 1 },
+      ...extraProviders,
     ],
     models: [
       ...extraModels,
@@ -121,7 +122,12 @@ export async function evalFixture(extraModels: ModelDef[] = []) {
         price: { input: 1, output: 1 },
       },
     ],
-    harnesses: { fake: harness("fake"), codex: harness("codex"), llm: harness("llm") },
+    harnesses: {
+      fake: harness("fake"),
+      codex: harness("codex"),
+      llm: harness("llm"),
+      decisions: harness("decisions"),
+    },
   });
   return {
     home,

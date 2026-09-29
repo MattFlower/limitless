@@ -369,12 +369,21 @@ export class EvalRunner {
       const prepared =
         "hidden" in effective
           ? implementation
-          : await prepareCase(effective, cwd, tree, patch, signal, cfg.reviewImplementerReport);
+          : await prepareCase(
+              effective,
+              cwd,
+              tree,
+              patch,
+              signal,
+              cfg.reviewImplementerReport,
+              cfg.triageDecisionConfidence,
+            );
       if (!prepared) throw new Error("missing trial preparation");
       const preparationMs = Date.now() - preparationStarted;
       let { prompt } = prepared;
       const { timeoutMs } = prepared;
       const reviewInput = "review" in prepared ? prepared.review : undefined;
+      const decisionTask = "decisionTask" in prepared ? prepared.decisionTask : undefined;
       const schema = "hidden" in item ? undefined : schemaFor(item);
       const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
@@ -419,7 +428,8 @@ export class EvalRunner {
       );
       if (signal.aborted) return skip("daemon shutdown");
       if (budget()) return skip("eval budget exhausted");
-      if (cache)
+      // Decision calls cost ~$0.0001 and keep their declined status only when executed.
+      if (cache && harnessName !== "decisions")
         for (const source of store.cachedEvalTrials(trial.cacheKey)) {
           const output =
             "hidden" in item
@@ -485,6 +495,7 @@ export class EvalRunner {
                 ...(sessionId ? { resumeSessionId: sessionId } : {}),
                 cwd,
                 ...request,
+                decisionTask,
                 systemAppend: FACTORY_PREAMBLE,
                 target,
                 mode: "hidden" in item ? "edit" : "readonly",
@@ -590,7 +601,9 @@ export class EvalRunner {
           tracker.blockModel(target.modelId, result.error ?? "model rejected");
         if (signal.aborted) return skip("daemon shutdown");
         const output = schema?.safeParse(result.structured ?? extractJson(result.finalText));
-        const ok = result.status === "ok" && ("hidden" in item || output?.success === true);
+        // A declined decision answer is still graded; details.invocationStatus records the escalation.
+        const answered = result.status === "ok" || result.status === "declined";
+        const ok = answered && ("hidden" in item || output?.success === true);
         const grade =
           "hidden" in effective && implementation
             ? result.status === "ok"

@@ -73,8 +73,27 @@ One call, five questions over a state of repository, top-level entries and the q
 triage prompt's guidance, risk with the blast-radius text), `needs_questions` (noul). Code derives
 `suggested_profile` (today's rule: large or high-risk → deep, trivial → quick, else standard), the
 title from the request's first line, and `blocking_questions: []`. If any choice/score confidence is
-below `[triage] decision_confidence` or P(needs_questions) ≥ 0.5, the invocation is **declined** and
-routing falls through to the next triage model.
+below `[triage] decision_confidence`, P(needs_questions) ≥ 0.5, or ambiguity is high (only an LLM
+can write the blocking questions), the invocation is **declined** and routing falls through to the
+next triage model; with none left, the declined answer is used with a warning.
+
+### Calibration (2026-09-28, k=1 on the 40-case `evals/triage` gold set)
+
+One live call per case: ~970 input tokens, **$0.00004 per call**, p50 154 ms (max 304 ms).
+Jev alone passes 72.5% (task_class 100%, complexity 92%, risk 87%, ambiguity 92.5%,
+needs_questions 90%; one risk under-call). Declining on low confidence trades escalation for accuracy:
+
+| `decision_confidence` | escalated | accepted pass |
+|---|---|---|
+| 0.5 | 42.5% | 87% (20/23) |
+| **0.6** (default) | 57.5% | 94% (16/17) |
+| 0.7 | 75% | 100% (10/10) |
+
+The three gold "needs questions" cases scored P = 0.65–0.83 and all others ≤ 0.52. An earlier
+wording, with a middle ambiguity level of "some details are unspecified", scored ambiguity 70%;
+the levels now follow the triage prompt ("prefer a reasonable assumption"). Because the wording was
+checked on this set, eval results on it are not fully held out; confirm at k=3 against the
+current triage default before routing production triage to Jev.
 
 ## Ideas for epics: deciding when and how to split a request
 

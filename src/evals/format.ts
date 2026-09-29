@@ -78,6 +78,11 @@ export function formatEvalReport(report: EvalReport): string {
       `  pass ${pct(m.passRate)} (${m.passes}/${m.evaluatedTrials}), Wilson 95% CI ${m.ci ? `[${pct(m.ci[0])}, ${pct(m.ci[1])}]` : "n/a"}; mean score ${number(m.meanScore)}`,
       ...roleLines,
       `  prediction coverage ${m.predictionTrials}/${m.scheduledTrials} (${pct(m.predictionCoverage)}); flip ${pct(m.flipRate)} (n=${m.flipDenominator})`,
+      ...(m.declined || m.cascade
+        ? [
+            `  declined (escalated to the next model): ${m.declined}/${m.evaluatedTrials} (${pct(m.evaluatedTrials ? m.declined / m.evaluatedTrials : null)})${m.cascade ? `; cascade via ${m.cascade.fallbackModel}: pass ${pct(m.cascade.passRate)} (${m.cascade.passes}/${m.cascade.trials})${m.cascade.missing ? `, ${m.cascade.missing} without a fallback trial` : ""}` : ""}`,
+          ]
+        : []),
       ...(report.run.role === "triage"
         ? [
             metric("risk under-call", {

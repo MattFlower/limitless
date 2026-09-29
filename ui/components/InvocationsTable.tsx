@@ -15,6 +15,7 @@ const STATUS_BADGE: Record<string, string> = {
   stuck: "warn",
   quota: "warn",
   unavailable: "warn",
+  declined: "info",
   running: "info",
 };
 

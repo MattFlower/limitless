@@ -102,7 +102,9 @@ export type InvocationStatus =
   | "timeout"
   | "stuck"
   | "quota"
-  | "unavailable";
+  | "unavailable"
+  /** A decision model answered but was not confident enough; routing falls through to the next model. */
+  | "declined";
 
 export interface Repo {
   id: string;

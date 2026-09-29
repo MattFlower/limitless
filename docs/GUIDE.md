@@ -159,6 +159,7 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
+| `[triage] decision_confidence` | `0.6` | A decision model's triage (e.g. `typesafe/jev-1.13`) is declined, and routing falls through to the next triage model, when any choice or score answer is less confident than this, when blocking questions are likely (P ≥ 0.5), or when ambiguity is high. If no other triage model is available, the declined answer is used with a warning. |
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
 | `[routing] exclude_origins` | unset | For example `["CN"]`. Excludes models by checkpoint origin from eval policy generation and the Evals matrix. Runtime routing is not affected. |
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |

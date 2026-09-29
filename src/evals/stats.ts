@@ -215,6 +215,38 @@ function implementMetrics(rows: EvalTrial[]) {
     executedTrials: executed.length,
   };
 }
+/**
+ * The production confidence cascade: a decision model's trials, with every trial it did not answer
+ * usably (declined, or any operational failure) replaced by the fallback's trial for the same case
+ * and trial number. The fallback is the non-decision model covering most of those trials, then the
+ * best pass rate; trials it lacks count as failures and are reported as missing.
+ */
+function cascade(
+  trials: EvalTrial[],
+  modelId: string,
+  candidates: { modelId: string; passRate: number | null }[],
+) {
+  const key = (t: EvalTrial) => `${t.caseId}#${t.trial}`;
+  const scored = (id: string) => trials.filter((t) => evidenceTarget(t) === id && scoredTrial(t));
+  const fallsThrough = (t: EvalTrial) => t.status !== "ok" || t.details.invocationStatus !== "ok";
+  const own = scored(modelId);
+  const needed = own.filter(fallsThrough).map(key);
+  const fallback = candidates
+    .map((c) => {
+      const passes = new Map(scored(c.modelId).map((t) => [key(t), t.pass]));
+      return { ...c, passes, missing: needed.filter((k) => !passes.has(k)).length };
+    })
+    .sort((a, b) => a.missing - b.missing || (b.passRate ?? 0) - (a.passRate ?? 0))[0];
+  if (!fallback) return null;
+  const passes = own.filter((t) => (fallsThrough(t) ? fallback.passes.get(key(t)) : t.pass)).length;
+  return {
+    fallbackModel: fallback.modelId,
+    passes,
+    trials: own.length,
+    missing: fallback.missing,
+    passRate: own.length ? passes / own.length : null,
+  };
+}
 export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptions = {}) {
   const settings = statsOptions(options);
   const targets = [
@@ -259,6 +291,8 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
       cases: new Set(evaluated.map((t) => t.caseId)).size,
       evaluatedTrials: evaluated.length,
       skipped: rows.filter((t) => t.status === "skipped").length,
+      /** Decision-model trials whose answer production would escalate to the next model. */
+      declined: rows.filter((t) => t.details.invocationStatus === "declined").length,
       errors: rows.filter((t) => t.status === "error").length,
       cached: rows.filter((t) => t.details.cache).length,
       pending: rows.filter((t) => t.status === "queued" || t.status === "running").length,
@@ -291,6 +325,9 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
     trials.filter((t) => evidenceTarget(t) === best?.modelId),
     run.k,
   );
+  const decides = (modelId: string) =>
+    trials.some((t) => evidenceTarget(t) === modelId && t.harness === "decisions");
+  const fallbacks = summaries.filter((m) => m.passRate !== null && !decides(m.modelId));
   return summaries.map((summary) => {
     const candidate = completeCases(
       trials.filter((t) => evidenceTarget(t) === summary.modelId),
@@ -306,6 +343,7 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
     }
     return {
       ...summary,
+      cascade: decides(summary.modelId) ? cascade(trials, summary.modelId, fallbacks) : null,
       comparison: {
         bestModel: best?.modelId ?? null,
         candidateCompleteCases: candidate.size,

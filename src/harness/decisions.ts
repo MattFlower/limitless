@@ -16,10 +16,12 @@ export type DecisionAnswer =
   | { type: "noul"; noul: number };
 
 export interface DecisionTask {
-  state: string;
+  state: string | Record<string, unknown>;
   questions: Record<string, DecisionQuestion>;
   /** Maps the answers (keyed like `questions`) to the role's structured output. */
   interpret(answers: Record<string, DecisionAnswer>): unknown;
+  /** A reason to decline the answers (e.g. low confidence), so routing tries the next model. */
+  decline?(answers: Record<string, DecisionAnswer>): string | null;
 }
 
 const Probability = z.number().min(0).max(1);
@@ -206,7 +208,13 @@ export const runDecisions: Harness = async (spec) => {
     log({ event: "answers", model: parsed.data.model, answers });
     spec.onEvent({ type: "status", text: `${parsed.data.model}: ${describe(answers)}` });
     try {
-      return finish("ok", null, { structured: task.interpret(answers), finalText: JSON.stringify(answers) });
+      // A declined result keeps its structured output so evals can grade what the model answered.
+      const structured = task.interpret(answers);
+      const declined = task.decline?.(answers) ?? null;
+      return finish(declined ? "declined" : "ok", declined, {
+        structured,
+        finalText: JSON.stringify(answers),
+      });
     } catch (error) {
       return finish("error", `decision mapping failed: ${(error as Error).message}`);
     }
