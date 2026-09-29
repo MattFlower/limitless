@@ -102,7 +102,9 @@ export type InvocationStatus =
   | "timeout"
   | "stuck"
   | "quota"
-  | "unavailable";
+  | "unavailable"
+  /** A decision model answered but was not confident enough; routing falls through to the next model. */
+  | "declined";
 
 export interface Repo {
   id: string;
@@ -474,6 +476,8 @@ export interface EvalTrial {
     reason?: string;
     grade?: EvalGrade;
     invocationStatus?: InvocationStatus;
+    /** `[triage] decision_confidence` a decision-model trial ran with. */
+    decisionConfidence?: number;
     preparationFailed?: boolean;
     interrupted?: boolean;
     cache?: {

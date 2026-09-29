@@ -1350,10 +1350,15 @@ p {
   margin-bottom: 14px;
 }
 .tab {
+  /* Rendered as a <button>: drop the user-agent grey background and font. */
+  appearance: none;
+  background: transparent;
+  font: inherit;
+  line-height: inherit;
   font-family: var(--font-mono);
   font-size: 11.5px;
   padding: 7px 12px;
-  color: var(--text-faint);
+  color: var(--text-dim);
   border: 1px solid transparent;
   border-bottom: none;
   border-radius: var(--radius-sm) var(--radius-sm) 0 0;
@@ -1362,6 +1367,11 @@ p {
 }
 .tab:hover {
   color: var(--text);
+  background: var(--bg-hover);
+}
+.tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 .tab.active {
   color: var(--accent);

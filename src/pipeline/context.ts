@@ -24,6 +24,7 @@ import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
+import type { DecisionTask } from "../harness/decisions.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
 import { parseFakeStream } from "../harness/stream-fault.ts";
@@ -177,6 +178,8 @@ export interface InvokeOptions {
   redactHoldout?: boolean;
   isolatedCwd?: boolean;
   noTools?: boolean;
+  /** Typed questions for decision models; a decline falls through to the next candidate. */
+  decisionTask?: DecisionTask;
 }
 
 export interface InvokeOutcome {
@@ -390,6 +393,15 @@ export class RunContext {
     const { router, tracker, store, harnesses } = this.deps;
     const tried: (string | ModelSelection)[] = [...(opts.constraints?.exclude ?? [])];
     let lastFailure: string | null = null;
+    // An unsure (not question-needing) decline beats failing the stage when nothing else answers.
+    let lastResort: InvokeOutcome | null = null;
+    const useLastResort = (outcome: InvokeOutcome, why: string) => {
+      this.log(
+        `${why}; using the declined answer from ${outcome.target.targetId ?? outcome.target.modelId}`,
+        "warn",
+      );
+      return outcome;
+    };
 
     for (let attempt = 0; attempt < 6; attempt++) {
       this.checkCancelled();
@@ -399,6 +411,7 @@ export class RunContext {
         this.routingConstraints({ ...opts.constraints, exclude: tried }),
       );
       const target = decision.candidates[0];
+      if (!target && lastResort) return useLastResort(lastResort, `No other model for ${opts.role}`);
       if (!target) {
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
         if (opts.privateOutput) throw new NoCapacityError(`No model available for ${opts.role}`);
@@ -462,6 +475,7 @@ export class RunContext {
           mode: opts.mode,
           ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
           ...(opts.schema ? { schema: opts.schema } : {}),
+          ...(opts.decisionTask ? { decisionTask: opts.decisionTask } : {}),
           timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUTS[opts.role],
           idleTimeoutMs: opts.idleTimeoutMs ?? 10 * 60_000,
           maxToolCalls: opts.maxToolCalls ?? (opts.mode === "edit" ? 400 : 150),
@@ -520,7 +534,11 @@ export class RunContext {
         result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };
       if (opts.requireStructured && result.status === "ok" && result.structured === null)
         result = { ...result, status: "error", error: "missing structured output" };
-      if (opts.schema && result.status === "ok" && result.structured !== null) {
+      if (
+        opts.schema &&
+        (result.status === "ok" || result.status === "declined") &&
+        result.structured !== null
+      ) {
         const parsed = opts.schema.safeParse(result.structured);
         result = parsed.success
           ? { ...result, structured: parsed.data }
@@ -566,6 +584,17 @@ export class RunContext {
 
       if (this.termination) throw this.termination;
       if (result.status === "cancelled" || this.signal.aborted) throw new CancelledError();
+      if (result.status === "declined") {
+        // Not a failure and not a routing attempt: each decision model declines at most once.
+        const reason = opts.privateOutput
+          ? "private invocation declined"
+          : (redact?.(result.error ?? "") ?? result.error ?? "");
+        lastFailure = `${target.targetId ?? target.modelId}: declined (${reason})`.slice(0, 300);
+        this.log(`${target.targetId ?? target.modelId} declined: ${reason}; trying the next model`);
+        if (result.decline?.lastResort) lastResort = { result, target, invocation: updated };
+        attempt--;
+        continue;
+      }
       if (result.status !== "ok" && MODEL_REJECTED.test(result.error ?? "")) {
         // A configuration problem with this model (e.g. not on the plan), not a task failure.
         tracker.blockModel(
@@ -608,6 +637,7 @@ export class RunContext {
       }
       return { result, target, invocation: updated };
     }
+    if (lastResort) return useLastResort(lastResort, `Gave up routing ${opts.role} after 6 failed attempts`);
     throw new NoCapacityError(
       opts.privateOutput
         ? `Gave up routing ${opts.role}`
