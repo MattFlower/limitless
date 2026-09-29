@@ -14,9 +14,11 @@ import {
 } from "../src/evals/cases.ts";
 import { evalFixture } from "./evals-support.ts";
 
-test("committed 40 cases load unchanged, including notes and gold alternatives", () => {
+test("committed 70 cases load (40 development + 30 held out), including notes and gold alternatives", () => {
   const file = loadCases();
-  expect(file.cases).toHaveLength(40);
+  expect(file.cases).toHaveLength(70);
+  // Held-out cases decide routing; wording is tuned only on the other 40.
+  expect(file.cases.filter((c) => c.tags.includes("holdout"))).toHaveLength(30);
   expect(file.notes).toContain("orchestrator");
   expect(file.cases.some((c) => Array.isArray(c.gold.complexity))).toBe(true);
 });
@@ -103,7 +105,7 @@ test("default dataset resolves from the application checkout, independently of c
       ],
       { cwd: home, stdout: "pipe", stderr: "pipe" },
     );
-    expect(await new Response(child.stdout).text()).toBe("40\n");
+    expect(await new Response(child.stdout).text()).toBe("70\n");
     expect(await child.exited).toBe(0);
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -134,6 +136,25 @@ test("review and verify datasets validate pins, nested inputs, labels and unique
     ])
       expect(schema.safeParse({ ...file, cases: [{ ...item, ...over }] }).success).toBe(false);
     expect(schema.safeParse({ ...file, cases: [item, item] }).success).toBe(false);
+    // Gate runs that were killed for exceeding their timeout carry `timedOut` on the result.
+    const timedOut = {
+      name: "test",
+      verdict: "regressed",
+      blocking: true,
+      result: {
+        name: "test",
+        command: "bun test",
+        ok: false,
+        exitCode: null,
+        durationMs: 1,
+        output: "",
+        timedOut: true,
+      },
+    };
+    expect(
+      schema.safeParse({ ...file, cases: [{ ...item, input: { ...item.input, gates: [timedOut] } }] })
+        .success,
+    ).toBe(true);
   }
   const r = review.cases[0];
   const v = verify.cases[0];

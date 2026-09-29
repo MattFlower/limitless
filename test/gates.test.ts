@@ -1,10 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { auditDiff } from "../src/gates/audit.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
-import { compareGates, type GateRun, retryRegressions, runGates } from "../src/gates/run.ts";
+import {
+  compareGates,
+  type GateRun,
+  retryBaselineFailures,
+  retryRegressions,
+  runGates,
+} from "../src/gates/run.ts";
 import { defaultGateSlots, gateSlots, Semaphore } from "../src/gates/slots.ts";
 import type { DiffInfo } from "../src/git/repos.ts";
 
@@ -190,6 +196,78 @@ describe("gate slots and flaky retry", () => {
     expect(failing.summary).toEqual(["still_failing", false, "not retried", 1]);
     const pointed = await retried("echo x >> runs; echo 'at /repo/src/app.ts:12:3'; exit 1");
     expect(pointed.summary).toEqual(["regressed", true, "not retried", 1]);
+  });
+
+  /** Baseline run plus its one retry; `runs` counts check invocations. */
+  async function baseline(cfg: GateConfig, dir: string, abort = new AbortController()) {
+    const run = await retryBaselineFailures(await runGates(dir, cfg, signal), dir, cfg, abort.signal);
+    const log = join(dir, "runs");
+    const runs = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").length : 0;
+    return { run, runs };
+  }
+
+  test("baseline fail → retry → pass is recorded as passing with the first attempt", async () => {
+    const dir = tempDir({});
+    const { run, runs } = await baseline(
+      config("echo x >> runs; test -f once || { touch once; echo slow; exit 1; }"),
+      dir,
+    );
+    const [c] = run.checks;
+    expect([c?.ok, c?.firstAttempt?.ok, runs]).toEqual([true, false, 2]);
+    expect(c?.firstAttempt?.output).toContain("slow");
+    expect(compareGates(run, await runGates(dir, config("exit 1"), signal))[0]).toMatchObject({
+      verdict: "regressed",
+      blocking: true,
+    });
+  });
+
+  test("baseline fail → retry → fail stays failing and later failures don't block", async () => {
+    const dir = tempDir({});
+    const { run, runs } = await baseline(
+      config("echo x >> runs; echo attempt $(( $(wc -l < runs) )); exit 1"),
+      dir,
+    );
+    const [c] = run.checks;
+    // The failed re-run is the result; the first failure is kept alongside it.
+    expect([c?.ok, c?.firstAttempt?.ok, runs]).toEqual([false, false, 2]);
+    expect([c?.output, c?.firstAttempt?.output]).toEqual(["attempt 2", "attempt 1"]);
+    expect(compareGates(run, await runGates(dir, config("exit 1"), signal))[0]).toMatchObject({
+      verdict: "still_failing",
+      blocking: false,
+    });
+  });
+
+  test("a failing baseline check whose output merely looks like a timeout is still retried", async () => {
+    const dir = tempDir({});
+    const { run, runs } = await baseline(
+      config("echo x >> runs; test -f once || { touch once; echo '[timed out] from nested tool'; exit 1; }"),
+      dir,
+    );
+    expect([run.checks[0]?.ok, run.checks[0]?.firstAttempt?.timedOut, runs]).toEqual([true, undefined, 2]);
+  });
+
+  test("baseline setup failures, timeouts and cancellation are not retried", async () => {
+    const setupDir = tempDir({});
+    const setupCfg = { ...config("echo x >> runs; exit 1"), setup: ["echo s >> setups; exit 1"] };
+    const setup = await baseline(setupCfg, setupDir);
+    expect([setup.run.setupOk, setup.runs, readFileSync(join(setupDir, "setups"), "utf8")]).toEqual([
+      false,
+      0,
+      "s\n",
+    ]);
+
+    const slowDir = tempDir({});
+    const slowCfg: GateConfig = {
+      ...config(""),
+      checks: [{ name: "test", run: "echo x >> runs; sleep 5", timeoutSec: 0.2 }],
+    };
+    const slow = await baseline(slowCfg, slowDir);
+    expect([slow.run.checks[0]?.ok, slow.run.checks[0]?.timedOut, slow.runs]).toEqual([false, true, 1]);
+
+    const cancelled = new AbortController();
+    cancelled.abort();
+    const abortDir = tempDir({});
+    expect((await baseline(config("echo x >> runs; exit 1"), abortDir, cancelled)).runs).toBe(1);
   });
 });
 

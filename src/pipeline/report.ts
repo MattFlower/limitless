@@ -1,6 +1,7 @@
 import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation } from "../core/types.ts";
 import type { RunContext, RunState } from "./context.ts";
+import type { Review } from "./schemas.ts";
 
 function money(n: number): string {
   return n === 0 ? "$0" : n < 0.01 ? "<$0.01" : `$${n.toFixed(2)}`;
@@ -143,6 +144,10 @@ export function renderReport(input: ReportInput): string {
     blocks.push("No automated checks were detected for this repository.");
   }
 
+  // Panel findings carry the verifier's consequence severity; unverified ones keep the finder's.
+  const severity = (f: Review["findings"][number]) =>
+    f.verification?.severity ??
+    (state.lastReview?.mode === "panel" ? `${f.severity} (unverified)` : f.severity);
   if (state.lastReview) {
     const r = state.lastReview;
     blocks.push(`## Code review (\`${r.modelId}\`)`, `**${r.verdict}** — ${r.summary}`);
@@ -151,7 +156,7 @@ export function renderReport(input: ReportInput): string {
         r.findings
           .map(
             (f) =>
-              `- ${f.severity}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title}`,
+              `- ${severity(f)}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title}`,
           )
           .join("\n"),
       );
@@ -163,7 +168,7 @@ export function renderReport(input: ReportInput): string {
       state.reviewFollowUps
         .map(
           (f) =>
-            `- ${f.severity}${f.security ? " (security)" : ""}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title} — ${f.detail}`,
+            `- ${severity(f)}${f.security ? " (security)" : ""}: ${f.file ? `\`${f.file}${f.line ? `:${f.line}` : ""}\` ` : ""}${f.title} — ${f.detail}`,
         )
         .join("\n"),
     );

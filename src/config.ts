@@ -50,6 +50,8 @@ export interface Config {
   dependabotRouting: "free_first" | "policy";
   /** Whether review prompts (production and eval) carry the implementer's self-report. */
   reviewImplementerReport: "include" | "omit";
+  /** Decision-model triage declines (falls through to the next model) below this answer confidence. */
+  triageDecisionConfidence: number;
   githubOwner: string | null; // allowlisted GitHub login for triggers
   discordOwnerId: string | null;
   discordChannelId: string | null;
@@ -82,6 +84,9 @@ function parseEnvFile(path: string): Record<string, string> {
 
 /** `[review]` is validated strictly: a misspelt key would otherwise silently keep the default. */
 const REVIEW_KEYS = ["implementer_report"];
+const TRIAGE_KEYS = ["decision_confidence"];
+/** Provisional until calibrated on evals/triage (docs/research/09-jev-decisions.md). */
+export const DEFAULT_DECISION_CONFIDENCE = 0.6;
 
 function num(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
@@ -176,6 +181,16 @@ export function loadConfig(
     review.implementer_report !== "omit"
   )
     throw new Error('review.implementer_report must be "include" or "omit"');
+  const rawTriage = raw.triage ?? {};
+  if (typeof rawTriage !== "object" || rawTriage === null || Array.isArray(rawTriage))
+    throw new Error("triage must be a table");
+  const triage = rawTriage as Record<string, unknown>;
+  for (const key of Object.keys(triage))
+    if (!TRIAGE_KEYS.includes(key))
+      throw new Error(`triage.${key}: unknown key (allowed: ${TRIAGE_KEYS.join(", ")})`);
+  const confidence = triage.decision_confidence ?? DEFAULT_DECISION_CONFIDENCE;
+  if (typeof confidence !== "number" || !(confidence >= 0 && confidence <= 1))
+    throw new Error("triage.decision_confidence must be a number from 0 to 1");
   const retention = (raw.retention ?? {}) as Record<string, unknown>;
   const port = overrides.port ?? num(Number(process.env.LIMITLESS_PORT) || server.port, 7400);
   const host = str(server.host, "127.0.0.1") as string;
@@ -238,6 +253,7 @@ export function loadConfig(
       : [],
     dependabotRouting: routing.dependabot === "policy" ? "policy" : "free_first",
     reviewImplementerReport: review.implementer_report === "omit" ? "omit" : "include",
+    triageDecisionConfidence: confidence,
     githubOwner: str(owners.github, "MattFlower"),
     discordOwnerId: str(owners.discord, null),
     discordChannelId: str(discord.channel_id, null),

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +18,9 @@ import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipe
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 import { findingEvidence } from "./review-support.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 const providers: ProviderDef[] = [
   { id: "alpha", label: "Alpha", harness: "fake", billing: "subscription", maxConcurrent: 2 },
@@ -477,6 +480,29 @@ esac
     expect(f.store.getRunState<RunState>(run.id)?.flow).toBe("build");
   });
 
+  test.each([undefined, "include", "omit"] as const)(
+    "production review system is one routed finder honoring implementer_report=%s",
+    async (mode) => {
+      const reviews: AgentSpec[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") {
+          reviews.push(s);
+          return { structured: approve };
+        }
+        return { files: { "farewell.txt": "goodbye\n" }, text: "IMPLEMENTER_SAYS_DONE" };
+      });
+      if (mode) f.deps.cfg.reviewImplementerReport = mode;
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(reviews.map((s) => s.target.provider)).toEqual(["beta"]);
+      const included = mode !== "omit";
+      expect(reviews[0]?.prompt.includes("# Implementer's own report")).toBe(included);
+      expect(reviews[0]?.prompt.includes("IMPLEMENTER_SAYS_DONE")).toBe(included);
+    },
+  );
+
   test("Dependabot falls back when free providers are unavailable; owner keeps policy routing", async () => {
     const f = start(
       (s) => {
@@ -581,6 +607,81 @@ esac
       f.store.listEvents(run.id).some((e) => e.message === "check retry: pass (flaky, not blocking)"),
     ).toBe(true);
     expect(f.store.getArtifact(run.id, "report.md")).toContain("Flaky: `check` failed, then passed");
+  });
+
+  test("a baseline check that fails once is retried and recorded as passing, so a regression blocks", async () => {
+    const count = join(home, "gate-runs");
+    // Run 1 is the baseline, run 2 its retry; every run after the change fails.
+    const check = `echo x >> '${count}'; test $(( $(wc -l < '${count}') )) -eq 2`;
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`,
+    );
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "flaky baseline"], {
+      cwd: repoDir,
+    });
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).not.toBe("succeeded");
+    const baseline = f.store.getRunState<RunState>(run.id)?.baseline?.checks[0];
+    expect([baseline?.ok, baseline?.firstAttempt?.ok]).toEqual([true, false]);
+    const artifact = JSON.parse(f.store.getArtifact(run.id, "baseline-gates.json") ?? "{}");
+    expect([artifact.checks?.[0]?.ok, artifact.checks?.[0]?.firstAttempt?.ok]).toEqual([true, false]);
+    const flaky = f.store.listEvents(run.id).find((e) => e.message === "baseline check: flaky");
+    expect(flaky?.data).toMatchObject({ flaky: true, firstAttempt: { ok: false }, retry: { ok: true } });
+    const gates = f.store.getRunState<RunState>(run.id)?.lastGates?.[0];
+    expect([gates?.verdict, gates?.blocking]).toEqual(["regressed", true]);
+    // Baseline, its retry, then each post-change round and its regression retry.
+    expect(readFileSync(count, "utf8").trim().split("\n").length % 2).toBe(0);
+  });
+
+  test("a baseline check that fails twice stays failing and does not block after the change", async () => {
+    const count = join(home, "gate-runs");
+    const check = `echo x >> '${count}'; echo attempt $(( $(wc -l < '${count}') )); exit 1`;
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`,
+    );
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "broken baseline"], {
+      cwd: repoDir,
+    });
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const state = f.store.getRunState<RunState>(run.id);
+    const baseline = state?.baseline?.checks[0];
+    expect([
+      baseline?.ok,
+      baseline?.output,
+      baseline?.firstAttempt?.ok,
+      baseline?.firstAttempt?.output,
+    ]).toEqual([false, "attempt 2", false, "attempt 1"]);
+    // Both failed attempts stay in the artifact.
+    const artifact = JSON.parse(f.store.getArtifact(run.id, "baseline-gates.json") ?? "{}");
+    expect([artifact.checks?.[0]?.output, artifact.checks?.[0]?.firstAttempt?.output]).toEqual([
+      "attempt 2",
+      "attempt 1",
+    ]);
+    expect([state?.lastGates?.[0]?.verdict, state?.lastGates?.[0]?.blocking]).toEqual([
+      "still_failing",
+      false,
+    ]);
+    const events = f.store.listEvents(run.id);
+    expect(events.some((e) => e.message.endsWith(": flaky"))).toBe(false);
+    const again = events.find((e) => e.message === "baseline check: retry FAIL again");
+    expect(again?.data).toMatchObject({ flaky: false, firstAttempt: { ok: false }, retry: { ok: false } });
+    // Two baseline attempts, one post-change run (still_failing is never retried).
+    expect(readFileSync(count, "utf8").trim().split("\n").length).toBe(3);
   });
 
   // Same text git generates, so a fixture line can never stand in for a real marker.
@@ -716,7 +817,7 @@ esac
     expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
     expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
     expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
-  }, 30_000);
+  });
 
   for (const kind of [
     "unchanged",
@@ -1608,7 +1709,9 @@ protected_paths = ["protected.txt"]
       expect(state?.flow).toBe("verify-change");
       expect(f.store.getRunDetail(runId)?.run.flow).toBe("verify-change");
       const revisions = readFileSync(records, "utf8").trim().split("\n");
-      expect(revisions.slice(0, 2)).toEqual([baseTip, head]);
+      // A check failing on base is retried once, still on base, before the head is checked out.
+      const baseRuns = scenario === "baseline" ? [baseTip, baseTip] : [baseTip];
+      expect(revisions.slice(0, baseRuns.length + 1)).toEqual([...baseRuns, head]);
       const remote = (await git("ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).split("\t")[0];
       const unchanged = ["approve", "baseline", "restart-initial"].includes(scenario);
       expect(remote).toBe(unchanged || blocked ? head : (f.store.getRun(runId)?.headSha ?? "missing"));
@@ -3946,4 +4049,234 @@ test("environment retry prefers another cross-vendor model over same-vendor fall
   const run = await factory.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
   expect(await waitFor(factory, run.id, ["succeeded", "needs_human", "failed"])).toBe("succeeded");
   expect(ids).toEqual(["beta/m", "beta/other"]);
+});
+
+test("panel review: a refuted blocker doesn't block, a CONFIRMED low does, and verifiers avoid the finder's vendor", async () => {
+  const candidate = (title: string, severity: string) => ({
+    severity,
+    security: false,
+    ...findingEvidence,
+    file: "farewell.txt",
+    line: 1,
+    title,
+    detail: `SECRET_DETAIL ${title}`,
+    suggestion: "Fix it",
+  });
+  const rulings: Record<string, [string, string]> = {
+    C1: ["REFUTED", "critical"],
+    C2: ["CONFIRMED", "low"],
+    C3: ["PLAUSIBLE", "medium"],
+  };
+  const verifiers: AgentSpec[] = [];
+  const implementPrompts: string[] = [];
+  const f = start((s) => {
+    if (s.prompt.startsWith("You are a code-review verifier")) {
+      verifiers.push(s);
+      const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+      return {
+        structured: {
+          results: ids.map((id) => ({
+            id,
+            verdict: rulings[id]?.[0],
+            severity: rulings[id]?.[1],
+            category: "correctness",
+            evidence: `farewell.txt:1 \`bye\` (${id})`,
+            trigger: `reading the file -> wrong farewell (${id})`,
+          })),
+        },
+      };
+    }
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review")
+      return {
+        structured: s.prompt.includes("# Previous review")
+          ? { verdict: "approve", summary: "P1 fixed; no regressions found.", findings: [] }
+          : {
+              verdict: "request_changes",
+              summary: "Found problems in the farewell text.",
+              findings: [
+                candidate("Refuted blocker", "blocker"),
+                candidate("Confirmed low", "minor"),
+                candidate("Plausible medium", "major"),
+              ],
+            },
+      };
+    implementPrompts.push(s.prompt);
+    return { files: { "farewell.txt": `goodbye ${implementPrompts.length}\n` } };
+  });
+  f.deps.reviewSystem = {
+    name: "panel",
+    mode: "panel",
+    finders: [{ prompt: "standard" }],
+    verifier: {},
+    implementerReport: "include",
+  };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  // Implementer alpha (anthropic) -> finder beta (openai) -> verifier routed away from openai.
+  expect(
+    f.store
+      .listInvocations(run.id)
+      .filter((i) => i.role === "review")
+      .map((i) => i.modelId),
+  ).toEqual(["beta/m", "alpha/m", "beta/m"]);
+  expect(verifiers.map((s) => [s.target.vendor, s.mode])).toEqual([["anthropic", "readonly"]]);
+  expect(verifiers[0]?.prompt).not.toContain("SECRET_DETAIL");
+  expect(implementPrompts).toHaveLength(2);
+  const feedback = implementPrompts[1] ?? "";
+  expect(feedback).toContain("**low** farewell.txt:1 — Confirmed low");
+  expect(feedback).toContain("farewell.txt:1 `bye` (C2)");
+  expect(feedback).toContain("Trigger: reading the file -> wrong farewell (C2)");
+  for (const dropped of ["Refuted blocker", "Plausible medium"]) expect(feedback).not.toContain(dropped);
+  const artifact = JSON.parse(f.store.getArtifact(run.id, "review-0.json") ?? "{}");
+  expect(artifact).toMatchObject({
+    mode: "panel",
+    verdict: "request_changes",
+    panel: { refuted: ["C1"], capped: [] },
+  });
+  expect(artifact.blocking.map((b: { title: string }) => b.title)).toEqual(["Confirmed low"]);
+  expect(artifact.panel.candidates.map((c: { id: string; title: string }) => [c.id, c.title])).toEqual([
+    ["C1", "Refuted blocker"],
+    ["C2", "Confirmed low"],
+    ["C3", "Plausible medium"],
+  ]);
+  expect(artifact.panel.verdicts.map((v: { id: string; verdict: string }) => [v.id, v.verdict])).toEqual([
+    ["C1", "REFUTED"],
+    ["C2", "CONFIRMED"],
+    ["C3", "PLAUSIBLE"],
+  ]);
+  const state = f.store.getRunState<RunState>(run.id);
+  expect(state?.reviewFollowUps?.map((x) => x.title)).toEqual(["Plausible medium"]);
+  const report = f.store.getArtifact(run.id, "report.md") ?? "";
+  expect(report).toContain("- medium: `farewell.txt:1` Plausible medium");
+  expect(report).not.toContain("Refuted blocker");
+});
+
+test("panel review: a verifier that omits candidates is retried once, then they stay unverified follow-ups", async () => {
+  const candidate = (title: string) => ({
+    severity: "blocker",
+    security: false,
+    ...findingEvidence,
+    file: "farewell.txt",
+    line: 1,
+    title,
+    detail: `Detail ${title}`,
+    suggestion: "Fix it",
+  });
+  const verifierIds: string[][] = [];
+  const f = start((s) => {
+    if (s.prompt.startsWith("You are a code-review verifier")) {
+      const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+      verifierIds.push(ids);
+      // Rules on C1 only; C2 is never answered.
+      return {
+        structured: {
+          results: ids
+            .filter((id) => id === "C1")
+            .map((id) => ({
+              id,
+              verdict: "PLAUSIBLE",
+              severity: "medium",
+              category: "correctness",
+              evidence: "farewell.txt:1 `bye`",
+              trigger: "reading the file -> wrong farewell",
+            })),
+        },
+      };
+    }
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review")
+      return {
+        structured: {
+          verdict: "request_changes",
+          summary: "Found problems in the farewell text.",
+          findings: [candidate("Answered"), candidate("Omitted")],
+        },
+      };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  f.deps.reviewSystem = {
+    name: "panel",
+    mode: "panel",
+    finders: [{ prompt: "standard" }],
+    verifier: {},
+    implementerReport: "include",
+  };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(verifierIds).toEqual([["C1", "C2"], ["C2"]]);
+  const artifact = JSON.parse(f.store.getArtifact(run.id, "review-0.json") ?? "{}");
+  expect(artifact).toMatchObject({ verdict: "approve", blocking: [], panel: { omitted: ["C2"] } });
+  const state = f.store.getRunState<RunState>(run.id);
+  expect(state?.reviewFollowUps?.map((x) => [x.title, x.verification?.verdict])).toEqual([
+    ["Answered", "PLAUSIBLE"],
+    ["Omitted", undefined],
+  ]);
+  const warnings = f.store
+    .listEvents(run.id)
+    .filter((e) => e.level === "warn")
+    .map((e) => e.message);
+  expect(warnings).toContainEqual(expect.stringContaining("Verifier gave no ruling for C2"));
+});
+
+test("panel review: a verifier left on the finder's vendor is logged as a warning", async () => {
+  const f = start((s) => {
+    if (s.prompt.startsWith("You are a code-review verifier")) {
+      const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+      return {
+        structured: {
+          results: ids.map((id) => ({
+            id,
+            verdict: "PLAUSIBLE",
+            severity: "low",
+            category: "correctness",
+            evidence: "farewell.txt:1 `bye`",
+            trigger: "reading the file -> wrong farewell",
+          })),
+        },
+      };
+    }
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review")
+      return {
+        structured: {
+          verdict: "approve",
+          summary: "One small note on the farewell text.",
+          findings: [
+            {
+              severity: "minor",
+              security: false,
+              ...findingEvidence,
+              file: "farewell.txt",
+              line: 1,
+              title: "Note",
+              detail: "d",
+              suggestion: "s",
+            },
+          ],
+        },
+      };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  // Only one vendor is routable, so the verifier cannot avoid the finder's.
+  f.tracker.record("beta", "quota", { exhaustedUntil: Date.now() + 3_600_000 });
+  f.deps.reviewSystem = {
+    name: "panel",
+    mode: "panel",
+    finders: [{ prompt: "standard" }],
+    verifier: {},
+    implementerReport: "include",
+  };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  const warnings = f.store
+    .listEvents(run.id)
+    .filter((e) => e.level === "warn")
+    .map((e) => e.message);
+  expect(warnings).toContainEqual(
+    expect.stringContaining("Verifier alpha/m shares vendor anthropic with the finder it checks"),
+  );
 });

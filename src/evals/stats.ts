@@ -215,16 +215,63 @@ function implementMetrics(rows: EvalTrial[]) {
     executedTrials: executed.length,
   };
 }
-export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptions = {}) {
+/** A candidate is its review system when it has one, otherwise its evidence target. */
+const candidateOf = (trial: EvalTrial) => trial.details.system ?? evidenceTarget(trial);
+/**
+ * How a decision model's trials escalate in production (declined, or any operational failure), and
+ * the confidence cascade: each escalated trial replaced by the fallback's trial for the same case
+ * and trial number. The fallback is the next triage model in the routing policy (n/a without one,
+ * or without its trials in this run); escalated trials it lacks count as failures.
+ */
+function escalation(trials: EvalTrial[], modelId: string, fallbackModel: string | undefined) {
+  const key = (t: EvalTrial) => `${t.caseId}#${t.trial}`;
+  const scored = (id: string) => trials.filter((t) => candidateOf(t) === id && scoredTrial(t));
+  const cost = (t: EvalTrial) => t.details.cache?.costUsd ?? t.costUsd;
+  const latency = (t: EvalTrial) => t.details.cache?.durationMs ?? t.durationMs;
+  const own = scored(modelId);
+  const escalated = own.filter((t) => t.status !== "ok" || t.details.invocationStatus !== "ok");
+  const declined = escalated.filter((t) => t.details.invocationStatus === "declined").length;
+  const summary = {
+    trials: own.length,
+    escalated: escalated.length,
+    declined,
+    failed: escalated.length - declined,
+    thresholds: [...new Set(own.flatMap((t) => t.details.decisionConfidence ?? []))],
+  };
+  if (!fallbackModel) return { ...summary, cascade: null };
+  const fallback = new Map(scored(fallbackModel).map((t) => [key(t), t]));
+  const replaced = escalated.flatMap((t) => fallback.get(key(t)) ?? []);
+  const perTrial = (total: number) => (own.length && fallback.size ? total / own.length : null);
+  const passes = own.filter((t) => (escalated.includes(t) ? fallback.get(key(t))?.pass : t.pass)).length;
+  return {
+    ...summary,
+    cascade: {
+      fallbackModel,
+      passes: fallback.size ? passes : null,
+      missing: escalated.length - replaced.length,
+      passRate: perTrial(passes),
+      costPerTrialUsd: perTrial([...own, ...replaced].reduce((n, t) => n + cost(t), 0)),
+      latencyPerTrialMs: perTrial([...own, ...replaced].reduce((n, t) => n + latency(t), 0)),
+    },
+  };
+}
+export function summarize(
+  run: EvalRun,
+  trials: EvalTrial[],
+  { cascadeFallback, ...options }: StatsOptions & { cascadeFallback?: string } = {},
+) {
   const settings = statsOptions(options);
-  const targets = [
+  const declared = run.systems?.map((system) => system.name) ?? run.models;
+  const candidates = [
     ...new Set([
-      ...trials.map(evidenceTarget),
-      ...run.models.filter((id) => !trials.some((t) => recordedTarget(t) === id)),
+      ...trials.map(candidateOf),
+      ...declared.filter((id) => !trials.some((t) => (t.details.system ?? recordedTarget(t)) === id)),
     ]),
   ];
-  const summaries = targets.map((modelId) => {
-    const rows = trials.filter((t) => evidenceTarget(t) === modelId);
+  const summaries = candidates.map((candidate) => {
+    const rows = trials.filter((t) => candidateOf(t) === candidate);
+    const system = run.systems?.find((s) => s.name === candidate) ?? null;
+    const first = rows[0];
     const evaluated = rows.filter(scoredTrial);
     const passes = evaluated.filter((t) => t.pass).length;
     const risk = rows.flatMap((t) =>
@@ -244,7 +291,9 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
       .sort((a, b) => a - b);
     const middle = Math.floor(latency.length / 2);
     return {
-      modelId,
+      candidate,
+      modelId: first ? evidenceTarget(first) : (system?.finders[0]?.target ?? candidate),
+      system,
       effort: rows[0]?.effort ?? null,
       ...roleMetrics(run, rows),
       ...(run.role === "implement"
@@ -285,15 +334,18 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
     .filter((m) => m.passRate !== null)
     .sort(
       (a, b) =>
-        (b.passRate ?? 0) - (a.passRate ?? 0) || (a.modelId < b.modelId ? -1 : a.modelId > b.modelId ? 1 : 0),
+        (b.passRate ?? 0) - (a.passRate ?? 0) ||
+        (a.candidate < b.candidate ? -1 : a.candidate > b.candidate ? 1 : 0),
     )[0];
   const bestCases = completeCases(
-    trials.filter((t) => evidenceTarget(t) === best?.modelId),
+    trials.filter((t) => candidateOf(t) === best?.candidate),
     run.k,
   );
+  const decides = (candidate: string) =>
+    trials.some((t) => candidateOf(t) === candidate && t.harness === "decisions");
   return summaries.map((summary) => {
     const candidate = completeCases(
-      trials.filter((t) => evidenceTarget(t) === summary.modelId),
+      trials.filter((t) => candidateOf(t) === summary.candidate),
       run.k,
     );
     const differences: number[] = [];
@@ -306,8 +358,9 @@ export function summarize(run: EvalRun, trials: EvalTrial[], options: StatsOptio
     }
     return {
       ...summary,
+      escalation: decides(summary.candidate) ? escalation(trials, summary.candidate, cascadeFallback) : null,
       comparison: {
-        bestModel: best?.modelId ?? null,
+        bestModel: best?.candidate ?? null,
         candidateCompleteCases: candidate.size,
         bestCompleteCases: bestCases.size,
         ...pairedBootstrap(differences, settings),

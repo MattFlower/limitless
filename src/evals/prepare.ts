@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { DEFAULT_DECISION_CONFIDENCE } from "../config.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { diffSince, readFileAt } from "../git/repos.ts";
@@ -7,6 +8,7 @@ import { readingTimeout } from "../pipeline/engine.ts";
 import { triagePrompt, verifyPrompt } from "../pipeline/prompts.ts";
 import { type ReviewInput, reviewRequest } from "../pipeline/review.ts";
 import { ReviewSchema, StoredReviewSchema, TriageSchema, VerifySchema } from "../pipeline/schemas.ts";
+import { triageDecisions } from "../pipeline/triage-decisions.ts";
 import { sh } from "../util/proc.ts";
 import type { EvalCase, ImplementCase, ReviewCase } from "./cases.ts";
 import { gradeReview } from "./graders/review.ts";
@@ -59,12 +61,16 @@ export async function prepareCase(
   patch: string | undefined,
   signal: AbortSignal,
   implementerReportMode: "include" | "omit" = "include",
+  decisionConfidence = DEFAULT_DECISION_CONFIDENCE,
 ) {
-  if ("prompt" in item)
+  if ("prompt" in item) {
+    const input = { repoSlug: item.repo, prompt: item.prompt, tree };
     return {
-      prompt: triagePrompt({ repoSlug: item.repo, prompt: item.prompt, tree }),
+      prompt: triagePrompt(input),
       timeoutMs: 5 * 60_000,
+      decisionTask: triageDecisions(input, decisionConfidence),
     };
+  }
   if (patch !== undefined) {
     await sh(["git", "apply", "--index", "-"], { cwd, stdin: patch, signal });
     await sh(

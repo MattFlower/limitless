@@ -1,4 +1,4 @@
-import type { Effort, EvalRun, EvalTrial } from "../core/types.ts";
+import type { Effort, EvalRun, EvalTrial, ReviewSystem } from "../core/types.ts";
 import type { ModelDef, Policy, ProviderDef } from "../router/catalog.ts";
 import type { PolicyOverlay } from "../router/policy.ts";
 import { effortTransportError, evidenceTarget, parseTarget, recordedTarget } from "../router/targets.ts";
@@ -18,6 +18,8 @@ export interface PolicyInput {
   providers: ProviderDef[];
   settings: EvalSettings;
   evalIds?: string[];
+  /** Production's `[review] implementer_report` (default "include"); see `selectEvidence`. */
+  implementerReport?: ReviewSystem["implementerReport"];
   /** B1 paired recovery comparison, when available from the escalation eval. */
   escalation?: {
     complexity: ImplementComplexity;
@@ -32,7 +34,11 @@ export interface PolicyInput {
 }
 const compareId = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 /** Newest completed evidence independently for each role/model; explicit IDs are fail-closed. */
-export function selectEvidence(evidence: Evidence[], ids?: string[]) {
+export function selectEvidence(
+  evidence: Evidence[],
+  ids?: string[],
+  implementerReport: ReviewSystem["implementerReport"] = "include",
+) {
   if (ids !== undefined) {
     if (!ids.length || ids.some((id) => !id.trim())) throw new Error("--evals requires nonempty eval IDs");
     for (const id of ids) {
@@ -51,16 +57,26 @@ export function selectEvidence(evidence: Evidence[], ids?: string[]) {
         compareId(b.run.id, a.run.id),
     );
   for (const entry of ordered) {
+    // Routing picks production's reviewer, so only systems reviewing the way production does count.
+    // Submission rejects duplicate configurations, which leaves at most one such system per target.
+    const systems = entry.run.systems?.filter(
+      (s) => s.mode === "single" && s.implementerReport === implementerReport,
+    );
+    const counted = new Set(systems?.map((s) => s.name));
     const scopes = entry.run.role === "implement" ? IMPLEMENT_COMPLEXITIES : [undefined];
     for (const complexity of scopes) {
       const trials = complexity
         ? entry.trials.filter((t) => t.details.complexity === complexity)
-        : entry.trials;
+        : entry.trials.filter((t) => t.details.system === undefined || counted.has(t.details.system));
       const targets = complexity
         ? trials.map(evidenceTarget)
         : [
             ...trials.map(evidenceTarget),
-            ...entry.run.models.filter((id) => !trials.some((t) => recordedTarget(t) === id)),
+            ...entry.run.models.filter(
+              (id) =>
+                (!systems || systems.some((s) => s.finders[0]?.target === id)) &&
+                !trials.some((t) => recordedTarget(t) === id),
+            ),
           ];
       for (const modelId of new Set(targets)) {
         const key = `${entry.run.role}:${complexity ?? "default"}:${modelId}`;
@@ -105,8 +121,8 @@ function metric(
   return { name, numerator, denominator, rate, ci, direction, floor, reason };
 }
 export function generatePolicy(input: PolicyInput) {
-  const { models, providers, settings } = input;
-  const selected = selectEvidence(input.evidence, input.evalIds);
+  const { models, providers, settings, implementerReport = "include" } = input;
+  const selected = selectEvidence(input.evidence, input.evalIds, implementerReport);
   const roles = [
     ...EVAL_ROLES.map((role) => ({ role, cell: "default" as const })),
     ...IMPLEMENT_COMPLEXITIES.map((cell) => ({ role: "implement" as const, cell })),
@@ -115,7 +131,16 @@ export function generatePolicy(input: PolicyInput) {
       .filter((e) => e.run.role === role && (e.complexity ?? "default") === cell)
       .map((entry) => {
         const rows = entry.trials.filter((t) => evidenceTarget(t) === entry.modelId);
-        const summary = summarize({ ...entry.run, models: [entry.modelId] }, rows)[0];
+        const systems = entry.run.systems?.filter(
+          (s) =>
+            s.mode === "single" &&
+            s.implementerReport === implementerReport &&
+            s.finders[0]?.target === entry.modelId,
+        );
+        const summary = summarize(
+          { ...entry.run, models: [entry.modelId], systems: systems?.length ? systems : undefined },
+          rows,
+        )[0];
         if (!summary) throw new Error("Missing model summary");
         const baseId = rows[0]?.modelId ?? parseTarget(entry.modelId).modelId;
         const model = models.find((m) => m.id === baseId);
