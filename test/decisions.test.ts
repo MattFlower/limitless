@@ -239,10 +239,10 @@ test("a decision model is routable only for roles with a decisions mapping", () 
     const offline = new Router(new ProviderTracker(PROVIDERS, store, reserves, {}), policy, MODELS);
     expect(offline.route("triage", "small").skipped).toContainEqual({
       modelId: jev,
-      reason: "typesafe: missing LIMITLESS_API_KEY",
+      reason: "typesafe: missing TYPESAFE_API_KEY",
     });
 
-    const tracker = new ProviderTracker(PROVIDERS, store, reserves, { LIMITLESS_API_KEY: "k" });
+    const tracker = new ProviderTracker(PROVIDERS, store, reserves, { TYPESAFE_API_KEY: "k" });
     const router = new Router(tracker, policy, MODELS);
     const triage = router.route("triage", "small").candidates[0];
     expect(triage).toMatchObject({
@@ -277,14 +277,7 @@ test("a per-model rate limit cools down only that model, then it is routable aga
   try {
     let now = 1_000_000;
     const reserves = { claudeFiveHour: 0.8, claudeSevenDay: 0.85, codexWeekly: 0.9, codexFiveHour: 0.9 };
-    const tracker = new ProviderTracker(
-      PROVIDERS,
-      store,
-      reserves,
-      { LIMITLESS_API_KEY: "k" },
-      {},
-      () => now,
-    );
+    const tracker = new ProviderTracker(PROVIDERS, store, reserves, { TYPESAFE_API_KEY: "k" }, {}, () => now);
     tracker.record("typesafe", "quota", {
       error: "model rate-limited (HTTP 429)",
       modelCooldown: { modelId: "typesafe/jev-1.13", ms: 12_000 },
