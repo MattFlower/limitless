@@ -1,5 +1,5 @@
 import { expect, setDefaultTimeout, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { evalCommand, formatEvalReport } from "../src/cli/eval.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -90,6 +90,8 @@ evalRoles("CLI %s submits options, follows HTTP results and emits JSON", async (
     const id = printed[0];
     if (!id) throw new Error("missing id");
     expect(printed[1]).toContain("completed");
+    expect(printed[1]).toContain("concurrency=2");
+    expect(f.factory.store.getEvalRun(id)?.concurrency).toBe(2);
     expect(printed[1]).toContain("Wilson 95% CI");
     expect(printed[1]).toContain("API-equivalent");
     expect(printed[1]).toContain("paired cases=2");
@@ -356,6 +358,61 @@ test("CLI validates implement round options before submitting", async () => {
   expect(bodies[0]).toMatchObject({ rounds: 3, strategy: "effort", k: 2 });
 });
 
+test("CLI validates --concurrency, records it on the run and shows it in reports", async () => {
+  const bodies: unknown[] = [];
+  const mock = {
+    api: async <T>(_path: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return { id: "eval" } as T;
+    },
+    print: () => {},
+    wait: async () => {},
+  };
+  for (const concurrency of ["0", "-1", "1.5", "Infinity", "NaN", "", "9007199254740992"])
+    await expect(evalCommand(["run", "triage"], { models: "a", concurrency }, mock)).rejects.toThrow();
+  expect(bodies).toEqual([]);
+  const f = await evalFixture();
+  try {
+    const routes = createHttpRoutes(f.factory);
+    const printed: string[] = [];
+    const io = {
+      async api<T>(path: string, init?: RequestInit): Promise<T> {
+        const id = path.split("/").at(-1) ?? "";
+        const route =
+          path === "/api/evals"
+            ? (routes[path] as { POST: Route }).POST
+            : (routes["/api/evals/:id"] as Route);
+        const response = await route(
+          requestWithParams(
+            `http://localhost:7400${path}`,
+            { ...init, headers: { "content-type": "application/json" } },
+            { id },
+          ),
+          localServer,
+        );
+        return (await response.json()) as T;
+      },
+      print: (text: string) => printed.push(text),
+      wait: async () => {
+        for (const run of f.factory.store.listEvalRuns()) await f.factory.evals.wait(run.id);
+      },
+    };
+    await evalCommand(
+      ["run", "triage"],
+      { models: "candidate-a", k: "1", concurrency: "3", follow: true },
+      io,
+    );
+    const id = printed[0] ?? "";
+    expect(printed[1]).toContain("concurrency=3");
+    expect(f.factory.store.getEvalRun(id)?.concurrency).toBe(3);
+    printed.length = 0;
+    await evalCommand(["report", id], { json: true }, io);
+    expect(JSON.parse(printed[0] ?? "{}").run.concurrency).toBe(3);
+  } finally {
+    await f.close();
+  }
+});
+
 test("CLI entrypoint recognizes round flags", () => {
   const child = Bun.spawnSync([
     process.execPath,
@@ -369,15 +426,23 @@ test("CLI entrypoint recognizes round flags", () => {
     "3",
     "--strategy",
     "effort",
+    "--concurrency",
+    "3",
     "--help",
   ]);
   expect(child.exitCode).toBe(0);
   expect(child.stdout.toString()).toContain("--strategy retry|effort|switch");
+  expect(child.stdout.toString()).toContain("[--concurrency N]");
 });
+
+/** The committed implement pins only, so triage stays an unpinned cell these tests can update. */
+const implementPins = (text: string) =>
+  JSON.stringify(
+    Object.fromEntries(Object.entries(JSON.parse(text)).filter(([key]) => key.startsWith("implement."))),
+  );
 
 async function pinFixture(extra: [string, string][] = []) {
   const { evidence, local, subscription, response } = await import("./evals-policy-support.ts");
-  const { readFileSync } = await import("node:fs");
   const cells = ["trivial", "small", "medium"] as const;
   const implement = evidence("implement", [subscription], { id: "implement-run" });
   implement.trials.forEach((t, i) => {
@@ -391,7 +456,7 @@ async function pinFixture(extra: [string, string][] = []) {
   data.policy = overlayPolicy(DEFAULT_POLICY, JSON.parse(policy));
   const files = new Map<string, string>([
     ["routing/policy.json", policy],
-    ["routing/overrides.json", readFileSync(join(root, "routing/overrides.json"), "utf8")],
+    ["routing/overrides.json", implementPins(readFileSync(join(root, "routing/overrides.json"), "utf8"))],
     ...extra,
   ]);
   const writes: string[] = [];
@@ -553,4 +618,14 @@ test("eval regrade CLI posts to the regrade route, lists kept grades and prints 
   } finally {
     await f.close();
   }
+});
+
+test("policy CLI keeps the committed triage pin", async () => {
+  const { io, files, printed } = await pinFixture();
+  const root = join(import.meta.dir, "..");
+  files.set("routing/overrides.json", readFileSync(join(root, "routing/overrides.json"), "utf8"));
+  const committed = JSON.parse(files.get("routing/policy.json") ?? "{}");
+  await evalCommand(["policy"], { write: true }, io);
+  expect(printed.join("\n")).toContain("triage.default: pinned by owner decision (2026-09-29)");
+  expect(JSON.parse(files.get("routing/policy.json") ?? "{}")).toEqual(committed);
 });

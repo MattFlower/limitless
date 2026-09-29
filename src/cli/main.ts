@@ -12,7 +12,7 @@ Usage:
   limitless serve                         Start the daemon (API, UI, scheduler)
   limitless run "<prompt>" --repo <repo>  Queue a run (repo: owner/name or a local path)
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
-  limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--no-cache] [--follow]
+  limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
         review only: --systems <file.json> instead of --models ({"systems": [ReviewSystem, ...]})
   limitless eval report <eval-id> [--json]
@@ -174,6 +174,7 @@ async function main(): Promise<void> {
       strategy: { type: "string" },
       cases: { type: "string" },
       "max-usd": { type: "string" },
+      concurrency: { type: "string" },
       "no-cache": { type: "boolean" },
       json: { type: "boolean" },
       after: { type: "string" },

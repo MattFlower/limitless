@@ -498,6 +498,13 @@ limitless eval policy --write          # write routing/policy.json and routing/E
 - The defaults are `--k 1`, `--max-usd 1.00`, all cases, and caching on (`--no-cache` forces fresh
   calls). `--max-usd` stops *scheduling* trials once recorded metered spend reaches the threshold.
   It is not a hard billing ceiling.
+- `--concurrency N` (default 2) runs up to N trials at once per provider, capped at the provider's
+  `max_concurrent` − 1 so production work always keeps a slot (a provider with `max_concurrent = 1`
+  still allows one eval call). All running evals together share that same cap: at most the largest
+  running eval's N, and never more than `max_concurrent` − 1. Every panel finder and verifier call
+  counts against its own provider's cap. Runs recorded before this option show
+  `concurrency=1 (legacy)`. The budget is checked before each trial starts, so trials already in flight can
+  overshoot `--max-usd` by up to N−1 trials per provider.
 - Evals respect reserves, budgets and circuit breakers and share provider concurrency with runs.
   Their metered spend counts toward provider budgets.
 - `eval policy` considers the latest completed eval for each model (`--evals id,id` restricts

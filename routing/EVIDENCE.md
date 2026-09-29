@@ -106,3 +106,19 @@ The generated implement cells above (`codex/luna@medium` first) are **not adopte
 Why: the implement dataset (12 tasks) has a ceiling problem. Opus, Sol, Luna, Sonnet and Astra all scored 100%, so the pass-rate evidence only shows that these tasks are too easy to separate the models. Luna ranked first on cost alone. The owner's extensive field use says Opus is far stronger than Luna on hard, underspecified work. A weaker implementer's failures show up later, as extra review/fix rounds and escaped defects, and this eval doesn't measure either. Luna belongs in a lower tier with the local Qwen models: good on simple, well-specified tasks and poor on the hardest ones.
 
 Revisit when the implement dataset is stratified by difficulty (harder, less-specified, multi-file tasks) and the eval measures rounds-to-converge and post-merge defects as well as first-pass tests. Until then, `routing/overrides.json` pins `implement.*` so `limitless eval policy --write` keeps these chains.
+
+## Owner decision: triage = `openrouter/gpt-6-luna@medium` first (2026-09-29)
+
+The generated triage cell above (`openrouter/gpt-6-luna@none` first) is **not adopted**. Triage starts with `openrouter/gpt-6-luna@medium`, then `@low` and `@none` on the same provider, then the existing availability fallbacks in their existing order.
+
+Why: the table above comes from the 40-case development set, which is also where triage prompt wording is tuned, so it overstates every model that the wording was tuned against. The 30 held-out cases (`evals/triage/cases.json`, ids `triage-h01`..`triage-h30`, tag `holdout`), used only for routing decisions, separate the settings clearly (eval-mump7s7re29l, k=3):
+
+| Model | Pass rate (Wilson 95% CI) | Risk under-call (Wilson 95% CI) | p50 latency | Metered cost, 90 trials |
+|---|---|---|---|---|
+| `openrouter/gpt-6-luna@medium` | 78.9% (71/90) [69.4%, 86.0%] | 0.0% (0/84) [0.0%, 4.4%] | 3978 ms | $0.0191 |
+| `openrouter/gpt-6-luna@none` | 63.3% (57/90) [53.0%, 72.6%] | 6.0% (5/84) [2.6%, 13.2%] | 2451 ms | $0.0125 |
+| `typesafe/jev-1.13`, then `@none` on decline | 60.0% (54/90) | 3.6% (3/84) [1.2%, 10.0%] | 197 ms (Jev call) | $0.0047 (Jev) |
+
+`@none` is not non-inferior to `@medium` (difference -0.156, one-sided 95% lower bound -0.256), and its under-call upper bound exceeds the 10% ceiling. The extra cost of `@medium` is about $0.0001 per run.
+
+The fallbacks after `@medium` were not measured on the held-out set; they run only when an earlier entry is unavailable or fails. `routing/overrides.json` pins `triage.default` so `limitless eval policy --write` keeps this chain. Revisit when the held-out set has results for the fallbacks or for a new candidate.

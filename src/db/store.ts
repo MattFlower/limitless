@@ -25,6 +25,7 @@ import type {
   StageStatus,
   StreamMessage,
 } from "../core/types.ts";
+import { DEFAULT_EVAL_CONCURRENCY } from "../core/types.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
 type Row = Record<string, unknown>;
@@ -68,6 +69,7 @@ const toEvalRun = (r: Row): EvalRun => ({
   models: parse(r.models, []),
   k: r.k as number,
   maxUsd: r.max_usd as number,
+  ...(r.concurrency == null ? {} : { concurrency: r.concurrency as number }),
   status: r.status as EvalRun["status"],
   createdAt: r.created_at as number,
   finishedAt: r.finished_at as number | null,
@@ -305,13 +307,17 @@ export class Store {
   }
 
   createEvalRun(
-    input: Pick<EvalRun, "role" | "models" | "k" | "maxUsd" | "rounds" | "strategy" | "systems">,
+    input: Pick<
+      EvalRun,
+      "role" | "models" | "k" | "maxUsd" | "rounds" | "strategy" | "systems" | "concurrency"
+    >,
     trials: EvalTrial[],
   ): EvalRun {
     const run: EvalRun = {
       ...input,
       rounds: input.rounds ?? 1,
       strategy: input.strategy ?? "retry",
+      concurrency: input.concurrency ?? DEFAULT_EVAL_CONCURRENCY,
       id: newId("eval-"),
       status: "queued",
       createdAt: Date.now(),
@@ -335,6 +341,9 @@ export class Store {
       this.db
         .query("INSERT INTO eval_run_options VALUES (?, ?, ?)")
         .run(run.id, run.rounds ?? 1, run.strategy ?? "retry");
+      this.db
+        .query("INSERT INTO eval_run_concurrency VALUES (?, ?)")
+        .run(run.id, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY);
       if (run.systems)
         this.db.query("INSERT INTO eval_run_systems VALUES (?, ?)").run(run.id, JSON.stringify(run.systems));
       for (const trial of trials) this.recordEvalTrial({ ...trial, evalRunId: run.id });
@@ -352,7 +361,7 @@ export class Store {
   getEvalRun(id: string): EvalRun | null {
     const row = this.db
       .query(
-        "SELECT eval_runs.*, rounds, strategy, systems_json FROM eval_runs LEFT JOIN eval_run_options o ON o.eval_run_id = id LEFT JOIN eval_run_systems s ON s.eval_run_id = id WHERE id = ?",
+        "SELECT eval_runs.*, rounds, strategy, systems_json, concurrency FROM eval_runs LEFT JOIN eval_run_options o ON o.eval_run_id = id LEFT JOIN eval_run_systems s ON s.eval_run_id = id LEFT JOIN eval_run_concurrency c ON c.eval_run_id = id WHERE id = ?",
       )
       .get(id) as Row | null;
     return row ? toEvalRun(row) : null;
@@ -362,7 +371,7 @@ export class Store {
     return (
       this.db
         .query(
-          "SELECT eval_runs.*, rounds, strategy, systems_json FROM eval_runs LEFT JOIN eval_run_options o ON o.eval_run_id = id LEFT JOIN eval_run_systems s ON s.eval_run_id = id ORDER BY created_at DESC, id DESC",
+          "SELECT eval_runs.*, rounds, strategy, systems_json, concurrency FROM eval_runs LEFT JOIN eval_run_options o ON o.eval_run_id = id LEFT JOIN eval_run_systems s ON s.eval_run_id = id LEFT JOIN eval_run_concurrency c ON c.eval_run_id = id ORDER BY created_at DESC, id DESC",
         )
         .all() as Row[]
     ).map(toEvalRun);
