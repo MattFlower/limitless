@@ -302,3 +302,19 @@ test("a per-model rate limit cools down only that model, then it is routable aga
     store.close();
   }
 });
+
+test("a decline keeps the mapped output and the cost, with the reason as the error", async () => {
+  const result = await runDecisions(
+    spec({
+      decisionTask: { ...task, decline: (a) => (a.urgent ? { reason: "unsure", lastResort: true } : null) },
+    }),
+  );
+  expect(result).toMatchObject({
+    status: "declined",
+    error: "unsure",
+    decline: { reason: "unsure", lastResort: true },
+    costUsd: 0.042,
+  });
+  expect(result.structured).toMatchObject({ mapped: { kind: { choice: "bug" } } });
+  expect(JSON.parse(result.finalText)).toMatchObject({ urgent: { noul: 0.2 } });
+});

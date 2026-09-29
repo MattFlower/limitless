@@ -105,6 +105,14 @@ export class Router {
     );
   }
 
+  /** Where a declined decision falls through to: the role's first policy target that isn't a decision model. */
+  decisionFallback(role: Role): string | undefined {
+    const target = this.policyTargets(role, "small").find(
+      (t) => this.tracker.def(this.models.get(t.modelId)?.provider ?? "")?.harness !== "decisions",
+    );
+    return target && formatTarget(target.modelId, target.effort);
+  }
+
   describeFallback(provider: string, exhausted: boolean): string {
     const alternatives = new Set<string>();
     const effortAlternatives = new Set<string>();
