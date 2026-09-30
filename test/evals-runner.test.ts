@@ -10,7 +10,7 @@ import { selectHarness } from "../src/harness/select.ts";
 import { FACTORY_PREAMBLE, triagePrompt } from "../src/pipeline/prompts.ts";
 import { TriageSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 import { sh } from "../src/util/proc.ts";
-import { answer, deferred, evalFixture } from "./evals-support.ts";
+import { answer, deferred, evalFixture, verifierModel } from "./evals-support.ts";
 
 test("3 cases x 2 exact models x k=2 use pinned bare inputs and shared invocation semantics", async () => {
   const f = await evalFixture();
@@ -1061,6 +1061,56 @@ test("a resumed run keeps its submitted dataset; a legacy run without one is not
       error: "interrupted by daemon restart; submit a new eval to reuse completed trials",
     });
     expect(f.factory.store.listEvalTrials(legacy.id)[0]?.status).toBe("skipped");
+  } finally {
+    await f.close();
+  }
+});
+
+test("a resumed review keeps the configured roster expanded at submission", async () => {
+  const { reviewCase } = await import("./evals-reading-support.ts");
+  const f = await evalFixture([verifierModel]);
+  try {
+    f.cfg.reviewRosters.quick = [{ prompt: "careful" }];
+    writeFileSync(
+      f.casePath,
+      JSON.stringify({
+        role: "review",
+        version: 1,
+        cases: [{ ...reviewCase, base: f.sha, head: f.sha }],
+      }),
+    );
+    f.respond(() => ({
+      structured: {
+        verdict: "approve",
+        summary: "Checked the changed code and its callers; no defects found.",
+        findings: [],
+      },
+    }));
+    const stalled = stallAcquire(f, 0);
+    const run = f.factory.evals.submit({
+      role: "review",
+      systems: [
+        {
+          name: "configured",
+          roster: "quick",
+          implementerReport: "include",
+          targets: ["candidate-a"],
+          verifier: { target: "verifier-c" },
+        },
+      ],
+      k: 1,
+    });
+    await stalled;
+    expect(run.systems?.[0]?.finders).toEqual([{ prompt: "careful", target: "candidate-a" }]);
+    f.cfg.reviewRosters.quick = [{ prompt: "adversarial" }, { prompt: "standard" }];
+    f.crash();
+    f.factory.start();
+    await f.factory.evals.wait(run.id);
+    const report = f.factory.evals.report(run.id);
+    expect(report?.run).toMatchObject({ id: run.id, status: "completed", systems: run.systems });
+    expect(report?.trials[0]).toMatchObject({ status: "ok", details: { resumed: true } });
+    expect(f.calls).toHaveLength(1);
+    expect(f.factory.store.evalCallAttempts(run.id)).toHaveLength(1);
   } finally {
     await f.close();
   }

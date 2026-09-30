@@ -263,6 +263,24 @@ export interface ProviderStatus {
   inFlight: number;
   maxConcurrent: number;
   updatedAt: number;
+  /** Latest confined-reader sandbox probe of the provider's CLI (Codex). */
+  confinement?: ConfinementProbe;
+}
+
+/** Fixed probe diagnostics: the CLI's own output can echo config, including tokens. */
+export type ConfinementFailure =
+  | "reader profile not enforced"
+  | "probe inconclusive"
+  | "probe timed out"
+  | "codex sandbox failed to start";
+
+/** Whether a CLI's sandbox let a confined reader read its cwd but denied every private root. */
+export interface ConfinementProbe {
+  ok: boolean;
+  path: string | null;
+  version: string | null;
+  reason: ConfinementFailure | null;
+  exitCode: number | null;
 }
 
 export interface QuotaAlert {
@@ -381,6 +399,20 @@ export type FinderPrompt = "standard" | "adversarial" | "careful";
 export interface ReviewFinder {
   target?: string;
   prompt: FinderPrompt;
+  /** A lens finder: the standard prompt plus this focus. */
+  lens?: ReviewLens;
+  /** Routed finders avoid the implementer's vendor (`cross`); `implementer` is a fresh session from its family. */
+  family?: "cross" | "implementer";
+  /** Only a local (free) model, under a shorter timeout; skipped when none answers. */
+  local?: boolean;
+}
+export interface ReviewLens {
+  name: string;
+  focus: string;
+}
+/** A lens from the base commit's `.limitless.toml`, added as a finder in the listed profiles. */
+export interface RepoReviewLens extends ReviewLens {
+  profiles: ResolvedProfile[];
 }
 /** How a review is performed: one finder (`single`), or finders whose candidates a verifier checks (`panel`). */
 export interface ReviewSystem {

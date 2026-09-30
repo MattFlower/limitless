@@ -216,4 +216,26 @@ test("provider card renders each window's label, bar, and full-width details in 
     );
   }
   expect(html.match(/class="gauge-details"/g)).toHaveLength(3);
+  expect(html).not.toContain("Confined readers");
+
+  const codex = (confinement: ProviderStatus["confinement"]) =>
+    renderToString(() => ProviderCard({ provider: { ...status, id: "codex", label: "Codex", confinement } }))
+      .replace(/<!--[^>]*-->/g, "")
+      .replace(/\s+/g, " ");
+  const reason = "reader profile not enforced";
+  expect(
+    codex({ ok: false, path: "/old/bin/codex", version: "codex-cli 0.154.0", reason, exitCode: 0 }),
+  ).toContain(`Confined readers skip this provider: ${reason} (/old/bin/codex, codex-cli 0.154.0, exit 0)`);
+  expect(
+    codex({ ok: false, path: null, version: null, reason: "codex sandbox failed to start", exitCode: null }),
+  ).toContain("Confined readers skip this provider: codex sandbox failed to start (no CLI)");
+  expect(
+    codex({
+      ok: true,
+      path: "/opt/homebrew/bin/codex",
+      version: "codex-cli 0.157.1",
+      reason: null,
+      exitCode: 0,
+    }),
+  ).not.toContain("Confined readers");
 });

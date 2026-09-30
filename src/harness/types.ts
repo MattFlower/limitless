@@ -1,5 +1,5 @@
 import type { ZodType } from "zod";
-import type { Billing, Effort, InvocationStatus, QuotaWindow } from "../core/types.ts";
+import type { Billing, ConfinementProbe, Effort, InvocationStatus, QuotaWindow } from "../core/types.ts";
 import type { DecisionDecline, DecisionTask } from "./decisions.ts";
 
 /** A concrete model on a concrete provider, as chosen by the router. */
@@ -108,6 +108,8 @@ export interface AgentResult {
    * however much they already report; spend that must be bounded treats such a call as unknown.
    */
   usageFinal?: boolean;
+  /** A confined reader's sandbox probe; when not ok, the agent never started. */
+  confinement?: ConfinementProbe;
 }
 
 export type Harness = (spec: AgentSpec) => Promise<AgentResult>;

@@ -17,6 +17,7 @@ import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
 import {
   combined,
+  FinderSkipped,
   panelIdentity,
   type ReviewRequest,
   runReview,
@@ -103,7 +104,7 @@ export class EvalRunner {
     const parsed = EvalRequestSchema.parse(input);
     const casePath = this.casePath ?? defaultCasePath(parsed.role);
     const { raw, file } = readRoleCases(parsed.role, casePath);
-    const { request, cases } = validateRequest(input, file, this.deps.router);
+    const { request, cases } = validateRequest(input, file, this.deps.router, this.deps.cfg.reviewRosters);
     const dataset = readDataset(raw, file, cases, casePath);
     const trials: EvalTrial[] = [];
     const candidates =
@@ -878,7 +879,12 @@ export class EvalRunner {
                     {
                       invoke: async (request, finder) => {
                         const to = finder > 0 ? panelTargets?.finders[finder - 1] : undefined;
-                        if (to) return sendTo(request, to, `finder-${finder}`);
+                        // As in production, a local finder that cannot run is skipped, not a failed panel.
+                        if (to)
+                          return sendTo(request, to, `finder-${finder}`).catch((error: Error) => {
+                            if (signal.aborted || !system?.finders[finder]?.local) throw error;
+                            throw new FinderSkipped(error.message);
+                          });
                         try {
                           own = await send(request);
                           spent.push(own);
@@ -890,13 +896,12 @@ export class EvalRunner {
                         }
                         return { result: own, target };
                       },
-                      verify: async (request, avoidVendors) => {
+                      verify: async (request, _avoidVendors, avoidModels) => {
                         if (!panelTargets) throw new Error("review system has no verifier");
-                        const { modelId, vendor } = panelTargets.verifier;
-                        if (avoidVendors.includes(vendor))
-                          throw new Error(
-                            `verifier ${modelId} shares vendor ${vendor} with a finder it checks`,
-                          );
+                        // A shared vendor is allowed and recorded by the panel, as in production.
+                        const { modelId } = panelTargets.verifier;
+                        if (avoidModels.includes(modelId))
+                          throw new Error(`verifier ${modelId} raised a candidate it would check`);
                         return sendTo(request, panelTargets.verifier, `verifier-${++verifications}`);
                       },
                     },

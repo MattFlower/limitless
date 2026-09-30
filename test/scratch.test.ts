@@ -1,9 +1,10 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -11,11 +12,19 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
-import { buildCodexArgs, runCodex } from "../src/harness/codex.ts";
+import {
+  buildCodexArgs,
+  type CanaryClasses,
+  CodexReaderProbe,
+  canaryRoots,
+  type ReaderProbeOptions,
+  runCodex,
+} from "../src/harness/codex.ts";
 import {
   createScratch,
+  privateReadRoots,
   removeScratch,
   SCRATCH_NAME,
   scratchEnv,
@@ -23,7 +32,7 @@ import {
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
-import type { ProcOptions, ProcResult } from "../src/util/proc.ts";
+import type { ProcOptions, ProcResult, runProcess } from "../src/util/proc.ts";
 
 const specFor = (cwd: string, scratchDir: string): AgentSpec => ({
   cwd,
@@ -303,10 +312,940 @@ test.skipIf(codexSkip !== null)(
   },
 );
 
+const CODEX = "/opt/codex/bin/codex";
+const SECRET = "sk-live-SENTINEL-4242";
+const denies = (file: string) => ({
+  exitCode: 1,
+  stderr: `cat: ${file}: Operation not permitted\n${SECRET}\n`,
+});
+const reads = (file: string) => ({ exitCode: 0, stdout: readFileSync(file, "utf8") });
+type Sandbox = (
+  file: string,
+  opts: ProcOptions,
+) => Partial<ProcResult> | Error | Promise<Partial<ProcResult> | Error>;
+/** An enforcing sandbox: the probe's cwd is readable, anything else is a permission denial. */
+const enforcing: Sandbox = (file, opts) => (file.startsWith(`${opts.cwd}/`) ? reads(file) : denies(file));
+
+const cleanups: (() => void)[] = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
+});
+
+interface SandboxRead {
+  file: string;
+  existed: boolean;
+  access: string;
+  cwd: string;
+  cmd: string[];
+  codexHome: string | undefined;
+  homeEmpty: boolean;
+  /** The production reader profile for the probe's cwd and scratch. */
+  built: string[];
+}
+
+/**
+ * A fake Codex CLI: `--version`, `sandbox` reads answered by `sandbox`, and a completing `exec`.
+ * Its private roots are distinct directories standing in for /tmp, the system TMPDIR, home and
+ * /var/tmp, whatever the host's layout; `nestedTmpdir` puts TMPDIR under /tmp, as `TMPDIR=/tmp/x`
+ * does, and hands the roots to the production selector.
+ */
+function fakeCodex(sandbox: Sandbox = enforcing, options: ReaderProbeOptions = {}, nestedTmpdir = false) {
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "probe-roots-")));
+  cleanups.push(() => rmSync(parent, { recursive: true, force: true }));
+  const roots = {
+    tmp: join(parent, "slash-tmp"),
+    TMPDIR: join(parent, nestedTmpdir ? "slash-tmp/var-folders" : "var-folders"),
+    home: join(parent, "home"),
+    varTmp: join(parent, "var-tmp"),
+  };
+  for (const dir of Object.values(roots)) mkdirSync(dir, { recursive: true });
+  const classes: CanaryClasses = { tmp: roots.tmp, tmpdir: roots.TMPDIR, home: roots.home };
+  const cli = {
+    path: CODEX as string | null,
+    version: "codex-cli 0.157.1",
+    lookup: null as Partial<ProcResult> | Error | null,
+  };
+  const calls: string[][] = [];
+  const execs: ProcOptions[] = [];
+  const sandboxReads: SandboxRead[] = [];
+  const runner = async (opts: ProcOptions): Promise<ProcResult> => {
+    calls.push(opts.cmd);
+    if (opts.cmd[1] === "--version") {
+      if (cli.lookup instanceof Error) throw cli.lookup;
+      return { ...procResult, stdout: `${cli.version}\n`, ...cli.lookup };
+    }
+    if (opts.cmd[1] === "sandbox") {
+      const file = opts.cmd.at(-1) ?? "";
+      const codexHome = opts.env.CODEX_HOME;
+      sandboxReads.push({
+        file,
+        existed: existsSync(file),
+        access: codexAccess(opts.cmd, file),
+        cwd: opts.cwd,
+        cmd: opts.cmd,
+        codexHome,
+        homeEmpty: !!codexHome && readdirSync(codexHome).length === 0,
+        built: profileArgs(
+          buildCodexArgs({ ...specFor(opts.cwd, writeGrant(opts.cmd)), confineReads: true }),
+        ),
+      });
+      await Bun.sleep(1);
+      const out = await sandbox(file, opts);
+      if (out instanceof Error) throw out;
+      return { ...procResult, ...out };
+    }
+    execs.push(opts);
+    opts.onStdoutLine?.('{"type":"turn.completed","usage":{}}');
+    return procResult;
+  };
+  const probe = new CodexReaderProbe(() => cli.path, {
+    canaryRoots: () => (nestedTmpdir ? canaryRoots(Object.values(roots), classes) : Object.values(roots)),
+    ...options,
+  });
+  /** Probe attempts that ran to the cwd control, i.e. complete ones. */
+  const probes = () => sandboxReads.filter((r) => r.file.startsWith(`${r.cwd}/`)).length;
+  return { cli, calls, execs, sandboxReads, roots, classes, runner, probe, probes };
+}
+const profileArgs = (cmd: string[] = []) =>
+  cmd.filter((arg, i) => cmd[i - 1] === "-c" && /permissions/.test(arg));
+const writeGrant = (cmd: string[]) =>
+  JSON.parse(
+    profileArgs(cmd)
+      .join("")
+      .match(/("(?:[^"\\]|\\.)*")="write"/)?.[1] ?? '""',
+  ) as string;
+
+test("an enforcing CLI runs exec only after a readable cwd and a denial in every private root", async () => {
+  const { cwd, scratch, spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  try {
+    const result = await runCodex(spec, fake.runner, fake.probe);
+    expect(result.status).toBe("ok");
+    expect(result.usageFinal).toBe(true);
+    expect(result.confinement).toEqual({
+      ok: true,
+      path: CODEX,
+      version: "codex-cli 0.157.1",
+      reason: null,
+      exitCode: 0,
+    });
+    expect(fake.calls.map((cmd) => cmd.slice(0, 2))).toEqual([
+      [CODEX, "--version"],
+      ...Array(5).fill([CODEX, "sandbox"]),
+      [CODEX, "exec"],
+    ]);
+    const negatives = fake.sandboxReads.slice(0, 4);
+    const positive = fake.sandboxReads[4];
+    if (!positive) throw new Error("no cwd control");
+    for (const root of Object.values(fake.roots))
+      expect(negatives.filter((r) => r.file.startsWith(`${root}/`))).toHaveLength(1);
+    for (const read of negatives) {
+      expect(read.existed).toBe(true);
+      expect(read.access).toBe("none");
+      expect(read.file.startsWith(`${read.cwd}/`)).toBe(false);
+      expect(read.file.startsWith(`${writeGrant(read.cmd)}/`)).toBe(false);
+    }
+    expect(positive).toMatchObject({ existed: true, access: "read" });
+    expect(positive.file.startsWith(`${positive.cwd}/`)).toBe(true);
+    // The probe's own cwd and scratch, not the caller's; the profile comes from the production builder.
+    expect([positive.cwd, writeGrant(positive.cmd)]).not.toContain(realpathSync(cwd));
+    expect(writeGrant(positive.cmd)).not.toBe(realpathSync(scratch));
+    for (const read of fake.sandboxReads) {
+      expect(profileArgs(read.cmd)).toEqual(read.built);
+      expect(read.cmd).not.toContain("--ignore-user-config");
+      expect(read.codexHome).toBe(positive.codexHome);
+      expect(read.homeEmpty).toBe(true);
+    }
+    expect(positive.codexHome).not.toBe(process.env.CODEX_HOME);
+    expect(positive.codexHome).not.toBe(join(homedir(), ".codex"));
+    expect(profileArgs(fake.calls.at(-1))).toEqual(profileArgs(buildCodexArgs(spec)));
+    expect(fake.execs[0]?.env.CODEX_HOME).toBe(process.env.CODEX_HOME);
+    // Probe-owned files are gone; the roots and the caller's files are not.
+    for (const read of fake.sandboxReads) expect(existsSync(dirname(read.file))).toBe(false);
+    expect(existsSync(positive.codexHome ?? "")).toBe(false);
+    expect(existsSync(writeGrant(positive.cmd))).toBe(false);
+    for (const root of Object.values(fake.roots)) expect(existsSync(root)).toBe(true);
+    expect(readFileSync(join(cwd, "base.txt"), "utf8")).toBe("base\n");
+    expect(existsSync(scratch)).toBe(true);
+  } finally {
+    cleanup();
+  }
+});
+
+const inRoot = (root: string, file: string) => file.startsWith(`${root}/`);
+const deferred = () => Promise.withResolvers<void>();
+
+for (const [name, sandbox, reason] of [
+  [
+    "codex 0.154.0: denies home and TMPDIR, allows /tmp",
+    (f: string, o: ProcOptions) => (f.includes("/slash-tmp/") ? reads(f) : enforcing(f, o)),
+    "reader profile not enforced",
+  ],
+  [
+    "readable home canary",
+    (f: string, o: ProcOptions) => (f.includes("/home/") ? reads(f) : enforcing(f, o)),
+    "reader profile not enforced",
+  ],
+  [
+    "private canary leaked despite a nonzero exit",
+    (f: string, o: ProcOptions) => (inRoot(o.cwd, f) ? reads(f) : { ...reads(f), exitCode: 1 }),
+    "reader profile not enforced",
+  ],
+  [
+    "enforces /tmp, TMPDIR and home but allows /var/tmp",
+    (f: string, o: ProcOptions) => (f.includes("/var-tmp/") ? reads(f) : enforcing(f, o)),
+    "reader profile not enforced",
+  ],
+  [
+    "clean exit without output on a private canary",
+    () => ({ exitCode: 0, stdout: SECRET }),
+    "probe inconclusive",
+  ],
+  [
+    "denial of a suffixed filename",
+    (f: string, o: ProcOptions) => (inRoot(o.cwd, f) ? reads(f) : denies(`${f}.backup`)),
+    "probe inconclusive",
+  ],
+  [
+    "denial of a prefixed filename",
+    (f: string, o: ProcOptions) => (inRoot(o.cwd, f) ? reads(f) : denies(`/x${f}`)),
+    "probe inconclusive",
+  ],
+  [
+    "denial naming a directory that contains the canary",
+    (f: string, o: ProcOptions) => (inRoot(o.cwd, f) ? reads(f) : denies(`/unrelated directory ${f}`)),
+    "probe inconclusive",
+  ],
+  [
+    "denial of a differently cased canary",
+    (f: string, o: ProcOptions) =>
+      inRoot(o.cwd, f) ? reads(f) : denies(f.replace(/canary\.txt$/, "CANARY.TXT")),
+    "probe inconclusive",
+  ],
+  [
+    "unrelated permission error on the canary's line",
+    (f: string, o: ProcOptions) =>
+      inRoot(o.cwd, f)
+        ? reads(f)
+        : { exitCode: 1, stderr: `cat: ${f}: Is a directory (/etc/x: Permission denied)` },
+    "probe inconclusive",
+  ],
+  ["timed out after leaking a canary", (f: string) => ({ ...reads(f), timedOut: true }), "probe timed out"],
+  [
+    "signalled after leaking a canary",
+    (f: string) => ({ ...reads(f), exitCode: null, signal: "SIGKILL" }),
+    "probe inconclusive",
+  ],
+  ["denies every read, including the cwd", denies, "probe inconclusive"],
+  [
+    "ENOENT on an existing canary",
+    (f: string, o: ProcOptions) =>
+      f.includes("/slash-tmp/")
+        ? { exitCode: 1, stderr: `cat: ${f}: No such file or directory ${SECRET}` }
+        : enforcing(f, o),
+    "probe inconclusive",
+  ],
+  [
+    "ENOENT reported alongside a denial",
+    (f: string, o: ProcOptions) =>
+      inRoot(o.cwd, f)
+        ? reads(f)
+        : { exitCode: 1, stderr: `cat: ${f}: Permission denied\ncat: ${f}: No such file or directory` },
+    "probe inconclusive",
+  ],
+  [
+    "another path denied",
+    (f: string, o: ProcOptions) => (inRoot(o.cwd, f) ? reads(f) : denies("/x")),
+    "probe inconclusive",
+  ],
+  [
+    "unrelated error",
+    () => ({ exitCode: 2, stderr: `error: unexpected argument '-c' ${SECRET}` }),
+    "probe inconclusive",
+  ],
+  [
+    "malformed output",
+    () => ({ exitCode: 1, stdout: `\u0000{${SECRET}`, stderr: "garbage" }),
+    "probe inconclusive",
+  ],
+  [
+    "signalled denial",
+    (f: string) => ({ exitCode: null, signal: "SIGKILL", stderr: denies(f).stderr }),
+    "probe inconclusive",
+  ],
+  [
+    "cwd control missing",
+    (f: string, o: ProcOptions) =>
+      inRoot(o.cwd, f) ? { exitCode: 1, stderr: `cat: ${f}: No such file or directory` } : denies(f),
+    "probe inconclusive",
+  ],
+  [
+    "cwd control returns other contents",
+    (f: string, o: ProcOptions) =>
+      inRoot(o.cwd, f) ? { exitCode: 0, stdout: `canary-other ${SECRET}` } : denies(f),
+    "probe inconclusive",
+  ],
+  [
+    "timeout",
+    (f: string) => ({ exitCode: null, timedOut: true, stderr: denies(f).stderr }),
+    "probe timed out",
+  ],
+  [
+    "idle timeout",
+    (f: string) => ({ exitCode: 1, idleTimedOut: true, stderr: denies(f).stderr }),
+    "probe timed out",
+  ],
+  ["sandbox startup", () => new Error(`spawn EACCES ${SECRET}`), "codex sandbox failed to start"],
+] as const)
+  test(`confined codex exec never starts when the probe fails: ${name}`, async () => {
+    const { spec, cleanup } = confinedFixture();
+    const fake = fakeCodex(sandbox as Sandbox);
+    try {
+      const result = await runCodex(spec, fake.runner, fake.probe);
+      expect(result.status).toBe("unavailable");
+      expect(result.confinement).toMatchObject({
+        ok: false,
+        path: CODEX,
+        version: "codex-cli 0.157.1",
+        reason,
+      });
+      expect(result.error).toContain(reason);
+      expect(JSON.stringify(result)).not.toContain(SECRET);
+      expect(JSON.stringify(result)).not.toContain("canary-");
+      expect(fake.execs).toHaveLength(0);
+      for (const read of fake.sandboxReads) {
+        expect(read.existed).toBe(true);
+        expect(existsSync(dirname(read.file))).toBe(false);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+test("a canary that cannot be created makes the probe inconclusive and removes the others", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  const missing = join(fake.roots.home, "missing");
+  const probe = new CodexReaderProbe(() => CODEX, { canaryRoots: () => [fake.roots.tmp, missing] });
+  try {
+    const result = await runCodex(spec, fake.runner, probe);
+    expect(result.confinement).toMatchObject({ ok: false, reason: "probe inconclusive", exitCode: null });
+    expect(fake.sandboxReads).toHaveLength(0);
+    expect(fake.execs).toHaveLength(0);
+    expect(readdirSync(fake.roots.tmp)).toEqual([]);
+    const empty = new CodexReaderProbe(() => CODEX, { canaryRoots: () => [] });
+    expect((await runCodex(spec, fake.runner, empty)).confinement?.reason).toBe("probe inconclusive");
+    expect(fake.sandboxReads).toHaveLength(0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("codex 0.154.0 is unsafe because /tmp leaks, even with home and TMPDIR denied", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex((f, o) => (inRoot(fake.roots.tmp, f) ? reads(f) : enforcing(f, o)), {
+    canaryRoots: () => [fake.roots.TMPDIR, fake.roots.home, fake.roots.tmp],
+  });
+  try {
+    const result = await runCodex(spec, fake.runner, fake.probe);
+    expect(result.confinement).toMatchObject({ ok: false, reason: "reader profile not enforced" });
+    const order = fake.sandboxReads.map((r) => [inRoot(fake.roots.tmp, r.file), r.access]);
+    // TMPDIR and home were denied first; the verdict rests on the /tmp canary alone.
+    expect(order).toEqual([
+      [false, "none"],
+      [false, "none"],
+      [true, "none"],
+    ]);
+    expect(fake.execs).toHaveLength(0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a probe cleanup error fails the call closed promptly and the next call probes again", async () => {
+  const { spec, cleanup } = confinedFixture();
+  let failing = true;
+  const fake = fakeCodex(enforcing, {
+    backoffMs: 0,
+    remove: (dir) => {
+      rmSync(dir, { recursive: true, force: true });
+      if (failing) throw Object.assign(new Error(`EBUSY ${SECRET}`), { code: "EBUSY" });
+    },
+  });
+  try {
+    const first = await runCodex(spec, fake.runner, fake.probe);
+    expect(first.status).toBe("unavailable");
+    expect(first.confinement).toMatchObject({ ok: false, reason: "probe inconclusive" });
+    expect(fake.execs).toHaveLength(0);
+    failing = false;
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+    expect(fake.probes()).toBe(2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("the probe's scratch and denyRead match the real reader's", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const extra = realpathSync(mkdtempSync(join(tmpdir(), "limitless-deny-test-")));
+  cleanups.push(() => rmSync(extra, { recursive: true, force: true }));
+  const fake = fakeCodex();
+  let deny: string[] = [];
+  const probe = new CodexReaderProbe(() => CODEX, {
+    canaryRoots: (d) => {
+      deny = d;
+      return Object.values(fake.roots);
+    },
+  });
+  try {
+    expect((await runCodex({ ...spec, denyRead: [extra] }, fake.runner, probe)).status).toBe("ok");
+    expect(deny).toContain(extra);
+    for (const read of fake.sandboxReads) {
+      expect(codexAccess(read.cmd, join(extra, "x"))).toBe("none");
+      const scratch = writeGrant(read.cmd);
+      expect(basename(scratch)).toBe(SCRATCH_NAME);
+      expect(basename(dirname(scratch))).toStartWith("lr-");
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("a verdict for one denyRead list is not reused for a caller denying more", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const extra = realpathSync(mkdtempSync(join(tmpdir(), "limitless-deny-test-")));
+  cleanups.push(() => rmSync(extra, { recursive: true, force: true }));
+  // Enforces the standard roots but leaves the second caller's extra denied path readable.
+  const fake = fakeCodex((f, o) => (inRoot(extra, f) ? reads(f) : enforcing(f, o)), {
+    canaryRoots: (deny) => [...Object.values(fake.roots), ...(deny.includes(extra) ? [extra] : [])],
+  });
+  try {
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+    const second = await runCodex({ ...spec, denyRead: [extra] }, fake.runner, fake.probe);
+    expect(second.confinement).toMatchObject({ ok: false, reason: "reader profile not enforced" });
+    expect(fake.sandboxReads.filter((r) => inRoot(extra, r.file))).toHaveLength(1);
+    expect(fake.execs).toHaveLength(1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a retargeted denyRead symlink is probed again instead of reusing the old verdict", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "limitless-deny-test-")));
+  cleanups.push(() => rmSync(parent, { recursive: true, force: true }));
+  const [a, b, link] = [join(parent, "a"), join(parent, "b"), join(parent, "link")];
+  for (const dir of [a, b]) mkdirSync(dir);
+  symlinkSync(a, link);
+  // Enforces everything except the second target, which stays readable.
+  const fake = fakeCodex((f, o) => (inRoot(b, f) ? reads(f) : enforcing(f, o)), {
+    canaryRoots: (deny) => [...Object.values(fake.roots), ...deny.filter((d) => d === a || d === b)],
+  });
+  try {
+    const confined = { ...spec, denyRead: [link] };
+    expect((await runCodex(confined, fake.runner, fake.probe)).status).toBe("ok");
+    expect(fake.sandboxReads.filter((r) => inRoot(a, r.file))).toHaveLength(1);
+    rmSync(link);
+    symlinkSync(b, link);
+    const second = await runCodex(confined, fake.runner, fake.probe);
+    expect(second.confinement).toMatchObject({ ok: false, reason: "reader profile not enforced" });
+    expect(fake.sandboxReads.filter((r) => inRoot(b, r.file))).toHaveLength(1);
+    expect(fake.execs).toHaveLength(1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a denyRead symlink retargeted during the version lookup fails closed instead of reusing a verdict", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "limitless-deny-test-")));
+  cleanups.push(() => rmSync(parent, { recursive: true, force: true }));
+  const [a, b, link] = [join(parent, "a"), join(parent, "b"), join(parent, "link")];
+  for (const dir of [a, b]) mkdirSync(dir);
+  const retarget = (target: string) => {
+    rmSync(link);
+    symlinkSync(target, link);
+  };
+  symlinkSync(b, link);
+  const fake = fakeCodex(enforcing, {
+    canaryRoots: (deny) => [...Object.values(fake.roots), ...deny.filter((d) => d === a || d === b)],
+  });
+  let duringLookup: string | null = null;
+  const runner = async (opts: ProcOptions) => {
+    if (opts.cmd[1] === "--version" && duringLookup) retarget(duringLookup);
+    return fake.runner(opts);
+  };
+  try {
+    const confined = { ...spec, denyRead: [link] };
+    expect((await runCodex(confined, runner, fake.probe)).status).toBe("ok");
+    // The profile is built for A, but by the time the verdict is looked up the link is back on B.
+    retarget(a);
+    duringLookup = b;
+    const second = await runCodex(confined, runner, fake.probe);
+    expect(second.status).toBe("unavailable");
+    expect(second.error).toContain("denied paths changed");
+    expect(second.confinement).toMatchObject({ ok: false, reason: "probe inconclusive" });
+    expect(fake.execs).toHaveLength(1);
+    // A was probed on its own, never taken for the cached B verdict.
+    expect(fake.sandboxReads.filter((r) => inRoot(a, r.file))).toHaveLength(1);
+    expect(fake.probes()).toBe(2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a verdict for one CLI is not reused for another that denies the first's path", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const [a, b] = ["/opt/codex-a/bin/codex", "/opt/codex-b/bin/codex"];
+  const fake = fakeCodex();
+  try {
+    fake.cli.path = a;
+    expect((await runCodex({ ...spec, denyRead: [b] }, fake.runner, fake.probe)).status).toBe("ok");
+    fake.cli.path = b;
+    const second = await runCodex({ ...spec, denyRead: [a] }, fake.runner, fake.probe);
+    expect(second.status).toBe("ok");
+    expect(second.confinement?.path).toBe(b);
+    expect(fake.probes()).toBe(2);
+    expect(fake.sandboxReads.map((r) => r.cmd[0])).toContain(b);
+  } finally {
+    cleanup();
+  }
+});
+
+test("canaries cover each distinct writable private root the production profile denies", async () => {
+  const roots = canaryRoots(privateReadRoots());
+  for (const root of ["/tmp", "/var/tmp", tmpdir()])
+    if (existsSync(root)) expect(roots).toContain(realpathSync(root));
+  const home = realpathSync(homedir());
+  expect(roots.filter((root) => root === home || root === join(home, ".limitless"))).toHaveLength(1);
+  expect(new Set(roots).size).toBe(roots.length);
+
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "canary-roots-")));
+  cleanups.push(() => {
+    for (const dir of ["locked", "home"]) chmodSync(join(parent, dir), 0o755);
+    rmSync(parent, { recursive: true, force: true });
+  });
+  for (const dir of ["outer/inner", "locked", "other", "home/.limitless"])
+    mkdirSync(join(parent, dir), { recursive: true });
+  symlinkSync(join(parent, "outer/inner"), join(parent, "alias"));
+  chmodSync(join(parent, "locked"), 0o555);
+  const at = (...dirs: string[]) => dirs.map((d) => join(parent, d));
+  const deny = at("outer", "outer/inner", "alias", "locked", "missing", "other", "home");
+  const classes = { tmp: join(parent, "outer"), tmpdir: join(parent, "alias"), home: join(parent, "home") };
+  // Aliases merge; a root nested in another is a distinct class and keeps its own canary; an optional
+  // root we cannot write to is skipped, and home's canary goes in the factory directory.
+  expect(canaryRoots(deny, classes)).toEqual(at("outer", "outer/inner", "other", "home/.limitless"));
+  rmSync(join(parent, "home/.limitless"), { recursive: true });
+  expect(canaryRoots(deny, classes)).toEqual(at("outer", "outer/inner", "other", "home"));
+  // A mandatory class with no writable location, or one the profile does not deny, is never dropped.
+  chmodSync(join(parent, "home"), 0o555);
+  expect(() => canaryRoots(deny, classes)).toThrow();
+  expect(() => canaryRoots(deny, { ...classes, home: join(parent, "other") })).not.toThrow();
+  expect(() =>
+    canaryRoots(deny, { ...classes, tmp: join(parent, "locked"), home: join(parent, "other") }),
+  ).toThrow();
+  expect(() =>
+    canaryRoots(
+      deny.filter((d) => d !== join(parent, "outer")),
+      classes,
+    ),
+  ).toThrow();
+  expect(() => canaryRoots(deny)).toThrow();
+
+  // The probe derives its canaries from the same deny list the real invocation gets.
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  const seen: string[][] = [];
+  const probe = new CodexReaderProbe(() => CODEX, {
+    canaryRoots: (d) => {
+      seen.push(d);
+      return Object.values(fake.roots);
+    },
+  });
+  try {
+    expect((await runCodex(spec, fake.runner, probe)).status).toBe("ok");
+    expect(seen).toEqual([privateReadRoots()]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a TMPDIR nested under /tmp keeps a /tmp canary outside it", async () => {
+  const { spec, cleanup } = confinedFixture();
+  // Denies TMPDIR, home and /var/tmp, but allows the rest of /tmp, where other readers' scratch lives.
+  const partial = fakeCodex(
+    (f, o) => (f.includes("/slash-tmp/") && !f.includes("/var-folders/") ? reads(f) : enforcing(f, o)),
+    {},
+    true,
+  );
+  const full = fakeCodex(enforcing, {}, true);
+  try {
+    expect(canaryRoots(Object.values(partial.roots), partial.classes)).toEqual(Object.values(partial.roots));
+    const result = await runCodex(spec, partial.runner, partial.probe);
+    expect(result.confinement).toMatchObject({ ok: false, reason: "reader profile not enforced" });
+    expect(partial.execs).toHaveLength(0);
+    const outer = partial.sandboxReads.filter(
+      (r) => inRoot(partial.roots.tmp, r.file) && !inRoot(partial.roots.TMPDIR, r.file),
+    );
+    expect(outer).toHaveLength(1);
+
+    expect((await runCodex(spec, full.runner, full.probe)).status).toBe("ok");
+    expect(full.sandboxReads).toHaveLength(5);
+    for (const root of Object.values(full.roots))
+      expect(full.sandboxReads.filter((r) => dirname(dirname(r.file)) === root)).toHaveLength(1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a read-only home is still probed through its factory directory, or not trusted at all", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  const factory = join(fake.roots.home, ".limitless");
+  mkdirSync(factory);
+  cleanups.unshift(() => {
+    for (const dir of [fake.roots.home, factory]) chmodSync(dir, 0o755);
+  });
+  chmodSync(fake.roots.home, 0o555);
+  const selector = () => canaryRoots(Object.values(fake.roots), fake.classes);
+  try {
+    const probe = new CodexReaderProbe(() => CODEX, { canaryRoots: selector });
+    expect((await runCodex(spec, fake.runner, probe)).status).toBe("ok");
+    const home = fake.sandboxReads.filter((r) => inRoot(fake.roots.home, r.file));
+    expect(home.map((r) => inRoot(factory, r.file))).toEqual([true]);
+    expect(home[0]?.access).toBe("none");
+    expect(readdirSync(factory)).toEqual([]);
+
+    // Nowhere writable in home: the probe is inconclusive rather than narrower, and exec never starts.
+    chmodSync(factory, 0o555);
+    fake.sandboxReads.length = 0;
+    const result = await runCodex(
+      spec,
+      fake.runner,
+      new CodexReaderProbe(() => CODEX, { canaryRoots: selector }),
+    );
+    expect(result.confinement).toMatchObject({ ok: false, reason: "probe inconclusive", exitCode: null });
+    expect(fake.sandboxReads).toHaveLength(0);
+    expect(fake.execs).toHaveLength(1);
+  } finally {
+    cleanup();
+  }
+});
+
+for (const destination of ["tmp", "home-sibling"] as const) {
+  for (const writableHome of [true, false]) {
+    test(`a factory symlink to ${destination} cannot replace coverage of ${writableHome ? "writable" : "read-only"} home`, async () => {
+      const { spec, cleanup } = confinedFixture();
+      // This CLI denies temporary roots but leaks home; testing the symlink target would trust it.
+      const fake = fakeCodex((file, opts) => (file.includes("/home/") ? reads(file) : enforcing(file, opts)));
+      const destinationRoot = destination === "tmp" ? fake.roots.tmp : `${fake.roots.home}-sibling`;
+      mkdirSync(destinationRoot, { recursive: true });
+      const sentinel = join(destinationRoot, "existing.txt");
+      writeFileSync(sentinel, "caller-owned");
+      const factory = join(fake.roots.home, ".limitless");
+      symlinkSync(destinationRoot, factory);
+      cleanups.unshift(() => chmodSync(fake.roots.home, 0o755));
+      if (!writableHome) chmodSync(fake.roots.home, 0o555);
+      const probe = new CodexReaderProbe(() => CODEX, {
+        canaryRoots: () => canaryRoots(Object.values(fake.roots), fake.classes),
+      });
+      try {
+        const result = await runCodex(spec, fake.runner, probe);
+        expect(result.status).toBe("unavailable");
+        expect(result.confinement).toMatchObject({
+          ok: false,
+          reason: writableHome ? "reader profile not enforced" : "probe inconclusive",
+        });
+        expect(fake.execs).toHaveLength(0);
+        if (writableHome) {
+          const homeReads = fake.sandboxReads.filter((read) => inRoot(fake.roots.home, read.file));
+          expect(homeReads).toHaveLength(1);
+          expect(homeReads[0]).toMatchObject({ existed: true, access: "none" });
+          expect(dirname(dirname(homeReads[0]?.file ?? ""))).toBe(fake.roots.home);
+        } else {
+          expect(fake.sandboxReads).toHaveLength(0);
+        }
+        for (const read of fake.sandboxReads) expect(existsSync(dirname(read.file))).toBe(false);
+        expect(realpathSync(factory)).toBe(destinationRoot);
+        expect(readFileSync(sentinel, "utf8")).toBe("caller-owned");
+        expect(readdirSync(destinationRoot)).toEqual(["existing.txt"]);
+      } finally {
+        cleanup();
+      }
+    });
+  }
+}
+
+for (const [name, shape] of [
+  ["cat", (f: string) => `cat: ${f}: Permission denied`],
+  ["full program path and quotes", (f: string) => `/bin/cat: '${f}': Operation not permitted`],
+  ["errno with a trailing note", (f: string) => `${f}: EACCES (os error 13)`],
+] as const)
+  test(`a denial diagnostic naming the canary exactly counts: ${name}`, async () => {
+    const { spec, cleanup } = confinedFixture();
+    const fake = fakeCodex((f, o) =>
+      inRoot(o.cwd, f) ? reads(f) : { exitCode: 1, stderr: `${shape(f)}\n` },
+    );
+    try {
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+      expect(fake.execs).toHaveLength(1);
+    } finally {
+      cleanup();
+    }
+  });
+
+test("a missing CLI fails closed without output", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  fake.cli.path = null;
+  try {
+    const result = await runCodex(spec, fake.runner, fake.probe);
+    expect(result.status).toBe("unavailable");
+    expect(result.confinement).toEqual({
+      ok: false,
+      path: null,
+      version: null,
+      reason: "codex sandbox failed to start",
+      exitCode: null,
+    });
+    expect(fake.calls).toHaveLength(0);
+  } finally {
+    cleanup();
+  }
+});
+
+for (const [name, lookup, reason, exitCode] of [
+  ["nonzero exit", { exitCode: 1, stdout: "codex-cli 0.157.1\n" }, "probe inconclusive", 1],
+  ["startup error", new Error(`spawn ENOENT ${SECRET}`), "codex sandbox failed to start", null],
+  ["malformed output", { stdout: `codex-cli 0.157.1 ${SECRET}\n` }, "probe inconclusive", 0],
+  ["unrelated output", { stdout: `${SECRET}\n` }, "probe inconclusive", 0],
+  ["timeout with plausible output", { exitCode: 0, timedOut: true }, "probe timed out", 0],
+  ["signal with plausible output", { exitCode: null, signal: "SIGTERM" }, "probe inconclusive", null],
+] as const)
+  test(`an unknown version fails closed and never reuses a cached verdict: ${name}`, async () => {
+    const { spec, cleanup } = confinedFixture();
+    const fake = fakeCodex();
+    try {
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+      const before = fake.calls.length;
+      fake.cli.lookup = lookup;
+      const result = await runCodex(spec, fake.runner, fake.probe);
+      expect(result.status).toBe("unavailable");
+      expect(result.confinement).toEqual({ ok: false, path: CODEX, version: null, reason, exitCode });
+      expect(JSON.stringify(result)).not.toContain(SECRET);
+      expect(fake.calls.slice(before).map((cmd) => cmd[1])).toEqual(["--version"]);
+      fake.cli.lookup = null;
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+      expect(fake.probes()).toBe(1);
+      expect(fake.execs).toHaveLength(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+test("definitive verdicts are cached per CLI path and version, shared by concurrent callers", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  const old = fakeCodex((f) => (f.includes("/var-folders/") ? denies(f) : reads(f)));
+  try {
+    await Promise.all([0, 1, 2].map(() => runCodex(spec, fake.runner, fake.probe)));
+    expect(fake.probes()).toBe(1);
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+    expect(fake.probes()).toBe(1);
+    fake.cli.version = "codex-cli 0.158.0";
+    await runCodex(spec, fake.runner, fake.probe);
+    expect(fake.probes()).toBe(2);
+    fake.cli.path = "/usr/local/bin/codex";
+    await runCodex(spec, fake.runner, fake.probe);
+    expect(fake.probes()).toBe(3);
+    expect(fake.execs).toHaveLength(6);
+
+    const results = await Promise.all([0, 1, 2].map(() => runCodex(spec, old.runner, old.probe)));
+    results.push(await runCodex(spec, old.runner, old.probe));
+    for (const result of results) expect(result.confinement?.reason).toBe("reader profile not enforced");
+    const attempts = old.sandboxReads.length;
+    expect(attempts).toBeGreaterThan(0);
+    expect(new Set(old.sandboxReads.map((r) => r.cwd)).size).toBe(1);
+    expect(old.execs).toHaveLength(0);
+    old.cli.version = "codex-cli 0.154.1";
+    await runCodex(spec, old.runner, old.probe);
+    expect(new Set(old.sandboxReads.map((r) => r.cwd)).size).toBe(2);
+    old.cli.path = "/usr/local/bin/codex";
+    await runCodex(spec, old.runner, old.probe);
+    expect(new Set(old.sandboxReads.map((r) => r.cwd)).size).toBe(3);
+    expect(old.execs).toHaveLength(0);
+  } finally {
+    cleanup();
+  }
+});
+
+for (const [name, first] of [
+  ["timeout", (f: string) => ({ exitCode: null, timedOut: true, stderr: denies(f).stderr })],
+  ["startup error", () => new Error("spawn EAGAIN")],
+  ["inconclusive", () => ({ exitCode: 1, stderr: "sandbox: unexpected failure" })],
+  ["clean exit without canary contents", () => ({ exitCode: 0, stdout: "" })],
+  ["leaking timeout", (f: string) => ({ ...reads(f), timedOut: true })],
+] as const)
+  test(`a ${name} probe fails closed, is not cached, and is retried after the backoff`, async () => {
+    const { spec, cleanup } = confinedFixture();
+    let now = 1_000;
+    const sleeps: number[] = [];
+    let failing = true;
+    const fake = fakeCodex(
+      (f, o) => (failing ? (first as (f: string) => Partial<ProcResult> | Error)(f) : enforcing(f, o)),
+      {
+        backoffMs: 250,
+        now: () => now,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+          now += ms;
+        },
+      },
+    );
+    try {
+      const failed = await runCodex(spec, fake.runner, fake.probe);
+      expect(failed.status).toBe("unavailable");
+      expect(fake.execs).toHaveLength(0);
+      const attempts = fake.sandboxReads.length;
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("unavailable");
+      expect(sleeps).toEqual([250]);
+      expect(fake.sandboxReads.length).toBeGreaterThan(attempts);
+      failing = false;
+      now += 100;
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+      expect(sleeps).toEqual([250, 150]);
+      expect(fake.execs).toHaveLength(1);
+      expect(fake.probes()).toBe(1);
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+      expect(sleeps).toHaveLength(2);
+      expect(fake.probes()).toBe(1);
+    } finally {
+      cleanup();
+    }
+  });
+
+/** Sandbox reads wait for `gate`; an aborted read ends as a cancelled process. */
+function gatedSandbox(gate: Promise<void>, signals: (AbortSignal | undefined)[]): Sandbox {
+  return async (file, opts) => {
+    signals.push(opts.signal);
+    const aborted = new Promise<"aborted">((resolve) => {
+      if (opts.signal?.aborted) resolve("aborted");
+      opts.signal?.addEventListener("abort", () => resolve("aborted"), { once: true });
+    });
+    if ((await Promise.race([gate.then(() => "open" as const), aborted])) === "aborted")
+      return { exitCode: null, signal: "SIGTERM", cancelled: true };
+    return enforcing(file, opts);
+  };
+}
+
+test("a cancelled waiter settles at once while the probe it joined completes for others", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const gate = deferred();
+  const signals: (AbortSignal | undefined)[] = [];
+  const fake = fakeCodex(gatedSandbox(gate.promise, signals));
+  const abort = new AbortController();
+  try {
+    const live = runCodex(spec, fake.runner, fake.probe);
+    while (!fake.sandboxReads.length) await Bun.sleep(1);
+    const cancelled = runCodex({ ...spec, signal: abort.signal }, fake.runner, fake.probe);
+    await Bun.sleep(5);
+    abort.abort();
+    expect((await cancelled).status).toBe("cancelled");
+    expect(fake.sandboxReads).toHaveLength(1);
+    gate.resolve();
+    expect((await live).status).toBe("ok");
+    expect(fake.execs).toHaveLength(1);
+    expect(signals.every((s) => s !== abort.signal && !s?.aborted)).toBe(true);
+  } finally {
+    gate.resolve();
+    cleanup();
+  }
+});
+
+test("cancelling the caller that started a probe leaves it running for a live waiter", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const gate = deferred();
+  const signals: (AbortSignal | undefined)[] = [];
+  const fake = fakeCodex(gatedSandbox(gate.promise, signals));
+  const abort = new AbortController();
+  try {
+    const initiator = runCodex({ ...spec, signal: abort.signal }, fake.runner, fake.probe);
+    while (!fake.sandboxReads.length) await Bun.sleep(1);
+    const live = runCodex(spec, fake.runner, fake.probe);
+    await Bun.sleep(5);
+    abort.abort();
+    const settled = await initiator;
+    expect(settled.status).toBe("cancelled");
+    expect(settled.confinement).toBeUndefined();
+    gate.resolve();
+    expect((await live).status).toBe("ok");
+    expect(fake.probes()).toBe(1);
+    expect(fake.execs).toHaveLength(1);
+  } finally {
+    gate.resolve();
+    cleanup();
+  }
+});
+
+test("cancelling the only caller stops its probe, never starts exec, and is not cached", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const gate = deferred();
+  const signals: (AbortSignal | undefined)[] = [];
+  const fake = fakeCodex(gatedSandbox(gate.promise, signals));
+  const abort = new AbortController();
+  try {
+    const pending = runCodex({ ...spec, signal: abort.signal }, fake.runner, fake.probe);
+    while (!fake.sandboxReads.length) await Bun.sleep(1);
+    abort.abort();
+    expect((await pending).status).toBe("cancelled");
+    await Bun.sleep(5);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(fake.execs).toHaveLength(0);
+    for (const read of fake.sandboxReads) expect(existsSync(dirname(read.file))).toBe(false);
+    gate.resolve();
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+    expect(fake.probes()).toBe(1);
+  } finally {
+    gate.resolve();
+    cleanup();
+  }
+});
+
+test("cancelling during the backoff returns promptly and is not cached", async () => {
+  const { spec, cleanup } = confinedFixture();
+  let now = 0;
+  let failing = true;
+  const fake = fakeCodex((f, o) => (failing ? { exitCode: 1, stderr: "?" } : enforcing(f, o)), {
+    backoffMs: 60_000,
+    now: () => now,
+  });
+  const abort = new AbortController();
+  try {
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("unavailable");
+    const attempts = fake.sandboxReads.length;
+    const started = Date.now();
+    const waiting = runCodex({ ...spec, signal: abort.signal }, fake.runner, fake.probe);
+    await Bun.sleep(5);
+    abort.abort();
+    expect((await waiting).status).toBe("cancelled");
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(fake.sandboxReads).toHaveLength(attempts);
+    failing = false;
+    now = 60_000;
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+    expect(fake.execs).toHaveLength(1);
+  } finally {
+    cleanup();
+  }
+});
+
 test("private logs keep the stream's structure but withhold its text", async () => {
   const { cwd, scratch, spec, cleanup } = confinedFixture();
   try {
-    for (const run of [runClaude, runCodex]) {
+    const probed = fakeCodex();
+    const runConfinedCodex = (s: AgentSpec, runner: typeof runProcess) =>
+      runCodex(s, (o) => (o.cmd[1] === "exec" ? runner(o) : probed.runner(o)), probed.probe);
+    for (const run of [runClaude, runConfinedCodex]) {
       const logPath = join(scratch, `${run.name}.log`);
       await run({ ...spec, logPath, redactOutput: withholdText }, async (opts: ProcOptions) => {
         opts.onStdoutLine?.(JSON.stringify({ type: "assistant", text: "H-1 private scenario", n: 3 }));
