@@ -1,6 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ReviewSystem } from "../core/types.ts";
 import { EvalRequestSchema } from "../evals/cases.ts";
 import { policyDiff, proposedOverlay, renderEvidence } from "../evals/evidence.ts";
 import { formatEvalReport } from "../evals/format.ts";
@@ -14,7 +13,7 @@ import {
 import type { EvalPolicyResponse } from "../evals/policy.ts";
 import type { EvalRegradeResult } from "../evals/runner.ts";
 import type { EvalReport } from "../evals/stats.ts";
-import { parseEvalReviewSystems } from "../pipeline/review-system.ts";
+import { type EvalReviewSystem, parseEvalReviewSystems } from "../pipeline/review-system.ts";
 import { DEFAULT_POLICY } from "../router/catalog.ts";
 import { overlayPolicy, parsePolicy, validatePolicy } from "../router/policy.ts";
 
@@ -109,7 +108,7 @@ export async function evalCommand(
   }
   if (flags.systems !== undefined && flags.models !== undefined)
     throw new Error("--models and --systems are mutually exclusive");
-  let systems: ReviewSystem[] | undefined;
+  let systems: EvalReviewSystem[] | undefined;
   if (flags.systems !== undefined) {
     if (value !== "review") throw new Error("--systems is only supported for review evals");
     if (typeof flags.systems !== "string" || !flags.systems.trim())

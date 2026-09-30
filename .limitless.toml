@@ -19,3 +19,15 @@ serve = "bun src/cli/main.ts serve"
 env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/config", LIMITLESS_PORT = "{port}" }
 seed = "bun scripts/preview-seed.ts"
 ready = "/api/health"
+
+# Review lenses are read from the base commit, so a change never sets the lenses that review it.
+[[review.lenses]]
+name = "compatibility-and-operations"
+focus = """
+Compatibility with the running release and rollback: the previous release must keep working with \
+the database, run state and files the new one writes, and the new one with what the previous one left. \
+Restart and resume: a run interrupted at any step resumes without losing state or repeating paid work \
+or side effects (commits, pushes, PR comments). Migrations: additive, in a new timestamped file, never \
+an edit to a shipped one. Trust in inputs from the change under test: configuration, scripts, test \
+output and reports that come from the change are untrusted data; what steers the factory comes from \
+the base commit."""
