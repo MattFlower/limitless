@@ -270,23 +270,37 @@ export class CodexReaderProbe {
     if (!path) return { ok: false, path: null, version: null, reason: "codex CLI not found on PATH" };
     let version: string | null = null;
     try {
-      const proc = await run({ cmd: [path, "--version"], cwd: spec.cwd, env: agentEnv(), timeoutMs: 30_000 });
+      const proc = await run({
+        cmd: [path, "--version"],
+        cwd: spec.cwd,
+        env: agentEnv(),
+        timeoutMs: 30_000,
+        signal: spec.signal,
+      });
       if (proc.exitCode === 0) version = proc.stdout.trim().split("\n")[0]?.trim() || null;
     } catch {
       version = null;
     }
+    if (spec.signal.aborted) return { ok: false, path, version, reason: PROBE_CANCELLED };
     if (!version) return { ok: false, path, version: null, reason: "codex --version failed" };
     const key = `${path}\0${version}`;
-    let result = this.results.get(key);
-    if (!result) {
-      result = sandboxProbe(spec, path, version, run);
-      this.results.set(key, result);
+    for (;;) {
+      let pending = this.results.get(key);
+      if (!pending) {
+        pending = sandboxProbe(spec, path, version, run);
+        this.results.set(key, pending);
+      }
+      const result = await pending;
+      if (result.reason !== PROBE_CANCELLED) return result;
+      // A cancelled probe says nothing about the CLI: drop it, and let live waiters probe again.
+      if (this.results.get(key) === pending) this.results.delete(key);
+      if (spec.signal.aborted) return result;
     }
-    return result;
   }
 }
 
 export const codexReaderProbe = new CodexReaderProbe();
+const PROBE_CANCELLED = "confinement probe cancelled";
 
 async function sandboxProbe(
   spec: AgentSpec,
@@ -311,10 +325,14 @@ async function sandboxProbe(
       cwd: spec.cwd,
       env: agentEnv(scratchEnv(spec)),
       timeoutMs: 60_000,
+      signal: spec.signal,
     });
+    if (proc.cancelled) return fail(PROBE_CANCELLED);
     if (proc.exitCode === 0 || proc.stdout.includes(token))
       return fail("sandbox allowed reading a canary outside the reader's cwd");
-    if (proc.cancelled || proc.timedOut || proc.idleTimedOut) return fail("sandbox probe did not finish");
+    // Only a completed, nonzero exit can confirm a denial; a signal or timeout is ambiguous.
+    if (proc.timedOut || proc.idleTimedOut || proc.exitCode === null || proc.signal)
+      return fail(`sandbox probe did not finish (${proc.signal ?? "timed out"})`);
     const denied = proc.stderr.split("\n").some((line) => line.includes(canary) && DENIED.test(line));
     if (!denied)
       return fail(
@@ -418,6 +436,20 @@ export async function runCodex(
   let confinement: ConfinementProbe | undefined;
   if (spec.confineReads && spec.mode === "readonly" && !spec.noTools) {
     confinement = await readerProbe.verify(spec, processRunner);
+    if (spec.signal.aborted)
+      return {
+        status: "cancelled",
+        finalText: "",
+        structured: null,
+        sessionId: null,
+        usage: emptyUsage(),
+        numTurns: 0,
+        costUsd: 0,
+        costEquivUsd: 0,
+        error: "cancelled",
+        quota: null,
+        confinement,
+      };
     if (!confinement.ok || !confinement.path) {
       const cli = `${confinement.path ?? "codex"}${confinement.version ? ` (${confinement.version})` : ""}`;
       return {

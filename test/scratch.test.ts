@@ -376,6 +376,12 @@ for (const [name, sandbox, change, reason] of [
     {},
     "did not finish",
   ],
+  [
+    "signaled denial",
+    (c: string) => ({ exitCode: null, signal: "SIGKILL", stderr: denies(c).stderr }),
+    {},
+    "did not finish (SIGKILL)",
+  ],
   ["sandbox startup", () => new Error("spawn EACCES"), {}, "failed to start: spawn EACCES"],
   ["missing CLI", denies, { path: null }, "codex CLI not found"],
   ["version lookup", denies, { version: null }, "--version failed"],
@@ -416,6 +422,32 @@ test("one probe per CLI path and version, shared by concurrent and later invocat
     for (const _ of [0, 1])
       expect((await runCodex(spec, failing.runner, failing.probe)).status).toBe("unavailable");
     expect(failing.cli.sandboxes).toBe(1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("cancelling during the probe stops it, never starts exec, and is not cached", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  const abort = new AbortController();
+  const signals: (AbortSignal | undefined)[] = [];
+  const runner = async (opts: ProcOptions): Promise<ProcResult> => {
+    signals.push(opts.signal);
+    if (opts.cmd[1] !== "sandbox" || opts.signal !== abort.signal) return fake.runner(opts);
+    await new Promise((resolve) => abort.signal.addEventListener("abort", resolve, { once: true }));
+    return { ...procResult, exitCode: null, signal: "SIGTERM", cancelled: true };
+  };
+  try {
+    const pending = runCodex({ ...spec, signal: abort.signal }, runner, fake.probe);
+    await Bun.sleep(5);
+    abort.abort();
+    const result = await pending;
+    expect(result.status).toBe("cancelled");
+    expect(signals.slice(0, 2)).toEqual([abort.signal, abort.signal]);
+    expect(fake.calls.some((cmd) => cmd[1] === "exec")).toBe(false);
+    expect((await runCodex(spec, runner, fake.probe)).status).toBe("ok");
+    expect(fake.cli.sandboxes).toBe(1);
   } finally {
     cleanup();
   }
