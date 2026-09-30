@@ -850,4 +850,19 @@ test("with the default policy, a verifier never reuses a raising model and prefe
   const both = verifier(["anthropic", "openai"], ["codex/sol", "claude/sonnet"]);
   expect(both).toBeDefined();
   expect(["codex/sol", "claude/sonnet", "claude/opus"]).not.toContain(both);
+  // Deep profile: adversarial on codex/astra, careful on the implementer's claude/opus. Both vendors
+  // raised it, so the one that did not implement verifies, even with more Claude headroom.
+  const deep = router.route(
+    "review",
+    "large",
+    verifierConstraints(["anthropic", "openai"], ["codex/astra", "claude/opus"], {
+      vendor: "anthropic",
+      modelId: "claude/opus",
+    }),
+  );
+  expect(deep.candidates[0]?.vendor).toBe("openai");
+  expect(deep.skipped).toContainEqual({
+    modelId: "claude/opus",
+    reason: "raised a candidate it would verify",
+  });
 });

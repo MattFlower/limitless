@@ -250,6 +250,7 @@ const StoredPanelSchema = z.object({
         lens: z.string().optional(),
         vendor: z.string().nullable(),
         skipped: z.string().optional(),
+        implementerModel: z.literal(true).optional(),
       }),
     )
     .optional(),

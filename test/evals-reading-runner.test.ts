@@ -400,10 +400,10 @@ test("panel systems run finders with their own prompts and a pinned verifier end
         implementerReport: "include",
       },
     ];
-    // The verifier must not share a vendor with any finder it checks.
+    // As in production, the verifier may never be one of the finders' models.
     expect(() =>
       f.run({ models: undefined, systems: [{ ...systems[0], verifier: { target: "candidate-b" } }] }),
-    ).toThrow("verifier candidate-b shares vendor other with finder candidate-a");
+    ).toThrow("verifier candidate-b is also one of its finders");
     const acquire = spyOn(f.factory.tracker, "acquire");
     const record = spyOn(f.factory.tracker, "record");
     const report = await f.run({ models: undefined, systems, cache: false });
@@ -684,6 +684,25 @@ test("an eval panel skips a local finder that cannot run, as production does", a
           { vendor: null, skipped: expect.stringContaining("local unavailable") },
         ],
       },
+    });
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("an eval verifier may share a finder's vendor, as in production, with the warning recorded", async () => {
+  const sameVendor: ModelDef = { ...verifierModel, id: "verifier-d", vendor: "other" };
+  const f = await fixture("review", [sameVendor]);
+  try {
+    f.respond((s) =>
+      s.prompt.includes("code-review verifier") ? refuteAll(s) : { structured: reviewOutput(), costUsd: 0.1 },
+    );
+    const system = { ...panelSystem, verifier: { target: "verifier-d" } };
+    const report = await f.run({ models: undefined, systems: [system], cache: false });
+    expect(report.trials[0]?.status).toBe("ok");
+    expect(report.trials[0]?.output).toMatchObject({
+      panel: { warnings: [expect.stringContaining("Verifier verifier-d shares vendor other")] },
     });
     await f.clean();
   } finally {

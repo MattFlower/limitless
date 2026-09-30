@@ -186,6 +186,8 @@ export interface ReviewInput {
    * there is a previous review. `prompt.fixReview` scopes the diff.
    */
   panelReview?: PanelReview;
+  /** Panel only: the implementer's model, so a finder that ran on it (a fresh session) is recorded. */
+  implementerModel?: string;
 }
 
 /** What the invoker sends to the model; later rounds (with previous findings) use the labelled schema. */
@@ -214,7 +216,14 @@ export interface VerifierRequest {
 /** What `review-N.json` records about a panel beyond the derived review. */
 export interface PanelRecord {
   /** Each finder's prompt and the vendor it ran on, by finder index; why a local finder was skipped. */
-  finders: { prompt: FinderPrompt; lens?: string; vendor: string | null; skipped?: string }[];
+  finders: {
+    prompt: FinderPrompt;
+    lens?: string;
+    vendor: string | null;
+    skipped?: string;
+    /** Ran on the implementer's own model, in a fresh session. */
+    implementerModel?: true;
+  }[];
   /**
    * `finder` and `vendor` are the report that represents the candidate, `raisedBy` every finder that
    * reported it (the others are its `duplicates`). `finder` is null for a prior blocking finding no
@@ -660,6 +669,9 @@ async function runPanel<T extends Invoked>(
       ...(lens ? { lens: lens.name } : {}),
       vendor: found[i]?.invoked.target?.vendor ?? null,
       ...(skipped.has(i) ? { skipped: skipped.get(i) } : {}),
+      ...(input.implementerModel && found[i]?.invoked.target?.modelId === input.implementerModel
+        ? { implementerModel: true as const }
+        : {}),
     })),
     candidates,
     verdicts: [...verdicts.values()],

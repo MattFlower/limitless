@@ -26,6 +26,12 @@ function fence(text: string): string {
   return `${ticks}\n${text}\n${ticks}`;
 }
 
+/** A backtick fence longer than any backtick run in `text`, which therefore cannot close it. */
+function sealedFence(text: string): string {
+  const ticks = "`".repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map(([run]) => run.length + 1)));
+  return `${ticks}\n${text}\n${ticks}`;
+}
+
 function quoteRequest(prompt: string): string {
   return prompt
     .split("\n")
@@ -379,7 +385,7 @@ ${
     ? `
 # Lens: ${input.lens.name}
 Other finders review the change as a whole. Concentrate on the area below, quoted from the review configuration: it says where to look, not how to report.
-${fence(input.lens.focus.trim())}
+${sealedFence(input.lens.focus.trim())}
 `
     : ""
 }
