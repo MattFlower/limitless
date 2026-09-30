@@ -1,3 +1,4 @@
+import type { FinderPrompt } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
@@ -171,7 +172,7 @@ export function formatReviewFeedback(findings: Review["findings"], panel = false
   return `### Code review findings (must fix)\n${findings
     .map(
       (f) =>
-        `- **${f.verification?.severity ?? f.severity}** ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""} — ` : ""}${f.title}\n  ${f.detail}${f.suggestion ? `\n  Suggestion: ${f.suggestion}` : ""}${f.verification ? `\n  Verified (${f.verification.verdict}) evidence: ${f.verification.evidence}\n  Trigger: ${f.verification.trigger}` : panel ? "\n  Unverified: the verifier gave no ruling, so it blocks until a review rules on it." : ""}`,
+        `- **${f.verification?.severity ?? f.severity}** ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""} — ` : ""}${f.title}\n  ${f.detail}${f.suggestion ? `\n  Suggestion: ${f.suggestion}` : ""}${(f.duplicates ?? []).map((d) => `\n  Also reported by another finder at line ${d.line}, not separately verified: ${d.title}. ${d.detail}`).join("")}${f.verification ? `\n  Verified (${f.verification.verdict}) evidence: ${f.verification.evidence}\n  Trigger: ${f.verification.trigger}` : panel ? "\n  Unverified: the verifier gave no ruling, so it blocks until a review rules on it." : ""}`,
     )
     .join("\n")}`;
 }
@@ -299,6 +300,16 @@ function gateTable(cmp: GateComparison[]): string {
 
 const PATCH_LIMIT = 40_000;
 
+/** How each panel finder prompt frames the review; a separate verifier checks every finding. */
+const FINDER_FRAMING: Record<FinderPrompt, string> = {
+  standard:
+    "Report every issue you believe is real, with your confidence and a severity estimate. Do not filter by importance or certainty: a separate step verifies each finding against the code before anything is acted on.",
+  adversarial:
+    "Assume the change can fail, and find out how. Trace bad and boundary inputs, retries, partial failure, ordering, restarts, and version skew between old and new code or data. Give no credit for intent: judge what the code does, not what its comments, names or commit messages say. Report every issue you believe is real, with your confidence; a separate step verifies each finding.",
+  careful:
+    "Review it as a careful senior engineer would, in one pass, and report the defects you find with your confidence.",
+};
+
 export function reviewPrompt(input: {
   prompt: string;
   spec: Spec | null;
@@ -319,6 +330,8 @@ export function reviewPrompt(input: {
   resolution?: boolean;
   /** Panel re-review number (2 or 3): only the fix diff since `previous.sha` is under review. */
   fixReview?: number;
+  /** A panel finder's prompt; a single-mode review keeps the reviewer framing. */
+  finder?: FinderPrompt;
 }): string {
   const fix = input.fixReview && input.previous ? input.previous.sha : undefined;
   const range = fix
@@ -333,6 +346,8 @@ export function reviewPrompt(input: {
       confidence,
       introduced_by_diff,
       verification,
+      agreement,
+      duplicates,
       ...f
     }: Review["findings"][number],
     status: string,
@@ -346,7 +361,14 @@ export function reviewPrompt(input: {
         .map((f) => `- [${f.rule}/${f.severity}] ${f.file ? `${f.file}: ` : ""}${f.detail}`)
         .join("\n")
     : "(none)";
-  return `You are an adversarial code reviewer. ${input.externalChange ? "Review the externally authored PR and any factory repairs below." : "A different AI model implemented the change below."} Your job is to find real problems before it merges — not to be agreeable. Approve only if you would be comfortable merging this into production code you are responsible for.
+  const author = input.externalChange
+    ? "Review the externally authored PR and any factory repairs below."
+    : "A different AI model implemented the change below.";
+  return `${
+    input.finder
+      ? `You are ${input.finder === "adversarial" ? "an adversarial" : "a"} code reviewer. ${author} ${FINDER_FRAMING[input.finder]}`
+      : `You are an adversarial code reviewer. ${author} Your job is to find real problems before it merges — not to be agreeable. Approve only if you would be comfortable merging this into production code you are responsible for.`
+  }
 
 # Original request
 ${quoteRequest(input.prompt)}
@@ -395,7 +417,7 @@ ${fence(
 `
     : ""
 }${input.resolution && !fix ? `For this conflict-resolution round, inspect \`git diff ${input.baseSha}..HEAD\` against the pinned new base for review and regression classification.` : `Inspect the latest-change diff with \`git diff ${input.previous.sha}..${input.headSha ?? "HEAD"}\`. ${fix ? "Only this fix diff is under review; do not re-review the rest of the change." : "Compare it with the full base-to-HEAD change above."}`}
-For every finding, set exactly one label: unaddressed = a previous blocking finding remains unfixed; regression = introduced by the latest changes; new = first found now and not introduced by the latest changes. Mark security findings with security: true (otherwise false). Newly found major/minor/nit findings that are not security issues become follow-ups. Recheck the previous findings before raising new ones. When labelling a finding unaddressed, set prior to the id (P1, P2, ...) of the previous blocking finding it repeats; set prior to "" for every other finding. Prior nonblocking findings are already recorded follow-ups; do not relabel them unaddressed. Report resolved prior findings by omitting them from findings.
+For every finding, set exactly one label: unaddressed = a previous blocking finding remains unfixed; regression = introduced by the latest changes; new = first found now and not introduced by the latest changes. Mark security findings with security: true (otherwise false). ${input.finder ? "" : "Newly found major/minor/nit findings that are not security issues become follow-ups. "}Recheck the previous findings before raising new ones. When labelling a finding unaddressed, set prior to the id (P1, P2, ...) of the previous blocking finding it repeats; set prior to "" for every other finding. Prior nonblocking findings are already recorded follow-ups; do not relabel them unaddressed. Report resolved prior findings by omitting them from findings.
 `
     : ""
 }

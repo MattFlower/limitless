@@ -139,6 +139,7 @@ limitless eval run triage --models omlx/qwen-27b@none,omlx/qwen-27b@high,claude/
 limitless eval run triage --models claude/haiku --cases triage-001,triage-002 --no-cache
 limitless eval run review --models openrouter/gpt-6-luna --follow
 limitless eval run review --systems systems.json --follow   # {"systems": [{name, mode: "single", finders: [{target, prompt: "standard"}], implementerReport}]}
+limitless eval run review --systems panel.json --follow     # mode "panel": parallel finders, prompt "standard" | "adversarial" | "careful", plus verifier: {target}
 limitless eval run verify --models openrouter/gpt-6-luna --follow
 limitless eval report <eval-id>
 limitless eval report <eval-id> --json

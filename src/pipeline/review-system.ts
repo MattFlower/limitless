@@ -13,7 +13,9 @@ const TargetSchema = z.string().superRefine((target, ctx) => {
 });
 const FinderSchema = z.strictObject({
   target: TargetSchema.optional(),
-  prompt: z.literal("standard", { error: 'unsupported finder prompt; only "standard" is implemented' }),
+  prompt: z.enum(["standard", "adversarial", "careful"], {
+    error: 'finder prompt must be "standard", "adversarial" or "careful"',
+  }),
 });
 export const ReviewSystemSchema = z
   .strictObject({
@@ -28,6 +30,12 @@ export const ReviewSystemSchema = z
   .superRefine((system, ctx) => {
     if (system.mode === "single" && system.finders.length !== 1)
       ctx.addIssue({ code: "custom", path: ["finders"], message: 'mode "single" takes exactly one finder' });
+    if (system.mode === "single" && system.finders.some((f) => f.prompt !== "standard"))
+      ctx.addIssue({
+        code: "custom",
+        path: ["finders"],
+        message: 'mode "single" uses the "standard" prompt',
+      });
     if (system.mode === "single" && system.verifier)
       ctx.addIssue({ code: "custom", path: ["verifier"], message: 'mode "single" takes no verifier' });
     if (system.mode === "panel" && !system.finders.length)

@@ -1,6 +1,7 @@
 import { z } from "zod";
-import type { ReviewSystem } from "../core/types.ts";
+import type { FinderPrompt, ReviewFinder, ReviewSystem } from "../core/types.ts";
 import { type AgentResult, extractJson } from "../harness/types.ts";
+import { MERGE_RULES, mergeReports } from "./panel-merge.ts";
 import { reviewPrompt, verifierPrompt } from "./prompts.ts";
 import {
   LaterReviewSchema,
@@ -20,16 +21,19 @@ const FINDER_SEVERITY_RANK = { blocker: 0, major: 1, minor: 2, nit: 3 } as const
 /** Finder candidates verified per review; prior blocking and security findings are exempt. */
 export const PANEL_VERIFY_CAP = 20;
 const PANEL_BATCH_SIZE = 5;
+/** A recheck of a prior blocking finding that no finder repeated. */
+const UNRAISED = { agreement: 0, finder: null, vendor: null, raisedBy: [] as number[] };
 /**
  * Bumped when what a panel verifies or blocks changes in a way a stored output can't show, so eval
  * caches stop reusing outputs made under the old policy. 2: security candidates are always verified,
- * and missing rulings on security or prior blocking findings fail closed.
+ * and missing rulings on security or prior blocking findings fail closed. 3: finder reports merge
+ * before verification.
  */
-const PANEL_POLICY_VERSION = 2;
+const PANEL_POLICY_VERSION = 3;
 
 /**
- * CONFIRMED, or PLAUSIBLE at high or above. PLAUSIBLE raised by two or more finders will also count
- * once panel agreement exists; until then every candidate has exactly one finder.
+ * CONFIRMED, or PLAUSIBLE at high or above. Agreement between finders is recorded but does not count:
+ * whether it should is for the panel ablations to decide.
  */
 function panelVerified(finding: Finding): boolean {
   const v = finding.verification;
@@ -204,8 +208,14 @@ export interface VerifierRequest {
 
 /** What `review-N.json` records about a panel beyond the derived review. */
 export interface PanelRecord {
-  /** `finder` is null for a prior blocking finding no finder repeated: the verifier rechecks it. */
-  candidates: (Finding & { id: string; finder: number | null; vendor: string | null })[];
+  /** Each finder's prompt and the vendor it ran on, by finder index. */
+  finders: { prompt: FinderPrompt; vendor: string | null }[];
+  /**
+   * `finder` and `vendor` are the report that represents the candidate, `raisedBy` every finder that
+   * reported it (the others are its `duplicates`). `finder` is null for a prior blocking finding no
+   * finder repeated: the verifier rechecks it.
+   */
+  candidates: (Finding & { id: string; finder: number | null; vendor: string | null; raisedBy: number[] })[];
   verdicts: (Verification & { id: string })[];
   refuted: string[];
   /** Eligible for verification but over the per-review cap: unverified follow-ups. */
@@ -222,13 +232,22 @@ type Invoked = { result: AgentResult; target?: { vendor: string } };
 export interface ReviewDeps<T extends Invoked> {
   /** Runs finder `finder` (an index into the system's finders). */
   invoke: (request: ReviewRequest, finder: number) => Promise<T>;
-  /** Panel only: one read-only verifier batch, routed away from the vendor that raised it. */
-  verify?: (request: VerifierRequest, avoidVendor: string | undefined) => Promise<T>;
+  /** Panel only: one read-only verifier batch, routed away from every vendor that raised it. */
+  verify?: (request: VerifierRequest, avoidVendors: string[]) => Promise<T>;
   /** Panel only: problems that degrade the review without failing it. */
   warn?: (message: string) => void;
 }
 
-/** Fixed input that renders the verifier prompt template, for cache identity. */
+/** Fixed inputs that render the finder and verifier prompt templates, for cache identity. */
+const FINDER_TEMPLATE: Parameters<typeof reviewPrompt>[0] = {
+  prompt: "",
+  spec: null,
+  baseSha: "BASE",
+  stat: "",
+  gates: [],
+  audit: [],
+  implementerReport: "",
+};
 const TEMPLATE_INPUT: Parameters<typeof verifierPrompt>[0] = {
   prompt: "",
   spec: null,
@@ -239,14 +258,19 @@ const TEMPLATE_INPUT: Parameters<typeof verifierPrompt>[0] = {
 };
 
 /**
- * What a panel's derived output depends on besides its finders' prompt: the policy version, the
- * verifier prompt templates, its schema and the batching policy. Eval caches key panel trials on it.
+ * What a panel's derived output depends on besides the case: the policy version, the finder and
+ * verifier prompt templates, the verifier schema, and the merge and batching policy. Eval caches key
+ * panel trials on it.
  */
-export function panelVerifierIdentity(): string {
+export function panelIdentity(): string {
   return new Bun.CryptoHasher("sha256")
     .update(
       JSON.stringify([
         PANEL_POLICY_VERSION,
+        (["standard", "adversarial", "careful"] as const).map((finder) =>
+          reviewPrompt({ ...FINDER_TEMPLATE, finder }),
+        ),
+        MERGE_RULES,
         verifierPrompt(TEMPLATE_INPUT),
         verifierPrompt({ ...TEMPLATE_INPUT, externalChange: true }),
         toStrictJsonSchema(VerifierSchema),
@@ -277,7 +301,7 @@ export async function runReview<T extends Invoked>(
   deps: ReviewDeps<T>,
   input: ReviewInput,
 ): Promise<ReviewOutcome<T>> {
-  if (input.system?.mode === "panel") return runPanel(deps, input, input.system.finders.length);
+  if (input.system?.mode === "panel") return runPanel(deps, input, input.system.finders);
   const request = reviewRequest(input);
   const invoked = await deps.invoke(request, 0);
   const output = request.schema.safeParse(invoked.result.structured ?? extractJson(invoked.result.finalText));
@@ -337,17 +361,27 @@ function failedPanel(results: AgentResult[], last: AgentResult, message: string)
 async function runPanel<T extends Invoked>(
   deps: ReviewDeps<T>,
   input: ReviewInput,
-  finders: number,
+  finders: ReviewFinder[],
 ): Promise<ReviewOutcome<T>> {
-  const request = reviewRequest(input);
-  const results: AgentResult[] = [];
+  // Finders run in parallel, each within its provider's limits. Every call settles before the panel
+  // goes on or fails, so none outlives it and each one's spend is recorded.
+  const settled = await Promise.allSettled(
+    finders.map(async ({ prompt }, finder) => {
+      const request = reviewRequest({ ...input, prompt: { ...input.prompt, finder: prompt } });
+      const invoked = await deps.invoke(request, finder);
+      const output = request.schema.safeParse(
+        invoked.result.structured ?? extractJson(invoked.result.finalText),
+      );
+      return { invoked, output };
+    }),
+  );
+  const members = settled.map((member) => {
+    if (member.status === "rejected") throw member.reason;
+    return member.value;
+  });
+  const results: AgentResult[] = members.map(({ invoked }) => invoked.result);
   const found: { invoked: T; review: Review }[] = [];
-  for (let finder = 0; finder < finders; finder++) {
-    const invoked = await deps.invoke(request, finder);
-    results.push(invoked.result);
-    const output = request.schema.safeParse(
-      invoked.result.structured ?? extractJson(invoked.result.finalText),
-    );
+  for (const [finder, { invoked, output }] of members.entries()) {
     if (!output.success)
       return {
         ...invoked,
@@ -382,6 +416,7 @@ async function runPanel<T extends Invoked>(
       };
     }),
   );
+  const merged = mergeReports(raised, cited);
   const fix = fixReview && previous ? { review: fixReview, ...previous } : undefined;
   // A re-review never assumes a prior blocking finding fixed: whatever no finder repeated, the
   // verifier rechecks as a candidate of its own, outside the cap.
@@ -389,9 +424,9 @@ async function runPanel<T extends Invoked>(
     if (raised.some((c) => cited(c) === i)) return [];
     const { verification: _stale, ...f } = prior;
     const recheck = { ...f, security: isSecurity(prior), label: "unaddressed" as const, prior: `P${i + 1}` };
-    return [{ ...recheck, finder: null, vendor: null }];
+    return [{ ...recheck, ...UNRAISED }];
   });
-  const candidates: PanelRecord["candidates"] = [...raised, ...rechecks].map((c, i) => ({
+  const candidates: PanelRecord["candidates"] = [...merged, ...rechecks].map((c, i) => ({
     ...c,
     id: `C${i + 1}`,
   }));
@@ -404,51 +439,67 @@ async function runPanel<T extends Invoked>(
     .filter((c) => !exempt(c) && !UNVERIFIED_CATEGORIES.includes(c.category))
     .sort((a, b) => FINDER_SEVERITY_RANK[a.severity] - FINDER_SEVERITY_RANK[b.severity]);
   const selected = [...ranked.slice(0, PANEL_VERIFY_CAP), ...candidates.filter(exempt)];
-  // One batch never mixes files or finder vendors, so each call avoids exactly its finder's vendor.
-  const groups = new Map<string, typeof selected>();
-  for (const c of candidates.filter((c) => selected.includes(c))) {
-    const key = JSON.stringify([c.vendor, c.file]);
-    groups.set(key, [...(groups.get(key) ?? []), c]);
-  }
-  const batches = [...groups.values()].flatMap((group) =>
-    Array.from({ length: Math.ceil(group.length / PANEL_BATCH_SIZE) }, (_, i) =>
-      group.slice(i * PANEL_BATCH_SIZE, (i + 1) * PANEL_BATCH_SIZE),
-    ),
-  );
+  // One batch never mixes files or the vendors that raised them, so each call avoids exactly those.
+  const vendorsOf = (c: PanelRecord["candidates"][number]) =>
+    [...new Set(c.raisedBy.flatMap((i) => found[i]?.invoked.target?.vendor ?? []))].sort();
+  const batchesOf = (list: typeof candidates) => {
+    const groups = new Map<string, typeof candidates>();
+    for (const c of list) {
+      const key = JSON.stringify([vendorsOf(c), c.file]);
+      groups.set(key, [...(groups.get(key) ?? []), c]);
+    }
+    return [...groups.values()].flatMap((group) =>
+      Array.from({ length: Math.ceil(group.length / PANEL_BATCH_SIZE) }, (_, i) =>
+        group.slice(i * PANEL_BATCH_SIZE, (i + 1) * PANEL_BATCH_SIZE),
+      ),
+    );
+  };
+  const batches = batchesOf(candidates.filter((c) => selected.includes(c)));
+  const firstPass = batches.length;
   // A re-review's verifier checks the same fix diff, and whether each prior finding is really resolved.
-  const verifierFix = fix
-    ? {
-        review: fix.review,
-        sha: fix.sha,
-        prior: fix.findings.map(({ file, line, title }, i) => {
-          const [repeated, recheck] = [true, false].map((byFinder) =>
-            candidates
-              .filter((c) => (c.finder !== null) === byFinder && cited(c) === i)
-              .map((c) => c.id)
-              .join(", "),
-          );
-          return {
-            id: `P${i + 1}`,
+  const verdicts = new Map<string, PanelRecord["verdicts"][number]>();
+  // Statuses name only candidates not yet refuted, so a second pass points at its own candidates.
+  const verifierFixNow = () =>
+    fix
+      ? {
+          review: fix.review,
+          sha: fix.sha,
+          prior: fix.findings.map(({ file, line, title }, i) => {
+            const [repeated, recheck] = [true, false].map((byFinder) =>
+              candidates
+                .filter(
+                  (c) =>
+                    (c.finder !== null) === byFinder &&
+                    cited(c) === i &&
+                    verdicts.get(c.id)?.verdict !== "REFUTED",
+                )
+                .map((c) => c.id)
+                .join(", "),
+            );
+            return {
+              id: `P${i + 1}`,
+              file,
+              line,
+              title,
+              status: repeated
+                ? `reported unaddressed by ${repeated}`
+                : recheck
+                  ? `not repeated by any finder; recheck it as ${recheck}`
+                  : "refuted at this review",
+            };
+          }),
+          resolved: (fix.resolved ?? []).map(({ file, line, title }) => ({
             file,
             line,
             title,
-            status: repeated
-              ? `reported unaddressed by ${repeated}`
-              : `not repeated by any finder; recheck it as ${recheck}`,
-          };
-        }),
-        resolved: (fix.resolved ?? []).map(({ file, line, title }) => ({
-          file,
-          line,
-          title,
-          status: "resolved at an earlier review",
-        })),
-      }
-    : undefined;
-  const verdicts = new Map<string, PanelRecord["verdicts"][number]>();
+            status: "resolved at an earlier review",
+          })),
+        }
+      : undefined;
+  let verifierFix = verifierFixNow();
   const omitted: string[] = [];
   let last = first.invoked.result;
-  for (const batch of batches) {
+  for (const [index, batch] of batches.entries()) {
     if (!deps.verify) throw new Error('mode "panel" needs a verifier');
     // Candidates the verifier leaves out get one more call, then stay unverified follow-ups.
     let pending = batch;
@@ -476,7 +527,7 @@ async function runPanel<T extends Invoked>(
           jsonSchema: toStrictJsonSchema(VerifierSchema),
           timeoutMs: input.timeoutMs,
         },
-        pending[0]?.vendor ?? undefined,
+        pending[0] ? vendorsOf(pending[0]) : [],
       );
       results.push(invoked.result);
       last = invoked.result;
@@ -506,11 +557,34 @@ async function runPanel<T extends Invoked>(
         `Verifier gave no ruling for ${pending.map((c) => c.id).join(", ")} after a retry; security and prior blocking findings among them block, the rest stay unverified follow-ups`,
       );
     }
+    // After the first pass, a refuted report doesn't settle the reports merged into it that differ in
+    // line or title: each is then verified as a candidate of its own, outside the cap.
+    if (index === firstPass - 1) {
+      const split = candidates.flatMap(({ duplicates, ...c }) =>
+        verdicts.get(c.id)?.verdict === "REFUTED"
+          ? (duplicates ?? [])
+              .filter((d) => d.line !== c.line || d.title !== c.title)
+              .map((d) => ({
+                ...c,
+                ...d,
+                severity: d.severity ?? c.severity,
+                failure_scenario: d.failure_scenario ?? "",
+                agreement: 1,
+                vendor: found[d.finder]?.invoked.target?.vendor ?? null,
+                raisedBy: [d.finder],
+              }))
+          : [],
+      );
+      const own = split.map((c, i) => ({ ...c, id: `C${candidates.length + i + 1}` }));
+      candidates.push(...own);
+      verifierFix = verifierFixNow();
+      batches.push(...batchesOf(own));
+    }
   }
 
   // Refuted candidates are dropped here, by id; a same-titled candidate keeps its own ruling.
   const findings: Finding[] = [];
-  for (const { id, finder: _finder, vendor: _vendor, ...finding } of candidates) {
+  for (const { id, finder: _finder, vendor: _vendor, raisedBy: _raisedBy, ...finding } of candidates) {
     const verdict = verdicts.get(id);
     if (!verdict) findings.push(finding);
     else if (verdict.verdict !== "REFUTED") {
@@ -533,6 +607,7 @@ async function runPanel<T extends Invoked>(
     : "approve";
   const decision = decide(input, review, modelVerdict);
   const panel: PanelRecord = {
+    finders: finders.map(({ prompt }, i) => ({ prompt, vendor: found[i]?.invoked.target?.vendor ?? null })),
     candidates,
     verdicts: [...verdicts.values()],
     refuted: [...verdicts.values()].filter((v) => v.verdict === "REFUTED").map((v) => v.id),
