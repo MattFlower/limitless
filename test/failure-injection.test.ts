@@ -1675,6 +1675,13 @@ test("GitHub retries classify structured failures and share one abortable deadli
   await expect(failing()).rejects.toBeInstanceOf(GitHubUnavailableError);
   expect(calls).toBe(3); // the second call of the delivery gets no fresh budget: one attempt
   expect(Date.now() - started).toBeLessThan(250);
+  await Bun.sleep(Math.max(0, budget.deadline - Date.now()) + 5);
+  await expect(failing()).rejects.toBeInstanceOf(GitHubUnavailableError);
+  expect(calls).toBe(3); // once the deadline passes, nothing more starts
+  const soon = { deadline: Date.now() + 500 };
+  expect(
+    await withGitHubRetry(async (timeout) => timeout(), { budget: soon, timeoutMs: 300_000 }),
+  ).toBeLessThanOrEqual(500);
   githubRetry.baseDelayMs = 60_000;
   const abort = new AbortController();
   setTimeout(() => abort.abort(), 20);
@@ -1705,6 +1712,24 @@ test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is fina
     writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr merge", err: bad502, landed: true }]));
     expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "T")).toBe("merged");
     expect(ghCalls(pr, "pr merge")).toHaveLength(1);
+    // The landed merge is found even though the first state lookup also hit a 502.
+    rmSync(`${pr}.merged`);
+    const lookups = ghCalls(pr, "pr view").length;
+    writeFileSync(
+      `${pr}.fail`,
+      JSON.stringify([
+        { on: "pr merge", err: bad502, landed: true },
+        { on: "pr view", err: bad502 },
+      ]),
+    );
+    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "T")).toBe("merged");
+    expect(ghCalls(pr, "pr merge")).toHaveLength(2);
+    expect(ghCalls(pr, "pr view")).toHaveLength(lookups + 2);
+    // Exhausting the immediate merge still falls back to auto-merge, as on main.
+    rmSync(`${pr}.merged`);
+    writeFileSync(`${pr}.fail`, JSON.stringify(Array(3).fill({ on: "pr merge", err: bad502 })));
+    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "T")).toBe("auto");
+    expect(ghCalls(pr, "pr merge").filter((c) => c.includes("--auto"))).toHaveLength(1);
   } finally {
     await restore();
   }

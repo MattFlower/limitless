@@ -1252,9 +1252,9 @@ async function recordVerified(ctx: RunContext, sha: string): Promise<void> {
   await ctx.save();
 }
 
-/** One GitHub retry deadline per delivery, persisted so a restart resumes it instead of renewing it. */
-async function deliveryBudget(ctx: RunContext, kind: "deliver" | "draft"): Promise<GitHubBudget> {
-  const key = `${kind}:${ctx.state.round}`;
+/** One GitHub retry deadline per delivery, fallback draft included, persisted so a restart resumes it. */
+async function deliveryBudget(ctx: RunContext): Promise<GitHubBudget> {
+  const key = `deliver:${ctx.state.round}`;
   if (ctx.state.githubDeadline?.key !== key) {
     ctx.state.githubDeadline = { key, at: githubBudget().deadline };
     await ctx.save();
@@ -1277,7 +1277,7 @@ async function deliverVerifiedDraft(
   const report = buildReport(ctx, false, { sha, stage, reason, base });
   ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
   ctx.checkCancelled();
-  const budget = await deliveryBudget(ctx, "draft");
+  const budget = await deliveryBudget(ctx);
   await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
@@ -1306,9 +1306,12 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     throw new Error("PR delivery base does not match the verified webhook head");
   const deliverStage = async () => {
     const cwd = ctx.state.worktreePath as string;
-    const budget = await deliveryBudget(ctx, success ? "deliver" : "draft");
+    const budget = await deliveryBudget(ctx);
     const gh: GhRunner = (args, signal) =>
-      withGitHubRetry(async () => (await (ctx.deps.gh ?? runGh)(args, signal)) ?? "", { budget, signal });
+      withGitHubRetry(async (timeout) => (await (ctx.deps.gh ?? runGh)(args, signal, timeout())) ?? "", {
+        budget,
+        signal,
+      });
     if (
       success &&
       ctx.repo.kind === "github" &&

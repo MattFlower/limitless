@@ -6,10 +6,14 @@ import { inAnyCidr } from "../util/cidr.ts";
 import { sh } from "../util/proc.ts";
 
 type GitHubFactory = Pick<Factory, "cfg" | "store" | "createRun">;
-export type GhRunner = (args: string[], signal?: AbortSignal) => Promise<string> | Promise<void>;
+export type GhRunner = (
+  args: string[],
+  signal?: AbortSignal,
+  timeoutMs?: number,
+) => Promise<string> | Promise<void>;
 
-export const runGh: GhRunner = async (args, signal) => {
-  return (await sh(["gh", ...args], { cwd: process.cwd(), timeoutMs: 30_000, signal })).stdout;
+export const runGh: GhRunner = async (args, signal, timeoutMs = 30_000) => {
+  return (await sh(["gh", ...args], { cwd: process.cwd(), timeoutMs, signal })).stdout;
 };
 
 const object = (value: unknown): Record<string, unknown> | null =>

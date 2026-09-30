@@ -8,7 +8,7 @@ import { CommandError, sh } from "../util/proc.ts";
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
 /** Retry policy for GitHub and remote git (tests shorten it). */
-export const githubRetry = { attempts: 3, budgetMs: 60_000, baseDelayMs: 5_000, minTimeoutMs: 10_000 };
+export const githubRetry = { attempts: 3, budgetMs: 60_000, baseDelayMs: 5_000 };
 /** One deadline shared by every GitHub call in a delivery. */
 export interface GitHubBudget {
   deadline: number;
@@ -45,15 +45,23 @@ function pause(ms: number, signal?: AbortSignal): Promise<void> {
 
 /** The single retry layer for GitHub and remote git: callers must never retry on top of it. */
 export async function withGitHubRetry<T>(
-  call: (timeoutMs: number) => Promise<T>,
+  call: (timeout: () => number) => Promise<T>,
   opts: { budget?: GitHubBudget; signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<T> {
-  const budget = opts.budget ?? githubBudget();
+  const cap = opts.timeoutMs ?? 120_000;
+  // Outside a delivery, a lone call gets a budget that never cuts its own timeout short.
+  const budget = opts.budget ?? { deadline: Date.now() + Math.max(githubRetry.budgetMs, cap) };
+  // Recomputed before every subprocess, so no command outlives the shared deadline.
+  const timeout = () => {
+    const left = budget.deadline - Date.now();
+    if (left <= 0) throw new GitHubUnavailableError("GitHub unavailable: delivery retry deadline passed");
+    return Math.min(cap, left);
+  };
   for (let attempt = 1; ; attempt++) {
     opts.signal?.throwIfAborted();
-    const left = Math.max(budget.deadline - Date.now(), githubRetry.minTimeoutMs);
+    timeout();
     try {
-      return await call(Math.min(opts.timeoutMs ?? 120_000, left));
+      return await call(timeout);
     } catch (error) {
       if (!isTransient(error) || opts.signal?.aborted) throw error;
       const delay = githubRetry.baseDelayMs * 3 ** (attempt - 1);
@@ -72,7 +80,7 @@ type RemoteOpts = {
   budget?: GitHubBudget;
 };
 const remoteSh = (cmd: string[], opts: RemoteOpts) =>
-  withGitHubRetry((timeoutMs) => sh(cmd, { ...opts, timeoutMs }), opts);
+  withGitHubRetry((timeout) => sh(cmd, { ...opts, timeoutMs: timeout() }), opts);
 
 export function slugify(text: string, max = 40): string {
   return (
@@ -468,24 +476,23 @@ export async function createPullRequest(
   const { cwd, signal } = opts;
   const list = ["gh", "pr", "list", "--repo", repo.slug, "--head", opts.branch, "--state", "all"];
   // A final lookup failure means "none found", as before; transient ones retry the attempt.
-  const find = (timeoutMs: number) =>
-    sh([...list, "--json", "url", "--jq", ".[0].url"], { cwd, signal, timeoutMs }).then(
+  const find = (timeout: () => number) =>
+    sh([...list, "--json", "url", "--jq", ".[0].url"], { cwd, signal, timeoutMs: timeout() }).then(
       (r) => r.stdout.trim(),
       (e) => (isTransient(e) || signal?.aborted ? Promise.reject(e) : ""),
     );
   let existing = false;
   // Look up before every create: a 5xx or timeout can hide a PR that was in fact opened.
-  const url = await withGitHubRetry(async (timeoutMs) => {
-    const found = await find(timeoutMs);
+  const url = await withGitHubRetry(async (timeout) => {
+    const found = await find(timeout);
     if (found) {
       existing = true;
       return found;
     }
     const create = ["gh", "pr", "create", "--repo", repo.slug, "--head", opts.branch, "--base", opts.base];
     const args = [...create, "--title", opts.title, "--body-file", "-", ...(opts.draft ? ["--draft"] : [])];
-    const res = await sh(args, { cwd, stdin: opts.body, signal, timeoutMs }).catch(async (e) => {
-      const again =
-        e instanceof CommandError && e.stderr.includes("already exists") && (await find(timeoutMs));
+    const res = await sh(args, { cwd, stdin: opts.body, signal, timeoutMs: timeout() }).catch(async (e) => {
+      const again = e instanceof CommandError && e.stderr.includes("already exists") && (await find(timeout));
       if (!again) throw e;
       existing = true;
       return { stdout: again };
@@ -513,39 +520,42 @@ export async function mergePullRequest(
   // Squash with the PR title as the subject, not the first round's commit message.
   const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
   const subject = title ? ["--subject", number ? `${title} (#${number})` : title] : [];
-  const merged = (timeoutMs: number) =>
-    sh(["gh", "pr", "view", prUrl, "--json", "state", "--jq", ".state"], { cwd, signal, timeoutMs }).then(
-      (r) => r.stdout.trim() === "MERGED",
-      () => false,
-    );
-  // A merge that timed out or failed transiently may still have landed: check before retrying.
+  // After a transient failure or timeout the merge may still have landed. Until a state lookup
+  // settles that, every attempt reconciles first; a failed lookup retries like any other call.
+  let unsure = false;
+  const landed = async (timeout: () => number) => {
+    const view = ["gh", "pr", "view", prUrl, "--json", "state", "--jq", ".state"];
+    const merged = (await sh(view, { cwd, signal, timeoutMs: timeout() })).stdout.trim() === "MERGED";
+    unsure = false;
+    return merged;
+  };
   const merge = (extra: string[]) =>
     withGitHubRetry(
-      (timeoutMs) =>
-        sh(["gh", "pr", "merge", prUrl, "--squash", ...extra, "--delete-branch", ...subject], {
-          cwd,
-          signal,
-          timeoutMs,
-        }).then(
+      async (timeout) => {
+        if (unsure && (await landed(timeout))) return "merged" as const;
+        const cmd = ["gh", "pr", "merge", prUrl, "--squash", ...extra, "--delete-branch", ...subject];
+        return sh(cmd, { cwd, signal, timeoutMs: timeout() }).then(
           () => "ok" as const,
           async (e) => {
-            if (signal?.aborted) throw e;
-            if (!isTransient(e)) return "failed" as const;
-            if (await merged(timeoutMs)) return "merged" as const;
+            if (signal?.aborted || !isTransient(e)) throw e;
+            unsure = true;
+            if (await landed(timeout)) return "merged" as const;
             throw e;
           },
-        ),
+        );
+      },
       { budget, signal },
-    );
-  try {
-    const now = await merge([]);
-    if (now !== "failed") return "merged";
-    const auto = await merge(["--auto"]);
-    return auto === "merged" ? "merged" : auto === "ok" ? "auto" : "failed";
-  } catch (e) {
-    if (e instanceof GitHubUnavailableError) return "unavailable";
-    throw e;
-  }
+    ).catch((e) => {
+      if (signal?.aborted) throw e;
+      return e instanceof GitHubUnavailableError ? ("unavailable" as const) : ("failed" as const);
+    });
+  const now = await merge([]);
+  if (now === "ok" || now === "merged") return "merged";
+  // As on main, fall back to auto-merge; it shares the budget and reconciles an unsure merge first.
+  const auto = await merge(["--auto"]);
+  if (auto === "merged") return "merged";
+  if (auto === "ok") return "auto";
+  return now === "unavailable" || auto === "unavailable" ? "unavailable" : "failed";
 }
 
 /** Same stable top-level representation used in pipeline and eval prompts. */
