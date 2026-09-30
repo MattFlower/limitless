@@ -1,5 +1,11 @@
 import type { Reserves } from "../config.ts";
-import type { InvocationStatus, ProviderStatus, QuotaAlert, QuotaWindow } from "../core/types.ts";
+import type {
+  ConfinementProbe,
+  InvocationStatus,
+  ProviderStatus,
+  QuotaAlert,
+  QuotaWindow,
+} from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import type { ProviderDef } from "./catalog.ts";
 
@@ -16,6 +22,7 @@ interface ProviderRuntime {
   healthy: boolean; // for local servers: last probe result
   inFlight: number;
   waiters: (() => void)[];
+  confinement?: ConfinementProbe;
 }
 
 interface KeyReading {
@@ -490,6 +497,14 @@ export class ProviderTracker {
     this.persist(id);
   }
 
+  /** Shown on the provider card; a failed probe only diverts confined readers, not the provider. */
+  observeConfinement(id: string, probe: ConfinementProbe): void {
+    const p = this.providers.get(id);
+    if (!p) return;
+    p.confinement = probe;
+    this.publish(id);
+  }
+
   setHealthy(id: string, healthy: boolean): void {
     const p = this.providers.get(id);
     if (!p || p.healthy === healthy) return;
@@ -563,6 +578,7 @@ export class ProviderTracker {
       inFlight: p.inFlight,
       maxConcurrent: p.def.maxConcurrent,
       updatedAt: now,
+      ...(p.confinement ? { confinement: p.confinement } : {}),
     };
   }
 
