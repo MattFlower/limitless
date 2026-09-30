@@ -384,7 +384,13 @@ for (const [name, sandbox, change, reason] of [
   ],
   ["sandbox startup", () => new Error("spawn EACCES"), {}, "failed to start: spawn EACCES"],
   ["missing CLI", denies, { path: null }, "codex CLI not found"],
-  ["version lookup", denies, { version: null }, "--version failed"],
+  ["version lookup", denies, { version: null }, "--version failed (exit 1)"],
+  [
+    "garbled version output",
+    denies,
+    { version: "garbled version output" },
+    '--version failed: unrecognised output "garbled version output"',
+  ],
 ] as const)
   test(`confined codex exec never starts when the probe fails: ${name}`, async () => {
     const { spec, cleanup } = confinedFixture();

@@ -255,6 +255,8 @@ function readerProfile(spec: AgentSpec, scratch: string): string[] {
 
 /** A denial names the canary; ENOENT counts because the canary exists outside the sandbox. */
 const DENIED = /operation not permitted|permission denied|no such file or directory/i;
+/** `codex --version` prints one line such as `codex-cli 0.157.1`. */
+const CODEX_VERSION = /^codex(?:-cli)?\s+v?\d+\.\d+\.\d+\S*$/;
 
 /**
  * Older Codex CLIs accept the reader profile but don't enforce it (0.154.0 allowed denied reads),
@@ -269,6 +271,7 @@ export class CodexReaderProbe {
     const path = this.which("codex");
     if (!path) return { ok: false, path: null, version: null, reason: "codex CLI not found on PATH" };
     let version: string | null = null;
+    let lookup = "codex --version failed";
     try {
       const proc = await run({
         cmd: [path, "--version"],
@@ -277,12 +280,16 @@ export class CodexReaderProbe {
         timeoutMs: 30_000,
         signal: spec.signal,
       });
-      if (proc.exitCode === 0) version = proc.stdout.trim().split("\n")[0]?.trim() || null;
-    } catch {
-      version = null;
+      const line = proc.stdout.trim().split("\n")[0]?.trim() ?? "";
+      if (proc.exitCode !== 0) lookup = `codex --version failed (exit ${proc.exitCode ?? proc.signal})`;
+      else if (CODEX_VERSION.test(line)) version = line;
+      else lookup = `codex --version failed: unrecognised output ${JSON.stringify(line.slice(0, 80))}`;
+    } catch (e) {
+      lookup = `codex --version failed: ${(e as Error).message}`;
     }
     if (spec.signal.aborted) return { ok: false, path, version, reason: PROBE_CANCELLED };
-    if (!version) return { ok: false, path, version: null, reason: "codex --version failed" };
+    // The version keys the cache, so only a line we can recognise as a Codex release counts.
+    if (!version) return { ok: false, path, version: null, reason: lookup };
     const key = `${path}\0${version}`;
     for (;;) {
       let pending = this.results.get(key);
