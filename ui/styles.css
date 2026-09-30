@@ -543,6 +543,12 @@ p {
   border-color: var(--danger-dim);
   background: var(--danger-bg);
 }
+/* An unmet holdout dismissed as not required does not block: neutral, not danger. */
+.badge-dismissed {
+  color: var(--muted);
+  border-color: var(--muted-dim);
+  background: var(--muted-bg);
+}
 .badge-unclear {
   color: var(--warning);
   border-color: var(--warning-dim);

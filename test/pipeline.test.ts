@@ -2631,16 +2631,23 @@ protected_paths = ["protected.txt"]
     const drive = (
       firstVerify: Record<string, unknown>,
       onImplement: (prompt: string, call: number) => void,
+      publicSpec = spec,
     ) => {
       let verifies = 0;
       let implementCalls = 0;
       const handler: Handler = (s) => {
         const role = roleOf(s);
         if (role === "triage") return { structured: triage() };
-        if (role === "spec") return { structured: { ...spec, out_of_scope: ["Delete the old parser"] } };
+        if (role === "spec")
+          return { structured: { ...publicSpec, out_of_scope: ["Delete the old parser"] } };
         if (role === "holdout") return { structured: privateHoldout };
         if (role === "review") return { structured: approve };
-        if (role === "verify") return { structured: ++verifies === 1 ? firstVerify : pass };
+        if (role === "verify") {
+          expect(s.prompt).toContain(
+            "A citation must be either at least three consecutive words quoted exactly, or one whole line of the request (a sentence or bullet) or one whole acceptance criterion, exactly as shown",
+          );
+          return { structured: ++verifies === 1 ? firstVerify : pass };
+        }
         onImplement(s.prompt, ++implementCalls);
         return { files: { "farewell.txt": "goodbye\n" } };
       };
@@ -2731,6 +2738,50 @@ protected_paths = ["protected.txt"]
         expect(first?.notes).toContain("requirement citation validation failed");
       },
     );
+
+    test.each([
+      ["Background\n\nOur service uses IPv4.\n\nRequirements\n\n- Support IPv6", "Background", false],
+      ["Background\n\nOur service uses IPv4.\n\nRequirements\n\n- Support IPv6", "Requirements", false],
+      ["Support IPv6\nKeep IPv4", "Support IPv6", true],
+      ["Support IPv6\nKeep IPv4", "Keep IPv4", true],
+      ["- Support IPv6", "Support IPv6", true],
+      ["Support IPv6 and IPv4", "Support IPv6", false],
+      ["Retry", "Retry", true],
+      ["Add a farewell file", "**AC-1** Done", true],
+    ] as const)("citation grounding in the fake pipeline: %s / %s", async (request, citation, grounded) => {
+      let checked = false;
+      const requirement = citation.startsWith("**AC-") ? "spec" : "request";
+      const { f, implementCalls } = drive(
+        unmetH2({ requirement, requirementCitation: citation }),
+        (prompt, call) => {
+          if (call !== 2) return;
+          const feedback = prompt.split("### Checks not met")[1] ?? "";
+          expect(feedback).not.toContain(secret);
+          expect(feedback).not.toContain("missing input");
+          if (grounded)
+            expect(feedback).toContain(
+              `violates this requirement of the ${requirement === "spec" ? "specification" : "original request"}:`,
+            );
+          else {
+            expect(feedback).toContain("the verifier's attribution could not be validated");
+            expect(feedback).not.toContain("the verifier's citation was not found in it");
+            expect(feedback).toContain("check them against the original request and specification above");
+          }
+          checked = true;
+        },
+        {
+          ...spec,
+          acceptance_criteria: [{ id: "AC-1", criterion: "Done", how_to_verify: "cat farewell.txt" }],
+        },
+      );
+      const run = await f.createRun({ repo: repoDir, prompt: request });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(checked).toBe(true);
+      expect(implementCalls()).toBe(2);
+      const first = f.store.getRunState<RunState>(run.id)?.verifyResults?.[0];
+      expect(first?.overall).toBe("fail");
+      expect(first?.notes.includes("citation is not a stated public requirement")).toBe(!grounded);
+    });
 
     test("an all-met verify with a non-enum requirement value succeeds instead of failing the invocation", async () => {
       const allMet = { ...pass, criteria: pass.criteria.map((c) => ({ ...c, requirement: "" })) };
