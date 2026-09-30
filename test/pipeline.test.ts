@@ -684,6 +684,158 @@ esac
     expect(readFileSync(count, "utf8").trim().split("\n").length).toBe(3);
   });
 
+  describe("baseline cache", () => {
+    const lines = (path: string) =>
+      existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").length : 0;
+    const cacheRows = (f: Factory) =>
+      f.store.db.query("SELECT base_sha, gate_run, created_at FROM baseline_cache").all() as {
+        base_sha: string;
+        gate_run: string;
+        created_at: number;
+      }[];
+    const quick = (s: AgentSpec): FakeReply => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    };
+    async function commitGates(toml: string): Promise<void> {
+      writeFileSync(join(repoDir, ".limitless.toml"), toml);
+      await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "gates"], {
+        cwd: repoDir,
+      });
+    }
+    async function finish(f: Factory, over: Partial<Parameters<Factory["createRun"]>[0]> = {}) {
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick", ...over });
+      await waitFor(f, run.id, ["succeeded", "failed", "needs_human", "cancelled"]);
+      return { run, state: f.store.getRunState<RunState>(run.id) };
+    }
+
+    test("a second run on the same base reuses a failing baseline with its retry evidence", async () => {
+      const count = join(home, "gate-runs");
+      const check = `echo x >> '${count}'; echo attempt $(( $(wc -l < '${count}') )); exit 1`;
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`);
+      const f = start(quick);
+      const first = await finish(f);
+      // Baseline, its retry, and the post-implement gates.
+      expect(lines(count)).toBe(3);
+      expect(first.state?.baselineCached).toBe(false);
+      expect(cacheRows(f)).toHaveLength(1);
+      const second = await finish(f);
+      // Only the post-implement gates executed.
+      expect(lines(count)).toBe(4);
+      expect(second.state?.baselineCached).toBe(true);
+      expect(second.state?.baseline).toEqual(first.state?.baseline ?? null);
+      expect(second.state?.baseline?.checks[0]?.firstAttempt?.output).toBe("attempt 1");
+      const verdicts = (s: RunState | null) => s?.lastGates?.map((g) => [g.name, g.verdict, g.blocking]);
+      expect(verdicts(second.state)).toEqual(verdicts(first.state));
+      expect(verdicts(second.state)).toEqual([["check", "still_failing", false]]);
+      expect(f.store.getRun(second.run.id)?.status).toBe("succeeded");
+      const prepare = f.store.listStages(second.run.id).find((s) => s.name === "prepare");
+      expect(prepare?.summary).toContain("baseline reused from cache");
+      expect(f.store.listStages(first.run.id).find((s) => s.name === "prepare")?.summary).not.toContain(
+        "cache",
+      );
+      expect(JSON.parse(f.store.getArtifact(second.run.id, "baseline-gates.json") ?? "{}")).toEqual(
+        second.state?.baseline,
+      );
+    });
+
+    test("a changed gate config or base commit misses", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const f = start(quick);
+      await finish(f);
+      expect(lines(count)).toBe(2);
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'; true" }]\n`);
+      const changedConfig = await finish(f);
+      expect([lines(count), changedConfig.state?.baselineCached]).toEqual([4, false]);
+      writeFileSync(join(repoDir, "greeting.txt"), "hello again\n");
+      await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "base"], {
+        cwd: repoDir,
+      });
+      const changedBase = await finish(f);
+      expect([lines(count), changedBase.state?.baselineCached]).toEqual([6, false]);
+      expect(cacheRows(f)).toHaveLength(3);
+    });
+
+    test("a timed-out or cancelled baseline is not cached", async () => {
+      const count = join(home, "gate-runs");
+      // The first execution outlasts its timeout; later ones pass.
+      const check = `echo x >> '${count}'; test $(( $(wc -l < '${count}') )) -ne 1 || sleep 5`;
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "${check}", timeoutSec = 1 }]\n`);
+      const f = start(quick);
+      const timedOut = await finish(f);
+      expect(timedOut.state?.baseline?.checks[0]?.timedOut).toBe(true);
+      expect(cacheRows(f)).toEqual([]);
+      const next = await finish(f);
+      expect(next.state?.baselineCached).toBe(false);
+      expect(next.state?.baseline?.checks[0]?.ok).toBe(true);
+      expect(cacheRows(f)).toHaveLength(1);
+
+      rmSync(count);
+      await commitGates(
+        `[gates]\nchecks = [{ name = "check", run = "${check.replace("sleep 5", "sleep 10")}" }]\n`,
+      );
+      const cancelled = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(count)) {
+        if (Date.now() > deadline) throw new Error("baseline never started");
+        await Bun.sleep(10);
+      }
+      f.cancelRun(cancelled.id);
+      expect(await waitFor(f, cancelled.id, ["cancelled", "failed"])).toBe("cancelled");
+      expect(cacheRows(f)).toHaveLength(1);
+      const after = await finish(f);
+      expect(after.state?.baselineCached).toBe(false);
+      // Cancelled baseline, then this run's baseline and post-implement gates.
+      expect(lines(count)).toBe(3);
+    });
+
+    test("--no-baseline-cache executes the baseline without reading or replacing the entry", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const f = start(quick);
+      await finish(f);
+      const primed = cacheRows(f);
+      expect(primed).toHaveLength(1);
+      const bypass = await finish(f, { noBaselineCache: true });
+      expect(f.store.getRun(bypass.run.id)?.noBaselineCache).toBe(true);
+      expect([lines(count), bypass.state?.baselineCached]).toEqual([4, false]);
+      expect(cacheRows(f)).toEqual(primed);
+      const retried = await f.retryRun(bypass.run.id);
+      expect(retried.noBaselineCache).toBe(true);
+      await waitFor(f, retried.id, ["succeeded", "failed", "needs_human"]);
+      expect(lines(count)).toBe(6);
+      expect(cacheRows(f)).toEqual(primed);
+    });
+
+    test("post-rebase gates execute when prepare reused the cached baseline", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const bare = await githubFixture();
+      let advance = false;
+      const f = start(async (s) => {
+        if (advance && roleOf(s) === "review") {
+          advance = false;
+          await advanceBase(bare, "base.txt", "new base\n");
+        }
+        return quick(s);
+      });
+      registerGithub(f, bare);
+      const first = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(lines(count)).toBe(2);
+      advance = true;
+      const second = await f.createRun({ repo: "test/repo", prompt: "Add farewell too", profile: "quick" });
+      expect(await waitFor(f, second.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(f.store.getRunState<RunState>(second.id)?.baselineCached).toBe(true);
+      // Post-implement gates, then the gates after merging the advanced base.
+      expect(lines(count)).toBe(4);
+      expect(f.store.listStages(second.id).filter((s) => s.name === "gates")).toHaveLength(2);
+    });
+  });
+
   // Same text git generates, so a fixture line can never stand in for a real marker.
   const fixture = "<<<<<<< HEAD\nexample\n=======\n>>>>>>> theirs\n";
 

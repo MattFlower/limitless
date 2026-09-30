@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { auditDiff } from "../src/gates/audit.ts";
+import { cacheableBaseline, gatesHash } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
 import {
   compareGates,
@@ -349,5 +350,64 @@ describe("auditDiff", () => {
       toolCommands: ["git commit --no-verify -m x"],
     });
     expect(f.map((x) => x.rule).sort()).toEqual(["assertions-removed", "no-verify"]);
+  });
+});
+
+describe("baseline cache", () => {
+  const cfg: GateConfig = {
+    setup: ["bun install"],
+    checks: [
+      { name: "lint", run: "bun run lint" },
+      { name: "test", run: "bun test" },
+    ],
+    source: ".limitless.toml",
+    protectedPaths: [],
+  };
+  const result = (name: string, command: string, over: Partial<GateRun["checks"][number]> = {}) => ({
+    name,
+    command,
+    ok: true,
+    exitCode: 0,
+    durationMs: 1,
+    output: "",
+    ...over,
+  });
+  const complete: GateRun = {
+    setupOk: true,
+    setup: [result("setup", "bun install")],
+    checks: [
+      result("lint", "bun run lint"),
+      result("test", "bun test", {
+        ok: false,
+        exitCode: 1,
+        firstAttempt: result("test", "bun test", { ok: false, exitCode: 1 }),
+      }),
+    ],
+  };
+
+  test("only a baseline that ran every configured step to an exit code is cacheable", () => {
+    expect(cacheableBaseline(complete, cfg)).toBe(true);
+    const [lint, tests] = complete.checks as [GateRun["checks"][number], GateRun["checks"][number]];
+    const incomplete: GateRun[] = [
+      { setupOk: false, setup: [result("setup", "bun install", { ok: false, exitCode: 1 })], checks: [] },
+      { ...complete, checks: [lint] },
+      { ...complete, checks: [lint, { ...tests, timedOut: true, exitCode: null }] },
+      { ...complete, checks: [lint, { ...tests, exitCode: null }] },
+      { ...complete, checks: [lint, { ...tests, firstAttempt: { ...tests, exitCode: null } }] },
+      { ...complete, checks: [lint, { ...tests, command: "bun test --bail" }] },
+      { ...complete, setup: [] },
+    ];
+    for (const run of incomplete) expect(cacheableBaseline(run, cfg)).toBe(false);
+  });
+
+  test("the config hash ignores key order but not content", () => {
+    const reordered = JSON.parse(
+      `{"protectedPaths":[],"source":".limitless.toml","checks":[{"run":"bun run lint","name":"lint"},{"run":"bun test","name":"test"}],"setup":["bun install"]}`,
+    ) as GateConfig;
+    expect(gatesHash(reordered)).toBe(gatesHash(cfg));
+    expect(gatesHash({ ...cfg, checks: [...cfg.checks].reverse() })).not.toBe(gatesHash(cfg));
+    expect(gatesHash({ ...cfg, checks: [{ name: "lint", run: "bun run lint", timeoutSec: 60 }] })).not.toBe(
+      gatesHash({ ...cfg, checks: [{ name: "lint", run: "bun run lint" }] }),
+    );
   });
 });

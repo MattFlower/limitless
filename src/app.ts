@@ -244,6 +244,7 @@ export class Factory {
         ...(run.baseBranch ? { baseBranch: run.baseBranch } : {}),
         ...(run.deliveryBranch ? { deliveryBranch: run.deliveryBranch } : {}),
         ...(run.requestedBy ? { requestedBy: run.requestedBy } : {}),
+        ...(run.noBaselineCache ? { noBaselineCache: true } : {}),
       },
       run.githubWebhookVerified,
     );

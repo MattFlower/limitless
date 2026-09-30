@@ -122,6 +122,30 @@ test("log and debug event retention is selective, including active-run events", 
   expect(ids).toEqual([cutoffDebug.id, newDebug.id, info.id]);
 });
 
+test("baseline cache entries expire after seven days and each key component misses", async () => {
+  const key = { repoId: repo.id, baseSha: "a".repeat(40), gatesHash: "h", envVersion: 1 };
+  const since = now - 7 * DAY;
+  store.putBaselineCache(key, { setupOk: true, setup: [], checks: [] }, now - 7 * DAY);
+  const young = { ...key, baseSha: "b".repeat(40) };
+  store.putBaselineCache(young, { setupOk: true, setup: [], checks: [] }, now - 7 * DAY + 1);
+  expect(store.getBaselineCache(key, since)).toBeNull();
+  expect(store.getBaselineCache<object>(young, since)).toEqual({ setupOk: true, setup: [], checks: [] });
+  for (const miss of [
+    { baseSha: "c".repeat(40) },
+    { gatesHash: "other" },
+    { envVersion: 2 },
+    { repoId: "x" },
+  ])
+    expect(store.getBaselineCache({ ...young, ...miss }, since)).toBeNull();
+  const dry = await collectGarbage(store, cfg, { now, dryRun: true });
+  expect(dry.baselineCache).toBe(1);
+  expect(store.countExpiredBaselineCache(since)).toBe(1);
+  const actual = await collectGarbage(store, cfg, { now });
+  expect([actual.errors, actual.baselineCache]).toEqual([[], 1]);
+  expect(store.countExpiredBaselineCache(now)).toBe(1);
+  expect(store.getBaselineCache(young, since)).not.toBeNull();
+});
+
 test("daemon API and CLI dry run leave Git, files and DB unchanged", async () => {
   const r = run("succeeded", 31);
   const path = await worktree(r.id);
@@ -246,6 +270,7 @@ test("startup and hourly passes do not overlap and shutdown clears the timer", a
     logs: [],
     metadata: [],
     debugEvents: 0,
+    baselineCache: 0,
     errors: [],
   };
   const factory = new Factory(cfg, {

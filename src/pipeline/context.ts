@@ -65,6 +65,8 @@ export interface RunState {
   gatesConfig?: GateConfig;
   previewConfig?: PreviewConfig | null;
   baseline?: GateRun | null;
+  /** The baseline came from the per-base-commit cache instead of executing at prepare. */
+  baselineCached?: boolean;
   triage?: Triage;
   spec?: Spec | null;
   specAuthorVendor?: string;

@@ -154,6 +154,8 @@ export interface Run {
   startedAt: number | null;
   finishedAt: number | null;
   priority: number;
+  /** Execute the baseline gates and bypass the baseline cache (`--no-baseline-cache`). */
+  noBaselineCache?: boolean;
 }
 
 export interface Stage {
@@ -288,6 +290,8 @@ export interface CreateRunRequest {
   baseBranch?: string;
   /** Existing same-repository PR head; accepted only from a verified GitHub webhook. */
   deliveryBranch?: string;
+  /** Execute the baseline gates and bypass the baseline cache for reads and writes. */
+  noBaselineCache?: boolean;
 }
 
 /** Messages pushed on the global SSE stream. */

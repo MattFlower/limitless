@@ -3,11 +3,13 @@ import { join } from "node:path";
 import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
+import { BASELINE_CACHE_TTL_MS, cacheableBaseline, GATE_ENV_VERSION, gatesHash } from "../gates/cache.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import {
   compareGates,
   type GateComparison,
   type GateHooks,
+  type GateRun,
   retryBaselineFailures,
   retryRegressions,
   runGates,
@@ -336,21 +338,41 @@ async function prepare(ctx: RunContext): Promise<void> {
       );
       await ctx.save();
       const { onWait } = gateEvents(ctx);
-      ctx.state.baseline =
-        gates.setup.length || gates.checks.length
-          ? await runGates(wt.path, gates, ctx.signal, { onWait })
+      const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
+      // Keyed by the commit actually checked out, so verify-change caches its PR base.
+      const cacheKey =
+        hasGates && !ctx.run.noBaselineCache
+          ? {
+              repoId: ctx.repo.id,
+              baseSha: await headSha(wt.path),
+              gatesHash: gatesHash(gates),
+              envVersion: GATE_ENV_VERSION,
+            }
           : null;
-      ctx.checkCancelled();
-      // Retry before resetting, so a check sees the same build output as its first attempt.
-      if (ctx.state.baseline)
-        ctx.state.baseline = await retryBaselineFailures(
-          ctx.state.baseline,
-          wt.path,
-          gates,
-          ctx.signal,
-          onWait,
-        );
-      ctx.checkCancelled();
+      const cached = cacheKey
+        ? store.getBaselineCache<GateRun>(cacheKey, Date.now() - BASELINE_CACHE_TTL_MS)
+        : null;
+      if (cached && cacheableBaseline(cached, gates)) {
+        ctx.state.baseline = cached;
+        ctx.state.baselineCached = true;
+        ctx.log(`Baseline reused from cache (${cacheKey?.baseSha.slice(0, 12)})`);
+      } else {
+        ctx.state.baselineCached = false;
+        ctx.state.baseline = hasGates ? await runGates(wt.path, gates, ctx.signal, { onWait }) : null;
+        ctx.checkCancelled();
+        // Retry before resetting, so a check sees the same build output as its first attempt.
+        if (ctx.state.baseline)
+          ctx.state.baseline = await retryBaselineFailures(
+            ctx.state.baseline,
+            wt.path,
+            gates,
+            ctx.signal,
+            onWait,
+          );
+        ctx.checkCancelled();
+        if (cacheKey && ctx.state.baseline && cacheableBaseline(ctx.state.baseline, gates))
+          store.putBaselineCache(cacheKey, ctx.state.baseline);
+      }
     } finally {
       if (verification) await resetTo(wt.path, verification.headSha);
       else await discardChanges(wt.path);
@@ -381,7 +403,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     await ctx.setPhase("triage");
     const failing = baseline ? baseline.checks.filter((c) => !c.ok).map((c) => c.name) : [];
     return {
-      summary: `worktree ${wt.branch}; ${gates.checks.length} checks${failing.length ? `, failing on base: ${failing.join(", ")}` : ""}`,
+      summary: `worktree ${wt.branch}; ${gates.checks.length} checks${failing.length ? `, failing on base: ${failing.join(", ")}` : ""}${ctx.state.baselineCached ? "; baseline reused from cache" : ""}`,
       value: undefined,
     };
   });
