@@ -25,13 +25,17 @@ export function gatesHash(cfg: GateConfig): string {
     .digest("hex");
 }
 
+/** A shell reports a child killed by signal N as 128+N, so those exits are interruptions too. */
 function finished(r: GateResult): boolean {
-  return r.exitCode !== null && !r.timedOut && (!r.firstAttempt || finished(r.firstAttempt));
+  return (
+    r.exitCode !== null && r.exitCode <= 128 && !r.timedOut && (!r.firstAttempt || finished(r.firstAttempt))
+  );
 }
 
 /**
  * Whether a baseline ran to completion: setup passed and every configured check ran to an exit
- * code (a check may fail). Timeouts, kills and partial check lists are never cached.
+ * code (a check may fail). Timeouts, kills (including signal-derived shell exits) and partial
+ * check lists are never cached.
  */
 export function cacheableBaseline(run: GateRun, cfg: GateConfig): boolean {
   return (

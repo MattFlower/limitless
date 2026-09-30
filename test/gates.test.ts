@@ -238,6 +238,14 @@ describe("gate slots and flaky retry", () => {
     });
   });
 
+  test("a baseline whose check subprocess was killed beneath the gate shell is not cacheable", async () => {
+    const cfg = config("echo x >> runs; /bin/sh -c 'kill -KILL $$'; exit $?");
+    const { run, runs } = await baseline(cfg, tempDir({}));
+    const [c] = run.checks;
+    expect([c?.exitCode, c?.firstAttempt?.exitCode, runs]).toEqual([137, 137, 2]);
+    expect(cacheableBaseline(run, cfg)).toBe(false);
+  });
+
   test("a failing baseline check whose output merely looks like a timeout is still retried", async () => {
     const dir = tempDir({});
     const { run, runs } = await baseline(
@@ -394,6 +402,8 @@ describe("baseline cache", () => {
       { ...complete, checks: [lint, { ...tests, timedOut: true, exitCode: null }] },
       { ...complete, checks: [lint, { ...tests, exitCode: null }] },
       { ...complete, checks: [lint, { ...tests, firstAttempt: { ...tests, exitCode: null } }] },
+      { ...complete, checks: [lint, { ...tests, exitCode: 137 }] },
+      { ...complete, checks: [lint, { ...tests, firstAttempt: { ...tests, exitCode: 143 } }] },
       { ...complete, checks: [lint, { ...tests, command: "bun test --bail" }] },
       { ...complete, setup: [] },
     ];
