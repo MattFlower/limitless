@@ -13,11 +13,14 @@ import {
   quotaCheck,
   reportChecks,
   runChecks,
+  SMOKE_BUDGET_MS,
+  type SmokeCheck,
   transientReason,
+  verifyLiveCheck,
 } from "../scripts/smoke.ts";
 import { deploy } from "../src/cli/service.ts";
 import { CodexStreamParser } from "../src/harness/codex.ts";
-import type { AgentResult, ModelTarget } from "../src/harness/types.ts";
+import type { AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 
@@ -129,7 +132,9 @@ test("smoke runner retries a transiently failed or thrown check once after the d
   expect(broken.calls).toBe(2);
   expect(delays).toHaveLength(3);
   expect(failed[0]).toMatchObject({ name: "broken", status: "fail" });
-  expect(formatReport(failed)).toMatch(/broken\s+FAIL\s+\d+ms\s+second \(first attempt: first\)/);
+  expect(formatReport(failed)).toMatch(
+    /broken\s+FAIL \(retried after: first\)\s+\d+ms\s+second \(first attempt: first\)/,
+  );
   expect(exitCode(failed)).toBe(1);
 
   const vanished = scripted("vanished", [
@@ -755,32 +760,91 @@ test("TypeSafe decisions smoke skips without its key and checks answers, usage a
   expect(malformed[0]?.retried).toBeUndefined();
 });
 
-test("a health failure with no time left to retry stays a failure", async () => {
+test("an optional backend that is down late in the run is still skipped", async () => {
+  // Scaled clock: an earlier check uses 530 s, so twilight's 330 s timeout no longer fits a retry.
   let clock = 0;
-  const rows = await runChecks(
-    [
-      {
-        name: "health",
-        timeoutMs: 100,
-        run: async () => {
-          clock += 30;
-          return { status: "fail", reason: "health probe returned HTTP 503", transient: "health" };
-        },
-      },
-    ],
-    () => clock,
-    noDelay,
-    // 80 ms are left after the first attempt: less than the check's 100 ms timeout.
-    { budgetMs: 120, stopGraceMs: 10, retryDelayMs: 0 },
-  );
-  expect(rows).toEqual([
-    {
-      name: "health",
-      status: "fail",
-      reason: "health probe returned HTTP 503 (no time left to retry)",
-      transient: "health",
-      durationMs: 30,
+  const earlier: SmokeCheck = {
+    name: "earlier",
+    run: async () => {
+      clock += 530_000;
+      return { status: "pass" };
     },
+  };
+  const down = (async () => {
+    clock += 3_000;
+    throw new Error("offline");
+  }) as unknown as typeof fetch;
+  const twilight = backendChecks({ TWILIGHT_API_KEY: "key" }, down).filter((c) =>
+    c.name.startsWith("twilight"),
+  );
+  const rows = await runChecks([earlier, ...twilight], () => clock, noDelay, { budgetMs: SMOKE_BUDGET_MS });
+  expect(rows.map((row) => [row.name, row.status, row.reason])).toEqual([
+    ["earlier", "pass", undefined],
+    ["twilight structured", "skip", "health probe failed"],
   ]);
-  expect(exitCode(rows)).toBe(1);
+  expect(formatReport(rows)).toMatch(/twilight structured\s+SKIP\s/);
+  expect(exitCode(rows)).toBe(0);
 });
+
+test("a failure on both attempts is marked retried with a bounded one-line reason", async () => {
+  const reason = `HTTP 503\n${"x".repeat(500)}`;
+  const rows = await runChecks(
+    [{ name: "flaky", run: async () => ({ status: "fail", reason, transient: "provider" }) }],
+    now,
+    noDelay,
+  );
+  const after = rows[0]?.retriedAfter ?? "";
+  expect(after).toBe(`HTTP 503 ${"x".repeat(191)}`);
+  expect(formatReport(rows)).toContain(`FAIL (retried after: ${after})`);
+});
+
+for (const outcome of ["silent", "probe-failed", "wrote"] as const) {
+  test(`verify smoke retries only a model that never ran the probe: ${outcome}`, async () => {
+    const target: ModelTarget = {
+      modelId: "fake/m",
+      provider: "fake",
+      model: "m",
+      vendor: "fake",
+      tier: 4,
+      harness: "fake",
+      billing: "subscription",
+    };
+    let calls = 0;
+    const harness: Harness = async (spec) => {
+      calls++;
+      const command = `python3 '${join(spec.cwd, "verify-probe.py")}'`;
+      if (calls === 1 && outcome === "wrote") writeFileSync(join(spec.cwd, "stray"), "oops");
+      if (calls === 1 && outcome === "probe-failed") {
+        spec.onEvent({ type: "tool_call", id: "probe", name: "Bash", input: { command } });
+        spec.onEvent({ type: "tool_result", id: "probe", output: "Traceback", isError: true });
+      }
+      if (calls > 1) {
+        const run = await sh(["/bin/sh", "-c", command], {
+          cwd: spec.cwd,
+          env: {
+            ...process.env,
+            TMPDIR: spec.scratchDir,
+            TMP: spec.scratchDir,
+            TEMP: spec.scratchDir,
+          } as Record<string, string>,
+          allowFail: true,
+        });
+        spec.onEvent({ type: "tool_call", id: "probe", name: "Bash", input: { command } });
+        spec.onEvent({ type: "tool_result", id: "probe", output: run.stdout, isError: false });
+      }
+      return { ...result, finalText: "done" };
+    };
+    const rows = await runChecks(
+      [{ name: "codex verify", run: (signal) => verifyLiveCheck(harness, target, signal) }],
+      now,
+      noDelay,
+    );
+    // The retry's probe writes to a writable worktree, so even a retry fails; what matters is whether one ran.
+    expect(calls).toBe(outcome === "silent" ? 2 : 1);
+    expect(rows[0]?.status).toBe("fail");
+    expect(rows[0]?.retried).toBe(outcome === "silent" ? true : undefined);
+    if (outcome === "silent")
+      expect(rows[0]?.retriedAfter).toContain("missing successful probe command evidence");
+    if (outcome === "wrote") expect(rows[0]?.reason).toContain("worktree changed");
+  });
+}

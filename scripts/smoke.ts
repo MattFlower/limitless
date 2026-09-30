@@ -15,9 +15,10 @@ import { sh } from "../src/util/proc.ts";
 
 /**
  * Why a failure may be retried: the provider was briefly unavailable. Anything else (a disclosed
- * token, a tool call, a forbidden write, a wrong answer) is an assertion failure and is final.
+ * token, a tool call, a forbidden write, a wrong answer) is an assertion failure and is final. "model"
+ * means the model never ran the verify probe at all and left the worktree untouched.
  */
-export type Transient = "timeout" | "provider" | "health";
+export type Transient = "timeout" | "provider" | "health" | "model";
 export type CheckResult = { status: "pass" | "fail" | "skip"; reason?: string; transient?: Transient };
 /**
  * `timeoutMs` bounds each attempt; it defaults to DEFAULT_CHECK_TIMEOUT_MS. `signal` aborts when that
@@ -130,8 +131,10 @@ export async function runChecks(
     const first = result.reason;
     const health = result.transient === "health";
     const retry = result.status === "fail" && result.transient !== undefined;
-    if (retry && left() < retryDelayMs + timeoutMs) {
-      // Still a failure: only a retry that fails the probe again may downgrade a health failure.
+    if (health && left() < retryDelayMs + timeoutMs) {
+      // A backend that is down is skipped however little of the budget is left.
+      result = { status: "skip", reason: first ?? "health probe failed" };
+    } else if (retry && left() < retryDelayMs + timeoutMs) {
       result = { ...result, reason: `${first ?? "failed"} (no time left to retry)` };
     } else if (retry) {
       await delay(retryDelayMs);
@@ -140,7 +143,8 @@ export async function runChecks(
       result = await attempt(check, timeoutMs, stopGraceMs);
       // A backend still down on the retry is skipped as before; a retry that skips after any
       // other failure must not hide it.
-      if (health && result.transient === "health") result = { status: "skip", reason: result.reason };
+      if (health && (result.transient === "health" || result.status === "skip"))
+        result = { status: "skip", reason: result.reason };
       else if (result.status === "skip")
         result = {
           status: "fail",
@@ -153,7 +157,9 @@ export async function runChecks(
       name: check.name,
       ...result,
       durationMs: Math.round(now() - start),
-      ...(retried ? { retried, retriedAfter: first ?? "failed" } : {}),
+      ...(retried
+        ? { retried, retriedAfter: (first ?? "failed").replace(/\s+/g, " ").trim().slice(0, 200) }
+        : {}),
     };
     rows.push(row);
     options.onRow?.(row);
@@ -170,8 +176,8 @@ export function formatHeader(width: number): string {
 
 export function formatRow(row: CheckRow, width: number): string {
   const label =
-    row.retried && row.status === "pass"
-      ? `PASS (retried after: ${row.retriedAfter})`
+    row.retried && row.status !== "skip"
+      ? `${row.status.toUpperCase()} (retried after: ${row.retriedAfter})`
       : row.status.toUpperCase();
   const detail = (row.reason ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
   return `${row.name.padEnd(width)}  ${label.padEnd(6)}  ${`${row.durationMs}ms`.padStart(7)}  ${detail}`;
@@ -394,8 +400,7 @@ export async function liveCheck(
   }
 }
 
-/** A command result, paired with the actual probe command, is required; prose never counts. */
-export function verifyProbeEvidence(events: AgentEvent[], command: string, token: string): boolean {
+function probeCallIds(events: AgentEvent[], command: string): Set<string> {
   const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
   const commands = [
     command,
@@ -406,7 +411,7 @@ export function verifyProbeEvidence(events: AgentEvent[], command: string, token
       ]),
     ),
   ];
-  const ids = new Set(
+  return new Set(
     events
       .filter(
         (e) =>
@@ -417,6 +422,11 @@ export function verifyProbeEvidence(events: AgentEvent[], command: string, token
       )
       .flatMap((e) => (e.type === "tool_call" ? [e.id] : [])),
   );
+}
+
+/** A command result, paired with the actual probe command, is required; prose never counts. */
+export function verifyProbeEvidence(events: AgentEvent[], command: string, token: string): boolean {
+  const ids = probeCallIds(events, command);
   return events.some(
     (e) =>
       e.type === "tool_result" &&
@@ -489,14 +499,17 @@ else:
             status: "pass",
             reason: `${target.model}: observed temp create/read/delete and denied worktree write`,
           }
-        : {
-            status: "fail",
-            reason: `missing successful probe command evidence (temp operations and denied worktree write): ${events
+        : fail(
+            `missing successful probe command evidence (temp operations and denied worktree write): ${events
               .filter((event) => event.type === "tool_result")
               .map((event) => (event.type === "tool_result" ? event.output : ""))
               .join("; ")
               .slice(0, 2000)}`,
-          };
+            // Only a model that never ran the probe (no call, no evidence line anywhere) may be retried.
+            probeCallIds(events, command).size === 0 && !JSON.stringify(events).includes(token)
+              ? "model"
+              : undefined,
+          );
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
