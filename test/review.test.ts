@@ -963,6 +963,38 @@ describe("runReview panel", () => {
       ).toEqual([[kept, "a quote in the name breaks the query string", "major", true, 1]]);
     });
 
+  for (const [ruling, blocks] of [
+    ["CONFIRMED", true],
+    ["REFUTED", false],
+  ] as const)
+    test(`a refuted merged claim's report at another line is verified on its own (${ruling})`, async () => {
+      const report = (name: string, line: number) => ({
+        ...candidate("src/a.ts", line),
+        title: `Unhandled rejection from writeFile in ${name}`,
+        failure_scenario:
+          "the promise rejects when the disk is full and nothing catches it, so the process crashes",
+      });
+      const { out, verifications } = await panel(
+        [[report("saveConfig", 10)], [report("saveCache", 25)]],
+        (id) => ({
+          ...confirmed,
+          verdict: id === "C1" ? "REFUTED" : ruling,
+        }),
+      );
+      expect(verifications.map((v) => [v.avoidVendors, ids(v.request.prompt)])).toEqual([
+        [["anthropic", "openai"], ["C1"]],
+        [["openai"], ["C2"]],
+      ]);
+      expect(verifications[1]?.request.prompt).toContain("writeFile in saveCache");
+      expect(out.panel?.candidates.map((c) => [c.id, c.line, c.raisedBy])).toEqual([
+        ["C1", 10, [0, 1]],
+        ["C2", 25, [1]],
+      ]);
+      expect(out.decision?.blocking.map((f) => f.title)).toEqual(
+        blocks ? ["Unhandled rejection from writeFile in saveCache"] : [],
+      );
+    });
+
   test("later-round finder prompts carry no panel agreement or merged reports", () => {
     const duplicates = [{ finder: 1, line: 2, title: "dup", detail: "DUP_DETAIL", suggestion: "" }];
     const prior = { ...finding("major"), agreement: 3, duplicates };
@@ -973,7 +1005,9 @@ describe("runReview panel", () => {
       expect(text).not.toContain("DUP_DETAIL");
     }
     // Feedback to the implementer does carry every merged report.
-    expect(formatReviewFeedback([prior], true)).toContain("Also reported at line 2: dup. DUP_DETAIL");
+    expect(formatReviewFeedback([prior], true)).toContain(
+      "Also reported by another finder at line 2, not separately verified: dup. DUP_DETAIL",
+    );
   });
 
   test("the panel cache identity covers the finder prompts and the merge rules", () => {

@@ -59,7 +59,8 @@ export function mergeReports<T extends Report>(
       a.line - b.line ||
       order(a.title, b.title) ||
       order(a.failure_scenario ?? "", b.failure_scenario ?? "") ||
-      a.finder - b.finder,
+      a.finder - b.finder ||
+      reports.indexOf(a) - reports.indexOf(b),
   );
   const groups: T[][] = [];
   for (const report of canonical) {

@@ -85,6 +85,14 @@ test("groups never chain, and neither finder nor report order changes them", () 
   expect(shape(renumbered).map(([line]) => line)).toEqual([10, 50]);
 });
 
+test("exact ties within one finder keep report order", () => {
+  const out = merge([report(0, 10, { detail: "first" }), report(0, 10, { detail: "second" }), report(1, 10)]);
+  expect(out.map((c) => [c.detail, c.agreement])).toEqual([
+    ["first", 2],
+    ["second", 1],
+  ]);
+});
+
 test("candidates keep the order of their first report", () => {
   const out = merge([report(0, 60, { title: "Other claim entirely here" }), report(0, 10), report(1, 11)]);
   expect(out.map((c) => [c.line, c.agreement])).toEqual([

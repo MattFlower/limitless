@@ -442,16 +442,20 @@ async function runPanel<T extends Invoked>(
   // One batch never mixes files or the vendors that raised them, so each call avoids exactly those.
   const vendorsOf = (c: PanelRecord["candidates"][number]) =>
     [...new Set(c.raisedBy.flatMap((i) => found[i]?.invoked.target?.vendor ?? []))].sort();
-  const groups = new Map<string, typeof selected>();
-  for (const c of candidates.filter((c) => selected.includes(c))) {
-    const key = JSON.stringify([vendorsOf(c), c.file]);
-    groups.set(key, [...(groups.get(key) ?? []), c]);
-  }
-  const batches = [...groups.values()].flatMap((group) =>
-    Array.from({ length: Math.ceil(group.length / PANEL_BATCH_SIZE) }, (_, i) =>
-      group.slice(i * PANEL_BATCH_SIZE, (i + 1) * PANEL_BATCH_SIZE),
-    ),
-  );
+  const batchesOf = (list: typeof candidates) => {
+    const groups = new Map<string, typeof candidates>();
+    for (const c of list) {
+      const key = JSON.stringify([vendorsOf(c), c.file]);
+      groups.set(key, [...(groups.get(key) ?? []), c]);
+    }
+    return [...groups.values()].flatMap((group) =>
+      Array.from({ length: Math.ceil(group.length / PANEL_BATCH_SIZE) }, (_, i) =>
+        group.slice(i * PANEL_BATCH_SIZE, (i + 1) * PANEL_BATCH_SIZE),
+      ),
+    );
+  };
+  const batches = batchesOf(candidates.filter((c) => selected.includes(c)));
+  const firstPass = batches.length;
   // A re-review's verifier checks the same fix diff, and whether each prior finding is really resolved.
   const verifierFix = fix
     ? {
@@ -485,7 +489,7 @@ async function runPanel<T extends Invoked>(
   const verdicts = new Map<string, PanelRecord["verdicts"][number]>();
   const omitted: string[] = [];
   let last = first.invoked.result;
-  for (const batch of batches) {
+  for (const [index, batch] of batches.entries()) {
     if (!deps.verify) throw new Error('mode "panel" needs a verifier');
     // Candidates the verifier leaves out get one more call, then stay unverified follow-ups.
     let pending = batch;
@@ -542,6 +546,27 @@ async function runPanel<T extends Invoked>(
       deps.warn?.(
         `Verifier gave no ruling for ${pending.map((c) => c.id).join(", ")} after a retry; security and prior blocking findings among them block, the rest stay unverified follow-ups`,
       );
+    }
+    // After the first pass, a refuted report doesn't settle the reports merged into it at other lines:
+    // each is then verified as a candidate of its own, outside the cap.
+    if (index === firstPass - 1) {
+      const split = candidates.flatMap(({ duplicates, ...c }) =>
+        verdicts.get(c.id)?.verdict === "REFUTED"
+          ? (duplicates ?? [])
+              .filter((d) => d.line !== c.line)
+              .map((d) => ({
+                ...c,
+                ...d,
+                failure_scenario: d.failure_scenario ?? "",
+                agreement: 1,
+                vendor: found[d.finder]?.invoked.target?.vendor ?? null,
+                raisedBy: [d.finder],
+              }))
+          : [],
+      );
+      const own = split.map((c, i) => ({ ...c, id: `C${candidates.length + i + 1}` }));
+      candidates.push(...own);
+      batches.push(...batchesOf(own));
     }
   }
 
