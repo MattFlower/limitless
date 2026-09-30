@@ -556,7 +556,7 @@ test.each([
   ["bad date format", JSON.stringify({ "implement.medium": { ...valid, decided: "2026-9-28" } })],
   ["impossible date", JSON.stringify({ "implement.medium": { ...valid, decided: "2026-02-30" } })],
   ["extra field", JSON.stringify({ "implement.medium": { ...valid, by: "me" } })],
-  ["no explicit chain", JSON.stringify({ "review.default": valid })],
+  ["no explicit chain", JSON.stringify({ "verify.default": valid })],
 ])("policy CLI rejects overrides with %s before writing", async (_name, text) => {
   const { io, writes } = await pinFixture([["routing/overrides.json", text]]);
   await expect(evalCommand(["policy"], { write: true }, io)).rejects.toThrow("routing/overrides.json");
