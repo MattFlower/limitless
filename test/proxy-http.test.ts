@@ -111,6 +111,38 @@ test("config validates LAN settings; exact binds share routes, stop together and
   }
 });
 
+test("direct navigation to every UI route serves the SPA shell; unknown API paths stay JSON 404s", async () => {
+  const f = await fixture();
+  const ui = await buildUi();
+  f.factory.cfg.port = 0;
+  const server = startHttp(f.factory, { ui });
+  try {
+    const shell = await ui["/index.html"]?.text();
+    if (!shell) throw new Error("missing bundled shell");
+    const declared = [...(await Bun.file("ui/main.tsx").text()).matchAll(/<Route path="([^"]+)"/g)].map(
+      (m) => m[1] ?? "",
+    );
+    expect(declared).toEqual(expect.arrayContaining(["/evals", "/evals/:id"]));
+    const html = { accept: "text/html" };
+    for (const path of declared.map((p) => p.replace(/:[^/]+/g, "abc-123")))
+      for (const suffix of ["", "?tab=x"]) {
+        const res = await fetch(new URL(path + suffix, server.url), { headers: html });
+        expect([path, res.status]).toEqual([path, 200]);
+        expect(await res.text()).toBe(shell);
+      }
+    for (const path of ["/api/evals/missing/nope", "/api/nope", "/api/"]) {
+      const res = await fetch(new URL(path, server.url), { headers: html });
+      expect(res.status).toBe(404);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({ error: "not found" });
+    }
+    expect((await fetch(new URL("/unknown", server.url), { headers: html })).status).toBe(404);
+  } finally {
+    await server.stop(true);
+    await f.close();
+  }
+});
+
 test("guarded UI/assets, API, SSE, mutations and webhook transports", async () => {
   const f = await fixture();
   try {
