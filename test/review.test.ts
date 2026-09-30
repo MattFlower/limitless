@@ -518,18 +518,15 @@ describe("panel decision", () => {
     });
   }
 
-  test("PLAUSIBLE below high is verified when two or more finders raised it", () => {
-    const at = (agreement: number, label?: "regression"): Review => ({
+  test("agreement is recorded but does not verify a PLAUSIBLE finding below high", () => {
+    const at = (label?: "regression"): Review => ({
       mode: "panel",
       verdict: "approve",
       summary: "s",
-      findings: [{ ...verified("PLAUSIBLE", "medium"), agreement, ...(label ? { label } : {}) }],
+      findings: [{ ...verified("PLAUSIBLE", "medium"), agreement: 3, ...(label ? { label } : {}) }],
     });
-    expect(blockingReviewFindings(at(2))).toHaveLength(1);
-    expect(blockingReviewFindings(at(1))).toEqual([]);
-    // Re-reviews keep their own severity bar: a medium regression blocks R2, a new medium does not.
-    expect(blockingReviewFindings(at(2, "regression"), [finding("major")], 2)).toHaveLength(1);
-    expect(blockingReviewFindings(at(2), [finding("major")], 2)).toEqual([]);
+    expect(blockingReviewFindings(at())).toEqual([]);
+    expect(blockingReviewFindings(at("regression"), [finding("major")], 2)).toEqual([]);
   });
 
   test("an unaddressed finding that cites no prior blocking finding is judged as new", () => {

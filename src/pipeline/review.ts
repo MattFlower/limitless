@@ -24,16 +24,14 @@ const PANEL_BATCH_SIZE = 5;
 /** A recheck of a prior blocking finding that no finder repeated. */
 const UNRAISED = { agreement: 0, finder: null, vendor: null, raisedBy: [] as number[] };
 
-/** CONFIRMED, PLAUSIBLE at high or above, or PLAUSIBLE raised by two or more finders. */
+/**
+ * CONFIRMED, or PLAUSIBLE at high or above. Agreement between finders is recorded but does not count:
+ * whether it should is for the panel ablations to decide.
+ */
 function panelVerified(finding: Finding): boolean {
   const v = finding.verification;
   if (!v || v.verdict === "REFUTED") return false;
-  return (
-    v.verdict === "CONFIRMED" ||
-    v.severity === "critical" ||
-    v.severity === "high" ||
-    (finding.agreement ?? 0) >= 2
-  );
+  return v.verdict === "CONFIRMED" || v.severity === "critical" || v.severity === "high";
 }
 
 export function reviewFindingKey(finding: Review["findings"][number]): string {
