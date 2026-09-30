@@ -15,7 +15,16 @@ export interface RouteConstraints {
   exclude?: (string | ModelSelection)[];
   /** Put this target first when it is available (stick with the current implementer). */
   prefer?: string | ModelSelection;
-  billing?: "free_first";
+  /** Put this vendor's models first, as if every other vendor were avoided. */
+  preferVendor?: string;
+  /** Tried after other vendors but before `avoidVendor` (a verifier: the implementer's vendor). */
+  preferNotVendor?: string[];
+  /** Model identities tried last of all (a verifier: the implementer's model). */
+  preferNotModels?: string[];
+  /** "free_first" tries free models first; "free_only" considers nothing else. */
+  billing?: "free_first" | "free_only";
+  /** Vendor independence outranks free-first billing (a verifier stays independent of free finders). */
+  independenceFirst?: boolean;
 }
 
 export interface RouteDecision {
@@ -167,10 +176,8 @@ export class Router {
     const entry = this.policy[role];
     const groups = entry?.[complexity] ?? entry?.default ?? [];
     const skipped: RouteDecision["skipped"] = [];
-    const preferred: ModelTarget[] = [];
-    const sameVendor: ModelTarget[] = [];
-    const freePreferred: ModelTarget[] = [];
-    const freeSameVendor: ModelTarget[] = [];
+    // Lower ranks first; the sort is stable, so policy and headroom order hold within a rank.
+    const ranked: { target: ModelTarget; rank: number }[] = [];
     const policyFreeModels = new Set<string>();
     const seen = new Set<string>();
     // Older run state can reference a model removed from the catalog.
@@ -185,6 +192,14 @@ export class Router {
     const preference = c.prefer ? identity(c.prefer) : undefined;
 
     const avoid = [c.avoidVendor ?? []].flat();
+    const independence = (m: ModelTarget) =>
+      c.preferNotModels?.includes(m.modelId)
+        ? 3
+        : avoid.includes(m.vendor) || (c.preferVendor !== undefined && m.vendor !== c.preferVendor)
+          ? 2
+          : c.preferNotVendor?.includes(m.vendor)
+            ? 1
+            : 0;
     const consider = (ids: (string | ModelSelection)[], fromPolicy = false) => {
       const group: ModelTarget[] = [];
       for (const reference of ids) {
@@ -225,22 +240,17 @@ export class Router {
         (a, b) => pref(a) - pref(b) || this.tracker.headroom(b.provider) - this.tracker.headroom(a.provider),
       );
       for (const m of group) {
-        const free = c.billing === "free_first" && m.billing === "free";
-        (free
-          ? avoid.includes(m.vendor)
-            ? freeSameVendor
-            : freePreferred
-          : avoid.includes(m.vendor)
-            ? sameVendor
-            : preferred
-        ).push(m);
+        const paid = c.billing !== undefined && m.billing !== "free" ? 1 : 0;
+        if (paid && c.billing === "free_only") continue;
+        const rank = independence(m);
+        ranked.push({ target: m, rank: c.independenceFirst ? rank * 2 + paid : paid * 4 + rank });
       }
     };
 
     for (const g of groups) consider(g.split("|"), true);
     // A persisted implementer can retain an explicit effort after the catalog default changes.
     if (c.prefer) consider([c.prefer]);
-    if (c.billing === "free_first") {
+    if (c.billing !== undefined) {
       for (const m of this.models.values())
         if (this.tracker.def(m.provider)?.billing === "free" && !policyFreeModels.has(m.id)) consider([m.id]);
     }
@@ -253,11 +263,7 @@ export class Router {
       for (const id of rest) consider([id]);
     }
 
-    const partitions =
-      c.billing === "free_first"
-        ? [freePreferred, freeSameVendor, preferred, sameVendor]
-        : [preferred, sameVendor];
-    const ordered = partitions.flat();
+    const ordered = ranked.sort((a, b) => a.rank - b.rank).map((r) => r.target);
     // The current implementer stays first in every mode: escalation never falls back to a model
     // that already failed, even a free one.
     const pinned = preference ? ordered.findIndex((m) => m.targetId === preference) : -1;
