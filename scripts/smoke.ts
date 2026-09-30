@@ -505,9 +505,10 @@ else:
               .map((event) => (event.type === "tool_result" ? event.output : ""))
               .join("; ")
               .slice(0, 2000)}`,
-            // Only a model that never ran the probe (no call touching it in any spelling, no evidence
-            // line in events or the final answer) may be retried.
-            !events.some((e) => e.type === "tool_call" && JSON.stringify(e.input).includes("verify-probe")) &&
+            // Only a model that never ran the probe may be retried. Any shell call could have run it
+            // (a glob, a relative path, a cd), so one shell call at all is final, as is any evidence
+            // line in events or the final answer.
+            !events.some((e) => e.type === "tool_call" && ["shell", "Bash"].includes(e.name)) &&
               !`${JSON.stringify(events)}${result.finalText ?? ""}`.includes(token)
               ? "model"
               : undefined,
