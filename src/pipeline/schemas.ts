@@ -3,13 +3,14 @@ import { z } from "zod";
 /** JSON Schema acceptable to both Claude (--json-schema) and OpenAI strict structured outputs. */
 export function toStrictJsonSchema(schema: z.ZodType): Record<string, unknown> {
   const raw = z.toJSONSchema(schema) as Record<string, unknown>;
-  const clean = (node: unknown): unknown => {
-    if (Array.isArray(node)) return node.map(clean);
+  // Keys of a `properties` map are field names, not keywords, and are never dropped.
+  const clean = (node: unknown, properties = false): unknown => {
+    if (Array.isArray(node)) return node.map((item) => clean(item));
     if (!node || typeof node !== "object") return node;
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-      if (k === "$schema" || k === "minimum" || k === "maximum") continue;
-      out[k] = clean(v);
+      if (!properties && ["$schema", "minimum", "maximum", "default"].includes(k)) continue;
+      out[k] = clean(v, !properties && k === "properties");
     }
     return out;
   };
@@ -275,12 +276,61 @@ export const VerifySchema = z.object({
         .describe(
           "For H-ids, short observed behavior without private inputs or expected values; empty for public criteria",
         ),
+      // Missing (output recorded before holdouts were classified) or invalid values (text recovery bypasses
+      // constrained decoding) parse as unclassified, which blocks. Citation validation happens after
+      // parsing so malformed classifications still yield a verdict.
+      requirement: z
+        .enum(["request", "spec", "not_required"])
+        .nullable()
+        .default(null)
+        .catch(null)
+        .describe("For unmet H-ids, what the failure violates; null for every other entry"),
+      requirementCitation: z
+        .string()
+        .default("")
+        .describe("For request/spec, the exact violated text quoted from the request or spec; else empty"),
     }),
   ),
   overall: z.enum(["pass", "fail"]),
   notes: z.string(),
 });
-export type Verify = z.infer<typeof VerifySchema>;
+export type Verify = z.input<typeof VerifySchema>;
+export type HoldoutRequirement = NonNullable<Verify["criteria"][number]["requirement"]>;
+
+/**
+ * The cited requirement as it will be shown, or null unless it is a verbatim quote of `source`
+ * (ignoring case, spacing, markdown emphasis and surrounding quotes). Only verbatim public text is
+ * ever repeated to the implementer: a paraphrase could carry scenario text.
+ */
+export function citedRequirement(citation: string, source: string): string | null {
+  const flat = (s: string) => s.replace(/[*`]/g, "").replace(/\s+/g, " ").toLowerCase();
+  const quote = citation
+    .trim()
+    .replace(/^[-*\s"'“”`]+|["'“”`.\s]+$/g, "")
+    .replace(/\s+/g, " ");
+  return /[\p{L}\p{N}]/u.test(quote) && flat(source).includes(flat(quote)) ? quote : null;
+}
+
+export function requirementSource(requirement: "request" | "spec", request: string, spec: Spec): string {
+  return requirement === "request"
+    ? request
+    : [...spec.requirements, ...spec.acceptance_criteria.map((ac) => ac.criterion)].join("\n");
+}
+
+/** Diagnostics contain no private evidence and can be persisted and shown in feedback. */
+export function requirementCitationIssue(
+  criterion: Verify["criteria"][number],
+  request: string,
+  spec: Spec,
+): string | null {
+  if (criterion.requirement !== "request" && criterion.requirement !== "spec") return null;
+  const citation = criterion.requirementCitation ?? "";
+  if (!citation.trim()) return "missing requirement citation";
+  if (!citedRequirement(citation, requirementSource(criterion.requirement, request, spec)))
+    return "citation is not a stated public requirement";
+  if (!citedRequirement(citation, criterion.evidence)) return "evidence does not cite the requirement";
+  return null;
+}
 
 export function renderSpec(spec: Spec): string {
   const list = (items: string[]) => (items.length ? items.map((i) => `- ${i}`).join("\n") : "- (none)");

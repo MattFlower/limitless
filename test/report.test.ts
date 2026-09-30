@@ -313,3 +313,56 @@ test("verification report names the flow without an implementer", () => {
   expect(md).toContain("Flow: verify-change");
   expect(md).not.toContain("Implementer's summary");
 });
+
+test("holdout counts separate blocking results from not-required follow-up notes", () => {
+  const scenario = (id: string, description: string) => ({
+    id,
+    description,
+    steps: "s",
+    expected: "e",
+    edge_case: true,
+  });
+  const md = renderReport({
+    success: false,
+    runId: "r4",
+    prompt: "x",
+    state: {
+      holdout: {
+        scenarios: [
+          scenario("H-1", "happy path"),
+          scenario("H-2", "invented flag"),
+          scenario("H-3", "unicode input"),
+          scenario("H-4", "legacy result"),
+          scenario("H-5", "flaky sandbox"),
+        ],
+      },
+      lastVerify: {
+        modelId: "claude/sonnet",
+        overall: "fail",
+        notes: "",
+        criteria: [
+          { id: "H-1", status: "met", evidence: "ok", publicSummary: "" },
+          {
+            id: "H-2",
+            status: "unmet",
+            evidence: "no such flag exists in this CLI",
+            publicSummary: "",
+            requirement: "not_required",
+          },
+          { id: "H-3", status: "unmet", evidence: "crashes", publicSummary: "", requirement: "request" },
+          { id: "H-4", status: "unmet", evidence: "wrong output", publicSummary: "" },
+          { id: "H-5", status: "unclear", evidence: "not established", publicSummary: "" },
+        ],
+      },
+    },
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "u",
+  });
+  expect(md).toContain("Holdouts not met: 3 blocking, 1 not required.");
+  expect(md).toContain("| H-2 | invented flag | unmet (not required) | no such flag exists in this CLI |");
+  expect(md).toContain("| H-3 | unicode input | unmet (request) | crashes |");
+  expect(md).toContain("| H-4 | legacy result | unmet (unclassified) | wrong output |");
+  expect(md).toContain("- H-2: invented flag — no such flag exists in this CLI");
+  expect(md).not.toContain("- H-3: unicode input");
+});
