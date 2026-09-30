@@ -68,6 +68,8 @@ export interface AgentSpec {
   noTools?: boolean;
   /** Do not retain CLI session transcripts for private structured calls. */
   privateSession?: boolean;
+  /** Stop internal retries once a request's final usage is unknown (required for resumed evals). */
+  stopOnUnknownUsage?: boolean;
   /** Redact private prompt content before writing the CLI transcript. */
   redactOutput?: (text: string) => string;
   signal: AbortSignal;

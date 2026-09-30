@@ -105,6 +105,7 @@ export const runLlm: Harness = async (spec) => {
   // and once a request went unaccounted no later request makes this call's spend final again.
   let accounted = true;
   for (let attempt = 0; attempt < 2; attempt++) {
+    if (spec.stopOnUnknownUsage && !accounted) break;
     if (signal.aborted)
       return finish(
         failure(spec.signal.aborted ? "cancelled" : "timeout", "completion interrupted", usage, spec.target),
@@ -142,14 +143,14 @@ export const runLlm: Harness = async (spec) => {
           continue;
         }
         const status = response.status === 429 ? "quota" : response.status >= 500 ? "unavailable" : "error";
-        // A refused request spent nothing, but a server failure may have generated before it failed.
+        // A refusal spent nothing, but a timeout or server failure may leave backend work unaccounted.
         return finish(
           failure(
             status,
             `completion rejected (HTTP ${response.status})`,
             usage,
             spec.target,
-            accounted && response.status < 500,
+            accounted && response.status < 500 && response.status !== 408,
           ),
         );
       }
@@ -206,6 +207,6 @@ export const runLlm: Harness = async (spec) => {
       return finish(failure("unavailable", "completion transport failure", usage, spec.target));
     }
   }
-  // Both attempts returned parsed responses (or a refusal); their usage is complete if each reported it.
+  // Sent requests returned parsed responses (or a refusal); usage is complete if each reported it.
   return finish(failure("error", lastError, usage, spec.target, accounted));
 };

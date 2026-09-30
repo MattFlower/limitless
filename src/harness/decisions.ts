@@ -164,6 +164,7 @@ export const runDecisions: Harness = async (spec) => {
     error: "decision call failed",
   };
   for (let attempt = 1; attempt <= 2 && !deadline.aborted; attempt++) {
+    if (spec.stopOnUnknownUsage && unresolved) break;
     if (attempt > 1) await untilAborted(AbortSignal.any([spec.signal, deadline]), RETRY_DELAY_MS);
     if (spec.signal.aborted) return finish("cancelled", "decision call cancelled");
     const attemptTimeout = AbortSignal.timeout(ATTEMPT_MS);

@@ -806,6 +806,7 @@ export class EvalRunner {
                     mode: "hidden" in item ? "edit" : "readonly",
                     noTools: to.noTools,
                     privateSession: run.role === "verify",
+                    stopOnUnknownUsage: inputs.resumed,
                     idleTimeoutMs: 10 * 60_000,
                     maxToolCalls: "hidden" in item ? 400 : 150,
                     signal,

@@ -3,7 +3,9 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cacheKey } from "../src/evals/cache.ts";
 import { pinnedTree, withRepoLock } from "../src/git/repos.ts";
+import { runDecisions } from "../src/harness/decisions.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
+import { runLlm } from "../src/harness/llm.ts";
 import { selectHarness } from "../src/harness/select.ts";
 import { FACTORY_PREAMBLE, triagePrompt } from "../src/pipeline/prompts.ts";
 import { TriageSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
@@ -1149,6 +1151,140 @@ test.each(["throw", "timeout", "kill"] as const)(
         [true, true],
       ]);
     } finally {
+      await f.close();
+    }
+  },
+);
+
+test.each([
+  ["llm", "408"],
+  ["llm", "missing usage"],
+  ["decisions", "408"],
+  ["decisions", "503"],
+  ["decisions", "transport"],
+  ["decisions", "request timeout"],
+  ["decisions", "body timeout"],
+] as const)("resumed %s calls stop before any retry or later trial after %s", async (adapter, fault) => {
+  const f = await evalFixture(
+    [
+      {
+        id: "decision-candidate",
+        provider: "decision-provider",
+        model: "d",
+        tier: 1,
+        vendor: "other",
+        origin: "unknown",
+        baseOrigin: "unknown",
+        supportedEfforts: [],
+        price: { input: 1, output: 1 },
+      },
+    ],
+    [
+      {
+        id: "decision-provider",
+        label: "Decisions",
+        harness: "decisions",
+        billing: "metered",
+        maxConcurrent: 1,
+        decisionsBaseUrl: "http://unused.invalid",
+      },
+    ],
+  );
+  const timeout = AbortSignal.timeout;
+  const timer = spyOn(AbortSignal, "timeout").mockImplementation((ms) => timeout(ms === 30_000 ? 1 : ms));
+  const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (_url, init) => {
+    if (fault === "transport") throw new Error("socket hang up after sending request");
+    if (fault === "request timeout" || fault === "body timeout") {
+      const signal = init?.signal;
+      if (!signal) throw new Error("missing request signal");
+      const interrupted = () =>
+        new Promise<never>((_resolve, reject) => {
+          if (signal.aborted) reject(signal.reason);
+          else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      if (fault === "request timeout") return interrupted();
+      const response = Response.json({});
+      response.json = interrupted;
+      return response;
+    }
+    if (fault === "missing usage") return Response.json({ choices: [{ message: { content: "{}" } }] });
+    return new Response("upstream failure", { status: Number(fault) });
+  }) as typeof fetch);
+  try {
+    const stalled = stallAcquire(f, 0);
+    const run = f.factory.evals.submit({
+      role: "triage",
+      models: [adapter === "llm" ? "candidate-a" : "decision-candidate"],
+      k: 1,
+      maxUsd: 5,
+      cache: false,
+    });
+    await stalled;
+    f.crash();
+    f.factory.deps.harnesses.llm = runLlm;
+    f.factory.deps.harnesses.decisions = runDecisions;
+    spyOn(f.factory.tracker, "refreshOpenRouter").mockResolvedValue(true);
+    f.factory.start();
+    await f.factory.evals.wait(run.id);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const report = f.factory.evals.report(run.id);
+    expect(report?.run.status).toBe("budget_exhausted");
+    expect(report?.run.error).toContain("final spend is unknown");
+    const [a, b, c] = report?.trials ?? [];
+    expect(a).toMatchObject({ status: "error", costUsd: 0, details: { usageUnknown: true, resumed: true } });
+    for (const trial of [b, c])
+      expect(trial).toMatchObject({ status: "skipped", details: { reason: report?.run.error } });
+    expect(f.factory.store.evalCallAttempts(run.id)).toMatchObject([
+      { resolved: true, usageUnknown: true, costUsd: 0 },
+    ]);
+    const { formatEvalReport } = await import("../src/evals/format.ts");
+    if (!report) throw new Error("missing report");
+    expect(formatEvalReport(report)).toContain("1 with unknown final usage");
+  } finally {
+    fetchMock.mockRestore();
+    timer.mockRestore();
+    await f.close();
+  }
+});
+
+test.each(["refusal", "accounted invalid answer"])(
+  "resumed HTTP calls may repair a %s with known usage and preserve all measured spend",
+  async (first) => {
+    const f = await evalFixture();
+    let requests = 0;
+    const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (_url, _init) => {
+      const n = ++requests;
+      if (n === 1 && first === "refusal") return new Response("format unsupported", { status: 400 });
+      return Response.json({
+        choices: [{ message: { content: n === 1 ? "{}" : JSON.stringify(answer) } }],
+        usage: { prompt_tokens: 100_000, completion_tokens: 0 },
+      });
+    }) as typeof fetch);
+    try {
+      const stalled = stallAcquire(f, 0);
+      const run = f.factory.evals.submit({
+        role: "triage",
+        models: ["candidate-a"],
+        k: 1,
+        maxUsd: 5,
+        cache: false,
+      });
+      await stalled;
+      f.crash();
+      f.factory.deps.harnesses.llm = runLlm;
+      spyOn(f.factory.tracker, "refreshOpenRouter").mockResolvedValue(true);
+      f.factory.start();
+      await f.factory.evals.wait(run.id);
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      const report = f.factory.evals.report(run.id);
+      expect(report?.run.status).toBe("completed");
+      expect(report?.trials.every((t) => t.status === "ok" && !t.details.usageUnknown)).toBe(true);
+      expect(f.factory.store.evalSpend(run.id)).toBeCloseTo(first === "refusal" ? 0.3 : 0.4);
+      const attempts = f.factory.store.evalCallAttempts(run.id);
+      expect(attempts).toHaveLength(3);
+      expect(attempts.every((a) => a.resolved && !a.usageUnknown)).toBe(true);
+    } finally {
+      fetchMock.mockRestore();
       await f.close();
     }
   },
