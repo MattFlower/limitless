@@ -44,7 +44,13 @@ export async function runChecks(
       start = now();
       const first = result.reason;
       result = await attempt(check);
-      if (result.status === "fail" && first && first !== result.reason)
+      // A retry that skips (e.g. its health probe now fails) must not hide the first failure.
+      if (result.status === "skip")
+        result = {
+          status: "fail",
+          reason: `${first ?? "failed"} (retry skipped: ${result.reason ?? "no reason"})`,
+        };
+      else if (result.status === "fail" && first && first !== result.reason)
         result = { ...result, reason: `${result.reason ?? "failed"} (first attempt: ${first})` };
     }
     rows.push({

@@ -125,6 +125,18 @@ test("smoke runner retries a failed or thrown check once after the delay", async
   expect(failed[0]).toMatchObject({ name: "broken", status: "fail" });
   expect(formatReport(failed)).toMatch(/broken\s+FAIL\s+\d+ms\s+second \(first attempt: first\)/);
   expect(exitCode(failed)).toBe(1);
+
+  const vanished = scripted("vanished", [
+    { status: "fail", reason: "bad object" },
+    { status: "skip", reason: "health probe failed" },
+  ]);
+  const skippedRetry = await runChecks([vanished], now, delay);
+  expect(vanished.calls).toBe(2);
+  expect(skippedRetry[0]).toMatchObject({
+    status: "fail",
+    reason: "bad object (retry skipped: health probe failed)",
+  });
+  expect(exitCode(skippedRetry)).toBe(1);
 });
 
 test("subscription quota check rejects absent windows and accepts observed windows", () => {
