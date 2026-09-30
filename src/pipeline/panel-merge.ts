@@ -86,14 +86,29 @@ export function mergeReports<T extends Report>(
         raisedBy: group.map((r) => r.finder).sort((a, b) => a - b),
         duplicates: group
           .filter((r) => r !== kept)
-          .map(({ finder, line, title, detail, suggestion, failure_scenario }) => ({
-            finder,
-            line,
-            title,
-            detail,
-            suggestion,
-            ...(failure_scenario === undefined ? {} : { failure_scenario }),
-          })),
+          .map(
+            ({
+              finder,
+              line,
+              title,
+              detail,
+              suggestion,
+              severity,
+              failure_scenario,
+              confidence,
+              introduced_by_diff,
+            }) => ({
+              finder,
+              line,
+              title,
+              detail,
+              suggestion,
+              severity,
+              ...(failure_scenario === undefined ? {} : { failure_scenario }),
+              ...(confidence === undefined ? {} : { confidence }),
+              ...(introduced_by_diff === undefined ? {} : { introduced_by_diff }),
+            }),
+          ),
       };
     });
 }
