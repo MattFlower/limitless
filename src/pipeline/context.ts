@@ -580,8 +580,9 @@ export class RunContext {
         cacheReadTokens: result.usage.cacheRead,
         numTurns: result.numTurns,
         sessionId: result.sessionId,
+        // A failed confinement probe ran before the agent, so its error holds no private output.
         error:
-          opts.privateOutput && result.error
+          opts.privateOutput && result.error && result.confinement?.ok !== false
             ? "private invocation failed"
             : result.error && redact
               ? redact(result.error)
@@ -589,18 +590,21 @@ export class RunContext {
         finishedAt: Date.now(),
       });
       if (result.quota?.windows) tracker.observeWindows(target.provider, result.quota.windows);
-      tracker.record(target.provider, result.status, {
-        exhaustedUntil: result.quota?.exhaustedUntil ?? null,
-        ...(result.modelCooldownMs === undefined
-          ? {}
-          : { modelCooldown: { modelId: target.modelId, ms: result.modelCooldownMs } }),
-        error:
-          opts.privateOutput && result.error
-            ? "private invocation failed"
-            : result.error && redact
-              ? redact(result.error)
-              : result.error,
-      });
+      if (result.confinement) tracker.observeConfinement(target.provider, result.confinement);
+      // An unconfinable CLI is no provider failure: unconfined roles still use it.
+      if (result.confinement?.ok !== false)
+        tracker.record(target.provider, result.status, {
+          exhaustedUntil: result.quota?.exhaustedUntil ?? null,
+          ...(result.modelCooldownMs === undefined
+            ? {}
+            : { modelCooldown: { modelId: target.modelId, ms: result.modelCooldownMs } }),
+          error:
+            opts.privateOutput && result.error
+              ? "private invocation failed"
+              : result.error && redact
+                ? redact(result.error)
+                : result.error,
+        });
       this.run = store.refreshRunTotals(this.run.id);
 
       if (this.termination) throw this.termination;
@@ -613,6 +617,14 @@ export class RunContext {
         lastFailure = `${target.targetId ?? target.modelId}: declined (${reason})`.slice(0, 300);
         this.log(`${target.targetId ?? target.modelId} declined: ${reason}; trying the next model`);
         if (result.decline?.lastResort) lastResort = { result, target, invocation: updated };
+        attempt--;
+        continue;
+      }
+      if (result.confinement?.ok === false) {
+        // Checked before MODEL_REJECTED: the CLI, not the model, failed, so nothing gets blocked.
+        // Never retried unconfined; each model is tried once, so this doesn't spend attempts.
+        lastFailure = `${target.targetId ?? target.modelId}: ${result.error ?? ""}`.slice(0, 300);
+        this.log(`${target.targetId ?? target.modelId} cannot confine reads; falling back`, "warn");
         attempt--;
         continue;
       }

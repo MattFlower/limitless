@@ -265,6 +265,24 @@ export interface ProviderStatus {
   inFlight: number;
   maxConcurrent: number;
   updatedAt: number;
+  /** Latest confined-reader sandbox probe of the provider's CLI (Codex). */
+  confinement?: ConfinementProbe;
+}
+
+/** Fixed probe diagnostics: the CLI's own output can echo config, including tokens. */
+export type ConfinementFailure =
+  | "reader profile not enforced"
+  | "probe inconclusive"
+  | "probe timed out"
+  | "codex sandbox failed to start";
+
+/** Whether a CLI's sandbox let a confined reader read its cwd but denied every private root. */
+export interface ConfinementProbe {
+  ok: boolean;
+  path: string | null;
+  version: string | null;
+  reason: ConfinementFailure | null;
+  exitCode: number | null;
 }
 
 export interface QuotaAlert {
