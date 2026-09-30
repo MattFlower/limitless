@@ -324,19 +324,15 @@ function quotedIn(quote: string, text: string): boolean {
 const LINE_MARKER = /^(?:(?:[-*>]|\d+[.)])\s+)*(?:\**AC-\d+\**:?\s+)?/i;
 const wholeLine = (s: string) => trimQuote(trimQuote(s).replace(LINE_MARKER, ""));
 
-/**
- * The lines of `source` that may state a requirement on their own. A heading labels the block
- * below it rather than stating one: "## Scope", "Networking:", or a plain unpunctuated line
- * directly followed by its block ("Requirements" above "- Support IPv6", "Background" above prose).
- * Any bullet, punctuated sentence, or line set apart by a blank line or the end of the request may
- * ("Support IPv6" is a complete imperative request).
- */
+// Plain section labels remain headings regardless of surrounding blank lines. Do not infer
+// headings from adjacency: consecutive imperative lines ("Support IPv6", "Keep IPv4") are valid.
+const SECTION_LABEL =
+  /^(?:background|context|overview|requirements?|acceptance criteria|scope|constraints?|notes?)$/i;
 function requirementLines(source: string): string[] {
-  const lines = source.split("\n");
-  return lines.filter((l, i) => {
-    if (/^\s*#/.test(l) || /:[*`\s]*$/.test(l)) return false;
-    if (/^\s*(?:[-*>]|\d+[.)])\s/.test(l) || /[.!?]["'”’)*`]*\s*$/.test(l)) return true;
-    return (lines[i + 1] ?? "").trim() === "";
+  return source.split("\n").filter((line) => {
+    if (/^\s*#/.test(line) || /:[*`\s]*$/.test(line)) return false;
+    if (/^\s*(?:[-*>]|\d+[.)])\s/.test(line) || /[.!?]["'”’)*`]*\s*$/.test(line)) return true;
+    return !SECTION_LABEL.test(flatText(line).trim());
   });
 }
 
