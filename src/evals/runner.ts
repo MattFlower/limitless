@@ -67,8 +67,23 @@ interface TrialCoordination {
 interface RunInputs {
   dataset: EvalDataset;
   cache: boolean;
+  /** Resumed after a restart, so any call of unknown spend stops further paid calls. */
+  resumed?: boolean;
   /** Set when unknown spend from an interrupted call rules out further paid calls. */
   unpaid?: string;
+}
+
+/**
+ * Whether a returned call reported its final spend. Only a final answer, or an error or quota
+ * result that carries usage, does; a timeout, kill or transport failure may have spent unseen.
+ */
+export function finalUsageKnown(result: AgentResult): boolean {
+  if (result.status === "ok" || result.status === "declined") return true;
+  const reported =
+    result.costUsd > 0 ||
+    result.costEquivUsd > 0 ||
+    result.usage.input + result.usage.output + result.usage.cacheRead + result.usage.cacheWrite > 0;
+  return reported && (result.status === "error" || result.status === "quota");
 }
 
 export class EvalRunner {
@@ -183,6 +198,7 @@ export class EvalRunner {
       this.launch(run, {
         dataset,
         cache: saved.cache,
+        resumed: true,
         ...(unknownCalls
           ? {
               unpaid: `resumed after a restart with ${unknownCalls} interrupted model call(s) of unknown spend; no further paid calls`,
@@ -427,7 +443,9 @@ export class EvalRunner {
         inputs.unpaid !== undefined &&
         store
           .listEvalTrials(run.id)
-          .some((t) => t.status === "skipped" && t.details.reason === inputs.unpaid);
+          .some(
+            (t) => t.details.usageUnknown || (t.status === "skipped" && t.details.reason === inputs.unpaid),
+          );
       if (unpaid) store.updateEvalRun(run.id, "budget_exhausted", inputs.unpaid);
       else
         store.updateEvalRun(run.id, store.evalSpend(run.id) >= run.maxUsd ? "budget_exhausted" : "completed");
@@ -439,12 +457,16 @@ export class EvalRunner {
     }
   }
 
-  /** Records durable intent before a harness call and its outcome after, including a throw. */
+  /**
+   * Records durable intent before a harness call and its outcome after, including a throw. A call
+   * whose final spend is unknown reports it through `onUnknown` before its result is used.
+   */
   private async attempt(
     evalRunId: string,
     trialKey: string,
     target: ModelTarget,
     call: () => Promise<AgentResult>,
+    onUnknown: () => void,
   ): Promise<AgentResult> {
     const { store } = this.deps;
     const id = store.beginEvalCall(evalRunId, trialKey, target.provider, target.modelId);
@@ -453,7 +475,9 @@ export class EvalRunner {
       result = await call();
       return result;
     } finally {
-      store.resolveEvalCall(id, result);
+      const usageKnown = result !== null && finalUsageKnown(result);
+      store.resolveEvalCall(id, result && { ...result, usageKnown });
+      if (!usageKnown) onUnknown();
     }
   }
 
@@ -516,6 +540,13 @@ export class EvalRunner {
       });
     };
     const budget = () => store.evalSpend(run.id) >= run.maxUsd;
+    // Why a new paid call may not start: the budget, or a resumed run's unknown spend.
+    const unpaid = () => inputs.unpaid ?? (budget() ? "eval budget exhausted" : undefined);
+    const unknownSpend = () => {
+      trial.details.usageUnknown = true;
+      // maxUsd can't bound a resumed run's spend once a call's is unknown, so paid calls stop.
+      if (inputs.resumed) inputs.unpaid ??= "a resumed call's final spend is unknown; no further paid calls";
+    };
     if (signal.aborted) return skip("daemon shutdown");
     const system =
       trial.details.system === undefined
@@ -700,7 +731,8 @@ export class EvalRunner {
       if (rounds > 1) scratch = createScratch(cwd);
       for (let round = 0; round < rounds; round++) {
         if (signal.aborted) return skip("daemon shutdown");
-        if (budget()) return skip("eval budget exhausted");
+        const blocked = unpaid();
+        if (blocked) return skip(blocked);
         ({ harnessName, noTools } = selectHarness(run.role, target));
         const harness = harnesses[harnessName];
         if (!harness) return skip(`No harness registered for ${harnessName}`);
@@ -715,7 +747,8 @@ export class EvalRunner {
           runSlot();
         };
         if (signal.aborted) return skip("daemon shutdown");
-        if (budget()) return skip("eval budget exhausted");
+        const blockedAfterWait = unpaid();
+        if (blockedAfterWait) return skip(blockedAfterWait);
         const afterWait = eligible();
         if (afterWait) return skip(afterWait);
         if (round === 0) trial.createdAt = Date.now();
@@ -761,35 +794,40 @@ export class EvalRunner {
               to = { target, harness, noTools },
               log = logPath,
             ) =>
-              this.attempt(run.id, identity, to.target, () =>
-                to.harness({
-                  scratchDir,
-                  ...(sessionId ? { resumeSessionId: sessionId } : {}),
-                  cwd,
-                  ...request,
-                  decisionTask,
-                  systemAppend: FACTORY_PREAMBLE,
-                  target: to.target,
-                  mode: "hidden" in item ? "edit" : "readonly",
-                  noTools: to.noTools,
-                  privateSession: run.role === "verify",
-                  idleTimeoutMs: 10 * 60_000,
-                  maxToolCalls: "hidden" in item ? 400 : 150,
-                  signal,
-                  logPath: log,
-                  onEvent: (event) => {
-                    if (
-                      event.type === "tool_call" &&
-                      event.input &&
-                      typeof event.input === "object" &&
-                      "command" in event.input &&
-                      typeof event.input.command === "string"
-                    )
-                      toolCommands.push(event.input.command);
-                    if (event.type === "rate_limit")
-                      tracker.observeWindows(to.target.provider, event.windows);
-                  },
-                }),
+              this.attempt(
+                run.id,
+                identity,
+                to.target,
+                () =>
+                  to.harness({
+                    scratchDir,
+                    ...(sessionId ? { resumeSessionId: sessionId } : {}),
+                    cwd,
+                    ...request,
+                    decisionTask,
+                    systemAppend: FACTORY_PREAMBLE,
+                    target: to.target,
+                    mode: "hidden" in item ? "edit" : "readonly",
+                    noTools: to.noTools,
+                    privateSession: run.role === "verify",
+                    idleTimeoutMs: 10 * 60_000,
+                    maxToolCalls: "hidden" in item ? 400 : 150,
+                    signal,
+                    logPath: log,
+                    onEvent: (event) => {
+                      if (
+                        event.type === "tool_call" &&
+                        event.input &&
+                        typeof event.input === "object" &&
+                        "command" in event.input &&
+                        typeof event.input.command === "string"
+                      )
+                        toolCommands.push(event.input.command);
+                      if (event.type === "rate_limit")
+                        tracker.observeWindows(to.target.provider, event.windows);
+                    },
+                  }),
+                unknownSpend,
               );
             const send = (
               request?: ReviewRequest | VerifierRequest,
@@ -810,6 +848,7 @@ export class EvalRunner {
               if (!agent) throw new Error(`No harness registered for ${picked.harnessName}`);
               const check = () => {
                 if (signal.aborted) throw new Error("daemon shutdown");
+                if (inputs.unpaid !== undefined) throw new Error(inputs.unpaid);
                 const reason = unavailable(to);
                 if (reason) throw new Error(`${to.provider} unavailable: ${reason}`);
               };
@@ -891,7 +930,7 @@ export class EvalRunner {
             resumeFailed = true;
             sessionId = undefined;
             store.recordEvalTrial({ ...trial, status: "running" });
-            if (!budget()) continue;
+            if (!unpaid()) continue;
           }
           break;
         }

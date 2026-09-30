@@ -211,9 +211,10 @@ next daemon's `start()` has brought up the provider tracker and SSH tunnels, it 
 runs a crash interrupted, under the same ID. They keep the dataset text, labels and cache setting
 saved at submission, and their completed trials and costs. Every harness call records a durable
 intent first. A trial that never recorded one runs again (once); a trial that did is an interrupted
-error and is never replayed. Its reported spend is kept; a call that never returned or was cancelled
-leaves `usageUnknown`, and the resumed run then makes no further paid calls (cached work still
-completes) and ends `budget_exhausted` with the reason. Runs submitted before resume support still
+error and is never replayed. Its reported spend is kept; a call that never returned, or returned
+without final usage (a throw, kill, timeout or transport failure), leaves `usageUnknown`. A resumed
+run with such a call, from before the restart or during the resume, makes no further paid calls
+(cached work still completes) and ends `budget_exhausted` with the reason. Runs submitted before resume support still
 fail on restart. Unknown latency is excluded from the p50. `--follow` polls until any
 terminal state and prints a final report. The Evals UI lists runs, displays per-trial reports, and
 compares latest completed evidence in a roles-by-models eligibility matrix. Other role graders remain pending.

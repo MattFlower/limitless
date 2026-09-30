@@ -938,7 +938,7 @@ test("crash boundaries: no intent runs once, a resolved call keeps its cost, a r
     store.recordEvalTrial({ ...c, status: "running" });
     const { evalTrialKey } = await import("../src/db/store.ts");
     const call = store.beginEvalCall(run.id, evalTrialKey(c), "openrouter", "candidate-a");
-    store.resolveEvalCall(call, { status: "ok", costUsd: 0.4, costEquivUsd: 0.8 });
+    store.resolveEvalCall(call, { status: "ok", costUsd: 0.4, costEquivUsd: 0.8, usageKnown: true });
 
     f.crash();
     f.factory.start();
@@ -1116,6 +1116,70 @@ test("a shutdown leaves the run for the next daemon, which resumes trials that n
     f.factory.start();
     await f.factory.evals.wait(run.id);
     expect(f.calls).toHaveLength(3);
+  } finally {
+    await f.close();
+  }
+});
+
+test.each(["throw", "timeout", "kill"] as const)(
+  "a resumed call that ends with unknown spend (%p) stops the run's further paid calls",
+  async (fault) => {
+    const f = await evalFixture();
+    try {
+      const stalled = stallAcquire(f, 0);
+      const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 1, maxUsd: 5 });
+      await stalled;
+      f.crash();
+      f.respond(() => ({ fault }));
+      f.factory.start();
+      await f.factory.evals.wait(run.id);
+      expect(f.calls).toHaveLength(1);
+      const report = f.factory.evals.report(run.id);
+      expect(report?.run.status).toBe("budget_exhausted");
+      expect(report?.run.error).toContain("final spend is unknown");
+      const [a, b, c] = report?.trials ?? [];
+      expect(a).toMatchObject({
+        status: "error",
+        costUsd: 0,
+        details: { usageUnknown: true, resumed: true },
+      });
+      for (const t of [b, c])
+        expect(t).toMatchObject({ status: "skipped", details: { reason: report?.run.error } });
+      expect(f.factory.store.evalCallAttempts(run.id).map((x) => [x.resolved, x.usageUnknown])).toEqual([
+        [true, true],
+      ]);
+    } finally {
+      await f.close();
+    }
+  },
+);
+
+test("a timeout that reported no usage before a crash counts as unknown spend on recovery", async () => {
+  const f = await evalFixture();
+  try {
+    f.respond(() => ({ fault: "timeout" }));
+    const stalled = stallAcquire(f, 1);
+    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 1, maxUsd: 5 });
+    await stalled;
+    // The live run keeps its ordinary semantics but records the evidence.
+    expect(f.factory.store.listEvalTrials(run.id)[0]).toMatchObject({
+      status: "error",
+      costUsd: 0,
+      details: { invocationStatus: "timeout", usageUnknown: true },
+    });
+    f.crash();
+    f.respond(() => ({ structured: answer, costUsd: 0.1 }));
+    f.factory.start();
+    await f.factory.evals.wait(run.id);
+    expect(f.calls).toHaveLength(1);
+    const report = f.factory.evals.report(run.id);
+    expect(report?.run.status).toBe("budget_exhausted");
+    expect(report?.run.error).toContain("unknown spend");
+    expect(report?.trials.map((t) => t.status)).toEqual(["error", "skipped", "skipped"]);
+    expect(f.factory.store.evalCallAttempts(run.id)[0]).toMatchObject({
+      status: "timeout",
+      usageUnknown: true,
+    });
   } finally {
     await f.close();
   }

@@ -523,16 +523,23 @@ export class Store {
     return row.id;
   }
 
-  /** `result` is null when the harness threw, which leaves its spend unknown. */
+  /** `result` is null when the harness threw; either way `usageKnown` false leaves its spend unknown. */
   resolveEvalCall(
     id: number,
-    result: { status: InvocationStatus; costUsd: number; costEquivUsd: number } | null,
+    result: { status: InvocationStatus; costUsd: number; costEquivUsd: number; usageKnown: boolean } | null,
   ): void {
     this.db
       .query(
-        "UPDATE eval_call_attempts SET resolved_at = ?, status = ?, cost_usd = ?, cost_equiv_usd = ? WHERE id = ?",
+        "UPDATE eval_call_attempts SET resolved_at = ?, status = ?, cost_usd = ?, cost_equiv_usd = ?, usage_known = ? WHERE id = ?",
       )
-      .run(Date.now(), result?.status ?? "threw", result?.costUsd ?? null, result?.costEquivUsd ?? null, id);
+      .run(
+        Date.now(),
+        result?.status ?? "threw",
+        result?.costUsd ?? null,
+        result?.costEquivUsd ?? null,
+        Number(result?.usageKnown ?? false),
+        id,
+      );
   }
 
   evalCallAttempts(evalRunId: string): EvalCallAttempt[] {
@@ -548,8 +555,8 @@ export class Store {
       status: r.status as string | null,
       costUsd: r.cost_usd as number | null,
       costEquivUsd: r.cost_equiv_usd as number | null,
-      // A call killed mid-flight or one that threw may have spent without reporting it.
-      usageUnknown: r.resolved_at === null || r.status === "cancelled" || r.status === "threw",
+      // Returning is not enough: a killed, timed-out or failed call may have spent without reporting it.
+      usageUnknown: r.resolved_at === null || r.usage_known !== 1,
     }));
   }
 
