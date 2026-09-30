@@ -323,9 +323,22 @@ function quotedIn(quote: string, text: string): boolean {
 // List and quote markers and an acceptance-criterion label, as the verify prompt renders them.
 const LINE_MARKER = /^(?:(?:[-*>]|\d+[.)])\s+)*(?:\**AC-\d+\**:?\s+)?/i;
 const wholeLine = (s: string) => trimQuote(trimQuote(s).replace(LINE_MARKER, ""));
-// A heading ("## Scope.", "Networking:") labels requirements rather than stating one; any other
-// whole line may, punctuated or not ("Support IPv6" is a complete imperative request).
-const heading = (l: string) => /^\s*#/.test(l) || /:[*`\s]*$/.test(l);
+
+/**
+ * The lines of `source` that may state a requirement on their own. A heading labels the block
+ * below it rather than stating one: "## Scope", "Networking:", or a plain unpunctuated line
+ * directly followed by its block ("Requirements" above "- Support IPv6", "Background" above prose).
+ * Any bullet, punctuated sentence, or line set apart by a blank line or the end of the request may
+ * ("Support IPv6" is a complete imperative request).
+ */
+function requirementLines(source: string): string[] {
+  const lines = source.split("\n");
+  return lines.filter((l, i) => {
+    if (/^\s*#/.test(l) || /:[*`\s]*$/.test(l)) return false;
+    if (/^\s*(?:[-*>]|\d+[.)])\s/.test(l) || /[.!?]["'”’)*`]*\s*$/.test(l)) return true;
+    return (lines[i + 1] ?? "").trim() === "";
+  });
+}
 
 /** Whether `citation` occurs verbatim in `source` on word boundaries, whatever its length. */
 export function citationInSource(citation: string, source: string): boolean {
@@ -348,7 +361,7 @@ export function citedRequirement(
   const key = flatText(line);
   if (
     /[\p{L}\p{N}]/u.test(key) &&
-    [...source.split("\n").filter((l) => !heading(l)), ...entries].some((e) => flatText(wholeLine(e)) === key)
+    [...requirementLines(source), ...entries].some((e) => flatText(wholeLine(e)) === key)
   )
     return line;
   const quote = trimQuote(citation);
