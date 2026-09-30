@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   backendChecks,
   type CheckResult,
+  type Clock,
   checkCodexModels,
   decisionsCheck,
   exitCode,
@@ -271,32 +272,45 @@ test("a disclosure after the outer timeout is final, and an attempt that will no
   };
   for (const stops of [true, false]) {
     let calls = 0;
+    // The attempt that will not stop is held until the runner has given up on it, so neither case
+    // depends on how quickly the attempt settles relative to the stop grace.
+    let release = () => {};
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let pending: Promise<CheckResult> | undefined;
     const rows = await runChecks(
       [
         {
           name: "late leak",
           timeoutMs: 30,
-          run: (signal) =>
-            liveCheck(
+          run: (signal) => {
+            pending = liveCheck(
               async (spec) => {
                 writeFileSync(spec.logPath, "");
                 if (++calls > 1) return { ...result, finalText: "Cannot read files." };
-                // The leak arrives only once the runner's timeout has already fired.
-                await new Promise((resolve) => signal.addEventListener("abort", resolve));
-                if (!stops) await Bun.sleep(80);
+                // The leak arrives only once the runner's timeout has already fired (it may have
+                // fired while liveCheck was still setting up the worktree).
+                if (!signal.aborted)
+                  await new Promise((resolve) => signal.addEventListener("abort", resolve));
+                if (!stops) await released;
                 const token = readFileSync(join(spec.cwd, "secret.txt"), "utf8");
                 return { ...result, status: "cancelled", error: "cancelled", finalText: token };
               },
               target,
               "noTools",
               signal,
-            ),
+            );
+            return pending;
+          },
         },
       ],
       now,
       noDelay,
-      { stopGraceMs: 40, retryDelayMs: 0 },
+      { stopGraceMs: stops ? 10_000 : 40, retryDelayMs: 0 },
     );
+    release();
+    await pending;
     expect(calls).toBe(1);
     expect(rows[0]).toMatchObject({ status: "fail" });
     expect(rows[0]?.retried).toBeUndefined();
@@ -306,8 +320,51 @@ test("a disclosure after the outer timeout is final, and an attempt that will no
   }
 });
 
+/**
+ * Virtual time: a timer fires only once every pending microtask has settled, then the clock jumps
+ * straight to it. Nothing depends on how fast the runner is.
+ */
+function fakeClock(): Clock {
+  let time = 0;
+  let seq = 0;
+  const timers = new Map<number, { at: number; fn: () => void }>();
+  let scheduled = false;
+  const pump = () => {
+    if (scheduled || timers.size === 0) return;
+    scheduled = true;
+    setImmediate(() => {
+      scheduled = false;
+      // Timers cleared while this was queued are gone; an empty queue just means nothing is waiting.
+      const next = [...timers].reduce<[number, { at: number; fn: () => void }] | undefined>(
+        (a, b) => (a && a[1].at <= b[1].at ? a : b),
+        undefined,
+      );
+      if (!next) return;
+      timers.delete(next[0]);
+      time = Math.max(time, next[1].at);
+      next[1].fn();
+      pump();
+    });
+  };
+  const clock: Clock = {
+    now: () => time,
+    setTimeout: (fn, ms) => {
+      const id = ++seq;
+      timers.set(id, { at: time + ms, fn });
+      pump();
+      return id;
+    },
+    clearTimeout: (handle) => {
+      if (typeof handle === "number") timers.delete(handle);
+    },
+    sleep: (ms) => new Promise((resolve) => clock.setTimeout(resolve, ms)),
+  };
+  return clock;
+}
+
 test("hung checks report per check as they finish and stay within the budget", async () => {
-  // Time-scaled: 100 ms stands for a check's timeout, 400 ms for the smoke budget.
+  // Simulated time: 100 ms stands for a check's timeout, 400 ms for the smoke budget.
+  const clock = fakeClock();
   const stoppable = (signal: AbortSignal) =>
     new Promise<CheckResult>((resolve) =>
       signal.addEventListener("abort", () =>
@@ -324,39 +381,40 @@ test("hung checks report per check as they finish and stay within the budget", a
     },
   });
   const lines: string[] = [];
-  const began = performance.now();
   const code = await reportChecks(
     [
-      // ~0-120 ms: times out, then passes on the retry.
+      // 0-120 ms: times out, then passes on the retry.
       counted("flaky", (signal, call) =>
         call === 1 ? stoppable(signal) : Promise.resolve({ status: "pass" }),
       ),
       counted("quick", async () => ({ status: "pass" })),
-      // ~120-240 ms: ignores its abort, so it is never retried.
+      // 120-240 ms: ignores its abort, so it is never retried.
       counted("stubborn", () => new Promise<CheckResult>(() => {})),
-      // ~240-340 ms: times out with too little budget left for a retry.
+      // 240-340 ms: times out with too little budget left for a retry.
       counted("hung", stoppable),
-      // ~340-380 ms: cut to the ~40 ms left in the budget.
+      // 340-380 ms: cut to the 40 ms left in the budget.
       counted("late", stoppable),
       counted("never", async () => ({ status: "pass" })),
     ],
-    (line) => lines.push(`${Math.round(performance.now() - began)} ${line}`),
-    { budgetMs: 400, retryDelayMs: 20, stopGraceMs: 20 },
+    (line) => lines.push(`${clock.now()} ${line}`),
+    { budgetMs: 400, retryDelayMs: 20, stopGraceMs: 20, clock },
   );
-  const elapsed = performance.now() - began;
   expect(code).toBe(1);
-  expect(elapsed).toBeLessThan(420);
+  expect(clock.now()).toBeLessThanOrEqual(400);
   expect(calls).toEqual({ flaky: 2, quick: 1, stubborn: 1, hung: 1, late: 1 });
   const text = lines.map((line) => line.replace(/^\d+ /, "")).join("\n");
   expect(text).toMatch(/flaky\s+PASS \(retried after: timeout 100ms\)/);
   expect(text).toMatch(/quick\s+PASS/);
   expect(text).toMatch(/stubborn\s+FAIL\s+\d+ms\s+timeout 100ms \(attempt did not stop, not retried\)/);
   expect(text).toMatch(/hung\s+FAIL\s+\d+ms\s+timeout 100ms \(no time left to retry\)/);
-  expect(text).toMatch(/late\s+FAIL\s+\d+ms\s+timeout \d{1,2}ms \(no time left to retry\)/);
+  expect(text).toMatch(/late\s+FAIL\s+\d+ms\s+timeout 40ms \(no time left to retry\)/);
   expect(text).toMatch(/never\s+FAIL\s+\d+ms\s+not run: no time left in the smoke budget/);
   // Each result line appears when its check finishes, not after the whole run.
   const at = (pattern: RegExp) => Number(lines.find((line) => pattern.test(line))?.split(" ")[0]);
-  expect(at(/flaky\s+PASS/)).toBeLessThan(at(/hung\s+FAIL/) - 150);
+  expect(at(/flaky\s+PASS/)).toBe(120);
+  expect(at(/stubborn\s+FAIL/)).toBe(240);
+  expect(at(/hung\s+FAIL/)).toBe(340);
+  expect(at(/late\s+FAIL/)).toBe(380);
   expect(text.split("\n").map((line) => line.split(/\s+/).slice(0, 2).join(" "))).toEqual([
     "Check Status",
     "-------- ------",
@@ -373,6 +431,28 @@ test("hung checks report per check as they finish and stay within the budget", a
     "never RUN",
     "never FAIL",
   ]);
+});
+
+test("reportChecks times out on the real clock by default", async () => {
+  const lines: string[] = [];
+  const code = await reportChecks(
+    [
+      { name: "pass", run: async () => ({ status: "pass" }) },
+      {
+        name: "stuck",
+        timeoutMs: 10,
+        run: (signal) =>
+          new Promise<CheckResult>((resolve) =>
+            signal.addEventListener("abort", () => resolve({ status: "fail", reason: "cancelled" })),
+          ),
+      },
+    ],
+    (line) => lines.push(line),
+    { retryDelayMs: 0, stopGraceMs: 1_000 },
+  );
+  expect(code).toBe(1);
+  expect(lines.join("\n")).toMatch(/pass\s+PASS/);
+  expect(lines.join("\n")).toMatch(/stuck\s+FAIL\s+\d+ms\s+cancelled/);
 });
 
 test("subscription quota check rejects absent windows and accepts observed windows", () => {

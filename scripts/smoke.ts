@@ -35,12 +35,27 @@ export type CheckRow = CheckResult & {
   retried?: boolean;
   retriedAfter?: string;
 };
+/** Time source for the smoke runner, so tests can drive budgets and timeouts deterministically. */
+export type Clock = {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  setTimeout: (fn: () => void, ms: number) => unknown;
+  clearTimeout: (handle: unknown) => void;
+};
+export const realClock: Clock = {
+  now: () => performance.now(),
+  sleep: (ms) => Bun.sleep(ms),
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout> | undefined),
+};
 export type RunOptions = {
   /** Overall time for every attempt; an attempt is cut to the time left and a retry needs its full timeout. */
   budgetMs?: number;
   retryDelayMs?: number;
   /** How long a timed-out attempt may take to settle after its signal aborts. */
   stopGraceMs?: number;
+  /** Timers for attempt timeouts and the stop grace; also the default `now` and retry delay. */
+  clock?: Clock;
   onStart?: (check: SmokeCheck) => void;
   onRow?: (row: CheckRow) => void;
 };
@@ -67,17 +82,17 @@ function fail(reason: string, transient?: Transient): CheckResult {
   return { status: "fail", reason, ...(transient ? { transient } : {}) };
 }
 
-async function within<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
+async function within<T>(promise: Promise<T>, ms: number, clock: Clock): Promise<T | undefined> {
+  let timer: unknown;
   try {
     return await Promise.race([
       promise,
       new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => resolve(undefined), ms);
+        timer = clock.setTimeout(() => resolve(undefined), ms);
       }),
     ]);
   } finally {
-    clearTimeout(timer);
+    clock.clearTimeout(timer);
   }
 }
 
@@ -85,15 +100,20 @@ async function within<T>(promise: Promise<T>, ms: number): Promise<T | undefined
  * A timed-out attempt is aborted and awaited: a disclosure or forbidden write it reports while
  * stopping is final, and one that never stops is not retried, so no later attempt can mask it.
  */
-async function attempt(check: SmokeCheck, timeoutMs: number, stopGraceMs: number): Promise<CheckResult> {
+async function attempt(
+  check: SmokeCheck,
+  timeoutMs: number,
+  stopGraceMs: number,
+  clock: Clock,
+): Promise<CheckResult> {
   const controller = new AbortController();
   const run = check
     .run(controller.signal)
     .catch((error: unknown) => fail(String(error), transientReason(String(error))));
-  const result = await within(run, timeoutMs);
+  const result = await within(run, timeoutMs, clock);
   if (result) return result;
   controller.abort();
-  const settled = await within(run, stopGraceMs);
+  const settled = await within(run, stopGraceMs, clock);
   if (!settled) return fail(`timeout ${timeoutMs}ms (attempt did not stop, not retried)`);
   if (settled.status === "fail" && !settled.transient) return settled;
   return fail(`timeout ${timeoutMs}ms`, "timeout");
@@ -106,26 +126,29 @@ async function attempt(check: SmokeCheck, timeoutMs: number, stopGraceMs: number
  */
 export async function runChecks(
   checks: SmokeCheck[],
-  now = () => performance.now(),
-  delay = (ms: number) => Bun.sleep(ms),
+  now?: () => number,
+  delay?: (ms: number) => Promise<void>,
   options: RunOptions = {},
 ): Promise<CheckRow[]> {
   const {
     budgetMs = Number.POSITIVE_INFINITY,
     retryDelayMs = RETRY_DELAY_MS,
     stopGraceMs = STOP_GRACE_MS,
+    clock = realClock,
   } = options;
-  const begin = now();
+  const time = now ?? clock.now;
+  const wait = delay ?? clock.sleep;
+  const begin = time();
   // Time an attempt may run so that it, and stopping it, still ends inside the budget.
-  const left = () => budgetMs - (now() - begin) - stopGraceMs;
+  const left = () => budgetMs - (time() - begin) - stopGraceMs;
   const rows: CheckRow[] = [];
   for (const check of checks) {
     const timeoutMs = check.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS;
     options.onStart?.(check);
-    let start = now();
+    let start = time();
     let result =
       left() > 0
-        ? await attempt(check, Math.min(timeoutMs, Math.floor(left())), stopGraceMs)
+        ? await attempt(check, Math.min(timeoutMs, Math.floor(left())), stopGraceMs, clock)
         : fail("not run: no time left in the smoke budget");
     let retried = false;
     const first = result.reason;
@@ -137,10 +160,10 @@ export async function runChecks(
     } else if (retry && left() < retryDelayMs + timeoutMs) {
       result = { ...result, reason: `${first ?? "failed"} (no time left to retry)` };
     } else if (retry) {
-      await delay(retryDelayMs);
+      await wait(retryDelayMs);
       retried = true;
-      start = now();
-      result = await attempt(check, timeoutMs, stopGraceMs);
+      start = time();
+      result = await attempt(check, timeoutMs, stopGraceMs, clock);
       // A backend still down on the retry is skipped as before; a retry that skips after any
       // other failure must not hide it.
       if (health && (result.transient === "health" || result.status === "skip"))
@@ -156,7 +179,7 @@ export async function runChecks(
     const row: CheckRow = {
       name: check.name,
       ...result,
-      durationMs: Math.round(now() - start),
+      durationMs: Math.round(time() - start),
       ...(retried
         ? { retried, retriedAfter: (first ?? "failed").replace(/\s+/g, " ").trim().slice(0, 200) }
         : {}),
