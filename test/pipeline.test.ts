@@ -503,6 +503,76 @@ esac
     },
   );
 
+  test("panel mode: the deep roster plus lenses from the base commit; an unavailable local finder is skipped", async () => {
+    const lens = (focus: string) => `[review]\nlenses = [{ name = "ops", focus = "${focus}" }]\n`;
+    const toml = readFileSync(join(repoDir, ".limitless.toml"), "utf8");
+    writeFileSync(join(repoDir, ".limitless.toml"), `${toml}${lens("BASE_FOCUS")}`);
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "lens"], {
+      cwd: repoDir,
+    });
+    const reviews: AgentSpec[] = [];
+    let verifications = 0;
+    let implementations = 0;
+    const f = start((s) => {
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        // R1's finding is real; R2's recheck finds it fixed.
+        const ruling = {
+          verdict: verifications++ ? "REFUTED" : "CONFIRMED",
+          severity: "high",
+          evidence: "a:1",
+        };
+        const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1]);
+        return {
+          structured: {
+            results: ids.map((id) => ({ id, ...ruling, category: "correctness", trigger: "x" })),
+          },
+        };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "deep" }) };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "verify") return { structured: pass };
+      if (role === "review") {
+        reviews.push(s);
+        const finding = {
+          ...findingEvidence,
+          severity: "major",
+          file: "farewell.txt",
+          line: 1,
+          title: "Terse",
+        };
+        const found = s.prompt.startsWith("You are an adversarial") && !s.prompt.includes("review R2");
+        const findings = found ? [{ ...finding, detail: "d", suggestion: "s", security: false }] : [];
+        return { structured: { ...approve, findings } };
+      }
+      // The change under review rewrites the lens; every review must keep the base's.
+      const farewell = implementations++ ? "goodbye!\n" : "goodbye\n";
+      return { files: { "farewell.txt": farewell, ".limitless.toml": `${toml}${lens("HEAD_FOCUS")}` } };
+    });
+    f.deps.cfg.reviewMode = "panel";
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "deep" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(f.store.getArtifact(run.id, "diff.patch")).toContain("HEAD_FOCUS");
+    const prompts = reviews.map((s) => s.prompt);
+    expect(prompts.filter((p) => p.includes("review R2"))).toHaveLength(3);
+    expect(prompts.filter((p) => p.includes("BASE_FOCUS"))).toHaveLength(2);
+    expect(prompts.some((p) => p.includes("HEAD_FOCUS"))).toBe(false);
+    // Adversarial avoids the implementer's vendor, careful takes its family, the lens finder is cross-vendor.
+    for (const review of [1, 2])
+      expect(JSON.parse(f.store.getArtifact(run.id, `review-${review}.json`) ?? "{}").panel.finders).toEqual([
+        { prompt: "adversarial", vendor: "openai" },
+        { prompt: "careful", vendor: "anthropic" },
+        {
+          prompt: "standard",
+          lens: "removed-behaviour-and-failure-paths",
+          vendor: null,
+          skipped: "no local model available",
+        },
+        { prompt: "standard", lens: "ops", vendor: "openai" },
+      ]);
+  });
+
   test("Dependabot falls back when free providers are unavailable; owner keeps policy routing", async () => {
     const f = start(
       (s) => {

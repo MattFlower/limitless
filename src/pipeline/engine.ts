@@ -71,7 +71,7 @@ import {
   runReview,
   type VerifierRequest,
 } from "./review.ts";
-import { productionReviewSystem } from "./review-system.ts";
+import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import {
   type Holdout,
   HoldoutSchema,
@@ -325,9 +325,10 @@ async function prepare(ctx: RunContext): Promise<void> {
     await discardChanges(wt.path);
     let gates: GateConfig;
     try {
-      ctx.state.previewConfig = readPreviewConfig(
-        await readFileAt(wt.path, verification?.baseSha ?? baseSha, ".limitless.toml"),
-      );
+      const repoConfig = await readFileAt(wt.path, verification?.baseSha ?? baseSha, ".limitless.toml");
+      ctx.state.previewConfig = readPreviewConfig(repoConfig);
+      // Review lenses come from the base commit, never from the change under review.
+      if (ctx.deps.cfg.reviewMode === "panel") ctx.state.reviewLenses = readReviewLenses(repoConfig);
       gates = detectGates(wt.path);
       ctx.state.gatesConfig = gates;
       ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
@@ -776,7 +777,8 @@ async function oneRound(
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
   const changeDiff = () => diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change");
-  const system = ctx.deps.reviewSystem ?? productionReviewSystem(ctx.deps.cfg);
+  const system =
+    ctx.deps.reviewSystem ?? configuredReviewSystem(ctx.deps.cfg, profile(ctx), ctx.state.reviewLenses);
   const resolution = ctx.state.conflictRound === round;
   // Panel reviews are numbered apart from implementation rounds (a gate-failed round reviews nothing,
   // a replayed round keeps its number); a conflict-resolution review is outside the count.
@@ -978,7 +980,7 @@ async function oneRound(
       // possibly while another finder still runs. Production reviews run a single finder.
       const call = async (
         request: ReviewRequest | VerifierRequest,
-        avoidVendor: string | string[] | undefined,
+        constraints: RouteConstraints,
         prefer: string | undefined,
       ) => {
         const invoked = await ctx.invoke({
@@ -986,7 +988,7 @@ async function oneRound(
           stage,
           mode: "readonly",
           complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
-          constraints: { avoidVendor, ...(prefer ? { prefer } : {}) },
+          constraints: { ...constraints, ...(prefer ? { prefer } : {}) },
           ...request,
           requireStructured: true,
         });
@@ -995,10 +997,23 @@ async function oneRound(
       };
       const { target, output, decision, panel } = await runReview(
         {
-          invoke: (request, finder) =>
-            call(request, ctx.state.implementer?.vendor, system.finders[finder]?.target),
+          invoke: async (request, index) => {
+            const finder = system.finders[index];
+            const vendor = ctx.state.implementer?.vendor;
+            const constraints: RouteConstraints = {
+              ...(finder?.family === "implementer" ? { preferVendor: vendor } : { avoidVendor: vendor }),
+              ...(finder?.local ? { billing: "free_only" as const } : {}),
+            };
+            try {
+              return await call(request, constraints, finder?.target);
+            } catch (error) {
+              // An unavailable local finder is skipped; the panel goes on without it.
+              if (finder?.local && error instanceof NoCapacityError) return null;
+              throw error;
+            }
+          },
           verify: async (request, avoidVendors) => {
-            const verified = await call(request, avoidVendors, system.verifier?.target);
+            const verified = await call(request, { avoidVendor: avoidVendors }, system.verifier?.target);
             if (avoidVendors.includes(verified.target.vendor))
               ctx.log(
                 `Verifier ${verified.target.modelId} shares vendor ${verified.target.vendor} with a finder it checks (no cross-vendor verifier available)`,

@@ -5,6 +5,7 @@ import * as prompts from "../src/pipeline/prompts.ts";
 import { formatReviewFeedback, reviewPrompt } from "../src/pipeline/prompts.ts";
 import {
   blockingReviewFindings,
+  LOCAL_FINDER_TIMEOUT_MS,
   PANEL_VERIFY_CAP,
   panelIdentity,
   type ReviewRequest,
@@ -905,6 +906,63 @@ describe("runReview panel", () => {
     );
     await expect(run).rejects.toThrow("provider unavailable");
     expect(settled).toBe(1);
+  });
+
+  test("a lens finder gets its focus; a local finder with no model or a failed call is skipped", async () => {
+    const timedOut = {
+      ...ok(null, "qwen"),
+      result: { ...ok(null, "qwen").result, status: "timeout", error: "slow" },
+    };
+    for (const [local, skipped] of [
+      [null, "no local model available"],
+      [timedOut as unknown as ReturnType<typeof ok>, "timeout: slow"],
+    ] as const) {
+      const requests: ReviewRequest[] = [];
+      const warnings: string[] = [];
+      const out = await runReview(
+        {
+          invoke: async (request, finder) => {
+            requests[finder] = request;
+            if (finder === 1) return local;
+            const findings = [candidate("src/a.ts", 1)];
+            return ok({ verdict: "request_changes", summary: "Checked everything.", findings }, "openai");
+          },
+          verify: async (request) =>
+            ok(
+              { results: ids(request.prompt).map((id) => ({ id, category: "correctness", ...confirmed })) },
+              "x",
+            ),
+          warn: (message) => warnings.push(message),
+        },
+        {
+          prompt,
+          timeoutMs: 60 * 60_000,
+          system: {
+            mode: "panel",
+            finders: [
+              { prompt: "standard", lens: { name: "ops", focus: "Rollback and restart." } },
+              { prompt: "standard", lens: { name: "paths", focus: "Failure paths." }, local: true },
+            ],
+          },
+        },
+      );
+      expect(requests[0]?.prompt).toContain(
+        "\n# Lens: ops\nOther finders review the change as a whole. Concentrate on this area:\nRollback and restart.\n",
+      );
+      expect(requests.map((r) => r.timeoutMs)).toEqual([60 * 60_000, LOCAL_FINDER_TIMEOUT_MS]);
+      expect(warnings).toEqual([`Local finder 1 skipped (${skipped})`]);
+      expect(out.panel?.finders).toEqual([
+        { prompt: "standard", lens: "ops", vendor: "openai" },
+        { prompt: "standard", lens: "paths", vendor: null, skipped },
+      ]);
+      expect(out.decision?.blocking.map((f) => f.title)).toEqual(["Issue src/a.ts 1"]);
+    }
+    // Only a local finder may be skipped.
+    const run = runReview(
+      { invoke: async () => null, verify: async () => ok({ results: [] }, "x") },
+      { prompt, timeoutMs: 1, system: { mode: "panel", finders: [{ prompt: "standard" }] } },
+    );
+    await expect(run).rejects.toThrow("Finder 0 has no model and is not local");
   });
 
   test("a later-round panel finder prompt does not describe single-mode follow-ups", () => {

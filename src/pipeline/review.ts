@@ -27,9 +27,11 @@ const UNRAISED = { agreement: 0, finder: null, vendor: null, raisedBy: [] as num
  * Bumped when what a panel verifies or blocks changes in a way a stored output can't show, so eval
  * caches stop reusing outputs made under the old policy. 2: security candidates are always verified,
  * and missing rulings on security or prior blocking findings fail closed. 3: finder reports merge
- * before verification.
+ * before verification. 4: a local finder that fails is skipped instead of failing the panel.
  */
-const PANEL_POLICY_VERSION = 3;
+const PANEL_POLICY_VERSION = 4;
+/** A local finder's time limit: it is free but slow, and must not hold up the panel. */
+export const LOCAL_FINDER_TIMEOUT_MS = 15 * 60_000;
 
 /**
  * CONFIRMED, or PLAUSIBLE at high or above. Agreement between finders is recorded but does not count:
@@ -208,8 +210,8 @@ export interface VerifierRequest {
 
 /** What `review-N.json` records about a panel beyond the derived review. */
 export interface PanelRecord {
-  /** Each finder's prompt and the vendor it ran on, by finder index. */
-  finders: { prompt: FinderPrompt; vendor: string | null }[];
+  /** Each finder's prompt and the vendor it ran on, by finder index; why a local finder was skipped. */
+  finders: { prompt: FinderPrompt; lens?: string; vendor: string | null; skipped?: string }[];
   /**
    * `finder` and `vendor` are the report that represents the candidate, `raisedBy` every finder that
    * reported it (the others are its `duplicates`). `finder` is null for a prior blocking finding no
@@ -230,8 +232,8 @@ export interface PanelRecord {
 type Invoked = { result: AgentResult; target?: { vendor: string } };
 
 export interface ReviewDeps<T extends Invoked> {
-  /** Runs finder `finder` (an index into the system's finders). */
-  invoke: (request: ReviewRequest, finder: number) => Promise<T>;
+  /** Runs finder `finder` (an index into the system's finders); null when a local finder has no model. */
+  invoke: (request: ReviewRequest, finder: number) => Promise<T | null>;
   /** Panel only: one read-only verifier batch, routed away from every vendor that raised it. */
   verify?: (request: VerifierRequest, avoidVendors: string[]) => Promise<T>;
   /** Panel only: problems that degrade the review without failing it. */
@@ -270,6 +272,8 @@ export function panelIdentity(): string {
         (["standard", "adversarial", "careful"] as const).map((finder) =>
           reviewPrompt({ ...FINDER_TEMPLATE, finder }),
         ),
+        reviewPrompt({ ...FINDER_TEMPLATE, finder: "standard", lens: { name: "LENS", focus: "FOCUS" } }),
+        LOCAL_FINDER_TIMEOUT_MS,
         MERGE_RULES,
         verifierPrompt(TEMPLATE_INPUT),
         verifierPrompt({ ...TEMPLATE_INPUT, externalChange: true }),
@@ -304,6 +308,7 @@ export async function runReview<T extends Invoked>(
   if (input.system?.mode === "panel") return runPanel(deps, input, input.system.finders);
   const request = reviewRequest(input);
   const invoked = await deps.invoke(request, 0);
+  if (!invoked) throw new Error("a single review has no local finder to skip");
   const output = request.schema.safeParse(invoked.result.structured ?? extractJson(invoked.result.finalText));
   if (!output.success) return { ...invoked, output };
   return { ...invoked, output, decision: decide(input, output.data, output.data.verdict) };
@@ -366,9 +371,14 @@ async function runPanel<T extends Invoked>(
   // Finders run in parallel, each within its provider's limits. Every call settles before the panel
   // goes on or fails, so none outlives it and each one's spend is recorded.
   const settled = await Promise.allSettled(
-    finders.map(async ({ prompt }, finder) => {
-      const request = reviewRequest({ ...input, prompt: { ...input.prompt, finder: prompt } });
+    finders.map(async ({ prompt, lens, local }, finder) => {
+      const request = reviewRequest({
+        ...input,
+        timeoutMs: local ? Math.min(input.timeoutMs, LOCAL_FINDER_TIMEOUT_MS) : input.timeoutMs,
+        prompt: { ...input.prompt, finder: prompt, ...(lens ? { lens } : {}) },
+      });
       const invoked = await deps.invoke(request, finder);
+      if (!invoked) return null;
       const output = request.schema.safeParse(
         invoked.result.structured ?? extractJson(invoked.result.finalText),
       );
@@ -379,23 +389,41 @@ async function runPanel<T extends Invoked>(
     if (member.status === "rejected") throw member.reason;
     return member.value;
   });
-  const results: AgentResult[] = members.map(({ invoked }) => invoked.result);
-  const found: { invoked: T; review: Review }[] = [];
-  for (const [finder, { invoked, output }] of members.entries()) {
-    if (!output.success)
-      return {
-        ...invoked,
-        result: failedPanel(
-          results,
-          invoked.result,
-          `Invalid review output from finder ${finder}: ${output.error.message}`,
-        ),
-        output,
-      };
-    found.push({ invoked, review: output.data });
+  const results: AgentResult[] = members.flatMap((member) => (member ? [member.invoked.result] : []));
+  // By finder index; a skipped local finder leaves a gap.
+  const found: ({ invoked: T; review: Review } | undefined)[] = [];
+  const skipped = new Map<number, string>();
+  for (const [finder, member] of members.entries()) {
+    const output = member?.output;
+    if (member && output?.success) {
+      found[finder] = { invoked: member.invoked, review: output.data };
+      continue;
+    }
+    found[finder] = undefined;
+    const result = member?.invoked.result;
+    if (finders[finder]?.local) {
+      const problem = !result
+        ? "no local model available"
+        : result.status !== "ok"
+          ? `${result.status}: ${result.error ?? "no output"}`
+          : "invalid review output";
+      skipped.set(finder, problem);
+      deps.warn?.(`Local finder ${finder} skipped (${problem})`);
+      continue;
+    }
+    if (!member || !output) throw new Error(`Finder ${finder} has no model and is not local`);
+    return {
+      ...member.invoked,
+      result: failedPanel(
+        results,
+        member.invoked.result,
+        `Invalid review output from finder ${finder}: ${output.error?.message}`,
+      ),
+      output,
+    };
   }
-  const first = found[0];
-  if (!first) throw new Error('mode "panel" needs at least one finder');
+  const first = found.find((member) => member !== undefined);
+  if (!first) throw new Error('mode "panel" needs a finder that is not skipped');
 
   const { fixReview, previous } = input.prompt;
   const priorBlocking = previous?.findings ?? [];
@@ -403,8 +431,8 @@ async function runPanel<T extends Invoked>(
   // A citation of a prior blocking finding takes that finding's category (the verifier's, else the
   // finder's), so retagging it can't drop it from verification. A citation or recheck of a prior
   // security finding (either definition) stays one: no later ruling's category releases it unrefuted.
-  const raised = found.flatMap(({ invoked, review }, finder) =>
-    review.findings.map((f) => {
+  const raised = found.flatMap((member, finder) =>
+    (member?.review.findings ?? []).map((f) => {
       const prior = priorBlocking[cited(f) ?? -1];
       const category = prior ? (prior.verification?.category ?? prior.category ?? f.category) : f.category;
       return {
@@ -412,7 +440,7 @@ async function runPanel<T extends Invoked>(
         ...(category ? { category } : {}),
         security: f.security || (!!prior && isSecurity(prior)),
         finder,
-        vendor: invoked.target?.vendor ?? null,
+        vendor: member?.invoked.target?.vendor ?? null,
       };
     }),
   );
@@ -597,17 +625,22 @@ async function runPanel<T extends Invoked>(
     verdict: "approve",
     // The tally also keeps a fully refuted panel from reading as a placeholder review.
     summary: [
-      ...found.map(({ review }) => review.summary),
+      ...found.flatMap((member) => (member ? [member.review.summary] : [])),
       `Verifier: ${candidates.length} candidates, ${verdicts.size} checked, ${[...verdicts.values()].filter((v) => v.verdict === "REFUTED").length} refuted.`,
     ].join("\n\n"),
     findings,
   };
-  const modelVerdict = found.some(({ review }) => review.verdict === "request_changes")
+  const modelVerdict = found.some((member) => member?.review.verdict === "request_changes")
     ? "request_changes"
     : "approve";
   const decision = decide(input, review, modelVerdict);
   const panel: PanelRecord = {
-    finders: finders.map(({ prompt }, i) => ({ prompt, vendor: found[i]?.invoked.target?.vendor ?? null })),
+    finders: finders.map(({ prompt, lens }, i) => ({
+      prompt,
+      ...(lens ? { lens: lens.name } : {}),
+      vendor: found[i]?.invoked.target?.vendor ?? null,
+      ...(skipped.has(i) ? { skipped: skipped.get(i) } : {}),
+    })),
     candidates,
     verdicts: [...verdicts.values()],
     refuted: [...verdicts.values()].filter((v) => v.verdict === "REFUTED").map((v) => v.id),

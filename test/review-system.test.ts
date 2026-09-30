@@ -7,7 +7,13 @@ import type { EvalTrial, ReviewSystem } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { reviewSystemHash } from "../src/evals/cache.ts";
 import { validateRequest } from "../src/evals/cases.ts";
-import { parseEvalReviewSystems, productionReviewSystem } from "../src/pipeline/review-system.ts";
+import {
+  configuredReviewSystem,
+  DEFAULT_ROSTERS,
+  parseEvalReviewSystems,
+  productionReviewSystem,
+  readReviewLenses,
+} from "../src/pipeline/review-system.ts";
 import { enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
 
 const system = (over: Record<string, unknown> = {}) => ({
@@ -63,6 +69,18 @@ const invalid: [string, string][] = [
   [file(system(), system()), 'duplicate review system name "with-report"'],
   [file(system({ name: "" })), "system name must not be empty"],
   [file(system({ implementerReport: "maybe" })), 'implementerReport must be "include" or "omit"'],
+  [
+    file(panel({ finders: [{ target: "candidate-a", prompt: "careful", lens: { name: "a", focus: "b" } }] })),
+    'a lens finder uses the "standard" prompt',
+  ],
+  [
+    file(system({ finders: [{ target: "candidate-a", prompt: "standard", local: true }] })),
+    'mode "single" uses the "standard" prompt, with no lens, family or local finder',
+  ],
+  [
+    file(panel({ finders: [{ target: "candidate-a", prompt: "standard", local: true }] })),
+    'mode "panel" needs at least one finder that is not local',
+  ],
 ];
 
 test("eval review systems reject unsupported shapes with clear errors", () => {
@@ -95,6 +113,10 @@ test("system hash ignores key order and name but not behaviour", () => {
   ) as ReviewSystem;
   expect(reviewSystemHash(reordered)).toBe(reviewSystemHash(base));
   expect(reviewSystemHash({ ...base, implementerReport: "omit" })).not.toBe(reviewSystemHash(base));
+  // A panel's roster and lens text are part of what eval caches key on.
+  const lensed = (focus: string) =>
+    reviewSystemHash({ ...base, finders: [{ prompt: "standard", lens: { name: "ops", focus } }] });
+  expect(lensed("Rollback.")).not.toBe(lensed("Restart."));
   expect(reviewSystemHash({ ...base, finders: [{ target: "candidate-b", prompt: "standard" }] })).not.toBe(
     reviewSystemHash(base),
   );
@@ -305,4 +327,58 @@ test("eval policy counts only systems matching the daemon's [review] implementer
   } finally {
     await f.close();
   }
+});
+
+test("single mode keeps the production review; a panel takes the profile's roster and its base lenses", () => {
+  const lenses = readReviewLenses(
+    '[review]\nlenses = [\n  { name = "ops", focus = "Rollback." },\n  { name = "api", focus = "Callers.", profiles = ["standard", "deep"] },\n]\n',
+  );
+  expect(lenses).toEqual([
+    { name: "ops", focus: "Rollback.", profiles: ["deep"] },
+    { name: "api", focus: "Callers.", profiles: ["standard", "deep"] },
+  ]);
+  const cfg = {
+    reviewImplementerReport: "omit",
+    reviewMode: "single",
+    reviewRosters: DEFAULT_ROSTERS,
+  } as const;
+  for (const profile of ["quick", "standard", "deep"] as const) {
+    expect(configuredReviewSystem(cfg, profile, lenses)).toEqual(productionReviewSystem(cfg));
+    // A run prepared in single mode read no lenses and stays single.
+    const panelMode = { ...cfg, reviewMode: "panel" } as const;
+    expect(configuredReviewSystem(panelMode, profile, undefined)).toEqual(productionReviewSystem(cfg));
+  }
+  const finders = (profile: "quick" | "standard" | "deep") =>
+    configuredReviewSystem({ ...cfg, reviewMode: "panel" }, profile, lenses).finders.map(
+      ({ prompt, lens, family, local }) => [prompt, lens?.name ?? null, family ?? null, local ?? false],
+    );
+  const standard = [
+    ["adversarial", null, null, false],
+    ["careful", null, "implementer", false],
+    ["standard", "removed-behaviour-and-failure-paths", null, true],
+  ];
+  expect(finders("quick")).toEqual([["standard", null, null, false]]);
+  expect(finders("standard")).toEqual([...standard, ["standard", "api", null, false]]);
+  expect(finders("deep")).toEqual([
+    ...standard,
+    ["standard", "ops", null, false],
+    ["standard", "api", null, false],
+  ]);
+  expect(configuredReviewSystem({ ...cfg, reviewMode: "panel" }, "deep", [])).toMatchObject({
+    name: "panel-deep",
+    mode: "panel",
+    verifier: {},
+    implementerReport: "omit",
+  });
+});
+
+test("repo lenses: absent config means none, and invalid config names the problem", () => {
+  expect(readReviewLenses(null)).toEqual([]);
+  expect(readReviewLenses('[gates]\nsetup = ["true"]\n')).toEqual([]);
+  for (const [toml, message] of [
+    ['[review]\nlenses = [{ name = "ops" }]', "lenses[0].focus"],
+    ['[review]\nlenses = [{ name = "ops", focus = "x", profiles = ["fast"] }]', "lenses[0].profiles[0]"],
+    ["[review]\nlense = []", 'Unrecognized key: "lense"'],
+  ] as const)
+    expect(() => readReviewLenses(toml)).toThrow(message);
 });

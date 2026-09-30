@@ -12,6 +12,7 @@ import type {
   Invocation,
   ModelSelection,
   Repo,
+  RepoReviewLens,
   ReviewSystem,
   Role,
   Run,
@@ -64,6 +65,8 @@ export interface RunState {
   worktreePath?: string;
   gatesConfig?: GateConfig;
   previewConfig?: PreviewConfig | null;
+  /** `[review] lenses` from the base commit, read at prepare in panel mode only (else single stays). */
+  reviewLenses?: RepoReviewLens[];
   baseline?: GateRun | null;
   triage?: Triage;
   spec?: Spec | null;
@@ -233,7 +236,9 @@ export class RunContext {
   }
 
   routingConstraints(constraints: RouteConstraints = {}): RouteConstraints {
-    return this.freeFirstRouting ? { ...constraints, billing: "free_first" } : constraints;
+    return this.freeFirstRouting
+      ? { ...constraints, billing: constraints.billing ?? "free_first" }
+      : constraints;
   }
 
   constructor(

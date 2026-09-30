@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import { DEFAULT_ROSTERS } from "../src/pipeline/review-system.ts";
 import { PROVIDERS } from "../src/router/catalog.ts";
 
 test("Dependabot routing defaults to free-first and accepts either configured mode", () => {
@@ -43,7 +44,9 @@ test("review implementer report defaults to include and accepts only include or 
     }
     // A misspelt key would otherwise silently keep the default.
     writeFileSync(join(configDir, "config.toml"), '[review]\nimplementer-report = "omit"\n');
-    expect(config).toThrow("review.implementer-report: unknown key (allowed: implementer_report)");
+    expect(config).toThrow(
+      "review.implementer-report: unknown key (allowed: implementer_report, mode, rosters)",
+    );
     writeFileSync(join(configDir, "config.toml"), 'review = "omit"\n');
     expect(config).toThrow("review must be a table");
   } finally {
@@ -96,6 +99,37 @@ test("invalid provider concurrency and unknown providers fail config loading", (
       }
     writeFileSync(join(configDir, "config.toml"), "[providers.unknown]\nmax_concurrent = 2\n");
     expect(config).toThrow("providers.unknown: unknown provider");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("review mode defaults to single; rosters default per profile and are validated", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-review-rosters-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  try {
+    expect(config()).toMatchObject({ reviewMode: "single", reviewRosters: DEFAULT_ROSTERS });
+    writeFileSync(
+      join(configDir, "config.toml"),
+      '[review]\nmode = "panel"\n[review.rosters]\nquick = [{ prompt = "careful", family = "implementer" }]\n',
+    );
+    expect(config()).toMatchObject({
+      reviewMode: "panel",
+      reviewRosters: { ...DEFAULT_ROSTERS, quick: [{ prompt: "careful", family: "implementer" }] },
+    });
+    for (const [toml, message] of [
+      ['mode = "triple"', 'review.mode must be "single" or "panel"'],
+      ["rosters = { quick = [] }", "a roster needs at least one finder"],
+      [
+        'rosters = { deep = [{ prompt = "adversarial", lens = { name = "a", focus = "b" } }] }',
+        "lens finder",
+      ],
+    ]) {
+      writeFileSync(join(configDir, "config.toml"), `[review]\n${toml}\n`);
+      expect(config).toThrow(message);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

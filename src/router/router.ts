@@ -15,7 +15,10 @@ export interface RouteConstraints {
   exclude?: (string | ModelSelection)[];
   /** Put this target first when it is available (stick with the current implementer). */
   prefer?: string | ModelSelection;
-  billing?: "free_first";
+  /** Put this vendor's models first, as if every other vendor were avoided. */
+  preferVendor?: string;
+  /** "free_first" tries free models first; "free_only" considers nothing else. */
+  billing?: "free_first" | "free_only";
 }
 
 export interface RouteDecision {
@@ -185,6 +188,8 @@ export class Router {
     const preference = c.prefer ? identity(c.prefer) : undefined;
 
     const avoid = [c.avoidVendor ?? []].flat();
+    const avoided = (vendor: string) =>
+      avoid.includes(vendor) || (c.preferVendor !== undefined && vendor !== c.preferVendor);
     const consider = (ids: (string | ModelSelection)[], fromPolicy = false) => {
       const group: ModelTarget[] = [];
       for (const reference of ids) {
@@ -225,12 +230,12 @@ export class Router {
         (a, b) => pref(a) - pref(b) || this.tracker.headroom(b.provider) - this.tracker.headroom(a.provider),
       );
       for (const m of group) {
-        const free = c.billing === "free_first" && m.billing === "free";
+        const free = c.billing !== undefined && m.billing === "free";
         (free
-          ? avoid.includes(m.vendor)
+          ? avoided(m.vendor)
             ? freeSameVendor
             : freePreferred
-          : avoid.includes(m.vendor)
+          : avoided(m.vendor)
             ? sameVendor
             : preferred
         ).push(m);
@@ -240,7 +245,7 @@ export class Router {
     for (const g of groups) consider(g.split("|"), true);
     // A persisted implementer can retain an explicit effort after the catalog default changes.
     if (c.prefer) consider([c.prefer]);
-    if (c.billing === "free_first") {
+    if (c.billing !== undefined) {
       for (const m of this.models.values())
         if (this.tracker.def(m.provider)?.billing === "free" && !policyFreeModels.has(m.id)) consider([m.id]);
     }
@@ -254,9 +259,11 @@ export class Router {
     }
 
     const partitions =
-      c.billing === "free_first"
-        ? [freePreferred, freeSameVendor, preferred, sameVendor]
-        : [preferred, sameVendor];
+      c.billing === "free_only"
+        ? [freePreferred, freeSameVendor]
+        : c.billing === "free_first"
+          ? [freePreferred, freeSameVendor, preferred, sameVendor]
+          : [preferred, sameVendor];
     const ordered = partitions.flat();
     // The current implementer stays first in every mode: escalation never falls back to a model
     // that already failed, even a free one.

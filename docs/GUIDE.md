@@ -78,8 +78,9 @@ A few more details:
   stronger tier (or to any model not yet tried). The total number of rounds is
   `[limits].max_rounds + 2`, which is 5 by default. When the rounds run out, the run ends as
   `needs_human` and opens a draft PR titled `[needs human] ...`.
-- **Profiles today.** `quick` skips spec, holdout and verify. `deep` currently differs from
-  `standard` only in routing review to the `large` policy cell, which puts frontier models first.
+- **Profiles today.** `quick` skips spec, holdout and verify. `deep` differs from `standard` in
+  routing review to the `large` policy cell, which puts frontier models first, and in panel review
+  mode it adds the repository's review lenses (see [Review configuration](#review-configuration-and-lenses)).
   ARCHITECTURE describes a plan stage and plan review, but they are not implemented.
 - **Deterministic control flow.** The code, not a model, derives the review verdict from the
   findings. The model's own verdict is stored for inspection only.
@@ -161,6 +162,7 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[triage] decision_confidence` | `0.6` | A decision model's triage (e.g. `typesafe/jev-1.13`) is declined, and routing falls through to the next triage model, when any choice or score answer is less confident than this, when blocking questions are likely (P ≥ 0.5), or when ambiguity is high. If no other triage model can answer, a decline for low confidence alone is used with a warning; one that needs questions ends the run in `needs_human`. |
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
+| `[review] mode`, `[review.rosters]` | `"single"`, see below | `"panel"` reviews with a verified finder panel whose roster depends on the profile; see [Review configuration](#review-configuration-and-lenses). |
 | `[routing] exclude_origins` | unset | For example `["CN"]`. Excludes models by checkpoint origin from eval policy generation and the Evals matrix. Runtime routing is not affected. |
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |
 | `[local] twilight_model_path`, `twilight_host`, `twilight_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
@@ -477,6 +479,71 @@ listed per model on the Models page. Claude receives `--effort`, and Codex recei
 `model_reasoning_effort`. OpenRouter and local models carry effort only in the tool-free roles
 (triage, chat, summarize); effort-qualified references for them elsewhere are rejected. Details
 are in [REASONING_EFFORT](REASONING_EFFORT.md).
+
+### Review configuration and lenses
+
+By default a review is one routed finder (`[review] mode = "single"`). With `mode = "panel"`,
+several finders run in parallel, their reports are merged, and a verifier from another vendor rules
+on each candidate before anything blocks. Panel mode is off by default until evals show it
+outperforms single mode. Runs prepared in single mode stay single; turning panel mode off takes
+effect at the next review of every run.
+
+A panel's finders depend on the run's profile:
+
+| Profile | Default roster |
+|---|---|
+| quick | One standard finder from a vendor other than the implementer's. |
+| standard | An adversarial finder from another vendor. A careful finder in a fresh session from the implementer's family. A standard finder on a local model with a removed-behaviour and failure-paths lens, only when a local model is available. |
+| deep | The standard roster plus the repository's lenses. |
+
+Override a profile's roster in `config.toml`. Profiles you leave out keep their defaults:
+
+```toml
+[review]
+mode = "panel"
+
+[review.rosters]
+standard = [{ prompt = "adversarial" }, { prompt = "careful", family = "implementer" }]
+```
+
+Each finder takes these keys:
+
+- `prompt`: `standard` (report everything, with confidence), `adversarial` (assume the change can
+  fail) or `careful` (one senior pass).
+- `target`: a pinned model such as `codex/sol`. Without it, the finder is routed by the review policy.
+- `family`: `cross` (the default) avoids the implementer's vendor; `implementer` prefers it.
+- `local = true`: only a free local model, with a 15-minute limit. When no local model is available
+  or the call fails, the finder is skipped and the run log says why.
+- `lens = { name = "...", focus = "..." }`: the standard prompt plus a focus. Only with
+  `prompt = "standard"`.
+
+A roster needs at least one finder that is not local.
+
+A repository adds its own lenses in `.limitless.toml`:
+
+```toml
+[[review.lenses]]
+name = "data-safety"
+focus = "Writes that can lose or corrupt stored data: partial updates, missing transactions, deletes without a guard."
+profiles = ["standard", "deep"]   # default ["deep"]
+
+[[review.lenses]]
+name = "public-api"
+focus = "Changes that break callers: renamed or removed fields, changed defaults, different error shapes."
+```
+
+Each lens adds a standard finder with its focus in the profiles it lists. Lenses are read from the
+base commit when the run is prepared, so a change never adds, edits or removes the lenses that
+review it. An edit to `[review]` takes effect for runs started after it merges. Lenses apply only in
+panel mode.
+
+Use a lens for judgement: a kind of defect that general review keeps missing in this repository.
+A mechanical rule belongs in `[gates] checks` instead, where it runs on every round and blocks
+when it fails. These are checks, not lenses:
+
+- every environment variable the code reads is declared in the deployment manifests;
+- container images come from an allowed registry;
+- files referenced by configuration exist.
 
 ### Evals and `routing/policy.json`
 
