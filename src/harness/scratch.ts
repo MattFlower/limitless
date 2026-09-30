@@ -68,7 +68,8 @@ export function validateScratch(spec: AgentSpec): string {
   return path;
 }
 
-function spellings(paths: string[]): string[] {
+/** Each path as given and, when it exists, canonical: what a confined profile actually denies. */
+export function spellings(paths: string[]): string[] {
   return [...new Set(paths.flatMap((p) => [resolve(p), ...(existsSync(p) ? [realpathSync(p)] : [])]))];
 }
 
