@@ -264,26 +264,49 @@ const INCONCLUSIVE: ConfinementFailure = "probe inconclusive";
 const TIMED_OUT: ConfinementFailure = "probe timed out";
 const START_FAILED: ConfinementFailure = "codex sandbox failed to start";
 
+/** The private-root classes every probe must cover. */
+export interface CanaryClasses {
+  tmp: string;
+  tmpdir: string;
+  home: string;
+}
+
+function writable(dir: string): boolean {
+  try {
+    accessSync(dir, constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Where to put a canary for each distinct root in `deny` (the production profile's private roots):
  * only aliases of one directory are merged. A root holding another (TMPDIR under /tmp) still needs
  * its own canary, since denying the inner one says nothing about sibling scratch directories.
- * Roots we cannot write to (e.g. /Volumes) cannot hold one. Home's canary goes in the factory's home.
+ * /tmp, the system TMPDIR and home are mandatory: home's canary goes in the factory's directory
+ * (home itself may be read-only yet full of secrets), and a class with no writable location or
+ * missing from `deny` throws, so the probe is inconclusive rather than silently narrower. Other
+ * roots we cannot write to (e.g. /Volumes) cannot hold a canary and are skipped.
  */
-export function canaryRoots(deny: string[]): string[] {
+export function canaryRoots(
+  deny: string[],
+  classes: CanaryClasses = { tmp: "/tmp", tmpdir: tmpdir(), home: homedir() },
+): string[] {
+  const home = realpathSync(classes.home);
+  const required = new Map<string, string[]>();
+  for (const root of [classes.tmp, classes.tmpdir].map((path) => realpathSync(path)))
+    required.set(root, [root]);
+  required.set(home, [join(home, ".limitless"), home]);
   const roots = [...new Set(deny.filter((path) => existsSync(path)).map((path) => realpathSync(path)))];
-  const home = realpathSync(homedir());
-  const factory = join(home, ".limitless");
-  return roots
-    .filter((root) => {
-      try {
-        accessSync(root, constants.W_OK);
-        return true;
-      } catch {
-        return false;
-      }
-    })
-    .map((root) => (root === home && existsSync(factory) ? factory : root));
+  for (const root of required.keys())
+    if (!roots.includes(root)) throw new Error("mandatory private root not denied");
+  return roots.flatMap((root) => {
+    const location = (required.get(root) ?? [root]).find(writable);
+    if (location) return [location];
+    if (required.has(root)) throw new Error("mandatory private root has no writable canary location");
+    return [];
+  });
 }
 
 /** The permission error ending a `cat: <file>: <error>` diagnostic; only the wording is case-free. */

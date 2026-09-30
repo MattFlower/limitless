@@ -16,6 +16,7 @@ import { dirname, join } from "node:path";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
+  type CanaryClasses,
   CodexReaderProbe,
   canaryRoots,
   type ReaderProbeOptions,
@@ -358,6 +359,7 @@ function fakeCodex(sandbox: Sandbox = enforcing, options: ReaderProbeOptions = {
     varTmp: join(parent, "var-tmp"),
   };
   for (const dir of Object.values(roots)) mkdirSync(dir, { recursive: true });
+  const classes: CanaryClasses = { tmp: roots.tmp, tmpdir: roots.TMPDIR, home: roots.home };
   const cli = {
     path: CODEX as string | null,
     version: "codex-cli 0.157.1",
@@ -397,12 +399,12 @@ function fakeCodex(sandbox: Sandbox = enforcing, options: ReaderProbeOptions = {
     return procResult;
   };
   const probe = new CodexReaderProbe(() => cli.path, {
-    canaryRoots: () => (nestedTmpdir ? canaryRoots(Object.values(roots)) : Object.values(roots)),
+    canaryRoots: () => (nestedTmpdir ? canaryRoots(Object.values(roots), classes) : Object.values(roots)),
     ...options,
   });
   /** Probe attempts that ran to the cwd control, i.e. complete ones. */
   const probes = () => sandboxReads.filter((r) => r.file.startsWith(`${r.cwd}/`)).length;
-  return { cli, calls, execs, sandboxReads, roots, runner, probe, probes };
+  return { cli, calls, execs, sandboxReads, roots, classes, runner, probe, probes };
 }
 const profileArgs = (cmd: string[] = []) =>
   cmd.filter((arg, i) => cmd[i - 1] === "-c" && /permissions/.test(arg));
@@ -642,22 +644,41 @@ test("canaries cover each distinct writable private root the production profile 
   const roots = canaryRoots(privateReadRoots());
   for (const root of ["/tmp", "/var/tmp", tmpdir()])
     if (existsSync(root)) expect(roots).toContain(realpathSync(root));
-  expect(
-    roots.some((root) => root.startsWith(`${realpathSync(homedir())}/`) || root === realpathSync(homedir())),
-  ).toBe(true);
+  const home = realpathSync(homedir());
+  expect(roots.filter((root) => root === home || root === join(home, ".limitless"))).toHaveLength(1);
   expect(new Set(roots).size).toBe(roots.length);
 
   const parent = realpathSync(mkdtempSync(join(tmpdir(), "canary-roots-")));
   cleanups.push(() => {
-    chmodSync(join(parent, "locked"), 0o755);
+    for (const dir of ["locked", "home"]) chmodSync(join(parent, dir), 0o755);
     rmSync(parent, { recursive: true, force: true });
   });
-  for (const dir of ["outer/inner", "locked", "other"]) mkdirSync(join(parent, dir), { recursive: true });
+  for (const dir of ["outer/inner", "locked", "other", "home/.limitless"])
+    mkdirSync(join(parent, dir), { recursive: true });
   symlinkSync(join(parent, "outer/inner"), join(parent, "alias"));
   chmodSync(join(parent, "locked"), 0o555);
-  const deny = ["outer", "outer/inner", "alias", "locked", "missing", "other"].map((d) => join(parent, d));
-  // Aliases merge; a root nested in another is a distinct class and keeps its own canary.
-  expect(canaryRoots(deny)).toEqual(["outer", "outer/inner", "other"].map((d) => join(parent, d)));
+  const at = (...dirs: string[]) => dirs.map((d) => join(parent, d));
+  const deny = at("outer", "outer/inner", "alias", "locked", "missing", "other", "home");
+  const classes = { tmp: join(parent, "outer"), tmpdir: join(parent, "alias"), home: join(parent, "home") };
+  // Aliases merge; a root nested in another is a distinct class and keeps its own canary; an optional
+  // root we cannot write to is skipped, and home's canary goes in the factory directory.
+  expect(canaryRoots(deny, classes)).toEqual(at("outer", "outer/inner", "other", "home/.limitless"));
+  rmSync(join(parent, "home/.limitless"), { recursive: true });
+  expect(canaryRoots(deny, classes)).toEqual(at("outer", "outer/inner", "other", "home"));
+  // A mandatory class with no writable location, or one the profile does not deny, is never dropped.
+  chmodSync(join(parent, "home"), 0o555);
+  expect(() => canaryRoots(deny, classes)).toThrow();
+  expect(() => canaryRoots(deny, { ...classes, home: join(parent, "other") })).not.toThrow();
+  expect(() =>
+    canaryRoots(deny, { ...classes, tmp: join(parent, "locked"), home: join(parent, "other") }),
+  ).toThrow();
+  expect(() =>
+    canaryRoots(
+      deny.filter((d) => d !== join(parent, "outer")),
+      classes,
+    ),
+  ).toThrow();
+  expect(() => canaryRoots(deny)).toThrow();
 
   // The probe derives its canaries from the same deny list the real invocation gets.
   const { spec, cleanup } = confinedFixture();
@@ -687,7 +708,7 @@ test("a TMPDIR nested under /tmp keeps a /tmp canary outside it", async () => {
   );
   const full = fakeCodex(enforcing, {}, true);
   try {
-    expect(canaryRoots(Object.values(partial.roots))).toEqual(Object.values(partial.roots));
+    expect(canaryRoots(Object.values(partial.roots), partial.classes)).toEqual(Object.values(partial.roots));
     const result = await runCodex(spec, partial.runner, partial.probe);
     expect(result.confinement).toMatchObject({ ok: false, reason: "reader profile not enforced" });
     expect(partial.execs).toHaveLength(0);
@@ -700,6 +721,40 @@ test("a TMPDIR nested under /tmp keeps a /tmp canary outside it", async () => {
     expect(full.sandboxReads).toHaveLength(5);
     for (const root of Object.values(full.roots))
       expect(full.sandboxReads.filter((r) => dirname(dirname(r.file)) === root)).toHaveLength(1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a read-only home is still probed through its factory directory, or not trusted at all", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  const factory = join(fake.roots.home, ".limitless");
+  mkdirSync(factory);
+  cleanups.unshift(() => {
+    for (const dir of [fake.roots.home, factory]) chmodSync(dir, 0o755);
+  });
+  chmodSync(fake.roots.home, 0o555);
+  const selector = () => canaryRoots(Object.values(fake.roots), fake.classes);
+  try {
+    const probe = new CodexReaderProbe(() => CODEX, { canaryRoots: selector });
+    expect((await runCodex(spec, fake.runner, probe)).status).toBe("ok");
+    const home = fake.sandboxReads.filter((r) => inRoot(fake.roots.home, r.file));
+    expect(home.map((r) => inRoot(factory, r.file))).toEqual([true]);
+    expect(home[0]?.access).toBe("none");
+    expect(readdirSync(factory)).toEqual([]);
+
+    // Nowhere writable in home: the probe is inconclusive rather than narrower, and exec never starts.
+    chmodSync(factory, 0o555);
+    fake.sandboxReads.length = 0;
+    const result = await runCodex(
+      spec,
+      fake.runner,
+      new CodexReaderProbe(() => CODEX, { canaryRoots: selector }),
+    );
+    expect(result.confinement).toMatchObject({ ok: false, reason: "probe inconclusive", exitCode: null });
+    expect(fake.sandboxReads).toHaveLength(0);
+    expect(fake.execs).toHaveLength(1);
   } finally {
     cleanup();
   }
