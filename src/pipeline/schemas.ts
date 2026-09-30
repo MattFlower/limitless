@@ -301,24 +301,80 @@ export const VerifySchema = z.object({
 export type Verify = z.input<typeof VerifySchema>;
 export type HoldoutRequirement = NonNullable<Verify["criteria"][number]["requirement"]>;
 
-/**
- * The cited requirement as it will be shown, or null unless it is a verbatim quote of `source`
- * (ignoring case, spacing, markdown emphasis and surrounding quotes). Only verbatim public text is
- * ever repeated to the implementer: a paraphrase could carry scenario text.
- */
-export function citedRequirement(citation: string, source: string): string | null {
-  const flat = (s: string) => s.replace(/[*`]/g, "").replace(/\s+/g, " ").toLowerCase();
-  const quote = citation
+const flatText = (s: string) => s.replace(/[*`]/g, "").replace(/\s+/g, " ").toLowerCase();
+const trimQuote = (s: string) =>
+  s
     .trim()
     .replace(/^[-*\s"'“”`]+|["'“”`.\s]+$/g, "")
     .replace(/\s+/g, " ");
-  return /[\p{L}\p{N}]/u.test(quote) && flat(source).includes(flat(quote)) ? quote : null;
+
+/** Whether `quote` occurs in `text` on word boundaries, so "e" or "the" never matches inside a word. */
+function quotedIn(quote: string, text: string): boolean {
+  const q = flatText(quote).trim();
+  if (!/[\p{L}\p{N}]/u.test(q)) return false;
+  // Underscores join identifiers, so "user" inside "user_id" is not a whole word.
+  const word = "[\\p{L}\\p{N}_]";
+  const before = /^[\p{L}\p{N}_]/u.test(q) ? `(?<!${word})` : "";
+  const after = /[\p{L}\p{N}_]$/u.test(q) ? `(?!${word})` : "";
+  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`${before}${escaped}${after}`, "u").test(flatText(text));
+}
+
+// List and quote markers and an acceptance-criterion label, as the verify prompt renders them.
+const LINE_MARKER = /^(?:(?:[-*>]|\d+[.)])\s+)*(?:\**AC-\d+\**:?\s+)?/i;
+const wholeLine = (s: string) => trimQuote(trimQuote(s).replace(LINE_MARKER, ""));
+
+// Plain section labels remain headings regardless of surrounding blank lines. Do not infer
+// headings from adjacency: consecutive imperative lines ("Support IPv6", "Keep IPv4") are valid.
+const SECTION_LABEL =
+  /^(?:background|context|overview|requirements?|acceptance criteria|scope|constraints?|notes?)$/i;
+function requirementLines(source: string): string[] {
+  return source.split("\n").filter((line) => {
+    if (/^\s*#/.test(line) || /:[*`\s]*$/.test(line)) return false;
+    if (/^\s*(?:[-*>]|\d+[.)])\s/.test(line) || /[.!?]["'”’)*`]*\s*$/.test(line)) return true;
+    return !SECTION_LABEL.test(flatText(line).trim());
+  });
+}
+
+/** Whether `citation` occurs verbatim in `source` on word boundaries, whatever its length. */
+export function citationInSource(citation: string, source: string): boolean {
+  return quotedIn(trimQuote(citation), source) || citedRequirement(citation, source) !== null;
+}
+
+/**
+ * The cited requirement as it will be shown, or null unless it is a verbatim whole-word quote of
+ * `source` (ignoring case, spacing, markdown emphasis and surrounding quotes) of at least three
+ * words, or a whole non-heading line of `source` or one of the complete `entries` (ignoring list
+ * markers and AC labels). Only verbatim public text is ever repeated to the implementer: a
+ * paraphrase could carry scenario text, and a fragment grounds nothing.
+ */
+export function citedRequirement(
+  citation: string,
+  source: string,
+  entries: readonly string[] = [],
+): string | null {
+  const line = wholeLine(citation);
+  const key = flatText(line);
+  if (
+    /[\p{L}\p{N}]/u.test(key) &&
+    [...requirementLines(source), ...entries].some((e) => flatText(wholeLine(e)) === key)
+  )
+    return line;
+  const quote = trimQuote(citation);
+  if (!quotedIn(quote, source)) return null;
+  const words = quote.split(" ").filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
+  return words >= 3 ? quote : null;
+}
+
+/** The complete entries of a public source a short citation may quote in full; none for the request. */
+export function requirementEntries(requirement: "request" | "spec", spec: Spec | null): string[] {
+  return requirement === "spec" && spec
+    ? [...spec.requirements, ...spec.acceptance_criteria.map((ac) => ac.criterion)]
+    : [];
 }
 
 export function requirementSource(requirement: "request" | "spec", request: string, spec: Spec): string {
-  return requirement === "request"
-    ? request
-    : [...spec.requirements, ...spec.acceptance_criteria.map((ac) => ac.criterion)].join("\n");
+  return requirement === "request" ? request : requirementEntries("spec", spec).join("\n");
 }
 
 /** Diagnostics contain no private evidence and can be persisted and shown in feedback. */
@@ -330,9 +386,14 @@ export function requirementCitationIssue(
   if (criterion.requirement !== "request" && criterion.requirement !== "spec") return null;
   const citation = criterion.requirementCitation ?? "";
   if (!citation.trim()) return "missing requirement citation";
-  if (!citedRequirement(citation, requirementSource(criterion.requirement, request, spec)))
-    return "citation is not a stated public requirement";
-  if (!citedRequirement(citation, criterion.evidence)) return "evidence does not cite the requirement";
+  const { requirement } = criterion;
+  const quote = citedRequirement(
+    citation,
+    requirementSource(requirement, request, spec),
+    requirementEntries(requirement, spec),
+  );
+  if (!quote) return "citation is not a stated public requirement";
+  if (!quotedIn(quote, criterion.evidence)) return "evidence does not cite the requirement";
   return null;
 }
 
