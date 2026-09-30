@@ -86,7 +86,7 @@ function roleOf(spec: AgentSpec): string {
   if (p.startsWith("Classify this software task")) return "triage";
   if (p.startsWith("Write the specification")) return "spec";
   if (p.startsWith("Write holdout checks")) return "holdout";
-  if (p.startsWith("You are an adversarial code reviewer")) return "review";
+  if (/^You are (an adversarial|a) code reviewer/.test(p)) return "review";
   if (p.startsWith("You are the acceptance verifier")) return "verify";
   return "implement";
 }
@@ -4976,6 +4976,6 @@ test("panel review: a verifier left on the finder's vendor is logged as a warnin
     .filter((e) => e.level === "warn")
     .map((e) => e.message);
   expect(warnings).toContainEqual(
-    expect.stringContaining("Verifier alpha/m shares vendor anthropic with the finder it checks"),
+    expect.stringContaining("Verifier alpha/m shares vendor anthropic with a finder it checks"),
   );
 });

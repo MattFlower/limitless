@@ -372,10 +372,15 @@ export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 
 export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed";
 export type EvalStrategy = "retry" | "effort" | "switch";
-/** One review finder; production may omit `target` (routed), evals may not. */
+/** Panel finder prompts: coverage-first `standard`, `adversarial`, or one `careful` senior pass. */
+export type FinderPrompt = "standard" | "adversarial" | "careful";
+/**
+ * One review finder; production may omit `target` (routed), evals may not. A single-mode review
+ * always uses the reviewer prompt, named `standard`.
+ */
 export interface ReviewFinder {
   target?: string;
-  prompt: "standard";
+  prompt: FinderPrompt;
 }
 /** How a review is performed: one finder (`single`), or finders whose candidates a verifier checks (`panel`). */
 export interface ReviewSystem {

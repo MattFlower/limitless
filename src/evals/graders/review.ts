@@ -43,9 +43,14 @@ export function gradeReview(item: ReviewCase, output: StoredReview): EvalGrade {
     (finding.line === 0
       ? defect.category === "completeness"
       : finding.line > 0 && finding.line >= defect.lines[0] - 5 && finding.line <= defect.lines[1] + 5);
-  // A finding repeated verbatim is still one finding.
+  // A finding repeated verbatim is still one finding. A merged panel finding also covers the lines of
+  // the reports merged into it, since production sends them all back for fixing.
   const distinct = (findings: Finding[]) => [
-    ...new Map(findings.map((f) => [JSON.stringify([normalize(f.file), f.line, f.title]), f])).values(),
+    ...new Map(
+      findings
+        .flatMap((f) => [f, ...(f.duplicates ?? []).map((d) => ({ ...f, line: d.line, title: d.title }))])
+        .map((f) => [JSON.stringify([normalize(f.file), f.line, f.title]), f]),
+    ).values(),
   ];
   // Most severe first, so an ambiguous assignment credits the defect that matters most.
   const required = item.defects
