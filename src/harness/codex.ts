@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import {
+  accessSync,
   appendFileSync,
+  constants,
   existsSync,
   mkdtempSync,
   readdirSync,
@@ -253,8 +255,8 @@ function readerProfile(spec: AgentSpec, scratch: string): string[] {
   ];
 }
 
-/** A genuine permission denial; ENOENT is not one (every canary exists). */
-const DENIED = /operation not permitted|permission denied|\bEACCES\b|\bEPERM\b/i;
+/** ENOENT is never a denial: every canary exists. */
+const MISSING = /no such file|\bENOENT\b/i;
 /** `codex --version` prints one line such as `codex-cli 0.157.1`. */
 const CODEX_VERSION = /^codex(?:-cli)?\s+v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/;
 const NOT_ENFORCED: ConfinementFailure = "reader profile not enforced";
@@ -263,18 +265,41 @@ const TIMED_OUT: ConfinementFailure = "probe timed out";
 const START_FAILED: ConfinementFailure = "codex sandbox failed to start";
 
 /**
- * Each distinct private root a confined reader is denied: /tmp (other readers' scratch), the
- * system TMPDIR, and the home directory (the factory's home when it exists).
+ * Where to put a canary for each distinct root in `deny` (the production profile's private roots):
+ * aliases are merged, a root holding another is covered by the inner one's canary, and roots we
+ * cannot write to (e.g. /Volumes) cannot hold one. Home's canary goes in the factory's home.
  */
-export function canaryRoots(): string[] {
-  const factory = join(homedir(), ".limitless");
-  const roots = ["/tmp", tmpdir(), existsSync(factory) ? factory : homedir()];
-  return [...new Set(roots.map((root) => realpathSync(root)))];
+export function canaryRoots(deny: string[]): string[] {
+  const roots = [...new Set(deny.filter((path) => existsSync(path)).map((path) => realpathSync(path)))];
+  const home = realpathSync(homedir());
+  const factory = join(home, ".limitless");
+  return roots
+    .filter((root) => !roots.some((other) => other.startsWith(`${root}/`)))
+    .filter((root) => {
+      try {
+        accessSync(root, constants.W_OK);
+        return true;
+      } catch {
+        return false;
+      }
+    })
+    .map((root) => (root === home && existsSync(factory) ? factory : root));
+}
+
+/** `stderr` reports a permission denial for exactly `file`, not a file sharing its prefix. */
+function deniedRead(stderr: string, file: string): boolean {
+  if (MISSING.test(stderr)) return false;
+  const path = file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const exact = new RegExp(
+    `(?:^|[\\s'"])${path}['"]?:\\s*(?:operation not permitted|permission denied|EACCES|EPERM)\\b`,
+    "i",
+  );
+  return stderr.split("\n").some((line) => exact.test(line));
 }
 
 export interface ReaderProbeOptions {
-  /** Where the negative canaries go; a probe needs one denied read in each. */
-  canaryRoots?: () => string[];
+  /** Where the negative canaries go, given the profile's denied roots; each needs a denied read. */
+  canaryRoots?: (deny: string[]) => string[];
   /** Wait after an inconclusive probe before the next attempt. */
   backoffMs?: number;
   now?: () => number;
@@ -324,7 +349,7 @@ export class CodexReaderProbe {
   private readonly verdicts = new Map<string, ConfinementProbe>();
   private readonly flights = new Map<string, Flight>();
   private readonly retryAt = new Map<string, number>();
-  private readonly roots: () => string[];
+  private readonly roots: (deny: string[]) => string[];
   private readonly backoffMs: number;
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
@@ -421,7 +446,7 @@ async function sandboxProbe(
   version: string,
   run: typeof runProcess,
   signal: AbortSignal,
-  roots: () => string[],
+  roots: (deny: string[]) => string[],
 ): Promise<ConfinementProbe | null> {
   const result = (reason: ConfinementFailure | null, exitCode: number | null): ConfinementProbe | null =>
     signal.aborted ? null : { ok: reason === null, path, version, reason, exitCode };
@@ -456,8 +481,8 @@ async function sandboxProbe(
       // An empty CODEX_HOME: `codex sandbox` has no --ignore-user-config, and exec ignores it.
       codexHome = temp(tmp, "limitless-probe-home-");
       positive = canary(spec.cwd);
-      negatives = roots().map((root) => canary(temp(root, "limitless-canary-")));
-      const { cwd, scratch: writable } = readConfinement(spec, scratch);
+      const { cwd, scratch: writable, deny } = readConfinement(spec, scratch);
+      negatives = roots(deny).map((root) => canary(temp(root, "limitless-canary-")));
       const granted = (file: string) => [...cwd, ...writable].some((root) => file.startsWith(`${root}/`));
       if (!negatives.length || negatives.some((file) => granted(file.path)))
         return result(INCONCLUSIVE, null);
@@ -480,17 +505,16 @@ async function sandboxProbe(
         return result(START_FAILED, null);
       }
       if (signal.aborted || proc.cancelled) return result(INCONCLUSIVE, proc.exitCode);
-      if (file !== positive && proc.stdout.includes(file.token)) return result(NOT_ENFORCED, proc.exitCode);
+      // Only a completed exit is an answer, and only an answer may be cached.
       if (proc.timedOut || proc.idleTimedOut) return result(TIMED_OUT, proc.exitCode);
-      // Only a completed exit is an answer; a signal is ambiguous.
       if (proc.signal || proc.exitCode === null) return result(INCONCLUSIVE, proc.exitCode);
       if (file === positive) {
         const ok = proc.exitCode === 0 && proc.stdout.trim() === file.token;
         return result(ok ? null : INCONCLUSIVE, proc.exitCode);
       }
-      if (proc.exitCode === 0) return result(NOT_ENFORCED, proc.exitCode);
-      const denied = proc.stderr.split("\n").some((line) => line.includes(file.path) && DENIED.test(line));
-      if (!denied || /no such file/i.test(proc.stderr)) return result(INCONCLUSIVE, proc.exitCode);
+      if (proc.stdout.includes(file.token)) return result(NOT_ENFORCED, proc.exitCode);
+      if (proc.exitCode === 0 || !deniedRead(proc.stderr, file.path))
+        return result(INCONCLUSIVE, proc.exitCode);
     }
     return result(INCONCLUSIVE, null);
   } finally {

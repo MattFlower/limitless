@@ -14,9 +14,16 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
-import { buildCodexArgs, CodexReaderProbe, type ReaderProbeOptions, runCodex } from "../src/harness/codex.ts";
+import {
+  buildCodexArgs,
+  CodexReaderProbe,
+  canaryRoots,
+  type ReaderProbeOptions,
+  runCodex,
+} from "../src/harness/codex.ts";
 import {
   createScratch,
+  privateReadRoots,
   removeScratch,
   SCRATCH_NAME,
   scratchEnv,
@@ -337,8 +344,8 @@ interface SandboxRead {
 
 /**
  * A fake Codex CLI: `--version`, `sandbox` reads answered by `sandbox`, and a completing `exec`.
- * Its private roots are distinct directories standing in for /tmp, the system TMPDIR and home,
- * whatever the host's layout.
+ * Its private roots are distinct directories standing in for /tmp, the system TMPDIR, home and
+ * /var/tmp, whatever the host's layout.
  */
 function fakeCodex(sandbox: Sandbox = enforcing, options: ReaderProbeOptions = {}) {
   const parent = realpathSync(mkdtempSync(join(tmpdir(), "probe-roots-")));
@@ -347,6 +354,7 @@ function fakeCodex(sandbox: Sandbox = enforcing, options: ReaderProbeOptions = {
     tmp: join(parent, "slash-tmp"),
     TMPDIR: join(parent, "var-folders"),
     home: join(parent, "home"),
+    varTmp: join(parent, "var-tmp"),
   };
   for (const dir of Object.values(roots)) mkdirSync(dir);
   const cli = {
@@ -416,11 +424,11 @@ test("an enforcing CLI runs exec only after a readable cwd and a denial in every
     });
     expect(fake.calls.map((cmd) => cmd.slice(0, 2))).toEqual([
       [CODEX, "--version"],
-      ...Array(4).fill([CODEX, "sandbox"]),
+      ...Array(5).fill([CODEX, "sandbox"]),
       [CODEX, "exec"],
     ]);
-    const negatives = fake.sandboxReads.slice(0, 3);
-    const positive = fake.sandboxReads[3];
+    const negatives = fake.sandboxReads.slice(0, 4);
+    const positive = fake.sandboxReads[4];
     if (!positive) throw new Error("no cwd control");
     for (const root of Object.values(fake.roots))
       expect(negatives.filter((r) => r.file.startsWith(`${root}/`))).toHaveLength(1);
@@ -477,9 +485,38 @@ for (const [name, sandbox, reason] of [
     "reader profile not enforced",
   ],
   [
+    "enforces /tmp, TMPDIR and home but allows /var/tmp",
+    (f: string, o: ProcOptions) => (f.includes("/var-tmp/") ? reads(f) : enforcing(f, o)),
+    "reader profile not enforced",
+  ],
+  [
     "clean exit without output on a private canary",
     () => ({ exitCode: 0, stdout: SECRET }),
-    "reader profile not enforced",
+    "probe inconclusive",
+  ],
+  [
+    "denial of a suffixed filename",
+    (f: string, o: ProcOptions) => (inRoot(o.cwd, f) ? reads(f) : denies(`${f}.backup`)),
+    "probe inconclusive",
+  ],
+  [
+    "denial of a prefixed filename",
+    (f: string, o: ProcOptions) => (inRoot(o.cwd, f) ? reads(f) : denies(`/x${f}`)),
+    "probe inconclusive",
+  ],
+  [
+    "unrelated permission error on the canary's line",
+    (f: string, o: ProcOptions) =>
+      inRoot(o.cwd, f)
+        ? reads(f)
+        : { exitCode: 1, stderr: `cat: ${f}: Is a directory (/etc/x: Permission denied)` },
+    "probe inconclusive",
+  ],
+  ["timed out after leaking a canary", (f: string) => ({ ...reads(f), timedOut: true }), "probe timed out"],
+  [
+    "signalled after leaking a canary",
+    (f: string) => ({ ...reads(f), exitCode: null, signal: "SIGKILL" }),
+    "probe inconclusive",
   ],
   ["denies every read, including the cwd", denies, "probe inconclusive"],
   [
@@ -586,6 +623,44 @@ test("a canary that cannot be created makes the probe inconclusive and removes t
   }
 });
 
+test("canaries cover each distinct writable private root the production profile denies", async () => {
+  const roots = canaryRoots(privateReadRoots());
+  for (const root of ["/tmp", "/var/tmp", tmpdir()])
+    if (existsSync(root)) expect(roots).toContain(realpathSync(root));
+  expect(
+    roots.some((root) => root.startsWith(`${realpathSync(homedir())}/`) || root === realpathSync(homedir())),
+  ).toBe(true);
+  expect(new Set(roots).size).toBe(roots.length);
+
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "canary-roots-")));
+  cleanups.push(() => {
+    chmodSync(join(parent, "locked"), 0o755);
+    rmSync(parent, { recursive: true, force: true });
+  });
+  for (const dir of ["outer/inner", "locked", "other"]) mkdirSync(join(parent, dir), { recursive: true });
+  symlinkSync(join(parent, "outer/inner"), join(parent, "alias"));
+  chmodSync(join(parent, "locked"), 0o555);
+  const deny = ["outer", "outer/inner", "alias", "locked", "missing", "other"].map((d) => join(parent, d));
+  expect(canaryRoots(deny)).toEqual([join(parent, "outer/inner"), join(parent, "other")]);
+
+  // The probe derives its canaries from the same deny list the real invocation gets.
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  const seen: string[][] = [];
+  const probe = new CodexReaderProbe(() => CODEX, {
+    canaryRoots: (d) => {
+      seen.push(d);
+      return Object.values(fake.roots);
+    },
+  });
+  try {
+    expect((await runCodex(spec, fake.runner, probe)).status).toBe("ok");
+    expect(seen).toEqual([privateReadRoots()]);
+  } finally {
+    cleanup();
+  }
+});
+
 test("a missing CLI fails closed without output", async () => {
   const { spec, cleanup } = confinedFixture();
   const fake = fakeCodex();
@@ -675,6 +750,8 @@ for (const [name, first] of [
   ["timeout", (f: string) => ({ exitCode: null, timedOut: true, stderr: denies(f).stderr })],
   ["startup error", () => new Error("spawn EAGAIN")],
   ["inconclusive", () => ({ exitCode: 1, stderr: "sandbox: unexpected failure" })],
+  ["clean exit without canary contents", () => ({ exitCode: 0, stdout: "" })],
+  ["leaking timeout", (f: string) => ({ ...reads(f), timedOut: true })],
 ] as const)
   test(`a ${name} probe fails closed, is not cached, and is retried after the backoff`, async () => {
     const { spec, cleanup } = confinedFixture();
