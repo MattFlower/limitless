@@ -157,6 +157,18 @@ export const MODELS: ModelDef[] = [
     tier: 3,
     price: { input: 1, output: 5, cacheRead: 0.1 },
   },
+  {
+    id: "claude/sonnet-5.5",
+    provider: "claude",
+    model: "claude-sonnet-5-5",
+    vendor: "anthropic",
+    origin: "US",
+    baseOrigin: "US",
+    supportedEfforts: ["low", "medium", "high"],
+    tier: 4,
+    price: { input: 2, output: 10, cacheRead: 0.2 },
+    notes: "Released 2026-09-28; under evaluation (#133), not in the routing policy",
+  },
   // OpenAI via the ChatGPT subscription (Codex CLI >= 0.157 serves the gpt-6 family on this plan).
   {
     id: "codex/astra",
@@ -275,6 +287,20 @@ export const MODELS: ModelDef[] = [
     price: { input: 0, output: 0 },
   },
   // Eval candidates; provisional tiers, deliberately absent from DEFAULT_POLICY.
+  {
+    // Codex rejects gpt-6.1-sol on ChatGPT-account sign-in (2026-09-29), so it is metered here.
+    id: "openrouter/gpt-6.1-sol",
+    provider: "openrouter",
+    model: "openai/gpt-6.1-sol",
+    vendor: "openai",
+    origin: "US",
+    baseOrigin: "US",
+    supportedEfforts: ["low", "medium", "high", "xhigh"],
+    tier: 4,
+    effort: "medium",
+    price: { input: 2, output: 10, cacheRead: 0.1 },
+    notes: "Released 2026-09-29; under evaluation (#133), not in the routing policy",
+  },
   {
     id: "openrouter/gpt-6-luna",
     provider: "openrouter",
