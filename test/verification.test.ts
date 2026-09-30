@@ -8,6 +8,8 @@ import {
 import {
   citedRequirement,
   type Holdout,
+  requirementCitationIssue,
+  requirementEntries,
   requirementSource,
   type Spec,
   toStrictJsonSchema,
@@ -434,7 +436,151 @@ test("a citation is grounded only when it is a verbatim quote of the named sourc
     [spec.acceptance_criteria[0]?.how_to_verify ?? "", source],
   ] as const)
     expect(citedRequirement(citation, text)).toBeNull();
-  expect(citedRequirement("works", source)).toBe("works");
+  // A fragment grounds nothing: single words, and text cut from inside words, are rejected.
+  for (const citation of ["lists", "e", "the", "mpty lists are accep", "lists are accepte"])
+    expect(citedRequirement(citation, source)).toBeNull();
+  expect(citedRequirement("make it", requirementSource("request", "make it work", spec))).toBeNull();
+  expect(citedRequirement("ake it wor", "make it work")).toBeNull();
+  // Underscores join identifiers: a quote cut from inside `user_id` is not a whole-word citation.
+  expect(citedRequirement("Return the user", "Return the user_id")).toBeNull();
+  expect(citedRequirement("id is required", "the user_id is required")).toBeNull();
+  expect(citedRequirement("Return the user_id", "Return the user_id")).toBe("Return the user_id");
+  expect(citedRequirement('  **Lists  ARE** accepted" ', source)).toBe("Lists ARE** accepted");
+});
+
+test("a complete short spec entry is grounded; a short partial quote is not", () => {
+  const shortSpec = {
+    ...spec,
+    requirements: ["Idempotent retries"],
+    acceptance_criteria: [{ id: "AC-1", criterion: "Paginated.", how_to_verify: "run it" }],
+  };
+  const source = requirementSource("spec", "", shortSpec);
+  const entries = requirementEntries("spec", shortSpec);
+  expect(citedRequirement("idempotent retries", source, entries)).toBe("idempotent retries");
+  expect(citedRequirement('"paginated"', source, entries)).toBe("paginated");
+  expect(citedRequirement("Idempotent", source, entries)).toBeNull();
+  expect(
+    citedRequirement("idempotent", "Idempotent retries", requirementEntries("request", shortSpec)),
+  ).toBeNull();
+  const issue = (requirementCitation: string, evidence: string) =>
+    requirementCitationIssue(
+      { id: "H-1", status: "unmet", evidence, publicSummary: "", requirement: "spec", requirementCitation },
+      "",
+      shortSpec,
+    );
+  expect(issue("Idempotent retries", "violates idempotent retries: second call fails")).toBeNull();
+  expect(issue("Paginated", "violates **Paginated**")).toBeNull();
+  expect(issue("Paginated", "the list is unpaginated")).toBe("evidence does not cite the requirement");
+  expect(issue("Idempotent retries", "idempotent retriesx")).toBe("evidence does not cite the requirement");
+  expect(issue("retries", "violates retries")).toBe("citation is not a stated public requirement");
+  expect(issue("Paginated", "see paginated_results")).toBe("evidence does not cite the requirement");
+  const requestIssue = requirementCitationIssue(
+    {
+      id: "H-1",
+      status: "unmet",
+      evidence: "Violation: Return the user_ref",
+      publicSummary: "",
+      requirement: "request",
+      requirementCitation: "Return the user",
+    },
+    "Return the user list",
+    shortSpec,
+  );
+  expect(requestIssue).toBe("evidence does not cite the requirement");
+});
+
+test("a trivial citation blocks and is never repeated to the implementer", () => {
+  for (const requirementCitation of ["e", "the", "work"]) {
+    const verify = unmetHoldout({
+      requirement: "request",
+      requirementCitation,
+      evidence: `violates ${requirementCitation}`,
+    });
+    const normalized = normalizeVerify(VerifySchema.parse(verify), spec, holdout, "make the thing work");
+    expect(normalized.overall).toBe("fail");
+    expect(normalized.notes).toContain("citation is not a stated public requirement");
+    const feedback = formatVerifyFeedback(
+      normalized,
+      spec,
+      holdout,
+      "make the thing work",
+      "make the thing work",
+    );
+    // "e" is not a whole word of the request; "the" and "work" are, but too short to ground anything.
+    expect(feedback).toContain(
+      requirementCitation === "e"
+        ? "(the verifier's citation was not found in it)"
+        : "(the verifier's attribution could not be validated)",
+    );
+    expect(feedback).toContain("check them against the original request and specification above");
+    expect(feedback).not.toContain(`requirement of the original request: "${requirementCitation}"`);
+  }
+});
+
+test("the verifier is told what makes a citation grounded", () => {
+  const prompt = verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" });
+  expect(prompt).toContain(
+    "A citation must be either at least three consecutive words quoted exactly, or one whole line of the request (a sentence or bullet) or one whole acceptance criterion, exactly as shown",
+  );
+});
+
+test("a whole request line or acceptance criterion is grounded however short; a short fragment is not", () => {
+  const request =
+    "Networking changes:\nBackground\nOur service uses IPv4.\n\nRequirements\n- Support IPv6\n* Keep IPv4\n> Log it\n1. Retry once\n- Support IPv6 and DNS over TLS\n## Limits\nCap it.\n## Scope.\nOther notes\n\n- Later:\nShip it";
+  const shortSpec = {
+    ...spec,
+    acceptance_criteria: [{ id: "AC-1", criterion: "Paginated.", how_to_verify: "run" }],
+  };
+  const source = requirementSource("spec", "", shortSpec);
+  const entries = requirementEntries("spec", shortSpec);
+  for (const [citation, line] of [
+    ["Support IPv6", "Support IPv6"],
+    ["- Support IPv6", "Support IPv6"],
+    ['"keep ipv4"', "keep ipv4"],
+    ["Log it", "Log it"],
+    ["1. Retry once", "Retry once"],
+    ["Cap it.", "Cap it"],
+    // A standalone sentence (set apart by a blank line or the end) needs no marker or punctuation.
+    ["Other notes", "Other notes"],
+    ["Ship it", "Ship it"],
+  ] as const)
+    expect(citedRequirement(citation, request)).toBe(line);
+  expect(citedRequirement("Support IPv6", "Support IPv6")).toBe("Support IPv6");
+  // Headings label requirements rather than stating one: marked, punctuated, or a plain line
+  // directly above its block ("Background" above prose, "Requirements" above a list).
+  for (const citation of [
+    "IPv6",
+    "Retry",
+    "Support",
+    "DNS over",
+    "Networking",
+    "Networking changes:",
+    "Networking changes",
+    "Background",
+    "Requirements",
+    "Limits",
+    "## Limits",
+    "Scope",
+    "## Scope.",
+    "Later",
+  ])
+    expect(citedRequirement(citation, request)).toBeNull();
+  expect(citedRequirement("## Scope.", "## Scope.\n- Support IPv6")).toBeNull();
+  const plain = "Background\nOur service uses IPv4.\n\nRequirements\n- Support IPv6";
+  for (const citation of ["Background", "Requirements"]) expect(citedRequirement(citation, plain)).toBeNull();
+  expect(citedRequirement("Support IPv6", plain)).toBe("Support IPv6");
+  for (const citation of ["**AC-1** Paginated.", "AC-1: Paginated", "- **AC-1** Paginated."])
+    expect(citedRequirement(citation, source, entries)).toBe("Paginated");
+  const verify = unmetHoldout({
+    requirement: "request",
+    requirementCitation: "Support IPv6",
+    evidence: "violates Support IPv6: connecting to ::1 fails",
+  });
+  const normalized = normalizeVerify(VerifySchema.parse(verify), spec, holdout, request);
+  expect(normalized.notes).not.toContain("citation");
+  expect(formatVerifyFeedback(normalized, spec, holdout, request, request)).toContain(
+    'violates this requirement of the original request: "Support IPv6"',
+  );
 });
 
 test.each(["request", "spec"] as const)(
