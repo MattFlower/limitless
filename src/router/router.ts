@@ -5,8 +5,8 @@ import type { ProviderTracker } from "./providers.ts";
 import { formatTarget, parseTarget, resolveTarget, transportError } from "./targets.ts";
 
 export interface RouteConstraints {
-  /** Skip models from this vendor (cross-vendor review). Falls back to it only if nothing else is available. */
-  avoidVendor?: string;
+  /** Skip models from these vendors (cross-vendor review). Falls back to them only if nothing else is available. */
+  avoidVendor?: string | string[];
   /** Exclude model identities regardless of reasoning effort. */
   excludeModels?: string[];
   /** Only consider models at or above this tier (escalation). */
@@ -184,6 +184,7 @@ export class Router {
     const excluded = new Set(c.exclude?.map(identity));
     const preference = c.prefer ? identity(c.prefer) : undefined;
 
+    const avoid = [c.avoidVendor ?? []].flat();
     const consider = (ids: (string | ModelSelection)[], fromPolicy = false) => {
       const group: ModelTarget[] = [];
       for (const reference of ids) {
@@ -226,10 +227,10 @@ export class Router {
       for (const m of group) {
         const free = c.billing === "free_first" && m.billing === "free";
         (free
-          ? c.avoidVendor && m.vendor === c.avoidVendor
+          ? avoid.includes(m.vendor)
             ? freeSameVendor
             : freePreferred
-          : c.avoidVendor && m.vendor === c.avoidVendor
+          : avoid.includes(m.vendor)
             ? sameVendor
             : preferred
         ).push(m);

@@ -974,9 +974,11 @@ async function oneRound(
           ...(fixSha && panelReview ? { fixReview: panelReview } : {}),
         },
       };
+      // TODO: parallel panel finders share this worktree, and each call discards changes when it ends,
+      // possibly while another finder still runs. Production reviews run a single finder.
       const call = async (
         request: ReviewRequest | VerifierRequest,
-        avoidVendor: string | undefined,
+        avoidVendor: string | string[] | undefined,
         prefer: string | undefined,
       ) => {
         const invoked = await ctx.invoke({
@@ -995,11 +997,11 @@ async function oneRound(
         {
           invoke: (request, finder) =>
             call(request, ctx.state.implementer?.vendor, system.finders[finder]?.target),
-          verify: async (request, avoidVendor) => {
-            const verified = await call(request, avoidVendor, system.verifier?.target);
-            if (avoidVendor && verified.target.vendor === avoidVendor)
+          verify: async (request, avoidVendors) => {
+            const verified = await call(request, avoidVendors, system.verifier?.target);
+            if (avoidVendors.includes(verified.target.vendor))
               ctx.log(
-                `Verifier ${verified.target.modelId} shares vendor ${avoidVendor} with the finder it checks (no cross-vendor verifier available)`,
+                `Verifier ${verified.target.modelId} shares vendor ${verified.target.vendor} with a finder it checks (no cross-vendor verifier available)`,
                 "warn",
               );
             return verified;

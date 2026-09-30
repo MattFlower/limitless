@@ -722,9 +722,9 @@ export class EvalRunner {
                   ? invoke(scratch, request, to, log)
                   : withScratch(cwd, (dir) => invoke(dir, request, to, log));
             // Panel members run in parallel, so each call logs (and keeps a schema file) of its own.
-            let members = 0;
+            let verifications = 0;
             // Never hold one provider's slot while waiting for another panel member's provider.
-            const sendTo = async (request: ReviewRequest | VerifierRequest, to: ModelTarget) => {
+            const sendTo = async (request: ReviewRequest | VerifierRequest, to: ModelTarget, log: string) => {
               const picked = selectHarness(run.role, to);
               const agent = harnesses[picked.harnessName];
               if (!agent) throw new Error(`No harness registered for ${picked.harnessName}`);
@@ -743,7 +743,7 @@ export class EvalRunner {
                   const sent = await send(
                     request,
                     { target: to, harness: agent, noTools: picked.noTools },
-                    `${logPath}.${++members}`,
+                    `${logPath}.${log}`,
                   );
                   spent.push(sent);
                   observe(to, sent);
@@ -762,7 +762,7 @@ export class EvalRunner {
                     {
                       invoke: async (request, finder) => {
                         const to = finder > 0 ? panelTargets?.finders[finder - 1] : undefined;
-                        if (to) return sendTo(request, to);
+                        if (to) return sendTo(request, to, `finder-${finder}`);
                         try {
                           own = await send(request);
                           spent.push(own);
@@ -774,13 +774,14 @@ export class EvalRunner {
                         }
                         return { result: own, target };
                       },
-                      verify: async (request, avoidVendor) => {
+                      verify: async (request, avoidVendors) => {
                         if (!panelTargets) throw new Error("review system has no verifier");
-                        if (panelTargets.verifier.vendor === avoidVendor)
+                        const { modelId, vendor } = panelTargets.verifier;
+                        if (avoidVendors.includes(vendor))
                           throw new Error(
-                            `verifier ${panelTargets.verifier.modelId} shares vendor ${avoidVendor} with its finder`,
+                            `verifier ${modelId} shares vendor ${vendor} with a finder it checks`,
                           );
-                        return sendTo(request, panelTargets.verifier);
+                        return sendTo(request, panelTargets.verifier, `verifier-${++verifications}`);
                       },
                     },
                     reviewInput,

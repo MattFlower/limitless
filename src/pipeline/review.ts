@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { FinderPrompt, ReviewFinder, ReviewSystem } from "../core/types.ts";
 import { type AgentResult, extractJson } from "../harness/types.ts";
-import { MERGE_WINDOW, mergeReports } from "./panel-merge.ts";
+import { MERGE_RULES, mergeReports } from "./panel-merge.ts";
 import { reviewPrompt, verifierPrompt } from "./prompts.ts";
 import {
   LaterReviewSchema,
@@ -212,11 +212,10 @@ export interface PanelRecord {
   finders: { prompt: FinderPrompt; vendor: string | null }[];
   /**
    * `finder` and `vendor` are the report that represents the candidate, `raisedBy` every finder that
-   * reported it. `finder` is null for a prior blocking finding no finder repeated: the verifier rechecks it.
+   * reported it (the others are its `duplicates`). `finder` is null for a prior blocking finding no
+   * finder repeated: the verifier rechecks it.
    */
   candidates: (Finding & { id: string; finder: number | null; vendor: string | null; raisedBy: number[] })[];
-  /** Finder reports folded into a candidate (`into`) by the deterministic merge. */
-  merged: (Finding & { into: string; finder: number; vendor: string | null })[];
   verdicts: (Verification & { id: string })[];
   refuted: string[];
   /** Eligible for verification but over the per-review cap: unverified follow-ups. */
@@ -233,8 +232,8 @@ type Invoked = { result: AgentResult; target?: { vendor: string } };
 export interface ReviewDeps<T extends Invoked> {
   /** Runs finder `finder` (an index into the system's finders). */
   invoke: (request: ReviewRequest, finder: number) => Promise<T>;
-  /** Panel only: one read-only verifier batch, routed away from the vendor that raised it. */
-  verify?: (request: VerifierRequest, avoidVendor: string | undefined) => Promise<T>;
+  /** Panel only: one read-only verifier batch, routed away from every vendor that raised it. */
+  verify?: (request: VerifierRequest, avoidVendors: string[]) => Promise<T>;
   /** Panel only: problems that degrade the review without failing it. */
   warn?: (message: string) => void;
 }
@@ -271,7 +270,7 @@ export function panelIdentity(): string {
         (["standard", "adversarial", "careful"] as const).map((finder) =>
           reviewPrompt({ ...FINDER_TEMPLATE, finder }),
         ),
-        MERGE_WINDOW,
+        MERGE_RULES,
         verifierPrompt(TEMPLATE_INPUT),
         verifierPrompt({ ...TEMPLATE_INPUT, externalChange: true }),
         toStrictJsonSchema(VerifierSchema),
@@ -417,7 +416,7 @@ async function runPanel<T extends Invoked>(
       };
     }),
   );
-  const reports = mergeReports(raised, cited);
+  const merged = mergeReports(raised, cited);
   const fix = fixReview && previous ? { review: fixReview, ...previous } : undefined;
   // A re-review never assumes a prior blocking finding fixed: whatever no finder repeated, the
   // verifier rechecks as a candidate of its own, outside the cap.
@@ -427,7 +426,7 @@ async function runPanel<T extends Invoked>(
     const recheck = { ...f, security: isSecurity(prior), label: "unaddressed" as const, prior: `P${i + 1}` };
     return [{ ...recheck, ...UNRAISED }];
   });
-  const candidates: PanelRecord["candidates"] = [...reports.candidates, ...rechecks].map((c, i) => ({
+  const candidates: PanelRecord["candidates"] = [...merged, ...rechecks].map((c, i) => ({
     ...c,
     id: `C${i + 1}`,
   }));
@@ -440,10 +439,12 @@ async function runPanel<T extends Invoked>(
     .filter((c) => !exempt(c) && !UNVERIFIED_CATEGORIES.includes(c.category))
     .sort((a, b) => FINDER_SEVERITY_RANK[a.severity] - FINDER_SEVERITY_RANK[b.severity]);
   const selected = [...ranked.slice(0, PANEL_VERIFY_CAP), ...candidates.filter(exempt)];
-  // One batch never mixes files or finder vendors, so each call avoids exactly its finder's vendor.
+  // One batch never mixes files or the vendors that raised them, so each call avoids exactly those.
+  const vendorsOf = (c: PanelRecord["candidates"][number]) =>
+    [...new Set(c.raisedBy.flatMap((i) => found[i]?.invoked.target?.vendor ?? []))].sort();
   const groups = new Map<string, typeof selected>();
   for (const c of candidates.filter((c) => selected.includes(c))) {
-    const key = JSON.stringify([c.vendor, c.file]);
+    const key = JSON.stringify([vendorsOf(c), c.file]);
     groups.set(key, [...(groups.get(key) ?? []), c]);
   }
   const batches = [...groups.values()].flatMap((group) =>
@@ -512,7 +513,7 @@ async function runPanel<T extends Invoked>(
           jsonSchema: toStrictJsonSchema(VerifierSchema),
           timeoutMs: input.timeoutMs,
         },
-        pending[0]?.vendor ?? undefined,
+        pending[0] ? vendorsOf(pending[0]) : [],
       );
       results.push(invoked.result);
       last = invoked.result;
@@ -571,7 +572,6 @@ async function runPanel<T extends Invoked>(
   const panel: PanelRecord = {
     finders: finders.map(({ prompt }, i) => ({ prompt, vendor: found[i]?.invoked.target?.vendor ?? null })),
     candidates,
-    merged: reports.merged.map(({ into, report }) => ({ ...report, into: `C${into + 1}` })),
     verdicts: [...verdicts.values()],
     refuted: [...verdicts.values()].filter((v) => v.verdict === "REFUTED").map((v) => v.id),
     capped: ranked.filter((c) => !selected.includes(c)).map((c) => c.id),

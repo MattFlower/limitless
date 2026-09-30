@@ -182,6 +182,15 @@ export const VerifierSchema = z.object({
   results: z.array(VerificationSchema.extend({ id: z.string().describe("The candidate id, e.g. C3") })),
 });
 
+const DuplicateSchema = z.object({
+  finder: z.number().int(),
+  line: z.number().int(),
+  title: z.string(),
+  detail: z.string(),
+  suggestion: z.string(),
+  failure_scenario: z.string().optional(),
+});
+
 type LiveFinding = z.infer<typeof ReviewSchema>["findings"][number];
 type FindingV2Field = keyof typeof findingV2;
 
@@ -197,6 +206,8 @@ export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
       verification?: Verification;
       /** Panel only: how many distinct finders raised it (0 for a recheck of a prior blocking finding). */
       agreement?: number;
+      /** Panel only: other finders' reports of the same claim, merged into this one. */
+      duplicates?: z.infer<typeof DuplicateSchema>[];
     })[];
 };
 
@@ -222,6 +233,7 @@ const StoredFindingSchema = reviewBase.shape.findings.element.extend({
   ...z.object(findingV2).partial().shape,
   verification: VerificationSchema.optional(),
   agreement: z.number().int().optional(),
+  duplicates: z.array(DuplicateSchema).optional(),
 });
 /** A panel's candidates and rulings, kept with eval output so refuted candidates stay regradable. */
 const StoredPanelSchema = z.object({
@@ -236,15 +248,6 @@ const StoredPanelSchema = z.object({
       raisedBy: z.array(z.number().int()).optional(),
     }),
   ),
-  merged: z
-    .array(
-      StoredFindingSchema.extend({
-        into: z.string(),
-        finder: z.number().int(),
-        vendor: z.string().nullable(),
-      }),
-    )
-    .default([]),
   verdicts: z.array(VerificationSchema.extend({ id: z.string() })),
   refuted: z.array(z.string()),
   capped: z.array(z.string()),

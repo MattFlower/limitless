@@ -437,16 +437,21 @@ test("panel systems run finders with their own prompts and a pinned verifier end
     expect(f.calls[3]?.prompt).toContain("Approve only if you would be comfortable merging");
     // Both finders report the same bug: one merged candidate with agreement 2.
     expect(f.calls[2]?.prompt).not.toContain('"id": "C2"');
+    // Each panel member logs apart, named by its role.
+    expect(f.calls.slice(0, 3).map((s) => s.logPath.split("/").at(-1))).toEqual([
+      "trial.log",
+      "trial.log.finder-1",
+      "trial.log.verifier-1",
+    ]);
     const panel = report.trials[0];
     expect(panel?.output).toMatchObject({
       mode: "panel",
-      findings: [{ agreement: 2, verification: { verdict: "CONFIRMED" } }],
+      findings: [{ agreement: 2, duplicates: [{ finder: 1 }], verification: { verdict: "CONFIRMED" } }],
       panel: {
         finders: [
           { prompt: "standard", vendor: "other" },
           { prompt: "adversarial", vendor: "other" },
         ],
-        merged: [{ into: "C1", finder: 1 }],
       },
     });
     expect(panel?.costUsd).toBeCloseTo(0.3);
@@ -656,8 +661,7 @@ test("panel trials keep their record for regrading and key the cache on the veri
       findings: [],
       panel: {
         refuted: ["C1"],
-        candidates: [{ id: "C1", line: 10, raisedBy: [0, 1] }],
-        merged: [{ into: "C1", finder: 1, line: 10 }],
+        candidates: [{ id: "C1", line: 10, raisedBy: [0, 1], duplicates: [{ finder: 1, line: 10 }] }],
       },
     });
     const calls = f.calls.length;
