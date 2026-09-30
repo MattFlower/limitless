@@ -52,7 +52,11 @@ const invalid: [string, string][] = [
   [file(system({ mode: "panel", verifier: {} })), "needs an explicit verifier target"],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
-    'only "standard" is implemented',
+    'finder prompt must be "standard", "adversarial" or "careful"',
+  ],
+  [
+    file(system({ finders: [{ target: "candidate-a", prompt: "careful" }] })),
+    'mode "single" uses the "standard" prompt',
   ],
   [file(system({ finders: [] })), "exactly one finder"],
   [file(system({ finders: [system().finders[0], system().finders[0]] })), "exactly one finder"],
@@ -67,6 +71,11 @@ test("eval review systems reject unsupported shapes with clear errors", () => {
   expect(
     parseEvalReviewSystems(file(system(), system({ name: "b", implementerReport: "omit" })), "s.json"),
   ).toEqual([system(), system({ name: "b", implementerReport: "omit" })] as ReviewSystem[]);
+  const finders = (["standard", "adversarial", "careful"] as const).map((prompt) => ({
+    target: "candidate-a",
+    prompt,
+  }));
+  expect(parseEvalReviewSystems(file(panel({ finders })), "s.json")[0]?.finders).toEqual(finders);
 });
 
 test("production derives one routed standard finder from [review] implementer_report", () => {

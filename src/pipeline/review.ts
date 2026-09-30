@@ -1,6 +1,7 @@
 import { z } from "zod";
-import type { ReviewSystem } from "../core/types.ts";
+import type { FinderPrompt, ReviewFinder, ReviewSystem } from "../core/types.ts";
 import { type AgentResult, extractJson } from "../harness/types.ts";
+import { MERGE_WINDOW, mergeReports } from "./panel-merge.ts";
 import { reviewPrompt, verifierPrompt } from "./prompts.ts";
 import {
   LaterReviewSchema,
@@ -20,15 +21,19 @@ const FINDER_SEVERITY_RANK = { blocker: 0, major: 1, minor: 2, nit: 3 } as const
 /** Finder candidates verified per review; prior blocking and security findings are exempt. */
 export const PANEL_VERIFY_CAP = 20;
 const PANEL_BATCH_SIZE = 5;
+/** A recheck of a prior blocking finding that no finder repeated. */
+const UNRAISED = { agreement: 0, finder: null, vendor: null, raisedBy: [] as number[] };
 
-/**
- * CONFIRMED, or PLAUSIBLE at high or above. PLAUSIBLE raised by two or more finders will also count
- * once panel agreement exists; until then every candidate has exactly one finder.
- */
+/** CONFIRMED, PLAUSIBLE at high or above, or PLAUSIBLE raised by two or more finders. */
 function panelVerified(finding: Finding): boolean {
   const v = finding.verification;
   if (!v || v.verdict === "REFUTED") return false;
-  return v.verdict === "CONFIRMED" || v.severity === "critical" || v.severity === "high";
+  return (
+    v.verdict === "CONFIRMED" ||
+    v.severity === "critical" ||
+    v.severity === "high" ||
+    (finding.agreement ?? 0) >= 2
+  );
 }
 
 export function reviewFindingKey(finding: Review["findings"][number]): string {
@@ -192,8 +197,15 @@ export interface VerifierRequest {
 
 /** What `review-N.json` records about a panel beyond the derived review. */
 export interface PanelRecord {
-  /** `finder` is null for a prior blocking finding no finder repeated: the verifier rechecks it. */
-  candidates: (Finding & { id: string; finder: number | null; vendor: string | null })[];
+  /** Each finder's prompt and the vendor it ran on, by finder index. */
+  finders: { prompt: FinderPrompt; vendor: string | null }[];
+  /**
+   * `finder` and `vendor` are the report that represents the candidate, `raisedBy` every finder that
+   * reported it. `finder` is null for a prior blocking finding no finder repeated: the verifier rechecks it.
+   */
+  candidates: (Finding & { id: string; finder: number | null; vendor: string | null; raisedBy: number[] })[];
+  /** Finder reports folded into a candidate (`into`) by the deterministic merge. */
+  merged: (Finding & { into: string; finder: number; vendor: string | null })[];
   verdicts: (Verification & { id: string })[];
   refuted: string[];
   /** Eligible for verification but over the per-review cap: unverified follow-ups. */
@@ -216,7 +228,16 @@ export interface ReviewDeps<T extends Invoked> {
   warn?: (message: string) => void;
 }
 
-/** Fixed input that renders the verifier prompt template, for cache identity. */
+/** Fixed inputs that render the finder and verifier prompt templates, for cache identity. */
+const FINDER_TEMPLATE: Parameters<typeof reviewPrompt>[0] = {
+  prompt: "",
+  spec: null,
+  baseSha: "BASE",
+  stat: "",
+  gates: [],
+  audit: [],
+  implementerReport: "",
+};
 const TEMPLATE_INPUT: Parameters<typeof verifierPrompt>[0] = {
   prompt: "",
   spec: null,
@@ -227,13 +248,17 @@ const TEMPLATE_INPUT: Parameters<typeof verifierPrompt>[0] = {
 };
 
 /**
- * What a panel's derived output depends on besides its finders' prompt: the verifier prompt templates,
- * its schema and the batching policy. Eval caches key panel trials on it.
+ * What a panel's derived output depends on besides the case: the finder and verifier prompt templates,
+ * the verifier schema, and the merge and batching policy. Eval caches key panel trials on it.
  */
-export function panelVerifierIdentity(): string {
+export function panelIdentity(): string {
   return new Bun.CryptoHasher("sha256")
     .update(
       JSON.stringify([
+        (["standard", "adversarial", "careful"] as const).map((finder) =>
+          reviewPrompt({ ...FINDER_TEMPLATE, finder }),
+        ),
+        MERGE_WINDOW,
         verifierPrompt(TEMPLATE_INPUT),
         verifierPrompt({ ...TEMPLATE_INPUT, externalChange: true }),
         toStrictJsonSchema(VerifierSchema),
@@ -264,7 +289,7 @@ export async function runReview<T extends Invoked>(
   deps: ReviewDeps<T>,
   input: ReviewInput,
 ): Promise<ReviewOutcome<T>> {
-  if (input.system?.mode === "panel") return runPanel(deps, input, input.system.finders.length);
+  if (input.system?.mode === "panel") return runPanel(deps, input, input.system.finders);
   const request = reviewRequest(input);
   const invoked = await deps.invoke(request, 0);
   const output = request.schema.safeParse(invoked.result.structured ?? extractJson(invoked.result.finalText));
@@ -324,17 +349,27 @@ function failedPanel(results: AgentResult[], last: AgentResult, message: string)
 async function runPanel<T extends Invoked>(
   deps: ReviewDeps<T>,
   input: ReviewInput,
-  finders: number,
+  finders: ReviewFinder[],
 ): Promise<ReviewOutcome<T>> {
-  const request = reviewRequest(input);
-  const results: AgentResult[] = [];
+  // Finders run in parallel, each within its provider's limits. Every call settles before the panel
+  // goes on or fails, so none outlives it and each one's spend is recorded.
+  const settled = await Promise.allSettled(
+    finders.map(async ({ prompt }, finder) => {
+      const request = reviewRequest({ ...input, prompt: { ...input.prompt, finder: prompt } });
+      const invoked = await deps.invoke(request, finder);
+      const output = request.schema.safeParse(
+        invoked.result.structured ?? extractJson(invoked.result.finalText),
+      );
+      return { invoked, output };
+    }),
+  );
+  const members = settled.map((member) => {
+    if (member.status === "rejected") throw member.reason;
+    return member.value;
+  });
+  const results: AgentResult[] = members.map(({ invoked }) => invoked.result);
   const found: { invoked: T; review: Review }[] = [];
-  for (let finder = 0; finder < finders; finder++) {
-    const invoked = await deps.invoke(request, finder);
-    results.push(invoked.result);
-    const output = request.schema.safeParse(
-      invoked.result.structured ?? extractJson(invoked.result.finalText),
-    );
+  for (const [finder, { invoked, output }] of members.entries()) {
     if (!output.success)
       return {
         ...invoked,
@@ -368,15 +403,16 @@ async function runPanel<T extends Invoked>(
       };
     }),
   );
+  const reports = mergeReports(raised, cited);
   const fix = fixReview && previous ? { review: fixReview, ...previous } : undefined;
   // A re-review never assumes a prior blocking finding fixed: whatever no finder repeated, the
   // verifier rechecks as a candidate of its own, outside the cap.
   const rechecks = (fix?.findings ?? []).flatMap(({ verification: _stale, ...f }, i) =>
     raised.some((c) => cited(c) === i)
       ? []
-      : [{ ...f, label: "unaddressed" as const, prior: `P${i + 1}`, finder: null, vendor: null }],
+      : [{ ...f, label: "unaddressed" as const, prior: `P${i + 1}`, ...UNRAISED }],
   );
-  const candidates: PanelRecord["candidates"] = [...raised, ...rechecks].map((c, i) => ({
+  const candidates: PanelRecord["candidates"] = [...reports.candidates, ...rechecks].map((c, i) => ({
     ...c,
     id: `C${i + 1}`,
   }));
@@ -495,7 +531,7 @@ async function runPanel<T extends Invoked>(
 
   // Refuted candidates are dropped here, by id; a same-titled candidate keeps its own ruling.
   const findings: Finding[] = [];
-  for (const { id, finder: _finder, vendor: _vendor, ...finding } of candidates) {
+  for (const { id, finder: _finder, vendor: _vendor, raisedBy: _raisedBy, ...finding } of candidates) {
     const verdict = verdicts.get(id);
     if (!verdict) findings.push(finding);
     else if (verdict.verdict !== "REFUTED") {
@@ -518,7 +554,9 @@ async function runPanel<T extends Invoked>(
     : "approve";
   const decision = decide(input, review, modelVerdict);
   const panel: PanelRecord = {
+    finders: finders.map(({ prompt }, i) => ({ prompt, vendor: found[i]?.invoked.target?.vendor ?? null })),
     candidates,
+    merged: reports.merged.map(({ into, report }) => ({ ...report, into: `C${into + 1}` })),
     verdicts: [...verdicts.values()],
     refuted: [...verdicts.values()].filter((v) => v.verdict === "REFUTED").map((v) => v.id),
     capped: ranked.filter((c) => !selected.includes(c)).map((c) => c.id),

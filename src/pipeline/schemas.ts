@@ -195,6 +195,8 @@ export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
       prior?: string;
       /** Panel only; absent when the candidate was not verified (capped, cleanup or conventions, or left out by the verifier). */
       verification?: Verification;
+      /** Panel only: how many distinct finders raised it (0 for a recheck of a prior blocking finding). */
+      agreement?: number;
     })[];
 };
 
@@ -219,17 +221,30 @@ const StoredFindingSchema = reviewBase.shape.findings.element.extend({
   suggestion: z.string().default(""),
   ...z.object(findingV2).partial().shape,
   verification: VerificationSchema.optional(),
+  agreement: z.number().int().optional(),
 });
 /** A panel's candidates and rulings, kept with eval output so refuted candidates stay regradable. */
 const StoredPanelSchema = z.object({
+  // Absent in records from before parallel finders and the merge.
+  finders: z.array(z.object({ prompt: z.string(), vendor: z.string().nullable() })).optional(),
   candidates: z.array(
     StoredFindingSchema.extend({
       id: z.string(),
       // Null: a prior blocking finding no finder repeated, rechecked by the verifier.
       finder: z.number().int().nullable(),
       vendor: z.string().nullable(),
+      raisedBy: z.array(z.number().int()).optional(),
     }),
   ),
+  merged: z
+    .array(
+      StoredFindingSchema.extend({
+        into: z.string(),
+        finder: z.number().int(),
+        vendor: z.string().nullable(),
+      }),
+    )
+    .default([]),
   verdicts: z.array(VerificationSchema.extend({ id: z.string() })),
   refuted: z.array(z.string()),
   capped: z.array(z.string()),

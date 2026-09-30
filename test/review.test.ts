@@ -518,6 +518,20 @@ describe("panel decision", () => {
     });
   }
 
+  test("PLAUSIBLE below high is verified when two or more finders raised it", () => {
+    const at = (agreement: number, label?: "regression"): Review => ({
+      mode: "panel",
+      verdict: "approve",
+      summary: "s",
+      findings: [{ ...verified("PLAUSIBLE", "medium"), agreement, ...(label ? { label } : {}) }],
+    });
+    expect(blockingReviewFindings(at(2))).toHaveLength(1);
+    expect(blockingReviewFindings(at(1))).toEqual([]);
+    // Re-reviews keep their own severity bar: a medium regression blocks R2, a new medium does not.
+    expect(blockingReviewFindings(at(2, "regression"), [finding("major")], 2)).toHaveLength(1);
+    expect(blockingReviewFindings(at(2), [finding("major")], 2)).toEqual([]);
+  });
+
   test("an unaddressed finding that cites no prior blocking finding is judged as new", () => {
     const f = { ...verified("CONFIRMED", "medium"), label: "unaddressed" as const, prior: "P2" };
     const review: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [f] };
@@ -624,7 +638,7 @@ describe("runReview panel", () => {
     const { out, verifications } = await panel(
       [
         [...[1, 2, 3, 4, 5, 6].map((n) => candidate("src/a.ts", n)), candidate("src/b.ts", 7)],
-        [candidate("src/a.ts", 8), { ...candidate("src/c.ts", 9), category: "cleanup" }],
+        [candidate("src/a.ts", 80), { ...candidate("src/c.ts", 9), category: "cleanup" }],
       ],
       () => confirmed,
     );
@@ -770,6 +784,92 @@ describe("runReview panel", () => {
     });
     expect(out.panel?.candidates.map((c) => [c.id, c.security])).toEqual([["C1", true]]);
     expect(out.decision?.blocking.map((f) => f.line)).toEqual([1]);
+  });
+
+  test("finders run in parallel with their own prompts, and a report they share is verified once", async () => {
+    const vendors = ["anthropic", "openai", "google"];
+    const prompts: string[] = [];
+    const started = Promise.withResolvers<void>();
+    const verified: string[][] = [];
+    const out = await runReview(
+      {
+        invoke: async (request, finder) => {
+          prompts[finder] = request.prompt;
+          if (prompts.filter(Boolean).length === 3) started.resolve();
+          // One finder at a time would never see the others start.
+          if (await Promise.race([started.promise.then(() => false), Bun.sleep(2000).then(() => true)]))
+            throw new Error("finders ran one at a time");
+          const findings = [candidate("src/a.ts", 10 + finder)];
+          return ok(
+            { verdict: "request_changes", summary: "Checked everything.", findings },
+            vendors[finder] ?? "",
+          );
+        },
+        verify: async (request) => {
+          verified.push(ids(request.prompt));
+          return ok({ results: ids(request.prompt).map((id) => ruling(id)) }, "other");
+        },
+      },
+      {
+        prompt,
+        timeoutMs: 1,
+        system: {
+          mode: "panel",
+          finders: [{ prompt: "standard" }, { prompt: "adversarial" }, { prompt: "careful" }],
+        },
+      },
+    );
+    for (const [finder, opening, framing] of [
+      [0, "You are a code reviewer.", "Do not filter by importance or certainty"],
+      [1, "You are an adversarial code reviewer.", "Give no credit for intent"],
+      [2, "You are a code reviewer.", "careful senior engineer"],
+    ] as const) {
+      expect(prompts[finder]).toStartWith(opening);
+      expect(prompts[finder]).toContain(framing);
+      expect(prompts[finder]).not.toContain("Approve only if");
+    }
+    expect(verified).toEqual([["C1"]]);
+    expect(out.panel?.finders).toEqual([
+      { prompt: "standard", vendor: "anthropic" },
+      { prompt: "adversarial", vendor: "openai" },
+      { prompt: "careful", vendor: "google" },
+    ]);
+    expect(out.panel?.candidates.map((c) => [c.id, c.line, c.raisedBy, c.agreement])).toEqual([
+      ["C1", 10, [0, 1, 2], 3],
+    ]);
+    expect(out.panel?.merged.map((m) => [m.into, m.finder, m.line])).toEqual([
+      ["C1", 1, 11],
+      ["C1", 2, 12],
+    ]);
+    expect(out.decision?.blocking.map((f) => f.agreement)).toEqual([3]);
+  });
+
+  test("a finder that fails fails the panel only after the other finders settle", async () => {
+    let settled = 0;
+    const run = runReview(
+      {
+        invoke: async (_request, finder) => {
+          if (finder === 0) throw new Error("provider unavailable");
+          await Bun.sleep(20);
+          settled++;
+          return ok({ verdict: "approve", summary: "Checked everything.", findings: [] }, "openai");
+        },
+        verify: async () => ok({ results: [] }, "google"),
+      },
+      {
+        prompt,
+        timeoutMs: 1,
+        system: { mode: "panel", finders: [{ prompt: "standard" }, { prompt: "careful" }] },
+      },
+    );
+    await expect(run).rejects.toThrow("provider unavailable");
+    expect(settled).toBe(1);
+  });
+
+  test("a later-round panel finder prompt does not describe single-mode follow-ups", () => {
+    const previous = { sha: "fixbase", findings: [finding("major")] };
+    expect(reviewPrompt({ ...prompt, previous })).toContain("become follow-ups");
+    expect(reviewPrompt({ ...prompt, previous, finder: "standard" })).not.toContain("become follow-ups");
   });
 
   test("an invalid verifier result fails the review instead of approving it", async () => {
