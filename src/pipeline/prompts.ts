@@ -3,6 +3,7 @@ import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import {
+  citationInSource,
   citedRequirement,
   type Holdout,
   type Review,
@@ -252,17 +253,16 @@ export function formatVerifyFeedback(
       if (!privateScenario) return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
       if (c.status !== "unmet" || (c.requirement !== "request" && c.requirement !== "spec"))
         return `- **${c.id}** private scenario (${c.status}): ${safeSummary}`;
-      const quote = groundedCitation(
-        c.requirement,
-        c.requirementCitation ?? "",
-        request,
-        spec,
-        holdout,
-        publicSources,
-      );
+      const citation = c.requirementCitation ?? "";
+      const sourceText = publicSource(c.requirement, request, spec);
+      const quote = groundedCitation(citation, sourceText, c.requirement, spec, holdout, publicSources);
       const source = c.requirement === "request" ? "the original request" : "the specification";
       if (quote === null) unvalidated = true;
-      return `- **${c.id}** violates ${quote === null ? `a requirement of ${source} (the verifier's citation was not found in it)` : `this requirement of ${source}: "${quote}"`}\n  Observed failure: ${safeSummary}`;
+      // Never the citation itself: an ungrounded one may carry scenario text.
+      const why = citationInSource(citation, sourceText)
+        ? "the verifier's attribution could not be validated"
+        : "the verifier's citation was not found in it";
+      return `- **${c.id}** violates ${quote === null ? `a requirement of ${source} (${why})` : `this requirement of ${source}: "${quote}"`}\n  Observed failure: ${safeSummary}`;
     })
     .join("\n");
   // Printed once: repeating the public sources per holdout bloated feedback and the needs_human error.
@@ -275,18 +275,20 @@ export function formatVerifyFeedback(
  * repeated to the implementer; anything else (a paraphrase could carry scenario text) yields null.
  */
 function groundedCitation(
-  requirement: "request" | "spec",
   citation: string,
-  request: string,
+  sourceText: string,
+  requirement: "request" | "spec",
   spec: Spec | null,
   holdout: Holdout | undefined,
   publicSources: string,
 ): string | null {
-  const sourceText =
-    requirement === "request" ? request : spec ? requirementSource("spec", request, spec) : "";
   const quote = citedRequirement(citation, sourceText, requirementEntries(requirement, spec));
   if (quote === null || !holdout || redactHoldoutText(quote, holdout, publicSources) !== quote) return null;
   return quote;
+}
+
+function publicSource(requirement: "request" | "spec", request: string, spec: Spec | null): string {
+  return requirement === "request" ? request : spec ? requirementSource("spec", request, spec) : "";
 }
 
 function gateTable(cmp: GateComparison[]): string {
@@ -556,6 +558,6 @@ Holdout scenarios are written by another model and can over-reach. For every unm
 - spec: it violates a stated specification requirement or acceptance criterion;
 - not_required: the scenario's expectation is implied by neither (invented, over-specified, or contradicting how this codebase already works), or it cannot be run as written in this repository.
 If a scenario cannot be run as written in this repository, report it \`unmet\` with requirement \`not_required\`; use \`unclear\` only for a check you ran whose outcome you could not determine.
-For request or spec, set requirementCitation to the violated text quoted exactly from the original request or the specification above, and cite that text in evidence too. Otherwise use an empty requirementCitation. Use requirement null for every entry that is not an unmet H-id.
+For request or spec, set requirementCitation to the violated text quoted exactly from the original request or the specification above, and cite that text in evidence too. A citation must be either at least three consecutive words quoted exactly, or one whole line of the request (a sentence or bullet) or one whole acceptance criterion, exactly as shown; shorter fragments are rejected. Otherwise use an empty requirementCitation. Use requirement null for every entry that is not an unmet H-id.
 overall = "pass" only if every entry is met, apart from unmet holdouts classified not_required.`;
 }

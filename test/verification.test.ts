@@ -437,7 +437,7 @@ test("a citation is grounded only when it is a verbatim quote of the named sourc
   ] as const)
     expect(citedRequirement(citation, text)).toBeNull();
   // A fragment grounds nothing: single words, and text cut from inside words, are rejected.
-  for (const citation of ["works", "e", "the", "mpty lists are accep", "lists are accepte"])
+  for (const citation of ["lists", "e", "the", "mpty lists are accep", "lists are accepte"])
     expect(citedRequirement(citation, source)).toBeNull();
   expect(citedRequirement("make it", requirementSource("request", "make it work", spec))).toBeNull();
   expect(citedRequirement("ake it wor", "make it work")).toBeNull();
@@ -460,7 +460,7 @@ test("a complete short spec entry is grounded; a short partial quote is not", ()
   expect(citedRequirement('"paginated"', source, entries)).toBe("paginated");
   expect(citedRequirement("Idempotent", source, entries)).toBeNull();
   expect(
-    citedRequirement("idempotent retries", "Idempotent retries", requirementEntries("request", shortSpec)),
+    citedRequirement("idempotent", "Idempotent retries", requirementEntries("request", shortSpec)),
   ).toBeNull();
   const issue = (requirementCitation: string, evidence: string) =>
     requirementCitationIssue(
@@ -506,9 +506,55 @@ test("a trivial citation blocks and is never repeated to the implementer", () =>
       "make the thing work",
       "make the thing work",
     );
-    expect(feedback).toContain("(the verifier's citation was not found in it)");
+    // "e" is not a whole word of the request; "the" and "work" are, but too short to ground anything.
+    expect(feedback).toContain(
+      requirementCitation === "e"
+        ? "(the verifier's citation was not found in it)"
+        : "(the verifier's attribution could not be validated)",
+    );
+    expect(feedback).toContain("check them against the original request and specification above");
     expect(feedback).not.toContain(`requirement of the original request: "${requirementCitation}"`);
   }
+});
+
+test("the verifier is told what makes a citation grounded", () => {
+  const prompt = verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" });
+  expect(prompt).toContain(
+    "A citation must be either at least three consecutive words quoted exactly, or one whole line of the request (a sentence or bullet) or one whole acceptance criterion, exactly as shown",
+  );
+});
+
+test("a whole request line or acceptance criterion is grounded however short; a short fragment is not", () => {
+  const request =
+    "Networking changes:\n- Support IPv6\n* Keep IPv4\n> Log it\n1. Retry once\n- Support IPv6 and DNS over TLS";
+  const shortSpec = {
+    ...spec,
+    acceptance_criteria: [{ id: "AC-1", criterion: "Paginated.", how_to_verify: "run" }],
+  };
+  const source = requirementSource("spec", "", shortSpec);
+  const entries = requirementEntries("spec", shortSpec);
+  for (const [citation, line] of [
+    ["Support IPv6", "Support IPv6"],
+    ["- Support IPv6", "Support IPv6"],
+    ['"keep ipv4"', "keep ipv4"],
+    ["Log it", "Log it"],
+    ["1. Retry once", "Retry once"],
+  ] as const)
+    expect(citedRequirement(citation, request)).toBe(line);
+  for (const citation of ["IPv6", "Retry", "Support", "DNS over", "Networking"])
+    expect(citedRequirement(citation, request)).toBeNull();
+  for (const citation of ["**AC-1** Paginated.", "AC-1: Paginated", "- **AC-1** Paginated."])
+    expect(citedRequirement(citation, source, entries)).toBe("Paginated");
+  const verify = unmetHoldout({
+    requirement: "request",
+    requirementCitation: "Support IPv6",
+    evidence: "violates Support IPv6: connecting to ::1 fails",
+  });
+  const normalized = normalizeVerify(VerifySchema.parse(verify), spec, holdout, request);
+  expect(normalized.notes).not.toContain("citation");
+  expect(formatVerifyFeedback(normalized, spec, holdout, request, request)).toContain(
+    'violates this requirement of the original request: "Support IPv6"',
+  );
 });
 
 test.each(["request", "spec"] as const)(

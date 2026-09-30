@@ -320,22 +320,38 @@ function quotedIn(quote: string, text: string): boolean {
   return new RegExp(`${before}${escaped}${after}`, "u").test(flatText(text));
 }
 
+// List and quote markers and an acceptance-criterion label, as the verify prompt renders them.
+const LINE_MARKER = /^(?:(?:[-*>]|\d+[.)])\s+)*(?:\**AC-\d+\**:?\s+)?/i;
+const wholeLine = (s: string) => trimQuote(trimQuote(s).replace(LINE_MARKER, ""));
+
+/** Whether `citation` occurs verbatim in `source` on word boundaries, whatever its length. */
+export function citationInSource(citation: string, source: string): boolean {
+  return quotedIn(trimQuote(citation), source) || citedRequirement(citation, source) !== null;
+}
+
 /**
  * The cited requirement as it will be shown, or null unless it is a verbatim whole-word quote of
  * `source` (ignoring case, spacing, markdown emphasis and surrounding quotes) of at least three
- * words, or one of the complete `entries`. Only verbatim public text is ever repeated to the
- * implementer: a paraphrase could carry scenario text, and a fragment grounds nothing.
+ * words, or a whole line of `source` or one of the complete `entries` (ignoring list markers and
+ * AC labels). Only verbatim public text is ever repeated to the implementer: a paraphrase could
+ * carry scenario text, and a fragment grounds nothing.
  */
 export function citedRequirement(
   citation: string,
   source: string,
   entries: readonly string[] = [],
 ): string | null {
+  const line = wholeLine(citation);
+  const key = flatText(line);
+  if (
+    /[\p{L}\p{N}]/u.test(key) &&
+    [...source.split("\n"), ...entries].some((e) => flatText(wholeLine(e)) === key)
+  )
+    return line;
   const quote = trimQuote(citation);
   if (!quotedIn(quote, source)) return null;
   const words = quote.split(" ").filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
-  const whole = entries.some((e) => flatText(trimQuote(e)) === flatText(quote));
-  return words >= 3 || whole ? quote : null;
+  return words >= 3 ? quote : null;
 }
 
 /** The complete entries of a public source a short citation may quote in full; none for the request. */

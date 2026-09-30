@@ -90,7 +90,9 @@ test("verification artifact renders blocked evidence and legacy statuses", async
     );
     expect(dismissed).toContain("unmet (not required)");
     expect(dismissed.split("unmet (not required)").length - 1).toBe(1);
-    expect(dismissed.split("badge-unmet").length - 1).toBe(2);
+    // Only the blocking row is red; the dismissed row is neutral.
+    expect(dismissed.split("badge-unmet").length - 1).toBe(1);
+    expect(dismissed).toMatch(/badge-dismissed[^>]*>unmet \(not required\)/);
     expect(dismissed).toContain("pill-succeeded");
   } finally {
     rmSync(dir, { recursive: true, force: true });
