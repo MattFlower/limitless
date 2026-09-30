@@ -424,7 +424,8 @@ export async function createPullRequest(
       await sh([...list, "--json", "url", "--jq", ".[0].url"], { cwd: opts.cwd, signal: opts.signal })
     ).stdout.trim();
   // A failed lookup is not proof that no PR exists, so it is retried rather than ignored.
-  const existing = await withGithubRetry("PR lookup", lookup, { signal: opts.signal });
+  const findExisting = () => withGithubRetry("PR lookup", lookup, { signal: opts.signal });
+  const existing = await findExisting();
   if (existing) {
     await withGithubRetry(
       "PR edit",
@@ -464,8 +465,9 @@ export async function createPullRequest(
       if (!url.startsWith("http")) throw new Error(`gh pr create returned unexpected output: ${res.stdout}`);
       return url;
     },
-    // A 5xx can hide a created PR; reuse it instead of opening a duplicate.
-    { signal: opts.signal, reconcile: async () => (await lookup()) || undefined },
+    // A 5xx can hide a created PR; reuse it instead of opening a duplicate. The lookup is itself
+    // retried, and once it is exhausted the outcome stays unknown: no further create is issued.
+    { signal: opts.signal, reconcile: async () => (await findExisting()) || undefined },
   );
 }
 
@@ -492,24 +494,28 @@ export async function mergePullRequest(
       },
       {
         signal,
-        // The failed attempt may have merged or queued the PR anyway.
+        // The failed attempt may have merged or queued the PR anyway; the lookup is retried so an
+        // unknown outcome leaves the PR open instead of repeating the merge.
         reconcile: async () => {
-          const view = await sh(["gh", "pr", "view", prUrl, "--json", "state,autoMergeRequest"], {
-            cwd,
-            signal,
-          });
+          const view = await withGithubRetry(
+            "PR view",
+            () => sh(["gh", "pr", "view", prUrl, "--json", "state,autoMergeRequest"], { cwd, signal }),
+            { signal },
+          );
           const pr = JSON.parse(view.stdout) as { state?: string; autoMergeRequest?: unknown };
           if (pr.state === "MERGED") return "merged";
           return auto && pr.autoMergeRequest ? "auto" : undefined;
         },
       },
-    ).catch((e) => {
-      // As before a merge that cannot happen leaves the PR open rather than failing the run.
-      if (e instanceof GitHubUnavailableError) return "failed" as const;
-      throw e;
-    });
-  const now = await merge(false);
-  return now === "failed" ? merge(true) : now;
+    );
+  try {
+    const now = await merge(false);
+    return now === "failed" ? await merge(true) : now;
+  } catch (e) {
+    // As before a merge that cannot happen leaves the PR open rather than failing the run.
+    if (e instanceof GitHubUnavailableError) return "failed";
+    throw e;
+  }
 }
 
 /** Same stable top-level representation used in pipeline and eval prompts. */

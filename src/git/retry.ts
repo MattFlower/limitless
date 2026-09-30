@@ -56,8 +56,9 @@ export async function withGithubRetry<T>(
       // Command arguments (e.g. a PR title mentioning "timeout") are not evidence of a failure.
       const evidence = e instanceof CommandError ? `Command failed (${e.status})\n${e.output}` : message;
       if (!isTransient(evidence)) throw e;
-      // A reconcile failure leaves the outcome unknown, which the retry or the final error covers.
-      const settled = reconcile ? await reconcile().catch(() => undefined) : undefined;
+      // A failed reconcile leaves the outcome unknown, so its error propagates rather than
+      // permitting another attempt that could duplicate a success the failure hid.
+      const settled = reconcile ? await reconcile() : undefined;
       if (settled !== undefined) return settled;
       signal?.throwIfAborted();
       const delay = githubRetry.delaysMs[attempt];

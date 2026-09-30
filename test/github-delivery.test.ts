@@ -144,6 +144,29 @@ test("exhausted retries report GitHub unavailable; a failed lookup never leads t
   expect(gh.calls("pr create")).toHaveLength(0);
 });
 
+test("a failed reconciliation lookup is retried before reusing the hidden PR", async () => {
+  const gh = withGh({ create: ["ok502"], list: ["ok", "fail502"] });
+  expect(await pr()).toBe(gh.url);
+  expect(gh.calls("pr create")).toHaveLength(1);
+  expect(gh.calls("pr list")).toHaveLength(3);
+});
+
+test("an unknown reconciliation outcome never leads to a second create", async () => {
+  const gh = withGh({ create: ["ok502"], list: ["ok", "fail502", "fail502", "fail502"] });
+  const error = await pr().catch((e: Error) => e);
+  expect(error).toBeInstanceOf(GitHubUnavailableError);
+  expect((error as Error).message).toStartWith("GitHub unavailable: PR lookup failed after 3 attempts");
+  expect(gh.calls("pr create")).toHaveLength(1);
+  expect(gh.calls("pr list")).toHaveLength(4);
+});
+
+test("merge with an unknown outcome is left open rather than merged again", async () => {
+  const gh = withGh({ merge: ["ok502"], view: ["fail502", "fail502", "fail502"] });
+  expect(await mergePullRequest(gh.url, work, "T")).toBe("failed");
+  expect(gh.calls("pr merge")).toHaveLength(1);
+  expect(gh.calls("pr view")).toHaveLength(3);
+});
+
 test("PR edit failures are retried, not treated as success", async () => {
   writeFileSync(join(dir, "gh-pr"), "https://github.com/test/repo/pull/1");
   const gh = withGh({ edit: ["fail502"] });
@@ -175,7 +198,9 @@ test("merge retries transient failures and leaves the PR open once exhausted", a
   rmSync(join(dir, "gh-merged"));
   gh = withGh({ merge: Array(6).fill("fail502") });
   expect(await mergePullRequest(gh.url, work)).toBe("failed");
-  expect(gh.calls("pr merge")).toHaveLength(6);
+  // GitHub being unavailable is not branch protection, so no auto-merge attempt follows.
+  expect(gh.calls("pr merge")).toHaveLength(3);
+  expect(gh.calls("pr merge").some((c) => c.includes("--auto"))).toBe(false);
 });
 
 test("cancelling during backoff stops further GitHub calls", async () => {
