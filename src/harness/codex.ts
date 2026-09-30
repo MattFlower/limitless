@@ -266,15 +266,15 @@ const START_FAILED: ConfinementFailure = "codex sandbox failed to start";
 
 /**
  * Where to put a canary for each distinct root in `deny` (the production profile's private roots):
- * aliases are merged, a root holding another is covered by the inner one's canary, and roots we
- * cannot write to (e.g. /Volumes) cannot hold one. Home's canary goes in the factory's home.
+ * only aliases of one directory are merged. A root holding another (TMPDIR under /tmp) still needs
+ * its own canary, since denying the inner one says nothing about sibling scratch directories.
+ * Roots we cannot write to (e.g. /Volumes) cannot hold one. Home's canary goes in the factory's home.
  */
 export function canaryRoots(deny: string[]): string[] {
   const roots = [...new Set(deny.filter((path) => existsSync(path)).map((path) => realpathSync(path)))];
   const home = realpathSync(homedir());
   const factory = join(home, ".limitless");
   return roots
-    .filter((root) => !roots.some((other) => other.startsWith(`${root}/`)))
     .filter((root) => {
       try {
         accessSync(root, constants.W_OK);
@@ -286,15 +286,25 @@ export function canaryRoots(deny: string[]): string[] {
     .map((root) => (root === home && existsSync(factory) ? factory : root));
 }
 
-/** `stderr` reports a permission denial for exactly `file`, not a file sharing its prefix. */
+/** The permission error ending a `cat: <file>: <error>` diagnostic; only the wording is case-free. */
+const PERMISSION_ERROR = /:\s*(?:operation not permitted|permission denied|EACCES|EPERM)\b[^:]*$/i;
+/**
+ * `stderr` reports a permission denial for exactly `file`: the diagnostic's whole filename field,
+ * after an optional `cat:` prefix and quotes, must equal it byte for byte. A field naming another
+ * path, even one containing `file`, or a differently cased spelling is not an answer.
+ */
 function deniedRead(stderr: string, file: string): boolean {
   if (MISSING.test(stderr)) return false;
-  const path = file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const exact = new RegExp(
-    `(?:^|[\\s'"])${path}['"]?:\\s*(?:operation not permitted|permission denied|EACCES|EPERM)\\b`,
-    "i",
-  );
-  return stderr.split("\n").some((line) => exact.test(line));
+  return stderr.split("\n").some((line) => {
+    const error = PERMISSION_ERROR.exec(line);
+    if (!error) return false;
+    const field = line
+      .slice(0, error.index)
+      .trim()
+      .replace(/^\S*cat:\s*/, "")
+      .replace(/^(['"])(.*)\1$/, "$2");
+    return field === file;
+  });
 }
 
 export interface ReaderProbeOptions {

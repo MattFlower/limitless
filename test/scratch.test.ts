@@ -345,18 +345,19 @@ interface SandboxRead {
 /**
  * A fake Codex CLI: `--version`, `sandbox` reads answered by `sandbox`, and a completing `exec`.
  * Its private roots are distinct directories standing in for /tmp, the system TMPDIR, home and
- * /var/tmp, whatever the host's layout.
+ * /var/tmp, whatever the host's layout; `nestedTmpdir` puts TMPDIR under /tmp, as `TMPDIR=/tmp/x`
+ * does, and hands the roots to the production selector.
  */
-function fakeCodex(sandbox: Sandbox = enforcing, options: ReaderProbeOptions = {}) {
+function fakeCodex(sandbox: Sandbox = enforcing, options: ReaderProbeOptions = {}, nestedTmpdir = false) {
   const parent = realpathSync(mkdtempSync(join(tmpdir(), "probe-roots-")));
   cleanups.push(() => rmSync(parent, { recursive: true, force: true }));
   const roots = {
     tmp: join(parent, "slash-tmp"),
-    TMPDIR: join(parent, "var-folders"),
+    TMPDIR: join(parent, nestedTmpdir ? "slash-tmp/var-folders" : "var-folders"),
     home: join(parent, "home"),
     varTmp: join(parent, "var-tmp"),
   };
-  for (const dir of Object.values(roots)) mkdirSync(dir);
+  for (const dir of Object.values(roots)) mkdirSync(dir, { recursive: true });
   const cli = {
     path: CODEX as string | null,
     version: "codex-cli 0.157.1",
@@ -395,7 +396,10 @@ function fakeCodex(sandbox: Sandbox = enforcing, options: ReaderProbeOptions = {
     opts.onStdoutLine?.('{"type":"turn.completed","usage":{}}');
     return procResult;
   };
-  const probe = new CodexReaderProbe(() => cli.path, { canaryRoots: () => Object.values(roots), ...options });
+  const probe = new CodexReaderProbe(() => cli.path, {
+    canaryRoots: () => (nestedTmpdir ? canaryRoots(Object.values(roots)) : Object.values(roots)),
+    ...options,
+  });
   /** Probe attempts that ran to the cwd control, i.e. complete ones. */
   const probes = () => sandboxReads.filter((r) => r.file.startsWith(`${r.cwd}/`)).length;
   return { cli, calls, execs, sandboxReads, roots, runner, probe, probes };
@@ -502,6 +506,17 @@ for (const [name, sandbox, reason] of [
   [
     "denial of a prefixed filename",
     (f: string, o: ProcOptions) => (inRoot(o.cwd, f) ? reads(f) : denies(`/x${f}`)),
+    "probe inconclusive",
+  ],
+  [
+    "denial naming a directory that contains the canary",
+    (f: string, o: ProcOptions) => (inRoot(o.cwd, f) ? reads(f) : denies(`/unrelated directory ${f}`)),
+    "probe inconclusive",
+  ],
+  [
+    "denial of a differently cased canary",
+    (f: string, o: ProcOptions) =>
+      inRoot(o.cwd, f) ? reads(f) : denies(f.replace(/canary\.txt$/, "CANARY.TXT")),
     "probe inconclusive",
   ],
   [
@@ -641,7 +656,8 @@ test("canaries cover each distinct writable private root the production profile 
   symlinkSync(join(parent, "outer/inner"), join(parent, "alias"));
   chmodSync(join(parent, "locked"), 0o555);
   const deny = ["outer", "outer/inner", "alias", "locked", "missing", "other"].map((d) => join(parent, d));
-  expect(canaryRoots(deny)).toEqual([join(parent, "outer/inner"), join(parent, "other")]);
+  // Aliases merge; a root nested in another is a distinct class and keeps its own canary.
+  expect(canaryRoots(deny)).toEqual(["outer", "outer/inner", "other"].map((d) => join(parent, d)));
 
   // The probe derives its canaries from the same deny list the real invocation gets.
   const { spec, cleanup } = confinedFixture();
@@ -660,6 +676,52 @@ test("canaries cover each distinct writable private root the production profile 
     cleanup();
   }
 });
+
+test("a TMPDIR nested under /tmp keeps a /tmp canary outside it", async () => {
+  const { spec, cleanup } = confinedFixture();
+  // Denies TMPDIR, home and /var/tmp, but allows the rest of /tmp, where other readers' scratch lives.
+  const partial = fakeCodex(
+    (f, o) => (f.includes("/slash-tmp/") && !f.includes("/var-folders/") ? reads(f) : enforcing(f, o)),
+    {},
+    true,
+  );
+  const full = fakeCodex(enforcing, {}, true);
+  try {
+    expect(canaryRoots(Object.values(partial.roots))).toEqual(Object.values(partial.roots));
+    const result = await runCodex(spec, partial.runner, partial.probe);
+    expect(result.confinement).toMatchObject({ ok: false, reason: "reader profile not enforced" });
+    expect(partial.execs).toHaveLength(0);
+    const outer = partial.sandboxReads.filter(
+      (r) => inRoot(partial.roots.tmp, r.file) && !inRoot(partial.roots.TMPDIR, r.file),
+    );
+    expect(outer).toHaveLength(1);
+
+    expect((await runCodex(spec, full.runner, full.probe)).status).toBe("ok");
+    expect(full.sandboxReads).toHaveLength(5);
+    for (const root of Object.values(full.roots))
+      expect(full.sandboxReads.filter((r) => dirname(dirname(r.file)) === root)).toHaveLength(1);
+  } finally {
+    cleanup();
+  }
+});
+
+for (const [name, shape] of [
+  ["cat", (f: string) => `cat: ${f}: Permission denied`],
+  ["full program path and quotes", (f: string) => `/bin/cat: '${f}': Operation not permitted`],
+  ["errno with a trailing note", (f: string) => `${f}: EACCES (os error 13)`],
+] as const)
+  test(`a denial diagnostic naming the canary exactly counts: ${name}`, async () => {
+    const { spec, cleanup } = confinedFixture();
+    const fake = fakeCodex((f, o) =>
+      inRoot(o.cwd, f) ? reads(f) : { exitCode: 1, stderr: `${shape(f)}\n` },
+    );
+    try {
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+      expect(fake.execs).toHaveLength(1);
+    } finally {
+      cleanup();
+    }
+  });
 
 test("a missing CLI fails closed without output", async () => {
   const { spec, cleanup } = confinedFixture();
