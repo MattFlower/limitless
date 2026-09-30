@@ -153,9 +153,8 @@ caches (cloning/fetching when needed). Triage reads the pinned tree listing; rev
 trials in a fixed order, running up to `max(1, min(concurrency, provider maxConcurrent − 1))` at once
 (`--concurrency N`, default 2, recorded on the run; runs from before the option omit it and report
 `concurrency=1 (legacy)`). All eval runs in the daemon also share one cap per provider,
-`max(1, min(largest concurrency among running evals, maxConcurrent − 1))`, so production runs keep
-a slot on providers with `maxConcurrent` of 2 or more; a provider with `maxConcurrent = 1` still
-allows one eval call, which can take its only slot. Provider groups may overlap, and every call
+`max(1, min(largest concurrency among running evals, maxConcurrent − 1))`, so evals never take a
+provider's last slot and production runs keep headroom. Provider groups may overlap, and every call
 takes its run's slot, then the shared eval slot, then a slot from the provider tracker. The caps
 apply to the provider each call actually uses, including every panel finder and verifier call and
 switched implement retry rounds. Trials that share a cache key wait for
