@@ -58,6 +58,7 @@ export function fakeHarness(handler: (spec: AgentSpec) => FakeReply | Promise<Fa
         status: reply.fault === "timeout" ? "timeout" : "error",
         error: reply.error ?? (reply.fault === "kill" ? HARNESS_KILLED : `harness ${reply.fault}`),
       });
+    // A reply the "agent" returned itself accounts its usage; a fault or cancellation above never does.
     return baseResult({
       status: reply.status ?? "ok",
       numTurns: 1,
@@ -69,6 +70,7 @@ export function fakeHarness(handler: (spec: AgentSpec) => FakeReply | Promise<Fa
       costEquivUsd: reply.costEquivUsd ?? 0.001,
       usage: reply.usage ?? { input: 100, output: 50, cacheRead: 0, cacheWrite: 0 },
       quota: reply.quota ?? null,
+      usageFinal: true,
     });
   };
 }

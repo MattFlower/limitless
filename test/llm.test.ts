@@ -79,6 +79,7 @@ test("direct completion sends model, schema, system and bearer token; captures u
   expect(result.status).toBe("ok");
   expect(result.structured).toEqual({ answer: "ok" });
   expect(result.usage.input).toBe(12);
+  expect(result.usageFinal).toBe(true);
   expect(requests[0]?.model).toBe("selected-model");
   expect(authorizations[0]).toBe("Bearer local-token");
   expect(requests[0]?.response_format).toEqual({
@@ -122,6 +123,8 @@ test("invalid response is retried once and never accepted", async () => {
   expect(result.status).toBe("error");
   expect(result.structured).toBeNull();
   expect(requests).toHaveLength(2);
+  // Both answers were parsed, so the usage they reported is the whole spend.
+  expect(result.usageFinal).toBe(true);
 });
 
 test("cancel, timeout, transport and provider errors are classified", async () => {
@@ -129,17 +132,18 @@ test("cancel, timeout, transport and provider errors are classified", async () =
     await Bun.sleep(100);
     return Response.json({ choices: [{ message: { content: "{}" } }] });
   };
-  expect((await runLlm(spec(undefined, 10))).status).toBe("timeout");
+  // Only a refusal (no work done) is accounted; a cut-off, failed or unreachable server is not.
+  expect(await runLlm(spec(undefined, 10))).toMatchObject({ status: "timeout", usageFinal: false });
   const controller = new AbortController();
   controller.abort();
-  expect((await runLlm(spec(controller.signal))).status).toBe("cancelled");
+  expect(await runLlm(spec(controller.signal))).toMatchObject({ status: "cancelled", usageFinal: false });
   reply = () => new Response("busy", { status: 503 });
-  expect((await runLlm(spec())).status).toBe("unavailable");
+  expect(await runLlm(spec())).toMatchObject({ status: "unavailable", usageFinal: false });
   reply = () => new Response("limited", { status: 429 });
-  expect((await runLlm(spec())).status).toBe("quota");
+  expect(await runLlm(spec())).toMatchObject({ status: "quota", usageFinal: true });
   const bad = spec();
   bad.target.openai = { baseUrl: "http://127.0.0.1:1/v1", authToken: "" };
-  expect((await runLlm(bad)).status).toBe("unavailable");
+  expect(await runLlm(bad)).toMatchObject({ status: "unavailable", usageFinal: false });
 });
 
 test("normal invocation records failed HTTP candidate and falls back", async () => {

@@ -327,6 +327,8 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
       Object.keys(parser.windows).length || parser.quotaRejectedUntil
         ? { windows: parser.windows, exhaustedUntil: parser.quotaRejectedUntil }
         : null,
+    // Usage arrives only with the result event; a process killed early never accounted its last request.
+    usageFinal: parser.gotResult && !proc.cancelled && !proc.timedOut && !proc.idleTimedOut,
   };
 
   if (proc.cancelled && stuckReason) return { ...base, status: "stuck", error: stuckReason };

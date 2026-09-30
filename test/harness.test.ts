@@ -13,6 +13,7 @@ import {
   redactJsonLine,
 } from "../src/harness/types.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
+import type { ProcOptions, ProcResult } from "../src/util/proc.ts";
 
 const fixture = (name: string) =>
   readFileSync(join(import.meta.dir, "fixtures", name), "utf8")
@@ -290,6 +291,112 @@ test("a no-tools Claude call returning StructuredOutput is not stopped by a zero
     expect(res.structured).toEqual({ ok: true });
   } finally {
     process.env.PATH = oldPath;
+  }
+});
+
+test("CLI adapters mark usage final only for an accounted completion, whatever was already spent", async () => {
+  const { runClaude } = await import("../src/harness/claude.ts");
+  const { runCodex } = await import("../src/harness/codex.ts");
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(join(tmpdir(), "limitless-usage-final-"));
+  const spec = (harness: "claude" | "codex"): AgentSpec => ({
+    cwd: dir,
+    prompt: "x",
+    mode: "readonly",
+    noTools: true,
+    target: {
+      modelId: `${harness}/m`,
+      provider: harness,
+      harness,
+      model: "m",
+      vendor: harness === "claude" ? "anthropic" : "openai",
+      tier: 4,
+      billing: "metered",
+      price: { input: 1, output: 1 },
+    },
+    timeoutMs: 10_000,
+    idleTimeoutMs: 10_000,
+    maxToolCalls: 0,
+    signal: new AbortController().signal,
+    logPath: join(dir, "log"),
+    onEvent: () => {},
+  });
+  // Replays a stream, then ends the way a real process would: cleanly, killed, or timed out.
+  const process =
+    (lines: object[], over: Partial<ProcResult> = {}) =>
+    (opts: ProcOptions): Promise<ProcResult> => {
+      for (const line of lines) opts.onStdoutLine?.(JSON.stringify(line));
+      return Promise.resolve({
+        exitCode: 0,
+        signal: null,
+        cancelled: false,
+        timedOut: false,
+        idleTimedOut: false,
+        stdout: "",
+        stderr: "",
+        truncated: false,
+        durationMs: 1,
+        ...over,
+      });
+    };
+  const claudeResult = (is_error: boolean) => ({
+    type: "result",
+    subtype: is_error ? "error" : "success",
+    is_error,
+    session_id: "s1",
+    num_turns: 2,
+    total_cost_usd: 0.5,
+    usage: { input_tokens: 1000, output_tokens: 100 },
+    result: is_error ? "something failed" : "done",
+  });
+  const codexTurn = [
+    { type: "thread.started", thread_id: "t1" },
+    { type: "turn.started" },
+    { type: "turn.completed", usage: { input_tokens: 1000, output_tokens: 100 } },
+  ];
+  try {
+    // A result event, even an error one, is Claude's final accounting.
+    expect(await runClaude(spec("claude"), process([claudeResult(false)]))).toMatchObject({
+      status: "ok",
+      usageFinal: true,
+    });
+    const failed = await runClaude(spec("claude"), process([claudeResult(true)], { exitCode: 1 }));
+    expect(failed).toMatchObject({ status: "error", usageFinal: true, usage: { input: 1000 } });
+    // Killed with no result, or timed out after one: the usage reported is not the last word.
+    expect(await runClaude(spec("claude"), process([], { exitCode: null, signal: "SIGKILL" }))).toMatchObject(
+      {
+        status: "error",
+        usageFinal: false,
+      },
+    );
+    const late = await runClaude(spec("claude"), process([claudeResult(false)], { timedOut: true }));
+    expect(late).toMatchObject({ status: "timeout", usageFinal: false, usage: { input: 1000 } });
+    expect(late.costUsd).toBeGreaterThan(0);
+
+    expect(await runCodex(spec("codex"), process(codexTurn))).toMatchObject({
+      status: "ok",
+      usageFinal: true,
+      usage: { input: 1000, output: 100 },
+    });
+    // A completed turn's usage survives a later kill, but the call is no longer accounted.
+    const killed = await runCodex(spec("codex"), process(codexTurn, { cancelled: true }));
+    expect(killed).toMatchObject({ status: "cancelled", usageFinal: false, usage: { input: 1000 } });
+    expect(killed.costUsd).toBeGreaterThan(0);
+    expect(
+      await runCodex(
+        spec("codex"),
+        process([...codexTurn.slice(0, 2), { type: "turn.failed", error: { message: "boom" } }], {
+          exitCode: 1,
+        }),
+      ),
+    ).toMatchObject({ status: "error", usageFinal: false });
+    expect(await runCodex(spec("codex"), process(codexTurn.slice(0, 2), { exitCode: null }))).toMatchObject({
+      status: "error",
+      usageFinal: false,
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

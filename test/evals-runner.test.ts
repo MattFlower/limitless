@@ -1154,6 +1154,68 @@ test.each(["throw", "timeout", "kill"] as const)(
   },
 );
 
+const partial = {
+  costUsd: 0.1,
+  costEquivUsd: 0.2,
+  usage: { input: 20, output: 5, cacheRead: 0, cacheWrite: 0 },
+};
+test.each([
+  // A killed process reports the turns it finished; its last request is unaccounted, so paid calls stop.
+  ["kill", { fault: "kill", ...partial } satisfies FakeReply, 1, "budget_exhausted", true],
+  ["timeout", { fault: "timeout", ...partial } satisfies FakeReply, 1, "budget_exhausted", true],
+  // An error the agent returned itself accounts its usage, so the resumed run carries on.
+  [
+    "returned error",
+    { status: "error", error: "bad answer", ...partial } satisfies FakeReply,
+    3,
+    "completed",
+    false,
+  ],
+] as const)(
+  "partial usage from a resumed call (%s) is kept but only an accounted result lets paid calls continue",
+  async (_name, reply, calls, status, unknown) => {
+    const f = await evalFixture();
+    try {
+      const stalled = stallAcquire(f, 0);
+      const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 1, maxUsd: 5 });
+      await stalled;
+      f.crash();
+      f.respond((s) => (/Fix a\b/.test(s.prompt) ? reply : { structured: answer, costUsd: 0.1 }));
+      f.factory.start();
+      await f.factory.evals.wait(run.id);
+      expect(f.calls).toHaveLength(calls);
+      const report = f.factory.evals.report(run.id);
+      expect(report?.run.status).toBe(status);
+      const [a, b, c] = report?.trials ?? [];
+      // The spend the call did report is recorded either way.
+      expect(a).toMatchObject({
+        status: "error",
+        costUsd: 0.1,
+        costEquivUsd: 0.2,
+        tokensIn: 20,
+        tokensOut: 5,
+      });
+      expect(a?.details.usageUnknown).toBe(unknown ? true : undefined);
+      expect(f.factory.store.evalCallAttempts(run.id)[0]).toMatchObject({
+        resolved: true,
+        costUsd: 0.1,
+        usageUnknown: unknown,
+      });
+      if (unknown) {
+        expect(report?.run.error).toContain("final spend is unknown");
+        for (const t of [b, c])
+          expect(t).toMatchObject({ status: "skipped", details: { reason: report?.run.error } });
+        expect(f.factory.store.evalSpend(run.id)).toBeCloseTo(0.1);
+      } else {
+        expect([b?.status, c?.status]).toEqual(["ok", "ok"]);
+        expect(f.factory.store.evalSpend(run.id)).toBeCloseTo(0.3);
+      }
+    } finally {
+      await f.close();
+    }
+  },
+);
+
 test("a timeout that reported no usage before a crash counts as unknown spend on recovery", async () => {
   const f = await evalFixture();
   try {

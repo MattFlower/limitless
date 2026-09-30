@@ -22,5 +22,7 @@ export function parseFakeStream(stream: StreamFault, emit: (event: AgentEvent) =
     costUsd: 0,
     costEquivUsd: 0,
     quota: null,
+    // The same completion markers the CLI adapters use: a Claude result event, a completed Codex turn.
+    usageFinal: parser instanceof ClaudeStreamParser ? parser.gotResult : parser.completed && !parser.failed,
   };
 }

@@ -380,6 +380,8 @@ export async function runCodex(spec: AgentSpec, processRunner = runProcess): Pro
     costUsd: t.billing === "metered" ? equiv : 0,
     costEquivUsd: equiv,
     quota: windows ? { windows, exhaustedUntil: null } : null,
+    // Only a completed turn accounts its requests; a failed or killed turn may have spent unseen.
+    usageFinal: parser.completed && !parser.failed && !proc.cancelled && !proc.timedOut && !proc.idleTimedOut,
   };
 
   if (proc.cancelled && stuckReason) return { ...base, status: "stuck", error: stuckReason };

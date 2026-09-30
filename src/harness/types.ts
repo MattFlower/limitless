@@ -99,6 +99,13 @@ export interface AgentResult {
   modelCooldownMs?: number;
   /** With status "declined": why, and whether the answer may still serve as a last resort. */
   decline?: DecisionDecline;
+  /**
+   * True only when the backend reported this call's final accounting (a Claude result event, a
+   * completed Codex turn, a parsed HTTP response) or the request was refused before any work.
+   * Otherwise `usage` and the costs may omit a request that was in flight when the call ended,
+   * however much they already report; spend that must be bounded treats such a call as unknown.
+   */
+  usageFinal?: boolean;
 }
 
 export type Harness = (spec: AgentSpec) => Promise<AgentResult>;

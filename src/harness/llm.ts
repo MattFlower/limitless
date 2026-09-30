@@ -9,11 +9,13 @@ import {
   type Usage,
 } from "./types.ts";
 
+/** `usageFinal`: every request sent was accounted (parsed with usage) or refused before any work. */
 function failure(
   status: AgentResult["status"],
   error: string,
   usage: Usage,
   target: ModelTarget,
+  usageFinal = false,
 ): AgentResult {
   const cost = priceOf(usage, target.price);
   return {
@@ -27,6 +29,7 @@ function failure(
     costUsd: target.billing === "metered" ? cost : 0,
     costEquivUsd: cost,
     quota: null,
+    usageFinal,
   };
 }
 
@@ -72,13 +75,15 @@ export const runLlm: Harness = async (spec) => {
   };
   log({ event: "start", provider: spec.target.provider, model: spec.target.model });
   if (!endpoint || !spec.jsonSchema || !spec.schema)
-    return finish(failure("error", "HTTP completion requires an endpoint and a schema", usage, spec.target));
+    return finish(
+      failure("error", "HTTP completion requires an endpoint and a schema", usage, spec.target, true),
+    );
 
   let reasoning: Record<string, unknown>;
   try {
     reasoning = effortFields(spec.target);
   } catch (error) {
-    return finish(failure("error", String(error), usage, spec.target));
+    return finish(failure("error", String(error), usage, spec.target, true));
   }
   const timeout = AbortSignal.timeout(spec.timeoutMs);
   const signal = AbortSignal.any([spec.signal, timeout]);
@@ -124,7 +129,16 @@ export const runLlm: Harness = async (spec) => {
           continue;
         }
         const status = response.status === 429 ? "quota" : response.status >= 500 ? "unavailable" : "error";
-        return finish(failure(status, `completion rejected (HTTP ${response.status})`, usage, spec.target));
+        // A refused request spent nothing, but a server failure may have generated before it failed.
+        return finish(
+          failure(
+            status,
+            `completion rejected (HTTP ${response.status})`,
+            usage,
+            spec.target,
+            response.status < 500,
+          ),
+        );
       }
       let data: unknown;
       try {
@@ -162,6 +176,7 @@ export const runLlm: Harness = async (spec) => {
           costUsd: spec.target.billing === "metered" ? cost : 0,
           costEquivUsd: cost,
           quota: null,
+          usageFinal: true,
         });
       }
       lastError = "completion failed schema validation";
@@ -176,5 +191,6 @@ export const runLlm: Harness = async (spec) => {
       return finish(failure("unavailable", "completion transport failure", usage, spec.target));
     }
   }
-  return finish(failure("error", lastError, usage, spec.target));
+  // Both attempts returned parsed responses (or a refusal), so their usage is complete.
+  return finish(failure("error", lastError, usage, spec.target, true));
 };

@@ -141,13 +141,17 @@ export const runDecisions: Harness = async (spec) => {
       costUsd: spec.target.billing === "metered" ? cost : 0,
       costEquivUsd: cost,
       quota: null,
+      usageFinal: false,
       ...extra,
     };
     log({ event: "complete", status, inputTokens: usage.input, costUsd: result.costUsd });
     return result;
   };
+  // A request the server refused, or one never sent, spent nothing; a parsed response reports its usage.
+  const settled = { usageFinal: true };
   log({ event: "start", provider: spec.target.provider, model: spec.target.model });
-  if (!endpoint || !task) return finish("error", "decision call requires a decisions endpoint and task");
+  if (!endpoint || !task)
+    return finish("error", "decision call requires a decisions endpoint and task", settled);
 
   const deadline = AbortSignal.timeout(spec.timeoutMs);
   const state = typeof task.state === "function" ? task.state() : task.state;
@@ -180,7 +184,7 @@ export const runDecisions: Harness = async (spec) => {
     if (!response.ok) {
       const code = response.status;
       // Key errors keep no server text (it could echo the key); other bodies are untrusted, so redact it.
-      if (code === 401 || code === 403) return finish("quota", `API key rejected (HTTP ${code})`);
+      if (code === 401 || code === 403) return finish("quota", `API key rejected (HTTP ${code})`, settled);
       const text = await response.text().catch(() => "");
       const detail = errorDetail(
         endpoint.authToken ? text.replaceAll(endpoint.authToken, "[redacted]") : text,
@@ -191,10 +195,11 @@ export const runDecisions: Harness = async (spec) => {
       }
       if (code === 429)
         return finish("quota", `model rate-limited (HTTP 429)${detail}`, {
+          ...settled,
           modelCooldownMs: cooldownMs(response.headers),
         });
-      if (code === 402) return finish("quota", `provider out of credit (HTTP 402)${detail}`);
-      return finish("error", `decision request rejected (HTTP ${code})${detail}`);
+      if (code === 402) return finish("quota", `provider out of credit (HTTP 402)${detail}`, settled);
+      return finish("error", `decision request rejected (HTTP ${code})${detail}`, settled);
     }
     let parsed: ReturnType<typeof ResponseSchema.safeParse>;
     try {
@@ -212,7 +217,8 @@ export const runDecisions: Harness = async (spec) => {
     usage.input = parsed.data.usage.input_tokens;
     usage.output = parsed.data.usage.output_tokens;
     const answers = mapAnswers(task, parsed.data.answers);
-    if (typeof answers === "string") return finish("unavailable", `malformed decisions response: ${answers}`);
+    if (typeof answers === "string")
+      return finish("unavailable", `malformed decisions response: ${answers}`, settled);
     log({ event: "answers", model: parsed.data.model, answers });
     spec.onEvent({ type: "status", text: `${parsed.data.model}: ${describe(answers)}` });
     try {
@@ -220,12 +226,13 @@ export const runDecisions: Harness = async (spec) => {
       const structured = task.interpret(answers);
       const decline = task.decline?.(answers) ?? null;
       return finish(decline ? "declined" : "ok", decline?.reason ?? null, {
+        ...settled,
         structured,
         finalText: JSON.stringify(answers),
         ...(decline ? { decline } : {}),
       });
     } catch (error) {
-      return finish("error", `decision mapping failed: ${(error as Error).message}`);
+      return finish("error", `decision mapping failed: ${(error as Error).message}`, settled);
     }
   }
   if (spec.signal.aborted) return finish("cancelled", "decision call cancelled");

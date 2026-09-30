@@ -107,6 +107,7 @@ test("sends typed questions with a bearer key, maps answers, and records usage a
   expect(result.usage).toMatchObject({ input: 1_000_000, output: 40 });
   expect(result.costUsd).toBeCloseTo(0.042, 9);
   expect(result.costEquivUsd).toBeCloseTo(0.042, 9);
+  expect(result.usageFinal).toBe(true);
   expect(events).toContainEqual({
     type: "status",
     text: "jev-1.13.0: kind=bug (0.91), size=2 (0.70), urgent P=0.20",
@@ -129,6 +130,8 @@ test("retries one transient failure, then reports the provider unavailable", asy
   expect(failed).toMatchObject({
     status: "unavailable",
     error: "decision service unavailable (HTTP 503): boom for [redacted]",
+    // A server failure may have spent before it failed; nothing accounted it.
+    usageFinal: false,
   });
 
   // A body that stalls past the deadline is a timeout, not a malformed response.
@@ -145,6 +148,7 @@ test("retries one transient failure, then reports the provider unavailable", asy
   expect(await runDecisions(spec({ timeoutMs: 200 }))).toMatchObject({
     status: "timeout",
     error: "decision call timed out",
+    usageFinal: false,
   });
 });
 
@@ -185,22 +189,25 @@ test("classifies credit, key, rate-limit and request errors", async () => {
     reply = () => response;
     const result = await runDecisions(spec());
     expect(requests).toHaveLength(1);
-    expect(result).toMatchObject({ status, error, costUsd: 0 });
+    // A refused request did no work, so its zero spend is final.
+    expect(result).toMatchObject({ status, error, costUsd: 0, usageFinal: true });
     expect(result.modelCooldownMs).toBe(cooldown);
   }
 });
 
 test("malformed answers, missing tasks, mapping errors, cancellation and timeouts", async () => {
-  const outcomes: [() => Response, Partial<AgentSpec>, string, string][] = [
+  // Usage is final once a response was parsed (mapping failures included) or the call was never sent.
+  const outcomes: [() => Response, Partial<AgentSpec>, string, string, boolean][] = [
     [
       () => ok({ ...answers, kind: { ...answers.kind, choice: "other" } }),
       {},
       "unavailable",
       "unknown option for kind",
+      true,
     ],
-    [() => ok({ kind: answers.kind, size: answers.size }), {}, "unavailable", "answer for urgent"],
-    [() => new Response("not json"), {}, "unavailable", "malformed decisions response"],
-    [() => ok(answers), { decisionTask: undefined }, "error", "requires a decisions endpoint and task"],
+    [() => ok({ kind: answers.kind, size: answers.size }), {}, "unavailable", "answer for urgent", true],
+    [() => new Response("not json"), {}, "unavailable", "malformed decisions response", false],
+    [() => ok(answers), { decisionTask: undefined }, "error", "requires a decisions endpoint and task", true],
     [
       () => ok(answers),
       {
@@ -213,14 +220,16 @@ test("malformed answers, missing tasks, mapping errors, cancellation and timeout
       },
       "error",
       "decision mapping failed: bad level",
+      true,
     ],
-    [() => ok(answers), { signal: AbortSignal.abort() }, "cancelled", "cancelled"],
+    [() => ok(answers), { signal: AbortSignal.abort() }, "cancelled", "cancelled", false],
   ];
-  for (const [response, over, status, error] of outcomes) {
+  for (const [response, over, status, error, usageFinal] of outcomes) {
     reply = response;
     const result = await runDecisions(spec(over));
     expect(result.status).toBe(status as typeof result.status);
     expect(result.error).toContain(error);
+    expect(result.usageFinal).toBe(usageFinal);
   }
   reply = async () => {
     await Bun.sleep(1_000);
@@ -229,6 +238,7 @@ test("malformed answers, missing tasks, mapping errors, cancellation and timeout
   expect(await runDecisions(spec({ timeoutMs: 100 }))).toMatchObject({
     status: "timeout",
     error: "decision call timed out",
+    usageFinal: false,
   });
 });
 

@@ -74,16 +74,12 @@ interface RunInputs {
 }
 
 /**
- * Whether a returned call reported its final spend. Only a final answer, or an error or quota
- * result that carries usage, does; a timeout, kill or transport failure may have spent unseen.
+ * Whether a returned call reported its final spend: only when its adapter saw the backend's final
+ * accounting. Usage a killed, timed-out or failed call reports may cover only its earlier requests,
+ * so its status or a positive cost never establishes finality; the spend it did report is still kept.
  */
 export function finalUsageKnown(result: AgentResult): boolean {
-  if (result.status === "ok" || result.status === "declined") return true;
-  const reported =
-    result.costUsd > 0 ||
-    result.costEquivUsd > 0 ||
-    result.usage.input + result.usage.output + result.usage.cacheRead + result.usage.cacheWrite > 0;
-  return reported && (result.status === "error" || result.status === "quota");
+  return result.usageFinal === true;
 }
 
 export class EvalRunner {
