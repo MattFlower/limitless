@@ -44,6 +44,8 @@ export interface Config {
   maxConcurrentGates: number;
   /** `[gates] baseline_cache`: reuse passing baselines per base commit. Off, every baseline runs (and refreshes). */
   baselineCache: boolean;
+  /** `[gates] baseline_env`: extra variable names whose values (hashed) key the baseline cache. */
+  baselineEnv: string[];
   maxRounds: number; // implement ⇄ feedback rounds before escalation
   openrouterBudgetUsd: number;
   reserves: Reserves;
@@ -197,6 +199,9 @@ export function loadConfig(
   const gates = (raw.gates ?? {}) as Record<string, unknown>;
   if (gates.baseline_cache !== undefined && typeof gates.baseline_cache !== "boolean")
     throw new Error("gates.baseline_cache must be true or false");
+  const baselineEnv = gates.baseline_env ?? [];
+  if (!Array.isArray(baselineEnv) || !baselineEnv.every((v) => typeof v === "string"))
+    throw new Error("gates.baseline_env must be an array of environment variable names");
   const port = overrides.port ?? num(Number(process.env.LIMITLESS_PORT) || server.port, 7400);
   const host = str(server.host, "127.0.0.1") as string;
 
@@ -235,6 +240,7 @@ export function loadConfig(
     providerMaxConcurrent,
     maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
     baselineCache: gates.baseline_cache !== false,
+    baselineEnv,
     maxRounds: num(limits.max_rounds, 3),
     openrouterBudgetUsd: num(limits.openrouter_budget_usd, 50),
     reserves: {

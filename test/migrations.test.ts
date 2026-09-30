@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MIGRATION_DIR, migrationNames, runMigrations } from "../src/db/migration-runner.ts";
@@ -213,5 +213,24 @@ test("recovery checkpoints upgrade older state JSON without changing its evidenc
     const reopened = new Store(path);
     expect(reopened.getRunState<unknown>("2")).toEqual(states[2]);
     reopened.close();
+  });
+});
+
+test("a database from before passing_baselines upgrades without touching the shipped baseline_cache migration", () => {
+  temporary((directory, path) => {
+    const previous = join(directory, "previous");
+    mkdirSync(previous);
+    for (const name of migrationNames(MIGRATION_DIR).filter((n) => n < "20260930T2157"))
+      copyFileSync(join(MIGRATION_DIR, name), join(previous, name));
+    new Store(path, previous).close();
+    const store = new Store(path, MIGRATION_DIR);
+    expect(fileNames(store.db)).toContain("20260930T2157-passing-baselines.sql");
+    const tables = store.db
+      .query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('baseline_cache', 'passing_baselines')",
+      )
+      .all();
+    expect(tables).toHaveLength(2);
+    store.close();
   });
 });

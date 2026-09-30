@@ -688,7 +688,7 @@ esac
     const lines = (path: string) =>
       existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").length : 0;
     const cacheRows = (f: Factory) =>
-      f.store.db.query("SELECT base_sha, gate_run, run_id, created_at FROM baseline_cache").all() as {
+      f.store.db.query("SELECT base_sha, gate_run, run_id, created_at FROM passing_baselines").all() as {
         base_sha: string;
         gate_run: string;
         run_id: string;
@@ -783,6 +783,36 @@ esac
       const changedBase = await finish(f);
       expect([lines(count), changedBase.state?.baselineCached]).toEqual([6, false]);
       expect(cacheRows(f)).toHaveLength(3);
+    });
+
+    test("a changed gate environment misses", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const saved = { npm: process.env.npm_config_ignore_scripts, flag: process.env.MY_GATE_FLAG };
+      const restore = (k: string, v: string | undefined) => {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      };
+      try {
+        process.env.npm_config_ignore_scripts = "false";
+        process.env.MY_GATE_FLAG = "a";
+        const f = start(quick);
+        await finish(f);
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+        process.env.npm_config_ignore_scripts = "true";
+        expect((await finish(f)).state?.baselineCached).toBe(false);
+        // Undeclared variables don't key the cache; declared ones do.
+        process.env.MY_GATE_FLAG = "b";
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+        f.cfg.baselineEnv = ["MY_GATE_FLAG"];
+        expect((await finish(f)).state?.baselineCached).toBe(false);
+        process.env.MY_GATE_FLAG = "c";
+        expect((await finish(f)).state?.baselineCached).toBe(false);
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+      } finally {
+        restore("npm_config_ignore_scripts", saved.npm);
+        restore("MY_GATE_FLAG", saved.flag);
+      }
     });
 
     test("a timed-out or cancelled baseline is not cached", async () => {

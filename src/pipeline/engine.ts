@@ -368,7 +368,7 @@ async function prepare(ctx: RunContext): Promise<void> {
           platform: process.platform,
           arch: process.arch,
           buildSha: ctx.deps.buildSha ?? "unknown",
-          envDigest: gateEnvDigest(gateEnv()),
+          envDigest: gateEnvDigest(gateEnv(), cfg.baselineEnv),
         });
         // A bypass still runs the baseline and refreshes the entry if it passes.
         const bypass = ctx.run.noBaselineCache === true || !cfg.baselineCache;

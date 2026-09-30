@@ -144,7 +144,7 @@ test("baseline cache entries expire after seven days and each key component miss
   expect([actual.errors, actual.baselineCache]).toEqual([[], 1]);
   expect(store.countExpiredBaselineCache(now)).toBe(1);
   expect(store.getBaselineCache(young, since)).not.toBeNull();
-  expect(store.db.query("SELECT run_id, created_at FROM baseline_cache").all()).toEqual([
+  expect(store.db.query("SELECT run_id, created_at FROM passing_baselines").all()).toEqual([
     { run_id: "r2", created_at: now - 7 * DAY + 1 },
   ]);
   expect(store.clearBaselineCache("x")).toBe(0);

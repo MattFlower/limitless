@@ -37,6 +37,12 @@ test("the baseline cache kill switch defaults on and accepts only booleans", () 
     }
     writeFileSync(join(configDir, "config.toml"), '[gates]\nbaseline_cache = "no"\n');
     expect(config).toThrow("gates.baseline_cache must be true or false");
+    rmSync(join(configDir, "config.toml"));
+    expect(config().baselineEnv).toEqual([]);
+    writeFileSync(join(configDir, "config.toml"), '[gates]\nbaseline_env = ["MY_GATE_FLAG"]\n');
+    expect(config().baselineEnv).toEqual(["MY_GATE_FLAG"]);
+    writeFileSync(join(configDir, "config.toml"), '[gates]\nbaseline_env = "MY_GATE_FLAG"\n');
+    expect(config).toThrow("gates.baseline_env must be an array");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

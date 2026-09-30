@@ -1206,7 +1206,7 @@ export class Store {
   getBaselineCache<T>(key: BaselineCacheKey, since: number): T | null {
     const row = this.db
       .query(
-        "SELECT gate_run FROM baseline_cache WHERE repo_id = ? AND base_sha = ? AND gates_hash = ? AND env_hash = ? AND created_at > ?",
+        "SELECT gate_run FROM passing_baselines WHERE repo_id = ? AND base_sha = ? AND gates_hash = ? AND env_hash = ? AND created_at > ?",
       )
       .get(key.repoId, key.baseSha, key.gatesHash, key.envHash, since) as Row | null;
     return row ? parse<T | null>(row.gate_run, null) : null;
@@ -1216,7 +1216,7 @@ export class Store {
   putBaselineCache(key: BaselineCacheKey, gateRun: unknown, runId: string, now = Date.now()): void {
     this.db
       .query(
-        `INSERT INTO baseline_cache (repo_id, base_sha, gates_hash, env_hash, gate_run, run_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO passing_baselines (repo_id, base_sha, gates_hash, env_hash, gate_run, run_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(repo_id, base_sha, gates_hash, env_hash) DO UPDATE SET gate_run = excluded.gate_run, run_id = excluded.run_id, created_at = excluded.created_at`,
       )
       .run(key.repoId, key.baseSha, key.gatesHash, key.envHash, JSON.stringify(gateRun), runId, now);
@@ -1224,18 +1224,18 @@ export class Store {
 
   /** Drop every cached baseline for a repo (repair after a bad entry); returns the count removed. */
   clearBaselineCache(repoId: string): number {
-    return this.db.query("DELETE FROM baseline_cache WHERE repo_id = ?").run(repoId).changes;
+    return this.db.query("DELETE FROM passing_baselines WHERE repo_id = ?").run(repoId).changes;
   }
 
   countExpiredBaselineCache(before: number): number {
     const row = this.db
-      .query("SELECT count(*) AS n FROM baseline_cache WHERE created_at <= ?")
+      .query("SELECT count(*) AS n FROM passing_baselines WHERE created_at <= ?")
       .get(before) as Row;
     return row.n as number;
   }
 
   deleteExpiredBaselineCache(before: number): number {
-    return this.db.query("DELETE FROM baseline_cache WHERE created_at <= ?").run(before).changes;
+    return this.db.query("DELETE FROM passing_baselines WHERE created_at <= ?").run(before).changes;
   }
 
   // ---- artifacts -----------------------------------------------------------

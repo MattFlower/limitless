@@ -461,6 +461,13 @@ describe("baseline cache", () => {
     expect(gateEnvDigest({ ...env, PATH: "/opt/bin:/usr/bin:/bin" })).not.toBe(digest);
     expect(gateEnvDigest({ ...env, NODE_OPTIONS: "--max-old-space-size=1" })).not.toBe(digest);
     expect(gateEnvDigest({ ...env, OPENAI_API_KEY: "sk-other" })).toBe(digest);
+    expect(gateEnvDigest({ ...env, npm_config_ignore_scripts: "true" })).not.toBe(digest);
+    expect(gateEnvDigest({ ...env, LD_LIBRARY_PATH: "/opt/lib" })).not.toBe(digest);
+    expect(gateEnvDigest({ ...env, npm_config__authToken: "npm-secret" })).toBe(digest);
+    expect(gateEnvDigest({ ...env, MY_GATE_FLAG: "1" })).toBe(digest);
+    expect(gateEnvDigest({ ...env, MY_GATE_FLAG: "1" }, ["MY_GATE_FLAG"])).not.toBe(
+      gateEnvDigest({ ...env, MY_GATE_FLAG: "2" }, ["MY_GATE_FLAG"]),
+    );
   });
 
   test("single flight runs one caller per key at a time", async () => {

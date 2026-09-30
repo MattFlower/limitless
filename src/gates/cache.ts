@@ -25,30 +25,44 @@ const LOCKFILES = [
   "composer.lock",
 ];
 
-/** Gate-relevant variables only; values are hashed, never stored, and secrets are never read. */
-const GATE_ENV_VARS = [
+/** Gate-relevant variables: values are hashed, never stored, and secret-looking names are skipped. */
+const GATE_ENV_VARS = new Set([
   "PATH",
   "HOME",
   "SHELL",
   "LANG",
-  "LC_ALL",
-  "LC_CTYPE",
   "TZ",
   "CI",
   "NO_COLOR",
   "FORCE_COLOR",
-  "NODE_ENV",
-  "NODE_OPTIONS",
-  "NODE_PATH",
-  "BUN_INSTALL",
+  "VIRTUAL_ENV",
+  "CONDA_PREFIX",
+  "GEM_HOME",
+  "GEM_PATH",
+  "CC",
+  "CXX",
+  "CFLAGS",
+  "CXXFLAGS",
+  "CPPFLAGS",
+  "LDFLAGS",
+  "PKG_CONFIG_PATH",
+  "CGO_ENABLED",
+  "GOROOT",
   "GOPATH",
   "GOFLAGS",
-  "CARGO_HOME",
-  "RUSTFLAGS",
-  "PYTHONPATH",
-  "VIRTUAL_ENV",
-  "JAVA_HOME",
-];
+  "GOOS",
+  "GOARCH",
+  "GOPROXY",
+  "GOPRIVATE",
+  "GONOSUMDB",
+  "GOTOOLCHAIN",
+  "GOEXPERIMENT",
+  "GOMODCACHE",
+]);
+/** Toolchain configuration families (npm/Bun/Node, dynamic linker, Rust, Python, JVM, locale). */
+const GATE_ENV_PREFIXES =
+  /^(npm_config_|NPM_CONFIG_|BUN_|NODE_|YARN_|PNPM_|COREPACK_|LD_|DYLD_|LC_|CARGO_|RUST|PYTHON|PIP_|UV_|POETRY_|JAVA_|JDK_|GRADLE_|MAVEN_)/;
+const SECRET_NAME = /TOKEN|SECRET|PASS|AUTH|CRED|KEY|PRIVATE|SESSION|COOKIE/i;
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
@@ -79,9 +93,17 @@ export function lockfileHash(dir: string): string {
   return hash.digest("hex");
 }
 
-/** Digest of the gate-relevant part of the environment gates run with. */
-export function gateEnvDigest(env: Record<string, string>): string {
-  return sha256(JSON.stringify(GATE_ENV_VARS.map((k) => [k, env[k] ?? null])));
+/**
+ * Digest of the gate-relevant part of the environment gates run with: the known toolchain
+ * variables plus `extra` (config `[gates] baseline_env`). Secret-looking names are never included.
+ */
+export function gateEnvDigest(env: Record<string, string>, extra: readonly string[] = []): string {
+  const relevant = (k: string) => GATE_ENV_VARS.has(k) || GATE_ENV_PREFIXES.test(k) || extra.includes(k);
+  const entries = Object.keys(env)
+    .filter((k) => relevant(k) && !SECRET_NAME.test(k))
+    .sort()
+    .map((k) => [k, env[k]]);
+  return sha256(JSON.stringify(entries));
 }
 
 export interface BaselineKeyInputs {
