@@ -441,6 +441,10 @@ test("a citation is grounded only when it is a verbatim quote of the named sourc
     expect(citedRequirement(citation, source)).toBeNull();
   expect(citedRequirement("make it", requirementSource("request", "make it work", spec))).toBeNull();
   expect(citedRequirement("ake it wor", "make it work")).toBeNull();
+  // Underscores join identifiers: a quote cut from inside `user_id` is not a whole-word citation.
+  expect(citedRequirement("Return the user", "Return the user_id")).toBeNull();
+  expect(citedRequirement("id is required", "the user_id is required")).toBeNull();
+  expect(citedRequirement("Return the user_id", "Return the user_id")).toBe("Return the user_id");
   expect(citedRequirement('  **Lists  ARE** accepted" ', source)).toBe("Lists ARE** accepted");
 });
 
@@ -469,6 +473,20 @@ test("a complete short spec entry is grounded; a short partial quote is not", ()
   expect(issue("Paginated", "the list is unpaginated")).toBe("evidence does not cite the requirement");
   expect(issue("Idempotent retries", "idempotent retriesx")).toBe("evidence does not cite the requirement");
   expect(issue("retries", "violates retries")).toBe("citation is not a stated public requirement");
+  expect(issue("Paginated", "see paginated_results")).toBe("evidence does not cite the requirement");
+  const requestIssue = requirementCitationIssue(
+    {
+      id: "H-1",
+      status: "unmet",
+      evidence: "Violation: Return the user_ref",
+      publicSummary: "",
+      requirement: "request",
+      requirementCitation: "Return the user",
+    },
+    "Return the user list",
+    shortSpec,
+  );
+  expect(requestIssue).toBe("evidence does not cite the requirement");
 });
 
 test("a trivial citation blocks and is never repeated to the implementer", () => {

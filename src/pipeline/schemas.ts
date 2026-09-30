@@ -290,9 +290,10 @@ const trimQuote = (s: string) =>
 function quotedIn(quote: string, text: string): boolean {
   const q = flatText(quote).trim();
   if (!/[\p{L}\p{N}]/u.test(q)) return false;
-  const word = "[\\p{L}\\p{N}]";
-  const before = /^[\p{L}\p{N}]/u.test(q) ? `(?<!${word})` : "";
-  const after = /[\p{L}\p{N}]$/u.test(q) ? `(?!${word})` : "";
+  // Underscores join identifiers, so "user" inside "user_id" is not a whole word.
+  const word = "[\\p{L}\\p{N}_]";
+  const before = /^[\p{L}\p{N}_]/u.test(q) ? `(?<!${word})` : "";
+  const after = /[\p{L}\p{N}_]$/u.test(q) ? `(?!${word})` : "";
   const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`${before}${escaped}${after}`, "u").test(flatText(text));
 }
