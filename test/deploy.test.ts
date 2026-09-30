@@ -605,6 +605,27 @@ test("a failed smoke gate reports the tail of both output streams and restores t
   expect(f.selected()).toBe("previous");
 });
 
+test("a failed gate tail keeps stderr first and stays within 4000 bytes", async () => {
+  const f = setup();
+  const command = f.opts.command;
+  f.opts.command = async (args, options) => {
+    if (args.join(" ") !== "bun test") return command(args, options);
+    return {
+      stdout: `${Array.from({ length: 200 }, (_, i) => `stdout ${i} ${"x".repeat(200)}`).join("\n")}\n`,
+      stderr: `${Array.from({ length: 40 }, (_, i) => `stderr ${i}`).join("\n")}\n 3 fail\n Ran 900 tests\n${"é".repeat(3000)}\n`,
+      exitCode: 1,
+    };
+  };
+  const message = String(await deploy(7400, "feature", false, f.opts).catch((e: unknown) => e));
+  const tail = message.slice(message.indexOf("Command failed (1): bun test"));
+  expect(Buffer.byteLength(tail)).toBeLessThan(4_200);
+  expect(tail).toContain(" 3 fail\n Ran 900 tests");
+  expect(tail).toContain("stderr 39");
+  expect(tail).toContain(`…${"é".repeat(500)}`);
+  expect(tail).not.toContain("stdout 0 ");
+  expect(f.selected()).toBe("previous");
+});
+
 test("a target checkout runs requested smoke before draining", async () => {
   const f = setup();
   f.setSelected("next");

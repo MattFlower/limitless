@@ -249,6 +249,22 @@ const GATES = [
 const SMOKE = ["bun", "scripts/smoke.ts"];
 
 const GATE_TAIL_LINES = 60;
+const GATE_TAIL_BYTES = 4_000;
+const GATE_LINE_CHARS = 500;
+
+/** The last lines that fit both limits; one long line is cut rather than dropping everything. */
+function tailLines(lines: string[], maxLines: number, maxBytes: number): string[] {
+  const kept: string[] = [];
+  let bytes = 0;
+  for (let i = lines.length - 1; i >= 0 && kept.length < maxLines; i--) {
+    const raw = lines[i] ?? "";
+    const line = raw.length > GATE_LINE_CHARS ? `…${raw.slice(-GATE_LINE_CHARS)}` : raw;
+    bytes += Buffer.byteLength(line) + 1;
+    if (bytes > maxBytes) break;
+    kept.unshift(line);
+  }
+  return kept;
+}
 
 async function gates(run: typeof sh, dir: string, smoke: boolean): Promise<void> {
   const gate = async (args: string[], timeoutMs: number) => {
@@ -257,13 +273,16 @@ async function gates(run: typeof sh, dir: string, smoke: boolean): Promise<void>
     // The failing check (a smoke row, a test name) is usually near the end of the output.
     const out = res.stdout.trimEnd().split("\n").filter(Boolean);
     const err = res.stderr.trimEnd().split("\n").filter(Boolean);
-    const outCount = Math.min(out.length, Math.max(GATE_TAIL_LINES / 2, GATE_TAIL_LINES - err.length));
-    const errCount = Math.min(err.length, GATE_TAIL_LINES - outCount);
-    const section = (name: string, lines: string[], count: number) =>
-      count
-        ? [`--- ${name} (last ${count} of ${lines.length} lines) ---`, ...lines.slice(lines.length - count)]
-        : [];
-    const tail = [...section("stdout", out, outCount), ...section("stderr", err, errCount)];
+    // stderr first: a `bun test` failure summary must not be pushed out by stdout lines.
+    const errTail = tailLines(err, GATE_TAIL_LINES, GATE_TAIL_BYTES);
+    const outTail = tailLines(
+      out,
+      GATE_TAIL_LINES - errTail.length,
+      GATE_TAIL_BYTES - errTail.reduce((sum, line) => sum + Buffer.byteLength(line) + 1, 0),
+    );
+    const section = (name: string, lines: string[], kept: string[]) =>
+      kept.length ? [`--- ${name} (last ${kept.length} of ${lines.length} lines) ---`, ...kept] : [];
+    const tail = [...section("stdout", out, outTail), ...section("stderr", err, errTail)];
     throw new Error(
       [`Command failed (${res.exitCode ?? "killed or timed out"}): ${args.join(" ")}`, ...tail].join("\n"),
     );

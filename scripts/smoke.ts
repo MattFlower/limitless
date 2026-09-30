@@ -13,37 +13,92 @@ import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/route
 import { resolveTarget } from "../src/router/targets.ts";
 import { sh } from "../src/util/proc.ts";
 
-export type CheckResult = { status: "pass" | "fail" | "skip"; reason?: string };
-export type SmokeCheck = { name: string; run: () => Promise<CheckResult> };
-export type CheckRow = CheckResult & { name: string; durationMs: number; retried?: boolean };
+/**
+ * Why a failure may be retried: the provider was briefly unavailable. Anything else (a disclosed
+ * token, a tool call, a forbidden write, a wrong answer) is an assertion failure and is final.
+ */
+export type Transient = "timeout" | "provider" | "health";
+export type CheckResult = { status: "pass" | "fail" | "skip"; reason?: string; transient?: Transient };
+/** `timeoutMs` bounds each attempt; it defaults to DEFAULT_CHECK_TIMEOUT_MS. */
+export type SmokeCheck = { name: string; timeoutMs?: number; run: () => Promise<CheckResult> };
+export type CheckRow = CheckResult & {
+  name: string;
+  durationMs: number;
+  retried?: boolean;
+  retriedAfter?: string;
+};
+export type RunOptions = {
+  /** Overall time for every attempt; a retry that cannot finish inside it is not started. */
+  budgetMs?: number;
+  retryDelayMs?: number;
+  onStart?: (check: SmokeCheck) => void;
+  onRow?: (row: CheckRow) => void;
+};
 
 const RETRY_DELAY_MS = 5_000;
+const DEFAULT_CHECK_TIMEOUT_MS = 120_000;
+/** The deploy gate kills smoke after 900 s; leave room for startup and reporting. */
+export const SMOKE_BUDGET_MS = 870_000;
 
-async function attempt(check: SmokeCheck): Promise<CheckResult> {
+const PROVIDER_ERROR =
+  /(?:HTTP|status|code)\s*5\d\d|\b50[0-4]\b|rate.?limit|\b429\b|overloaded|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|stream disconnected|connection (?:refused|reset|closed|error|failed)|network error/i;
+
+/** Classify a failure message explicitly; an unrecognized one is never retried. */
+export function transientReason(reason: string): Transient | undefined {
+  if (/health probe/i.test(reason)) return "health";
+  if (/\btimed out\b|\btimeout\b|no output for \d+s/i.test(reason)) return "timeout";
+  if (PROVIDER_ERROR.test(reason)) return "provider";
+  return undefined;
+}
+
+function fail(reason: string, transient?: Transient): CheckResult {
+  return { status: "fail", reason, ...(transient ? { transient } : {}) };
+}
+
+async function attempt(check: SmokeCheck, timeoutMs: number): Promise<CheckResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await check.run();
+    return await Promise.race([
+      check.run(),
+      new Promise<CheckResult>((resolve) => {
+        timer = setTimeout(() => resolve(fail(`timeout ${timeoutMs}ms`, "timeout")), timeoutMs);
+      }),
+    ]);
   } catch (error) {
-    return { status: "fail", reason: String(error) };
+    return fail(String(error), transientReason(String(error)));
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-/** Live providers fail transiently (Codex has rejected models intermittently), so a failed check gets one retry. */
+/**
+ * Live providers fail transiently (Codex has rejected models intermittently), so a check that
+ * failed for an availability reason gets one retry if it still fits the budget.
+ */
 export async function runChecks(
   checks: SmokeCheck[],
   now = () => performance.now(),
   delay = (ms: number) => Bun.sleep(ms),
+  options: RunOptions = {},
 ): Promise<CheckRow[]> {
+  const { budgetMs = Number.POSITIVE_INFINITY, retryDelayMs = RETRY_DELAY_MS } = options;
+  const begin = now();
   const rows: CheckRow[] = [];
   for (const check of checks) {
+    const timeoutMs = check.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS;
+    options.onStart?.(check);
     let start = now();
-    let result = await attempt(check);
+    let result = await attempt(check, timeoutMs);
     let retried = false;
-    if (result.status === "fail") {
-      await delay(RETRY_DELAY_MS);
+    const first = result.reason;
+    const retry = result.status === "fail" && result.transient !== undefined;
+    if (retry && budgetMs - (now() - begin) < retryDelayMs + timeoutMs) {
+      result = { ...result, reason: `${first ?? "failed"} (no time left to retry)` };
+    } else if (retry) {
+      await delay(retryDelayMs);
       retried = true;
       start = now();
-      const first = result.reason;
-      result = await attempt(check);
+      result = await attempt(check, timeoutMs);
       // A retry that skips (e.g. its health probe now fails) must not hide the first failure.
       if (result.status === "skip")
         result = {
@@ -53,32 +108,58 @@ export async function runChecks(
       else if (result.status === "fail" && first && first !== result.reason)
         result = { ...result, reason: `${result.reason ?? "failed"} (first attempt: ${first})` };
     }
-    rows.push({
+    const row: CheckRow = {
       name: check.name,
       ...result,
       durationMs: Math.round(now() - start),
-      ...(retried ? { retried } : {}),
-    });
+      ...(retried ? { retried, retriedAfter: first ?? "failed" } : {}),
+    };
+    rows.push(row);
+    options.onRow?.(row);
   }
   return rows;
 }
 
+export function formatHeader(width: number): string {
+  return [
+    `${"Check".padEnd(width)}  Status  Time     Detail`,
+    `${"-".repeat(width)}  ------  -------  ------`,
+  ].join("\n");
+}
+
+export function formatRow(row: CheckRow, width: number): string {
+  const label =
+    row.retried && row.status === "pass"
+      ? `PASS (retried after: ${row.retriedAfter})`
+      : row.status.toUpperCase();
+  const detail = (row.reason ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
+  return `${row.name.padEnd(width)}  ${label.padEnd(6)}  ${`${row.durationMs}ms`.padStart(7)}  ${detail}`;
+}
+
+function nameWidth(names: { name: string }[]): number {
+  return Math.max(5, ...names.map((row) => row.name.length));
+}
+
 export function formatReport(rows: CheckRow[]): string {
-  const width = Math.max(5, ...rows.map((row) => row.name.length));
-  const label = (row: CheckRow) =>
-    `${row.status.toUpperCase()}${row.retried && row.status === "pass" ? " (retried)" : ""}`;
-  const statusWidth = Math.max(6, ...rows.map((row) => label(row).length));
-  const lines = [
-    `${"Check".padEnd(width)}  ${"Status".padEnd(statusWidth)}  Time     Detail`,
-    `${"-".repeat(width)}  ${"-".repeat(statusWidth)}  -------  ------`,
-  ];
-  for (const row of rows) {
-    const detail = (row.reason ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
-    lines.push(
-      `${row.name.padEnd(width)}  ${label(row).padEnd(statusWidth)}  ${`${row.durationMs}ms`.padStart(7)}  ${detail}`,
-    );
-  }
-  return lines.join("\n");
+  const width = nameWidth(rows);
+  return [formatHeader(width), ...rows.map((row) => formatRow(row, width))].join("\n");
+}
+
+/** Print each row as it finishes, so a run killed by the deploy timeout still shows its progress. */
+export async function reportChecks(
+  checks: SmokeCheck[],
+  print = console.log,
+  options: RunOptions = {},
+): Promise<number> {
+  const width = nameWidth(checks);
+  print(formatHeader(width));
+  const rows = await runChecks(checks, undefined, undefined, {
+    budgetMs: SMOKE_BUDGET_MS,
+    ...options,
+    onStart: (check) => print(`${check.name.padEnd(width)}  RUN`),
+    onRow: (row) => print(formatRow(row, width)),
+  });
+  return exitCode(rows);
 }
 
 export function exitCode(rows: CheckRow[]): number {
@@ -189,9 +270,11 @@ export function quotaCheck(result: AgentResult, events: AgentEvent[], provider: 
 }
 
 function status(result: AgentResult): CheckResult {
-  return result.status === "ok"
-    ? { status: "pass" }
-    : { status: "fail", reason: result.error ?? result.status };
+  if (result.status === "ok") return { status: "pass" };
+  const reason = result.error ?? result.status;
+  if (result.status === "timeout") return fail(reason, "timeout");
+  if (result.status === "unavailable") return fail(reason, "provider");
+  return fail(reason, transientReason(reason));
 }
 
 export async function liveCheck(
@@ -234,13 +317,7 @@ export async function liveCheck(
     if (kind === "noTools" && readFileSync(join(cwd, "stream.log"), "utf8").includes(token)) {
       return { status: "fail", reason: "local file token appeared in raw stream" };
     }
-    const outcome = status(result);
-    if (outcome.status === "fail") return outcome;
-    if (kind === "structured") {
-      return JSON.stringify(result.structured) === JSON.stringify({ smoke: "ready" })
-        ? { status: "pass" }
-        : { status: "fail", reason: "structured response did not match expected object" };
-    }
+    // Disclosure and tool-call checks come first: a leak followed by a timeout must not look transient.
     if (kind === "noTools") {
       if (events.some((event) => event.type === "tool_call"))
         return { status: "fail", reason: "tool call observed" };
@@ -249,8 +326,15 @@ export async function liveCheck(
       ) {
         return { status: "fail", reason: "local file token appeared in output" };
       }
-      return { status: "pass" };
     }
+    const outcome = status(result);
+    if (outcome.status === "fail") return outcome;
+    if (kind === "structured") {
+      return JSON.stringify(result.structured) === JSON.stringify({ smoke: "ready" })
+        ? { status: "pass" }
+        : { status: "fail", reason: "structured response did not match expected object" };
+    }
+    if (kind === "noTools") return { status: "pass" };
     if (kind === "edit") {
       try {
         return readFileSync(join(cwd, "smoke-edit.txt"), "utf8").trim() === "smoke edit ok"
@@ -410,7 +494,7 @@ export async function decisionsCheck(
         if (event.type === "status") served = event.text;
       },
     });
-    if (result.status !== "ok") return { status: "fail", reason: result.error ?? result.status };
+    if (result.status !== "ok") return status(result);
     const kind = (result.structured as Record<string, DecisionAnswer>).kind;
     if (kind?.type !== "choice" || kind.choice !== "bug")
       return { status: "fail", reason: `unexpected answers: ${served}` };
@@ -457,6 +541,7 @@ export function backendChecks(
     for (const kind of id === "omlx" ? (["structured", "edit"] as const) : (["structured"] as const))
       checks.push({
         name: `${id} ${kind === "edit" ? "claude-harness edit" : kind}`,
+        timeoutMs: provider.billing === "free" ? 330_000 : 90_000,
         run: async () => {
           const reason = await providerAvailability(provider, secrets, fetchHealth);
           if (reason) return { status: "skip", reason };
@@ -477,6 +562,7 @@ export function backendChecks(
   const key = typesafe.apiKeySecret;
   checks.push({
     name: "typesafe decisions",
+    timeoutMs: 90_000,
     run: async () => {
       const reason = await providerAvailability(typesafe, secrets, fetchHealth);
       if (reason) return { status: "skip", reason };
@@ -499,12 +585,11 @@ export async function main(): Promise<number> {
       const target = { ...targetFor(provider, resolved.model), effort: resolved.effort };
       return {
         name: `${resolved.targetId} structured`,
+        timeoutMs: 90_000,
         run: () => liveCheck(provider.id === "claude" ? runClaude : runCodex, target, "structured"),
       };
     });
-    const rows = await runChecks(checks);
-    console.log(formatReport(rows));
-    return exitCode(rows);
+    return reportChecks(checks);
   }
   const { secrets } = loadConfig();
   const checks: SmokeCheck[] = [];
@@ -516,6 +601,13 @@ export async function main(): Promise<number> {
     for (const kind of ["structured", "noTools", "edit", "quota", "verify"] as const) {
       checks.push({
         name: `${id} ${kind}`,
+        // Outer bounds sit above liveCheck's own harness timeouts, which report the precise reason.
+        timeoutMs:
+          id === "codex" && kind === "structured"
+            ? 60_000 * modelsByPrice(id).length + 30_000
+            : kind === "verify"
+              ? 120_000
+              : 90_000,
         run: async () => {
           if (id === "codex" && kind === "structured") {
             const selected = await checkCodexModels(modelsByPrice(id), (model) =>
@@ -530,9 +622,7 @@ export async function main(): Promise<number> {
     }
   }
   checks.push(...backendChecks(secrets));
-  const rows = await runChecks(checks);
-  console.log(formatReport(rows));
-  return exitCode(rows);
+  return reportChecks(checks);
 }
 
 if (import.meta.main) process.exitCode = await main();

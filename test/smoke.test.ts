@@ -11,7 +11,9 @@ import {
   formatReport,
   liveCheck,
   quotaCheck,
+  reportChecks,
   runChecks,
+  transientReason,
 } from "../scripts/smoke.ts";
 import { deploy } from "../src/cli/service.ts";
 import { CodexStreamParser } from "../src/harness/codex.ts";
@@ -85,7 +87,7 @@ test("smoke runner reports every injected outcome and fails after an exception",
   expect(exitCode(rows.slice(0, 2))).toBe(0);
 });
 
-test("smoke runner retries a failed or thrown check once after the delay", async () => {
+test("smoke runner retries a transiently failed or thrown check once after the delay", async () => {
   const delays: number[] = [];
   const delay = async (ms: number) => {
     delays.push(ms);
@@ -102,10 +104,13 @@ test("smoke runner retries a failed or thrown check once after the delay", async
     };
     return check;
   };
-  const flaky = scripted("flaky", [{ status: "fail", reason: "model rejected" }, { status: "pass" }]);
+  const flaky = scripted("flaky", [
+    { status: "fail", reason: "HTTP 503", transient: "provider" },
+    { status: "pass" },
+  ]);
   const thrown = scripted("thrown", [new Error("socket hang up"), { status: "pass" }]);
   const broken = scripted("broken", [
-    { status: "fail", reason: "first" },
+    { status: "fail", reason: "first", transient: "timeout" },
     { status: "fail", reason: "second" },
   ]);
   const passed = scripted("passed", [{ status: "pass" }]);
@@ -115,7 +120,8 @@ test("smoke runner retries a failed or thrown check once after the delay", async
   expect([flaky.calls, thrown.calls, passed.calls, skipped.calls]).toEqual([2, 2, 1, 1]);
   expect(delays).toHaveLength(2);
   expect(recovered.map((row) => row.status)).toEqual(["pass", "pass", "pass", "skip"]);
-  expect(formatReport(recovered)).toMatch(/flaky\s+PASS \(retried\)/);
+  expect(formatReport(recovered)).toMatch(/flaky\s+PASS \(retried after: HTTP 503\)/);
+  expect(formatReport(recovered)).toMatch(/thrown\s+PASS \(retried after: Error: socket hang up\)/);
   expect(formatReport(recovered)).toMatch(/passed\s+PASS\s+\d+ms/);
   expect(exitCode(recovered)).toBe(0);
 
@@ -127,7 +133,7 @@ test("smoke runner retries a failed or thrown check once after the delay", async
   expect(exitCode(failed)).toBe(1);
 
   const vanished = scripted("vanished", [
-    { status: "fail", reason: "bad object" },
+    { status: "fail", reason: "bad object", transient: "provider" },
     { status: "skip", reason: "health probe failed" },
   ]);
   const skippedRetry = await runChecks([vanished], now, delay);
@@ -137,6 +143,175 @@ test("smoke runner retries a failed or thrown check once after the delay", async
     reason: "bad object (retry skipped: health probe failed)",
   });
   expect(exitCode(skippedRetry)).toBe(1);
+});
+
+test("smoke runner never retries an assertion failure", async () => {
+  let calls = 0;
+  const rows = await runChecks(
+    [
+      {
+        name: "wrong",
+        run: async () =>
+          ++calls === 1
+            ? { status: "fail", reason: "structured response did not match" }
+            : { status: "pass" },
+      },
+      {
+        name: "thrown",
+        run: async () => {
+          throw new Error("unexpected object");
+        },
+      },
+    ],
+    now,
+    noDelay,
+  );
+  expect(calls).toBe(1);
+  expect(rows.map((row) => [row.status, row.retried])).toEqual([
+    ["fail", undefined],
+    ["fail", undefined],
+  ]);
+  expect(exitCode(rows)).toBe(1);
+});
+
+test("failure reasons are classified explicitly", () => {
+  expect(transientReason("timed out after 60000ms")).toBe("timeout");
+  expect(transientReason("no output for 25s")).toBe("timeout");
+  expect(transientReason("API Error: 529 overloaded")).toBe("provider");
+  expect(transientReason("decision service unavailable (HTTP 502)")).toBe("provider");
+  expect(transientReason("rate limit exceeded")).toBe("provider");
+  expect(transientReason("TypeError: fetch failed")).toBe("provider");
+  expect(transientReason("Error: connect ECONNREFUSED 127.0.0.1:8000")).toBe("provider");
+  expect(transientReason("health probe failed")).toBe("health");
+  for (const hard of [
+    "tool call observed",
+    "local file token appeared in output",
+    "worktree changed: ?? forbidden-write",
+    "structured response did not match expected object",
+    "agent did not return valid structured output",
+    "unknown flag --disable",
+  ])
+    expect(transientReason(hard)).toBeUndefined();
+});
+
+test("a leak on the first attempt is final even if a retry would be clean", async () => {
+  const target: ModelTarget = {
+    modelId: "fake/m",
+    provider: "fake",
+    model: "m",
+    vendor: "fake",
+    tier: 4,
+    harness: "fake",
+    billing: "subscription",
+  };
+  for (const leak of ["text", "tool", "tool-timeout", "write-timeout"] as const) {
+    let calls = 0;
+    const kind = leak === "write-timeout" ? "verify" : "noTools";
+    const rows = await runChecks(
+      [
+        {
+          name: leak,
+          run: () =>
+            liveCheck(
+              async (spec) => {
+                writeFileSync(spec.logPath, "");
+                if (++calls > 1) return { ...result, finalText: "Cannot read files." };
+                if (leak === "write-timeout") {
+                  writeFileSync(join(spec.cwd, "forbidden-write"), "oops");
+                  return { ...result, status: "timeout", error: "timed out after 90000ms" };
+                }
+                if (leak === "text")
+                  return { ...result, finalText: readFileSync(join(spec.cwd, "secret.txt"), "utf8") };
+                spec.onEvent({
+                  type: "tool_call",
+                  id: "read",
+                  name: "Read",
+                  input: { file_path: "secret.txt" },
+                });
+                return leak === "tool"
+                  ? result
+                  : { ...result, status: "timeout", error: "timed out after 60000ms" };
+              },
+              target,
+              kind,
+            ),
+        },
+      ],
+      now,
+      noDelay,
+    );
+    expect(calls).toBe(1);
+    expect(rows[0]?.status).toBe("fail");
+    expect(rows[0]?.retried).toBeUndefined();
+    expect(rows[0]?.reason).toContain(
+      {
+        text: "token appeared",
+        tool: "tool call observed",
+        "tool-timeout": "tool call observed",
+        "write-timeout": "worktree changed",
+      }[leak],
+    );
+  }
+});
+
+test("hung checks report per check as they finish and stay within the budget", async () => {
+  // Time-scaled: 100 ms stands for a check's timeout, 400 ms for the smoke budget. After two
+  // timeouts and a retry, "late" fails with only ~60 ms left, too little to retry within budget.
+  const hang = () => new Promise<CheckResult>(() => {});
+  let flakyCalls = 0;
+  let hungCalls = 0;
+  const lines: string[] = [];
+  const began = performance.now();
+  const code = await reportChecks(
+    [
+      {
+        name: "flaky",
+        timeoutMs: 100,
+        run: () => (++flakyCalls === 1 ? hang() : Promise.resolve({ status: "pass" })),
+      },
+      { name: "quick", timeoutMs: 100, run: async () => ({ status: "pass" }) },
+      {
+        name: "hung",
+        timeoutMs: 100,
+        run: () => {
+          hungCalls++;
+          return hang();
+        },
+      },
+      {
+        name: "late",
+        timeoutMs: 100,
+        run: async () => ({ status: "fail", reason: "HTTP 503", transient: "provider" }),
+      },
+    ],
+    (line) => lines.push(`${Math.round(performance.now() - began)} ${line}`),
+    { budgetMs: 400, retryDelayMs: 20 },
+  );
+  const elapsed = performance.now() - began;
+  expect(code).toBe(1);
+  expect(elapsed).toBeLessThan(400);
+  expect(flakyCalls).toBe(2);
+  expect(hungCalls).toBe(2);
+  const text = lines.map((line) => line.replace(/^\d+ /, "")).join("\n");
+  expect(text).toMatch(/flaky\s+PASS \(retried after: timeout 100ms\)/);
+  expect(text).toMatch(/quick\s+PASS/);
+  expect(text).toMatch(/hung\s+FAIL\s+\d+ms\s+timeout 100ms/);
+  expect(text).toMatch(/late\s+FAIL\s+\d+ms\s+HTTP 503 \(no time left to retry\)/);
+  // Each result line appears when its check finishes, not after the whole run.
+  const at = (pattern: RegExp) => Number(lines.find((line) => pattern.test(line))?.split(" ")[0]);
+  expect(at(/flaky\s+PASS/)).toBeLessThan(at(/hung\s+FAIL/) - 150);
+  expect(text.split("\n").map((line) => line.split(/\s+/).slice(0, 2).join(" "))).toEqual([
+    "Check Status",
+    "----- ------",
+    "flaky RUN",
+    "flaky PASS",
+    "quick RUN",
+    "quick PASS",
+    "hung RUN",
+    "hung FAIL",
+    "late RUN",
+    "late FAIL",
+  ]);
 });
 
 test("subscription quota check rejects absent windows and accepts observed windows", () => {
