@@ -122,3 +122,20 @@ Why: the table above comes from the 40-case development set, which is also where
 `@none` is not non-inferior to `@medium` (difference -0.156, one-sided 95% lower bound -0.256), and its under-call upper bound exceeds the 10% ceiling. The extra cost of `@medium` is about $0.0001 per run.
 
 The fallbacks after `@medium` were not measured on the held-out set; they run only when an earlier entry is unavailable or fails. `routing/overrides.json` pins `triage.default` so `limitless eval policy --write` keeps this chain. Revisit when the held-out set has results for the fallbacks or for a new candidate.
+
+## Owner decision: review = `codex/sol-6.1` first (2026-09-30)
+
+The review cells are pinned with `codex/sol-6.1` at the head of the Sol group. The rest of each chain is unchanged from the previous default.
+
+Evidence: review eval v2, 34 cases with blocking-recall grading (eval-muo4xsbk3p8f). Both models ran on Codex at medium effort, k=3, on the same harness.
+
+| Model | Blocking recall | High-severity recall | Clean false-block | API-equivalent | p50 latency |
+|---|---|---|---|---|---|
+| `codex/sol-6.1@medium` | 27.6% (34/123) [20.5%, 36.1%] | 50.0% (12/24) | 18.2% (6/33) [8.6%, 34.4%] | $15.63 | 196 s |
+| `codex/sol@medium` (6.0) | 28.6% (36/126) [21.4%, 37.0%] | 37.5% (9/24) | 36.4% (12/33) [22.2%, 53.4%] | $16.36 | 203 s |
+
+Sol 6.1 is at parity on recall and halves false blocks on clean changes, which are a source of avoidable fix rounds. Sol 6.0 is not non-inferior to 6.1 on pass rate (difference −0.059, one-sided 95% lower bound −0.137).
+
+Neither model clears the review floors (defect recall ≥ 0.5). That is why this is a pinned owner decision rather than a generated policy update. The M4.5 review panel is expected to change these defaults once its ablations complete.
+
+Sol 6.1 needs Codex CLI 0.159 or later on ChatGPT sign-in. With an older CLI the call fails with HTTP 400 and routing falls through to Sol 6.0.

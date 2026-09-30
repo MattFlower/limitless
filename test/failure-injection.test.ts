@@ -1,10 +1,20 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory, type FactoryOptions } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
+import { CodexReaderProbe, runCodex } from "../src/harness/codex.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { NoCapacityError, RunContext, type RunState } from "../src/pipeline/context.ts";
@@ -16,7 +26,7 @@ import {
   untilAborted,
 } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
-import { runProcess, sh } from "../src/util/proc.ts";
+import { type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
 import { findingEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -457,6 +467,140 @@ for (const fallback of [false, true])
     expect(inv.slice(1).every((i) => i.provider === "b")).toBe(true);
     history(f, id);
   });
+
+const SECRET = "sk-live-SENTINEL-0154";
+
+/** Stand-ins for /tmp, the macOS TMPDIR (/var/folders/...) and home, distinct on any host. */
+function privateRoots() {
+  const roots = { tmp: join(root, "slash-tmp"), TMPDIR: join(root, "var-folders"), home: join(root, "home") };
+  for (const dir of Object.values(roots)) mkdirSync(dir);
+  // Canonical, as the probe's canary paths are.
+  return { tmp: realpathSync(roots.tmp), TMPDIR: realpathSync(roots.TMPDIR), home: realpathSync(roots.home) };
+}
+
+async function confinedHoldout(f: ReturnType<typeof factory>, prompt = "Write holdout checks") {
+  const r = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
+  const repo = f.store.getRepo(r.repoId);
+  if (!repo) throw new Error("missing repo");
+  const ctx = new RunContext(f.deps, r, repo, new AbortController().signal);
+  const cwd = mkdtempSync(join(root, "snapshot-"));
+  const invoke = (confined: boolean) =>
+    ctx.invoke({
+      stage: f.store.startStage(r.id, "holdout"),
+      role: "holdout",
+      complexity: "small",
+      mode: "readonly",
+      prompt,
+      cwd,
+      ...(confined ? { confineReads: true } : {}),
+      privateOutput: true,
+    });
+  return { run: r, invoke };
+}
+
+test("codex 0.154.0, which denies home and TMPDIR but allows /tmp, diverts confined readers", async () => {
+  const roots = privateRoots();
+  const commands: string[][] = [];
+  const cli = async (opts: ProcOptions): Promise<ProcResult> => {
+    commands.push(opts.cmd);
+    const base = { exitCode: 0, signal: null, cancelled: false, timedOut: false, idleTimedOut: false };
+    const done = { ...base, stdout: "", stderr: "", truncated: false, durationMs: 1 };
+    if (opts.cmd[1] === "--version") return { ...done, stdout: "codex-cli 0.154.0\n" };
+    if (opts.cmd[1] === "sandbox") {
+      // 0.154.0 accepts the profile but leaves /tmp readable; stderr echoes config.
+      const file = opts.cmd.at(-1) ?? "";
+      if (file.startsWith(`${roots.TMPDIR}/`) || file.startsWith(`${roots.home}/`))
+        return {
+          ...done,
+          exitCode: 1,
+          stderr: `token = "${SECRET}"\ncat: ${file}: Operation not permitted\n`,
+        };
+      return { ...done, stdout: readFileSync(file, "utf8"), stderr: `token = "${SECRET}"\n` };
+    }
+    return done;
+  };
+  const probe = new CodexReaderProbe(() => "/old/node_modules/.bin/codex", {
+    canaryRoots: () => [roots.TMPDIR, roots.home, roots.tmp],
+  });
+  const [a, b] = providers;
+  if (!a || !b) throw new Error("missing fixture providers");
+  const f = factory(undefined, answer, {
+    providers: [{ ...a, harness: "codex" }, b],
+    harnesses: { fake: fakeHarness(answer), codex: (s) => runCodex(s, cli, probe) },
+  });
+  const { run: r, invoke } = await confinedHoldout(f);
+  const outcome = await invoke(true);
+  expect(outcome.target.provider).toBe("b");
+  expect(commands.map((cmd) => cmd[1])).not.toContain("exec");
+  // Home and TMPDIR were denied; the /tmp canary is the one that leaked.
+  const reads = commands.filter((cmd) => cmd[1] === "sandbox").map((cmd) => cmd.at(-1) ?? "");
+  expect(reads.map((file) => file.startsWith(`${roots.tmp}/`))).toEqual([false, false, true]);
+  const [rejected, fallback] = f.store.listInvocations(r.id);
+  expect(fallback).toMatchObject({ provider: "b", status: "ok" });
+  expect(rejected).toMatchObject({ provider: "a", status: "unavailable" });
+  expect(rejected?.error).toContain("/old/node_modules/.bin/codex (codex-cli 0.154.0)");
+  expect(rejected?.error).toContain("reader profile not enforced, exit 0");
+  // The provider stays routable for unconfined roles; its card says why confined readers skip it.
+  expect(f.tracker.status("a")).toMatchObject({
+    state: "ok",
+    confinement: {
+      ok: false,
+      path: "/old/node_modules/.bin/codex",
+      version: "codex-cli 0.154.0",
+      reason: "reader profile not enforced",
+      exitCode: 0,
+    },
+  });
+  const surfaces = JSON.stringify([
+    f.store.listInvocations(r.id),
+    f.store.listEvents(r.id),
+    f.tracker.status("a"),
+  ]);
+  expect(surfaces).not.toContain(SECRET);
+});
+
+test("a confinement failure that reads like a model rejection blocks neither model nor provider", async () => {
+  const [a, b] = providers;
+  if (!a || !b) throw new Error("missing fixture providers");
+  const confinedCalls: string[] = [];
+  const f = factory(undefined, answer, {
+    providers: [{ ...a, harness: "codex" }, b],
+    harnesses: {
+      fake: fakeHarness(answer),
+      codex: async (s) => {
+        const result = await fakeHarness(answer)(s);
+        if (!s.confineReads) return result;
+        confinedCalls.push(s.target.modelId);
+        return {
+          ...result,
+          status: "unavailable",
+          structured: null,
+          error: "model a is not supported: unknown model",
+          confinement: {
+            ok: false,
+            path: "/bin/codex",
+            version: null,
+            reason: "probe inconclusive",
+            exitCode: 1,
+          },
+        };
+      },
+    },
+  });
+  const { run: r, invoke } = await confinedHoldout(f);
+  expect((await invoke(true)).target.provider).toBe("b");
+  expect(confinedCalls).toEqual(["a"]);
+  expect(f.tracker.modelUnavailableReason("a")).toBeNull();
+  expect(f.tracker.status("a")).toMatchObject({ state: "ok", reason: null, until: null });
+  expect(f.tracker.isAvailable("a")).toBe(true);
+  // The same model still serves unconfined roles.
+  expect((await invoke(false)).target.modelId).toBe("a");
+  expect(f.store.listInvocations(r.id).map((i) => [i.provider, i.status])).toEqual([
+    ["a", "unavailable"],
+    ["b", "ok"],
+    ["a", "ok"],
+  ]);
+});
 
 test("fault matching is one-shot, independent, and already-aborted hangs settle", async () => {
   const hit: string[] = [];
