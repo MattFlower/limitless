@@ -563,7 +563,8 @@ esac
     for (const review of [1, 2])
       expect(JSON.parse(f.store.getArtifact(run.id, `review-${review}.json`) ?? "{}").panel.finders).toEqual([
         { prompt: "adversarial", vendor: "openai" },
-        { prompt: "careful", vendor: "anthropic" },
+        // The careful finder took the implementer's own model, in a fresh session.
+        { prompt: "careful", vendor: "anthropic", implementerModel: true },
         {
           prompt: "standard",
           lens: "removed-behaviour-and-failure-paths",
@@ -5196,4 +5197,5 @@ test("panel review: a verifier left on the finder's vendor is another model, wit
   const alone = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
   expect(await waitFor(f, alone.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
   expect(verifiers).toEqual(["gamma/m"]);
+  expect(f.store.getRun(alone.id)?.error).toContain("alpha/m (raised a candidate it would verify)");
 });

@@ -770,9 +770,9 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
 }
 
 /**
- * A verifier never runs on a model that raised its candidates. It avoids their vendors, then the
- * implementer's vendor, and takes the implementer's own model only as a last resort; that
- * independence outranks free-first billing.
+ * A verifier never runs on a model that raised its candidates. It prefers a vendor that neither
+ * raised them nor implemented the change, then the implementer's, then a raising vendor (not the
+ * implementer's first), and the implementer's own model last; that outranks free-first billing.
  */
 export function verifierConstraints(
   avoidVendors: string[],
@@ -782,6 +782,7 @@ export function verifierConstraints(
   return {
     avoidVendor: avoidVendors,
     excludeModels: avoidModels,
+    excludedBecause: "raised a candidate it would verify",
     ...(implementer ? { preferNotVendor: [implementer.vendor], preferNotModels: [implementer.modelId] } : {}),
     independenceFirst: true,
   };
@@ -977,6 +978,7 @@ async function oneRound(
         replayedFollowUps: replayed?.followUps,
         system,
         ...(panelRules ? { panelReview: panelRules } : {}),
+        ...(ctx.state.implementer ? { implementerModel: ctx.state.implementer.modelId } : {}),
         prompt: {
           prompt: ctx.run.prompt,
           spec: ctx.state.spec ?? null,

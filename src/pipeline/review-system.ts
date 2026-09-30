@@ -214,13 +214,16 @@ const RostersSchema = z.strictObject({
 
 /**
  * Checked at startup, so a mistyped pin fails loudly instead of routing by policy: roster targets
- * must be catalog models the review role can run, and a local finder's must be free.
+ * must be catalog models the review role can run, and a local finder's must be free. Single mode
+ * uses no roster, so there a problem (e.g. a pinned model a later release dropped) only warns.
  */
 export function checkRosterTargets(
-  rosters: Record<ResolvedProfile, ReviewFinder[]>,
+  cfg: Pick<Config, "reviewMode" | "reviewRosters">,
   models: ModelDef[],
   providers: ProviderDef[],
+  warn: (message: string) => void,
 ): void {
+  const rosters = cfg.reviewRosters;
   const problems = Object.entries(rosters).flatMap(([profile, finders]) =>
     finders.flatMap(({ target, local }, i) => {
       if (target === undefined) return [];
@@ -236,7 +239,10 @@ export function checkRosterTargets(
       }
     }),
   );
-  if (problems.length) throw new Error(`Invalid review rosters: ${problems.join("; ")}`);
+  if (!problems.length) return;
+  const message = `Invalid review rosters: ${problems.join("; ")}`;
+  if (cfg.reviewMode === "panel") throw new Error(message);
+  warn(`${message} (ignored: [review] mode is single)`);
 }
 
 /** `[review.rosters]` from config.toml; a profile it leaves out keeps its default roster. */

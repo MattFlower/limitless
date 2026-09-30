@@ -484,10 +484,10 @@ are in [REASONING_EFFORT](REASONING_EFFORT.md).
 
 By default a review is one routed finder (`[review] mode = "single"`). With `mode = "panel"`,
 several finders run in parallel, their reports are merged, and a verifier rules on each candidate
-before anything blocks. The verifier never runs on a model that raised the candidate. It avoids the
-vendors that raised it, then the implementer's vendor, and takes the implementer's own model only as
-a last resort, even on free-first runs. When it has to share a vendor with a finder, the panel
-record says so. Panel mode is off by default until evals show it
+before anything blocks. The verifier never runs on a model that raised the candidate. It prefers a
+vendor that neither raised it nor implemented the change, then the implementer's vendor, then a
+raising vendor, and takes the implementer's own model only as a last resort, even on free-first
+runs. When it has to share a vendor with a finder, the panel record says so. Panel mode is off by default until evals show it
 outperforms single mode. Runs prepared in single mode stay single; turning panel mode off takes
 effect at the next review of every run.
 
@@ -514,7 +514,9 @@ Each finder takes these keys:
 - `prompt`: `standard` (report everything, with confidence), `adversarial` (assume the change can
   fail) or `careful` (one senior pass).
 - `target`: a pinned model such as `codex/sol`. Without it, the finder is routed by the review policy.
-- `family`: `cross` (the default) avoids the implementer's vendor; `implementer` prefers it.
+- `family`: `cross` (the default) avoids the implementer's vendor; `implementer` prefers it, and
+  may run on the implementer's own model in a fresh session. The panel record marks such a finder
+  `implementerModel`.
 - `local = true`: only a free local model. One 15-minute limit covers waiting for a slot and every
   fallback. When no local model answers in time, or its output is invalid, the finder is skipped and
   the panel record says why.

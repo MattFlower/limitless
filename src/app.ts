@@ -85,7 +85,7 @@ export class Factory {
       ...provider,
       maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
     }));
-    checkRosterTargets(cfg.reviewRosters, this.models, this.providerDefs);
+    checkRosterTargets(cfg, this.models, this.providerDefs, (message) => console.warn(message));
     this.policy =
       opts.policy ??
       (opts.policyPath === undefined

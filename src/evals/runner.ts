@@ -780,13 +780,12 @@ export class EvalRunner {
                         }
                         return { result: own, target };
                       },
-                      verify: async (request, avoidVendors) => {
+                      verify: async (request, _avoidVendors, avoidModels) => {
                         if (!panelTargets) throw new Error("review system has no verifier");
-                        const { modelId, vendor } = panelTargets.verifier;
-                        if (avoidVendors.includes(vendor))
-                          throw new Error(
-                            `verifier ${modelId} shares vendor ${vendor} with a finder it checks`,
-                          );
+                        // A shared vendor is allowed and recorded by the panel, as in production.
+                        const { modelId } = panelTargets.verifier;
+                        if (avoidModels.includes(modelId))
+                          throw new Error(`verifier ${modelId} raised a candidate it would check`);
                         return sendTo(request, panelTargets.verifier, `verifier-${++verifications}`);
                       },
                     },
