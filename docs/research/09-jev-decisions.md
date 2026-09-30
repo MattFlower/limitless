@@ -68,9 +68,10 @@ eligibility call to the owner.
 
 ## Triage mapping (design for #32)
 
-One call, five questions over a state of repository, top-level entries and the quoted request:
-`task_class` (choice over the eight classes), `complexity` / `risk` / `ambiguity` (scores reusing the
-triage prompt's guidance, risk with the blast-radius text), `needs_questions` (noul). Code derives
+One call, five questions over a state of repository, top-level entries and the request (condensed
+since v2, below): `task_class` (choice over the eight classes), `complexity` / `risk` / `ambiguity`
+(scores following the triage prompt's guidance, with levels that describe situations since v2),
+`needs_questions` (noul). Code derives
 `suggested_profile` (today's rule: large or high-risk → deep, trivial → quick, else standard), the
 title from the request's first line, and `blocking_questions: []`. If any choice/score confidence is
 below `[triage] decision_confidence`, P(needs_questions) ≥ 0.5, or ambiguity is high (only an LLM
@@ -95,6 +96,83 @@ wording, with a middle ambiguity level of "some details are unspecified", scored
 the levels now follow the triage prompt ("prefer a reasonable assumption"). Because the wording was
 checked on this set, eval results on it are not fully held out; confirm at k=3 against the
 current triage default before routing production triage to Jev.
+
+### Question design v2 (2026-09-29)
+
+The 30 held-out cases (#155) showed design v1 failing on long, realistic requests (Jev alone 50%),
+but the 40 development cases were all one-liners, so the dev set could not measure that. It now has
+20 long cases (`triage-l01`…`l21`, tag `long`, 700–5,600 characters) from public issues and a
+Dependabot PR, wrapped exactly as the factory wraps issues, `/limitless` comments and Dependabot
+PRs. l10 was dropped because its source issue (#71) is also the source of held-out h08. The session
+that revised the questions also wrote these labels, before any model answered them; a second
+labeller should check them. Wording was iterated only on the dev cases, with k=3 calls through the
+decisions harness and the eval grader; the cascade uses Luna trials by case and trial number, as
+`eval run` does.
+
+- **Levels describe situations.** Complexity no longer counts files (Jev can't count). Risk levels are
+  Contained / Wide / Severe with examples; v1's low level had no place for dependency bumps, CI,
+  questions or removing unused code, so correct answers came back at confidence 0.2–0.5. Ambiguity
+  levels are Clear / Open choice / Unclear, and Clear covers questions ("explain").
+- **Request state.** GitHub prompts with one of the factory's three prefaces come out of their quoted
+  JSON as `request.{title, body}` (plus Dependabot's `instruction`), or as `request` and `issue` for
+  a comment, with `source` keeping the untrusted-content label. Plain prompts split into title and
+  body. Nothing is removed: an earlier variant stripped HTML, comments and collapsed `<details>`,
+  but that hid text the implementer still reads, so it was dropped. Fields longer than 12,000
+  characters are cut with a "not shown" marker, and such a request is declined, never as a last
+  resort. The state is built only when a decision model is called.
+- **Top-level entries stay.** Dropping them cost 6–8 points on dev, mostly risk and ambiguity answers
+  for the small sandbox repository, so they are context, not a distractor.
+
+Dev set (60 cases, k=3, labels as first written; v1 re-run through the same harness):
+
+| | v1 | v2 |
+|---|---|---|
+| Jev alone (40 short / 20 long) | 72.2% (70.8% / 75.0%) | 88.3% (87.5% / 90.0%) |
+| escalated / accepted pass | 60.6% / 91.5% | 45.6% / 96.9% |
+| cascade via Luna@none (85.6% alone) | 86.1% | 88.3% |
+| cascade via Luna@medium (82.2% alone) | 81.7% | 86.7% |
+
+The same v1 design scored 74.2% on the 40 short cases in the daemon's `eval-mum1tifut5dn`, so runs
+vary by up to about 3.5 points. Step by step, on the earlier 61-case set with two labels re-read
+after the first sweep (since restored): condensed state without
+the top-level entries 74.3%, then risk levels 80–81%, ambiguity levels 81%, complexity levels
+84–85%, then the entries restored 91%. With the final wording, the raw request (90.7%) and the
+condensed one (91.3%) were within noise: on dev the gain comes from the level wording. The variant
+with content stripping scored 88.9% (long 95.0%) on the current set; the one-case difference on long
+requests is l16, whose complexity score sits on the small/medium boundary.
+
+**Thresholds.** Per-question thresholds did no better than a uniform one. A uniform 0.5 cuts dev
+escalation from 46% to 32%, with accepted pass 95.1% (116/122), no accepted risk under-call, and the
+cascade at 87.8% / 88.3% (Luna@none / Luna@medium). The default stays 0.6.
+
+**Held-out check.** It ran once, on the pre-registered design (0.6 primary, 0.5 secondary): the
+same questions, with the content-stripping state that was dropped afterwards. The code that lands
+builds a different state for 8 of the 30 held-out cases, and the set was not re-run. v1 is
+eval-mump7s7re29l, and the cascade reuses its Luna trials.
+
+| | v1 | pre-registered v2 |
+|---|---|---|
+| Jev alone (15 long / 15 short) | 50.0% (66.7% / 33.3%) | 66.7% (93.3% / 40.0%) |
+| escalated / accepted pass | 63.3% / 72.7% (24/33) | 56.7% / 100% (39/39) |
+| cascade via Luna@none (63.3% alone) | 60.0% | 70.0% |
+| cascade via Luna@medium (78.9% alone) | 74.4% | 84.4% |
+| cases whose trials disagree | 2/30 | 0/30 |
+
+- At 0.5, held-out escalation is 50.0%, with the same cascade figures, and no accepted answer
+  under-called risk.
+- Jev alone improves on 6 cases and gets worse on none. The cascade's lead over Luna@medium alone
+  rests on 3 cases.
+- The held-out set does not exercise the GitHub unwrapping. Its only GitHub-wrapped case, h03, is cut
+  at 6,000 characters without its closing tag, so it takes the plain path. It scores 0/3 and
+  accounts for all 3 long-case failures. The 14 plain-text long requests pass 42/42.
+- Short issue titles escalate 87% (39 trials). The gold for 15 of these needs questions or has high
+  ambiguity; 12 are high risk and need no questions; 12 are neither. Jev's own answer was right in 12
+  of them.
+- **This set has now been seen.** Any routing decision needs a fresh held-out run of the landed code,
+  ideally on new held-out cases.
+
+Improving short titles would take another dev-only round: real issue titles, since the dev set's
+short cases are cleaner.
 
 ## Ideas for epics: deciding when and how to split a request
 

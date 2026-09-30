@@ -112,6 +112,9 @@ test("sends typed questions with a bearer key, maps answers, and records usage a
     text: "jev-1.13.0: kind=bug (0.91), size=2 (0.70), urgent P=0.20",
   });
   expect(readFileSync(join(dir, "log"), "utf8")).not.toContain("secret-key");
+  // A lazy state is built when the call is made.
+  await runDecisions(spec({ decisionTask: { ...task, state: () => ({ ticket: "built late" }) } }));
+  expect(requests[1]?.body.state).toEqual({ ticket: "built late" });
 });
 
 test("retries one transient failure, then reports the provider unavailable", async () => {
