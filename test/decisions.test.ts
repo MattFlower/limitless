@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -120,8 +120,31 @@ test("sends typed questions with a bearer key, maps answers, and records usage a
 
 test("retries one transient failure, then reports the provider unavailable", async () => {
   reply = (n) => (n === 1 ? new Response("overloaded", { status: 529 }) : ok(answers, 10));
-  expect((await runDecisions(spec())).status).toBe("ok");
+  const retried = await runDecisions(spec());
   expect(requests).toHaveLength(2);
+  // The retry answered, but the overloaded request may have been billed without ever reporting usage.
+  expect(retried).toMatchObject({ status: "ok", usage: { input: 10, output: 40 }, usageFinal: false });
+
+  // A refusal after such a request spent nothing itself, yet cannot resolve the earlier spend either.
+  requests = [];
+  reply = (n) =>
+    n === 1 ? new Response("boom", { status: 503 }) : new Response("slow down", { status: 429 });
+  expect(await runDecisions(spec())).toMatchObject({ status: "quota", costUsd: 0, usageFinal: false });
+  expect(requests).toHaveLength(2);
+
+  // The same holds when the first attempt failed in transport: the server may still have run it.
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  const mock = spyOn(globalThis, "fetch").mockImplementation(((url, init) =>
+    ++calls === 1 ? Promise.reject(new Error("socket hang up")) : realFetch(url, init)) as typeof fetch);
+  try {
+    requests = [];
+    reply = () => new Response("slow down", { status: 429 });
+    expect(await runDecisions(spec())).toMatchObject({ status: "quota", costUsd: 0, usageFinal: false });
+    expect(calls).toBe(2);
+  } finally {
+    mock.mockRestore();
+  }
 
   requests = [];
   reply = () => Response.json({ detail: "boom for secret-key" }, { status: 503 });

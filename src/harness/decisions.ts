@@ -147,11 +147,14 @@ export const runDecisions: Harness = async (spec) => {
     log({ event: "complete", status, inputTokens: usage.input, costUsd: result.costUsd });
     return result;
   };
-  // A request the server refused, or one never sent, spent nothing; a parsed response reports its usage.
-  const settled = { usageFinal: true };
+  // A request the server refused, or one never sent, spent nothing; a parsed response reports its
+  // usage. But a request that failed or timed out may have been billed without ever being accounted,
+  // so once one did, no later refusal or success makes this call's spend final again.
+  let unresolved = false;
+  const accounted = () => ({ usageFinal: !unresolved });
   log({ event: "start", provider: spec.target.provider, model: spec.target.model });
   if (!endpoint || !task)
-    return finish("error", "decision call requires a decisions endpoint and task", settled);
+    return finish("error", "decision call requires a decisions endpoint and task", accounted());
 
   const deadline = AbortSignal.timeout(spec.timeoutMs);
   const state = typeof task.state === "function" ? task.state() : task.state;
@@ -174,6 +177,7 @@ export const runDecisions: Harness = async (spec) => {
       });
     } catch {
       if (spec.signal.aborted) return finish("cancelled", "decision call cancelled");
+      unresolved = true;
       failure =
         deadline.aborted || attemptTimeout.aborted
           ? { status: "timeout", error: "decision call timed out" }
@@ -184,22 +188,24 @@ export const runDecisions: Harness = async (spec) => {
     if (!response.ok) {
       const code = response.status;
       // Key errors keep no server text (it could echo the key); other bodies are untrusted, so redact it.
-      if (code === 401 || code === 403) return finish("quota", `API key rejected (HTTP ${code})`, settled);
+      if (code === 401 || code === 403)
+        return finish("quota", `API key rejected (HTTP ${code})`, accounted());
       const text = await response.text().catch(() => "");
       const detail = errorDetail(
         endpoint.authToken ? text.replaceAll(endpoint.authToken, "[redacted]") : text,
       );
       if (code >= 500 || code === 408) {
+        unresolved = true;
         failure = { status: "unavailable", error: `decision service unavailable (HTTP ${code})${detail}` };
         continue;
       }
       if (code === 429)
         return finish("quota", `model rate-limited (HTTP 429)${detail}`, {
-          ...settled,
+          ...accounted(),
           modelCooldownMs: cooldownMs(response.headers),
         });
-      if (code === 402) return finish("quota", `provider out of credit (HTTP 402)${detail}`, settled);
-      return finish("error", `decision request rejected (HTTP ${code})${detail}`, settled);
+      if (code === 402) return finish("quota", `provider out of credit (HTTP 402)${detail}`, accounted());
+      return finish("error", `decision request rejected (HTTP ${code})${detail}`, accounted());
     }
     let parsed: ReturnType<typeof ResponseSchema.safeParse>;
     try {
@@ -208,6 +214,7 @@ export const runDecisions: Harness = async (spec) => {
       // Reading the body can also be cut short by cancellation or a timeout.
       if (spec.signal.aborted) return finish("cancelled", "decision call cancelled");
       if (deadline.aborted || attemptTimeout.aborted) {
+        unresolved = true;
         failure = { status: "timeout", error: "decision call timed out" };
         continue;
       }
@@ -218,7 +225,7 @@ export const runDecisions: Harness = async (spec) => {
     usage.output = parsed.data.usage.output_tokens;
     const answers = mapAnswers(task, parsed.data.answers);
     if (typeof answers === "string")
-      return finish("unavailable", `malformed decisions response: ${answers}`, settled);
+      return finish("unavailable", `malformed decisions response: ${answers}`, accounted());
     log({ event: "answers", model: parsed.data.model, answers });
     spec.onEvent({ type: "status", text: `${parsed.data.model}: ${describe(answers)}` });
     try {
@@ -226,13 +233,13 @@ export const runDecisions: Harness = async (spec) => {
       const structured = task.interpret(answers);
       const decline = task.decline?.(answers) ?? null;
       return finish(decline ? "declined" : "ok", decline?.reason ?? null, {
-        ...settled,
+        ...accounted(),
         structured,
         finalText: JSON.stringify(answers),
         ...(decline ? { decline } : {}),
       });
     } catch (error) {
-      return finish("error", `decision mapping failed: ${(error as Error).message}`, settled);
+      return finish("error", `decision mapping failed: ${(error as Error).message}`, accounted());
     }
   }
   if (spec.signal.aborted) return finish("cancelled", "decision call cancelled");

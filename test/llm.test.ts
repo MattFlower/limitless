@@ -118,13 +118,63 @@ test("format rejection and fenced JSON use one repair request", async () => {
 });
 
 test("invalid response is retried once and never accepted", async () => {
-  reply = () => Response.json({ choices: [{ message: { content: '{"wrong":1}' } }] });
+  reply = () =>
+    Response.json({
+      choices: [{ message: { content: '{"wrong":1}' } }],
+      usage: { prompt_tokens: 3, completion_tokens: 1 },
+    });
   const result = await runLlm(spec());
   expect(result.status).toBe("error");
   expect(result.structured).toBeNull();
   expect(requests).toHaveLength(2);
-  // Both answers were parsed, so the usage they reported is the whole spend.
+  // Both answers were parsed with usage, so what they reported is the whole spend.
+  expect(result.usage).toMatchObject({ input: 6, output: 2 });
   expect(result.usageFinal).toBe(true);
+});
+
+test("a response without usage is a valid answer but never final accounting", async () => {
+  // A metered endpoint that omits usage may still bill: zero recorded is not zero spent.
+  const metered = () => {
+    const input = spec();
+    input.target.billing = "metered";
+    return input;
+  };
+  reply = () => Response.json({ choices: [{ message: { content: '{"answer":"ok"}' } }] });
+  let result = await runLlm(metered());
+  expect(result).toMatchObject({ status: "ok", structured: { answer: "ok" }, costUsd: 0, usageFinal: false });
+
+  // Usage on the repair request does not account for the first response that lacked it.
+  requests.length = 0;
+  reply = (_body, n) =>
+    n === 1
+      ? Response.json({ choices: [{ message: { content: "{}" } }] })
+      : Response.json({
+          choices: [{ message: { content: '{"answer":"ok"}' } }],
+          usage: { prompt_tokens: 7, completion_tokens: 2 },
+        });
+  result = await runLlm(metered());
+  expect(requests).toHaveLength(2);
+  expect(result).toMatchObject({ status: "ok", usage: { input: 7, output: 2 }, usageFinal: false });
+
+  // Nor does a later refusal, which spent nothing itself, resolve the earlier unaccounted request.
+  requests.length = 0;
+  reply = (_body, n) =>
+    n === 1
+      ? Response.json({ choices: [{ message: { content: "{}" } }] })
+      : new Response("limited", { status: 429 });
+  result = await runLlm(metered());
+  expect(requests).toHaveLength(2);
+  expect(result).toMatchObject({ status: "quota", usageFinal: false });
+
+  // Malformed usage counts as missing rather than as zero.
+  requests.length = 0;
+  reply = () =>
+    Response.json({
+      choices: [{ message: { content: '{"answer":"ok"}' } }],
+      usage: { prompt_tokens: "12", completion_tokens: null },
+    });
+  result = await runLlm(metered());
+  expect(result).toMatchObject({ status: "ok", usage: { input: 0, output: 0 }, usageFinal: false });
 });
 
 test("cancel, timeout, transport and provider errors are classified", async () => {

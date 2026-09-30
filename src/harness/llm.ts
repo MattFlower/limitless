@@ -39,6 +39,16 @@ function object(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/** The response's token counts, or null when the server sent no authoritative usage. */
+function reportedUsage(response: Record<string, unknown> | null): { input: number; output: number } | null {
+  const tokens = object(response?.usage);
+  const input = tokens?.prompt_tokens;
+  const output = tokens?.completion_tokens;
+  return typeof input === "number" && typeof output === "number" && input >= 0 && output >= 0
+    ? { input, output }
+    : null;
+}
+
 export function effortFields(target: ModelTarget): Record<string, unknown> {
   if (target.effort === undefined) return {};
   if (!target.openai) throw new Error("Effort requires an HTTP endpoint");
@@ -91,6 +101,9 @@ export const runLlm: Harness = async (spec) => {
   if (spec.systemAppend) messages.push({ role: "system", content: spec.systemAppend });
   messages.push({ role: "user", content: spec.prompt });
   let lastError = "invalid structured response";
+  // A valid answer is not final accounting: a metered response without usage may still be billed,
+  // and once a request went unaccounted no later request makes this call's spend final again.
+  let accounted = true;
   for (let attempt = 0; attempt < 2; attempt++) {
     if (signal.aborted)
       return finish(
@@ -136,7 +149,7 @@ export const runLlm: Harness = async (spec) => {
             `completion rejected (HTTP ${response.status})`,
             usage,
             spec.target,
-            response.status < 500,
+            accounted && response.status < 500,
           ),
         );
       }
@@ -147,9 +160,11 @@ export const runLlm: Harness = async (spec) => {
         return finish(failure("unavailable", "malformed completion response", usage, spec.target));
       }
       const parsed = object(data);
-      const tokens = object(parsed?.usage);
-      usage.input += Number(tokens?.prompt_tokens) || 0;
-      usage.output += Number(tokens?.completion_tokens) || 0;
+      const tokens = reportedUsage(parsed);
+      if (tokens) {
+        usage.input += tokens.input;
+        usage.output += tokens.output;
+      } else accounted = false;
       const choices = parsed?.choices;
       const choice = Array.isArray(choices) ? object(choices[0]) : null;
       const message = object(choice?.message);
@@ -176,7 +191,7 @@ export const runLlm: Harness = async (spec) => {
           costUsd: spec.target.billing === "metered" ? cost : 0,
           costEquivUsd: cost,
           quota: null,
-          usageFinal: true,
+          usageFinal: accounted,
         });
       }
       lastError = "completion failed schema validation";
@@ -191,6 +206,6 @@ export const runLlm: Harness = async (spec) => {
       return finish(failure("unavailable", "completion transport failure", usage, spec.target));
     }
   }
-  // Both attempts returned parsed responses (or a refusal), so their usage is complete.
-  return finish(failure("error", lastError, usage, spec.target, true));
+  // Both attempts returned parsed responses (or a refusal); their usage is complete if each reported it.
+  return finish(failure("error", lastError, usage, spec.target, accounted));
 };
