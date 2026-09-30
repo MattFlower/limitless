@@ -35,12 +35,14 @@ limitless deploy --smoke            # also run live CLI contract checks before r
 1. The change lands on `main` (normally a factory PR that the orchestrator reviewed and merged).
 2. `limitless deploy` in any checkout:
    - checks out `origin/main` in `~/.limitless/app`, runs `bun install --frozen-lockfile` and
-     the full `bun run check` there before draining, even when the checkout is already at that
+     the checks there (`bun run lint`, `bun run typecheck`, and `bun test` run directly, so
+     `PATH` matches the daemon's) before draining, even when the checkout is already at that
      commit — **a failing check aborts the deploy and keeps the old daemon running**;
    - restarts the daemon via launchd and waits for `/api/health`;
    - **rolls back** to the previous commit and restarts again if the new version doesn't come up.
    Add `--smoke` (with or without an explicit ref) to run live CLI contract checks in the release
-   checkout after `bun run check` and before restart. A smoke failure restores the previous
+   checkout after the checks and before restart (`bun scripts/smoke.ts`, run directly for the same
+   reason). A smoke failure restores the previous
    checkout through the same deploy gate failure path.
 3. Runs in flight are interrupted by the restart and **resume** at the step they were on
    (the worktree and run state are persisted; a round whose implementation already committed
@@ -121,7 +123,7 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 | A model shows "model rejected" in a run | the provider refused that model (plan, CLI version) | it's blocked for 24h automatically; check the CLI version in the daemon log |
 | Runs stuck in `queued` | concurrency limit, or no provider available | `limitless providers`; UI Models page shows why candidates were skipped |
 | `exhausted` on a subscription | reserve reached (Claude 80% of 5h, Codex per `config.toml`) | wait for the window reset shown in the UI, or raise the reserve |
-| Deploy says "deploy gate failed" | `bun run check` failed on `main` | fix `main`; production keeps running the previous commit |
+| Deploy says "deploy gate failed" | a check failed on `main` in the release checkout | fix `main`; production keeps running the previous commit. If `bun run check` passes elsewhere, compare `which -a codex claude` with the daemon's `PATH`: a CLI in a parent directory's `node_modules/.bin` is picked up only by `bun run` scripts |
 | Run failed with a git error in `prepare` | repo cache problem | delete `~/.limitless/repos/<owner>__<name>.git`; it is re-cloned on the next run |
 
 Every agent session's raw event stream is kept in `~/.limitless/runs/<run>/inv-<n>.log`, and the UI

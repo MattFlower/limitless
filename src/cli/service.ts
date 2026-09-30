@@ -237,7 +237,24 @@ export async function uninstall(): Promise<void> {
 }
 
 /**
- * Deploy a ref to the release checkout: gate on `bun run check`, restart, health-check, and roll
+ * The factory's gate commands, run directly instead of through `bun run check`: `bun run` puts every
+ * parent directory's node_modules/.bin first on PATH, so a stray CLI under $HOME (an older `codex`,
+ * say) would be checked and smoke-tested instead of the one the daemon runs.
+ */
+const GATES = [
+  ["bun", "run", "lint"],
+  ["bun", "run", "typecheck"],
+  ["bun", "test"],
+];
+const SMOKE = ["bun", "scripts/smoke.ts"];
+
+async function gates(run: typeof sh, dir: string, smoke: boolean): Promise<void> {
+  for (const args of GATES) await run(args, { cwd: dir, timeoutMs: 600_000 });
+  if (smoke) await run(SMOKE, { cwd: dir, timeoutMs: 900_000 });
+}
+
+/**
+ * Deploy a ref to the release checkout: gate on the checks, restart, health-check, and roll
  * back to the previous commit if the new version does not come up.
  */
 export async function deploy(
@@ -324,10 +341,7 @@ export async function deploy(
         await race(requestAdmin(client, clock, "resume"));
         drainAttempted = false;
       }
-      if (smoke) {
-        await run(["bun", "run", "check"], { cwd: dir, timeoutMs: 600_000 });
-        await run(["bun", "run", "smoke"], { cwd: dir, timeoutMs: 900_000 });
-      }
+      if (smoke) await gates(run, dir, smoke);
       log(`daemon after: ${running.sha}`);
       log(`already deployed ${target}`);
       return;
@@ -335,8 +349,7 @@ export async function deploy(
     if (checkout !== target) await run(["git", "checkout", "-q", "--detach", target], { cwd: dir });
     else log(`checkout already at ${target}; continuing deployment`);
     await run(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000 });
-    await run(["bun", "run", "check"], { cwd: dir, timeoutMs: 600_000 });
-    if (smoke) await run(["bun", "run", "smoke"], { cwd: dir, timeoutMs: 900_000 });
+    await gates(run, dir, smoke);
     gatesPassed = true;
     // A lost response may still have enabled drain on the daemon.
     drainAttempted = true;
