@@ -280,13 +280,17 @@ test("verify reports pooled confusion counts, accuracy and null rates without la
   });
 });
 
-test("verify grader counts an unmet not_required prediction as a pass", async () => {
+test("verify grader counts an unmet not_required holdout prediction as a pass", async () => {
   const { gradeVerify } = await import("../src/evals/graders/verify.ts");
   const { loadRoleCases, VerifyCaseFileSchema } = await import("../src/evals/cases.ts");
-  const item = VerifyCaseFileSchema.parse(
+  const fixture = VerifyCaseFileSchema.parse(
     loadRoleCases("verify", new URL("./data/evals-verify.json", import.meta.url).pathname),
   ).cases[2];
-  if (!item) throw new Error("fixture");
+  if (!fixture) throw new Error("fixture");
+  const item = {
+    ...fixture,
+    gold: { "AC-1": "unmet" as const, "H-1": "met" as const, "H-2": "unmet" as const },
+  };
   const grade = gradeVerify(item, {
     overall: "pass",
     notes: "",
@@ -299,10 +303,13 @@ test("verify grader counts an unmet not_required prediction as a pass", async ()
         requirement: "not_required",
       },
       { id: "H-1", status: "unmet", evidence: "dismissed", publicSummary: "", requirement: "not_required" },
+      { id: "H-2", status: "unmet", evidence: "real defect", publicSummary: "", requirement: "not_required" },
     ],
   });
-  expect(grade.verify?.criteria["AC-1"]).toMatchObject({ gold: "unmet", match: false, falseAccept: true });
+  // The pipeline ignores not_required on a public criterion, so AC-1 stays an unmet prediction.
+  expect(grade.verify?.criteria["AC-1"]).toMatchObject({ gold: "unmet", predicted: "unmet", match: true });
   expect(grade.verify?.criteria["H-1"]).toMatchObject({ gold: "met", match: true, falseReject: false });
+  expect(grade.verify?.criteria["H-2"]).toMatchObject({ gold: "unmet", match: false, falseAccept: true });
   expect(grade.verify?.falseAccepts).toBe(1);
   expect(grade.pass).toBe(false);
 });
