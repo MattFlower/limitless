@@ -280,6 +280,33 @@ test("verify reports pooled confusion counts, accuracy and null rates without la
   });
 });
 
+test("verify grader counts an unmet not_required prediction as a pass", async () => {
+  const { gradeVerify } = await import("../src/evals/graders/verify.ts");
+  const { loadRoleCases, VerifyCaseFileSchema } = await import("../src/evals/cases.ts");
+  const item = VerifyCaseFileSchema.parse(
+    loadRoleCases("verify", new URL("./data/evals-verify.json", import.meta.url).pathname),
+  ).cases[2];
+  if (!item) throw new Error("fixture");
+  const grade = gradeVerify(item, {
+    overall: "pass",
+    notes: "",
+    criteria: [
+      {
+        id: "AC-1",
+        status: "unmet",
+        evidence: "dismissed defect",
+        publicSummary: "",
+        requirement: "not_required",
+      },
+      { id: "H-1", status: "unmet", evidence: "dismissed", publicSummary: "", requirement: "not_required" },
+    ],
+  });
+  expect(grade.verify?.criteria["AC-1"]).toMatchObject({ gold: "unmet", match: false, falseAccept: true });
+  expect(grade.verify?.criteria["H-1"]).toMatchObject({ gold: "met", match: true, falseReject: false });
+  expect(grade.verify?.falseAccepts).toBe(1);
+  expect(grade.pass).toBe(false);
+});
+
 test("summaries and paired comparisons separate efforts of the same base model", () => {
   const trials = [
     { ...trial("a", "case", 0, false), effort: "low" as const },

@@ -5,7 +5,10 @@ import type { VerifyCase } from "../cases.ts";
 export function gradeVerify(item: VerifyCase, output: Verify): EvalGrade {
   const criteria: NonNullable<EvalGrade["verify"]>["criteria"] = {};
   for (const [id, gold] of Object.entries(item.gold)) {
-    const predictions = output.criteria.filter((c) => c.id === id).map((c) => c.status);
+    // unmet + not_required passes the pipeline, so it is graded as a met prediction.
+    const predictions = output.criteria
+      .filter((c) => c.id === id)
+      .map((c) => (c.status === "unmet" && c.requirement === "not_required" ? "met" : c.status));
     const predicted = predictions.length > 1 ? "duplicate" : (predictions[0] ?? "missing");
     criteria[id] = {
       gold,

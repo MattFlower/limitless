@@ -2679,9 +2679,7 @@ protected_paths = ["protected.txt"]
             expect(prompt).not.toContain(secret);
             expect(prompt).not.toContain("missing input");
             expect(prompt).not.toContain("[private detail]");
-            expect(prompt.includes("Citation validation: evidence does not cite the requirement")).toBe(
-              !!evidence,
-            );
+            expect(prompt).not.toContain("Citation validation");
             checked = true;
           },
         );
@@ -2714,7 +2712,7 @@ protected_paths = ["protected.txt"]
             expect(prompt).not.toContain("[private detail]");
             const feedback = prompt.split("### Checks not met")[1] ?? "";
             expect(feedback).not.toContain("Delete the old parser");
-            expect(feedback).toContain("public requirements:\nfarewell.txt exists");
+            expect(feedback).toContain("check them against the original request and specification above");
             checked = true;
           },
         );
@@ -2731,6 +2729,21 @@ protected_paths = ["protected.txt"]
         expect(first?.notes).toContain("requirement citation validation failed");
       },
     );
+
+    test("an all-met verify with a non-enum requirement value succeeds instead of failing the invocation", async () => {
+      const allMet = { ...pass, criteria: pass.criteria.map((c) => ({ ...c, requirement: "" })) };
+      const { f, implementCalls, verifies } = drive(allMet, () => {});
+      const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(
+        f.store
+          .listInvocations(run.id)
+          .filter((i) => i.role === "verify")
+          .map((i) => i.status),
+      ).toEqual(["ok"]);
+      expect(verifies()).toBe(1);
+      expect(implementCalls()).toBe(1);
+    });
 
     test("verifier output without a requirement field stays blocking on replay", async () => {
       let checked = false;

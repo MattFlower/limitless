@@ -258,12 +258,14 @@ export const VerifySchema = z.object({
         .describe(
           "For H-ids, short observed behavior without private inputs or expected values; empty for public criteria",
         ),
-      // Defaults let output recorded before holdouts were classified parse as unclassified, which blocks.
-      // Citation validation happens after parsing so malformed classifications still yield a verdict.
+      // Missing (output recorded before holdouts were classified) or invalid values (text recovery bypasses
+      // constrained decoding) parse as unclassified, which blocks. Citation validation happens after
+      // parsing so malformed classifications still yield a verdict.
       requirement: z
         .enum(["request", "spec", "not_required"])
         .nullable()
         .default(null)
+        .catch(null)
         .describe("For unmet H-ids, what the failure violates; null for every other entry"),
       requirementCitation: z
         .string()

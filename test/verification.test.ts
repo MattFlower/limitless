@@ -487,8 +487,56 @@ test("out-of-scope citations remain blocking but are never attributed as spec re
   expect(result.notes).toContain("citation is not a stated public requirement");
   const feedback = formatVerifyFeedback(result, publicSpec, holdout);
   expect(feedback).not.toContain("Delete the old parser");
-  expect(feedback).toContain("This attribution is unvalidated");
-  expect(feedback).toContain("public requirements:\nworks");
+  expect(feedback).toContain("check them against the original request and specification above");
+});
+
+test("feedback for several ungrounded holdouts states the fallback once and omits the request", () => {
+  const request = "REQUEST_BODY_MARKER make it work";
+  const verify: Verify = {
+    criteria: ["H-1", "H-2", "H-3", "H-4"].map((id) => ({
+      id,
+      status: "unmet" as const,
+      evidence: "secret input failed",
+      publicSummary: "rejects an empty list",
+      requirement: "request" as const,
+      requirementCitation: "fabricated requirement",
+    })),
+    overall: "fail",
+    notes: "",
+  };
+  const feedback = formatVerifyFeedback(verify, spec, holdout, request, request);
+  expect(feedback.split("(the verifier's citation was not found in it)").length - 1).toBe(4);
+  expect(feedback.split("REQUEST_BODY_MARKER").length - 1).toBeLessThanOrEqual(1);
+  expect(feedback.split("check them against the original request and specification above").length - 1).toBe(
+    1,
+  );
+  expect(feedback).not.toContain("Citation validation");
+  expect(feedback).not.toContain("secret input");
+});
+
+test("an unrunnable scenario is reported unmet not_required; unclear stays blocking", () => {
+  expect(verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" })).toContain(
+    "If a scenario cannot be run as written in this repository, report it `unmet` with requirement `not_required`; use `unclear` only for a check you ran whose outcome you could not determine.",
+  );
+  expect(normalizeVerify(unmetHoldout({ status: "unclear" }), spec, holdout).overall).toBe("fail");
+});
+
+test("an invalid requirement value parses as null and blocks; the strict schema is unchanged", () => {
+  for (const requirement of ["", "none"]) {
+    const parsed = VerifySchema.parse({
+      ...unmetHoldout({}),
+      criteria: unmetHoldout({}).criteria.map((c) => ({ ...c, requirement })),
+    });
+    expect(parsed.criteria.map((c) => c.requirement)).toEqual([null, null]);
+    expect(normalizeVerify(parsed, spec, holdout).overall).toBe("fail");
+  }
+  const item = (toStrictJsonSchema(VerifySchema) as { properties: { criteria: { items: unknown } } })
+    .properties.criteria.items as { required: string[]; properties: Record<string, unknown> };
+  expect(item.required).toContain("requirement");
+  expect(item.properties.requirement).toEqual({
+    description: "For unmet H-ids, what the failure violates; null for every other entry",
+    anyOf: [{ type: "string", enum: ["request", "spec", "not_required"] }, { type: "null" }],
+  });
 });
 
 test("only unmet holdouts classified request or spec block the verdict", () => {
