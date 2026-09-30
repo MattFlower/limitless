@@ -413,17 +413,24 @@ export class CodexReaderProbe {
     this.remove = options.remove ?? ((dir) => rmSync(dir, { recursive: true, force: true }));
   }
 
-  async verify(spec: AgentSpec, run: typeof runProcess): Promise<ConfinementProbe> {
+  /**
+   * `deny` is the caller's denyRead as the profile will deny it, resolved once: the probe checks it
+   * too, so a verdict only covers those effective paths, and a symlink retargeted between lookups
+   * would otherwise pair one verdict with another profile.
+   */
+  async verify(
+    spec: AgentSpec,
+    run: typeof runProcess,
+    deny: string[] = spellings(spec.denyRead ?? []),
+  ): Promise<ConfinementProbe> {
     const path = this.which("codex");
     if (!path) return { ok: false, path: null, version: null, reason: START_FAILED, exitCode: null };
     const lookup = await codexVersion(path, spec, run);
     const unverified = { ok: false, path, version: lookup.version, reason: INCONCLUSIVE, exitCode: null };
     if (spec.signal.aborted) return unverified;
     if (!lookup.version) return { ...unverified, reason: lookup.reason, exitCode: lookup.exitCode };
-    // The probe checks the caller's denyRead too, so a verdict only covers the same effective paths:
-    // a retargeted symlink changes the canonical spelling the profile denies. The list is encoded
-    // separately so a denied path can never stand in for the CLI path or version.
-    const key = `${path}\0${lookup.version}\0${JSON.stringify(spellings(spec.denyRead ?? []).sort())}`;
+    // The list is encoded separately so a denied path can never stand in for the CLI path or version.
+    const key = `${path}\0${lookup.version}\0${JSON.stringify([...deny].sort())}`;
     for (;;) {
       const verdict = this.verdicts.get(key);
       if (verdict) return verdict;
@@ -434,7 +441,7 @@ export class CodexReaderProbe {
         if (spec.signal.aborted) return unverified;
         continue;
       }
-      flight ??= this.start(key, spec, path, lookup.version, run);
+      flight ??= this.start(key, { ...spec, denyRead: deny }, path, lookup.version, run);
       flight.waiters++;
       const result = await unlessAborted(flight.result, spec.signal);
       flight.waiters--;
@@ -675,10 +682,14 @@ export async function runCodex(
   readerProbe = codexReaderProbe,
 ): Promise<AgentResult> {
   const t = spec.target;
-  const args = buildCodexArgs(spec);
+  const confined = spec.confineReads && spec.mode === "readonly" && !spec.noTools;
+  // One snapshot of the denied paths keys the verdict, drives the probe and builds the exec
+  // profile; resolving it again is a no-op unless a symlink was retargeted meanwhile.
+  const deny = confined ? spellings(spec.denyRead ?? []) : [];
+  const args = buildCodexArgs(confined ? { ...spec, denyRead: deny } : spec);
   let confinement: ConfinementProbe | undefined;
-  if (spec.confineReads && spec.mode === "readonly" && !spec.noTools) {
-    confinement = await readerProbe.verify(spec, processRunner);
+  if (confined) {
+    confinement = await readerProbe.verify(spec, processRunner, deny);
     if (spec.signal.aborted)
       return {
         status: "cancelled",
@@ -692,9 +703,15 @@ export async function runCodex(
         error: "cancelled",
         quota: null,
       };
+    // The profile would now deny paths the verdict never covered: fail closed, nothing is cached.
+    const moved = spellings(deny).length !== deny.length;
+    if (moved) confinement = { ...confinement, ok: false, reason: INCONCLUSIVE, exitCode: null };
     if (!confinement.ok || !confinement.path) {
       const exit = confinement.exitCode === null ? "" : `, exit ${confinement.exitCode}`;
       const cli = `${confinement.path ?? "codex"}${confinement.version ? ` (${confinement.version})` : ""}`;
+      const detail = moved
+        ? "denied paths changed during the probe"
+        : `${confinement.reason}${exit}; confined readers will not run on this CLI`;
       return {
         status: "unavailable",
         finalText: "",
@@ -704,7 +721,7 @@ export async function runCodex(
         numTurns: 0,
         costUsd: 0,
         costEquivUsd: 0,
-        error: `Codex read confinement not verified for ${cli}: ${confinement.reason}${exit}; confined readers will not run on this CLI`,
+        error: `Codex read confinement not verified for ${cli}: ${detail}`,
         quota: null,
         confinement,
       };

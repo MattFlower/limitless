@@ -755,6 +755,44 @@ test("a retargeted denyRead symlink is probed again instead of reusing the old v
   }
 });
 
+test("a denyRead symlink retargeted during the version lookup fails closed instead of reusing a verdict", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "limitless-deny-test-")));
+  cleanups.push(() => rmSync(parent, { recursive: true, force: true }));
+  const [a, b, link] = [join(parent, "a"), join(parent, "b"), join(parent, "link")];
+  for (const dir of [a, b]) mkdirSync(dir);
+  const retarget = (target: string) => {
+    rmSync(link);
+    symlinkSync(target, link);
+  };
+  symlinkSync(b, link);
+  const fake = fakeCodex(enforcing, {
+    canaryRoots: (deny) => [...Object.values(fake.roots), ...deny.filter((d) => d === a || d === b)],
+  });
+  let duringLookup: string | null = null;
+  const runner = async (opts: ProcOptions) => {
+    if (opts.cmd[1] === "--version" && duringLookup) retarget(duringLookup);
+    return fake.runner(opts);
+  };
+  try {
+    const confined = { ...spec, denyRead: [link] };
+    expect((await runCodex(confined, runner, fake.probe)).status).toBe("ok");
+    // The profile is built for A, but by the time the verdict is looked up the link is back on B.
+    retarget(a);
+    duringLookup = b;
+    const second = await runCodex(confined, runner, fake.probe);
+    expect(second.status).toBe("unavailable");
+    expect(second.error).toContain("denied paths changed");
+    expect(second.confinement).toMatchObject({ ok: false, reason: "probe inconclusive" });
+    expect(fake.execs).toHaveLength(1);
+    // A was probed on its own, never taken for the cached B verdict.
+    expect(fake.sandboxReads.filter((r) => inRoot(a, r.file))).toHaveLength(1);
+    expect(fake.probes()).toBe(2);
+  } finally {
+    cleanup();
+  }
+});
+
 test("a verdict for one CLI is not reused for another that denies the first's path", async () => {
   const { spec, cleanup } = confinedFixture();
   const [a, b] = ["/opt/codex-a/bin/codex", "/opt/codex-b/bin/codex"];
