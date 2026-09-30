@@ -251,6 +251,10 @@ const SMOKE = ["bun", "scripts/smoke.ts"];
 const GATE_TAIL_LINES = 60;
 const GATE_TAIL_BYTES = 4_000;
 const GATE_LINE_CHARS = 500;
+const GATE_FAIL_ROWS = 10;
+const SMOKE_FAIL_ROW = /\S\s{2,}FAIL\s{2,}/;
+
+const bytes = (lines: string[]) => lines.reduce((sum, line) => sum + Buffer.byteLength(line) + 1, 0);
 
 /** The last lines that fit both limits; one long line is cut rather than dropping everything. */
 function tailLines(lines: string[], maxLines: number, maxBytes: number): string[] {
@@ -273,16 +277,30 @@ async function gates(run: typeof sh, dir: string, smoke: boolean): Promise<void>
     // The failing check (a smoke row, a test name) is usually near the end of the output.
     const out = res.stdout.trimEnd().split("\n").filter(Boolean);
     const err = res.stderr.trimEnd().split("\n").filter(Boolean);
-    // stderr first: a `bun test` failure summary must not be pushed out by stdout lines.
-    const errTail = tailLines(err, GATE_TAIL_LINES, GATE_TAIL_BYTES);
-    const outTail = tailLines(
-      out,
-      GATE_TAIL_LINES - errTail.length,
-      GATE_TAIL_BYTES - errTail.reduce((sum, line) => sum + Buffer.byteLength(line) + 1, 0),
+    // A smoke FAIL row names the failed check, so room is reserved for it; stderr comes next so a
+    // `bun test` failure summary is not pushed out by stdout lines, and stdout gets what is left.
+    const failRows = tailLines(
+      out.filter((line) => SMOKE_FAIL_ROW.test(line)),
+      GATE_FAIL_ROWS,
+      GATE_TAIL_BYTES / 4,
     );
+    const errTail = tailLines(err, GATE_TAIL_LINES - failRows.length, GATE_TAIL_BYTES - bytes(failRows));
+    const outTail = (reserved: string[]) =>
+      tailLines(
+        out,
+        GATE_TAIL_LINES - errTail.length - reserved.length,
+        GATE_TAIL_BYTES - bytes(errTail) - bytes(reserved),
+      );
+    let outKept = outTail([]);
+    const missed = failRows.filter((line) => !outKept.includes(line));
+    if (missed.length) outKept = outTail(missed);
     const section = (name: string, lines: string[], kept: string[]) =>
       kept.length ? [`--- ${name} (last ${kept.length} of ${lines.length} lines) ---`, ...kept] : [];
-    const tail = [...section("stdout", out, outTail), ...section("stderr", err, errTail)];
+    const tail = [
+      ...(missed.length ? ["--- failed smoke rows from stdout ---", ...missed] : []),
+      ...section("stdout", out, outKept),
+      ...section("stderr", err, errTail),
+    ];
     throw new Error(
       [`Command failed (${res.exitCode ?? "killed or timed out"}): ${args.join(" ")}`, ...tail].join("\n"),
     );

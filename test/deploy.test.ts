@@ -626,6 +626,27 @@ test("a failed gate tail keeps stderr first and stays within 4000 bytes", async 
   expect(f.selected()).toBe("previous");
 });
 
+test("a smoke failure keeps its FAIL row when stderr fills the tail", async () => {
+  const f = setup();
+  const command = f.opts.command;
+  f.opts.command = async (args, options) => {
+    if (args.join(" ") !== "bun scripts/smoke.ts") return command(args, options);
+    return {
+      stdout: `${[
+        "claude noTools    FAIL     812ms  local file token appeared in output",
+        ...Array.from({ length: 30 }, (_, i) => `row ${i}  PASS  1ms`),
+      ].join("\n")}\n`,
+      stderr: `${Array.from({ length: 80 }, (_, i) => `warn ${i}`).join("\n")}\n`,
+      exitCode: 1,
+    };
+  };
+  const message = String(await deploy(7400, "feature", true, f.opts).catch((e: unknown) => e));
+  expect(message).toContain("claude noTools    FAIL     812ms  local file token appeared in output");
+  expect(message).toContain("warn 79");
+  expect(message).not.toContain("row 29");
+  expect(f.selected()).toBe("previous");
+});
+
 test("a target checkout runs requested smoke before draining", async () => {
   const f = setup();
   f.setSelected("next");

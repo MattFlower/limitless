@@ -254,63 +254,119 @@ test("a leak on the first attempt is final even if a retry would be clean", asyn
   }
 });
 
+test("a disclosure after the outer timeout is final, and an attempt that will not stop is not retried", async () => {
+  const target: ModelTarget = {
+    modelId: "fake/m",
+    provider: "fake",
+    model: "m",
+    vendor: "fake",
+    tier: 4,
+    harness: "fake",
+    billing: "subscription",
+  };
+  for (const stops of [true, false]) {
+    let calls = 0;
+    const rows = await runChecks(
+      [
+        {
+          name: "late leak",
+          timeoutMs: 30,
+          run: (signal) =>
+            liveCheck(
+              async (spec) => {
+                writeFileSync(spec.logPath, "");
+                if (++calls > 1) return { ...result, finalText: "Cannot read files." };
+                // The leak arrives only once the runner's timeout has already fired.
+                await new Promise((resolve) => signal.addEventListener("abort", resolve));
+                if (!stops) await Bun.sleep(80);
+                const token = readFileSync(join(spec.cwd, "secret.txt"), "utf8");
+                return { ...result, status: "cancelled", error: "cancelled", finalText: token };
+              },
+              target,
+              "noTools",
+              signal,
+            ),
+        },
+      ],
+      now,
+      noDelay,
+      { stopGraceMs: 40, retryDelayMs: 0 },
+    );
+    expect(calls).toBe(1);
+    expect(rows[0]).toMatchObject({ status: "fail" });
+    expect(rows[0]?.retried).toBeUndefined();
+    expect(rows[0]?.reason).toBe(
+      stops ? "local file token appeared in output" : "timeout 30ms (attempt did not stop, not retried)",
+    );
+  }
+});
+
 test("hung checks report per check as they finish and stay within the budget", async () => {
-  // Time-scaled: 100 ms stands for a check's timeout, 400 ms for the smoke budget. After two
-  // timeouts and a retry, "late" fails with only ~60 ms left, too little to retry within budget.
-  const hang = () => new Promise<CheckResult>(() => {});
-  let flakyCalls = 0;
-  let hungCalls = 0;
+  // Time-scaled: 100 ms stands for a check's timeout, 400 ms for the smoke budget.
+  const stoppable = (signal: AbortSignal) =>
+    new Promise<CheckResult>((resolve) =>
+      signal.addEventListener("abort", () =>
+        resolve({ status: "fail", reason: "cancelled", transient: "timeout" }),
+      ),
+    );
+  const calls: Record<string, number> = {};
+  const counted = (name: string, run: (signal: AbortSignal, call: number) => Promise<CheckResult>) => ({
+    name,
+    timeoutMs: 100,
+    run: (signal: AbortSignal) => {
+      calls[name] = (calls[name] ?? 0) + 1;
+      return run(signal, calls[name] ?? 0);
+    },
+  });
   const lines: string[] = [];
   const began = performance.now();
   const code = await reportChecks(
     [
-      {
-        name: "flaky",
-        timeoutMs: 100,
-        run: () => (++flakyCalls === 1 ? hang() : Promise.resolve({ status: "pass" })),
-      },
-      { name: "quick", timeoutMs: 100, run: async () => ({ status: "pass" }) },
-      {
-        name: "hung",
-        timeoutMs: 100,
-        run: () => {
-          hungCalls++;
-          return hang();
-        },
-      },
-      {
-        name: "late",
-        timeoutMs: 100,
-        run: async () => ({ status: "fail", reason: "HTTP 503", transient: "provider" }),
-      },
+      // ~0-120 ms: times out, then passes on the retry.
+      counted("flaky", (signal, call) =>
+        call === 1 ? stoppable(signal) : Promise.resolve({ status: "pass" }),
+      ),
+      counted("quick", async () => ({ status: "pass" })),
+      // ~120-240 ms: ignores its abort, so it is never retried.
+      counted("stubborn", () => new Promise<CheckResult>(() => {})),
+      // ~240-340 ms: times out with too little budget left for a retry.
+      counted("hung", stoppable),
+      // ~340-380 ms: cut to the ~40 ms left in the budget.
+      counted("late", stoppable),
+      counted("never", async () => ({ status: "pass" })),
     ],
     (line) => lines.push(`${Math.round(performance.now() - began)} ${line}`),
-    { budgetMs: 400, retryDelayMs: 20 },
+    { budgetMs: 400, retryDelayMs: 20, stopGraceMs: 20 },
   );
   const elapsed = performance.now() - began;
   expect(code).toBe(1);
-  expect(elapsed).toBeLessThan(400);
-  expect(flakyCalls).toBe(2);
-  expect(hungCalls).toBe(2);
+  expect(elapsed).toBeLessThan(420);
+  expect(calls).toEqual({ flaky: 2, quick: 1, stubborn: 1, hung: 1, late: 1 });
   const text = lines.map((line) => line.replace(/^\d+ /, "")).join("\n");
   expect(text).toMatch(/flaky\s+PASS \(retried after: timeout 100ms\)/);
   expect(text).toMatch(/quick\s+PASS/);
-  expect(text).toMatch(/hung\s+FAIL\s+\d+ms\s+timeout 100ms/);
-  expect(text).toMatch(/late\s+FAIL\s+\d+ms\s+HTTP 503 \(no time left to retry\)/);
+  expect(text).toMatch(/stubborn\s+FAIL\s+\d+ms\s+timeout 100ms \(attempt did not stop, not retried\)/);
+  expect(text).toMatch(/hung\s+FAIL\s+\d+ms\s+timeout 100ms \(no time left to retry\)/);
+  expect(text).toMatch(/late\s+FAIL\s+\d+ms\s+timeout \d{1,2}ms \(no time left to retry\)/);
+  expect(text).toMatch(/never\s+FAIL\s+\d+ms\s+not run: no time left in the smoke budget/);
   // Each result line appears when its check finishes, not after the whole run.
   const at = (pattern: RegExp) => Number(lines.find((line) => pattern.test(line))?.split(" ")[0]);
   expect(at(/flaky\s+PASS/)).toBeLessThan(at(/hung\s+FAIL/) - 150);
   expect(text.split("\n").map((line) => line.split(/\s+/).slice(0, 2).join(" "))).toEqual([
     "Check Status",
-    "----- ------",
+    "-------- ------",
     "flaky RUN",
     "flaky PASS",
     "quick RUN",
     "quick PASS",
+    "stubborn RUN",
+    "stubborn FAIL",
     "hung RUN",
     "hung FAIL",
     "late RUN",
     "late FAIL",
+    "never RUN",
+    "never FAIL",
   ]);
 });
 
@@ -598,9 +654,30 @@ test("oMLX smoke rows skip unavailable providers and fail attempted bad edits", 
     "missing OMLX_API_KEY",
   ]);
   expect(probes).toBe(0);
-  for (status of [503, 0])
-    expect((await runChecks(checks({ OMLX_API_KEY: "key" }))).every((r) => r.status === "skip")).toBe(true);
+  // A failed probe is retried once; a backend still down on the retry is skipped.
+  for (status of [503, 0]) {
+    probes = 0;
+    const down = await runChecks(checks({ OMLX_API_KEY: "key" }), now, noDelay);
+    expect(down.map((r) => [r.status, r.retried])).toEqual([
+      ["skip", true],
+      ["skip", true],
+    ]);
+    expect(probes).toBe(4);
+  }
   expect(invocations).toBe(0);
+  const statuses = [503, 200];
+  const flakyProbe = (async (url, init) => {
+    status = statuses.shift() ?? 200;
+    return probe(url, init);
+  }) as typeof fetch;
+  const recovered = backendChecks({ OMLX_API_KEY: "key" }, flakyProbe, check).filter(
+    (c) => c.name === "omlx structured",
+  );
+  expect(await runChecks(recovered, now, noDelay)).toMatchObject([
+    { status: "pass", retried: true, retriedAfter: "health probe returned HTTP 503" },
+  ]);
+  expect(invocations).toBe(1);
+  invocations = 0;
   status = 200;
   const rows = await runChecks(checks({ OMLX_API_KEY: "key" }), now, noDelay);
   expect(rows.map((r) => r.status)).toEqual(["pass", "fail"]);

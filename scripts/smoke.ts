@@ -19,8 +19,15 @@ import { sh } from "../src/util/proc.ts";
  */
 export type Transient = "timeout" | "provider" | "health";
 export type CheckResult = { status: "pass" | "fail" | "skip"; reason?: string; transient?: Transient };
-/** `timeoutMs` bounds each attempt; it defaults to DEFAULT_CHECK_TIMEOUT_MS. */
-export type SmokeCheck = { name: string; timeoutMs?: number; run: () => Promise<CheckResult> };
+/**
+ * `timeoutMs` bounds each attempt; it defaults to DEFAULT_CHECK_TIMEOUT_MS. `signal` aborts when that
+ * bound expires, and the attempt must then settle so its assertions still count.
+ */
+export type SmokeCheck = {
+  name: string;
+  timeoutMs?: number;
+  run: (signal: AbortSignal) => Promise<CheckResult>;
+};
 export type CheckRow = CheckResult & {
   name: string;
   durationMs: number;
@@ -28,14 +35,17 @@ export type CheckRow = CheckResult & {
   retriedAfter?: string;
 };
 export type RunOptions = {
-  /** Overall time for every attempt; a retry that cannot finish inside it is not started. */
+  /** Overall time for every attempt; an attempt is cut to the time left and a retry needs its full timeout. */
   budgetMs?: number;
   retryDelayMs?: number;
+  /** How long a timed-out attempt may take to settle after its signal aborts. */
+  stopGraceMs?: number;
   onStart?: (check: SmokeCheck) => void;
   onRow?: (row: CheckRow) => void;
 };
 
 const RETRY_DELAY_MS = 5_000;
+const STOP_GRACE_MS = 10_000;
 const DEFAULT_CHECK_TIMEOUT_MS = 120_000;
 /** The deploy gate kills smoke after 900 s; leave room for startup and reporting. */
 export const SMOKE_BUDGET_MS = 870_000;
@@ -55,25 +65,42 @@ function fail(reason: string, transient?: Transient): CheckResult {
   return { status: "fail", reason, ...(transient ? { transient } : {}) };
 }
 
-async function attempt(check: SmokeCheck, timeoutMs: number): Promise<CheckResult> {
+async function within<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      check.run(),
-      new Promise<CheckResult>((resolve) => {
-        timer = setTimeout(() => resolve(fail(`timeout ${timeoutMs}ms`, "timeout")), timeoutMs);
+      promise,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), ms);
       }),
     ]);
-  } catch (error) {
-    return fail(String(error), transientReason(String(error)));
   } finally {
     clearTimeout(timer);
   }
 }
 
 /**
+ * A timed-out attempt is aborted and awaited: a disclosure or forbidden write it reports while
+ * stopping is final, and one that never stops is not retried, so no later attempt can mask it.
+ */
+async function attempt(check: SmokeCheck, timeoutMs: number, stopGraceMs: number): Promise<CheckResult> {
+  const controller = new AbortController();
+  const run = check
+    .run(controller.signal)
+    .catch((error: unknown) => fail(String(error), transientReason(String(error))));
+  const result = await within(run, timeoutMs);
+  if (result) return result;
+  controller.abort();
+  const settled = await within(run, stopGraceMs);
+  if (!settled) return fail(`timeout ${timeoutMs}ms (attempt did not stop, not retried)`);
+  if (settled.status === "fail" && !settled.transient) return settled;
+  return fail(`timeout ${timeoutMs}ms`, "timeout");
+}
+
+/**
  * Live providers fail transiently (Codex has rejected models intermittently), so a check that
- * failed for an availability reason gets one retry if it still fits the budget.
+ * failed for an availability reason gets one retry if it still fits the budget. A backend whose
+ * health probe fails on both attempts is skipped.
  */
 export async function runChecks(
   checks: SmokeCheck[],
@@ -81,26 +108,40 @@ export async function runChecks(
   delay = (ms: number) => Bun.sleep(ms),
   options: RunOptions = {},
 ): Promise<CheckRow[]> {
-  const { budgetMs = Number.POSITIVE_INFINITY, retryDelayMs = RETRY_DELAY_MS } = options;
+  const {
+    budgetMs = Number.POSITIVE_INFINITY,
+    retryDelayMs = RETRY_DELAY_MS,
+    stopGraceMs = STOP_GRACE_MS,
+  } = options;
   const begin = now();
+  // Time an attempt may run so that it, and stopping it, still ends inside the budget.
+  const left = () => budgetMs - (now() - begin) - stopGraceMs;
   const rows: CheckRow[] = [];
   for (const check of checks) {
     const timeoutMs = check.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS;
     options.onStart?.(check);
     let start = now();
-    let result = await attempt(check, timeoutMs);
+    let result =
+      left() > 0
+        ? await attempt(check, Math.min(timeoutMs, Math.floor(left())), stopGraceMs)
+        : fail("not run: no time left in the smoke budget");
     let retried = false;
     const first = result.reason;
+    const health = result.transient === "health";
     const retry = result.status === "fail" && result.transient !== undefined;
-    if (retry && budgetMs - (now() - begin) < retryDelayMs + timeoutMs) {
-      result = { ...result, reason: `${first ?? "failed"} (no time left to retry)` };
+    if (retry && left() < retryDelayMs + timeoutMs) {
+      result = health
+        ? { status: "skip", reason: `${first} (no time left to retry)` }
+        : { ...result, reason: `${first ?? "failed"} (no time left to retry)` };
     } else if (retry) {
       await delay(retryDelayMs);
       retried = true;
       start = now();
-      result = await attempt(check, timeoutMs);
-      // A retry that skips (e.g. its health probe now fails) must not hide the first failure.
-      if (result.status === "skip")
+      result = await attempt(check, timeoutMs, stopGraceMs);
+      // A backend still down on the retry is skipped as before; a retry that skips after any
+      // other failure must not hide it.
+      if (health && result.transient === "health") result = { status: "skip", reason: result.reason };
+      else if (result.status === "skip")
         result = {
           status: "fail",
           reason: `${first ?? "failed"} (retry skipped: ${result.reason ?? "no reason"})`,
@@ -272,7 +313,8 @@ export function quotaCheck(result: AgentResult, events: AgentEvent[], provider: 
 function status(result: AgentResult): CheckResult {
   if (result.status === "ok") return { status: "pass" };
   const reason = result.error ?? result.status;
-  if (result.status === "timeout") return fail(reason, "timeout");
+  // Only the runner's timeout aborts a smoke attempt, so a cancellation is that timeout.
+  if (result.status === "timeout" || result.status === "cancelled") return fail(reason, "timeout");
   if (result.status === "unavailable") return fail(reason, "provider");
   return fail(reason, transientReason(reason));
 }
@@ -281,8 +323,9 @@ export async function liveCheck(
   harness: Harness,
   target: ModelTarget,
   kind: "structured" | "noTools" | "edit" | "quota" | "verify",
+  signal = new AbortController().signal,
 ): Promise<CheckResult> {
-  if (kind === "verify") return verifyLiveCheck(harness, target);
+  if (kind === "verify") return verifyLiveCheck(harness, target, signal);
   const cwd = mkdtempSync(join(tmpdir(), "limitless-smoke-"));
   try {
     await sh(["git", "init", "-q"], { cwd, timeoutMs: 5000 });
@@ -309,7 +352,7 @@ export async function liveCheck(
         timeoutMs: target.billing === "free" ? 300_000 : 60_000,
         idleTimeoutMs: target.billing === "free" ? 120_000 : 25_000,
         maxToolCalls: 8,
-        signal: new AbortController().signal,
+        signal,
         logPath: join(cwd, "stream.log"),
         onEvent: (event) => events.push(event),
       }),
@@ -383,7 +426,11 @@ export function verifyProbeEvidence(events: AgentEvent[], command: string, token
   );
 }
 
-export async function verifyLiveCheck(harness: Harness, target: ModelTarget): Promise<CheckResult> {
+export async function verifyLiveCheck(
+  harness: Harness,
+  target: ModelTarget,
+  signal = new AbortController().signal,
+): Promise<CheckResult> {
   const root = mkdtempSync(join(tmpdir(), "limitless-smoke-verify-"));
   const cwd = join(root, "worktree");
   try {
@@ -428,7 +475,7 @@ else:
         timeoutMs: 90_000,
         idleTimeoutMs: 30_000,
         maxToolCalls: 8,
-        signal: new AbortController().signal,
+        signal,
         logPath: join(root, "stream.log"),
         onEvent: (event) => events.push(event),
       });
@@ -459,6 +506,7 @@ else:
 export async function decisionsCheck(
   target: ModelTarget,
   harness: Harness = runDecisions,
+  signal = new AbortController().signal,
 ): Promise<CheckResult> {
   const dir = mkdtempSync(join(tmpdir(), "limitless-smoke-decisions-"));
   try {
@@ -488,7 +536,7 @@ export async function decisionsCheck(
       timeoutMs: 60_000,
       idleTimeoutMs: 60_000,
       maxToolCalls: 0,
-      signal: new AbortController().signal,
+      signal,
       logPath: join(dir, "decisions.log"),
       onEvent: (event) => {
         if (event.type === "status") served = event.text;
@@ -513,8 +561,9 @@ async function providerAvailability(
   provider: ProviderDef,
   secrets: Record<string, string>,
   fetchHealth = fetch,
-): Promise<string | null> {
-  if (provider.apiKeySecret && !secrets[provider.apiKeySecret]) return `missing ${provider.apiKeySecret}`;
+): Promise<CheckResult | null> {
+  if (provider.apiKeySecret && !secrets[provider.apiKeySecret])
+    return { status: "skip", reason: `missing ${provider.apiKeySecret}` };
   if (!provider.healthUrl) return null;
   try {
     const token = provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey;
@@ -522,9 +571,9 @@ async function providerAvailability(
       signal: AbortSignal.timeout(3000),
       ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
     });
-    return response.ok ? null : `health probe returned HTTP ${response.status}`;
+    return response.ok ? null : fail(`health probe returned HTTP ${response.status}`, "health");
   } catch {
-    return "health probe failed";
+    return fail("health probe failed", "health");
   }
 }
 
@@ -542,9 +591,9 @@ export function backendChecks(
       checks.push({
         name: `${id} ${kind === "edit" ? "claude-harness edit" : kind}`,
         timeoutMs: provider.billing === "free" ? 330_000 : 90_000,
-        run: async () => {
-          const reason = await providerAvailability(provider, secrets, fetchHealth);
-          if (reason) return { status: "skip", reason };
+        run: async (signal) => {
+          const unavailable = await providerAvailability(provider, secrets, fetchHealth);
+          if (unavailable) return unavailable;
           return check(
             runClaude,
             targetFor(
@@ -553,6 +602,7 @@ export function backendChecks(
               provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey,
             ),
             kind,
+            signal,
           );
         },
       });
@@ -563,10 +613,10 @@ export function backendChecks(
   checks.push({
     name: "typesafe decisions",
     timeoutMs: 90_000,
-    run: async () => {
-      const reason = await providerAvailability(typesafe, secrets, fetchHealth);
-      if (reason) return { status: "skip", reason };
-      return decide(targetFor(typesafe, cheapestModel("typesafe"), secrets[key]));
+    run: async (signal) => {
+      const unavailable = await providerAvailability(typesafe, secrets, fetchHealth);
+      if (unavailable) return unavailable;
+      return decide(targetFor(typesafe, cheapestModel("typesafe"), secrets[key]), runDecisions, signal);
     },
   });
   return checks;
@@ -586,7 +636,8 @@ export async function main(): Promise<number> {
       return {
         name: `${resolved.targetId} structured`,
         timeoutMs: 90_000,
-        run: () => liveCheck(provider.id === "claude" ? runClaude : runCodex, target, "structured"),
+        run: (signal) =>
+          liveCheck(provider.id === "claude" ? runClaude : runCodex, target, "structured", signal),
       };
     });
     return reportChecks(checks);
@@ -608,15 +659,15 @@ export async function main(): Promise<number> {
             : kind === "verify"
               ? 120_000
               : 90_000,
-        run: async () => {
+        run: async (signal) => {
           if (id === "codex" && kind === "structured") {
             const selected = await checkCodexModels(modelsByPrice(id), (model) =>
-              liveCheck(harness, targetFor(provider, model), kind),
+              liveCheck(harness, targetFor(provider, model), kind, signal),
             );
             target = targetFor(provider, selected.model);
             return selected.result;
           }
-          return liveCheck(harness, target, kind);
+          return liveCheck(harness, target, kind, signal);
         },
       });
     }
