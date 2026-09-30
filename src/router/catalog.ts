@@ -297,7 +297,6 @@ export const MODELS: ModelDef[] = [
     baseOrigin: "US",
     supportedEfforts: ["low", "medium", "high", "xhigh"],
     tier: 4,
-    effort: "medium",
     price: { input: 2, output: 10, cacheRead: 0.1 },
     notes: "Released 2026-09-29; under evaluation (#133), not in the routing policy",
   },
