@@ -3,7 +3,14 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { auditDiff } from "../src/gates/audit.ts";
-import { cacheableBaseline, gatesHash } from "../src/gates/cache.ts";
+import {
+  baselineCacheKey,
+  cacheableBaseline,
+  gateEnvDigest,
+  gatesHash,
+  lockfileHash,
+  singleFlight,
+} from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
 import {
   compareGates,
@@ -385,29 +392,108 @@ describe("baseline cache", () => {
     setup: [result("setup", "bun install")],
     checks: [
       result("lint", "bun run lint"),
-      result("test", "bun test", {
-        ok: false,
-        exitCode: 1,
-        firstAttempt: result("test", "bun test", { ok: false, exitCode: 1 }),
-      }),
+      result("test", "bun test", { firstAttempt: result("test", "bun test", { ok: false, exitCode: 1 }) }),
     ],
   };
 
-  test("only a baseline that ran every configured step to an exit code is cacheable", () => {
+  test("only a baseline whose every configured step passed is cacheable", () => {
     expect(cacheableBaseline(complete, cfg)).toBe(true);
     const [lint, tests] = complete.checks as [GateRun["checks"][number], GateRun["checks"][number]];
+    const failed = { ...tests, ok: false, exitCode: 1 };
     const incomplete: GateRun[] = [
       { setupOk: false, setup: [result("setup", "bun install", { ok: false, exitCode: 1 })], checks: [] },
       { ...complete, checks: [lint] },
-      { ...complete, checks: [lint, { ...tests, timedOut: true, exitCode: null }] },
-      { ...complete, checks: [lint, { ...tests, exitCode: null }] },
-      { ...complete, checks: [lint, { ...tests, firstAttempt: { ...tests, exitCode: null } }] },
-      { ...complete, checks: [lint, { ...tests, exitCode: 137 }] },
-      { ...complete, checks: [lint, { ...tests, firstAttempt: { ...tests, exitCode: 143 } }] },
+      // A check that failed its first attempt and its retry: a flaky base must not be cached.
+      { ...complete, checks: [lint, failed] },
+      { ...complete, checks: [{ ...lint, ok: false, exitCode: 2 }, tests] },
+      { ...complete, checks: [lint, { ...failed, timedOut: true, exitCode: null }] },
+      { ...complete, checks: [lint, { ...tests, firstAttempt: { ...failed, exitCode: 143 } }] },
       { ...complete, checks: [lint, { ...tests, command: "bun test --bail" }] },
       { ...complete, setup: [] },
     ];
     for (const run of incomplete) expect(cacheableBaseline(run, cfg)).toBe(false);
+  });
+
+  test("changing any key input misses: base, repo, gates, lockfile, Bun, platform, arch, build, env", () => {
+    const inputs = {
+      repoId: "repo",
+      baseSha: "a".repeat(40),
+      gates: cfg,
+      lockfileHash: "lock",
+      bunVersion: "1.3.0",
+      platform: "darwin",
+      arch: "arm64",
+      buildSha: "b".repeat(40),
+      envDigest: "env",
+    };
+    const key = JSON.stringify(baselineCacheKey(inputs));
+    expect(JSON.stringify(baselineCacheKey({ ...inputs }))).toBe(key);
+    const changes: Partial<typeof inputs>[] = [
+      { repoId: "other" },
+      { baseSha: "c".repeat(40) },
+      { gates: { ...cfg, checks: [{ name: "lint", run: "bun run lint --fix" }] } },
+      { lockfileHash: "lock2" },
+      { bunVersion: "1.3.1" },
+      { platform: "linux" },
+      { arch: "x64" },
+      { buildSha: "d".repeat(40) },
+      { envDigest: "env2" },
+    ];
+    for (const change of changes)
+      expect(JSON.stringify(baselineCacheKey({ ...inputs, ...change }))).not.toBe(key);
+  });
+
+  test("the lockfile hash follows lockfile content", () => {
+    const dir = tempDir({ "bun.lock": "a" });
+    const before = lockfileHash(dir);
+    expect(lockfileHash(dir)).toBe(before);
+    writeFileSync(join(dir, "bun.lock"), "b");
+    expect(lockfileHash(dir)).not.toBe(before);
+    writeFileSync(join(dir, "bun.lock"), "a");
+    writeFileSync(join(dir, "go.sum"), "x");
+    expect(lockfileHash(dir)).not.toBe(before);
+  });
+
+  test("the env digest covers PATH and gate variables, hashes them, and ignores secrets", () => {
+    const env = { PATH: "/usr/bin:/bin", NODE_OPTIONS: "", OPENAI_API_KEY: "sk-secret-value" };
+    const digest = gateEnvDigest(env);
+    expect(digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(gateEnvDigest({ ...env, PATH: "/opt/bin:/usr/bin:/bin" })).not.toBe(digest);
+    expect(gateEnvDigest({ ...env, NODE_OPTIONS: "--max-old-space-size=1" })).not.toBe(digest);
+    expect(gateEnvDigest({ ...env, OPENAI_API_KEY: "sk-other" })).toBe(digest);
+  });
+
+  test("single flight runs one caller per key at a time", async () => {
+    const order: string[] = [];
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const signal = new AbortController().signal;
+    const first = singleFlight("k", signal, async () => {
+      order.push("first start");
+      await gate;
+      order.push("first end");
+    });
+    const second = singleFlight("k", signal, async () => {
+      order.push("second");
+    });
+    const other = singleFlight("other", signal, async () => {
+      order.push("other");
+    });
+    await other;
+    expect(order).toEqual(["first start", "other"]);
+    release();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first start", "other", "first end", "second"]);
+    const aborted = new AbortController();
+    let unblock = () => {};
+    const blocker = singleFlight("k", signal, () => new Promise<void>((resolve) => (unblock = resolve)));
+    const waiting = singleFlight("k", aborted.signal, async () => {});
+    aborted.abort(new Error("cancelled"));
+    await expect(waiting).rejects.toThrow("cancelled");
+    unblock();
+    await blocker;
   });
 
   test("the config hash ignores key order but not content", () => {

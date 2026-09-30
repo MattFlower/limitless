@@ -24,6 +24,24 @@ test("Dependabot routing defaults to free-first and accepts either configured mo
   }
 });
 
+test("the baseline cache kill switch defaults on and accepts only booleans", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-gates-config-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  try {
+    expect(config().baselineCache).toBe(true);
+    for (const value of [true, false]) {
+      writeFileSync(join(configDir, "config.toml"), `[gates]\nbaseline_cache = ${value}\n`);
+      expect(config().baselineCache).toBe(value);
+    }
+    writeFileSync(join(configDir, "config.toml"), '[gates]\nbaseline_cache = "no"\n');
+    expect(config).toThrow("gates.baseline_cache must be true or false");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("review implementer report defaults to include and accepts only include or omit", () => {
   const root = mkdtempSync(join(tmpdir(), "limitless-review-config-"));
   const configDir = join(root, "config");

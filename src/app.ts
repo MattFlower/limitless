@@ -112,6 +112,7 @@ export class Factory {
       cfg,
       faults: opts.faults,
       store: this.store,
+      buildSha: this.bootSha,
       router: this.router,
       tracker: this.tracker,
       harnesses: opts.harnesses ?? {

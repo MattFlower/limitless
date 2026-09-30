@@ -12,7 +12,7 @@ Usage:
   limitless serve                         Start the daemon (API, UI, scheduler)
   limitless run "<prompt>" --repo <repo>  Queue a run (repo: owner/name or a local path)
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
-        [--no-baseline-cache]  Always execute the baseline gates (skip the per-base-commit cache)
+        [--no-baseline-cache]  Always execute the baseline gates; a passing one refreshes the cache
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
         review only: --systems <file.json> instead of --models ({"systems": [ReviewSystem, ...]})

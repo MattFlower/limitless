@@ -206,7 +206,8 @@ export interface BaselineCacheKey {
   repoId: string;
   baseSha: string;
   gatesHash: string;
-  envVersion: number;
+  /** Lockfiles, Bun version, platform/arch, Limitless build and gate environment digest. */
+  envHash: string;
 }
 
 const RUN_SELECT = "SELECT runs.*, repos.slug AS repo_slug FROM runs JOIN repos ON repos.id = runs.repo_id";
@@ -1205,19 +1206,25 @@ export class Store {
   getBaselineCache<T>(key: BaselineCacheKey, since: number): T | null {
     const row = this.db
       .query(
-        "SELECT gate_run FROM baseline_cache WHERE repo_id = ? AND base_sha = ? AND gates_hash = ? AND env_version = ? AND created_at > ?",
+        "SELECT gate_run FROM baseline_cache WHERE repo_id = ? AND base_sha = ? AND gates_hash = ? AND env_hash = ? AND created_at > ?",
       )
-      .get(key.repoId, key.baseSha, key.gatesHash, key.envVersion, since) as Row | null;
+      .get(key.repoId, key.baseSha, key.gatesHash, key.envHash, since) as Row | null;
     return row ? parse<T | null>(row.gate_run, null) : null;
   }
 
-  putBaselineCache(key: BaselineCacheKey, gateRun: unknown, now = Date.now()): void {
+  /** Callers store passing baselines only, so a refresh never replaces a pass with a failure. */
+  putBaselineCache(key: BaselineCacheKey, gateRun: unknown, runId: string, now = Date.now()): void {
     this.db
       .query(
-        `INSERT INTO baseline_cache (repo_id, base_sha, gates_hash, env_version, gate_run, created_at) VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(repo_id, base_sha, gates_hash, env_version) DO UPDATE SET gate_run = excluded.gate_run, created_at = excluded.created_at`,
+        `INSERT INTO baseline_cache (repo_id, base_sha, gates_hash, env_hash, gate_run, run_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(repo_id, base_sha, gates_hash, env_hash) DO UPDATE SET gate_run = excluded.gate_run, run_id = excluded.run_id, created_at = excluded.created_at`,
       )
-      .run(key.repoId, key.baseSha, key.gatesHash, key.envVersion, JSON.stringify(gateRun), now);
+      .run(key.repoId, key.baseSha, key.gatesHash, key.envHash, JSON.stringify(gateRun), runId, now);
+  }
+
+  /** Drop every cached baseline for a repo (repair after a bad entry); returns the count removed. */
+  clearBaselineCache(repoId: string): number {
+    return this.db.query("DELETE FROM baseline_cache WHERE repo_id = ?").run(repoId).changes;
   }
 
   countExpiredBaselineCache(before: number): number {

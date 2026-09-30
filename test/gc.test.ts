@@ -123,17 +123,17 @@ test("log and debug event retention is selective, including active-run events", 
 });
 
 test("baseline cache entries expire after seven days and each key component misses", async () => {
-  const key = { repoId: repo.id, baseSha: "a".repeat(40), gatesHash: "h", envVersion: 1 };
+  const key = { repoId: repo.id, baseSha: "a".repeat(40), gatesHash: "h", envHash: "e" };
   const since = now - 7 * DAY;
-  store.putBaselineCache(key, { setupOk: true, setup: [], checks: [] }, now - 7 * DAY);
+  store.putBaselineCache(key, { setupOk: true, setup: [], checks: [] }, "r1", now - 7 * DAY);
   const young = { ...key, baseSha: "b".repeat(40) };
-  store.putBaselineCache(young, { setupOk: true, setup: [], checks: [] }, now - 7 * DAY + 1);
+  store.putBaselineCache(young, { setupOk: true, setup: [], checks: [] }, "r2", now - 7 * DAY + 1);
   expect(store.getBaselineCache(key, since)).toBeNull();
   expect(store.getBaselineCache<object>(young, since)).toEqual({ setupOk: true, setup: [], checks: [] });
   for (const miss of [
     { baseSha: "c".repeat(40) },
     { gatesHash: "other" },
-    { envVersion: 2 },
+    { envHash: "other" },
     { repoId: "x" },
   ])
     expect(store.getBaselineCache({ ...young, ...miss }, since)).toBeNull();
@@ -144,6 +144,12 @@ test("baseline cache entries expire after seven days and each key component miss
   expect([actual.errors, actual.baselineCache]).toEqual([[], 1]);
   expect(store.countExpiredBaselineCache(now)).toBe(1);
   expect(store.getBaselineCache(young, since)).not.toBeNull();
+  expect(store.db.query("SELECT run_id, created_at FROM baseline_cache").all()).toEqual([
+    { run_id: "r2", created_at: now - 7 * DAY + 1 },
+  ]);
+  expect(store.clearBaselineCache("x")).toBe(0);
+  expect(store.clearBaselineCache(repo.id)).toBe(1);
+  expect(store.getBaselineCache(young, since)).toBeNull();
 });
 
 test("daemon API and CLI dry run leave Git, files and DB unchanged", async () => {

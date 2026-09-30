@@ -688,9 +688,10 @@ esac
     const lines = (path: string) =>
       existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").length : 0;
     const cacheRows = (f: Factory) =>
-      f.store.db.query("SELECT base_sha, gate_run, created_at FROM baseline_cache").all() as {
+      f.store.db.query("SELECT base_sha, gate_run, run_id, created_at FROM baseline_cache").all() as {
         base_sha: string;
         gate_run: string;
+        run_id: string;
         created_at: number;
       }[];
     const quick = (s: AgentSpec): FakeReply => {
@@ -711,25 +712,20 @@ esac
       return { run, state: f.store.getRunState<RunState>(run.id) };
     }
 
-    test("a second run on the same base reuses a failing baseline with its retry evidence", async () => {
+    test("a second run on the same base reuses a passing baseline", async () => {
       const count = join(home, "gate-runs");
-      const check = `echo x >> '${count}'; echo attempt $(( $(wc -l < '${count}') )); exit 1`;
-      await commitGates(`[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`);
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
       const f = start(quick);
       const first = await finish(f);
-      // Baseline, its retry, and the post-implement gates.
-      expect(lines(count)).toBe(3);
+      // Baseline and the post-implement gates.
+      expect(lines(count)).toBe(2);
       expect(first.state?.baselineCached).toBe(false);
-      expect(cacheRows(f)).toHaveLength(1);
+      expect(cacheRows(f).map((r) => r.run_id)).toEqual([first.run.id]);
       const second = await finish(f);
       // Only the post-implement gates executed.
-      expect(lines(count)).toBe(4);
+      expect(lines(count)).toBe(3);
       expect(second.state?.baselineCached).toBe(true);
       expect(second.state?.baseline).toEqual(first.state?.baseline ?? null);
-      expect(second.state?.baseline?.checks[0]?.firstAttempt?.output).toBe("attempt 1");
-      const verdicts = (s: RunState | null) => s?.lastGates?.map((g) => [g.name, g.verdict, g.blocking]);
-      expect(verdicts(second.state)).toEqual(verdicts(first.state));
-      expect(verdicts(second.state)).toEqual([["check", "still_failing", false]]);
       expect(f.store.getRun(second.run.id)?.status).toBe("succeeded");
       const prepare = f.store.listStages(second.run.id).find((s) => s.name === "prepare");
       expect(prepare?.summary).toContain("baseline reused from cache");
@@ -739,6 +735,36 @@ esac
       expect(JSON.parse(f.store.getArtifact(second.run.id, "baseline-gates.json") ?? "{}")).toEqual(
         second.state?.baseline,
       );
+    });
+
+    test("a flaky base that failed twice is not cached, so the next run blocks the regression", async () => {
+      const count = join(home, "gate-runs");
+      // Fails the first baseline and its retry; later it fails only once the change exists.
+      const check = `echo x >> '${count}'; test $(( $(wc -l < '${count}') )) -gt 2 || exit 1; test ! -f farewell.txt`;
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`);
+      const f = start(quick);
+      const first = await finish(f);
+      expect(first.state?.baseline?.checks[0]?.firstAttempt?.ok).toBe(false);
+      expect(first.state?.baseline?.checks[0]?.ok).toBe(false);
+      expect(cacheRows(f)).toEqual([]);
+      const second = await finish(f);
+      expect(second.state?.baselineCached).toBe(false);
+      expect(second.state?.baseline?.checks[0]?.ok).toBe(true);
+      expect(second.state?.lastGates?.map((g) => [g.name, g.verdict, g.blocking])).toEqual([
+        ["check", "regressed", true],
+      ]);
+      expect(f.store.getRun(second.run.id)?.status).not.toBe("succeeded");
+    });
+
+    test("concurrent runs on one base execute the baseline once", async () => {
+      const count = join(home, "gate-runs");
+      const check = `test -f farewell.txt || echo base >> '${count}'; sleep 1`;
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`);
+      const f = start(quick);
+      const [a, b] = await Promise.all([finish(f), finish(f)]);
+      expect(lines(count)).toBe(1);
+      expect([a.state?.baselineCached, b.state?.baselineCached].sort()).toEqual([false, true]);
+      expect(cacheRows(f)).toHaveLength(1);
     });
 
     test("a changed gate config or base commit misses", async () => {
@@ -792,22 +818,37 @@ esac
       expect(lines(count)).toBe(3);
     });
 
-    test("--no-baseline-cache executes the baseline without reading or replacing the entry", async () => {
+    test("a bypass run refreshes a passing entry and never replaces it with a failure", async () => {
       const count = join(home, "gate-runs");
-      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const broken = join(home, "broken");
+      await commitGates(
+        `[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'; test ! -f '${broken}'" }]\n`,
+      );
       const f = start(quick);
-      await finish(f);
-      const primed = cacheRows(f);
-      expect(primed).toHaveLength(1);
+      const primed = await finish(f);
+      expect(cacheRows(f).map((r) => r.run_id)).toEqual([primed.run.id]);
       const bypass = await finish(f, { noBaselineCache: true });
       expect(f.store.getRun(bypass.run.id)?.noBaselineCache).toBe(true);
       expect([lines(count), bypass.state?.baselineCached]).toEqual([4, false]);
-      expect(cacheRows(f)).toEqual(primed);
-      const retried = await f.retryRun(bypass.run.id);
+      expect(cacheRows(f).map((r) => r.run_id)).toEqual([bypass.run.id]);
+      const refreshed = cacheRows(f);
+
+      writeFileSync(broken, "");
+      const failing = await finish(f, { noBaselineCache: true });
+      expect(failing.state?.baseline?.checks[0]?.ok).toBe(false);
+      expect(cacheRows(f)).toEqual(refreshed);
+      const retried = await f.retryRun(failing.run.id);
       expect(retried.noBaselineCache).toBe(true);
       await waitFor(f, retried.id, ["succeeded", "failed", "needs_human"]);
-      expect(lines(count)).toBe(6);
-      expect(cacheRows(f)).toEqual(primed);
+      expect(cacheRows(f)).toEqual(refreshed);
+
+      // The config kill switch bypasses reads too, and still refreshes on a pass.
+      rmSync(broken);
+      f.cfg.baselineCache = false;
+      const before = lines(count);
+      const switchedOff = await finish(f);
+      expect([lines(count) - before, switchedOff.state?.baselineCached]).toEqual([2, false]);
+      expect(cacheRows(f).map((r) => r.run_id)).toEqual([switchedOff.run.id]);
     });
 
     test("post-rebase gates execute when prepare reused the cached baseline", async () => {

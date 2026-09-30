@@ -3,13 +3,21 @@ import { join } from "node:path";
 import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
-import { BASELINE_CACHE_TTL_MS, cacheableBaseline, GATE_ENV_VERSION, gatesHash } from "../gates/cache.ts";
+import {
+  BASELINE_CACHE_TTL_MS,
+  baselineCacheKey,
+  cacheableBaseline,
+  gateEnvDigest,
+  lockfileHash,
+  singleFlight,
+} from "../gates/cache.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import {
   compareGates,
   type GateComparison,
   type GateHooks,
   type GateRun,
+  gateEnv,
   retryBaselineFailures,
   retryRegressions,
   runGates,
@@ -339,39 +347,46 @@ async function prepare(ctx: RunContext): Promise<void> {
       await ctx.save();
       const { onWait } = gateEvents(ctx);
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
-      // Keyed by the commit actually checked out, so verify-change caches its PR base.
-      const cacheKey =
-        hasGates && !ctx.run.noBaselineCache
-          ? {
-              repoId: ctx.repo.id,
-              baseSha: await headSha(wt.path),
-              gatesHash: gatesHash(gates),
-              envVersion: GATE_ENV_VERSION,
-            }
-          : null;
-      const cached = cacheKey
-        ? store.getBaselineCache<GateRun>(cacheKey, Date.now() - BASELINE_CACHE_TTL_MS)
-        : null;
-      if (cached && cacheableBaseline(cached, gates)) {
-        ctx.state.baseline = cached;
-        ctx.state.baselineCached = true;
-        ctx.log(`Baseline reused from cache (${cacheKey?.baseSha.slice(0, 12)})`);
-      } else {
-        ctx.state.baselineCached = false;
-        ctx.state.baseline = hasGates ? await runGates(wt.path, gates, ctx.signal, { onWait }) : null;
+      const runBaseline = async (): Promise<GateRun> => {
+        const run = await runGates(wt.path, gates, ctx.signal, { onWait });
         ctx.checkCancelled();
         // Retry before resetting, so a check sees the same build output as its first attempt.
-        if (ctx.state.baseline)
-          ctx.state.baseline = await retryBaselineFailures(
-            ctx.state.baseline,
-            wt.path,
-            gates,
-            ctx.signal,
-            onWait,
-          );
+        const retried = await retryBaselineFailures(run, wt.path, gates, ctx.signal, onWait);
         ctx.checkCancelled();
-        if (cacheKey && ctx.state.baseline && cacheableBaseline(ctx.state.baseline, gates))
-          store.putBaselineCache(cacheKey, ctx.state.baseline);
+        return retried;
+      };
+      ctx.state.baselineCached = false;
+      if (!hasGates) ctx.state.baseline = null;
+      else {
+        // Keyed by the commit actually checked out, so verify-change caches its PR base.
+        const key = baselineCacheKey({
+          repoId: ctx.repo.id,
+          baseSha: await headSha(wt.path),
+          gates,
+          lockfileHash: lockfileHash(wt.path),
+          bunVersion: Bun.version,
+          platform: process.platform,
+          arch: process.arch,
+          buildSha: ctx.deps.buildSha ?? "unknown",
+          envDigest: gateEnvDigest(gateEnv()),
+        });
+        // A bypass still runs the baseline and refreshes the entry if it passes.
+        const bypass = ctx.run.noBaselineCache === true || !cfg.baselineCache;
+        // One baseline per key at a time: a concurrent run on the same base waits, then reuses it.
+        ctx.state.baseline = await singleFlight(JSON.stringify(key), ctx.signal, async () => {
+          const cached = bypass
+            ? null
+            : store.getBaselineCache<GateRun>(key, Date.now() - BASELINE_CACHE_TTL_MS);
+          if (cached && cacheableBaseline(cached, gates)) {
+            ctx.state.baselineCached = true;
+            ctx.log(`Baseline reused from cache (${key.baseSha.slice(0, 12)})`);
+            return cached;
+          }
+          const fresh = await runBaseline();
+          // Only a passing baseline is cached; a failure (maybe flaky) must run again next time.
+          if (cacheableBaseline(fresh, gates)) store.putBaselineCache(key, fresh, ctx.run.id);
+          return fresh;
+        });
       }
     } finally {
       if (verification) await resetTo(wt.path, verification.headSha);

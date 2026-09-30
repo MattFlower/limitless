@@ -102,6 +102,17 @@ Gate suites (baseline, post-change, post-rebase, eval trials) share a process-wi
 passed on the baseline, fails after the change, and whose output names no changed file is re-run
 once; a pass on retry is recorded as `flaky` (a non-blocking warning with both outputs kept).
 
+Prepare caches the baseline in `baseline_cache`, keyed by repo, base SHA, gate commands and an
+environment hash (lockfiles, Bun version, platform/arch, Limitless build SHA, and a digest of PATH
+and other gate-relevant variables; values are hashed, never stored, and secrets are excluded).
+**Only a baseline where setup and every check passed is cached**: a failing base (possibly flaky,
+even after its retry) runs again on every run, so it can never turn a later regression into a
+non-blocking `still_failing`, and a failure never overwrites a cached pass. Lookups and writes run
+in a per-key single flight, so concurrent runs on one base execute the baseline once. Entries
+record the writing run and time, expire after seven days (removed by `gc`), and can be dropped per
+repo with `Store.clearBaselineCache(repoId)`. `limitless run --no-baseline-cache` or
+`[gates] baseline_cache = false` skips the lookup; a passing bypass baseline refreshes the entry.
+
 The optional preview configuration is validated and saved from the base revision during prepare,
 before model calls. A matching committed diff starts an isolated preview immediately before a new
 verify attempt; reused round results do not start one. Build and seed use scratch HOME/TMPDIR,
