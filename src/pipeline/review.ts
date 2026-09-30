@@ -14,12 +14,18 @@ import {
 
 type Finding = Review["findings"][number];
 
-/** Categories a panel never verifies or blocks on; they go straight to the follow-up ledger. */
+/** Categories a panel neither verifies nor blocks on, except security findings; they go to the follow-up ledger. */
 const UNVERIFIED_CATEGORIES: readonly (Finding["category"] | undefined)[] = ["cleanup", "conventions"];
 const FINDER_SEVERITY_RANK = { blocker: 0, major: 1, minor: 2, nit: 3 } as const;
-/** Finder candidates verified per review; prior blocker rechecks are exempt. */
+/** Finder candidates verified per review; prior blocking and security findings are exempt. */
 export const PANEL_VERIFY_CAP = 20;
 const PANEL_BATCH_SIZE = 5;
+/**
+ * Bumped when what a panel verifies or blocks changes in a way a stored output can't show, so eval
+ * caches stop reusing outputs made under the old policy. 2: security candidates are always verified,
+ * and missing rulings on security or prior blocking findings fail closed.
+ */
+const PANEL_POLICY_VERSION = 2;
 
 /**
  * CONFIRMED, or PLAUSIBLE at high or above. PLAUSIBLE raised by two or more finders will also count
@@ -53,6 +59,17 @@ function citesPriorBlocking(finding: Review["findings"][number], priorBlocking: 
 export const PANEL_REVIEWS = 3;
 const VERIFIED_SEVERITY_RANK = { low: 0, medium: 1, high: 2, critical: 3 } as const;
 
+/**
+ * Which panel review decides what blocks: R1-R3 by number, or a conflict-resolution review, which is
+ * outside that count and follows R2's rules.
+ */
+export type PanelReview = number | "resolution";
+
+/** A security finding by the verifier's category or the finder's flag. */
+function isSecurity(finding: Finding): boolean {
+  return finding.security || finding.verification?.category === "security";
+}
+
 /** Verified by the panel rule, at `min` or above by the verifier's consequence severity. */
 function verifiedAtLeast(finding: Finding, min: Verification["severity"]): boolean {
   const severity = finding.verification?.severity;
@@ -62,28 +79,36 @@ function verifiedAtLeast(finding: Finding, min: Verification["severity"]): boole
 }
 
 /**
- * Only verified findings ever block, and a verified security finding (the verifier's category, or the
- * finder's flag) blocks in every review. Otherwise re-reviews tighten what blocks:
+ * A security finding blocks in every review unless the verifier refutes it, whatever its severity or
+ * category. Otherwise only verified findings block, never cleanup or conventions, and re-reviews
+ * tighten what blocks:
  * R2 — a cited unaddressed prior blocking finding, a regression of medium or above, or a new high/critical;
  * R3 — a critical finding (cited prior, regression or new).
+ * The panel always sends security findings and prior blocking findings to the verifier, so one without
+ * a ruling was left out after a retry: it blocks (fail closed).
  */
 function panelBlocks(
   finding: Finding,
   priorBlocking: Review["findings"] | undefined,
-  panelReview: number,
+  panelReview: PanelReview,
 ): boolean {
+  const v = finding.verification;
+  const cited = !!priorBlocking && citesPriorBlocking(finding, priorBlocking);
+  if (!v) return isSecurity(finding) || cited;
+  if (v.verdict === "REFUTED") return false;
+  if (isSecurity(finding)) return true;
+  if (UNVERIFIED_CATEGORIES.includes(v.category)) return false;
   if (!panelVerified(finding)) return false;
-  if (finding.verification?.category === "security" || finding.security) return true;
-  if (!priorBlocking || panelReview <= 1) return true;
-  if (panelReview >= PANEL_REVIEWS) return verifiedAtLeast(finding, "critical");
-  if (citesPriorBlocking(finding, priorBlocking)) return true;
+  const round = panelReview === "resolution" ? 2 : panelReview;
+  if (!priorBlocking || round <= 1) return true;
+  if (round >= PANEL_REVIEWS) return verifiedAtLeast(finding, "critical");
+  if (cited) return true;
   return verifiedAtLeast(finding, finding.label === "regression" ? "medium" : "high");
 }
 
 /**
- * Panel reviews block on the verifier's ruling and never on cleanup or conventions (the verifier's
- * category, else the finder's): see `panelBlocks`. `panelReview` defaults to 2, whose rules a
- * conflict-resolution review (outside the R1-R3 count) also follows.
+ * Panel reviews block on the verifier's ruling: see `panelBlocks`. A panel re-review must say which
+ * review it is (`panelReview`), a conflict-resolution review included.
  *
  * Single reviews, first round: blockers and majors block. Later rounds may not move the goalposts: a finding blocks
  * only if it is a regression from the latest changes, an unaddressed previous *blocking* finding
@@ -93,14 +118,19 @@ function panelBlocks(
 export function blockingReviewFindings(
   review: StoredReview,
   priorBlocking?: Review["findings"],
-  panelReview = 2,
+  panelReview?: PanelReview,
 ): Review["findings"] {
   const panel = review.mode === "panel";
+  if (panel && priorBlocking && panelReview === undefined)
+    throw new Error('A panel re-review needs its review number or "resolution" to decide what blocks');
+  if (
+    panel &&
+    typeof panelReview === "number" &&
+    !(Number.isInteger(panelReview) && panelReview >= 1 && panelReview <= PANEL_REVIEWS)
+  )
+    throw new Error(`A panel review number is 1-${PANEL_REVIEWS} or "resolution", not ${panelReview}`);
   return review.findings.filter((finding) => {
-    if (panel) {
-      if (UNVERIFIED_CATEGORIES.includes(finding.verification?.category ?? finding.category)) return false;
-      return panelBlocks(finding, priorBlocking, panelReview);
-    }
+    if (panel) return panelBlocks(finding, priorBlocking, panelReview ?? 1);
     if (!priorBlocking) return finding.severity === "blocker" || finding.severity === "major";
     if (finding.label === "regression") return true;
     if (citesPriorBlocking(finding, priorBlocking)) return true;
@@ -130,7 +160,7 @@ export function resolvedPriorFindings(
 export function reviewVerdict(
   review: StoredReview,
   priorBlocking?: Review["findings"],
-  panelReview?: number,
+  panelReview?: PanelReview,
 ): Review["verdict"] {
   return blockingReviewFindings(review, priorBlocking, panelReview).length ? "request_changes" : "approve";
 }
@@ -142,8 +172,11 @@ export interface ReviewInput {
   replayedFollowUps?: Review["findings"];
   /** Defaults to one finder (`single`). */
   system?: Pick<ReviewSystem, "mode" | "finders">;
-  /** Panel only: which review this is (1–3); decides what blocks. `prompt.fixReview` scopes the diff. */
-  panelReview?: number;
+  /**
+   * Panel only: which review this is (1–3, or "resolution"); decides what blocks and is required once
+   * there is a previous review. `prompt.fixReview` scopes the diff.
+   */
+  panelReview?: PanelReview;
 }
 
 /** What the invoker sends to the model; later rounds (with previous findings) use the labelled schema. */
@@ -177,7 +210,10 @@ export interface PanelRecord {
   refuted: string[];
   /** Eligible for verification but over the per-review cap: unverified follow-ups. */
   capped: string[];
-  /** Sent to the verifier but left without a ruling after one retry: unverified follow-ups. */
+  /**
+   * Sent to the verifier but left without a ruling after one retry: unverified follow-ups, except
+   * security and prior blocking findings, which block.
+   */
   omitted: string[];
 }
 
@@ -203,13 +239,14 @@ const TEMPLATE_INPUT: Parameters<typeof verifierPrompt>[0] = {
 };
 
 /**
- * What a panel's derived output depends on besides its finders' prompt: the verifier prompt templates,
- * its schema and the batching policy. Eval caches key panel trials on it.
+ * What a panel's derived output depends on besides its finders' prompt: the policy version, the
+ * verifier prompt templates, its schema and the batching policy. Eval caches key panel trials on it.
  */
 export function panelVerifierIdentity(): string {
   return new Bun.CryptoHasher("sha256")
     .update(
       JSON.stringify([
+        PANEL_POLICY_VERSION,
         verifierPrompt(TEMPLATE_INPUT),
         verifierPrompt({ ...TEMPLATE_INPUT, externalChange: true }),
         toStrictJsonSchema(VerifierSchema),
@@ -329,29 +366,39 @@ async function runPanel<T extends Invoked>(
   const { fixReview, previous } = input.prompt;
   const priorBlocking = previous?.findings ?? [];
   const cited = (c: Finding) => citedPriorIndex(c, priorBlocking.length);
-  // A citation of a prior blocking finding keeps that finding's category, so retagging it cleanup or
-  // conventions can't drop it from verification.
+  // A citation of a prior blocking finding takes that finding's category (the verifier's, else the
+  // finder's), so retagging it can't drop it from verification. A citation or recheck of a prior
+  // security finding (either definition) stays one: no later ruling's category releases it unrefuted.
   const raised = found.flatMap(({ invoked, review }, finder) =>
     review.findings.map((f) => {
       const prior = priorBlocking[cited(f) ?? -1];
       const category = prior ? (prior.verification?.category ?? prior.category ?? f.category) : f.category;
-      return { ...f, ...(category ? { category } : {}), finder, vendor: invoked.target?.vendor ?? null };
+      return {
+        ...f,
+        ...(category ? { category } : {}),
+        security: f.security || (!!prior && isSecurity(prior)),
+        finder,
+        vendor: invoked.target?.vendor ?? null,
+      };
     }),
   );
   const fix = fixReview && previous ? { review: fixReview, ...previous } : undefined;
   // A re-review never assumes a prior blocking finding fixed: whatever no finder repeated, the
   // verifier rechecks as a candidate of its own, outside the cap.
-  const rechecks = (fix?.findings ?? []).flatMap(({ verification: _stale, ...f }, i) =>
-    raised.some((c) => cited(c) === i)
-      ? []
-      : [{ ...f, label: "unaddressed" as const, prior: `P${i + 1}`, finder: null, vendor: null }],
-  );
+  const rechecks = (fix?.findings ?? []).flatMap((prior, i) => {
+    if (raised.some((c) => cited(c) === i)) return [];
+    const { verification: _stale, ...f } = prior;
+    const recheck = { ...f, security: isSecurity(prior), label: "unaddressed" as const, prior: `P${i + 1}` };
+    return [{ ...recheck, finder: null, vendor: null }];
+  });
   const candidates: PanelRecord["candidates"] = [...raised, ...rechecks].map((c, i) => ({
     ...c,
     id: `C${i + 1}`,
   }));
-  // A cited prior blocking finding is always verified: the citation replaces the automatic recheck.
-  const exempt = (c: PanelRecord["candidates"][number]) => c.finder === null || cited(c) !== undefined;
+  // Prior blocking findings (a citation replaces the automatic recheck) and security findings are
+  // always verified, whatever their category.
+  const exempt = (c: PanelRecord["candidates"][number]) =>
+    c.finder === null || cited(c) !== undefined || c.security;
   // Stable sort: equal severities keep finder order.
   const ranked = candidates
     .filter((c) => !exempt(c) && !UNVERIFIED_CATEGORIES.includes(c.category))
@@ -456,7 +503,7 @@ async function runPanel<T extends Invoked>(
     if (pending.length) {
       omitted.push(...pending.map((c) => c.id));
       deps.warn?.(
-        `Verifier gave no ruling for ${pending.map((c) => c.id).join(", ")} after a retry; they stay unverified follow-ups`,
+        `Verifier gave no ruling for ${pending.map((c) => c.id).join(", ")} after a retry; security and prior blocking findings among them block, the rest stay unverified follow-ups`,
       );
     }
   }

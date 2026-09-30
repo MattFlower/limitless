@@ -63,6 +63,7 @@ import { buildReport } from "./report.ts";
 import {
   blockingReviewFindings,
   PANEL_REVIEWS,
+  type PanelReview,
   type ReviewInput,
   type ReviewRequest,
   resolvedPriorFindings,
@@ -786,6 +787,9 @@ async function oneRound(
           ...(ctx.state.reviewHistory ?? []).filter((e) => e.round < round).map((e) => e.panelReview ?? 0),
         ) + 1
       : undefined;
+  // What decides a panel review's blocking findings; a conflict-resolution review follows R2's rules.
+  const panelRules: PanelReview | undefined =
+    resolution && system.mode === "panel" ? "resolution" : panelReview;
   // Checked before implementing: work no review can see is not worth paying for. The worktree keeps
   // the head the last review saw, which the draft delivers.
   if (panelReview && panelReview > PANEL_REVIEWS)
@@ -950,7 +954,7 @@ async function oneRound(
         timeoutMs: readingTimeout(reviewDiff.added + reviewDiff.removed),
         replayedFollowUps: replayed?.followUps,
         system,
-        ...(panelReview ? { panelReview } : {}),
+        ...(panelRules ? { panelReview: panelRules } : {}),
         prompt: {
           prompt: ctx.run.prompt,
           spec: ctx.state.spec ?? null,
@@ -1062,7 +1066,10 @@ async function oneRound(
 
   const reviewFeedback =
     review.verdict === "request_changes"
-      ? formatReviewFeedback(blockingReviewFindings(review, previousReview?.findings, panelReview))
+      ? formatReviewFeedback(
+          blockingReviewFindings(review, previousReview?.findings, panelRules),
+          review.mode === "panel",
+        )
       : "";
   if (review.verdict === "request_changes") {
     ctx.state.feedback = reviewFeedback || `### Code review requested changes\n${review.summary}`;

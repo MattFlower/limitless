@@ -1114,6 +1114,8 @@ esac
       } else {
         expect(resolution.verdict).toBe("request_changes");
         expect(resolution.blocking.map((b: { title: string }) => b.title)).toEqual(["R4 bug"]);
+        // The resolution review's feedback follows R2's rules too, so the finding reaches the human.
+        expect(f.store.getRun(run.id)?.error).toContain("R4 bug");
         for (const v of verifiers[3] ?? []) {
           expect(v.timeoutMs).toBe(readingTimeout(502));
           expect(v.prompt).toContain(`git diff ${baseTip}..${resolution.reviewedSha}`);

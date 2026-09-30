@@ -518,6 +518,64 @@ test("a panel member that throws keeps the spend of the calls that ran", async (
   }
 });
 
+test("a panel member re-checks its provider after waiting for its slots", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    f.respond((s) =>
+      s.prompt.includes("code-review verifier") ? refuteAll(s) : { structured: reviewOutput(), costUsd: 0.1 },
+    );
+    const tracker = f.factory.tracker;
+    const acquire = tracker.acquire.bind(tracker);
+    // provider-b runs out of quota, briefly, while finder b waits for its slot.
+    const spy = spyOn(tracker, "acquire").mockImplementation(async (provider, signal) => {
+      const release = await acquire(provider, signal);
+      if (provider === "provider-b")
+        tracker.record("provider-b", "quota", { exhaustedUntil: Date.now() + 200 });
+      return release;
+    });
+    const report = await f.run({ models: undefined, systems: [panelSystem], cache: false });
+    spy.mockRestore();
+    expect(report.trials.map((t) => t.status)).toEqual(["error"]);
+    expect(report.trials[0]?.details.reason).toContain("provider-b unavailable");
+    expect(f.calls.map((s) => s.target.modelId)).toEqual(["candidate-a"]);
+    expect(tracker.status("provider-b")?.inFlight).toBe(0);
+    // Finder b released its run and eval slots too: once quota returns, the next provider-b eval runs.
+    await Bun.sleep(250);
+    const single = {
+      name: "single-b",
+      mode: "single",
+      finders: [{ target: "candidate-b", prompt: "standard" }],
+      implementerReport: "include",
+    };
+    const after = await f.run({ models: undefined, systems: [single], cache: false });
+    expect(after.trials.map((t) => t.status)).toEqual(["ok"]);
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("a panel member stops after its slot wait when the eval was aborted meanwhile", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    f.respond(() => ({ structured: reviewOutput(), costUsd: 0.1 }));
+    const tracker = f.factory.tracker;
+    const acquire = tracker.acquire.bind(tracker);
+    const spy = spyOn(tracker, "acquire").mockImplementation(async (provider, signal) => {
+      const release = await acquire(provider, signal);
+      if (provider === "provider-b") void f.factory.evals.stop();
+      return release;
+    });
+    const report = await f.run({ models: undefined, systems: [panelSystem], cache: false });
+    spy.mockRestore();
+    expect(report.run.status).toBe("failed");
+    expect(f.calls.map((s) => s.target.modelId)).toEqual(["candidate-a"]);
+    expect(tracker.status("provider-b")?.inFlight).toBe(0);
+  } finally {
+    await f.close();
+  }
+});
+
 test("panel calls count against the run's per-provider cap and release it when a member fails", async () => {
   const f = await fixture("review", [verifierModel]);
   try {
