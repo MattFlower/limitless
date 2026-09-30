@@ -18,5 +18,13 @@
   "implement.large": {
     "reason": "Opus first, Sol fallback: the implement eval has a ceiling (every model scored 100%), so Luna led on cost alone; field use shows Opus far stronger on hard, underspecified work. Revisit when the dataset is stratified by difficulty.",
     "decided": "2026-09-28"
+  },
+  "review.default": {
+    "reason": "Sol 6.1 first: on review eval v2 (eval-muo4xsbk3p8f, Codex, medium effort, k=3) it matched Sol 6.0 on blocking recall (27.6% vs 28.6%), caught more high-severity defects (50.0% vs 37.5%) and falsely blocked clean changes half as often (18.2% vs 36.4%), at the same cost and latency. The rest of each chain is the previous default. Neither model clears the review floors yet; this pins the better of the two.",
+    "decided": "2026-09-30"
+  },
+  "review.large": {
+    "reason": "Sol 6.1 first: on review eval v2 (eval-muo4xsbk3p8f, Codex, medium effort, k=3) it matched Sol 6.0 on blocking recall (27.6% vs 28.6%), caught more high-severity defects (50.0% vs 37.5%) and falsely blocked clean changes half as often (18.2% vs 36.4%), at the same cost and latency. The rest of each chain is the previous default. Neither model clears the review floors yet; this pins the better of the two.",
+    "decided": "2026-09-30"
   }
 }
