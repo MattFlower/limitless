@@ -2,6 +2,7 @@ import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation } from "../core/types.ts";
 import type { RunContext, RunState } from "./context.ts";
 import type { Review } from "./schemas.ts";
+import { notRequired } from "./verification.ts";
 
 function money(n: number): string {
   return n === 0 ? "$0" : n < 0.01 ? "<$0.01" : `$${n.toFixed(2)}`;
@@ -104,21 +105,42 @@ export function renderReport(input: ReportInput): string {
   }
 
   if (state.holdout) {
+    const results = state.holdout.scenarios.map((scenario) => ({
+      scenario,
+      result: state.lastVerify?.criteria.find((c) => c.id === scenario.id),
+    }));
+    const followUps = results.filter(({ result }) => result && notRequired(result));
+    const blocking = results.filter(
+      ({ result }) => result?.status !== "met" && !(result && notRequired(result)),
+    );
     blocks.push(
       "## Holdout scenarios",
       table(
         ["", "Scenario", "Result", "Evidence"],
-        state.holdout.scenarios.map((scenario) => {
-          const result = state.lastVerify?.criteria.find((c) => c.id === scenario.id);
-          return [
-            scenario.id,
-            escapeCell(scenario.description),
-            result?.status === "blocked" ? "🚧 blocked" : (result?.status ?? "unclear"),
-            escapeCell(result?.evidence ?? "not verified"),
-          ];
-        }),
+        results.map(({ scenario, result }) => [
+          scenario.id,
+          escapeCell(scenario.description),
+          result?.status === "blocked"
+            ? "🚧 blocked"
+            : result?.status === "unmet"
+              ? `unmet (${result.requirement ? result.requirement.replace("_", " ") : "unclassified"})`
+              : (result?.status ?? "unclear"),
+          escapeCell(result?.evidence ?? "not verified"),
+        ]),
       ),
     );
+    if (state.lastVerify)
+      blocks.push(`Holdouts not met: ${blocking.length} blocking, ${followUps.length} not required.`);
+    if (followUps.length)
+      blocks.push(
+        "**Holdout follow-ups** (not required by the request or spec; they did not trigger another round)",
+        followUps
+          .map(
+            ({ scenario, result }) =>
+              `- ${scenario.id}: ${escapeCell(scenario.description)} — ${escapeCell(result?.evidence ?? "")}`,
+          )
+          .join("\n"),
+      );
   }
 
   blocks.push("## Checks");
