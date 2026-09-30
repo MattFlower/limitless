@@ -29,6 +29,28 @@ import { DEFAULT_EVAL_CONCURRENCY } from "../core/types.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
 type Row = Record<string, unknown>;
+export type EvalResumeState = "active" | "interrupted" | "done";
+export interface EvalCallAttempt {
+  trialKey: string;
+  provider: string;
+  modelId: string;
+  resolved: boolean;
+  status: string | null;
+  costUsd: number | null;
+  costEquivUsd: number | null;
+  usageUnknown: boolean;
+}
+
+/** A trial's identity within its run, matching the eval_trials uniqueness index. */
+export function evalTrialKey(trial: Pick<EvalTrial, "caseId" | "modelId" | "trial" | "effort" | "details">) {
+  return JSON.stringify([
+    trial.caseId,
+    trial.modelId,
+    trial.trial,
+    trial.effort ?? "",
+    trial.details.system ?? "",
+  ]);
+}
 type Listener = (msg: StreamMessage) => void;
 
 const MAX_EVENT_DATA = 16_000;
@@ -312,6 +334,8 @@ export class Store {
       "role" | "models" | "k" | "maxUsd" | "rounds" | "strategy" | "systems" | "concurrency"
     >,
     trials: EvalTrial[],
+    /** What a restarted daemon needs to resume the run; runs without it fail on restart. */
+    resume?: { cache: boolean; dataset: unknown },
   ): EvalRun {
     const run: EvalRun = {
       ...input,
@@ -346,6 +370,12 @@ export class Store {
         .run(run.id, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY);
       if (run.systems)
         this.db.query("INSERT INTO eval_run_systems VALUES (?, ?)").run(run.id, JSON.stringify(run.systems));
+      if (resume)
+        this.db
+          .query(
+            "INSERT INTO eval_run_resume (eval_run_id, cache, dataset_json, state) VALUES (?, ?, ?, 'active')",
+          )
+          .run(run.id, Number(resume.cache), JSON.stringify(resume.dataset));
       for (const trial of trials) this.recordEvalTrial({ ...trial, evalRunId: run.id });
     })();
     return run;
@@ -443,6 +473,7 @@ export class Store {
             details: {
               ...trial.details,
               interrupted: trial.status === "running",
+              ...(trial.status === "running" ? { usageUnknown: true } : {}),
               reason: trial.status === "running" ? `${reason}; final usage unknown` : reason,
             },
           });
@@ -451,14 +482,157 @@ export class Store {
     })();
   }
 
+  /** Fails runs a restart can't resume; resumable ones wait for `EvalRunner.start()`. */
   recoverEvals(): void {
     for (const run of this.listEvalRuns()) {
-      if (run.status === "queued" || run.status === "running")
+      if (
+        (run.status === "queued" || run.status === "running") &&
+        this.getEvalResume(run.id)?.state !== "active"
+      )
         this.interruptEval(
           run.id,
           "interrupted by daemon restart; submit a new eval to reuse completed trials",
         );
     }
+  }
+
+  getEvalResume(id: string): { cache: boolean; dataset: unknown; state: EvalResumeState } | null {
+    const row = this.db
+      .query("SELECT cache, dataset_json, state FROM eval_run_resume WHERE eval_run_id = ?")
+      .get(id) as Row | null;
+    return row
+      ? {
+          cache: row.cache === 1,
+          dataset: parse(row.dataset_json, null),
+          state: row.state as EvalResumeState,
+        }
+      : null;
+  }
+
+  setEvalResumeState(id: string, state: EvalResumeState): void {
+    this.db.query("UPDATE eval_run_resume SET state = ? WHERE eval_run_id = ?").run(state, id);
+  }
+
+  /** Records the intent to call a model before the call, so a crash during it is never replayed. */
+  beginEvalCall(evalRunId: string, trialKey: string, provider: string, modelId: string): number {
+    const row = this.db
+      .query(
+        "INSERT INTO eval_call_attempts (eval_run_id, trial_key, provider, model_id, started_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
+      )
+      .get(evalRunId, trialKey, provider, modelId, Date.now()) as { id: number };
+    return row.id;
+  }
+
+  /** `result` is null when the harness threw, which leaves its spend unknown. */
+  resolveEvalCall(
+    id: number,
+    result: { status: InvocationStatus; costUsd: number; costEquivUsd: number } | null,
+  ): void {
+    this.db
+      .query(
+        "UPDATE eval_call_attempts SET resolved_at = ?, status = ?, cost_usd = ?, cost_equiv_usd = ? WHERE id = ?",
+      )
+      .run(Date.now(), result?.status ?? "threw", result?.costUsd ?? null, result?.costEquivUsd ?? null, id);
+  }
+
+  evalCallAttempts(evalRunId: string): EvalCallAttempt[] {
+    return (
+      this.db
+        .query("SELECT * FROM eval_call_attempts WHERE eval_run_id = ? ORDER BY id")
+        .all(evalRunId) as Row[]
+    ).map((r) => ({
+      trialKey: r.trial_key as string,
+      provider: r.provider as string,
+      modelId: r.model_id as string,
+      resolved: r.resolved_at !== null,
+      status: r.status as string | null,
+      costUsd: r.cost_usd as number | null,
+      costEquivUsd: r.cost_equiv_usd as number | null,
+      // A call killed mid-flight or one that threw may have spent without reporting it.
+      usageUnknown: r.resolved_at === null || r.status === "cancelled" || r.status === "threw",
+    }));
+  }
+
+  /**
+   * Prepares an interrupted run to resume: trials that never recorded a call intent go back to
+   * the queue; trials with one are interrupted errors that are never replayed, keeping the spend
+   * their resolved calls reported. Returns how many calls have unknown spend.
+   */
+  reconcileEvalResume(id: string): { requeued: number; interrupted: number; unknownCalls: number } {
+    return this.db.transaction(() => {
+      const attempts = new Map<string, EvalCallAttempt[]>();
+      for (const attempt of this.evalCallAttempts(id))
+        attempts.set(attempt.trialKey, [...(attempts.get(attempt.trialKey) ?? []), attempt]);
+      const result = { requeued: 0, interrupted: 0, unknownCalls: 0 };
+      for (const trial of this.listEvalTrials(id)) {
+        const calls = attempts.get(evalTrialKey(trial)) ?? [];
+        const unknown = calls.filter((c) => c.usageUnknown).length;
+        result.unknownCalls += unknown;
+        const pending =
+          trial.status === "queued" ||
+          trial.status === "running" ||
+          (trial.status === "skipped" &&
+            !trial.details.interrupted &&
+            (trial.details.reason === "daemon shutdown" ||
+              trial.details.reason === "eval interrupted by daemon shutdown"));
+        if (!pending) {
+          if (unknown > 0 && !trial.details.usageUnknown)
+            this.recordEvalTrial({ ...trial, details: { ...trial.details, usageUnknown: true } });
+          continue;
+        }
+        if (calls.length === 0) {
+          const { system, complexity, switchChain } = trial.details;
+          this.recordEvalTrial({
+            ...trial,
+            cacheKey: "",
+            harness: "",
+            status: "queued",
+            output: null,
+            pass: null,
+            score: null,
+            details: {
+              ...(system === undefined ? {} : { system }),
+              ...(complexity === undefined ? {} : { complexity }),
+              ...(switchChain === undefined ? {} : { switchChain }),
+              resumed: true,
+            },
+            costUsd: 0,
+            costEquivUsd: 0,
+            tokensIn: 0,
+            tokensOut: 0,
+            durationMs: 0,
+          });
+          result.requeued++;
+          continue;
+        }
+        const sum = (pick: (c: EvalCallAttempt) => number | null) =>
+          calls.reduce((n, c) => n + (pick(c) ?? 0), 0);
+        const reason = `interrupted by daemon restart after ${calls.length} model call(s); not replayed${unknown ? "; final usage unknown" : ""}`;
+        this.recordEvalTrial({
+          ...trial,
+          status: "error",
+          pass: false,
+          score: 0,
+          // Resolved calls report what they spent even when the trial never recorded it.
+          costUsd: Math.max(
+            trial.costUsd,
+            sum((c) => c.costUsd),
+          ),
+          costEquivUsd: Math.max(
+            trial.costEquivUsd,
+            sum((c) => c.costEquivUsd),
+          ),
+          details: {
+            ...trial.details,
+            interrupted: true,
+            ...(unknown ? { usageUnknown: true } : {}),
+            reason,
+          },
+        });
+        result.interrupted++;
+      }
+      return result;
+    })();
   }
 
   // ---- pub/sub -------------------------------------------------------------

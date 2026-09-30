@@ -206,10 +206,15 @@ the usual local Origin and JSON content-type rules; Cloudflare tunnel requests a
 
 Runs progress from `queued` to `running`, then `completed`, `budget_exhausted` or `failed`. Completed
 means execution ended, not that candidates passed. Trial errors and skips remain visible in partial
-reports. Daemon shutdown aborts active calls and releases slots; startup marks interrupted evals
-failed, retaining completed trials for cache reuse on a new submission. In-flight trials interrupted
-by a crash are errors with unknown final usage/latency; queued trials are skipped. Unknown latency is
-excluded from the p50. `--follow` polls until any
+reports. Daemon shutdown aborts active calls and releases slots, marking the run `failed`. Once the
+next daemon's `start()` has brought up the provider tracker and SSH tunnels, it resumes such runs, and
+runs a crash interrupted, under the same ID. They keep the dataset text, labels and cache setting
+saved at submission, and their completed trials and costs. Every harness call records a durable
+intent first. A trial that never recorded one runs again (once); a trial that did is an interrupted
+error and is never replayed. Its reported spend is kept; a call that never returned or was cancelled
+leaves `usageUnknown`, and the resumed run then makes no further paid calls (cached work still
+completes) and ends `budget_exhausted` with the reason. Runs submitted before resume support still
+fail on restart. Unknown latency is excluded from the p50. `--follow` polls until any
 terminal state and prints a final report. The Evals UI lists runs, displays per-trial reports, and
 compares latest completed evidence in a roles-by-models eligibility matrix. Other role graders remain pending.
 

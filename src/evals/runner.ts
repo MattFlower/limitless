@@ -1,6 +1,7 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_EVAL_CONCURRENCY, type EvalRun, type EvalTrial } from "../core/types.ts";
+import { evalTrialKey } from "../db/store.ts";
 import { Semaphore } from "../gates/slots.ts";
 import { createEvalWorktree, type EvalLabels, pinnedTree, snapshotTopLevel } from "../git/repos.ts";
 import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
@@ -25,13 +26,12 @@ import { StoredReviewSchema, toStrictJsonSchema } from "../pipeline/schemas.ts";
 import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
 import { cacheKey, reviewSystemHash } from "./cache.ts";
 import {
-  type AnyCaseFile,
   defaultCasePath,
   type EvalCase,
   EvalRequestSchema,
-  hiddenContents,
   type ImplementCase,
   loadRoleCases,
+  readRoleCases,
   type TriageCase,
   validateRequest,
 } from "./cases.ts";
@@ -42,7 +42,8 @@ import {
   nextImplementTarget,
   prepareImplement,
 } from "./implement.ts";
-import { gradeCase, prepareCase, schemaFor, seedContent, storedSchemaFor } from "./prepare.ts";
+import { gradeCase, prepareCase, schemaFor, storedSchemaFor } from "./prepare.ts";
+import { type EvalDataset, readDataset, restoreDataset, snapshotDataset } from "./resume.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 
 /** Where Limitless keeps eval datasets; pins whose history touches these are rejected. */
@@ -62,9 +63,18 @@ interface TrialCoordination {
   keyed: (key: string) => Promise<void>;
 }
 
+/** What a run executes with; fixed at submission and restored unchanged on resume. */
+interface RunInputs {
+  dataset: EvalDataset;
+  cache: boolean;
+  /** Set when unknown spend from an interrupted call rules out further paid calls. */
+  unpaid?: string;
+}
+
 export class EvalRunner {
   private readonly active = new Map<string, { controller: AbortController; done: Promise<void> }>();
   private stopping = false;
+  private started = false;
   /** Per-provider cap shared by all eval runs, so production work keeps a slot where the provider has two or more. */
   private readonly evalSlots = new Map<string, Semaphore>();
   /** Requested concurrency of each executing run, which sizes `evalSlots`. */
@@ -80,10 +90,10 @@ export class EvalRunner {
     if (this.stopping) throw new Error("daemon is stopping");
     // Reject unsupported roles before accessing any dataset or repository.
     const parsed = EvalRequestSchema.parse(input);
-    const file = loadRoleCases(parsed.role, this.casePath);
-    for (const item of file.cases)
-      if ("defects" in item) seedContent(item, this.casePath ?? defaultCasePath(parsed.role));
+    const casePath = this.casePath ?? defaultCasePath(parsed.role);
+    const { raw, file } = readRoleCases(parsed.role, casePath);
     const { request, cases } = validateRequest(input, file, this.deps.router);
+    const dataset = readDataset(raw, file, cases, casePath);
     const trials: EvalTrial[] = [];
     const candidates =
       request.systems?.map((system) => ({ modelId: system.finders[0]?.target ?? "", system: system.name })) ??
@@ -128,13 +138,66 @@ export class EvalRunner {
             durationMs: 0,
             createdAt: Date.now(),
           });
-    const run = this.deps.store.createEvalRun(request, trials);
+    const run = this.deps.store.createEvalRun(request, trials, {
+      cache: request.cache,
+      dataset: snapshotDataset(dataset),
+    });
+    this.launch(run, { dataset, cache: request.cache });
+    return run;
+  }
+
+  /**
+   * Resumes runs a restart or shutdown interrupted, under their IDs and with their saved dataset
+   * and options. Call once the provider tracker and tunnels are up; later calls do nothing.
+   */
+  start(): void {
+    if (this.started || this.stopping) return;
+    this.started = true;
+    const { store } = this.deps;
+    for (const run of store.listEvalRuns().reverse()) {
+      if (this.active.has(run.id)) continue;
+      const saved = store.getEvalResume(run.id);
+      if (!saved || saved.state === "done") continue;
+      const live = run.status === "queued" || run.status === "running";
+      // A failed run is resumable only if this release's shutdown stopped it, not a rolled-back release.
+      if (!live && !(saved.state === "interrupted" && run.status === "failed")) {
+        store.setEvalResumeState(run.id, "done");
+        continue;
+      }
+      let dataset: EvalDataset;
+      try {
+        dataset = restoreDataset(run.role, saved.dataset);
+      } catch (error) {
+        // Never fall back to the current dataset: its labels may differ from the ones submitted.
+        store.setEvalResumeState(run.id, "done");
+        if (live)
+          store.interruptEval(
+            run.id,
+            `interrupted by daemon restart; its saved dataset is unusable (${(error as Error).message}); submit a new eval to reuse completed trials`,
+          );
+        continue;
+      }
+      const { unknownCalls } = store.reconcileEvalResume(run.id);
+      store.setEvalResumeState(run.id, "active");
+      store.updateEvalRun(run.id, "queued");
+      this.launch(run, {
+        dataset,
+        cache: saved.cache,
+        ...(unknownCalls
+          ? {
+              unpaid: `resumed after a restart with ${unknownCalls} interrupted model call(s) of unknown spend; no further paid calls`,
+            }
+          : {}),
+      });
+    }
+  }
+
+  private launch(run: EvalRun, inputs: RunInputs): void {
     const controller = new AbortController();
     const done = Promise.resolve()
-      .then(() => this.execute(run, file, cases, request.cache, controller.signal))
+      .then(() => this.execute(run, inputs, controller.signal))
       .finally(() => this.active.delete(run.id));
     this.active.set(run.id, { controller, done });
-    return run;
   }
 
   report(id: string, options?: StatsOptions): EvalReport | null {
@@ -216,31 +279,20 @@ export class EvalRunner {
     return semaphore;
   }
 
-  private async execute(
-    run: EvalRun,
-    file: AnyCaseFile,
-    cases: EvalCase[],
-    cache: boolean,
-    signal: AbortSignal,
-  ): Promise<void> {
+  private async execute(run: EvalRun, inputs: RunInputs, signal: AbortSignal): Promise<void> {
     this.executing.set(run.id, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY);
     this.resizeEvalSlots();
     try {
-      await this.executeRun(run, file, cases, cache, signal);
+      await this.executeRun(run, inputs, signal);
     } finally {
       this.executing.delete(run.id);
       this.resizeEvalSlots();
     }
   }
 
-  private async executeRun(
-    run: EvalRun,
-    file: AnyCaseFile,
-    cases: EvalCase[],
-    cache: boolean,
-    signal: AbortSignal,
-  ): Promise<void> {
+  private async executeRun(run: EvalRun, inputs: RunInputs, signal: AbortSignal): Promise<void> {
     const { store, router } = this.deps;
+    const { file, cases } = inputs.dataset;
     store.updateEvalRun(run.id, "running");
     const trees = new Map<string, Promise<string>>();
     const implementations = new Map<string, ReturnType<typeof prepareImplement>>();
@@ -267,18 +319,13 @@ export class EvalRunner {
       return tree;
     };
     try {
-      const casePath = this.casePath ?? defaultCasePath(run.role);
-      const hidden = new Map(
-        file.cases.flatMap((item) =>
-          "hidden" in item ? [[item.id, hiddenContents(item, casePath)] as const] : [],
-        ),
-      );
+      const { raw, hidden, seeds } = inputs.dataset;
       const labels: EvalLabels = {
         paths: run.role === "implement" ? ["evals/implement"] : LABEL_PATHS,
         contents: [
-          readFileSync(casePath, "utf8"),
+          raw,
           ...[...hidden.values()].flatMap((files) => files.map((f) => f.content)),
-          ...file.cases.flatMap((item) => ("defects" in item ? (seedContent(item, casePath) ?? []) : [])),
+          ...seeds.values(),
         ],
       };
       const groups = new Map<string, string[]>();
@@ -321,7 +368,7 @@ export class EvalRunner {
           const queue = models.flatMap((modelId) =>
             cases.flatMap((item) =>
               recorded
-                .filter((t) => recordedTarget(t) === modelId && t.caseId === item.id)
+                .filter((t) => recordedTarget(t) === modelId && t.caseId === item.id && t.status === "queued")
                 .map((trial) => ({ trial, item })),
             ),
           );
@@ -354,10 +401,9 @@ export class EvalRunner {
                   treeFor,
                   implementFor,
                   labels,
-                  cache,
+                  inputs,
                   signal,
                   coordination,
-                  hidden.get(entry.item.id),
                 );
               } catch (error) {
                 // Like the sequential stream: an unexpected failure stops this provider's new trials.
@@ -377,9 +423,37 @@ export class EvalRunner {
       const failed = outcomes.find((result) => result.status === "rejected");
       if (signal.aborted) throw new Error("eval interrupted by daemon shutdown");
       if (failed?.status === "rejected") throw failed.reason;
-      store.updateEvalRun(run.id, store.evalSpend(run.id) >= run.maxUsd ? "budget_exhausted" : "completed");
+      const unpaid =
+        inputs.unpaid !== undefined &&
+        store
+          .listEvalTrials(run.id)
+          .some((t) => t.status === "skipped" && t.details.reason === inputs.unpaid);
+      if (unpaid) store.updateEvalRun(run.id, "budget_exhausted", inputs.unpaid);
+      else
+        store.updateEvalRun(run.id, store.evalSpend(run.id) >= run.maxUsd ? "budget_exhausted" : "completed");
+      store.setEvalResumeState(run.id, "done");
     } catch (error) {
       store.interruptEval(run.id, (error as Error).message);
+      // A shutdown leaves the run for the next daemon to resume; anything else ends it.
+      store.setEvalResumeState(run.id, signal.aborted ? "interrupted" : "done");
+    }
+  }
+
+  /** Records durable intent before a harness call and its outcome after, including a throw. */
+  private async attempt(
+    evalRunId: string,
+    trialKey: string,
+    target: ModelTarget,
+    call: () => Promise<AgentResult>,
+  ): Promise<AgentResult> {
+    const { store } = this.deps;
+    const id = store.beginEvalCall(evalRunId, trialKey, target.provider, target.modelId);
+    let result: AgentResult | null = null;
+    try {
+      result = await call();
+      return result;
+    } finally {
+      store.resolveEvalCall(id, result);
     }
   }
 
@@ -402,12 +476,14 @@ export class EvalRunner {
     treeFor: (item: TriageCase, labels: EvalLabels) => Promise<string>,
     implementFor: (item: ImplementCase, cwd: string) => ReturnType<typeof prepareImplement>,
     labels: EvalLabels,
-    cache: boolean,
+    inputs: RunInputs,
     signal: AbortSignal,
     coordination: TrialCoordination,
-    hidden: ReturnType<typeof hiddenContents> = [],
   ): Promise<void> {
     const { store, router, tracker, harnesses, cfg } = this.deps;
+    const { cache } = inputs;
+    const hidden = inputs.dataset.hidden.get(item.id) ?? [];
+    const identity = evalTrialKey(trial);
     const rounds = run.rounds ?? 1;
     const strategy = run.strategy ?? "retry";
     let roundStarted = 0;
@@ -483,8 +559,7 @@ export class EvalRunner {
       mkdirSync(cfg.paths.runs, { recursive: true });
       directory = mkdtempSync(join(cfg.paths.runs, "eval-"));
       const cwd = "gold" in item && "prompt" in item ? directory : join(directory, "worktree");
-      const patch =
-        "defects" in item ? seedContent(item, this.casePath ?? defaultCasePath(run.role)) : undefined;
+      const patch = "defects" in item ? inputs.dataset.seeds.get(item.id) : undefined;
       // Snapshot cases replace the pinned history, so every base-relative step uses its base.
       let effective = item;
       if (!("gold" in item && "prompt" in item)) {
@@ -618,6 +693,8 @@ export class EvalRunner {
           });
           return;
         }
+      // Only cached work may finish once interrupted calls leave the run's spend unknown.
+      if (inputs.unpaid !== undefined) return skip(inputs.unpaid);
       const toolCommands: string[] = [];
       let sessionId: string | undefined;
       if (rounds > 1) scratch = createScratch(cwd);
@@ -684,33 +761,36 @@ export class EvalRunner {
               to = { target, harness, noTools },
               log = logPath,
             ) =>
-              to.harness({
-                scratchDir,
-                ...(sessionId ? { resumeSessionId: sessionId } : {}),
-                cwd,
-                ...request,
-                decisionTask,
-                systemAppend: FACTORY_PREAMBLE,
-                target: to.target,
-                mode: "hidden" in item ? "edit" : "readonly",
-                noTools: to.noTools,
-                privateSession: run.role === "verify",
-                idleTimeoutMs: 10 * 60_000,
-                maxToolCalls: "hidden" in item ? 400 : 150,
-                signal,
-                logPath: log,
-                onEvent: (event) => {
-                  if (
-                    event.type === "tool_call" &&
-                    event.input &&
-                    typeof event.input === "object" &&
-                    "command" in event.input &&
-                    typeof event.input.command === "string"
-                  )
-                    toolCommands.push(event.input.command);
-                  if (event.type === "rate_limit") tracker.observeWindows(to.target.provider, event.windows);
-                },
-              });
+              this.attempt(run.id, identity, to.target, () =>
+                to.harness({
+                  scratchDir,
+                  ...(sessionId ? { resumeSessionId: sessionId } : {}),
+                  cwd,
+                  ...request,
+                  decisionTask,
+                  systemAppend: FACTORY_PREAMBLE,
+                  target: to.target,
+                  mode: "hidden" in item ? "edit" : "readonly",
+                  noTools: to.noTools,
+                  privateSession: run.role === "verify",
+                  idleTimeoutMs: 10 * 60_000,
+                  maxToolCalls: "hidden" in item ? 400 : 150,
+                  signal,
+                  logPath: log,
+                  onEvent: (event) => {
+                    if (
+                      event.type === "tool_call" &&
+                      event.input &&
+                      typeof event.input === "object" &&
+                      "command" in event.input &&
+                      typeof event.input.command === "string"
+                    )
+                      toolCommands.push(event.input.command);
+                    if (event.type === "rate_limit")
+                      tracker.observeWindows(to.target.provider, event.windows);
+                  },
+                }),
+              );
             const send = (
               request?: ReviewRequest | VerifierRequest,
               to = { target, harness, noTools },

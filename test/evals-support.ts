@@ -99,57 +99,80 @@ export async function evalFixture(
       harnessNames.push(name);
       return handler(s);
     });
-  const factory = new Factory(cfg, {
-    ...(policy ? { policy } : {}),
-    evalCasePath: casePath,
-    providers: [
-      {
-        id: "openrouter",
-        label: "A",
-        harness: "fake",
-        billing: "metered",
-        maxConcurrent: 1,
-        openaiBaseUrl: "http://unused.invalid",
+  const make = () =>
+    new Factory(cfg, {
+      cleanup: async (dryRun) => ({
+        dryRun,
+        worktrees: [],
+        logs: [],
+        metadata: [],
+        debugEvents: 0,
+        errors: [],
+      }),
+      ...(policy ? { policy } : {}),
+      evalCasePath: casePath,
+      providers: [
+        {
+          id: "openrouter",
+          label: "A",
+          harness: "fake",
+          billing: "metered",
+          maxConcurrent: 1,
+          openaiBaseUrl: "http://unused.invalid",
+        },
+        { id: "provider-b", label: "B", harness: "fake", billing: "subscription", maxConcurrent: 1 },
+        ...extraProviders,
+      ],
+      models: [
+        ...extraModels,
+        {
+          id: "candidate-a",
+          provider: "openrouter",
+          model: "a",
+          tier: 1,
+          vendor: "other",
+          origin: "unknown",
+          baseOrigin: "unknown",
+          supportedEfforts: [],
+          price: { input: 1, output: 1 },
+        },
+        {
+          id: "candidate-b",
+          provider: "provider-b",
+          model: "b",
+          tier: 1,
+          vendor: "other",
+          origin: "unknown",
+          baseOrigin: "unknown",
+          supportedEfforts: [],
+          price: { input: 1, output: 1 },
+        },
+      ],
+      harnesses: {
+        fake: harness("fake"),
+        codex: harness("codex"),
+        llm: harness("llm"),
+        decisions: harness("decisions"),
       },
-      { id: "provider-b", label: "B", harness: "fake", billing: "subscription", maxConcurrent: 1 },
-      ...extraProviders,
-    ],
-    models: [
-      ...extraModels,
-      {
-        id: "candidate-a",
-        provider: "openrouter",
-        model: "a",
-        tier: 1,
-        vendor: "other",
-        origin: "unknown",
-        baseOrigin: "unknown",
-        supportedEfforts: [],
-        price: { input: 1, output: 1 },
-      },
-      {
-        id: "candidate-b",
-        provider: "provider-b",
-        model: "b",
-        tier: 1,
-        vendor: "other",
-        origin: "unknown",
-        baseOrigin: "unknown",
-        supportedEfforts: [],
-        price: { input: 1, output: 1 },
-      },
-    ],
-    harnesses: {
-      fake: harness("fake"),
-      codex: harness("codex"),
-      llm: harness("llm"),
-      decisions: harness("decisions"),
-    },
-  });
+    });
+  let factory = make();
+  // Factories replaced by `crash`: their in-flight calls never return and they never stop.
+  const crashed: Factory[] = [];
   return {
     home,
     cfg,
-    factory,
+    get factory() {
+      return factory;
+    },
+    /**
+     * Simulates a daemon dying and a new one opening the same database, without starting it. Stop a
+     * started factory first: a crashed one keeps no timers running.
+     */
+    crash() {
+      crashed.push(factory);
+      factory = make();
+      return factory;
+    },
     dataset,
     casePath,
     save,
@@ -176,6 +199,7 @@ export async function evalFixture(
     async close() {
       await factory.stop();
       factory.store.close();
+      for (const dead of crashed) dead.store.close();
       rmSync(home, { recursive: true, force: true });
     },
   };

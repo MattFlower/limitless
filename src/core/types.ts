@@ -492,6 +492,10 @@ export interface EvalTrial {
     decisionConfidence?: number;
     preparationFailed?: boolean;
     interrupted?: boolean;
+    /** A model call for this trial may have spent more than recorded (it never reported back). */
+    usageUnknown?: boolean;
+    /** Requeued after a daemon restart; it had never called a model before the restart. */
+    resumed?: boolean;
     cache?: {
       evalRunId: string;
       caseId: string;

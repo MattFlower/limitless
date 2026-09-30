@@ -25,6 +25,12 @@ export function formatEvalReport(report: EvalReport): string {
     `${report.run.id}: ${report.run.status} (role=${report.run.role}, k=${report.run.k}, maxUsd=${report.run.maxUsd}, concurrency=${report.run.concurrency ?? "1 (legacy)"})`,
   ];
   if (report.run.error) lines.push(report.run.error);
+  const resumed = report.trials.filter((t) => t.details.resumed).length;
+  const unknown = report.trials.filter((t) => t.details.usageUnknown).length;
+  if (resumed || unknown)
+    lines.push(
+      `restart recovery: ${resumed} trials resumed, ${report.trials.filter((t) => t.details.interrupted).length} interrupted and not replayed, ${unknown} with unknown final usage`,
+    );
   for (const m of report.summaries) {
     const c = m.comparison;
     const metric = (name: string, value: { numerator: number; denominator: number; rate: number | null }) =>

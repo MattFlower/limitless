@@ -231,18 +231,30 @@ export function loadRoleCases(
   role: "triage" | "review" | "verify" | "implement",
   path = defaultCasePath(role),
 ): AnyCaseFile {
+  return readRoleCases(role, path).file;
+}
+/** Parses a role's dataset text, e.g. the copy an eval run saved when it was submitted. */
+export function parseRoleCases(role: "triage" | "review" | "verify" | "implement", raw: string): AnyCaseFile {
+  const schema =
+    role === "triage"
+      ? CaseFileSchema
+      : role === "review"
+        ? ReviewCaseFileSchema
+        : role === "implement"
+          ? ImplementCaseFileSchema
+          : VerifyCaseFileSchema;
+  return schema.parse(JSON.parse(raw));
+}
+/** The dataset and the exact text it was parsed from. */
+export function readRoleCases(
+  role: "triage" | "review" | "verify" | "implement",
+  path = defaultCasePath(role),
+): { raw: string; file: AnyCaseFile } {
   try {
-    const schema =
-      role === "triage"
-        ? CaseFileSchema
-        : role === "review"
-          ? ReviewCaseFileSchema
-          : role === "implement"
-            ? ImplementCaseFileSchema
-            : VerifyCaseFileSchema;
-    const file = schema.parse(JSON.parse(readFileSync(path, "utf8")));
+    const raw = readFileSync(path, "utf8");
+    const file = parseRoleCases(role, raw);
     if (file.role === "implement") for (const item of file.cases) hiddenContents(item, path);
-    return file;
+    return { raw, file };
   } catch (error) {
     throw new Error(
       `Invalid ${role} eval cases ${path}: ${(error as Error).message}${role === "verify" ? "; curate evals/verify/cases.json before running verify evals" : ""}`,

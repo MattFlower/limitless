@@ -178,6 +178,8 @@ export class Factory {
         .map((p) => p.sshForward as NonNullable<ProviderDef["sshForward"]>),
     );
     this.scheduler.start();
+    // Resumed evals call models, so they wait for the tracker and tunnels above.
+    this.evals.start();
   }
 
   async stop(): Promise<void> {

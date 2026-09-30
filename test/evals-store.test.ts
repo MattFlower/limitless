@@ -324,3 +324,76 @@ test("eval concurrency survives reload and legacy runs omit it", () => {
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("after the resume migration the previous release's positional eval inserts and reads still work", () => {
+  const home = mkdtempSync(join(tmpdir(), "eval-rollback-store-"));
+  const path = join(home, "db.sqlite");
+  let store = new Store(path);
+  try {
+    const run = store.createEvalRun(
+      { role: "triage", models: ["opaque-model"], k: 1, maxUsd: 1, concurrency: 3 },
+      [row],
+      { cache: false, dataset: { version: 1 } },
+    );
+    const call = store.beginEvalCall(run.id, "key", "provider", "opaque-model");
+    store.close();
+    // The previous release opens the upgraded database and writes exactly as it always did.
+    const old = new Database(path);
+    old.exec("PRAGMA foreign_keys = ON");
+    old
+      .query("INSERT INTO eval_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run("eval-old", "implement", JSON.stringify(["opaque-model"]), 2, 3, "queued", 5, null, null);
+    old.query("INSERT INTO eval_run_options VALUES (?, ?, ?)").run("eval-old", 2, "switch");
+    old.query("INSERT INTO eval_run_concurrency VALUES (?, ?)").run("eval-old", 4);
+    old
+      .query("INSERT INTO eval_trials VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(
+        "eval-old",
+        "a",
+        "opaque-model",
+        0,
+        "",
+        "",
+        "queued",
+        null,
+        null,
+        null,
+        "{}",
+        0,
+        0,
+        0,
+        0,
+        0,
+        6,
+        null,
+      );
+    old.query("UPDATE eval_runs SET status = 'failed' WHERE id = ?").run(run.id);
+    old.close();
+    store = new Store(path);
+    expect(store.getEvalRun("eval-old")).toMatchObject({
+      role: "implement",
+      rounds: 2,
+      strategy: "switch",
+      concurrency: 4,
+      status: "queued",
+    });
+    expect(store.listEvalTrials("eval-old")).toHaveLength(1);
+    expect(store.getEvalResume("eval-old")).toBeNull();
+    expect(store.getEvalRun(run.id)).toMatchObject({ status: "failed", concurrency: 3 });
+    expect(store.listEvalTrials(run.id)).toEqual([{ ...row, evalRunId: run.id }]);
+    expect(store.getEvalResume(run.id)).toEqual({ cache: false, dataset: { version: 1 }, state: "active" });
+    expect(store.evalCallAttempts(run.id)).toMatchObject([
+      { trialKey: "key", resolved: false, usageUnknown: true },
+    ]);
+    store.resolveEvalCall(call, null);
+    expect(store.evalCallAttempts(run.id)).toMatchObject([
+      { resolved: true, status: "threw", usageUnknown: true },
+    ]);
+    // Without resume data, restart recovery keeps failing the run as before.
+    store.recoverEvals();
+    expect(store.getEvalRun("eval-old")?.status).toBe("failed");
+  } finally {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
