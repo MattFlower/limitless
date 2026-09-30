@@ -422,30 +422,46 @@ describe("panel decision", () => {
         findings: [verified(verdict, severity, category)],
       };
       expect(blockingReviewFindings(review).length > 0).toBe(firstRound);
-      expect(blockingReviewFindings(review, [finding("major")]).length > 0).toBe(laterRound);
+      expect(blockingReviewFindings(review, [finding("major")], 2).length > 0).toBe(laterRound);
     });
   }
 
-  test("unverified panel findings never block round 1, whatever the finder's severity", () => {
-    const review: Review = {
-      mode: "panel",
-      verdict: "approve",
-      summary: "s",
-      findings: [finding("blocker"), finding("blocker", true)],
-    };
-    expect(blockingReviewFindings(review)).toEqual([]);
-    // Re-reviews block only verified findings, whatever their label.
+  test("unverified panel findings block only as security findings or prior blocking findings (fail closed)", () => {
+    const plain = finding("blocker");
+    const security = { ...finding("nit", true), category: "cleanup" as const };
+    const review: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [plain, security] };
+    // The panel always verifies these two kinds, so no ruling means the verifier left them out.
+    expect(blockingReviewFindings(review)).toEqual([security]);
     const regression = { ...finding("blocker"), label: "regression" as const };
-    const cited = { ...finding("blocker"), label: "unaddressed" as const, prior: "P1" };
-    for (const round of [2, 3])
+    const cited = {
+      ...finding("nit"),
+      category: "conventions" as const,
+      label: "unaddressed" as const,
+      prior: "P1",
+    };
+    for (const round of [2, 3, "resolution"] as const)
       expect(
-        blockingReviewFindings({ ...review, findings: [regression, cited] }, [finding("major")], round),
-      ).toEqual([]);
+        blockingReviewFindings(
+          { ...review, findings: [regression, cited, security] },
+          [finding("major")],
+          round,
+        ),
+      ).toEqual([cited, security]);
+  });
+
+  test("a panel re-review must say which review it is", () => {
+    const review: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [] };
+    expect(() => blockingReviewFindings(review, [finding("major")])).toThrow("review number");
+    expect(() => reviewVerdict(review, [])).toThrow("review number");
+    expect(blockingReviewFindings(review)).toEqual([]);
+    // Single reviews have no panel numbering.
+    expect(blockingReviewFindings({ ...review, mode: undefined }, [finding("major")])).toEqual([]);
   });
 
   // R1, R2 (and a conflict-resolution review, which follows R2's rules) and R3 by label and the
   // verifier's ruling; "cited" is unaddressed citing P1, "miscited" cites a P2 that does not exist.
-  // "finder-security" is a finder's security: true under the verifier's own category.
+  // "finder-security" is a finder's security: true under the verifier's own category. A security
+  // finding blocks in every review unless refuted, at any severity and in any category.
   for (const [label, verdict, severity, category, finderSecurity, r1, r2, r3] of [
     ["new", "CONFIRMED", "low", "correctness", false, true, false, false],
     ["new", "CONFIRMED", "medium", "correctness", false, true, false, false],
@@ -456,14 +472,17 @@ describe("panel decision", () => {
     ["new", "CONFIRMED", "low", "security", false, true, true, true],
     ["new", "CONFIRMED", "medium", "security", false, true, true, true],
     ["new", "PLAUSIBLE", "high", "security", false, true, true, true],
-    ["new", "PLAUSIBLE", "medium", "security", false, false, false, false],
+    ["new", "PLAUSIBLE", "medium", "security", false, true, true, true],
+    ["new", "PLAUSIBLE", "low", "security", false, true, true, true],
     ["new", "REFUTED", "critical", "security", true, false, false, false],
     ["new", "CONFIRMED", "low", "correctness", true, true, true, true],
     ["new", "PLAUSIBLE", "high", "correctness", true, true, true, true],
-    ["new", "PLAUSIBLE", "medium", "correctness", true, false, false, false],
+    ["new", "PLAUSIBLE", "medium", "correctness", true, true, true, true],
+    ["new", "PLAUSIBLE", "low", "correctness", true, true, true, true],
     ["new", "REFUTED", "critical", "correctness", true, false, false, false],
-    ["new", "CONFIRMED", "critical", "cleanup", true, false, false, false],
-    ["new", "CONFIRMED", "critical", "conventions", true, false, false, false],
+    ["new", "CONFIRMED", "critical", "cleanup", true, true, true, true],
+    ["new", "PLAUSIBLE", "low", "conventions", true, true, true, true],
+    ["new", "CONFIRMED", "critical", "cleanup", false, false, false, false],
     ["regression", "CONFIRMED", "low", "correctness", false, true, false, false],
     ["regression", "CONFIRMED", "medium", "correctness", false, true, true, false],
     ["regression", "PLAUSIBLE", "medium", "correctness", false, false, false, false],
@@ -492,8 +511,8 @@ describe("panel decision", () => {
       expect(blockingReviewFindings(review).length > 0).toBe(r1);
       expect(blockingReviewFindings(review, prior, 1).length > 0).toBe(r1);
       expect(blockingReviewFindings(review, prior, 2).length > 0).toBe(r2);
-      // A conflict-resolution review has no panel review number: R2's rules.
-      expect(blockingReviewFindings(review, prior).length > 0).toBe(r2);
+      // A conflict-resolution review is outside R1-R3 and follows R2's rules.
+      expect(blockingReviewFindings(review, prior, "resolution").length > 0).toBe(r2);
       expect(blockingReviewFindings(review, prior, 3).length > 0).toBe(r3);
       expect(reviewVerdict(review, prior, 3)).toBe(r3 ? "request_changes" : "approve");
     });
@@ -518,19 +537,25 @@ describe("panel decision", () => {
     expect(resolvedPriorFindings([r1])).toEqual([]);
   });
 
-  test("cleanup and conventions never block, in any round, by either category", () => {
+  test("cleanup and conventions never block in any round, unless the finding is a security one", () => {
     const prior = [finding("major")];
     for (const f of [
-      // Unverified: the finder's category decides.
-      { ...finding("blocker", true), category: "cleanup" as const, label: "regression" as const },
-      { ...finding("blocker"), category: "conventions" as const, label: "unaddressed" as const, prior: "P1" },
-      // Verified: the verifier's category decides.
+      // Unverified: the finder's category.
+      { ...finding("blocker"), category: "cleanup" as const, label: "regression" as const },
+      // Verified: the verifier's category, whatever the finder's.
       { ...verified("CONFIRMED", "critical", "cleanup"), label: "regression" as const },
+      { ...verified("CONFIRMED", "critical", "conventions"), category: "security" as const },
     ]) {
       const review: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [f] };
       expect(blockingReviewFindings(review)).toEqual([]);
-      expect(blockingReviewFindings(review, prior)).toEqual([]);
+      for (const round of [2, 3, "resolution"] as const)
+        expect(blockingReviewFindings(review, prior, round)).toEqual([]);
     }
+    const security = { ...verified("PLAUSIBLE", "low", "cleanup"), security: true };
+    const review: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [security] };
+    expect(blockingReviewFindings(review)).toEqual([security]);
+    for (const round of [2, 3, "resolution"] as const)
+      expect(blockingReviewFindings(review, prior, round)).toEqual([security]);
   });
 });
 
@@ -557,7 +582,8 @@ describe("runReview panel", () => {
   const ids = (text: string) => [...text.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
   const panel = async (
     found: unknown[][],
-    rule: (id: string) => Omit<Verification, "category"> & { category?: Verification["category"] },
+    // null: the verifier leaves the candidate out.
+    rule: (id: string) => (Omit<Verification, "category"> & { category?: Verification["category"] }) | null,
     input: Partial<Parameters<typeof runReview>[1]> = {},
   ) => {
     const verifications: { request: VerifierRequest; avoidVendor?: string }[] = [];
@@ -571,10 +597,11 @@ describe("runReview panel", () => {
           ),
         verify: async (request, avoidVendor) => {
           verifications.push({ request, avoidVendor });
-          return ok(
-            { results: ids(request.prompt).map((id) => ({ id, category: "correctness", ...rule(id) })) },
-            "google",
-          );
+          const results = ids(request.prompt).flatMap((id) => {
+            const ruling = rule(id);
+            return ruling ? [{ id, category: "correctness", ...ruling }] : [];
+          });
+          return ok({ results }, "google");
         },
       },
       {
@@ -668,6 +695,81 @@ describe("runReview panel", () => {
       undefined,
       undefined,
     ]);
+  });
+
+  test("a security finding is verified whatever its category and blocks unless refuted", async () => {
+    const security = { ...candidate("src/a.ts", 1, "nit"), category: "cleanup", security: true };
+    const plain = { ...candidate("src/a.ts", 2, "nit"), category: "conventions" };
+    const { out, verifications } = await panel([[security, plain]], () => ({
+      ...confirmed,
+      verdict: "PLAUSIBLE",
+      category: "cleanup",
+    }));
+    expect(verifications.flatMap((v) => ids(v.request.prompt))).toEqual(["C1"]);
+    expect(out.decision?.blocking.map((f) => f.line)).toEqual([1]);
+    expect(out.decision?.followUps.map((f) => f.line)).toEqual([2]);
+    const refuted = await panel([[security]], () => ({ ...confirmed, verdict: "REFUTED" }));
+    expect(refuted.out.decision?.blocking).toEqual([]);
+  });
+
+  test("security findings are verified beyond the cap", async () => {
+    const found = [
+      ...Array.from({ length: PANEL_VERIFY_CAP }, (_, i) => candidate("src/a.ts", i + 1, "blocker")),
+      { ...candidate("src/b.ts", 100, "nit"), security: true },
+      candidate("src/b.ts", 101, "nit"),
+    ];
+    const { out, verifications } = await panel([found], () => confirmed);
+    const sent = verifications.flatMap((v) => ids(v.request.prompt));
+    expect(sent).toHaveLength(PANEL_VERIFY_CAP + 1);
+    expect(sent).toContain(`C${PANEL_VERIFY_CAP + 1}`);
+    expect(out.panel?.capped).toEqual([`C${PANEL_VERIFY_CAP + 2}`]);
+    expect(out.decision?.blocking.map((f) => f.line)).toContain(100);
+  });
+
+  for (const round of [2, 3] as const)
+    test(`R${round} fails closed: prior blocking and security findings the verifier leaves out keep blocking`, async () => {
+      const previous = {
+        sha: "fixbase",
+        findings: [
+          { ...finding("major"), title: "Rechecked" },
+          { ...finding("major"), title: "Cited" },
+        ],
+      };
+      // C1 cites P2, C2 is a security finding, C3 a plain new one, C4 the automatic recheck of P1.
+      const found = [
+        { ...candidate("src/a.ts", 1), label: "unaddressed", prior: "P2" },
+        { ...candidate("src/a.ts", 2, "nit"), label: "new", prior: "", security: true },
+        { ...candidate("src/a.ts", 3, "blocker"), label: "new", prior: "" },
+      ];
+      const { out, verifications } = await panel([found], () => null, {
+        panelReview: round,
+        prompt: { ...prompt, headSha: "head", previous, fixReview: round },
+      });
+      expect(verifications.map((v) => ids(v.request.prompt))).toEqual([
+        ["C1", "C2", "C3"],
+        ["C1", "C2", "C3"],
+        ["C4"],
+        ["C4"],
+      ]);
+      expect(out.panel?.omitted).toEqual(["C1", "C2", "C3", "C4"]);
+      expect(out.decision?.review.verdict).toBe("request_changes");
+      expect(out.decision?.blocking.map((f) => f.title)).toEqual([
+        "Issue src/a.ts 1",
+        "Issue src/a.ts 2",
+        "Rechecked",
+      ]);
+      expect(out.decision?.followUps.map((f) => f.title)).toEqual(["Issue src/a.ts 3"]);
+    });
+
+  test("a citation keeps the prior finding's security flag, so R3 still blocks it below critical", async () => {
+    const previous = { sha: "fixbase", findings: [{ ...finding("major", true), title: "Injection" }] };
+    const found = [{ ...candidate("src/a.ts", 1), label: "unaddressed", prior: "P1" }];
+    const { out } = await panel([found], () => confirmed, {
+      panelReview: 3,
+      prompt: { ...prompt, headSha: "head", previous, fixReview: 3 },
+    });
+    expect(out.panel?.candidates.map((c) => [c.id, c.security])).toEqual([["C1", true]]);
+    expect(out.decision?.blocking.map((f) => f.line)).toEqual([1]);
   });
 
   test("an invalid verifier result fails the review instead of approving it", async () => {

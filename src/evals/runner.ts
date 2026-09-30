@@ -65,7 +65,7 @@ interface TrialCoordination {
 export class EvalRunner {
   private readonly active = new Map<string, { controller: AbortController; done: Promise<void> }>();
   private stopping = false;
-  /** Per-provider cap shared by all eval runs, so production work keeps a slot. */
+  /** Per-provider cap shared by all eval runs, so production work keeps a slot where the provider has two or more. */
   private readonly evalSlots = new Map<string, Semaphore>();
   /** Requested concurrency of each executing run, which sizes `evalSlots`. */
   private readonly executing = new Map<string, number>();
@@ -449,14 +449,14 @@ export class EvalRunner {
     const model = router.model(trial.modelId);
     if (!model) return skip("model no longer in catalog");
     trial.details.provider = model.provider;
-    const eligible = () => {
-      const reason = tracker.unavailableReason(target.provider);
+    const unavailable = (to: ModelTarget) => {
+      const reason = tracker.unavailableReason(to.provider);
       return (
-        (reason === "at reserve limit"
-          ? (tracker.budgetUnavailableReason(target.provider) ?? reason)
-          : reason) ?? tracker.modelUnavailableReason(target.modelId)
+        (reason === "at reserve limit" ? (tracker.budgetUnavailableReason(to.provider) ?? reason) : reason) ??
+        tracker.modelUnavailableReason(to.modelId)
       );
     };
+    const eligible = () => unavailable(target);
     if (budget()) return skip("eval budget exhausted");
     if (!tracker.def(model.provider)) return skip("unknown provider");
     // Legacy queued trials (null) and "default" both leave the backend effort unset.
@@ -721,12 +721,17 @@ export class EvalRunner {
               const picked = selectHarness(run.role, to);
               const agent = harnesses[picked.harnessName];
               if (!agent) throw new Error(`No harness registered for ${picked.harnessName}`);
-              const unavailable = tracker.unavailableReason(to.provider);
-              if (unavailable) throw new Error(`${to.provider} unavailable: ${unavailable}`);
+              const check = () => {
+                const reason = unavailable(to);
+                if (reason) throw new Error(`${to.provider} unavailable: ${reason}`);
+              };
+              check();
               const releaseEval = await coordination.slot(to.provider);
               try {
                 const releaseOther = await tracker.acquire(to.provider, signal);
                 try {
+                  // Quota, a circuit breaker or the reserve may have closed the provider during the wait.
+                  check();
                   const sent = await send(request, { target: to, harness: agent, noTools: picked.noTools });
                   spent.push(sent);
                   observe(to, sent);
