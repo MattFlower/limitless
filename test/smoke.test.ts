@@ -727,4 +727,60 @@ test("TypeSafe decisions smoke skips without its key and checks answers, usage a
       error: "API key rejected (HTTP 401)",
     })),
   ).toEqual({ status: "fail", reason: "API key rejected (HTTP 401)" });
+  // The harness reports a malformed response as unavailable; it is a contract failure, never retried.
+  const unavailable = (error: string): AgentResult => ({ ...result, status: "unavailable", error });
+  expect(await decisionsCheck(target, async () => unavailable("malformed decisions response"))).toEqual({
+    status: "fail",
+    reason: "malformed decisions response",
+  });
+  expect(
+    await decisionsCheck(target, async () => unavailable("decision service unavailable (HTTP 502)")),
+  ).toEqual({ status: "fail", reason: "decision service unavailable (HTTP 502)", transient: "provider" });
+  let calls = 0;
+  const malformed = await runChecks(
+    [
+      {
+        name: "decisions",
+        run: async () =>
+          ++calls === 1
+            ? decisionsCheck(target, async () => unavailable("malformed decisions response: kind"))
+            : { status: "pass" },
+      },
+    ],
+    now,
+    noDelay,
+  );
+  expect(calls).toBe(1);
+  expect(malformed[0]).toMatchObject({ status: "fail", reason: "malformed decisions response: kind" });
+  expect(malformed[0]?.retried).toBeUndefined();
+});
+
+test("a health failure with no time left to retry stays a failure", async () => {
+  let clock = 0;
+  const rows = await runChecks(
+    [
+      {
+        name: "health",
+        timeoutMs: 100,
+        run: async () => {
+          clock += 30;
+          return { status: "fail", reason: "health probe returned HTTP 503", transient: "health" };
+        },
+      },
+    ],
+    () => clock,
+    noDelay,
+    // 80 ms are left after the first attempt: less than the check's 100 ms timeout.
+    { budgetMs: 120, stopGraceMs: 10, retryDelayMs: 0 },
+  );
+  expect(rows).toEqual([
+    {
+      name: "health",
+      status: "fail",
+      reason: "health probe returned HTTP 503 (no time left to retry)",
+      transient: "health",
+      durationMs: 30,
+    },
+  ]);
+  expect(exitCode(rows)).toBe(1);
 });

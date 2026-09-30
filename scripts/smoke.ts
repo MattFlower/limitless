@@ -52,6 +52,7 @@ export const SMOKE_BUDGET_MS = 870_000;
 
 const PROVIDER_ERROR =
   /(?:HTTP|status|code)\s*5\d\d|\b50[0-4]\b|rate.?limit|\b429\b|overloaded|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|stream disconnected|connection (?:refused|reset|closed|error|failed)|network error/i;
+const MALFORMED = /malformed/i;
 
 /** Classify a failure message explicitly; an unrecognized one is never retried. */
 export function transientReason(reason: string): Transient | undefined {
@@ -130,9 +131,8 @@ export async function runChecks(
     const health = result.transient === "health";
     const retry = result.status === "fail" && result.transient !== undefined;
     if (retry && left() < retryDelayMs + timeoutMs) {
-      result = health
-        ? { status: "skip", reason: `${first} (no time left to retry)` }
-        : { ...result, reason: `${first ?? "failed"} (no time left to retry)` };
+      // Still a failure: only a retry that fails the probe again may downgrade a health failure.
+      result = { ...result, reason: `${first ?? "failed"} (no time left to retry)` };
     } else if (retry) {
       await delay(retryDelayMs);
       retried = true;
@@ -315,7 +315,8 @@ function status(result: AgentResult): CheckResult {
   const reason = result.error ?? result.status;
   // Only the runner's timeout aborts a smoke attempt, so a cancellation is that timeout.
   if (result.status === "timeout" || result.status === "cancelled") return fail(reason, "timeout");
-  if (result.status === "unavailable") return fail(reason, "provider");
+  // Harnesses also report a malformed response as unavailable; that is a contract failure, not an outage.
+  if (result.status === "unavailable") return fail(reason, MALFORMED.test(reason) ? undefined : "provider");
   return fail(reason, transientReason(reason));
 }
 
