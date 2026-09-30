@@ -14,6 +14,14 @@ import { join } from "node:path";
 import { Factory, type FactoryOptions } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
+import {
+  createPullRequest,
+  GitHubUnavailableError,
+  githubRetry,
+  isTransient,
+  mergePullRequest,
+  withGitHubRetry,
+} from "../src/git/repos.ts";
 import { CodexReaderProbe, runCodex } from "../src/harness/codex.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
@@ -26,11 +34,12 @@ import {
   untilAborted,
 } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
-import { type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
+import { CommandError, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
 import { findingEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
+githubRetry.baseDelayMs = 10;
 
 const providers: ProviderDef[] = ["a", "b"].map((id) => ({
   id,
@@ -826,7 +835,22 @@ function fakeGh(pr: string) {
   mkdirSync(bin);
   writeFileSync(
     join(bin, "gh"),
-    `#!${process.execPath}\nimport {existsSync,readFileSync,writeFileSync} from "node:fs";\nconst file=${JSON.stringify(pr)};\nif(process.argv[3]==="list" && existsSync(file)) { const url=readFileSync(file,"utf8"); console.log(process.argv.includes("--jq") ? url : JSON.stringify([{state:"OPEN",url}])); }\nif(process.argv[3]==="create") { if(existsSync(file)) process.exit(9); writeFileSync(file,"https://github.com/test/repo/pull/1"); console.log(readFileSync(file,"utf8")); }\n`,
+    // `${pr}.fail` queues scripted failures: {on, err?, landed?} (no err: succeed with no output).
+    `#!${process.execPath}
+import {appendFileSync,existsSync,readFileSync,writeFileSync} from "node:fs";
+const file=${JSON.stringify(pr)}, cmd=process.argv.slice(2).join(" "), state=()=>existsSync(file+".merged")?"MERGED":"OPEN";
+appendFileSync(file+".calls",cmd+"\\n");
+const q=existsSync(file+".fail")?JSON.parse(readFileSync(file+".fail","utf8")):[];
+const fail=q[0]&&cmd.startsWith(q[0].on)?q.shift():null;
+writeFileSync(file+".fail",JSON.stringify(q));
+const out=fail?()=>{}:console.log, end=()=>{ if(fail?.err){console.error(fail.err);process.exit(1);} };
+if(fail&&!fail.landed){end();process.exit(0);}
+if(process.argv[3]==="list" && existsSync(file)) { const url=readFileSync(file,"utf8"); out(process.argv.includes("--jq") ? url : JSON.stringify([{state:state(),url}])); }
+if(process.argv[3]==="create") { if(existsSync(file)) {console.error("a pull request for branch already exists");process.exit(9);} writeFileSync(file,"https://github.com/test/repo/pull/1"); out(readFileSync(file,"utf8")); }
+if(process.argv[3]==="merge") writeFileSync(file+".merged","");
+if(process.argv[3]==="view") out(process.argv.includes("--jq") ? state() : JSON.stringify({state:state(),url:readFileSync(file,"utf8")}));
+end();
+`,
     { mode: 0o755 },
   );
   writeFileSync(
@@ -1612,4 +1636,126 @@ test("Factory stop waits for its active health probe before database replacement
   }
   const next = await reopen(f);
   expect(next.scheduler.activeRunIds).toEqual([]);
+});
+
+const ghError = (stderr: string, timedOut = false) => new CommandError("gh failed", 1, "", stderr, timedOut);
+const bad502 = "HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)";
+const ghCalls = (pr: string, prefix: string) =>
+  readFileSync(`${pr}.calls`, "utf8")
+    .split("\n")
+    .filter((c) => c.startsWith(prefix));
+
+test("GitHub retries classify structured failures and share one abortable deadline", async () => {
+  for (const stderr of [bad502, "error connecting to api.github.com", "non-200 OK status code: 503 x"])
+    expect(isTransient(ghError(stderr))).toBe(true);
+  expect(isTransient(ghError("", true))).toBe(true);
+  expect(isTransient(ghError("HTTP 422: Validation Failed"))).toBe(false);
+  expect(isTransient(ghError("! [rejected] limitless/fix-timeout-502 (stale info)"))).toBe(false);
+  expect(isTransient(new Error(bad502))).toBe(false);
+  let calls = 0;
+  const flaky = (errors: CommandError[]) => async () => {
+    calls++;
+    const e = errors.shift();
+    if (e) throw e;
+    return "ok";
+  };
+  expect(await withGitHubRetry(flaky([ghError(bad502), ghError(bad502)]))).toBe("ok");
+  expect(calls).toBe(3);
+  calls = 0;
+  const final = ghError("HTTP 422: Validation Failed");
+  await expect(withGitHubRetry(flaky([final]))).rejects.toBe(final);
+  expect(calls).toBe(1);
+  // 100 ms, then 300 ms of backoff would overrun a 150 ms budget: give up without sleeping past it.
+  githubRetry.baseDelayMs = 100;
+  const budget = { deadline: Date.now() + 150 };
+  const started = Date.now();
+  calls = 0;
+  const failing = () => withGitHubRetry(flaky(Array(9).fill(ghError(bad502))), { budget });
+  await expect(failing()).rejects.toBeInstanceOf(GitHubUnavailableError);
+  await expect(failing()).rejects.toBeInstanceOf(GitHubUnavailableError);
+  expect(calls).toBe(3); // the second call of the delivery gets no fresh budget: one attempt
+  expect(Date.now() - started).toBeLessThan(250);
+  githubRetry.baseDelayMs = 60_000;
+  const abort = new AbortController();
+  setTimeout(() => abort.abort(), 20);
+  try {
+    await expect(withGitHubRetry(flaky([ghError(bad502)]), { signal: abort.signal })).rejects.toThrow();
+  } finally {
+    githubRetry.baseDelayMs = 10;
+  }
+});
+
+test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is final", async () => {
+  const pr = join(root, "pr");
+  const restore = fakeGh(pr);
+  const opts = { branch: "limitless/x-timeout", base: "main", title: "T", body: "B", cwd: root };
+  const repo = { slug: "test/repo" } as Parameters<typeof createPullRequest>[0];
+  try {
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr create", err: bad502, landed: true }]));
+    expect(await createPullRequest(repo, opts)).toBe("https://github.com/test/repo/pull/1");
+    expect(ghCalls(pr, "pr create")).toHaveLength(1);
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr list" }]));
+    expect(await createPullRequest(repo, opts)).toBe("https://github.com/test/repo/pull/1");
+    expect(ghCalls(pr, "pr create")).toHaveLength(2);
+    expect(ghCalls(pr, "pr edit")).toHaveLength(2);
+    rmSync(pr);
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr list" }, { on: "pr create", err: "HTTP 422: x" }]));
+    await expect(createPullRequest(repo, opts)).rejects.toThrow("HTTP 422");
+    expect(ghCalls(pr, "pr create")).toHaveLength(3);
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr merge", err: bad502, landed: true }]));
+    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "T")).toBe("merged");
+    expect(ghCalls(pr, "pr merge")).toHaveLength(1);
+  } finally {
+    await restore();
+  }
+});
+
+for (const failures of [2, 3])
+  test(`delivery with ${failures} PR-create 502s ${failures < 3 ? "delivers" : "falls back as GitHub unavailable"}`, async () => {
+    const pr = join(root, "pr");
+    const restore = fakeGh(pr);
+    try {
+      writeFileSync(`${pr}.fail`, JSON.stringify(Array(failures).fill({ on: "pr create", err: bad502 })));
+      const f = factory();
+      const repo = githubRun(f);
+      const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
+      f.scheduler.start();
+      await settled(f, r.id);
+      const run = f.store.getRun(r.id);
+      expect(run?.prUrl).toBe("https://github.com/test/repo/pull/1");
+      expect(ghCalls(pr, "pr create")).toHaveLength(failures + 1);
+      expect(ghCalls(pr, "pr create").some((c) => c.includes("--draft"))).toBe(failures === 3);
+      expect(run?.status).toBe(failures === 3 ? "needs_human" : "succeeded");
+      if (failures === 3) expect(run?.error).toStartWith("GitHub unavailable: ");
+    } finally {
+      await restore();
+    }
+  });
+
+test("restart during GitHub backoff resumes the delivery budget without duplicating the PR", async () => {
+  const pr = join(root, "pr");
+  const restore = fakeGh(pr);
+  githubRetry.baseDelayMs = 5_000;
+  try {
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr create", err: bad502 }]));
+    const f = factory();
+    const repo = githubRun(f);
+    const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
+    f.scheduler.start();
+    await wait(() => existsSync(`${pr}.calls`) && ghCalls(pr, "pr create").length === 1);
+    const deadline = f.store.getRunState<RunState>(r.id)?.githubDeadline;
+    expect(deadline).toBeDefined();
+    const next = await reopen(f);
+    await settled(next, r.id);
+    expect(next.store.getRun(r.id)).toMatchObject({
+      status: "succeeded",
+      prUrl: "https://github.com/test/repo/pull/1",
+    });
+    expect(next.store.getRunState<RunState>(r.id)?.githubDeadline).toEqual(deadline);
+    expect(ghCalls(pr, "pr create")).toHaveLength(2);
+    history(next, r.id);
+  } finally {
+    githubRetry.baseDelayMs = 10;
+    await restore();
+  }
 });
