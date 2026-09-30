@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   backendChecks,
+  type CheckResult,
   checkCodexModels,
   decisionsCheck,
   exitCode,
@@ -30,6 +31,8 @@ const result: AgentResult = {
   error: null,
   quota: null,
 };
+const now = () => performance.now();
+const noDelay = async () => {};
 
 test("smoke runner reports every injected outcome and fails after an exception", async () => {
   let clock = 0;
@@ -65,6 +68,7 @@ test("smoke runner reports every injected outcome and fails after an exception",
       },
     ],
     () => clock,
+    noDelay,
   );
   expect(rows.map((row) => [row.status, row.durationMs])).toEqual([
     ["pass", 12],
@@ -79,6 +83,48 @@ test("smoke runner reports every injected outcome and fails after an exception",
   ).toContain("first line second line");
   expect(exitCode(rows)).toBe(1);
   expect(exitCode(rows.slice(0, 2))).toBe(0);
+});
+
+test("smoke runner retries a failed or thrown check once after the delay", async () => {
+  const delays: number[] = [];
+  const delay = async (ms: number) => {
+    delays.push(ms);
+  };
+  const scripted = (name: string, outcomes: (CheckResult | Error)[]) => {
+    const check = {
+      name,
+      calls: 0,
+      run: async () => {
+        const outcome = outcomes[check.calls++] ?? new Error("ran too often");
+        if (outcome instanceof Error) throw outcome;
+        return outcome;
+      },
+    };
+    return check;
+  };
+  const flaky = scripted("flaky", [{ status: "fail", reason: "model rejected" }, { status: "pass" }]);
+  const thrown = scripted("thrown", [new Error("socket hang up"), { status: "pass" }]);
+  const broken = scripted("broken", [
+    { status: "fail", reason: "first" },
+    { status: "fail", reason: "second" },
+  ]);
+  const passed = scripted("passed", [{ status: "pass" }]);
+  const skipped = scripted("skipped", [{ status: "skip", reason: "disabled" }]);
+
+  const recovered = await runChecks([flaky, thrown, passed, skipped], now, delay);
+  expect([flaky.calls, thrown.calls, passed.calls, skipped.calls]).toEqual([2, 2, 1, 1]);
+  expect(delays).toHaveLength(2);
+  expect(recovered.map((row) => row.status)).toEqual(["pass", "pass", "pass", "skip"]);
+  expect(formatReport(recovered)).toMatch(/flaky\s+PASS \(retried\)/);
+  expect(formatReport(recovered)).toMatch(/passed\s+PASS\s+\d+ms/);
+  expect(exitCode(recovered)).toBe(0);
+
+  const failed = await runChecks([broken], now, delay);
+  expect(broken.calls).toBe(2);
+  expect(delays).toHaveLength(3);
+  expect(failed[0]).toMatchObject({ name: "broken", status: "fail" });
+  expect(formatReport(failed)).toMatch(/broken\s+FAIL\s+\d+ms\s+second \(first attempt: first\)/);
+  expect(exitCode(failed)).toBe(1);
 });
 
 test("subscription quota check rejects absent windows and accepts observed windows", () => {
@@ -113,43 +159,47 @@ test("noTools smoke rejects MCP calls and token leaks and cleans up after every 
   };
   for (const scenario of ["mcp", "raw", "text", "throw", "pass"] as const) {
     let cwd = "";
-    const rows = await runChecks([
-      {
-        name: scenario,
-        run: () =>
-          liveCheck(
-            async (spec) => {
-              cwd = spec.cwd;
-              expect(existsSync(join(cwd, ".git"))).toBe(true);
-              expect(spec.noTools).toBe(true);
-              expect(spec.mode).toBe("readonly");
-              expect(spec.timeoutMs).toBeLessThanOrEqual(60_000);
-              const token = readFileSync(join(cwd, "secret.txt"), "utf8");
-              expect(spec.prompt).not.toContain(token);
-              writeFileSync(spec.logPath, scenario === "raw" ? token : "");
-              if (scenario === "throw") throw new Error("fake invocation failed");
-              if (scenario === "mcp") {
-                const parser = new CodexStreamParser(spec.onEvent);
-                parser.feed(
-                  JSON.stringify({
-                    type: "item.started",
-                    item: {
-                      id: "read",
-                      type: "mcp_tool_call",
-                      server: "node_repl",
-                      tool: "js",
-                      arguments: { code: "fs.readFileSync('secret.txt', 'utf8')" },
-                    },
-                  }),
-                );
-              }
-              return { ...result, finalText: scenario === "text" ? token : "Cannot read files." };
-            },
-            target,
-            "noTools",
-          ),
-      },
-    ]);
+    const rows = await runChecks(
+      [
+        {
+          name: scenario,
+          run: () =>
+            liveCheck(
+              async (spec) => {
+                cwd = spec.cwd;
+                expect(existsSync(join(cwd, ".git"))).toBe(true);
+                expect(spec.noTools).toBe(true);
+                expect(spec.mode).toBe("readonly");
+                expect(spec.timeoutMs).toBeLessThanOrEqual(60_000);
+                const token = readFileSync(join(cwd, "secret.txt"), "utf8");
+                expect(spec.prompt).not.toContain(token);
+                writeFileSync(spec.logPath, scenario === "raw" ? token : "");
+                if (scenario === "throw") throw new Error("fake invocation failed");
+                if (scenario === "mcp") {
+                  const parser = new CodexStreamParser(spec.onEvent);
+                  parser.feed(
+                    JSON.stringify({
+                      type: "item.started",
+                      item: {
+                        id: "read",
+                        type: "mcp_tool_call",
+                        server: "node_repl",
+                        tool: "js",
+                        arguments: { code: "fs.readFileSync('secret.txt', 'utf8')" },
+                      },
+                    }),
+                  );
+                }
+                return { ...result, finalText: scenario === "text" ? token : "Cannot read files." };
+              },
+              target,
+              "noTools",
+            ),
+        },
+      ],
+      now,
+      noDelay,
+    );
     expect(cwd).not.toBe("");
     expect(existsSync(cwd)).toBe(false);
     expect(rows[0]?.status).toBe(scenario === "pass" ? "pass" : "fail");
@@ -365,13 +415,13 @@ test("oMLX smoke rows skip unavailable providers and fail attempted bad edits", 
     expect((await runChecks(checks({ OMLX_API_KEY: "key" }))).every((r) => r.status === "skip")).toBe(true);
   expect(invocations).toBe(0);
   status = 200;
-  const rows = await runChecks(checks({ OMLX_API_KEY: "key" }));
+  const rows = await runChecks(checks({ OMLX_API_KEY: "key" }), now, noDelay);
   expect(rows.map((r) => r.status)).toEqual(["pass", "fail"]);
   expect(rows[1]?.reason).toBe("edit file was not created");
   const failed = backendChecks({ OMLX_API_KEY: "key" }, probe, async () => {
     throw new Error("invocation failed");
   }).filter((c) => c.name.startsWith("omlx"));
-  expect((await runChecks(failed)).map((r) => r.status)).toEqual(["fail", "fail"]);
+  expect((await runChecks(failed, now, noDelay)).map((r) => r.status)).toEqual(["fail", "fail"]);
 });
 
 test("TypeSafe decisions smoke skips without its key and checks answers, usage and cost", async () => {

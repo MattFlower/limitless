@@ -573,6 +573,38 @@ test("a target checkout still aborts on failed gates before draining", async () 
   expect(f.calls).not.toContain("bun scripts/smoke.ts");
 });
 
+test("a failed smoke gate reports the tail of both output streams and restores the checkout", async () => {
+  const f = setup();
+  const command = f.opts.command;
+  const stdout = [
+    "FIRST-STDOUT-LINE",
+    ...Array.from({ length: 80 }, (_, i) => `row ${i}`),
+    "codex structured  FAIL  12ms  model rejected",
+  ];
+  f.opts.command = async (args, options) => {
+    if (args.join(" ") !== "bun scripts/smoke.ts") return command(args, options);
+    f.calls.push("smoke");
+    return {
+      stdout: `${stdout.join("\n")}\n`,
+      stderr: "FIRST-STDERR-LINE\nwarning: last stderr\n",
+      exitCode: 1,
+    };
+  };
+  const error = await deploy(7400, "feature", true, f.opts).catch((e: unknown) => e);
+  const message = String(error);
+  expect(message).toContain("deploy gate failed; staying on previous");
+  expect(message).toContain("Command failed (1): bun scripts/smoke.ts");
+  expect(message).toContain("codex structured  FAIL  12ms  model rejected");
+  expect(message).toContain("FIRST-STDERR-LINE\nwarning: last stderr");
+  expect(message).not.toContain("FIRST-STDOUT-LINE");
+  expect(message.split("\n").filter((line) => line.startsWith("row "))).toHaveLength(57);
+  expect(f.calls).toContain("smoke");
+  expect(f.calls).not.toContain("drain");
+  expect(f.calls).not.toContain("restart");
+  expect(f.calls.at(-2)).toBe("git checkout -q --detach previous");
+  expect(f.selected()).toBe("previous");
+});
+
 test("a target checkout runs requested smoke before draining", async () => {
   const f = setup();
   f.setSelected("next");

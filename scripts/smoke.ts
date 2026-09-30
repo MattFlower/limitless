@@ -15,36 +15,61 @@ import { sh } from "../src/util/proc.ts";
 
 export type CheckResult = { status: "pass" | "fail" | "skip"; reason?: string };
 export type SmokeCheck = { name: string; run: () => Promise<CheckResult> };
-export type CheckRow = CheckResult & { name: string; durationMs: number };
+export type CheckRow = CheckResult & { name: string; durationMs: number; retried?: boolean };
 
-export async function runChecks(checks: SmokeCheck[], now = () => performance.now()): Promise<CheckRow[]> {
+const RETRY_DELAY_MS = 5_000;
+
+async function attempt(check: SmokeCheck): Promise<CheckResult> {
+  try {
+    return await check.run();
+  } catch (error) {
+    return { status: "fail", reason: String(error) };
+  }
+}
+
+/** Live providers fail transiently (Codex has rejected models intermittently), so a failed check gets one retry. */
+export async function runChecks(
+  checks: SmokeCheck[],
+  now = () => performance.now(),
+  delay = (ms: number) => Bun.sleep(ms),
+): Promise<CheckRow[]> {
   const rows: CheckRow[] = [];
   for (const check of checks) {
-    const start = now();
-    try {
-      rows.push({ name: check.name, ...(await check.run()), durationMs: Math.round(now() - start) });
-    } catch (error) {
-      rows.push({
-        name: check.name,
-        status: "fail",
-        reason: String(error),
-        durationMs: Math.round(now() - start),
-      });
+    let start = now();
+    let result = await attempt(check);
+    let retried = false;
+    if (result.status === "fail") {
+      await delay(RETRY_DELAY_MS);
+      retried = true;
+      start = now();
+      const first = result.reason;
+      result = await attempt(check);
+      if (result.status === "fail" && first && first !== result.reason)
+        result = { ...result, reason: `${result.reason ?? "failed"} (first attempt: ${first})` };
     }
+    rows.push({
+      name: check.name,
+      ...result,
+      durationMs: Math.round(now() - start),
+      ...(retried ? { retried } : {}),
+    });
   }
   return rows;
 }
 
 export function formatReport(rows: CheckRow[]): string {
   const width = Math.max(5, ...rows.map((row) => row.name.length));
+  const label = (row: CheckRow) =>
+    `${row.status.toUpperCase()}${row.retried && row.status === "pass" ? " (retried)" : ""}`;
+  const statusWidth = Math.max(6, ...rows.map((row) => label(row).length));
   const lines = [
-    `${"Check".padEnd(width)}  Status  Time     Detail`,
-    `${"-".repeat(width)}  ------  -------  ------`,
+    `${"Check".padEnd(width)}  ${"Status".padEnd(statusWidth)}  Time     Detail`,
+    `${"-".repeat(width)}  ${"-".repeat(statusWidth)}  -------  ------`,
   ];
   for (const row of rows) {
     const detail = (row.reason ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
     lines.push(
-      `${row.name.padEnd(width)}  ${row.status.toUpperCase().padEnd(6)}  ${`${row.durationMs}ms`.padStart(7)}  ${detail}`,
+      `${row.name.padEnd(width)}  ${label(row).padEnd(statusWidth)}  ${`${row.durationMs}ms`.padStart(7)}  ${detail}`,
     );
   }
   return lines.join("\n");

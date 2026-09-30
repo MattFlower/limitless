@@ -248,9 +248,28 @@ const GATES = [
 ];
 const SMOKE = ["bun", "scripts/smoke.ts"];
 
+const GATE_TAIL_LINES = 60;
+
 async function gates(run: typeof sh, dir: string, smoke: boolean): Promise<void> {
-  for (const args of GATES) await run(args, { cwd: dir, timeoutMs: 600_000 });
-  if (smoke) await run(SMOKE, { cwd: dir, timeoutMs: 900_000 });
+  const gate = async (args: string[], timeoutMs: number) => {
+    const res = await run(args, { cwd: dir, timeoutMs, allowFail: true });
+    if (res.exitCode === 0) return;
+    // The failing check (a smoke row, a test name) is usually near the end of the output.
+    const out = res.stdout.trimEnd().split("\n").filter(Boolean);
+    const err = res.stderr.trimEnd().split("\n").filter(Boolean);
+    const outCount = Math.min(out.length, Math.max(GATE_TAIL_LINES / 2, GATE_TAIL_LINES - err.length));
+    const errCount = Math.min(err.length, GATE_TAIL_LINES - outCount);
+    const section = (name: string, lines: string[], count: number) =>
+      count
+        ? [`--- ${name} (last ${count} of ${lines.length} lines) ---`, ...lines.slice(lines.length - count)]
+        : [];
+    const tail = [...section("stdout", out, outCount), ...section("stderr", err, errCount)];
+    throw new Error(
+      [`Command failed (${res.exitCode ?? "killed or timed out"}): ${args.join(" ")}`, ...tail].join("\n"),
+    );
+  };
+  for (const args of GATES) await gate(args, 600_000);
+  if (smoke) await gate(SMOKE, 900_000);
 }
 
 /**
