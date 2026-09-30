@@ -101,45 +101,56 @@ current triage default before routing production triage to Jev.
 
 The 30 held-out cases (#155) showed design v1 failing on long, realistic requests (Jev alone 50%),
 but the 40 development cases were all one-liners, so the dev set could not measure that. It now has
-21 long cases (`triage-l01`…`l21`, tag `long`, 700–5,600 characters): public issues and a Dependabot
-PR, none the source of a held-out case, wrapped exactly as the factory wraps issues, `/limitless`
-comments and Dependabot PRs. Wording was iterated only on these 61 cases, with k=3 calls through the
-decisions harness and the eval grader, and the cascade uses the same Luna trials, by case and trial
-number, as `eval run` would.
+20 long cases (`triage-l01`…`l21`, tag `long`, 700–5,600 characters) from public issues and a
+Dependabot PR, wrapped exactly as the factory wraps issues, `/limitless` comments and Dependabot
+PRs. l10 was dropped because its source issue (#71) is also the source of held-out h08. The session
+that revised the questions also wrote these labels, before any model answered them; a second
+labeller should check them. Wording was iterated only on the dev cases, with k=3 calls through the
+decisions harness and the eval grader; the cascade uses Luna trials by case and trial number, as
+`eval run` does.
 
-- **Condensed request.** GitHub prompts leave their quoted JSON: the issue or PR becomes
-  `request.{title, body}`, a non-default instruction (Dependabot's) becomes `request.instruction`, and a
-  comment's request stays `request` with the issue beside it as `issue`. Bodies drop HTML comments,
-  collapsed `<details>` (release notes, commit lists, logs), tags and link targets. Plain prompts split
-  into title and body. The top-level entries stay. Dropping them cost 6–8 points on dev, mostly
-  risk and ambiguity answers for the small sandbox repository, so they are context, not a distractor.
 - **Levels describe situations.** Complexity no longer counts files (Jev can't count). Risk levels are
   Contained / Wide / Severe with examples; v1's low level had no place for dependency bumps, CI,
   questions or removing unused code, so correct answers came back at confidence 0.2–0.5. Ambiguity
-  levels are Clear / Open choice / Unclear, and Clear covers questions (what to "explain").
+  levels are Clear / Open choice / Unclear, and Clear covers questions ("explain").
+- **Request state.** GitHub prompts with one of the factory's three prefaces come out of their quoted
+  JSON as `request.{title, body}` (plus Dependabot's `instruction`), or as `request` and `issue` for
+  a comment, with `source` keeping the untrusted-content label. Plain prompts split into title and
+  body. Nothing is removed: an earlier variant stripped HTML, comments and collapsed `<details>`,
+  but that hid text the implementer still reads, so it was dropped. Fields longer than 12,000
+  characters are cut with a "not shown" marker, and such a request is declined, never as a last
+  resort. The state is built only when a decision model is called.
+- **Top-level entries stay.** Dropping them cost 6–8 points on dev, mostly risk and ambiguity answers
+  for the small sandbox repository, so they are context, not a distractor.
 
-Dev set (61 cases, k=3, same gold; v1 re-run through the same harness):
+Dev set (60 cases, k=3, labels as first written; v1 re-run through the same harness):
 
 | | v1 | v2 |
 |---|---|---|
-| Jev alone (40 short / 21 long) | 74.9% (70.8% / 82.5%) | 90.7% (85.8% / 100%) |
-| escalated / accepted pass | 59.6% / 95.9% | 42.6% / 97.1% |
-| cascade via Luna@none (87.4% alone) | 88.0% | 90.2% |
-| cascade via Luna@medium (83.1% alone) | 83.6% | 87.4% |
+| Jev alone (40 short / 20 long) | 72.2% (70.8% / 75.0%) | 88.3% (87.5% / 90.0%) |
+| escalated / accepted pass | 60.6% / 91.5% | 45.6% / 96.9% |
+| cascade via Luna@none (85.6% alone) | 86.1% | 88.3% |
+| cascade via Luna@medium (82.2% alone) | 81.7% | 86.7% |
 
-Step by step (Jev alone): condensed state without the top-level entries 74.3%, then risk levels
-80–81%, ambiguity levels 81%, complexity levels 84–85%, then the entries restored 91%. With the final
-wording, the raw request scored 90.7% against the condensed request's 91.3%. So on dev the gain comes
-from the level wording; condensation is neutral there. Runs of the same design varied by about ±1.5 points.
+The same v1 design scored 74.2% on the 40 short cases in the daemon's `eval-mum1tifut5dn`, so runs
+vary by up to about 3.5 points. Step by step, on the earlier 61-case set with two labels re-read
+after the first sweep (since restored): condensed state without
+the top-level entries 74.3%, then risk levels 80–81%, ambiguity levels 81%, complexity levels
+84–85%, then the entries restored 91%. With the final wording, the raw request (90.7%) and the
+condensed one (91.3%) were within noise: on dev the gain comes from the level wording. The variant
+with content stripping scored 88.9% (long 95.0%) on the current set; the one-case difference on long
+requests is l16, whose complexity score sits on the small/medium boundary.
 
 **Thresholds.** Per-question thresholds did no better than a uniform one. A uniform 0.5 cuts dev
-escalation from 43% to 32%, with accepted pass 97.6% (122/125), no accepted risk under-calls, and
-the cascade at 90.7% for both Luna@none and Luna@medium. The default stays 0.6.
+escalation from 46% to 32%, with accepted pass 95.1% (116/122), no accepted risk under-call, and the
+cascade at 87.8% / 88.3% (Luna@none / Luna@medium). The default stays 0.6.
 
-**Held-out check** (once, after the design was final, pre-registered: 0.6 primary, 0.5 secondary;
-v1 = eval-mump7s7re29l; the cascade reuses that eval's Luna trials):
+**Held-out check.** It ran once, on the pre-registered design (0.6 primary, 0.5 secondary): the
+same questions, with the content-stripping state that was dropped afterwards. The code that lands
+builds a different state for 8 of the 30 held-out cases, and the set was not re-run. v1 is
+eval-mump7s7re29l, and the cascade reuses its Luna trials.
 
-| | v1 | v2 |
+| | v1 | pre-registered v2 |
 |---|---|---|
 | Jev alone (15 long / 15 short) | 50.0% (66.7% / 33.3%) | 66.7% (93.3% / 40.0%) |
 | escalated / accepted pass | 63.3% / 72.7% (24/33) | 56.7% / 100% (39/39) |
@@ -147,12 +158,21 @@ v1 = eval-mump7s7re29l; the cascade reuses that eval's Luna trials):
 | cascade via Luna@medium (78.9% alone) | 74.4% | 84.4% |
 | cases whose trials disagree | 2/30 | 0/30 |
 
-At 0.5, held-out escalation is 50.0% with the same cascade figures. No accepted answer under-called
-risk. The check ran before one last fix: tag stripping now keeps angle-bracket text such as
-`` `<sha>` `` placeholders and generics. The fix changes the state of 7 dev and 8 held-out cases; the
-dev table above is after it. The held-out set was not re-run. Long requests are fixed. Short issue titles still escalate 87%, largely correctly: vague and
-security-sensitive titles need an LLM to write questions. Improving them would take another dev-only
-round (the dev set's short cases are cleaner than real issue titles), not tuning on these numbers.
+- At 0.5, held-out escalation is 50.0%, with the same cascade figures, and no accepted answer
+  under-called risk.
+- Jev alone improves on 6 cases and gets worse on none. The cascade's lead over Luna@medium alone
+  rests on 3 cases.
+- The held-out set does not exercise the GitHub unwrapping. Its only GitHub-wrapped case, h03, is cut
+  at 6,000 characters without its closing tag, so it takes the plain path. It scores 0/3 and
+  accounts for all 3 long-case failures. The 14 plain-text long requests pass 42/42.
+- Short issue titles escalate 87% (39 trials). The gold for 15 of these needs questions or has high
+  ambiguity; 12 are high risk and need no questions; 12 are neither. Jev's own answer was right in 12
+  of them.
+- **This set has now been seen.** Any routing decision needs a fresh held-out run of the landed code,
+  ideally on new held-out cases.
+
+Improving short titles would take another dev-only round: real issue titles, since the dev set's
+short cases are cleaner.
 
 ## Ideas for epics: deciding when and how to split a request
 

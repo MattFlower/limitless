@@ -1,7 +1,7 @@
 {
   "role": "triage",
   "version": 1,
-  "notes": "Gold labels written by the orchestrator. A list means any of those values is correct (genuinely borderline cases); null means the field is not graded for that case. needs_questions grades whether blocking_questions is non-empty. v1.1 (2026-09-26): widened five genuinely borderline labels after the first sweep (007, 012, 017, 029, 031); security-risk labels unchanged. v1.2 (2026-09-29): 21 long development cases (triage-l01..l21, tag `long`) from public issues and a Dependabot PR of MattFlower/limitless and limitless-sandbox, none the source of a held-out case, wrapped the way the factory wraps GitHub issues, `/limitless` comments and Dependabot PRs (the #61 host name is replaced with example.net). Labelled by the session that revised the decision-model questions; l14 ambiguity and l18 risk were re-read against the rubric after the first sweep.",
+  "notes": "Gold labels written by the orchestrator. A list means any of those values is correct (genuinely borderline cases); null means the field is not graded for that case. needs_questions grades whether blocking_questions is non-empty. v1.1 (2026-09-26): widened five genuinely borderline labels after the first sweep (007, 012, 017, 029, 031); security-risk labels unchanged. v1.2 (2026-09-29): 20 long development cases (triage-l01..l21, tag `long`; l10 removed because its source issue is also the source of held-out h08) from public issues and a Dependabot PR of MattFlower/limitless and limitless-sandbox, wrapped the way the factory wraps GitHub issues, `/limitless` comments and Dependabot PRs (the #61 host name is replaced with example.net). Labelled by the session that revised the decision-model questions, as first written, before any model answered them; a second labeller should check them before the next round.",
   "repos": {
     "MattFlower/limitless-sandbox": "b63e95b7dd34c7933a2676110ae09d04230c2b1c",
     "MattFlower/limitless": "5a4d539e27758b02bdfe33306ba97279ecc7d9b2"
@@ -645,19 +645,6 @@
       "tags": ["long"]
     },
     {
-      "id": "triage-l10",
-      "repo": "MattFlower/limitless",
-      "prompt": "# User guide\n\nM5 \"complete user docs\". Existing docs (README, ARCHITECTURE, OPERATIONS, EVALS, REASONING_EFFORT) are written for maintainers. Add `docs/GUIDE.md` for a new user, linked from the README, covering:\n1. What Limitless is and the pipeline in one diagram (profiles quick/standard/deep; what each stage guarantees).\n2. Install and first run: prerequisites (bun, gh, claude and codex CLIs), `limitless service install`, config.toml and secrets.env keys, and the first `limitless run` against a sandbox repo.\n3. Starting work from the CLI, UI, Discord, GitHub (issue label or `/limitless` comment by the owner; Dependabot) and MCP from Claude Code or Codex.\n4. Reading a run: the stage timeline, holdout and verify results, needs-human and what to do about it, and the PR report.\n5. Models and routing: providers, enabling/disabling, effort, how evals produce `routing/policy.json`, and running an eval.\n6. Costs and quotas: metered vs. subscription-equivalent, reserves, budget alerts.\n7. Operations: deploy (drain), logs, GC, the remote UI via a LAN proxy, the webhook tunnel.\n8. Troubleshooting FAQ, built from the failure modes seen so far (verify blocked by the environment, quota exhaustion, rebase conflicts, an interrupted deploy).\nKeep it accurate to the code at the time of writing, and link to the maintainer docs for depth. It's docs-only: no code changes.",
-      "gold": {
-        "task_class": "docs",
-        "complexity": ["small", "medium"],
-        "risk": "low",
-        "ambiguity": "low",
-        "needs_questions": false
-      },
-      "tags": ["long"]
-    },
-    {
       "id": "triage-l11",
       "repo": "MattFlower/limitless",
       "prompt": "# Conflict-resolution round must produce a real merge commit (factory merges, agent resolves)\n\n## Bug\nRun mukacfa88tqj (#61, PR #81): the delivery rebase conflicted, so the engine scheduled a resolution round whose feedback tells the implementer to `git merge origin/<base>` and resolve. The resulting commit `efb08dd` was a **single-parent** commit containing 1,442 lines of `main`'s changes across 21 files. The merge parent was lost, probably because the agent sandbox can't write the worktree's git metadata (it lives outside the worktree), so the agent applied `main`'s changes by hand.\n\nEffects:\n- GitHub showed other PRs' work as this PR's changes (38 files instead of 19), which misleads review.\n- If `main` has moved further on those files, landing risks conflicts or confusing 3-way merges.\n- The orchestrator had to reconstruct the merge by hand.\nParallel runs make delivery conflicts common, so this recurs.\n\n## Design\n- The **factory** performs the merge in the worktree (it has permission to write git metadata): `git merge --no-ff --no-commit origin/<base>` with hooks disabled and the scrubbed env.\n  - Clean: commit it as a merge commit (two parents), re-run gates and continue to delivery; no agent needed.\n  - Conflicted: leave conflict markers and `MERGE_HEAD` in place. The resolution round tells the agent: \"resolve the conflict markers in these files, preserving both intents; do not run git\". The factory then verifies no markers remain, stages, and commits with `MERGE_HEAD` (a real merge commit).\n- If the agent's result has no `MERGE_HEAD`, or the commit has fewer than two parents, fail the round with a clear error instead of delivering.\n- The audit and review diff for the resolution round is against the new base tip, so reviewers see the resolution, not `main`'s changes.\n- Reuse the same helper for #46's refresh runs.\n\n## Acceptance\n- Real-git tests (temp repos, no network):\n  - a conflicting base advance produces a two-parent merge commit on the run branch, with conflicts resolved by a fake agent editing files only;\n  - a clean advance merges without an agent round;\n  - an agent result without a merge parent fails the round;\n  - the PR diff (`git diff base...branch`) contains only the run's own changes.\n- `bun run check` passes; under ~350 lines.",
@@ -704,7 +691,7 @@
         "task_class": "feature",
         "complexity": "large",
         "risk": ["medium", "high"],
-        "ambiguity": ["low", "medium"],
+        "ambiguity": ["medium", "high"],
         "needs_questions": null
       },
       "tags": ["long", "large"]
@@ -755,7 +742,7 @@
       "gold": {
         "task_class": ["feature", "bugfix"],
         "complexity": "small",
-        "risk": ["medium", "high"],
+        "risk": ["low", "medium"],
         "ambiguity": "low",
         "needs_questions": false
       },
