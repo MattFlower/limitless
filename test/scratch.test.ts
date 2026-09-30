@@ -710,6 +710,25 @@ test("the probe's scratch and denyRead match the real reader's", async () => {
   }
 });
 
+test("a verdict for one denyRead list is not reused for a caller denying more", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const extra = realpathSync(mkdtempSync(join(tmpdir(), "limitless-deny-test-")));
+  cleanups.push(() => rmSync(extra, { recursive: true, force: true }));
+  // Enforces the standard roots but leaves the second caller's extra denied path readable.
+  const fake = fakeCodex((f, o) => (inRoot(extra, f) ? reads(f) : enforcing(f, o)), {
+    canaryRoots: (deny) => [...Object.values(fake.roots), ...(deny.includes(extra) ? [extra] : [])],
+  });
+  try {
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+    const second = await runCodex({ ...spec, denyRead: [extra] }, fake.runner, fake.probe);
+    expect(second.confinement).toMatchObject({ ok: false, reason: "reader profile not enforced" });
+    expect(fake.sandboxReads.filter((r) => inRoot(extra, r.file))).toHaveLength(1);
+    expect(fake.execs).toHaveLength(1);
+  } finally {
+    cleanup();
+  }
+});
+
 test("canaries cover each distinct writable private root the production profile denies", async () => {
   const roots = canaryRoots(privateReadRoots());
   for (const root of ["/tmp", "/var/tmp", tmpdir()])

@@ -419,7 +419,8 @@ export class CodexReaderProbe {
     const unverified = { ok: false, path, version: lookup.version, reason: INCONCLUSIVE, exitCode: null };
     if (spec.signal.aborted) return unverified;
     if (!lookup.version) return { ...unverified, reason: lookup.reason, exitCode: lookup.exitCode };
-    const key = `${path}\0${lookup.version}`;
+    // The probe checks the caller's denyRead too, so a verdict only covers that same list.
+    const key = [path, lookup.version, ...[...new Set(spec.denyRead ?? [])].sort()].join("\0");
     for (;;) {
       const verdict = this.verdicts.get(key);
       if (verdict) return verdict;
