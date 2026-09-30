@@ -22,7 +22,8 @@ export interface DecisionDecline {
 }
 
 export interface DecisionTask {
-  state: string | Record<string, unknown>;
+  /** The state, or a function building it when the call is made, so an unused task costs nothing. */
+  state: string | Record<string, unknown> | (() => string | Record<string, unknown>);
   questions: Record<string, DecisionQuestion>;
   /** Maps the answers (keyed like `questions`) to the role's structured output. */
   interpret(answers: Record<string, DecisionAnswer>): unknown;
@@ -149,7 +150,8 @@ export const runDecisions: Harness = async (spec) => {
   if (!endpoint || !task) return finish("error", "decision call requires a decisions endpoint and task");
 
   const deadline = AbortSignal.timeout(spec.timeoutMs);
-  const body = JSON.stringify({ model: spec.target.model, state: task.state, questions: task.questions });
+  const state = typeof task.state === "function" ? task.state() : task.state;
+  const body = JSON.stringify({ model: spec.target.model, state, questions: task.questions });
   let failure: { status: "unavailable" | "timeout"; error: string } = {
     status: "unavailable",
     error: "decision call failed",
