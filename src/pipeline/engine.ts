@@ -1262,8 +1262,10 @@ async function deliveryBudget(ctx: RunContext): Promise<GitHubBudget> {
   const saved = ctx.state.githubBudget;
   const budget: GitHubBudget = {
     leftMs: saved.leftMs,
+    activeSince: saved.activeSince,
     onSpend: async () => {
       saved.leftMs = budget.leftMs;
+      saved.activeSince = budget.activeSince;
       await ctx.save();
     },
   };

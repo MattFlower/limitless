@@ -15,7 +15,9 @@ export const githubRetry = { attempts: 3, budgetMs: 60_000, baseDelayMs: 5_000 }
  */
 export interface GitHubBudget {
   leftMs: number;
-  /** Runs after every charge, so a delivery can persist what is left across a restart. */
+  /** Persisted before remote work/backoff, so a hard restart cannot refund interrupted time. */
+  activeSince?: number;
+  /** Persist both the start timestamp and the remaining budget after every charge. */
   onSpend?: () => Promise<void>;
 }
 export class GitHubUnavailableError extends Error {}
@@ -29,6 +31,7 @@ const TRANSIENT = [
   /non-200 OK status code: (5\d\d|429)\b/,
   /unable to access .*(Could not resolve host|Failed to connect|timed out|Recv failure|returned error: (5\d\d|429))/,
   /ssh: connect to host .*(timed out|refused|unreachable)/,
+  /ssh: Could not resolve hostname .*: Temporary failure in name resolution/,
   /kex_exchange_identification: |Connection (reset|closed) by /,
 ];
 
@@ -57,7 +60,7 @@ export async function withGitHubRetry<T>(
   const cap = opts.timeoutMs ?? 120_000;
   // Outside a delivery, a lone call gets a budget that never cuts its own timeout short.
   const budget = opts.budget ?? { leftMs: Math.max(githubRetry.budgetMs, cap) };
-  let started = Date.now();
+  let started = budget.activeSince ?? Date.now();
   const left = () => budget.leftMs - (Date.now() - started);
   // Recomputed before every subprocess, so no command outlives the shared budget.
   const timeout = () => {
@@ -65,11 +68,15 @@ export async function withGitHubRetry<T>(
     return Math.min(cap, left());
   };
   const charged = async <R>(work: () => Promise<R>): Promise<R> => {
+    budget.activeSince = started;
+    await budget.onSpend?.();
     try {
+      opts.signal?.throwIfAborted();
       return await work();
     } finally {
       budget.leftMs = left();
       started = Date.now();
+      delete budget.activeSince;
       await budget.onSpend?.();
     }
   };

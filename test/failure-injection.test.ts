@@ -16,6 +16,7 @@ import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import {
   createPullRequest,
+  type GitHubBudget,
   GitHubUnavailableError,
   githubRetry,
   isTransient,
@@ -1677,7 +1678,7 @@ test("GitHub retries classify structured failures and share one abortable deadli
   await expect(failing()).rejects.toBeInstanceOf(GitHubUnavailableError);
   expect(calls).toBe(3); // the second call of the delivery gets no fresh budget: one attempt
   expect(Date.now() - started).toBeLessThan(250);
-  expect(spent).toHaveLength(4); // every call and every backoff is persisted as soon as it ends
+  expect(spent).toHaveLength(8); // every call and backoff persists both its start and its end
   // Local work between GitHub calls (merging, gates) does not drain the budget; only remote time does.
   await Bun.sleep(100);
   expect(budget.leftMs).toBeGreaterThan(0);
@@ -1699,6 +1700,73 @@ test("GitHub retries classify structured failures and share one abortable deadli
     githubRetry.baseDelayMs = 10;
   }
 });
+
+test("GitHub retries SSH temporary DNS failures", async () => {
+  let calls = 0;
+  expect(
+    await withGitHubRetry(async () => {
+      if (++calls === 1)
+        throw new CommandError(
+          "git push failed",
+          128,
+          "",
+          "ssh: Could not resolve hostname github.com: Temporary failure in name resolution",
+          false,
+        );
+      return "pushed";
+    }),
+  ).toBe("pushed");
+  expect(calls).toBe(2);
+});
+
+for (const phase of ["command", "backoff"])
+  test(`SIGKILL during GitHub ${phase} does not restore spent budget`, async () => {
+    const worker = join(root, "github-worker.ts");
+    const checkpoint = join(root, "budget.json");
+    const ready = join(root, "ready");
+    writeFileSync(
+      worker,
+      `import { writeFileSync } from "node:fs";
+       import { withGitHubRetry, githubRetry } from ${JSON.stringify(join(import.meta.dir, "../src/git/repos.ts"))};
+       import { CommandError } from ${JSON.stringify(join(import.meta.dir, "../src/util/proc.ts"))};
+       githubRetry.baseDelayMs = 1000;
+       let saves = 0;
+       const budget = { leftMs: 4000, onSpend: async () => {
+         writeFileSync(${JSON.stringify(checkpoint)}, JSON.stringify(budget));
+         if (++saves === 3) writeFileSync(${JSON.stringify(ready)}, "backoff");
+       }};
+       writeFileSync(${JSON.stringify(checkpoint)}, JSON.stringify(budget));
+       await withGitHubRetry(async () => {
+         if (${JSON.stringify(phase)} === "backoff")
+           throw new CommandError("gh failed", 1, "", "HTTP 502: Bad Gateway", false);
+         writeFileSync(${JSON.stringify(ready)}, "command");
+         await Bun.sleep(10000);
+       }, { budget });`,
+    );
+    const child = Bun.spawn([process.execPath, worker], { stdout: "ignore", stderr: "pipe" });
+    try {
+      await wait(() => existsSync(ready));
+      await Bun.sleep(250);
+      child.kill("SIGKILL");
+      await child.exited;
+      const saved: GitHubBudget = JSON.parse(readFileSync(checkpoint, "utf8"));
+      const before = saved.leftMs;
+      const timeout = await withGitHubRetry(async (remaining) => remaining(), { budget: saved });
+      expect(timeout).toBeGreaterThan(0);
+      expect(timeout).toBeLessThanOrEqual(before - 200);
+      expect(saved.activeSince).toBeUndefined();
+      // A crash that consumes the remaining budget must not start another remote command.
+      saved.activeSince = Date.now() - saved.leftMs - 1;
+      let calls = 0;
+      await expect(withGitHubRetry(async () => ++calls, { budget: saved })).rejects.toBeInstanceOf(
+        GitHubUnavailableError,
+      );
+      expect(calls).toBe(0);
+    } finally {
+      child.kill("SIGKILL");
+      await child.exited;
+    }
+  });
 
 test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is final", async () => {
   const pr = join(root, "pr");
@@ -1790,6 +1858,7 @@ test("restart during GitHub backoff resumes the delivery budget without duplicat
     await Bun.sleep(1_500);
     const before = f.store.getRunState<RunState>(r.id)?.githubBudget;
     expect(before?.leftMs).toBeLessThan(githubRetry.budgetMs);
+    expect(before?.activeSince).toBeNumber();
     const next = await reopen(f);
     await settled(next, r.id);
     expect(next.store.getRun(r.id)).toMatchObject({
@@ -1800,6 +1869,7 @@ test("restart during GitHub backoff resumes the delivery budget without duplicat
     expect(after?.key).toBe(before?.key as string);
     // Resumed, not renewed: the interrupted backoff alone cost over a second of the same budget.
     expect(after?.leftMs).toBeLessThan((before?.leftMs as number) - 1_000);
+    expect(after?.activeSince).toBeUndefined();
     expect(ghCalls(pr, "pr create")).toHaveLength(2);
     history(next, r.id);
   } finally {
