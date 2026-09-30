@@ -722,6 +722,7 @@ export class EvalRunner {
               const agent = harnesses[picked.harnessName];
               if (!agent) throw new Error(`No harness registered for ${picked.harnessName}`);
               const check = () => {
+                if (signal.aborted) throw new Error("daemon shutdown");
                 const reason = unavailable(to);
                 if (reason) throw new Error(`${to.provider} unavailable: ${reason}`);
               };

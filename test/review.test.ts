@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { emptyUsage } from "../src/harness/types.ts";
-import { reviewPrompt } from "../src/pipeline/prompts.ts";
+import { formatReviewFeedback, reviewPrompt } from "../src/pipeline/prompts.ts";
 import {
   blockingReviewFindings,
   PANEL_VERIFY_CAP,
+  panelVerifierIdentity,
   type ReviewRequest,
   resolvedPriorFindings,
   reviewRequest,
@@ -453,6 +454,8 @@ describe("panel decision", () => {
     const review: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [] };
     expect(() => blockingReviewFindings(review, [finding("major")])).toThrow("review number");
     expect(() => reviewVerdict(review, [])).toThrow("review number");
+    for (const bad of [0, 4, 1.5, Number.NaN])
+      expect(() => blockingReviewFindings(review, [], bad)).toThrow("panel review number is 1-3");
     expect(blockingReviewFindings(review)).toEqual([]);
     // Single reviews have no panel numbering.
     expect(blockingReviewFindings({ ...review, mode: undefined }, [finding("major")])).toEqual([]);
@@ -761,15 +764,53 @@ describe("runReview panel", () => {
       expect(out.decision?.followUps.map((f) => f.title)).toEqual(["Issue src/a.ts 3"]);
     });
 
-  test("a citation keeps the prior finding's security flag, so R3 still blocks it below critical", async () => {
-    const previous = { sha: "fixbase", findings: [{ ...finding("major", true), title: "Injection" }] };
-    const found = [{ ...candidate("src/a.ts", 1), label: "unaddressed", prior: "P1" }];
-    const { out } = await panel([found], () => confirmed, {
-      panelReview: 3,
-      prompt: { ...prompt, headSha: "head", previous, fixReview: 3 },
-    });
-    expect(out.panel?.candidates.map((c) => [c.id, c.security])).toEqual([["C1", true]]);
-    expect(out.decision?.blocking.map((f) => f.line)).toEqual([1]);
+  // A prior security finding, by the finder's flag or the verifier's category, stays one whether a
+  // finder cites it or the verifier rechecks it: a later ruling in another category can't release it.
+  for (const [source, prior] of [
+    ["finder flag", { ...finding("major", true), title: "Injection" }],
+    [
+      "verifier category",
+      { ...finding("major"), title: "Injection", verification: { ...confirmed, category: "security" } },
+    ],
+  ] as const)
+    for (const path of ["citation", "recheck"] as const)
+      for (const [round, ruling] of [
+        [2, { ...confirmed, verdict: "PLAUSIBLE", severity: "medium", category: "reliability" }],
+        [3, { ...confirmed, severity: "high", category: "reliability" }],
+      ] as const)
+        test(`R${round}: a ${path} of a prior security finding (${source}) blocks below the round's bar`, async () => {
+          const found =
+            path === "citation" ? [{ ...candidate("src/a.ts", 1), label: "unaddressed", prior: "P1" }] : [];
+          const { out } = await panel([found], () => ruling, {
+            panelReview: round,
+            prompt: {
+              ...prompt,
+              headSha: "head",
+              previous: { sha: "fixbase", findings: [prior] },
+              fixReview: round,
+            },
+          });
+          expect(out.panel?.candidates.map((c) => [c.finder === null, c.security])).toEqual([
+            [path === "recheck", true],
+          ]);
+          expect(out.decision?.review.verdict).toBe("request_changes");
+        });
+
+  test("panel feedback marks a finding that blocks only because the verifier gave no ruling", () => {
+    const ruled = { ...finding("major"), verification: { ...confirmed, category: "correctness" as const } };
+    const unruled = { ...finding("nit", true), title: "Unruled" };
+    const text = formatReviewFeedback([ruled, unruled], true);
+    expect(text.match(/Unverified: the verifier gave no ruling/g)).toHaveLength(1);
+    expect(text.slice(text.indexOf("Unruled"))).toContain("Unverified");
+    // Single-mode findings are never verified, so nothing is marked.
+    expect(formatReviewFeedback([unruled])).not.toContain("Unverified");
+  });
+
+  test("the panel cache identity moved with the fail-closed policy, so older cached outputs are not reused", () => {
+    // The identity under which outputs were cached before security candidates were always verified.
+    expect(panelVerifierIdentity()).not.toBe(
+      "1615aed46380764c34cc3dbe53a944a4b17f56fc96578bd5bc3d91e8e026966c",
+    );
   });
 
   test("an invalid verifier result fails the review instead of approving it", async () => {
@@ -1075,14 +1116,15 @@ describe("runReview panel", () => {
           const candidateOf = kept.out.panel?.candidates.find((c) => c.id === citedId);
           expect(candidateOf?.category).toBe(category);
           expect(kept.out.decision?.blocking.map((f) => [f.line, f.category])).toEqual([[100, category]]);
-          // Eligibility then follows the verifier: refuted, or ruled cleanup, it never blocks.
-          for (const ruling of [
-            { ...confirmed, verdict: "REFUTED", severity: "critical" },
-            { ...confirmed, severity: "critical", category: retag },
+          // Then the verifier decides: refuted, it never blocks; ruled cleanup, it blocks only as a prior
+          // security finding.
+          for (const [ruling, blocks] of [
+            [{ ...confirmed, verdict: "REFUTED", severity: "critical" }, false],
+            [{ ...confirmed, severity: "critical", category: retag }, category === "security"],
           ] as const) {
-            const dropped = await run((id) => (id === citedId ? ruling : { ...confirmed }));
-            expect(dropped.verifications.flatMap((v) => ids(v.request.prompt))).toContain(citedId);
-            expect(dropped.out.decision?.blocking).toEqual([]);
+            const ruled = await run((id) => (id === citedId ? ruling : { ...confirmed }));
+            expect(ruled.verifications.flatMap((v) => ids(v.request.prompt))).toContain(citedId);
+            expect(ruled.out.decision?.blocking.length).toBe(blocks ? 1 : 0);
           }
         });
 
