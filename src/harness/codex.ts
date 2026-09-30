@@ -20,6 +20,7 @@ import {
   readConfinement,
   scratchEnv,
   scratchParent,
+  spellings,
   validateDenyRead,
   validateScratch,
 } from "./scratch.ts";
@@ -419,8 +420,10 @@ export class CodexReaderProbe {
     const unverified = { ok: false, path, version: lookup.version, reason: INCONCLUSIVE, exitCode: null };
     if (spec.signal.aborted) return unverified;
     if (!lookup.version) return { ...unverified, reason: lookup.reason, exitCode: lookup.exitCode };
-    // The probe checks the caller's denyRead too, so a verdict only covers that same list.
-    const key = [path, lookup.version, ...[...new Set(spec.denyRead ?? [])].sort()].join("\0");
+    // The probe checks the caller's denyRead too, so a verdict only covers the same effective paths:
+    // a retargeted symlink changes the canonical spelling the profile denies. The list is encoded
+    // separately so a denied path can never stand in for the CLI path or version.
+    const key = `${path}\0${lookup.version}\0${JSON.stringify(spellings(spec.denyRead ?? []).sort())}`;
     for (;;) {
       const verdict = this.verdicts.get(key);
       if (verdict) return verdict;

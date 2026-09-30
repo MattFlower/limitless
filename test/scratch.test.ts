@@ -729,6 +729,50 @@ test("a verdict for one denyRead list is not reused for a caller denying more", 
   }
 });
 
+test("a retargeted denyRead symlink is probed again instead of reusing the old verdict", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "limitless-deny-test-")));
+  cleanups.push(() => rmSync(parent, { recursive: true, force: true }));
+  const [a, b, link] = [join(parent, "a"), join(parent, "b"), join(parent, "link")];
+  for (const dir of [a, b]) mkdirSync(dir);
+  symlinkSync(a, link);
+  // Enforces everything except the second target, which stays readable.
+  const fake = fakeCodex((f, o) => (inRoot(b, f) ? reads(f) : enforcing(f, o)), {
+    canaryRoots: (deny) => [...Object.values(fake.roots), ...deny.filter((d) => d === a || d === b)],
+  });
+  try {
+    const confined = { ...spec, denyRead: [link] };
+    expect((await runCodex(confined, fake.runner, fake.probe)).status).toBe("ok");
+    expect(fake.sandboxReads.filter((r) => inRoot(a, r.file))).toHaveLength(1);
+    rmSync(link);
+    symlinkSync(b, link);
+    const second = await runCodex(confined, fake.runner, fake.probe);
+    expect(second.confinement).toMatchObject({ ok: false, reason: "reader profile not enforced" });
+    expect(fake.sandboxReads.filter((r) => inRoot(b, r.file))).toHaveLength(1);
+    expect(fake.execs).toHaveLength(1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a verdict for one CLI is not reused for another that denies the first's path", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const [a, b] = ["/opt/codex-a/bin/codex", "/opt/codex-b/bin/codex"];
+  const fake = fakeCodex();
+  try {
+    fake.cli.path = a;
+    expect((await runCodex({ ...spec, denyRead: [b] }, fake.runner, fake.probe)).status).toBe("ok");
+    fake.cli.path = b;
+    const second = await runCodex({ ...spec, denyRead: [a] }, fake.runner, fake.probe);
+    expect(second.status).toBe("ok");
+    expect(second.confinement?.path).toBe(b);
+    expect(fake.probes()).toBe(2);
+    expect(fake.sandboxReads.map((r) => r.cmd[0])).toContain(b);
+  } finally {
+    cleanup();
+  }
+});
+
 test("canaries cover each distinct writable private root the production profile denies", async () => {
   const roots = canaryRoots(privateReadRoots());
   for (const root of ["/tmp", "/var/tmp", tmpdir()])
