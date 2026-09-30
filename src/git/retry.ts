@@ -1,16 +1,24 @@
+import { CommandError } from "../util/proc.ts";
+
 /** Raised once transient GitHub failures exhaust their retries, so runs read as environment-caused. */
 export class GitHubUnavailableError extends Error {}
 
 /** Delays between attempts (3 attempts over about a minute). Mutable so tests can shorten them. */
 export const githubRetry = { delaysMs: [15_000, 45_000] };
 
-// 5xx, 429 and network/timeout failures only; 4xx validation or auth errors never match.
+// Network/timeout failures; a reported HTTP status is classified before these are consulted.
 // `Command failed (SIGTERM)` is `sh` killing a command at its timeout (cancellation throws earlier).
-const TRANSIENT =
-  /HTTP (5\d\d|429)\b|returned error: (5\d\d|429)\b|\b(502 Bad Gateway|503 Service Unavailable|504 Gateway Time-?out)\b|Command failed \(SIG(TERM|KILL)\)|timed? ?out|could not resolve host|connection (reset|refused|closed)|network is unreachable|ECONNRESET|ETIMEDOUT|TLS handshake|unexpected disconnect|remote end hung up|early EOF/i;
+const NETWORK =
+  /\b(502 Bad Gateway|503 Service Unavailable|504 Gateway Time-?out)\b|Command failed \(SIG(TERM|KILL)\)|timed? ?out|could not resolve host|could not connect to server|temporary failure in name resolution|connection (reset|refused|closed)|network is unreachable|ECONNRESET|ETIMEDOUT|TLS handshake|unexpected disconnect|remote end hung up|early EOF/i;
 
+/** Only 5xx, 429 and network/timeout failures; 4xx validation or auth errors never match. */
 export function isTransient(text: string): boolean {
-  return TRANSIENT.test(text);
+  const status = text.match(/\bHTTP (\d{3})\b|returned error: (\d{3})\b/);
+  if (status) {
+    const code = Number(status[1] ?? status[2]);
+    return code >= 500 || code === 429;
+  }
+  return NETWORK.test(text);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -43,7 +51,9 @@ export async function withGithubRetry<T>(
     } catch (e) {
       signal?.throwIfAborted();
       const message = (e as Error).message;
-      if (!isTransient(message)) throw e;
+      // Command arguments (e.g. a PR title mentioning "timeout") are not evidence of a failure.
+      const evidence = e instanceof CommandError ? `Command failed (${e.status})\n${e.output}` : message;
+      if (!isTransient(evidence)) throw e;
       const delay = githubRetry.delaysMs[attempt];
       if (delay === undefined)
         throw new GitHubUnavailableError(

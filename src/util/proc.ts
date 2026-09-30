@@ -186,6 +186,17 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
 
 const SH_OUTPUT_LIMIT = 50_000_000;
 
+/** A failed `sh` command; `output` holds only what the command reported, never its arguments. */
+export class CommandError extends Error {
+  constructor(
+    message: string,
+    readonly status: string,
+    readonly output: string,
+  ) {
+    super(message);
+  }
+}
+
 /** Convenience wrapper for short commands (git, gh). Throws on non-zero exit. */
 export async function sh(
   cmd: string[],
@@ -215,11 +226,12 @@ export async function sh(
     throw new Error(`Output of \`${cmd.join(" ")}\` exceeded ${SH_OUTPUT_LIMIT} characters`);
   }
   if (res.exitCode !== 0 && !opts.allowFail) {
-    throw new Error(
-      `Command failed (${res.exitCode ?? res.signal}): ${cmd.join(" ")}\n${res.stderr.trim() || res.stdout.trim()}`.slice(
-        0,
-        4000,
-      ),
+    const status = String(res.exitCode ?? res.signal);
+    const output = res.stderr.trim() || res.stdout.trim();
+    throw new CommandError(
+      `Command failed (${status}): ${cmd.join(" ")}\n${output}`.slice(0, 4000),
+      status,
+      output,
     );
   }
   return { stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode };

@@ -431,7 +431,7 @@ export async function createPullRequest(
     );
     return existing;
   }
-  return withGithubRetry(
+  const created = withGithubRetry(
     "PR create",
     async (retrying) => {
       // A 5xx can hide a created PR; reuse it instead of opening a duplicate.
@@ -462,6 +462,13 @@ export async function createPullRequest(
     },
     opts.signal,
   );
+  return created.catch(async (e) => {
+    // The last uncertain attempt may have created the PR too.
+    if (!(e instanceof GitHubUnavailableError)) throw e;
+    const found = await lookup().catch(() => "");
+    if (found) return found;
+    throw e;
+  });
 }
 
 /** Merge now if possible; if branch protection requires checks, enable auto-merge instead. */

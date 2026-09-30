@@ -52,8 +52,8 @@ function withGh(plan: Record<string, string[]>) {
   process.env.PATH = `${gh.bin}:${oldPath}`;
   return gh;
 }
-const pr = (signal?: AbortSignal) =>
-  createPullRequest(repo, { branch: "b", base: "main", title: "T", body: "B", cwd: work, signal });
+const pr = (signal?: AbortSignal, title = "T") =>
+  createPullRequest(repo, { branch: "b", base: "main", title, body: "B", cwd: work, signal });
 
 /** A `git push` that lands, then reports a 502, once. */
 function flakyPush() {
@@ -94,6 +94,9 @@ test("classifies only 5xx, 429 and network failures as transient", () => {
   expect(isTransient("HTTP 429: Too Many Requests")).toBe(true);
   expect(isTransient("dial tcp: lookup api.github.com: i/o timeout")).toBe(true);
   expect(isTransient("ssh: Could not resolve host github.com")).toBe(true);
+  expect(isTransient("curl: (7) Could not connect to server")).toBe(true);
+  expect(isTransient("dial tcp: lookup github.com: Temporary failure in name resolution")).toBe(true);
+  expect(isTransient("HTTP 422: Validation Failed (504 Gateway Timeout in title)")).toBe(false);
   expect(isTransient("HTTP 422: Validation Failed")).toBe(false);
   expect(isTransient("HTTP 401: Bad credentials")).toBe(false);
   expect(isTransient("HTTP 409: Conflict")).toBe(false);
@@ -111,6 +114,19 @@ test("PR create does not retry a 422", async () => {
   expect(error).toBeInstanceOf(Error);
   expect(error).not.toBeInstanceOf(GitHubUnavailableError);
   expect(gh.calls("pr create")).toHaveLength(1);
+});
+
+test("a 422 is not retried even when the PR title mentions a timeout", async () => {
+  const gh = withGh({ create: ["fail422", "fail422", "fail422"] });
+  const error = await pr(undefined, "Fix timeout handling").catch((e: Error) => e);
+  expect(error).not.toBeInstanceOf(GitHubUnavailableError);
+  expect(gh.calls("pr create")).toHaveLength(1);
+});
+
+test("a PR created by the last uncertain attempt is still found", async () => {
+  const gh = withGh({ create: ["fail502", "fail502", "ok502"] });
+  expect(await pr()).toBe(gh.url);
+  expect(gh.calls("pr create")).toHaveLength(3);
 });
 
 test("a 502 that hid a created PR reuses it instead of creating another", async () => {
