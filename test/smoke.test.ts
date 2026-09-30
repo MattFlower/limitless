@@ -200,7 +200,7 @@ test("deploy restores the previous checkout when injected smoke fails before res
       return { stdout: `${args[2] === "HEAD" ? selected : "next-commit"}\n`, stderr: "", exitCode: 0 };
     }
     if (args[0] === "git" && args[1] === "checkout") selected = args[4] ?? selected;
-    if (args.join(" ") === "bun run smoke") throw new Error("injected smoke failure");
+    if (args.join(" ") === "bun scripts/smoke.ts") throw new Error("injected smoke failure");
     return { stdout: "", stderr: "", exitCode: 0 };
   };
   try {
@@ -236,8 +236,10 @@ test("deploy restores the previous checkout when injected smoke fails before res
       "git rev-parse feature^{commit}",
       "git checkout -q --detach next-commit",
       "bun install --frozen-lockfile",
-      "bun run check",
-      "bun run smoke",
+      "bun run lint",
+      "bun run typecheck",
+      "bun test",
+      "bun scripts/smoke.ts",
       "git checkout -q --detach previous-commit",
       "bun install --frozen-lockfile",
     ]);
