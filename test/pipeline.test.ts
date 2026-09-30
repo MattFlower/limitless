@@ -7,6 +7,7 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus, StageName } from "../src/core/types.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
+import { githubRetry } from "../src/git/retry.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
@@ -17,6 +18,7 @@ import { renderReport } from "../src/pipeline/report.ts";
 import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
+import { fakeGh } from "./fake-gh.ts";
 import { findingEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -775,6 +777,63 @@ esac
     expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
     expect(f.store.getRunState<RunState>(run.id)?.pendingRebaseSha).toBeUndefined();
     expect(f.scheduler.parkedRunIds).toEqual([]);
+  });
+
+  describe("transient GitHub failures during delivery", () => {
+    const delays = githubRetry.delaysMs;
+    afterEach(() => {
+      githubRetry.delaysMs = delays;
+    });
+    const deliverWith = async (plan: Record<string, string[]>, retryDelays: number[]) => {
+      const bare = await githubFixture();
+      const gh = fakeGh(home, plan);
+      githubRetry.delaysMs = retryDelays;
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      registerGithub(f, bare);
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      return { f, gh, run };
+    };
+
+    test("502 twice then success delivers normally", async () => {
+      const { f, gh, run } = await deliverWith({ create: ["fail502", "fail502"] }, [5, 10]);
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(gh.calls("pr create")).toHaveLength(3);
+      expect(gh.calls("pr create").some((c) => c.includes("--draft"))).toBe(false);
+      expect(f.store.getRun(run.id)?.prUrl).toBe(gh.url);
+    });
+
+    test("exhausted retries fall back to the verified draft as GitHub unavailable", async () => {
+      const { f, gh, run } = await deliverWith({ create: ["fail502", "fail502", "fail502"] }, [5, 10]);
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+      const finished = f.store.getRun(run.id);
+      expect(finished?.error).toStartWith("GitHub unavailable: PR create failed after 3 attempts");
+      expect(finished?.error).toContain("HTTP 502");
+      expect(f.store.getRunState<RunState>(run.id)?.needsHumanReason).toStartWith("GitHub unavailable");
+      expect(f.store.getArtifact(run.id, "report.md")).toContain("GitHub unavailable");
+      expect(gh.calls("pr create").filter((c) => c.includes("--draft"))).toHaveLength(1);
+      expect(finished?.prUrl).toBe(gh.url);
+    });
+
+    test("cancelling during retry backoff stops delivery", async () => {
+      const { f, gh, run } = await deliverWith({ create: ["fail502"] }, [10_000, 10_000]);
+      const deadline = Date.now() + 20_000;
+      while (gh.calls("pr create").length === 0) {
+        if (Date.now() > deadline) throw new Error("create never attempted");
+        await Bun.sleep(10);
+      }
+      await Bun.sleep(100);
+      expect(f.cancelRun(run.id, "tester")).toBe(true);
+      expect(await waitFor(f, run.id, ["cancelled", "succeeded", "failed", "needs_human"])).toBe("cancelled");
+      const calls = gh.calls("pr");
+      await Bun.sleep(200);
+      expect(gh.calls("pr")).toEqual(calls);
+      expect(gh.calls("pr create")).toHaveLength(1);
+    });
   });
 
   test("needs-human draft delivery continues during drain", async () => {

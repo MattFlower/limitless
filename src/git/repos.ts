@@ -4,6 +4,7 @@ import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { sh } from "../util/proc.ts";
+import { GitHubUnavailableError, isTransient, withGithubRetry } from "./retry.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -329,11 +330,20 @@ export async function pushBranch(
   signal?: AbortSignal,
 ): Promise<void> {
   if (repo.kind !== "github" || !repo.url) return;
-  await sh(["git", "push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
-    cwd,
-    timeoutMs: 300_000,
+  const url = repo.url;
+  const target = (await sh(["git", "rev-parse", `${sha}^{commit}`], { cwd, signal })).stdout.trim();
+  await withGithubRetry(
+    "push",
+    async (retrying) => {
+      if (retrying && (await remoteBranchSha(repo, cwd, branch, signal)) === target) return;
+      await sh(["git", "push", "--force-with-lease", url, `${target}:refs/heads/${branch}`], {
+        cwd,
+        timeoutMs: 300_000,
+        signal,
+      });
+    },
     signal,
-  });
+  );
 }
 
 export async function remoteBranchSha(
@@ -342,8 +352,13 @@ export async function remoteBranchSha(
   branch: string,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  if (repo.kind !== "github" || !repo.url) return null;
-  const remote = await sh(["git", "ls-remote", repo.url, `refs/heads/${branch}`], { cwd, signal });
+  const url = repo.url;
+  if (repo.kind !== "github" || !url) return null;
+  const remote = await withGithubRetry(
+    "branch lookup",
+    () => sh(["git", "ls-remote", url, `refs/heads/${branch}`], { cwd, signal }),
+    signal,
+  );
   return remote.stdout.split("\t")[0] || null;
 }
 
@@ -358,20 +373,30 @@ export async function pushExistingBranch(
   if (repo.kind !== "github" || !repo.url) throw new Error("existing PR delivery requires a GitHub repo");
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") || branch.endsWith("/"))
     throw new Error("invalid PR head branch");
+  const url = repo.url;
   const ref = `refs/heads/${branch}`;
-  const remote = await sh(["git", "ls-remote", repo.url, ref], { cwd, signal });
-  if (remote.stdout.split("\t")[0] !== baseSha) throw new Error("PR head moved since the run started");
-  const ancestor = await sh(["git", "merge-base", "--is-ancestor", baseSha, "HEAD"], {
+  const head = await headSha(cwd);
+  const ancestor = await sh(["git", "merge-base", "--is-ancestor", baseSha, head], {
     cwd,
     allowFail: true,
     signal,
   });
   if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
-  await sh(["git", "push", `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
-    cwd,
-    timeoutMs: 300_000,
+  await withGithubRetry(
+    "push",
+    async (retrying) => {
+      const remote = (await remoteBranchSha(repo, cwd, branch, signal)) ?? "";
+      // A retry may find the uncertain previous push already landed.
+      if (retrying && remote === head) return;
+      if (remote !== baseSha) throw new Error("PR head moved since the run started");
+      await sh(["git", "push", `--force-with-lease=${ref}:${baseSha}`, url, `${head}:${ref}`], {
+        cwd,
+        timeoutMs: 300_000,
+        signal,
+      });
+    },
     signal,
-  });
+  );
 }
 
 export async function createPullRequest(
@@ -386,55 +411,57 @@ export async function createPullRequest(
     signal?: AbortSignal;
   },
 ): Promise<string> {
-  const existing = await sh(
-    [
-      "gh",
-      "pr",
-      "list",
-      "--repo",
-      repo.slug,
-      "--head",
-      opts.branch,
-      "--state",
-      "all",
-      "--json",
-      "url",
-      "--jq",
-      ".[0].url",
-    ],
-    { cwd: opts.cwd, allowFail: true, signal: opts.signal },
-  );
-  if (existing.stdout.trim()) {
-    await sh(["gh", "pr", "edit", existing.stdout.trim(), "--body-file", "-"], {
-      cwd: opts.cwd,
-      stdin: opts.body,
-      allowFail: true,
-      signal: opts.signal,
-    });
-    return existing.stdout.trim();
+  const list = ["gh", "pr", "list", "--repo", repo.slug, "--head", opts.branch, "--state", "all"];
+  const lookup = async () =>
+    (
+      await sh([...list, "--json", "url", "--jq", ".[0].url"], { cwd: opts.cwd, signal: opts.signal })
+    ).stdout.trim();
+  // A failed lookup is not proof that no PR exists, so it is retried rather than ignored.
+  const existing = await withGithubRetry("PR lookup", lookup, opts.signal);
+  if (existing) {
+    await withGithubRetry(
+      "PR edit",
+      () =>
+        sh(["gh", "pr", "edit", existing, "--body-file", "-"], {
+          cwd: opts.cwd,
+          stdin: opts.body,
+          signal: opts.signal,
+        }),
+      opts.signal,
+    );
+    return existing;
   }
-  const res = await sh(
-    [
-      "gh",
-      "pr",
-      "create",
-      "--repo",
-      repo.slug,
-      "--head",
-      opts.branch,
-      "--base",
-      opts.base,
-      "--title",
-      opts.title,
-      "--body-file",
-      "-",
-      ...(opts.draft ? ["--draft"] : []),
-    ],
-    { cwd: opts.cwd, stdin: opts.body, signal: opts.signal },
+  return withGithubRetry(
+    "PR create",
+    async (retrying) => {
+      // A 5xx can hide a created PR; reuse it instead of opening a duplicate.
+      const found = retrying ? await lookup() : "";
+      if (found) return found;
+      const res = await sh(
+        [
+          "gh",
+          "pr",
+          "create",
+          "--repo",
+          repo.slug,
+          "--head",
+          opts.branch,
+          "--base",
+          opts.base,
+          "--title",
+          opts.title,
+          "--body-file",
+          "-",
+          ...(opts.draft ? ["--draft"] : []),
+        ],
+        { cwd: opts.cwd, stdin: opts.body, signal: opts.signal },
+      );
+      const url = res.stdout.trim().split("\n").pop() ?? "";
+      if (!url.startsWith("http")) throw new Error(`gh pr create returned unexpected output: ${res.stdout}`);
+      return url;
+    },
+    opts.signal,
   );
-  const url = res.stdout.trim().split("\n").pop() ?? "";
-  if (!url.startsWith("http")) throw new Error(`gh pr create returned unexpected output: ${res.stdout}`);
-  return url;
 }
 
 /** Merge now if possible; if branch protection requires checks, enable auto-merge instead. */
@@ -447,18 +474,35 @@ export async function mergePullRequest(
   // Squash with the PR title as the subject, not the first round's commit message.
   const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
   const subject = title ? ["--subject", number ? `${title} (#${number})` : title] : [];
-  const now = await sh(["gh", "pr", "merge", prUrl, "--squash", "--delete-branch", ...subject], {
-    cwd,
-    allowFail: true,
-    signal,
-  });
-  if (now.exitCode === 0) return "merged";
-  const auto = await sh(["gh", "pr", "merge", prUrl, "--squash", "--auto", "--delete-branch", ...subject], {
-    cwd,
-    allowFail: true,
-    signal,
-  });
-  return auto.exitCode === 0 ? "auto" : "failed";
+  const merge = (auto: boolean) =>
+    withGithubRetry<"merged" | "auto" | "failed">(
+      "PR merge",
+      async (retrying) => {
+        if (retrying) {
+          // The failed attempt may have merged or queued the PR anyway.
+          const view = await sh(["gh", "pr", "view", prUrl, "--json", "state,autoMergeRequest"], {
+            cwd,
+            signal,
+          });
+          const pr = JSON.parse(view.stdout) as { state?: string; autoMergeRequest?: unknown };
+          if (pr.state === "MERGED") return "merged";
+          if (auto && pr.autoMergeRequest) return "auto";
+        }
+        const args = ["gh", "pr", "merge", prUrl, "--squash", ...(auto ? ["--auto"] : []), "--delete-branch"];
+        const res = await sh([...args, ...subject], { cwd, allowFail: true, signal });
+        if (res.exitCode === 0) return auto ? "auto" : "merged";
+        const output = `${res.stderr}\n${res.stdout}`.trim();
+        if (isTransient(output)) throw new Error(`gh pr merge failed: ${output}`);
+        return "failed";
+      },
+      signal,
+    ).catch((e) => {
+      // As before a merge that cannot happen leaves the PR open rather than failing the run.
+      if (e instanceof GitHubUnavailableError) return "failed" as const;
+      throw e;
+    });
+  const now = await merge(false);
+  return now === "failed" ? merge(true) : now;
 }
 
 /** Same stable top-level representation used in pipeline and eval prompts. */
