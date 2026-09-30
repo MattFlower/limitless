@@ -68,9 +68,18 @@ Codex no-tools calls ignore user configuration and disable MCP, plugins, apps, c
 sub-agents, image viewing, and web search; they retain session rollouts for quota inspection.
 If the ChatGPT account rejects the cheapest Codex model, the runner tries the next catalog model
 in price order and reports which model it used. Other CLI errors fail the check.
+A check that fails for a transient availability reason (a timeout, a provider or network error
+such as HTTP 5xx, a rate limit or a connection failure, or a failed health probe) is retried once,
+and a passing retry still reports the first attempt's reason. Assertion failures (a disclosed
+token, a tool call, a forbidden worktree write, wrong structured output) are never retried. Each
+check has its own timeout, cut to what is left of the smoke budget (inside the deploy gate's
+900 s); a retry is not started when the remaining budget is shorter than that timeout. A timed-out
+attempt is cancelled and awaited, so a leak it reports while stopping still fails the check, and
+one that does not stop is not retried. Each result line is printed as the check finishes, so a
+killed run still shows which checks passed and which one was running.
 
 The oMLX structured / Claude-harness edit and twilight checks are skipped when their required key is absent or their health probe
-fails. OpenRouter is skipped when `OPENROUTER_API_KEY` is absent from the Limitless secrets file or
+fails on both attempts. OpenRouter is skipped when `OPENROUTER_API_KEY` is absent from the Limitless secrets file or
 environment. An attempted check that fails exits nonzero; skips alone do not. Use
 `limitless deploy [ref] --smoke` to require these checks during deployment.
 
