@@ -25,7 +25,10 @@ const LOCKFILES = [
   "composer.lock",
 ];
 
-/** Gate-relevant variables: values are hashed, never stored, and secret-looking names are skipped. */
+/**
+ * Gate-relevant variables known to be nonsecret settings: values are hashed, never stored. Some
+ * (GOPRIVATE, NODE_TLS_REJECT_UNAUTHORIZED) look like credentials to SECRET_NAME but aren't.
+ */
 const GATE_ENV_VARS = new Set([
   "PATH",
   "HOME",
@@ -58,8 +61,14 @@ const GATE_ENV_VARS = new Set([
   "GOTOOLCHAIN",
   "GOEXPERIMENT",
   "GOMODCACHE",
+  "GOINSECURE",
+  "NODE_TLS_REJECT_UNAUTHORIZED",
 ]);
-/** Toolchain configuration families (npm/Bun/Node, dynamic linker, Rust, Python, JVM, locale). */
+/**
+ * Toolchain configuration families (npm/Bun/Node, dynamic linker, Rust, Python, JVM, locale).
+ * These admit credentials too (`npm_config__authToken`, `CARGO_REGISTRY_TOKEN`), so names matched
+ * only by prefix are also screened by SECRET_NAME.
+ */
 const GATE_ENV_PREFIXES =
   /^(npm_config_|NPM_CONFIG_|BUN_|NODE_|YARN_|PNPM_|COREPACK_|LD_|DYLD_|LC_|CARGO_|RUST|PYTHON|PIP_|UV_|POETRY_|JAVA_|JDK_|GRADLE_|MAVEN_)/;
 const SECRET_NAME = /TOKEN|SECRET|PASS|AUTH|CRED|KEY|PRIVATE|SESSION|COOKIE/i;
@@ -95,12 +104,14 @@ export function lockfileHash(dir: string): string {
 
 /**
  * Digest of the gate-relevant part of the environment gates run with: the known toolchain
- * variables plus `extra` (config `[gates] baseline_env`). Secret-looking names are never included.
+ * variables plus `extra` (config `[gates] baseline_env`). Names known or declared to be gate
+ * settings are always included; a prefix-family name is included only if it doesn't look secret.
  */
 export function gateEnvDigest(env: Record<string, string>, extra: readonly string[] = []): string {
-  const relevant = (k: string) => GATE_ENV_VARS.has(k) || GATE_ENV_PREFIXES.test(k) || extra.includes(k);
+  const relevant = (k: string) =>
+    GATE_ENV_VARS.has(k) || extra.includes(k) || (GATE_ENV_PREFIXES.test(k) && !SECRET_NAME.test(k));
   const entries = Object.keys(env)
-    .filter((k) => relevant(k) && !SECRET_NAME.test(k))
+    .filter(relevant)
     .sort()
     .map((k) => [k, env[k]]);
   return sha256(JSON.stringify(entries));

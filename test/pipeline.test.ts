@@ -815,6 +815,31 @@ esac
       }
     });
 
+    test("a changed nonsecret setting with a secret-looking name misses", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const names = ["GOPRIVATE", "NODE_TLS_REJECT_UNAUTHORIZED"] as const;
+      const saved = Object.fromEntries(names.map((k) => [k, process.env[k]]));
+      try {
+        process.env.GOPRIVATE = "example.com/*";
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = "1";
+        const f = start(quick);
+        await finish(f);
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+        process.env.GOPRIVATE = "other.example/*";
+        expect((await finish(f)).state?.baselineCached).toBe(false);
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+        expect((await finish(f)).state?.baselineCached).toBe(false);
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+      } finally {
+        for (const k of names) {
+          if (saved[k] === undefined) delete process.env[k];
+          else process.env[k] = saved[k];
+        }
+      }
+    });
+
     test("a timed-out or cancelled baseline is not cached", async () => {
       const count = join(home, "gate-runs");
       // The first execution outlasts its timeout; later ones pass.

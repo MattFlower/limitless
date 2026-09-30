@@ -470,6 +470,23 @@ describe("baseline cache", () => {
     );
   });
 
+  test("known nonsecret settings with secret-looking names still key the env digest", () => {
+    const env = { PATH: "/usr/bin:/bin" };
+    const digest = gateEnvDigest(env);
+    // Toolchain settings, not credentials, despite containing PRIVATE / AUTH.
+    expect(gateEnvDigest({ ...env, GOPRIVATE: "example.com/*" })).not.toBe(digest);
+    expect(gateEnvDigest({ ...env, NODE_TLS_REJECT_UNAUTHORIZED: "0" })).not.toBe(digest);
+    expect(gateEnvDigest({ ...env, NODE_TLS_REJECT_UNAUTHORIZED: "0" })).not.toBe(
+      gateEnvDigest({ ...env, NODE_TLS_REJECT_UNAUTHORIZED: "1" }),
+    );
+    // Prefix-family credentials stay out; an operator-declared name is included as written.
+    expect(gateEnvDigest({ ...env, CARGO_REGISTRY_TOKEN: "t" })).toBe(digest);
+    expect(gateEnvDigest({ ...env, NODE_AUTH_TOKEN: "t" })).toBe(digest);
+    expect(gateEnvDigest({ ...env, MY_AUTH_MODE: "a" }, ["MY_AUTH_MODE"])).not.toBe(
+      gateEnvDigest({ ...env, MY_AUTH_MODE: "b" }, ["MY_AUTH_MODE"]),
+    );
+  });
+
   test("single flight runs one caller per key at a time", async () => {
     const order: string[] = [];
     let release = () => {};

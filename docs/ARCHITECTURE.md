@@ -105,7 +105,9 @@ once; a pass on retry is recorded as `flaky` (a non-blocking warning with both o
 Prepare caches the baseline in `passing_baselines`, keyed by repo, base SHA, gate commands and an
 environment hash (lockfiles, Bun version, platform/arch, Limitless build SHA, and a digest of PATH
 and toolchain variables such as `npm_config_*`, `NODE_*`, `LD_*`, plus any names listed in
-`[gates] baseline_env`; values are hashed, never stored, and secret-looking names are excluded).
+`[gates] baseline_env`; values are hashed, never stored, and secret-looking names in the prefix
+families are excluded, while known settings such as `GOPRIVATE` and `NODE_TLS_REJECT_UNAUTHORIZED`
+and operator-listed names are always included).
 **Only a baseline where setup and every check passed is cached**: a failing base (possibly flaky,
 even after its retry) runs again on every run, so it can never turn a later regression into a
 non-blocking `still_failing`, and a failure never overwrites a cached pass. Lookups and writes run
