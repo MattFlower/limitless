@@ -15,6 +15,8 @@ export interface GitHubBudget {
 }
 export const githubBudget = (): GitHubBudget => ({ deadline: Date.now() + githubRetry.budgetMs });
 export class GitHubUnavailableError extends Error {}
+/** Time kept back from a merge command so its outcome can still be looked up after a timeout. */
+const MERGE_RECONCILE_MS = 10_000;
 
 // Every pattern contains a space, which a branch name cannot, so echoed refs never look transient.
 const TRANSIENT = [
@@ -523,6 +525,12 @@ export async function mergePullRequest(
   // After a transient failure or timeout the merge may still have landed. Until a state lookup
   // settles that, every attempt reconciles first; a failed lookup retries like any other call.
   let unsure = false;
+  // The merge command must not consume the whole shared deadline: a timed-out merge still needs
+  // budget for the state lookup that tells a landed merge from a lost one.
+  const mergeTimeout = (timeout: () => number) => {
+    const left = timeout();
+    return Math.max(left - MERGE_RECONCILE_MS, left / 2);
+  };
   const landed = async (timeout: () => number) => {
     const view = ["gh", "pr", "view", prUrl, "--json", "state", "--jq", ".state"];
     const merged = (await sh(view, { cwd, signal, timeoutMs: timeout() })).stdout.trim() === "MERGED";
@@ -534,7 +542,7 @@ export async function mergePullRequest(
       async (timeout) => {
         if (unsure && (await landed(timeout))) return "merged" as const;
         const cmd = ["gh", "pr", "merge", prUrl, "--squash", ...extra, "--delete-branch", ...subject];
-        return sh(cmd, { cwd, signal, timeoutMs: timeout() }).then(
+        return sh(cmd, { cwd, signal, timeoutMs: mergeTimeout(timeout) }).then(
           () => "ok" as const,
           async (e) => {
             if (signal?.aborted || !isTransient(e)) throw e;

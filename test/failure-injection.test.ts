@@ -835,7 +835,8 @@ function fakeGh(pr: string) {
   mkdirSync(bin);
   writeFileSync(
     join(bin, "gh"),
-    // `${pr}.fail` queues scripted failures: {on, err?, landed?} (no err: succeed with no output).
+    // `${pr}.fail` queues scripted failures: {on, err?, landed?, hang?} (no err: succeed with no
+    // output; hang: never exit, so the caller's command timeout fires).
     `#!${process.execPath}
 import {appendFileSync,existsSync,readFileSync,writeFileSync} from "node:fs";
 const file=${JSON.stringify(pr)}, cmd=process.argv.slice(2).join(" "), state=()=>existsSync(file+".merged")?"MERGED":"OPEN";
@@ -843,7 +844,7 @@ appendFileSync(file+".calls",cmd+"\\n");
 const q=existsSync(file+".fail")?JSON.parse(readFileSync(file+".fail","utf8")):[];
 const fail=q[0]&&cmd.startsWith(q[0].on)?q.shift():null;
 writeFileSync(file+".fail",JSON.stringify(q));
-const out=fail?()=>{}:console.log, end=()=>{ if(fail?.err){console.error(fail.err);process.exit(1);} };
+const out=fail?()=>{}:console.log, end=()=>{ if(fail?.hang){setInterval(()=>{},1e6);return;} if(fail?.err){console.error(fail.err);process.exit(1);} };
 if(fail&&!fail.landed){end();process.exit(0);}
 if(process.argv[3]==="list" && existsSync(file)) { const url=readFileSync(file,"utf8"); out(process.argv.includes("--jq") ? url : JSON.stringify([{state:state(),url}])); }
 if(process.argv[3]==="create") { if(existsSync(file)) {console.error("a pull request for branch already exists");process.exit(9);} writeFileSync(file,"https://github.com/test/repo/pull/1"); out(readFileSync(file,"utf8")); }
@@ -1730,6 +1731,16 @@ test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is fina
     writeFileSync(`${pr}.fail`, JSON.stringify(Array(3).fill({ on: "pr merge", err: bad502 })));
     expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "T")).toBe("auto");
     expect(ghCalls(pr, "pr merge").filter((c) => c.includes("--auto"))).toHaveLength(1);
+    // A merge that lands but never returns times out with budget left to look its state up.
+    rmSync(`${pr}.merged`);
+    const merges = ghCalls(pr, "pr merge").length;
+    const views = ghCalls(pr, "pr view").length;
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr merge", landed: true, hang: true }]));
+    const budget = { deadline: Date.now() + 3_000 };
+    const url = "https://github.com/test/repo/pull/1";
+    expect(await mergePullRequest(url, root, "T", undefined, budget)).toBe("merged");
+    expect(ghCalls(pr, "pr merge")).toHaveLength(merges + 1);
+    expect(ghCalls(pr, "pr view")).toHaveLength(views + 1);
   } finally {
     await restore();
   }
