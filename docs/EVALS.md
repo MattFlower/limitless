@@ -193,7 +193,12 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
   grades from each trial's stored output against the current labels: no model calls, cache
   lookups or spend. Stored outputs from older schemas regrade because grading reads only each
   finding's severity, file and line (a missing `security` counts as false, and a missing model
-  verdict is irrelevant); a degenerate review still fails. Trials whose case has left the dataset
+  verdict is irrelevant); a degenerate review still fails. Panel outputs also regrade under the
+  current panel rules, which read each finding's security flag and verifier ruling. Since panel
+  policy 2, an unverified security finding blocks (fail closed), so a panel output stored under
+  policy 1, which left security findings in cleanup or over the cap unverified, can regrade as a
+  false block. Re-run such evals instead: the panel cache identity includes the policy version,
+  so a re-run makes fresh calls. Trials whose case has left the dataset
   or whose output doesn't parse keep their stored grade and stay excluded.
 - Verify scores only gold IDs. A single binary status must match exactly; missing, unclear and
   duplicate entries are inconclusive and match neither label. False accepts are gold unmet with

@@ -538,11 +538,11 @@ test("a panel member re-checks its provider after waiting for its slots", async 
     );
     const tracker = f.factory.tracker;
     const acquire = tracker.acquire.bind(tracker);
-    // provider-b runs out of quota while finder b waits for its slot.
+    // provider-b runs out of quota, briefly, while finder b waits for its slot.
     const spy = spyOn(tracker, "acquire").mockImplementation(async (provider, signal) => {
       const release = await acquire(provider, signal);
       if (provider === "provider-b")
-        tracker.record("provider-b", "quota", { exhaustedUntil: Date.now() + 3_600_000 });
+        tracker.record("provider-b", "quota", { exhaustedUntil: Date.now() + 200 });
       return release;
     });
     const report = await f.run({ models: undefined, systems: [panelSystem], cache: false });
@@ -551,7 +551,38 @@ test("a panel member re-checks its provider after waiting for its slots", async 
     expect(report.trials[0]?.details.reason).toContain("provider-b unavailable");
     expect(f.calls.map((s) => s.target.modelId)).toEqual(["candidate-a"]);
     expect(tracker.status("provider-b")?.inFlight).toBe(0);
+    // Finder b released its run and eval slots too: once quota returns, the next provider-b eval runs.
+    await Bun.sleep(250);
+    const single = {
+      name: "single-b",
+      mode: "single",
+      finders: [{ target: "candidate-b", prompt: "standard" }],
+      implementerReport: "include",
+    };
+    const after = await f.run({ models: undefined, systems: [single], cache: false });
+    expect(after.trials.map((t) => t.status)).toEqual(["ok"]);
     await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("a panel member stops after its slot wait when the eval was aborted meanwhile", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    f.respond(() => ({ structured: reviewOutput(), costUsd: 0.1 }));
+    const tracker = f.factory.tracker;
+    const acquire = tracker.acquire.bind(tracker);
+    const spy = spyOn(tracker, "acquire").mockImplementation(async (provider, signal) => {
+      const release = await acquire(provider, signal);
+      if (provider === "provider-b") void f.factory.evals.stop();
+      return release;
+    });
+    const report = await f.run({ models: undefined, systems: [panelSystem], cache: false });
+    spy.mockRestore();
+    expect(report.run.status).toBe("failed");
+    expect(f.calls.map((s) => s.target.modelId)).toEqual(["candidate-a"]);
+    expect(tracker.status("provider-b")?.inFlight).toBe(0);
   } finally {
     await f.close();
   }

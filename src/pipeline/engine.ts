@@ -1066,7 +1066,10 @@ async function oneRound(
 
   const reviewFeedback =
     review.verdict === "request_changes"
-      ? formatReviewFeedback(blockingReviewFindings(review, previousReview?.findings, panelRules))
+      ? formatReviewFeedback(
+          blockingReviewFindings(review, previousReview?.findings, panelRules),
+          review.mode === "panel",
+        )
       : "";
   if (review.verdict === "request_changes") {
     ctx.state.feedback = reviewFeedback || `### Code review requested changes\n${review.summary}`;

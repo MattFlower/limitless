@@ -158,12 +158,13 @@ export function formatAuditFeedback(findings: AuditFinding[]): string {
   return `### Policy violations\n${block.map((f) => `- [${f.rule}] ${f.file ? `${f.file}: ` : ""}${f.detail}`).join("\n")}`;
 }
 
-export function formatReviewFeedback(findings: Review["findings"]): string {
+/** `panel`: a finding without a ruling blocks only because the verifier left it out (fail closed). */
+export function formatReviewFeedback(findings: Review["findings"], panel = false): string {
   if (!findings.length) return "";
   return `### Code review findings (must fix)\n${findings
     .map(
       (f) =>
-        `- **${f.verification?.severity ?? f.severity}** ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""} — ` : ""}${f.title}\n  ${f.detail}${f.suggestion ? `\n  Suggestion: ${f.suggestion}` : ""}${f.verification ? `\n  Verified (${f.verification.verdict}) evidence: ${f.verification.evidence}\n  Trigger: ${f.verification.trigger}` : ""}`,
+        `- **${f.verification?.severity ?? f.severity}** ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""} — ` : ""}${f.title}\n  ${f.detail}${f.suggestion ? `\n  Suggestion: ${f.suggestion}` : ""}${f.verification ? `\n  Verified (${f.verification.verdict}) evidence: ${f.verification.evidence}\n  Trigger: ${f.verification.trigger}` : panel ? "\n  Unverified: the verifier gave no ruling, so it blocks until a review rules on it." : ""}`,
     )
     .join("\n")}`;
 }

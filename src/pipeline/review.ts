@@ -23,6 +23,13 @@ export const PANEL_VERIFY_CAP = 20;
 const PANEL_BATCH_SIZE = 5;
 /** A recheck of a prior blocking finding that no finder repeated. */
 const UNRAISED = { agreement: 0, finder: null, vendor: null, raisedBy: [] as number[] };
+/**
+ * Bumped when what a panel verifies or blocks changes in a way a stored output can't show, so eval
+ * caches stop reusing outputs made under the old policy. 2: security candidates are always verified,
+ * and missing rulings on security or prior blocking findings fail closed. 3: finder reports merge
+ * before verification.
+ */
+const PANEL_POLICY_VERSION = 3;
 
 /**
  * CONFIRMED, or PLAUSIBLE at high or above. Agreement between finders is recorded but does not count:
@@ -120,6 +127,12 @@ export function blockingReviewFindings(
   const panel = review.mode === "panel";
   if (panel && priorBlocking && panelReview === undefined)
     throw new Error('A panel re-review needs its review number or "resolution" to decide what blocks');
+  if (
+    panel &&
+    typeof panelReview === "number" &&
+    !(Number.isInteger(panelReview) && panelReview >= 1 && panelReview <= PANEL_REVIEWS)
+  )
+    throw new Error(`A panel review number is 1-${PANEL_REVIEWS} or "resolution", not ${panelReview}`);
   return review.findings.filter((finding) => {
     if (panel) return panelBlocks(finding, priorBlocking, panelReview ?? 1);
     if (!priorBlocking) return finding.severity === "blocker" || finding.severity === "major";
@@ -246,13 +259,15 @@ const TEMPLATE_INPUT: Parameters<typeof verifierPrompt>[0] = {
 };
 
 /**
- * What a panel's derived output depends on besides the case: the finder and verifier prompt templates,
- * the verifier schema, and the merge and batching policy. Eval caches key panel trials on it.
+ * What a panel's derived output depends on besides the case: the policy version, the finder and
+ * verifier prompt templates, the verifier schema, and the merge and batching policy. Eval caches key
+ * panel trials on it.
  */
 export function panelIdentity(): string {
   return new Bun.CryptoHasher("sha256")
     .update(
       JSON.stringify([
+        PANEL_POLICY_VERSION,
         (["standard", "adversarial", "careful"] as const).map((finder) =>
           reviewPrompt({ ...FINDER_TEMPLATE, finder }),
         ),
@@ -386,8 +401,9 @@ async function runPanel<T extends Invoked>(
   const { fixReview, previous } = input.prompt;
   const priorBlocking = previous?.findings ?? [];
   const cited = (c: Finding) => citedPriorIndex(c, priorBlocking.length);
-  // A citation of a prior blocking finding keeps that finding's category and finder security flag, as
-  // the automatic recheck does, so retagging it can't drop it from verification or the security rule.
+  // A citation of a prior blocking finding takes that finding's category (the verifier's, else the
+  // finder's), so retagging it can't drop it from verification. A citation or recheck of a prior
+  // security finding (either definition) stays one: no later ruling's category releases it unrefuted.
   const raised = found.flatMap(({ invoked, review }, finder) =>
     review.findings.map((f) => {
       const prior = priorBlocking[cited(f) ?? -1];
@@ -395,7 +411,7 @@ async function runPanel<T extends Invoked>(
       return {
         ...f,
         ...(category ? { category } : {}),
-        security: f.security || !!prior?.security,
+        security: f.security || (!!prior && isSecurity(prior)),
         finder,
         vendor: invoked.target?.vendor ?? null,
       };
@@ -405,11 +421,12 @@ async function runPanel<T extends Invoked>(
   const fix = fixReview && previous ? { review: fixReview, ...previous } : undefined;
   // A re-review never assumes a prior blocking finding fixed: whatever no finder repeated, the
   // verifier rechecks as a candidate of its own, outside the cap.
-  const rechecks = (fix?.findings ?? []).flatMap(({ verification: _stale, ...f }, i) =>
-    raised.some((c) => cited(c) === i)
-      ? []
-      : [{ ...f, label: "unaddressed" as const, prior: `P${i + 1}`, ...UNRAISED }],
-  );
+  const rechecks = (fix?.findings ?? []).flatMap((prior, i) => {
+    if (raised.some((c) => cited(c) === i)) return [];
+    const { verification: _stale, ...f } = prior;
+    const recheck = { ...f, security: isSecurity(prior), label: "unaddressed" as const, prior: `P${i + 1}` };
+    return [{ ...recheck, ...UNRAISED }];
+  });
   const candidates: PanelRecord["candidates"] = [...reports.candidates, ...rechecks].map((c, i) => ({
     ...c,
     id: `C${i + 1}`,
