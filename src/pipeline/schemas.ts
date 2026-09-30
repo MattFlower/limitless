@@ -193,7 +193,7 @@ export type Review = Omit<z.infer<typeof ReviewSchema>, "findings"> & {
     Partial<Pick<LiveFinding, FindingV2Field>> & {
       label?: z.infer<typeof LaterReviewSchema>["findings"][number]["label"];
       prior?: string;
-      /** Panel only; absent when the candidate was not verified (capped, cleanup or conventions, or left out by the verifier). */
+      /** Panel only; absent when the candidate was not verified (capped, cleanup or conventions). */
       verification?: Verification;
     })[];
 };

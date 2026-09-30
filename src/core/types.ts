@@ -386,7 +386,7 @@ export interface ReviewSystem {
   verifier?: { target?: string };
   implementerReport: "include" | "omit";
 }
-/** Trials an eval runs at once per provider, capped at the provider's `maxConcurrent` − 1 (at least 1). */
+/** Trials an eval runs at once per provider, before the provider's own `maxConcurrent` cap. */
 export const DEFAULT_EVAL_CONCURRENCY = 2;
 export interface EvalRun {
   rounds?: number;
