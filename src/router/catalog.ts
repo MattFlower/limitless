@@ -219,6 +219,19 @@ export const MODELS: ModelDef[] = [
     price: { input: 2, output: 10 },
     notes: "Previous generation; fallback if gpt-6-sol is unavailable",
   },
+  {
+    id: "codex/sol-6.1",
+    provider: "codex",
+    model: "gpt-6.1-sol",
+    vendor: "openai",
+    origin: "US",
+    baseOrigin: "US",
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    tier: 4,
+    effort: "medium",
+    price: { input: 2, output: 10, cacheRead: 0.1 },
+    notes: "Needs Codex CLI >= 0.159 on ChatGPT sign-in; under evaluation (#133), not in the routing policy",
+  },
   // Metered open models via OpenRouter (tiers are provisional until the M4 eval suite calibrates them).
   {
     id: "openrouter/deepseek-v4-pro",
@@ -288,7 +301,7 @@ export const MODELS: ModelDef[] = [
   },
   // Eval candidates; provisional tiers, deliberately absent from DEFAULT_POLICY.
   {
-    // Codex rejects gpt-6.1-sol on ChatGPT-account sign-in (2026-09-29), so it is metered here.
+    // Metered alternative to codex/sol-6.1 (Codex CLI before 0.159 rejects gpt-6.1-sol on ChatGPT sign-in).
     id: "openrouter/gpt-6.1-sol",
     provider: "openrouter",
     model: "openai/gpt-6.1-sol",
