@@ -55,8 +55,8 @@ function withGh(plan: Record<string, string[]>) {
 const pr = (signal?: AbortSignal, title = "T") =>
   createPullRequest(repo, { branch: "b", base: "main", title, body: "B", cwd: work, signal });
 
-/** A `git push` that lands, then reports a 502, once. */
-function flakyPush() {
+/** A `git push` that fails `dropped` times without effect, then lands but reports a 502, once. */
+function flakyPush(dropped = 0) {
   const real = Bun.which("git") ?? "git";
   const bin = join(dir, "bin");
   mkdirSync(bin, { recursive: true });
@@ -65,7 +65,7 @@ function flakyPush() {
     `#!/bin/sh
 if [ "$1" = push ]; then echo push >> '${join(dir, "pushes")}'; fi
 if [ "$1" = push ] && [ ! -f '${join(dir, "flaked")}' ]; then
-  touch '${join(dir, "flaked")}'; '${real}' "$@" || exit 1
+  if [ "$(wc -l < '${join(dir, "pushes")}')" -gt ${dropped} ]; then touch '${join(dir, "flaked")}'; '${real}' "$@" || exit 1; fi
   echo "error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502" >&2; exit 1
 fi
 exec '${real}' "$@"
@@ -160,6 +160,13 @@ test("merge reconciles a 502 that actually merged", async () => {
   expect(gh.calls("pr view")).toHaveLength(1);
 });
 
+test("a merge that lands on the final attempt is reported merged, not retried as auto-merge", async () => {
+  const gh = withGh({ merge: ["fail502", "fail502", "ok502"] });
+  expect(await mergePullRequest(gh.url, work, "T")).toBe("merged");
+  expect(gh.calls("pr merge")).toHaveLength(3);
+  expect(gh.calls("pr merge").some((c) => c.includes("--auto"))).toBe(false);
+});
+
 test("merge retries transient failures and leaves the PR open once exhausted", async () => {
   let gh = withGh({ merge: ["fail502"] });
   expect(await mergePullRequest(gh.url, work)).toBe("merged");
@@ -181,7 +188,8 @@ test("cancelling during backoff stops further GitHub calls", async () => {
   expect(Date.now() - started).toBeLessThan(3_000);
   await Bun.sleep(50);
   expect(gh.calls("pr create")).toHaveLength(1);
-  expect(gh.calls("pr list")).toHaveLength(1);
+  // The initial lookup plus the reconciliation right after the uncertain create; nothing after cancel.
+  expect(gh.calls("pr list")).toHaveLength(2);
 });
 
 test("push reconciles a 502 that actually landed", async () => {
@@ -190,6 +198,14 @@ test("push reconciles a 502 that actually landed", async () => {
   const head = (await git(work, "rev-parse", "HEAD")).stdout.trim();
   expect((await git(work, "ls-remote", bare, "refs/heads/feature")).stdout).toContain(head);
   expect(pushes()).toBe(1);
+});
+
+test("a push that lands on the final attempt is reconciled instead of reported unavailable", async () => {
+  const pushes = flakyPush(2);
+  await pushBranch(repo, work, "feature");
+  const head = (await git(work, "rev-parse", "HEAD")).stdout.trim();
+  expect((await git(work, "ls-remote", bare, "refs/heads/feature")).stdout).toContain(head);
+  expect(pushes()).toBe(3);
 });
 
 test("existing-branch push reconciles a 502 that actually landed", async () => {

@@ -37,23 +37,29 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Run `op` with bounded backoff on transient failures. Retries get `retrying = true` so they can
- * first reconcile with remote state: a 502 can hide an operation that actually succeeded.
+ * Run `op` with bounded backoff on transient failures. A 502 can hide an operation that actually
+ * succeeded, so after every transient failure (the last one included) `reconcile` may inspect
+ * remote state and return the settled result instead of repeating or failing the operation.
  */
 export async function withGithubRetry<T>(
   label: string,
-  op: (retrying: boolean) => Promise<T>,
-  signal?: AbortSignal,
+  op: () => Promise<T>,
+  opts: { signal?: AbortSignal; reconcile?: () => Promise<T | undefined> } = {},
 ): Promise<T> {
+  const { signal, reconcile } = opts;
   for (let attempt = 0; ; attempt++) {
     try {
-      return await op(attempt > 0);
+      return await op();
     } catch (e) {
       signal?.throwIfAborted();
       const message = (e as Error).message;
       // Command arguments (e.g. a PR title mentioning "timeout") are not evidence of a failure.
       const evidence = e instanceof CommandError ? `Command failed (${e.status})\n${e.output}` : message;
       if (!isTransient(evidence)) throw e;
+      // A reconcile failure leaves the outcome unknown, which the retry or the final error covers.
+      const settled = reconcile ? await reconcile().catch(() => undefined) : undefined;
+      if (settled !== undefined) return settled;
+      signal?.throwIfAborted();
       const delay = githubRetry.delaysMs[attempt];
       if (delay === undefined)
         throw new GitHubUnavailableError(
