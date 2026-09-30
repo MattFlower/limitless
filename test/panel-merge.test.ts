@@ -35,7 +35,17 @@ test("reports of the same claim from different finders merge, carrying every rep
   // The most concrete report is kept, with the highest severity; the other rides along.
   expect(candidate).toMatchObject({ line: 12, severity: "major", agreement: 2, raisedBy: [0, 1] });
   expect(candidate?.duplicates).toEqual([
-    { finder: 0, line: 10, title: claim, detail: "finder 0", suggestion: "s", failure_scenario: "" },
+    {
+      finder: 0,
+      line: 10,
+      title: claim,
+      detail: "finder 0",
+      suggestion: "s",
+      severity: "nit",
+      failure_scenario: "",
+      confidence: 0.9,
+      introduced_by_diff: true,
+    },
   ]);
 });
 

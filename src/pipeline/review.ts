@@ -457,36 +457,46 @@ async function runPanel<T extends Invoked>(
   const batches = batchesOf(candidates.filter((c) => selected.includes(c)));
   const firstPass = batches.length;
   // A re-review's verifier checks the same fix diff, and whether each prior finding is really resolved.
-  const verifierFix = fix
-    ? {
-        review: fix.review,
-        sha: fix.sha,
-        prior: fix.findings.map(({ file, line, title }, i) => {
-          const [repeated, recheck] = [true, false].map((byFinder) =>
-            candidates
-              .filter((c) => (c.finder !== null) === byFinder && cited(c) === i)
-              .map((c) => c.id)
-              .join(", "),
-          );
-          return {
-            id: `P${i + 1}`,
+  const verdicts = new Map<string, PanelRecord["verdicts"][number]>();
+  // Statuses name only candidates not yet refuted, so a second pass points at its own candidates.
+  const verifierFixNow = () =>
+    fix
+      ? {
+          review: fix.review,
+          sha: fix.sha,
+          prior: fix.findings.map(({ file, line, title }, i) => {
+            const [repeated, recheck] = [true, false].map((byFinder) =>
+              candidates
+                .filter(
+                  (c) =>
+                    (c.finder !== null) === byFinder &&
+                    cited(c) === i &&
+                    verdicts.get(c.id)?.verdict !== "REFUTED",
+                )
+                .map((c) => c.id)
+                .join(", "),
+            );
+            return {
+              id: `P${i + 1}`,
+              file,
+              line,
+              title,
+              status: repeated
+                ? `reported unaddressed by ${repeated}`
+                : recheck
+                  ? `not repeated by any finder; recheck it as ${recheck}`
+                  : "refuted at this review",
+            };
+          }),
+          resolved: (fix.resolved ?? []).map(({ file, line, title }) => ({
             file,
             line,
             title,
-            status: repeated
-              ? `reported unaddressed by ${repeated}`
-              : `not repeated by any finder; recheck it as ${recheck}`,
-          };
-        }),
-        resolved: (fix.resolved ?? []).map(({ file, line, title }) => ({
-          file,
-          line,
-          title,
-          status: "resolved at an earlier review",
-        })),
-      }
-    : undefined;
-  const verdicts = new Map<string, PanelRecord["verdicts"][number]>();
+            status: "resolved at an earlier review",
+          })),
+        }
+      : undefined;
+  let verifierFix = verifierFixNow();
   const omitted: string[] = [];
   let last = first.invoked.result;
   for (const [index, batch] of batches.entries()) {
@@ -547,16 +557,17 @@ async function runPanel<T extends Invoked>(
         `Verifier gave no ruling for ${pending.map((c) => c.id).join(", ")} after a retry; security and prior blocking findings among them block, the rest stay unverified follow-ups`,
       );
     }
-    // After the first pass, a refuted report doesn't settle the reports merged into it at other lines:
-    // each is then verified as a candidate of its own, outside the cap.
+    // After the first pass, a refuted report doesn't settle the reports merged into it that differ in
+    // line or title: each is then verified as a candidate of its own, outside the cap.
     if (index === firstPass - 1) {
       const split = candidates.flatMap(({ duplicates, ...c }) =>
         verdicts.get(c.id)?.verdict === "REFUTED"
           ? (duplicates ?? [])
-              .filter((d) => d.line !== c.line)
+              .filter((d) => d.line !== c.line || d.title !== c.title)
               .map((d) => ({
                 ...c,
                 ...d,
+                severity: d.severity ?? c.severity,
                 failure_scenario: d.failure_scenario ?? "",
                 agreement: 1,
                 vendor: found[d.finder]?.invoked.target?.vendor ?? null,
@@ -566,6 +577,7 @@ async function runPanel<T extends Invoked>(
       );
       const own = split.map((c, i) => ({ ...c, id: `C${candidates.length + i + 1}` }));
       candidates.push(...own);
+      verifierFix = verifierFixNow();
       batches.push(...batchesOf(own));
     }
   }

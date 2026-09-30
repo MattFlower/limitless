@@ -995,6 +995,58 @@ describe("runReview panel", () => {
       );
     });
 
+  test("a refuted claim's merged report with another title is verified on its own, at its own severity", async () => {
+    // Two different bugs at one line whose shared boilerplate scenario makes them merge.
+    const report = (title: string, severity: "blocker" | "nit") => ({
+      ...candidate("src/a.ts", 10, severity),
+      title,
+      failure_scenario:
+        "any request that reaches this handler throws before the response is written and the client receives an internal server error for every retry it makes",
+    });
+    const { out, verifications } = await panel(
+      [
+        [report("Null dereference in parseHeader", "blocker")],
+        [report("Off-by-one in pagination offset", "nit")],
+      ],
+      (id) => ({ ...confirmed, verdict: id === "C1" ? "REFUTED" : "PLAUSIBLE", severity: "medium" }),
+    );
+    expect(verifications.map((v) => ids(v.request.prompt))).toEqual([["C1"], ["C2"]]);
+    expect(out.panel?.candidates.map((c) => [c.id, c.line, c.title, c.severity])).toEqual([
+      ["C1", 10, "Null dereference in parseHeader", "blocker"],
+      ["C2", 10, "Off-by-one in pagination offset", "nit"],
+    ]);
+    expect(out.decision?.followUps.map((f) => [f.title, f.verification?.verdict])).toEqual([
+      ["Off-by-one in pagination offset", "PLAUSIBLE"],
+    ]);
+  });
+
+  test("the second pass tells the verifier which candidate now cites the prior finding", async () => {
+    const report = (name: string, line: number) => ({
+      ...candidate("src/a.ts", line),
+      title: `Unhandled rejection from writeFile in ${name}`,
+      failure_scenario:
+        "the promise rejects when the disk is full and nothing catches it, so the process crashes",
+      label: "unaddressed",
+      prior: "P1",
+    });
+    const { verifications } = await panel(
+      [[report("saveConfig", 10)], [report("saveCache", 25)]],
+      (id) => ({ ...confirmed, verdict: id === "C1" ? "REFUTED" : "CONFIRMED" }),
+      {
+        panelReview: 2,
+        prompt: {
+          ...prompt,
+          headSha: "head",
+          previous: { sha: "fixbase", findings: [finding("major")] },
+          fixReview: 2,
+        },
+      },
+    );
+    expect(verifications.map((v) => ids(v.request.prompt))).toEqual([["C1"], ["C2"]]);
+    expect(verifications[0]?.request.prompt).toContain('"status": "reported unaddressed by C1"');
+    expect(verifications[1]?.request.prompt).toContain('"status": "reported unaddressed by C2"');
+  });
+
   test("later-round finder prompts carry no panel agreement or merged reports", () => {
     const duplicates = [{ finder: 1, line: 2, title: "dup", detail: "DUP_DETAIL", suggestion: "" }];
     const prior = { ...finding("major"), agreement: 3, duplicates };

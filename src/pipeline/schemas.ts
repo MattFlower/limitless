@@ -183,8 +183,12 @@ export const VerifierSchema = z.object({
   results: z.array(VerificationSchema.extend({ id: z.string().describe("The candidate id, e.g. C3") })),
 });
 
+// A merged report keeps what its own verification would need if its claim is split off again.
 const DuplicateSchema = z.object({
   finder: z.number().int(),
+  severity: z.enum(["blocker", "major", "minor", "nit"]).optional(),
+  confidence: z.number().optional(),
+  introduced_by_diff: z.boolean().optional(),
   line: z.number().int(),
   title: z.string(),
   detail: z.string(),
