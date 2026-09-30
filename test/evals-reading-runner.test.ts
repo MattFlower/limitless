@@ -11,7 +11,7 @@ import { readingTimeout } from "../src/pipeline/engine.ts";
 import { FACTORY_PREAMBLE, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
 import * as review from "../src/pipeline/review.ts";
 import { ReviewSchema, toStrictJsonSchema, VerifySchema } from "../src/pipeline/schemas.ts";
-import type { ModelDef } from "../src/router/catalog.ts";
+import type { ModelDef, ProviderDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
@@ -21,8 +21,12 @@ import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
 
-async function fixture(role: "review" | "verify" = "review", extraModels: ModelDef[] = []) {
-  const f = await evalFixture(extraModels);
+async function fixture(
+  role: "review" | "verify" = "review",
+  extraModels: ModelDef[] = [],
+  extraProviders: ProviderDef[] = [],
+) {
+  const f = await evalFixture(extraModels, extraProviders);
   const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
   const item: ReviewCase = structuredClone({ ...reviewCase, base: f.sha, head });
   const verify = VerifyCaseFileSchema.parse(
@@ -643,6 +647,44 @@ test("panel calls count against the run's per-provider cap and release it when a
     f.respond(() => ({ structured: reviewOutput(), costUsd: 0.1 }));
     const after = await f.run({ models: undefined, systems: [single], concurrency: 1, cache: false });
     expect(after.trials.map((t) => t.status)).toEqual(["ok"]);
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("an eval panel skips a local finder that cannot run, as production does", async () => {
+  const local: ModelDef = { ...verifierModel, id: "local-q", provider: "local", vendor: "meta" };
+  const free: ProviderDef = {
+    id: "local",
+    label: "Local",
+    harness: "fake",
+    billing: "free",
+    maxConcurrent: 1,
+  };
+  const f = await fixture("review", [verifierModel, local], [free]);
+  try {
+    f.respond((s) =>
+      s.prompt.includes("code-review verifier") ? refuteAll(s) : { structured: reviewOutput(), costUsd: 0.1 },
+    );
+    f.factory.tracker.record("local", "quota", { exhaustedUntil: Date.now() + 3_600_000 });
+    const system = {
+      ...panelSystem,
+      finders: [
+        { target: "candidate-a", prompt: "standard" },
+        { target: "local-q", prompt: "standard", local: true },
+      ],
+    };
+    const report = await f.run({ models: undefined, systems: [system], cache: false });
+    expect(report.trials[0]?.status).toBe("ok");
+    expect(report.trials[0]?.output).toMatchObject({
+      panel: {
+        finders: [
+          { vendor: "other" },
+          { vendor: null, skipped: expect.stringContaining("local unavailable") },
+        ],
+      },
+    });
     await f.clean();
   } finally {
     await f.close();
