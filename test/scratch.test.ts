@@ -1,9 +1,10 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -13,7 +14,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
-import { buildCodexArgs, CodexReaderProbe, runCodex } from "../src/harness/codex.ts";
+import { buildCodexArgs, CodexReaderProbe, type ReaderProbeOptions, runCodex } from "../src/harness/codex.ts";
 import {
   createScratch,
   removeScratch,
@@ -304,156 +305,525 @@ test.skipIf(codexSkip !== null)(
 );
 
 const CODEX = "/opt/codex/bin/codex";
-const denies = (canary: string) => ({ exitCode: 1, stderr: `cat: ${canary}: Operation not permitted\n` });
+const SECRET = "sk-live-SENTINEL-4242";
+const denies = (file: string) => ({
+  exitCode: 1,
+  stderr: `cat: ${file}: Operation not permitted\n${SECRET}\n`,
+});
+const reads = (file: string) => ({ exitCode: 0, stdout: readFileSync(file, "utf8") });
+type Sandbox = (
+  file: string,
+  opts: ProcOptions,
+) => Partial<ProcResult> | Error | Promise<Partial<ProcResult> | Error>;
+/** An enforcing sandbox: the probe's cwd is readable, anything else is a permission denial. */
+const enforcing: Sandbox = (file, opts) => (file.startsWith(`${opts.cwd}/`) ? reads(file) : denies(file));
 
-/** A fake Codex CLI: `--version`, the `sandbox` probe (answered by `sandbox`), and a completing `exec`. */
-function fakeCodex(sandbox: (canary: string) => Partial<ProcResult> | Error = denies) {
-  const cli = { path: CODEX as string | null, version: "codex-cli 0.157.1" as string | null, sandboxes: 0 };
+const cleanups: (() => void)[] = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
+});
+
+interface SandboxRead {
+  file: string;
+  existed: boolean;
+  access: string;
+  cwd: string;
+  cmd: string[];
+  codexHome: string | undefined;
+  homeEmpty: boolean;
+  /** The production reader profile for the probe's cwd and scratch. */
+  built: string[];
+}
+
+/**
+ * A fake Codex CLI: `--version`, `sandbox` reads answered by `sandbox`, and a completing `exec`.
+ * Its private roots are distinct directories standing in for /tmp, the system TMPDIR and home,
+ * whatever the host's layout.
+ */
+function fakeCodex(sandbox: Sandbox = enforcing, options: ReaderProbeOptions = {}) {
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "probe-roots-")));
+  cleanups.push(() => rmSync(parent, { recursive: true, force: true }));
+  const roots = {
+    tmp: join(parent, "slash-tmp"),
+    TMPDIR: join(parent, "var-folders"),
+    home: join(parent, "home"),
+  };
+  for (const dir of Object.values(roots)) mkdirSync(dir);
+  const cli = {
+    path: CODEX as string | null,
+    version: "codex-cli 0.157.1",
+    lookup: null as Partial<ProcResult> | Error | null,
+  };
   const calls: string[][] = [];
-  const canaries: string[] = [];
+  const execs: ProcOptions[] = [];
+  const sandboxReads: SandboxRead[] = [];
   const runner = async (opts: ProcOptions): Promise<ProcResult> => {
     calls.push(opts.cmd);
-    if (opts.cmd[1] === "--version")
-      return cli.version ? { ...procResult, stdout: `${cli.version}\n` } : { ...procResult, exitCode: 1 };
+    if (opts.cmd[1] === "--version") {
+      if (cli.lookup instanceof Error) throw cli.lookup;
+      return { ...procResult, stdout: `${cli.version}\n`, ...cli.lookup };
+    }
     if (opts.cmd[1] === "sandbox") {
-      cli.sandboxes++;
-      const canary = opts.cmd.at(-1) ?? "";
-      canaries.push(canary);
-      await Bun.sleep(5);
-      const out = sandbox(canary);
+      const file = opts.cmd.at(-1) ?? "";
+      const codexHome = opts.env.CODEX_HOME;
+      sandboxReads.push({
+        file,
+        existed: existsSync(file),
+        access: codexAccess(opts.cmd, file),
+        cwd: opts.cwd,
+        cmd: opts.cmd,
+        codexHome,
+        homeEmpty: !!codexHome && readdirSync(codexHome).length === 0,
+        built: profileArgs(
+          buildCodexArgs({ ...specFor(opts.cwd, writeGrant(opts.cmd)), confineReads: true }),
+        ),
+      });
+      await Bun.sleep(1);
+      const out = await sandbox(file, opts);
       if (out instanceof Error) throw out;
       return { ...procResult, ...out };
     }
+    execs.push(opts);
     opts.onStdoutLine?.('{"type":"turn.completed","usage":{}}');
     return procResult;
   };
-  return { cli, calls, canaries, runner, probe: new CodexReaderProbe(() => cli.path) };
+  const probe = new CodexReaderProbe(() => cli.path, { canaryRoots: () => Object.values(roots), ...options });
+  /** Probe attempts that ran to the cwd control, i.e. complete ones. */
+  const probes = () => sandboxReads.filter((r) => r.file.startsWith(`${r.cwd}/`)).length;
+  return { cli, calls, execs, sandboxReads, roots, runner, probe, probes };
 }
 const profileArgs = (cmd: string[] = []) =>
   cmd.filter((arg, i) => cmd[i - 1] === "-c" && /permissions/.test(arg));
+const writeGrant = (cmd: string[]) =>
+  JSON.parse(
+    profileArgs(cmd)
+      .join("")
+      .match(/("(?:[^"\\]|\\.)*")="write"/)?.[1] ?? '""',
+  ) as string;
 
-test("a denied canary read lets confined codex exec run with the probed CLI and profile", async () => {
-  const { cwd, spec, cleanup } = confinedFixture();
+test("an enforcing CLI runs exec only after a readable cwd and a denial in every private root", async () => {
+  const { cwd, scratch, spec, cleanup } = confinedFixture();
   const fake = fakeCodex();
   try {
     const result = await runCodex(spec, fake.runner, fake.probe);
     expect(result.status).toBe("ok");
-    expect(result.confinement).toEqual({ ok: true, path: CODEX, version: "codex-cli 0.157.1", reason: null });
+    expect(result.confinement).toEqual({
+      ok: true,
+      path: CODEX,
+      version: "codex-cli 0.157.1",
+      reason: null,
+      exitCode: 0,
+    });
     expect(fake.calls.map((cmd) => cmd.slice(0, 2))).toEqual([
       [CODEX, "--version"],
-      [CODEX, "sandbox"],
+      ...Array(4).fill([CODEX, "sandbox"]),
       [CODEX, "exec"],
     ]);
-    const [, probe, exec] = fake.calls;
-    expect(profileArgs(exec)).toHaveLength(2);
-    expect(profileArgs(probe)).toEqual(profileArgs(exec));
-    const canary = fake.canaries[0] ?? "";
-    expect(canary.startsWith(realpathSync(cwd))).toBe(false);
-    expect(codexAccess(exec ?? [], canary)).toBe("none");
-    expect(existsSync(canary)).toBe(false);
+    const negatives = fake.sandboxReads.slice(0, 3);
+    const positive = fake.sandboxReads[3];
+    if (!positive) throw new Error("no cwd control");
+    for (const root of Object.values(fake.roots))
+      expect(negatives.filter((r) => r.file.startsWith(`${root}/`))).toHaveLength(1);
+    for (const read of negatives) {
+      expect(read.existed).toBe(true);
+      expect(read.access).toBe("none");
+      expect(read.file.startsWith(`${read.cwd}/`)).toBe(false);
+      expect(read.file.startsWith(`${writeGrant(read.cmd)}/`)).toBe(false);
+    }
+    expect(positive).toMatchObject({ existed: true, access: "read" });
+    expect(positive.file.startsWith(`${positive.cwd}/`)).toBe(true);
+    // The probe's own cwd and scratch, not the caller's; the profile comes from the production builder.
+    expect([positive.cwd, writeGrant(positive.cmd)]).not.toContain(realpathSync(cwd));
+    expect(writeGrant(positive.cmd)).not.toBe(realpathSync(scratch));
+    for (const read of fake.sandboxReads) {
+      expect(profileArgs(read.cmd)).toEqual(read.built);
+      expect(read.cmd).not.toContain("--ignore-user-config");
+      expect(read.codexHome).toBe(positive.codexHome);
+      expect(read.homeEmpty).toBe(true);
+    }
+    expect(positive.codexHome).not.toBe(process.env.CODEX_HOME);
+    expect(positive.codexHome).not.toBe(join(homedir(), ".codex"));
+    expect(profileArgs(fake.calls.at(-1))).toEqual(profileArgs(buildCodexArgs(spec)));
+    expect(fake.execs[0]?.env.CODEX_HOME).toBe(process.env.CODEX_HOME);
+    // Probe-owned files are gone; the roots and the caller's files are not.
+    for (const read of fake.sandboxReads) expect(existsSync(dirname(read.file))).toBe(false);
+    expect(existsSync(positive.codexHome ?? "")).toBe(false);
+    expect(existsSync(writeGrant(positive.cmd))).toBe(false);
+    for (const root of Object.values(fake.roots)) expect(existsSync(root)).toBe(true);
+    expect(readFileSync(join(cwd, "base.txt"), "utf8")).toBe("base\n");
+    expect(existsSync(scratch)).toBe(true);
   } finally {
     cleanup();
   }
 });
 
-for (const [name, sandbox, change, reason] of [
+const inRoot = (root: string, file: string) => file.startsWith(`${root}/`);
+const deferred = () => Promise.withResolvers<void>();
+
+for (const [name, sandbox, reason] of [
   [
-    "readable canary",
-    (c: string) => ({ exitCode: 0, stdout: readFileSync(c, "utf8") }),
-    {},
-    "allowed reading",
+    "codex 0.154.0: denies TMPDIR, allows /tmp and home",
+    (f: string) => (f.includes("/var-folders/") ? denies(f) : reads(f)),
+    "reader profile not enforced",
+  ],
+  [
+    "readable home canary",
+    (f: string, o: ProcOptions) => (f.includes("/home/") ? reads(f) : enforcing(f, o)),
+    "reader profile not enforced",
+  ],
+  [
+    "private canary leaked despite a nonzero exit",
+    (f: string, o: ProcOptions) => (inRoot(o.cwd, f) ? reads(f) : { ...reads(f), exitCode: 1 }),
+    "reader profile not enforced",
+  ],
+  [
+    "clean exit without output on a private canary",
+    () => ({ exitCode: 0, stdout: SECRET }),
+    "reader profile not enforced",
+  ],
+  ["denies every read, including the cwd", denies, "probe inconclusive"],
+  [
+    "ENOENT on an existing canary",
+    (f: string, o: ProcOptions) =>
+      f.includes("/slash-tmp/")
+        ? { exitCode: 1, stderr: `cat: ${f}: No such file or directory ${SECRET}` }
+        : enforcing(f, o),
+    "probe inconclusive",
+  ],
+  [
+    "ENOENT reported alongside a denial",
+    (f: string, o: ProcOptions) =>
+      inRoot(o.cwd, f)
+        ? reads(f)
+        : { exitCode: 1, stderr: `cat: ${f}: Permission denied\ncat: ${f}: No such file or directory` },
+    "probe inconclusive",
+  ],
+  [
+    "another path denied",
+    (f: string, o: ProcOptions) => (inRoot(o.cwd, f) ? reads(f) : denies("/x")),
+    "probe inconclusive",
   ],
   [
     "unrelated error",
-    () => ({ exitCode: 2, stderr: "error: unexpected argument '-c'" }),
-    {},
-    "did not report",
+    () => ({ exitCode: 2, stderr: `error: unexpected argument '-c' ${SECRET}` }),
+    "probe inconclusive",
   ],
-  ["other path denied", () => ({ exitCode: 1, stderr: "cat: /x: Permission denied" }), {}, "did not report"],
+  [
+    "malformed output",
+    () => ({ exitCode: 1, stdout: `\u0000{${SECRET}`, stderr: "garbage" }),
+    "probe inconclusive",
+  ],
+  [
+    "signalled denial",
+    (f: string) => ({ exitCode: null, signal: "SIGKILL", stderr: denies(f).stderr }),
+    "probe inconclusive",
+  ],
+  [
+    "cwd control missing",
+    (f: string, o: ProcOptions) =>
+      inRoot(o.cwd, f) ? { exitCode: 1, stderr: `cat: ${f}: No such file or directory` } : denies(f),
+    "probe inconclusive",
+  ],
+  [
+    "cwd control returns other contents",
+    (f: string, o: ProcOptions) =>
+      inRoot(o.cwd, f) ? { exitCode: 0, stdout: `canary-other ${SECRET}` } : denies(f),
+    "probe inconclusive",
+  ],
   [
     "timeout",
-    (c: string) => ({ exitCode: null, timedOut: true, stderr: denies(c).stderr }),
-    {},
-    "did not finish",
+    (f: string) => ({ exitCode: null, timedOut: true, stderr: denies(f).stderr }),
+    "probe timed out",
   ],
   [
-    "signaled denial",
-    (c: string) => ({ exitCode: null, signal: "SIGKILL", stderr: denies(c).stderr }),
-    {},
-    "did not finish (SIGKILL)",
+    "idle timeout",
+    (f: string) => ({ exitCode: 1, idleTimedOut: true, stderr: denies(f).stderr }),
+    "probe timed out",
   ],
-  ["sandbox startup", () => new Error("spawn EACCES"), {}, "failed to start: spawn EACCES"],
-  ["missing CLI", denies, { path: null }, "codex CLI not found"],
-  ["version lookup", denies, { version: null }, "--version failed (exit 1)"],
-  [
-    "garbled version output",
-    denies,
-    { version: "garbled version output" },
-    '--version failed: unrecognised output "garbled version output"',
-  ],
+  ["sandbox startup", () => new Error(`spawn EACCES ${SECRET}`), "codex sandbox failed to start"],
 ] as const)
   test(`confined codex exec never starts when the probe fails: ${name}`, async () => {
     const { spec, cleanup } = confinedFixture();
-    const fake = fakeCodex(sandbox);
-    Object.assign(fake.cli, change);
+    const fake = fakeCodex(sandbox as Sandbox);
     try {
       const result = await runCodex(spec, fake.runner, fake.probe);
       expect(result.status).toBe("unavailable");
-      expect(result.confinement?.ok).toBe(false);
-      expect(result.confinement?.reason).toContain(reason);
+      expect(result.confinement).toMatchObject({
+        ok: false,
+        path: CODEX,
+        version: "codex-cli 0.157.1",
+        reason,
+      });
       expect(result.error).toContain(reason);
-      expect(fake.calls.some((cmd) => cmd[1] === "exec")).toBe(false);
-      for (const canary of fake.canaries) expect(existsSync(canary)).toBe(false);
+      expect(JSON.stringify(result)).not.toContain(SECRET);
+      expect(JSON.stringify(result)).not.toContain("canary-");
+      expect(fake.execs).toHaveLength(0);
+      for (const read of fake.sandboxReads) {
+        expect(read.existed).toBe(true);
+        expect(existsSync(dirname(read.file))).toBe(false);
+      }
     } finally {
       cleanup();
     }
   });
 
-test("one probe per CLI path and version, shared by concurrent and later invocations", async () => {
+test("a canary that cannot be created makes the probe inconclusive and removes the others", async () => {
   const { spec, cleanup } = confinedFixture();
   const fake = fakeCodex();
-  const failing = fakeCodex(() => ({ exitCode: 0 }));
+  const missing = join(fake.roots.home, "missing");
+  const probe = new CodexReaderProbe(() => CODEX, { canaryRoots: () => [fake.roots.tmp, missing] });
   try {
-    await Promise.all([0, 1, 2].map(() => runCodex(spec, fake.runner, fake.probe)));
-    expect(fake.cli.sandboxes).toBe(1);
-    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
-    expect(fake.cli.sandboxes).toBe(1);
-    fake.cli.version = "codex-cli 0.158.0";
-    await runCodex(spec, fake.runner, fake.probe);
-    expect(fake.cli.sandboxes).toBe(2);
-    fake.cli.path = "/usr/local/bin/codex";
-    await runCodex(spec, fake.runner, fake.probe);
-    expect(fake.cli.sandboxes).toBe(3);
-    expect(fake.calls.filter((cmd) => cmd[1] === "exec")).toHaveLength(6);
-    for (const _ of [0, 1])
-      expect((await runCodex(spec, failing.runner, failing.probe)).status).toBe("unavailable");
-    expect(failing.cli.sandboxes).toBe(1);
+    const result = await runCodex(spec, fake.runner, probe);
+    expect(result.confinement).toMatchObject({ ok: false, reason: "probe inconclusive", exitCode: null });
+    expect(fake.sandboxReads).toHaveLength(0);
+    expect(fake.execs).toHaveLength(0);
+    expect(readdirSync(fake.roots.tmp)).toEqual([]);
+    const empty = new CodexReaderProbe(() => CODEX, { canaryRoots: () => [] });
+    expect((await runCodex(spec, fake.runner, empty)).confinement?.reason).toBe("probe inconclusive");
+    expect(fake.sandboxReads).toHaveLength(0);
   } finally {
     cleanup();
   }
 });
 
-test("cancelling during the probe stops it, never starts exec, and is not cached", async () => {
+test("a missing CLI fails closed without output", async () => {
   const { spec, cleanup } = confinedFixture();
   const fake = fakeCodex();
-  const abort = new AbortController();
-  const signals: (AbortSignal | undefined)[] = [];
-  const runner = async (opts: ProcOptions): Promise<ProcResult> => {
-    signals.push(opts.signal);
-    if (opts.cmd[1] !== "sandbox" || opts.signal !== abort.signal) return fake.runner(opts);
-    await new Promise((resolve) => abort.signal.addEventListener("abort", resolve, { once: true }));
-    return { ...procResult, exitCode: null, signal: "SIGTERM", cancelled: true };
-  };
+  fake.cli.path = null;
   try {
-    const pending = runCodex({ ...spec, signal: abort.signal }, runner, fake.probe);
+    const result = await runCodex(spec, fake.runner, fake.probe);
+    expect(result.status).toBe("unavailable");
+    expect(result.confinement).toEqual({
+      ok: false,
+      path: null,
+      version: null,
+      reason: "codex sandbox failed to start",
+      exitCode: null,
+    });
+    expect(fake.calls).toHaveLength(0);
+  } finally {
+    cleanup();
+  }
+});
+
+for (const [name, lookup, reason, exitCode] of [
+  ["nonzero exit", { exitCode: 1, stdout: "codex-cli 0.157.1\n" }, "probe inconclusive", 1],
+  ["startup error", new Error(`spawn ENOENT ${SECRET}`), "codex sandbox failed to start", null],
+  ["malformed output", { stdout: `codex-cli 0.157.1 ${SECRET}\n` }, "probe inconclusive", 0],
+  ["unrelated output", { stdout: `${SECRET}\n` }, "probe inconclusive", 0],
+  ["timeout with plausible output", { exitCode: 0, timedOut: true }, "probe timed out", 0],
+  ["signal with plausible output", { exitCode: null, signal: "SIGTERM" }, "probe inconclusive", null],
+] as const)
+  test(`an unknown version fails closed and never reuses a cached verdict: ${name}`, async () => {
+    const { spec, cleanup } = confinedFixture();
+    const fake = fakeCodex();
+    try {
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+      const before = fake.calls.length;
+      fake.cli.lookup = lookup;
+      const result = await runCodex(spec, fake.runner, fake.probe);
+      expect(result.status).toBe("unavailable");
+      expect(result.confinement).toEqual({ ok: false, path: CODEX, version: null, reason, exitCode });
+      expect(JSON.stringify(result)).not.toContain(SECRET);
+      expect(fake.calls.slice(before).map((cmd) => cmd[1])).toEqual(["--version"]);
+      fake.cli.lookup = null;
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+      expect(fake.probes()).toBe(1);
+      expect(fake.execs).toHaveLength(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+test("definitive verdicts are cached per CLI path and version, shared by concurrent callers", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  const old = fakeCodex((f) => (f.includes("/var-folders/") ? denies(f) : reads(f)));
+  try {
+    await Promise.all([0, 1, 2].map(() => runCodex(spec, fake.runner, fake.probe)));
+    expect(fake.probes()).toBe(1);
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+    expect(fake.probes()).toBe(1);
+    fake.cli.version = "codex-cli 0.158.0";
+    await runCodex(spec, fake.runner, fake.probe);
+    expect(fake.probes()).toBe(2);
+    fake.cli.path = "/usr/local/bin/codex";
+    await runCodex(spec, fake.runner, fake.probe);
+    expect(fake.probes()).toBe(3);
+    expect(fake.execs).toHaveLength(6);
+
+    const results = await Promise.all([0, 1, 2].map(() => runCodex(spec, old.runner, old.probe)));
+    results.push(await runCodex(spec, old.runner, old.probe));
+    for (const result of results) expect(result.confinement?.reason).toBe("reader profile not enforced");
+    const attempts = old.sandboxReads.length;
+    expect(attempts).toBeGreaterThan(0);
+    expect(new Set(old.sandboxReads.map((r) => r.cwd)).size).toBe(1);
+    expect(old.execs).toHaveLength(0);
+    old.cli.version = "codex-cli 0.154.1";
+    await runCodex(spec, old.runner, old.probe);
+    expect(new Set(old.sandboxReads.map((r) => r.cwd)).size).toBe(2);
+    old.cli.path = "/usr/local/bin/codex";
+    await runCodex(spec, old.runner, old.probe);
+    expect(new Set(old.sandboxReads.map((r) => r.cwd)).size).toBe(3);
+    expect(old.execs).toHaveLength(0);
+  } finally {
+    cleanup();
+  }
+});
+
+for (const [name, first] of [
+  ["timeout", (f: string) => ({ exitCode: null, timedOut: true, stderr: denies(f).stderr })],
+  ["startup error", () => new Error("spawn EAGAIN")],
+  ["inconclusive", () => ({ exitCode: 1, stderr: "sandbox: unexpected failure" })],
+] as const)
+  test(`a ${name} probe fails closed, is not cached, and is retried after the backoff`, async () => {
+    const { spec, cleanup } = confinedFixture();
+    let now = 1_000;
+    const sleeps: number[] = [];
+    let failing = true;
+    const fake = fakeCodex(
+      (f, o) => (failing ? (first as (f: string) => Partial<ProcResult> | Error)(f) : enforcing(f, o)),
+      {
+        backoffMs: 250,
+        now: () => now,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+          now += ms;
+        },
+      },
+    );
+    try {
+      const failed = await runCodex(spec, fake.runner, fake.probe);
+      expect(failed.status).toBe("unavailable");
+      expect(fake.execs).toHaveLength(0);
+      const attempts = fake.sandboxReads.length;
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("unavailable");
+      expect(sleeps).toEqual([250]);
+      expect(fake.sandboxReads.length).toBeGreaterThan(attempts);
+      failing = false;
+      now += 100;
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+      expect(sleeps).toEqual([250, 150]);
+      expect(fake.execs).toHaveLength(1);
+      expect(fake.probes()).toBe(1);
+      expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+      expect(sleeps).toHaveLength(2);
+      expect(fake.probes()).toBe(1);
+    } finally {
+      cleanup();
+    }
+  });
+
+/** Sandbox reads wait for `gate`; an aborted read ends as a cancelled process. */
+function gatedSandbox(gate: Promise<void>, signals: (AbortSignal | undefined)[]): Sandbox {
+  return async (file, opts) => {
+    signals.push(opts.signal);
+    const aborted = new Promise<"aborted">((resolve) => {
+      if (opts.signal?.aborted) resolve("aborted");
+      opts.signal?.addEventListener("abort", () => resolve("aborted"), { once: true });
+    });
+    if ((await Promise.race([gate.then(() => "open" as const), aborted])) === "aborted")
+      return { exitCode: null, signal: "SIGTERM", cancelled: true };
+    return enforcing(file, opts);
+  };
+}
+
+test("a cancelled waiter settles at once while the probe it joined completes for others", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const gate = deferred();
+  const signals: (AbortSignal | undefined)[] = [];
+  const fake = fakeCodex(gatedSandbox(gate.promise, signals));
+  const abort = new AbortController();
+  try {
+    const live = runCodex(spec, fake.runner, fake.probe);
+    while (!fake.sandboxReads.length) await Bun.sleep(1);
+    const cancelled = runCodex({ ...spec, signal: abort.signal }, fake.runner, fake.probe);
     await Bun.sleep(5);
     abort.abort();
-    const result = await pending;
-    expect(result.status).toBe("cancelled");
-    expect(signals.slice(0, 2)).toEqual([abort.signal, abort.signal]);
-    expect(fake.calls.some((cmd) => cmd[1] === "exec")).toBe(false);
-    expect((await runCodex(spec, runner, fake.probe)).status).toBe("ok");
-    expect(fake.cli.sandboxes).toBe(1);
+    expect((await cancelled).status).toBe("cancelled");
+    expect(fake.sandboxReads).toHaveLength(1);
+    gate.resolve();
+    expect((await live).status).toBe("ok");
+    expect(fake.execs).toHaveLength(1);
+    expect(signals.every((s) => s !== abort.signal && !s?.aborted)).toBe(true);
+  } finally {
+    gate.resolve();
+    cleanup();
+  }
+});
+
+test("cancelling the caller that started a probe leaves it running for a live waiter", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const gate = deferred();
+  const signals: (AbortSignal | undefined)[] = [];
+  const fake = fakeCodex(gatedSandbox(gate.promise, signals));
+  const abort = new AbortController();
+  try {
+    const initiator = runCodex({ ...spec, signal: abort.signal }, fake.runner, fake.probe);
+    while (!fake.sandboxReads.length) await Bun.sleep(1);
+    const live = runCodex(spec, fake.runner, fake.probe);
+    await Bun.sleep(5);
+    abort.abort();
+    const settled = await initiator;
+    expect(settled.status).toBe("cancelled");
+    expect(settled.confinement).toBeUndefined();
+    gate.resolve();
+    expect((await live).status).toBe("ok");
+    expect(fake.probes()).toBe(1);
+    expect(fake.execs).toHaveLength(1);
+  } finally {
+    gate.resolve();
+    cleanup();
+  }
+});
+
+test("cancelling the only caller stops its probe, never starts exec, and is not cached", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const gate = deferred();
+  const signals: (AbortSignal | undefined)[] = [];
+  const fake = fakeCodex(gatedSandbox(gate.promise, signals));
+  const abort = new AbortController();
+  try {
+    const pending = runCodex({ ...spec, signal: abort.signal }, fake.runner, fake.probe);
+    while (!fake.sandboxReads.length) await Bun.sleep(1);
+    abort.abort();
+    expect((await pending).status).toBe("cancelled");
+    await Bun.sleep(5);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(fake.execs).toHaveLength(0);
+    for (const read of fake.sandboxReads) expect(existsSync(dirname(read.file))).toBe(false);
+    gate.resolve();
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+    expect(fake.probes()).toBe(1);
+  } finally {
+    gate.resolve();
+    cleanup();
+  }
+});
+
+test("cancelling during the backoff returns promptly and is not cached", async () => {
+  const { spec, cleanup } = confinedFixture();
+  let now = 0;
+  let failing = true;
+  const fake = fakeCodex((f, o) => (failing ? { exitCode: 1, stderr: "?" } : enforcing(f, o)), {
+    backoffMs: 60_000,
+    now: () => now,
+  });
+  const abort = new AbortController();
+  try {
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("unavailable");
+    const attempts = fake.sandboxReads.length;
+    const started = Date.now();
+    const waiting = runCodex({ ...spec, signal: abort.signal }, fake.runner, fake.probe);
+    await Bun.sleep(5);
+    abort.abort();
+    expect((await waiting).status).toBe("cancelled");
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(fake.sandboxReads).toHaveLength(attempts);
+    failing = false;
+    now = 60_000;
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+    expect(fake.execs).toHaveLength(1);
   } finally {
     cleanup();
   }

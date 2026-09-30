@@ -88,7 +88,8 @@ export const ProviderCard: Component<{ provider: ProviderStatus; workload?: Prov
           {(c) => (
             <div class="provider-reason">
               Confined readers skip this provider: {c().reason} ({c().path ?? "no CLI"}
-              {c().version ? `, ${c().version}` : ""})
+              {c().version ? `, ${c().version}` : ""}
+              {c().exitCode === null ? "" : `, exit ${c().exitCode}`})
             </div>
           )}
         </Show>

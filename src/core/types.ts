@@ -267,12 +267,20 @@ export interface ProviderStatus {
   confinement?: ConfinementProbe;
 }
 
-/** Whether a CLI's sandbox denied a canary read outside a confined reader's cwd and scratch. */
+/** Fixed probe diagnostics: the CLI's own output can echo config, including tokens. */
+export type ConfinementFailure =
+  | "reader profile not enforced"
+  | "probe inconclusive"
+  | "probe timed out"
+  | "codex sandbox failed to start";
+
+/** Whether a CLI's sandbox let a confined reader read its cwd but denied every private root. */
 export interface ConfinementProbe {
   ok: boolean;
   path: string | null;
   version: string | null;
-  reason: string | null;
+  reason: ConfinementFailure | null;
+  exitCode: number | null;
 }
 
 export interface QuotaAlert {

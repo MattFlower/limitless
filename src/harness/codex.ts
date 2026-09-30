@@ -11,8 +11,8 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ConfinementProbe, QuotaWindow } from "../core/types.ts";
-import { agentEnv, runProcess } from "../util/proc.ts";
+import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
+import { agentEnv, type ProcResult, runProcess } from "../util/proc.ts";
 import { readConfinement, scratchEnv, validateDenyRead, validateScratch } from "./scratch.ts";
 import {
   type AgentEvent,
@@ -253,103 +253,248 @@ function readerProfile(spec: AgentSpec, scratch: string): string[] {
   ];
 }
 
-/** A denial names the canary; ENOENT counts because the canary exists outside the sandbox. */
-const DENIED = /operation not permitted|permission denied|no such file or directory/i;
+/** A genuine permission denial; ENOENT is not one (every canary exists). */
+const DENIED = /operation not permitted|permission denied|\bEACCES\b|\bEPERM\b/i;
 /** `codex --version` prints one line such as `codex-cli 0.157.1`. */
-const CODEX_VERSION = /^codex(?:-cli)?\s+v?\d+\.\d+\.\d+\S*$/;
+const CODEX_VERSION = /^codex(?:-cli)?\s+v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/;
+const NOT_ENFORCED: ConfinementFailure = "reader profile not enforced";
+const INCONCLUSIVE: ConfinementFailure = "probe inconclusive";
+const TIMED_OUT: ConfinementFailure = "probe timed out";
+const START_FAILED: ConfinementFailure = "codex sandbox failed to start";
 
 /**
- * Older Codex CLIs accept the reader profile but don't enforce it (0.154.0 allowed denied reads),
- * so before the first confined run per CLI path and version, require `codex sandbox` with the same
- * profile to deny a canary outside cwd and scratch. Results, passing or not, last for the process.
+ * Each distinct private root a confined reader is denied: /tmp (other readers' scratch), the
+ * system TMPDIR, and the home directory (the factory's home when it exists).
+ */
+export function canaryRoots(): string[] {
+  const factory = join(homedir(), ".limitless");
+  const roots = ["/tmp", tmpdir(), existsSync(factory) ? factory : homedir()];
+  return [...new Set(roots.map((root) => realpathSync(root)))];
+}
+
+export interface ReaderProbeOptions {
+  /** Where the negative canaries go; a probe needs one denied read in each. */
+  canaryRoots?: () => string[];
+  /** Wait after an inconclusive probe before the next attempt. */
+  backoffMs?: number;
+  now?: () => number;
+  /** Resolves after `ms`, or early once `signal` aborts. */
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+}
+
+interface Flight {
+  result: Promise<ConfinementProbe | null>;
+  abort: AbortController;
+  waiters: number;
+}
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+    if (signal.aborted) done();
+  });
+}
+
+/** `promise`, or undefined as soon as `signal` aborts. */
+function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
+  if (signal.aborted) return Promise.resolve(undefined);
+  return new Promise((resolve) => {
+    const onAbort = () => resolve(undefined);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then((value) => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    });
+  });
+}
+
+/**
+ * Older Codex CLIs accept the reader profile but don't fully enforce it (0.154.0 denies TMPDIR yet
+ * allows /tmp and home), so before confined runs on a CLI path and version, `codex sandbox` with
+ * the production profile must read a canary in its cwd and be denied one in every private root.
+ * Only definitive verdicts are cached; anything else fails closed and is retried after a backoff.
  */
 export class CodexReaderProbe {
-  private readonly results = new Map<string, Promise<ConfinementProbe>>();
-  constructor(private readonly which: (cmd: string) => string | null = (cmd) => Bun.which(cmd)) {}
+  private readonly verdicts = new Map<string, ConfinementProbe>();
+  private readonly flights = new Map<string, Flight>();
+  private readonly retryAt = new Map<string, number>();
+  private readonly roots: () => string[];
+  private readonly backoffMs: number;
+  private readonly now: () => number;
+  private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+
+  constructor(
+    private readonly which: (cmd: string) => string | null = (cmd) => Bun.which(cmd),
+    options: ReaderProbeOptions = {},
+  ) {
+    this.roots = options.canaryRoots ?? canaryRoots;
+    this.backoffMs = options.backoffMs ?? 250;
+    this.now = options.now ?? Date.now;
+    this.sleep = options.sleep ?? abortableSleep;
+  }
 
   async verify(spec: AgentSpec, run: typeof runProcess): Promise<ConfinementProbe> {
     const path = this.which("codex");
-    if (!path) return { ok: false, path: null, version: null, reason: "codex CLI not found on PATH" };
-    let version: string | null = null;
-    let lookup = "codex --version failed";
-    try {
-      const proc = await run({
-        cmd: [path, "--version"],
-        cwd: spec.cwd,
-        env: agentEnv(),
-        timeoutMs: 30_000,
-        signal: spec.signal,
-      });
-      const line = proc.stdout.trim().split("\n")[0]?.trim() ?? "";
-      if (proc.exitCode !== 0) lookup = `codex --version failed (exit ${proc.exitCode ?? proc.signal})`;
-      else if (CODEX_VERSION.test(line)) version = line;
-      else lookup = `codex --version failed: unrecognised output ${JSON.stringify(line.slice(0, 80))}`;
-    } catch (e) {
-      lookup = `codex --version failed: ${(e as Error).message}`;
-    }
-    if (spec.signal.aborted) return { ok: false, path, version, reason: PROBE_CANCELLED };
-    // The version keys the cache, so only a line we can recognise as a Codex release counts.
-    if (!version) return { ok: false, path, version: null, reason: lookup };
-    const key = `${path}\0${version}`;
+    if (!path) return { ok: false, path: null, version: null, reason: START_FAILED, exitCode: null };
+    const lookup = await codexVersion(path, spec, run);
+    const unverified = { ok: false, path, version: lookup.version, reason: INCONCLUSIVE, exitCode: null };
+    if (spec.signal.aborted) return unverified;
+    if (!lookup.version) return { ...unverified, reason: lookup.reason, exitCode: lookup.exitCode };
+    const key = `${path}\0${lookup.version}`;
     for (;;) {
-      let pending = this.results.get(key);
-      if (!pending) {
-        pending = sandboxProbe(spec, path, version, run);
-        this.results.set(key, pending);
+      const verdict = this.verdicts.get(key);
+      if (verdict) return verdict;
+      let flight = this.flights.get(key);
+      const wait = (this.retryAt.get(key) ?? 0) - this.now();
+      if (!flight && wait > 0) {
+        await this.sleep(wait, spec.signal);
+        if (spec.signal.aborted) return unverified;
+        continue;
       }
-      const result = await pending;
-      if (result.reason !== PROBE_CANCELLED) return result;
-      // A cancelled probe says nothing about the CLI: drop it, and let live waiters probe again.
-      if (this.results.get(key) === pending) this.results.delete(key);
-      if (spec.signal.aborted) return result;
+      flight ??= this.start(key, spec, path, lookup.version, run);
+      flight.waiters++;
+      const result = await unlessAborted(flight.result, spec.signal);
+      flight.waiters--;
+      if (spec.signal.aborted) {
+        // Stop a probe nobody waits for; a cancelled probe says nothing about the CLI.
+        if (flight.waiters === 0 && this.flights.get(key) === flight) {
+          this.flights.delete(key);
+          flight.abort.abort();
+        }
+        return unverified;
+      }
+      if (result) return result;
     }
+  }
+
+  private start(key: string, spec: AgentSpec, path: string, version: string, run: typeof runProcess): Flight {
+    const abort = new AbortController();
+    const result = sandboxProbe(spec, path, version, run, abort.signal, this.roots).then((probe) => {
+      if (this.flights.get(key) === flight) this.flights.delete(key);
+      if (!probe) return null;
+      if (probe.ok || probe.reason === NOT_ENFORCED) this.verdicts.set(key, probe);
+      else this.retryAt.set(key, this.now() + this.backoffMs);
+      return probe;
+    });
+    const flight: Flight = { result, abort, waiters: 0 };
+    this.flights.set(key, flight);
+    return flight;
   }
 }
 
 export const codexReaderProbe = new CodexReaderProbe();
-const PROBE_CANCELLED = "confinement probe cancelled";
 
-async function sandboxProbe(
+/** Only a clean, completed lookup with recognisable output identifies the CLI. */
+async function codexVersion(
+  path: string,
   spec: AgentSpec,
+  run: typeof runProcess,
+): Promise<{ version: string | null; reason: ConfinementFailure; exitCode: number | null }> {
+  try {
+    const proc = await run({
+      cmd: [path, "--version"],
+      cwd: spec.cwd,
+      env: agentEnv(),
+      timeoutMs: 30_000,
+      signal: spec.signal,
+    });
+    if (proc.timedOut || proc.idleTimedOut)
+      return { version: null, reason: TIMED_OUT, exitCode: proc.exitCode };
+    const line = proc.stdout.trim().split("\n")[0]?.trim() ?? "";
+    const clean = proc.exitCode === 0 && !proc.signal && !proc.cancelled && CODEX_VERSION.test(line);
+    return { version: clean ? line : null, reason: INCONCLUSIVE, exitCode: proc.exitCode };
+  } catch {
+    return { version: null, reason: START_FAILED, exitCode: null };
+  }
+}
+
+/** Null when `signal` aborted it. Never keeps the CLI's output: it can echo config and tokens. */
+async function sandboxProbe(
+  template: AgentSpec,
   path: string,
   version: string,
   run: typeof runProcess,
-): Promise<ConfinementProbe> {
-  const fail = (reason: string): ConfinementProbe => ({ ok: false, path, version, reason });
-  let dir: string | null = null;
+  signal: AbortSignal,
+  roots: () => string[],
+): Promise<ConfinementProbe | null> {
+  const result = (reason: ConfinementFailure | null, exitCode: number | null): ConfinementProbe | null =>
+    signal.aborted ? null : { ok: reason === null, path, version, reason, exitCode };
+  const owned: string[] = [];
+  const temp = (root: string, prefix: string) => {
+    const dir = mkdtempSync(join(root, prefix));
+    owned.push(dir);
+    return realpathSync(dir);
+  };
+  const canary = (dir: string) => {
+    const file = { path: join(dir, "canary.txt"), token: `canary-${randomUUID()}` };
+    writeFileSync(file.path, file.token);
+    return file;
+  };
   try {
-    const scratch = validateScratch(spec);
-    // The temporary directory is a private root: denied to the reader, and outside cwd and scratch.
-    dir = mkdtempSync(join(realpathSync(tmpdir()), "limitless-canary-"));
-    const canary = join(dir, "canary.txt");
-    const token = `canary-${randomUUID()}`;
-    writeFileSync(canary, token);
-    const { cwd, scratch: own } = readConfinement(spec, scratch);
-    if ([...cwd, ...own].some((root) => canary.startsWith(`${root}/`)))
-      return fail("no canary location outside the reader's cwd and scratch");
-    const proc = await run({
-      cmd: [path, "sandbox", ...readerProfile(spec, scratch), "--", "/bin/cat", canary],
-      cwd: spec.cwd,
-      env: agentEnv(scratchEnv(spec)),
-      timeoutMs: 60_000,
-      signal: spec.signal,
-    });
-    if (proc.cancelled) return fail(PROBE_CANCELLED);
-    if (proc.exitCode === 0 || proc.stdout.includes(token))
-      return fail("sandbox allowed reading a canary outside the reader's cwd");
-    // Only a completed, nonzero exit can confirm a denial; a signal or timeout is ambiguous.
-    if (proc.timedOut || proc.idleTimedOut || proc.exitCode === null || proc.signal)
-      return fail(`sandbox probe did not finish (${proc.signal ?? "timed out"})`);
-    const denied = proc.stderr.split("\n").some((line) => line.includes(canary) && DENIED.test(line));
-    if (!denied)
-      return fail(
-        `sandbox did not report a denied read (exit ${proc.exitCode ?? proc.signal}): ${proc.stderr.trim().slice(-300)}`,
-      );
-    return { ok: true, path, version, reason: null };
-  } catch (e) {
-    return fail(`sandbox probe failed to start: ${(e as Error).message}`);
+    let spec: AgentSpec;
+    let scratch: string;
+    let codexHome: string;
+    let positive: { path: string; token: string };
+    let negatives: { path: string; token: string }[];
+    try {
+      const tmp = realpathSync(tmpdir());
+      // The probe owns its cwd and scratch, laid out like a real reader's, so no caller's files move.
+      spec = {
+        ...template,
+        cwd: temp(tmp, "limitless-probe-"),
+        scratchDir: temp(tmp, "limitless-probe-scratch-"),
+        denyRead: [],
+        confineReads: true,
+      };
+      scratch = validateScratch(spec);
+      // An empty CODEX_HOME: `codex sandbox` has no --ignore-user-config, and exec ignores it.
+      codexHome = temp(tmp, "limitless-probe-home-");
+      positive = canary(spec.cwd);
+      negatives = roots().map((root) => canary(temp(root, "limitless-canary-")));
+      const { cwd, scratch: writable } = readConfinement(spec, scratch);
+      const granted = (file: string) => [...cwd, ...writable].some((root) => file.startsWith(`${root}/`));
+      if (!negatives.length || negatives.some((file) => granted(file.path)))
+        return result(INCONCLUSIVE, null);
+    } catch {
+      return result(INCONCLUSIVE, null);
+    }
+    const read = async (file: string) =>
+      run({
+        cmd: [path, "sandbox", ...readerProfile(spec, scratch), "--", "/bin/cat", file],
+        cwd: spec.cwd,
+        env: agentEnv({ ...scratchEnv(spec), CODEX_HOME: codexHome }),
+        timeoutMs: 60_000,
+        signal,
+      });
+    for (const file of [...negatives, positive]) {
+      let proc: ProcResult;
+      try {
+        proc = await read(file.path);
+      } catch {
+        return result(START_FAILED, null);
+      }
+      if (signal.aborted || proc.cancelled) return result(INCONCLUSIVE, proc.exitCode);
+      if (file !== positive && proc.stdout.includes(file.token)) return result(NOT_ENFORCED, proc.exitCode);
+      if (proc.timedOut || proc.idleTimedOut) return result(TIMED_OUT, proc.exitCode);
+      // Only a completed exit is an answer; a signal is ambiguous.
+      if (proc.signal || proc.exitCode === null) return result(INCONCLUSIVE, proc.exitCode);
+      if (file === positive) {
+        const ok = proc.exitCode === 0 && proc.stdout.trim() === file.token;
+        return result(ok ? null : INCONCLUSIVE, proc.exitCode);
+      }
+      if (proc.exitCode === 0) return result(NOT_ENFORCED, proc.exitCode);
+      const denied = proc.stderr.split("\n").some((line) => line.includes(file.path) && DENIED.test(line));
+      if (!denied || /no such file/i.test(proc.stderr)) return result(INCONCLUSIVE, proc.exitCode);
+    }
+    return result(INCONCLUSIVE, null);
   } finally {
-    if (dir) rmSync(dir, { recursive: true, force: true });
+    for (const dir of owned) rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -455,9 +600,9 @@ export async function runCodex(
         costEquivUsd: 0,
         error: "cancelled",
         quota: null,
-        confinement,
       };
     if (!confinement.ok || !confinement.path) {
+      const exit = confinement.exitCode === null ? "" : `, exit ${confinement.exitCode}`;
       const cli = `${confinement.path ?? "codex"}${confinement.version ? ` (${confinement.version})` : ""}`;
       return {
         status: "unavailable",
@@ -468,7 +613,7 @@ export async function runCodex(
         numTurns: 0,
         costUsd: 0,
         costEquivUsd: 0,
-        error: `Codex read confinement not verified for ${cli}: ${confinement.reason}; confined readers will not run on this CLI`,
+        error: `Codex read confinement not verified for ${cli}: ${confinement.reason}${exit}; confined readers will not run on this CLI`,
         quota: null,
         confinement,
       };

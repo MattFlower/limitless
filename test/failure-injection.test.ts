@@ -459,52 +459,135 @@ for (const fallback of [false, true])
     history(f, id);
   });
 
-test("a Codex CLI that fails the reader probe diverts confined readers without running them", async () => {
+const SECRET = "sk-live-SENTINEL-0154";
+
+/** Stand-ins for /tmp, the macOS TMPDIR (/var/folders/...) and home, distinct on any host. */
+function privateRoots() {
+  const roots = { tmp: join(root, "slash-tmp"), TMPDIR: join(root, "var-folders"), home: join(root, "home") };
+  for (const dir of Object.values(roots)) mkdirSync(dir);
+  return roots;
+}
+
+async function confinedHoldout(f: ReturnType<typeof factory>, prompt = "Write holdout checks") {
+  const r = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
+  const repo = f.store.getRepo(r.repoId);
+  if (!repo) throw new Error("missing repo");
+  const ctx = new RunContext(f.deps, r, repo, new AbortController().signal);
+  const cwd = mkdtempSync(join(root, "snapshot-"));
+  const invoke = (confined: boolean) =>
+    ctx.invoke({
+      stage: f.store.startStage(r.id, "holdout"),
+      role: "holdout",
+      complexity: "small",
+      mode: "readonly",
+      prompt,
+      cwd,
+      ...(confined ? { confineReads: true } : {}),
+      privateOutput: true,
+    });
+  return { run: r, invoke };
+}
+
+test("codex 0.154.0, which denies TMPDIR but allows /tmp and home, diverts confined readers", async () => {
+  const roots = privateRoots();
   const commands: string[][] = [];
   const cli = async (opts: ProcOptions): Promise<ProcResult> => {
     commands.push(opts.cmd);
     const base = { exitCode: 0, signal: null, cancelled: false, timedOut: false, idleTimedOut: false };
     const done = { ...base, stdout: "", stderr: "", truncated: false, durationMs: 1 };
     if (opts.cmd[1] === "--version") return { ...done, stdout: "codex-cli 0.154.0\n" };
-    // 0.154.0 accepts the profile but lets the denied read through.
-    if (opts.cmd[1] === "sandbox") return { ...done, stdout: readFileSync(opts.cmd.at(-1) ?? "", "utf8") };
+    if (opts.cmd[1] === "sandbox") {
+      // 0.154.0 accepts the profile but only the TMPDIR deny takes effect; stderr echoes config.
+      const file = opts.cmd.at(-1) ?? "";
+      if (file.startsWith(`${roots.TMPDIR}/`))
+        return {
+          ...done,
+          exitCode: 1,
+          stderr: `token = "${SECRET}"\ncat: ${file}: Operation not permitted\n`,
+        };
+      return { ...done, stdout: readFileSync(file, "utf8"), stderr: `token = "${SECRET}"\n` };
+    }
     return done;
   };
-  const probe = new CodexReaderProbe(() => "/old/node_modules/.bin/codex");
+  const probe = new CodexReaderProbe(() => "/old/node_modules/.bin/codex", {
+    canaryRoots: () => Object.values(roots),
+  });
   const [a, b] = providers;
   if (!a || !b) throw new Error("missing fixture providers");
   const f = factory(undefined, answer, {
     providers: [{ ...a, harness: "codex" }, b],
     harnesses: { fake: fakeHarness(answer), codex: (s) => runCodex(s, cli, probe) },
   });
-  const r = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
-  const repo = f.store.getRepo(r.repoId);
-  if (!repo) throw new Error("missing repo");
-  const ctx = new RunContext(f.deps, r, repo, new AbortController().signal);
-  const cwd = join(root, "snapshot");
-  mkdirSync(cwd);
-  const outcome = await ctx.invoke({
-    stage: f.store.startStage(r.id, "holdout"),
-    role: "holdout",
-    complexity: "small",
-    mode: "readonly",
-    prompt: "Write holdout checks",
-    cwd,
-    confineReads: true,
-    privateOutput: true,
-  });
+  const { run: r, invoke } = await confinedHoldout(f);
+  const outcome = await invoke(true);
   expect(outcome.target.provider).toBe("b");
-  expect(commands.map((cmd) => cmd[1])).toEqual(["--version", "sandbox"]);
+  expect(commands.map((cmd) => cmd[1])).not.toContain("exec");
+  expect(commands.filter((cmd) => cmd[1] === "sandbox").length).toBeGreaterThan(0);
   const [rejected, fallback] = f.store.listInvocations(r.id);
   expect(fallback).toMatchObject({ provider: "b", status: "ok" });
   expect(rejected).toMatchObject({ provider: "a", status: "unavailable" });
   expect(rejected?.error).toContain("/old/node_modules/.bin/codex (codex-cli 0.154.0)");
-  expect(rejected?.error).toContain("allowed reading a canary");
+  expect(rejected?.error).toContain("reader profile not enforced, exit 0");
   // The provider stays routable for unconfined roles; its card says why confined readers skip it.
   expect(f.tracker.status("a")).toMatchObject({
     state: "ok",
-    confinement: { ok: false, path: "/old/node_modules/.bin/codex", version: "codex-cli 0.154.0" },
+    confinement: {
+      ok: false,
+      path: "/old/node_modules/.bin/codex",
+      version: "codex-cli 0.154.0",
+      reason: "reader profile not enforced",
+      exitCode: 0,
+    },
   });
+  const surfaces = JSON.stringify([
+    f.store.listInvocations(r.id),
+    f.store.listEvents(r.id),
+    f.tracker.status("a"),
+  ]);
+  expect(surfaces).not.toContain(SECRET);
+});
+
+test("a confinement failure that reads like a model rejection blocks neither model nor provider", async () => {
+  const [a, b] = providers;
+  if (!a || !b) throw new Error("missing fixture providers");
+  const confinedCalls: string[] = [];
+  const f = factory(undefined, answer, {
+    providers: [{ ...a, harness: "codex" }, b],
+    harnesses: {
+      fake: fakeHarness(answer),
+      codex: async (s) => {
+        const result = await fakeHarness(answer)(s);
+        if (!s.confineReads) return result;
+        confinedCalls.push(s.target.modelId);
+        return {
+          ...result,
+          status: "unavailable",
+          structured: null,
+          error: "model a is not supported: unknown model",
+          confinement: {
+            ok: false,
+            path: "/bin/codex",
+            version: null,
+            reason: "probe inconclusive",
+            exitCode: 1,
+          },
+        };
+      },
+    },
+  });
+  const { run: r, invoke } = await confinedHoldout(f);
+  expect((await invoke(true)).target.provider).toBe("b");
+  expect(confinedCalls).toEqual(["a"]);
+  expect(f.tracker.modelUnavailableReason("a")).toBeNull();
+  expect(f.tracker.status("a")).toMatchObject({ state: "ok", reason: null, until: null });
+  expect(f.tracker.isAvailable("a")).toBe(true);
+  // The same model still serves unconfined roles.
+  expect((await invoke(false)).target.modelId).toBe("a");
+  expect(f.store.listInvocations(r.id).map((i) => [i.provider, i.status])).toEqual([
+    ["a", "unavailable"],
+    ["b", "ok"],
+    ["a", "ok"],
+  ]);
 });
 
 test("fault matching is one-shot, independent, and already-aborted hangs settle", async () => {

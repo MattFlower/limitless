@@ -618,6 +618,14 @@ export class RunContext {
         attempt--;
         continue;
       }
+      if (result.confinement?.ok === false) {
+        // Checked before MODEL_REJECTED: the CLI, not the model, failed, so nothing gets blocked.
+        // Never retried unconfined; each model is tried once, so this doesn't spend attempts.
+        lastFailure = `${target.targetId ?? target.modelId}: ${result.error ?? ""}`.slice(0, 300);
+        this.log(`${target.targetId ?? target.modelId} cannot confine reads; falling back`, "warn");
+        attempt--;
+        continue;
+      }
       if (result.status !== "ok" && MODEL_REJECTED.test(result.error ?? "")) {
         // A configuration problem with this model (e.g. not on the plan), not a task failure.
         tracker.blockModel(
@@ -635,13 +643,6 @@ export class RunContext {
           `${target.targetId ?? target.modelId} rejected by provider; blocking it for 24h and falling back`,
           "warn",
         );
-        continue;
-      }
-      if (result.confinement?.ok === false) {
-        // Never retried unconfined; each model is tried once, so this doesn't spend attempts.
-        lastFailure = `${target.targetId ?? target.modelId}: ${result.error ?? ""}`.slice(0, 300);
-        this.log(`${target.targetId ?? target.modelId} cannot confine reads; falling back`, "warn");
-        attempt--;
         continue;
       }
       if (result.status === "quota" || result.status === "unavailable") {
