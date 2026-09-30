@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { type PresetTarget, transformAsync } from "@babel/core";
 import ts from "@babel/preset-typescript";
 import { renderToString } from "solid-js/web";
+import { fakeHarness } from "../src/harness/fake.ts";
+import { VerifySchema } from "../src/pipeline/schemas.ts";
 
 const solid = createRequire(import.meta.url)("babel-preset-solid") as PresetTarget<object>;
 test("verification artifact renders blocked evidence and legacy statuses", async () => {
@@ -75,6 +77,49 @@ test("verification artifact renders blocked evidence and legacy statuses", async
     );
     expect(legacy).toContain("old/model");
     expect(legacy).not.toContain("🚧");
+    expect(legacy).not.toContain("not required");
+    const reply = await fakeHarness(() => ({
+      structured: {
+        criteria: [
+          {
+            id: "H-1",
+            status: "unmet",
+            evidence: "dismissed",
+            publicSummary: "",
+            requirement: "not_required",
+          },
+          { id: "H-2", status: "unmet", evidence: "blocking", publicSummary: "", requirement: "spec" },
+        ],
+        overall: "pass",
+        notes: "",
+      },
+    }))({
+      cwd: dir,
+      prompt: "Verify the holdouts",
+      target: {
+        modelId: "fake/model",
+        provider: "fake",
+        harness: "fake",
+        model: "fake",
+        vendor: "fake",
+        tier: 1,
+        billing: "subscription",
+      },
+      mode: "readonly",
+      timeoutMs: 1000,
+      idleTimeoutMs: 1000,
+      maxToolCalls: 0,
+      signal: new AbortController().signal,
+      logPath: join(dir, "fake.log"),
+      onEvent: () => {},
+    });
+    const dismissed = renderToString(() => VerifyArtifact({ data: VerifySchema.parse(reply.structured) }));
+    expect(dismissed).toContain("unmet (not required)");
+    expect(dismissed.split("unmet (not required)").length - 1).toBe(1);
+    // Only the blocking row is red; the dismissed row is neutral.
+    expect(dismissed.split("badge-unmet").length - 1).toBe(1);
+    expect(dismissed).toMatch(/badge-dismissed[^>]*>unmet \(not required\)/);
+    expect(dismissed).toContain("pill-succeeded");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

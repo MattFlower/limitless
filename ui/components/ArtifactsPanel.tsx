@@ -44,6 +44,7 @@ interface VerifyCriterionJson {
   id: string;
   status: "met" | "unmet" | "unclear" | "blocked";
   evidence: string;
+  requirement?: "request" | "spec" | "not_required" | null;
 }
 interface VerifyJson {
   criteria: VerifyCriterionJson[];
@@ -227,9 +228,13 @@ export const VerifyArtifact: Component<{ data: VerifyJson }> = (props) => (
             <tr>
               <td class="mono">{c.id}</td>
               <td>
-                <span class={`badge badge-${c.status}`}>
-                  {c.status === "blocked" ? "🚧 blocked" : c.status}
-                </span>
+                {c.status === "unmet" && c.requirement === "not_required" ? (
+                  <span class="badge badge-dismissed">unmet (not required)</span>
+                ) : (
+                  <span class={`badge badge-${c.status}`}>
+                    {c.status === "blocked" ? "🚧 blocked" : c.status}
+                  </span>
+                )}
               </td>
               <td class="text-dim">{c.evidence}</td>
             </tr>
