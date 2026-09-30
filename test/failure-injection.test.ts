@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory, type FactoryOptions } from "../src/app.ts";
@@ -465,7 +474,8 @@ const SECRET = "sk-live-SENTINEL-0154";
 function privateRoots() {
   const roots = { tmp: join(root, "slash-tmp"), TMPDIR: join(root, "var-folders"), home: join(root, "home") };
   for (const dir of Object.values(roots)) mkdirSync(dir);
-  return roots;
+  // Canonical, as the probe's canary paths are.
+  return { tmp: realpathSync(roots.tmp), TMPDIR: realpathSync(roots.TMPDIR), home: realpathSync(roots.home) };
 }
 
 async function confinedHoldout(f: ReturnType<typeof factory>, prompt = "Write holdout checks") {
@@ -488,7 +498,7 @@ async function confinedHoldout(f: ReturnType<typeof factory>, prompt = "Write ho
   return { run: r, invoke };
 }
 
-test("codex 0.154.0, which denies TMPDIR but allows /tmp and home, diverts confined readers", async () => {
+test("codex 0.154.0, which denies home and TMPDIR but allows /tmp, diverts confined readers", async () => {
   const roots = privateRoots();
   const commands: string[][] = [];
   const cli = async (opts: ProcOptions): Promise<ProcResult> => {
@@ -497,9 +507,9 @@ test("codex 0.154.0, which denies TMPDIR but allows /tmp and home, diverts confi
     const done = { ...base, stdout: "", stderr: "", truncated: false, durationMs: 1 };
     if (opts.cmd[1] === "--version") return { ...done, stdout: "codex-cli 0.154.0\n" };
     if (opts.cmd[1] === "sandbox") {
-      // 0.154.0 accepts the profile but only the TMPDIR deny takes effect; stderr echoes config.
+      // 0.154.0 accepts the profile but leaves /tmp readable; stderr echoes config.
       const file = opts.cmd.at(-1) ?? "";
-      if (file.startsWith(`${roots.TMPDIR}/`))
+      if (file.startsWith(`${roots.TMPDIR}/`) || file.startsWith(`${roots.home}/`))
         return {
           ...done,
           exitCode: 1,
@@ -510,7 +520,7 @@ test("codex 0.154.0, which denies TMPDIR but allows /tmp and home, diverts confi
     return done;
   };
   const probe = new CodexReaderProbe(() => "/old/node_modules/.bin/codex", {
-    canaryRoots: () => Object.values(roots),
+    canaryRoots: () => [roots.TMPDIR, roots.home, roots.tmp],
   });
   const [a, b] = providers;
   if (!a || !b) throw new Error("missing fixture providers");
@@ -522,7 +532,9 @@ test("codex 0.154.0, which denies TMPDIR but allows /tmp and home, diverts confi
   const outcome = await invoke(true);
   expect(outcome.target.provider).toBe("b");
   expect(commands.map((cmd) => cmd[1])).not.toContain("exec");
-  expect(commands.filter((cmd) => cmd[1] === "sandbox").length).toBeGreaterThan(0);
+  // Home and TMPDIR were denied; the /tmp canary is the one that leaked.
+  const reads = commands.filter((cmd) => cmd[1] === "sandbox").map((cmd) => cmd.at(-1) ?? "");
+  expect(reads.map((file) => file.startsWith(`${roots.tmp}/`))).toEqual([false, false, true]);
   const [rejected, fallback] = f.store.listInvocations(r.id);
   expect(fallback).toMatchObject({ provider: "b", status: "ok" });
   expect(rejected).toMatchObject({ provider: "a", status: "unavailable" });

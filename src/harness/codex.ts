@@ -15,7 +15,14 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
 import { agentEnv, type ProcResult, runProcess } from "../util/proc.ts";
-import { readConfinement, scratchEnv, validateDenyRead, validateScratch } from "./scratch.ts";
+import {
+  createScratch,
+  readConfinement,
+  scratchEnv,
+  scratchParent,
+  validateDenyRead,
+  validateScratch,
+} from "./scratch.ts";
 import {
   type AgentEvent,
   type AgentResult,
@@ -342,6 +349,8 @@ export interface ReaderProbeOptions {
   now?: () => number;
   /** Resolves after `ms`, or early once `signal` aborts. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /** Removes a probe-owned directory once the probe settles. */
+  remove?: (dir: string) => void;
 }
 
 interface Flight {
@@ -377,8 +386,8 @@ function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T |
 }
 
 /**
- * Older Codex CLIs accept the reader profile but don't fully enforce it (0.154.0 denies TMPDIR yet
- * allows /tmp and home), so before confined runs on a CLI path and version, `codex sandbox` with
+ * Older Codex CLIs accept the reader profile but don't fully enforce it (0.154.0 denies home and TMPDIR
+ * yet allows /tmp), so before confined runs on a CLI path and version, `codex sandbox` with
  * the production profile must read a canary in its cwd and be denied one in every private root.
  * Only definitive verdicts are cached; anything else fails closed and is retried after a backoff.
  */
@@ -390,6 +399,7 @@ export class CodexReaderProbe {
   private readonly backoffMs: number;
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+  private readonly remove: (dir: string) => void;
 
   constructor(
     private readonly which: (cmd: string) => string | null = (cmd) => Bun.which(cmd),
@@ -399,6 +409,7 @@ export class CodexReaderProbe {
     this.backoffMs = options.backoffMs ?? 250;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? abortableSleep;
+    this.remove = options.remove ?? ((dir) => rmSync(dir, { recursive: true, force: true }));
   }
 
   async verify(spec: AgentSpec, run: typeof runProcess): Promise<ConfinementProbe> {
@@ -437,16 +448,37 @@ export class CodexReaderProbe {
 
   private start(key: string, spec: AgentSpec, path: string, version: string, run: typeof runProcess): Flight {
     const abort = new AbortController();
-    const result = sandboxProbe(spec, path, version, run, abort.signal, this.roots).then((probe) => {
-      if (this.flights.get(key) === flight) this.flights.delete(key);
-      if (!probe) return null;
-      if (probe.ok || probe.reason === NOT_ENFORCED) this.verdicts.set(key, probe);
-      else this.retryAt.set(key, this.now() + this.backoffMs);
-      return probe;
-    });
+    const owned: string[] = [];
+    const unsettled = (): ConfinementProbe | null =>
+      abort.signal.aborted ? null : { ok: false, path, version, reason: INCONCLUSIVE, exitCode: null };
+    const result = sandboxProbe(spec, path, version, run, abort.signal, this.roots, owned)
+      .catch(unsettled)
+      .then((settled) => {
+        // Leftover canaries mean the probe didn't finish cleanly: fail closed and retry later.
+        const cleaned = owned.filter((dir) => !this.cleanup(dir)).length === 0;
+        if (this.flights.get(key) === flight) this.flights.delete(key);
+        if (!settled) return null;
+        const probe = cleaned ? settled : { ...settled, ok: false, reason: INCONCLUSIVE, exitCode: null };
+        if (probe.ok || probe.reason === NOT_ENFORCED) this.verdicts.set(key, probe);
+        else this.retryAt.set(key, this.now() + this.backoffMs);
+        return probe;
+      });
     const flight: Flight = { result, abort, waiters: 0 };
     this.flights.set(key, flight);
     return flight;
+  }
+
+  /** Best-effort; logs only the error code, never the path. */
+  private cleanup(dir: string): boolean {
+    try {
+      this.remove(dir);
+      return true;
+    } catch (error) {
+      console.warn(
+        `[codex] probe cleanup failed: ${(error as NodeJS.ErrnoException).code ?? "unknown error"}`,
+      );
+      return false;
+    }
   }
 }
 
@@ -484,10 +516,11 @@ async function sandboxProbe(
   run: typeof runProcess,
   signal: AbortSignal,
   roots: (deny: string[]) => string[],
+  /** Directories the probe created; the caller removes them once it settles. */
+  owned: string[],
 ): Promise<ConfinementProbe | null> {
   const result = (reason: ConfinementFailure | null, exitCode: number | null): ConfinementProbe | null =>
     signal.aborted ? null : { ok: reason === null, path, version, reason, exitCode };
-  const owned: string[] = [];
   const temp = (root: string, prefix: string) => {
     const dir = mkdtempSync(join(root, prefix));
     owned.push(dir);
@@ -498,65 +531,58 @@ async function sandboxProbe(
     writeFileSync(file.path, file.token);
     return file;
   };
+  let spec: AgentSpec;
+  let scratch: string;
+  let codexHome: string;
+  let positive: { path: string; token: string };
+  let negatives: { path: string; token: string }[];
   try {
-    let spec: AgentSpec;
-    let scratch: string;
-    let codexHome: string;
-    let positive: { path: string; token: string };
-    let negatives: { path: string; token: string }[];
-    try {
-      const tmp = realpathSync(tmpdir());
-      // The probe owns its cwd and scratch, laid out like a real reader's, so no caller's files move.
-      spec = {
-        ...template,
-        cwd: temp(tmp, "limitless-probe-"),
-        scratchDir: temp(tmp, "limitless-probe-scratch-"),
-        denyRead: [],
-        confineReads: true,
-      };
-      scratch = validateScratch(spec);
-      // An empty CODEX_HOME: `codex sandbox` has no --ignore-user-config, and exec ignores it.
-      codexHome = temp(tmp, "limitless-probe-home-");
-      positive = canary(spec.cwd);
-      const { cwd, scratch: writable, deny } = readConfinement(spec, scratch);
-      negatives = roots(deny).map((root) => canary(temp(root, "limitless-canary-")));
-      const granted = (file: string) => [...cwd, ...writable].some((root) => file.startsWith(`${root}/`));
-      if (!negatives.length || negatives.some((file) => granted(file.path)))
-        return result(INCONCLUSIVE, null);
-    } catch {
-      return result(INCONCLUSIVE, null);
-    }
-    const read = async (file: string) =>
-      run({
-        cmd: [path, "sandbox", ...readerProfile(spec, scratch), "--", "/bin/cat", file],
-        cwd: spec.cwd,
-        env: agentEnv({ ...scratchEnv(spec), CODEX_HOME: codexHome }),
-        timeoutMs: 60_000,
-        signal,
-      });
-    for (const file of [...negatives, positive]) {
-      let proc: ProcResult;
-      try {
-        proc = await read(file.path);
-      } catch {
-        return result(START_FAILED, null);
-      }
-      if (signal.aborted || proc.cancelled) return result(INCONCLUSIVE, proc.exitCode);
-      // Only a completed exit is an answer, and only an answer may be cached.
-      if (proc.timedOut || proc.idleTimedOut) return result(TIMED_OUT, proc.exitCode);
-      if (proc.signal || proc.exitCode === null) return result(INCONCLUSIVE, proc.exitCode);
-      if (file === positive) {
-        const ok = proc.exitCode === 0 && proc.stdout.trim() === file.token;
-        return result(ok ? null : INCONCLUSIVE, proc.exitCode);
-      }
-      if (proc.stdout.includes(file.token)) return result(NOT_ENFORCED, proc.exitCode);
-      if (proc.exitCode === 0 || !deniedRead(proc.stderr, file.path))
-        return result(INCONCLUSIVE, proc.exitCode);
-    }
+    const tmp = realpathSync(tmpdir());
+    // The probe owns its cwd and scratch, so no caller's files move; the scratch comes from a real
+    // reader's createScratch and the caller's denyRead applies, so it checks the profile that runs.
+    const probeCwd = temp(tmp, "limitless-probe-");
+    const scratchDir = createScratch(probeCwd);
+    owned.push(scratchParent(scratchDir));
+    spec = { ...template, cwd: probeCwd, scratchDir, confineReads: true };
+    scratch = validateScratch(spec);
+    // An empty CODEX_HOME: `codex sandbox` has no --ignore-user-config, and exec ignores it.
+    codexHome = temp(tmp, "limitless-probe-home-");
+    positive = canary(spec.cwd);
+    const { cwd, scratch: writable, deny } = readConfinement(spec, scratch);
+    negatives = roots(deny).map((root) => canary(temp(root, "limitless-canary-")));
+    const granted = (file: string) => [...cwd, ...writable].some((root) => file.startsWith(`${root}/`));
+    if (!negatives.length || negatives.some((file) => granted(file.path))) return result(INCONCLUSIVE, null);
+  } catch {
     return result(INCONCLUSIVE, null);
-  } finally {
-    for (const dir of owned) rmSync(dir, { recursive: true, force: true });
   }
+  const read = async (file: string) =>
+    run({
+      cmd: [path, "sandbox", ...readerProfile(spec, scratch), "--", "/bin/cat", file],
+      cwd: spec.cwd,
+      env: agentEnv({ ...scratchEnv(spec), CODEX_HOME: codexHome }),
+      timeoutMs: 60_000,
+      signal,
+    });
+  for (const file of [...negatives, positive]) {
+    let proc: ProcResult;
+    try {
+      proc = await read(file.path);
+    } catch {
+      return result(START_FAILED, null);
+    }
+    if (signal.aborted || proc.cancelled) return result(INCONCLUSIVE, proc.exitCode);
+    // Only a completed exit is an answer, and only an answer may be cached.
+    if (proc.timedOut || proc.idleTimedOut) return result(TIMED_OUT, proc.exitCode);
+    if (proc.signal || proc.exitCode === null) return result(INCONCLUSIVE, proc.exitCode);
+    if (file === positive) {
+      const ok = proc.exitCode === 0 && proc.stdout.trim() === file.token;
+      return result(ok ? null : INCONCLUSIVE, proc.exitCode);
+    }
+    if (proc.stdout.includes(file.token)) return result(NOT_ENFORCED, proc.exitCode);
+    if (proc.exitCode === 0 || !deniedRead(proc.stderr, file.path))
+      return result(INCONCLUSIVE, proc.exitCode);
+  }
+  return result(INCONCLUSIVE, null);
 }
 
 export function buildCodexArgs(spec: AgentSpec): string[] {

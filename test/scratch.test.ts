@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
@@ -476,8 +476,8 @@ const deferred = () => Promise.withResolvers<void>();
 
 for (const [name, sandbox, reason] of [
   [
-    "codex 0.154.0: denies TMPDIR, allows /tmp and home",
-    (f: string) => (f.includes("/var-folders/") ? denies(f) : reads(f)),
+    "codex 0.154.0: denies home and TMPDIR, allows /tmp",
+    (f: string, o: ProcOptions) => (f.includes("/slash-tmp/") ? reads(f) : enforcing(f, o)),
     "reader profile not enforced",
   ],
   [
@@ -635,6 +635,76 @@ test("a canary that cannot be created makes the probe inconclusive and removes t
     const empty = new CodexReaderProbe(() => CODEX, { canaryRoots: () => [] });
     expect((await runCodex(spec, fake.runner, empty)).confinement?.reason).toBe("probe inconclusive");
     expect(fake.sandboxReads).toHaveLength(0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("codex 0.154.0 is unsafe because /tmp leaks, even with home and TMPDIR denied", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex((f, o) => (inRoot(fake.roots.tmp, f) ? reads(f) : enforcing(f, o)), {
+    canaryRoots: () => [fake.roots.TMPDIR, fake.roots.home, fake.roots.tmp],
+  });
+  try {
+    const result = await runCodex(spec, fake.runner, fake.probe);
+    expect(result.confinement).toMatchObject({ ok: false, reason: "reader profile not enforced" });
+    const order = fake.sandboxReads.map((r) => [inRoot(fake.roots.tmp, r.file), r.access]);
+    // TMPDIR and home were denied first; the verdict rests on the /tmp canary alone.
+    expect(order).toEqual([
+      [false, "none"],
+      [false, "none"],
+      [true, "none"],
+    ]);
+    expect(fake.execs).toHaveLength(0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a probe cleanup error fails the call closed promptly and the next call probes again", async () => {
+  const { spec, cleanup } = confinedFixture();
+  let failing = true;
+  const fake = fakeCodex(enforcing, {
+    backoffMs: 0,
+    remove: (dir) => {
+      rmSync(dir, { recursive: true, force: true });
+      if (failing) throw Object.assign(new Error(`EBUSY ${SECRET}`), { code: "EBUSY" });
+    },
+  });
+  try {
+    const first = await runCodex(spec, fake.runner, fake.probe);
+    expect(first.status).toBe("unavailable");
+    expect(first.confinement).toMatchObject({ ok: false, reason: "probe inconclusive" });
+    expect(fake.execs).toHaveLength(0);
+    failing = false;
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+    expect(fake.probes()).toBe(2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("the probe's scratch and denyRead match the real reader's", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const extra = realpathSync(mkdtempSync(join(tmpdir(), "limitless-deny-test-")));
+  cleanups.push(() => rmSync(extra, { recursive: true, force: true }));
+  const fake = fakeCodex();
+  let deny: string[] = [];
+  const probe = new CodexReaderProbe(() => CODEX, {
+    canaryRoots: (d) => {
+      deny = d;
+      return Object.values(fake.roots);
+    },
+  });
+  try {
+    expect((await runCodex({ ...spec, denyRead: [extra] }, fake.runner, probe)).status).toBe("ok");
+    expect(deny).toContain(extra);
+    for (const read of fake.sandboxReads) {
+      expect(codexAccess(read.cmd, join(extra, "x"))).toBe("none");
+      const scratch = writeGrant(read.cmd);
+      expect(basename(scratch)).toBe(SCRATCH_NAME);
+      expect(basename(dirname(scratch))).toStartWith("lr-");
+    }
   } finally {
     cleanup();
   }
