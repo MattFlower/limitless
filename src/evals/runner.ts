@@ -16,7 +16,7 @@ import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
 import {
   combined,
-  panelVerifierIdentity,
+  panelIdentity,
   type ReviewRequest,
   runReview,
   type VerifierRequest,
@@ -563,7 +563,7 @@ export class EvalRunner {
                   }
                 : { head: item.head, input: item.input }),
               ...(system ? { reviewSystem: reviewSystemHash(system) } : {}),
-              ...(system?.mode === "panel" ? { verifier: panelVerifierIdentity() } : {}),
+              ...(system?.mode === "panel" ? { panel: panelIdentity() } : {}),
               patch,
               ...(item.snapshot ? { snapshot: true } : {}),
               source:
@@ -682,6 +682,7 @@ export class EvalRunner {
                 timeoutMs,
               },
               to = { target, harness, noTools },
+              log = logPath,
             ) =>
               to.harness({
                 scratchDir,
@@ -697,7 +698,7 @@ export class EvalRunner {
                 idleTimeoutMs: 10 * 60_000,
                 maxToolCalls: "hidden" in item ? 400 : 150,
                 signal,
-                logPath,
+                logPath: log,
                 onEvent: (event) => {
                   if (
                     event.type === "tool_call" &&
@@ -710,14 +711,20 @@ export class EvalRunner {
                   if (event.type === "rate_limit") tracker.observeWindows(to.target.provider, event.windows);
                 },
               });
-            const send = (request?: ReviewRequest | VerifierRequest, to = { target, harness, noTools }) =>
+            const send = (
+              request?: ReviewRequest | VerifierRequest,
+              to = { target, harness, noTools },
+              log = logPath,
+            ) =>
               to.noTools
-                ? invoke(undefined, request, to)
+                ? invoke(undefined, request, to, log)
                 : scratch
-                  ? invoke(scratch, request, to)
-                  : withScratch(cwd, (dir) => invoke(dir, request, to));
+                  ? invoke(scratch, request, to, log)
+                  : withScratch(cwd, (dir) => invoke(dir, request, to, log));
+            // Panel members run in parallel, so each call logs (and keeps a schema file) of its own.
+            let verifications = 0;
             // Never hold one provider's slot while waiting for another panel member's provider.
-            const sendTo = async (request: ReviewRequest | VerifierRequest, to: ModelTarget) => {
+            const sendTo = async (request: ReviewRequest | VerifierRequest, to: ModelTarget, log: string) => {
               const picked = selectHarness(run.role, to);
               const agent = harnesses[picked.harnessName];
               if (!agent) throw new Error(`No harness registered for ${picked.harnessName}`);
@@ -733,7 +740,11 @@ export class EvalRunner {
                 try {
                   // Quota, a circuit breaker or the reserve may have closed the provider during the wait.
                   check();
-                  const sent = await send(request, { target: to, harness: agent, noTools: picked.noTools });
+                  const sent = await send(
+                    request,
+                    { target: to, harness: agent, noTools: picked.noTools },
+                    `${logPath}.${log}`,
+                  );
                   spent.push(sent);
                   observe(to, sent);
                   return { result: sent, target: to };
@@ -751,7 +762,7 @@ export class EvalRunner {
                     {
                       invoke: async (request, finder) => {
                         const to = finder > 0 ? panelTargets?.finders[finder - 1] : undefined;
-                        if (to) return sendTo(request, to);
+                        if (to) return sendTo(request, to, `finder-${finder}`);
                         try {
                           own = await send(request);
                           spent.push(own);
@@ -763,13 +774,14 @@ export class EvalRunner {
                         }
                         return { result: own, target };
                       },
-                      verify: async (request, avoidVendor) => {
+                      verify: async (request, avoidVendors) => {
                         if (!panelTargets) throw new Error("review system has no verifier");
-                        if (panelTargets.verifier.vendor === avoidVendor)
+                        const { modelId, vendor } = panelTargets.verifier;
+                        if (avoidVendors.includes(vendor))
                           throw new Error(
-                            `verifier ${panelTargets.verifier.modelId} shares vendor ${avoidVendor} with its finder`,
+                            `verifier ${modelId} shares vendor ${vendor} with a finder it checks`,
                           );
-                        return sendTo(request, panelTargets.verifier);
+                        return sendTo(request, panelTargets.verifier, `verifier-${++verifications}`);
                       },
                     },
                     reviewInput,

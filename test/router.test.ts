@@ -381,6 +381,14 @@ describe("Router", () => {
     expect(ids).toEqual(["claude/sonnet"]);
   });
 
+  test("avoids every listed vendor, and falls back to them when nothing else is left", () => {
+    const { router } = setup();
+    const ids = (avoidVendor: string[]) =>
+      router.route("review", "small", { avoidVendor }).candidates.map((c) => c.modelId);
+    expect(ids(["google", "openai"])).toEqual(["claude/sonnet", "codex/sol"]);
+    expect(ids(["openai", "anthropic"])).toEqual(ids([]));
+  });
+
   test("escalation adds higher-tier models beyond the policy list", () => {
     const { router } = setup();
     const ids = router.route("implement", "small", { minTier: 5, exclude: ["claude/sonnet"] }).candidates;

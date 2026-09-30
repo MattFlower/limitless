@@ -361,7 +361,7 @@ test("review trials need v2 fields and keep the model's verdict, and pre-v2 stor
   }
 });
 
-test("panel systems run finders and a pinned verifier end to end, grading what the panel blocks", async () => {
+test("panel systems run finders with their own prompts and a pinned verifier end to end, grading what the panel blocks", async () => {
   const f = await fixture("review", [verifierModel]);
   try {
     const verdict = { current: "CONFIRMED" };
@@ -384,7 +384,7 @@ test("panel systems run finders and a pinned verifier end to end, grading what t
         mode: "panel",
         finders: [
           { target: "candidate-a", prompt: "standard" },
-          { target: "candidate-b", prompt: "standard" },
+          { target: "candidate-b", prompt: "adversarial" },
         ],
         verifier: { target: "verifier-c" },
         implementerReport: "include",
@@ -431,11 +431,28 @@ test("panel systems run finders and a pinned verifier end to end, grading what t
         ["candidate-a", false, "readonly"],
       ],
     );
-    expect(f.calls[2]?.prompt).toContain('"id": "C2"');
+    expect(f.calls[0]?.prompt).toStartWith("You are a code reviewer.");
+    expect(f.calls[1]?.prompt).toStartWith("You are an adversarial code reviewer.");
+    expect(f.calls[1]?.prompt).toContain("Assume the change can fail");
+    expect(f.calls[3]?.prompt).toContain("Approve only if you would be comfortable merging");
+    // Both finders report the same bug: one merged candidate with agreement 2.
+    expect(f.calls[2]?.prompt).not.toContain('"id": "C2"');
+    // Each panel member logs apart, named by its role.
+    expect(f.calls.slice(0, 3).map((s) => s.logPath.split("/").at(-1))).toEqual([
+      "trial.log",
+      "trial.log.finder-1",
+      "trial.log.verifier-1",
+    ]);
     const panel = report.trials[0];
     expect(panel?.output).toMatchObject({
       mode: "panel",
-      findings: [{ verification: { verdict: "CONFIRMED" } }, {}],
+      findings: [{ agreement: 2, duplicates: [{ finder: 1 }], verification: { verdict: "CONFIRMED" } }],
+      panel: {
+        finders: [
+          { prompt: "standard", vendor: "other" },
+          { prompt: "adversarial", vendor: "other" },
+        ],
+      },
     });
     expect(panel?.costUsd).toBeCloseTo(0.3);
     // A refuted defect does not block, so the panel misses it.
@@ -643,19 +660,16 @@ test("panel trials keep their record for regrading and key the cache on the veri
       mode: "panel",
       findings: [],
       panel: {
-        refuted: ["C1", "C2"],
-        candidates: [
-          { id: "C1", line: 10 },
-          { id: "C2", line: 10 },
-        ],
+        refuted: ["C1"],
+        candidates: [{ id: "C1", line: 10, raisedBy: [0, 1], duplicates: [{ finder: 1, line: 10 }] }],
       },
     });
     const calls = f.calls.length;
     const cached = await f.run({ models: undefined, systems: [panelSystem] });
     expect(f.calls.length).toBe(calls);
-    expect(cached.trials[0]?.output).toMatchObject({ panel: { refuted: ["C1", "C2"] } });
+    expect(cached.trials[0]?.output).toMatchObject({ panel: { refuted: ["C1"] } });
     // A different verifier prompt or schema must not reuse those rulings.
-    const identity = spyOn(review, "panelVerifierIdentity").mockReturnValue("changed");
+    const identity = spyOn(review, "panelIdentity").mockReturnValue("changed");
     await f.run({ models: undefined, systems: [panelSystem] });
     identity.mockRestore();
     expect(f.calls.length).toBe(calls + 3);

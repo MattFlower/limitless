@@ -1,10 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { emptyUsage } from "../src/harness/types.ts";
+import { MERGE_RULES } from "../src/pipeline/panel-merge.ts";
+import * as prompts from "../src/pipeline/prompts.ts";
 import { formatReviewFeedback, reviewPrompt } from "../src/pipeline/prompts.ts";
 import {
   blockingReviewFindings,
   PANEL_VERIFY_CAP,
-  panelVerifierIdentity,
+  panelIdentity,
   type ReviewRequest,
   resolvedPriorFindings,
   reviewRequest,
@@ -521,6 +523,17 @@ describe("panel decision", () => {
     });
   }
 
+  test("agreement is recorded but does not verify a PLAUSIBLE finding below high", () => {
+    const at = (label?: "regression"): Review => ({
+      mode: "panel",
+      verdict: "approve",
+      summary: "s",
+      findings: [{ ...verified("PLAUSIBLE", "medium"), agreement: 3, ...(label ? { label } : {}) }],
+    });
+    expect(blockingReviewFindings(at())).toEqual([]);
+    expect(blockingReviewFindings(at("regression"), [finding("major")], 2)).toEqual([]);
+  });
+
   test("an unaddressed finding that cites no prior blocking finding is judged as new", () => {
     const f = { ...verified("CONFIRMED", "medium"), label: "unaddressed" as const, prior: "P2" };
     const review: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [f] };
@@ -589,7 +602,7 @@ describe("runReview panel", () => {
     rule: (id: string) => (Omit<Verification, "category"> & { category?: Verification["category"] }) | null,
     input: Partial<Parameters<typeof runReview>[1]> = {},
   ) => {
-    const verifications: { request: VerifierRequest; avoidVendor?: string }[] = [];
+    const verifications: { request: VerifierRequest; avoidVendors: string[] }[] = [];
     const vendors = ["anthropic", "openai"];
     const out = await runReview(
       {
@@ -598,8 +611,8 @@ describe("runReview panel", () => {
             { verdict: "request_changes", summary: "Checked everything.", findings: found[index] },
             vendors[index] ?? "",
           ),
-        verify: async (request, avoidVendor) => {
-          verifications.push({ request, avoidVendor });
+        verify: async (request, avoidVendors) => {
+          verifications.push({ request, avoidVendors });
           const results = ids(request.prompt).flatMap((id) => {
             const ruling = rule(id);
             return ruling ? [{ id, category: "correctness", ...ruling }] : [];
@@ -627,15 +640,15 @@ describe("runReview panel", () => {
     const { out, verifications } = await panel(
       [
         [...[1, 2, 3, 4, 5, 6].map((n) => candidate("src/a.ts", n)), candidate("src/b.ts", 7)],
-        [candidate("src/a.ts", 8), { ...candidate("src/c.ts", 9), category: "cleanup" }],
+        [candidate("src/a.ts", 80), { ...candidate("src/c.ts", 9), category: "cleanup" }],
       ],
       () => confirmed,
     );
-    expect(verifications.map((v) => [v.avoidVendor, ids(v.request.prompt)])).toEqual([
-      ["anthropic", ["C1", "C2", "C3", "C4", "C5"]],
-      ["anthropic", ["C6"]],
-      ["anthropic", ["C7"]],
-      ["openai", ["C8"]],
+    expect(verifications.map((v) => [v.avoidVendors, ids(v.request.prompt)])).toEqual([
+      [["anthropic"], ["C1", "C2", "C3", "C4", "C5"]],
+      [["anthropic"], ["C6"]],
+      [["anthropic"], ["C7"]],
+      [["openai"], ["C8"]],
     ]);
     const [first] = verifications;
     expect(first?.request.schema).toBe(VerifierSchema);
@@ -808,9 +821,264 @@ describe("runReview panel", () => {
 
   test("the panel cache identity moved with the fail-closed policy, so older cached outputs are not reused", () => {
     // The identity under which outputs were cached before security candidates were always verified.
-    expect(panelVerifierIdentity()).not.toBe(
-      "1615aed46380764c34cc3dbe53a944a4b17f56fc96578bd5bc3d91e8e026966c",
+    expect(panelIdentity()).not.toBe("1615aed46380764c34cc3dbe53a944a4b17f56fc96578bd5bc3d91e8e026966c");
+  });
+
+  test("finders run in parallel with their own prompts, and a report they share is verified once", async () => {
+    const vendors = ["anthropic", "openai", "google"];
+    const prompts: string[] = [];
+    const started = Promise.withResolvers<void>();
+    const verified: string[][] = [];
+    const avoided: string[][] = [];
+    const out = await runReview(
+      {
+        invoke: async (request, finder) => {
+          prompts[finder] = request.prompt;
+          if (prompts.filter(Boolean).length === 3) started.resolve();
+          // One finder at a time would never see the others start.
+          if (await Promise.race([started.promise.then(() => false), Bun.sleep(2000).then(() => true)]))
+            throw new Error("finders ran one at a time");
+          const findings = [candidate("src/a.ts", 10 + finder)];
+          return ok(
+            { verdict: "request_changes", summary: "Checked everything.", findings },
+            vendors[finder] ?? "",
+          );
+        },
+        verify: async (request, avoidVendors) => {
+          verified.push(ids(request.prompt));
+          avoided.push(avoidVendors);
+          return ok({ results: ids(request.prompt).map((id) => ruling(id)) }, "other");
+        },
+      },
+      {
+        prompt,
+        timeoutMs: 1,
+        system: {
+          mode: "panel",
+          finders: [{ prompt: "standard" }, { prompt: "adversarial" }, { prompt: "careful" }],
+        },
+      },
     );
+    for (const [finder, opening, framing] of [
+      [0, "You are a code reviewer.", "Do not filter by importance or certainty"],
+      [1, "You are an adversarial code reviewer.", "Give no credit for intent"],
+      [2, "You are a code reviewer.", "careful senior engineer"],
+    ] as const) {
+      expect(prompts[finder]).toStartWith(opening);
+      expect(prompts[finder]).toContain(framing);
+      expect(prompts[finder]).not.toContain("Approve only if");
+    }
+    expect(verified).toEqual([["C1"]]);
+    expect(out.panel?.finders).toEqual([
+      { prompt: "standard", vendor: "anthropic" },
+      { prompt: "adversarial", vendor: "openai" },
+      { prompt: "careful", vendor: "google" },
+    ]);
+    expect(out.panel?.candidates.map((c) => [c.id, c.line, c.raisedBy, c.agreement])).toEqual([
+      ["C1", 10, [0, 1, 2], 3],
+    ]);
+    expect(out.panel?.candidates[0]?.duplicates?.map((d) => [d.finder, d.line])).toEqual([
+      [1, 11],
+      [2, 12],
+    ]);
+    expect(avoided).toEqual([["anthropic", "google", "openai"]]);
+    expect(out.decision?.blocking.map((f) => [f.agreement, f.duplicates?.length])).toEqual([[3, 2]]);
+  });
+
+  test("a finder that fails fails the panel only after the other finders settle", async () => {
+    let settled = 0;
+    const run = runReview(
+      {
+        invoke: async (_request, finder) => {
+          if (finder === 0) throw new Error("provider unavailable");
+          await Bun.sleep(20);
+          settled++;
+          return ok({ verdict: "approve", summary: "Checked everything.", findings: [] }, "openai");
+        },
+        verify: async () => ok({ results: [] }, "google"),
+      },
+      {
+        prompt,
+        timeoutMs: 1,
+        system: { mode: "panel", finders: [{ prompt: "standard" }, { prompt: "careful" }] },
+      },
+    );
+    await expect(run).rejects.toThrow("provider unavailable");
+    expect(settled).toBe(1);
+  });
+
+  test("a later-round panel finder prompt does not describe single-mode follow-ups", () => {
+    const previous = { sha: "fixbase", findings: [finding("major")] };
+    expect(reviewPrompt({ ...prompt, previous })).toContain("become follow-ups");
+    expect(reviewPrompt({ ...prompt, previous, finder: "standard" })).not.toContain("become follow-ups");
+  });
+
+  test("a distinct nearby claim is never merged away behind a refuted one", async () => {
+    const offByOne = {
+      ...candidate("src/a.ts", 10),
+      title: "Off-by-one in loop bound",
+      failure_scenario: "a list of n items processes only n - 1 of them because the loop stops one early",
+    };
+    const traversal = {
+      ...candidate("src/a.ts", 25),
+      title: "Path traversal via unsanitized filename",
+      failure_scenario: "../ escapes the upload directory",
+      security: true,
+    };
+    const { out, verifications } = await panel([[offByOne], [traversal]], (id) =>
+      id === "C1" ? { ...confirmed, verdict: "REFUTED" } : confirmed,
+    );
+    expect(verifications.flatMap((v) => ids(v.request.prompt))).toEqual(["C1", "C2"]);
+    expect(out.decision?.blocking.map((f) => f.title)).toEqual(["Path traversal via unsanitized filename"]);
+  });
+
+  for (const longer of [0, 1])
+    test(`a merged claim blocks as the report the verifier saw, away from both vendors (finder ${longer} more concrete)`, async () => {
+      const report = (finder: number, line: number, severity: "minor" | "major") => ({
+        ...candidate("src/a.ts", line, severity),
+        title: "SQL built by string concatenation",
+        failure_scenario:
+          finder === longer
+            ? "a quote in the name breaks the query string"
+            : "a quote in name breaks the query",
+        security: true,
+      });
+      const { out, verifications } = await panel(
+        [[report(0, 10, "minor")], [report(1, 12, "major")]],
+        () => confirmed,
+      );
+      const kept = longer === 0 ? 10 : 12;
+      expect(verifications.map((v) => [v.avoidVendors, ids(v.request.prompt)])).toEqual([
+        [["anthropic", "openai"], ["C1"]],
+      ]);
+      expect(verifications[0]?.request.prompt).toContain(`"line": ${kept}`);
+      expect(
+        out.decision?.blocking.map((f) => [
+          f.line,
+          f.failure_scenario,
+          f.severity,
+          f.security,
+          f.duplicates?.length,
+        ]),
+      ).toEqual([[kept, "a quote in the name breaks the query string", "major", true, 1]]);
+    });
+
+  for (const [ruling, blocks] of [
+    ["CONFIRMED", true],
+    ["REFUTED", false],
+  ] as const)
+    test(`a refuted merged claim's report at another line is verified on its own (${ruling})`, async () => {
+      const report = (name: string, line: number) => ({
+        ...candidate("src/a.ts", line),
+        title: `Unhandled rejection from writeFile in ${name}`,
+        failure_scenario:
+          "the promise rejects when the disk is full and nothing catches it, so the process crashes",
+      });
+      const { out, verifications } = await panel(
+        [[report("saveConfig", 10)], [report("saveCache", 25)]],
+        (id) => ({
+          ...confirmed,
+          verdict: id === "C1" ? "REFUTED" : ruling,
+        }),
+      );
+      expect(verifications.map((v) => [v.avoidVendors, ids(v.request.prompt)])).toEqual([
+        [["anthropic", "openai"], ["C1"]],
+        [["openai"], ["C2"]],
+      ]);
+      expect(verifications[1]?.request.prompt).toContain("writeFile in saveCache");
+      expect(out.panel?.candidates.map((c) => [c.id, c.line, c.raisedBy])).toEqual([
+        ["C1", 10, [0, 1]],
+        ["C2", 25, [1]],
+      ]);
+      expect(out.decision?.blocking.map((f) => f.title)).toEqual(
+        blocks ? ["Unhandled rejection from writeFile in saveCache"] : [],
+      );
+    });
+
+  test("a refuted claim's merged report with another title is verified on its own, at its own severity", async () => {
+    // Two different bugs at one line whose shared boilerplate scenario makes them merge.
+    const report = (title: string, severity: "blocker" | "nit") => ({
+      ...candidate("src/a.ts", 10, severity),
+      title,
+      failure_scenario:
+        "any request that reaches this handler throws before the response is written and the client receives an internal server error for every retry it makes",
+    });
+    const { out, verifications } = await panel(
+      [
+        [report("Null dereference in parseHeader", "blocker")],
+        [report("Off-by-one in pagination offset", "nit")],
+      ],
+      (id) => ({ ...confirmed, verdict: id === "C1" ? "REFUTED" : "PLAUSIBLE", severity: "medium" }),
+    );
+    expect(verifications.map((v) => ids(v.request.prompt))).toEqual([["C1"], ["C2"]]);
+    expect(out.panel?.candidates.map((c) => [c.id, c.line, c.title, c.severity])).toEqual([
+      ["C1", 10, "Null dereference in parseHeader", "blocker"],
+      ["C2", 10, "Off-by-one in pagination offset", "nit"],
+    ]);
+    expect(out.decision?.followUps.map((f) => [f.title, f.verification?.verdict])).toEqual([
+      ["Off-by-one in pagination offset", "PLAUSIBLE"],
+    ]);
+  });
+
+  test("the second pass tells the verifier which candidate now cites the prior finding", async () => {
+    const report = (name: string, line: number) => ({
+      ...candidate("src/a.ts", line),
+      title: `Unhandled rejection from writeFile in ${name}`,
+      failure_scenario:
+        "the promise rejects when the disk is full and nothing catches it, so the process crashes",
+      label: "unaddressed",
+      prior: "P1",
+    });
+    const { verifications } = await panel(
+      [[report("saveConfig", 10)], [report("saveCache", 25)]],
+      (id) => ({ ...confirmed, verdict: id === "C1" ? "REFUTED" : "CONFIRMED" }),
+      {
+        panelReview: 2,
+        prompt: {
+          ...prompt,
+          headSha: "head",
+          previous: { sha: "fixbase", findings: [finding("major")] },
+          fixReview: 2,
+        },
+      },
+    );
+    expect(verifications.map((v) => ids(v.request.prompt))).toEqual([["C1"], ["C2"]]);
+    expect(verifications[0]?.request.prompt).toContain('"status": "reported unaddressed by C1"');
+    expect(verifications[1]?.request.prompt).toContain('"status": "reported unaddressed by C2"');
+  });
+
+  test("later-round finder prompts carry no panel agreement or merged reports", () => {
+    const duplicates = [{ finder: 1, line: 2, title: "dup", detail: "DUP_DETAIL", suggestion: "" }];
+    const prior = { ...finding("major"), agreement: 3, duplicates };
+    for (const fixReview of [undefined, 2]) {
+      const previous = { sha: "fixbase", findings: [prior], resolved: [prior] };
+      const text = reviewPrompt({ ...prompt, previous, ...(fixReview ? { fixReview } : {}) });
+      expect(text).not.toContain('"agreement"');
+      expect(text).not.toContain("DUP_DETAIL");
+    }
+    // Feedback to the implementer does carry every merged report.
+    expect(formatReviewFeedback([prior], true)).toContain(
+      "Also reported by another finder at line 2, not separately verified: dup. DUP_DETAIL",
+    );
+  });
+
+  test("the panel cache identity covers the finder prompts and the merge rules", () => {
+    const before = panelIdentity();
+    const rules = MERGE_RULES as { similarity: number };
+    const similarity = rules.similarity;
+    rules.similarity = 0.5;
+    try {
+      expect(panelIdentity()).not.toBe(before);
+    } finally {
+      rules.similarity = similarity;
+    }
+    const render = spyOn(prompts, "reviewPrompt").mockImplementation(() => "changed");
+    try {
+      expect(panelIdentity()).not.toBe(before);
+    } finally {
+      render.mockRestore();
+    }
+    expect(panelIdentity()).toBe(before);
   });
 
   test("an invalid verifier result fails the review instead of approving it", async () => {
@@ -977,9 +1245,9 @@ describe("runReview panel", () => {
     expect(finderPrompt).not.toContain("git diff a..HEAD");
     expect(finderPrompt).not.toContain("full base-to-HEAD");
     // The finder's candidate avoids its vendor; the recheck has no finder vendor to avoid.
-    expect(verifications.map((v) => [v.avoidVendor, ids(v.request.prompt)])).toEqual([
-      ["anthropic", ["C1"]],
-      [undefined, ["C2"]],
+    expect(verifications.map((v) => [v.avoidVendors, ids(v.request.prompt)])).toEqual([
+      [["anthropic"], ["C1"]],
+      [[], ["C2"]],
     ]);
     for (const verifierText of verifications.map((v) => v.request.prompt)) {
       expect(verifierText).toContain("git diff fixbase..head");
@@ -1055,7 +1323,7 @@ describe("runReview panel", () => {
       const sent = verifications.flatMap((v) => ids(v.request.prompt));
       expect(sent).toHaveLength(PANEL_VERIFY_CAP + 1);
       expect(sent).toContain(citedId);
-      expect(verifications.every((v) => v.avoidVendor === "anthropic")).toBe(true);
+      expect(verifications.every((v) => v.avoidVendors.join() === "anthropic")).toBe(true);
       expect(out.panel?.candidates).toHaveLength(found.length);
       expect(out.panel?.capped).toEqual([`C${PANEL_VERIFY_CAP + 1}`, `C${PANEL_VERIFY_CAP + 3}`]);
       expect(out.panel?.verdicts.find((v) => v.id === citedId)?.severity).toBe(severity);

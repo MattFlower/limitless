@@ -30,6 +30,34 @@ test("review location windows are inclusive, normalize ./, exclude nits and neve
   output.findings.push(...output.findings);
   expect(gradeReview(reviewCase, output).review?.requiredMatched).toBe(1);
 });
+test("a merged panel finding also covers the lines of the reports merged into it", () => {
+  const [defect] = reviewCase.defects;
+  const [finding] = reviewOutput(10).findings;
+  if (!defect || !finding) throw new Error("fixture");
+  const item = {
+    ...reviewCase,
+    defects: [10, 28].map((line) => ({ ...defect, lines: [line, line + 1] as [number, number] })),
+  };
+  const verification = {
+    verdict: "CONFIRMED",
+    severity: "high",
+    category: "correctness",
+    evidence: "e",
+    trigger: "t",
+  } as const;
+  const duplicates = [{ finder: 1, line: 28, title: "Bug", detail: "Observed", suggestion: "Fix" }];
+  const panel = (f: Review["findings"][number]): Review => ({
+    mode: "panel",
+    verdict: "approve",
+    summary: "reviewed",
+    findings: [f],
+  });
+  expect(gradeReview(item, panel({ ...finding, verification, duplicates }))).toMatchObject({
+    pass: true,
+    review: { requiredMatched: 2, blockingFindings: 1 },
+  });
+  expect(gradeReview(item, panel({ ...finding, verification })).review?.requiredMatched).toBe(1);
+});
 test("review optional defects, returned verdict and clean blocking rules", () => {
   const optional = { ...reviewCase, defects: reviewCase.defects.map((d) => ({ ...d, required: false })) };
   // With no required defects a real case still needs the derived verdict to request changes.
