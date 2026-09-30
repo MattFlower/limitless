@@ -160,9 +160,9 @@ test("an unknown reconciliation outcome never leads to a second create", async (
   expect(gh.calls("pr list")).toHaveLength(4);
 });
 
-test("merge with an unknown outcome is left open rather than merged again", async () => {
+test("merge with an unknown outcome propagates the outage without merging again", async () => {
   const gh = withGh({ merge: ["ok502"], view: ["fail502", "fail502", "fail502"] });
-  expect(await mergePullRequest(gh.url, work, "T")).toBe("failed");
+  await expect(mergePullRequest(gh.url, work, "T")).rejects.toThrow(GitHubUnavailableError);
   expect(gh.calls("pr merge")).toHaveLength(1);
   expect(gh.calls("pr view")).toHaveLength(3);
 });
@@ -190,14 +190,14 @@ test("a merge that lands on the final attempt is reported merged, not retried as
   expect(gh.calls("pr merge").some((c) => c.includes("--auto"))).toBe(false);
 });
 
-test("merge retries transient failures and leaves the PR open once exhausted", async () => {
+test("merge retries transient failures and propagates the outage once exhausted", async () => {
   let gh = withGh({ merge: ["fail502"] });
   expect(await mergePullRequest(gh.url, work)).toBe("merged");
   expect(gh.calls("pr merge")).toHaveLength(2);
   rmSync(join(dir, "gh-calls"));
   rmSync(join(dir, "gh-merged"));
   gh = withGh({ merge: Array(6).fill("fail502") });
-  expect(await mergePullRequest(gh.url, work)).toBe("failed");
+  await expect(mergePullRequest(gh.url, work)).rejects.toThrow(GitHubUnavailableError);
   // GitHub being unavailable is not branch protection, so no auto-merge attempt follows.
   expect(gh.calls("pr merge")).toHaveLength(3);
   expect(gh.calls("pr merge").some((c) => c.includes("--auto"))).toBe(false);

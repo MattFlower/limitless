@@ -19,6 +19,7 @@ import {
   createWorktree,
   diffSince,
   discardChanges,
+  editPullRequest,
   ensureCache,
   exportCommit,
   fetchBase,
@@ -33,6 +34,7 @@ import {
   removeWorktree,
   resetTo,
 } from "../git/repos.ts";
+import { GitHubUnavailableError } from "../git/retry.ts";
 import { runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
@@ -193,7 +195,7 @@ export async function executeRun(
       verifiedSha &&
       ctx.repo.kind === "github" &&
       !ctx.run.deliveryBranch &&
-      (!ctx.run.prUrl || !!ctx.state.needsHumanReason) &&
+      (!ctx.run.prUrl || !!ctx.state.needsHumanReason || e instanceof GitHubUnavailableError) &&
       (ctx.state.phase === "deliver" || ctx.state.conflictRound !== undefined);
     const needsHuman = e instanceof NeedsHumanError || e instanceof NoCapacityError || !!verifiedFailure;
     const message = (e as Error).message;
@@ -1263,6 +1265,12 @@ async function deliverVerifiedDraft(
   if (!cwd || !branch || !base) throw new Error("Missing verified draft delivery details");
   const report = buildReport(ctx, false, { sha, stage, reason, base });
   ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
+  if (ctx.run.prUrl) {
+    // A merge may have landed despite its error. Preserve the PR and remote branch state;
+    // publish the failure report without pushing again or creating another PR.
+    await editPullRequest(ctx.run.prUrl, cwd, report, ctx.signal);
+    return;
+  }
   ctx.checkCancelled();
   await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal);
   ctx.checkCancelled();

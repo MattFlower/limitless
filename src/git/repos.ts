@@ -4,7 +4,7 @@ import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { sh } from "../util/proc.ts";
-import { GitHubUnavailableError, isTransient, withGithubRetry } from "./retry.ts";
+import { isTransient, withGithubRetry } from "./retry.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -406,6 +406,14 @@ export async function pushExistingBranch(
   );
 }
 
+export async function editPullRequest(prUrl: string, cwd: string, body: string, signal?: AbortSignal) {
+  await withGithubRetry(
+    "PR edit",
+    () => sh(["gh", "pr", "edit", prUrl, "--body-file", "-"], { cwd, stdin: body, signal }),
+    { signal },
+  );
+}
+
 export async function createPullRequest(
   repo: Repo,
   opts: {
@@ -427,16 +435,7 @@ export async function createPullRequest(
   const findExisting = () => withGithubRetry("PR lookup", lookup, { signal: opts.signal });
   const existing = await findExisting();
   if (existing) {
-    await withGithubRetry(
-      "PR edit",
-      () =>
-        sh(["gh", "pr", "edit", existing, "--body-file", "-"], {
-          cwd: opts.cwd,
-          stdin: opts.body,
-          signal: opts.signal,
-        }),
-      { signal: opts.signal },
-    );
+    await editPullRequest(existing, opts.cwd, opts.body, opts.signal);
     return existing;
   }
   return withGithubRetry(
@@ -508,14 +507,8 @@ export async function mergePullRequest(
         },
       },
     );
-  try {
-    const now = await merge(false);
-    return now === "failed" ? await merge(true) : now;
-  } catch (e) {
-    // As before a merge that cannot happen leaves the PR open rather than failing the run.
-    if (e instanceof GitHubUnavailableError) return "failed";
-    throw e;
-  }
+  const now = await merge(false);
+  return now === "failed" ? await merge(true) : now;
 }
 
 /** Same stable top-level representation used in pipeline and eval prompts. */

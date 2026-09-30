@@ -709,14 +709,14 @@ esac
     return bare;
   }
 
-  function registerGithub(f: Factory, bare: string): void {
+  function registerGithub(f: Factory, bare: string, mergePolicy: "pr" | "auto" = "pr"): void {
     f.store.upsertRepo({
       slug: "test/repo",
       kind: "github",
       url: bare,
       localPath: null,
       defaultBranch: "main",
-      mergePolicy: "pr",
+      mergePolicy,
     });
   }
 
@@ -784,7 +784,11 @@ esac
     afterEach(() => {
       githubRetry.delaysMs = delays;
     });
-    const deliverWith = async (plan: Record<string, string[]>, retryDelays: number[]) => {
+    const deliverWith = async (
+      plan: Record<string, string[]>,
+      retryDelays: number[],
+      mergePolicy: "pr" | "auto" = "pr",
+    ) => {
       const bare = await githubFixture();
       const gh = fakeGh(home, plan);
       githubRetry.delaysMs = retryDelays;
@@ -794,7 +798,7 @@ esac
         if (role === "review") return { structured: approve };
         return { files: { "farewell.txt": "goodbye\n" } };
       });
-      registerGithub(f, bare);
+      registerGithub(f, bare, mergePolicy);
       const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
       return { f, gh, run };
     };
@@ -818,6 +822,59 @@ esac
       expect(gh.calls("pr create").filter((c) => c.includes("--draft"))).toHaveLength(1);
       expect(finished?.prUrl).toBe(gh.url);
     });
+
+    const mergeFailures: {
+      name: string;
+      plan: Record<string, string[]>;
+      attempts: number;
+      cause: string;
+    }[] = [
+      {
+        name: "merge exhausted",
+        plan: { merge: ["fail502", "fail502", "fail502"] },
+        attempts: 3,
+        cause: "PR merge",
+      },
+      {
+        name: "merge outcome unknown",
+        plan: { merge: ["ok502"], view: ["fail502", "fail502", "fail502"] },
+        attempts: 1,
+        cause: "PR view",
+      },
+      {
+        name: "auto-merge exhausted",
+        plan: { merge: ["fail422", "fail502", "fail502", "fail502"] },
+        attempts: 4,
+        cause: "PR merge",
+      },
+      {
+        name: "merge and report edit exhausted",
+        plan: { merge: ["fail502", "fail502", "fail502"], edit: ["fail502", "fail502", "fail502"] },
+        attempts: 3,
+        cause: "PR merge",
+      },
+    ];
+    for (const scenario of mergeFailures) {
+      test(`${scenario.name} preserves the PR and records an environment failure`, async () => {
+        const { f, gh, run } = await deliverWith(scenario.plan, [5, 10], "auto");
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+        const finished = f.store.getRun(run.id);
+        expect(finished?.error).toStartWith(`GitHub unavailable: ${scenario.cause} failed after 3 attempts`);
+        expect(finished?.error).toContain("HTTP 502");
+        expect(finished?.prUrl).toBe(gh.url);
+        expect(finished?.merged).toBe(false);
+        const state = f.store.getRunState<RunState>(run.id);
+        expect(state?.needsHumanReason).toBe(finished?.error ?? "");
+        expect(state?.deliveryComplete).not.toBe(true);
+        const report = f.store.getArtifact(run.id, "report.md");
+        expect(report).toContain("GitHub unavailable");
+        expect(report).toContain("HTTP 502");
+        expect(gh.calls("pr merge")).toHaveLength(scenario.attempts);
+        expect(gh.calls("pr create")).toHaveLength(1);
+        expect(gh.calls("pr edit").length).toBeGreaterThan(0);
+        if (!scenario.plan.edit) expect(readFileSync(join(home, "gh-body"), "utf8")).toBe(report ?? "");
+      });
+    }
 
     test("cancelling during retry backoff stops delivery", async () => {
       const { f, gh, run } = await deliverWith({ create: ["fail502"] }, [10_000, 10_000]);

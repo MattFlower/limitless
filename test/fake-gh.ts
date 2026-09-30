@@ -25,6 +25,7 @@ writeFileSync(dir + "/gh-plan.json", JSON.stringify(plan));
 const fail = (code) => { console.error(code === 422 ? "HTTP 422: Validation Failed" : "HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)"); process.exit(1); };
 if (step === "fail502") fail(502);
 if (step === "fail422") fail(422);
+if (key.startsWith("create") || key === "edit") writeFileSync(dir + "/gh-body", readFileSync(0, "utf8"));
 if (key === "list" && existsSync(dir + "/gh-pr")) console.log(readFileSync(dir + "/gh-pr", "utf8"));
 if (key.startsWith("create")) { writeFileSync(dir + "/gh-pr", ${JSON.stringify(url)}); if (step !== "ok502") console.log(${JSON.stringify(url)}); }
 if (key === "merge") writeFileSync(dir + "/gh-merged", args.includes("--auto") ? "AUTO" : "MERGED");
