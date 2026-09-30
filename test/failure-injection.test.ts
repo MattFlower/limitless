@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Factory, type FactoryOptions } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
+import { CodexReaderProbe, runCodex } from "../src/harness/codex.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { NoCapacityError, RunContext, type RunState } from "../src/pipeline/context.ts";
@@ -16,7 +17,7 @@ import {
   untilAborted,
 } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
-import { runProcess, sh } from "../src/util/proc.ts";
+import { type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
 import { findingEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -457,6 +458,54 @@ for (const fallback of [false, true])
     expect(inv.slice(1).every((i) => i.provider === "b")).toBe(true);
     history(f, id);
   });
+
+test("a Codex CLI that fails the reader probe diverts confined readers without running them", async () => {
+  const commands: string[][] = [];
+  const cli = async (opts: ProcOptions): Promise<ProcResult> => {
+    commands.push(opts.cmd);
+    const base = { exitCode: 0, signal: null, cancelled: false, timedOut: false, idleTimedOut: false };
+    const done = { ...base, stdout: "", stderr: "", truncated: false, durationMs: 1 };
+    if (opts.cmd[1] === "--version") return { ...done, stdout: "codex-cli 0.154.0\n" };
+    // 0.154.0 accepts the profile but lets the denied read through.
+    if (opts.cmd[1] === "sandbox") return { ...done, stdout: readFileSync(opts.cmd.at(-1) ?? "", "utf8") };
+    return done;
+  };
+  const probe = new CodexReaderProbe(() => "/old/node_modules/.bin/codex");
+  const [a, b] = providers;
+  if (!a || !b) throw new Error("missing fixture providers");
+  const f = factory(undefined, answer, {
+    providers: [{ ...a, harness: "codex" }, b],
+    harnesses: { fake: fakeHarness(answer), codex: (s) => runCodex(s, cli, probe) },
+  });
+  const r = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
+  const repo = f.store.getRepo(r.repoId);
+  if (!repo) throw new Error("missing repo");
+  const ctx = new RunContext(f.deps, r, repo, new AbortController().signal);
+  const cwd = join(root, "snapshot");
+  mkdirSync(cwd);
+  const outcome = await ctx.invoke({
+    stage: f.store.startStage(r.id, "holdout"),
+    role: "holdout",
+    complexity: "small",
+    mode: "readonly",
+    prompt: "Write holdout checks",
+    cwd,
+    confineReads: true,
+    privateOutput: true,
+  });
+  expect(outcome.target.provider).toBe("b");
+  expect(commands.map((cmd) => cmd[1])).toEqual(["--version", "sandbox"]);
+  const [rejected, fallback] = f.store.listInvocations(r.id);
+  expect(fallback).toMatchObject({ provider: "b", status: "ok" });
+  expect(rejected).toMatchObject({ provider: "a", status: "unavailable" });
+  expect(rejected?.error).toContain("/old/node_modules/.bin/codex (codex-cli 0.154.0)");
+  expect(rejected?.error).toContain("allowed reading a canary");
+  // The provider stays routable for unconfined roles; its card says why confined readers skip it.
+  expect(f.tracker.status("a")).toMatchObject({
+    state: "ok",
+    confinement: { ok: false, path: "/old/node_modules/.bin/codex", version: "codex-cli 0.154.0" },
+  });
+});
 
 test("fault matching is one-shot, independent, and already-aborted hangs settle", async () => {
   const hit: string[] = [];

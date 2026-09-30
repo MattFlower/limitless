@@ -13,7 +13,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
-import { buildCodexArgs, runCodex } from "../src/harness/codex.ts";
+import { buildCodexArgs, CodexReaderProbe, runCodex } from "../src/harness/codex.ts";
 import {
   createScratch,
   removeScratch,
@@ -23,7 +23,7 @@ import {
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
-import type { ProcOptions, ProcResult } from "../src/util/proc.ts";
+import type { ProcOptions, ProcResult, runProcess } from "../src/util/proc.ts";
 
 const specFor = (cwd: string, scratchDir: string): AgentSpec => ({
   cwd,
@@ -303,10 +303,131 @@ test.skipIf(codexSkip !== null)(
   },
 );
 
+const CODEX = "/opt/codex/bin/codex";
+const denies = (canary: string) => ({ exitCode: 1, stderr: `cat: ${canary}: Operation not permitted\n` });
+
+/** A fake Codex CLI: `--version`, the `sandbox` probe (answered by `sandbox`), and a completing `exec`. */
+function fakeCodex(sandbox: (canary: string) => Partial<ProcResult> | Error = denies) {
+  const cli = { path: CODEX as string | null, version: "codex-cli 0.157.1" as string | null, sandboxes: 0 };
+  const calls: string[][] = [];
+  const canaries: string[] = [];
+  const runner = async (opts: ProcOptions): Promise<ProcResult> => {
+    calls.push(opts.cmd);
+    if (opts.cmd[1] === "--version")
+      return cli.version ? { ...procResult, stdout: `${cli.version}\n` } : { ...procResult, exitCode: 1 };
+    if (opts.cmd[1] === "sandbox") {
+      cli.sandboxes++;
+      const canary = opts.cmd.at(-1) ?? "";
+      canaries.push(canary);
+      await Bun.sleep(5);
+      const out = sandbox(canary);
+      if (out instanceof Error) throw out;
+      return { ...procResult, ...out };
+    }
+    opts.onStdoutLine?.('{"type":"turn.completed","usage":{}}');
+    return procResult;
+  };
+  return { cli, calls, canaries, runner, probe: new CodexReaderProbe(() => cli.path) };
+}
+const profileArgs = (cmd: string[] = []) =>
+  cmd.filter((arg, i) => cmd[i - 1] === "-c" && /permissions/.test(arg));
+
+test("a denied canary read lets confined codex exec run with the probed CLI and profile", async () => {
+  const { cwd, spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  try {
+    const result = await runCodex(spec, fake.runner, fake.probe);
+    expect(result.status).toBe("ok");
+    expect(result.confinement).toEqual({ ok: true, path: CODEX, version: "codex-cli 0.157.1", reason: null });
+    expect(fake.calls.map((cmd) => cmd.slice(0, 2))).toEqual([
+      [CODEX, "--version"],
+      [CODEX, "sandbox"],
+      [CODEX, "exec"],
+    ]);
+    const [, probe, exec] = fake.calls;
+    expect(profileArgs(exec)).toHaveLength(2);
+    expect(profileArgs(probe)).toEqual(profileArgs(exec));
+    const canary = fake.canaries[0] ?? "";
+    expect(canary.startsWith(realpathSync(cwd))).toBe(false);
+    expect(codexAccess(exec ?? [], canary)).toBe("none");
+    expect(existsSync(canary)).toBe(false);
+  } finally {
+    cleanup();
+  }
+});
+
+for (const [name, sandbox, change, reason] of [
+  [
+    "readable canary",
+    (c: string) => ({ exitCode: 0, stdout: readFileSync(c, "utf8") }),
+    {},
+    "allowed reading",
+  ],
+  [
+    "unrelated error",
+    () => ({ exitCode: 2, stderr: "error: unexpected argument '-c'" }),
+    {},
+    "did not report",
+  ],
+  ["other path denied", () => ({ exitCode: 1, stderr: "cat: /x: Permission denied" }), {}, "did not report"],
+  [
+    "timeout",
+    (c: string) => ({ exitCode: null, timedOut: true, stderr: denies(c).stderr }),
+    {},
+    "did not finish",
+  ],
+  ["sandbox startup", () => new Error("spawn EACCES"), {}, "failed to start: spawn EACCES"],
+  ["missing CLI", denies, { path: null }, "codex CLI not found"],
+  ["version lookup", denies, { version: null }, "--version failed"],
+] as const)
+  test(`confined codex exec never starts when the probe fails: ${name}`, async () => {
+    const { spec, cleanup } = confinedFixture();
+    const fake = fakeCodex(sandbox);
+    Object.assign(fake.cli, change);
+    try {
+      const result = await runCodex(spec, fake.runner, fake.probe);
+      expect(result.status).toBe("unavailable");
+      expect(result.confinement?.ok).toBe(false);
+      expect(result.confinement?.reason).toContain(reason);
+      expect(result.error).toContain(reason);
+      expect(fake.calls.some((cmd) => cmd[1] === "exec")).toBe(false);
+      for (const canary of fake.canaries) expect(existsSync(canary)).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+test("one probe per CLI path and version, shared by concurrent and later invocations", async () => {
+  const { spec, cleanup } = confinedFixture();
+  const fake = fakeCodex();
+  const failing = fakeCodex(() => ({ exitCode: 0 }));
+  try {
+    await Promise.all([0, 1, 2].map(() => runCodex(spec, fake.runner, fake.probe)));
+    expect(fake.cli.sandboxes).toBe(1);
+    expect((await runCodex(spec, fake.runner, fake.probe)).status).toBe("ok");
+    expect(fake.cli.sandboxes).toBe(1);
+    fake.cli.version = "codex-cli 0.158.0";
+    await runCodex(spec, fake.runner, fake.probe);
+    expect(fake.cli.sandboxes).toBe(2);
+    fake.cli.path = "/usr/local/bin/codex";
+    await runCodex(spec, fake.runner, fake.probe);
+    expect(fake.cli.sandboxes).toBe(3);
+    expect(fake.calls.filter((cmd) => cmd[1] === "exec")).toHaveLength(6);
+    for (const _ of [0, 1])
+      expect((await runCodex(spec, failing.runner, failing.probe)).status).toBe("unavailable");
+    expect(failing.cli.sandboxes).toBe(1);
+  } finally {
+    cleanup();
+  }
+});
+
 test("private logs keep the stream's structure but withhold its text", async () => {
   const { cwd, scratch, spec, cleanup } = confinedFixture();
   try {
-    for (const run of [runClaude, runCodex]) {
+    const probed = fakeCodex();
+    const runConfinedCodex = (s: AgentSpec, runner: typeof runProcess) =>
+      runCodex(s, (o) => (o.cmd[1] === "exec" ? runner(o) : probed.runner(o)), probed.probe);
+    for (const run of [runClaude, runConfinedCodex]) {
       const logPath = join(scratch, `${run.name}.log`);
       await run({ ...spec, logPath, redactOutput: withholdText }, async (opts: ProcOptions) => {
         opts.onStdoutLine?.(JSON.stringify({ type: "assistant", text: "H-1 private scenario", n: 3 }));

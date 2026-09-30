@@ -263,6 +263,16 @@ export interface ProviderStatus {
   inFlight: number;
   maxConcurrent: number;
   updatedAt: number;
+  /** Latest confined-reader sandbox probe of the provider's CLI (Codex). */
+  confinement?: ConfinementProbe;
+}
+
+/** Whether a CLI's sandbox denied a canary read outside a confined reader's cwd and scratch. */
+export interface ConfinementProbe {
+  ok: boolean;
+  path: string | null;
+  version: string | null;
+  reason: string | null;
 }
 
 export interface QuotaAlert {

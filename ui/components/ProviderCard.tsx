@@ -84,6 +84,14 @@ export const ProviderCard: Component<{ provider: ProviderStatus; workload?: Prov
         <Show when={props.provider.reason}>
           <div class="provider-reason">{props.provider.reason}</div>
         </Show>
+        <Show when={props.provider.confinement?.ok === false && props.provider.confinement}>
+          {(c) => (
+            <div class="provider-reason">
+              Confined readers skip this provider: {c().reason} ({c().path ?? "no CLI"}
+              {c().version ? `, ${c().version}` : ""})
+            </div>
+          )}
+        </Show>
         <div class="provider-meta">
           <span>
             in-flight <span class="mono">{props.provider.inFlight}</span>/{props.provider.maxConcurrent}

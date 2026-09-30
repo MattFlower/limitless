@@ -1,7 +1,17 @@
-import { appendFileSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { QuotaWindow } from "../core/types.ts";
+import type { ConfinementProbe, QuotaWindow } from "../core/types.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
 import { readConfinement, scratchEnv, validateDenyRead, validateScratch } from "./scratch.ts";
 import {
@@ -234,6 +244,90 @@ function readerFilesystem(spec: AgentSpec, scratch: string): string {
   return [...unique].map(([path, access]) => `${JSON.stringify(path)}="${access}"`).join(",");
 }
 
+function readerProfile(spec: AgentSpec, scratch: string): string[] {
+  return [
+    "-c",
+    'default_permissions="limitless-reader"',
+    "-c",
+    `permissions={limitless-reader={filesystem={${readerFilesystem(spec, scratch)}},network={enabled=false}}}`,
+  ];
+}
+
+/** A denial names the canary; ENOENT counts because the canary exists outside the sandbox. */
+const DENIED = /operation not permitted|permission denied|no such file or directory/i;
+
+/**
+ * Older Codex CLIs accept the reader profile but don't enforce it (0.154.0 allowed denied reads),
+ * so before the first confined run per CLI path and version, require `codex sandbox` with the same
+ * profile to deny a canary outside cwd and scratch. Results, passing or not, last for the process.
+ */
+export class CodexReaderProbe {
+  private readonly results = new Map<string, Promise<ConfinementProbe>>();
+  constructor(private readonly which: (cmd: string) => string | null = (cmd) => Bun.which(cmd)) {}
+
+  async verify(spec: AgentSpec, run: typeof runProcess): Promise<ConfinementProbe> {
+    const path = this.which("codex");
+    if (!path) return { ok: false, path: null, version: null, reason: "codex CLI not found on PATH" };
+    let version: string | null = null;
+    try {
+      const proc = await run({ cmd: [path, "--version"], cwd: spec.cwd, env: agentEnv(), timeoutMs: 30_000 });
+      if (proc.exitCode === 0) version = proc.stdout.trim().split("\n")[0]?.trim() || null;
+    } catch {
+      version = null;
+    }
+    if (!version) return { ok: false, path, version: null, reason: "codex --version failed" };
+    const key = `${path}\0${version}`;
+    let result = this.results.get(key);
+    if (!result) {
+      result = sandboxProbe(spec, path, version, run);
+      this.results.set(key, result);
+    }
+    return result;
+  }
+}
+
+export const codexReaderProbe = new CodexReaderProbe();
+
+async function sandboxProbe(
+  spec: AgentSpec,
+  path: string,
+  version: string,
+  run: typeof runProcess,
+): Promise<ConfinementProbe> {
+  const fail = (reason: string): ConfinementProbe => ({ ok: false, path, version, reason });
+  let dir: string | null = null;
+  try {
+    const scratch = validateScratch(spec);
+    // The temporary directory is a private root: denied to the reader, and outside cwd and scratch.
+    dir = mkdtempSync(join(realpathSync(tmpdir()), "limitless-canary-"));
+    const canary = join(dir, "canary.txt");
+    const token = `canary-${randomUUID()}`;
+    writeFileSync(canary, token);
+    const { cwd, scratch: own } = readConfinement(spec, scratch);
+    if ([...cwd, ...own].some((root) => canary.startsWith(`${root}/`)))
+      return fail("no canary location outside the reader's cwd and scratch");
+    const proc = await run({
+      cmd: [path, "sandbox", ...readerProfile(spec, scratch), "--", "/bin/cat", canary],
+      cwd: spec.cwd,
+      env: agentEnv(scratchEnv(spec)),
+      timeoutMs: 60_000,
+    });
+    if (proc.exitCode === 0 || proc.stdout.includes(token))
+      return fail("sandbox allowed reading a canary outside the reader's cwd");
+    if (proc.cancelled || proc.timedOut || proc.idleTimedOut) return fail("sandbox probe did not finish");
+    const denied = proc.stderr.split("\n").some((line) => line.includes(canary) && DENIED.test(line));
+    if (!denied)
+      return fail(
+        `sandbox did not report a denied read (exit ${proc.exitCode ?? proc.signal}): ${proc.stderr.trim().slice(-300)}`,
+      );
+    return { ok: true, path, version, reason: null };
+  } catch (e) {
+    return fail(`sandbox probe failed to start: ${(e as Error).message}`);
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 export function buildCodexArgs(spec: AgentSpec): string[] {
   const t = spec.target;
   if (spec.mode === "readonly" && spec.addDirs?.length)
@@ -278,16 +372,12 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
     );
   }
   if (spec.mode === "readonly" && !spec.noTools) {
-    const scratch = validateScratch(spec);
     // Named filesystem profiles (verified live on codex-cli 0.157.1). Legacy read-only mode
     // ignores sandbox_workspace_write roots, and workspace-write grants cwd implicitly.
     args.push(
       "--strict-config",
       "--ignore-rules",
-      "-c",
-      'default_permissions="limitless-reader"',
-      "-c",
-      `permissions={limitless-reader={filesystem={${readerFilesystem(spec, scratch)}},network={enabled=false}}}`,
+      ...readerProfile(spec, validateScratch(spec)),
       "-c",
       "orchestrator.mcp.enabled=false",
       "--disable",
@@ -318,9 +408,34 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
   return args;
 }
 
-export async function runCodex(spec: AgentSpec, processRunner = runProcess): Promise<AgentResult> {
+export async function runCodex(
+  spec: AgentSpec,
+  processRunner = runProcess,
+  readerProbe = codexReaderProbe,
+): Promise<AgentResult> {
   const t = spec.target;
   const args = buildCodexArgs(spec);
+  let confinement: ConfinementProbe | undefined;
+  if (spec.confineReads && spec.mode === "readonly" && !spec.noTools) {
+    confinement = await readerProbe.verify(spec, processRunner);
+    if (!confinement.ok || !confinement.path) {
+      const cli = `${confinement.path ?? "codex"}${confinement.version ? ` (${confinement.version})` : ""}`;
+      return {
+        status: "unavailable",
+        finalText: "",
+        structured: null,
+        sessionId: null,
+        usage: emptyUsage(),
+        numTurns: 0,
+        costUsd: 0,
+        costEquivUsd: 0,
+        error: `Codex read confinement not verified for ${cli}: ${confinement.reason}; confined readers will not run on this CLI`,
+        quota: null,
+        confinement,
+      };
+    }
+    args[0] = confinement.path;
+  }
   const prompt = spec.systemAppend ? `${spec.systemAppend}\n\n---\n\n${spec.prompt}` : spec.prompt;
 
   const loop = new LoopDetector(spec.maxToolCalls);
@@ -380,6 +495,7 @@ export async function runCodex(spec: AgentSpec, processRunner = runProcess): Pro
     costUsd: t.billing === "metered" ? equiv : 0,
     costEquivUsd: equiv,
     quota: windows ? { windows, exhaustedUntil: null } : null,
+    ...(confinement ? { confinement } : {}),
   };
 
   if (proc.cancelled && stuckReason) return { ...base, status: "stuck", error: stuckReason };
