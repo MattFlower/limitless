@@ -24,7 +24,7 @@ import {
   fetchBase,
   formatTopLevel,
   type GitHubBudget,
-  githubBudget,
+  githubRetry,
   headSha,
   isAncestor,
   mergePullRequest,
@@ -1252,14 +1252,22 @@ async function recordVerified(ctx: RunContext, sha: string): Promise<void> {
   await ctx.save();
 }
 
-/** One GitHub retry deadline per delivery, fallback draft included, persisted so a restart resumes it. */
+/** One GitHub retry budget per delivery, fallback draft included, persisted so a restart resumes it. */
 async function deliveryBudget(ctx: RunContext): Promise<GitHubBudget> {
   const key = `deliver:${ctx.state.round}`;
-  if (ctx.state.githubDeadline?.key !== key) {
-    ctx.state.githubDeadline = { key, at: githubBudget().deadline };
+  if (ctx.state.githubBudget?.key !== key) {
+    ctx.state.githubBudget = { key, leftMs: githubRetry.budgetMs };
     await ctx.save();
   }
-  return { deadline: ctx.state.githubDeadline.at };
+  const saved = ctx.state.githubBudget;
+  const budget: GitHubBudget = {
+    leftMs: saved.leftMs,
+    onSpend: async () => {
+      saved.leftMs = budget.leftMs;
+      await ctx.save();
+    },
+  };
+  return budget;
 }
 
 async function deliverVerifiedDraft(

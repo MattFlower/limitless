@@ -1668,7 +1668,8 @@ test("GitHub retries classify structured failures and share one abortable deadli
   expect(calls).toBe(1);
   // 100 ms, then 300 ms of backoff would overrun a 150 ms budget: give up without sleeping past it.
   githubRetry.baseDelayMs = 100;
-  const budget = { deadline: Date.now() + 150 };
+  const spent: number[] = [];
+  const budget = { leftMs: 150, onSpend: async () => void spent.push(budget.leftMs) };
   const started = Date.now();
   calls = 0;
   const failing = () => withGitHubRetry(flaky(Array(9).fill(ghError(bad502))), { budget });
@@ -1676,10 +1677,16 @@ test("GitHub retries classify structured failures and share one abortable deadli
   await expect(failing()).rejects.toBeInstanceOf(GitHubUnavailableError);
   expect(calls).toBe(3); // the second call of the delivery gets no fresh budget: one attempt
   expect(Date.now() - started).toBeLessThan(250);
-  await Bun.sleep(Math.max(0, budget.deadline - Date.now()) + 5);
+  expect(spent).toHaveLength(4); // every call and every backoff is persisted as soon as it ends
+  // Local work between GitHub calls (merging, gates) does not drain the budget; only remote time does.
+  await Bun.sleep(100);
+  expect(budget.leftMs).toBeGreaterThan(0);
+  const slow = () => withGitHubRetry(() => Bun.sleep(budget.leftMs + 5).then(() => "ok"), { budget });
+  expect(await slow()).toBe("ok");
+  expect(budget.leftMs).toBeLessThanOrEqual(0);
   await expect(failing()).rejects.toBeInstanceOf(GitHubUnavailableError);
-  expect(calls).toBe(3); // once the deadline passes, nothing more starts
-  const soon = { deadline: Date.now() + 500 };
+  expect(calls).toBe(3); // once the budget is spent, nothing more starts
+  const soon = { leftMs: 500 };
   expect(
     await withGitHubRetry(async (timeout) => timeout(), { budget: soon, timeoutMs: 300_000 }),
   ).toBeLessThanOrEqual(500);
@@ -1736,7 +1743,7 @@ test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is fina
     const merges = ghCalls(pr, "pr merge").length;
     const views = ghCalls(pr, "pr view").length;
     writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr merge", landed: true, hang: true }]));
-    const budget = { deadline: Date.now() + 3_000 };
+    const budget = { leftMs: 3_000 };
     const url = "https://github.com/test/repo/pull/1";
     expect(await mergePullRequest(url, root, "T", undefined, budget)).toBe("merged");
     expect(ghCalls(pr, "pr merge")).toHaveLength(merges + 1);
@@ -1779,15 +1786,20 @@ test("restart during GitHub backoff resumes the delivery budget without duplicat
     const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
     f.scheduler.start();
     await wait(() => existsSync(`${pr}.calls`) && ghCalls(pr, "pr create").length === 1);
-    const deadline = f.store.getRunState<RunState>(r.id)?.githubDeadline;
-    expect(deadline).toBeDefined();
+    // Sit in the 5 s backoff: the stop aborts it and the wait so far is charged to the budget.
+    await Bun.sleep(1_500);
+    const before = f.store.getRunState<RunState>(r.id)?.githubBudget;
+    expect(before?.leftMs).toBeLessThan(githubRetry.budgetMs);
     const next = await reopen(f);
     await settled(next, r.id);
     expect(next.store.getRun(r.id)).toMatchObject({
       status: "succeeded",
       prUrl: "https://github.com/test/repo/pull/1",
     });
-    expect(next.store.getRunState<RunState>(r.id)?.githubDeadline).toEqual(deadline);
+    const after = next.store.getRunState<RunState>(r.id)?.githubBudget;
+    expect(after?.key).toBe(before?.key as string);
+    // Resumed, not renewed: the interrupted backoff alone cost over a second of the same budget.
+    expect(after?.leftMs).toBeLessThan((before?.leftMs as number) - 1_000);
     expect(ghCalls(pr, "pr create")).toHaveLength(2);
     history(next, r.id);
   } finally {

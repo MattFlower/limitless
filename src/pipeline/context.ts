@@ -60,8 +60,8 @@ export interface RunState {
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
   verdictCommentPosted?: boolean;
   verdictCommentPending?: boolean;
-  /** GitHub retry deadline of the current delivery, so a restart resumes rather than renews it. */
-  githubDeadline?: { key: string; at: number };
+  /** GitHub retry budget left in the current delivery, so a restart resumes rather than renews it. */
+  githubBudget?: { key: string; leftMs: number };
   phase: Phase;
   worktreePath?: string;
   gatesConfig?: GateConfig;

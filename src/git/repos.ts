@@ -9,11 +9,15 @@ const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
 /** Retry policy for GitHub and remote git (tests shorten it). */
 export const githubRetry = { attempts: 3, budgetMs: 60_000, baseDelayMs: 5_000 };
-/** One deadline shared by every GitHub call in a delivery. */
+/**
+ * GitHub time shared by every call in a delivery. It only drains while a remote command or a
+ * backoff pause runs, so local work in between (merging, post-merge gates) never eats into it.
+ */
 export interface GitHubBudget {
-  deadline: number;
+  leftMs: number;
+  /** Runs after every charge, so a delivery can persist what is left across a restart. */
+  onSpend?: () => Promise<void>;
 }
-export const githubBudget = (): GitHubBudget => ({ deadline: Date.now() + githubRetry.budgetMs });
 export class GitHubUnavailableError extends Error {}
 /** Time kept back from a merge command so its outcome can still be looked up after a timeout. */
 const MERGE_RECONCILE_MS = 10_000;
@@ -52,24 +56,34 @@ export async function withGitHubRetry<T>(
 ): Promise<T> {
   const cap = opts.timeoutMs ?? 120_000;
   // Outside a delivery, a lone call gets a budget that never cuts its own timeout short.
-  const budget = opts.budget ?? { deadline: Date.now() + Math.max(githubRetry.budgetMs, cap) };
-  // Recomputed before every subprocess, so no command outlives the shared deadline.
+  const budget = opts.budget ?? { leftMs: Math.max(githubRetry.budgetMs, cap) };
+  let started = Date.now();
+  const left = () => budget.leftMs - (Date.now() - started);
+  // Recomputed before every subprocess, so no command outlives the shared budget.
   const timeout = () => {
-    const left = budget.deadline - Date.now();
-    if (left <= 0) throw new GitHubUnavailableError("GitHub unavailable: delivery retry deadline passed");
-    return Math.min(cap, left);
+    if (left() <= 0) throw new GitHubUnavailableError("GitHub unavailable: delivery retry budget exhausted");
+    return Math.min(cap, left());
+  };
+  const charged = async <R>(work: () => Promise<R>): Promise<R> => {
+    try {
+      return await work();
+    } finally {
+      budget.leftMs = left();
+      started = Date.now();
+      await budget.onSpend?.();
+    }
   };
   for (let attempt = 1; ; attempt++) {
     opts.signal?.throwIfAborted();
     timeout();
     try {
-      return await call(timeout);
+      return await charged(() => call(timeout));
     } catch (error) {
       if (!isTransient(error) || opts.signal?.aborted) throw error;
       const delay = githubRetry.baseDelayMs * 3 ** (attempt - 1);
-      if (attempt >= githubRetry.attempts || Date.now() + delay >= budget.deadline)
+      if (attempt >= githubRetry.attempts || delay >= left())
         throw new GitHubUnavailableError(`GitHub unavailable: ${(error as Error).message}`);
-      await pause(delay, opts.signal);
+      await charged(() => pause(delay, opts.signal));
     }
   }
 }
