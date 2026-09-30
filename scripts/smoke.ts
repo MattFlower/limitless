@@ -505,8 +505,10 @@ else:
               .map((event) => (event.type === "tool_result" ? event.output : ""))
               .join("; ")
               .slice(0, 2000)}`,
-            // Only a model that never ran the probe (no call, no evidence line anywhere) may be retried.
-            probeCallIds(events, command).size === 0 && !JSON.stringify(events).includes(token)
+            // Only a model that never ran the probe (no call touching it in any spelling, no evidence
+            // line in events or the final answer) may be retried.
+            !events.some((e) => e.type === "tool_call" && JSON.stringify(e.input).includes("verify-probe")) &&
+              !`${JSON.stringify(events)}${result.finalText ?? ""}`.includes(token)
               ? "model"
               : undefined,
           );

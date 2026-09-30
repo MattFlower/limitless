@@ -798,7 +798,7 @@ test("a failure on both attempts is marked retried with a bounded one-line reaso
   expect(formatReport(rows)).toContain(`FAIL (retried after: ${after})`);
 });
 
-for (const outcome of ["silent", "probe-failed", "wrote"] as const) {
+for (const outcome of ["silent", "probe-failed", "respelled-probe-failed", "claimed", "wrote"] as const) {
   test(`verify smoke retries only a model that never ran the probe: ${outcome}`, async () => {
     const target: ModelTarget = {
       modelId: "fake/m",
@@ -817,6 +817,15 @@ for (const outcome of ["silent", "probe-failed", "wrote"] as const) {
       if (calls === 1 && outcome === "probe-failed") {
         spec.onEvent({ type: "tool_call", id: "probe", name: "Bash", input: { command } });
         spec.onEvent({ type: "tool_result", id: "probe", output: "Traceback", isError: true });
+      }
+      if (calls === 1 && outcome === "respelled-probe-failed") {
+        const respelled = `python3 ${join(spec.cwd, "verify-probe.py")}`;
+        spec.onEvent({ type: "tool_call", id: "probe", name: "Bash", input: { command: respelled } });
+        spec.onEvent({ type: "tool_result", id: "probe", output: "Traceback", isError: true });
+      }
+      if (calls === 1 && outcome === "claimed") {
+        const token = readFileSync(join(spec.cwd, "verify-probe.py"), "utf8").match(/print\("(.*):temp/)?.[1];
+        return { ...result, finalText: `${token}:temp-created-read-deleted\n${token}:worktree-write-denied` };
       }
       if (calls > 1) {
         const run = await sh(["/bin/sh", "-c", command], {
