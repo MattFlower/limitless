@@ -323,9 +323,9 @@ function quotedIn(quote: string, text: string): boolean {
 // List and quote markers and an acceptance-criterion label, as the verify prompt renders them.
 const LINE_MARKER = /^(?:(?:[-*>]|\d+[.)])\s+)*(?:\**AC-\d+\**:?\s+)?/i;
 const wholeLine = (s: string) => trimQuote(trimQuote(s).replace(LINE_MARKER, ""));
-// A request line states a requirement only as a bullet or a sentence; a heading like "Networking:" does not.
-const requirementLine = (l: string) =>
-  !/:[*`\s]*$/.test(l) && (/^\s*(?:[-*>]|\d+[.)])\s/.test(l) || /[.!?]["'”)*`]*\s*$/.test(l));
+// A heading ("## Scope.", "Networking:") labels requirements rather than stating one; any other
+// whole line may, punctuated or not ("Support IPv6" is a complete imperative request).
+const heading = (l: string) => /^\s*#/.test(l) || /:[*`\s]*$/.test(l);
 
 /** Whether `citation` occurs verbatim in `source` on word boundaries, whatever its length. */
 export function citationInSource(citation: string, source: string): boolean {
@@ -335,9 +335,9 @@ export function citationInSource(citation: string, source: string): boolean {
 /**
  * The cited requirement as it will be shown, or null unless it is a verbatim whole-word quote of
  * `source` (ignoring case, spacing, markdown emphasis and surrounding quotes) of at least three
- * words, or a whole sentence or bullet line of `source` or one of the complete `entries` (ignoring list markers and
- * AC labels). Only verbatim public text is ever repeated to the implementer: a paraphrase could
- * carry scenario text, and a fragment grounds nothing.
+ * words, or a whole non-heading line of `source` or one of the complete `entries` (ignoring list
+ * markers and AC labels). Only verbatim public text is ever repeated to the implementer: a
+ * paraphrase could carry scenario text, and a fragment grounds nothing.
  */
 export function citedRequirement(
   citation: string,
@@ -348,7 +348,7 @@ export function citedRequirement(
   const key = flatText(line);
   if (
     /[\p{L}\p{N}]/u.test(key) &&
-    [...source.split("\n").filter(requirementLine), ...entries].some((e) => flatText(wholeLine(e)) === key)
+    [...source.split("\n").filter((l) => !heading(l)), ...entries].some((e) => flatText(wholeLine(e)) === key)
   )
     return line;
   const quote = trimQuote(citation);

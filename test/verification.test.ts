@@ -526,7 +526,7 @@ test("the verifier is told what makes a citation grounded", () => {
 
 test("a whole request line or acceptance criterion is grounded however short; a short fragment is not", () => {
   const request =
-    "Networking changes:\n- Support IPv6\n* Keep IPv4\n> Log it\n1. Retry once\n- Support IPv6 and DNS over TLS\n## Limits\nCap it.\nOther notes\n- Later:";
+    "Networking changes:\n- Support IPv6\n* Keep IPv4\n> Log it\n1. Retry once\n- Support IPv6 and DNS over TLS\n## Limits\nCap it.\n## Scope.\nOther notes\n- Later:";
   const shortSpec = {
     ...spec,
     acceptance_criteria: [{ id: "AC-1", criterion: "Paginated.", how_to_verify: "run" }],
@@ -540,8 +540,12 @@ test("a whole request line or acceptance criterion is grounded however short; a 
     ["Log it", "Log it"],
     ["1. Retry once", "Retry once"],
     ["Cap it.", "Cap it"],
+    // A standalone sentence needs no list marker or terminal punctuation.
+    ["Other notes", "Other notes"],
   ] as const)
     expect(citedRequirement(citation, request)).toBe(line);
+  expect(citedRequirement("Support IPv6", "Support IPv6")).toBe("Support IPv6");
+  // Headings label requirements rather than stating one, even when they end in punctuation.
   for (const citation of [
     "IPv6",
     "Retry",
@@ -551,10 +555,13 @@ test("a whole request line or acceptance criterion is grounded however short; a 
     "Networking changes:",
     "Networking changes",
     "Limits",
-    "Other notes",
+    "## Limits",
+    "Scope",
+    "## Scope.",
     "Later",
   ])
     expect(citedRequirement(citation, request)).toBeNull();
+  expect(citedRequirement("## Scope.", "## Scope.\n- Support IPv6")).toBeNull();
   for (const citation of ["**AC-1** Paginated.", "AC-1: Paginated", "- **AC-1** Paginated."])
     expect(citedRequirement(citation, source, entries)).toBe("Paginated");
   const verify = unmetHoldout({
