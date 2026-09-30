@@ -760,6 +760,50 @@ test("a read-only home is still probed through its factory directory, or not tru
   }
 });
 
+for (const destination of ["tmp", "home-sibling"] as const) {
+  for (const writableHome of [true, false]) {
+    test(`a factory symlink to ${destination} cannot replace coverage of ${writableHome ? "writable" : "read-only"} home`, async () => {
+      const { spec, cleanup } = confinedFixture();
+      // This CLI denies temporary roots but leaks home; testing the symlink target would trust it.
+      const fake = fakeCodex((file, opts) => (file.includes("/home/") ? reads(file) : enforcing(file, opts)));
+      const destinationRoot = destination === "tmp" ? fake.roots.tmp : `${fake.roots.home}-sibling`;
+      mkdirSync(destinationRoot, { recursive: true });
+      const sentinel = join(destinationRoot, "existing.txt");
+      writeFileSync(sentinel, "caller-owned");
+      const factory = join(fake.roots.home, ".limitless");
+      symlinkSync(destinationRoot, factory);
+      cleanups.unshift(() => chmodSync(fake.roots.home, 0o755));
+      if (!writableHome) chmodSync(fake.roots.home, 0o555);
+      const probe = new CodexReaderProbe(() => CODEX, {
+        canaryRoots: () => canaryRoots(Object.values(fake.roots), fake.classes),
+      });
+      try {
+        const result = await runCodex(spec, fake.runner, probe);
+        expect(result.status).toBe("unavailable");
+        expect(result.confinement).toMatchObject({
+          ok: false,
+          reason: writableHome ? "reader profile not enforced" : "probe inconclusive",
+        });
+        expect(fake.execs).toHaveLength(0);
+        if (writableHome) {
+          const homeReads = fake.sandboxReads.filter((read) => inRoot(fake.roots.home, read.file));
+          expect(homeReads).toHaveLength(1);
+          expect(homeReads[0]).toMatchObject({ existed: true, access: "none" });
+          expect(dirname(dirname(homeReads[0]?.file ?? ""))).toBe(fake.roots.home);
+        } else {
+          expect(fake.sandboxReads).toHaveLength(0);
+        }
+        for (const read of fake.sandboxReads) expect(existsSync(dirname(read.file))).toBe(false);
+        expect(realpathSync(factory)).toBe(destinationRoot);
+        expect(readFileSync(sentinel, "utf8")).toBe("caller-owned");
+        expect(readdirSync(destinationRoot)).toEqual(["existing.txt"]);
+      } finally {
+        cleanup();
+      }
+    });
+  }
+}
+
 for (const [name, shape] of [
   ["cat", (f: string) => `cat: ${f}: Permission denied`],
   ["full program path and quotes", (f: string) => `/bin/cat: '${f}': Operation not permitted`],

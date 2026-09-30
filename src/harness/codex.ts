@@ -302,7 +302,11 @@ export function canaryRoots(
   for (const root of required.keys())
     if (!roots.includes(root)) throw new Error("mandatory private root not denied");
   return roots.flatMap((root) => {
-    const location = (required.get(root) ?? [root]).find(writable);
+    // A symlinked factory directory must not substitute another root for the home control.
+    const location = (required.get(root) ?? [root])
+      .filter(writable)
+      .map((path) => realpathSync(path))
+      .find((path) => path === root || path.startsWith(`${root}/`));
     if (location) return [location];
     if (required.has(root)) throw new Error("mandatory private root has no writable canary location");
     return [];
