@@ -118,17 +118,19 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
   await deploy(7400, "feature", true, f.opts);
   expect(process.listenerCount("SIGINT")).toBe(intListeners);
   expect(process.listenerCount("SIGTERM")).toBe(termListeners);
-  expect(f.calls.slice(0, 8)).toEqual([
+  expect(f.calls.slice(0, 10)).toEqual([
     "health",
     "git rev-parse HEAD",
     "git fetch origin --prune",
     "git rev-parse feature^{commit}",
     "git checkout -q --detach next",
     "bun install --frozen-lockfile",
-    "bun run check",
-    "bun run smoke",
+    "bun run lint",
+    "bun run typecheck",
+    "bun test",
+    "bun scripts/smoke.ts",
   ]);
-  expect(f.calls[8]).toBe("drain");
+  expect(f.calls[10]).toBe("drain");
   expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
   expect(f.sleeps).toEqual([5000, 5000]);
   expect(f.logs.join("\n")).toContain("run-a (implement)");
@@ -300,7 +302,12 @@ test("initially empty and unchanged ref do not wait", async () => {
   ]);
   f.calls.length = 0;
   await deploy(7400, "feature", true, f.opts);
-  expect(f.calls.slice(-2)).toEqual(["bun run check", "bun run smoke"]);
+  expect(f.calls.slice(-4)).toEqual([
+    "bun run lint",
+    "bun run typecheck",
+    "bun test",
+    "bun scripts/smoke.ts",
+  ]);
   expect(f.calls).not.toContain("drain");
 });
 
@@ -322,7 +329,7 @@ test("--now retains gates and drain without sleeps; disappearing details are exp
   const f = setup();
   await deploy(7400, "feature", true, { ...f.opts, now: true, maxWaitMs: 3000 });
   expect(f.sleeps).toEqual([]);
-  expect(f.calls).toContain("bun run smoke");
+  expect(f.calls).toContain("bun scripts/smoke.ts");
   expect(f.calls.indexOf("drain")).toBeLessThan(f.calls.indexOf("restart"));
   expect(f.logs.join("\n")).toContain("--now");
   const other = setup();
@@ -345,7 +352,7 @@ test("failure after a possible drain restores release and resumes, retaining cle
     if (failure === "gate") {
       const command = f.opts.command;
       f.opts.command = async (args, opts) => {
-        if (args.join(" ") === "bun run check") throw new Error("bad gate");
+        if (args.join(" ") === "bun test") throw new Error("bad gate");
         return command(args, opts);
       };
     }
@@ -542,8 +549,8 @@ test("checkout already at target reruns gates before drain", async () => {
   const f = setup();
   f.setSelected("next");
   await deploy(7400, "feature", false, f.opts);
-  expect(f.calls.indexOf("bun install --frozen-lockfile")).toBeLessThan(f.calls.indexOf("bun run check"));
-  expect(f.calls.indexOf("bun run check")).toBeLessThan(f.calls.indexOf("drain"));
+  expect(f.calls.indexOf("bun install --frozen-lockfile")).toBeLessThan(f.calls.indexOf("bun run lint"));
+  expect(f.calls.indexOf("bun test")).toBeLessThan(f.calls.indexOf("drain"));
   expect(f.calls).not.toContain("git checkout -q --detach next");
   expect(f.calls.indexOf("drain")).toBeLessThan(f.calls.indexOf("restart"));
   expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
@@ -556,21 +563,21 @@ test("a target checkout still aborts on failed gates before draining", async () 
   f.setSelected("next");
   const command = f.opts.command;
   f.opts.command = async (args, options) => {
-    if (args.join(" ") === "bun run check") throw new Error("failed check");
+    if (args.join(" ") === "bun test") throw new Error("failed check");
     return command(args, options);
   };
   await expect(deploy(7400, "feature", true, f.opts)).rejects.toThrow("failed check");
   expect(f.calls).toContain("bun install --frozen-lockfile");
   expect(f.calls).not.toContain("drain");
   expect(f.calls).not.toContain("restart");
-  expect(f.calls).not.toContain("bun run smoke");
+  expect(f.calls).not.toContain("bun scripts/smoke.ts");
 });
 
 test("a target checkout runs requested smoke before draining", async () => {
   const f = setup();
   f.setSelected("next");
   await deploy(7400, "feature", true, f.opts);
-  expect(f.calls.indexOf("bun run smoke")).toBeLessThan(f.calls.indexOf("drain"));
+  expect(f.calls.indexOf("bun scripts/smoke.ts")).toBeLessThan(f.calls.indexOf("drain"));
 });
 
 test("a pre-upgrade daemon without a boot SHA deploys using the checkout commit", async () => {
@@ -583,7 +590,7 @@ test("a pre-upgrade daemon without a boot SHA deploys using the checkout commit"
     };
     await deploy(7400, "feature", false, f.opts);
     expect(f.calls).toContain("git checkout -q --detach next");
-    expect(f.calls).toContain("bun run check");
+    expect(f.calls).toContain("bun test");
     expect(f.calls.filter((call) => call === "restart")).toHaveLength(1);
     expect(f.logs).toContain("daemon before: unknown");
     expect(f.logs).toContain("daemon after: next");
@@ -695,7 +702,7 @@ test("a gate failure resumes a daemon that was draining on entry", async () => {
   f.setDraining(true);
   const command = f.opts.command;
   f.opts.command = async (args, opts) => {
-    if (args.join(" ") === "bun run check") throw new Error("bad gate");
+    if (args.join(" ") === "bun test") throw new Error("bad gate");
     return command(args, opts);
   };
   await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("bad gate");
@@ -727,7 +734,7 @@ test("a second signal exits immediately during rollback", async () => {
   const exits: number[] = [];
   const command = f.opts.command;
   f.opts.command = async (args, options) => {
-    if (args.join(" ") === "bun run check") process.emit("SIGINT");
+    if (args.join(" ") === "bun test") process.emit("SIGINT");
     if (args[1] === "checkout" && args[4] === "previous") {
       process.emit("SIGTERM");
       expect(exits).toEqual([143]);
@@ -749,7 +756,7 @@ test("a signal during gates cancels the command before restoring the checkout", 
   const f = setup();
   const command = f.opts.command;
   f.opts.command = async (args, options) => {
-    if (args.join(" ") !== "bun run check") return command(args, options);
+    if (args.join(" ") !== "bun test") return command(args, options);
     f.calls.push("gate started");
     process.emit("SIGINT");
     expect(options.signal?.aborted).toBe(true);

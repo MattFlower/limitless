@@ -592,9 +592,12 @@ runs at a time. Then it:
 
 1. Reads the running daemon's boot SHA.
 2. Fetches `origin` in the release checkout and resolves `ref` (default `origin/main`).
-3. Checks out the target and runs `bun install --frozen-lockfile` and `bun run check`. With
-   `--smoke`, it also runs `bun run smoke`, which spends a little real quota. A failure here keeps
-   the old daemon running (`deploy gate failed`).
+3. Checks out the target and runs `bun install --frozen-lockfile`, then the checks (`bun run lint`,
+   `bun run typecheck`, `bun test`). With `--smoke`, it also runs `bun scripts/smoke.ts`, which
+   spends a little real quota. A failure here keeps the old daemon running (`deploy gate failed`).
+   The tests and smoke run directly, not through `bun run`, which would put every parent
+   directory's `node_modules/.bin` first on `PATH` and test a stray CLI there (for example an older
+   `codex` under `$HOME`) instead of the one the daemon uses.
 4. **Drains** the scheduler. New runs stay `queued`, while active runs, answers and cancellation
    continue. It waits up to `--max-wait` seconds (default 2700) for active runs to finish,
    reporting their IDs and stages every 5 seconds. At the timeout it restarts anyway.
