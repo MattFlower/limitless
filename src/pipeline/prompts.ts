@@ -6,6 +6,7 @@ import {
   type Holdout,
   type Review,
   renderSpec,
+  requirementEntries,
   requirementSource,
   type Spec,
   type Verify,
@@ -282,7 +283,7 @@ function groundedCitation(
 ): string | null {
   const sourceText =
     requirement === "request" ? request : spec ? requirementSource("spec", request, spec) : "";
-  const quote = citedRequirement(citation, sourceText);
+  const quote = citedRequirement(citation, sourceText, requirementEntries(requirement, spec));
   if (quote === null || !holdout || redactHoldoutText(quote, holdout, publicSources) !== quote) return null;
   return quote;
 }

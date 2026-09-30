@@ -8,6 +8,8 @@ import {
 import {
   citedRequirement,
   type Holdout,
+  requirementCitationIssue,
+  requirementEntries,
   requirementSource,
   type Spec,
   toStrictJsonSchema,
@@ -434,7 +436,61 @@ test("a citation is grounded only when it is a verbatim quote of the named sourc
     [spec.acceptance_criteria[0]?.how_to_verify ?? "", source],
   ] as const)
     expect(citedRequirement(citation, text)).toBeNull();
-  expect(citedRequirement("works", source)).toBe("works");
+  // A fragment grounds nothing: single words, and text cut from inside words, are rejected.
+  for (const citation of ["works", "e", "the", "mpty lists are accep", "lists are accepte"])
+    expect(citedRequirement(citation, source)).toBeNull();
+  expect(citedRequirement("make it", requirementSource("request", "make it work", spec))).toBeNull();
+  expect(citedRequirement("ake it wor", "make it work")).toBeNull();
+  expect(citedRequirement('  **Lists  ARE** accepted" ', source)).toBe("Lists ARE** accepted");
+});
+
+test("a complete short spec entry is grounded; a short partial quote is not", () => {
+  const shortSpec = {
+    ...spec,
+    requirements: ["Idempotent retries"],
+    acceptance_criteria: [{ id: "AC-1", criterion: "Paginated.", how_to_verify: "run it" }],
+  };
+  const source = requirementSource("spec", "", shortSpec);
+  const entries = requirementEntries("spec", shortSpec);
+  expect(citedRequirement("idempotent retries", source, entries)).toBe("idempotent retries");
+  expect(citedRequirement('"paginated"', source, entries)).toBe("paginated");
+  expect(citedRequirement("Idempotent", source, entries)).toBeNull();
+  expect(
+    citedRequirement("idempotent retries", "Idempotent retries", requirementEntries("request", shortSpec)),
+  ).toBeNull();
+  const issue = (requirementCitation: string, evidence: string) =>
+    requirementCitationIssue(
+      { id: "H-1", status: "unmet", evidence, publicSummary: "", requirement: "spec", requirementCitation },
+      "",
+      shortSpec,
+    );
+  expect(issue("Idempotent retries", "violates idempotent retries: second call fails")).toBeNull();
+  expect(issue("Paginated", "violates **Paginated**")).toBeNull();
+  expect(issue("Paginated", "the list is unpaginated")).toBe("evidence does not cite the requirement");
+  expect(issue("Idempotent retries", "idempotent retriesx")).toBe("evidence does not cite the requirement");
+  expect(issue("retries", "violates retries")).toBe("citation is not a stated public requirement");
+});
+
+test("a trivial citation blocks and is never repeated to the implementer", () => {
+  for (const requirementCitation of ["e", "the", "work"]) {
+    const verify = unmetHoldout({
+      requirement: "request",
+      requirementCitation,
+      evidence: `violates ${requirementCitation}`,
+    });
+    const normalized = normalizeVerify(VerifySchema.parse(verify), spec, holdout, "make the thing work");
+    expect(normalized.overall).toBe("fail");
+    expect(normalized.notes).toContain("citation is not a stated public requirement");
+    const feedback = formatVerifyFeedback(
+      normalized,
+      spec,
+      holdout,
+      "make the thing work",
+      "make the thing work",
+    );
+    expect(feedback).toContain("(the verifier's citation was not found in it)");
+    expect(feedback).not.toContain(`requirement of the original request: "${requirementCitation}"`);
+  }
 });
 
 test.each(["request", "spec"] as const)(

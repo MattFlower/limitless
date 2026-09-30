@@ -75,6 +75,23 @@ test("verification artifact renders blocked evidence and legacy statuses", async
     );
     expect(legacy).toContain("old/model");
     expect(legacy).not.toContain("🚧");
+    expect(legacy).not.toContain("not required");
+    const dismissed = renderToString(() =>
+      VerifyArtifact({
+        data: {
+          criteria: [
+            { id: "H-1", status: "unmet", evidence: "dismissed", requirement: "not_required" },
+            { id: "H-2", status: "unmet", evidence: "blocking", requirement: "spec" },
+          ],
+          overall: "pass",
+          notes: "",
+        },
+      }),
+    );
+    expect(dismissed).toContain("unmet (not required)");
+    expect(dismissed.split("unmet (not required)").length - 1).toBe(1);
+    expect(dismissed.split("badge-unmet").length - 1).toBe(2);
+    expect(dismissed).toContain("pill-succeeded");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
