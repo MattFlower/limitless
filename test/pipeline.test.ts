@@ -4976,6 +4976,6 @@ test("panel review: a verifier left on the finder's vendor is logged as a warnin
     .filter((e) => e.level === "warn")
     .map((e) => e.message);
   expect(warnings).toContainEqual(
-    expect.stringContaining("Verifier alpha/m shares vendor anthropic with the finder it checks"),
+    expect.stringContaining("Verifier alpha/m shares vendor anthropic with a finder it checks"),
   );
 });
