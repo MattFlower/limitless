@@ -1469,3 +1469,41 @@ test("Factory stop waits for its active health probe before database replacement
   const next = await reopen(f);
   expect(next.scheduler.activeRunIds).toEqual([]);
 });
+
+test("an invoke deadline bounds slot waits and every fallback, then gives up saying why", async () => {
+  let reply: (s: AgentSpec) => Promise<FakeReply> = async () => ({});
+  const f = factory(undefined, (s) => reply(s));
+  const r = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
+  const repo = f.store.getRepo(r.repoId);
+  if (!repo) throw new Error("missing fixture");
+  const ctx = new RunContext(f.deps, r, repo, new AbortController().signal);
+  const stage = f.store.startStage(r.id, "review", 0);
+  const call = () =>
+    ctx.invoke({
+      stage,
+      role: "review",
+      complexity: "small",
+      mode: "readonly",
+      prompt: "test",
+      requireStructured: true,
+      deadline: Date.now() + 300,
+    });
+  // A slow model gets only what is left of the deadline, and no fallback starts after it.
+  const timeouts: number[] = [];
+  reply = async (s) => {
+    timeouts.push(s.timeoutMs);
+    await Bun.sleep(s.timeoutMs);
+    return { fault: "timeout" };
+  };
+  await expect(call()).rejects.toThrow("Timed out routing review after: a@high: harness timeout");
+  expect(timeouts).toHaveLength(1);
+  expect(timeouts[0]).toBeLessThanOrEqual(300);
+  // Busy slots are waited for only until the deadline.
+  const never = new AbortController().signal;
+  const held = await Promise.all(["a", "a", "b", "b"].map((p) => f.tracker.acquire(p, never)));
+  const started = Date.now();
+  await expect(call()).rejects.toThrow("a@high: busy until the deadline");
+  expect(Date.now() - started).toBeLessThan(5_000);
+  for (const release of held) release();
+  expect(timeouts).toHaveLength(1);
+});

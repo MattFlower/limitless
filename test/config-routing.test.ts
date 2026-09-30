@@ -134,3 +134,26 @@ test("review mode defaults to single; rosters default per profile and are valida
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("roster targets are checked against the catalog at startup", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-roster-targets-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const start = (roster: string) => {
+    writeFileSync(join(configDir, "config.toml"), `[review.rosters]\nstandard = [${roster}]\n`);
+    new Factory(loadConfig({ home: join(root, "data"), configDir })).store.close();
+  };
+  try {
+    start(
+      '{ prompt = "adversarial", target = "codex/sol" }, { prompt = "standard", local = true, target = "omlx/qwen-27b" }',
+    );
+    expect(() => start('{ prompt = "adversarial", target = "claude/opsu" }')).toThrow(
+      'review.rosters.standard[0].target claude/opsu: unknown model ID "claude/opsu"',
+    );
+    expect(() =>
+      start('{ prompt = "careful" }, { prompt = "standard", local = true, target = "claude/opus" }'),
+    ).toThrow("review.rosters.standard[1].target claude/opus: a local finder needs a free model");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

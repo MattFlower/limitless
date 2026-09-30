@@ -14,6 +14,7 @@ import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
 import { renderReport } from "../src/pipeline/report.ts";
+import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
 import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
@@ -567,10 +568,97 @@ esac
           prompt: "standard",
           lens: "removed-behaviour-and-failure-paths",
           vendor: null,
-          skipped: "no local model available",
+          skipped: expect.stringContaining("No model available for review"),
         },
         { prompt: "standard", lens: "ops", vendor: "openai" },
       ]);
+  });
+
+  test("panel mode: one deadline covers a local finder's fallbacks, and its skip says why", async () => {
+    const local: number[] = [];
+    const f = start(
+      (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "verify") return { structured: pass };
+        if (role !== "review") return { files: { "farewell.txt": "goodbye\n" } };
+        if (!s.prompt.includes("# Lens: removed-behaviour-and-failure-paths")) return { structured: approve };
+        local.push(s.timeoutMs);
+        return { fault: "timeout", delayMs: 50 };
+      },
+      false,
+      true,
+    );
+    f.deps.cfg.reviewMode = "panel";
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    // Both free models were tried, the second with only what was left of the first's time.
+    expect(local).toHaveLength(2);
+    const [first = 0, second = 0] = local;
+    expect(first).toBeLessThanOrEqual(LOCAL_FINDER_TIMEOUT_MS);
+    expect(second).toBeLessThanOrEqual(first - 50);
+    const finders = JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}").panel.finders;
+    expect(finders[2]).toMatchObject({ vendor: null, skipped: expect.stringContaining("harness timeout") });
+  });
+
+  test("panel mode on free-first runs: the verifier is independent of the implementer and the finder", async () => {
+    const calls: { role: string; model: string; vendor: string }[] = [];
+    let implementations = 0;
+    const f = start(
+      (s) => {
+        const verifier = s.prompt.startsWith("You are a code-review verifier");
+        const role = verifier ? "verifier" : roleOf(s);
+        calls.push({ role, model: s.target.modelId, vendor: s.target.vendor });
+        if (verifier) {
+          const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1]);
+          const ruling = {
+            verdict: "REFUTED",
+            severity: "low",
+            category: "correctness",
+            evidence: "a:1",
+            trigger: "x",
+          };
+          return { structured: { results: ids.map((id) => ({ id, ...ruling })) } };
+        }
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") {
+          const finding = {
+            ...findingEvidence,
+            severity: "major",
+            file: "farewell.txt",
+            line: 1,
+            title: "T",
+          };
+          return {
+            structured: {
+              ...approve,
+              findings: [{ ...finding, detail: "d", suggestion: "s", security: false }],
+            },
+          };
+        }
+        return { files: { "farewell.txt": implementations++ ? "goodbye!\n" : "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    f.deps.cfg.reviewMode = "panel";
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "quick",
+      requestedBy: "dependabot[bot]",
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const [implementer, finder, verifier] = ["implement", "review", "verifier"].map((role) =>
+      calls.find((c) => c.role === role),
+    );
+    // Free-first picks free models for the implementer and the finder, but not an unindependent verifier.
+    expect([implementer?.model, finder?.model]).toEqual(["gamma/m", "delta/m"]);
+    expect(verifier?.model).not.toBe(implementer?.model);
+    expect(verifier?.vendor).not.toBe(finder?.vendor);
+    expect(verifier?.model).toBe("alpha/m");
   });
 
   test("Dependabot falls back when free providers are unavailable; owner keeps policy routing", async () => {
@@ -5041,62 +5129,71 @@ test("panel review: a verifier that omits candidates is retried once, then they 
   expect(warnings).toContainEqual(expect.stringContaining("Verifier gave no ruling for C2"));
 });
 
-test("panel review: a verifier left on the finder's vendor is logged as a warning", async () => {
-  const f = start((s) => {
-    if (s.prompt.startsWith("You are a code-review verifier")) {
-      const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
-      return {
-        structured: {
-          results: ids.map((id) => ({
-            id,
-            verdict: "PLAUSIBLE",
-            severity: "low",
-            category: "correctness",
-            evidence: "farewell.txt:1 `bye`",
-            trigger: "reading the file -> wrong farewell",
-          })),
-        },
-      };
-    }
-    const role = roleOf(s);
-    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
-    if (role === "review")
-      return {
-        structured: {
-          verdict: "approve",
-          summary: "One small note on the farewell text.",
-          findings: [
-            {
-              severity: "minor",
-              security: false,
-              ...findingEvidence,
-              file: "farewell.txt",
-              line: 1,
-              title: "Note",
-              detail: "d",
-              suggestion: "s",
-            },
-          ],
-        },
-      };
-    return { files: { "farewell.txt": "goodbye\n" } };
-  });
-  // Only one vendor is routable, so the verifier cannot avoid the finder's.
+test("panel review: a verifier left on the finder's vendor is another model, with a recorded warning", async () => {
+  const verifiers: string[] = [];
+  const f = start(
+    (s) => {
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        verifiers.push(s.target.modelId);
+        const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+        return {
+          structured: {
+            results: ids.map((id) => ({
+              id,
+              verdict: "PLAUSIBLE",
+              severity: "low",
+              category: "correctness",
+              evidence: "farewell.txt:1 `bye`",
+              trigger: "reading the file -> wrong farewell",
+            })),
+          },
+        };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review")
+        return {
+          structured: {
+            verdict: "approve",
+            summary: "One small note on the farewell text.",
+            findings: [
+              {
+                severity: "minor",
+                security: false,
+                ...findingEvidence,
+                file: "farewell.txt",
+                line: 1,
+                title: "Note",
+                detail: "d",
+                suggestion: "s",
+              },
+            ],
+          },
+        };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    },
+    false,
+    true,
+  );
+  // Only one vendor is routable, so the verifier cannot avoid the finder's; it may not reuse its model.
   f.tracker.record("beta", "quota", { exhaustedUntil: Date.now() + 3_600_000 });
   f.deps.reviewSystem = {
     name: "panel",
     mode: "panel",
     finders: [{ prompt: "standard" }],
-    verifier: {},
+    verifier: { target: "gamma/m" },
     implementerReport: "include",
   };
   const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
   expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-  const warnings = f.store
-    .listEvents(run.id)
-    .filter((e) => e.level === "warn")
-    .map((e) => e.message);
-  expect(warnings).toContainEqual(
-    expect.stringContaining("Verifier alpha/m shares vendor anthropic with a finder it checks"),
-  );
+  expect(verifiers).toEqual(["gamma/m"]);
+  const warning =
+    "Verifier gamma/m shares vendor anthropic with a finder it checks (C1); no other vendor was available";
+  expect(JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}").panel.warnings).toEqual([warning]);
+  expect(f.store.listEvents(run.id).map((e) => e.message)).toContain(warning);
+  // With nothing but the finder's own model, there is no verifier: the run goes to a human.
+  f.tracker.setEnabled("gamma", false);
+  const alone = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, alone.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  expect(verifiers).toEqual(["gamma/m"]);
 });

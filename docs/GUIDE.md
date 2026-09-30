@@ -483,8 +483,11 @@ are in [REASONING_EFFORT](REASONING_EFFORT.md).
 ### Review configuration and lenses
 
 By default a review is one routed finder (`[review] mode = "single"`). With `mode = "panel"`,
-several finders run in parallel, their reports are merged, and a verifier from another vendor rules
-on each candidate before anything blocks. Panel mode is off by default until evals show it
+several finders run in parallel, their reports are merged, and a verifier rules on each candidate
+before anything blocks. The verifier never runs on a model that raised the candidate. It avoids the
+vendors that raised it, then the implementer's vendor, and takes the implementer's own model only as
+a last resort, even on free-first runs. When it has to share a vendor with a finder, the panel
+record says so. Panel mode is off by default until evals show it
 outperforms single mode. Runs prepared in single mode stay single; turning panel mode off takes
 effect at the next review of every run.
 
@@ -512,12 +515,14 @@ Each finder takes these keys:
   fail) or `careful` (one senior pass).
 - `target`: a pinned model such as `codex/sol`. Without it, the finder is routed by the review policy.
 - `family`: `cross` (the default) avoids the implementer's vendor; `implementer` prefers it.
-- `local = true`: only a free local model, with a 15-minute limit. When no local model is available
-  or the call fails, the finder is skipped and the run log says why.
+- `local = true`: only a free local model. One 15-minute limit covers waiting for a slot and every
+  fallback. When no local model answers in time, or its output is invalid, the finder is skipped and
+  the panel record says why.
 - `lens = { name = "...", focus = "..." }`: the standard prompt plus a focus. Only with
   `prompt = "standard"`.
 
-A roster needs at least one finder that is not local.
+A roster needs at least one finder that is not local. The daemon checks pinned targets against the
+catalog at startup; a local finder's target must be a free model.
 
 A repository adds its own lenses in `.limitless.toml`:
 
@@ -532,10 +537,17 @@ name = "public-api"
 focus = "Changes that break callers: renamed or removed fields, changed defaults, different error shapes."
 ```
 
-Each lens adds a standard finder with its focus in the profiles it lists. Lenses are read from the
-base commit when the run is prepared, so a change never adds, edits or removes the lenses that
-review it. An edit to `[review]` takes effect for runs started after it merges. Lenses apply only in
-panel mode.
+Each lens adds a standard finder with its focus in the profiles it lists. A name is a lowercase
+slug, names are unique, and a focus is at most 2000 characters; the prompt quotes the focus as
+repository data. Lenses are read from the base commit when the run is prepared, so a change never
+adds, edits or removes the lenses that review it. An edit to `[review]` takes effect for runs
+started after it merges. Keys this release does not know are ignored with a warning in the run log.
+Lenses apply only in panel mode.
+
+To measure a roster, name it in an eval systems file:
+`{ "name": "...", "roster": "standard", "targets": [...], "verifier": { "target": "..." }, "implementerReport": "include" }`.
+It expands to the daemon's configured roster for that profile, with `targets` pinning each finder in
+order, then one per lens in an optional `lenses` list.
 
 Use a lens for judgement: a kind of defect that general review keeps missing in this repository.
 A mechanical rule belongs in `[gates] checks` instead, where it runs on every round and blocks

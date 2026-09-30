@@ -30,8 +30,11 @@ const UNRAISED = { agreement: 0, finder: null, vendor: null, raisedBy: [] as num
  * before verification. 4: a local finder that fails is skipped instead of failing the panel.
  */
 const PANEL_POLICY_VERSION = 4;
-/** A local finder's time limit: it is free but slow, and must not hold up the panel. */
+/** A local finder's time limit, slot waits and fallbacks included: it must not hold up the panel. */
 export const LOCAL_FINDER_TIMEOUT_MS = 15 * 60_000;
+
+/** Thrown by `invoke` when a local finder gets no answer in time; the panel goes on without it. */
+export class FinderSkipped extends Error {}
 
 /**
  * CONFIRMED, or PLAUSIBLE at high or above. Agreement between finders is recorded but does not count:
@@ -227,15 +230,20 @@ export interface PanelRecord {
    * security and prior blocking findings, which block.
    */
   omitted: string[];
+  /** Where independence was compromised, e.g. a verifier sharing a vendor with a finder it checks. */
+  warnings?: string[];
 }
 
-type Invoked = { result: AgentResult; target?: { vendor: string } };
+type Invoked = { result: AgentResult; target?: { vendor: string; modelId?: string } };
 
 export interface ReviewDeps<T extends Invoked> {
-  /** Runs finder `finder` (an index into the system's finders); null when a local finder has no model. */
-  invoke: (request: ReviewRequest, finder: number) => Promise<T | null>;
-  /** Panel only: one read-only verifier batch, routed away from every vendor that raised it. */
-  verify?: (request: VerifierRequest, avoidVendors: string[]) => Promise<T>;
+  /** Runs finder `finder` (an index into the system's finders); a local one may throw FinderSkipped. */
+  invoke: (request: ReviewRequest, finder: number) => Promise<T>;
+  /**
+   * Panel only: one read-only verifier batch, routed away from every vendor that raised it and never
+   * to a model that did.
+   */
+  verify?: (request: VerifierRequest, avoidVendors: string[], avoidModels: string[]) => Promise<T>;
   /** Panel only: problems that degrade the review without failing it. */
   warn?: (message: string) => void;
 }
@@ -308,7 +316,6 @@ export async function runReview<T extends Invoked>(
   if (input.system?.mode === "panel") return runPanel(deps, input, input.system.finders);
   const request = reviewRequest(input);
   const invoked = await deps.invoke(request, 0);
-  if (!invoked) throw new Error("a single review has no local finder to skip");
   const output = request.schema.safeParse(invoked.result.structured ?? extractJson(invoked.result.finalText));
   if (!output.success) return { ...invoked, output };
   return { ...invoked, output, decision: decide(input, output.data, output.data.verdict) };
@@ -378,48 +385,50 @@ async function runPanel<T extends Invoked>(
         prompt: { ...input.prompt, finder: prompt, ...(lens ? { lens } : {}) },
       });
       const invoked = await deps.invoke(request, finder);
-      if (!invoked) return null;
       const output = request.schema.safeParse(
         invoked.result.structured ?? extractJson(invoked.result.finalText),
       );
       return { invoked, output };
     }),
   );
-  const members = settled.map((member) => {
-    if (member.status === "rejected") throw member.reason;
-    return member.value;
-  });
-  const results: AgentResult[] = members.flatMap((member) => (member ? [member.invoked.result] : []));
+  const skippable = (member: (typeof settled)[number], finder: number) =>
+    member.status === "rejected" && member.reason instanceof FinderSkipped && !!finders[finder]?.local;
+  for (const [finder, member] of settled.entries())
+    if (member.status === "rejected" && !skippable(member, finder)) throw member.reason;
+  const results: AgentResult[] = settled.flatMap((m) =>
+    m.status === "fulfilled" ? [m.value.invoked.result] : [],
+  );
   // By finder index; a skipped local finder leaves a gap.
   const found: ({ invoked: T; review: Review } | undefined)[] = [];
   const skipped = new Map<number, string>();
-  for (const [finder, member] of members.entries()) {
-    const output = member?.output;
-    if (member && output?.success) {
-      found[finder] = { invoked: member.invoked, review: output.data };
+  for (const [finder, member] of settled.entries()) {
+    const value = member.status === "fulfilled" ? member.value : undefined;
+    if (value?.output.success) {
+      found[finder] = { invoked: value.invoked, review: value.output.data };
       continue;
     }
     found[finder] = undefined;
-    const result = member?.invoked.result;
+    const result = value?.invoked.result;
     if (finders[finder]?.local) {
-      const problem = !result
-        ? "no local model available"
-        : result.status !== "ok"
-          ? `${result.status}: ${result.error ?? "no output"}`
-          : "invalid review output";
-      skipped.set(finder, problem);
-      deps.warn?.(`Local finder ${finder} skipped (${problem})`);
+      const problem =
+        member.status === "rejected"
+          ? String((member.reason as Error).message)
+          : result && result.status !== "ok"
+            ? `${result.status}: ${result.error ?? "no output"}`
+            : "invalid review output";
+      skipped.set(finder, problem.slice(0, 300));
+      deps.warn?.(`Local finder ${finder} skipped: ${problem}`);
       continue;
     }
-    if (!member || !output) throw new Error(`Finder ${finder} has no model and is not local`);
+    if (!value) throw new Error(`Finder ${finder} settled without a result`);
     return {
-      ...member.invoked,
+      ...value.invoked,
       result: failedPanel(
         results,
-        member.invoked.result,
-        `Invalid review output from finder ${finder}: ${output.error?.message}`,
+        value.invoked.result,
+        `Invalid review output from finder ${finder}: ${value.output.error?.message}`,
       ),
-      output,
+      output: value.output,
     };
   }
   const first = found.find((member) => member !== undefined);
@@ -470,6 +479,9 @@ async function runPanel<T extends Invoked>(
   // One batch never mixes files or the vendors that raised them, so each call avoids exactly those.
   const vendorsOf = (c: PanelRecord["candidates"][number]) =>
     [...new Set(c.raisedBy.flatMap((i) => found[i]?.invoked.target?.vendor ?? []))].sort();
+  const modelsOf = (list: PanelRecord["candidates"]) => [
+    ...new Set(list.flatMap((c) => c.raisedBy.flatMap((i) => found[i]?.invoked.target?.modelId ?? []))),
+  ];
   const batchesOf = (list: typeof candidates) => {
     const groups = new Map<string, typeof candidates>();
     for (const c of list) {
@@ -526,6 +538,7 @@ async function runPanel<T extends Invoked>(
       : undefined;
   let verifierFix = verifierFixNow();
   const omitted: string[] = [];
+  const warnings: string[] = [];
   let last = first.invoked.result;
   for (const [index, batch] of batches.entries()) {
     if (!deps.verify) throw new Error('mode "panel" needs a verifier');
@@ -556,7 +569,14 @@ async function runPanel<T extends Invoked>(
           timeoutMs: input.timeoutMs,
         },
         pending[0] ? vendorsOf(pending[0]) : [],
+        modelsOf(pending),
       );
+      const shared = invoked.target?.vendor;
+      if (shared && pending[0] && vendorsOf(pending[0]).includes(shared)) {
+        const warning = `Verifier ${invoked.target?.modelId ?? "?"} shares vendor ${shared} with a finder it checks (${pending.map((c) => c.id).join(", ")}); no other vendor was available`;
+        warnings.push(warning);
+        deps.warn?.(warning);
+      }
       results.push(invoked.result);
       last = invoked.result;
       const parsed = VerifierSchema.safeParse(
@@ -646,6 +666,7 @@ async function runPanel<T extends Invoked>(
     refuted: [...verdicts.values()].filter((v) => v.verdict === "REFUTED").map((v) => v.id),
     capped: ranked.filter((c) => !selected.includes(c)).map((c) => c.id),
     omitted,
+    ...(warnings.length ? { warnings } : {}),
   };
   return {
     ...first.invoked,

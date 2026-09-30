@@ -62,6 +62,7 @@ import {
 import { buildReport } from "./report.ts";
 import {
   blockingReviewFindings,
+  FinderSkipped,
   PANEL_REVIEWS,
   type PanelReview,
   type ReviewInput,
@@ -328,7 +329,8 @@ async function prepare(ctx: RunContext): Promise<void> {
       const repoConfig = await readFileAt(wt.path, verification?.baseSha ?? baseSha, ".limitless.toml");
       ctx.state.previewConfig = readPreviewConfig(repoConfig);
       // Review lenses come from the base commit, never from the change under review.
-      if (ctx.deps.cfg.reviewMode === "panel") ctx.state.reviewLenses = readReviewLenses(repoConfig);
+      if (ctx.deps.cfg.reviewMode === "panel")
+        ctx.state.reviewLenses = readReviewLenses(repoConfig, (message) => ctx.log(message, "warn"));
       gates = detectGates(wt.path);
       ctx.state.gatesConfig = gates;
       ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
@@ -767,6 +769,24 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
   );
 }
 
+/**
+ * A verifier never runs on a model that raised its candidates. It avoids their vendors, then the
+ * implementer's vendor, and takes the implementer's own model only as a last resort; that
+ * independence outranks free-first billing.
+ */
+export function verifierConstraints(
+  avoidVendors: string[],
+  avoidModels: string[],
+  implementer?: { vendor: string; modelId: string },
+): RouteConstraints {
+  return {
+    avoidVendor: avoidVendors,
+    excludeModels: avoidModels,
+    ...(implementer ? { preferNotVendor: [implementer.vendor], preferNotModels: [implementer.modelId] } : {}),
+    independenceFirst: true,
+  };
+}
+
 /** Returns true when every gate passes. */
 async function oneRound(
   ctx: RunContext,
@@ -977,11 +997,12 @@ async function oneRound(
         },
       };
       // TODO: parallel panel finders share this worktree, and each call discards changes when it ends,
-      // possibly while another finder still runs. Production reviews run a single finder.
+      // possibly while another finder still runs. Readers are read-only; single mode runs one finder.
       const call = async (
         request: ReviewRequest | VerifierRequest,
         constraints: RouteConstraints,
         prefer: string | undefined,
+        deadline?: number,
       ) => {
         const invoked = await ctx.invoke({
           role: "review",
@@ -990,6 +1011,7 @@ async function oneRound(
           complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
           constraints: { ...constraints, ...(prefer ? { prefer } : {}) },
           ...request,
+          ...(deadline ? { deadline } : {}),
           requireStructured: true,
         });
         await discardChanges(cwd);
@@ -1004,23 +1026,21 @@ async function oneRound(
               ...(finder?.family === "implementer" ? { preferVendor: vendor } : { avoidVendor: vendor }),
               ...(finder?.local ? { billing: "free_only" as const } : {}),
             };
+            // One deadline covers a local finder's slot waits and fallbacks; past it, the panel skips it.
+            const deadline = finder?.local ? Date.now() + request.timeoutMs : undefined;
             try {
-              return await call(request, constraints, finder?.target);
+              return await call(request, constraints, finder?.target, deadline);
             } catch (error) {
-              // An unavailable local finder is skipped; the panel goes on without it.
-              if (finder?.local && error instanceof NoCapacityError) return null;
+              if (finder?.local && error instanceof NoCapacityError) throw new FinderSkipped(error.message);
               throw error;
             }
           },
-          verify: async (request, avoidVendors) => {
-            const verified = await call(request, { avoidVendor: avoidVendors }, system.verifier?.target);
-            if (avoidVendors.includes(verified.target.vendor))
-              ctx.log(
-                `Verifier ${verified.target.modelId} shares vendor ${verified.target.vendor} with a finder it checks (no cross-vendor verifier available)`,
-                "warn",
-              );
-            return verified;
-          },
+          verify: (request, avoidVendors, avoidModels) =>
+            call(
+              request,
+              verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer),
+              system.verifier?.target,
+            ),
           warn: (message) => ctx.log(message, "warn"),
         },
         input,

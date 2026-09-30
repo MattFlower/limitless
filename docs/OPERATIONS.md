@@ -48,6 +48,10 @@ limitless deploy --smoke            # also run live CLI contract checks before r
    (the worktree and run state are persisted; a round whose implementation already committed
    goes straight to its checks).
 
+Releases before panel review rosters (#136) refuse to start when `config.toml` sets `[review] mode`
+or `[review.rosters]`. Leave both unset until the release that added them is known good: a rollback
+to an older release fails at startup until they are removed.
+
 Changing the launchd units themselves (PATH, arguments) needs `limitless service install`.
 An interrupted deploy logs `interrupted, rolling back...` and attempts to restore the previous
 checkout and resume the scheduler. If the process was killed during rollback, inspect
@@ -140,6 +144,7 @@ limitless eval run triage --models claude/haiku --cases triage-001,triage-002 --
 limitless eval run review --models openrouter/gpt-6-luna --follow
 limitless eval run review --systems systems.json --follow   # {"systems": [{name, mode: "single", finders: [{target, prompt: "standard"}], implementerReport}]}
 limitless eval run review --systems panel.json --follow     # mode "panel": parallel finders, prompt "standard" | "adversarial" | "careful", plus verifier: {target}
+limitless eval run review --systems roster.json --follow    # {name, roster: "standard", targets: [one per roster finder, then per lens], lenses?, verifier: {target}, implementerReport}
 limitless eval run verify --models openrouter/gpt-6-luna --follow
 limitless eval report <eval-id>
 limitless eval report <eval-id> --json

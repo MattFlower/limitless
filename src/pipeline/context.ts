@@ -174,6 +174,8 @@ export interface InvokeOptions {
   jsonSchema?: Record<string, unknown>;
   systemAppend?: string;
   timeoutMs?: number;
+  /** Epoch ms by which the whole call ends, slot waits and fallbacks included; then NoCapacityError. */
+  deadline?: number;
   idleTimeoutMs?: number;
   maxToolCalls?: number;
   /** Retry a failed structured-output call once on the next candidate. */
@@ -423,8 +425,13 @@ export class RunContext {
       return outcome;
     };
 
+    const left = () => (opts.deadline === undefined ? Number.POSITIVE_INFINITY : opts.deadline - Date.now());
     for (let attempt = 0; attempt < 6; attempt++) {
       this.checkCancelled();
+      if (left() <= 0)
+        throw new NoCapacityError(
+          `Timed out routing ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}`,
+        );
       const decision = router.route(
         opts.role,
         opts.complexity,
@@ -444,7 +451,16 @@ export class RunContext {
       const harness = harnesses[harnessName];
       if (!harness) throw new Error(`No harness registered for ${harnessName}`);
 
-      const release = await tracker.acquire(target.provider, this.signal);
+      const wait = Number.isFinite(left())
+        ? AbortSignal.any([this.signal, AbortSignal.timeout(Math.max(1, left()))])
+        : this.signal;
+      let release: () => void;
+      try {
+        release = await tracker.acquire(target.provider, wait);
+      } catch (error) {
+        if (this.signal.aborted || !wait.aborted) throw error;
+        throw new NoCapacityError(`${target.targetId ?? target.modelId}: busy until the deadline`);
+      }
       if (!(await tracker.preflight(target.provider)) || tracker.modelUnavailableReason(target.modelId)) {
         release();
         lastFailure = `${target.targetId ?? target.modelId}: no capacity after provider refresh`;
@@ -496,7 +512,7 @@ export class RunContext {
           ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
           ...(opts.schema ? { schema: opts.schema } : {}),
           ...(opts.decisionTask ? { decisionTask: opts.decisionTask } : {}),
-          timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUTS[opts.role],
+          timeoutMs: Math.max(1, Math.min(opts.timeoutMs ?? DEFAULT_TIMEOUTS[opts.role], left())),
           idleTimeoutMs: opts.idleTimeoutMs ?? 10 * 60_000,
           maxToolCalls: opts.maxToolCalls ?? (opts.mode === "edit" ? 400 : 150),
           ...(opts.denyRead ? { denyRead: opts.denyRead } : {}),

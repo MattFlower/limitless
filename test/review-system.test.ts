@@ -10,6 +10,7 @@ import { validateRequest } from "../src/evals/cases.ts";
 import {
   configuredReviewSystem,
   DEFAULT_ROSTERS,
+  type EvalReviewSystem,
   parseEvalReviewSystems,
   productionReviewSystem,
   readReviewLenses,
@@ -93,7 +94,7 @@ test("eval review systems reject unsupported shapes with clear errors", () => {
     target: "candidate-a",
     prompt,
   }));
-  expect(parseEvalReviewSystems(file(panel({ finders })), "s.json")[0]?.finders).toEqual(finders);
+  expect(parseEvalReviewSystems(file(panel({ finders })), "s.json")[0]).toMatchObject({ finders });
 });
 
 test("production derives one routed standard finder from [review] implementer_report", () => {
@@ -332,6 +333,7 @@ test("eval policy counts only systems matching the daemon's [review] implementer
 test("single mode keeps the production review; a panel takes the profile's roster and its base lenses", () => {
   const lenses = readReviewLenses(
     '[review]\nlenses = [\n  { name = "ops", focus = "Rollback." },\n  { name = "api", focus = "Callers.", profiles = ["standard", "deep"] },\n]\n',
+    () => {},
   );
   expect(lenses).toEqual([
     { name: "ops", focus: "Rollback.", profiles: ["deep"] },
@@ -372,13 +374,80 @@ test("single mode keeps the production review; a panel takes the profile's roste
   });
 });
 
-test("repo lenses: absent config means none, and invalid config names the problem", () => {
-  expect(readReviewLenses(null)).toEqual([]);
-  expect(readReviewLenses('[gates]\nsetup = ["true"]\n')).toEqual([]);
+test("repo lenses: none when absent; unknown keys ignored with a warning; known keys strict", () => {
+  const warnings: string[] = [];
+  const read = (toml: string | null) => readReviewLenses(toml, (message) => warnings.push(message));
+  expect(read(null)).toEqual([]);
+  expect(read('[gates]\nsetup = ["true"]\n')).toEqual([]);
+  expect(warnings).toEqual([]);
+  // A later release's keys must not fail this release's runs.
+  expect(
+    read('[review]\nsuppress = ["x"]\nlenses = [{ name = "ops", focus = "Rollback.", paths = ["src/"] }]'),
+  ).toEqual([{ name: "ops", focus: "Rollback.", profiles: ["deep"] }]);
+  expect(warnings).toEqual([
+    "Ignoring unknown .limitless.toml keys: review.suppress, review.lenses[0].paths",
+  ]);
   for (const [toml, message] of [
     ['[review]\nlenses = [{ name = "ops" }]', "lenses[0].focus"],
     ['[review]\nlenses = [{ name = "ops", focus = "x", profiles = ["fast"] }]', "lenses[0].profiles[0]"],
-    ["[review]\nlense = []", 'Unrecognized key: "lense"'],
+    ['[review]\nlenses = [{ name = "ops\\n\\n# Output", focus = "x" }]', "lowercase slug"],
+    [`[review]\nlenses = [{ name = "ops", focus = "${"x".repeat(2001)}" }]`, "at most 2000"],
+    ['[review]\nlenses = [{ name = "a", focus = "x" }, { name = "a", focus = "y" }]', "unique"],
   ] as const)
-    expect(() => readReviewLenses(toml)).toThrow(message);
+    expect(() => read(toml)).toThrow(message);
+});
+
+test("an eval system can name a configured roster; it expands to exactly the production finders", async () => {
+  const local = { ...verifierModel, id: "local-q", provider: "local", vendor: "meta" as const };
+  const f = await evalFixture(
+    [verifierModel, local],
+    [{ id: "local", label: "Local", harness: "fake", billing: "free", maxConcurrent: 1 }],
+  );
+  try {
+    const review = { ...f.dataset, role: "review" } as unknown as Parameters<typeof validateRequest>[1];
+    const reference = {
+      name: "standard-roster",
+      roster: "standard",
+      targets: ["candidate-a", "candidate-b", "local-q"],
+      verifier: { target: "verifier-c" },
+      implementerReport: "include",
+    };
+    expect(parseEvalReviewSystems(file(reference), "s.json")).toEqual([reference] as EvalReviewSystem[]);
+    const expanded = validateRequest({ role: "review", systems: [reference] }, review, f.factory.router);
+    expect(expanded.request.systems).toEqual([
+      {
+        name: "standard-roster",
+        mode: "panel",
+        finders: DEFAULT_ROSTERS.standard.map((finder, i) => ({ ...finder, target: reference.targets[i] })),
+        verifier: { target: "verifier-c" },
+        implementerReport: "include",
+      },
+    ]);
+    // The daemon's configured roster, plus inline lenses as a base `.limitless.toml` would add them.
+    const rosters = { ...DEFAULT_ROSTERS, quick: [{ prompt: "careful" as const }] };
+    const lens = { name: "ops", focus: "Rollback." };
+    const quick = { ...reference, roster: "quick", targets: ["candidate-a", "candidate-b"], lenses: [lens] };
+    expect(
+      validateRequest({ role: "review", systems: [quick] }, review, f.factory.router, rosters).request
+        .systems?.[0]?.finders,
+    ).toEqual([
+      { prompt: "careful", target: "candidate-a" },
+      { prompt: "standard", lens, target: "candidate-b" },
+    ]);
+    expect(() =>
+      validateRequest(
+        { role: "review", systems: [{ ...quick, lenses: [] }] },
+        review,
+        f.factory.router,
+        rosters,
+      ),
+    ).toThrow("roster quick has 1 finders with its lenses; give 1 targets, not 2");
+    // A local finder pins a free model, as production routes it.
+    const paid = { ...reference, targets: ["candidate-a", "candidate-b", "candidate-a"] };
+    expect(() => validateRequest({ role: "review", systems: [paid] }, review, f.factory.router)).toThrow(
+      'review system "standard-roster": local finder candidate-a is not a free model',
+    );
+  } finally {
+    await f.close();
+  }
 });
