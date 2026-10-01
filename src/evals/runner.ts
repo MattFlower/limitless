@@ -17,7 +17,9 @@ import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
 import {
   combined,
   FinderSkipped,
+  mapVerifier,
   panelIdentity,
+  pickVerifier,
   type ReviewRequest,
   runReview,
   type VerifierRequest,
@@ -45,6 +47,7 @@ import {
   RETRY_FEEDBACK_GRADE,
 } from "./implement.ts";
 import { gradeCase, prepareCase, schemaFor, seedContent, storedSchemaFor } from "./prepare.ts";
+import { replayFinders, validateReplay } from "./replay.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 
 /** The abort reason of `eval cancel`; any other abort is a daemon shutdown. */
@@ -112,6 +115,13 @@ export class EvalRunner {
     for (const item of file.cases)
       if ("defects" in item) seedContent(item, this.casePath ?? defaultCasePath(parsed.role));
     const { request, cases } = validateRequest(input, file, this.deps.router, this.deps.cfg.reviewRosters);
+    if (request.replayFinders)
+      validateReplay(
+        this.deps.store,
+        request.replayFinders,
+        request.systems ?? [],
+        (id) => this.deps.router.model(parseTarget(id).modelId)?.vendor,
+      );
     // The selected cases, resolved targets and expanded systems, so a resume replays exactly these
     // trials; an unset effort is stored as `@default` so today's model default cannot change it.
     const explicit = (target = "") =>
@@ -124,9 +134,7 @@ export class EvalRunner {
             systems: request.systems?.map((system) => ({
               ...system,
               finders: system.finders.map((finder) => ({ ...finder, target: explicit(finder.target) })),
-              ...(system.verifier
-                ? { verifier: { ...system.verifier, target: explicit(system.verifier.target) } }
-                : {}),
+              ...(system.verifier ? { verifier: mapVerifier(system.verifier, explicit) } : {}),
             })),
           }
         : { models: request.models.map((target) => explicit(target)) }),
@@ -574,7 +582,8 @@ export class EvalRunner {
         tracker.modelUnavailableReason(to.modelId)
       );
     };
-    const eligible = () => unavailable(target);
+    const replayId = (store.evalRequest(run.id) as StoredEvalRequest | null)?.request.replayFinders;
+    const eligible = () => (typeof replayId === "string" ? null : unavailable(target));
     // A copy costs nothing, so the budget is checked once its cache key is known.
     if (!predecessor && budget()) return skip("eval budget exhausted");
     if (!tracker.def(model.provider)) return skip("unknown provider");
@@ -597,6 +606,10 @@ export class EvalRunner {
     let scratch: string | undefined;
     let cleanup: (() => Promise<void>) | undefined;
     try {
+      const replay =
+        typeof replayId === "string" && system
+          ? replayFinders(store, replayId, system, item.id, trial.trial)
+          : undefined;
       // Inside the try: a missing pin or failed snapshot fails this case's preparation, not the run.
       const tree = "gold" in item && "prompt" in item ? await treeFor(item, labels) : "";
       mkdirSync(cfg.paths.runs, { recursive: true });
@@ -656,9 +669,15 @@ export class EvalRunner {
         system?.mode === "panel"
           ? {
               finders: system.finders.slice(1).map((f) => pinned(f.target)),
-              verifier: pinned(system.verifier?.target),
+              verifiers: (system.verifier?.targets ?? [system.verifier?.target]).map((t) => pinned(t)),
             }
           : undefined;
+      // A replay makes no finder calls, so it waits on its verifiers instead of the trial's target:
+      // an unavailable one skips the trial (resumable) rather than failing it.
+      const gate = () =>
+        typeof replayId === "string"
+          ? ((panelTargets?.verifiers ?? []).map(unavailable).find(Boolean) ?? null)
+          : eligible();
       const schema = "hidden" in item ? undefined : schemaFor(item);
       const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
@@ -684,6 +703,7 @@ export class EvalRunner {
                     })),
                   }
                 : { head: item.head, input: item.input }),
+              ...(replay ? { replay: replay.identity } : {}),
               ...(system ? { reviewSystem: reviewSystemHash(system) } : {}),
               ...(system?.mode === "panel" ? { panel: panelIdentity() } : {}),
               patch,
@@ -700,7 +720,7 @@ export class EvalRunner {
           targets.push(null);
         }
       }
-      if (panelTargets) targets.push(...panelTargets.finders, panelTargets.verifier);
+      if (panelTargets) targets.push(...panelTargets.finders, ...panelTargets.verifiers);
       trial.cacheKey = cacheKey(
         model.id,
         harnessName,
@@ -766,6 +786,7 @@ export class EvalRunner {
             details: {
               ...("hidden" in item ? source.details : {}),
               ...trial.details,
+              ...(source.details.verifiers ? { verifiers: source.details.verifiers } : {}),
               grade,
               cache: source.details.cache ?? {
                 evalRunId: source.evalRunId,
@@ -789,19 +810,19 @@ export class EvalRunner {
         ({ harnessName, noTools } = selectHarness(run.role, target));
         const harness = harnesses[harnessName];
         if (!harness) return skip(`No harness registered for ${harnessName}`);
-        const reason = eligible();
+        const reason = gate();
         if (reason)
           return skip(strategy === "switch" && round > 0 ? `Switch target unavailable: ${reason}` : reason);
-        const runSlot = await coordination.slot(target.provider);
+        const runSlot = replay ? () => {} : await coordination.slot(target.provider);
         release = runSlot;
-        const trackerSlot = await tracker.acquire(target.provider, signal);
+        const trackerSlot = replay ? () => {} : await tracker.acquire(target.provider, signal);
         release = () => {
           trackerSlot();
           runSlot();
         };
         if (signal.aborted) return skip(stopReason(signal));
         if (budget()) return skip("eval budget exhausted");
-        const afterWait = eligible();
+        const afterWait = gate();
         if (afterWait) return skip(afterWait);
         if (round === 0) trial.createdAt = Date.now();
         roundStarted = Date.now();
@@ -923,6 +944,15 @@ export class EvalRunner {
                   await runReview(
                     {
                       invoke: async (request, finder) => {
+                        if (replay) {
+                          release?.();
+                          release = undefined;
+                          const stored = replay.invoke(finder);
+                          const to = finder === 0 ? target : panelTargets?.finders[finder - 1];
+                          if (!to || !stored.vendor)
+                            throw new Error(`replay finder ${finder} identity missing`);
+                          return { result: stored.result, target: { ...to, vendor: stored.vendor } };
+                        }
                         const to = finder > 0 ? panelTargets?.finders[finder - 1] : undefined;
                         // As in production, a local finder that cannot run is skipped, not a failed panel.
                         if (to)
@@ -941,13 +971,15 @@ export class EvalRunner {
                         }
                         return { result: own, target };
                       },
-                      verify: async (request, _avoidVendors, avoidModels) => {
+                      verify: async (request, avoidVendors, avoidModels, candidates) => {
                         if (!panelTargets) throw new Error("review system has no verifier");
                         // A shared vendor is allowed and recorded by the panel, as in production.
-                        const { modelId } = panelTargets.verifier;
-                        if (avoidModels.includes(modelId))
-                          throw new Error(`verifier ${modelId} raised a candidate it would check`);
-                        return sendTo(request, panelTargets.verifier, `verifier-${++verifications}`);
+                        const identity = this.deps.router.checkpointIdentity;
+                        const to = pickVerifier(panelTargets.verifiers, avoidVendors, avoidModels, identity);
+                        const { modelId, effort } = to;
+                        trial.details.verifiers ??= [];
+                        trial.details.verifiers.push({ modelId, effort: recordEffort(effort), candidates });
+                        return sendTo(request, to, `verifier-${++verifications}`);
                       },
                     },
                     reviewInput,
@@ -1008,7 +1040,7 @@ export class EvalRunner {
           store.recordEvalTrial({ ...trial, status: "running" });
         }
         // A panel's combined result carries its last call's status; the trial's own call is recorded here.
-        observe(target, own ?? result);
+        if (!replay) observe(target, own ?? result);
         if (signal.aborted) return skip(stopReason(signal));
         // A panel's result is its derived review, whose verification fields only the stored schema keeps;
         // anything without the panel's mark (e.g. one member's raw review) is not a panel result.
