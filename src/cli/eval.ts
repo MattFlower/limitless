@@ -149,6 +149,7 @@ export async function evalCommand(
   };
   const request = {
     role: value,
+    replayFinders: flags["replay-finders"],
     ...(systems ? { systems } : { models: String(flags.models).split(",") }),
     k: numeric("k"),
     maxUsd: numeric("max-usd"),

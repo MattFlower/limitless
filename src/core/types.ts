@@ -421,6 +421,8 @@ export interface RepoReviewLens extends ReviewLens {
 }
 /** How a review is performed: one finder (`single`), or finders whose candidates a verifier checks (`panel`). */
 export interface ReviewSystem {
+  /** Eval only: the source panel system for stored finder replay. */
+  replayFrom?: string;
   name: string;
   mode: "single" | "panel";
   finders: ReviewFinder[];

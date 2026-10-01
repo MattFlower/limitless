@@ -9,9 +9,10 @@ import type { FakeReply } from "../src/harness/fake.ts";
 import { selectHarness } from "../src/harness/select.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { FACTORY_PREAMBLE, triagePrompt } from "../src/pipeline/prompts.ts";
-import { TriageSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import { StoredReviewSchema, TriageSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 import { sh } from "../src/util/proc.ts";
-import { answer, deferred, enableEfforts, evalFixture } from "./evals-support.ts";
+import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
+import { answer, deferred, enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
 
 test("3 cases x 2 exact models x k=2 use pinned bare inputs and shared invocation semantics", async () => {
   const f = await evalFixture();
@@ -1157,3 +1158,135 @@ test("resume retries preparation failures instead of copying them", async () => 
     await f.close();
   }
 });
+
+test("stored panel finder replay pairs candidates, bills only verifiers and survives cancel/resume", async () => {
+  const f = await evalFixture([verifierModel, { ...verifierModel, id: "verifier-d", model: "d" }]);
+  try {
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+    writeFileSync(
+      f.casePath,
+      JSON.stringify({ role: "review", version: 1, cases: [{ ...reviewCase, base: f.sha, head }] }),
+    );
+    const system = {
+      name: "source",
+      mode: "panel",
+      implementerReport: "include",
+      finders: ["candidate-a", "candidate-b"].map((target) => ({ target, prompt: "standard" })),
+      verifier: { target: "verifier-c" },
+    };
+    const ruling = {
+      id: "C1",
+      verdict: "CONFIRMED",
+      severity: "high",
+      category: "correctness",
+      evidence: "src/a.ts:10",
+      trigger: "unguarded call",
+    };
+    const reply = {
+      structured: { results: [ruling] },
+      costUsd: 0.02,
+      costEquivUsd: 0.04,
+      usage: { input: 7, output: 3, cacheRead: 2, cacheWrite: 1 },
+    };
+    f.respond((s) =>
+      s.target.modelId.startsWith("candidate-")
+        ? { structured: reviewOutput(s.target.modelId === "candidate-a" ? 10 : 11), costUsd: 1 }
+        : reply,
+    );
+    const run = (systems: unknown[], extra = {}) =>
+      f.run({ role: "review", models: undefined, k: 1, systems, ...extra });
+    const source = await run([system]);
+    const original = source.trials[0];
+    if (!original) throw new Error("missing source trial");
+    const replaySystem = {
+      ...system,
+      name: "paired",
+      replayFrom: "source",
+      verifier: { target: "verifier-d" },
+    };
+    const replay = (extra = {}) => run([replaySystem], { replayFinders: source.run.id, ...extra });
+    const calls = f.calls.length;
+    const first = await replay();
+    expect(f.calls.slice(calls).map((s) => s.target.modelId)).toEqual(["verifier-d"]);
+    expect(f.calls.at(-1)?.prompt).toContain('"id": "C1"');
+    const trial = first.trials[0];
+    expect(trial).toMatchObject({
+      status: "ok",
+      pass: true,
+      details: {
+        grade: { review: { requiredMatched: 1 } },
+        verifiers: [{ modelId: "verifier-d", candidates: ["C1"] }],
+      },
+    });
+    expect([trial?.costUsd, trial?.costEquivUsd, trial?.tokensIn, trial?.tokensOut]).toEqual([
+      0.02, 0.04, 10, 3,
+    ]);
+    const stored = StoredReviewSchema.parse(trial?.output);
+    expect(stored.panel?.candidates).toEqual(StoredReviewSchema.parse(original.output).panel?.candidates);
+    expect(stored.panel?.candidates[0]?.duplicates).toHaveLength(1);
+    expect(formatEvalReport(first)).toContain("paired: replayed finders from source");
+    const repeat = await replay();
+    expect(repeat.trials[0]?.cacheKey).toBe(first.trials[0]?.cacheKey);
+    expect(f.calls).toHaveLength(calls + 1);
+    const live = await run([{ ...replaySystem, replayFrom: undefined }]);
+    expect(live.trials[0]?.cacheKey).not.toBe(first.trials[0]?.cacheKey);
+    const request = { role: "review", systems: [replaySystem], replayFinders: source.run.id };
+    const submit = (over = {}) => f.factory.evals.submit({ ...request, ...over });
+    const count = f.factory.store.listEvalRuns().length;
+    for (const finders of [
+      system.finders.slice(1),
+      [...system.finders].reverse(),
+      system.finders.map((finder, i) => (i ? finder : { ...finder, prompt: "careful" })),
+    ]) {
+      expect(() => submit({ systems: [{ ...replaySystem, finders }] })).toThrow(/mismatch/);
+    }
+    const output = StoredReviewSchema.parse(original.output);
+    const member = output.panel?.finders?.[0];
+    if (!member) throw new Error("missing finder");
+    member.vendor = "changed";
+    f.factory.store.recordEvalTrial({ ...original, output });
+    expect(() => submit()).toThrow(/vendor mismatch/);
+    expect(f.factory.store.listEvalRuns()).toHaveLength(count);
+    const beforeErrors = f.calls.length;
+    const wrong = StoredReviewSchema.parse(original.output);
+    if (wrong.panel?.candidates[0]) wrong.panel.candidates[0].id = "changed";
+    for (const mutation of [{ output: null }, { status: "error" as const }, { output: wrong }]) {
+      f.factory.store.recordEvalTrial({ ...original, ...mutation });
+      const failed = await replay();
+      expect(failed.trials[0]?.status).toBe("error");
+      expect(failed.trials[0]?.details.reason).toMatch(/replay source/);
+    }
+    f.factory.store.recordEvalTrial(original);
+    const absent = await replay({ k: 2 });
+    expect(absent.trials.find((t) => t.trial === 1)).toMatchObject({
+      status: "error",
+      details: { reason: expect.stringContaining("missing") },
+    });
+    expect(f.calls).toHaveLength(beforeErrors);
+    const changed = StoredReviewSchema.parse(original.output);
+    if (changed.panel?.candidates[0]) changed.panel.candidates[0].detail += " more evidence";
+    f.factory.store.recordEvalTrial({ ...original, output: changed });
+    const arrived = deferred<void>();
+    f.respond(() => {
+      arrived.resolve();
+      return { fault: "block" };
+    });
+    const cancelled = submit();
+    await arrived.promise;
+    await f.factory.evals.cancel(cancelled.id);
+    expect(f.factory.store.evalRequest(cancelled.id)).toMatchObject({
+      request: {
+        replayFinders: source.run.id,
+        systems: [{ replayFrom: "source" }],
+      },
+    });
+    f.respond(() => reply);
+    const resumed = f.factory.evals.resume(cancelled.id);
+    if (!resumed) throw new Error("missing resumed run");
+    await f.factory.evals.wait(resumed.id);
+    expect(f.factory.evals.report(resumed.id)?.trials[0]?.status).toBe("ok");
+    expect(f.calls.slice(beforeErrors).every((s) => s.target.modelId === "verifier-d")).toBe(true);
+  } finally {
+    await f.close();
+  }
+}, 30_000);
