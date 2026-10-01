@@ -166,6 +166,12 @@ does before implementation, compared against the scripts at the effective HEAD; 
 audit flags do not bypass the eval invocation. Review and verify retain the pipeline's scaled
 20/25-minute reading timeouts, 10-minute idle timeout, 150-tool limit and verify private sessions.
 
+Panel review systems can set verifier `targets` to an ordered list. Each batch uses the first
+target whose vendor raised none of its candidates, then the first model that raised none.
+Targets must be unique by base model id and include a model outside all finders. A selected
+listed target that is unavailable fails the call rather than trying the next one. The list
+path does not apply the implementer preference used by routed verification.
+
 ### Grading and reporting
 
 - Review grades what production would block in round 1, using the engine's own

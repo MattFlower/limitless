@@ -1137,3 +1137,66 @@ test("shutdown removes active and capacity-waiting worktrees", async () => {
     await f.close();
   }
 });
+
+test("an eval panel picks each batch's verifier from an ordered list, as production does", async () => {
+  // Earlier tests give the shared verifier model efforts; these keep none.
+  const plain = { ...verifierModel, supportedEfforts: [], effort: undefined };
+  const model = (id: string, vendor: ModelDef["vendor"]) => ({ ...plain, id, vendor });
+  const f = await fixture("review", [
+    model("finder-x", "anthropic"),
+    model("finder-y", "openai"),
+    model("verifier-x", "anthropic"),
+    model("verifier-y", "openai"),
+  ]);
+  try {
+    let verifierCalls = 0;
+    const respond = (joint: boolean) =>
+      f.respond((s) => {
+        const file = joint || s.target.modelId === "finder-x" ? "src/a.ts" : "src/b.ts";
+        if (!s.prompt.includes("code-review verifier"))
+          return { structured: reviewOutput(10, "major", file), costUsd: 0.1 };
+        // The first verifier call rules on nothing, so its candidates are sent again.
+        return ++verifierCalls === 1 ? { structured: { results: [] }, costUsd: 0.1 } : refuteAll(s);
+      });
+    respond(false);
+    const finders = ["finder-x", "finder-y"].map((target) => ({ target, prompt: "standard" }));
+    const system = { ...panelSystem, finders, verifier: { targets: ["verifier-x", "verifier-y"] } };
+    const report = await f.run({ models: undefined, systems: [system], cache: true });
+    expect(report.trials[0]?.status).toBe("ok");
+    const [run] = f.factory.store.listEvalRuns();
+    expect(f.factory.store.evalRequest(run?.id ?? "")).toMatchObject({
+      request: { systems: [{ verifier: { targets: ["verifier-x@default", "verifier-y@default"] } }] },
+    });
+    const [trial] = f.factory.store.listEvalTrials(run?.id ?? "");
+    expect(trial?.details.verifiers).toEqual([
+      { modelId: "verifier-y", effort: "default", candidates: ["C1"] },
+      { modelId: "verifier-y", effort: "default", candidates: ["C1"] },
+      { modelId: "verifier-x", effort: "default", candidates: ["C2"] },
+    ]);
+    const callCount = f.calls.length;
+    const cached = await f.run({ models: undefined, systems: [system], cache: true });
+    expect(cached.trials[0]?.details.cache).toBeDefined();
+    expect(cached.trials[0]?.details.verifiers).toEqual(trial?.details.verifiers);
+    expect(f.calls).toHaveLength(callCount);
+
+    // Both vendors raised it: the first listed model that raised none, with the shared vendor recorded.
+    respond(true);
+    const joint = { ...system, verifier: { targets: ["finder-x", "verifier-y", "verifier-x"] } };
+    const shared = await f.run({ models: undefined, systems: [joint], cache: false });
+    expect(f.calls.at(-1)?.target.modelId).toBe("verifier-y");
+    expect(shared.trials[0]?.output).toMatchObject({
+      panel: { warnings: [expect.stringContaining("Verifier verifier-y shares vendor openai")] },
+    });
+
+    // Every listed model is a finder: reject before paying for any calls.
+    const calls = f.calls.length;
+    const none = { ...system, verifier: { targets: ["finder-x", "finder-y"] } };
+    await expect(f.run({ models: undefined, systems: [none], cache: false })).rejects.toThrow(
+      "not any finder's",
+    );
+    expect(f.calls).toHaveLength(calls);
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
