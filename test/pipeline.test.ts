@@ -4946,6 +4946,77 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
   });
 });
 
+for (const phase of ["clarify", "spec"] as const) {
+  test.each(["parked", "transition", "entering", "cancelled"] as const)(
+    `drain parks ${phase} answer waits (%s)`,
+    async (when) => {
+      const question = "Formal or casual farewell?";
+      const specPrompts: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage")
+          return {
+            structured: triage(
+              phase === "clarify" ? { ambiguity: "high", blocking_questions: [question] } : {},
+            ),
+          };
+        if (role === "spec") {
+          specPrompts.push(s.prompt);
+          return { structured: { ...spec, blocking_questions: phase === "spec" ? [question] : [] } };
+        }
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") return { structured: pass };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const unsubscribe = f.store.subscribe((msg) => {
+        if (when === "entering" && msg.kind === "run" && msg.run.status === "waiting_input")
+          f.scheduler.drain();
+      });
+      try {
+        const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+        if (when !== "entering") {
+          await waitFor(f, run.id, ["waiting_input"]);
+          f.scheduler.drain();
+        }
+        if (when === "transition") f.answer(run.id, "Casual", "tester");
+        if (when === "cancelled") f.cancelRun(run.id, "tester");
+        expect(await waitFor(f, run.id, ["queued", "cancelled"], 500)).toBe(
+          when === "cancelled" ? "cancelled" : "queued",
+        );
+        expect(f.scheduler.activeRunIds).toEqual([]);
+        if (when === "cancelled") {
+          expect(f.scheduler.parkedRunIds).toEqual([]);
+          expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+          expect(f.store.getRun(run.id)?.error).toBe("cancelled by tester");
+          return;
+        }
+        expect(f.store.getRun(run.id)?.stage).toBeNull();
+        expect(f.store.getRunState<RunState>(run.id)).toMatchObject({ phase, parked: true });
+        expect(f.scheduler.parkedRunIds).toEqual([run.id]);
+        if (when === "parked") {
+          f.scheduler.resume();
+          await waitFor(f, run.id, ["waiting_input"]);
+          expect(f.store.listQuestions(run.id)).toHaveLength(1);
+          f.scheduler.drain();
+          await waitFor(f, run.id, ["queued"], 500);
+        }
+        if (when !== "transition") f.answer(run.id, "Casual", "tester");
+        expect(f.store.listQuestions(run.id)[0]?.answer).toBe("Casual");
+        f.scheduler.tick();
+        expect(f.scheduler.activeRunIds).toEqual([]);
+        f.scheduler.resume();
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        expect(specPrompts.at(-1)).toContain("A: Casual");
+        expect(f.store.listQuestions(run.id)).toHaveLength(1);
+        expect(f.store.getRunState<RunState>(run.id)?.phase).toBe("done");
+      } finally {
+        unsubscribe();
+      }
+    },
+  );
+}
+
 test("drain blocks queued starts and parks the active run at its next boundary", async () => {
   let release = () => {};
   const held = new Promise<void>((resolve) => {

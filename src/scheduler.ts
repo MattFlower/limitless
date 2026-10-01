@@ -14,6 +14,7 @@ export class Scheduler {
   private probeTimer: ReturnType<typeof setInterval> | null = null;
   private readonly probes = new Set<Promise<void>>();
   private drainEnabled = false;
+  private readonly drainEvents = new EventTarget();
   private unsubscribe: (() => void) | null = null;
 
   constructor(
@@ -87,6 +88,7 @@ export class Scheduler {
 
   drain(): void {
     this.drainEnabled = true;
+    this.drainEvents.dispatchEvent(new Event("drain"));
   }
 
   resume(): void {
@@ -105,7 +107,7 @@ export class Scheduler {
       if (this.stopping || this.draining) return;
       if (this.active.has(run.id)) continue;
       const controller = new AbortController();
-      const done = executeRun(this.deps, run.id, controller.signal, () => this.draining)
+      const done = executeRun(this.deps, run.id, controller.signal, () => this.draining, this.drainEvents)
         .catch((e) => {
           this.deps.store.updateRun(run.id, {
             status: "failed",

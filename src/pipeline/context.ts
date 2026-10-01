@@ -253,6 +253,7 @@ export class RunContext {
     readonly repo: Repo,
     signal: AbortSignal,
     readonly isDraining: () => boolean = () => false,
+    readonly drainEvents?: EventTarget,
   ) {
     this.signal = AbortSignal.any([signal, this.interruption.signal]);
     this.faults = injectorFor(deps.faults);
