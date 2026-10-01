@@ -44,12 +44,20 @@ const FinderSchema = z
     path: ["lens"],
     message: 'a lens finder uses the "standard" prompt',
   });
+const VerifierSchema = z
+  .strictObject({
+    target: TargetSchema.optional(),
+    targets: z.array(TargetSchema).min(1, "verifier targets must not be empty").optional(),
+  })
+  .refine((v) => v.target === undefined || v.targets === undefined, {
+    message: 'a verifier takes "target" or "targets", not both',
+  });
 export const ReviewSystemSchema = z
   .strictObject({
     name: z.string().trim().min(1, "system name must not be empty"),
     mode: z.enum(["single", "panel"], { error: 'unsupported review system mode; use "single" or "panel"' }),
     finders: z.array(FinderSchema),
-    verifier: z.strictObject({ target: TargetSchema.optional() }).optional(),
+    verifier: VerifierSchema.optional(),
     implementerReport: z.enum(["include", "omit"], {
       error: 'implementerReport must be "include" or "omit"',
     }),
@@ -88,7 +96,9 @@ const RosterReferenceSchema = z.strictObject({
   roster: z.enum(["quick", "standard", "deep"]),
   targets: z.array(TargetSchema).min(1),
   lenses: z.array(LensSchema).optional(),
-  verifier: z.strictObject({ target: TargetSchema }),
+  verifier: VerifierSchema.refine((v) => v.target !== undefined || v.targets !== undefined, {
+    message: 'a roster verifier needs "target" or "targets"',
+  }),
   implementerReport: z.enum(["include", "omit"]),
 });
 export type RosterReference = z.infer<typeof RosterReferenceSchema>;
@@ -126,7 +136,7 @@ export const EvalReviewSystemsSchema = z
             path: [index, "finders", finder, "target"],
             message: `review system ${JSON.stringify(system.name)} needs an explicit finder target; routed finders are not allowed in evals`,
           });
-      if (system.verifier && system.verifier.target === undefined)
+      if (system.verifier && system.verifier.target === undefined && !system.verifier.targets)
         ctx.addIssue({
           code: "custom",
           path: [index, "verifier", "target"],

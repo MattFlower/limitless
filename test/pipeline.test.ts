@@ -22,6 +22,7 @@ import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipe
 import { specScopeViolation } from "../src/pipeline/spec-scope.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
+import { reviewOutput } from "./evals-reading-support.ts";
 import { findingEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -5620,4 +5621,69 @@ test("panel review: a verifier left on the finder's vendor is another model, wit
   expect(await waitFor(f, alone.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
   expect(verifiers).toEqual(["gamma/m"]);
   expect(f.store.getRun(alone.id)?.error).toContain("alpha/m (raised a candidate it would verify)");
+  // A listed verifier is picked per batch, past the finder's own model, to one routing would not offer.
+  Object.assign(f.deps.reviewSystem ?? {}, { verifier: { targets: ["alpha/m", "delta/m"] } });
+  const listed = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, listed.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(verifiers).toEqual(["gamma/m", "delta/m"]);
+  // The picked target alone is offered: with it down, routing never falls back to an unlisted model.
+  f.tracker.setEnabled("gamma", true);
+  f.tracker.setEnabled("delta", false);
+  const down = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, down.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  expect(verifiers).toEqual(["gamma/m", "delta/m"]);
+  expect(f.store.getRun(down.id)?.error).toContain("delta/m (disabled)");
+  Object.assign(f.deps.reviewSystem ?? {}, { verifier: { targets: ["alpha/m"] } });
+  const noVerifier = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, noVerifier.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  expect(verifiers).toEqual(["gamma/m", "delta/m"]);
+  expect(f.store.getRun(noVerifier.id)?.error).toContain("raised a candidate it would check");
+});
+
+test("panel review: batches from different vendors go to different listed verifiers", async () => {
+  const verifiers: [string, string[]][] = [];
+  const f = start(
+    (s) => {
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+        verifiers.push([s.target.modelId, ids]);
+        return {
+          structured: {
+            results: ids.map((id) => ({
+              id,
+              verdict: "REFUTED",
+              severity: "low",
+              category: "correctness",
+              evidence: "Checked the farewell text",
+              trigger: "none",
+            })),
+          },
+        };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: reviewOutput(1, "minor", `${s.target.vendor}.txt`) };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    },
+    false,
+    true,
+  );
+  f.deps.reviewSystem = {
+    name: "panel",
+    mode: "panel",
+    implementerReport: "include",
+    finders: ["alpha/m", "beta/m"].map((target) => ({ target, prompt: "standard" })),
+    verifier: { targets: ["gamma/m", "delta/m"] },
+  };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(verifiers).toEqual([
+    ["delta/m", ["C1"]],
+    ["gamma/m", ["C2"]],
+  ]);
+  expect(
+    JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}").panel.candidates.map(
+      (c: { vendor: string }) => c.vendor,
+    ),
+  ).toEqual(["anthropic", "openai"]);
 });
