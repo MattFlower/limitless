@@ -19,6 +19,7 @@ import { specPrompt } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
 import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import { outOfRunCriteria } from "../src/pipeline/spec-criteria.ts";
 import { specScopeViolation } from "../src/pipeline/spec-scope.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
@@ -227,7 +228,128 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(prompt).toContain("while investigating the repository, read and search but do not edit files");
     expect(prompt).toContain("change itself will be implemented later");
     expect(prompt).not.toContain("DO NOT modify anything");
+    expect(prompt).toContain("verifiable inside the run's own checkout");
+    expect(prompt).toContain("using the repository's commands and tests");
+    expect(prompt).toContain(
+      "a person, the orchestrator, a browser, live external services, a deploy, or a later event",
+    );
+    expect(prompt).toContain("Put such concerns under assumptions or out_of_scope");
   });
+
+  test.each(
+    "manual,manually,human,humans,owner,owners,orchestrator,reviewer approves,in a browser,visually,screenshot,screenshots,deploy,deploys,deployed,deploying,deployment,deployments,production,live API,after merge,wait for".split(
+      ",",
+    ),
+  )("out-of-run criteria match bounded phrases in how_to_verify only: %s", (phrase) => {
+    expect(
+      outOfRunCriteria({
+        ...spec,
+        acceptance_criteria: [
+          { id: "AC-1", criterion: `(${phrase})`, how_to_verify: "bun test test/page.test.ts" },
+        ],
+      }),
+    ).toEqual([]);
+    for (const text of [phrase, phrase.toUpperCase(), phrase.replaceAll(" ", "\n ")]) {
+      const criterion = { id: "AC-1", criterion: "Works", how_to_verify: `(${text})` };
+      expect(outOfRunCriteria({ ...spec, acceptance_criteria: [criterion] })).toEqual([criterion]);
+      expect(
+        outOfRunCriteria({
+          ...spec,
+          acceptance_criteria: [{ ...criterion, how_to_verify: `pre${text}post` }],
+        }),
+      ).toEqual([]);
+    }
+    expect(outOfRunCriteria(spec)).toEqual([]);
+    expect(
+      outOfRunCriteria({
+        ...spec,
+        acceptance_criteria: [
+          { id: "AC-1", criterion: "Test passes", how_to_verify: "bun test test/page.test.ts" },
+        ],
+      }),
+    ).toEqual([]);
+  });
+
+  test.each(["clean", "persistent", "empty", "invalid scope", "scope retry", "new dependency"])(
+    "out-of-run criteria retry: %s",
+    async (scenario) => {
+      const external = {
+        id: "AC-2",
+        criterion: "the page shows the farewell",
+        how_to_verify: "The owner opens the page in a browser",
+      };
+      const other = { id: "AC-3", criterion: "Page works", how_to_verify: "manual check" };
+      const initial = { ...spec, acceptance_criteria: [...spec.acceptance_criteria, external, other] };
+      if (scenario === "scope retry" || scenario === "new dependency") initial.summary = "No code changes.";
+      if (scenario === "new dependency") initial.acceptance_criteria = spec.acceptance_criteria;
+      const retry =
+        scenario === "clean"
+          ? { ...spec, summary: "Locally verifiable farewell" }
+          : scenario === "empty"
+            ? { ...spec, acceptance_criteria: [external, { ...other, id: "AC-4" }] }
+            : scenario === "invalid scope"
+              ? { ...spec, summary: "No code changes." }
+              : {
+                  ...spec,
+                  acceptance_criteria: [...spec.acceptance_criteria, external, { ...other, id: "AC-4" }],
+                };
+      // Flagged criteria that survive the retry are kept and logged, never dropped.
+      const expected = retry;
+      const prompts: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") {
+          prompts.push(s.prompt);
+          return { structured: prompts.length === 1 ? initial : retry };
+        }
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") {
+          // Every criterion in the stored spec, kept out-of-run ones included, is met.
+          const ids = (f.store.getRunState<RunState>(run.id)?.spec?.acceptance_criteria ?? []).map(
+            (a) => a.id,
+          );
+          const met = ids.map((id) => ({ id, status: "met", evidence: "observed", publicSummary: "" }));
+          return {
+            structured: {
+              ...pass,
+              criteria: [...met, ...pass.criteria.filter((c) => !c.id.startsWith("AC-"))],
+            },
+          };
+        }
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        scenario === "invalid scope" ? "failed" : "succeeded",
+      );
+      expect(prompts).toHaveLength(scenario === "invalid scope" || scenario === "new dependency" ? 3 : 2);
+      expect(prompts[scenario === "new dependency" ? 2 : 1]).toContain(
+        scenario === "new dependency" ? "AC-2, AC-4" : "AC-2, AC-3",
+      );
+      if (scenario === "scope retry") expect(prompts[1]).toContain("Invalid specification:");
+      if (scenario === "invalid scope") {
+        expect(f.store.getArtifact(run.id, "spec.md")).toBeNull();
+        expect(f.store.getRun(run.id)?.error).toContain("invalid spec scope");
+        return;
+      }
+      expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual(expected);
+      const artifact = f.store.getArtifact(run.id, "spec.md");
+      expect(artifact).toContain(expected.summary);
+      if (scenario !== "clean") expect(artifact).toContain(other.how_to_verify);
+      if (scenario !== "empty") expect(artifact).toContain("farewell.txt says goodbye");
+      const kept = f.store
+        .listEvents(run.id)
+        .filter((e) => e.message?.startsWith("Kept acceptance criteria that may depend"));
+      expect(kept.map((e) => e.message)).toEqual(
+        scenario === "clean"
+          ? []
+          : ["Kept acceptance criteria that may depend on something outside the run: AC-2, AC-4"],
+      );
+    },
+  );
+
   test("spec scope phrases normalize punctuation and leave ordinary documentation work alone", () => {
     for (const summary of [
       "SPECIFICATION—ONLY task",
