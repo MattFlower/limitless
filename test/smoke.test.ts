@@ -885,6 +885,8 @@ for (const outcome of [
   "glob-probe-failed",
   "claimed",
   "wrote",
+  "timeout",
+  "timeout-wrote",
 ] as const) {
   test(`verify smoke retries only a model that never ran the probe: ${outcome}`, async () => {
     const target: ModelTarget = {
@@ -897,10 +899,19 @@ for (const outcome of [
       billing: "subscription",
     };
     let calls = 0;
+    const timed = outcome === "timeout" || outcome === "timeout-wrote";
     const harness: Harness = async (spec) => {
       calls++;
       const command = `python3 '${join(spec.cwd, "verify-probe.py")}'`;
       if (calls === 1 && outcome === "wrote") writeFileSync(join(spec.cwd, "stray"), "oops");
+      if (timed) {
+        if (outcome === "timeout-wrote") writeFileSync(join(spec.cwd, "stray"), "oops");
+        if (!spec.signal.aborted)
+          await new Promise<void>((resolve) =>
+            spec.signal.addEventListener("abort", () => resolve(), { once: true }),
+          );
+        return { ...result, status: "cancelled", error: "cancelled" };
+      }
       if (calls === 1 && outcome === "probe-failed") {
         spec.onEvent({ type: "tool_call", id: "probe", name: "Bash", input: { command } });
         spec.onEvent({ type: "tool_result", id: "probe", output: "Traceback", isError: true });
@@ -941,17 +952,26 @@ for (const outcome of [
       return { ...result, finalText: "done" };
     };
     const rows = await runChecks(
-      [{ name: "codex verify", run: (signal) => verifyLiveCheck(harness, target, signal) }],
+      [
+        {
+          name: "codex verify",
+          timeoutMs: timed ? 100 : undefined,
+          run: (signal) => verifyLiveCheck(harness, target, signal),
+        },
+      ],
       now,
       noDelay,
     );
-    // The retry's probe writes to a writable worktree, so even a retry fails; what matters is whether one ran.
-    expect(calls).toBe(outcome === "silent" ? 2 : 1);
+    // A retry either times out or runs the probe in a writable worktree; both must still fail.
+    const retries = outcome === "silent" || outcome === "timeout";
+    expect(calls).toBe(retries ? 2 : 1);
     expect(rows[0]?.status).toBe("fail");
-    expect(rows[0]?.retried).toBe(outcome === "silent" ? true : undefined);
+    expect(rows[0]?.retried).toBe(retries ? true : undefined);
     if (outcome === "silent")
       expect(rows[0]?.retriedAfter).toContain("missing successful probe command evidence");
-    if (outcome === "wrote") expect(rows[0]?.reason).toContain("worktree changed");
+    if (outcome === "wrote" || outcome === "timeout-wrote")
+      expect(rows[0]?.reason).toContain("worktree changed: ?? stray");
+    if (outcome === "timeout") expect(rows[0]?.reason).toBe("timeout 100ms");
   });
 }
 

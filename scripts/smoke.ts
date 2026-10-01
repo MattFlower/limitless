@@ -115,8 +115,9 @@ async function attempt(
     await Promise.all(scope.children.values());
     return result;
   };
+  // Keep post-timeout inspection commands cancellable only by shutdown, not by the attempt.
   const run = processScope
-    .run({ ...scope, signal }, async () => check.run(signal))
+    .run(scope, async () => check.run(signal))
     .catch((error: unknown) => fail(String(error), transientReason(String(error))));
   const result = await within(run, timeoutMs, clock);
   if (result) return finish(result);
