@@ -9,6 +9,8 @@ export interface RouteConstraints {
   avoidVendor?: string | string[];
   /** Exclude model identities regardless of reasoning effort. */
   excludeModels?: string[];
+  /** Why `excludeModels` are skipped, for the run log (default "already tried"). */
+  excludedBecause?: string;
   /** Only consider models at or above this tier (escalation). */
   minTier?: number;
   /** Resolved targets to skip (already failed in this stage). */
@@ -17,7 +19,7 @@ export interface RouteConstraints {
   prefer?: string | ModelSelection;
   /** Put this vendor's models first, as if every other vendor were avoided. */
   preferVendor?: string;
-  /** Tried after other vendors but before `avoidVendor` (a verifier: the implementer's vendor). */
+  /** Ranked after the same vendor without it; below `avoidVendor` (a verifier: the implementer's vendor). */
   preferNotVendor?: string[];
   /** Model identities tried last of all (a verifier: the implementer's model). */
   preferNotModels?: string[];
@@ -192,14 +194,11 @@ export class Router {
     const preference = c.prefer ? identity(c.prefer) : undefined;
 
     const avoid = [c.avoidVendor ?? []].flat();
+    // Additive, so an avoided vendor that is also the implementer's ranks below one that is not.
     const independence = (m: ModelTarget) =>
-      c.preferNotModels?.includes(m.modelId)
-        ? 3
-        : avoid.includes(m.vendor) || (c.preferVendor !== undefined && m.vendor !== c.preferVendor)
-          ? 2
-          : c.preferNotVendor?.includes(m.vendor)
-            ? 1
-            : 0;
+      (c.preferNotModels?.includes(m.modelId) ? 4 : 0) +
+      (avoid.includes(m.vendor) || (c.preferVendor !== undefined && m.vendor !== c.preferVendor) ? 2 : 0) +
+      (c.preferNotVendor?.includes(m.vendor) ? 1 : 0);
     const consider = (ids: (string | ModelSelection)[], fromPolicy = false) => {
       const group: ModelTarget[] = [];
       for (const reference of ids) {
@@ -215,7 +214,10 @@ export class Router {
         if (seen.has(id)) continue;
         seen.add(id);
         if (excluded.has(id) || c.excludeModels?.includes(m.id)) {
-          skipped.push({ modelId: id, reason: "already tried" });
+          skipped.push({
+            modelId: id,
+            reason: excluded.has(id) ? "already tried" : (c.excludedBecause ?? "already tried"),
+          });
           continue;
         }
         const transport = transportError(role, resolved, this.tracker.def(m.provider));
@@ -243,7 +245,7 @@ export class Router {
         const paid = c.billing !== undefined && m.billing !== "free" ? 1 : 0;
         if (paid && c.billing === "free_only") continue;
         const rank = independence(m);
-        ranked.push({ target: m, rank: c.independenceFirst ? rank * 2 + paid : paid * 4 + rank });
+        ranked.push({ target: m, rank: c.independenceFirst ? rank * 2 + paid : paid * 8 + rank });
       }
     };
 

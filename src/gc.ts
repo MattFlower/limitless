@@ -3,6 +3,7 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import type { Config } from "./config.ts";
 import type { Repo, Run } from "./core/types.ts";
 import type { Store } from "./db/store.ts";
+import { BASELINE_CACHE_TTL_MS } from "./gates/cache.ts";
 import { cachePath, withRepoLock } from "./git/repos.ts";
 import { sh } from "./util/proc.ts";
 
@@ -14,6 +15,7 @@ export interface GcResult {
   logs: string[];
   metadata: string[];
   debugEvents: number;
+  baselineCache: number;
   errors: string[];
 }
 
@@ -65,7 +67,15 @@ export async function collectGarbage(
 ): Promise<GcResult> {
   const now = opts.now ?? Date.now();
   const dryRun = opts.dryRun ?? false;
-  const result: GcResult = { dryRun, worktrees: [], logs: [], metadata: [], debugEvents: 0, errors: [] };
+  const result: GcResult = {
+    dryRun,
+    worktrees: [],
+    logs: [],
+    metadata: [],
+    debugEvents: 0,
+    baselineCache: 0,
+    errors: [],
+  };
   const finished = store.finishedRuns();
   const repos = new Map(store.listRepos().map((repo) => [repo.id, repo]));
   const workRoot = resolve(cfg.paths.work);
@@ -186,6 +196,15 @@ export async function collectGarbage(
     result.debugEvents = dryRun ? store.countOldDebugEvents(cutoff) : store.deleteOldDebugEvents(cutoff);
   } catch (error) {
     result.errors.push(`debug events: ${(error as Error).message}`);
+  }
+
+  try {
+    const cutoff = now - BASELINE_CACHE_TTL_MS;
+    result.baselineCache = dryRun
+      ? store.countExpiredBaselineCache(cutoff)
+      : store.deleteExpiredBaselineCache(cutoff);
+  } catch (error) {
+    result.errors.push(`baseline cache: ${(error as Error).message}`);
   }
   return result;
 }

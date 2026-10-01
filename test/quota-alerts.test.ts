@@ -535,3 +535,16 @@ test("the SSE endpoint streams exhaustion, fallback changes and timed clearing",
     await reader.cancel();
   }
 });
+
+test("a reading whose reset differs by seconds still updates the window; an earlier window does not", () => {
+  const reset = now + 5 * 86_400_000;
+  // Sources report the same weekly reset a few seconds apart (observed 2026-09-30: 5 s).
+  factory.tracker.observeWindows("codex", { seven_day: { utilization: 0.02, resetsAt: reset + 5_000 } });
+  factory.tracker.observeWindows("codex", { seven_day: { utilization: 0.42, resetsAt: reset } });
+  expect(factory.tracker.status("codex")?.windows.seven_day?.utilization).toBe(0.42);
+  // A reading from the previous week's window is stale and ignored.
+  factory.tracker.observeWindows("codex", {
+    seven_day: { utilization: 0.9, resetsAt: reset - 7 * 86_400_000 },
+  });
+  expect(factory.tracker.status("codex")?.windows.seven_day?.utilization).toBe(0.42);
+});

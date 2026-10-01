@@ -3,11 +3,21 @@ import { join } from "node:path";
 import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
+import {
+  BASELINE_CACHE_TTL_MS,
+  baselineCacheKey,
+  cacheableBaseline,
+  gateEnvDigest,
+  lockfileHash,
+  singleFlight,
+} from "../gates/cache.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import {
   compareGates,
   type GateComparison,
   type GateHooks,
+  type GateRun,
+  gateEnv,
   retryBaselineFailures,
   retryRegressions,
   runGates,
@@ -343,21 +353,57 @@ async function prepare(ctx: RunContext): Promise<void> {
       );
       await ctx.save();
       const { onWait } = gateEvents(ctx);
-      ctx.state.baseline =
-        gates.setup.length || gates.checks.length
-          ? await runGates(wt.path, gates, ctx.signal, { onWait })
-          : null;
-      ctx.checkCancelled();
-      // Retry before resetting, so a check sees the same build output as its first attempt.
-      if (ctx.state.baseline)
-        ctx.state.baseline = await retryBaselineFailures(
-          ctx.state.baseline,
-          wt.path,
+      const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
+      const runBaseline = async (): Promise<GateRun> => {
+        const run = await runGates(wt.path, gates, ctx.signal, { onWait });
+        ctx.checkCancelled();
+        // Retry before resetting, so a check sees the same build output as its first attempt.
+        const retried = await retryBaselineFailures(run, wt.path, gates, ctx.signal, onWait);
+        ctx.checkCancelled();
+        return retried;
+      };
+      ctx.state.baselineCached = false;
+      const buildSha = ctx.deps.buildSha;
+      if (!hasGates) ctx.state.baseline = null;
+      // Without a known build the gate environment can't be keyed: never read or write the cache.
+      else if (!buildSha) ctx.state.baseline = await runBaseline();
+      else {
+        // Keyed by the commit actually checked out, so verify-change caches its PR base.
+        const key = baselineCacheKey({
+          repoId: ctx.repo.id,
+          baseSha: await headSha(wt.path),
           gates,
-          ctx.signal,
-          onWait,
-        );
-      ctx.checkCancelled();
+          lockfileHash: lockfileHash(wt.path),
+          bunVersion: Bun.version,
+          platform: process.platform,
+          arch: process.arch,
+          buildSha,
+          envDigest: gateEnvDigest(gateEnv(), cfg.baselineEnv),
+        });
+        // A bypass still runs the baseline and refreshes the entry if it passes.
+        const bypass = ctx.run.noBaselineCache === true || !cfg.baselineCache;
+        const baseline = async (): Promise<GateRun> => {
+          const cached = bypass
+            ? null
+            : store.getBaselineCache<GateRun>(key, Date.now() - BASELINE_CACHE_TTL_MS);
+          if (cached && cacheableBaseline(cached, gates)) {
+            ctx.state.baselineCached = true;
+            ctx.log(`Baseline reused from cache (${key.baseSha.slice(0, 12)})`);
+            return cached;
+          }
+          const fresh = await runBaseline();
+          // Only a passing baseline is cached; a failure (maybe flaky) must run again next time,
+          // and it contradicts any cached pass for this key, so that entry goes.
+          if (cacheableBaseline(fresh, gates)) store.putBaselineCache(key, fresh, ctx.run.id);
+          else store.deleteBaselineCache(key);
+          return fresh;
+        };
+        // One cacheable baseline per key at a time: a concurrent run on the same base waits, then
+        // reuses it. A bypass can't reuse anything, so it never waits.
+        ctx.state.baseline = bypass
+          ? await baseline()
+          : await singleFlight(JSON.stringify(key), ctx.signal, baseline, (r) => cacheableBaseline(r, gates));
+      }
     } finally {
       if (verification) await resetTo(wt.path, verification.headSha);
       else await discardChanges(wt.path);
@@ -388,7 +434,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     await ctx.setPhase("triage");
     const failing = baseline ? baseline.checks.filter((c) => !c.ok).map((c) => c.name) : [];
     return {
-      summary: `worktree ${wt.branch}; ${gates.checks.length} checks${failing.length ? `, failing on base: ${failing.join(", ")}` : ""}`,
+      summary: `worktree ${wt.branch}; ${gates.checks.length} checks${failing.length ? `, failing on base: ${failing.join(", ")}` : ""}${ctx.state.baselineCached ? "; baseline reused from cache" : ""}`,
       value: undefined,
     };
   });
@@ -774,9 +820,9 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
 }
 
 /**
- * A verifier never runs on a model that raised its candidates. It avoids their vendors, then the
- * implementer's vendor, and takes the implementer's own model only as a last resort; that
- * independence outranks free-first billing.
+ * A verifier never runs on a model that raised its candidates. It prefers a vendor that neither
+ * raised them nor implemented the change, then the implementer's, then a raising vendor (not the
+ * implementer's first), and the implementer's own model last; that outranks free-first billing.
  */
 export function verifierConstraints(
   avoidVendors: string[],
@@ -786,6 +832,7 @@ export function verifierConstraints(
   return {
     avoidVendor: avoidVendors,
     excludeModels: avoidModels,
+    excludedBecause: "raised a candidate it would verify",
     ...(implementer ? { preferNotVendor: [implementer.vendor], preferNotModels: [implementer.modelId] } : {}),
     independenceFirst: true,
   };
@@ -981,6 +1028,7 @@ async function oneRound(
         replayedFollowUps: replayed?.followUps,
         system,
         ...(panelRules ? { panelReview: panelRules } : {}),
+        ...(ctx.state.implementer ? { implementerModel: ctx.state.implementer.modelId } : {}),
         prompt: {
           prompt: ctx.run.prompt,
           spec: ctx.state.spec ?? null,
