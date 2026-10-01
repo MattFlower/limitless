@@ -16,7 +16,7 @@ import {
   productionReviewSystem,
   readReviewLenses,
 } from "../src/pipeline/review-system.ts";
-import type { ModelDef } from "../src/router/catalog.ts";
+import { MODELS, type ModelDef } from "../src/router/catalog.ts";
 import { enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
 
 const system = (over: Record<string, unknown> = {}) => ({
@@ -119,7 +119,12 @@ test("verifier lists require distinct base models and a model outside all finder
     supportedEfforts: ["medium", "high"],
     effort: undefined,
   });
-  const f = await evalFixture([model("claude/opus"), model("codex/sol-6.1"), model("codex/sol")]);
+  const f = await evalFixture([
+    model("claude/opus"),
+    model("codex/sol-6.1"),
+    model("codex/sol"),
+    ...MODELS.filter((m) => m.checkpoint).map((m) => ({ ...m, provider: "provider-b" })),
+  ]);
   try {
     const review = { ...f.dataset, role: "review" } as unknown as Parameters<typeof validateRequest>[1];
     const validate = (targets: string[]) =>
@@ -142,6 +147,12 @@ test("verifier lists require distinct base models and a model outside all finder
     expect(
       validate(["claude/opus", "codex/sol-6.1@medium", "codex/sol@medium"]).request.systems,
     ).toHaveLength(1);
+    const alias = { modelId: "mtplx/qwen-27b", vendor: "qwen" };
+    const eligible = { modelId: "codex/sol", vendor: "qwen" };
+    const pick = (targets: (typeof alias)[]) =>
+      pickVerifier(targets, ["qwen"], ["omlx/qwen-27b"], f.factory.router.checkpointIdentity);
+    expect(() => pick([alias])).toThrow("raised a candidate it would check");
+    expect(pick([alias, eligible])).toBe(eligible);
     expect(f.calls).toHaveLength(0);
   } finally {
     await f.close();

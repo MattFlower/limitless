@@ -298,7 +298,7 @@ export type EvalRequest = z.infer<typeof EvalRequestSchema>;
 export function validateRequest(
   input: unknown,
   file: AnyCaseFile,
-  router: Pick<Router, "resolveFor" | "toTarget">,
+  router: Pick<Router, "resolveFor" | "toTarget" | "checkpointIdentity">,
   rosters: Record<ResolvedProfile, ReviewFinder[]> = DEFAULT_ROSTERS,
 ) {
   const request = EvalRequestSchema.parse(input);
@@ -348,21 +348,21 @@ export function validateRequest(
   for (const id of request.systems ? [] : (request.models ?? [])) resolve(id);
   // As in production, a verifier never reuses a finder's model; a shared vendor is recorded, not refused.
   for (const system of resolvedSystems ?? []) {
+    const finders = system.finders.map((finder) => router.checkpointIdentity(finder.target));
     if (system.verifier?.targets) {
       const models = system.verifier.targets.map((target) => parseTarget(target).modelId);
-      const finders = system.finders.map((finder) => parseTarget(finder.target).modelId);
       if (new Set(models).size !== models.length)
         problems.push(
           `review system ${JSON.stringify(system.name)}: verifier targets must be unique by base model id`,
         );
-      if (!models.some((model) => !finders.includes(model)))
+      if (!models.some((model) => !finders.includes(router.checkpointIdentity(model))))
         problems.push(
-          `review system ${JSON.stringify(system.name)}: verifier targets must include at least one base model id that is not any finder's`,
+          `review system ${JSON.stringify(system.name)}: verifier targets must include at least one checkpoint that is not any finder's`,
         );
       continue;
     }
-    const [verifier, ...rest] = system.verifier?.targets ?? [system.verifier?.target];
-    if (!rest.length && system.finders.some((finder) => finder.target === verifier))
+    const verifier = system.verifier?.target;
+    if (verifier && finders.includes(router.checkpointIdentity(verifier)))
       problems.push(
         `review system ${JSON.stringify(system.name)}: verifier ${verifier} is also one of its finders`,
       );

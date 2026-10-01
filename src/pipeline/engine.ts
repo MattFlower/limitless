@@ -1158,7 +1158,8 @@ async function oneRound(
               const { model, targetId } = ctx.deps.router.resolve(target);
               return { vendor: model.vendor, modelId: model.id, targetId };
             });
-            const only = pickVerifier(listed, avoidVendors, avoidModels).targetId;
+            const identity = ctx.deps.router.checkpointIdentity;
+            const only = pickVerifier(listed, avoidVendors, avoidModels, identity).targetId;
             return call(request, { ...constraints, only }, undefined);
           },
           warn: (message) => ctx.log(message, "warn"),
