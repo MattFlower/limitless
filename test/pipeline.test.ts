@@ -237,7 +237,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
   });
 
   test.each(
-    "manual,human,owner,orchestrator,reviewer approves,in a browser,visually,screenshot,deploy,production,live API,after merge,wait for".split(
+    "manual,manually,human,humans,owner,owners,orchestrator,reviewer approves,in a browser,visually,screenshot,screenshots,deploy,deploys,deployed,deploying,deployment,deployments,production,live API,after merge,wait for".split(
       ",",
     ),
   )("out-of-run criteria match bounded phrases in either field: %s", (phrase) => {
