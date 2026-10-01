@@ -9,6 +9,9 @@ import type {
 import type { Store } from "../db/store.ts";
 import type { ProviderDef } from "./catalog.ts";
 
+/** How far apart sources report one window's reset (seen: 5 s; allows minute rounding). Windows are hours apart. */
+const RESET_JITTER_MS = 60_000;
+
 interface ProviderRuntime {
   def: ProviderDef;
   enabled: boolean;
@@ -385,11 +388,13 @@ export class ProviderTracker {
     const current = Object.fromEntries(
       Object.entries(windows).filter(([name, window]) => {
         const previous = prior[name];
+        // Only a reading from an earlier window is stale. Sources report one window's reset a few
+        // seconds apart, so a slightly earlier resetsAt is still the current window.
         return (
           !previous ||
           previous.resetsAt === null ||
           window.resetsAt === null ||
-          window.resetsAt >= previous.resetsAt
+          window.resetsAt >= previous.resetsAt - RESET_JITTER_MS
         );
       }),
     );
