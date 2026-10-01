@@ -253,6 +253,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBeNull();
       expect(specScopeViolation({ ...spec, summary: "No code changes." }, summary)).toBe("No code changes.");
     }
+    // "X only" in ordinary prose is not a task restriction (a request that says it is still exempt).
+    for (const summary of [
+      "The README docs only list supported commands.",
+      "The spec only covers the CLI path; the UI is out of scope.",
+    ])
+      expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBeNull();
     expect(
       specScopeViolation(
         {
