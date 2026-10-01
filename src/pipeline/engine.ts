@@ -102,6 +102,7 @@ import {
   VerifySchema,
 } from "./schemas.ts";
 import { createSnapshotParent } from "./snapshots.ts";
+import { outOfRunCriteria } from "./spec-criteria.ts";
 import { specScopeViolation } from "./spec-scope.ts";
 import { triageDecisions } from "./triage-decisions.ts";
 import {
@@ -564,15 +565,35 @@ async function spec(ctx: RunContext): Promise<void> {
     let { result, target } = await ctx.invoke(invocation);
     await discardChanges(ctx.state.worktreePath as string);
     let s = SpecSchema.parse(result.structured);
-    const offending = specScopeViolation(s, ctx.run.prompt);
-    if (offending) {
-      const feedback = `\n\nInvalid specification: this sentence restricts the task beyond the request: ${JSON.stringify(offending)}\nThe read-only rule applies to your investigation only. Rewrite the spec to describe the requested change without this restriction.`;
+    let scopeRetried = false;
+    let criteriaRetried = false;
+    for (;;) {
+      const offending = specScopeViolation(s, ctx.run.prompt);
+      const flagged = outOfRunCriteria(s);
+      if (offending && scopeRetried)
+        throw new Error(`structured output failed validation: invalid spec scope: ${offending}`);
+      const retryCriteria: boolean = flagged.length > 0 && !criteriaRetried;
+      if (!offending && !retryCriteria) {
+        if (flagged.length) {
+          s.acceptance_criteria = s.acceptance_criteria.filter((a) => !flagged.includes(a));
+          ctx.log(`Dropped out-of-run acceptance criteria: ${flagged.map((a) => a.id).join(", ")}`, "warn");
+        }
+        break;
+      }
+      const feedback = [
+        offending
+          ? `\n\nInvalid specification: this sentence restricts the task beyond the request: ${JSON.stringify(offending)}\nThe read-only rule applies to your investigation only. Rewrite the spec to describe the requested change without this restriction.`
+          : "",
+        retryCriteria
+          ? `\n\nInvalid acceptance criteria: ${flagged.map((a) => a.id).join(", ")} depend on something outside the run. Replace them with criteria verifiable in the run's checkout using repository commands and tests; move external concerns to assumptions or out_of_scope.`
+          : "",
+      ].join("");
       ctx.log(feedback.trim(), "warn");
+      scopeRetried ||= Boolean(offending);
+      criteriaRetried ||= retryCriteria;
       ({ result, target } = await ctx.invoke({ ...invocation, prompt: invocation.prompt + feedback }));
       await discardChanges(ctx.state.worktreePath as string);
       s = SpecSchema.parse(result.structured);
-      const repeated = specScopeViolation(s, ctx.run.prompt);
-      if (repeated) throw new Error(`structured output failed validation: invalid spec scope: ${repeated}`);
     }
     ctx.store.putArtifact(ctx.run.id, "spec.md", "spec", `# ${ctx.run.title}\n\n${renderSpec(s)}\n`);
     const unanswered = s.blocking_questions.filter(Boolean);

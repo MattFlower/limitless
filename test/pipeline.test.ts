@@ -19,6 +19,7 @@ import { specPrompt } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
 import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import { outOfRunCriteria } from "../src/pipeline/spec-criteria.ts";
 import { specScopeViolation } from "../src/pipeline/spec-scope.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
@@ -227,7 +228,119 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(prompt).toContain("while investigating the repository, read and search but do not edit files");
     expect(prompt).toContain("change itself will be implemented later");
     expect(prompt).not.toContain("DO NOT modify anything");
+    expect(prompt).toContain("verifiable inside the run's own checkout");
+    expect(prompt).toContain("using the repository's commands and tests");
+    expect(prompt).toContain(
+      "a person, the orchestrator, a browser, live external services, a deploy, or a later event",
+    );
+    expect(prompt).toContain("Put such concerns under assumptions or out_of_scope");
   });
+
+  test.each(
+    "manual,human,owner,orchestrator,reviewer approves,in a browser,visually,screenshot,deploy,production,live API,after merge,wait for".split(
+      ",",
+    ),
+  )("out-of-run criteria match bounded phrases in either field: %s", (phrase) => {
+    for (const field of ["criterion", "how_to_verify"] as const) {
+      for (const text of [phrase, phrase.toUpperCase(), phrase.replaceAll(" ", "\n ")]) {
+        const criterion = {
+          id: "AC-1",
+          criterion: "Works",
+          how_to_verify: "bun test test/page.test.ts",
+          [field]: `(${text})`,
+        };
+        expect(outOfRunCriteria({ ...spec, acceptance_criteria: [criterion] })).toEqual([criterion]);
+        expect(
+          outOfRunCriteria({ ...spec, acceptance_criteria: [{ ...criterion, [field]: `pre${text}post` }] }),
+        ).toEqual([]);
+      }
+    }
+    expect(outOfRunCriteria(spec)).toEqual([]);
+    expect(
+      outOfRunCriteria({
+        ...spec,
+        acceptance_criteria: [
+          { id: "AC-1", criterion: "Test passes", how_to_verify: "bun test test/page.test.ts" },
+        ],
+      }),
+    ).toEqual([]);
+  });
+
+  test.each(["clean", "persistent", "empty", "invalid scope", "scope retry", "new dependency"])(
+    "out-of-run criteria retry: %s",
+    async (scenario) => {
+      const external = {
+        id: "AC-2",
+        criterion: "the owner verifies the page in a browser",
+        how_to_verify: "Inspect the page",
+      };
+      const other = { id: "AC-3", criterion: "Page works", how_to_verify: "manual check" };
+      const initial = { ...spec, acceptance_criteria: [...spec.acceptance_criteria, external, other] };
+      if (scenario === "scope retry" || scenario === "new dependency") initial.summary = "No code changes.";
+      if (scenario === "new dependency") initial.acceptance_criteria = spec.acceptance_criteria;
+      const retry =
+        scenario === "clean"
+          ? { ...spec, summary: "Locally verifiable farewell" }
+          : scenario === "empty"
+            ? { ...spec, acceptance_criteria: [external, { ...other, id: "AC-4" }] }
+            : scenario === "invalid scope"
+              ? { ...spec, summary: "No code changes." }
+              : {
+                  ...spec,
+                  acceptance_criteria: [...spec.acceptance_criteria, external, { ...other, id: "AC-4" }],
+                };
+      const expected = {
+        ...retry,
+        acceptance_criteria: scenario === "empty" ? [] : spec.acceptance_criteria,
+      };
+      const prompts: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") {
+          prompts.push(s.prompt);
+          return { structured: prompts.length === 1 ? initial : retry };
+        }
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify")
+          return {
+            structured:
+              scenario === "empty"
+                ? { ...pass, criteria: pass.criteria.filter((a) => a.id !== "AC-1") }
+                : pass,
+          };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        scenario === "invalid scope" ? "failed" : "succeeded",
+      );
+      expect(prompts).toHaveLength(scenario === "invalid scope" || scenario === "new dependency" ? 3 : 2);
+      expect(prompts[scenario === "new dependency" ? 2 : 1]).toContain(
+        scenario === "new dependency" ? "AC-2, AC-4" : "AC-2, AC-3",
+      );
+      if (scenario === "scope retry") expect(prompts[1]).toContain("Invalid specification:");
+      if (scenario === "invalid scope") {
+        expect(f.store.getArtifact(run.id, "spec.md")).toBeNull();
+        expect(f.store.getRun(run.id)?.error).toContain("invalid spec scope");
+        return;
+      }
+      expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual(expected);
+      const artifact = f.store.getArtifact(run.id, "spec.md");
+      expect(artifact).toContain(expected.summary);
+      expect(artifact).not.toContain(external.criterion);
+      expect(artifact).not.toContain(other.how_to_verify);
+      if (scenario !== "empty") expect(artifact).toContain("farewell.txt says goodbye");
+      const drops = f.store
+        .listEvents(run.id)
+        .filter((e) => e.message?.startsWith("Dropped out-of-run acceptance criteria:"));
+      expect(drops.map((e) => e.message)).toEqual(
+        scenario === "clean" ? [] : ["Dropped out-of-run acceptance criteria: AC-2, AC-4"],
+      );
+    },
+  );
+
   test("spec scope phrases normalize punctuation and leave ordinary documentation work alone", () => {
     for (const summary of [
       "SPECIFICATION—ONLY task",
