@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  cpSync,
   lstatSync,
   mkdirSync,
   readdirSync,
@@ -81,7 +82,6 @@ function inject(cwd: string, files: ReturnType<typeof hiddenContents>) {
   }
 }
 
-/** Fingerprint ignored and untracked entries without following symlinks or trusting directory metadata. */
 async function untrackedState(cwd: string, env: Record<string, string>, since: bigint) {
   const state = new Map<string, string>();
   const visit = (path: string) => {
@@ -93,22 +93,15 @@ async function untrackedState(cwd: string, env: Record<string, string>, since: b
       for (const entry of readdirSync(file)) visit(`${path}/${entry}`);
     } else {
       const meta = `${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
-      const body =
-        stat.ctimeNs < since
-          ? ""
-          : stat.isSymbolicLink()
-            ? readlinkSync(file)
-            : stat.isFile()
-              ? readFileSync(file)
-              : "";
-      state.set(path, `${meta}:${createHash("sha256").update(body).digest("hex")}`);
+      const hash = createHash("sha256").update(stat.isSymbolicLink() ? readlinkSync(file) : "");
+      if (stat.isFile() && stat.ctimeNs >= since) hash.update(readFileSync(file));
+      state.set(path, `${meta}:${hash.digest("hex")}`);
     }
   };
   const out = await sh(["git", "ls-files", "-z", "-o"], { cwd, env });
   for (const path of out.stdout.split("\0").filter(Boolean)) visit(path.replace(/\/$/, ""));
   return state;
 }
-
 /** Refuse to remove through a parent replaced with a symlink. Cleanup failure stops recovery. */
 function removeWithin(root: string, path: string) {
   let current = root;
@@ -120,7 +113,6 @@ function removeWithin(root: string, path: string) {
   for (let dir = dirname(join(root, path)); dir !== root && readdirSync(dir).length === 0; dir = dirname(dir))
     rmSync(dir, { recursive: true });
 }
-
 async function restoreCandidate(
   cwd: string,
   env: Record<string, string>,
@@ -189,6 +181,7 @@ export async function gradeImplement(
     hidden: null,
   };
   let checkout: string | undefined;
+  let gitSnapshot: string | undefined;
   let before: Map<string, string> | undefined;
   const since = BigInt(Date.now() - 5_000) * 1_000_000n;
   try {
@@ -219,6 +212,9 @@ export async function gradeImplement(
     // and its Git metadata (filters, drivers, hooks, index flags) has no say in grading. Fetching
     // only reads the candidate's objects; nothing in the grading repository points back at it.
     checkout = createScratch(cwd);
+    const backup = join(dirname(checkout), "candidate-git");
+    cpSync(join(cwd, ".git"), backup, { recursive: true });
+    gitSnapshot = backup;
     const opts = { cwd: checkout, env, signal };
     await sh(["git", "init", "-q"], opts);
     await sh(["git", "fetch", "-q", "--no-tags", "--no-write-fetch-head", cwd, commit, item.base], opts);
@@ -289,9 +285,13 @@ export async function gradeImplement(
   } finally {
     // A failed removal throws: recovery must not continue while grading artifacts remain.
     try {
-      if (checkout) removeScratch(checkout);
-    } finally {
+      if (gitSnapshot) {
+        removeScratch(join(cwd, ".git"));
+        cpSync(gitSnapshot, join(cwd, ".git"), { recursive: true });
+      }
       if (before && evidence.commit) await restoreCandidate(cwd, env, evidence.commit, before, since);
+    } finally {
+      if (checkout) removeScratch(checkout);
     }
   }
   return {

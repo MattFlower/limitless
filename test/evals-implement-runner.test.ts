@@ -1255,7 +1255,7 @@ for (const rounds of [1, 2])
       expect(paths.every((p) => !existsSync(p))).toBe(true);
       const harnessScratch = basename(dirname(f.calls[0]?.scratchDir ?? ""));
       expect(paths.every((p) => !p.includes(`/${harnessScratch}/`))).toBe(true);
-      expect(copies).not.toHaveBeenCalled();
+      expect(copies).toHaveBeenCalledTimes(2);
       const text = formatEvalReport(report);
       expect(text.includes("strategy=")).toBe(rounds > 1);
       expect(text.includes("recovery")).toBe(rounds > 1);
@@ -1263,7 +1263,9 @@ for (const rounds of [1, 2])
       f.respond(() => ({ files: { answer: "wrong" } }));
       await f.run({ rounds, cache: false });
       expect(f.calls).toHaveLength(1 + rounds);
-      expect(copies).not.toHaveBeenCalled();
+      expect(copies).toHaveBeenCalledTimes(2 * (rounds + 1));
+      for (const [from, to] of copies.mock.calls)
+        expect([basename(String(from)), basename(String(to))].sort()).toEqual([".git", "candidate-git"]);
     } finally {
       copies.mockRestore();
       await f.close();
@@ -1529,11 +1531,11 @@ for (const [outcome, reason] of [
       await f.close();
     }
   });
-
 for (const rounds of [1, 2])
-  test(`a committed Bun preload leaves no hidden copies in the worktree or scratch (rounds=${rounds})`, async () => {
+  test(`a committed Bun preload leaves no hidden copies in the worktree, Git or scratch (rounds=${rounds})`, async () => {
     const f = await fixture();
     try {
+      const oid = (await sh(["git", "hash-object", "hidden/check.sh"], { cwd: f.hiddenDir })).stdout.trim();
       f.item.hidden.command = `bun test candidate.test.ts && ${f.item.hidden.command}`;
       f.save();
       f.respond((s): FakeReply => {
@@ -1546,22 +1548,28 @@ for (const rounds of [1, 2])
               "bunfig.toml": '[test]\npreload=["./steal.ts"]\n',
               "candidate.test.ts":
                 'import { test, expect } from "bun:test"; test("candidate", () => expect(true).toBe(true));',
-              "steal.ts": `import { cpSync, existsSync } from "node:fs";
+              "steal.ts": `import { cpSync, existsSync, readFileSync } from "node:fs";
           if (existsSync("hidden")) {
-            for (const dest of ${JSON.stringify([join(s.cwd, "stolen"), join(s.cwd, "dist/stolen"), join(s.scratchDir ?? "", "stolen")])}) cpSync("hidden", dest, { recursive: true });
+            const cwd = ${JSON.stringify(s.cwd)};
+            for (const dest of ${JSON.stringify([join(s.cwd, "stolen"), join(s.cwd, ".git/stolen"), join(s.cwd, "dist/stolen"), join(s.scratchDir ?? "", "stolen")])}) cpSync("hidden", dest, { recursive: true });
+            const git = (...args) => { const result = Bun.spawnSync(["git", "-C", cwd, ...args]); if (result.exitCode) throw new Error(result.stderr.toString()); return result; };
+            const object = git("hash-object", "-w", process.cwd() + "/hidden/check.sh").stdout.toString().trim();
+            git("update-ref", "refs/stolen", object);
+            git("config", "stolen.hidden", readFileSync("hidden/check.sh", "utf8"));
             cpSync("hidden/check.sh", ${JSON.stringify(join(s.cwd, "dist/output"))});
             cpSync("hidden/check.sh", ${JSON.stringify(join(s.cwd, "overwrite"))});
-            console.log("copies created");
+            console.log("copies created", object);
           }`,
             },
           };
-        expect(existsSync(join(s.cwd, "stolen"))).toBe(false);
-        expect(existsSync(join(s.cwd, "dist/stolen"))).toBe(false);
-        expect(existsSync(join(s.cwd, "dist/output"))).toBe(false);
+        const paths = ["stolen", ".git/stolen", ".git/refs/stolen", "dist/stolen", "dist/output"];
+        for (const path of paths) expect(existsSync(join(s.cwd, path))).toBe(false);
+        expect(existsSync(join(s.cwd, ".git/objects", oid.slice(0, 2), oid.slice(2)))).toBe(false);
+        expect(readFileSync(join(s.cwd, ".git/config"), "utf8")).not.toContain("stolen");
         expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
         expect(existsSync(f.calls[0]?.scratchDir ?? "")).toBe(false);
         const prior = f.factory.store.listEvalTrials(f.factory.store.listEvalRuns()[0]?.id ?? "")[0];
-        expect(prior?.details.grade?.implement?.hidden?.output).toContain("copies created");
+        expect(prior?.details.grade?.implement?.hidden?.output).toContain(`copies created ${oid}`);
         return { files: { answer: "correct", "steal.ts": "" } };
       });
       expect((await f.run({ rounds })).trials[0]?.pass).toBe(rounds === 2);
@@ -1571,7 +1579,6 @@ for (const rounds of [1, 2])
       await f.close();
     }
   });
-
 test("grading removes hidden tests even when candidate code makes checkout directories read-only", async () => {
   const f = await fixture();
   const allocated = spyOn(scratch, "createScratch");
