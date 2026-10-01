@@ -903,7 +903,6 @@ async function oneRound(
         const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
         // Retry before discarding, so a check sees the same build output as its first attempt, but
         // on the candidate's tracked files: a failing check may have rewritten them into passing ones.
-        await restoreTracked(cwd, head);
         cmp = await retryRegressions(
           compareGates(ctx.state.baseline ?? null, after),
           cwd,
@@ -911,6 +910,7 @@ async function oneRound(
           changed,
           ctx.signal,
           events.onWait,
+          () => restoreTracked(cwd, head),
         );
         ctx.checkCancelled();
         // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.

@@ -198,6 +198,7 @@ function pointsAt(output: string, changed: string[]): boolean {
 /**
  * Re-run once, inside a slot, each check that passed on the baseline but failed after the change
  * without its output pointing at a changed file. A pass on retry is `flaky` and doesn't block.
+ * beforeRetry restores the candidate's tracked tree and metadata before each check, keeping build output.
  */
 export async function retryRegressions(
   cmp: GateComparison[],
@@ -206,6 +207,7 @@ export async function retryRegressions(
   changed: string[],
   signal: AbortSignal,
   onWait?: GateHooks["onWait"],
+  beforeRetry?: () => Promise<void>,
 ): Promise<GateComparison[]> {
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
   const retryable = (c: GateComparison) =>
@@ -222,6 +224,7 @@ export async function retryRegressions(
         out.push(c);
         continue;
       }
+      await beforeRetry?.();
       const retry = await runOne(check, cwd, signal);
       out.push({
         ...c,

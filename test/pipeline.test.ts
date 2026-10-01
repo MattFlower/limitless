@@ -5780,6 +5780,47 @@ describe("candidate git metadata", () => {
     expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toBe("BAD\n");
   });
 
+  test("each gate retry restores the commit after an earlier retry tampers with it", async () => {
+    mkdirSync(join(home, "markers"));
+    // The first check fails initially, then rewrites and hides the edit on retry. Its untracked
+    // build output must survive, but the next retry must still test the committed BAD contents.
+    const rewrite = [
+      "if grep -q BAD greeting.txt; then",
+      "if test -f retry-output; then",
+      "echo hello > greeting.txt; git update-index --skip-worktree greeting.txt;",
+      `git config core.fsmonitor 'touch ${join(home, "markers", "fsmonitor")}'; exit 0; fi;`,
+      "touch retry-output; exit 1; fi",
+    ].join(" ");
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [
+        { name = "rewrite", run = ${JSON.stringify(rewrite)} },
+        { name = "no-bad", run = "! grep -q BAD greeting.txt" }
+      ]\n`,
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "retry gates"], {
+      cwd: repoDir,
+    });
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "greeting.txt": "BAD\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Break greeting", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).not.toBe("succeeded");
+    const gates = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "[]");
+    expect(gates[0]).toMatchObject({ name: "rewrite", verdict: "flaky", blocking: false });
+    expect(gates[1]).toMatchObject({ name: "no-bad", verdict: "regressed", blocking: true });
+    expect(gates[1].firstAttempt).toBeDefined();
+    const cwd = f.store.getRunState<RunState>(run.id)?.worktreePath ?? "";
+    const head = f.store.getRun(run.id)?.headSha ?? "";
+    expect((await sh(["git", "show", `${head}:greeting.txt`], { cwd })).stdout).toBe("BAD\n");
+    expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toBe("BAD\n");
+    expect(readdirSync(join(home, "markers"))).toEqual([]);
+  });
+
   test.each(["kept", "missing"])("restart restores from the original snapshot (%s)", async (snapshot) => {
     await addFixtures();
     const handler: Handler = (s) => {

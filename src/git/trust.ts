@@ -41,8 +41,9 @@ export interface GitTrust {
 /** The factory's copies of a shared repository's config and info/attributes, outside any git metadata. */
 export const trustedConfigPath = (key: string) => `${key}.trusted-config`;
 export const trustedAttributesPath = (key: string) => `${key}.trusted-attributes`;
-/** The main worktree's own `config.worktree`, which commands run in the shared repository read. */
-export const trustedWorktreeConfigPath = (key: string) => `${key}.trusted-config-worktree`;
+/** The main worktree's config, or a linked source's config keyed by its canonical git directory. */
+export const trustedWorktreeConfigPath = (key: string, gitDir?: string) =>
+  `${key}.trusted-config-worktree${gitDir ? `-${new Bun.CryptoHasher("sha256").update(gitDir).digest("hex")}` : ""}`;
 
 const read = (path: string) => {
   try {
@@ -72,18 +73,20 @@ export function restoreOwned(commonDir: string, config: string): void {
 }
 
 /** Record a repository's current shared config, config.worktree and info/attributes as the trusted copies. */
-export function captureShared(commonDir: string, key: string): void {
+export function captureShared(commonDir: string, key: string, gitDir = commonDir): void {
   const config = read(join(commonDir, "config"));
   if (config === null) throw new Error(`git config unreadable in ${commonDir}`);
   mkdirSync(dirname(key), { recursive: true });
   writeFileSync(trustedConfigPath(key), config);
   // An empty copy records that there was none, distinct from a copy an older release never took.
   writeFileSync(trustedWorktreeConfigPath(key), read(join(commonDir, "config.worktree")) ?? "");
+  if (gitDir !== commonDir)
+    writeFileSync(trustedWorktreeConfigPath(key, gitDir), read(join(gitDir, "config.worktree")) ?? "");
   put(trustedAttributesPath(key), read(join(commonDir, "info", "attributes")));
 }
 
 /** Put the trusted copies back; a factory-owned repository also loses its hooks and attributes. */
-export function restoreShared(commonDir: string, key: string, owned: boolean): void {
+export function restoreShared(commonDir: string, key: string, owned: boolean, gitDir = commonDir): void {
   const config = read(trustedConfigPath(key));
   if (config === null) throw new Error(`trusted git config missing: ${trustedConfigPath(key)}`);
   if (owned) restoreOwned(commonDir, config);
@@ -91,6 +94,12 @@ export function restoreShared(commonDir: string, key: string, owned: boolean): v
     put(join(commonDir, "config"), config);
     put(join(commonDir, "config.worktree"), read(trustedWorktreeConfigPath(key)) || null);
     put(join(commonDir, "info", "attributes"), read(trustedAttributesPath(key)));
+    // worktree add reads the source checkout's effective config, even when it is itself linked.
+    if (gitDir !== commonDir) {
+      const source = read(trustedWorktreeConfigPath(key, gitDir));
+      if (source === null) throw new Error(`trusted source git config missing for ${gitDir}`);
+      put(join(gitDir, "config.worktree"), source || null);
+    }
   }
 }
 

@@ -271,8 +271,15 @@ async function restoreCache(cache: string, url: string): Promise<void> {
  * agent may already have written them, and no trusted input remains to rebuild them from.
  */
 async function restoreLocal(paths: Paths, cache: string, key: string): Promise<void> {
-  const common = resolve(cache, (await git(["rev-parse", "--git-common-dir"], { cwd: cache })).stdout.trim());
-  if (!existsSync(trustedConfigPath(key)) || !existsSync(trustedWorktreeConfigPath(key))) {
+  const metadata = async (flag: string) =>
+    realpathSync(resolve(cache, (await git(["rev-parse", flag], { cwd: cache })).stdout.trim()));
+  const common = await metadata("--git-common-dir");
+  const gitDir = await metadata("--absolute-git-dir");
+  if (
+    !existsSync(trustedConfigPath(key)) ||
+    !existsSync(trustedWorktreeConfigPath(key)) ||
+    (gitDir !== common && !existsSync(trustedWorktreeConfigPath(key, gitDir)))
+  ) {
     const under = (path: string) => {
       try {
         return realpathSync(path).startsWith(realpathSync(paths.work) + sep);
@@ -289,9 +296,9 @@ async function restoreLocal(paths: Paths, cache: string, key: string): Promise<v
       throw new Error(
         `no trusted git state for ${cache} while factory worktrees exist (remove them first): ${active.join(", ")}`,
       );
-    captureShared(common, key);
+    captureShared(common, key, gitDir);
   }
-  restoreShared(common, key, false);
+  restoreShared(common, key, false, gitDir);
 }
 
 export interface Worktree {

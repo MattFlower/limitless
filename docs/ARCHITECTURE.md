@@ -244,12 +244,13 @@ detection, per-invocation budget, process-group kill on cancel.
   info/attributes are emptied, and skip-worktree/assume-unchanged bits are cleared. Cache operations
   (fetch, worktree add, eval staging) restore the cache's copy first; a cache without one gets its
   config rebuilt from the repo's URL rather than adopting the live file. A local repo's shared config,
-  its main worktree's `config.worktree` and info/attributes are copied to
-  `repos/local__<name>.trusted-*` by the first worktree the factory creates and restored before every
-  later one (delete the copies, with no factory worktrees left, to adopt a changed local config).
+  its main worktree's `config.worktree`, a linked source checkout's own `config.worktree`, and
+  info/attributes are copied to `repos/local__<name>.trusted-*` by the first worktree the factory
+  creates and restored before every later one (delete the copies, with no factory worktrees left,
+  to adopt a changed local config).
   Gates, reviewers and verifiers run code that can move HEAD or rewrite tracked files, so each
-  round's cleanup, gate retry, diff, audit, grading and every reader attempt's cleanup bind to the
-  recorded candidate commit, not the live branch.
+  round's cleanup, each individual gate retry, diff, audit, grading and every reader attempt's cleanup
+  bind to the recorded candidate commit, not the live branch.
 - Agents run with the CLIs' own sandboxes (Seatbelt on macOS) where they're compatible with the
   repo's toolchain; secrets for Discord/GitHub/OpenRouter are scrubbed from agent environments.
 - Triggers are **allowlisted** (your GitHub login, `dependabot[bot]`, your Discord user id).

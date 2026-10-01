@@ -323,33 +323,50 @@ describe("shared local repository", () => {
     expect(readdirSync(join(dir, ".git", "hooks"))).toContain("pre-commit");
   });
 
-  test("a later run's worktree never runs a filter from the main worktree's own config", async () => {
-    const { dir, paths, local } = await setup();
-    // The user's repository tracks attributes naming a filter and uses per-worktree config; the
-    // main worktree's copy is theirs.
-    writeFileSync(join(dir, ".gitattributes"), "*.txt filter=text\n");
-    await run(dir, "add", ".gitattributes");
-    await run(dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "attributes");
-    await run(dir, "config", "extensions.worktreeConfig", "true");
-    await run(dir, "config", "--worktree", "user.name", "owner");
-    const first = await createWorktree(paths, local, "run1", "t", "main");
-    // Through its worktree, the agent defines that filter's driver in the main worktree's
-    // config.worktree, which worktree add (run in the main worktree) reads.
-    const smudge = (name: string) => `sh -c 'touch ${marker(name)}; cat'`;
-    await run(
-      first.path,
-      "config",
-      "-f",
-      join(dir, ".git", "config.worktree"),
-      "filter.text.smudge",
-      smudge("main"),
-    );
-    await run(first.path, "config", "--worktree", "filter.text.smudge", smudge("own"));
-    const second = await createWorktree(paths, local, "run2", "t", "main");
-    expect(markers()).toEqual([]);
-    expect(readFileSync(join(dir, ".git", "config.worktree"), "utf8")).toBe("[user]\n\tname = owner\n");
-    expect(readFileSync(join(second.path, "plain.txt"), "utf8")).toBe("one\n");
-  });
+  test.each(["main", "linked"])(
+    "a later run never runs a filter from the %s source config",
+    async (layout) => {
+      const { dir, paths, local } = await setup();
+      // The user's repository tracks attributes naming a filter and uses per-worktree config; the
+      // main worktree's copy is theirs.
+      writeFileSync(join(dir, ".gitattributes"), "*.txt filter=text\n");
+      await run(dir, "add", ".gitattributes");
+      await run(dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "attributes");
+      await run(dir, "config", "extensions.worktreeConfig", "true");
+      await run(dir, "config", "--worktree", "user.name", "owner");
+      if (layout === "linked") {
+        local.localPath = join(home, "source");
+        await run(dir, "worktree", "add", "--detach", local.localPath, "main");
+        await run(local.localPath, "config", "--worktree", "user.name", "source-owner");
+      }
+      const sourceDir = (await run(local.localPath ?? dir, "rev-parse", "--absolute-git-dir")).stdout.trim();
+      const first = await createWorktree(paths, local, "run1", "t", "main");
+      // Through its worktree, the agent defines a filter in the source's effective config.
+      const smudge = (name: string) => `sh -c 'touch ${marker(name)}; cat'`;
+      await run(
+        first.path,
+        "config",
+        "-f",
+        join(sourceDir, "config.worktree"),
+        "filter.text.smudge",
+        smudge("main"),
+      );
+      await run(first.path, "config", "--worktree", "filter.text.smudge", smudge("own"));
+      const second = await createWorktree(paths, local, "run2", "t", "main");
+      expect(markers()).toEqual([]);
+      expect(readFileSync(join(dir, ".git", "config.worktree"), "utf8")).toBe("[user]\n\tname = owner\n");
+      expect(readFileSync(join(sourceDir, "config.worktree"), "utf8")).toBe(
+        `[user]\n\tname = ${layout === "linked" ? "source-owner" : "owner"}\n`,
+      );
+      expect(readFileSync(join(second.path, "plain.txt"), "utf8")).toBe("one\n");
+      if (layout === "linked") {
+        rmSync(trustedWorktreeConfigPath(key(paths), sourceDir));
+        await expect(createWorktree(paths, local, "run3", "t", "main")).rejects.toThrow(
+          "no trusted git state",
+        );
+      }
+    },
+  );
 
   test.each([trustedConfigPath, trustedWorktreeConfigPath])(
     "a touched repository without trusted copies fails instead of adopting its config (%p)",
