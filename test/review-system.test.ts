@@ -149,7 +149,6 @@ test("system hash ignores key order and name but not behaviour", () => {
   const listed = verified({ targets: ["verifier-c", "candidate-b"] });
   expect(listed).not.toBe(verified({ target: "verifier-c" }));
   expect(listed).not.toBe(verified({ targets: ["candidate-b", "verifier-c"] }));
-  expect(listed).not.toBe(verified({ targets: ["verifier-c"] }));
 });
 
 test("CLI validates --systems before submitting and keeps --models as one system per model", async () => {

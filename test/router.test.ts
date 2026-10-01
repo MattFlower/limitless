@@ -252,12 +252,7 @@ describe("Router", () => {
         reason: "disabled",
       });
     }
-    // A verifier picked from a configured list never falls back to an unlisted model.
-    expect(router.route("review", "small", { only: "claude/opus" }).candidates).toEqual([]);
     tracker.setEnabled("claude", true);
-    expect(router.route("review", "small", { only: "claude/opus" }).candidates.map((m) => m.modelId)).toEqual(
-      ["claude/opus"],
-    );
     expect(
       router.route("implement", "small").candidates.some((candidate) => candidate.provider === "claude"),
     ).toBe(true);

@@ -950,12 +950,9 @@ export class EvalRunner {
                         if (!panelTargets) throw new Error("review system has no verifier");
                         // A shared vendor is allowed and recorded by the panel, as in production.
                         const to = pickVerifier(panelTargets.verifiers, avoidVendors, avoidModels);
+                        const { modelId, effort } = to;
                         trial.details.verifiers ??= [];
-                        trial.details.verifiers.push({
-                          modelId: to.modelId,
-                          effort: recordEffort(to.effort),
-                          candidates,
-                        });
+                        trial.details.verifiers.push({ modelId, effort: recordEffort(effort), candidates });
                         return sendTo(request, to, `verifier-${++verifications}`);
                       },
                     },

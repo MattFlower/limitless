@@ -345,9 +345,8 @@ export function validateRequest(
   // As in production, a verifier never reuses a finder's model; a shared vendor is recorded, not refused.
   // A longer list may name finders: each batch skips the models that raised it, failing if none is left.
   for (const system of resolvedSystems ?? []) {
-    const verifiers = system.verifier?.targets ?? [system.verifier?.target];
-    const [verifier] = verifiers;
-    if (verifiers.length === 1 && system.finders.some((finder) => finder.target === verifier))
+    const [verifier, ...rest] = system.verifier?.targets ?? [system.verifier?.target];
+    if (!rest.length && system.finders.some((finder) => finder.target === verifier))
       problems.push(
         `review system ${JSON.stringify(system.name)}: verifier ${verifier} is also one of its finders`,
       );

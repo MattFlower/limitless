@@ -17,8 +17,6 @@ export interface RouteConstraints {
   exclude?: (string | ModelSelection)[];
   /** Put this target first when it is available (stick with the current implementer). */
   prefer?: string | ModelSelection;
-  /** Consider only this target, with no fallback (a verifier picked from a configured list). */
-  only?: string;
   /** Put this vendor's models first, as if every other vendor were avoided. */
   preferVendor?: string;
   /** Ranked after the same vendor without it; below `avoidVendor` (a verifier: the implementer's vendor). */
@@ -251,10 +249,6 @@ export class Router {
       }
     };
 
-    if (c.only) {
-      consider([c.only]);
-      return { candidates: ranked.map((r) => r.target), skipped };
-    }
     for (const g of groups) consider(g.split("|"), true);
     // A persisted implementer can retain an explicit effort after the catalog default changes.
     if (c.prefer) consider([c.prefer]);

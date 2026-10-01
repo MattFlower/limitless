@@ -1159,10 +1159,7 @@ test("an eval panel picks each batch's verifier from an ordered list, as product
         return ++verifierCalls === 1 ? { structured: { results: [] }, costUsd: 0.1 } : refuteAll(s);
       });
     respond(false);
-    const finders = [
-      { target: "finder-x", prompt: "standard" },
-      { target: "finder-y", prompt: "standard" },
-    ];
+    const finders = ["finder-x", "finder-y"].map((target) => ({ target, prompt: "standard" }));
     const system = { ...panelSystem, finders, verifier: { targets: ["verifier-x", "verifier-y"] } };
     const report = await f.run({ models: undefined, systems: [system], cache: false });
     expect(report.trials[0]?.status).toBe("ok");
