@@ -11,7 +11,7 @@ import {
 import { DEFAULT_ROSTERS, EvalReviewSystemsSchema, expandRoster } from "../pipeline/review-system.ts";
 import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
 import type { Router } from "../router/router.ts";
-import { EFFORT_LEVELS } from "../router/targets.ts";
+import { EFFORT_LEVELS, parseTarget } from "../router/targets.ts";
 import { reviewSystemHash } from "./cache.ts";
 
 const nonempty = z.string().trim().min(1);
@@ -300,7 +300,12 @@ export function validateRequest(
   const billing = new Map<string, string>();
   const resolve = (id: string): string => {
     try {
-      let target = router.resolveFor(request.role, id);
+      // `model@default` (a resume's stored form) pins an unset effort regardless of today's model default.
+      const parsed = parseTarget(id);
+      let target = router.resolveFor(
+        request.role,
+        parsed.effort === "default" ? { modelId: parsed.modelId, effort: null } : id,
+      );
       if (request.strategy === "effort") {
         const levels = EFFORT_LEVELS.filter((level) => target.model.supportedEfforts.includes(level));
         const effort = target.effort ?? levels[0];

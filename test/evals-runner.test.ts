@@ -8,7 +8,7 @@ import { selectHarness } from "../src/harness/select.ts";
 import { FACTORY_PREAMBLE, triagePrompt } from "../src/pipeline/prompts.ts";
 import { TriageSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 import { sh } from "../src/util/proc.ts";
-import { answer, deferred, evalFixture } from "./evals-support.ts";
+import { answer, deferred, enableEfforts, evalFixture } from "./evals-support.ts";
 
 test("3 cases x 2 exact models x k=2 use pinned bare inputs and shared invocation semantics", async () => {
   const f = await evalFixture();
@@ -843,7 +843,9 @@ test("resume replays an interrupted eval's stored request; completed trials come
     const state = gate(f);
     const resumed = runner.resume(run.id);
     expect(resumed).toMatchObject({ resumedFrom: run.id, status: "queued" });
-    expect(f.factory.store.evalRequest(resumed?.id ?? "")).toEqual({ ...request, maxUsd: 1, cache: true });
+    expect(f.factory.store.evalRequest(resumed?.id ?? "")).toEqual({
+      request: { ...request, models: ["candidate-a@default"], maxUsd: 1, cache: true },
+    });
     await until(() => state.active === 2);
     await Bun.sleep(20);
     state.open.resolve();
@@ -870,7 +872,7 @@ test("resume refuses unknown, active, legacy, cache-disabled and no-longer-valid
       const run = store.createEvalRun(
         { role: "triage", models: ["candidate-a"], k: 1, maxUsd: 1 },
         [],
-        request,
+        request && { request },
       );
       store.updateEvalRun(run.id, "failed", "boom");
       return run.id;
@@ -899,6 +901,37 @@ test("resume refuses unknown, active, legacy, cache-disabled and no-longer-valid
     for (const [id, reason] of refusals) expect(() => evals.resume(id)).toThrow(reason);
     expect(store.listEvalRuns()).toHaveLength(count);
     expect(store.getEvalRun(refusals[0]?.[0] ?? "")?.status).toBe("failed");
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume replays the selected cases and unset effort, not today's dataset or model default", async () => {
+  const f = await evalFixture();
+  try {
+    const { store, evals } = f.factory;
+    const interrupted = async () => {
+      const run = evals.submit({ role: "triage", models: ["candidate-a"] });
+      await evals.cancel(run.id);
+      return run.id;
+    };
+    const first = await interrupted();
+    const second = await interrupted();
+    expect(store.evalRequest(first)).toMatchObject({ request: { caseIds: ["a", "b", "c"] } });
+    enableEfforts(f);
+    const resumed = evals.resume(first);
+    await evals.wait(resumed?.id ?? "");
+    const trials = evals.report(resumed?.id ?? "")?.trials ?? [];
+    expect(trials.map((t) => [t.caseId, t.effort])).toEqual([
+      ["a", "default"],
+      ["b", "default"],
+      ["c", "default"],
+    ]);
+    f.dataset.cases = f.dataset.cases.filter((c) => c.id !== "b");
+    f.save();
+    const count = store.listEvalRuns().length;
+    expect(() => evals.resume(second)).toThrow("Unknown case ID: b");
+    expect(store.listEvalRuns()).toHaveLength(count);
   } finally {
     await f.close();
   }

@@ -506,55 +506,60 @@ test("hidden bytes in renamed/deleted reachable history reject before invocation
 });
 
 for (const rounds of [1, 3])
-  test(`cancellation during hidden grading retains spend and removes trial resources (rounds=${rounds})`, async () => {
-    const f = await fixture();
-    try {
-      f.item.hidden.command = 'test "$(cat answer)" = correct || exit 1; touch grading-started; sleep 10';
-      if (rounds > 1)
-        f.respond(() => ({ files: { answer: f.calls.length === 1 ? "wrong" : "correct" }, costUsd: 0.1 }));
-      f.save();
-      const pending = f.run({ rounds });
-      let cwd: string | undefined;
-      for (let i = 0; i < 200; i++) {
-        cwd = f.calls.at(-1)?.cwd;
-        if (cwd && existsSync(join(cwd, "grading-started"))) break;
-        await new Promise((resolve) => setTimeout(resolve, 10));
+  for (const via of ["stop", "cancel"] as const)
+    test(`cancellation during hidden grading retains spend and removes trial resources (rounds=${rounds}, ${via})`, async () => {
+      const f = await fixture();
+      try {
+        f.item.hidden.command = 'test "$(cat answer)" = correct || exit 1; touch grading-started; sleep 10';
+        if (rounds > 1)
+          f.respond(() => ({ files: { answer: f.calls.length === 1 ? "wrong" : "correct" }, costUsd: 0.1 }));
+        f.save();
+        const pending = f.run({ rounds });
+        let cwd: string | undefined;
+        for (let i = 0; i < 200; i++) {
+          cwd = f.calls.at(-1)?.cwd;
+          if (cwd && existsSync(join(cwd, "grading-started"))) break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(cwd && existsSync(join(cwd, "grading-started"))).toBe(true);
+        expect(f.factory.store.listEvalRuns().map((r) => f.factory.store.evalSpend(r.id))).toEqual([
+          rounds > 1 ? 0.2 : 0.1,
+        ]);
+        const id = f.factory.store.listEvalRuns()[0]?.id ?? "";
+        await (via === "stop" ? f.factory.evals.stop() : f.factory.evals.cancel(id));
+        const report = await pending;
+        expect(report.run.status).toBe("interrupted");
+        expect(report.trials[0]).toMatchObject(
+          rounds > 1
+            ? {
+                // Aborted mid-trial: unscored, but its rounds and spend remain as evidence.
+                status: "skipped",
+                pass: null,
+                score: null,
+                costUsd: 0.2,
+                details: {
+                  roundsUsed: 2,
+                  interrupted: true,
+                  rounds: [
+                    { round: 0, pass: false },
+                    { round: 1, pass: null },
+                  ],
+                },
+              }
+            : { status: "skipped", pass: null, costUsd: 0.1 },
+        );
+        if (rounds > 1) {
+          expect(report.trials[0]?.details.grade).toBeUndefined();
+          expect(report.summaries[0]?.implement?.passAtR).toMatchObject({ denominator: 0 });
+          expect(report.summaries[0]?.implement?.recovery).toMatchObject({ denominator: 0, notAttempted: 0 });
+        }
+        expect(f.factory.store.cachedEvalTrials(report.trials[0]?.cacheKey ?? "")).toEqual([]);
+        expect(cwd && existsSync(cwd)).toBe(false);
+        expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+      } finally {
+        await f.close();
       }
-      expect(cwd && existsSync(join(cwd, "grading-started"))).toBe(true);
-      expect(f.factory.store.listEvalRuns().map((r) => f.factory.store.evalSpend(r.id))).toEqual([
-        rounds > 1 ? 0.2 : 0.1,
-      ]);
-      await f.factory.evals.stop();
-      const report = await pending;
-      expect(report.run.status).toBe("interrupted");
-      expect(report.trials[0]).toMatchObject(
-        rounds > 1
-          ? {
-              status: "error",
-              pass: false,
-              costUsd: 0.2,
-              details: {
-                roundsUsed: 2,
-                interrupted: true,
-                rounds: [
-                  { round: 0, pass: false },
-                  { round: 1, pass: null },
-                ],
-              },
-            }
-          : { status: "skipped", pass: null, costUsd: 0.1 },
-      );
-      if (rounds > 1) {
-        expect(report.trials[0]?.details.grade?.implement?.reason).toBe("hidden_tests");
-        expect(report.summaries[0]?.implement?.recovery).toMatchObject({ denominator: 0, notAttempted: 1 });
-      }
-      expect(f.factory.store.cachedEvalTrials(report.trials[0]?.cacheKey ?? "")).toEqual([]);
-      expect(cwd && existsSync(cwd)).toBe(false);
-      expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
-    } finally {
-      await f.close();
-    }
-  });
+    });
 
 for (const strategy of ["retry", "effort", "switch"] as const)
   test(`multi-round ${strategy} preserves edits, sanitizes grading, records costs and caches`, async () => {
@@ -958,6 +963,15 @@ test("switch freezes policy order, ignores live headroom, records harness and ke
     expect(report.trials[0]?.harness).toBe("codex");
     expect(report.trials[0]?.details.rounds?.map((r) => r.harness)).toEqual(["fake", "codex"]);
     expect(route).not.toHaveBeenCalled();
+    // A resume keeps its predecessor's chain, part of the cache key, despite the policy change.
+    const calls = f.calls.length;
+    f.factory.store.updateEvalRun(report.run.id, "failed", "boom");
+    const resumed = f.factory.evals.resume(report.run.id);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    const replayed = f.factory.evals.report(resumed?.id ?? "");
+    expect(replayed?.trials[0]?.details.switchChain).toEqual(report.trials[0]?.details.switchChain);
+    expect(replayed?.summaries[0]?.cached).toBe(1);
+    expect(f.calls).toHaveLength(calls);
     const changed = await f.run({ rounds: 2, strategy: "switch" });
     expect(changed.trials[0]?.cacheKey).not.toBe(report.trials[0]?.cacheKey);
     expect(changed.summaries[0]?.cached).toBe(0);

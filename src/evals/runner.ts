@@ -50,6 +50,13 @@ import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 const CANCELLED = "cancelled";
 const stopReason = (signal: AbortSignal) => (signal.reason === CANCELLED ? CANCELLED : "daemon shutdown");
 
+type SwitchChain = NonNullable<EvalTrial["details"]["switchChain"]>;
+/** What `eval resume` replays: the explicit request and each implement case's frozen switch chain. */
+interface StoredEvalRequest {
+  request: Record<string, unknown>;
+  switchChains?: Record<string, SwitchChain>;
+}
+
 /** Where Limitless keeps eval datasets; pins whose history touches these are rejected. */
 const LABEL_PATHS = ["evals/triage", "evals/review", "evals/verify", "evals/implement"];
 
@@ -81,7 +88,7 @@ export class EvalRunner {
     deps.store.recoverEvals();
   }
 
-  submit(input: unknown, resumedFrom?: string): EvalRun {
+  submit(input: unknown, resume?: { from: string; switchChains?: Record<string, SwitchChain> }): EvalRun {
     if (this.stopping) throw new Error("daemon is stopping");
     // Reject unsupported roles before accessing any dataset or repository.
     const parsed = EvalRequestSchema.parse(input);
@@ -89,10 +96,25 @@ export class EvalRunner {
     for (const item of file.cases)
       if ("defects" in item) seedContent(item, this.casePath ?? defaultCasePath(parsed.role));
     const { request, cases } = validateRequest(input, file, this.deps.router, this.deps.cfg.reviewRosters);
-    // Resolved targets and expanded systems, so a resume replays exactly these candidates.
-    const replay = parsed.systems
-      ? { ...parsed, systems: request.systems }
-      : { ...parsed, models: request.models };
+    // The selected cases, resolved targets and expanded systems, so a resume replays exactly these
+    // trials; an unset effort is stored as `@default` so today's model default cannot change it.
+    const explicit = (target = "") =>
+      parseTarget(target).effort === undefined ? `${target}@default` : target;
+    const replay = {
+      ...parsed,
+      caseIds: cases.map((item) => item.id),
+      ...(parsed.systems
+        ? {
+            systems: request.systems?.map((system) => ({
+              ...system,
+              finders: system.finders.map((finder) => ({ ...finder, target: explicit(finder.target) })),
+              ...(system.verifier
+                ? { verifier: { ...system.verifier, target: explicit(system.verifier.target) } }
+                : {}),
+            })),
+          }
+        : { models: request.models.map((target) => explicit(target)) }),
+    };
     const trials: EvalTrial[] = [];
     const candidates =
       request.systems?.map((system) => ({ modelId: system.finders[0]?.target ?? "", system: system.name })) ??
@@ -104,7 +126,11 @@ export class EvalRunner {
             evalRunId: "",
             caseId: item.id,
             modelId: parseTarget(modelId).modelId,
-            effort: recordEffort(this.deps.router.resolve(modelId).effort),
+            // A resolved target names its effort unless it is unset; never re-resolve today's default.
+            effort:
+              parseTarget(modelId).effort === undefined
+                ? "default"
+                : recordEffort(this.deps.router.resolve(modelId).effort),
             trial,
             cacheKey: "",
             harness: "",
@@ -120,12 +146,15 @@ export class EvalRunner {
                       complexity: item.complexity,
                       ...(request.strategy === "switch"
                         ? {
-                            switchChain: this.deps.router
-                              .policyTargets("implement", item.complexity)
-                              .sort((a, b) => a.tier - b.tier)
-                              .filter(
-                                (target, i, targets) => i === 0 || target.tier !== targets[i - 1]?.tier,
-                              ),
+                            // A resume keeps its predecessor's chain, which is part of the cache key.
+                            switchChain:
+                              resume?.switchChains?.[item.id] ??
+                              this.deps.router
+                                .policyTargets("implement", item.complexity)
+                                .sort((a, b) => a.tier - b.tier)
+                                .filter(
+                                  (target, i, targets) => i === 0 || target.tier !== targets[i - 1]?.tier,
+                                ),
                           }
                         : {}),
                     }
@@ -137,7 +166,14 @@ export class EvalRunner {
             durationMs: 0,
             createdAt: Date.now(),
           });
-    const run = this.deps.store.createEvalRun(request, trials, replay, resumedFrom);
+    const switchChains = Object.fromEntries(
+      trials.flatMap((t) => (t.details.switchChain ? [[t.caseId, t.details.switchChain]] : [])),
+    );
+    const stored: StoredEvalRequest = {
+      request: replay,
+      ...(trials.some((t) => t.details.switchChain) ? { switchChains } : {}),
+    };
+    const run = this.deps.store.createEvalRun(request, trials, stored, resume?.from);
     const controller = new AbortController();
     const done = Promise.resolve()
       .then(() => this.execute(run, file, cases, request.cache, controller.signal))
@@ -158,17 +194,27 @@ export class EvalRunner {
     if (run.resumedBy) throw new Error(`eval ${id} was already resumed as ${run.resumedBy}`);
     if (run.status !== "interrupted" && run.status !== "failed")
       throw new Error(`eval ${id} is ${run.status}; only interrupted or failed evals can be resumed`);
-    const request = this.deps.store.evalRequest(id);
-    if (!request || typeof request !== "object")
+    // Written only by `submit`, so its shape is trusted; the request itself is revalidated below.
+    const stored = this.deps.store.evalRequest(id) as StoredEvalRequest | null;
+    if (!stored?.request)
       throw new Error(
         `eval ${id} predates stored eval requests and cannot be reconstructed; submit it again`,
       );
-    if ("cache" in request && request.cache === false)
+    if (stored.request.cache === false)
       throw new Error(
         `eval ${id} ran with the cache disabled, so a resume would repeat its completed trials`,
       );
     try {
-      return this.submit(request, id);
+      for (const [caseId, chain] of Object.entries(stored.switchChains ?? {}))
+        for (const target of chain)
+          try {
+            this.deps.router.resolveFor("implement", target);
+          } catch (error) {
+            throw new Error(
+              `case ${caseId} switch chain target ${target.modelId}: ${(error as Error).message}`,
+            );
+          }
+      return this.submit(stored.request, { from: id, switchChains: stored.switchChains });
     } catch (error) {
       throw new Error(`cannot resume eval ${id}: ${(error as Error).message}`);
     }
@@ -474,21 +520,21 @@ export class EvalRunner {
     };
     const skip = (reason: string, preserveRound = false) => {
       if (!preserveRound) interruptRound(reason);
-      const interrupted = rounds > 1 && (trial.details.roundsUsed ?? 0) > 0;
+      const started = rounds > 1 && (trial.details.roundsUsed ?? 0) > 0;
+      // A cancel or shutdown leaves the trial unscored; its rounds and spend remain as evidence.
+      const interrupted = started && !signal.aborted;
+      const { grade, ...details } = trial.details;
       store.recordEvalTrial({
         ...trial,
         status: interrupted ? "error" : "skipped",
+        ...(signal.aborted ? { pass: null, score: null } : {}),
         details: {
-          ...trial.details,
+          ...details,
+          ...(grade && !signal.aborted ? { grade } : {}),
           ...("hidden" in item ? { roundsUsed: trial.details.roundsUsed ?? 0, stopReason: reason } : {}),
           reason,
-          ...(interrupted
-            ? {
-                interrupted: true,
-                stopReason: reason,
-                grade: trial.details.grade ?? failedImplement("error", reason),
-              }
-            : {}),
+          ...(started ? { interrupted: true, stopReason: reason } : {}),
+          ...(interrupted ? { grade: grade ?? failedImplement("error", reason) } : {}),
         },
       });
     };
