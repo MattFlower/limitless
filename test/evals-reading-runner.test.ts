@@ -1176,11 +1176,7 @@ test("an eval panel picks each batch's verifier from an ordered list, as product
 
     // Both vendors raised it: the first listed model that raised none, with the shared vendor recorded.
     respond(true);
-    const joint = {
-      ...system,
-      name: "joint",
-      verifier: { targets: ["finder-x", "verifier-y", "verifier-x"] },
-    };
+    const joint = { ...system, verifier: { targets: ["finder-x", "verifier-y", "verifier-x"] } };
     const shared = await f.run({ models: undefined, systems: [joint], cache: false });
     expect(f.calls.at(-1)?.target.modelId).toBe("verifier-y");
     expect(shared.trials[0]?.output).toMatchObject({
@@ -1189,7 +1185,7 @@ test("an eval panel picks each batch's verifier from an ordered list, as product
 
     // Every listed model raised it: the trial fails without calling a verifier.
     const calls = f.calls.length;
-    const none = { ...system, name: "none", verifier: { targets: ["finder-x", "finder-y"] } };
+    const none = { ...system, verifier: { targets: ["finder-x", "finder-y"] } };
     const failed = await f.run({ models: undefined, systems: [none], cache: false });
     expect(failed.trials[0]?.status).toBe("error");
     expect(failed.trials[0]?.details.reason).toContain("raised a candidate it would check");

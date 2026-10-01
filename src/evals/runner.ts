@@ -17,6 +17,7 @@ import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
 import {
   combined,
   FinderSkipped,
+  mapVerifier,
   panelIdentity,
   pickVerifier,
   type ReviewRequest,
@@ -125,13 +126,7 @@ export class EvalRunner {
             systems: request.systems?.map((system) => ({
               ...system,
               finders: system.finders.map((finder) => ({ ...finder, target: explicit(finder.target) })),
-              ...(system.verifier
-                ? {
-                    verifier: system.verifier.targets
-                      ? { targets: system.verifier.targets.map((target) => explicit(target)) }
-                      : { target: explicit(system.verifier.target) },
-                  }
-                : {}),
+              ...(system.verifier ? { verifier: mapVerifier(system.verifier, explicit) } : {}),
             })),
           }
         : { models: request.models.map((target) => explicit(target)) }),

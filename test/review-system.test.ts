@@ -58,10 +58,7 @@ const invalid: [string, string][] = [
   [file(system({ verifier: { target: "candidate-b" } })), 'mode "single" takes no verifier'],
   [file(system({ mode: "panel", finders: [], verifier: { target: "candidate-b" } })), "at least one finder"],
   [file(system({ mode: "panel", verifier: {} })), "needs an explicit verifier target"],
-  [
-    file(panel({ verifier: { target: "verifier-c", targets: ["verifier-c"] } })),
-    '"target" or "targets", not both',
-  ],
+  [file(panel({ verifier: { target: "verifier-c", targets: ["verifier-c"] } })), '"targets", not both'],
   [file(panel({ verifier: { targets: [] } })), "verifier targets must not be empty"],
   [file(panel({ verifier: { targets: ["verifier-c", "x@"] } })), "expected model or model@effort"],
   [
@@ -105,11 +102,8 @@ test("eval review systems reject unsupported shapes with clear errors", () => {
 });
 
 test("a batch's verifier is the first listed target independent of it, else the first other model", () => {
-  const list = [
-    { modelId: "a1", vendor: "a" },
-    { modelId: "o1", vendor: "o" },
-    { modelId: "a2", vendor: "a" },
-  ];
+  const t = (modelId: string, vendor: string) => ({ modelId, vendor });
+  const list = [t("a1", "a"), t("o1", "o"), t("a2", "a")];
   expect(pickVerifier(list, ["o"], ["o2"]).modelId).toBe("a1");
   expect(pickVerifier(list, ["a"], ["a1"]).modelId).toBe("o1");
   expect(pickVerifier(list, ["a", "o"], ["a1", "o1"]).modelId).toBe("a2");

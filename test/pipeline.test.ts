@@ -5535,4 +5535,11 @@ test("panel review: a verifier left on the finder's vendor is another model, wit
   const listed = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
   expect(await waitFor(f, listed.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
   expect(verifiers).toEqual(["gamma/m", "delta/m"]);
+  // The picked target alone is offered: with it down, routing never falls back to an unlisted model.
+  f.tracker.setEnabled("gamma", true);
+  f.tracker.setEnabled("delta", false);
+  const down = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, down.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  expect(verifiers).toEqual(["gamma/m", "delta/m"]);
+  expect(f.store.getRun(down.id)?.error).toContain("delta/m (disabled)");
 });

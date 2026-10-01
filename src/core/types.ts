@@ -424,7 +424,7 @@ export interface ReviewSystem {
   name: string;
   mode: "single" | "panel";
   finders: ReviewFinder[];
-  /** Panel only; production may omit a target (routed), evals may not. `targets` is ordered: `pickVerifier`. */
+  /** Panel only; production may omit `target` (routed), evals may not. */
   verifier?: { target?: string; targets?: string[] };
   implementerReport: "include" | "omit";
 }

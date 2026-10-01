@@ -8,6 +8,7 @@ import {
   type ReviewFinder,
   type ReviewSystem,
 } from "../core/types.ts";
+import { mapVerifier } from "../pipeline/review.ts";
 import { DEFAULT_ROSTERS, EvalReviewSystemsSchema, expandRoster } from "../pipeline/review-system.ts";
 import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
 import type { Router } from "../router/router.ts";
@@ -333,13 +334,7 @@ export function validateRequest(
         );
       return { ...finder, target };
     }),
-    ...(system.verifier
-      ? {
-          verifier: system.verifier.targets
-            ? { targets: system.verifier.targets.map(resolve) }
-            : { target: resolve(system.verifier.target ?? "") },
-        }
-      : {}),
+    ...(system.verifier ? { verifier: mapVerifier(system.verifier, resolve) } : {}),
   }));
   for (const id of request.systems ? [] : (request.models ?? [])) resolve(id);
   // As in production, a verifier never reuses a finder's model; a shared vendor is recorded, not refused.

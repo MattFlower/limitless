@@ -249,8 +249,8 @@ export interface ReviewDeps<T extends Invoked> {
   /** Runs finder `finder` (an index into the system's finders); a local one may throw FinderSkipped. */
   invoke: (request: ReviewRequest, finder: number) => Promise<T>;
   /**
-   * Panel only: one read-only verifier batch (the candidates' ids), routed away from every vendor that
-   * raised it and never to a model that did.
+   * Panel only: one read-only verifier batch, routed away from every vendor that raised it and never
+   * to a model that did.
    */
   verify?: (
     request: VerifierRequest,
@@ -264,8 +264,7 @@ export interface ReviewDeps<T extends Invoked> {
 
 /**
  * A batch's verifier from ordered `targets`: the first whose vendor and model raised none of it, else
- * the first whose model raised none (the panel then records the shared vendor). Shared by the engine
- * and evals, so both route a batch the same way.
+ * the first whose model raised none (the panel records the shared vendor). Shared by engine and evals.
  */
 export function pickVerifier<V extends { vendor: string; modelId: string }>(
   targets: V[],
@@ -278,6 +277,11 @@ export function pickVerifier<V extends { vendor: string; modelId: string }>(
   if (!picked)
     throw new Error(`verifier ${targets.map((t) => t.modelId).join(", ")} raised a candidate it would check`);
   return picked;
+}
+
+/** A verifier's lone `target` or ordered `targets`, each mapped by `f` (resolved or stored for replay). */
+export function mapVerifier(verifier: NonNullable<ReviewSystem["verifier"]>, f: (target: string) => string) {
+  return verifier.targets ? { targets: verifier.targets.map(f) } : { target: f(verifier.target ?? "") };
 }
 
 /** Fixed inputs that render the finder and verifier prompt templates, for cache identity. */
