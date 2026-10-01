@@ -3,8 +3,10 @@ import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { ResolvedProfile, ReviewFinder } from "./core/types.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { defaultGateSlots } from "./gates/slots.ts";
+import { parseReviewRosters } from "./pipeline/review-system.ts";
 import { PROVIDERS } from "./router/catalog.ts";
 import { isLanAddress, isLoopback, publicOrigin } from "./server/access.ts";
 
@@ -54,6 +56,10 @@ export interface Config {
   dependabotRouting: "free_first" | "policy";
   /** Whether review prompts (production and eval) carry the implementer's self-report. */
   reviewImplementerReport: "include" | "omit";
+  /** `single` (production today) or a verified finder panel with the profile's roster. */
+  reviewMode: "single" | "panel";
+  /** Panel finders per profile, before repo lenses. */
+  reviewRosters: Record<ResolvedProfile, ReviewFinder[]>;
   /** Decision-model triage declines (falls through to the next model) below this answer confidence. */
   triageDecisionConfidence: number;
   githubOwner: string | null; // allowlisted GitHub login for triggers
@@ -87,7 +93,7 @@ function parseEnvFile(path: string): Record<string, string> {
 }
 
 /** `[review]` is validated strictly: a misspelt key would otherwise silently keep the default. */
-const REVIEW_KEYS = ["implementer_report"];
+const REVIEW_KEYS = ["implementer_report", "mode", "rosters"];
 const TRIAGE_KEYS = ["decision_confidence"];
 /** Provisional until calibrated on evals/triage (docs/research/09-jev-decisions.md). */
 export const DEFAULT_DECISION_CONFIDENCE = 0.6;
@@ -185,6 +191,8 @@ export function loadConfig(
     review.implementer_report !== "omit"
   )
     throw new Error('review.implementer_report must be "include" or "omit"');
+  if (review.mode !== undefined && review.mode !== "single" && review.mode !== "panel")
+    throw new Error('review.mode must be "single" or "panel"');
   const rawTriage = raw.triage ?? {};
   if (typeof rawTriage !== "object" || rawTriage === null || Array.isArray(rawTriage))
     throw new Error("triage must be a table");
@@ -265,6 +273,8 @@ export function loadConfig(
       : [],
     dependabotRouting: routing.dependabot === "policy" ? "policy" : "free_first",
     reviewImplementerReport: review.implementer_report === "omit" ? "omit" : "include",
+    reviewMode: review.mode === "panel" ? "panel" : "single",
+    reviewRosters: parseReviewRosters(review.rosters),
     triageDecisionConfidence: confidence,
     githubOwner: str(owners.github, "MattFlower"),
     discordOwnerId: str(owners.discord, null),

@@ -15,7 +15,7 @@ import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
 import type { Harness } from "./harness/types.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
-import { productionReviewSystem } from "./pipeline/review-system.ts";
+import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import {
   DEFAULT_POLICY,
   MODELS,
@@ -85,6 +85,7 @@ export class Factory {
       ...provider,
       maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
     }));
+    checkRosterTargets(cfg, this.models, this.providerDefs, (message) => console.warn(message));
     this.policy =
       opts.policy ??
       (opts.policyPath === undefined

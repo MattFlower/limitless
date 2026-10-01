@@ -403,6 +403,20 @@ export type FinderPrompt = "standard" | "adversarial" | "careful";
 export interface ReviewFinder {
   target?: string;
   prompt: FinderPrompt;
+  /** A lens finder: the standard prompt plus this focus. */
+  lens?: ReviewLens;
+  /** Routed finders avoid the implementer's vendor (`cross`); `implementer` is a fresh session from its family. */
+  family?: "cross" | "implementer";
+  /** Only a local (free) model, under a shorter timeout; skipped when none answers. */
+  local?: boolean;
+}
+export interface ReviewLens {
+  name: string;
+  focus: string;
+}
+/** A lens from the base commit's `.limitless.toml`, added as a finder in the listed profiles. */
+export interface RepoReviewLens extends ReviewLens {
+  profiles: ResolvedProfile[];
 }
 /** How a review is performed: one finder (`single`), or finders whose candidates a verifier checks (`panel`). */
 export interface ReviewSystem {

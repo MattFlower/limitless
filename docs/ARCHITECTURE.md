@@ -14,8 +14,11 @@ and delivers a pull request — while spending as little of your paid AI capacit
    factory does next. This makes runs debuggable, resumable and cheap. (Every competitor that
    let an LLM orchestrate — see research/01 pitfalls — got runaway loops and cost blowups.)
 2. **External verification beats self-assessment.** The implementer never grades its own work.
-   Gates are run by the factory, reviews are done by a *different vendor's* model, and acceptance
-   scenarios are written by an author who never sees the implementation (research/02 §1, §3, §4).
+   Gates are run by the factory, the review verdict comes from a *different vendor's* model where
+   one is available, and acceptance scenarios are written by an author who never sees the
+   implementation (research/02 §1, §3, §4). In panel review mode one finder is deliberately from
+   the implementer's family, possibly its own model in a fresh session (recorded in the panel
+   record); nothing it reports blocks until a verifier that did not raise it confirms it.
 3. **Spend is a first-class dimension.** Every invocation records tokens, $ (metered) and
    $-equivalent (subscription). Routing picks the cheapest model that is *capable enough* for the
    role, and quota headroom on subscriptions is tracked from live rate-limit telemetry.
@@ -189,7 +192,9 @@ does not remove existing installations.
   rollout after every `codex exec`. Reserves are config (default: Codex stops at 90% to honor the
   "leave 10%" rule; Claude stops at 80% five-hour so your interactive use isn't starved),
 - **budget** — OpenRouter spend vs. the $50 cap (and per-run budgets),
-- **vendor constraints** — reviewer/verifier vendor ≠ implementer vendor.
+- **vendor constraints** — the reviewer avoids the implementer's vendor. A panel verifier never
+  reuses a model that raised the candidate; it prefers a vendor that neither raised it nor
+  implemented the change, then the implementer's, then a raising vendor.
 
 When two subscriptions can both serve a role, the router prefers the one with **more headroom**,
 spreading load across Claude and ChatGPT.

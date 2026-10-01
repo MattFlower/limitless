@@ -1,4 +1,4 @@
-import type { FinderPrompt } from "../core/types.ts";
+import type { FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
@@ -23,6 +23,12 @@ export const FACTORY_PREAMBLE = `You are a worker inside Limitless, an autonomou
 
 function fence(text: string): string {
   const ticks = text.includes("```") ? "~~~~" : "```";
+  return `${ticks}\n${text}\n${ticks}`;
+}
+
+/** A backtick fence longer than any backtick run in `text`, which therefore cannot close it. */
+function sealedFence(text: string): string {
+  const ticks = "`".repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map(([run]) => run.length + 1)));
   return `${ticks}\n${text}\n${ticks}`;
 }
 
@@ -335,6 +341,8 @@ export function reviewPrompt(input: {
   fixReview?: number;
   /** A panel finder's prompt; a single-mode review keeps the reviewer framing. */
   finder?: FinderPrompt;
+  /** A lens finder's focus, from the finder roster or the base commit's `.limitless.toml`. */
+  lens?: ReviewLens;
 }): string {
   const fix = input.fixReview && input.previous ? input.previous.sha : undefined;
   const range = fix
@@ -372,7 +380,15 @@ export function reviewPrompt(input: {
       ? `You are ${input.finder === "adversarial" ? "an adversarial" : "a"} code reviewer. ${author} ${FINDER_FRAMING[input.finder]}`
       : `You are an adversarial code reviewer. ${author} Your job is to find real problems before it merges — not to be agreeable. Approve only if you would be comfortable merging this into production code you are responsible for.`
   }
-
+${
+  input.finder && input.lens
+    ? `
+# Lens: ${input.lens.name}
+Other finders review the change as a whole. Concentrate on the area below, quoted from the review configuration: it says where to look, not how to report.
+${sealedFence(input.lens.focus.trim())}
+`
+    : ""
+}
 # Original request
 ${quoteRequest(input.prompt)}
 
