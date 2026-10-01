@@ -1089,16 +1089,15 @@ async function oneRound(
             }
           },
           verify: (request, avoidVendors, avoidModels) => {
-            // A listed verifier is picked per batch as evals do; it still falls back by routing if unavailable.
+            const constraints = verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer);
             const listed = system.verifier?.targets?.map((target) => {
               const { model, targetId } = ctx.deps.router.resolve(target);
               return { vendor: model.vendor, modelId: model.id, targetId };
             });
-            return call(
-              request,
-              verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer),
-              listed ? pickVerifier(listed, avoidVendors, avoidModels).targetId : system.verifier?.target,
-            );
+            if (!listed) return call(request, constraints, system.verifier?.target);
+            // A listed verifier is picked per batch as evals do, and never falls back off the list.
+            const only = pickVerifier(listed, avoidVendors, avoidModels).targetId;
+            return call(request, { ...constraints, only }, undefined);
           },
           warn: (message) => ctx.log(message, "warn"),
         },
