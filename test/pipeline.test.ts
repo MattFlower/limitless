@@ -18,7 +18,7 @@ import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
 import { specPrompt } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
-import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import { LaterReviewSchema, ReviewSchema, renderSpec, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 import { outOfRunCriteria } from "../src/pipeline/spec-criteria.ts";
 import { specScopeViolation } from "../src/pipeline/spec-scope.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
@@ -222,6 +222,89 @@ afterEach(async () => {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each([
+    ["trivial", "1–2"],
+    ["small", "1–3"],
+    ["medium", "3–5"],
+    ["large", "5–8"],
+    [undefined, "2–8"],
+  ] as const)("spec prompt sizes criteria for %s complexity", (complexity, range) => {
+    const prompt = specPrompt({ prompt: "Add farewell", answers: [], complexity });
+    expect(prompt).toContain(`acceptance_criteria: ${range} observable`);
+    expect(prompt).toContain(
+      "Require a specific new test only where behavior is new or at risk of regression, not for every criterion",
+    );
+    expect(prompt).toContain("Each needs a concrete how_to_verify");
+  });
+
+  test.each([
+    ["small", 7, 3],
+    ["small", 7, 7],
+    ["trivial", 2, 2],
+    ["small", 3, 3],
+    ["medium", 5, 5],
+    ["large", 8, 8],
+  ] as const)("spec size retry: %s %i → %i", async (complexity, initialCount, finalCount) => {
+    const oversized = initialCount === 7;
+    const prompts: string[] = [];
+    const expected = {
+      ...spec,
+      summary: oversized ? "Retried farewell specification" : spec.summary,
+      acceptance_criteria: Array.from({ length: finalCount }, (_, i) => ({
+        id: `AC-${i + 1}`,
+        criterion: `Farewell behavior ${i + 1}`,
+        how_to_verify: "cat farewell.txt",
+      })),
+    };
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ complexity }) };
+      if (role === "spec") {
+        prompts.push(s.prompt);
+        return {
+          structured:
+            prompts.length === 1 && oversized
+              ? {
+                  ...expected,
+                  summary: "Initial farewell specification",
+                  acceptance_criteria: Array.from({ length: initialCount }, (_, i) => ({
+                    ...expected.acceptance_criteria[0],
+                    id: `AC-${i + 1}`,
+                  })),
+                }
+              : expected,
+        };
+      }
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify")
+        return {
+          structured: {
+            ...pass,
+            criteria: [
+              ...expected.acceptance_criteria.map((a) => ({
+                id: a.id,
+                status: "met",
+                evidence: "observed",
+                publicSummary: "",
+              })),
+              ...pass.criteria.filter((c) => !c.id.startsWith("AC-")),
+            ],
+          },
+        };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(prompts).toHaveLength(oversized ? 2 : 1);
+    if (oversized) expect(prompts[1]).toContain("For small complexity, use at most 3 criteria");
+    expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual(expected);
+    expect(f.store.getArtifact(run.id, "spec.md")).toContain(renderSpec(expected));
+    const warnings = f.store.listEvents(run.id).filter((e) => e.message?.startsWith("Kept oversized spec"));
+    expect(warnings).toHaveLength(oversized && finalCount === 7 ? 1 : 0);
+    if (warnings.length) expect(warnings[0]).toMatchObject({ level: "warn" });
+  });
+
   test("spec prompt confines the read-only rule to investigation", () => {
     const prompt = specPrompt({ prompt: "Add farewell", answers: [] });
     expect(prompt).toContain("task below.\n\nYou are only writing the specification");
