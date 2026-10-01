@@ -102,7 +102,7 @@ import {
   VerifySchema,
 } from "./schemas.ts";
 import { createSnapshotParent } from "./snapshots.ts";
-import { outOfRunCriteria } from "./spec-criteria.ts";
+import { outOfRunCriteria, specCriteriaRange } from "./spec-criteria.ts";
 import { specScopeViolation } from "./spec-scope.ts";
 import { triageDecisions } from "./triage-decisions.ts";
 import {
@@ -551,12 +551,14 @@ async function clarify(ctx: RunContext): Promise<void> {
 
 async function spec(ctx: RunContext): Promise<void> {
   await ctx.stage("spec", async (stage) => {
+    const complexity = ctx.state.triage?.complexity ?? ctx.run.complexity ?? undefined;
+    const [, maxCriteria] = specCriteriaRange(complexity);
     const invocation = {
       role: "spec" as const,
       stage,
       mode: "readonly" as const,
       complexity: ctx.complexity,
-      prompt: specPrompt({ prompt: ctx.run.prompt, answers: ctx.state.answers }),
+      prompt: specPrompt({ prompt: ctx.run.prompt, answers: ctx.state.answers, complexity }),
       jsonSchema: toStrictJsonSchema(SpecSchema),
       schema: SpecSchema,
       requireStructured: true,
@@ -567,17 +569,25 @@ async function spec(ctx: RunContext): Promise<void> {
     let s = SpecSchema.parse(result.structured);
     let scopeRetried = false;
     let criteriaRetried = false;
+    let sizeRetried = false;
     for (;;) {
       const offending = specScopeViolation(s, ctx.run.prompt);
       const flagged = outOfRunCriteria(s);
       if (offending && scopeRetried)
         throw new Error(`structured output failed validation: invalid spec scope: ${offending}`);
       const retryCriteria: boolean = flagged.length > 0 && !criteriaRetried;
-      if (!offending && !retryCriteria) {
+      const oversized = s.acceptance_criteria.length > maxCriteria;
+      const retrySize: boolean = oversized && !sizeRetried;
+      if (!offending && !retryCriteria && !retrySize) {
         // Kept, not dropped: the match is a word list, and a wrongly dropped criterion weakens verify.
         if (flagged.length)
           ctx.log(
             `Kept acceptance criteria that may depend on something outside the run: ${flagged.map((a) => a.id).join(", ")}`,
+            "warn",
+          );
+        if (oversized)
+          ctx.log(
+            `Kept oversized spec: ${s.acceptance_criteria.length} acceptance criteria exceed the ${complexity ?? "unknown"} limit of ${maxCriteria} after size retry`,
             "warn",
           );
         break;
@@ -589,10 +599,14 @@ async function spec(ctx: RunContext): Promise<void> {
         retryCriteria
           ? `\n\nInvalid acceptance criteria: ${flagged.map((a) => a.id).join(", ")} depend on something outside the run. Replace them with criteria verifiable in the run's checkout using repository commands and tests; move external concerns to assumptions or out_of_scope.`
           : "",
+        retrySize
+          ? `\n\nToo many acceptance criteria: ${s.acceptance_criteria.length}. For ${complexity ?? "unknown"} complexity, use at most ${maxCriteria} criteria. Consolidate the spec while preserving the requested behavior and concrete how_to_verify for every criterion.`
+          : "",
       ].join("");
       ctx.log(feedback.trim(), "warn");
       scopeRetried ||= Boolean(offending);
       criteriaRetried ||= retryCriteria;
+      sizeRetried ||= retrySize;
       ({ result, target } = await ctx.invoke({ ...invocation, prompt: invocation.prompt + feedback }));
       await discardChanges(ctx.state.worktreePath as string);
       s = SpecSchema.parse(result.structured);
