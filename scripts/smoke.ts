@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import type { ChildProcess } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,7 +12,7 @@ import { withScratch } from "../src/harness/scratch.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import { resolveTarget } from "../src/router/targets.ts";
-import { sh } from "../src/util/proc.ts";
+import { processScope, sh } from "../src/util/proc.ts";
 
 /**
  * Why a failure may be retried: the provider was briefly unavailable. Anything else (a disclosed
@@ -105,18 +106,25 @@ async function attempt(
   timeoutMs: number,
   stopGraceMs: number,
   clock: Clock,
+  scope: NonNullable<ReturnType<typeof processScope.getStore>>,
 ): Promise<CheckResult> {
   const controller = new AbortController();
-  const run = check
-    .run(controller.signal)
+  const signal = AbortSignal.any([controller.signal, scope.signal]);
+  const finish = async (result: CheckResult) => {
+    controller.abort();
+    await Promise.all(scope.children.values());
+    return result;
+  };
+  const run = processScope
+    .run({ ...scope, signal }, async () => check.run(signal))
     .catch((error: unknown) => fail(String(error), transientReason(String(error))));
   const result = await within(run, timeoutMs, clock);
-  if (result) return result;
+  if (result) return finish(result);
   controller.abort();
   const settled = await within(run, stopGraceMs, clock);
-  if (!settled) return fail(`timeout ${timeoutMs}ms (attempt did not stop, not retried)`);
-  if (settled.status === "fail" && !settled.transient) return settled;
-  return fail(`timeout ${timeoutMs}ms`, "timeout");
+  if (!settled) return finish(fail(`timeout ${timeoutMs}ms (attempt did not stop, not retried)`));
+  if (settled.status === "fail" && !settled.transient) return finish(settled);
+  return finish(fail(`timeout ${timeoutMs}ms`, "timeout"));
 }
 
 /**
@@ -125,6 +133,43 @@ async function attempt(
  * health probe fails on both attempts is skipped.
  */
 export async function runChecks(
+  checks: SmokeCheck[],
+  now?: () => number,
+  delay?: (ms: number) => Promise<void>,
+  options: RunOptions = {},
+): Promise<CheckRow[]> {
+  const shutdown = new AbortController();
+  const children = new Map<ChildProcess, Promise<void>>();
+  const scope = {
+    signal: shutdown.signal,
+    killGraceMs: 1_000,
+    children,
+  };
+  let interrupted = false;
+  const interrupt = async (code: number) => {
+    if (interrupted) return;
+    interrupted = true;
+    shutdown.abort();
+    await Promise.all(children.values());
+    process.exit(code);
+  };
+  const onInt = () => void interrupt(130);
+  const onTerm = () => void interrupt(143);
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
+  try {
+    return await processScope.run(scope, () => checksWithinBudget(checks, now, delay, options));
+  } finally {
+    if (!interrupted) {
+      shutdown.abort();
+      await Promise.all(children.values());
+      process.off("SIGINT", onInt);
+      process.off("SIGTERM", onTerm);
+    }
+  }
+}
+
+async function checksWithinBudget(
   checks: SmokeCheck[],
   now?: () => number,
   delay?: (ms: number) => Promise<void>,
@@ -142,13 +187,16 @@ export async function runChecks(
   // Time an attempt may run so that it, and stopping it, still ends inside the budget.
   const left = () => budgetMs - (time() - begin) - stopGraceMs;
   const rows: CheckRow[] = [];
+  const scope = processScope.getStore();
+  if (!scope) throw new Error("missing smoke process scope");
   for (const check of checks) {
+    if (scope.signal.aborted) break;
     const timeoutMs = check.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS;
     options.onStart?.(check);
     let start = time();
     let result =
       left() > 0
-        ? await attempt(check, Math.min(timeoutMs, Math.floor(left())), stopGraceMs, clock)
+        ? await attempt(check, Math.min(timeoutMs, Math.floor(left())), stopGraceMs, clock, scope)
         : fail("not run: no time left in the smoke budget");
     let retried = false;
     const first = result.reason;
@@ -161,9 +209,10 @@ export async function runChecks(
       result = { ...result, reason: `${first ?? "failed"} (no time left to retry)` };
     } else if (retry) {
       await wait(retryDelayMs);
+      if (scope.signal.aborted) break;
       retried = true;
       start = time();
-      result = await attempt(check, timeoutMs, stopGraceMs, clock);
+      result = await attempt(check, timeoutMs, stopGraceMs, clock, scope);
       // A backend still down on the retry is skipped as before; a retry that skips after any
       // other failure must not hide it.
       if (health && (result.transient === "health" || result.status === "skip"))

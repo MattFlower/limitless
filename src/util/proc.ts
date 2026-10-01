@@ -1,4 +1,11 @@
-import { spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { type ChildProcess, spawn } from "node:child_process";
+
+export const processScope = new AsyncLocalStorage<{
+  signal: AbortSignal;
+  killGraceMs: number;
+  children: Map<ChildProcess, Promise<void>>;
+}>();
 
 export interface ProcOptions {
   cmd: string[];
@@ -57,6 +64,10 @@ function lineSplitter(onLine?: (line: string) => void) {
  * (agent CLIs spawn shells, MCP servers and test runners).
  */
 export function runProcess(opts: ProcOptions): Promise<ProcResult> {
+  const scope = processScope.getStore();
+  if (scope)
+    opts = { ...opts, signal: AbortSignal.any([scope.signal, ...(opts.signal ? [opts.signal] : [])]) };
+  if (scope) opts.signal?.throwIfAborted();
   const started = Date.now();
   return new Promise((resolve) => {
     const [bin, ...args] = opts.cmd;
@@ -67,6 +78,15 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    scope?.children.set(
+      child,
+      new Promise<void>((resolve) =>
+        child.once("close", () => {
+          scope.children.delete(child);
+          resolve();
+        }),
+      ),
+    );
 
     const limit = opts.tailLimit ?? DEFAULT_TAIL;
     let truncated = false;
@@ -98,9 +118,12 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
         }
       }
     };
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
     const terminate = () => {
+      if (killTimer) return;
       killTree("SIGTERM");
-      setTimeout(() => killTree("SIGKILL"), 5_000).unref?.();
+      killTimer = setTimeout(() => killTree("SIGKILL"), scope?.killGraceMs ?? 5_000);
+      killTimer.unref?.();
     };
 
     const onAbort = () => {
@@ -155,6 +178,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     child.on("close", (code, sig) => {
       if (settled) return;
       settled = true;
+      clearTimeout(killTimer);
       out.flush();
       err.flush();
       for (const t of timers) clearTimeout(t);

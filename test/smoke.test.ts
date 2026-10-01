@@ -954,3 +954,97 @@ for (const outcome of [
     if (outcome === "wrote") expect(rows[0]?.reason).toContain("worktree changed");
   });
 }
+
+for (const mode of ["SIGINT", "SIGTERM", "stubborn", "probe", "timeout", "budget", "completed"] as const) {
+  test(`smoke cleans CLI groups: ${mode}`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "smoke-processes-"));
+    const pids = () =>
+      existsSync(join(dir, "pids"))
+        ? readFileSync(join(dir, "pids"), "utf8").trim().split(/\s+/).map(Number).filter(Boolean)
+        : [];
+    const gone = () => {
+      for (const pid of pids()) expect(() => process.kill(pid, 0)).toThrow();
+    };
+    const timed = mode === "timeout" || mode === "budget";
+    writeFileSync(
+      join(dir, "claude"),
+      `#!/bin/sh
+${mode === "stubborn" || timed ? "trap '' TERM" : ""}
+sleep 60 &
+echo "$$ $!" >> '${dir}/pids'
+wait
+`,
+      { mode: 0o755 },
+    );
+    writeFileSync(join(dir, "codex"), readFileSync(join(dir, "claude")), { mode: 0o755 });
+    const entry = join(dir, "runner.ts");
+    writeFileSync(
+      entry,
+      `
+import { reportChecks } from ${JSON.stringify(join(process.cwd(), "scripts/smoke.ts"))};
+import { sh, runProcess } from ${JSON.stringify(join(process.cwd(), "src/util/proc.ts"))};
+import { readFileSync, appendFileSync } from 'node:fs';
+import { CodexReaderProbe } from ${JSON.stringify(join(process.cwd(), "src/harness/codex.ts"))};
+const kill = process.kill.bind(process);
+process.kill = (pid, signal) => { appendFileSync('${dir}/signals', pid + ' ' + signal + '\\n'); return kill(pid, signal); };
+const run = async (signal) => {
+  if (${mode === "probe"}) { await new CodexReaderProbe().verify({cwd: '${dir}', signal}, runProcess); return {status: 'pass'}; }
+  const previous = ${timed} ? readFileSync('${dir}/pids', 'utf8').trim().split(/\\s+/).map(Number).filter(Boolean) : [];
+  for (const pid of previous) { try { kill(pid, 0); throw Error('previous attempt survived'); } catch (e) { if (e.code !== 'ESRCH') throw e; } }
+  try { await sh(['claude'], {cwd: '${dir}', signal}); return {status: 'pass'}; }
+  catch (e) { if (!signal.aborted) throw e; return {status: 'fail', transient: 'timeout', reason: 'cancelled'}; }
+};
+process.exitCode = await reportChecks([
+${mode === "completed" ? `{name: 'completed', run: async () => { await sh(['sh', '-c', "echo $$ > completed; exit 0"], {cwd: '${dir}'}); return {status: 'pass'};}},` : ""}
+{name: 'sleeping', timeoutMs: ${timed ? 250 : 60000}, run}
+], console.log, {retryDelayMs: 0, stopGraceMs: 2000, budgetMs: ${mode === "budget" ? 2250 : 60000}});
+`,
+    );
+    writeFileSync(join(dir, "pids"), "");
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        ...(timed || mode === "completed" || mode === "probe"
+          ? [entry]
+          : ["scripts/smoke.ts", "--models", mode === "SIGTERM" ? "codex/luna@low" : "claude/sonnet@low"]),
+      ],
+      {
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    try {
+      const until = Date.now() + 3000;
+      while (pids().length < 2 && Date.now() < until) await Bun.sleep(10);
+      expect(pids().length).toBe(2);
+      if (!timed) child.kill(mode === "SIGTERM" ? "SIGTERM" : "SIGINT");
+      const code = await Promise.race([child.exited, Bun.sleep(4000).then(() => -1)]);
+      expect(code).toBe(timed ? 1 : mode === "SIGTERM" ? 143 : 130);
+      gone();
+      const output = await new Response(child.stdout).text();
+      if (timed) {
+        expect(output).toContain("FAIL");
+        expect(pids()).toHaveLength(mode === "timeout" ? 4 : 2);
+      }
+      if (mode === "completed") {
+        expect(output).toMatch(/completed\s+PASS/);
+        const completed = readFileSync(join(dir, "completed"), "utf8").trim();
+        expect(
+          readFileSync(join(dir, "signals"), "utf8")
+            .split("\n")
+            .filter((line) => line.startsWith(`-${completed} `)),
+        ).toHaveLength(1);
+      }
+    } finally {
+      child.kill("SIGKILL");
+      await child.exited;
+      for (const pid of pids()) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 6000);
+}
