@@ -495,6 +495,69 @@ const refuteAll = (s: { prompt: string }) => ({
   costUsd: 0.1,
 });
 
+test("a resumed panel keeps every member's unset effort after the catalog gains defaults", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    f.respond((s) =>
+      s.prompt.includes("code-review verifier") ? refuteAll(s) : { structured: reviewOutput(), costUsd: 0.1 },
+    );
+    const { evals, router } = f.factory;
+    const run = evals.submit({ role: "review", systems: [panelSystem], k: 1 });
+    await evals.cancel(run.id);
+    expect(f.calls).toHaveLength(0);
+    for (const id of ["candidate-a", "candidate-b", "verifier-c"]) {
+      const model = router.model(id);
+      if (!model) throw new Error(`missing ${id}`);
+      model.supportedEfforts = ["low"];
+      model.effort = "low";
+    }
+    const resumed = evals.resume(run.id);
+    await evals.wait(resumed?.id ?? "");
+    expect(f.calls.map((s) => [s.target.modelId, s.target.effort])).toEqual([
+      ["candidate-a", undefined],
+      ["candidate-b", undefined],
+      ["verifier-c", undefined],
+    ]);
+    expect(evals.report(resumed?.id ?? "")?.trials.map((t) => [t.status, t.effort])).toEqual([
+      ["ok", "default"],
+    ]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a resumed panel copies its finished trial only while the verifier backend is unchanged", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    f.respond((s) =>
+      s.prompt.includes("code-review verifier") ? refuteAll(s) : { structured: reviewOutput(), costUsd: 0.1 },
+    );
+    const { evals, store, router } = f.factory;
+    const resume = async (id: string) => {
+      store.updateEvalRun(id, "interrupted");
+      const resumed = evals.resume(id);
+      await evals.wait(resumed?.id ?? "");
+      return resumed?.id ?? "";
+    };
+    const run = evals.submit({ role: "review", systems: [panelSystem], k: 1 });
+    await evals.wait(run.id);
+    expect(f.calls).toHaveLength(3);
+    const copied = await resume(run.id);
+    expect(f.calls).toHaveLength(3);
+    expect(evals.report(copied)?.trials[0]?.details.resumedFrom).toBe(run.id);
+    const verifier = router.model("verifier-c");
+    if (!verifier) throw new Error("missing verifier-c");
+    verifier.model = "c-new-checkpoint";
+    const rerun = await resume(copied);
+    expect(f.calls).toHaveLength(6);
+    expect(f.calls.at(-1)?.target.model).toBe("c-new-checkpoint");
+    expect(evals.report(rerun)?.trials[0]).toMatchObject({ status: "ok" });
+    expect(evals.report(rerun)?.trials[0]?.details.resumedFrom).toBeUndefined();
+  } finally {
+    await f.close();
+  }
+});
+
 test("a panel whose finder output is invalid is an error trial, never a graded single review", async () => {
   const f = await fixture("review", [verifierModel]);
   try {
@@ -589,7 +652,7 @@ test("a panel member stops after its slot wait when the eval was aborted meanwhi
     });
     const report = await f.run({ models: undefined, systems: [panelSystem], cache: false });
     spy.mockRestore();
-    expect(report.run.status).toBe("failed");
+    expect(report.run.status).toBe("interrupted");
     expect(f.calls.map((s) => s.target.modelId)).toEqual(["candidate-a"]);
     expect(tracker.status("provider-b")?.inFlight).toBe(0);
   } finally {
@@ -1050,7 +1113,8 @@ test("shutdown removes active and capacity-waiting worktrees", async () => {
     spy.mockRestore();
     await f.factory.evals.stop();
     for (const release of production) release();
-    for (const id of [first.id, second.id]) expect(f.factory.evals.report(id)?.run.status).toBe("failed");
+    for (const id of [first.id, second.id])
+      expect(f.factory.evals.report(id)?.run.status).toBe("interrupted");
     const report = f.factory.evals.report(second.id);
     expect(report?.trials[0]).toMatchObject({
       status: "skipped",

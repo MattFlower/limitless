@@ -151,6 +151,29 @@ export function failedImplement(reason: "timeout" | "error", error?: string): Ev
   };
 }
 
+/** Exercise nonempty feedback branches when fingerprinting retry prompts, even before a failure. */
+export const RETRY_FEEDBACK_GRADE: EvalGrade = {
+  ...failedImplement("error"),
+  implement: {
+    reason: "gates",
+    commit: null,
+    gates: (["regressed", "new_failure"] as const).map((verdict) => ({
+      name: "CHECK",
+      verdict,
+      blocking: true,
+      result: { name: "CHECK", command: "COMMAND", ok: false, exitCode: 1, durationMs: 0, output: "OUTPUT" },
+    })),
+    auditBlocks: [undefined, "FILE"].map((file) => ({
+      rule: "RULE",
+      severity: "block",
+      file,
+      detail: "DETAIL",
+    })),
+    auditWarnings: [],
+    hidden: { exitCode: 1, timedOut: false, output: "" },
+  },
+};
+
 export async function gradeImplement(
   item: ImplementCase,
   cwd: string,

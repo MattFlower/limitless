@@ -392,7 +392,8 @@ export interface ChatConversation {
 
 export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 
-export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed";
+/** `interrupted`: stopped by a restart, a cancel or a resume; its partial results never feed policy. */
+export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed" | "interrupted";
 export type EvalStrategy = "retry" | "effort" | "switch";
 /** Panel finder prompts: coverage-first `standard`, `adversarial`, or one `careful` senior pass. */
 export type FinderPrompt = "standard" | "adversarial" | "careful";
@@ -448,6 +449,9 @@ export interface EvalRun {
   createdAt: number;
   finishedAt: number | null;
   error: string | null;
+  /** The interrupted eval this one resumed, and the eval that resumed this one. */
+  resumedFrom?: string;
+  resumedBy?: string;
 }
 export interface EvalGrade {
   pass: boolean | null;
@@ -528,6 +532,8 @@ export interface EvalTrial {
     decisionConfidence?: number;
     preparationFailed?: boolean;
     interrupted?: boolean;
+    /** Eval the trial ran in before a resume copied it; its spend was already charged to the provider there. */
+    resumedFrom?: string;
     cache?: {
       evalRunId: string;
       caseId: string;

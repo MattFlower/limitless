@@ -194,3 +194,46 @@ test("POST evals validates targets before scheduling and returns persisted effor
     await f.close();
   }
 });
+
+test("resume and cancel routes return the new run ID or final status and refuse ineligible evals", async () => {
+  const f = await evalFixture();
+  try {
+    const routes = createHttpRoutes(f.factory);
+    const post = (action: "resume" | "cancel", id: string) =>
+      (routes[`/api/evals/:id/${action}`] as { POST: Route }).POST(
+        requestWithParams(
+          `http://localhost:7400/api/evals/${id}/${action}`,
+          { method: "POST", headers: { "content-type": "application/json" }, body: "{}" },
+          { id },
+        ),
+        server,
+      );
+    expect((await post("resume", "missing")).status).toBe(404);
+    expect((await post("cancel", "missing")).status).toBe(404);
+    const entered = deferred<void>();
+    f.respond(async (s) => {
+      entered.resolve();
+      await new Promise<void>((resolve) =>
+        s.signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      return { structured: answer };
+    });
+    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], caseIds: ["a"] });
+    await entered.promise;
+    expect((await post("resume", run.id)).status).toBe(400);
+    const cancelled = await post("cancel", run.id);
+    expect(await cancelled.json()).toEqual({ id: run.id, status: "interrupted" });
+    expect((await post("cancel", run.id)).status).toBe(400);
+    f.respond(() => ({ structured: answer }));
+    const resumed = await post("resume", run.id);
+    expect(resumed.status).toBe(202);
+    const body = (await resumed.json()) as { id: string; resumedFrom: string };
+    expect(body.resumedFrom).toBe(run.id);
+    await f.factory.evals.wait(body.id);
+    expect(f.factory.evals.report(run.id)?.run.resumedBy).toBe(body.id);
+    expect((await post("resume", body.id)).status).toBe(400);
+    expect(f.factory.store.listEvalRuns()).toHaveLength(2);
+  } finally {
+    await f.close();
+  }
+});

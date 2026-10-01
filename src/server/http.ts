@@ -228,6 +228,18 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         return result ? json(result) : error("eval not found", 404);
       }),
     },
+    "/api/evals/:id/resume": {
+      POST: handle((req) => {
+        const run = factory.evals.resume(req.params.id ?? "");
+        return run ? json({ id: run.id, resumedFrom: run.resumedFrom }, 202) : error("eval not found", 404);
+      }),
+    },
+    "/api/evals/:id/cancel": {
+      POST: handle(async (req) => {
+        const run = await factory.evals.cancel(req.params.id ?? "");
+        return run ? json({ id: run.id, status: run.status }) : error("eval not found", 404);
+      }),
+    },
     "/api/evals/:id": handle((req) => {
       const report = factory.evals.report(req.params.id ?? "", { delta: factory.evalSettings.delta });
       return report ? json(report) : error("eval not found", 404);

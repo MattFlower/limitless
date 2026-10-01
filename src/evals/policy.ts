@@ -44,7 +44,8 @@ export function selectEvidence(
     for (const id of ids) {
       const entry = evidence.find((e) => e.run.id === id);
       if (!entry) throw new Error(`Unknown eval ID: ${id}`);
-      if (entry.run.status !== "completed") throw new Error(`Eval ${id} is not completed`);
+      if (entry.run.status !== "completed")
+        throw new Error(`Eval ${id} is ${entry.run.status}, not completed`);
     }
   }
   const selected = new Map<string, Evidence & { modelId: string; complexity?: ImplementComplexity }>();

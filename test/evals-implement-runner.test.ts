@@ -506,55 +506,60 @@ test("hidden bytes in renamed/deleted reachable history reject before invocation
 });
 
 for (const rounds of [1, 3])
-  test(`cancellation during hidden grading retains spend and removes trial resources (rounds=${rounds})`, async () => {
-    const f = await fixture();
-    try {
-      f.item.hidden.command = 'test "$(cat answer)" = correct || exit 1; touch grading-started; sleep 10';
-      if (rounds > 1)
-        f.respond(() => ({ files: { answer: f.calls.length === 1 ? "wrong" : "correct" }, costUsd: 0.1 }));
-      f.save();
-      const pending = f.run({ rounds });
-      let cwd: string | undefined;
-      for (let i = 0; i < 200; i++) {
-        cwd = f.calls.at(-1)?.cwd;
-        if (cwd && existsSync(join(cwd, "grading-started"))) break;
-        await new Promise((resolve) => setTimeout(resolve, 10));
+  for (const via of ["stop", "cancel"] as const)
+    test(`cancellation during hidden grading retains spend and removes trial resources (rounds=${rounds}, ${via})`, async () => {
+      const f = await fixture();
+      try {
+        f.item.hidden.command = 'test "$(cat answer)" = correct || exit 1; touch grading-started; sleep 10';
+        if (rounds > 1)
+          f.respond(() => ({ files: { answer: f.calls.length === 1 ? "wrong" : "correct" }, costUsd: 0.1 }));
+        f.save();
+        const pending = f.run({ rounds });
+        let cwd: string | undefined;
+        for (let i = 0; i < 200; i++) {
+          cwd = f.calls.at(-1)?.cwd;
+          if (cwd && existsSync(join(cwd, "grading-started"))) break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(cwd && existsSync(join(cwd, "grading-started"))).toBe(true);
+        expect(f.factory.store.listEvalRuns().map((r) => f.factory.store.evalSpend(r.id))).toEqual([
+          rounds > 1 ? 0.2 : 0.1,
+        ]);
+        const id = f.factory.store.listEvalRuns()[0]?.id ?? "";
+        await (via === "stop" ? f.factory.evals.stop() : f.factory.evals.cancel(id));
+        const report = await pending;
+        expect(report.run.status).toBe("interrupted");
+        expect(report.trials[0]).toMatchObject(
+          rounds > 1
+            ? {
+                // Aborted mid-trial: unscored, but its rounds and spend remain as evidence.
+                status: "skipped",
+                pass: null,
+                score: null,
+                costUsd: 0.2,
+                details: {
+                  roundsUsed: 2,
+                  interrupted: true,
+                  rounds: [
+                    { round: 0, pass: false },
+                    { round: 1, pass: null },
+                  ],
+                },
+              }
+            : { status: "skipped", pass: null, costUsd: 0.1 },
+        );
+        if (rounds > 1) {
+          expect(report.trials[0]?.details.grade).toBeUndefined();
+          expect(report.summaries[0]?.implement?.passAtR).toMatchObject({ denominator: 0 });
+          expect(report.summaries[0]?.implement?.recovery).toMatchObject({ denominator: 0, notAttempted: 0 });
+        }
+        expect(f.factory.store.cachedEvalTrials(report.trials[0]?.cacheKey ?? "")).toEqual([]);
+        expect(cwd && existsSync(cwd)).toBe(false);
+        expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+      } finally {
+        await f.close();
       }
-      expect(cwd && existsSync(join(cwd, "grading-started"))).toBe(true);
-      expect(f.factory.store.listEvalRuns().map((r) => f.factory.store.evalSpend(r.id))).toEqual([
-        rounds > 1 ? 0.2 : 0.1,
-      ]);
-      await f.factory.evals.stop();
-      const report = await pending;
-      expect(report.run.status).toBe("failed");
-      expect(report.trials[0]).toMatchObject(
-        rounds > 1
-          ? {
-              status: "error",
-              pass: false,
-              costUsd: 0.2,
-              details: {
-                roundsUsed: 2,
-                interrupted: true,
-                rounds: [
-                  { round: 0, pass: false },
-                  { round: 1, pass: null },
-                ],
-              },
-            }
-          : { status: "skipped", pass: null, costUsd: 0.1 },
-      );
-      if (rounds > 1) {
-        expect(report.trials[0]?.details.grade?.implement?.reason).toBe("hidden_tests");
-        expect(report.summaries[0]?.implement?.recovery).toMatchObject({ denominator: 0, notAttempted: 1 });
-      }
-      expect(f.factory.store.cachedEvalTrials(report.trials[0]?.cacheKey ?? "")).toEqual([]);
-      expect(cwd && existsSync(cwd)).toBe(false);
-      expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
-    } finally {
-      await f.close();
-    }
-  });
+    });
 
 for (const strategy of ["retry", "effort", "switch"] as const)
   test(`multi-round ${strategy} preserves edits, sanitizes grading, records costs and caches`, async () => {
@@ -958,6 +963,20 @@ test("switch freezes policy order, ignores live headroom, records harness and ke
     expect(report.trials[0]?.harness).toBe("codex");
     expect(report.trials[0]?.details.rounds?.map((r) => r.harness)).toEqual(["fake", "codex"]);
     expect(route).not.toHaveBeenCalled();
+    // A resume keeps its predecessor's chain, part of the cache key, despite the policy change.
+    const calls = f.calls.length;
+    f.factory.store.updateEvalRun(report.run.id, "failed", "boom");
+    // Unfinished, so the resume runs it again instead of copying it; another run keeps its cache entry.
+    const [finished] = report.trials;
+    if (!finished) throw new Error("missing trial");
+    f.factory.store.createEvalRun(report.run, [finished]);
+    f.factory.store.recordEvalTrial({ ...finished, status: "skipped" });
+    const resumed = f.factory.evals.resume(report.run.id);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    const replayed = f.factory.evals.report(resumed?.id ?? "");
+    expect(replayed?.trials[0]?.details.switchChain).toEqual(report.trials[0]?.details.switchChain);
+    expect(replayed?.summaries[0]?.cached).toBe(1);
+    expect(f.calls).toHaveLength(calls);
     const changed = await f.run({ rounds: 2, strategy: "switch" });
     expect(changed.trials[0]?.cacheKey).not.toBe(report.trials[0]?.cacheKey);
     expect(changed.summaries[0]?.cached).toBe(0);
@@ -968,6 +987,141 @@ test("switch freezes policy order, ignores live headroom, records harness and ke
   } finally {
     route.mockRestore();
     f.factory.policy.implement.small = policy;
+    await f.close();
+  }
+});
+
+test("resume reruns a multi-round trial whose switch target backend or retry prompt changed", async () => {
+  const f = await fixture();
+  const policy = f.factory.policy.implement.small;
+  const prompts = await import("../src/pipeline/prompts.ts");
+  const original = prompts.implementPrompt;
+  const retryRule = spyOn(prompts, "implementPrompt");
+  try {
+    const model = f.factory.router.model("candidate-b");
+    if (!model) throw new Error("missing target");
+    model.tier = 2;
+    f.factory.policy.implement.small = ["candidate-a", "candidate-b"];
+    f.respond((s) => ({ files: { answer: s.target.modelId === "candidate-a" ? "wrong" : "correct" } }));
+    const resume = async (id: string) => {
+      f.factory.store.updateEvalRun(id, "interrupted");
+      const resumed = f.factory.evals.resume(id);
+      await f.factory.evals.wait(resumed?.id ?? "");
+      return f.factory.evals.report(resumed?.id ?? "")?.trials[0];
+    };
+    const report = await f.run({ rounds: 2, strategy: "switch" });
+    expect(f.calls).toHaveLength(2);
+    const copied = await resume(report.run.id);
+    expect(f.calls).toHaveLength(2);
+    expect(copied?.details.resumedFrom).toBe(report.run.id);
+    model.model = "b-new-checkpoint";
+    const switched = await resume(copied?.evalRunId ?? "");
+    expect(f.calls.map((s) => s.target.model).slice(2)).toEqual([expect.any(String), "b-new-checkpoint"]);
+    expect(switched?.details.resumedFrom).toBeUndefined();
+    retryRule.mockImplementation(
+      (input) => `${original(input)}${input.round > 0 ? "\nA new retry rule." : ""}`,
+    );
+    const retried = await resume(switched?.evalRunId ?? "");
+    expect(f.calls).toHaveLength(6);
+    expect(f.calls.at(-1)?.prompt).toContain("A new retry rule.");
+    expect(retried?.details.resumedFrom).toBeUndefined();
+  } finally {
+    retryRule.mockRestore();
+    f.factory.policy.implement.small = policy;
+    await f.close();
+  }
+});
+
+test("resume reruns a three-round trial whose prompt changed only in its third round", async () => {
+  const f = await fixture();
+  const prompts = await import("../src/pipeline/prompts.ts");
+  const original = prompts.implementPrompt;
+  const thirdRoundRule = spyOn(prompts, "implementPrompt");
+  try {
+    f.respond(() => ({ files: { answer: "wrong" } }));
+    const resume = async (id: string) => {
+      f.factory.store.updateEvalRun(id, "interrupted");
+      const resumed = f.factory.evals.resume(id);
+      await f.factory.evals.wait(resumed?.id ?? "");
+      return f.factory.evals.report(resumed?.id ?? "")?.trials[0];
+    };
+    const report = await f.run({ rounds: 3 });
+    expect(f.calls).toHaveLength(3);
+    const copied = await resume(report.run.id);
+    expect(f.calls).toHaveLength(3);
+    expect(copied?.details.resumedFrom).toBe(report.run.id);
+    // A branch the first retry round never renders.
+    thirdRoundRule.mockImplementation(
+      (input) => `${original(input)}${input.round === 2 ? "\nA third-round rule." : ""}`,
+    );
+    const rerun = await resume(copied?.evalRunId ?? "");
+    expect(f.calls).toHaveLength(6);
+    expect(f.calls.map((s) => s.prompt.includes("A third-round rule."))).toEqual([
+      ...Array(5).fill(false),
+      true,
+    ]);
+    expect(rerun?.details.resumedFrom).toBeUndefined();
+  } finally {
+    thirdRoundRule.mockRestore();
+    await f.close();
+  }
+});
+
+for (const formatter of ["formatGateFeedback", "formatAuditFeedback"] as const)
+  test(`resume invalidates changed nonempty ${formatter} in retry prompts`, async () => {
+    const f = await fixture();
+    const prompts = await import("../src/pipeline/prompts.ts");
+    const originals = { ...prompts };
+    const gateFeedback = spyOn(prompts, "formatGateFeedback");
+    const auditFeedback = spyOn(prompts, "formatAuditFeedback");
+    try {
+      f.respond(() => ({ files: { answer: "correct", broken: "yes", protected: "changed" } }));
+      const report = await f.run({ rounds: 2 });
+      expect(f.calls).toHaveLength(2);
+      expect(f.calls[1]?.prompt).toContain("now FAILS");
+      expect(f.calls[1]?.prompt).toContain("Policy violations");
+      // Only the nonempty branch changes; an empty failure grade cannot fingerprint it.
+      const edit = (text: string) => (text ? `${text}\nNew feedback instructions.` : text);
+      if (formatter === "formatGateFeedback")
+        gateFeedback.mockImplementation((evidence) => edit(originals.formatGateFeedback(evidence)));
+      else auditFeedback.mockImplementation((evidence) => edit(originals.formatAuditFeedback(evidence)));
+      f.factory.store.updateEvalRun(report.run.id, "interrupted");
+      const resumed = f.factory.evals.resume(report.run.id);
+      await f.factory.evals.wait(resumed?.id ?? "");
+      expect(f.calls).toHaveLength(4);
+      expect(f.calls[3]?.prompt).toContain("New feedback instructions.");
+      const rerun = f.factory.evals.report(resumed?.id ?? "")?.trials[0];
+      expect(rerun?.cacheKey).not.toBe(report.trials[0]?.cacheKey);
+      expect(rerun?.details.resumedFrom).toBeUndefined();
+      expect(rerun?.details.cache).toBeUndefined();
+    } finally {
+      gateFeedback.mockRestore();
+      auditFeedback.mockRestore();
+      await f.close();
+    }
+  });
+
+test("resume reruns an effort trial whose later-round effort changed with the supported efforts", async () => {
+  const f = await fixture();
+  try {
+    const model = enableEfforts(f);
+    f.respond(() => ({ files: { answer: "wrong" } }));
+    const resume = async (id: string) => {
+      f.factory.store.updateEvalRun(id, "interrupted");
+      const resumed = f.factory.evals.resume(id);
+      await f.factory.evals.wait(resumed?.id ?? "");
+      return f.factory.evals.report(resumed?.id ?? "")?.trials[0];
+    };
+    const report = await f.run({ rounds: 2, strategy: "effort" });
+    const copied = await resume(report.run.id);
+    expect(f.calls.map((s) => s.target.effort)).toEqual(["low", "high"]);
+    expect(copied?.details.resumedFrom).toBe(report.run.id);
+    // Same provider, backend and harness, but the second round now resolves to a different effort.
+    model.supportedEfforts = ["none", "low", "medium", "high"];
+    const rerun = await resume(copied?.evalRunId ?? "");
+    expect(f.calls.map((s) => s.target.effort)).toEqual(["low", "high", "low", "medium"]);
+    expect(rerun?.details.resumedFrom).toBeUndefined();
+  } finally {
     await f.close();
   }
 });

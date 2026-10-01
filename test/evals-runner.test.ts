@@ -2,13 +2,16 @@ import { expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cacheKey } from "../src/evals/cache.ts";
+import { formatEvalReport } from "../src/evals/format.ts";
+import type { EvalReport } from "../src/evals/stats.ts";
 import { pinnedTree, withRepoLock } from "../src/git/repos.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import { selectHarness } from "../src/harness/select.ts";
+import type { AgentSpec } from "../src/harness/types.ts";
 import { FACTORY_PREAMBLE, triagePrompt } from "../src/pipeline/prompts.ts";
 import { TriageSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 import { sh } from "../src/util/proc.ts";
-import { answer, deferred, evalFixture } from "./evals-support.ts";
+import { answer, deferred, enableEfforts, evalFixture } from "./evals-support.ts";
 
 test("3 cases x 2 exact models x k=2 use pinned bare inputs and shared invocation semantics", async () => {
   const f = await evalFixture();
@@ -127,6 +130,7 @@ test("cache identity includes every invocation component and ignores schema obje
     cacheKey("model", "fake", "prompt", "changed", { a: 1, b: 2 }, 0),
     cacheKey("model", "fake", "prompt", "system", { a: 2, b: 2 }, 0),
     cacheKey("model", "fake", "prompt", "system", { a: 1, b: 2 }, 1),
+    cacheKey("model", "fake", "prompt", "system", { a: 1, b: 2 }, 0, undefined, undefined, [["p", "m"]]),
   ])
     expect(key).not.toBe(base);
   expect(cacheKey("model", "fake", "prompt", "system", { b: 2, a: 1 }, 0)).toBe(base);
@@ -327,10 +331,10 @@ test("shutdown aborts active and waiting trials, releases slots, and preserves p
     await f.factory.stop();
     for (const release of production) release();
     expect(f.factory.evals.report(run.id)?.run).toMatchObject({
-      status: "failed",
+      status: "interrupted",
       error: "eval interrupted by daemon shutdown",
     });
-    expect(f.factory.evals.report(waiting.id)?.run.status).toBe("failed");
+    expect(f.factory.evals.report(waiting.id)?.run.status).toBe("interrupted");
     const report = f.factory.evals.report(waiting.id);
     expect(report?.trials).toHaveLength(3);
     for (const trial of report?.trials ?? []) {
@@ -338,7 +342,8 @@ test("shutdown aborts active and waiting trials, releases slots, and preserves p
         status: "skipped",
         pass: null,
         score: null,
-        details: { reason: "daemon shutdown" },
+        // The waiting trial aborts; trials never dequeued are skipped by the run's interruption.
+        details: { reason: expect.stringContaining("daemon shutdown") },
       });
       expect(trial.details.preparationFailed).toBeUndefined();
     }
@@ -651,7 +656,10 @@ test("shutdown interrupts concurrent trials, releases slots, and a resubmission 
     expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(2);
     await f.factory.stop();
     const report = f.factory.evals.report(run.id);
-    expect(report?.run).toMatchObject({ status: "failed", error: "eval interrupted by daemon shutdown" });
+    expect(report?.run).toMatchObject({
+      status: "interrupted",
+      error: "eval interrupted by daemon shutdown",
+    });
     expect(report?.trials.every((t) => !["queued", "running"].includes(t.status))).toBe(true);
     expect(report?.trials.filter((t) => t.status === "ok")).toHaveLength(2);
     expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
@@ -802,6 +810,349 @@ test("the shared eval cap follows the largest concurrency among running evals", 
     for (const run of later) await f.factory.evals.wait(run.id);
     expect(state.max).toBe(1);
     expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume replays an interrupted eval's stored request and copies its finished trials", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 3);
+    let active = 0;
+    f.respond(async (s) => {
+      if (f.calls.length <= 2) return { structured: answer };
+      active++;
+      await new Promise<void>((resolve) =>
+        s.signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      return { structured: answer };
+    });
+    const request = {
+      role: "triage",
+      models: ["candidate-a"],
+      caseIds: ["a", "b", "c"],
+      k: 2,
+      concurrency: 2,
+    };
+    const run = f.factory.evals.submit(request);
+    await until(() => active === 2);
+    await f.factory.stop();
+    // A restart only marks unfinished evals; nothing runs until an explicit resume.
+    const { EvalRunner } = await import("../src/evals/runner.ts");
+    const runner = new EvalRunner(f.factory.deps, f.casePath);
+    await Bun.sleep(20);
+    expect(f.calls).toHaveLength(4);
+    expect(runner.report(run.id)?.run.status).toBe("interrupted");
+    const state = gate(f);
+    const resumed = runner.resume(run.id);
+    expect(resumed).toMatchObject({ resumedFrom: run.id, status: "queued" });
+    expect(f.factory.store.evalRequest(resumed?.id ?? "")).toEqual({
+      request: { ...request, models: ["candidate-a@default"], maxUsd: 1, cache: true },
+    });
+    await until(() => state.active === 2);
+    await Bun.sleep(20);
+    state.open.resolve();
+    await runner.wait(resumed?.id ?? "");
+    const report = runner.report(resumed?.id ?? "");
+    expect(report?.run.status).toBe("completed");
+    const finished = runner.report(run.id)?.trials.filter((t) => t.status === "ok") ?? [];
+    expect(finished).toHaveLength(2);
+    for (const trial of finished)
+      expect(report?.trials).toContainEqual({
+        ...trial,
+        evalRunId: resumed?.id ?? "",
+        details: { ...trial.details, resumedFrom: run.id },
+      });
+    expect(f.calls).toHaveLength(8);
+    expect(state.max).toBe(2);
+    expect(runner.report(run.id)?.run).toMatchObject({ status: "interrupted", resumedBy: resumed?.id });
+    expect(() => runner.resume(run.id)).toThrow(`already resumed as ${resumed?.id}`);
+    expect(() => runner.resume(resumed?.id ?? "")).toThrow("is completed");
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume refuses unknown, active, legacy, cache-disabled and no-longer-valid evals without a new run", async () => {
+  const f = await evalFixture();
+  try {
+    const { store, evals } = f.factory;
+    expect(evals.resume("missing")).toBeNull();
+    const stored = (request: Record<string, unknown> | undefined) => {
+      const run = store.createEvalRun(
+        { role: "triage", models: ["candidate-a"], k: 1, maxUsd: 1 },
+        [],
+        request && { request },
+      );
+      store.updateEvalRun(run.id, "failed", "boom");
+      return run.id;
+    };
+    const valid = { role: "triage", models: ["candidate-a"], k: 1, maxUsd: 1, cache: true, concurrency: 2 };
+    const refusals: [string, string][] = [
+      [stored(undefined), "cannot be reconstructed"],
+      [stored({ ...valid, cache: false }), "cache disabled"],
+      [stored({ ...valid, models: ["retired-model"] }), "retired-model"],
+      [stored({ ...valid, caseIds: ["c"] }), "Unknown case ID: c"],
+    ];
+    f.dataset.cases = f.dataset.cases.filter((c) => c.id !== "c");
+    f.save();
+    const entered = deferred<void>();
+    f.respond(async (s) => {
+      entered.resolve();
+      await new Promise<void>((resolve) =>
+        s.signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      return { structured: answer };
+    });
+    const active = evals.submit({ role: "triage", models: ["candidate-a"] });
+    await entered.promise;
+    refusals.push([active.id, "still running"]);
+    const count = store.listEvalRuns().length;
+    for (const [id, reason] of refusals) expect(() => evals.resume(id)).toThrow(reason);
+    expect(store.listEvalRuns()).toHaveLength(count);
+    expect(store.getEvalRun(refusals[0]?.[0] ?? "")?.status).toBe("failed");
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume replays the selected cases and unset effort, not today's dataset or model default", async () => {
+  const f = await evalFixture();
+  try {
+    const { store, evals } = f.factory;
+    const interrupted = async () => {
+      const run = evals.submit({ role: "triage", models: ["candidate-a"] });
+      await evals.cancel(run.id);
+      return run.id;
+    };
+    const first = await interrupted();
+    const second = await interrupted();
+    expect(store.evalRequest(first)).toMatchObject({ request: { caseIds: ["a", "b", "c"] } });
+    enableEfforts(f);
+    const resumed = evals.resume(first);
+    await evals.wait(resumed?.id ?? "");
+    const trials = evals.report(resumed?.id ?? "")?.trials ?? [];
+    expect(trials.map((t) => [t.caseId, t.effort])).toEqual([
+      ["a", "default"],
+      ["b", "default"],
+      ["c", "default"],
+    ]);
+    f.dataset.cases = f.dataset.cases.filter((c) => c.id !== "b");
+    f.save();
+    const count = store.listEvalRuns().length;
+    expect(() => evals.resume(second)).toThrow("Unknown case ID: b");
+    expect(store.listEvalRuns()).toHaveLength(count);
+  } finally {
+    await f.close();
+  }
+});
+
+test("cancel stops scheduling, aborts in-flight trials unscored and releases slots", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 3);
+    let active = 0;
+    f.respond(async (s) => {
+      active++;
+      await new Promise<void>((resolve) =>
+        s.signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      return { structured: answer };
+    });
+    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 2, concurrency: 2 });
+    await until(() => active === 2);
+    expect(await f.factory.evals.cancel(run.id)).toMatchObject({
+      status: "interrupted",
+      error: "eval cancelled",
+    });
+    await Bun.sleep(20);
+    expect(f.calls).toHaveLength(2);
+    const report = f.factory.evals.report(run.id);
+    expect(report?.trials).toHaveLength(6);
+    for (const trial of report?.trials ?? [])
+      expect(trial).toMatchObject({ status: "skipped", pass: null, score: null });
+    expect(report?.summaries[0]).toMatchObject({ evaluatedTrials: 0, errors: 0, pending: 0, skipped: 6 });
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+    await expect(f.factory.evals.cancel(run.id)).rejects.toThrow("not running");
+    expect(await f.factory.evals.cancel("missing")).toBeNull();
+  } finally {
+    await f.close();
+  }
+});
+
+/** Submits a sequential triage eval and cancels it once the call for `hang` starts. */
+async function interruptedAt(f: Fixture, hang: string, reply: (s: AgentSpec) => FakeReply, over = {}) {
+  const entered = deferred<void>();
+  f.respond(async (s) => {
+    if (!s.prompt.includes(`Fix ${hang}`)) return reply(s);
+    entered.resolve();
+    await new Promise<void>((resolve) => s.signal.addEventListener("abort", () => resolve(), { once: true }));
+    return { structured: answer };
+  });
+  const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], ...over });
+  await entered.promise;
+  await f.factory.evals.cancel(run.id);
+  return run.id;
+}
+
+test("resume copies errored trials with their grades and counts the chain's spend against maxUsd", async () => {
+  const f = await evalFixture();
+  try {
+    const first = await interruptedAt(
+      f,
+      "c",
+      (s) => ({ structured: s.prompt.includes("Fix b") ? {} : answer, costUsd: 0.1 }),
+      { maxUsd: 0.25 },
+    );
+    const calls = f.calls.length;
+    expect(f.factory.store.providerSpendSince("openrouter", 0)).toBeCloseTo(0.2);
+    f.respond(() => ({ structured: answer, costUsd: 0.1 }));
+    const resumed = f.factory.evals.resume(first);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    // Copies keep their spend for the eval chain but were already charged to the provider.
+    expect(f.factory.store.providerSpendSince("openrouter", 0)).toBeCloseTo(0.3);
+    const report = f.factory.evals.report(resumed?.id ?? "");
+    // Only the unfinished trial runs; the invalid output stays a failure instead of being re-billed.
+    expect(f.calls.slice(calls).map((s) => s.prompt.includes("Fix c"))).toEqual([true]);
+    expect(report?.trials.map((t) => [t.caseId, t.status, t.pass])).toEqual([
+      ["a", "ok", true],
+      ["b", "error", false],
+      ["c", "ok", true],
+    ]);
+    expect(report?.trials[1]?.details.reason).toContain("Invalid triage output");
+    expect(report?.summaries[0]?.passRate).toBeCloseTo(2 / 3);
+    expect(f.factory.store.evalSpend(resumed?.id ?? "")).toBeCloseTo(0.3);
+    expect(report?.run.status).toBe("budget_exhausted");
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume copies finished decision trials instead of running them again", async () => {
+  const f = await evalFixture(
+    [
+      {
+        id: "decider",
+        provider: "decider-provider",
+        model: "d",
+        tier: 1,
+        vendor: "other",
+        origin: "unknown",
+        baseOrigin: "unknown",
+        supportedEfforts: [],
+        price: { input: 1, output: 1 },
+      },
+    ],
+    [{ id: "decider-provider", label: "D", harness: "decisions", billing: "subscription", maxConcurrent: 1 }],
+  );
+  try {
+    const first = await interruptedAt(f, "b", () => ({ structured: answer }), { models: ["decider"] });
+    expect(f.harnessNames).toEqual(["decisions", "decisions"]);
+    const calls = f.calls.length;
+    f.respond(() => ({ structured: answer }));
+    const resumed = f.factory.evals.resume(first);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    expect(f.calls.slice(calls).map((s) => s.prompt.includes("Fix a"))).toEqual([false, false]);
+    expect(f.factory.evals.report(resumed?.id ?? "")?.trials.map((t) => t.status)).toEqual([
+      "ok",
+      "ok",
+      "ok",
+    ]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume reruns a finished trial whose prompt changed and copies the unchanged ones", async () => {
+  const f = await evalFixture();
+  try {
+    const first = await interruptedAt(f, "c", () => ({ structured: answer }));
+    const changed = f.dataset.cases[0];
+    if (!changed || !("prompt" in changed)) throw new Error("missing case");
+    changed.prompt = "Fix a differently";
+    f.save();
+    const calls = f.calls.length;
+    f.respond(() => ({ structured: answer }));
+    const resumed = f.factory.evals.resume(first);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    expect(f.calls.slice(calls).map((s) => s.prompt.match(/Fix \w+( differently)?/)?.[0])).toEqual([
+      "Fix a differently",
+      "Fix c",
+    ]);
+    const report = f.factory.evals.report(resumed?.id ?? "");
+    expect(report?.trials.map((t) => [t.caseId, t.details.resumedFrom])).toEqual([
+      ["a", undefined],
+      ["b", first],
+      ["c", undefined],
+    ]);
+    expect(formatEvalReport(report as EvalReport)).toContain(
+      `resumed from ${first}: 1 trials copied, 2 run again`,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume reruns finished trials whose backend model changed behind the same catalog ID", async () => {
+  const f = await evalFixture();
+  try {
+    const first = await interruptedAt(f, "b", () => ({ structured: answer }));
+    const model = f.factory.router.model("candidate-a");
+    if (!model) throw new Error("missing model");
+    model.model = "a-new-checkpoint";
+    const calls = f.calls.length;
+    f.respond(() => ({ structured: answer }));
+    const resumed = f.factory.evals.resume(first);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    expect(f.calls.slice(calls).map((s) => s.target.model)).toEqual(Array(3).fill("a-new-checkpoint"));
+    expect(f.factory.evals.report(resumed?.id ?? "")?.trials.some((t) => t.details.resumedFrom)).toBe(false);
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume regrades copied trials against the current labels without a model call", async () => {
+  const f = await evalFixture();
+  try {
+    const first = await interruptedAt(f, "b", () => ({ structured: answer }));
+    expect(f.factory.evals.report(first)?.trials[0]?.pass).toBe(true);
+    const relabeled = f.dataset.cases[0];
+    if (!relabeled || !("gold" in relabeled) || !("prompt" in relabeled)) throw new Error("missing case");
+    relabeled.gold = { ...relabeled.gold, risk: "high" };
+    f.save();
+    const calls = f.calls.length;
+    f.respond(() => ({ structured: answer }));
+    const resumed = f.factory.evals.resume(first);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    expect(f.calls.slice(calls).some((s) => s.prompt.includes("Fix a"))).toBe(false);
+    expect(f.factory.evals.report(resumed?.id ?? "")?.trials[0]).toMatchObject({
+      caseId: "a",
+      pass: false,
+      details: { resumedFrom: first, grade: { pass: false } },
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume retries preparation failures instead of copying them", async () => {
+  const f = await evalFixture();
+  try {
+    const first = await interruptedAt(f, "b", () => ({ structured: answer }));
+    const failed = f.factory.evals.report(first)?.trials[0];
+    if (!failed) throw new Error("missing trial");
+    f.factory.store.recordEvalTrial({
+      ...failed,
+      status: "error",
+      details: { ...failed.details, preparationFailed: true, reason: "missing pin" },
+    });
+    const calls = f.calls.length;
+    f.respond(() => ({ structured: answer }));
+    const resumed = f.factory.evals.resume(first);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    expect(f.calls.slice(calls).some((s) => s.prompt.includes("Fix a"))).toBe(true);
+    expect(f.factory.evals.report(resumed?.id ?? "")?.trials[0]).toMatchObject({ status: "ok", pass: true });
   } finally {
     await f.close();
   }

@@ -23,8 +23,8 @@ test("independent latest completed role/model evidence, deterministic ties and e
   const tie = evidence("triage", [local], { id: "z", finishedAt: 3000 });
   const created = evidence("triage", [local], { id: "a", finishedAt: 3000, createdAt: 1500 });
   const review = evidence("review", [local]);
-  const ignored = (["running", "queued", "failed", "budget_exhausted"] as const).map((status) =>
-    evidence("triage", [local], { id: status, status, finishedAt: 9999 }),
+  const ignored = (["running", "queued", "failed", "budget_exhausted", "interrupted"] as const).map(
+    (status) => evidence("triage", [local], { id: status, status, finishedAt: 9999 }),
   );
   const rows = [old, newer, tie, created, review, ...ignored];
   expect(selectEvidence(rows).map((e) => [e.run.role, e.modelId, e.run.id])).toEqual([
@@ -46,6 +46,9 @@ test("independent latest completed role/model evidence, deterministic ties and e
     ["budget_exhausted"],
   ])
     expect(() => selectEvidence(rows, ids)).toThrow();
+  expect(() => selectEvidence(rows, ["interrupted"])).toThrow(
+    "Eval interrupted is interrupted, not completed",
+  );
 });
 
 for (const [role, field, bound] of [
