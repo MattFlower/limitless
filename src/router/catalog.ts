@@ -230,7 +230,7 @@ export const MODELS: ModelDef[] = [
     tier: 4,
     effort: "medium",
     price: { input: 2, output: 10, cacheRead: 0.1 },
-    notes: "Needs Codex CLI >= 0.159 on ChatGPT sign-in; under evaluation (#133), not in the routing policy",
+    notes: "Needs Codex CLI >= 0.159 on ChatGPT sign-in; routes review (#189) and the implement trial (#216)",
   },
   // Metered open models via OpenRouter (tiers are provisional until the M4 eval suite calibrates them).
   {
