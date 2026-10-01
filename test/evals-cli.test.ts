@@ -649,3 +649,18 @@ test("eval resume and cancel CLI print the new run ID and the cancelled status",
   expect(printed).toEqual(["eval-new (resumes eval-old)", "eval-old: interrupted"]);
   await expect(evalCommand(["resume"], {}, io)).rejects.toThrow("eval resume <eval-id>");
 });
+
+test("eval resume --allow-changed asks the API to allow a changed identity", async () => {
+  const bodies: unknown[] = [];
+  const io = {
+    async api<T>(_path: string, init?: RequestInit): Promise<T> {
+      bodies.push(JSON.parse(String(init?.body)));
+      return { id: "eval-new" } as T;
+    },
+    print: () => {},
+    wait: async () => {},
+  };
+  await evalCommand(["resume", "eval-old"], { "allow-changed": true }, io);
+  await evalCommand(["resume", "eval-old"], {}, io);
+  expect(bodies).toEqual([{ allowChanged: true }, {}]);
+});

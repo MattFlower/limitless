@@ -229,8 +229,9 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       }),
     },
     "/api/evals/:id/resume": {
-      POST: handle((req) => {
-        const run = factory.evals.resume(req.params.id ?? "");
+      POST: handle(async (req) => {
+        const input = await body<{ allowChanged?: boolean }>(req);
+        const run = factory.evals.resume(req.params.id ?? "", input.allowChanged === true);
         return run ? json({ id: run.id, resumedFrom: run.resumedFrom }, 202) : error("eval not found", 404);
       }),
     },

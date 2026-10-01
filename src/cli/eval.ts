@@ -88,12 +88,12 @@ export async function evalCommand(
   }
   if (args.length !== 2 || !value || !["run", "report", "regrade", "resume", "cancel"].includes(action ?? ""))
     throw new Error(
-      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval run review --systems <file.json> | eval report <eval-id> [--json] | eval regrade <eval-id> | eval resume <eval-id> | eval cancel <eval-id>",
+      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval run review --systems <file.json> | eval report <eval-id> [--json] | eval regrade <eval-id> | eval resume <eval-id> [--allow-changed] | eval cancel <eval-id>",
     );
   if (action === "resume") {
     const { id } = await io.api<{ id: string }>(`/api/evals/${encodeURIComponent(value)}/resume`, {
       method: "POST",
-      body: "{}",
+      body: JSON.stringify(flags["allow-changed"] ? { allowChanged: true } : {}),
     });
     io.print(`${id} (resumes ${value})`);
     return;

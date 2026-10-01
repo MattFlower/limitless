@@ -111,7 +111,8 @@ test("upgrade to the eval migration preserves data and adds eval columns, cache 
     store.recoverEvals();
     expect(store.getEvalRun(run.id)).toMatchObject({
       status: "interrupted",
-      error: `interrupted by daemon restart; \`limitless eval resume ${run.id}\` reuses its completed trials`,
+      // A run without a stored request cannot be resumed.
+      error: "interrupted by daemon restart; submit a new eval to rerun it",
     });
     expect(store.getEvalRun(run.id)?.finishedAt).toBeNumber();
     expect(store.listEvalTrials(run.id)[1]?.status).toBe("skipped");
@@ -357,5 +358,78 @@ test("resume links persist in both directions and appear in text and JSON report
   } finally {
     store.close();
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a restart suggests eval resume only for evals resume would accept", () => {
+  const store = new Store(":memory:");
+  try {
+    const input = { role: "triage" as const, models: ["opaque-model"], k: 1, maxUsd: 1 };
+    const run = (request?: unknown) => {
+      const created = store.createEvalRun(input, [], request);
+      store.updateEvalRun(created.id, "running");
+      return created.id;
+    };
+    const resumable = run({ request: { ...input, cache: true } });
+    const uncached = run({ request: { ...input, cache: false } });
+    const legacy = run();
+    store.recoverEvals();
+    expect(store.getEvalRun(resumable)?.error).toBe(
+      `interrupted by daemon restart; \`limitless eval resume ${resumable}\` reuses its finished trials`,
+    );
+    for (const id of [uncached, legacy])
+      expect(store.getEvalRun(id)?.error).toBe(
+        "interrupted by daemon restart; submit a new eval to rerun it",
+      );
+  } finally {
+    store.close();
+  }
+});
+
+test("eval spend covers the resume chain without counting copied trials twice", () => {
+  const store = new Store(":memory:");
+  try {
+    const input = { role: "triage" as const, models: ["opaque-model"], k: 1, maxUsd: 1 };
+    const trial = (caseId: string, status: EvalTrial["status"], costUsd: number): EvalTrial => ({
+      evalRunId: "",
+      caseId,
+      modelId: "opaque-model",
+      effort: "default",
+      trial: 0,
+      cacheKey: "",
+      harness: "fake",
+      status,
+      output: null,
+      pass: null,
+      score: null,
+      details: {},
+      costUsd,
+      costEquivUsd: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+      durationMs: 0,
+      createdAt: 1,
+    });
+    // An interrupted multi-round trial keeps its spend while unfinished; a resume reruns it.
+    const first = store.createEvalRun(input, [trial("a", "ok", 0.1), trial("b", "skipped", 0.2)], {});
+    store.updateEvalRun(first.id, "interrupted");
+    const second = store.createEvalRun(
+      input,
+      [trial("a", "ok", 0.1), trial("b", "error", 0.05)],
+      {},
+      first.id,
+    );
+    expect(store.evalSpend(first.id)).toBeCloseTo(0.3);
+    expect(store.evalSpend(second.id)).toBeCloseTo(0.35);
+    store.updateEvalRun(second.id, "interrupted");
+    const third = store.createEvalRun(
+      input,
+      [trial("a", "ok", 0.1), trial("b", "error", 0.05)],
+      {},
+      second.id,
+    );
+    expect(store.evalSpend(third.id)).toBeCloseTo(0.35);
+  } finally {
+    store.close();
   }
 });

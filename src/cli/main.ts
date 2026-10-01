@@ -17,7 +17,8 @@ Usage:
         implement only: [--rounds N] [--strategy retry|effort|switch]
         review only: --systems <file.json> instead of --models ({"systems": [ReviewSystem, ...]})
   limitless eval report <eval-id> [--json]
-  limitless eval resume <eval-id>         Rerun an interrupted or failed eval's request; the cache supplies completed trials
+  limitless eval resume <eval-id>         Continue an interrupted or failed eval; finished trials and spend carry over
+        [--allow-changed]  Resume even though the prompt, a case or a target changed since it ran
   limitless eval cancel <eval-id>         Stop scheduling an eval's trials; it ends interrupted
   limitless eval regrade <eval-id>        Recompute a review eval's grades from stored outputs (no model calls)
   limitless eval policy [--evals id,id] [--write]
@@ -180,6 +181,7 @@ async function main(): Promise<void> {
       "max-usd": { type: "string" },
       concurrency: { type: "string" },
       "no-cache": { type: "boolean" },
+      "allow-changed": { type: "boolean" },
       "no-baseline-cache": { type: "boolean" },
       json: { type: "boolean" },
       after: { type: "string" },

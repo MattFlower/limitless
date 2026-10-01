@@ -159,6 +159,8 @@ limitless eval run verify --models openrouter/gpt-6-luna --follow
 limitless eval report <eval-id>
 limitless eval report <eval-id> --json
 limitless eval regrade <eval-id>   # review: recompute grades from stored outputs, no model calls
+limitless eval cancel <eval-id>    # stop a running eval; it ends interrupted
+limitless eval resume <eval-id>    # continue an interrupted or failed eval; --allow-changed after a prompt/case/target change
 ```
 
 Use catalog IDs shown by the daemon's `/api/models` endpoint. `triage`, `review`, and `verify` are supported, including models absent from the routing policy. Defaults
@@ -216,15 +218,20 @@ model. Denominators and comparison coverage are included in both text and JSON:
   in JSON and `n/a` in text.
 
 The API provides `POST /api/evals` with `{role, models | systems, k?, maxUsd?, concurrency?, caseIds?, cache?}` (202 with `{id}`),
-`GET /api/evals` to list runs, and `GET /api/evals/:id` for the run, summaries and trials. Mutations use
+`GET /api/evals` to list runs, `GET /api/evals/:id` for the run, summaries and trials,
+`POST /api/evals/:id/cancel` (returns `{id, status}`) and `POST /api/evals/:id/resume` with
+`{allowChanged?}` (202 with `{id, resumedFrom}`). Mutations use
 the usual local Origin and JSON content-type rules; Cloudflare tunnel requests are refused.
 
-Runs progress from `queued` to `running`, then `completed`, `budget_exhausted` or `failed`. Completed
-means execution ended, not that candidates passed. Trial errors and skips remain visible in partial
-reports. Daemon shutdown aborts active calls and releases slots; startup marks interrupted evals
-failed, retaining completed trials for cache reuse on a new submission. In-flight trials interrupted
-by a crash are errors with unknown final usage/latency; queued trials are skipped. Unknown latency is
-excluded from the p50. `--follow` polls until any
+Runs progress from `queued` to `running`, then `completed`, `budget_exhausted`, `failed` or
+`interrupted`. Completed means execution ended, not that candidates passed. Trial errors and skips
+remain visible in partial reports. Daemon shutdown and `limitless eval cancel <eval-id>` abort active
+calls, release slots and end the run `interrupted`; startup marks evals left queued or running by a
+crash `interrupted` too. Unfinished trials (queued, or in flight with unknown final usage/latency)
+are skipped and unscored. Nothing resumes automatically: `limitless eval resume <eval-id>
+[--allow-changed]` continues an interrupted or failed eval as a new linked run that copies its
+finished trials and spend and runs only the unfinished ones, against a `maxUsd` that covers the
+whole chain (see [EVALS.md](EVALS.md)). Unknown latency is excluded from the p50. `--follow` polls until any
 terminal state and prints a final report. The Evals UI lists runs, displays per-trial reports, and
 compares latest completed evidence in a roles-by-models eligibility matrix. Other role graders remain pending.
 

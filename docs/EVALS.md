@@ -214,9 +214,16 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
   trials start, in-flight trials abort, and unfinished trials stay unscored. Interrupted evals
   never feed `eval policy`. Nothing resumes automatically; `limitless eval resume <eval-id>`
   resubmits an interrupted or failed eval's stored request unchanged as a new run (linked both
-  ways in reports), so the cache supplies completed trials and at most the eval's concurrency of
-  in-flight trials repeat. Resume refuses legacy evals without a stored request, `--no-cache`
-  evals, and requests that no longer validate against the current dataset, models or systems.
+  ways in reports). The new run copies every finished trial (passed, failed or errored, with its
+  grade and spend) and runs only the trials that never finished, so at most the eval's concurrency
+  of in-flight trials repeat. Its `maxUsd` covers the spend of the whole resume chain, including
+  spend recorded on unfinished trials. Resume refuses legacy evals without a stored request,
+  `--no-cache` evals, requests that no longer validate against the current dataset, models or
+  systems, and, unless `--allow-changed` (API `allowChanged: true`), evals whose prompt template,
+  preamble, panel policy, case content or target model/harness changed since they ran; the error
+  names the changed parts. Allowed anyway, finished trials are still copied and only the
+  unfinished ones run under the change. A restart's message suggests `eval resume` only for evals
+  with a stored, cached request.
 
 Repository-reading cache identity additionally includes role, repository identity, pinned base
 and head, normal input and seed content. Same-stat code or patch changes invalidate it; temporary
@@ -296,7 +303,7 @@ recovery feedback.
 `limitless eval policy` reads persisted evidence and effective settings through the daemon API;
 it never runs or regrades models. By default it selects the latest **completed** run independently
 for each triage/review/verify model, ordered by finishedAt, createdAt, then run ID (descending).
-Queued, running, failed and budget-exhausted runs are ignored. `--evals id,id` restricts the pool
+Queued, running, failed, interrupted and budget-exhausted runs are ignored. `--evals id,id` restricts the pool
 before the same selection; empty, unknown or non-completed IDs fail before any files are written.
 
 Configure the daemon in `~/.config/limitless/config.toml`:

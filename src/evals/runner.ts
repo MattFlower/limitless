@@ -36,6 +36,7 @@ import {
   type TriageCase,
   validateRequest,
 } from "./cases.ts";
+import { changedIdentity, type EvalIdentity, evalIdentity } from "./identity.ts";
 import {
   failedImplement,
   gradeImplement,
@@ -55,7 +56,20 @@ type SwitchChain = NonNullable<EvalTrial["details"]["switchChain"]>;
 interface StoredEvalRequest {
   request: Record<string, unknown>;
   switchChains?: Record<string, SwitchChain>;
+  /** Absent for evals submitted before identities were stored; a resume then cannot compare. */
+  identity?: EvalIdentity;
 }
+/** What `eval resume` continues from, and whether it may run under a changed identity. */
+interface ResumeFrom {
+  from: string;
+  switchChains?: Record<string, SwitchChain>;
+  identity?: EvalIdentity;
+  allowChanged?: boolean;
+}
+/** A finished trial keeps its grade and spend across a resume; the rest run again. */
+const finished = (trial: EvalTrial) => trial.status === "ok" || trial.status === "error";
+const trialKey = (trial: EvalTrial) =>
+  JSON.stringify([trial.caseId, recordedTarget(trial), trial.trial, trial.details.system ?? null]);
 
 /** Where Limitless keeps eval datasets; pins whose history touches these are rejected. */
 const LABEL_PATHS = ["evals/triage", "evals/review", "evals/verify", "evals/implement"];
@@ -88,7 +102,7 @@ export class EvalRunner {
     deps.store.recoverEvals();
   }
 
-  submit(input: unknown, resume?: { from: string; switchChains?: Record<string, SwitchChain> }): EvalRun {
+  submit(input: unknown, resume?: ResumeFrom): EvalRun {
     if (this.stopping) throw new Error("daemon is stopping");
     // Reject unsupported roles before accessing any dataset or repository.
     const parsed = EvalRequestSchema.parse(input);
@@ -115,7 +129,7 @@ export class EvalRunner {
           }
         : { models: request.models.map((target) => explicit(target)) }),
     };
-    const trials: EvalTrial[] = [];
+    let trials: EvalTrial[] = [];
     const candidates =
       request.systems?.map((system) => ({ modelId: system.finders[0]?.target ?? "", system: system.name })) ??
       request.models.map((modelId) => ({ modelId, system: undefined }));
@@ -166,11 +180,34 @@ export class EvalRunner {
             durationMs: 0,
             createdAt: Date.now(),
           });
+    const identity = evalIdentity(
+      parsed.role,
+      cases,
+      this.casePath ?? defaultCasePath(parsed.role),
+      trials,
+      this.deps.router,
+      request.systems?.some((system) => system.mode === "panel") === true,
+    );
+    if (resume) {
+      const changed = resume.identity ? changedIdentity(resume.identity, identity) : [];
+      if (changed.length && !resume.allowChanged)
+        throw new Error(
+          `changed since it ran: ${changed.join(", ")}; its unfinished trials would run under the change (allow it with --allow-changed)`,
+        );
+      const copies = new Map(
+        this.deps.store
+          .listEvalTrials(resume.from)
+          .filter(finished)
+          .map((trial) => [trialKey(trial), trial]),
+      );
+      trials = trials.map((trial) => copies.get(trialKey(trial)) ?? trial);
+    }
     const switchChains = Object.fromEntries(
       trials.flatMap((t) => (t.details.switchChain ? [[t.caseId, t.details.switchChain]] : [])),
     );
     const stored: StoredEvalRequest = {
       request: replay,
+      identity,
       ...(trials.some((t) => t.details.switchChain) ? { switchChains } : {}),
     };
     const run = this.deps.store.createEvalRun(request, trials, stored, resume?.from);
@@ -183,10 +220,11 @@ export class EvalRunner {
   }
 
   /**
-   * Resubmits an interrupted or failed eval's stored request unchanged as a new linked run, so the
-   * cache supplies its completed trials and only unfinished ones run again.
+   * Resubmits an interrupted or failed eval's stored request unchanged as a new linked run that
+   * copies its finished trials, grades and spend; only unfinished trials run again. A changed
+   * identity (prompt, case, target) is refused unless `allowChanged`.
    */
-  resume(id: string): EvalRun | null {
+  resume(id: string, allowChanged = false): EvalRun | null {
     const run = this.deps.store.getEvalRun(id);
     if (!run) return null;
     if (this.active.has(id) || run.status === "queued" || run.status === "running")
@@ -201,9 +239,7 @@ export class EvalRunner {
         `eval ${id} predates stored eval requests and cannot be reconstructed; submit it again`,
       );
     if (stored.request.cache === false)
-      throw new Error(
-        `eval ${id} ran with the cache disabled, so a resume would repeat its completed trials`,
-      );
+      throw new Error(`eval ${id} ran with the cache disabled; submit it again for a fresh measurement`);
     try {
       for (const [caseId, chain] of Object.entries(stored.switchChains ?? {}))
         for (const target of chain)
@@ -214,7 +250,12 @@ export class EvalRunner {
               `case ${caseId} switch chain target ${target.modelId}: ${(error as Error).message}`,
             );
           }
-      return this.submit(stored.request, { from: id, switchChains: stored.switchChains });
+      return this.submit(stored.request, {
+        from: id,
+        switchChains: stored.switchChains,
+        identity: stored.identity,
+        allowChanged,
+      });
     } catch (error) {
       throw new Error(`cannot resume eval ${id}: ${(error as Error).message}`);
     }
@@ -415,7 +456,7 @@ export class EvalRunner {
           const queue = models.flatMap((modelId) =>
             cases.flatMap((item) =>
               recorded
-                .filter((t) => recordedTarget(t) === modelId && t.caseId === item.id)
+                .filter((t) => t.status === "queued" && recordedTarget(t) === modelId && t.caseId === item.id)
                 .map((trial) => ({ trial, item })),
             ),
           );

@@ -444,10 +444,23 @@ export class Store {
     ).map(toEvalTrial);
   }
 
+  /**
+   * A run's spend, including the spend of every eval it resumed: a resume copies its predecessor's
+   * finished (`ok`/`error`) trials with their cost, so only the predecessors' other trials add to it.
+   */
   evalSpend(id: string): number {
     return (
       this.db
-        .query("SELECT COALESCE(SUM(cost_usd), 0) AS spend FROM eval_trials WHERE eval_run_id = ?")
+        .query(
+          `WITH RECURSIVE chain(id, own) AS (
+            SELECT ?, 1
+            UNION ALL
+            SELECT q.resumed_from, 0 FROM eval_run_requests q JOIN chain ON q.eval_run_id = chain.id
+            WHERE q.resumed_from IS NOT NULL
+          )
+          SELECT COALESCE(SUM(t.cost_usd), 0) AS spend FROM chain JOIN eval_trials t ON t.eval_run_id = chain.id
+          WHERE chain.own = 1 OR t.status NOT IN ('ok', 'error')`,
+        )
         .get(id) as { spend: number }
     ).spend;
   }
@@ -483,11 +496,15 @@ export class Store {
 
   recoverEvals(): void {
     for (const run of this.listEvalRuns()) {
-      if (run.status === "queued" || run.status === "running")
-        this.interruptEval(
-          run.id,
-          `interrupted by daemon restart; \`limitless eval resume ${run.id}\` reuses its completed trials`,
-        );
+      if (run.status !== "queued" && run.status !== "running") continue;
+      // Only suggest a resume that `EvalRunner.resume` would not refuse outright.
+      const stored = this.evalRequest(run.id) as { request?: { cache?: boolean } } | null;
+      this.interruptEval(
+        run.id,
+        stored?.request && stored.request.cache !== false
+          ? `interrupted by daemon restart; \`limitless eval resume ${run.id}\` reuses its finished trials`
+          : "interrupted by daemon restart; submit a new eval to rerun it",
+      );
     }
   }
 

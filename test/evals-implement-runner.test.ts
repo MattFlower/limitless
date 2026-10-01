@@ -966,6 +966,11 @@ test("switch freezes policy order, ignores live headroom, records harness and ke
     // A resume keeps its predecessor's chain, part of the cache key, despite the policy change.
     const calls = f.calls.length;
     f.factory.store.updateEvalRun(report.run.id, "failed", "boom");
+    // Unfinished, so the resume runs it again instead of copying it; another run keeps its cache entry.
+    const [finished] = report.trials;
+    if (!finished) throw new Error("missing trial");
+    f.factory.store.createEvalRun(report.run, [finished]);
+    f.factory.store.recordEvalTrial({ ...finished, status: "skipped" });
     const resumed = f.factory.evals.resume(report.run.id);
     await f.factory.evals.wait(resumed?.id ?? "");
     const replayed = f.factory.evals.report(resumed?.id ?? "");

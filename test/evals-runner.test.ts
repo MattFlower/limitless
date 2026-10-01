@@ -5,6 +5,7 @@ import { cacheKey } from "../src/evals/cache.ts";
 import { pinnedTree, withRepoLock } from "../src/git/repos.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import { selectHarness } from "../src/harness/select.ts";
+import type { AgentSpec } from "../src/harness/types.ts";
 import { FACTORY_PREAMBLE, triagePrompt } from "../src/pipeline/prompts.ts";
 import { TriageSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 import { sh } from "../src/util/proc.ts";
@@ -811,7 +812,7 @@ test("the shared eval cap follows the largest concurrency among running evals", 
   }
 });
 
-test("resume replays an interrupted eval's stored request; completed trials come from the cache", async () => {
+test("resume replays an interrupted eval's stored request and copies its finished trials", async () => {
   const f = await evalFixture();
   try {
     setLimit(f, "openrouter", 3);
@@ -845,6 +846,7 @@ test("resume replays an interrupted eval's stored request; completed trials come
     expect(resumed).toMatchObject({ resumedFrom: run.id, status: "queued" });
     expect(f.factory.store.evalRequest(resumed?.id ?? "")).toEqual({
       request: { ...request, models: ["candidate-a@default"], maxUsd: 1, cache: true },
+      identity: expect.any(Object),
     });
     await until(() => state.active === 2);
     await Bun.sleep(20);
@@ -852,7 +854,10 @@ test("resume replays an interrupted eval's stored request; completed trials come
     await runner.wait(resumed?.id ?? "");
     const report = runner.report(resumed?.id ?? "");
     expect(report?.run.status).toBe("completed");
-    expect(report?.trials.filter((t) => t.details.cache?.evalRunId === run.id)).toHaveLength(2);
+    const finished = runner.report(run.id)?.trials.filter((t) => t.status === "ok") ?? [];
+    expect(finished).toHaveLength(2);
+    for (const trial of finished)
+      expect(report?.trials).toContainEqual({ ...trial, evalRunId: resumed?.id ?? "" });
     expect(f.calls).toHaveLength(8);
     expect(state.max).toBe(2);
     expect(runner.report(run.id)?.run).toMatchObject({ status: "interrupted", resumedBy: resumed?.id });
@@ -965,6 +970,109 @@ test("cancel stops scheduling, aborts in-flight trials unscored and releases slo
     expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
     await expect(f.factory.evals.cancel(run.id)).rejects.toThrow("not running");
     expect(await f.factory.evals.cancel("missing")).toBeNull();
+  } finally {
+    await f.close();
+  }
+});
+
+/** Submits a sequential triage eval and cancels it once the call for `hang` starts. */
+async function interruptedAt(f: Fixture, hang: string, reply: (s: AgentSpec) => FakeReply, over = {}) {
+  const entered = deferred<void>();
+  f.respond(async (s) => {
+    if (!s.prompt.includes(`Fix ${hang}`)) return reply(s);
+    entered.resolve();
+    await new Promise<void>((resolve) => s.signal.addEventListener("abort", () => resolve(), { once: true }));
+    return { structured: answer };
+  });
+  const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], ...over });
+  await entered.promise;
+  await f.factory.evals.cancel(run.id);
+  return run.id;
+}
+
+test("resume copies errored trials with their grades and counts the chain's spend against maxUsd", async () => {
+  const f = await evalFixture();
+  try {
+    const first = await interruptedAt(
+      f,
+      "c",
+      (s) => ({ structured: s.prompt.includes("Fix b") ? {} : answer, costUsd: 0.1 }),
+      { maxUsd: 0.25 },
+    );
+    const calls = f.calls.length;
+    f.respond(() => ({ structured: answer, costUsd: 0.1 }));
+    const resumed = f.factory.evals.resume(first);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    const report = f.factory.evals.report(resumed?.id ?? "");
+    // Only the unfinished trial runs; the invalid output stays a failure instead of being re-billed.
+    expect(f.calls.slice(calls).map((s) => s.prompt.includes("Fix c"))).toEqual([true]);
+    expect(report?.trials.map((t) => [t.caseId, t.status, t.pass])).toEqual([
+      ["a", "ok", true],
+      ["b", "error", false],
+      ["c", "ok", true],
+    ]);
+    expect(report?.trials[1]?.details.reason).toContain("Invalid triage output");
+    expect(report?.summaries[0]?.passRate).toBeCloseTo(2 / 3);
+    expect(f.factory.store.evalSpend(resumed?.id ?? "")).toBeCloseTo(0.3);
+    expect(report?.run.status).toBe("budget_exhausted");
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume copies finished decision trials instead of running them again", async () => {
+  const f = await evalFixture(
+    [
+      {
+        id: "decider",
+        provider: "decider-provider",
+        model: "d",
+        tier: 1,
+        vendor: "other",
+        origin: "unknown",
+        baseOrigin: "unknown",
+        supportedEfforts: [],
+        price: { input: 1, output: 1 },
+      },
+    ],
+    [{ id: "decider-provider", label: "D", harness: "decisions", billing: "subscription", maxConcurrent: 1 }],
+  );
+  try {
+    const first = await interruptedAt(f, "b", () => ({ structured: answer }), { models: ["decider"] });
+    expect(f.harnessNames).toEqual(["decisions", "decisions"]);
+    const calls = f.calls.length;
+    f.respond(() => ({ structured: answer }));
+    const resumed = f.factory.evals.resume(first);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    expect(f.calls.slice(calls).map((s) => s.prompt.includes("Fix a"))).toEqual([false, false]);
+    expect(f.factory.evals.report(resumed?.id ?? "")?.trials.map((t) => t.status)).toEqual([
+      "ok",
+      "ok",
+      "ok",
+    ]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume refuses a changed case or prompt unless allowChanged, naming the change", async () => {
+  const f = await evalFixture();
+  try {
+    const first = await interruptedAt(f, "b", () => ({ structured: answer }));
+    const changed = f.dataset.cases[2];
+    if (!changed || !("prompt" in changed)) throw new Error("missing case");
+    changed.prompt = "Fix c differently";
+    f.save();
+    const count = f.factory.store.listEvalRuns().length;
+    expect(() => f.factory.evals.resume(first)).toThrow(
+      `cannot resume eval ${first}: changed since it ran: case c;`,
+    );
+    expect(() => f.factory.evals.resume(first)).toThrow("--allow-changed");
+    expect(f.factory.store.listEvalRuns()).toHaveLength(count);
+    f.respond(() => ({ structured: answer }));
+    const resumed = f.factory.evals.resume(first, true);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    expect(f.factory.evals.report(resumed?.id ?? "")?.run.status).toBe("completed");
   } finally {
     await f.close();
   }
