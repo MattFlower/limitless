@@ -1067,6 +1067,40 @@ test("resume reruns a three-round trial whose prompt changed only in its third r
   }
 });
 
+for (const formatter of ["formatGateFeedback", "formatAuditFeedback"] as const)
+  test(`resume invalidates changed nonempty ${formatter} in retry prompts`, async () => {
+    const f = await fixture();
+    const prompts = await import("../src/pipeline/prompts.ts");
+    const originals = { ...prompts };
+    const gateFeedback = spyOn(prompts, "formatGateFeedback");
+    const auditFeedback = spyOn(prompts, "formatAuditFeedback");
+    try {
+      f.respond(() => ({ files: { answer: "correct", broken: "yes", protected: "changed" } }));
+      const report = await f.run({ rounds: 2 });
+      expect(f.calls).toHaveLength(2);
+      expect(f.calls[1]?.prompt).toContain("now FAILS");
+      expect(f.calls[1]?.prompt).toContain("Policy violations");
+      // Only the nonempty branch changes; an empty failure grade cannot fingerprint it.
+      const edit = (text: string) => (text ? `${text}\nNew feedback instructions.` : text);
+      if (formatter === "formatGateFeedback")
+        gateFeedback.mockImplementation((evidence) => edit(originals.formatGateFeedback(evidence)));
+      else auditFeedback.mockImplementation((evidence) => edit(originals.formatAuditFeedback(evidence)));
+      f.factory.store.updateEvalRun(report.run.id, "interrupted");
+      const resumed = f.factory.evals.resume(report.run.id);
+      await f.factory.evals.wait(resumed?.id ?? "");
+      expect(f.calls).toHaveLength(4);
+      expect(f.calls[3]?.prompt).toContain("New feedback instructions.");
+      const rerun = f.factory.evals.report(resumed?.id ?? "")?.trials[0];
+      expect(rerun?.cacheKey).not.toBe(report.trials[0]?.cacheKey);
+      expect(rerun?.details.resumedFrom).toBeUndefined();
+      expect(rerun?.details.cache).toBeUndefined();
+    } finally {
+      gateFeedback.mockRestore();
+      auditFeedback.mockRestore();
+      await f.close();
+    }
+  });
+
 test("resume reruns an effort trial whose later-round effort changed with the supported efforts", async () => {
   const f = await fixture();
   try {

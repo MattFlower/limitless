@@ -42,6 +42,7 @@ import {
   implementRetryPrompt,
   nextImplementTarget,
   prepareImplement,
+  RETRY_FEEDBACK_GRADE,
 } from "./implement.ts";
 import { gradeCase, prepareCase, schemaFor, seedContent, storedSchemaFor } from "./prepare.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
@@ -719,7 +720,9 @@ export class EvalRunner {
               retryPrompts:
                 "hidden" in effective && implementation
                   ? Array.from({ length: rounds - 1 }, (_, round) =>
-                      implementRetryPrompt(effective, implementation, failedImplement("error"), round + 1),
+                      [failedImplement("error"), RETRY_FEEDBACK_GRADE].map((grade) =>
+                        implementRetryPrompt(effective, implementation, grade, round + 1),
+                      ),
                     )
                   : null,
             }
