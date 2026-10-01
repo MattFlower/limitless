@@ -16,7 +16,7 @@ for (const round of [0, 1]) {
       });
       expect(prompt).not.toContain("beyond only the listed criteria");
       expect(prompt).toContain(
-        "Stay within the request and specification; if the specification asks for more than the request needs, implement the request and explain the omitted extras in your final report.",
+        "Stay within the request and specification: add nothing that neither asks for. If part of the specification looks unnecessary for the request, still meet its acceptance criteria and name that part in your final report.",
       );
       if (round === 0 && hasHoldout) {
         expect(prompt).toContain(
