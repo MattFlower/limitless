@@ -22,6 +22,7 @@ import {
   ensureCache,
   exportCommit,
   fetchBase,
+  findPullRequest,
   formatTopLevel,
   type GitHubBudget,
   githubRetry,
@@ -1287,23 +1288,17 @@ async function recordVerified(ctx: RunContext, sha: string): Promise<void> {
   await ctx.save();
 }
 
-/** One GitHub retry budget per delivery, fallback draft included, persisted so a restart resumes it. */
-async function deliveryBudget(ctx: RunContext): Promise<GitHubBudget> {
-  const key = `deliver:${ctx.state.round}`;
-  if (ctx.state.githubBudget?.key !== key) {
-    ctx.state.githubBudget = { key, leftMs: githubRetry.budgetMs };
-    await ctx.save();
-  }
-  const saved = ctx.state.githubBudget;
-  const budget: GitHubBudget = {
-    leftMs: saved.leftMs,
-    activeSince: saved.activeSince,
-    onSpend: async () => {
-      saved.leftMs = budget.leftMs;
-      saved.activeSince = budget.activeSince;
-      await ctx.save();
-    },
-  };
+const deliveryBudgets = new WeakMap<RunContext, { round: number; budget: GitHubBudget }>();
+
+/**
+ * One in-memory GitHub retry budget per delivery attempt, fallback draft included. A resumed
+ * delivery runs in a new context and so starts fresh: downtime never counts against it.
+ */
+function deliveryBudget(ctx: RunContext): GitHubBudget {
+  const held = deliveryBudgets.get(ctx);
+  if (held?.round === ctx.state.round) return held.budget;
+  const budget = { leftMs: githubRetry.budgetMs };
+  deliveryBudgets.set(ctx, { round: ctx.state.round, budget });
   return budget;
 }
 
@@ -1322,7 +1317,14 @@ async function deliverVerifiedDraft(
   const report = buildReport(ctx, false, { sha, stage, reason, base });
   ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
   ctx.checkCancelled();
-  const budget = await deliveryBudget(ctx);
+  // The failed delivery may have opened its PR without hearing back, and its spent budget would
+  // keep the draft below from finding it.
+  if (!ctx.run.prUrl) {
+    const found = await findPullRequest(ctx.repo, branch, cwd, ctx.signal);
+    if (found) ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: found });
+  }
+  ctx.checkCancelled();
+  const budget = deliveryBudget(ctx);
   await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
@@ -1351,12 +1353,10 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     throw new Error("PR delivery base does not match the verified webhook head");
   const deliverStage = async () => {
     const cwd = ctx.state.worktreePath as string;
-    const budget = await deliveryBudget(ctx);
+    const budget = deliveryBudget(ctx);
+    const runner = ctx.deps.gh ?? runGh;
     const gh: GhRunner = (args, signal) =>
-      withGitHubRetry(async (timeout) => (await (ctx.deps.gh ?? runGh)(args, signal, timeout())) ?? "", {
-        budget,
-        signal,
-      });
+      withGitHubRetry(async () => (await runner(args, signal)) ?? "", { budget, signal });
     if (
       success &&
       ctx.repo.kind === "github" &&
@@ -1415,36 +1415,27 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         if (!ctx.state.verdictCommentPosted) {
           const marker = `<!-- limitless-verification:${ctx.run.id} -->`;
           ctx.checkCancelled();
-          // A pending post may already exist remotely even when its local checkpoint was lost.
-          const comments = ctx.state.verdictCommentPending
-            ? await gh(
-                [
-                  "api",
-                  `repos/${ctx.repo.slug}/issues/${ctx.run.sourceRef?.number}/comments`,
-                  "--paginate",
-                  "--jq",
-                  ".[].body",
-                ],
-                ctx.signal,
-              )
-            : "";
-          if (!comments?.includes(marker)) {
-            ctx.state.verdictCommentPending = true;
-            await ctx.save("verification-comment-pending");
-            ctx.checkCancelled();
-            await gh(
-              [
-                "pr",
-                "comment",
-                String(ctx.run.sourceRef?.number),
-                "--repo",
-                ctx.repo.slug,
-                "--body",
-                `${marker}\n${report}`,
-              ],
-              ctx.signal,
-            );
-          }
+          const comments = [
+            "api",
+            `repos/${ctx.repo.slug}/issues/${ctx.run.sourceRef?.number}/comments`,
+            "--paginate",
+            "--jq",
+            ".[].body",
+          ];
+          const comment = ["pr", "comment", String(ctx.run.sourceRef?.number), "--repo", ctx.repo.slug];
+          await withGitHubRetry(
+            async () => {
+              // A pending post (an earlier attempt that failed late, or one whose checkpoint was
+              // lost) may already exist remotely: look for its marker before posting again.
+              if (ctx.state.verdictCommentPending && (await runner(comments, ctx.signal))?.includes(marker))
+                return;
+              ctx.state.verdictCommentPending = true;
+              await ctx.save("verification-comment-pending");
+              ctx.checkCancelled();
+              await runner([...comment, "--body", `${marker}\n${report}`], ctx.signal);
+            },
+            { budget, signal: ctx.signal },
+          );
           ctx.checkCancelled();
           ctx.state.verdictCommentPosted = true;
           await ctx.save("verification-comment-posted");

@@ -61,8 +61,6 @@ export interface RunState {
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
   verdictCommentPosted?: boolean;
   verdictCommentPending?: boolean;
-  /** GitHub retry budget left in the current delivery, so a restart resumes rather than renews it. */
-  githubBudget?: { key: string; leftMs: number; activeSince?: number };
   phase: Phase;
   worktreePath?: string;
   gatesConfig?: GateConfig;
