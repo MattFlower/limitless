@@ -1,9 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CaseFile } from "../src/evals/cases.ts";
+import { trustedConfigPath } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import type { Triage } from "../src/pipeline/schemas.ts";
@@ -74,6 +75,8 @@ export async function evalFixture(
   const cache = join(cfg.paths.repos, "fixture__repo.git");
   mkdirSync(cfg.paths.repos, { recursive: true });
   await git(["clone", "--bare", source, cache]);
+  // As if the factory cloned it: its fresh config is the cache's trusted copy.
+  copyFileSync(join(cache, "config"), trustedConfigPath(cache));
   const dataset: CaseFile = {
     role: "triage",
     version: 1,

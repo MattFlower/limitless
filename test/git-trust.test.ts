@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -10,8 +10,19 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Repo } from "../src/core/types.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
-import { commitAll, diffSince, discardChanges, headSha, resetTo } from "../src/git/repos.ts";
+import {
+  commitAll,
+  createWorktree,
+  diffSince,
+  discardChanges,
+  ensureCache,
+  fetchBase,
+  headSha,
+  resetTo,
+  trustedConfigPath,
+} from "../src/git/repos.ts";
 import {
   captureTrust,
   forgetCheckout,
@@ -188,4 +199,74 @@ test("restoration replaces a redirected .git file and fails on missing trusted s
   rmSync(join(home, "repo", ".git"), { recursive: true });
   writeFileSync(join(home, "repo", ".git"), `gitdir: ${join(home, "elsewhere")}\n`);
   await expect(restoreTrust(join(home, "repo"), standalone)).rejects.toThrow("was replaced");
+});
+
+test("a trusted per-worktree config survives restoration", async () => {
+  const cwd = await checkout("linked");
+  await run(cwd, "config", "extensions.worktreeConfig", "true");
+  await run(cwd, "config", "--worktree", "remote.origin.pushurl", "no-push://factory");
+  const trust = await captureTrust(cwd, false);
+  await run(cwd, "config", "--worktree", "remote.origin.pushurl", "https://example.invalid/evil.git");
+  for (let i = 0; i < 2; i++) await restoreTrust(cwd, trust);
+  expect((await run(cwd, "config", "--get", "remote.origin.pushurl")).stdout.trim()).toBe(
+    "no-push://factory",
+  );
+});
+
+describe("shared GitHub cache", () => {
+  const setup = async () => {
+    const origin = await repo();
+    const paths = {
+      home,
+      db: "",
+      repos: join(home, "repos"),
+      work: join(home, "work"),
+      runs: "",
+      configDir: "",
+    };
+    const github: Repo = {
+      id: "r",
+      slug: "o/repo",
+      kind: "github",
+      url: origin,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+      createdAt: 0,
+    };
+    const cache = await ensureCache(paths, github);
+    // Upload-pack runs on every fetch, so a hostile one shows whether the cache's config was used.
+    const hostile = `touch ${marker("uploadpack")}; git-upload-pack`;
+    const uploadpack = async () =>
+      (
+        await run(cache, "config", "--get", "remote.origin.uploadpack").catch(() => ({ stdout: "" }))
+      ).stdout.trim();
+    return { paths, github, cache, hostile, uploadpack };
+  };
+
+  test("fetches restore the trusted config an agent changed through its worktree", async () => {
+    const { paths, github, cache, hostile, uploadpack } = await setup();
+    const wt = await createWorktree(paths, github, "run1", "t", "main");
+    if (!wt.trust) throw new Error("fresh worktree lacks trust");
+    trustCheckout(wt.path, wt.trust);
+    await run(wt.path, "config", "remote.origin.uploadpack", hostile);
+    expect(await fetchBase(paths, github, "main")).toHaveLength(40);
+    expect(await uploadpack()).toBe("");
+    expect(readdirSync(join(cache, "hooks"))).toEqual([]);
+    expect(markers()).toEqual([]);
+    forgetCheckout(wt.path);
+  });
+
+  test("an existing cache without a trusted copy is rebuilt, never adopted", async () => {
+    const { paths, github, cache, hostile, uploadpack } = await setup();
+    rmSync(trustedConfigPath(cache));
+    await run(cache, "config", "remote.origin.uploadpack", hostile);
+    await ensureCache(paths, github);
+    expect(await uploadpack()).toBe("");
+    expect(readFileSync(trustedConfigPath(cache), "utf8")).not.toContain("uploadpack");
+    const get = async (key: string) => (await run(cache, "config", "--get", key)).stdout.trim();
+    expect(await get("remote.origin.url")).toBe(github.url as string);
+    expect(await get("remote.origin.pushurl")).toStartWith("no-push://");
+    expect(markers()).toEqual([]);
+  });
 });

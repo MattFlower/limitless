@@ -241,7 +241,9 @@ detection, per-invocation budget, process-group kill on cancel.
   hooks, fsmonitor, external diffs and attribute files are overridden on every call, and before
   staging, cleaning, auditing or pushing the config captured at prepare (`runs/<run-id>/git-trust.json`;
   the cache's own copy in `repos/<name>.git.trusted-config`) is restored, factory-owned hooks and
-  info/attributes are emptied, and skip-worktree/assume-unchanged bits are cleared.
+  info/attributes are emptied, and skip-worktree/assume-unchanged bits are cleared. Cache operations
+  (fetch, worktree add, eval staging) restore the cache's copy first; a cache without one gets its
+  config rebuilt from the repo's URL rather than adopting the live file.
 - Agents run with the CLIs' own sandboxes (Seatbelt on macOS) where they're compatible with the
   repo's toolchain; secrets for Discord/GitHub/OpenRouter are scrubbed from agent environments.
 - Triggers are **allowlisted** (your GitHub login, `dependabot[bot]`, your Discord user id).

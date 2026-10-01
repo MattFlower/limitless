@@ -2089,6 +2089,44 @@ esac
     expect(f.store.getArtifact(run.id, "report.md")).toContain("post-merge gates");
   });
 
+  test("post-merge cleanup restores metadata a post-merge gate tampered with", async () => {
+    const leak = join(home, "post-merge-filter-ran");
+    // On the merged tree only: hide an edit behind skip-worktree and a clean filter, then regress.
+    const tamper = [
+      "test ! -f base.txt || { echo BAD > farewell.txt && git update-index --skip-worktree farewell.txt",
+      `git config filter.leak.clean "sh -c 'touch ${leak}; cat'"`,
+      `echo '* filter=leak' > "$(git rev-parse --git-common-dir)/info/attributes"; exit 1; }`,
+    ].join(" && ");
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "check", run = ${JSON.stringify(tamper)} }]\n`,
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "tamper gate"], {
+      cwd: repoDir,
+    });
+    const bare = await githubFixture();
+    let cwd = "";
+    const f = start(async (s): Promise<FakeReply> => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        cwd = s.cwd;
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      if (role === "verify" || role === "spec" || role === "holdout") throw new Error(`unexpected ${role}`);
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add a farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+    expect(f.store.getArtifact(run.id, "report.md")).toContain("post-merge gates");
+    expect(existsSync(leak)).toBe(false);
+    expect(readFileSync(join(cwd, "farewell.txt"), "utf8")).toBe("goodbye\n");
+    expect((await sh(["git", "ls-files", "-v", "farewell.txt"], { cwd })).stdout).toStartWith("H ");
+  });
+
   for (const fault of [
     "missing",
     "single-parent",

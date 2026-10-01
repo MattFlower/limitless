@@ -22,7 +22,7 @@ import {
   retryRegressions,
   runGates,
 } from "../gates/run.ts";
-import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
+import { completeMerge, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
   commitAll,
   createPullRequest,
@@ -1675,8 +1675,7 @@ async function mergeForDelivery(
   }
   if ((await headSha(cwd)) === before) await completeMerge(cwd, before, fetched);
   await validateMerge(cwd, before, fetched);
-  await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
-  await mergeGit(cwd, ["clean", "-fdq"]);
+  await resetTo(cwd, "HEAD");
   const previous = ctx.state.preRebaseGates ?? [];
   try {
     await ctx.stage(
@@ -1684,8 +1683,8 @@ async function mergeForDelivery(
       async () => {
         const after = await runGates(cwd, ctx.state.gatesConfig as GateConfig, ctx.signal, gateEvents(ctx));
         ctx.checkCancelled();
-        await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
-        await mergeGit(cwd, ["clean", "-fdq"]);
+        // Gates ran repository code: restore metadata so filters or index flags cannot skew the reset.
+        await resetTo(cwd, "HEAD");
         // A check fixed by the implementation must stay fixed after merging, even when
         // it failed on the original base. Persist that regression in the evidence too.
         const comparison = compareGates(
@@ -1713,8 +1712,7 @@ async function mergeForDelivery(
     );
   } catch (error) {
     if (!(error instanceof MergeRegressedError)) throw error;
-    await mergeGit(cwd, ["reset", "--hard", before]);
-    await mergeGit(cwd, ["clean", "-fdq"]);
+    await resetTo(cwd, before);
     ctx.state.lastGates = previous;
     ctx.state.pendingRebaseSha = undefined;
     ctx.state.preRebaseGates = undefined;

@@ -1,5 +1,13 @@
-import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
@@ -11,6 +19,7 @@ import {
   git,
   RAW_DIFF,
   restoreCheckout,
+  restoreOwned,
   trustCheckout,
 } from "./trust.ts";
 
@@ -206,23 +215,46 @@ export async function ensureCache(paths: Paths, repo: Repo, signal?: AbortSignal
           cwd: tmp,
           signal,
         });
+        // The factory's own fresh clone is the trusted baseline for this cache's config.
+        copyFileSync(join(tmp, "config"), trustedConfigPath(cache));
         renameSync(tmp, cache);
       } finally {
         rmSync(tmp, { recursive: true, force: true });
       }
     }
-    // Agents can write this shared config from their worktrees: start from the factory's last copy.
-    const trusted = trustedConfigPath(cache);
-    if (existsSync(trusted)) {
-      rmSync(join(cache, "config"), { recursive: true, force: true });
-      copyFileSync(trusted, join(cache, "config"));
-    }
+    await restoreCache(cache, repo.url as string);
     // Agents run inside worktrees of this repo; make any push attempt from them fail.
     await git(["config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
-    copyFileSync(join(cache, "config"), trusted);
+    copyFileSync(join(cache, "config"), trustedConfigPath(cache));
     await git(["fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
     return cache;
   });
+}
+
+/**
+ * Agents can write a GitHub cache's config, hooks and info/attributes through their worktrees: put
+ * the factory's back before any cache operation (under the repo lock). An existing cache without a
+ * trusted copy (e.g. one cloned by an older release) gets its config rebuilt from the factory's
+ * inputs, never adopted from the live file.
+ */
+async function restoreCache(cache: string, url: string): Promise<void> {
+  const trusted = trustedConfigPath(cache);
+  if (!existsSync(trusted)) {
+    const tmp = `${cache}.config-${process.pid}-${Date.now()}`;
+    try {
+      await git(["init", "-q", "--bare", tmp], { cwd: dirname(cache) });
+      for (const [key, value] of [
+        ["remote.origin.url", url],
+        ["remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+        ["remote.origin.pushurl", NO_PUSH],
+      ] as const)
+        await git(["config", "-f", join(tmp, "config"), key, value], { cwd: tmp });
+      copyFileSync(join(tmp, "config"), trusted);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+  restoreOwned(cache, readFileSync(trusted, "utf8"));
 }
 
 export interface Worktree {
@@ -251,6 +283,7 @@ export async function createWorktree(
     return { path, branch, baseSha: base.stdout.trim() || head.stdout.trim() };
   }
   return withRepoLock(cache, async () => {
+    if (repo.kind === "github") await restoreCache(cache, repo.url as string);
     const base = await git(["rev-parse", baseRef], { cwd: cache });
     await git(["worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
     // A user's local repository keeps its own hooks, attributes and config; GitHub caches are ours.
@@ -283,6 +316,7 @@ export async function fetchBase(
   const cache = cachePath(paths, repo);
   return withRepoLock(cache, async () => {
     const ref = `refs/heads/${branch}`;
+    if (repo.kind === "github") await restoreCache(cache, repo.url as string);
     await remoteGit(["fetch", "origin", `+${ref}:refs/remotes/origin/${branch}`], {
       cwd: cache,
       timeoutMs: 300_000,
@@ -662,6 +696,7 @@ export async function pinnedTree(paths: Paths, store: Store, slug: string, sha: 
   const cache = cachePath(paths, repo);
   if (!existsSync(cache)) await ensureCache(paths, repo);
   return withRepoLock(cache, async () => {
+    await restoreCache(cache, repo.url as string);
     const bare = await git(["rev-parse", "--is-bare-repository"], { cwd: cache });
     if (bare.stdout.trim() !== "true") throw new Error(`eval repository cache is not bare: ${cache}`);
     const check = () => git(["cat-file", "-e", `${sha}^{commit}`], { cwd: cache, allowFail: true });
@@ -766,6 +801,7 @@ async function stageEvalRepo(
   let pins: [string, string] = [base, head];
   await withRepoLock(cache, async () => {
     signal.throwIfAborted();
+    await restoreCache(cache, repo.url as string);
     const opts = { cwd: cache, signal };
     const bare = await git(["rev-parse", "--is-bare-repository"], opts);
     if (bare.stdout.trim() !== "true") throw new Error(`eval repository cache is not bare: ${cache}`);

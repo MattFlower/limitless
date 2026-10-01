@@ -29,6 +29,8 @@ export interface GitTrust {
   dotGit: string | null;
   commondir: string | null;
   config: string;
+  /** A linked worktree's own `config.worktree` (null when absent), effective with extensions.worktreeConfig. */
+  configWorktree: string | null;
   /** A factory-maintained copy of a shared cache's config, read at restore time instead of `config`. */
   sharedConfig?: string;
   attributes: string | null;
@@ -54,6 +56,14 @@ function put(path: string, content: string | null) {
   writeFileSync(path, content);
 }
 
+/** Reset a factory-owned repository's config, and empty its hooks and info/attributes. */
+export function restoreOwned(commonDir: string, config: string): void {
+  put(join(commonDir, "config"), config);
+  put(join(commonDir, "info", "attributes"), null);
+  rmSync(join(commonDir, "hooks"), { recursive: true, force: true });
+  mkdirSync(join(commonDir, "hooks"));
+}
+
 export async function captureTrust(cwd: string, owned: boolean, sharedConfig?: string): Promise<GitTrust> {
   const rev = async (flag: string) =>
     realpathSync(resolve(cwd, (await git(["rev-parse", flag], { cwd })).stdout.trim()));
@@ -68,6 +78,7 @@ export async function captureTrust(cwd: string, owned: boolean, sharedConfig?: s
     dotGit: linked ? read(join(cwd, ".git")) : null,
     commondir: linked ? read(join(gitDir, "commondir")) : null,
     config,
+    configWorktree: read(join(gitDir, "config.worktree")),
     ...(sharedConfig ? { sharedConfig } : {}),
     attributes: owned ? null : read(join(commonDir, "info", "attributes")),
     owned,
@@ -90,12 +101,11 @@ export async function restoreTrust(cwd: string, trust: GitTrust, signal?: AbortS
   }
   const config = trust.sharedConfig ? read(trust.sharedConfig) : trust.config;
   if (config === null) throw new Error(`trusted git config missing: ${trust.sharedConfig}`);
-  put(join(trust.commonDir, "config"), config);
-  rmSync(join(trust.gitDir, "config.worktree"), { recursive: true, force: true });
-  put(join(trust.commonDir, "info", "attributes"), trust.attributes);
-  if (trust.owned) {
-    rmSync(join(trust.commonDir, "hooks"), { recursive: true, force: true });
-    mkdirSync(join(trust.commonDir, "hooks"));
+  put(join(trust.gitDir, "config.worktree"), trust.configWorktree);
+  if (trust.owned) restoreOwned(trust.commonDir, config);
+  else {
+    put(join(trust.commonDir, "config"), config);
+    put(join(trust.commonDir, "info", "attributes"), trust.attributes);
   }
   const entries = (await git(["ls-files", "-v", "-z"], { cwd, signal })).stdout.split("\0").filter(Boolean);
   // Lowercase tags are assume-unchanged, S/s skip-worktree. update-index honours only one such flag per call.
@@ -139,6 +149,7 @@ export function loadTrust(file: string): GitTrust | Error {
     const trust = JSON.parse(text) as GitTrust;
     if (
       typeof trust.config !== "string" ||
+      !(typeof trust.configWorktree === "string" || trust.configWorktree === null) ||
       typeof trust.gitDir !== "string" ||
       typeof trust.commonDir !== "string"
     )

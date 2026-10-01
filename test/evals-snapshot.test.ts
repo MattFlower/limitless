@@ -1,8 +1,17 @@
 import { expect, setDefaultTimeout, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { ImplementCase, ReviewCase } from "../src/evals/cases.ts";
-import { createEvalWorktree } from "../src/git/repos.ts";
+import { createEvalWorktree, trustedConfigPath } from "../src/git/repos.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
@@ -400,9 +409,9 @@ for (const snapshot of [false, true])
     const f = await evalFixture();
     try {
       // A second local cache, so the failed fetch never reaches the network.
-      await sh(["git", "clone", "-q", "--bare", f.source, join(f.cfg.paths.repos, "fixture__other.git")], {
-        cwd: f.home,
-      });
+      const other = join(f.cfg.paths.repos, "fixture__other.git");
+      await sh(["git", "clone", "-q", "--bare", f.source, other], { cwd: f.home });
+      copyFileSync(join(other, "config"), trustedConfigPath(other));
       const missing = "f".repeat(40);
       f.dataset.repos["fixture/other"] = missing;
       f.dataset.cases = f.dataset.cases.map((item) => ({
