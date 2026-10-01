@@ -49,12 +49,14 @@ export interface GateHooks {
 
 const OUTPUT_TAIL = 6_000;
 
+/** Gates execute code the agent wrote; give them the same scrubbed environment as agents. */
+export const gateEnv = (): Record<string, string> => agentEnv({ CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" });
+
 async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promise<GateResult> {
   const res = await runProcess({
     cmd: ["/bin/sh", "-c", cmd.run],
     cwd,
-    // Gates execute code the agent wrote; give them the same scrubbed environment as agents.
-    env: agentEnv({ CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" }),
+    env: gateEnv(),
     signal,
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
   });

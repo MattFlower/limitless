@@ -113,6 +113,7 @@ export class Factory {
       cfg,
       faults: opts.faults,
       store: this.store,
+      buildSha: opts.bootSha,
       router: this.router,
       tracker: this.tracker,
       harnesses: opts.harnesses ?? {
@@ -245,6 +246,7 @@ export class Factory {
         ...(run.baseBranch ? { baseBranch: run.baseBranch } : {}),
         ...(run.deliveryBranch ? { deliveryBranch: run.deliveryBranch } : {}),
         ...(run.requestedBy ? { requestedBy: run.requestedBy } : {}),
+        ...(run.noBaselineCache ? { noBaselineCache: true } : {}),
       },
       run.githubWebhookVerified,
     );
