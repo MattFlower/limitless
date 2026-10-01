@@ -98,8 +98,12 @@ async function untrackedState(cwd: string, env: Record<string, string>, since: b
       state.set(path, `${meta}:${hash.digest("hex")}`);
     }
   };
-  const out = await sh(["git", "ls-files", "-z", "-o"], { cwd, env });
-  for (const path of out.stdout.split("\0").filter(Boolean)) visit(path.replace(/\/$/, ""));
+  const others = await sh(["git", "ls-files", "-z", "-o"], { cwd, env });
+  for (const path of others.stdout.split("\0").filter(Boolean)) visit(path.replace(/\/$/, ""));
+  // A nested repository is a gitlink: git lists nothing inside it, so walk it like untracked files.
+  const staged = await sh(["git", "ls-files", "-z", "-s"], { cwd, env });
+  for (const entry of staged.stdout.split("\0"))
+    if (entry.startsWith("160000 ")) visit(entry.slice(entry.indexOf("\t") + 1));
   return state;
 }
 /** Content digest of a tree, held in memory so candidate code cannot rewrite the expected value. */
@@ -140,25 +144,45 @@ async function restoreCandidate(
   before: Map<string, string>,
   since: bigint,
 ) {
-  // The candidate's index flags (skip-worktree, assume-unchanged) and sparse or fsmonitor config
-  // would let reset leave modified tracked files alone. Clearing just the flags keeps stat data, so
-  // reset rewrites (and smudges) only files that actually changed.
-  const config = ["core.hooksPath=/dev/null", "core.sparseCheckout=false", "core.fsmonitor=false"];
-  const git = ["git", ...config.flatMap((c) => ["-c", c])];
-  const flagged = (await sh([...git, "ls-files", "-v", "-z"], { cwd, env })).stdout
-    .split("\0")
-    .filter((entry) => /^([a-z]|S) /.test(entry))
-    .map((entry) => entry.slice(2));
-  // update-index applies only the last of several flag options, so clear each separately.
-  for (const flag of ["--no-skip-worktree", "--no-assume-unchanged"])
-    if (flagged.length) await sh([...git, "update-index", flag, "--", ...flagged], { cwd, env });
-  await sh([...git, "reset", "--hard", "-q", commit], { cwd, env });
-  await sh(["git", "clean", "-fdq"], { cwd, env });
-  const root = realpathSync(cwd);
-  for (const [path, fingerprint] of await untrackedState(cwd, env, since))
-    if (before.get(path) !== fingerprint) removeWithin(root, path);
-  for (const [path, fingerprint] of await untrackedState(cwd, env, since))
-    if (before.get(path) !== fingerprint) throw new Error(`Grading artifact remains: ${path}`);
+  // The candidate's .git/config, hooks, info/attributes and index flags are its code: a smudge
+  // filter could copy hidden tests into a tracked file during reset while its clean filter keeps
+  // status clean, and skip-worktree would keep reset away from a file. Restore through a fresh
+  // repository that only borrows the candidate's (already restored) objects, so no candidate
+  // configuration is read and no candidate command runs; in-tree .gitattributes name drivers that
+  // this repository doesn't define.
+  const dir = createScratch(cwd);
+  try {
+    const git = {
+      cwd,
+      env: {
+        ...env,
+        GIT_DIR: join(dir, ".git"),
+        GIT_WORK_TREE: cwd,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+      },
+    };
+    await sh(["git", "init", "-q"], git);
+    writeFileSync(join(dir, ".git/objects/info/alternates"), `${join(cwd, ".git/objects")}\n`);
+    // Refreshing a fresh index hashes every tracked file, so reset rewrites only those whose
+    // content differs from the commit and leaves the candidate's own modes and times alone.
+    await sh(["git", "read-tree", commit], git);
+    await sh(["git", "update-index", "-q", "--refresh"], { ...git, allowFail: true });
+    await sh(["git", "reset", "--hard", "-q", commit], git);
+    await sh(["git", "clean", "-fdq"], git);
+    const root = realpathSync(cwd);
+    for (const [path, fingerprint] of await untrackedState(cwd, git.env, since))
+      if (before.get(path) !== fingerprint) removeWithin(root, path);
+    // A freshly read index carries no stat data, so the diff compares every tracked file by content.
+    await sh(["git", "read-tree", commit], git);
+    const diff = ["diff", "--quiet", "--no-ext-diff", "--ignore-submodules=all", commit, "--"];
+    if ((await sh(["git", ...diff], { ...git, allowFail: true })).exitCode !== 0)
+      throw new Error("Tracked files differ from the commit after restoration");
+    for (const [path, fingerprint] of await untrackedState(cwd, git.env, since))
+      if (before.get(path) !== fingerprint) throw new Error(`Grading artifact remains: ${path}`);
+  } finally {
+    removeScratch(dir);
+  }
 }
 
 export function failedImplement(reason: "timeout" | "error", error?: string): EvalGrade {

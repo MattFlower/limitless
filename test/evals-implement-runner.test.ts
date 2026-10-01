@@ -1523,8 +1523,9 @@ for (const [outcome, reason] of [
       const t = (await f.run()).trials[0];
       expect(t?.details.grade?.implement?.reason).toBe(reason);
       const dirs = allocated.mock.results.map((r) => String(r.value));
-      // The harness scratch, the .git backup, the grading checkout and, once injection succeeded, the hidden scratch.
-      expect(dirs).toHaveLength(outcome === "injection" ? 3 : 4);
+      // The harness scratch, the .git backup, the grading checkout, the hidden scratch once injection
+      // succeeded, and the restore repository.
+      expect(dirs).toHaveLength(outcome === "injection" ? 4 : 5);
       expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
     } finally {
       allocated.mockRestore();
@@ -1567,7 +1568,7 @@ test("hidden files written into the .git backup never reach the candidate reposi
   }
 });
 for (const rounds of [1, 2])
-  test(`a committed Bun preload leaves no hidden copies in the worktree, Git or scratch (rounds=${rounds})`, async () => {
+  test(`a committed Bun preload leaves no hidden copies in the worktree, Git, filters or scratch (rounds=${rounds})`, async () => {
     const f = await fixture();
     try {
       const oid = (await sh(["git", "hash-object", "hidden/check.sh"], { cwd: f.hiddenDir })).stdout.trim();
@@ -1575,12 +1576,21 @@ for (const rounds of [1, 2])
       f.save();
       f.respond((s): FakeReply => {
         if (f.calls.length === 1) {
-          // A skip-worktree flag would make reset --hard keep the hidden copy the preload writes here.
-          const flag = ["git", "update-index", "--skip-worktree", "overwrite"];
-          expect(Bun.spawnSync(flag, { cwd: s.cwd }).exitCode).toBe(0);
+          // A skip-worktree flag would make reset --hard keep the hidden copy the preload writes here,
+          // and a smudge filter would rewrite the restored tracked file from an untracked copy while
+          // its clean filter keeps git status clean. A nested repository is only a gitlink to git.
+          for (const args of [
+            ["update-index", "--skip-worktree", "overwrite"],
+            ["config", "filter.steal.smudge", `cat ${join(s.cwd, "stolen/check.sh")}`],
+            ["config", "filter.steal.clean", "printf original"],
+            ["init", "-q", "nested"],
+            ["-C", "nested", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-qm", "nested", "--allow-empty"],
+          ])
+            expect(Bun.spawnSync(["git", ...args], { cwd: s.cwd }).exitCode).toBe(0);
           return {
             files: {
               answer: "wrong",
+              ".gitattributes": "overwrite filter=steal\n",
               ".gitignore": "dist/\n",
               "dist/output": "built",
               "bunfig.toml": '[test]\npreload=["./steal.ts"]\n',
@@ -1589,7 +1599,7 @@ for (const rounds of [1, 2])
               "steal.ts": `import { cpSync, existsSync, readFileSync } from "node:fs";
           if (existsSync("hidden")) {
             const cwd = ${JSON.stringify(s.cwd)};
-            for (const dest of ${JSON.stringify([join(s.cwd, "stolen"), join(s.cwd, ".git/stolen"), join(s.cwd, "dist/stolen"), join(s.scratchDir ?? "", "stolen")])}) cpSync("hidden", dest, { recursive: true });
+            for (const dest of ${JSON.stringify([join(s.cwd, "stolen"), join(s.cwd, ".git/stolen"), join(s.cwd, "dist/stolen"), join(s.cwd, "nested/stolen"), join(s.scratchDir ?? "", "stolen")])}) cpSync("hidden", dest, { recursive: true });
             const git = (...args) => { const result = Bun.spawnSync(["git", "-C", cwd, ...args]); if (result.exitCode) throw new Error(result.stderr.toString()); return result; };
             const object = git("hash-object", "-w", process.cwd() + "/hidden/check.sh").stdout.toString().trim();
             git("update-ref", "refs/stolen", object);
@@ -1601,10 +1611,11 @@ for (const rounds of [1, 2])
             },
           };
         }
-        const paths = ["stolen", ".git/stolen", ".git/refs/stolen", "dist/stolen", "dist/output"];
+        const paths = ["stolen", ".git/stolen", ".git/refs/stolen", "dist/stolen", "dist/output", "nested/stolen"];
+        expect(existsSync(join(s.cwd, "nested/.git"))).toBe(true);
         for (const path of paths) expect(existsSync(join(s.cwd, path))).toBe(false);
         expect(existsSync(join(s.cwd, ".git/objects", oid.slice(0, 2), oid.slice(2)))).toBe(false);
-        expect(readFileSync(join(s.cwd, ".git/config"), "utf8")).not.toContain("stolen");
+        expect(readFileSync(join(s.cwd, ".git/config"), "utf8")).not.toContain("[stolen]");
         expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
         expect(existsSync(f.calls[0]?.scratchDir ?? "")).toBe(false);
         const prior = f.factory.store.listEvalTrials(f.factory.store.listEvalRuns()[0]?.id ?? "")[0];
@@ -1627,7 +1638,7 @@ test("grading removes hidden tests even when candidate code makes checkout direc
     f.save();
     expect((await f.run()).trials[0]?.pass).toBe(true);
     const dirs = allocated.mock.results.map((r) => String(r.value));
-    expect(dirs).toHaveLength(4);
+    expect(dirs).toHaveLength(5);
     expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
   } finally {
     allocated.mockRestore();
