@@ -101,6 +101,7 @@ import {
   VerifySchema,
 } from "./schemas.ts";
 import { createSnapshotParent } from "./snapshots.ts";
+import { specScopeViolation } from "./spec-scope.ts";
 import { triageDecisions } from "./triage-decisions.ts";
 import {
   blockedOnly,
@@ -548,19 +549,30 @@ async function clarify(ctx: RunContext): Promise<void> {
 
 async function spec(ctx: RunContext): Promise<void> {
   await ctx.stage("spec", async (stage) => {
-    const { result, target } = await ctx.invoke({
-      role: "spec",
+    const invocation = {
+      role: "spec" as const,
       stage,
-      mode: "readonly",
+      mode: "readonly" as const,
       complexity: ctx.complexity,
       prompt: specPrompt({ prompt: ctx.run.prompt, answers: ctx.state.answers }),
       jsonSchema: toStrictJsonSchema(SpecSchema),
       schema: SpecSchema,
       requireStructured: true,
       maxToolCalls: 60,
-    });
+    };
+    let { result, target } = await ctx.invoke(invocation);
     await discardChanges(ctx.state.worktreePath as string);
-    const s = SpecSchema.parse(result.structured);
+    let s = SpecSchema.parse(result.structured);
+    const offending = specScopeViolation(s, ctx.run.prompt);
+    if (offending) {
+      const feedback = `\n\nInvalid specification: this sentence restricts the task beyond the request: ${JSON.stringify(offending)}\nThe read-only rule applies to your investigation only. Rewrite the spec to describe the requested change without this restriction.`;
+      ctx.log(feedback.trim(), "warn");
+      ({ result, target } = await ctx.invoke({ ...invocation, prompt: invocation.prompt + feedback }));
+      await discardChanges(ctx.state.worktreePath as string);
+      s = SpecSchema.parse(result.structured);
+      const repeated = specScopeViolation(s, ctx.run.prompt);
+      if (repeated) throw new Error(`structured output failed validation: invalid spec scope: ${repeated}`);
+    }
     ctx.store.putArtifact(ctx.run.id, "spec.md", "spec", `# ${ctx.run.title}\n\n${renderSpec(s)}\n`);
     const unanswered = s.blocking_questions.filter(Boolean);
     if (unanswered.length && ctx.state.answers.length === 0) {

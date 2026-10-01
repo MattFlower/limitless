@@ -62,7 +62,9 @@ export function specPrompt(input: { prompt: string; answers: string[] }): string
   const answers = input.answers.length
     ? `\nThe requester answered earlier clarifying questions:\n${input.answers.map((a) => `- ${a}`).join("\n")}\n`
     : "";
-  return `Write the specification for the task below. Investigate the repository as needed to ground it in the actual code (read files, search) but DO NOT modify anything.
+  return `Write the specification for the task below.
+
+You are only writing the specification; while investigating the repository, read and search but do not edit files. The requested change itself will be implemented later.
 
 Request:
 ${quoteRequest(input.prompt)}
