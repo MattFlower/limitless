@@ -439,14 +439,16 @@ skips them.
 its provider card (Dashboard or **Models** page). The setting persists across restarts. A provider
 whose API key is missing stays disabled.
 
-For the Mac, select `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`). Put `OMLX_API_KEY`
+For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-REAP-288-MLX-4bit`);
+`omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first
+routing among free models the policy does not name, take catalog order, so they use Flash. Put `OMLX_API_KEY`
 in `secrets.env`; inference and health probes authenticate with it. Default concurrency is 4;
 override using `[providers.omlx] max_concurrent = 8` in `config.toml`. Tool-free selections
-`omlx/qwen-27b@none` and `omlx/qwen-27b@high` switch thinking off/on; agentic selections must
+`omlx/qwen-flash@none` and `omlx/qwen-flash@high` switch thinking off/on; agentic selections must
 use the bare ID, preserving server-default thinking. Compare them with:
 
 ```sh
-limitless eval run triage --models omlx/qwen-27b@none,omlx/qwen-27b@high --follow
+limitless eval run triage --models omlx/qwen-flash@none,omlx/qwen-flash@high --follow
 ```
 
 The committed `routing/policy.json` overlay remains authoritative over built-in defaults.

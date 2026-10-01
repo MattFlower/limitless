@@ -243,9 +243,10 @@ const schema = {
   additionalProperties: false,
 };
 
+/** Cheapest first; equal prices keep catalog order (stable sort), as free-first routing does. */
 function modelsByPrice(provider: string): ModelDef[] {
   const models = MODELS.filter((m) => m.provider === provider).sort(
-    (a, b) => a.price.input + a.price.output - b.price.input - b.price.output || a.id.localeCompare(b.id),
+    (a, b) => a.price.input + a.price.output - b.price.input - b.price.output,
   );
   if (models.length === 0) throw new Error(`no catalog model for ${provider}`);
   return models;

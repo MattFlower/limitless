@@ -7,7 +7,7 @@ How the factory runs day to day, where to look when something breaks, and how ch
 | Component | Where | Managed by | Logs |
 |---|---|---|---|
 | Daemon (API, UI, scheduler, pipeline) | Mac, `~/.limitless/app` (release checkout of `main`) | launchd `cc.mattflower.limitless` | `~/.limitless/logs/cc.mattflower.limitless.log` |
-| Local model (Swift-1.5 Qwen3.8 27B MTP) | Mac, `127.0.0.1:8989` | external: oMLX.app / `omlx start` | oMLX server logs |
+| Local model (Qwen3.8 Flash Next; Swift-1.5 27B opt-in) | Mac, `127.0.0.1:8989` | external: oMLX.app / `omlx start` | oMLX server logs |
 | GPU model (Qwen 3.8 27B, CUDA llama.cpp) | twilight, `:8080` (LAN, API key) | systemd user unit `limitless-llama` (linger on) | `journalctl --user -u limitless-llama` on twilight |
 | Public webhook tunnel | Cloudflare → `limitless.mattflower.cc/webhooks/*` | launchd `cc.mattflower.limitless-tunnel` (opt-in) | `~/.limitless/logs/cc.mattflower.limitless-tunnel.log` |
 | Data | `~/.limitless/` — `limitless.db`, `repos/` (bare caches), `work/` (worktrees), `runs/<id>/inv-*.log` (raw agent streams) | the daemon | — |
@@ -113,10 +113,11 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 
 - **Mac (oMLX):** start the server with oMLX.app / `omlx start`; Limitless does not manage it.
   Put `OMLX_API_KEY` in `~/.config/limitless/secrets.env` (used by both inference transports and
-  health probes). Select `omlx/qwen-27b`, backend `Swift-1.5-Qwen3.8-27b-oQ8e-mtp`.
+  health probes). The default is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-REAP-288-MLX-4bit`);
+  `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in and needs far more memory.
   Limitless allows 4 concurrent requests by default; override with `[providers.omlx]` and
   `max_concurrent = 8` in `config.toml`. This does not tune oMLX's own scheduler.
-  Use `omlx/qwen-27b@none` or `@high` for tool-free roles (thinking off/on); bare selections
+  Use `omlx/qwen-flash@none` or `@high` for tool-free roles (thinking off/on); bare selections
   preserve server-default thinking and are required for agentic roles such as review/verify.
   Built-in triage/summarize/chat prefer oMLX, but the committed `routing/policy.json` overlay
   remains authoritative where present until replaced by eval-backed policy.
@@ -149,7 +150,7 @@ Evaluations run in the daemon using its catalog, harness adapters, pipeline role
 provider tracker. Start the daemon first; the CLI only submits and reads HTTP requests:
 
 ```sh
-limitless eval run triage --models omlx/qwen-27b@none,omlx/qwen-27b@high,claude/haiku --k 2 --max-usd 1 --follow
+limitless eval run triage --models omlx/qwen-flash@none,omlx/qwen-flash@high,claude/haiku --k 2 --max-usd 1 --follow
 limitless eval run triage --models claude/haiku --cases triage-001,triage-002 --no-cache
 limitless eval run review --models openrouter/gpt-6-luna --follow
 limitless eval run review --systems systems.json --follow   # {"systems": [{name, mode: "single", finders: [{target, prompt: "standard"}], implementerReport}]}
