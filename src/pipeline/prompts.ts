@@ -73,6 +73,7 @@ Produce:
 - summary: what will be built and why, in 2–4 sentences.
 - requirements: precise, implementation-relevant requirements.
 - acceptance_criteria: 2–8 observable, independently testable criteria (ids AC-1, AC-2, ...). Each needs a concrete how_to_verify (a command to run, a test to add, a behavior to observe). Cover edge cases the requester would expect, not just the happy path. Do not write criteria that only restate the repository's automated checks (lint, typecheck, the whole test suite): the factory runs those on every round. A criterion may require a specific new test to exist and pass.
+  Every acceptance criterion must be verifiable inside the run's own checkout using the repository's commands and tests. Criteria requiring a person, the orchestrator, a browser, live external services, a deploy, or a later event are not allowed. Put such concerns under assumptions or out_of_scope.
 - assumptions: decisions you made where the request was silent.
 - out_of_scope: tempting things that should NOT be done.
 - blocking_questions: only if the task truly cannot proceed sensibly without an answer; otherwise empty.
