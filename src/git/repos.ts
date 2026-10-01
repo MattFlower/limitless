@@ -12,7 +12,7 @@ export const githubRetry = { attempts: 3, budgetMs: 60_000, baseDelayMs: 5_000 }
 /**
  * In-memory GitHub time shared by every call in one delivery attempt. It only drains while a
  * remote command or a backoff pause runs, so local work in between never eats into it. It bounds
- * retry decisions and waits, never a started call, which keeps its own timeout.
+ * retries and their waits only: a call's first attempt always runs and keeps its own timeout.
  */
 export interface GitHubBudget {
   leftMs: number;
@@ -67,7 +67,9 @@ export async function withGitHubRetry<T>(
   };
   for (let attempt = 1; ; attempt++) {
     opts.signal?.throwIfAborted();
-    if (budget.leftMs <= 0)
+    // Every call's first attempt runs, as on main: a slow or hung earlier call must not cost later
+    // calls (or the fallbacks) their one try. The budget only decides whether to retry.
+    if (attempt > 1 && budget.leftMs <= 0)
       throw new GitHubUnavailableError("GitHub unavailable: delivery retry budget exhausted");
     try {
       return await charged(call);

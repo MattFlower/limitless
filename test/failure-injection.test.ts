@@ -1718,7 +1718,7 @@ test("GitHub retries classify structured failures and share one abortable deadli
   expect(await slow()).toBe("ok");
   expect(budget.leftMs).toBeLessThanOrEqual(0);
   await expect(failing()).rejects.toBeInstanceOf(GitHubUnavailableError);
-  expect(calls).toBe(3); // once the budget is spent, nothing more starts
+  expect(calls).toBe(4); // a spent budget still allows each call's first attempt, never a retry
   githubRetry.baseDelayMs = 60_000;
   const abort = new AbortController();
   setTimeout(() => abort.abort(), 20);
@@ -1747,7 +1747,7 @@ test("GitHub retries SSH temporary DNS failures", async () => {
   expect(calls).toBe(2);
 });
 
-test("the budget bounds retries and waits, never a healthy call slower than what is left", async () => {
+test("the budget bounds retries and waits, never a call's first attempt or a healthy slow call", async () => {
   const restore = fakeGh(join(root, "pr"));
   // A healthy push that takes longer than the budget left still completes on its own timeout.
   writeFileSync(join(root, "bin", "git"), `#!/bin/sh\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`, {
@@ -1761,11 +1761,9 @@ test("the budget bounds retries and waits, never a healthy call slower than what
     await pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget);
     expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(1);
     expect(budget.leftMs).toBeLessThan(0);
-    // With the budget spent, no new attempt starts.
-    await expect(pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget)).rejects.toBeInstanceOf(
-      GitHubUnavailableError,
-    );
-    expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(1);
+    // With the budget spent, the next call's first attempt still runs (as on main); only retries stop.
+    await pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget);
+    expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(2);
   } finally {
     await restore();
   }
@@ -1900,14 +1898,17 @@ test("a delivery resumed after a crash and downtime starts a fresh GitHub budget
   const budgetMs = githubRetry.budgetMs;
   githubRetry.budgetMs = 2_000;
   try {
-    // Crash mid-delivery, just after its first remote call, then stay down past the whole budget.
+    // Crash mid-delivery, after the PR exists but before its URL is saved, then stay down past the
+    // whole budget: the resumed delivery gets a fresh budget and reuses the PR.
     const f = factory({
-      "store:save": { action: "kill", occurrence: 3, when: (c) => c.stage === "deliver" && !c.checkpoint },
+      "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-pr-created" },
     });
     const repo = githubRun(f);
     const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
     f.scheduler.start();
     await settled(f, r.id);
+    expect(f.store.getRun(r.id)?.status).toBe("running");
+    expect(f.store.getRun(r.id)?.prUrl).toBeNull();
     await f.stop();
     await Bun.sleep(githubRetry.budgetMs + 500);
     const next = await reopen(f);
