@@ -14,6 +14,15 @@ import { join } from "node:path";
 import { Factory, type FactoryOptions } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
+import {
+  createPullRequest,
+  GitHubUnavailableError,
+  githubRetry,
+  isTransient,
+  mergePullRequest,
+  pushBranch,
+  withGitHubRetry,
+} from "../src/git/repos.ts";
 import { CodexReaderProbe, runCodex } from "../src/harness/codex.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
@@ -26,11 +35,12 @@ import {
   untilAborted,
 } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
-import { type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
+import { CommandError, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
 import { findingEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
+githubRetry.baseDelayMs = 10;
 
 const providers: ProviderDef[] = ["a", "b"].map((id) => ({
   id,
@@ -826,7 +836,24 @@ function fakeGh(pr: string) {
   mkdirSync(bin);
   writeFileSync(
     join(bin, "gh"),
-    `#!${process.execPath}\nimport {existsSync,readFileSync,writeFileSync} from "node:fs";\nconst file=${JSON.stringify(pr)};\nif(process.argv[3]==="list" && existsSync(file)) { const url=readFileSync(file,"utf8"); console.log(process.argv.includes("--jq") ? url : JSON.stringify([{state:"OPEN",url}])); }\nif(process.argv[3]==="create") { if(existsSync(file)) process.exit(9); writeFileSync(file,"https://github.com/test/repo/pull/1"); console.log(readFileSync(file,"utf8")); }\n`,
+    // `${pr}.fail` queues scripted failures: {on, err?, landed?, hang?, delay?} (no err: succeed with
+    // no output; hang: never exit, so the caller's command timeout fires; delay: ms before acting).
+    `#!${process.execPath}
+import {appendFileSync,existsSync,readFileSync,writeFileSync} from "node:fs";
+const file=${JSON.stringify(pr)}, cmd=process.argv.slice(2).join(" "), state=()=>existsSync(file+".merged")?"MERGED":"OPEN";
+appendFileSync(file+".calls",cmd+"\\n");
+const q=existsSync(file+".fail")?JSON.parse(readFileSync(file+".fail","utf8")):[];
+const fail=q[0]&&cmd.startsWith(q[0].on)?q.shift():null;
+writeFileSync(file+".fail",JSON.stringify(q));
+if(fail?.delay) await Bun.sleep(fail.delay);
+const out=fail?()=>{}:console.log, end=()=>{ if(fail?.hang){setInterval(()=>{},1e6);return;} if(fail?.err){console.error(fail.err);process.exit(1);} };
+if(fail&&!fail.landed){end();process.exit(0);}
+if(process.argv[3]==="list" && existsSync(file)) { const url=readFileSync(file,"utf8"); out(process.argv.includes("--jq") ? url : JSON.stringify([{state:state(),url}])); }
+if(process.argv[3]==="create") { if(existsSync(file)) {console.error("a pull request for branch already exists");process.exit(9);} writeFileSync(file,"https://github.com/test/repo/pull/1"); out(readFileSync(file,"utf8")); }
+if(process.argv[3]==="merge") writeFileSync(file+".merged","");
+if(process.argv[3]==="view") out(process.argv.includes("--jq") ? state() : JSON.stringify({state:state(),url:readFileSync(file,"utf8")}));
+end();
+`,
     { mode: 0o755 },
   );
   writeFileSync(
@@ -1410,6 +1437,23 @@ test("verify-change reconciles a posted verification comment after its save is l
   history(next, run.id);
 });
 
+test("verify-change does not post its comment twice when the post lands but answers 502", async () => {
+  const comments: string[] = [];
+  const f = factory();
+  f.deps.gh = async (args) => {
+    if (args[0] === "api") return comments.join("\n");
+    comments.push(args.at(-1) ?? "");
+    if (comments.length === 1) throw new CommandError("gh failed", 1, "", "HTTP 502: Bad Gateway", false);
+    return "";
+  };
+  const { run } = await externalChange(f);
+  f.scheduler.start();
+  await settled(f, run.id);
+  expect(f.store.getRun(run.id)?.status).toBe("succeeded");
+  expect(comments).toHaveLength(1);
+  expect(comments[0]).toStartWith(`<!-- limitless-verification:${run.id} -->`);
+});
+
 for (const moved of [false, true])
   test(`verify-change repairs reconcile branch push and reject unrelated movement (moved=${moved})`, async () => {
     let reviews = 0;
@@ -1612,6 +1656,273 @@ test("Factory stop waits for its active health probe before database replacement
   }
   const next = await reopen(f);
   expect(next.scheduler.activeRunIds).toEqual([]);
+});
+
+const ghError = (stderr: string, timedOut = false) => new CommandError("gh failed", 1, "", stderr, timedOut);
+const bad502 = "HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)";
+const ghCalls = (pr: string, prefix: string) =>
+  readFileSync(`${pr}.calls`, "utf8")
+    .split("\n")
+    .filter((c) => c.startsWith(prefix));
+
+test("GitHub retries classify structured failures and share one abortable deadline", async () => {
+  for (const stderr of [
+    bad502,
+    "error connecting to api.github.com",
+    "non-200 OK status code: 503 x",
+    'Post "https://api.github.com/graphql": read tcp 10.0.0.2:5->1.2.3.4:443: read: Connection Reset By Peer',
+    'Get "https://api.github.com/repos/o/r": dial tcp: lookup api.github.com: i/o timeout',
+    "ssh: Could not resolve hostname github.com: nodename nor servname provided, or not known",
+    'Post "https://api.github.com/graphql": net/http: TLS handshake timeout',
+    'Post "https://api.github.com/graphql": EOF',
+    "error: RPC failed; curl 18 transfer closed\nfatal: early EOF",
+    "fatal: unexpected eof",
+  ])
+    expect(isTransient(ghError(stderr))).toBe(true);
+  expect(isTransient(ghError("", true))).toBe(true);
+  expect(isTransient(ghError("HTTP 422: Validation Failed"))).toBe(false);
+  expect(isTransient(ghError("! [rejected] limitless/fix-timeout-502 (stale info)"))).toBe(false);
+  // Branch names echoed in errors never look transient, however they are spelled.
+  for (const branch of ["eof", "i/o-timeout", "connection-reset-by-peer", "tls-handshake-timeout"])
+    expect(isTransient(ghError(`! [rejected] ${branch} -> ${branch} (non-fast-forward)`))).toBe(false);
+  expect(isTransient(new Error(bad502))).toBe(false);
+  // Only the failing call's stderr counts, not what it printed to stdout.
+  expect(isTransient(new CommandError("x", 1, "i/o timeout", "fatal: denied", false))).toBe(false);
+  let calls = 0;
+  const flaky = (errors: CommandError[]) => async () => {
+    calls++;
+    const e = errors.shift();
+    if (e) throw e;
+    return "ok";
+  };
+  expect(await withGitHubRetry(flaky([ghError(bad502), ghError(bad502)]))).toBe("ok");
+  expect(calls).toBe(3);
+  calls = 0;
+  const final = ghError("HTTP 422: Validation Failed");
+  await expect(withGitHubRetry(flaky([final]))).rejects.toBe(final);
+  expect(calls).toBe(1);
+  // 100 ms, then 300 ms of backoff would overrun a 150 ms budget: give up without sleeping past it.
+  githubRetry.baseDelayMs = 100;
+  const budget = { leftMs: 150 };
+  const started = Date.now();
+  calls = 0;
+  const failing = () => withGitHubRetry(flaky(Array(9).fill(ghError(bad502))), { budget });
+  await expect(failing()).rejects.toBeInstanceOf(GitHubUnavailableError);
+  await expect(failing()).rejects.toBeInstanceOf(GitHubUnavailableError);
+  expect(calls).toBe(3); // the second call of the delivery gets no fresh budget: one attempt
+  expect(Date.now() - started).toBeLessThan(250);
+  // Local work between GitHub calls (merging, gates) does not drain the budget; only remote time does.
+  await Bun.sleep(100);
+  expect(budget.leftMs).toBeGreaterThan(0);
+  const slow = () => withGitHubRetry(() => Bun.sleep(budget.leftMs + 5).then(() => "ok"), { budget });
+  expect(await slow()).toBe("ok");
+  expect(budget.leftMs).toBeLessThanOrEqual(0);
+  await expect(failing()).rejects.toBeInstanceOf(GitHubUnavailableError);
+  expect(calls).toBe(4); // a spent budget still allows each call's first attempt, never a retry
+  githubRetry.baseDelayMs = 60_000;
+  const abort = new AbortController();
+  setTimeout(() => abort.abort(), 20);
+  try {
+    await expect(withGitHubRetry(flaky([ghError(bad502)]), { signal: abort.signal })).rejects.toThrow();
+  } finally {
+    githubRetry.baseDelayMs = 10;
+  }
+});
+
+test("GitHub retries SSH temporary DNS failures", async () => {
+  let calls = 0;
+  expect(
+    await withGitHubRetry(async () => {
+      if (++calls === 1)
+        throw new CommandError(
+          "git push failed",
+          128,
+          "",
+          "ssh: Could not resolve hostname github.com: Temporary failure in name resolution",
+          false,
+        );
+      return "pushed";
+    }),
+  ).toBe("pushed");
+  expect(calls).toBe(2);
+});
+
+test("the budget bounds retries and waits, never a call's first attempt or a healthy slow call", async () => {
+  const restore = fakeGh(join(root, "pr"));
+  // A healthy push that takes longer than the budget left still completes on its own timeout.
+  writeFileSync(join(root, "bin", "git"), `#!/bin/sh\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`, {
+    mode: 0o755,
+  });
+  const repo = { kind: "github", url: "https://github.com/test/repo.git" } as Parameters<
+    typeof pushBranch
+  >[0];
+  const budget = { leftMs: 100 };
+  try {
+    await pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget);
+    expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(1);
+    expect(budget.leftMs).toBeLessThan(0);
+    // With the budget spent, the next call's first attempt still runs (as on main); only retries stop.
+    await pushBranch(repo, root, "limitless/x", "HEAD", undefined, budget);
+    expect(readFileSync(join(root, "pushes"), "utf8").trim().split("\n")).toHaveLength(2);
+  } finally {
+    await restore();
+  }
+});
+
+test("PR create reuses a PR hidden by a 502 or reported as existing; 422 is final", async () => {
+  const pr = join(root, "pr");
+  const restore = fakeGh(pr);
+  const opts = { branch: "limitless/x-timeout", base: "main", title: "T", body: "B", cwd: root };
+  const repo = { slug: "test/repo" } as Parameters<typeof createPullRequest>[0];
+  try {
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr create", err: bad502, landed: true }]));
+    expect(await createPullRequest(repo, opts)).toBe("https://github.com/test/repo/pull/1");
+    expect(ghCalls(pr, "pr create")).toHaveLength(1);
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr list" }]));
+    expect(await createPullRequest(repo, opts)).toBe("https://github.com/test/repo/pull/1");
+    expect(ghCalls(pr, "pr create")).toHaveLength(2);
+    expect(ghCalls(pr, "pr edit")).toHaveLength(2);
+    rmSync(pr);
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr list" }, { on: "pr create", err: "HTTP 422: x" }]));
+    await expect(createPullRequest(repo, opts)).rejects.toThrow("HTTP 422");
+    expect(ghCalls(pr, "pr create")).toHaveLength(3);
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr merge", err: bad502, landed: true }]));
+    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "T")).toBe("merged");
+    expect(ghCalls(pr, "pr merge")).toHaveLength(1);
+    // The landed merge is found even though the first state lookup also hit a 502.
+    rmSync(`${pr}.merged`);
+    const lookups = ghCalls(pr, "pr view").length;
+    writeFileSync(
+      `${pr}.fail`,
+      JSON.stringify([
+        { on: "pr merge", err: bad502, landed: true },
+        { on: "pr view", err: bad502 },
+      ]),
+    );
+    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "T")).toBe("merged");
+    expect(ghCalls(pr, "pr merge")).toHaveLength(2);
+    expect(ghCalls(pr, "pr view")).toHaveLength(lookups + 2);
+    // Exhausting the immediate merge still falls back to auto-merge, as on main.
+    rmSync(`${pr}.merged`);
+    writeFileSync(`${pr}.fail`, JSON.stringify(Array(3).fill({ on: "pr merge", err: bad502 })));
+    expect(await mergePullRequest("https://github.com/test/repo/pull/1", root, "T")).toBe("auto");
+    expect(ghCalls(pr, "pr merge").filter((c) => c.includes("--auto"))).toHaveLength(1);
+    // A healthy merge slower than the budget left is not cut off, so it needs no reconciling.
+    rmSync(`${pr}.merged`);
+    const merges = ghCalls(pr, "pr merge").length;
+    const views = ghCalls(pr, "pr view").length;
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr merge", landed: true, delay: 300 }]));
+    const budget = { leftMs: 100 };
+    const url = "https://github.com/test/repo/pull/1";
+    expect(await mergePullRequest(url, root, "T", undefined, budget)).toBe("merged");
+    expect(ghCalls(pr, "pr merge")).toHaveLength(merges + 1);
+    expect(ghCalls(pr, "pr view")).toHaveLength(views);
+  } finally {
+    await restore();
+  }
+});
+
+for (const failures of [2, 3])
+  test(`delivery with ${failures} PR-create 502s ${failures < 3 ? "delivers" : "falls back as GitHub unavailable"}`, async () => {
+    const pr = join(root, "pr");
+    const restore = fakeGh(pr);
+    try {
+      writeFileSync(`${pr}.fail`, JSON.stringify(Array(failures).fill({ on: "pr create", err: bad502 })));
+      const f = factory();
+      const repo = githubRun(f);
+      const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
+      f.scheduler.start();
+      await settled(f, r.id);
+      const run = f.store.getRun(r.id);
+      expect(run?.prUrl).toBe("https://github.com/test/repo/pull/1");
+      expect(ghCalls(pr, "pr create")).toHaveLength(failures + 1);
+      expect(ghCalls(pr, "pr create").some((c) => c.includes("--draft"))).toBe(failures === 3);
+      expect(run?.status).toBe(failures === 3 ? "needs_human" : "succeeded");
+      if (failures === 3) expect(run?.error).toStartWith("GitHub unavailable: ");
+    } finally {
+      await restore();
+    }
+  });
+
+test("PR create retries a lagging lookup after 'already exists', up to twice", async () => {
+  const pr = join(root, "pr");
+  const restore = fakeGh(pr);
+  const opts = { branch: "limitless/x", base: "main", title: "T", body: "B", cwd: root };
+  const repo = { slug: "test/repo" } as Parameters<typeof createPullRequest>[0];
+  try {
+    for (const lagging of [3, 4]) {
+      // The PR exists, so create says so, but the first lookups do not see it yet.
+      writeFileSync(pr, "https://github.com/test/repo/pull/1");
+      writeFileSync(`${pr}.fail`, JSON.stringify(Array(lagging).fill({ on: "pr list" })));
+      const creates = existsSync(`${pr}.calls`) ? ghCalls(pr, "pr create").length : 0;
+      const created = createPullRequest(repo, opts);
+      if (lagging === 3) expect(await created).toBe("https://github.com/test/repo/pull/1");
+      else await expect(created).rejects.toBeInstanceOf(GitHubUnavailableError);
+      expect(ghCalls(pr, "pr create")).toHaveLength(creates + 1);
+    }
+  } finally {
+    await restore();
+  }
+});
+
+test("a fallback after the budget is spent still records a PR that was created", async () => {
+  const pr = join(root, "pr");
+  const restore = fakeGh(pr);
+  const budgetMs = githubRetry.budgetMs;
+  githubRetry.budgetMs = 1_000;
+  try {
+    // The create lands but answers 502 only after the whole budget is gone.
+    writeFileSync(
+      `${pr}.fail`,
+      JSON.stringify([{ on: "pr create", err: bad502, landed: true, delay: 1_200 }]),
+    );
+    const f = factory();
+    const repo = githubRun(f);
+    const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
+    f.scheduler.start();
+    await settled(f, r.id);
+    expect(f.store.getRun(r.id)).toMatchObject({
+      status: "needs_human",
+      prUrl: "https://github.com/test/repo/pull/1",
+    });
+    expect(ghCalls(pr, "pr create")).toHaveLength(1);
+  } finally {
+    githubRetry.budgetMs = budgetMs;
+    await restore();
+  }
+});
+
+test("a delivery resumed after a crash and downtime starts a fresh GitHub budget", async () => {
+  const pr = join(root, "pr");
+  const restore = fakeGh(pr);
+  const budgetMs = githubRetry.budgetMs;
+  githubRetry.budgetMs = 2_000;
+  try {
+    // Crash mid-delivery, after the PR exists but before its URL is saved, then stay down past the
+    // whole budget: the resumed delivery gets a fresh budget and reuses the PR.
+    const f = factory({
+      "store:save": { action: "kill", when: (c) => c.checkpoint === "delivery-pr-created" },
+    });
+    const repo = githubRun(f);
+    const r = f.store.createRun(repo, { repo: repo.slug, prompt: "Change", profile: "standard" });
+    f.scheduler.start();
+    await settled(f, r.id);
+    expect(f.store.getRun(r.id)?.status).toBe("running");
+    expect(f.store.getRun(r.id)?.prUrl).toBeNull();
+    await f.stop();
+    await Bun.sleep(githubRetry.budgetMs + 500);
+    const next = await reopen(f);
+    await settled(next, r.id);
+    expect(next.store.getRun(r.id)).toMatchObject({
+      status: "succeeded",
+      prUrl: "https://github.com/test/repo/pull/1",
+    });
+    expect(ghCalls(pr, "pr create")).toHaveLength(1);
+    history(next, r.id);
+  } finally {
+    githubRetry.budgetMs = budgetMs;
+    await restore();
+  }
 });
 
 test("an invoke deadline bounds slot waits and every fallback, then gives up saying why", async () => {

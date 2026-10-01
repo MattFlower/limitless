@@ -8,6 +8,7 @@ import { loadConfig } from "../src/config.ts";
 import type { RunStatus, StageName } from "../src/core/types.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
+import { githubRetry } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
@@ -1232,6 +1233,39 @@ esac
     expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
     expect(f.store.getRunState<RunState>(run.id)?.pendingRebaseSha).toBeUndefined();
     expect(f.scheduler.parkedRunIds).toEqual([]);
+  });
+
+  test("post-merge gates slower than the GitHub retry budget still deliver", async () => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      '[gates]\nchecks = [{ name = "slow", run = "sleep 2" }]\n',
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "slow gate"], {
+      cwd: repoDir,
+    });
+    const bare = await githubFixture();
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    registerGithub(f, bare);
+    const budgetMs = githubRetry.budgetMs;
+    githubRetry.budgetMs = 1_500;
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    try {
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    } finally {
+      githubRetry.budgetMs = budgetMs;
+    }
+    expect(f.store.getRun(run.id)?.prUrl).toBe("https://github.com/test/repo/pull/1");
+    expect(f.store.listStages(run.id).filter((stage) => stage.name === "gates")).toHaveLength(2);
+    expect(readFileSync(join(home, "gh-calls"), "utf8").match(/^pr create/gm)).toHaveLength(1);
   });
 
   test("needs-human draft delivery continues during drain", async () => {
