@@ -132,7 +132,7 @@ export function implementPrompt(input: {
       : "";
   const privateNotice =
     input.round === 0 && input.hasHoldout
-      ? "\nA separate verifier will check private scenarios derived from the request, including edge and failure cases. Implement the request's intent robustly, beyond only the listed criteria.\n"
+      ? "\nA separate verifier will check private scenarios derived from the request, including edge and failure cases: handle the edge and failure cases the request implies, within its scope.\n"
       : "";
   return `# Task
 ${quoteRequest(input.prompt)}
@@ -152,6 +152,7 @@ ${checksSection(input.gates, input.baseline)}
 5. Stay in scope: no unrelated refactors or reformatting.
 6. Follow repository conventions (CLAUDE.md, AGENTS.md, CONTRIBUTING, existing code style).
 7. ${input.resolution ? "Do not run Git. Edit files only; the factory stages and commits the merge." : "Committing is optional (the factory commits for you). Never push."}
+8. Stay within the request and specification: add nothing that neither asks for. If part of the specification looks unnecessary for the request, still meet its acceptance criteria and name that part in your final report.
 
 # Final message
 Reply with a concise report: files changed, how you verified (commands and results), assumptions, and anything left undone.`;
@@ -461,7 +462,7 @@ ${input.dependencyUpdate ? "Dependency update: check breaking changes between ve
 - Completeness: every requirement and acceptance criterion is actually implemented.
 - Tests: new behavior is genuinely exercised; nothing was weakened, skipped, or special-cased to pass.
 - Security: injection, secrets, unsafe handling of external input.
-- Scope: unrelated changes or needless churn.
+- Scope: unrelated changes or needless churn. Code mandated by the specification but unnecessary to the request may be flagged as unnecessary scope (minor or nit); specification text alone is not a reason to keep it.
 - Maintainability: clarity and consistency with the codebase.
 
 Severity: blocker = must fix (bug, unmet requirement, security issue, test gaming); major = should fix before merge; minor/nit = optional polish.
