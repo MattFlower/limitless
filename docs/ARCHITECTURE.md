@@ -175,8 +175,8 @@ max_concurrent = 8
 ```
 
 The default local model is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-REAP-288-MLX-4bit`);
-`omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. Free models are tried in catalog order,
-so free-first routing and the smoke check use Flash. Tool-free roles accept
+`omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first routing
+among free models the policy does not name, take catalog order, so they use Flash. Tool-free roles accept
 `omlx/qwen-flash@none` / `omlx/qwen-flash@high` to turn thinking off/on; compare them with
 `limitless eval run triage --models omlx/qwen-flash@none,omlx/qwen-flash@high --follow`.
 Agentic roles require the bare ID, preserving server-default thinking. Built-in triage,

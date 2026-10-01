@@ -425,7 +425,8 @@ export const MODELS: ModelDef[] = [
     price: { input: 0.042, output: 0 },
     notes: "Pinned version: confidence thresholds are tuned per version. Base model undisclosed.",
   },
-  // Free local models. Free models are tried in catalog order, so the one kept loaded comes first.
+  // Free local models. Free models the policy does not name are tried in catalog order (as is the
+  // smoke check), so the one kept loaded comes first.
   {
     id: "omlx/qwen-flash",
     provider: "omlx",
