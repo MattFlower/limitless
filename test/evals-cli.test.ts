@@ -629,3 +629,23 @@ test("policy CLI keeps the committed triage pin", async () => {
   expect(printed.join("\n")).toContain("triage.default: pinned by owner decision (2026-09-29)");
   expect(JSON.parse(files.get("routing/policy.json") ?? "{}")).toEqual(committed);
 });
+
+test("eval resume and cancel CLI print the new run ID and the cancelled status", async () => {
+  const printed: string[] = [];
+  const posted: string[] = [];
+  const io = {
+    async api<T>(path: string, init?: RequestInit): Promise<T> {
+      posted.push(`${init?.method} ${path}`);
+      return (
+        path.endsWith("/resume") ? { id: "eval-new", resumedFrom: "eval-old" } : { status: "interrupted" }
+      ) as T;
+    },
+    print: (text: string) => printed.push(text),
+    wait: async () => {},
+  };
+  await evalCommand(["resume", "eval-old"], {}, io);
+  await evalCommand(["cancel", "eval-old"], {}, io);
+  expect(posted).toEqual(["POST /api/evals/eval-old/resume", "POST /api/evals/eval-old/cancel"]);
+  expect(printed).toEqual(["eval-new (resumes eval-old)", "eval-old: interrupted"]);
+  await expect(evalCommand(["resume"], {}, io)).rejects.toThrow("eval resume <eval-id>");
+});

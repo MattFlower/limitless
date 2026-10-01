@@ -110,15 +110,15 @@ test("upgrade to the eval migration preserves data and adds eval columns, cache 
     expect(store.listEvalTrials(run.id)[0]).toEqual(saved);
     store.recoverEvals();
     expect(store.getEvalRun(run.id)).toMatchObject({
-      status: "failed",
-      error: "interrupted by daemon restart; submit a new eval to reuse completed trials",
+      status: "interrupted",
+      error: `interrupted by daemon restart; \`limitless eval resume ${run.id}\` reuses its completed trials`,
     });
     expect(store.getEvalRun(run.id)?.finishedAt).toBeNumber();
     expect(store.listEvalTrials(run.id)[1]?.status).toBe("skipped");
     expect(store.listEvalTrials(run.id)[2]).toMatchObject({
-      status: "error",
-      pass: false,
-      score: 0,
+      status: "skipped",
+      pass: null,
+      score: null,
       details: { interrupted: true },
     });
     expect(store.listEvalTrials(run.id)[2]?.details.reason).toContain("final usage unknown");
@@ -319,6 +319,41 @@ test("eval concurrency survives reload and legacy runs omit it", () => {
     expect([listed.get(explicit.id), listed.get(omitted.id)]).toEqual([undefined, 2]);
     if (!legacy) throw new Error("missing run");
     expect(formatEvalReport({ run: legacy, summaries: [], trials: [] })).toContain("concurrency=1 (legacy)");
+  } finally {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("resume links persist in both directions and appear in text and JSON reports", () => {
+  const home = mkdtempSync(join(tmpdir(), "eval-resume-"));
+  const path = join(home, "db.sqlite");
+  let store = new Store(path);
+  try {
+    const input = { role: "triage" as const, models: ["opaque-model"], k: 1, maxUsd: 1 };
+    const request = { ...input, cache: true, concurrency: 2 };
+    const old = store.createEvalRun(input, [], request);
+    store.updateEvalRun(old.id, "failed", "provider exploded");
+    const next = store.createEvalRun(input, [], request, old.id);
+    expect(() => store.createEvalRun(input, [], request, old.id)).toThrow("already resumed");
+    expect(store.listEvalRuns()).toHaveLength(2);
+    store.close();
+    store = new Store(path);
+    expect(store.getEvalRun(old.id)).toMatchObject({
+      status: "interrupted",
+      error: "provider exploded",
+      resumedBy: next.id,
+    });
+    expect(store.getEvalRun(next.id)).toMatchObject({ status: "queued", resumedFrom: old.id });
+    expect(store.evalRequest(next.id)).toEqual(request);
+    const report = (id: string) => {
+      const run = store.getEvalRun(id);
+      if (!run) throw new Error("missing run");
+      return { run, summaries: [], trials: [] };
+    };
+    expect(formatEvalReport(report(old.id))).toContain(`resumed by ${next.id}`);
+    expect(formatEvalReport(report(next.id))).toContain(`resumed from ${old.id}`);
+    expect(JSON.parse(JSON.stringify(report(next.id))).run.resumedFrom).toBe(old.id);
   } finally {
     store.close();
     rmSync(home, { recursive: true, force: true });

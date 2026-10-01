@@ -210,6 +210,13 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
   prediction coverage, explicit numerators/denominators, null (`n/a`) for empty denominators,
   skips, errors, cache hits, costs and invocation latency. Grades are persisted in existing trial
   JSON so label edits cannot rewrite historical reports; `eval regrade` is the explicit exception.
+- A daemon restart or `limitless eval cancel <eval-id>` stops an eval as `interrupted`: no new
+  trials start, in-flight trials abort, and unfinished trials stay unscored. Interrupted evals
+  never feed `eval policy`. Nothing resumes automatically; `limitless eval resume <eval-id>`
+  resubmits an interrupted or failed eval's stored request unchanged as a new run (linked both
+  ways in reports), so the cache supplies completed trials and at most the eval's concurrency of
+  in-flight trials repeat. Resume refuses legacy evals without a stored request, `--no-cache`
+  evals, and requests that no longer validate against the current dataset, models or systems.
 
 Repository-reading cache identity additionally includes role, repository identity, pinned base
 and head, normal input and seed content. Same-stat code or patch changes invalidate it; temporary

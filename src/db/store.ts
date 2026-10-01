@@ -60,6 +60,8 @@ function clampData(data: unknown): string | null {
   return JSON.stringify({ truncated: true, preview: s.slice(0, MAX_EVENT_DATA) });
 }
 
+const EVAL_RUN_SELECT =
+  "SELECT eval_runs.*, rounds, strategy, systems_json, concurrency, resumed_from, resumed_by FROM eval_runs LEFT JOIN eval_run_options o ON o.eval_run_id = id LEFT JOIN eval_run_systems s ON s.eval_run_id = id LEFT JOIN eval_run_concurrency c ON c.eval_run_id = id LEFT JOIN eval_run_requests q ON q.eval_run_id = id";
 const toEvalRun = (r: Row): EvalRun => ({
   id: r.id as string,
   role: r.role as EvalRun["role"],
@@ -74,6 +76,8 @@ const toEvalRun = (r: Row): EvalRun => ({
   createdAt: r.created_at as number,
   finishedAt: r.finished_at as number | null,
   error: r.error as string | null,
+  ...(r.resumed_from ? { resumedFrom: r.resumed_from as string } : {}),
+  ...(r.resumed_by ? { resumedBy: r.resumed_by as string } : {}),
 });
 const toEvalTrial = (r: Row): EvalTrial => ({
   evalRunId: r.eval_run_id as string,
@@ -312,9 +316,13 @@ export class Store {
       "role" | "models" | "k" | "maxUsd" | "rounds" | "strategy" | "systems" | "concurrency"
     >,
     trials: EvalTrial[],
+    /** The validated request, kept so `eval resume` can replay it; `resumedFrom` is the run it resumes. */
+    request?: unknown,
+    resumedFrom?: string,
   ): EvalRun {
     const run: EvalRun = {
       ...input,
+      ...(resumedFrom ? { resumedFrom } : {}),
       rounds: input.rounds ?? 1,
       strategy: input.strategy ?? "retry",
       concurrency: input.concurrency ?? DEFAULT_EVAL_CONCURRENCY,
@@ -346,6 +354,18 @@ export class Store {
         .run(run.id, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY);
       if (run.systems)
         this.db.query("INSERT INTO eval_run_systems VALUES (?, ?)").run(run.id, JSON.stringify(run.systems));
+      if (request !== undefined)
+        this.db
+          .query("INSERT INTO eval_run_requests VALUES (?, ?, ?, NULL)")
+          .run(run.id, JSON.stringify(request), resumedFrom ?? null);
+      if (resumedFrom) {
+        const linked = this.db
+          .query("UPDATE eval_run_requests SET resumed_by = ? WHERE eval_run_id = ? AND resumed_by IS NULL")
+          .run(run.id, resumedFrom);
+        if (linked.changes !== 1) throw new Error(`eval ${resumedFrom} was already resumed`);
+        // The predecessor keeps its error for diagnosis.
+        this.db.query("UPDATE eval_runs SET status = 'interrupted' WHERE id = ?").run(resumedFrom);
+      }
       for (const trial of trials) this.recordEvalTrial({ ...trial, evalRunId: run.id });
     })();
     return run;
@@ -359,22 +379,14 @@ export class Store {
   }
 
   getEvalRun(id: string): EvalRun | null {
-    const row = this.db
-      .query(
-        "SELECT eval_runs.*, rounds, strategy, systems_json, concurrency FROM eval_runs LEFT JOIN eval_run_options o ON o.eval_run_id = id LEFT JOIN eval_run_systems s ON s.eval_run_id = id LEFT JOIN eval_run_concurrency c ON c.eval_run_id = id WHERE id = ?",
-      )
-      .get(id) as Row | null;
+    const row = this.db.query(`${EVAL_RUN_SELECT} WHERE id = ?`).get(id) as Row | null;
     return row ? toEvalRun(row) : null;
   }
 
   listEvalRuns(): EvalRun[] {
-    return (
-      this.db
-        .query(
-          "SELECT eval_runs.*, rounds, strategy, systems_json, concurrency FROM eval_runs LEFT JOIN eval_run_options o ON o.eval_run_id = id LEFT JOIN eval_run_systems s ON s.eval_run_id = id LEFT JOIN eval_run_concurrency c ON c.eval_run_id = id ORDER BY created_at DESC, id DESC",
-        )
-        .all() as Row[]
-    ).map(toEvalRun);
+    return (this.db.query(`${EVAL_RUN_SELECT} ORDER BY created_at DESC, id DESC`).all() as Row[]).map(
+      toEvalRun,
+    );
   }
 
   recordEvalTrial(t: EvalTrial): void {
@@ -431,15 +443,24 @@ export class Store {
     ).spend;
   }
 
-  interruptEval(id: string, reason: string): void {
+  /** The stored request of an eval run, or null for runs that predate stored requests. */
+  evalRequest(id: string): unknown {
+    const row = this.db.query("SELECT request_json FROM eval_run_requests WHERE eval_run_id = ?").get(id) as {
+      request_json: string;
+    } | null;
+    return row ? parse(row.request_json, null) : null;
+  }
+
+  /** Ends a run's unfinished trials unscored: an interrupted trial is neither a pass nor a failure. */
+  interruptEval(id: string, reason: string, status: "interrupted" | "failed" = "interrupted"): void {
     this.db.transaction(() => {
       for (const trial of this.listEvalTrials(id)) {
         if (trial.status === "queued" || trial.status === "running")
           this.recordEvalTrial({
             ...trial,
-            status: trial.status === "running" ? "error" : "skipped",
-            pass: trial.status === "running" ? false : null,
-            score: trial.status === "running" ? 0 : null,
+            status: "skipped",
+            pass: null,
+            score: null,
             details: {
               ...trial.details,
               interrupted: trial.status === "running",
@@ -447,7 +468,7 @@ export class Store {
             },
           });
       }
-      this.updateEvalRun(id, "failed", reason);
+      this.updateEvalRun(id, status, reason);
     })();
   }
 
@@ -456,7 +477,7 @@ export class Store {
       if (run.status === "queued" || run.status === "running")
         this.interruptEval(
           run.id,
-          "interrupted by daemon restart; submit a new eval to reuse completed trials",
+          `interrupted by daemon restart; \`limitless eval resume ${run.id}\` reuses its completed trials`,
         );
     }
   }

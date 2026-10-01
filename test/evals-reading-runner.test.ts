@@ -589,7 +589,7 @@ test("a panel member stops after its slot wait when the eval was aborted meanwhi
     });
     const report = await f.run({ models: undefined, systems: [panelSystem], cache: false });
     spy.mockRestore();
-    expect(report.run.status).toBe("failed");
+    expect(report.run.status).toBe("interrupted");
     expect(f.calls.map((s) => s.target.modelId)).toEqual(["candidate-a"]);
     expect(tracker.status("provider-b")?.inFlight).toBe(0);
   } finally {
@@ -1050,7 +1050,8 @@ test("shutdown removes active and capacity-waiting worktrees", async () => {
     spy.mockRestore();
     await f.factory.evals.stop();
     for (const release of production) release();
-    for (const id of [first.id, second.id]) expect(f.factory.evals.report(id)?.run.status).toBe("failed");
+    for (const id of [first.id, second.id])
+      expect(f.factory.evals.report(id)?.run.status).toBe("interrupted");
     const report = f.factory.evals.report(second.id);
     expect(report?.trials[0]).toMatchObject({
       status: "skipped",

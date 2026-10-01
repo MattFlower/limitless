@@ -327,10 +327,10 @@ test("shutdown aborts active and waiting trials, releases slots, and preserves p
     await f.factory.stop();
     for (const release of production) release();
     expect(f.factory.evals.report(run.id)?.run).toMatchObject({
-      status: "failed",
+      status: "interrupted",
       error: "eval interrupted by daemon shutdown",
     });
-    expect(f.factory.evals.report(waiting.id)?.run.status).toBe("failed");
+    expect(f.factory.evals.report(waiting.id)?.run.status).toBe("interrupted");
     const report = f.factory.evals.report(waiting.id);
     expect(report?.trials).toHaveLength(3);
     for (const trial of report?.trials ?? []) {
@@ -338,7 +338,8 @@ test("shutdown aborts active and waiting trials, releases slots, and preserves p
         status: "skipped",
         pass: null,
         score: null,
-        details: { reason: "daemon shutdown" },
+        // The waiting trial aborts; trials never dequeued are skipped by the run's interruption.
+        details: { reason: expect.stringContaining("daemon shutdown") },
       });
       expect(trial.details.preparationFailed).toBeUndefined();
     }
@@ -651,7 +652,10 @@ test("shutdown interrupts concurrent trials, releases slots, and a resubmission 
     expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(2);
     await f.factory.stop();
     const report = f.factory.evals.report(run.id);
-    expect(report?.run).toMatchObject({ status: "failed", error: "eval interrupted by daemon shutdown" });
+    expect(report?.run).toMatchObject({
+      status: "interrupted",
+      error: "eval interrupted by daemon shutdown",
+    });
     expect(report?.trials.every((t) => !["queued", "running"].includes(t.status))).toBe(true);
     expect(report?.trials.filter((t) => t.status === "ok")).toHaveLength(2);
     expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
@@ -802,6 +806,132 @@ test("the shared eval cap follows the largest concurrency among running evals", 
     for (const run of later) await f.factory.evals.wait(run.id);
     expect(state.max).toBe(1);
     expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume replays an interrupted eval's stored request; completed trials come from the cache", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 3);
+    let active = 0;
+    f.respond(async (s) => {
+      if (f.calls.length <= 2) return { structured: answer };
+      active++;
+      await new Promise<void>((resolve) =>
+        s.signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      return { structured: answer };
+    });
+    const request = {
+      role: "triage",
+      models: ["candidate-a"],
+      caseIds: ["a", "b", "c"],
+      k: 2,
+      concurrency: 2,
+    };
+    const run = f.factory.evals.submit(request);
+    await until(() => active === 2);
+    await f.factory.stop();
+    // A restart only marks unfinished evals; nothing runs until an explicit resume.
+    const { EvalRunner } = await import("../src/evals/runner.ts");
+    const runner = new EvalRunner(f.factory.deps, f.casePath);
+    await Bun.sleep(20);
+    expect(f.calls).toHaveLength(4);
+    expect(runner.report(run.id)?.run.status).toBe("interrupted");
+    const state = gate(f);
+    const resumed = runner.resume(run.id);
+    expect(resumed).toMatchObject({ resumedFrom: run.id, status: "queued" });
+    expect(f.factory.store.evalRequest(resumed?.id ?? "")).toEqual({ ...request, maxUsd: 1, cache: true });
+    await until(() => state.active === 2);
+    await Bun.sleep(20);
+    state.open.resolve();
+    await runner.wait(resumed?.id ?? "");
+    const report = runner.report(resumed?.id ?? "");
+    expect(report?.run.status).toBe("completed");
+    expect(report?.trials.filter((t) => t.details.cache?.evalRunId === run.id)).toHaveLength(2);
+    expect(f.calls).toHaveLength(8);
+    expect(state.max).toBe(2);
+    expect(runner.report(run.id)?.run).toMatchObject({ status: "interrupted", resumedBy: resumed?.id });
+    expect(() => runner.resume(run.id)).toThrow(`already resumed as ${resumed?.id}`);
+    expect(() => runner.resume(resumed?.id ?? "")).toThrow("is completed");
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume refuses unknown, active, legacy, cache-disabled and no-longer-valid evals without a new run", async () => {
+  const f = await evalFixture();
+  try {
+    const { store, evals } = f.factory;
+    expect(evals.resume("missing")).toBeNull();
+    const stored = (request: Record<string, unknown> | undefined) => {
+      const run = store.createEvalRun(
+        { role: "triage", models: ["candidate-a"], k: 1, maxUsd: 1 },
+        [],
+        request,
+      );
+      store.updateEvalRun(run.id, "failed", "boom");
+      return run.id;
+    };
+    const valid = { role: "triage", models: ["candidate-a"], k: 1, maxUsd: 1, cache: true, concurrency: 2 };
+    const refusals: [string, string][] = [
+      [stored(undefined), "cannot be reconstructed"],
+      [stored({ ...valid, cache: false }), "cache disabled"],
+      [stored({ ...valid, models: ["retired-model"] }), "retired-model"],
+      [stored({ ...valid, caseIds: ["c"] }), "Unknown case ID: c"],
+    ];
+    f.dataset.cases = f.dataset.cases.filter((c) => c.id !== "c");
+    f.save();
+    const entered = deferred<void>();
+    f.respond(async (s) => {
+      entered.resolve();
+      await new Promise<void>((resolve) =>
+        s.signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      return { structured: answer };
+    });
+    const active = evals.submit({ role: "triage", models: ["candidate-a"] });
+    await entered.promise;
+    refusals.push([active.id, "still running"]);
+    const count = store.listEvalRuns().length;
+    for (const [id, reason] of refusals) expect(() => evals.resume(id)).toThrow(reason);
+    expect(store.listEvalRuns()).toHaveLength(count);
+    expect(store.getEvalRun(refusals[0]?.[0] ?? "")?.status).toBe("failed");
+  } finally {
+    await f.close();
+  }
+});
+
+test("cancel stops scheduling, aborts in-flight trials unscored and releases slots", async () => {
+  const f = await evalFixture();
+  try {
+    setLimit(f, "openrouter", 3);
+    let active = 0;
+    f.respond(async (s) => {
+      active++;
+      await new Promise<void>((resolve) =>
+        s.signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      return { structured: answer };
+    });
+    const run = f.factory.evals.submit({ role: "triage", models: ["candidate-a"], k: 2, concurrency: 2 });
+    await until(() => active === 2);
+    expect(await f.factory.evals.cancel(run.id)).toMatchObject({
+      status: "interrupted",
+      error: "eval cancelled",
+    });
+    await Bun.sleep(20);
+    expect(f.calls).toHaveLength(2);
+    const report = f.factory.evals.report(run.id);
+    expect(report?.trials).toHaveLength(6);
+    for (const trial of report?.trials ?? [])
+      expect(trial).toMatchObject({ status: "skipped", pass: null, score: null });
+    expect(report?.summaries[0]).toMatchObject({ evaluatedTrials: 0, errors: 0, pending: 0, skipped: 6 });
+    expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
+    await expect(f.factory.evals.cancel(run.id)).rejects.toThrow("not running");
+    expect(await f.factory.evals.cancel("missing")).toBeNull();
   } finally {
     await f.close();
   }

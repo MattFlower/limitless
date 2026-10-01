@@ -16,6 +16,8 @@ Usage:
         implement only: [--rounds N] [--strategy retry|effort|switch]
         review only: --systems <file.json> instead of --models ({"systems": [ReviewSystem, ...]})
   limitless eval report <eval-id> [--json]
+  limitless eval resume <eval-id>         Rerun an interrupted or failed eval's request; the cache supplies completed trials
+  limitless eval cancel <eval-id>         Stop scheduling an eval's trials; it ends interrupted
   limitless eval regrade <eval-id>        Recompute a review eval's grades from stored outputs (no model calls)
   limitless eval policy [--evals id,id] [--write]
   limitless ls [--status s1,s2] [-n 20]   List runs

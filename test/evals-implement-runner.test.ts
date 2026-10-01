@@ -526,7 +526,7 @@ for (const rounds of [1, 3])
       ]);
       await f.factory.evals.stop();
       const report = await pending;
-      expect(report.run.status).toBe("failed");
+      expect(report.run.status).toBe("interrupted");
       expect(report.trials[0]).toMatchObject(
         rounds > 1
           ? {

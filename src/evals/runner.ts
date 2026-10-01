@@ -46,6 +46,10 @@ import {
 import { gradeCase, prepareCase, schemaFor, seedContent, storedSchemaFor } from "./prepare.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 
+/** The abort reason of `eval cancel`; any other abort is a daemon shutdown. */
+const CANCELLED = "cancelled";
+const stopReason = (signal: AbortSignal) => (signal.reason === CANCELLED ? CANCELLED : "daemon shutdown");
+
 /** Where Limitless keeps eval datasets; pins whose history touches these are rejected. */
 const LABEL_PATHS = ["evals/triage", "evals/review", "evals/verify", "evals/implement"];
 
@@ -77,7 +81,7 @@ export class EvalRunner {
     deps.store.recoverEvals();
   }
 
-  submit(input: unknown): EvalRun {
+  submit(input: unknown, resumedFrom?: string): EvalRun {
     if (this.stopping) throw new Error("daemon is stopping");
     // Reject unsupported roles before accessing any dataset or repository.
     const parsed = EvalRequestSchema.parse(input);
@@ -85,6 +89,10 @@ export class EvalRunner {
     for (const item of file.cases)
       if ("defects" in item) seedContent(item, this.casePath ?? defaultCasePath(parsed.role));
     const { request, cases } = validateRequest(input, file, this.deps.router, this.deps.cfg.reviewRosters);
+    // Resolved targets and expanded systems, so a resume replays exactly these candidates.
+    const replay = parsed.systems
+      ? { ...parsed, systems: request.systems }
+      : { ...parsed, models: request.models };
     const trials: EvalTrial[] = [];
     const candidates =
       request.systems?.map((system) => ({ modelId: system.finders[0]?.target ?? "", system: system.name })) ??
@@ -129,13 +137,52 @@ export class EvalRunner {
             durationMs: 0,
             createdAt: Date.now(),
           });
-    const run = this.deps.store.createEvalRun(request, trials);
+    const run = this.deps.store.createEvalRun(request, trials, replay, resumedFrom);
     const controller = new AbortController();
     const done = Promise.resolve()
       .then(() => this.execute(run, file, cases, request.cache, controller.signal))
       .finally(() => this.active.delete(run.id));
     this.active.set(run.id, { controller, done });
     return run;
+  }
+
+  /**
+   * Resubmits an interrupted or failed eval's stored request unchanged as a new linked run, so the
+   * cache supplies its completed trials and only unfinished ones run again.
+   */
+  resume(id: string): EvalRun | null {
+    const run = this.deps.store.getEvalRun(id);
+    if (!run) return null;
+    if (this.active.has(id) || run.status === "queued" || run.status === "running")
+      throw new Error(`eval ${id} is still ${run.status}; cancel it before resuming`);
+    if (run.resumedBy) throw new Error(`eval ${id} was already resumed as ${run.resumedBy}`);
+    if (run.status !== "interrupted" && run.status !== "failed")
+      throw new Error(`eval ${id} is ${run.status}; only interrupted or failed evals can be resumed`);
+    const request = this.deps.store.evalRequest(id);
+    if (!request || typeof request !== "object")
+      throw new Error(
+        `eval ${id} predates stored eval requests and cannot be reconstructed; submit it again`,
+      );
+    if ("cache" in request && request.cache === false)
+      throw new Error(
+        `eval ${id} ran with the cache disabled, so a resume would repeat its completed trials`,
+      );
+    try {
+      return this.submit(request, id);
+    } catch (error) {
+      throw new Error(`cannot resume eval ${id}: ${(error as Error).message}`);
+    }
+  }
+
+  /** Stops scheduling an eval's trials; in-flight trials abort and the run ends interrupted. */
+  async cancel(id: string): Promise<EvalRun | null> {
+    const run = this.deps.store.getEvalRun(id);
+    const entry = this.active.get(id);
+    if (!run) return null;
+    if (!entry) throw new Error(`eval ${id} is ${run.status}, not running`);
+    entry.controller.abort(CANCELLED);
+    await entry.done;
+    return this.deps.store.getEvalRun(id);
   }
 
   report(id: string, options?: StatsOptions): EvalReport | null {
@@ -333,7 +380,7 @@ export class EvalRunner {
           let next = 0;
           let failed = false;
           const worker = async () => {
-            while (!failed) {
+            while (!failed && !signal.aborted) {
               const index = next++;
               const entry = queue[index];
               if (!entry) return;
@@ -376,11 +423,16 @@ export class EvalRunner {
         }),
       );
       const failed = outcomes.find((result) => result.status === "rejected");
-      if (signal.aborted) throw new Error("eval interrupted by daemon shutdown");
+      if (signal.aborted) throw new Error("eval aborted");
       if (failed?.status === "rejected") throw failed.reason;
       store.updateEvalRun(run.id, store.evalSpend(run.id) >= run.maxUsd ? "budget_exhausted" : "completed");
     } catch (error) {
-      store.interruptEval(run.id, (error as Error).message);
+      if (signal.aborted)
+        store.interruptEval(
+          run.id,
+          signal.reason === CANCELLED ? "eval cancelled" : "eval interrupted by daemon shutdown",
+        );
+      else store.interruptEval(run.id, (error as Error).message, "failed");
     }
   }
 
@@ -441,7 +493,7 @@ export class EvalRunner {
       });
     };
     const budget = () => store.evalSpend(run.id) >= run.maxUsd;
-    if (signal.aborted) return skip("daemon shutdown");
+    if (signal.aborted) return skip(stopReason(signal));
     const system =
       trial.details.system === undefined
         ? undefined
@@ -583,7 +635,7 @@ export class EvalRunner {
         trial.effort,
       );
       if (cache) await coordination.keyed(trial.cacheKey);
-      if (signal.aborted) return skip("daemon shutdown");
+      if (signal.aborted) return skip(stopReason(signal));
       if (budget()) return skip("eval budget exhausted");
       // Decision calls cost ~$0.0001 and keep their declined status only when executed.
       if (cache && harnessName !== "decisions")
@@ -623,7 +675,7 @@ export class EvalRunner {
       let sessionId: string | undefined;
       if (rounds > 1) scratch = createScratch(cwd);
       for (let round = 0; round < rounds; round++) {
-        if (signal.aborted) return skip("daemon shutdown");
+        if (signal.aborted) return skip(stopReason(signal));
         if (budget()) return skip("eval budget exhausted");
         ({ harnessName, noTools } = selectHarness(run.role, target));
         const harness = harnesses[harnessName];
@@ -638,7 +690,7 @@ export class EvalRunner {
           trackerSlot();
           runSlot();
         };
-        if (signal.aborted) return skip("daemon shutdown");
+        if (signal.aborted) return skip(stopReason(signal));
         if (budget()) return skip("eval budget exhausted");
         const afterWait = eligible();
         if (afterWait) return skip(afterWait);
@@ -848,7 +900,7 @@ export class EvalRunner {
         }
         // A panel's combined result carries its last call's status; the trial's own call is recorded here.
         observe(target, own ?? result);
-        if (signal.aborted) return skip("daemon shutdown");
+        if (signal.aborted) return skip(stopReason(signal));
         // A panel's result is its derived review, whose verification fields only the stored schema keeps;
         // anything without the panel's mark (e.g. one member's raw review) is not a panel result.
         const output = (
@@ -936,7 +988,7 @@ export class EvalRunner {
         break;
       }
     } catch (error) {
-      if (signal.aborted) return skip("daemon shutdown");
+      if (signal.aborted) return skip(stopReason(signal));
       if (trial.details.grade) return skip((error as Error).message);
       interruptRound((error as Error).message);
       store.recordEvalTrial({
