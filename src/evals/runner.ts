@@ -624,10 +624,13 @@ export class EvalRunner {
           ? { ...prepared.review, ...(system ? { system } : {}) }
           : undefined;
       const decisionTask = "decisionTask" in prepared ? prepared.decisionTask : undefined;
-      // Panel targets beyond the trial's own (its first finder) are pinned in the system.
-      const pinned = (id: string | undefined) => {
-        const { model: pinnedModel, effort: pinnedEffort } = router.resolve(id ?? "");
-        return router.toTarget(pinnedModel, pinnedEffort);
+      // Panel targets beyond the trial's own (its first finder) are pinned in the system. A bare
+      // target is an unset effort, which today's model default must not restore (as for the trial).
+      const pinned = (id = "") => {
+        const { model: pinnedModel, effort: pinnedEffort } = router.resolve(
+          parseTarget(id).effort === undefined ? { modelId: id, effort: null } : id,
+        );
+        return router.toTarget(pinnedModel, pinnedEffort ?? null);
       };
       const panelTargets =
         system?.mode === "panel"

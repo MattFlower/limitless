@@ -495,6 +495,37 @@ const refuteAll = (s: { prompt: string }) => ({
   costUsd: 0.1,
 });
 
+test("a resumed panel keeps every member's unset effort after the catalog gains defaults", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    f.respond((s) =>
+      s.prompt.includes("code-review verifier") ? refuteAll(s) : { structured: reviewOutput(), costUsd: 0.1 },
+    );
+    const { evals, router } = f.factory;
+    const run = evals.submit({ role: "review", systems: [panelSystem], k: 1 });
+    await evals.cancel(run.id);
+    expect(f.calls).toHaveLength(0);
+    for (const id of ["candidate-a", "candidate-b", "verifier-c"]) {
+      const model = router.model(id);
+      if (!model) throw new Error(`missing ${id}`);
+      model.supportedEfforts = ["low"];
+      model.effort = "low";
+    }
+    const resumed = evals.resume(run.id);
+    await evals.wait(resumed?.id ?? "");
+    expect(f.calls.map((s) => [s.target.modelId, s.target.effort])).toEqual([
+      ["candidate-a", undefined],
+      ["candidate-b", undefined],
+      ["verifier-c", undefined],
+    ]);
+    expect(evals.report(resumed?.id ?? "")?.trials.map((t) => [t.status, t.effort])).toEqual([
+      ["ok", "default"],
+    ]);
+  } finally {
+    await f.close();
+  }
+});
+
 test("a panel whose finder output is invalid is an error trial, never a graded single review", async () => {
   const f = await fixture("review", [verifierModel]);
   try {
