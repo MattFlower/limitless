@@ -974,7 +974,8 @@ export class EvalRunner {
                       verify: async (request, avoidVendors, avoidModels, candidates) => {
                         if (!panelTargets) throw new Error("review system has no verifier");
                         // A shared vendor is allowed and recorded by the panel, as in production.
-                        const to = pickVerifier(panelTargets.verifiers, avoidVendors, avoidModels);
+                        const identity = this.deps.router.checkpointIdentity;
+                        const to = pickVerifier(panelTargets.verifiers, avoidVendors, avoidModels, identity);
                         const { modelId, effort } = to;
                         trial.details.verifiers ??= [];
                         trial.details.verifiers.push({ modelId, effort: recordEffort(effort), candidates });

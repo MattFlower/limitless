@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { FinderPrompt, ReviewFinder, ReviewSystem } from "../core/types.ts";
 import { type AgentResult, extractJson } from "../harness/types.ts";
+import { parseTarget } from "../router/targets.ts";
 import { NoCapacityError } from "./context.ts";
 import { MERGE_RULES, mergeReports } from "./panel-merge.ts";
 import { reviewPrompt, verifierPrompt } from "./prompts.ts";
@@ -29,8 +30,9 @@ const UNRAISED = { agreement: 0, finder: null, vendor: null, raisedBy: [] as num
  * caches stop reusing outputs made under the old policy. 2: security candidates are always verified,
  * and missing rulings on security or prior blocking findings fail closed. 3: finder reports merge
  * before verification. 4: a local finder that fails is skipped instead of failing the panel.
+ * 5: verifier exclusions use checkpoint identity across backends.
  */
-const PANEL_POLICY_VERSION = 4;
+const PANEL_POLICY_VERSION = 5;
 /** A local finder's time limit, slot waits and fallbacks included: it must not hold up the panel. */
 export const LOCAL_FINDER_TIMEOUT_MS = 15 * 60_000;
 
@@ -271,10 +273,12 @@ export function pickVerifier<V extends { vendor: string; modelId: string }>(
   targets: V[],
   avoidVendors: string[],
   avoidModels: string[],
+  identity: (id: string) => string = (id) => parseTarget(id).modelId,
 ): V {
+  const raised = new Set(avoidModels.map(identity));
   const picked =
-    targets.find((t) => !avoidVendors.includes(t.vendor) && !avoidModels.includes(t.modelId)) ??
-    targets.find((t) => !avoidModels.includes(t.modelId));
+    targets.find((t) => !avoidVendors.includes(t.vendor) && !raised.has(identity(t.modelId))) ??
+    targets.find((t) => !raised.has(identity(t.modelId)));
   if (!picked)
     throw new NoCapacityError(
       `verifier ${targets.map((t) => t.modelId).join(", ")} raised a candidate it would check`,
