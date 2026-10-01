@@ -424,8 +424,8 @@ export interface ReviewSystem {
   name: string;
   mode: "single" | "panel";
   finders: ReviewFinder[];
-  /** Panel only; production may omit `target` (routed), evals may not. */
-  verifier?: { target?: string };
+  /** Panel only; production may omit a target (routed), evals may not. `targets` is ordered: `pickVerifier`. */
+  verifier?: { target?: string; targets?: string[] };
   implementerReport: "include" | "omit";
 }
 /** Trials an eval runs at once per provider, capped at the provider's `maxConcurrent` − 1 (at least 1). */
@@ -534,6 +534,8 @@ export interface EvalTrial {
     interrupted?: boolean;
     /** Eval the trial ran in before a resume copied it; its spend was already charged to the provider there. */
     resumedFrom?: string;
+    /** Panel verifier calls in order, retries included: the model each ran on and the candidates it was sent. */
+    verifiers?: { modelId: string; effort: RecordedEffort; candidates: string[] }[];
     cache?: {
       evalRunId: string;
       caseId: string;

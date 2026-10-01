@@ -79,6 +79,7 @@ import {
   FinderSkipped,
   PANEL_REVIEWS,
   type PanelReview,
+  pickVerifier,
   type ReviewInput,
   type ReviewRequest,
   resolvedPriorFindings,
@@ -1087,12 +1088,18 @@ async function oneRound(
               throw error;
             }
           },
-          verify: (request, avoidVendors, avoidModels) =>
-            call(
+          verify: (request, avoidVendors, avoidModels) => {
+            // A listed verifier is picked per batch as evals do; it still falls back by routing if unavailable.
+            const listed = system.verifier?.targets?.map((target) => {
+              const { model, targetId } = ctx.deps.router.resolve(target);
+              return { vendor: model.vendor, modelId: model.id, targetId };
+            });
+            return call(
               request,
               verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer),
-              system.verifier?.target,
-            ),
+              listed ? pickVerifier(listed, avoidVendors, avoidModels).targetId : system.verifier?.target,
+            );
+          },
           warn: (message) => ctx.log(message, "warn"),
         },
         input,

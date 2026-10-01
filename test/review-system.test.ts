@@ -7,6 +7,7 @@ import type { EvalTrial, ReviewSystem } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { reviewSystemHash } from "../src/evals/cache.ts";
 import { validateRequest } from "../src/evals/cases.ts";
+import { pickVerifier } from "../src/pipeline/review.ts";
 import {
   configuredReviewSystem,
   DEFAULT_ROSTERS,
@@ -58,6 +59,12 @@ const invalid: [string, string][] = [
   [file(system({ mode: "panel", finders: [], verifier: { target: "candidate-b" } })), "at least one finder"],
   [file(system({ mode: "panel", verifier: {} })), "needs an explicit verifier target"],
   [
+    file(panel({ verifier: { target: "verifier-c", targets: ["verifier-c"] } })),
+    '"target" or "targets", not both',
+  ],
+  [file(panel({ verifier: { targets: [] } })), "verifier targets must not be empty"],
+  [file(panel({ verifier: { targets: ["verifier-c", "x@"] } })), "expected model or model@effort"],
+  [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
     'finder prompt must be "standard", "adversarial" or "careful"',
   ],
@@ -97,6 +104,18 @@ test("eval review systems reject unsupported shapes with clear errors", () => {
   expect(parseEvalReviewSystems(file(panel({ finders })), "s.json")[0]).toMatchObject({ finders });
 });
 
+test("a batch's verifier is the first listed target independent of it, else the first other model", () => {
+  const list = [
+    { modelId: "a1", vendor: "a" },
+    { modelId: "o1", vendor: "o" },
+    { modelId: "a2", vendor: "a" },
+  ];
+  expect(pickVerifier(list, ["o"], ["o2"]).modelId).toBe("a1");
+  expect(pickVerifier(list, ["a"], ["a1"]).modelId).toBe("o1");
+  expect(pickVerifier(list, ["a", "o"], ["a1", "o1"]).modelId).toBe("a2");
+  expect(() => pickVerifier(list, ["a"], ["a1", "a2", "o1"])).toThrow("raised a candidate it would check");
+});
+
 test("production derives one routed standard finder from [review] implementer_report", () => {
   for (const mode of ["include", "omit"] as const)
     expect(productionReviewSystem({ reviewImplementerReport: mode })).toEqual({
@@ -121,6 +140,16 @@ test("system hash ignores key order and name but not behaviour", () => {
   expect(reviewSystemHash({ ...base, finders: [{ target: "candidate-b", prompt: "standard" }] })).not.toBe(
     reviewSystemHash(base),
   );
+  // A lone verifier target keeps its hash; a list keys on its targets and their order.
+  const verified = (verifier: ReviewSystem["verifier"]) =>
+    reviewSystemHash({ ...base, mode: "panel", verifier });
+  expect(verified({ target: "verifier-c" })).toBe(
+    "9abea7c5ba7833dba2740b930f32b26b1aa2476852acf94916d829f964700c35",
+  );
+  const listed = verified({ targets: ["verifier-c", "candidate-b"] });
+  expect(listed).not.toBe(verified({ target: "verifier-c" }));
+  expect(listed).not.toBe(verified({ targets: ["candidate-b", "verifier-c"] }));
+  expect(listed).not.toBe(verified({ targets: ["verifier-c"] }));
 });
 
 test("CLI validates --systems before submitting and keeps --models as one system per model", async () => {
@@ -227,6 +256,8 @@ test("request validation resolves systems, expands --models, and rejects bad sys
       { role: "review", systems: [system({ finders: [{ prompt: "standard" }] })] },
       { role: "review", systems: [system({ mode: "panel" })] },
       { role: "review", systems: [panel({ verifier: { target: "nope" } })] },
+      { role: "review", systems: [panel({ verifier: { targets: ["verifier-c", "nope"] } })] },
+      { role: "review", systems: [panel({ verifier: { targets: ["candidate-b"] } })] },
       // A verifier sharing a finder's vendor could not check that finder's candidates cross-vendor.
       { role: "review", systems: [panel({ verifier: { target: "candidate-b" } })] },
       { role: "review", systems: [system(), system()] },

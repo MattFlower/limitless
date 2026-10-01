@@ -18,6 +18,7 @@ import {
   combined,
   FinderSkipped,
   panelIdentity,
+  pickVerifier,
   type ReviewRequest,
   runReview,
   type VerifierRequest,
@@ -125,7 +126,11 @@ export class EvalRunner {
               ...system,
               finders: system.finders.map((finder) => ({ ...finder, target: explicit(finder.target) })),
               ...(system.verifier
-                ? { verifier: { ...system.verifier, target: explicit(system.verifier.target) } }
+                ? {
+                    verifier: system.verifier.targets
+                      ? { targets: system.verifier.targets.map((target) => explicit(target)) }
+                      : { target: explicit(system.verifier.target) },
+                  }
                 : {}),
             })),
           }
@@ -656,7 +661,7 @@ export class EvalRunner {
         system?.mode === "panel"
           ? {
               finders: system.finders.slice(1).map((f) => pinned(f.target)),
-              verifier: pinned(system.verifier?.target),
+              verifiers: (system.verifier?.targets ?? [system.verifier?.target]).map((t) => pinned(t)),
             }
           : undefined;
       const schema = "hidden" in item ? undefined : schemaFor(item);
@@ -700,7 +705,7 @@ export class EvalRunner {
           targets.push(null);
         }
       }
-      if (panelTargets) targets.push(...panelTargets.finders, panelTargets.verifier);
+      if (panelTargets) targets.push(...panelTargets.finders, ...panelTargets.verifiers);
       trial.cacheKey = cacheKey(
         model.id,
         harnessName,
@@ -941,13 +946,17 @@ export class EvalRunner {
                         }
                         return { result: own, target };
                       },
-                      verify: async (request, _avoidVendors, avoidModels) => {
+                      verify: async (request, avoidVendors, avoidModels, candidates) => {
                         if (!panelTargets) throw new Error("review system has no verifier");
                         // A shared vendor is allowed and recorded by the panel, as in production.
-                        const { modelId } = panelTargets.verifier;
-                        if (avoidModels.includes(modelId))
-                          throw new Error(`verifier ${modelId} raised a candidate it would check`);
-                        return sendTo(request, panelTargets.verifier, `verifier-${++verifications}`);
+                        const to = pickVerifier(panelTargets.verifiers, avoidVendors, avoidModels);
+                        trial.details.verifiers ??= [];
+                        trial.details.verifiers.push({
+                          modelId: to.modelId,
+                          effort: recordEffort(to.effort),
+                          candidates,
+                        });
+                        return sendTo(request, to, `verifier-${++verifications}`);
                       },
                     },
                     reviewInput,

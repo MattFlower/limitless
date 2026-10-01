@@ -5530,4 +5530,9 @@ test("panel review: a verifier left on the finder's vendor is another model, wit
   expect(await waitFor(f, alone.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
   expect(verifiers).toEqual(["gamma/m"]);
   expect(f.store.getRun(alone.id)?.error).toContain("alpha/m (raised a candidate it would verify)");
+  // A listed verifier is picked per batch, past the finder's own model, to one routing would not offer.
+  Object.assign(f.deps.reviewSystem ?? {}, { verifier: { targets: ["alpha/m", "delta/m"] } });
+  const listed = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, listed.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(verifiers).toEqual(["gamma/m", "delta/m"]);
 });

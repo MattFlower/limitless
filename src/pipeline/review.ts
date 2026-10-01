@@ -249,12 +249,35 @@ export interface ReviewDeps<T extends Invoked> {
   /** Runs finder `finder` (an index into the system's finders); a local one may throw FinderSkipped. */
   invoke: (request: ReviewRequest, finder: number) => Promise<T>;
   /**
-   * Panel only: one read-only verifier batch, routed away from every vendor that raised it and never
-   * to a model that did.
+   * Panel only: one read-only verifier batch (the candidates' ids), routed away from every vendor that
+   * raised it and never to a model that did.
    */
-  verify?: (request: VerifierRequest, avoidVendors: string[], avoidModels: string[]) => Promise<T>;
+  verify?: (
+    request: VerifierRequest,
+    avoidVendors: string[],
+    avoidModels: string[],
+    candidates: string[],
+  ) => Promise<T>;
   /** Panel only: problems that degrade the review without failing it. */
   warn?: (message: string) => void;
+}
+
+/**
+ * A batch's verifier from ordered `targets`: the first whose vendor and model raised none of it, else
+ * the first whose model raised none (the panel then records the shared vendor). Shared by the engine
+ * and evals, so both route a batch the same way.
+ */
+export function pickVerifier<V extends { vendor: string; modelId: string }>(
+  targets: V[],
+  avoidVendors: string[],
+  avoidModels: string[],
+): V {
+  const picked =
+    targets.find((t) => !avoidVendors.includes(t.vendor) && !avoidModels.includes(t.modelId)) ??
+    targets.find((t) => !avoidModels.includes(t.modelId));
+  if (!picked)
+    throw new Error(`verifier ${targets.map((t) => t.modelId).join(", ")} raised a candidate it would check`);
+  return picked;
 }
 
 /** Fixed inputs that render the finder and verifier prompt templates, for cache identity. */
@@ -579,6 +602,7 @@ async function runPanel<T extends Invoked>(
         },
         pending[0] ? vendorsOf(pending[0]) : [],
         modelsOf(pending),
+        pending.map((c) => c.id),
       );
       const shared = invoked.target?.vendor;
       if (shared && pending[0] && vendorsOf(pending[0]).includes(shared)) {
