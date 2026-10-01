@@ -410,25 +410,35 @@ test("eval spend covers the resume chain without counting copied trials twice", 
       durationMs: 0,
       createdAt: 1,
     });
-    // An interrupted multi-round trial keeps its spend while unfinished; a resume reruns it.
-    const first = store.createEvalRun(input, [trial("a", "ok", 0.1), trial("b", "skipped", 0.2)], {});
+    const copy = (t: EvalTrial, from: string): EvalTrial => ({ ...t, details: { resumedFrom: from } });
+    // An interrupted multi-round trial keeps its spend while unfinished; a resume reruns it. A
+    // finished trial whose cache key changed (c) is rerun too, so both of its calls count.
+    const first = store.createEvalRun(
+      input,
+      [trial("a", "ok", 0.1), trial("b", "skipped", 0.2), trial("c", "ok", 0.4)],
+      {},
+    );
     store.updateEvalRun(first.id, "interrupted");
     const second = store.createEvalRun(
       input,
-      [trial("a", "ok", 0.1), trial("b", "error", 0.05)],
+      [copy(trial("a", "ok", 0.1), first.id), trial("b", "error", 0.05), trial("c", "ok", 0.4)],
       {},
       first.id,
     );
-    expect(store.evalSpend(first.id)).toBeCloseTo(0.3);
-    expect(store.evalSpend(second.id)).toBeCloseTo(0.35);
+    expect(store.evalSpend(first.id)).toBeCloseTo(0.7);
+    expect(store.evalSpend(second.id)).toBeCloseTo(1.15);
     store.updateEvalRun(second.id, "interrupted");
     const third = store.createEvalRun(
       input,
-      [trial("a", "ok", 0.1), trial("b", "error", 0.05)],
+      [
+        copy(trial("a", "ok", 0.1), first.id),
+        copy(trial("b", "error", 0.05), second.id),
+        copy(trial("c", "ok", 0.4), second.id),
+      ],
       {},
       second.id,
     );
-    expect(store.evalSpend(third.id)).toBeCloseTo(0.35);
+    expect(store.evalSpend(third.id)).toBeCloseTo(1.15);
   } finally {
     store.close();
   }

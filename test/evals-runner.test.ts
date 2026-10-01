@@ -2,6 +2,8 @@ import { expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cacheKey } from "../src/evals/cache.ts";
+import { formatEvalReport } from "../src/evals/format.ts";
+import type { EvalReport } from "../src/evals/stats.ts";
 import { pinnedTree, withRepoLock } from "../src/git/repos.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import { selectHarness } from "../src/harness/select.ts";
@@ -128,6 +130,7 @@ test("cache identity includes every invocation component and ignores schema obje
     cacheKey("model", "fake", "prompt", "changed", { a: 1, b: 2 }, 0),
     cacheKey("model", "fake", "prompt", "system", { a: 2, b: 2 }, 0),
     cacheKey("model", "fake", "prompt", "system", { a: 1, b: 2 }, 1),
+    cacheKey("model", "fake", "prompt", "system", { a: 1, b: 2 }, 0, undefined, undefined, [["p", "m"]]),
   ])
     expect(key).not.toBe(base);
   expect(cacheKey("model", "fake", "prompt", "system", { b: 2, a: 1 }, 0)).toBe(base);
@@ -846,7 +849,6 @@ test("resume replays an interrupted eval's stored request and copies its finishe
     expect(resumed).toMatchObject({ resumedFrom: run.id, status: "queued" });
     expect(f.factory.store.evalRequest(resumed?.id ?? "")).toEqual({
       request: { ...request, models: ["candidate-a@default"], maxUsd: 1, cache: true },
-      identity: expect.any(Object),
     });
     await until(() => state.active === 2);
     await Bun.sleep(20);
@@ -1062,44 +1064,95 @@ test("resume copies finished decision trials instead of running them again", asy
   }
 });
 
-test("resume refuses a changed case or prompt unless allowChanged, naming the change", async () => {
+test("resume reruns a finished trial whose prompt changed and copies the unchanged ones", async () => {
   const f = await evalFixture();
   try {
-    const first = await interruptedAt(f, "b", () => ({ structured: answer }));
-    const changed = f.dataset.cases[2];
+    const first = await interruptedAt(f, "c", () => ({ structured: answer }));
+    const changed = f.dataset.cases[0];
     if (!changed || !("prompt" in changed)) throw new Error("missing case");
-    changed.prompt = "Fix c differently";
+    changed.prompt = "Fix a differently";
     f.save();
-    const count = f.factory.store.listEvalRuns().length;
-    expect(() => f.factory.evals.resume(first)).toThrow(
-      `cannot resume eval ${first}: changed since it ran: case c;`,
-    );
-    expect(() => f.factory.evals.resume(first)).toThrow("--allow-changed");
-    expect(f.factory.store.listEvalRuns()).toHaveLength(count);
+    const calls = f.calls.length;
     f.respond(() => ({ structured: answer }));
-    const resumed = f.factory.evals.resume(first, true);
+    const resumed = f.factory.evals.resume(first);
     await f.factory.evals.wait(resumed?.id ?? "");
-    expect(f.factory.evals.report(resumed?.id ?? "")?.run.status).toBe("completed");
+    expect(f.calls.slice(calls).map((s) => s.prompt.match(/Fix \w+( differently)?/)?.[0])).toEqual([
+      "Fix a differently",
+      "Fix c",
+    ]);
+    const report = f.factory.evals.report(resumed?.id ?? "");
+    expect(report?.trials.map((t) => [t.caseId, t.details.resumedFrom])).toEqual([
+      ["a", undefined],
+      ["b", first],
+      ["c", undefined],
+    ]);
+    expect(formatEvalReport(report as EvalReport)).toContain(
+      `resumed from ${first}: 1 trials copied, 2 run again`,
+    );
   } finally {
     await f.close();
   }
 });
 
-test("resume refuses a changed backend model behind the same catalog ID unless allowChanged", async () => {
+test("resume reruns finished trials whose backend model changed behind the same catalog ID", async () => {
   const f = await evalFixture();
   try {
     const first = await interruptedAt(f, "b", () => ({ structured: answer }));
     const model = f.factory.router.model("candidate-a");
     if (!model) throw new Error("missing model");
     model.model = "a-new-checkpoint";
-    expect(() => f.factory.evals.resume(first)).toThrow(
-      `cannot resume eval ${first}: changed since it ran: target candidate-a;`,
-    );
     const calls = f.calls.length;
     f.respond(() => ({ structured: answer }));
-    const resumed = f.factory.evals.resume(first, true);
+    const resumed = f.factory.evals.resume(first);
     await f.factory.evals.wait(resumed?.id ?? "");
-    expect(f.calls.slice(calls).map((s) => s.target.model)).toEqual(["a-new-checkpoint", "a-new-checkpoint"]);
+    expect(f.calls.slice(calls).map((s) => s.target.model)).toEqual(Array(3).fill("a-new-checkpoint"));
+    expect(f.factory.evals.report(resumed?.id ?? "")?.trials.some((t) => t.details.resumedFrom)).toBe(false);
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume regrades copied trials against the current labels without a model call", async () => {
+  const f = await evalFixture();
+  try {
+    const first = await interruptedAt(f, "b", () => ({ structured: answer }));
+    expect(f.factory.evals.report(first)?.trials[0]?.pass).toBe(true);
+    const relabeled = f.dataset.cases[0];
+    if (!relabeled || !("gold" in relabeled) || !("prompt" in relabeled)) throw new Error("missing case");
+    relabeled.gold = { ...relabeled.gold, risk: "high" };
+    f.save();
+    const calls = f.calls.length;
+    f.respond(() => ({ structured: answer }));
+    const resumed = f.factory.evals.resume(first);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    expect(f.calls.slice(calls).some((s) => s.prompt.includes("Fix a"))).toBe(false);
+    expect(f.factory.evals.report(resumed?.id ?? "")?.trials[0]).toMatchObject({
+      caseId: "a",
+      pass: false,
+      details: { resumedFrom: first, grade: { pass: false } },
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume retries preparation failures instead of copying them", async () => {
+  const f = await evalFixture();
+  try {
+    const first = await interruptedAt(f, "b", () => ({ structured: answer }));
+    const failed = f.factory.evals.report(first)?.trials[0];
+    if (!failed) throw new Error("missing trial");
+    f.factory.store.recordEvalTrial({
+      ...failed,
+      status: "error",
+      details: { ...failed.details, preparationFailed: true, reason: "missing pin" },
+    });
+    const calls = f.calls.length;
+    f.respond(() => ({ structured: answer }));
+    const resumed = f.factory.evals.resume(first);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    expect(f.calls.slice(calls).some((s) => s.prompt.includes("Fix a"))).toBe(true);
+    expect(f.factory.evals.report(resumed?.id ?? "")?.trials[0]).toMatchObject({ status: "ok", pass: true });
   } finally {
     await f.close();
   }

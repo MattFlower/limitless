@@ -526,6 +526,38 @@ test("a resumed panel keeps every member's unset effort after the catalog gains 
   }
 });
 
+test("a resumed panel copies its finished trial only while the verifier backend is unchanged", async () => {
+  const f = await fixture("review", [verifierModel]);
+  try {
+    f.respond((s) =>
+      s.prompt.includes("code-review verifier") ? refuteAll(s) : { structured: reviewOutput(), costUsd: 0.1 },
+    );
+    const { evals, store, router } = f.factory;
+    const resume = async (id: string) => {
+      store.updateEvalRun(id, "interrupted");
+      const resumed = evals.resume(id);
+      await evals.wait(resumed?.id ?? "");
+      return resumed?.id ?? "";
+    };
+    const run = evals.submit({ role: "review", systems: [panelSystem], k: 1 });
+    await evals.wait(run.id);
+    expect(f.calls).toHaveLength(3);
+    const copied = await resume(run.id);
+    expect(f.calls).toHaveLength(3);
+    expect(evals.report(copied)?.trials[0]?.details.resumedFrom).toBe(run.id);
+    const verifier = router.model("verifier-c");
+    if (!verifier) throw new Error("missing verifier-c");
+    verifier.model = "c-new-checkpoint";
+    const rerun = await resume(copied);
+    expect(f.calls).toHaveLength(6);
+    expect(f.calls.at(-1)?.target.model).toBe("c-new-checkpoint");
+    expect(evals.report(rerun)?.trials[0]).toMatchObject({ status: "ok" });
+    expect(evals.report(rerun)?.trials[0]?.details.resumedFrom).toBeUndefined();
+  } finally {
+    await f.close();
+  }
+});
+
 test("a panel whose finder output is invalid is an error trial, never a graded single review", async () => {
   const f = await fixture("review", [verifierModel]);
   try {

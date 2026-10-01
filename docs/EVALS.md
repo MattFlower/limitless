@@ -214,16 +214,16 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
   trials start, in-flight trials abort, and unfinished trials stay unscored. Interrupted evals
   never feed `eval policy`. Nothing resumes automatically; `limitless eval resume <eval-id>`
   resubmits an interrupted or failed eval's stored request unchanged as a new run (linked both
-  ways in reports). The new run copies every finished trial (passed, failed or errored, with its
-  grade and spend) and runs only the trials that never finished, so at most the eval's concurrency
-  of in-flight trials repeat. Its `maxUsd` covers the spend of the whole resume chain, including
-  spend recorded on unfinished trials; copies don't count toward provider budgets a second time. Resume refuses legacy evals without a stored request,
-  `--no-cache` evals, requests that no longer validate against the current dataset, models or
-  systems, and, unless `--allow-changed` (API `allowChanged: true`), evals whose prompt template,
-  preamble, panel policy, case content or target (catalog ID, provider, backend model or harness) changed since they ran; the error
-  names the changed parts. Allowed anyway, finished trials are still copied and only the
-  unfinished ones run under the change. A restart's message suggests `eval resume` only for evals
-  with a stored, cached request.
+  ways in reports). The new run copies a finished trial (passed, failed or errored, with its spend)
+  only when its stored cache key equals the key the trial computes now (prompt, system additions,
+  schema, review system, panel identity, every target's provider and backend model, case content),
+  and regrades the copy against the current labels. Every other trial, including preparation
+  failures and trials whose key changed, runs again, so a resumed eval never mixes versions; its
+  report counts the trials copied and run again. Its `maxUsd` covers the spend of the whole resume
+  chain, counting each copy once; copies don't count toward provider budgets a second time. Resume
+  refuses legacy evals without a stored request, `--no-cache` evals and requests that no longer
+  validate against the current dataset, models or systems. A restart's message suggests `eval
+  resume` only for evals with a stored, cached request.
 
 Repository-reading cache identity additionally includes role, repository identity, pinned base
 and head, normal input and seed content. Same-stat code or patch changes invalidate it; temporary

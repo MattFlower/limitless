@@ -445,21 +445,21 @@ export class Store {
   }
 
   /**
-   * A run's spend, including the spend of every eval it resumed: a resume copies its predecessor's
-   * finished (`ok`/`error`) trials with their cost, so only the predecessors' other trials add to it.
+   * A run's spend, including the spend of every eval it resumed. A copied trial (`resumedFrom`)
+   * repeats its original's cost, which the chain already counts.
    */
   evalSpend(id: string): number {
     return (
       this.db
         .query(
-          `WITH RECURSIVE chain(id, own) AS (
-            SELECT ?, 1
+          `WITH RECURSIVE chain(id) AS (
+            SELECT ?
             UNION ALL
-            SELECT q.resumed_from, 0 FROM eval_run_requests q JOIN chain ON q.eval_run_id = chain.id
+            SELECT q.resumed_from FROM eval_run_requests q JOIN chain ON q.eval_run_id = chain.id
             WHERE q.resumed_from IS NOT NULL
           )
           SELECT COALESCE(SUM(t.cost_usd), 0) AS spend FROM chain JOIN eval_trials t ON t.eval_run_id = chain.id
-          WHERE chain.own = 1 OR t.status NOT IN ('ok', 'error')`,
+          WHERE json_extract(t.details_json, '$.resumedFrom') IS NULL`,
         )
         .get(id) as { spend: number }
     ).spend;

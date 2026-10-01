@@ -25,7 +25,12 @@ export function formatEvalReport(report: EvalReport): string {
     `${report.run.id}: ${report.run.status} (role=${report.run.role}, k=${report.run.k}, maxUsd=${report.run.maxUsd}, concurrency=${report.run.concurrency ?? "1 (legacy)"})`,
   ];
   if (report.run.error) lines.push(report.run.error);
-  if (report.run.resumedFrom) lines.push(`resumed from ${report.run.resumedFrom}`);
+  if (report.run.resumedFrom) {
+    const copied = report.trials.filter((t) => t.details.resumedFrom).length;
+    lines.push(
+      `resumed from ${report.run.resumedFrom}: ${copied} trials copied, ${report.trials.length - copied} run again`,
+    );
+  }
   if (report.run.resumedBy) lines.push(`resumed by ${report.run.resumedBy}`);
   for (const m of report.summaries) {
     const c = m.comparison;
