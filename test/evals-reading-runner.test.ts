@@ -1161,7 +1161,7 @@ test("an eval panel picks each batch's verifier from an ordered list, as product
     respond(false);
     const finders = ["finder-x", "finder-y"].map((target) => ({ target, prompt: "standard" }));
     const system = { ...panelSystem, finders, verifier: { targets: ["verifier-x", "verifier-y"] } };
-    const report = await f.run({ models: undefined, systems: [system], cache: false });
+    const report = await f.run({ models: undefined, systems: [system], cache: true });
     expect(report.trials[0]?.status).toBe("ok");
     const [run] = f.factory.store.listEvalRuns();
     expect(f.factory.store.evalRequest(run?.id ?? "")).toMatchObject({
@@ -1173,6 +1173,11 @@ test("an eval panel picks each batch's verifier from an ordered list, as product
       { modelId: "verifier-y", effort: "default", candidates: ["C1"] },
       { modelId: "verifier-x", effort: "default", candidates: ["C2"] },
     ]);
+    const callCount = f.calls.length;
+    const cached = await f.run({ models: undefined, systems: [system], cache: true });
+    expect(cached.trials[0]?.details.cache).toBeDefined();
+    expect(cached.trials[0]?.details.verifiers).toEqual(trial?.details.verifiers);
+    expect(f.calls).toHaveLength(callCount);
 
     // Both vendors raised it: the first listed model that raised none, with the shared vendor recorded.
     respond(true);
@@ -1183,13 +1188,13 @@ test("an eval panel picks each batch's verifier from an ordered list, as product
       panel: { warnings: [expect.stringContaining("Verifier verifier-y shares vendor openai")] },
     });
 
-    // Every listed model raised it: the trial fails without calling a verifier.
+    // Every listed model is a finder: reject before paying for any calls.
     const calls = f.calls.length;
     const none = { ...system, verifier: { targets: ["finder-x", "finder-y"] } };
-    const failed = await f.run({ models: undefined, systems: [none], cache: false });
-    expect(failed.trials[0]?.status).toBe("error");
-    expect(failed.trials[0]?.details.reason).toContain("raised a candidate it would check");
-    expect(f.calls.slice(calls).map((s) => s.target.modelId)).toEqual(["finder-x", "finder-y"]);
+    await expect(f.run({ models: undefined, systems: [none], cache: false })).rejects.toThrow(
+      "not any finder's",
+    );
+    expect(f.calls).toHaveLength(calls);
     await f.clean();
   } finally {
     await f.close();

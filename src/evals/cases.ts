@@ -338,8 +338,20 @@ export function validateRequest(
   }));
   for (const id of request.systems ? [] : (request.models ?? [])) resolve(id);
   // As in production, a verifier never reuses a finder's model; a shared vendor is recorded, not refused.
-  // A longer list may name finders: each batch skips the models that raised it, failing if none is left.
   for (const system of resolvedSystems ?? []) {
+    if (system.verifier?.targets) {
+      const models = system.verifier.targets.map((target) => parseTarget(target).modelId);
+      const finders = system.finders.map((finder) => parseTarget(finder.target).modelId);
+      if (new Set(models).size !== models.length)
+        problems.push(
+          `review system ${JSON.stringify(system.name)}: verifier targets must be unique by base model id`,
+        );
+      if (!models.some((model) => !finders.includes(model)))
+        problems.push(
+          `review system ${JSON.stringify(system.name)}: verifier targets must include at least one base model id that is not any finder's`,
+        );
+      continue;
+    }
     const [verifier, ...rest] = system.verifier?.targets ?? [system.verifier?.target];
     if (!rest.length && system.finders.some((finder) => finder.target === verifier))
       problems.push(

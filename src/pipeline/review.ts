@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { FinderPrompt, ReviewFinder, ReviewSystem } from "../core/types.ts";
 import { type AgentResult, extractJson } from "../harness/types.ts";
+import { NoCapacityError } from "./context.ts";
 import { MERGE_RULES, mergeReports } from "./panel-merge.ts";
 import { reviewPrompt, verifierPrompt } from "./prompts.ts";
 import {
@@ -275,7 +276,9 @@ export function pickVerifier<V extends { vendor: string; modelId: string }>(
     targets.find((t) => !avoidVendors.includes(t.vendor) && !avoidModels.includes(t.modelId)) ??
     targets.find((t) => !avoidModels.includes(t.modelId));
   if (!picked)
-    throw new Error(`verifier ${targets.map((t) => t.modelId).join(", ")} raised a candidate it would check`);
+    throw new NoCapacityError(
+      `verifier ${targets.map((t) => t.modelId).join(", ")} raised a candidate it would check`,
+    );
   return picked;
 }
 

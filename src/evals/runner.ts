@@ -766,6 +766,7 @@ export class EvalRunner {
             details: {
               ...("hidden" in item ? source.details : {}),
               ...trial.details,
+              ...(source.details.verifiers ? { verifiers: source.details.verifiers } : {}),
               grade,
               cache: source.details.cache ?? {
                 evalRunId: source.evalRunId,

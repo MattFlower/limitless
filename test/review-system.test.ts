@@ -16,6 +16,7 @@ import {
   productionReviewSystem,
   readReviewLenses,
 } from "../src/pipeline/review-system.ts";
+import type { ModelDef } from "../src/router/catalog.ts";
 import { enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
 
 const system = (over: Record<string, unknown> = {}) => ({
@@ -106,8 +107,45 @@ test("a batch's verifier is the first listed target independent of it, else the 
   const list = [t("a1", "a"), t("o1", "o"), t("a2", "a")];
   expect(pickVerifier(list, ["o"], ["o2"]).modelId).toBe("a1");
   expect(pickVerifier(list, ["a"], ["a1"]).modelId).toBe("o1");
+  expect(pickVerifier(list, ["a"], ["a3"]).modelId).toBe("o1");
   expect(pickVerifier(list, ["a", "o"], ["a1", "o1"]).modelId).toBe("a2");
   expect(() => pickVerifier(list, ["a"], ["a1", "a2", "o1"])).toThrow("raised a candidate it would check");
+});
+
+test("verifier lists require distinct base models and a model outside all finders", async () => {
+  const model = (id: string): ModelDef => ({
+    ...verifierModel,
+    id,
+    supportedEfforts: ["medium", "high"],
+    effort: undefined,
+  });
+  const f = await evalFixture([model("claude/opus"), model("codex/sol-6.1"), model("codex/sol")]);
+  try {
+    const review = { ...f.dataset, role: "review" } as unknown as Parameters<typeof validateRequest>[1];
+    const validate = (targets: string[]) =>
+      validateRequest(
+        {
+          role: "review",
+          systems: [
+            panel({
+              finders: ["codex/sol-6.1", "claude/opus"].map((target) => ({ target, prompt: "standard" })),
+              verifier: { targets },
+            }),
+          ],
+        },
+        review,
+        f.factory.router,
+      );
+    expect(() => validate(["claude/opus", "codex/sol-6.1@high"])).toThrow("not any finder's");
+    expect(() => validate(["claude/opus", "claude/opus"])).toThrow("unique by base model id");
+    expect(() => validate(["codex/sol@medium", "codex/sol@high"])).toThrow("unique by base model id");
+    expect(
+      validate(["claude/opus", "codex/sol-6.1@medium", "codex/sol@medium"]).request.systems,
+    ).toHaveLength(1);
+    expect(f.calls).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
 });
 
 test("production derives one routed standard finder from [review] implementer_report", () => {
