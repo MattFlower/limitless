@@ -227,23 +227,30 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(prompt).toContain("change itself will be implemented later");
     expect(prompt).not.toContain("DO NOT modify anything");
   });
-
   test("spec scope phrases normalize punctuation and leave ordinary documentation work alone", () => {
     for (const summary of [
       "SPECIFICATION—ONLY task",
       "Documentation  \nonly.",
       "Do NOT modify source code.",
       "No code changes.",
+      "Do not modify code in this task.",
     ]) {
       expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBe(summary);
-      expect(specScopeViolation({ ...spec, summary }, summary)).toBeNull();
+      expect(specScopeViolation({ ...spec, summary }, `${summary} Explain the behavior.`)).toBeNull();
     }
     for (const summary of [
       "Add code and documentation.",
       "Verify behavior without modifying fixtures.",
       "Document the read-only API.",
+      "Do not change the code path for legacy users.",
+      "Do not modify code outside src/pipeline.",
+      "Must not edit the code generator output.",
+      "Do not change code in existing callers.",
+      "Existing plugins keep working without code changes.",
+      "Existing plugins require no code changes.",
     ]) {
       expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBeNull();
+      expect(specScopeViolation({ ...spec, summary: "No code changes." }, summary)).toBe("No code changes.");
     }
     expect(
       specScopeViolation(
@@ -260,20 +267,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "spec scope validation: %s",
     async (scenario) => {
       const sentence = "This is a specification-only task; do not modify code";
-      const invalid = {
-        ...spec,
-        summary:
-          scenario === "documentation"
-            ? "Documentation-only task"
-            : scenario === "requirement" || scenario === "criterion"
-              ? spec.summary
-              : sentence,
-        requirements: scenario === "requirement" ? [sentence] : spec.requirements,
-        acceptance_criteria:
-          scenario === "criterion"
-            ? [{ id: "AC-1", criterion: sentence, how_to_verify: "Inspect" }]
-            : spec.acceptance_criteria,
-      };
+      const invalid = { ...spec };
+      if (scenario === "requirement") invalid.requirements = [sentence];
+      else if (scenario === "criterion")
+        invalid.acceptance_criteria = [{ id: "AC-1", criterion: sentence, how_to_verify: "Inspect" }];
+      else invalid.summary = scenario === "documentation" ? "Documentation-only task" : sentence;
       const prompts: string[] = [];
       let implementCalls = 0;
       const f = start((s) => {

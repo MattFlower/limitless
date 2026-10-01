@@ -1,19 +1,21 @@
 import type { Spec } from "./schemas.ts";
 
-// Deliberately bounded scope phrases, shared by request exemptions and spec validation.
-// Normalize punctuation (including hyphens) and whitespace; do not classify general prose.
+// Bounded phrases shared by request exemptions and spec validation; normalize punctuation/whitespace.
+// Code bans must end a clause (optionally "in this task"); scoped/compatibility constraints are allowed.
 const phrases = [
   /\b(?:specification|spec|documentation|docs) only\b/,
   /\bonly (?:write|produce|update) (?:the )?(?:specification|documentation|docs)\b/,
-  /\b(?:do not|don t|must not) (?:modify|edit|change|write) (?:any |the |source |production )?code\b/,
-  /\b(?:no|without(?: any)?) code (?:changes|modifications|edits)\b/,
-  /\bcode (?:changes|modifications|edits) (?:are )?(?:forbidden|prohibited|not allowed)\b/,
-  /\bdo not modify anything\b/,
+  /\b(?:do not|don t|must not) (?:modify|edit|change|write) (?:any |the |source |production )?code(?: in this task)?$/,
+  /^no code (?:changes|modifications|edits)(?: in this task)?$/,
+  /^code (?:changes|modifications|edits) (?:are )?(?:forbidden|prohibited|not allowed)(?: in this task)?$/,
+  /\bdo not modify anything(?: in this task)?$/,
 ];
 
 function restricted(text: string): boolean {
-  const normalized = text.toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, " ");
-  return phrases.some((phrase) => phrase.test(normalized));
+  return text.split(/[.!?;]/).some((clause) => {
+    const normalized = clause.toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, " ");
+    return phrases.some((phrase) => phrase.test(normalized.trim()));
+  });
 }
 
 /** Return the original offending sentence for retry feedback, before any spec is persisted. */
