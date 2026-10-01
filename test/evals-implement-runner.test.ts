@@ -1032,6 +1032,31 @@ test("resume reruns a multi-round trial whose switch target backend or retry pro
   }
 });
 
+test("resume reruns an effort trial whose later-round effort changed with the supported efforts", async () => {
+  const f = await fixture();
+  try {
+    const model = enableEfforts(f);
+    f.respond(() => ({ files: { answer: "wrong" } }));
+    const resume = async (id: string) => {
+      f.factory.store.updateEvalRun(id, "interrupted");
+      const resumed = f.factory.evals.resume(id);
+      await f.factory.evals.wait(resumed?.id ?? "");
+      return f.factory.evals.report(resumed?.id ?? "")?.trials[0];
+    };
+    const report = await f.run({ rounds: 2, strategy: "effort" });
+    const copied = await resume(report.run.id);
+    expect(f.calls.map((s) => s.target.effort)).toEqual(["low", "high"]);
+    expect(copied?.details.resumedFrom).toBe(report.run.id);
+    // Same provider, backend and harness, but the second round now resolves to a different effort.
+    model.supportedEfforts = ["none", "low", "medium", "high"];
+    const rerun = await resume(copied?.evalRunId ?? "");
+    expect(f.calls.map((s) => s.target.effort)).toEqual(["low", "high", "low", "medium"]);
+    expect(rerun?.details.resumedFrom).toBeUndefined();
+  } finally {
+    await f.close();
+  }
+});
+
 test("switched retry rounds respect the eval concurrency on their destination provider", async () => {
   const f = await fixture();
   const policy = f.factory.policy.implement.small;

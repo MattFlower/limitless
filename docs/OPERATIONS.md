@@ -189,8 +189,8 @@ trials. Already-started calls finish and retain their full costs, so concurrent 
 threshold: by at most N−1 in-flight trials per provider group (N being that group's concurrency),
 plus whatever other provider groups have in flight. Failed calls also consume metered budget; API-equivalent subscription costs do not.
 
-The SHA-256 cache identity includes model ID, selected harness, each target's provider and backend
-model, prompt and system additions, strict JSON schema and trial index. Only schema-valid `ok` outputs are reusable, even when they failed
+The SHA-256 cache identity includes model ID, selected harness, each target's provider, backend
+model and effort, prompt and system additions, strict JSON schema and trial index. Only schema-valid `ok` outputs are reusable, even when they failed
 grading. Cache replay re-grades current gold, adds zero new cost/tokens, and leaves provider quota and
 health untouched (cached outputs remain usable when the provider is unavailable). Original cost, tokens and latency are retained in trial cache provenance. Gold-only
 changes do not invalidate the cache; `--no-cache` forces fresh calls. Historical reports use their

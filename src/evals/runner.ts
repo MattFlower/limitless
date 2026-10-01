@@ -722,7 +722,9 @@ export class EvalRunner {
             }
           : repository,
         trial.effort,
-        targets.map((to) => to && [to.provider, to.model, selectHarness(run.role, to).harnessName]),
+        targets.map(
+          (to) => to && [to.provider, to.model, selectHarness(run.role, to).harnessName, to.effort ?? null],
+        ),
       );
       if (predecessor?.cacheKey === trial.cacheKey) {
         const copy =

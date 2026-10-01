@@ -21,7 +21,7 @@ export function cacheKey(
   repository?: unknown,
   /** Resolved at submission; null/undefined marks legacy trials whose effort is unknown. */
   effort?: string | null,
-  /** Provider, backend model and harness of every target, so a new checkpoint behind a catalog ID is a miss. */
+  /** Provider, backend model, harness and effort of every target, so a new checkpoint behind a catalog ID is a miss. */
   backends?: unknown,
 ): string {
   return new Bun.CryptoHasher("sha256")
