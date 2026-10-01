@@ -110,11 +110,13 @@ families are excluded, while known settings such as `GOPRIVATE` and `NODE_TLS_RE
 and operator-listed names are always included).
 **Only a baseline where setup and every check passed is cached**: a failing base (possibly flaky,
 even after its retry) runs again on every run, so it can never turn a later regression into a
-non-blocking `still_failing`, and a failure never overwrites a cached pass. Lookups and writes run
-in a per-key single flight, so concurrent runs on one base execute the baseline once. Entries
-record the writing run and time, expire after seven days (removed by `gc`), and can be dropped per
-repo with `Store.clearBaselineCache(repoId)`. `limitless run --no-baseline-cache` or
-`[gates] baseline_cache = false` skips the lookup; a passing bypass baseline refreshes the entry.
+non-blocking `still_failing`; a fresh failing baseline evicts any cached pass for its key instead.
+Cacheable lookups run in a per-key single flight, so concurrent runs on one base execute the
+baseline once; if the flight's baseline fails, its waiters run theirs concurrently. Entries record
+the writing run and time, expire after seven days (removed by `gc`), and can be dropped with
+`limitless gates clear-cache [--repo owner/name]`. `limitless run --no-baseline-cache` or
+`[gates] baseline_cache = false` skips the lookup and the single flight; a passing bypass baseline
+refreshes the entry. Without a known Limitless build SHA the cache is neither read nor written.
 
 The optional preview configuration is validated and saved from the base revision during prepare,
 before model calls. A matching committed diff starts an isolated preview immediately before a new

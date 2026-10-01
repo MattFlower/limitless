@@ -23,6 +23,7 @@ limitless providers                 # health + quota per provider
 limitless ls                        # recent runs
 limitless logs <run> -f             # follow a run
 limitless gc --dry-run              # preview hourly retention cleanup
+limitless gates clear-cache [--repo owner/name]  # drop cached passing baselines (all repos by default)
 limitless service status            # launchd units, release commit, health
 limitless deploy                    # ship origin/main (gated, auto-rollback)
 limitless deploy --smoke            # also run live CLI contract checks before restart

@@ -356,7 +356,10 @@ async function prepare(ctx: RunContext): Promise<void> {
         return retried;
       };
       ctx.state.baselineCached = false;
+      const buildSha = ctx.deps.buildSha;
       if (!hasGates) ctx.state.baseline = null;
+      // Without a known build the gate environment can't be keyed: never read or write the cache.
+      else if (!buildSha) ctx.state.baseline = await runBaseline();
       else {
         // Keyed by the commit actually checked out, so verify-change caches its PR base.
         const key = baselineCacheKey({
@@ -367,13 +370,12 @@ async function prepare(ctx: RunContext): Promise<void> {
           bunVersion: Bun.version,
           platform: process.platform,
           arch: process.arch,
-          buildSha: ctx.deps.buildSha ?? "unknown",
+          buildSha,
           envDigest: gateEnvDigest(gateEnv(), cfg.baselineEnv),
         });
         // A bypass still runs the baseline and refreshes the entry if it passes.
         const bypass = ctx.run.noBaselineCache === true || !cfg.baselineCache;
-        // One baseline per key at a time: a concurrent run on the same base waits, then reuses it.
-        ctx.state.baseline = await singleFlight(JSON.stringify(key), ctx.signal, async () => {
+        const baseline = async (): Promise<GateRun> => {
           const cached = bypass
             ? null
             : store.getBaselineCache<GateRun>(key, Date.now() - BASELINE_CACHE_TTL_MS);
@@ -383,10 +385,17 @@ async function prepare(ctx: RunContext): Promise<void> {
             return cached;
           }
           const fresh = await runBaseline();
-          // Only a passing baseline is cached; a failure (maybe flaky) must run again next time.
+          // Only a passing baseline is cached; a failure (maybe flaky) must run again next time,
+          // and it contradicts any cached pass for this key, so that entry goes.
           if (cacheableBaseline(fresh, gates)) store.putBaselineCache(key, fresh, ctx.run.id);
+          else store.deleteBaselineCache(key);
           return fresh;
-        });
+        };
+        // One cacheable baseline per key at a time: a concurrent run on the same base waits, then
+        // reuses it. A bypass can't reuse anything, so it never waits.
+        ctx.state.baseline = bypass
+          ? await baseline()
+          : await singleFlight(JSON.stringify(key), ctx.signal, baseline, (r) => cacheableBaseline(r, gates));
       }
     } finally {
       if (verification) await resetTo(wt.path, verification.headSha);

@@ -44,7 +44,7 @@ export interface EngineDeps {
   gh?: GhRunner;
   cfg: Config;
   store: Store;
-  /** Limitless build (git SHA), part of the baseline cache key. */
+  /** Limitless build (git SHA), part of the baseline cache key; unknown disables the cache. */
   buildSha?: string;
   router: Router;
   tracker: ProviderTracker;

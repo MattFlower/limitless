@@ -27,6 +27,7 @@ Usage:
   limitless providers                     Provider health and quota
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless gc [--dry-run]                Clean up expired worktrees, logs, debug events and baseline cache
+  limitless gates clear-cache [--repo owner/name]  Drop cached passing baselines (all repos by default)
   limitless mcp                           MCP stdio proxy (daemon must be running)
   limitless integrations install [--write] Print setup; --write installs the Codex skill
   limitless service install [--tunnel] [--mtplx]   launchd agents: daemon (+ mtplx, tunnel)
@@ -393,6 +394,16 @@ async function main(): Promise<void> {
       for (const entry of result.metadata) console.log(`  metadata ${entry}`);
       for (const error of result.errors) console.error(color.red(`  error ${error}`));
       if (result.errors.length) process.exitCode = 1;
+      return;
+    }
+    case "gates": {
+      if (rest.length !== 1 || rest[0] !== "clear-cache")
+        throw new Error("usage: limitless gates clear-cache [--repo owner/name]");
+      const { cleared } = await api<{ cleared: number }>("/api/gates/clear-cache", {
+        method: "POST",
+        body: JSON.stringify(values.repo === undefined ? {} : { repo: values.repo }),
+      });
+      console.log(`Cleared ${cleared} cached baselines`);
       return;
     }
     default:

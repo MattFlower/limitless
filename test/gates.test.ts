@@ -494,17 +494,19 @@ describe("baseline cache", () => {
       release = resolve;
     });
     const signal = new AbortController().signal;
-    const first = singleFlight("k", signal, async () => {
-      order.push("first start");
-      await gate;
-      order.push("first end");
-    });
-    const second = singleFlight("k", signal, async () => {
-      order.push("second");
-    });
-    const other = singleFlight("other", signal, async () => {
-      order.push("other");
-    });
+    const reusable = () => true;
+    const first = singleFlight(
+      "k",
+      signal,
+      async () => {
+        order.push("first start");
+        await gate;
+        order.push("first end");
+      },
+      reusable,
+    );
+    const second = singleFlight("k", signal, async () => order.push("second"), reusable);
+    const other = singleFlight("other", signal, async () => order.push("other"), reusable);
     await other;
     expect(order).toEqual(["first start", "other"]);
     release();
@@ -512,12 +514,40 @@ describe("baseline cache", () => {
     expect(order).toEqual(["first start", "other", "first end", "second"]);
     const aborted = new AbortController();
     let unblock = () => {};
-    const blocker = singleFlight("k", signal, () => new Promise<void>((resolve) => (unblock = resolve)));
-    const waiting = singleFlight("k", aborted.signal, async () => {});
+    const blocker = singleFlight(
+      "k",
+      signal,
+      () => new Promise<void>((resolve) => (unblock = resolve)),
+      reusable,
+    );
+    const waiting = singleFlight("k", aborted.signal, async () => {}, reusable);
     aborted.abort(new Error("cancelled"));
     await expect(waiting).rejects.toThrow("cancelled");
     unblock();
     await blocker;
+  });
+
+  test("waiters on a flight with an unreusable result run concurrently", async () => {
+    const signal = new AbortController().signal;
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let active = 0;
+    let peak = 0;
+    const attempt = async () => {
+      active++;
+      peak = Math.max(peak, active);
+      await Bun.sleep(20);
+      active--;
+      return false;
+    };
+    const ok = (passed: boolean) => passed;
+    const failing = singleFlight("fail", signal, () => gate.then(() => false), ok);
+    const waiters = [1, 2, 3].map(() => singleFlight("fail", signal, attempt, ok));
+    release();
+    expect(await Promise.all([failing, ...waiters])).toEqual([false, false, false, false]);
+    expect(peak).toBe(3);
   });
 
   test("the config hash ignores key order but not content", () => {

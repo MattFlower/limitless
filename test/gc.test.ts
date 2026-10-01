@@ -190,6 +190,46 @@ test("daemon API and CLI dry run leave Git, files and DB unchanged", async () =>
   }
 });
 
+test("gates clear-cache drops cached baselines for one repo or all of them", async () => {
+  const other = store.upsertRepo({
+    slug: "local/other",
+    kind: "local",
+    url: null,
+    localPath: root,
+    defaultBranch: repo.defaultBranch,
+    mergePolicy: "none",
+  });
+  const pass = { setupOk: true, setup: [], checks: [] };
+  const key = { repoId: repo.id, baseSha: "a".repeat(40), gatesHash: "h", envHash: "e" };
+  store.putBaselineCache(key, pass, "r");
+  store.putBaselineCache({ ...key, baseSha: "b".repeat(40) }, pass, "r");
+  store.putBaselineCache({ ...key, repoId: other.id }, pass, "r");
+  const count = () => store.db.query("SELECT repo_id FROM passing_baselines ORDER BY repo_id").all();
+  const factory = new Factory(cfg, { store, providers: [] });
+  const server = startHttp(factory);
+  const url = `http://127.0.0.1:${server.port}`;
+  const cli = (...args: string[]) =>
+    sh(["bun", "src/cli/main.ts", "gates", "clear-cache", ...args], {
+      cwd: process.cwd(),
+      env: { ...process.env, LIMITLESS_URL: url } as Record<string, string>,
+    });
+  try {
+    expect(count()).toHaveLength(3);
+    expect((await cli("--repo", repo.slug)).stdout).toContain("Cleared 2 cached baselines");
+    expect(count()).toEqual([{ repo_id: other.id }]);
+    const missing = await fetch(`${url}/api/gates/clear-cache`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "no/such" }),
+    });
+    expect(missing.status).toBe(404);
+    expect((await cli()).stdout).toContain("Cleared 1 cached baselines");
+    expect(count()).toEqual([]);
+  } finally {
+    await server.stop(true);
+  }
+});
+
 test("one worktree failure leaves other items retryable", async () => {
   const bad = run("succeeded", 4);
   const good = run("succeeded", 4);

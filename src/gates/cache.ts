@@ -160,28 +160,36 @@ export function cacheableBaseline(run: GateRun, cfg: GateConfig): boolean {
   );
 }
 
-const flights = new Map<string, Promise<unknown>>();
+const flights = new Map<string, Promise<boolean>>();
 
-function settled(flight: Promise<unknown>, signal: AbortSignal): Promise<void> {
+/** Resolves with whether the flight's result can be reused; a rejected flight can't. */
+function settled(flight: Promise<boolean>, signal: AbortSignal): Promise<boolean> {
   signal.throwIfAborted();
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<boolean>((resolve, reject) => {
     const abort = () => reject(signal.reason);
     signal.addEventListener("abort", abort, { once: true });
-    flight.then(
-      () => resolve(),
-      () => resolve(),
-    );
+    flight.then(resolve, () => resolve(false));
     flight.finally(() => signal.removeEventListener("abort", abort)).catch(() => undefined);
   });
 }
 
-/** Run `fn` once per key at a time: a concurrent caller waits, then runs (and usually hits the cache). */
-export async function singleFlight<T>(key: string, signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
-  for (let prior = flights.get(key); prior; prior = flights.get(key)) await settled(prior, signal);
-  const flight = fn();
+/**
+ * Run `fn` once per key at a time: a concurrent caller waits, then runs (and usually hits the cache).
+ * When a flight's result is not `reusable`, there is nothing to hit, so its waiters run concurrently.
+ */
+export async function singleFlight<T>(
+  key: string,
+  signal: AbortSignal,
+  fn: () => Promise<T>,
+  reusable: (result: T) => boolean,
+): Promise<T> {
+  for (let prior = flights.get(key); prior; prior = flights.get(key))
+    if (!(await settled(prior, signal))) return fn();
+  const result = fn();
+  const flight = result.then(reusable, () => false);
   flights.set(key, flight);
   try {
-    return await flight;
+    return await result;
   } finally {
     if (flights.get(key) === flight) flights.delete(key);
   }

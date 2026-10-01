@@ -1222,8 +1222,17 @@ export class Store {
       .run(key.repoId, key.baseSha, key.gatesHash, key.envHash, JSON.stringify(gateRun), runId, now);
   }
 
-  /** Drop every cached baseline for a repo (repair after a bad entry); returns the count removed. */
-  clearBaselineCache(repoId: string): number {
+  deleteBaselineCache(key: BaselineCacheKey): void {
+    this.db
+      .query(
+        "DELETE FROM passing_baselines WHERE repo_id = ? AND base_sha = ? AND gates_hash = ? AND env_hash = ?",
+      )
+      .run(key.repoId, key.baseSha, key.gatesHash, key.envHash);
+  }
+
+  /** Drop every cached baseline, or one repo's (repair after a bad entry); returns the count removed. */
+  clearBaselineCache(repoId?: string): number {
+    if (repoId === undefined) return this.db.query("DELETE FROM passing_baselines").run().changes;
     return this.db.query("DELETE FROM passing_baselines WHERE repo_id = ?").run(repoId).changes;
   }
 

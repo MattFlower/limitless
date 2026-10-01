@@ -6,6 +6,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus, StageName } from "../src/core/types.ts";
+import { gateSlots } from "../src/gates/slots.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
@@ -180,6 +181,7 @@ function start(handler: Handler, effortRouting = false, freeProviders = false): 
           ]
         : models,
     policy: effortRouting ? { ...policy, implement: { default: ["alpha/m@high", "alpha/m@low"] } } : policy,
+    bootSha: "test-build",
   });
   factory.start();
   return factory;
@@ -767,6 +769,51 @@ esac
       expect(cacheRows(f)).toHaveLength(1);
     });
 
+    describe("uncacheable baselines on one base", () => {
+      let slots = 1;
+      beforeEach(() => {
+        slots = gateSlots.limit;
+      });
+      afterEach(() => gateSlots.setLimit(slots));
+      // Each baseline attempt logs start and end around a sleep; adjacent starts mean overlap.
+      const overlapping = (log: string) => readFileSync(log, "utf8").includes("start\nstart\n");
+      const timed = (log: string, exit: number) =>
+        `test -f farewell.txt && exit 0; echo start >> '${log}'; sleep 1; echo end >> '${log}'; exit ${exit}`;
+
+      test("with the kill switch, same-base runs execute their baselines concurrently", async () => {
+        const log = join(home, "gate-log");
+        await commitGates(`[gates]\nchecks = [{ name = "check", run = "${timed(log, 0)}" }]\n`);
+        const f = start(quick);
+        f.cfg.baselineCache = false;
+        gateSlots.setLimit(3);
+        const runs = await Promise.all([finish(f), finish(f), finish(f)]);
+        expect(runs.map((r) => r.state?.baselineCached)).toEqual([false, false, false]);
+        expect(readFileSync(log, "utf8").split("\n").slice(0, 3)).toEqual(["start", "start", "start"]);
+      });
+
+      test("a failing flight releases its waiters to run concurrently", async () => {
+        const log = join(home, "gate-log");
+        await commitGates(`[gates]\nchecks = [{ name = "check", run = "${timed(log, 1)}" }]\n`);
+        const f = start(quick);
+        gateSlots.setLimit(3);
+        const runs = await Promise.all([finish(f), finish(f), finish(f)]);
+        expect(runs.map((r) => r.state?.baseline?.checks[0]?.ok)).toEqual([false, false, false]);
+        expect(cacheRows(f)).toEqual([]);
+        expect(overlapping(log)).toBe(true);
+      });
+    });
+
+    test("an unknown build SHA neither reads nor writes the cache", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const f = start(quick);
+      f.deps.buildSha = undefined;
+      await finish(f);
+      const second = await finish(f);
+      expect([lines(count), second.state?.baselineCached]).toEqual([4, false]);
+      expect(cacheRows(f)).toEqual([]);
+    });
+
     test("a changed gate config or base commit misses", async () => {
       const count = join(home, "gate-runs");
       await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
@@ -873,7 +920,7 @@ esac
       expect(lines(count)).toBe(3);
     });
 
-    test("a bypass run refreshes a passing entry and never replaces it with a failure", async () => {
+    test("a bypass run refreshes a passing entry and evicts it when the base fails", async () => {
       const count = join(home, "gate-runs");
       const broken = join(home, "broken");
       await commitGates(
@@ -888,14 +935,17 @@ esac
       expect(cacheRows(f).map((r) => r.run_id)).toEqual([bypass.run.id]);
       const refreshed = cacheRows(f);
 
+      expect(refreshed).toHaveLength(1);
+
+      // A failing fresh baseline contradicts the cached pass, so it is evicted, not replaced.
       writeFileSync(broken, "");
       const failing = await finish(f, { noBaselineCache: true });
       expect(failing.state?.baseline?.checks[0]?.ok).toBe(false);
-      expect(cacheRows(f)).toEqual(refreshed);
+      expect(cacheRows(f)).toEqual([]);
       const retried = await f.retryRun(failing.run.id);
       expect(retried.noBaselineCache).toBe(true);
       await waitFor(f, retried.id, ["succeeded", "failed", "needs_human"]);
-      expect(cacheRows(f)).toEqual(refreshed);
+      expect(cacheRows(f)).toEqual([]);
 
       // The config kill switch bypasses reads too, and still refreshes on a pass.
       rmSync(broken);
