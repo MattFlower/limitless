@@ -23,6 +23,7 @@ import {
   restoreShared,
   trustCheckout,
   trustedConfigPath,
+  trustedWorktreeConfigPath,
 } from "./trust.ts";
 
 export { trustedAttributesPath, trustedConfigPath } from "./trust.ts";
@@ -271,7 +272,7 @@ async function restoreCache(cache: string, url: string): Promise<void> {
  */
 async function restoreLocal(paths: Paths, cache: string, key: string): Promise<void> {
   const common = resolve(cache, (await git(["rev-parse", "--git-common-dir"], { cwd: cache })).stdout.trim());
-  if (!existsSync(trustedConfigPath(key))) {
+  if (!existsSync(trustedConfigPath(key)) || !existsSync(trustedWorktreeConfigPath(key))) {
     const under = (path: string) => {
       try {
         return realpathSync(path).startsWith(realpathSync(paths.work) + sep);
@@ -447,10 +448,18 @@ export async function commitAll(cwd: string, message: string): Promise<string | 
   return headSha(cwd);
 }
 
-/** Move the worktree's branch back to a known commit, discarding everything after it. */
-export async function resetTo(cwd: string, sha: string, env?: Record<string, string>): Promise<void> {
+/**
+ * Put the branch, index and tracked files back to a known commit, keeping untracked files: a gate
+ * retry must see its first attempt's build output but not the tracked edits the attempt made.
+ */
+export async function restoreTracked(cwd: string, sha: string, env?: Record<string, string>): Promise<void> {
   await restoreCheckout(cwd);
   await git(["reset", "--hard", "-q", sha], { cwd, env });
+}
+
+/** Move the worktree's branch back to a known commit, discarding everything after it. */
+export async function resetTo(cwd: string, sha: string, env?: Record<string, string>): Promise<void> {
+  await restoreTracked(cwd, sha, env);
   await git(["clean", "-fdq"], { cwd, env });
 }
 

@@ -195,6 +195,8 @@ export interface InvokeOptions {
   redactHoldout?: boolean;
   /** Run in this directory instead of the worktree (e.g. a base-commit snapshot). */
   cwd?: string;
+  /** The recorded commit a read-only attempt's cleanup restores, so a fallback never reads its edits. */
+  head?: string;
   /** Paths a tool-enabled reader must not read (see AgentSpec.denyRead). */
   denyRead?: string[];
   /** Tools read only the cwd and scratch (see AgentSpec.confineReads). */
@@ -573,7 +575,7 @@ export class RunContext {
         release();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
         if ((opts.role === "review" || opts.role === "verify") && this.state.worktreePath)
-          await discardChanges(this.state.worktreePath);
+          await discardChanges(this.state.worktreePath, undefined, opts.head);
       }
       if (this.signal.aborted)
         result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };

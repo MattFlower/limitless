@@ -45,6 +45,7 @@ import {
   remoteBranchSha,
   removeWorktree,
   resetTo,
+  restoreTracked,
   withGitHubRetry,
 } from "../git/repos.ts";
 import { loadTrust, saveTrust, trustCheckout } from "../git/trust.ts";
@@ -900,7 +901,9 @@ async function oneRound(
         const after = await runGates(cwd, gates, ctx.signal, events);
         ctx.checkCancelled();
         const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
-        // Retry before discarding, so a check sees the same build output as its first attempt.
+        // Retry before discarding, so a check sees the same build output as its first attempt, but
+        // on the candidate's tracked files: a failing check may have rewritten them into passing ones.
+        await restoreTracked(cwd, head);
         cmp = await retryRegressions(
           compareGates(ctx.state.baseline ?? null, after),
           cwd,
@@ -1076,6 +1079,7 @@ async function oneRound(
           ...request,
           ...(deadline ? { deadline } : {}),
           requireStructured: true,
+          head,
         });
         await discardChanges(cwd, undefined, head);
         return invoked;
@@ -1233,6 +1237,7 @@ async function oneRound(
             requireStructured: true,
             privateSession: true,
             redactHoldout: true,
+            head,
           });
           await discardChanges(cwd, undefined, head);
           const v = normalizeVerify(

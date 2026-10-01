@@ -41,6 +41,8 @@ export interface GitTrust {
 /** The factory's copies of a shared repository's config and info/attributes, outside any git metadata. */
 export const trustedConfigPath = (key: string) => `${key}.trusted-config`;
 export const trustedAttributesPath = (key: string) => `${key}.trusted-attributes`;
+/** The main worktree's own `config.worktree`, which commands run in the shared repository read. */
+export const trustedWorktreeConfigPath = (key: string) => `${key}.trusted-config-worktree`;
 
 const read = (path: string) => {
   try {
@@ -60,20 +62,23 @@ function put(path: string, content: string | null) {
   writeFileSync(path, content);
 }
 
-/** Reset a factory-owned repository's config, and empty its hooks and info/attributes. */
+/** Reset a factory-owned repository's config, and empty its hooks, info/attributes and config.worktree. */
 export function restoreOwned(commonDir: string, config: string): void {
   put(join(commonDir, "config"), config);
+  put(join(commonDir, "config.worktree"), null);
   put(join(commonDir, "info", "attributes"), null);
   rmSync(join(commonDir, "hooks"), { recursive: true, force: true });
   mkdirSync(join(commonDir, "hooks"));
 }
 
-/** Record a repository's current shared config and info/attributes as the factory's trusted copies. */
+/** Record a repository's current shared config, config.worktree and info/attributes as the trusted copies. */
 export function captureShared(commonDir: string, key: string): void {
   const config = read(join(commonDir, "config"));
   if (config === null) throw new Error(`git config unreadable in ${commonDir}`);
   mkdirSync(dirname(key), { recursive: true });
   writeFileSync(trustedConfigPath(key), config);
+  // An empty copy records that there was none, distinct from a copy an older release never took.
+  writeFileSync(trustedWorktreeConfigPath(key), read(join(commonDir, "config.worktree")) ?? "");
   put(trustedAttributesPath(key), read(join(commonDir, "info", "attributes")));
 }
 
@@ -84,6 +89,7 @@ export function restoreShared(commonDir: string, key: string, owned: boolean): v
   if (owned) restoreOwned(commonDir, config);
   else {
     put(join(commonDir, "config"), config);
+    put(join(commonDir, "config.worktree"), read(trustedWorktreeConfigPath(key)) || null);
     put(join(commonDir, "info", "attributes"), read(trustedAttributesPath(key)));
   }
 }
@@ -123,13 +129,14 @@ export async function restoreTrust(cwd: string, trust: GitTrust, signal?: AbortS
     put(dotGit, trust.dotGit);
     put(join(trust.gitDir, "commondir"), trust.commondir);
   }
-  put(join(trust.gitDir, "config.worktree"), trust.configWorktree);
   if (trust.shared) restoreShared(trust.commonDir, trust.shared, trust.owned);
   else if (trust.owned) restoreOwned(trust.commonDir, trust.config);
   else {
     put(join(trust.commonDir, "config"), trust.config);
     put(join(trust.commonDir, "info", "attributes"), trust.attributes);
   }
+  // After the shared restoration: in a standalone repository this is the same file.
+  put(join(trust.gitDir, "config.worktree"), trust.configWorktree);
   const entries = (await git(["ls-files", "-v", "-z"], { cwd, signal })).stdout.split("\0").filter(Boolean);
   // Lowercase tags are assume-unchanged, S/s skip-worktree. update-index honours only one such flag per call.
   for (const [flag, test] of [

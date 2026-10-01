@@ -5727,6 +5727,59 @@ describe("candidate git metadata", () => {
     expect(f.store.getArtifact(run.id, "diff.patch")).toContain("+bye");
   });
 
+  test("a failed reviewer attempt that replaces the commit cannot change what the fallback reads", async () => {
+    const seen: string[] = [];
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        seen.push(Bun.spawnSync(["git", "show", "HEAD:farewell.txt"], { cwd: s.cwd }).stdout.toString());
+        if (seen.length > 1) return { structured: approve };
+        // The first attempt commits replacement contents in the candidate's place, then fails.
+        writeFileSync(join(s.cwd, "farewell.txt"), "replaced\n");
+        agentGit(s.cwd, "add", "-A");
+        agentGit(s.cwd, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "replacement");
+        return { status: "error", error: "reviewer crashed" };
+      }
+      return { files: { "farewell.txt": "bye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(seen).toEqual(["bye\n", "bye\n"]);
+    const cwd = f.store.getRunState<RunState>(run.id)?.worktreePath ?? "";
+    const head = f.store.getRun(run.id)?.headSha ?? "";
+    expect((await sh(["git", "show", `${head}:farewell.txt`], { cwd })).stdout).toBe("bye\n");
+    expect((await sh(["git", "log", "--format=%s", "-1", head], { cwd })).stdout.trim()).not.toBe(
+      "replacement",
+    );
+  });
+
+  test("a failing gate that rewrites the file it fails on stays blocking after its retry", async () => {
+    // Repository code running as a gate: fail on the candidate's edit and replace it with a passing one.
+    const check = "! grep -q BAD greeting.txt || { echo hello > greeting.txt; exit 1; }";
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "no-bad", run = ${JSON.stringify(check)} }]\n`,
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "rewriting gate"], {
+      cwd: repoDir,
+    });
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "greeting.txt": "BAD\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Break greeting", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).not.toBe("succeeded");
+    const gates = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "[]");
+    expect(gates[0]).toMatchObject({ name: "no-bad", verdict: "regressed", blocking: true });
+    expect(gates[0].firstAttempt).toBeDefined();
+    const cwd = f.store.getRunState<RunState>(run.id)?.worktreePath ?? "";
+    expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toBe("BAD\n");
+  });
+
   test.each(["kept", "missing"])("restart restores from the original snapshot (%s)", async (snapshot) => {
     await addFixtures();
     const handler: Handler = (s) => {

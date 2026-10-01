@@ -33,6 +33,7 @@ import {
   restoreTrust,
   saveTrust,
   trustCheckout,
+  trustedWorktreeConfigPath,
 } from "../src/git/trust.ts";
 import { sh } from "../src/util/proc.ts";
 
@@ -322,12 +323,43 @@ describe("shared local repository", () => {
     expect(readdirSync(join(dir, ".git", "hooks"))).toContain("pre-commit");
   });
 
-  test("a touched repository without trusted copies fails instead of adopting its config", async () => {
-    const { paths, local } = await setup();
+  test("a later run's worktree never runs a filter from the main worktree's own config", async () => {
+    const { dir, paths, local } = await setup();
+    // The user's repository tracks attributes naming a filter and uses per-worktree config; the
+    // main worktree's copy is theirs.
+    writeFileSync(join(dir, ".gitattributes"), "*.txt filter=text\n");
+    await run(dir, "add", ".gitattributes");
+    await run(dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "attributes");
+    await run(dir, "config", "extensions.worktreeConfig", "true");
+    await run(dir, "config", "--worktree", "user.name", "owner");
     const first = await createWorktree(paths, local, "run1", "t", "main");
-    await tamper(first.path);
-    rmSync(trustedConfigPath(key(paths)));
-    await expect(createWorktree(paths, local, "run2", "t", "main")).rejects.toThrow("no trusted git state");
-    expect(existsSync(trustedConfigPath(key(paths)))).toBe(false);
+    // Through its worktree, the agent defines that filter's driver in the main worktree's
+    // config.worktree, which worktree add (run in the main worktree) reads.
+    const smudge = (name: string) => `sh -c 'touch ${marker(name)}; cat'`;
+    await run(
+      first.path,
+      "config",
+      "-f",
+      join(dir, ".git", "config.worktree"),
+      "filter.text.smudge",
+      smudge("main"),
+    );
+    await run(first.path, "config", "--worktree", "filter.text.smudge", smudge("own"));
+    const second = await createWorktree(paths, local, "run2", "t", "main");
+    expect(markers()).toEqual([]);
+    expect(readFileSync(join(dir, ".git", "config.worktree"), "utf8")).toBe("[user]\n\tname = owner\n");
+    expect(readFileSync(join(second.path, "plain.txt"), "utf8")).toBe("one\n");
   });
+
+  test.each([trustedConfigPath, trustedWorktreeConfigPath])(
+    "a touched repository without trusted copies fails instead of adopting its config (%p)",
+    async (copy) => {
+      const { paths, local } = await setup();
+      const first = await createWorktree(paths, local, "run1", "t", "main");
+      await tamper(first.path);
+      rmSync(copy(key(paths)));
+      await expect(createWorktree(paths, local, "run2", "t", "main")).rejects.toThrow("no trusted git state");
+      expect(existsSync(copy(key(paths)))).toBe(false);
+    },
+  );
 });
