@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import type { ChildProcess } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,11 +8,11 @@ import type { QuotaWindow } from "../src/core/types.ts";
 import { runClaude } from "../src/harness/claude.ts";
 import { runCodex } from "../src/harness/codex.ts";
 import { type DecisionAnswer, runDecisions } from "../src/harness/decisions.ts";
-import { withScratch } from "../src/harness/scratch.ts";
+import { scratchParent, withScratch as usingScratch } from "../src/harness/scratch.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import { resolveTarget } from "../src/router/targets.ts";
-import { sh } from "../src/util/proc.ts";
+import { processScope, sh } from "../src/util/proc.ts";
 
 /**
  * Why a failure may be retried: the provider was briefly unavailable. Anything else (a disclosed
@@ -60,6 +61,36 @@ export type RunOptions = {
   onRow?: (row: CheckRow) => void;
 };
 
+const KILL_GRACE_MS = 1_000;
+const CLOSE_WAIT_MS = KILL_GRACE_MS + 500;
+function registerTemp(dir: string): string {
+  processScope.getStore()?.scratchDirs.add(dir);
+  return dir;
+}
+function withScratch<T>(cwd: string, run: (dir: string) => Promise<T>): Promise<T> {
+  return usingScratch(cwd, (dir) => {
+    registerTemp(scratchParent(dir));
+    return run(dir);
+  });
+}
+async function closeChildren(children: Map<ChildProcess, Promise<void>>): Promise<boolean> {
+  const closed = await within(
+    Promise.all(children.values()).then(() => true),
+    CLOSE_WAIT_MS,
+    realClock,
+  );
+  if (!closed) {
+    // Escaped descendants can retain pipes after the process group has been killed.
+    for (const child of children.keys()) {
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+    }
+  }
+  return closed === true;
+}
+
 const RETRY_DELAY_MS = 5_000;
 const STOP_GRACE_MS = 10_000;
 const DEFAULT_CHECK_TIMEOUT_MS = 120_000;
@@ -105,18 +136,30 @@ async function attempt(
   timeoutMs: number,
   stopGraceMs: number,
   clock: Clock,
+  scope: NonNullable<ReturnType<typeof processScope.getStore>>,
 ): Promise<CheckResult> {
   const controller = new AbortController();
-  const run = check
-    .run(controller.signal)
+  const signal = AbortSignal.any([controller.signal, scope.signal]);
+  const finish = async (result: CheckResult) => {
+    controller.abort();
+    const closed = await closeChildren(scope.children);
+    if (closed) return result;
+    // A final failure keeps its own reason (never retried); a passing check that left children open fails.
+    const stuck = " (attempt did not stop, not retried)";
+    if (result.status !== "fail" || !result.reason) return fail(`timeout ${timeoutMs}ms${stuck}`);
+    return fail(result.reason.endsWith(stuck) ? result.reason : `${result.reason}${stuck}`);
+  };
+  // Keep post-timeout inspection commands cancellable only by shutdown, not by the attempt.
+  const run = processScope
+    .run(scope, async () => check.run(signal))
     .catch((error: unknown) => fail(String(error), transientReason(String(error))));
   const result = await within(run, timeoutMs, clock);
-  if (result) return result;
+  if (result) return finish(result);
   controller.abort();
   const settled = await within(run, stopGraceMs, clock);
-  if (!settled) return fail(`timeout ${timeoutMs}ms (attempt did not stop, not retried)`);
-  if (settled.status === "fail" && !settled.transient) return settled;
-  return fail(`timeout ${timeoutMs}ms`, "timeout");
+  if (!settled) return finish(fail(`timeout ${timeoutMs}ms (attempt did not stop, not retried)`));
+  if (settled.status === "fail" && !settled.transient) return finish(settled);
+  return finish(fail(`timeout ${timeoutMs}ms`, "timeout"));
 }
 
 /**
@@ -125,6 +168,57 @@ async function attempt(
  * health probe fails on both attempts is skipped.
  */
 export async function runChecks(
+  checks: SmokeCheck[],
+  now?: () => number,
+  delay?: (ms: number) => Promise<void>,
+  options: RunOptions = {},
+): Promise<CheckRow[]> {
+  const shutdown = new AbortController();
+  const children = new Map<ChildProcess, Promise<void>>();
+  const scope = {
+    signal: shutdown.signal,
+    killGraceMs: KILL_GRACE_MS,
+    children,
+    scratchDirs: new Set<string>(),
+  };
+  const exit = (code: number) => {
+    for (const child of children.keys()) {
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+      } catch {}
+    }
+    for (const dir of scope.scratchDirs) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
+    process.exit(code);
+  };
+  let interrupted = false;
+  const interrupt = async (code: number) => {
+    if (interrupted) return exit(code);
+    interrupted = true;
+    shutdown.abort();
+    await closeChildren(children);
+    exit(code);
+  };
+  const onInt = () => void interrupt(130);
+  const onTerm = () => void interrupt(143);
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
+  try {
+    return await processScope.run(scope, () => checksWithinBudget(checks, now, delay, options));
+  } finally {
+    if (!interrupted) {
+      shutdown.abort();
+      await closeChildren(children);
+      process.off("SIGINT", onInt);
+      process.off("SIGTERM", onTerm);
+    }
+  }
+}
+
+async function checksWithinBudget(
   checks: SmokeCheck[],
   now?: () => number,
   delay?: (ms: number) => Promise<void>,
@@ -142,13 +236,16 @@ export async function runChecks(
   // Time an attempt may run so that it, and stopping it, still ends inside the budget.
   const left = () => budgetMs - (time() - begin) - stopGraceMs;
   const rows: CheckRow[] = [];
+  const scope = processScope.getStore();
+  if (!scope) throw new Error("missing smoke process scope");
   for (const check of checks) {
+    if (scope.signal.aborted) break;
     const timeoutMs = check.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS;
     options.onStart?.(check);
     let start = time();
     let result =
       left() > 0
-        ? await attempt(check, Math.min(timeoutMs, Math.floor(left())), stopGraceMs, clock)
+        ? await attempt(check, Math.min(timeoutMs, Math.floor(left())), stopGraceMs, clock, scope)
         : fail("not run: no time left in the smoke budget");
     let retried = false;
     const first = result.reason;
@@ -161,9 +258,10 @@ export async function runChecks(
       result = { ...result, reason: `${first ?? "failed"} (no time left to retry)` };
     } else if (retry) {
       await wait(retryDelayMs);
+      if (scope.signal.aborted) break;
       retried = true;
       start = time();
-      result = await attempt(check, timeoutMs, stopGraceMs, clock);
+      result = await attempt(check, timeoutMs, stopGraceMs, clock, scope);
       // A backend still down on the retry is skipped as before; a retry that skips after any
       // other failure must not hide it.
       if (health && (result.transient === "health" || result.status === "skip"))
@@ -357,7 +455,7 @@ export async function liveCheck(
   signal = new AbortController().signal,
 ): Promise<CheckResult> {
   if (kind === "verify") return verifyLiveCheck(harness, target, signal);
-  const cwd = mkdtempSync(join(tmpdir(), "limitless-smoke-"));
+  const cwd = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-")));
   try {
     await sh(["git", "init", "-q"], { cwd, timeoutMs: 5000 });
     const token = crypto.randomUUID().replaceAll("-", "");
@@ -466,7 +564,7 @@ export async function verifyLiveCheck(
   target: ModelTarget,
   signal = new AbortController().signal,
 ): Promise<CheckResult> {
-  const root = mkdtempSync(join(tmpdir(), "limitless-smoke-verify-"));
+  const root = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-verify-")));
   const cwd = join(root, "worktree");
   try {
     await sh(["git", "init", "-q", cwd], { cwd: root });
@@ -549,7 +647,7 @@ export async function decisionsCheck(
   harness: Harness = runDecisions,
   signal = new AbortController().signal,
 ): Promise<CheckResult> {
-  const dir = mkdtempSync(join(tmpdir(), "limitless-smoke-decisions-"));
+  const dir = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-decisions-")));
   try {
     let served = target.model;
     const result = await harness({
