@@ -1,27 +1,27 @@
 {
   "triage.default": {
-    "reason": "Luna at medium effort first: on the 30 held-out triage cases (eval-mump7s7re29l) it passed 78.9% with no risk under-calls, while Luna with no reasoning passed 63.3% and its risk under-call upper bound (13.2%) exceeded the 10% ceiling. The 40-case dev set, used for prompt wording, had flattered the fast settings. The remaining entries are availability fallbacks that the held-out set has not ranked.",
-    "decided": "2026-09-29"
+    "reason": "Luna at medium effort first, through the Codex subscription (codex/luna, the same gpt-6-luna model as openrouter/gpt-6-luna), then low and none; OpenRouter Luna follows as the metered fallback. Held-out evidence for Luna@medium: eval-mump7s7re29l (78.9%, no risk under-calls); the owner judged the transport difference to be within standard error. The remaining entries are availability fallbacks that the held-out set has not ranked.",
+    "decided": "2026-10-01"
   },
   "implement.trivial": {
-    "reason": "Opus first, Sol fallback: the implement eval has a ceiling (every model scored 100%), so Luna led on cost alone; field use shows Opus far stronger on hard, underspecified work. Revisit when the dataset is stratified by difficulty.",
-    "decided": "2026-09-28"
+    "reason": "Field trial (owner decision, 2026-10-01): Sol 6.1 at high effort first, through the Codex subscription, with Opus as the fallback. The implement eval cannot rank models (every model scores 100%), so evidence comes from factory runs: rounds to converge, verify first-pass rate and review findings, compared with recent Opus-first runs. Large work stays Opus-first.",
+    "decided": "2026-10-01"
   },
   "implement.small": {
-    "reason": "Opus first, Sol fallback: the implement eval has a ceiling (every model scored 100%), so Luna led on cost alone; field use shows Opus far stronger on hard, underspecified work. Revisit when the dataset is stratified by difficulty.",
-    "decided": "2026-09-28"
+    "reason": "Field trial (owner decision, 2026-10-01): Sol 6.1 at high effort first, through the Codex subscription, with Opus as the fallback. The implement eval cannot rank models (every model scores 100%), so evidence comes from factory runs: rounds to converge, verify first-pass rate and review findings, compared with recent Opus-first runs. Large work stays Opus-first.",
+    "decided": "2026-10-01"
   },
   "implement.medium": {
-    "reason": "Opus first, Sol fallback: the implement eval has a ceiling (every model scored 100%), so Luna led on cost alone; field use shows Opus far stronger on hard, underspecified work. Revisit when the dataset is stratified by difficulty.",
-    "decided": "2026-09-28"
+    "reason": "Field trial (owner decision, 2026-10-01): Sol 6.1 at high effort first, through the Codex subscription, with Opus as the fallback. The implement eval cannot rank models (every model scores 100%), so evidence comes from factory runs: rounds to converge, verify first-pass rate and review findings, compared with recent Opus-first runs. Large work stays Opus-first.",
+    "decided": "2026-10-01"
   },
   "implement.large": {
     "reason": "Opus first, Sol fallback: the implement eval has a ceiling (every model scored 100%), so Luna led on cost alone; field use shows Opus far stronger on hard, underspecified work. Revisit when the dataset is stratified by difficulty.",
     "decided": "2026-09-28"
   },
   "review.default": {
-    "reason": "Sol 6.1 first: on review eval v2 (eval-muo4xsbk3p8f, Codex, medium effort, k=3) it matched Sol 6.0 on blocking recall (27.6% vs 28.6%), caught more high-severity defects (50.0% vs 37.5%) and falsely blocked clean changes half as often (18.2% vs 36.4%), at the same cost and latency. The rest of each chain is the previous default. Neither model clears the review floors yet; this pins the better of the two.",
-    "decided": "2026-09-30"
+    "reason": "Sol 6.1 first: on review eval v2 (eval-muo4xsbk3p8f, Codex, medium effort, k=3) it matched Sol 6.0 on blocking recall (27.6% vs 28.6%), caught more high-severity defects (50.0% vs 37.5%) and falsely blocked clean changes half as often (18.2% vs 36.4%), at the same cost and latency. The rest of each chain is the previous default. Neither model clears the review floors yet; this pins the better of the two. Opus, not Sonnet 5, is the Anthropic reviewer in the first group (2026-10-01): a reviewer avoids the implementer's vendor, so a Sol-implemented run is reviewed by the first non-OpenAI entry, and on the same eval run Opus 5.5 caught 23.0% of blocking defects with 3.0% clean false-blocks against Sonnet 5's 10.5% and 9.1% (eval-munjly1s57xk).",
+    "decided": "2026-10-01"
   },
   "review.large": {
     "reason": "Sol 6.1 first: on review eval v2 (eval-muo4xsbk3p8f, Codex, medium effort, k=3) it matched Sol 6.0 on blocking recall (27.6% vs 28.6%), caught more high-severity defects (50.0% vs 37.5%) and falsely blocked clean changes half as often (18.2% vs 36.4%), at the same cost and latency. The rest of each chain is the previous default. Neither model clears the review floors yet; this pins the better of the two.",

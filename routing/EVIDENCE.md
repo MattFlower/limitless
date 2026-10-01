@@ -107,6 +107,25 @@ Why: the implement dataset (12 tasks) has a ceiling problem. Opus, Sol, Luna, So
 
 Revisit when the implement dataset is stratified by difficulty (harder, less-specified, multi-file tasks) and the eval measures rounds-to-converge and post-merge defects as well as first-pass tests. Until then, `routing/overrides.json` pins `implement.*` so `limitless eval policy --write` keeps these chains.
 
+## Owner decision: triage = `codex/luna@medium` first (2026-10-01)
+
+Supersedes the 2026-09-29 triage decision below. Triage starts with `codex/luna@medium`, then `@low` and `@none`, the same `gpt-6-luna` model through the Codex subscription. OpenRouter Luna (`@medium`, `@low`, `@none`) follows as the metered fallback, then the existing availability fallbacks.
+
+Why: same model, different transport, and the subscription has unused quota. The owner judged the transport difference to be within standard error. A held-out check (eval-mupjkaccha17, the 30 held-out cases, k=3) agrees that the gap is within noise. It cannot establish equivalence within the 10-point non-inferiority margin:
+
+| Model | Pass rate (Wilson 95% CI) | Risk under-call | p50 latency | Metered cost, 90 trials |
+|---|---|---|---|---|
+| `codex/luna@medium` | 71.1% (64/90) [61.0%, 79.5%] | 2.4% (2/84) | 5513 ms | $0 (subscription) |
+| `openrouter/gpt-6-luna@medium` | 76.7% (69/90) [67.0%, 84.2%] | 0.0% (0/84) | 4099 ms | $0.0189 |
+
+Paired difference -0.056, one-sided 95% lower bound -0.167. The same OpenRouter setting scored 78.9% on these cases two days earlier (eval-mump7s7re29l), so run-to-run variation is of the same order. Revisit if the field risk under-call rate rises.
+
+## Owner decision: implement trial = `codex/sol-6.1@high` first below large (2026-10-01)
+
+`implement.trivial`, `implement.small` and `implement.medium` start with `codex/sol-6.1@high`, with `claude/opus` as the fallback. `implement.large` stays `claude/opus` then `codex/sol@medium`. This is a field trial, because the implement eval cannot rank models (every model scores 100%; see the implement decision below). It runs on factory work through 2026-10-05. Evidence will come from rounds to converge, verify first-pass rate, review findings and orchestrator review findings, compared with the preceding Opus-first runs. Known confound: verify avoids the implementer's vendor, so Sol-implemented runs are verified by `claude/sonnet` and Opus-implemented runs by `codex/sol`.
+
+Review follows the implementer: a reviewer avoids the implementer's vendor, so a Sol-implemented run is reviewed by the first non-OpenAI entry in `review.default`. That entry is now `claude/opus` instead of `claude/sonnet` (Sonnet 5). On review eval v2 (eval-munjly1s57xk, k=3), Opus 5.5 caught 23.0% of blocking defects with 3.0% clean false-blocks, against Sonnet 5's 10.5% and 9.1%. Runs implemented by Anthropic models still get `codex/sol-6.1` first.
+
 ## Owner decision: triage = `openrouter/gpt-6-luna@medium` first (2026-09-29)
 
 The generated triage cell above (`openrouter/gpt-6-luna@none` first) is **not adopted**. Triage starts with `openrouter/gpt-6-luna@medium`, then `@low` and `@none` on the same provider, then the existing availability fallbacks in their existing order.
