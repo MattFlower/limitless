@@ -45,6 +45,8 @@ export interface EngineDeps {
   gh?: GhRunner;
   cfg: Config;
   store: Store;
+  /** Limitless build (git SHA), part of the baseline cache key; unknown disables the cache. */
+  buildSha?: string;
   router: Router;
   tracker: ProviderTracker;
   harnesses: Record<string, Harness>;
@@ -68,6 +70,8 @@ export interface RunState {
   /** `[review] lenses` from the base commit, read at prepare in panel mode only (else single stays). */
   reviewLenses?: RepoReviewLens[];
   baseline?: GateRun | null;
+  /** The baseline came from the per-base-commit cache instead of executing at prepare. */
+  baselineCached?: boolean;
   triage?: Triage;
   spec?: Spec | null;
   specAuthorVendor?: string;

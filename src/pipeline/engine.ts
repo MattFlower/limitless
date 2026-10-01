@@ -3,11 +3,21 @@ import { join } from "node:path";
 import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
+import {
+  BASELINE_CACHE_TTL_MS,
+  baselineCacheKey,
+  cacheableBaseline,
+  gateEnvDigest,
+  lockfileHash,
+  singleFlight,
+} from "../gates/cache.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import {
   compareGates,
   type GateComparison,
   type GateHooks,
+  type GateRun,
+  gateEnv,
   retryBaselineFailures,
   retryRegressions,
   runGates,
@@ -22,7 +32,10 @@ import {
   ensureCache,
   exportCommit,
   fetchBase,
+  findPullRequest,
   formatTopLevel,
+  type GitHubBudget,
+  githubRetry,
   headSha,
   isAncestor,
   mergePullRequest,
@@ -32,8 +45,9 @@ import {
   remoteBranchSha,
   removeWorktree,
   resetTo,
+  withGitHubRetry,
 } from "../git/repos.ts";
-import { runGh } from "../integrations/github.ts";
+import { type GhRunner, runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
 import {
@@ -339,21 +353,57 @@ async function prepare(ctx: RunContext): Promise<void> {
       );
       await ctx.save();
       const { onWait } = gateEvents(ctx);
-      ctx.state.baseline =
-        gates.setup.length || gates.checks.length
-          ? await runGates(wt.path, gates, ctx.signal, { onWait })
-          : null;
-      ctx.checkCancelled();
-      // Retry before resetting, so a check sees the same build output as its first attempt.
-      if (ctx.state.baseline)
-        ctx.state.baseline = await retryBaselineFailures(
-          ctx.state.baseline,
-          wt.path,
+      const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
+      const runBaseline = async (): Promise<GateRun> => {
+        const run = await runGates(wt.path, gates, ctx.signal, { onWait });
+        ctx.checkCancelled();
+        // Retry before resetting, so a check sees the same build output as its first attempt.
+        const retried = await retryBaselineFailures(run, wt.path, gates, ctx.signal, onWait);
+        ctx.checkCancelled();
+        return retried;
+      };
+      ctx.state.baselineCached = false;
+      const buildSha = ctx.deps.buildSha;
+      if (!hasGates) ctx.state.baseline = null;
+      // Without a known build the gate environment can't be keyed: never read or write the cache.
+      else if (!buildSha) ctx.state.baseline = await runBaseline();
+      else {
+        // Keyed by the commit actually checked out, so verify-change caches its PR base.
+        const key = baselineCacheKey({
+          repoId: ctx.repo.id,
+          baseSha: await headSha(wt.path),
           gates,
-          ctx.signal,
-          onWait,
-        );
-      ctx.checkCancelled();
+          lockfileHash: lockfileHash(wt.path),
+          bunVersion: Bun.version,
+          platform: process.platform,
+          arch: process.arch,
+          buildSha,
+          envDigest: gateEnvDigest(gateEnv(), cfg.baselineEnv),
+        });
+        // A bypass still runs the baseline and refreshes the entry if it passes.
+        const bypass = ctx.run.noBaselineCache === true || !cfg.baselineCache;
+        const baseline = async (): Promise<GateRun> => {
+          const cached = bypass
+            ? null
+            : store.getBaselineCache<GateRun>(key, Date.now() - BASELINE_CACHE_TTL_MS);
+          if (cached && cacheableBaseline(cached, gates)) {
+            ctx.state.baselineCached = true;
+            ctx.log(`Baseline reused from cache (${key.baseSha.slice(0, 12)})`);
+            return cached;
+          }
+          const fresh = await runBaseline();
+          // Only a passing baseline is cached; a failure (maybe flaky) must run again next time,
+          // and it contradicts any cached pass for this key, so that entry goes.
+          if (cacheableBaseline(fresh, gates)) store.putBaselineCache(key, fresh, ctx.run.id);
+          else store.deleteBaselineCache(key);
+          return fresh;
+        };
+        // One cacheable baseline per key at a time: a concurrent run on the same base waits, then
+        // reuses it. A bypass can't reuse anything, so it never waits.
+        ctx.state.baseline = bypass
+          ? await baseline()
+          : await singleFlight(JSON.stringify(key), ctx.signal, baseline, (r) => cacheableBaseline(r, gates));
+      }
     } finally {
       if (verification) await resetTo(wt.path, verification.headSha);
       else await discardChanges(wt.path);
@@ -384,7 +434,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     await ctx.setPhase("triage");
     const failing = baseline ? baseline.checks.filter((c) => !c.ok).map((c) => c.name) : [];
     return {
-      summary: `worktree ${wt.branch}; ${gates.checks.length} checks${failing.length ? `, failing on base: ${failing.join(", ")}` : ""}`,
+      summary: `worktree ${wt.branch}; ${gates.checks.length} checks${failing.length ? `, failing on base: ${failing.join(", ")}` : ""}${ctx.state.baselineCached ? "; baseline reused from cache" : ""}`,
       value: undefined,
     };
   });
@@ -1286,6 +1336,20 @@ async function recordVerified(ctx: RunContext, sha: string): Promise<void> {
   await ctx.save();
 }
 
+const deliveryBudgets = new WeakMap<RunContext, { round: number; budget: GitHubBudget }>();
+
+/**
+ * One in-memory GitHub retry budget per delivery attempt, fallback draft included. A resumed
+ * delivery runs in a new context and so starts fresh: downtime never counts against it.
+ */
+function deliveryBudget(ctx: RunContext): GitHubBudget {
+  const held = deliveryBudgets.get(ctx);
+  if (held?.round === ctx.state.round) return held.budget;
+  const budget = { leftMs: githubRetry.budgetMs };
+  deliveryBudgets.set(ctx, { round: ctx.state.round, budget });
+  return budget;
+}
+
 async function deliverVerifiedDraft(
   ctx: RunContext,
   sha: string,
@@ -1301,7 +1365,15 @@ async function deliverVerifiedDraft(
   const report = buildReport(ctx, false, { sha, stage, reason, base });
   ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
   ctx.checkCancelled();
-  await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal);
+  // The failed delivery may have opened its PR without hearing back, and its spent budget would
+  // keep the draft below from finding it.
+  if (!ctx.run.prUrl) {
+    const found = await findPullRequest(ctx.repo, branch, cwd, ctx.signal);
+    if (found) ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: found });
+  }
+  ctx.checkCancelled();
+  const budget = deliveryBudget(ctx);
+  await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
     branch,
@@ -1311,6 +1383,7 @@ async function deliverVerifiedDraft(
     cwd,
     draft: true,
     signal: ctx.signal,
+    budget,
   });
   await ctx.save("delivery-pr-created");
   ctx.checkCancelled();
@@ -1328,13 +1401,16 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     throw new Error("PR delivery base does not match the verified webhook head");
   const deliverStage = async () => {
     const cwd = ctx.state.worktreePath as string;
+    const budget = deliveryBudget(ctx);
+    const runner = ctx.deps.gh ?? runGh;
+    const gh: GhRunner = (args, signal) =>
+      withGitHubRetry(async () => (await runner(args, signal)) ?? "", { budget, signal });
     if (
       success &&
       ctx.repo.kind === "github" &&
       !ctx.run.deliveryBranch &&
       (ctx.run.prUrl || ctx.store.listStages(ctx.run.id).filter((s) => s.name === "deliver").length > 1)
     ) {
-      const gh = ctx.deps.gh ?? runGh;
       const raw = await gh(
         ctx.run.prUrl
           ? ["pr", "view", ctx.run.prUrl, "--repo", ctx.repo.slug, "--json", "state,url"]
@@ -1385,39 +1461,29 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         const report = buildReport(ctx, true);
         ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
         if (!ctx.state.verdictCommentPosted) {
-          const gh = ctx.deps.gh ?? runGh;
           const marker = `<!-- limitless-verification:${ctx.run.id} -->`;
           ctx.checkCancelled();
-          // A pending post may already exist remotely even when its local checkpoint was lost.
-          const comments = ctx.state.verdictCommentPending
-            ? await gh(
-                [
-                  "api",
-                  `repos/${ctx.repo.slug}/issues/${ctx.run.sourceRef?.number}/comments`,
-                  "--paginate",
-                  "--jq",
-                  ".[].body",
-                ],
-                ctx.signal,
-              )
-            : "";
-          if (!comments?.includes(marker)) {
-            ctx.state.verdictCommentPending = true;
-            await ctx.save("verification-comment-pending");
-            ctx.checkCancelled();
-            await gh(
-              [
-                "pr",
-                "comment",
-                String(ctx.run.sourceRef?.number),
-                "--repo",
-                ctx.repo.slug,
-                "--body",
-                `${marker}\n${report}`,
-              ],
-              ctx.signal,
-            );
-          }
+          const comments = [
+            "api",
+            `repos/${ctx.repo.slug}/issues/${ctx.run.sourceRef?.number}/comments`,
+            "--paginate",
+            "--jq",
+            ".[].body",
+          ];
+          const comment = ["pr", "comment", String(ctx.run.sourceRef?.number), "--repo", ctx.repo.slug];
+          await withGitHubRetry(
+            async () => {
+              // A pending post (an earlier attempt that failed late, or one whose checkpoint was
+              // lost) may already exist remotely: look for its marker before posting again.
+              if (ctx.state.verdictCommentPending && (await runner(comments, ctx.signal))?.includes(marker))
+                return;
+              ctx.state.verdictCommentPending = true;
+              await ctx.save("verification-comment-pending");
+              ctx.checkCancelled();
+              await runner([...comment, "--body", `${marker}\n${report}`], ctx.signal);
+            },
+            { budget, signal: ctx.signal },
+          );
           ctx.checkCancelled();
           ctx.state.verdictCommentPosted = true;
           await ctx.save("verification-comment-posted");
@@ -1438,7 +1504,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch) {
       const baseBranch = ctx.run.baseBranch as string;
-      const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch, ctx.signal);
+      const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch, ctx.signal, budget);
       const recorded = ctx.run.baseSha as string;
       const note = (why: string) => {
         ctx.state.rebaseNote = `Not merged with the latest ${baseBranch}: ${why}. Delivered on ${(ctx.run.baseSha as string).slice(0, 8)}.`;
@@ -1492,13 +1558,14 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       publish();
       if (!success) return { summary: "PR update needs human review; no push", value: undefined };
       ctx.checkCancelled();
-      if ((await remoteBranchSha(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.signal)) !== head)
+      if ((await remoteBranchSha(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.signal, budget)) !== head)
         await pushExistingBranch(
           ctx.repo,
           cwd,
           ctx.run.deliveryBranch,
           ctx.run.baseSha as string,
           ctx.signal,
+          budget,
         );
       if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number") {
         ctx.run = ctx.store.updateRun(ctx.run.id, {
@@ -1510,7 +1577,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       return { summary: `updated existing PR branch ${ctx.run.deliveryBranch}`, value: undefined };
     }
     ctx.checkCancelled();
-    await pushBranch(ctx.repo, cwd, ctx.run.branch as string, "HEAD", ctx.signal);
+    await pushBranch(ctx.repo, cwd, ctx.run.branch as string, "HEAD", ctx.signal, budget);
     ctx.checkCancelled();
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     const url = await createPullRequest(ctx.repo, {
@@ -1521,6 +1588,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       cwd,
       draft: !success,
       signal: ctx.signal,
+      budget,
     });
     await ctx.save("delivery-pr-created");
     ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
@@ -1536,10 +1604,10 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     let summary = `PR ${url}`;
     if (policy === "auto") {
       ctx.checkCancelled();
-      const outcome = await mergePullRequest(url, cwd, ctx.run.title, ctx.signal);
+      const outcome = await mergePullRequest(url, cwd, ctx.run.title, ctx.signal, budget);
       if (outcome === "merged") ctx.run = ctx.store.updateRun(ctx.run.id, { merged: true });
-      summary += ` — ${outcome === "merged" ? "merged" : outcome === "auto" ? "auto-merge enabled" : "merge failed (left open)"}`;
-      ctx.log(summary, outcome === "failed" ? "warn" : "info");
+      summary += ` — ${outcome === "merged" ? "merged" : outcome === "auto" ? "auto-merge enabled" : `merge failed (left open)${outcome === "unavailable" ? ": GitHub unavailable" : ""}`}`;
+      ctx.log(summary, outcome === "failed" || outcome === "unavailable" ? "warn" : "info");
     } else {
       summary += ` — left open (merge policy: ${policy})`;
     }

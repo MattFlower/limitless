@@ -148,6 +148,7 @@ const toRun = (r: Row): Run => ({
   startedAt: (r.started_at as number) ?? null,
   finishedAt: (r.finished_at as number) ?? null,
   priority: r.priority as number,
+  ...(r.no_baseline_cache === 1 ? { noBaselineCache: true } : {}),
 });
 
 const toStage = (r: Row): Stage => ({
@@ -204,6 +205,14 @@ const toQuestion = (r: Row): Question => ({
   answeredAt: (r.answered_at as number) ?? null,
   answeredBy: (r.answered_by as string) ?? null,
 });
+
+export interface BaselineCacheKey {
+  repoId: string;
+  baseSha: string;
+  gatesHash: string;
+  /** Lockfiles, Bun version, platform/arch, Limitless build and gate environment digest. */
+  envHash: string;
+}
 
 const RUN_SELECT = "SELECT runs.*, repos.slug AS repo_slug FROM runs JOIN repos ON repos.id = runs.repo_id";
 
@@ -786,8 +795,8 @@ export class Store {
     const title = req.title ?? req.prompt.split("\n")[0]?.slice(0, 80) ?? "Untitled";
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -807,6 +816,7 @@ export class Store {
         json(dependsOn),
         dependency.error ?? null,
         dependency.finishedAt ?? null,
+        req.noBaselineCache === true ? 1 : 0,
       );
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });
@@ -1209,6 +1219,53 @@ export class Store {
 
   deleteOldDebugEvents(before: number): number {
     return this.db.query("DELETE FROM events WHERE level = 'debug' AND ts < ?").run(before).changes;
+  }
+
+  // ---- baseline cache ------------------------------------------------------
+
+  /** A cached baseline recorded after `since`; older entries are expired and never returned. */
+  getBaselineCache<T>(key: BaselineCacheKey, since: number): T | null {
+    const row = this.db
+      .query(
+        "SELECT gate_run FROM passing_baselines WHERE repo_id = ? AND base_sha = ? AND gates_hash = ? AND env_hash = ? AND created_at > ?",
+      )
+      .get(key.repoId, key.baseSha, key.gatesHash, key.envHash, since) as Row | null;
+    return row ? parse<T | null>(row.gate_run, null) : null;
+  }
+
+  /** Callers store passing baselines only, so a refresh never replaces a pass with a failure. */
+  putBaselineCache(key: BaselineCacheKey, gateRun: unknown, runId: string, now = Date.now()): void {
+    this.db
+      .query(
+        `INSERT INTO passing_baselines (repo_id, base_sha, gates_hash, env_hash, gate_run, run_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(repo_id, base_sha, gates_hash, env_hash) DO UPDATE SET gate_run = excluded.gate_run, run_id = excluded.run_id, created_at = excluded.created_at`,
+      )
+      .run(key.repoId, key.baseSha, key.gatesHash, key.envHash, JSON.stringify(gateRun), runId, now);
+  }
+
+  deleteBaselineCache(key: BaselineCacheKey): void {
+    this.db
+      .query(
+        "DELETE FROM passing_baselines WHERE repo_id = ? AND base_sha = ? AND gates_hash = ? AND env_hash = ?",
+      )
+      .run(key.repoId, key.baseSha, key.gatesHash, key.envHash);
+  }
+
+  /** Drop every cached baseline, or one repo's (repair after a bad entry); returns the count removed. */
+  clearBaselineCache(repoId?: string): number {
+    if (repoId === undefined) return this.db.query("DELETE FROM passing_baselines").run().changes;
+    return this.db.query("DELETE FROM passing_baselines WHERE repo_id = ?").run(repoId).changes;
+  }
+
+  countExpiredBaselineCache(before: number): number {
+    const row = this.db
+      .query("SELECT count(*) AS n FROM passing_baselines WHERE created_at <= ?")
+      .get(before) as Row;
+    return row.n as number;
+  }
+
+  deleteExpiredBaselineCache(before: number): number {
+    return this.db.query("DELETE FROM passing_baselines WHERE created_at <= ?").run(before).changes;
   }
 
   // ---- artifacts -----------------------------------------------------------

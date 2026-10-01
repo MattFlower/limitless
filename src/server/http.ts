@@ -206,6 +206,14 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         return json(await factory.gc(input.dryRun === true));
       }),
     },
+    "/api/gates/clear-cache": {
+      POST: handle(async (req) => {
+        const input = await body<{ repo?: string }>(req);
+        if (input.repo === undefined) return json({ cleared: store.clearBaselineCache() });
+        const repo = store.getRepoBySlug(input.repo);
+        return repo ? json({ cleared: store.clearBaselineCache(repo.id) }) : error("repo not found", 404);
+      }),
+    },
     "/api/evals": {
       POST: handle(async (req) => json({ id: factory.evals.submit(await body<unknown>(req)).id }, 202)),
       GET: handle(() => json(store.listEvalRuns())),
