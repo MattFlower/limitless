@@ -102,6 +102,26 @@ async function untrackedState(cwd: string, env: Record<string, string>, since: b
   for (const path of out.stdout.split("\0").filter(Boolean)) visit(path.replace(/\/$/, ""));
   return state;
 }
+/** Content digest of a tree, held in memory so candidate code cannot rewrite the expected value. */
+function treeDigest(root: string): string {
+  const hash = createHash("sha256");
+  const visit = (path: string) => {
+    const stat = lstatSync(path);
+    hash.update(`${path.slice(root.length)}\0${stat.mode}\0`);
+    if (stat.isSymbolicLink()) hash.update(readlinkSync(path));
+    else if (stat.isDirectory()) for (const entry of readdirSync(path).sort()) visit(join(path, entry));
+    else hash.update(readFileSync(path));
+    hash.update("\0");
+  };
+  visit(root);
+  return hash.digest("hex");
+}
+function restoreGit(cwd: string, dir: string, digest: string) {
+  const backup = join(dir, "candidate-git");
+  if (treeDigest(backup) !== digest) throw new Error("Git backup changed during grading");
+  removeScratch(join(cwd, ".git"));
+  cpSync(backup, join(cwd, ".git"), { recursive: true });
+}
 /** Refuse to remove through a parent replaced with a symlink. Cleanup failure stops recovery. */
 function removeWithin(root: string, path: string) {
   let current = root;
@@ -181,7 +201,7 @@ export async function gradeImplement(
     hidden: null,
   };
   let checkout: string | undefined;
-  let gitSnapshot: string | undefined;
+  let gitSnapshot: { dir: string; digest: string } | undefined;
   let before: Map<string, string> | undefined;
   const since = BigInt(Date.now() - 5_000) * 1_000_000n;
   try {
@@ -211,10 +231,14 @@ export async function gradeImplement(
     // Grade in a fresh repository outside the candidate's: hidden files never touch its checkout,
     // and its Git metadata (filters, drivers, hooks, index flags) has no say in grading. Fetching
     // only reads the candidate's objects; nothing in the grading repository points back at it.
-    checkout = createScratch(cwd);
-    const backup = join(dirname(checkout), "candidate-git");
+    // The .git backup lives in its own scratch, not beside the checkout, and is verified against
+    // an in-memory digest before restoring: grading code could still find and rewrite it.
+    const backupDir = createScratch(cwd);
+    const backup = join(backupDir, "candidate-git");
+    gitSnapshot = { dir: backupDir, digest: "" };
     cpSync(join(cwd, ".git"), backup, { recursive: true });
-    gitSnapshot = backup;
+    gitSnapshot.digest = treeDigest(backup);
+    checkout = createScratch(cwd);
     const opts = { cwd: checkout, env, signal };
     await sh(["git", "init", "-q"], opts);
     await sh(["git", "fetch", "-q", "--no-tags", "--no-write-fetch-head", cwd, commit, item.base], opts);
@@ -285,13 +309,14 @@ export async function gradeImplement(
   } finally {
     // A failed removal throws: recovery must not continue while grading artifacts remain.
     try {
-      if (gitSnapshot) {
-        removeScratch(join(cwd, ".git"));
-        cpSync(gitSnapshot, join(cwd, ".git"), { recursive: true });
-      }
+      if (gitSnapshot?.digest) restoreGit(cwd, gitSnapshot.dir, gitSnapshot.digest);
       if (before && evidence.commit) await restoreCandidate(cwd, env, evidence.commit, before, since);
     } finally {
-      if (checkout) removeScratch(checkout);
+      try {
+        if (checkout) removeScratch(checkout);
+      } finally {
+        if (gitSnapshot) removeScratch(gitSnapshot.dir);
+      }
     }
   }
   return {

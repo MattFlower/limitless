@@ -1523,14 +1523,49 @@ for (const [outcome, reason] of [
       const t = (await f.run()).trials[0];
       expect(t?.details.grade?.implement?.reason).toBe(reason);
       const dirs = allocated.mock.results.map((r) => String(r.value));
-      // The harness scratch, the grading checkout and, once injection succeeded, the hidden scratch.
-      expect(dirs).toHaveLength(outcome === "injection" ? 2 : 3);
+      // The harness scratch, the .git backup, the grading checkout and, once injection succeeded, the hidden scratch.
+      expect(dirs).toHaveLength(outcome === "injection" ? 3 : 4);
       expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
     } finally {
       allocated.mockRestore();
       await f.close();
     }
   });
+test("hidden files written into the .git backup never reach the candidate repository", async () => {
+  const f = await fixture();
+  const located = join(f.home, "backup-path");
+  const original = fs.cpSync;
+  const copies = spyOn(fs, "cpSync").mockImplementation((from, to, opts) => {
+    if (basename(String(to)) === "candidate-git") writeFileSync(located, String(to));
+    original(from, to, opts);
+  });
+  try {
+    f.item.hidden.command = `bun test candidate.test.ts && ${f.item.hidden.command}`;
+    f.save();
+    f.respond((s): FakeReply => {
+      if (f.calls.length > 1) expect(existsSync(join(s.cwd, ".git/stolen"))).toBe(false);
+      return {
+        files: {
+          answer: "wrong",
+          "bunfig.toml": '[test]\npreload=["./steal.ts"]\n',
+          "candidate.test.ts":
+            'import { test, expect } from "bun:test"; test("candidate", () => expect(true).toBe(true));',
+          "steal.ts": `import { cpSync, existsSync, readFileSync } from "node:fs";
+            if (existsSync("hidden")) cpSync("hidden", readFileSync(${JSON.stringify(located)}, "utf8") + "/stolen", { recursive: true });`,
+        },
+      };
+    });
+    const t = (await f.run({ rounds: 2 })).trials[0];
+    expect(t?.pass).toBe(false);
+    expect(t?.details.grade?.implement?.error).toBe("Git backup changed during grading");
+    expect(f.calls).toHaveLength(1);
+    expect(existsSync(join(f.calls[0]?.cwd ?? "", ".git/stolen"))).toBe(false);
+    expect(existsSync(dirname(readFileSync(located, "utf8")))).toBe(false);
+  } finally {
+    copies.mockRestore();
+    await f.close();
+  }
+});
 for (const rounds of [1, 2])
   test(`a committed Bun preload leaves no hidden copies in the worktree, Git or scratch (rounds=${rounds})`, async () => {
     const f = await fixture();
@@ -1588,7 +1623,7 @@ test("grading removes hidden tests even when candidate code makes checkout direc
     f.save();
     expect((await f.run()).trials[0]?.pass).toBe(true);
     const dirs = allocated.mock.results.map((r) => String(r.value));
-    expect(dirs).toHaveLength(3);
+    expect(dirs).toHaveLength(4);
     expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
   } finally {
     allocated.mockRestore();
