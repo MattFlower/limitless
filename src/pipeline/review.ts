@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { FinderPrompt, ReviewFinder, ReviewSystem } from "../core/types.ts";
 import { type AgentResult, extractJson } from "../harness/types.ts";
+import { NoCapacityError } from "./context.ts";
 import { MERGE_RULES, mergeReports } from "./panel-merge.ts";
 import { reviewPrompt, verifierPrompt } from "./prompts.ts";
 import {
@@ -252,9 +253,38 @@ export interface ReviewDeps<T extends Invoked> {
    * Panel only: one read-only verifier batch, routed away from every vendor that raised it and never
    * to a model that did.
    */
-  verify?: (request: VerifierRequest, avoidVendors: string[], avoidModels: string[]) => Promise<T>;
+  verify?: (
+    request: VerifierRequest,
+    avoidVendors: string[],
+    avoidModels: string[],
+    candidates: string[],
+  ) => Promise<T>;
   /** Panel only: problems that degrade the review without failing it. */
   warn?: (message: string) => void;
+}
+
+/**
+ * A batch's verifier from ordered `targets`: the first whose vendor and model raised none of it, else
+ * the first whose model raised none (the panel records the shared vendor). Shared by engine and evals.
+ */
+export function pickVerifier<V extends { vendor: string; modelId: string }>(
+  targets: V[],
+  avoidVendors: string[],
+  avoidModels: string[],
+): V {
+  const picked =
+    targets.find((t) => !avoidVendors.includes(t.vendor) && !avoidModels.includes(t.modelId)) ??
+    targets.find((t) => !avoidModels.includes(t.modelId));
+  if (!picked)
+    throw new NoCapacityError(
+      `verifier ${targets.map((t) => t.modelId).join(", ")} raised a candidate it would check`,
+    );
+  return picked;
+}
+
+/** A verifier's lone `target` or ordered `targets`, each mapped by `f` (resolved or stored for replay). */
+export function mapVerifier(verifier: NonNullable<ReviewSystem["verifier"]>, f: (target: string) => string) {
+  return verifier.targets ? { targets: verifier.targets.map(f) } : { target: f(verifier.target ?? "") };
 }
 
 /** Fixed inputs that render the finder and verifier prompt templates, for cache identity. */
@@ -579,6 +609,7 @@ async function runPanel<T extends Invoked>(
         },
         pending[0] ? vendorsOf(pending[0]) : [],
         modelsOf(pending),
+        pending.map((c) => c.id),
       );
       const shared = invoked.target?.vendor;
       if (shared && pending[0] && vendorsOf(pending[0]).includes(shared)) {

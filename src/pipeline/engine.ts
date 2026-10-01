@@ -79,6 +79,7 @@ import {
   FinderSkipped,
   PANEL_REVIEWS,
   type PanelReview,
+  pickVerifier,
   type ReviewInput,
   type ReviewRequest,
   resolvedPriorFindings,
@@ -1087,12 +1088,17 @@ async function oneRound(
               throw error;
             }
           },
-          verify: (request, avoidVendors, avoidModels) =>
-            call(
-              request,
-              verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer),
-              system.verifier?.target,
-            ),
+          verify: (request, avoidVendors, avoidModels) => {
+            const constraints = verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer);
+            if (!system.verifier?.targets) return call(request, constraints, system.verifier?.target);
+            // Picked per batch, as evals do, and offered alone: a routed fallback could share its vendor.
+            const listed = system.verifier.targets.map((target) => {
+              const { model, targetId } = ctx.deps.router.resolve(target);
+              return { vendor: model.vendor, modelId: model.id, targetId };
+            });
+            const only = pickVerifier(listed, avoidVendors, avoidModels).targetId;
+            return call(request, { ...constraints, only }, undefined);
+          },
           warn: (message) => ctx.log(message, "warn"),
         },
         input,
