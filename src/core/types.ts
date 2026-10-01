@@ -532,6 +532,8 @@ export interface EvalTrial {
     decisionConfidence?: number;
     preparationFailed?: boolean;
     interrupted?: boolean;
+    /** Eval the trial ran in before a resume copied it; its spend was already charged to the provider there. */
+    resumedFrom?: string;
     cache?: {
       evalRunId: string;
       caseId: string;

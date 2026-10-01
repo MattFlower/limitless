@@ -198,7 +198,13 @@ export class EvalRunner {
         this.deps.store
           .listEvalTrials(resume.from)
           .filter(finished)
-          .map((trial) => [trialKey(trial), trial]),
+          .map((trial): [string, EvalTrial] => [
+            trialKey(trial),
+            {
+              ...trial,
+              details: { ...trial.details, resumedFrom: trial.details.resumedFrom ?? resume.from },
+            },
+          ]),
       );
       trials = trials.map((trial) => copies.get(trialKey(trial)) ?? trial);
     }

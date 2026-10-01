@@ -76,9 +76,14 @@ export function evalIdentity(
   for (const trial of trials) {
     const model = router.model(trial.modelId);
     const effort = trial.effort === null || trial.effort === "default" ? null : trial.effort;
-    identity[`target ${recordedTarget(trial)}`] = hash(
+    const target =
       model && (effort === null || model.supportedEfforts.includes(effort))
-        ? [model.id, selectHarness(role, router.toTarget(model, effort)).harnessName]
+        ? router.toTarget(model, effort)
+        : null;
+    // The backend model and provider, not just the catalog ID: a new checkpoint behind an ID is a change.
+    identity[`target ${recordedTarget(trial)}`] = hash(
+      target
+        ? [target.modelId, target.provider, target.model, selectHarness(role, target).harnessName]
         : null,
     );
   }

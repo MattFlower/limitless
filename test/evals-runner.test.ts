@@ -857,7 +857,11 @@ test("resume replays an interrupted eval's stored request and copies its finishe
     const finished = runner.report(run.id)?.trials.filter((t) => t.status === "ok") ?? [];
     expect(finished).toHaveLength(2);
     for (const trial of finished)
-      expect(report?.trials).toContainEqual({ ...trial, evalRunId: resumed?.id ?? "" });
+      expect(report?.trials).toContainEqual({
+        ...trial,
+        evalRunId: resumed?.id ?? "",
+        details: { ...trial.details, resumedFrom: run.id },
+      });
     expect(f.calls).toHaveLength(8);
     expect(state.max).toBe(2);
     expect(runner.report(run.id)?.run).toMatchObject({ status: "interrupted", resumedBy: resumed?.id });
@@ -1000,9 +1004,12 @@ test("resume copies errored trials with their grades and counts the chain's spen
       { maxUsd: 0.25 },
     );
     const calls = f.calls.length;
+    expect(f.factory.store.providerSpendSince("openrouter", 0)).toBeCloseTo(0.2);
     f.respond(() => ({ structured: answer, costUsd: 0.1 }));
     const resumed = f.factory.evals.resume(first);
     await f.factory.evals.wait(resumed?.id ?? "");
+    // Copies keep their spend for the eval chain but were already charged to the provider.
+    expect(f.factory.store.providerSpendSince("openrouter", 0)).toBeCloseTo(0.3);
     const report = f.factory.evals.report(resumed?.id ?? "");
     // Only the unfinished trial runs; the invalid output stays a failure instead of being re-billed.
     expect(f.calls.slice(calls).map((s) => s.prompt.includes("Fix c"))).toEqual([true]);
@@ -1073,6 +1080,26 @@ test("resume refuses a changed case or prompt unless allowChanged, naming the ch
     const resumed = f.factory.evals.resume(first, true);
     await f.factory.evals.wait(resumed?.id ?? "");
     expect(f.factory.evals.report(resumed?.id ?? "")?.run.status).toBe("completed");
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume refuses a changed backend model behind the same catalog ID unless allowChanged", async () => {
+  const f = await evalFixture();
+  try {
+    const first = await interruptedAt(f, "b", () => ({ structured: answer }));
+    const model = f.factory.router.model("candidate-a");
+    if (!model) throw new Error("missing model");
+    model.model = "a-new-checkpoint";
+    expect(() => f.factory.evals.resume(first)).toThrow(
+      `cannot resume eval ${first}: changed since it ran: target candidate-a;`,
+    );
+    const calls = f.calls.length;
+    f.respond(() => ({ structured: answer }));
+    const resumed = f.factory.evals.resume(first, true);
+    await f.factory.evals.wait(resumed?.id ?? "");
+    expect(f.calls.slice(calls).map((s) => s.target.model)).toEqual(["a-new-checkpoint", "a-new-checkpoint"]);
   } finally {
     await f.close();
   }

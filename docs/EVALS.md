@@ -217,10 +217,10 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
   ways in reports). The new run copies every finished trial (passed, failed or errored, with its
   grade and spend) and runs only the trials that never finished, so at most the eval's concurrency
   of in-flight trials repeat. Its `maxUsd` covers the spend of the whole resume chain, including
-  spend recorded on unfinished trials. Resume refuses legacy evals without a stored request,
+  spend recorded on unfinished trials; copies don't count toward provider budgets a second time. Resume refuses legacy evals without a stored request,
   `--no-cache` evals, requests that no longer validate against the current dataset, models or
   systems, and, unless `--allow-changed` (API `allowChanged: true`), evals whose prompt template,
-  preamble, panel policy, case content or target model/harness changed since they ran; the error
+  preamble, panel policy, case content or target (catalog ID, provider, backend model or harness) changed since they ran; the error
   names the changed parts. Allowed anyway, finished trials are still copied and only the
   unfinished ones run under the change. A restart's message suggests `eval resume` only for evals
   with a stored, cached request.

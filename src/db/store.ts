@@ -1146,7 +1146,8 @@ export class Store {
           THEN (SELECT COALESCE(SUM(json_extract(value, '$.costUsd')), 0)
             FROM json_each(details_json, '$.rounds') WHERE json_extract(value, '$.provider') = ?)
           WHEN json_extract(details_json, '$.provider') = ? THEN cost_usd ELSE 0 END), 0) AS s
-         FROM eval_trials WHERE created_at >= ? AND json_extract(details_json, '$.cache') IS NULL`,
+         FROM eval_trials WHERE created_at >= ? AND json_extract(details_json, '$.cache') IS NULL
+           AND json_extract(details_json, '$.resumedFrom') IS NULL`,
       )
       .get(provider, provider, since) as Row;
     return (r.s as number) + (chat.s as number) + (evals.s as number);
