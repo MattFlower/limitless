@@ -4,7 +4,6 @@ import { emptyUsage } from "../harness/types.ts";
 import { mergeReports } from "../pipeline/panel-merge.ts";
 import { FinderSkipped } from "../pipeline/review.ts";
 import { ReviewSchema, StoredReviewSchema } from "../pipeline/schemas.ts";
-import { parseTarget } from "../router/targets.ts";
 
 export function validateReplay(
   store: Store,
@@ -14,10 +13,7 @@ export function validateReplay(
 ): void {
   const source = store.getEvalRun(id);
   if (source?.role !== "review") throw new Error(`replay source ${id} is not a review eval`);
-  const targetKey = (target: string) => {
-    const { modelId, effort } = parseTarget(target);
-    return JSON.stringify([modelId, effort ?? "default"]);
-  };
+  const targetKey = (target: string) => (target.includes("@") ? target : `${target}@default`);
   for (const system of systems) {
     const prior = source.systems?.find((s) => s.name === system.replayFrom);
     if (system.mode !== "panel" || prior?.mode !== "panel")
@@ -62,6 +58,10 @@ export function replayFinders(store: Store, id: string, system: ReviewSystem, ca
   const panel = parsed.success ? parsed.data.panel : undefined;
   if (!panel?.finders || panel.finders.length !== system.finders.length)
     throw new Error("replay source trial has missing or invalid panel output/roster");
+  // Refutation splits differing duplicates into extra candidates, which are not finder reports.
+  for (const c of panel.candidates)
+    if (panel.refuted.includes(c.id) && c.duplicates?.some((d) => d.line !== c.line || d.title !== c.title))
+      throw new Error("replay source trial contains verifier-split candidates");
   // Parsing the live schema strips panel metadata; duplicates inherit the shared claim fields.
   const outputs = system.finders.map((_, finder) =>
     ReviewSchema.parse({
