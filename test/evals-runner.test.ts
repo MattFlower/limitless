@@ -1285,6 +1285,12 @@ test("stored panel finder replay pairs candidates, bills only verifiers and surv
     await f.factory.evals.wait(resumed.id);
     expect(f.factory.evals.report(resumed.id)?.trials[0]?.status).toBe("ok");
     expect(f.calls.slice(beforeErrors).every((s) => s.target.modelId === "verifier-d")).toBe(true);
+    // An unavailable verifier skips the replayed trial (resumable) instead of scoring it as an error.
+    f.factory.tracker.blockModel("verifier-d", "not supported");
+    const beforeBlocked = f.calls.length;
+    const blocked = await replay({ cache: false });
+    expect(blocked.trials[0]).toMatchObject({ status: "skipped", pass: null });
+    expect(f.calls).toHaveLength(beforeBlocked);
   } finally {
     await f.close();
   }

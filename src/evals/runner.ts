@@ -672,6 +672,12 @@ export class EvalRunner {
               verifiers: (system.verifier?.targets ?? [system.verifier?.target]).map((t) => pinned(t)),
             }
           : undefined;
+      // A replay makes no finder calls, so it waits on its verifiers instead of the trial's target:
+      // an unavailable one skips the trial (resumable) rather than failing it.
+      const gate = () =>
+        typeof replayId === "string"
+          ? ((panelTargets?.verifiers ?? []).map(unavailable).find(Boolean) ?? null)
+          : eligible();
       const schema = "hidden" in item ? undefined : schemaFor(item);
       const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
@@ -804,7 +810,7 @@ export class EvalRunner {
         ({ harnessName, noTools } = selectHarness(run.role, target));
         const harness = harnesses[harnessName];
         if (!harness) return skip(`No harness registered for ${harnessName}`);
-        const reason = eligible();
+        const reason = gate();
         if (reason)
           return skip(strategy === "switch" && round > 0 ? `Switch target unavailable: ${reason}` : reason);
         const runSlot = replay ? () => {} : await coordination.slot(target.provider);
@@ -816,7 +822,7 @@ export class EvalRunner {
         };
         if (signal.aborted) return skip(stopReason(signal));
         if (budget()) return skip("eval budget exhausted");
-        const afterWait = eligible();
+        const afterWait = gate();
         if (afterWait) return skip(afterWait);
         if (round === 0) trial.createdAt = Date.now();
         roundStarted = Date.now();
