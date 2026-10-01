@@ -120,6 +120,7 @@ export async function executeRun(
   runId: string,
   signal: AbortSignal,
   isDraining: () => boolean = () => false,
+  drainEvents?: EventTarget,
 ): Promise<RunStatus> {
   const run = deps.store.getRun(runId);
   if (!run) return "failed";
@@ -128,7 +129,7 @@ export async function executeRun(
     deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  const ctx = new RunContext(deps, run, repo, signal, isDraining);
+  const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
   ctx.state.parked = false;
   ctx.run = deps.store.updateRun(
     runId,
@@ -517,6 +518,9 @@ async function waitForAnswers(ctx: RunContext): Promise<void> {
       if (ctx.signal.aborted) {
         cleanup();
         reject(new CancelledError());
+      } else if (ctx.isDraining()) {
+        cleanup();
+        reject(new ParkedError());
       } else if (!pending().length) {
         cleanup();
         resolve();
@@ -527,9 +531,11 @@ async function waitForAnswers(ctx: RunContext): Promise<void> {
     });
     const onAbort = () => check();
     ctx.signal.addEventListener("abort", onAbort);
+    ctx.drainEvents?.addEventListener("drain", onAbort);
     const cleanup = () => {
       unsubscribe();
       ctx.signal.removeEventListener("abort", onAbort);
+      ctx.drainEvents?.removeEventListener("drain", onAbort);
     };
     check();
   });
@@ -551,6 +557,13 @@ async function clarify(ctx: RunContext): Promise<void> {
 
 async function spec(ctx: RunContext): Promise<void> {
   await ctx.stage("spec", async (stage) => {
+    // A resumed spec may already have asked questions before it parked.
+    if (ctx.store.listQuestions(ctx.run.id).length) {
+      await waitForAnswers(ctx);
+      ctx.state.answers = ctx.store
+        .listQuestions(ctx.run.id)
+        .map((q) => `Q: ${q.question}\n  A: ${q.answer}`);
+    }
     const complexity = ctx.state.triage?.complexity ?? ctx.run.complexity ?? undefined;
     const [, maxCriteria] = specCriteriaRange(complexity);
     const invocation = {
