@@ -140,7 +140,19 @@ async function restoreCandidate(
   before: Map<string, string>,
   since: bigint,
 ) {
-  await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "-q", commit], { cwd, env });
+  // The candidate's index flags (skip-worktree, assume-unchanged) and sparse or fsmonitor config
+  // would let reset leave modified tracked files alone. Clearing just the flags keeps stat data, so
+  // reset rewrites (and smudges) only files that actually changed.
+  const config = ["core.hooksPath=/dev/null", "core.sparseCheckout=false", "core.fsmonitor=false"];
+  const git = ["git", ...config.flatMap((c) => ["-c", c])];
+  const flagged = (await sh([...git, "ls-files", "-v", "-z"], { cwd, env })).stdout
+    .split("\0")
+    .filter((entry) => /^([a-z]|S) /.test(entry))
+    .map((entry) => entry.slice(2));
+  // update-index applies only the last of several flag options, so clear each separately.
+  for (const flag of ["--no-skip-worktree", "--no-assume-unchanged"])
+    if (flagged.length) await sh([...git, "update-index", flag, "--", ...flagged], { cwd, env });
+  await sh([...git, "reset", "--hard", "-q", commit], { cwd, env });
   await sh(["git", "clean", "-fdq"], { cwd, env });
   const root = realpathSync(cwd);
   for (const [path, fingerprint] of await untrackedState(cwd, env, since))

@@ -1574,7 +1574,10 @@ for (const rounds of [1, 2])
       f.item.hidden.command = `bun test candidate.test.ts && ${f.item.hidden.command}`;
       f.save();
       f.respond((s): FakeReply => {
-        if (f.calls.length === 1)
+        if (f.calls.length === 1) {
+          // A skip-worktree flag would make reset --hard keep the hidden copy the preload writes here.
+          const flag = ["git", "update-index", "--skip-worktree", "overwrite"];
+          expect(Bun.spawnSync(flag, { cwd: s.cwd }).exitCode).toBe(0);
           return {
             files: {
               answer: "wrong",
@@ -1597,6 +1600,7 @@ for (const rounds of [1, 2])
           }`,
             },
           };
+        }
         const paths = ["stolen", ".git/stolen", ".git/refs/stolen", "dist/stolen", "dist/output"];
         for (const path of paths) expect(existsSync(join(s.cwd, path))).toBe(false);
         expect(existsSync(join(s.cwd, ".git/objects", oid.slice(0, 2), oid.slice(2)))).toBe(false);
