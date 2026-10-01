@@ -34,6 +34,7 @@ export function formatEvalReport(report: EvalReport): string {
   if (report.run.resumedBy) lines.push(`resumed by ${report.run.resumedBy}`);
   for (const m of report.summaries) {
     const c = m.comparison;
+    if (m.system?.replayFrom) lines.push(`${m.candidate}: replayed finders from ${m.system.replayFrom}`);
     const metric = (name: string, value: { numerator: number; denominator: number; rate: number | null }) =>
       `  ${name} ${pct(value.rate)} (${value.numerator}/${value.denominator}), Wilson 95% CI ${wilson(value.numerator, value.denominator)?.map(pct).join(" – ") ?? "n/a"}`;
     const roleLines: string[] = [];

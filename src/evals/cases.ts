@@ -264,6 +264,7 @@ export const EvalRequestSchema = z
     role: z.enum(["triage", "review", "verify", "implement"]),
     models: z.array(z.string().min(1)).min(1).optional(),
     systems: EvalReviewSystemsSchema.optional(),
+    replayFinders: nonempty.optional(),
     k: z.number().int().positive().default(1),
     maxUsd: z.number().finite().nonnegative().default(1),
     caseIds: unique.optional(),
@@ -281,6 +282,14 @@ export const EvalRequestSchema = z
     "give exactly one of models or systems",
   )
   .refine((r) => r.systems === undefined || r.role === "review", "systems are a review-only option")
+  .refine(
+    (r) => r.replayFinders === undefined || (r.role === "review" && r.systems !== undefined),
+    "replayFinders requires review systems",
+  )
+  .refine(
+    (r) => r.systems?.every((s) => !!s.replayFrom === !!r.replayFinders) ?? true,
+    "every replay system needs replayFrom, only with replayFinders",
+  )
   .transform((r) =>
     r.role === "implement" ? { ...r, rounds: r.rounds ?? 1, strategy: r.strategy ?? "retry" } : r,
   );
