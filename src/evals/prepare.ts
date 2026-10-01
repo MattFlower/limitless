@@ -4,12 +4,12 @@ import { DEFAULT_DECISION_CONFIDENCE } from "../config.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { diffSince, readFileAt } from "../git/repos.ts";
+import { git } from "../git/trust.ts";
 import { readingTimeout } from "../pipeline/engine.ts";
 import { triagePrompt, verifyPrompt } from "../pipeline/prompts.ts";
 import { type ReviewInput, reviewRequest } from "../pipeline/review.ts";
 import { ReviewSchema, StoredReviewSchema, TriageSchema, VerifySchema } from "../pipeline/schemas.ts";
 import { triageDecisions } from "../pipeline/triage-decisions.ts";
-import { sh } from "../util/proc.ts";
 import type { EvalCase, ImplementCase, ReviewCase } from "./cases.ts";
 import { gradeReview } from "./graders/review.ts";
 import { gradeTriage } from "./graders/triage.ts";
@@ -37,7 +37,7 @@ export async function gatesAt(cwd: string, revision: string, signal: AbortSignal
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir);
   try {
-    const tree = await sh(["git", "ls-tree", "-z", revision], { cwd, signal });
+    const tree = await git(["ls-tree", "-z", revision], { cwd, signal });
     for (const entry of tree.stdout.split("\0").filter(Boolean)) {
       const [meta = "", name = ""] = entry.split("\t");
       const [, type, oid = ""] = meta.split(" ");
@@ -45,7 +45,7 @@ export async function gatesAt(cwd: string, revision: string, signal: AbortSignal
       else if (type === "blob")
         writeFileSync(
           join(dir, name),
-          GATE_FILES.has(name) ? (await sh(["git", "cat-file", "blob", oid], { cwd, signal })).stdout : "",
+          GATE_FILES.has(name) ? (await git(["cat-file", "blob", oid], { cwd, signal })).stdout : "",
         );
     }
     return detectGates(dir);
@@ -72,10 +72,9 @@ export async function prepareCase(
     };
   }
   if (patch !== undefined) {
-    await sh(["git", "apply", "--index", "-"], { cwd, stdin: patch, signal });
-    await sh(
+    await git(["apply", "--index", "-"], { cwd, stdin: patch, signal });
+    await git(
       [
-        "git",
         "-c",
         "user.name=Limitless",
         "-c",

@@ -25,6 +25,7 @@ import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
+import { HARDENED } from "../git/trust.ts";
 import type { DecisionTask } from "../harness/decisions.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
@@ -295,7 +296,7 @@ export class RunContext {
     const cwd = this.state.worktreePath;
     if (cwd) {
       try {
-        const { stdout } = await execFileAsync("git", ["ls-files", "-z"], {
+        const { stdout } = await execFileAsync("git", [...HARDENED, "ls-files", "-z"], {
           cwd,
           maxBuffer: 16 * 1024 * 1024,
           encoding: "utf8",

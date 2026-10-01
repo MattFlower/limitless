@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -5530,4 +5538,163 @@ test("panel review: a verifier left on the finder's vendor is another model, wit
   expect(await waitFor(f, alone.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
   expect(verifiers).toEqual(["gamma/m"]);
   expect(f.store.getRun(alone.id)?.error).toContain("alpha/m (raised a candidate it would verify)");
+});
+
+describe("candidate git metadata", () => {
+  const ODD = "-odd\tname.txt";
+  const flagsFor = {
+    skip: ["--skip-worktree"],
+    assume: ["--assume-unchanged"],
+    both: ["--skip-worktree", "--assume-unchanged"],
+  };
+  const agentGit = (cwd: string, ...args: string[]) => {
+    const result = Bun.spawnSync(["git", ...args], { cwd });
+    if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+  };
+  /** Hide edits to tracked files, then install config, attributes and hooks that run marker commands. */
+  function tamper(cwd: string, flags: string[], files: Record<string, string>) {
+    for (const [path, content] of Object.entries(files)) {
+      writeFileSync(join(cwd, path), content);
+      agentGit(cwd, "update-index", ...flags, "--", path);
+    }
+    const common = Bun.spawnSync(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd })
+      .stdout.toString()
+      .trim();
+    const touch = (name: string) => `sh -c 'touch ${join(home, "markers", name)}'`;
+    mkdirSync(join(home, "hooks"), { recursive: true });
+    for (const hook of ["reference-transaction", "post-checkout", "pre-commit", "commit-msg"])
+      writeFileSync(join(home, "hooks", hook), `#!/bin/sh\ntouch ${join(home, "markers", hook)}\n`, {
+        mode: 0o755,
+      });
+    writeFileSync(join(common, "info", "attributes"), "*.ts diff=hide\n");
+    agentGit(cwd, "config", "diff.hide.textconv", `${touch("textconv")}; echo`);
+    agentGit(cwd, "config", "diff.external", touch("external"));
+    agentGit(cwd, "config", "core.hooksPath", join(home, "hooks"));
+    agentGit(cwd, "config", "core.fsmonitor", touch("fsmonitor"));
+  }
+
+  async function addFixtures() {
+    writeFileSync(join(repoDir, "greet.test.ts"), 'test("greets", () => {});\n');
+    writeFileSync(join(repoDir, ODD), "fine\n");
+    await sh(["git", "add", "-A"], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "fixtures"], {
+      cwd: repoDir,
+    });
+    mkdirSync(join(home, "markers"));
+  }
+
+  test.each(Object.keys(flagsFor) as (keyof typeof flagsFor)[])(
+    "hidden %s edits are committed, audited and gated; later tampering is cleaned up",
+    async (flag) => {
+      await addFixtures();
+      let implementations = 0;
+      const committed: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") {
+          // A reviewer hides its own edit and reinstalls hostile metadata; cleanup must undo both.
+          tamper(s.cwd, flagsFor[flag], { "greeting.txt": "reviewer\n" });
+          return { structured: approve };
+        }
+        if (++implementations === 1) {
+          tamper(s.cwd, flagsFor[flag], {
+            "greet.test.ts": 'test("greets", () => {});\ntest.skip("later", () => {});\n',
+            [ODD]: "BAD\n",
+          });
+          return {};
+        }
+        committed.push(
+          Bun.spawnSync(["git", "-c", "core.fsmonitor=false", "show", "HEAD:greet.test.ts"], {
+            cwd: s.cwd,
+          }).stdout.toString(),
+          Bun.spawnSync(["git", "-c", "core.fsmonitor=false", "show", `HEAD:${ODD}`], {
+            cwd: s.cwd,
+          }).stdout.toString(),
+        );
+        return {
+          files: { "greet.test.ts": 'test("greets", () => {});\n', [ODD]: "fine\n", "farewell.txt": "bye\n" },
+        };
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(committed).toEqual(['test("greets", () => {});\ntest.skip("later", () => {});\n', "BAD\n"]);
+      const audit = f.store
+        .listEvents(run.id)
+        .filter((e) => e.type === "audit")
+        .map((e) => e.message);
+      expect(audit).toContain("[test-skipped] greet.test.ts: test skipped/focused with .skip/.only");
+      const gates = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "[]");
+      expect(gates[0]).toMatchObject({ name: "no-bad", blocking: true });
+      const cwd = f.store.getRunState<RunState>(run.id)?.worktreePath ?? "";
+      expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+      expect((await sh(["git", "-c", "core.fsmonitor=false", "ls-files", "-v"], { cwd })).stdout).not.toMatch(
+        /^[a-zS]/m,
+      );
+      expect(
+        (
+          await sh(["git", "config", "--local", "--get-regexp", "^(diff|core\\.(hooksPath|fsmonitor))"], {
+            cwd,
+            allowFail: true,
+          })
+        ).stdout,
+      ).toBe("");
+      expect(readdirSync(join(home, "markers"))).toEqual([]);
+    },
+  );
+
+  test.each(["kept", "missing"])("restart restores from the original snapshot (%s)", async (snapshot) => {
+    await addFixtures();
+    const handler: Handler = (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      const skipped = readFileSync(join(s.cwd, "greet.test.ts"), "utf8").includes("skip");
+      return {
+        files: {
+          "greet.test.ts": `test("greets", () => {});\n${skipped ? "" : 'test.skip("x", () => {});\n'}`,
+          "farewell.txt": "bye\n",
+        },
+      };
+    };
+    const f = start(handler);
+    f.deps.faults = { "store:save": { action: "kill", when: (c) => c.stage === "prepare" } };
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    const deadline = Date.now() + 10_000;
+    while (
+      f.store.listStages(run.id).at(-1)?.status !== "cancelled" ||
+      f.store.getRun(run.id)?.status !== "running"
+    ) {
+      if (Date.now() > deadline) throw new Error("prepare interruption timed out");
+      await Bun.sleep(10);
+    }
+    await f.stop();
+    f.store.close();
+    const cwd = join(home, "data", "work", run.id);
+    tamper(cwd, [], {});
+    // Hostile config now in the shared repository: it must not become the trusted baseline.
+    if (snapshot === "missing") rmSync(join(home, "data", "runs", run.id, "git-trust.json"));
+    const resumed = start(handler);
+    const status = await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"]);
+    if (snapshot === "missing") {
+      expect(status).toBe("failed");
+      expect(resumed.store.getRun(run.id)?.error).toContain("trusted git state missing");
+      return;
+    }
+    expect(status).toBe("succeeded");
+    const audit = resumed.store
+      .listEvents(run.id)
+      .filter((e) => e.type === "audit")
+      .map((e) => e.message);
+    expect(audit).toContain("[test-skipped] greet.test.ts: test skipped/focused with .skip/.only");
+    expect(
+      (
+        await sh(["git", "config", "--local", "--get-regexp", "^(diff|core\\.(hooksPath|fsmonitor))"], {
+          cwd: repoDir,
+          allowFail: true,
+        })
+      ).stdout,
+    ).toBe("");
+    expect(readdirSync(join(home, "markers"))).toEqual([]);
+  });
 });

@@ -1,9 +1,18 @@
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { CommandError, sh } from "../util/proc.ts";
+import {
+  captureTrust,
+  forgetCheckout,
+  type GitTrust,
+  git,
+  RAW_DIFF,
+  restoreCheckout,
+  trustCheckout,
+} from "./trust.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -91,6 +100,11 @@ type RemoteOpts = {
   budget?: GitHubBudget;
 };
 const remoteSh = (cmd: string[], opts: RemoteOpts) => withGitHubRetry(() => sh(cmd, opts), opts);
+// Pushes from a checkout read its config (insteadOf, push options): restore the factory's first.
+const remoteGit = async (args: string[], opts: RemoteOpts) => {
+  await restoreCheckout(opts.cwd, opts.signal);
+  return withGitHubRetry(() => git(args, opts), opts);
+};
 
 export function slugify(text: string, max = 40): string {
   return (
@@ -119,7 +133,7 @@ export async function resolveRepo(store: Store, input: string): Promise<Repo> {
     if (store.getRepoBySlug(slug)) {
       slug = `local/${basename(path)}-${new Bun.CryptoHasher("sha256").update(path).digest("hex").slice(0, 6)}`;
     }
-    const head = await sh(["git", "symbolic-ref", "--short", "HEAD"], { cwd: path, allowFail: true });
+    const head = await git(["symbolic-ref", "--short", "HEAD"], { cwd: path, allowFail: true });
     return store.upsertRepo({
       slug,
       kind: "local",
@@ -154,6 +168,9 @@ export function cachePath(paths: Paths, repo: Repo): string {
   return join(paths.repos, `${repo.slug.replace("/", "__")}.git`);
 }
 
+/** The factory's copy of a GitHub cache's config, outside any metadata an agent can reach through git. */
+export const trustedConfigPath = (cache: string) => `${cache}.trusted-config`;
+
 /** Make sure a fresh bare mirror exists (GitHub repos) and is fetched. */
 const cacheLocks = new Map<string, Promise<unknown>>();
 
@@ -180,12 +197,12 @@ export async function ensureCache(paths: Paths, repo: Repo, signal?: AbortSignal
       // Clone to a temporary path and rename, so a crash never leaves a half-configured cache.
       const tmp = `${cache}.tmp-${process.pid}-${Date.now()}`;
       try {
-        await sh(["git", "clone", "--bare", repo.url as string, tmp], {
+        await git(["clone", "--bare", repo.url as string, tmp], {
           cwd: paths.repos,
           timeoutMs: 600_000,
           signal,
         });
-        await sh(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
+        await git(["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
           cwd: tmp,
           signal,
         });
@@ -194,9 +211,16 @@ export async function ensureCache(paths: Paths, repo: Repo, signal?: AbortSignal
         rmSync(tmp, { recursive: true, force: true });
       }
     }
+    // Agents can write this shared config from their worktrees: start from the factory's last copy.
+    const trusted = trustedConfigPath(cache);
+    if (existsSync(trusted)) {
+      rmSync(join(cache, "config"), { recursive: true, force: true });
+      copyFileSync(trusted, join(cache, "config"));
+    }
     // Agents run inside worktrees of this repo; make any push attempt from them fail.
-    await sh(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
-    await sh(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
+    await git(["config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
+    copyFileSync(join(cache, "config"), trusted);
+    await git(["fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
     return cache;
   });
 }
@@ -205,6 +229,8 @@ export interface Worktree {
   path: string;
   branch: string;
   baseSha: string;
+  /** Factory git state captured when the worktree was created; absent when an existing one is reused. */
+  trust?: GitTrust;
 }
 
 export async function createWorktree(
@@ -220,24 +246,31 @@ export async function createWorktree(
   const baseRef = repo.kind === "github" ? `origin/${baseBranch}` : baseBranch;
   if (existsSync(path)) {
     // Resuming an interrupted run: reuse the worktree as-is.
-    const head = await sh(["git", "rev-parse", "HEAD"], { cwd: path });
-    const base = await sh(["git", "rev-parse", baseRef], { cwd: cache });
+    const head = await git(["rev-parse", "HEAD"], { cwd: path });
+    const base = await git(["rev-parse", baseRef], { cwd: cache });
     return { path, branch, baseSha: base.stdout.trim() || head.stdout.trim() };
   }
   return withRepoLock(cache, async () => {
-    const base = await sh(["git", "rev-parse", baseRef], { cwd: cache });
-    await sh(["git", "worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
-    return { path, branch, baseSha: base.stdout.trim() };
+    const base = await git(["rev-parse", baseRef], { cwd: cache });
+    await git(["worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
+    // A user's local repository keeps its own hooks, attributes and config; GitHub caches are ours.
+    const trust = await captureTrust(
+      path,
+      repo.kind === "github",
+      repo.kind === "github" ? trustedConfigPath(cache) : undefined,
+    );
+    return { path, branch, baseSha: base.stdout.trim(), trust };
   });
 }
 
 export async function removeWorktree(paths: Paths, repo: Repo, path: string): Promise<void> {
+  forgetCheckout(path);
   if (!existsSync(path)) return;
-  await sh(["git", "worktree", "remove", "--force", path], { cwd: cachePath(paths, repo), allowFail: true });
+  await git(["worktree", "remove", "--force", path], { cwd: cachePath(paths, repo), allowFail: true });
 }
 
 export async function headSha(cwd: string): Promise<string> {
-  return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+  return (await git(["rev-parse", "HEAD"], { cwd })).stdout.trim();
 }
 
 export async function fetchBase(
@@ -250,15 +283,13 @@ export async function fetchBase(
   const cache = cachePath(paths, repo);
   return withRepoLock(cache, async () => {
     const ref = `refs/heads/${branch}`;
-    await remoteSh(["git", "fetch", "origin", `+${ref}:refs/remotes/origin/${branch}`], {
+    await remoteGit(["fetch", "origin", `+${ref}:refs/remotes/origin/${branch}`], {
       cwd: cache,
       timeoutMs: 300_000,
       signal,
       budget,
     });
-    return (
-      await sh(["git", "rev-parse", `refs/remotes/origin/${branch}`], { cwd: cache, signal })
-    ).stdout.trim();
+    return (await git(["rev-parse", `refs/remotes/origin/${branch}`], { cwd: cache, signal })).stdout.trim();
   });
 }
 
@@ -268,9 +299,9 @@ export async function readFileAt(
   path: string,
   env?: Record<string, string>,
 ): Promise<string | null> {
-  const entry = await sh(["git", "ls-tree", "--name-only", revision, "--", path], { cwd, env });
+  const entry = await git(["ls-tree", "--name-only", revision, "--", path], { cwd, env });
   if (!entry.stdout.trim()) return null;
-  return (await sh(["git", "show", `${revision}:${path}`], { cwd, env })).stdout;
+  return (await git(["show", ...RAW_DIFF, `${revision}:${path}`], { cwd, env })).stdout;
 }
 
 /** Extract the files of `sha` (no .git, no history, no working state) into the empty directory `dest`. */
@@ -282,11 +313,12 @@ export async function exportCommit(
 ): Promise<void> {
   // `git archive` honours export-ignore and would drop committed files; a private index checks out
   // exactly the commit's tracked files without touching the worktree's own index.
+  await restoreCheckout(cwd, signal);
   const index = `${dest}.index`;
   const env = { ...(process.env as Record<string, string>), GIT_INDEX_FILE: index };
   try {
-    await sh(["git", "read-tree", `${sha}^{commit}`], { cwd, env, signal, timeoutMs: 300_000 });
-    await sh(["git", "checkout-index", "--all", `--prefix=${dest}/`], {
+    await git(["read-tree", `${sha}^{commit}`], { cwd, env, signal, timeoutMs: 300_000 });
+    await git(["checkout-index", "--all", `--prefix=${dest}/`], {
       cwd,
       env,
       signal,
@@ -298,7 +330,7 @@ export async function exportCommit(
 }
 
 export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
-  const result = await sh(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
+  const result = await git(["merge-base", "--is-ancestor", ancestor, descendant], {
     cwd,
     allowFail: true,
   });
@@ -306,57 +338,61 @@ export async function isAncestor(cwd: string, ancestor: string, descendant: stri
 }
 
 export async function rebaseOnto(cwd: string, baseSha: string): Promise<"clean" | "conflict"> {
-  const result = await sh(
-    ["git", "-c", "user.name=Limitless", "-c", "user.email=limitless@localhost", "rebase", baseSha],
+  await restoreCheckout(cwd);
+  const result = await git(
+    ["-c", "user.name=Limitless", "-c", "user.email=limitless@localhost", "rebase", baseSha],
     {
       cwd,
       allowFail: true,
     },
   );
   if (result.exitCode === 0) return "clean";
-  const state = await sh(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
-  const apply = await sh(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
+  const state = await git(["rev-parse", "--git-path", "rebase-merge"], { cwd });
+  const apply = await git(["rev-parse", "--git-path", "rebase-apply"], { cwd });
   if (!existsSync(resolve(cwd, state.stdout.trim())) && !existsSync(resolve(cwd, apply.stdout.trim())))
     throw new Error(`rebase failed: ${result.stderr || result.stdout}`);
-  await sh(["git", "rebase", "--abort"], { cwd });
+  await git(["rebase", "--abort"], { cwd });
   if (existsSync(resolve(cwd, state.stdout.trim())) || existsSync(resolve(cwd, apply.stdout.trim())))
     throw new Error("rebase abort left worktree in rebase state");
   return "conflict";
 }
 
 export async function clearInterruptedRebase(cwd: string, expected: boolean): Promise<void> {
-  const state = await sh(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
-  const apply = await sh(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
+  const state = await git(["rev-parse", "--git-path", "rebase-merge"], { cwd });
+  const apply = await git(["rev-parse", "--git-path", "rebase-apply"], { cwd });
   if (!existsSync(resolve(cwd, state.stdout.trim())) && !existsSync(resolve(cwd, apply.stdout.trim())))
     return;
   if (!expected) throw new Error("worktree has an unexpected rebase in progress");
-  await sh(["git", "rebase", "--abort"], { cwd });
+  await git(["rebase", "--abort"], { cwd });
   if (existsSync(resolve(cwd, state.stdout.trim())) || existsSync(resolve(cwd, apply.stdout.trim())))
     throw new Error("interrupted rebase could not be aborted");
 }
 
 /** Commit everything in the worktree. Returns the new sha, or null when there was nothing to commit. */
 export async function commitAll(cwd: string, message: string): Promise<string | null> {
-  await sh(["git", "add", "-A"], { cwd });
-  const status = await sh(["git", "status", "--porcelain"], { cwd });
+  await restoreCheckout(cwd);
+  await git(["add", "-A"], { cwd });
+  const status = await git(["status", "--porcelain"], { cwd });
   if (!status.stdout.trim()) return null;
-  await sh(["git", "commit", "--no-verify", "-q", "-m", message], { cwd });
+  await git(["commit", "--no-verify", "-q", "-m", message], { cwd });
   return headSha(cwd);
 }
 
 /** Move the worktree's branch back to a known commit, discarding everything after it. */
 export async function resetTo(cwd: string, sha: string): Promise<void> {
-  await sh(["git", "reset", "--hard", "-q", sha], { cwd });
-  await sh(["git", "clean", "-fdq"], { cwd });
+  await restoreCheckout(cwd);
+  await git(["reset", "--hard", "-q", sha], { cwd });
+  await git(["clean", "-fdq"], { cwd });
 }
 
 /** Throw away any uncommitted changes (used after read-only stages). */
 /** `env` matters when the checkout's git config is untrusted: filters and drivers run with it. */
 export async function discardChanges(cwd: string, env?: Record<string, string>): Promise<boolean> {
-  const status = await sh(["git", "status", "--porcelain"], { cwd, env });
+  await restoreCheckout(cwd);
+  const status = await git(["status", "--porcelain"], { cwd, env });
   if (!status.stdout.trim()) return false;
-  await sh(["git", "reset", "--hard", "-q", "HEAD"], { cwd, env });
-  await sh(["git", "clean", "-fdq"], { cwd, env });
+  await git(["reset", "--hard", "-q", "HEAD"], { cwd, env });
+  await git(["clean", "-fdq"], { cwd, env });
   return true;
 }
 
@@ -380,12 +416,13 @@ export async function diffSince(
   env?: Record<string, string>,
   threeDot = false,
 ): Promise<DiffInfo> {
+  await restoreCheckout(cwd);
   const range = `${baseSha}${threeDot ? "..." : ".."}HEAD`;
   const [patch, names, stat, numstat] = await Promise.all([
-    sh(["git", "diff", range], { cwd, env }),
-    sh(["git", "diff", "--name-status", range], { cwd, env }),
-    sh(["git", "diff", "--stat", range], { cwd, env }),
-    sh(["git", "diff", "--numstat", range], { cwd, env }),
+    git(["diff", ...RAW_DIFF, range], { cwd, env }),
+    git(["diff", ...RAW_DIFF, "--name-status", range], { cwd, env }),
+    git(["diff", ...RAW_DIFF, "--stat", range], { cwd, env }),
+    git(["diff", ...RAW_DIFF, "--numstat", range], { cwd, env }),
   ]);
   let added = 0;
   let removed = 0;
@@ -417,7 +454,7 @@ export async function pushBranch(
   budget?: GitHubBudget,
 ): Promise<void> {
   if (repo.kind !== "github" || !repo.url) return;
-  await remoteSh(["git", "push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
+  await remoteGit(["push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
     cwd,
     timeoutMs: 300_000,
     signal,
@@ -433,7 +470,7 @@ export async function remoteBranchSha(
   budget?: GitHubBudget,
 ): Promise<string | null> {
   if (repo.kind !== "github" || !repo.url) return null;
-  const remote = await remoteSh(["git", "ls-remote", repo.url, `refs/heads/${branch}`], {
+  const remote = await remoteGit(["ls-remote", repo.url, `refs/heads/${branch}`], {
     cwd,
     signal,
     budget,
@@ -454,15 +491,15 @@ export async function pushExistingBranch(
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") || branch.endsWith("/"))
     throw new Error("invalid PR head branch");
   const ref = `refs/heads/${branch}`;
-  const remote = await remoteSh(["git", "ls-remote", repo.url, ref], { cwd, signal, budget });
+  const remote = await remoteGit(["ls-remote", repo.url, ref], { cwd, signal, budget });
   if (remote.stdout.split("\t")[0] !== baseSha) throw new Error("PR head moved since the run started");
-  const ancestor = await sh(["git", "merge-base", "--is-ancestor", baseSha, "HEAD"], {
+  const ancestor = await git(["merge-base", "--is-ancestor", baseSha, "HEAD"], {
     cwd,
     allowFail: true,
     signal,
   });
   if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
-  await remoteSh(["git", "push", `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
+  await remoteGit(["push", `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
     cwd,
     timeoutMs: 300_000,
     signal,
@@ -625,14 +662,14 @@ export async function pinnedTree(paths: Paths, store: Store, slug: string, sha: 
   const cache = cachePath(paths, repo);
   if (!existsSync(cache)) await ensureCache(paths, repo);
   return withRepoLock(cache, async () => {
-    const bare = await sh(["git", "rev-parse", "--is-bare-repository"], { cwd: cache });
+    const bare = await git(["rev-parse", "--is-bare-repository"], { cwd: cache });
     if (bare.stdout.trim() !== "true") throw new Error(`eval repository cache is not bare: ${cache}`);
-    const check = () => sh(["git", "cat-file", "-e", `${sha}^{commit}`], { cwd: cache, allowFail: true });
+    const check = () => git(["cat-file", "-e", `${sha}^{commit}`], { cwd: cache, allowFail: true });
     if ((await check()).exitCode !== 0) {
-      await sh(["git", "fetch", "origin", sha], { cwd: cache, timeoutMs: 300_000 });
+      await git(["fetch", "origin", sha], { cwd: cache, timeoutMs: 300_000 });
       if ((await check()).exitCode !== 0) throw new Error(`pinned commit ${sha} missing in ${slug}`);
     }
-    const tree = await sh(["git", "ls-tree", "--name-only", "-z", sha], { cwd: cache });
+    const tree = await git(["ls-tree", "--name-only", "-z", sha], { cwd: cache });
     return formatTopLevel(tree.stdout.split("\0").filter(Boolean));
   });
 }
@@ -657,13 +694,18 @@ export async function createEvalWorktree(
   labels: EvalLabels = { paths: [], contents: [] },
   snapshot = false,
 ): Promise<(() => Promise<void>) & { base: string }> {
-  const cleanup = async () => rmSync(path, { recursive: true, force: true });
+  const cleanup = async () => {
+    forgetCheckout(path);
+    rmSync(path, { recursive: true, force: true });
+  };
   try {
     const pins = await stageEvalRepo(paths, store, slug, base, head, path, signal, labels, snapshot);
     const opts = { cwd: path, signal };
-    await sh(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", pins[1]], opts);
-    for (const ref of ["refs/eval/base", "refs/eval/head"]) await sh(["git", "update-ref", "-d", ref], opts);
-    await sh(["git", "reflog", "expire", "--expire=now", "--all"], opts);
+    await git(["-c", "advice.detachedHead=false", "checkout", "-q", "--detach", pins[1]], opts);
+    for (const ref of ["refs/eval/base", "refs/eval/head"]) await git(["update-ref", "-d", ref], opts);
+    await git(["reflog", "expire", "--expire=now", "--all"], opts);
+    // Each checkout gets its own baseline, before baseline gates or a candidate run in it.
+    trustCheckout(path, await captureTrust(path, true));
     return Object.assign(cleanup, { base: pins[0] });
   } catch (error) {
     await cleanup();
@@ -683,7 +725,7 @@ export async function snapshotTopLevel(
 ): Promise<string> {
   try {
     const [, head] = await stageEvalRepo(paths, store, slug, sha, sha, path, signal, labels, true);
-    const tree = await sh(["git", "ls-tree", "--name-only", "-z", head], { cwd: path, signal });
+    const tree = await git(["ls-tree", "--name-only", "-z", head], { cwd: path, signal });
     return formatTopLevel(tree.stdout.split("\0").filter(Boolean));
   } finally {
     rmSync(path, { recursive: true, force: true });
@@ -725,10 +767,10 @@ async function stageEvalRepo(
   await withRepoLock(cache, async () => {
     signal.throwIfAborted();
     const opts = { cwd: cache, signal };
-    const bare = await sh(["git", "rev-parse", "--is-bare-repository"], opts);
+    const bare = await git(["rev-parse", "--is-bare-repository"], opts);
     if (bare.stdout.trim() !== "true") throw new Error(`eval repository cache is not bare: ${cache}`);
     const exists = async (sha: string) =>
-      (await sh(["git", "cat-file", "-e", `${sha}^{commit}`], { ...opts, allowFail: true })).exitCode === 0;
+      (await git(["cat-file", "-e", `${sha}^{commit}`], { ...opts, allowFail: true })).exitCode === 0;
     const missing = async () => {
       const absent: string[] = [];
       for (const sha of new Set([base, head])) if (!(await exists(sha))) absent.push(sha);
@@ -737,18 +779,12 @@ async function stageEvalRepo(
     let absent = await missing();
     if (snapshot && absent.length) {
       // Like pinnedTree: fetch the exact pins, which may be reachable only from a tag.
-      await sh(["git", "fetch", "origin", ...absent], { ...opts, timeoutMs: 300_000, allowFail: true });
+      await git(["fetch", "origin", ...absent], { ...opts, timeoutMs: 300_000, allowFail: true });
       absent = await missing();
     }
     if (absent.length) {
-      await sh(
-        [
-          "git",
-          "fetch",
-          "origin",
-          "+refs/heads/*:refs/remotes/origin/*",
-          "+refs/pull/*/head:refs/pull/*/head",
-        ],
+      await git(
+        ["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*", "+refs/pull/*/head:refs/pull/*/head"],
         { ...opts, timeoutMs: 300_000 },
       );
     }
@@ -758,9 +794,9 @@ async function stageEvalRepo(
     // A standalone repo holding only history reachable from the pins: a linked worktree
     // would share the cache's refs and objects, exposing later fixes and labeled datasets.
     mkdirSync(path, { recursive: true });
-    await sh(["git", "init", "-q", path], opts);
+    await git(["init", "-q", path], opts);
     if (snapshot) pins = await pushSnapshot(cache, base, head, path, signal);
-    else await sh(["git", "push", "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
+    else await git(["push", "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
   });
   await rejectContamination(path, labels, signal);
   return pins;
@@ -793,10 +829,8 @@ async function pushSnapshot(
   const staging = `${path}.snapshot`;
   rmSync(staging, { recursive: true, force: true });
   try {
-    await sh(["git", "init", "-q", staging], { cwd: cache, signal });
-    const objects = (
-      await sh(["git", "rev-parse", "--git-path", "objects"], { cwd: cache, signal })
-    ).stdout.trim();
+    await git(["init", "-q", staging], { cwd: cache, signal });
+    const objects = (await git(["rev-parse", "--git-path", "objects"], { cwd: cache, signal })).stdout.trim();
     writeFileSync(join(staging, ".git/objects/info/alternates"), `${resolve(cache, objects)}\n`);
     const opts = {
       cwd: staging,
@@ -804,18 +838,15 @@ async function pushSnapshot(
       env: { ...(process.env as Record<string, string>), ...SNAPSHOT_ENV },
     };
     const commit = async (sha: string, message: string, parent?: string) => {
-      await sh(["git", "read-tree", `${sha}^{tree}`], opts);
-      await sh(["git", "rm", "-r", "-f", "-q", "--cached", "--ignore-unmatch", "--", "evals/"], opts);
-      const tree = (await sh(["git", "write-tree"], opts)).stdout.trim();
-      const args = ["git", "-c", "i18n.commitEncoding=UTF-8", "commit-tree", "--no-gpg-sign", tree];
-      return (await sh([...args, ...(parent ? ["-p", parent] : []), "-m", message], opts)).stdout.trim();
+      await git(["read-tree", `${sha}^{tree}`], opts);
+      await git(["rm", "-r", "-f", "-q", "--cached", "--ignore-unmatch", "--", "evals/"], opts);
+      const tree = (await git(["write-tree"], opts)).stdout.trim();
+      const args = ["-c", "i18n.commitEncoding=UTF-8", "commit-tree", "--no-gpg-sign", tree];
+      return (await git([...args, ...(parent ? ["-p", parent] : []), "-m", message], opts)).stdout.trim();
     };
     const snapshotBase = await commit(base, "Snapshot base");
     const snapshotHead = await commit(head, "Snapshot head", snapshotBase);
-    await sh(
-      ["git", "push", "-q", path, `${snapshotBase}:refs/eval/base`, `${snapshotHead}:refs/eval/head`],
-      opts,
-    );
+    await git(["push", "-q", path, `${snapshotBase}:refs/eval/base`, `${snapshotHead}:refs/eval/head`], opts);
     return [snapshotBase, snapshotHead];
   } finally {
     rmSync(staging, { recursive: true, force: true });
@@ -831,8 +862,8 @@ async function rejectContamination(path: string, labels: EvalLabels, signal: Abo
   if (labels.paths.length) {
     // Default history simplification skips a side branch whose labels a merge discarded
     // (e.g. `merge -s ours`), yet its objects are still copied into the checkout.
-    const touched = await sh(
-      ["git", "rev-list", "-1", "--full-history", "refs/eval/base", "refs/eval/head", "--", ...labels.paths],
+    const touched = await git(
+      ["rev-list", "-1", "--full-history", "refs/eval/base", "refs/eval/head", "--", ...labels.paths],
       opts,
     );
     if (touched.stdout.trim())
@@ -847,7 +878,7 @@ async function rejectContamination(path: string, labels: EvalLabels, signal: Abo
   });
   if (!oids.length) return;
   // Check every label in one process: repeated trials otherwise spawn once per hidden file.
-  const found = await sh(["git", "cat-file", "--batch-check=%(objectname)"], {
+  const found = await git(["cat-file", "--batch-check=%(objectname)"], {
     ...opts,
     stdin: `${oids.join("\n")}\n`,
   });

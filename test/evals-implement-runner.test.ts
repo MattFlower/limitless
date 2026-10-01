@@ -443,9 +443,8 @@ test("candidate-configured git filters run without daemon secrets", async () => 
     });
     const trial = (await f.run()).trials[0];
     expect(trial?.pass).toBe(true);
-    // The filter did run, so the empty result proves the secret was withheld rather than unused.
-    expect(existsSync(leak)).toBe(true);
-    expect(readFileSync(leak, "utf8")).toBe("");
+    // Grading restores the factory's git config first, so the filter can no longer run at all.
+    expect(existsSync(leak) ? readFileSync(leak, "utf8") : "").toBe("");
   } finally {
     if (previous === undefined) delete process.env.LIMITLESS_EVAL_SECRET;
     else process.env.LIMITLESS_EVAL_SECRET = previous;
@@ -468,9 +467,8 @@ test("baseline-gate-configured git filters run without daemon secrets during cle
   const leak = join(f.home, "leak");
   try {
     f.respond((s) => {
-      // The baseline cleanup already ran the filter before the candidate was invoked.
-      expect(existsSync(leak)).toBe(true);
-      expect(readFileSync(leak, "utf8")).toBe("");
+      // The baseline cleanup restored the factory's git config before the filter could run.
+      expect(existsSync(leak) ? readFileSync(leak, "utf8") : "").toBe("");
       expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
       return { files: { answer: "correct" } };
     });
@@ -478,7 +476,7 @@ test("baseline-gate-configured git filters run without daemon secrets during cle
     expect(trial?.status).toBe("ok");
     expect(trial?.pass).toBe(true);
     expect(f.calls).toHaveLength(1);
-    expect(readFileSync(leak, "utf8")).toBe("");
+    expect(existsSync(leak) ? readFileSync(leak, "utf8") : "").toBe("");
   } finally {
     if (previous === undefined) delete process.env.LIMITLESS_EVAL_SECRET;
     else process.env.LIMITLESS_EVAL_SECRET = previous;
@@ -1234,6 +1232,64 @@ for (const rounds of [1, 2])
       ).toHaveLength(rounds - 1);
     } finally {
       copies.mockRestore();
+      await f.close();
+    }
+  });
+
+const ODD = "-odd\tname.txt";
+for (const flags of [["--skip-worktree"], ["--assume-unchanged"], ["--skip-worktree", "--assume-unchanged"]])
+  test(`hidden ${flags.join(" ")} edits and hostile git metadata never escape grading`, async () => {
+    const f = await fixture("! grep -q BAD ./-odd*", () => ({
+      "greet.test.ts": 'test("greets", () => {});\n',
+      [ODD]: "fine\n",
+    }));
+    const markers = join(f.home, "markers");
+    mkdirSync(markers);
+    const touch = (name: string) => `sh -c 'touch ${join(markers, name)}'`;
+    try {
+      f.item.hidden.command += "; s=$?; git show HEAD:greet.test.ts; cat ./-odd*; exit $s";
+      f.save();
+      f.respond((s): FakeReply => {
+        const agent = (...args: string[]) => Bun.spawnSync(["git", ...args], { cwd: s.cwd });
+        const retry = readFileSync(join(s.cwd, "greet.test.ts"), "utf8").includes("skip");
+        if (retry) {
+          // Hostile metadata from the first round and its grading never reach the next candidate.
+          expect(s.prompt).toContain("test skipped/focused");
+          expect(existsSync(join(s.cwd, "hidden/check.sh"))).toBe(false);
+          expect(agent("config", "--local", "--get", "diff.external").stdout.toString()).toBe("");
+          expect(agent("log", "--all", "--format=%s").stdout.toString()).not.toContain("hidden");
+        }
+        const edits = retry
+          ? { "greet.test.ts": 'test("greets", () => {});\n', [ODD]: "fine again\n" }
+          : { "greet.test.ts": 'test("greets", () => {});\ntest.skip("later", () => {});\n', [ODD]: "BAD\n" };
+        for (const [path, content] of Object.entries(edits)) {
+          writeFileSync(join(s.cwd, path), content);
+          agent("update-index", ...flags, "--", path);
+        }
+        mkdirSync(join(f.home, "hooks"), { recursive: true });
+        for (const dir of [join(s.cwd, ".git", "hooks"), join(f.home, "hooks")])
+          for (const hook of ["reference-transaction", "post-checkout", "pre-commit"])
+            writeFileSync(join(dir, hook), `#!/bin/sh\ntouch ${join(markers, hook)}\n`, { mode: 0o755 });
+        writeFileSync(join(s.cwd, ".git", "info", "attributes"), "*.ts diff=hide\n");
+        agent("config", "diff.hide.textconv", `${touch("textconv")}; echo`);
+        agent("config", "diff.external", touch("external"));
+        agent("config", "core.hooksPath", join(f.home, "hooks"));
+        agent("config", "core.fsmonitor", touch("fsmonitor"));
+        return { files: { answer: "correct" } };
+      });
+      const report = await f.run({ models: ["candidate-a", "candidate-b"], rounds: 2 });
+      expect(report.trials).toHaveLength(2);
+      for (const t of report.trials) {
+        expect(t.details.rounds?.map((r) => [r.pass, r.reason])).toEqual([
+          [false, "gates"],
+          [true, null],
+        ]);
+        expect(t.details.grade?.implement?.hidden?.output).toBe('test("greets", () => {});\nfine again');
+      }
+      // Each trial's checkout was sanitized on its own: both first rounds were caught.
+      expect(f.calls.filter((s) => s.prompt.includes("test skipped/focused"))).toHaveLength(2);
+      expect(readdirSync(markers)).toEqual([]);
+    } finally {
       await f.close();
     }
   });

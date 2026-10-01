@@ -1,10 +1,11 @@
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { agentEnv, sh } from "../util/proc.ts";
+import { agentEnv } from "../util/proc.ts";
+import { git, RAW_DIFF, restoreCheckout } from "./trust.ts";
 
 /** All merge lifecycle operations share hook suppression, identity and the agent's scrubbed env. */
 export function mergeGit(cwd: string, args: string[], allowFail = false) {
-  return sh(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], {
+  return git(["-c", "commit.gpgSign=false", ...args], {
     cwd,
     allowFail,
     env: agentEnv({
@@ -39,6 +40,7 @@ export async function requireMerge(cwd: string, head: string, base: string): Pro
 
 /** Resume an existing preparation without resetting its index or worktree edits. */
 export async function prepareMerge(cwd: string, head: string, base: string): Promise<string[]> {
+  await restoreCheckout(cwd);
   if ((await mergeGit(cwd, ["rev-parse", "HEAD"])).stdout.trim() !== head) {
     await validateMerge(cwd, head, base);
     return [];
@@ -57,7 +59,7 @@ export async function prepareMerge(cwd: string, head: string, base: string): Pro
     }
   }
   await requireMerge(cwd, head, base);
-  return (await mergeGit(cwd, ["diff", "--name-only", "--diff-filter=U", "-z"])).stdout
+  return (await mergeGit(cwd, ["diff", ...RAW_DIFF, "--name-only", "--diff-filter=U", "-z"])).stdout
     .split("\0")
     .filter(Boolean);
 }
@@ -85,12 +87,13 @@ async function leftoverMarkers(cwd: string, head: string, base: string, path: st
 
 /** Never use commitAll: even a resolution identical to the first parent needs a merge commit. */
 export async function completeMerge(cwd: string, head: string, base: string): Promise<string> {
+  await restoreCheckout(cwd);
   await requireMerge(cwd, head, base);
   const list = async (args: string[]) => (await mergeGit(cwd, args)).stdout.split("\0").filter(Boolean);
   // The file-only resolver leaves the unmerged index intact, including across restarts.
-  const unmerged = await list(["diff", "--name-only", "--diff-filter=U", "-z"]);
+  const unmerged = await list(["diff", ...RAW_DIFF, "--name-only", "--diff-filter=U", "-z"]);
   const untracked = await list(["ls-files", "-z", "--others", "--exclude-standard"]);
-  const edited = (await list(["diff", "--name-only", "--diff-filter=MT", "-z"])).filter(
+  const edited = (await list(["diff", ...RAW_DIFF, "--name-only", "--diff-filter=MT", "-z"])).filter(
     (path) => !unmerged.includes(path),
   );
   const markers: string[] = [];

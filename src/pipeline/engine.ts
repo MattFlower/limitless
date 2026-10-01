@@ -47,6 +47,7 @@ import {
   resetTo,
   withGitHubRetry,
 } from "../git/repos.ts";
+import { loadTrust, saveTrust, trustCheckout } from "../git/trust.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
@@ -144,6 +145,7 @@ export async function executeRun(
     if (ctx.state.needsHumanReason) throw new NeedsHumanError(ctx.state.needsHumanReason);
     ctx.state.flow ??= "build";
     await ctx.save();
+    if (ctx.state.worktreePath) trustCheckout(ctx.state.worktreePath, loadTrust(trustFile(ctx)));
     if (ctx.state.flow === "verify-change" && ctx.state.phase !== "prepare" && !ctx.state.verification)
       throw new Error("Verification state is missing its recorded PR revisions");
     if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined) {
@@ -298,6 +300,8 @@ function gateEvents(ctx: RunContext): Required<GateHooks> {
   };
 }
 
+const trustFile = (ctx: RunContext) => join(ctx.runDir, "git-trust.json");
+
 async function prepare(ctx: RunContext): Promise<void> {
   assertExistingBranchDelivery(ctx.repo, ctx.run);
   await ctx.stage("prepare", async () => {
@@ -324,6 +328,9 @@ async function prepare(ctx: RunContext): Promise<void> {
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
     const reusingWorktree = existsSync(join(cfg.paths.work, ctx.run.id));
     const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base);
+    // Captured with a fresh worktree, before baseline gates; a reused one must already have it.
+    if (wt.trust) saveTrust(trustFile(ctx), wt.trust);
+    trustCheckout(wt.path, loadTrust(trustFile(ctx)));
     if (ctx.run.deliveryBranch && ctx.run.sourceRef?.headSha !== wt.baseSha)
       throw new Error("PR head moved before preparation");
     ctx.state.worktreePath = wt.path;

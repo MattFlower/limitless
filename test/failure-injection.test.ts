@@ -858,7 +858,8 @@ end();
   );
   writeFileSync(
     join(bin, "git"),
-    `#!/bin/sh\nif [ "$1" = push ]; then printf '%s\\n' "$@" >> '${join(root, "pushes")}'; exit 0; fi\nexec /usr/bin/git "$@"\n`,
+    // Factory git calls lead with hardening -c options; match and record the command after them.
+    `#!/bin/sh\nif [ "$(while [ "$1" = -c ]; do shift 2; done; printf %s "$1")" = push ]; then while [ "$1" = -c ]; do shift 2; done; printf '%s\\n' "$@" >> '${join(root, "pushes")}'; exit 0; fi\nexec /usr/bin/git "$@"\n`,
     { mode: 0o755 },
   );
   const oldPath = process.env.PATH;
@@ -921,8 +922,9 @@ for (const operation of [
         writeFileSync(
           path,
           `#!/bin/sh
-printf '%s\\n' "${bin} $*" >> '${calls}'
-case "${bin} $*" in
+cmd=$(while [ "$1" = -c ]; do shift 2; done; printf %s "$*")
+printf '%s\\n' "${bin} $cmd" >> '${calls}'
+case "${bin} $cmd" in
   ${pattern
     .split("*")
     .map((part) => `'${part}'`)

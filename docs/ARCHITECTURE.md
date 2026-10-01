@@ -237,6 +237,11 @@ detection, per-invocation budget, process-group kill on cancel.
 - One worktree per run at `~/.limitless/work/<run-id>` on branch `limitless/<run-id>-<slug>`.
 - Local-only (non-GitHub) repos are supported: worktrees come straight from the local clone and
   delivery leaves a branch instead of a PR.
+- Agents control their checkout's git metadata, so factory git calls go through `src/git/trust.ts`:
+  hooks, fsmonitor, external diffs and attribute files are overridden on every call, and before
+  staging, cleaning, auditing or pushing the config captured at prepare (`runs/<run-id>/git-trust.json`;
+  the cache's own copy in `repos/<name>.git.trusted-config`) is restored, factory-owned hooks and
+  info/attributes are emptied, and skip-worktree/assume-unchanged bits are cleared.
 - Agents run with the CLIs' own sandboxes (Seatbelt on macOS) where they're compatible with the
   repo's toolchain; secrets for Discord/GitHub/OpenRouter are scrubbed from agent environments.
 - Triggers are **allowlisted** (your GitHub login, `dependabot[bot]`, your Discord user id).

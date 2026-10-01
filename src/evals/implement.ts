@@ -19,12 +19,13 @@ import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
 import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
+import { git, restoreCheckout } from "../git/trust.ts";
 import { withScratch } from "../harness/scratch.ts";
 import type { ModelTarget } from "../harness/types.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../pipeline/prompts.ts";
 import type { Router } from "../router/router.ts";
 import { EFFORT_LEVELS } from "../router/targets.ts";
-import { agentEnv, runProcess, sh } from "../util/proc.ts";
+import { agentEnv, runProcess } from "../util/proc.ts";
 import type { hiddenContents, ImplementCase } from "./cases.ts";
 import { gatesAt } from "./prepare.ts";
 
@@ -90,7 +91,7 @@ function inject(cwd: string, files: ReturnType<typeof hiddenContents>) {
  */
 async function* ignoredEntries(cwd: string, env: Record<string, string>, signal: AbortSignal) {
   const root = realpathSync(cwd);
-  const out = await sh(["git", "ls-files", "-z", "-o", "-i", "--exclude-standard"], { cwd, env, signal });
+  const out = await git(["ls-files", "-z", "-o", "-i", "--exclude-standard"], { cwd, env, signal });
   const pending = out.stdout
     .split("\0")
     .filter(Boolean)
@@ -199,10 +200,11 @@ export async function gradeImplement(
   const modes = new Map<string, number>();
   try {
     signal.throwIfAborted();
-    await sh(["git", "add", "-A"], { cwd, env, signal });
-    await sh(
+    // Config, hooks, attributes and index flags go back to the factory's before anything is staged.
+    await restoreCheckout(cwd, signal, true);
+    await git(["add", "-A"], { cwd, env, signal });
+    await git(
       [
-        "git",
         "-c",
         "user.name=Limitless",
         "-c",
@@ -218,12 +220,12 @@ export async function gradeImplement(
       ],
       { cwd, env, signal },
     );
-    evidence.commit = (await sh(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
+    evidence.commit = (await git(["rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
     if (snapshot) {
       // Keep candidate Git metadata private: graders may commit hidden inputs.
       // Reconstruct files only after failure; never copy the worktree (including dependencies).
       cpSync(join(cwd, ".git"), join(snapshot, ".git"), { recursive: true, verbatimSymlinks: true });
-      for (const path of (await sh(["git", "ls-files", "-z"], { cwd, env, signal })).stdout
+      for (const path of (await git(["ls-files", "-z"], { cwd, env, signal })).stdout
         .split("\0")
         .filter(Boolean))
         if (!lstatSync(join(cwd, path)).isSymbolicLink()) modes.set(path, statSync(join(cwd, path)).mode);
@@ -297,12 +299,12 @@ export async function gradeImplement(
           // Preserve ignored dependencies/build outputs across recovery rounds.
           rmSync(join(cwd, ".git"), { recursive: true, force: true });
           cpSync(join(snapshot, ".git"), join(cwd, ".git"), { recursive: true, verbatimSymlinks: true });
-          await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "HEAD"], {
+          await git(["reset", "--hard", "HEAD"], {
             cwd,
             env,
             signal,
           });
-          await sh(["git", "clean", "-fd"], { cwd, env, signal });
+          await git(["clean", "-fd"], { cwd, env, signal });
           // Ignore rules are candidate-controlled: drop hidden files and anything the grader created
           // or rewrote, since a pre-existing ignored output may now hold hidden test contents.
           if (ignoredBefore) {
@@ -313,7 +315,7 @@ export async function gradeImplement(
               if (before === undefined || before !== fingerprint(root, path, ignoredBefore.since))
                 removeWithin(root, path);
             }
-            await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "HEAD"], {
+            await git(["reset", "--hard", "HEAD"], {
               cwd,
               env,
               signal,

@@ -5,7 +5,7 @@ import type { Repo, Run } from "./core/types.ts";
 import type { Store } from "./db/store.ts";
 import { BASELINE_CACHE_TTL_MS } from "./gates/cache.ts";
 import { cachePath, withRepoLock } from "./git/repos.ts";
-import { sh } from "./util/proc.ts";
+import { git } from "./git/trust.ts";
 
 const DAY = 86_400_000;
 
@@ -103,11 +103,9 @@ export async function collectGarbage(
         if (lstatSync(path).isSymbolicLink() || !lstatSync(path).isDirectory()) {
           throw new Error(`worktree path is not a directory: ${path}`);
         }
-        const listed = worktreePaths(
-          (await sh(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout,
-        );
+        const listed = worktreePaths((await git(["worktree", "list", "--porcelain"], { cwd: cache })).stdout);
         if (realpathSync(path).startsWith(realpathSync(workRoot) + sep) && listed.has(canonical(path))) {
-          if (!dryRun) await sh(["git", "worktree", "remove", "--force", path], { cwd: cache });
+          if (!dryRun) await git(["worktree", "remove", "--force", path], { cwd: cache });
           result.worktrees.push(path);
         } else {
           throw new Error(`worktree is not registered to ${repo.slug}: ${path}`);
@@ -147,19 +145,19 @@ export async function collectGarbage(
             )
             .map((run) => canonical(child(workRoot, run.id))),
         );
-        const listed = (await sh(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout;
+        const listed = (await git(["worktree", "list", "--porcelain"], { cwd: cache })).stdout;
         const prunable = prunablePaths(listed);
         const unrelated = prunable.filter((path) => !eligible.has(path));
         if (unrelated.length)
           throw new Error(`prune would affect unrelated worktrees: ${unrelated.join(", ")}`);
-        const output = await sh(["git", "worktree", "prune", "--expire", "now", "--dry-run", "--verbose"], {
+        const output = await git(["worktree", "prune", "--expire", "now", "--dry-run", "--verbose"], {
           cwd: cache,
         });
         const entries = `${output.stdout}\n${output.stderr}`.split("\n").filter((line) => line.trim());
         if (entries.length !== prunable.length) {
           throw new Error("prune reported metadata that could not be matched to eligible worktrees");
         }
-        if (!dryRun) await sh(["git", "worktree", "prune", "--expire", "now"], { cwd: cache });
+        if (!dryRun) await git(["worktree", "prune", "--expire", "now"], { cwd: cache });
         for (const entry of entries) result.metadata.push(`${repo.slug}: ${entry.trim()}`);
       });
     } catch (error) {
