@@ -21,6 +21,7 @@ import {
   fetchBase,
   headSha,
   resetTo,
+  trustedAttributesPath,
   trustedConfigPath,
 } from "../src/git/repos.ts";
 import {
@@ -188,7 +189,7 @@ test("restoration replaces a redirected .git file and fails on missing trusted s
   trustCheckout(cwd, loadTrust(file));
   await expect(restoreCheckout(cwd)).rejects.toThrow("trusted git state unusable");
   // A missing factory copy of a shared config is never replaced by the live (candidate) one.
-  saveTrust(file, { ...trust, sharedConfig: join(home, "missing-config") });
+  saveTrust(file, { ...trust, shared: join(home, "missing") });
   trustCheckout(cwd, loadTrust(file));
   await expect(restoreCheckout(cwd)).rejects.toThrow("trusted git config missing");
   await expect(commitAll(cwd, "x")).rejects.toThrow("trusted git config missing");
@@ -268,5 +269,65 @@ describe("shared GitHub cache", () => {
     expect(await get("remote.origin.url")).toBe(github.url as string);
     expect(await get("remote.origin.pushurl")).toStartWith("no-push://");
     expect(markers()).toEqual([]);
+  });
+});
+
+describe("shared local repository", () => {
+  const setup = async () => {
+    const dir = await repo();
+    const paths = {
+      home,
+      db: "",
+      repos: join(home, "repos"),
+      work: join(home, "work"),
+      runs: "",
+      configDir: "",
+    };
+    const local: Repo = {
+      id: "l",
+      slug: "local/repo",
+      kind: "local",
+      url: null,
+      localPath: dir,
+      defaultBranch: "main",
+      mergePolicy: "none",
+      createdAt: 0,
+    };
+    // The user's own attributes and hooks stay; what an agent adds must not.
+    writeFileSync(join(dir, ".git", "info", "attributes"), "*.bin binary\n");
+    return { dir, paths, local };
+  };
+  const key = (paths: { repos: string }) => join(paths.repos, "local__repo");
+
+  test("a later run's worktree never runs or trusts metadata an earlier agent left", async () => {
+    const { dir, paths, local } = await setup();
+    const first = await createWorktree(paths, local, "run1", "t", "main");
+    expect(readFileSync(trustedConfigPath(key(paths)), "utf8")).toContain("example.invalid/repo.git");
+    expect(readFileSync(trustedAttributesPath(key(paths)), "utf8")).toBe("*.bin binary\n");
+    // The agent in run1 installs a smudge filter in the shared config, selected by shared attributes.
+    await tamper(first.path);
+    await run(first.path, "config", "filter.leak.smudge", `sh -c 'touch ${marker("smudge")}; cat'`);
+    for (const name of markers()) rmSync(marker(name));
+    const second = await createWorktree(paths, local, "run2", "t", "main");
+    expect(markers()).toEqual([]);
+    expect(JSON.stringify(second.trust)).not.toContain("leak");
+    expect(readFileSync(join(dir, ".git", "info", "attributes"), "utf8")).toBe("*.bin binary\n");
+    const get = async (key: string) => (await run(dir, "config", "--get", key)).stdout.trim();
+    expect(await get("remote.origin.pushurl")).toBe("no-push://x");
+    expect(await get("branch.main.remote")).toBe("origin");
+    expect(
+      (await sh(["git", "config", "--get-regexp", "^filter"], { cwd: dir, allowFail: true })).stdout,
+    ).toBe("");
+    // A user's hooks directory is not the factory's to empty; factory calls bypass it instead.
+    expect(readdirSync(join(dir, ".git", "hooks"))).toContain("pre-commit");
+  });
+
+  test("a touched repository without trusted copies fails instead of adopting its config", async () => {
+    const { paths, local } = await setup();
+    const first = await createWorktree(paths, local, "run1", "t", "main");
+    await tamper(first.path);
+    rmSync(trustedConfigPath(key(paths)));
+    await expect(createWorktree(paths, local, "run2", "t", "main")).rejects.toThrow("no trusted git state");
+    expect(existsSync(trustedConfigPath(key(paths)))).toBe(false);
   });
 });

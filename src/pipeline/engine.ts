@@ -412,8 +412,9 @@ async function prepare(ctx: RunContext): Promise<void> {
           : await singleFlight(JSON.stringify(key), ctx.signal, baseline, (r) => cacheableBaseline(r, gates));
       }
     } finally {
+      // Baseline gates ran repository code that may have moved HEAD: back to the recorded base.
       if (verification) await resetTo(wt.path, verification.headSha);
-      else await discardChanges(wt.path);
+      else await resetTo(wt.path, baseSha);
     }
     const baseline = ctx.state.baseline;
     if (baseline) {
@@ -854,7 +855,6 @@ async function oneRound(
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
-  const changeDiff = () => diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change");
   const system =
     ctx.deps.reviewSystem ?? configuredReviewSystem(ctx.deps.cfg, profile(ctx), ctx.state.reviewLenses);
   const resolution = ctx.state.conflictRound === round;
@@ -884,6 +884,10 @@ async function oneRound(
       throw new Error("Missing expected merge state for resolution checks");
     await validateMerge(cwd, ctx.state.preRebaseHead, baseSha);
   }
+  // The committed revision under test. Gates, reviewers and verifiers run code that can move HEAD,
+  // so every factory step from here binds to it rather than to the live branch.
+  const head = ctx.run.headSha ?? (await headSha(cwd));
+  const changeDiff = () => diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change", head);
 
   // --- gates
   const comparison = await ctx.stage(
@@ -892,7 +896,7 @@ async function oneRound(
       const events = gateEvents(ctx);
       let cmp: GateComparison[];
       try {
-        await discardChanges(cwd);
+        await resetTo(cwd, head);
         const after = await runGates(cwd, gates, ctx.signal, events);
         ctx.checkCancelled();
         const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
@@ -908,7 +912,7 @@ async function oneRound(
         ctx.checkCancelled();
         // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
       } finally {
-        await discardChanges(cwd);
+        await resetTo(cwd, head);
       }
       for (const c of cmp.filter((c) => c.firstAttempt)) {
         ctx.store.addEvent({
@@ -948,7 +952,7 @@ async function oneRound(
         },
       });
       if (ctx.state.verification) {
-        const repairs = await diffSince(cwd, ctx.state.verification.headSha);
+        const repairs = await diffSince(cwd, ctx.state.verification.headSha, undefined, false, head);
         if (repairs.files.length)
           findings.push(
             ...auditDiff(repairs, {
@@ -1002,7 +1006,7 @@ async function oneRound(
     throw new NeedsHumanError("Previous review has no round history; cannot classify later findings");
   const earlierReviews = (ctx.state.reviewHistory ?? []).filter((entry) => entry.round < round);
   const priorReview = earlierReviews.at(-1);
-  const reviewedSha = await headSha(cwd);
+  const reviewedSha = head;
   // R2 and R3 review only the fixes since the previous review. A conflict-resolution review, like a
   // single one, sees the change against the new base, so upstream-only files never appear.
   const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
@@ -1073,7 +1077,7 @@ async function oneRound(
           ...(deadline ? { deadline } : {}),
           requireStructured: true,
         });
-        await discardChanges(cwd);
+        await discardChanges(cwd, undefined, head);
         return invoked;
       };
       const { target, output, decision, panel } = await runReview(
@@ -1230,7 +1234,7 @@ async function oneRound(
             privateSession: true,
             redactHoldout: true,
           });
-          await discardChanges(cwd);
+          await discardChanges(cwd, undefined, head);
           const v = normalizeVerify(
             VerifySchema.parse(result.structured),
             ctx.state.spec as Spec,
@@ -1318,7 +1322,7 @@ async function oneRound(
       await ctx.save();
       return false;
     }
-    await recordVerified(ctx, await headSha(cwd));
+    await recordVerified(ctx, head);
     return true;
   } finally {
     ctx.previewUrl = undefined;
@@ -1674,8 +1678,8 @@ async function mergeForDelivery(
     return "conflict";
   }
   if ((await headSha(cwd)) === before) await completeMerge(cwd, before, fetched);
-  await validateMerge(cwd, before, fetched);
-  await resetTo(cwd, "HEAD");
+  const merged = await validateMerge(cwd, before, fetched);
+  await resetTo(cwd, merged);
   const previous = ctx.state.preRebaseGates ?? [];
   try {
     await ctx.stage(
@@ -1683,8 +1687,8 @@ async function mergeForDelivery(
       async () => {
         const after = await runGates(cwd, ctx.state.gatesConfig as GateConfig, ctx.signal, gateEvents(ctx));
         ctx.checkCancelled();
-        // Gates ran repository code: restore metadata so filters or index flags cannot skew the reset.
-        await resetTo(cwd, "HEAD");
+        // Gates ran repository code that may have moved HEAD or hidden edits: back to the merge commit.
+        await resetTo(cwd, merged);
         // A check fixed by the implementation must stay fixed after merging, even when
         // it failed on the original base. Persist that regression in the evidence too.
         const comparison = compareGates(
@@ -1724,6 +1728,6 @@ async function mergeForDelivery(
   ctx.state.pendingRebaseSha = undefined;
   ctx.state.preRebaseGates = undefined;
   ctx.state.preRebaseHead = undefined;
-  ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: await headSha(cwd) }, ctx.state);
+  ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: merged }, ctx.state);
   return "done";
 }

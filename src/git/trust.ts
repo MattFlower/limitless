@@ -31,12 +31,16 @@ export interface GitTrust {
   config: string;
   /** A linked worktree's own `config.worktree` (null when absent), effective with extensions.worktreeConfig. */
   configWorktree: string | null;
-  /** A factory-maintained copy of a shared cache's config, read at restore time instead of `config`. */
-  sharedConfig?: string;
+  /** Key of the factory's copies of a shared repository's config and attributes, read at restore time. */
+  shared?: string;
   attributes: string | null;
   /** Hooks and info/attributes belong to the factory and are emptied (not a user's own repository). */
   owned: boolean;
 }
+
+/** The factory's copies of a shared repository's config and info/attributes, outside any git metadata. */
+export const trustedConfigPath = (key: string) => `${key}.trusted-config`;
+export const trustedAttributesPath = (key: string) => `${key}.trusted-attributes`;
 
 const read = (path: string) => {
   try {
@@ -64,7 +68,27 @@ export function restoreOwned(commonDir: string, config: string): void {
   mkdirSync(join(commonDir, "hooks"));
 }
 
-export async function captureTrust(cwd: string, owned: boolean, sharedConfig?: string): Promise<GitTrust> {
+/** Record a repository's current shared config and info/attributes as the factory's trusted copies. */
+export function captureShared(commonDir: string, key: string): void {
+  const config = read(join(commonDir, "config"));
+  if (config === null) throw new Error(`git config unreadable in ${commonDir}`);
+  mkdirSync(dirname(key), { recursive: true });
+  writeFileSync(trustedConfigPath(key), config);
+  put(trustedAttributesPath(key), read(join(commonDir, "info", "attributes")));
+}
+
+/** Put the trusted copies back; a factory-owned repository also loses its hooks and attributes. */
+export function restoreShared(commonDir: string, key: string, owned: boolean): void {
+  const config = read(trustedConfigPath(key));
+  if (config === null) throw new Error(`trusted git config missing: ${trustedConfigPath(key)}`);
+  if (owned) restoreOwned(commonDir, config);
+  else {
+    put(join(commonDir, "config"), config);
+    put(join(commonDir, "info", "attributes"), read(trustedAttributesPath(key)));
+  }
+}
+
+export async function captureTrust(cwd: string, owned: boolean, shared?: string): Promise<GitTrust> {
   const rev = async (flag: string) =>
     realpathSync(resolve(cwd, (await git(["rev-parse", flag], { cwd })).stdout.trim()));
   const gitDir = await rev("--absolute-git-dir");
@@ -79,7 +103,7 @@ export async function captureTrust(cwd: string, owned: boolean, sharedConfig?: s
     commondir: linked ? read(join(gitDir, "commondir")) : null,
     config,
     configWorktree: read(join(gitDir, "config.worktree")),
-    ...(sharedConfig ? { sharedConfig } : {}),
+    ...(shared ? { shared } : {}),
     attributes: owned ? null : read(join(commonDir, "info", "attributes")),
     owned,
   };
@@ -99,12 +123,11 @@ export async function restoreTrust(cwd: string, trust: GitTrust, signal?: AbortS
     put(dotGit, trust.dotGit);
     put(join(trust.gitDir, "commondir"), trust.commondir);
   }
-  const config = trust.sharedConfig ? read(trust.sharedConfig) : trust.config;
-  if (config === null) throw new Error(`trusted git config missing: ${trust.sharedConfig}`);
   put(join(trust.gitDir, "config.worktree"), trust.configWorktree);
-  if (trust.owned) restoreOwned(trust.commonDir, config);
+  if (trust.shared) restoreShared(trust.commonDir, trust.shared, trust.owned);
+  else if (trust.owned) restoreOwned(trust.commonDir, trust.config);
   else {
-    put(join(trust.commonDir, "config"), config);
+    put(join(trust.commonDir, "config"), trust.config);
     put(join(trust.commonDir, "info", "attributes"), trust.attributes);
   }
   const entries = (await git(["ls-files", "-v", "-z"], { cwd, signal })).stdout.split("\0").filter(Boolean);

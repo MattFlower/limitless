@@ -1293,3 +1293,25 @@ for (const flags of [["--skip-worktree"], ["--assume-unchanged"], ["--skip-workt
       await f.close();
     }
   });
+
+test("a gate that replaces HEAD with a clean commit cannot change what is audited or graded", async () => {
+  // Candidate code running as a gate: drop the candidate commit and commit a passing tree instead.
+  const rewrite = [
+    "git reset -q --hard HEAD~1",
+    "echo correct > answer",
+    "git add -A",
+    "git -c user.email=g@g -c user.name=g commit -qm clean",
+  ].join(" && ");
+  const f = await fixture(rewrite);
+  try {
+    f.respond(() => ({ files: { answer: "wrong", "greet.test.ts": 'test.skip("later", () => {});\n' } }));
+    const grade = (await f.run()).trials[0]?.details.grade?.implement;
+    expect(grade?.reason).toBe("audit");
+    expect(grade?.gates.map((g) => g.verdict)).toEqual(["pass"]);
+    expect(grade?.auditBlocks.map((b) => b.rule)).toEqual(["test-skipped"]);
+    // Hidden tests ran against the recorded commit's tree, where answer is still wrong.
+    expect(grade?.hidden?.exitCode).toBe(1);
+  } finally {
+    await f.close();
+  }
+});

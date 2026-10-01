@@ -5681,6 +5681,52 @@ describe("candidate git metadata", () => {
     },
   );
 
+  test("a gate that replaces HEAD with a clean commit cannot change what is audited or delivered", async () => {
+    // Repository code running as a gate: drop the candidate commit and leave a clean one in its place.
+    const rewrite = [
+      "test ! -f farewell.txt || { git reset -q --hard HEAD~1",
+      "git -c user.email=t@t -c user.name=t commit -q --allow-empty -m clean; }",
+    ].join(" && ");
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "rewrite", run = "${rewrite}" }]\n`,
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "rewrite gate"], {
+      cwd: repoDir,
+    });
+    const base = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      // Round 1 adds a skipped test; round 2 (reached only if the audit saw it) removes it again.
+      const retry = existsSync(join(s.cwd, "greet.test.ts"));
+      return {
+        files: {
+          "greet.test.ts": `test("greets", () => {});\n${retry ? "" : 'test.skip("x", () => {});\n'}`,
+          "farewell.txt": "bye\n",
+        },
+      };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const audit = f.store
+      .listEvents(run.id)
+      .filter((e) => e.type === "audit")
+      .map((e) => e.message);
+    expect(audit).toContain("[test-skipped] greet.test.ts: test skipped/focused with .skip/.only");
+    const cwd = f.store.getRunState<RunState>(run.id)?.worktreePath ?? "";
+    const head = f.store.getRun(run.id)?.headSha ?? "";
+    expect((await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim()).toBe(head);
+    // Both rounds' commits are delivered; the gate's replacement commit is nowhere in the branch.
+    expect(
+      (await sh(["git", "log", "--format=%s", `${base}..${head}`], { cwd })).stdout.trim().split("\n"),
+    ).toEqual(["limitless: Add farewell (round 2)", "limitless: Add farewell (round 1)"]);
+    expect((await sh(["git", "show", `${head}:farewell.txt`], { cwd })).stdout).toBe("bye\n");
+    expect(f.store.getArtifact(run.id, "diff.patch")).toContain("+bye");
+  });
+
   test.each(["kept", "missing"])("restart restores from the original snapshot (%s)", async (snapshot) => {
     await addFixtures();
     const handler: Handler = (s) => {

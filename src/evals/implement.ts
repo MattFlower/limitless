@@ -18,7 +18,7 @@ import type { EvalGrade, EvalStrategy, EvalTrial } from "../core/types.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
-import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
+import { diffSince, readFileAt, resetTo } from "../git/repos.ts";
 import { git, restoreCheckout } from "../git/trust.ts";
 import { withScratch } from "../harness/scratch.ts";
 import type { ModelTarget } from "../harness/types.ts";
@@ -31,6 +31,7 @@ import { gatesAt } from "./prepare.ts";
 
 export async function prepareImplement(item: ImplementCase, cwd: string, signal: AbortSignal) {
   const gates = await gatesAt(cwd, item.base, signal);
+  const head = (await git(["rev-parse", "HEAD"], { cwd, signal })).stdout.trim();
   const baseline = await runGates(cwd, gates, signal);
   signal.throwIfAborted();
   if (!baseline.setupOk) throw new Error("baseline gate setup failed");
@@ -44,8 +45,8 @@ export async function prepareImplement(item: ImplementCase, cwd: string, signal:
       `snapshot mode removed evals/ and baseline check ${failing.name} fails; this case can't use snapshot mode`,
     );
   // Baseline gates already ran repository code that may have configured filters in .git/config
-  // and .gitattributes, so this checkout is no more trustworthy than a candidate's.
-  await discardChanges(cwd, agentEnv());
+  // and .gitattributes or moved HEAD, so this checkout is no more trustworthy than a candidate's.
+  await resetTo(cwd, head, agentEnv());
   return {
     gates,
     baseline,
@@ -233,7 +234,8 @@ export async function gradeImplement(
     }
     const after = await runGates(cwd, prepared.gates, signal);
     signal.throwIfAborted();
-    await discardChanges(cwd, env);
+    // Gates ran candidate code that may have moved HEAD: audit and hidden tests use the recorded commit.
+    await resetTo(cwd, evidence.commit, env);
     evidence.gates = compareGates(prepared.baseline, after);
     const gateTimeout = [
       ...prepared.baseline.setup,
@@ -243,13 +245,13 @@ export async function gradeImplement(
     ].some((g) => g.output.startsWith("[timed out]"));
     if (gateTimeout) evidence.reason = "timeout";
     const names = gateScriptNames(prepared.gates);
-    const findings = auditDiff(await diffSince(cwd, item.base, env), {
+    const findings = auditDiff(await diffSince(cwd, item.base, env, false, evidence.commit), {
       taskClass: null,
       protectedPaths: prepared.gates.protectedPaths,
       toolCommands,
       gateScripts: {
         before: pickScripts(await readFileAt(cwd, item.base, "package.json", env), names),
-        after: pickScripts(await readFileAt(cwd, "HEAD", "package.json", env), names),
+        after: pickScripts(await readFileAt(cwd, evidence.commit, "package.json", env), names),
       },
     });
     evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");

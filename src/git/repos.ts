@@ -2,26 +2,30 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
-  readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { CommandError, sh } from "../util/proc.ts";
 import {
+  captureShared,
   captureTrust,
   forgetCheckout,
   type GitTrust,
   git,
   RAW_DIFF,
   restoreCheckout,
-  restoreOwned,
+  restoreShared,
   trustCheckout,
+  trustedConfigPath,
 } from "./trust.ts";
+
+export { trustedAttributesPath, trustedConfigPath } from "./trust.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -177,10 +181,11 @@ export function cachePath(paths: Paths, repo: Repo): string {
   return join(paths.repos, `${repo.slug.replace("/", "__")}.git`);
 }
 
-/** The factory's copy of a GitHub cache's config, outside any metadata an agent can reach through git. */
-export const trustedConfigPath = (cache: string) => `${cache}.trusted-config`;
+/** Where the factory keeps its trusted copies of a repository's shared git config and attributes. */
+export function trustedKey(paths: Paths, repo: Repo): string {
+  return repo.kind === "github" ? cachePath(paths, repo) : join(paths.repos, repo.slug.replace("/", "__"));
+}
 
-/** Make sure a fresh bare mirror exists (GitHub repos) and is fetched. */
 const cacheLocks = new Map<string, Promise<unknown>>();
 
 /** Serialize work on one repo cache (clone/fetch/worktree add) across concurrent runs. */
@@ -254,7 +259,38 @@ async function restoreCache(cache: string, url: string): Promise<void> {
       rmSync(tmp, { recursive: true, force: true });
     }
   }
-  restoreOwned(cache, readFileSync(trusted, "utf8"));
+  restoreShared(cache, cache, true);
+}
+
+/**
+ * A user's local repository shares its config and info/attributes with every factory worktree, so an
+ * agent in one run can change what the next run's checkout runs and snapshots. The factory keeps its
+ * own copies from the first worktree it creates and restores them before every later one. Without
+ * copies, the live files count as the user's only while no factory worktree exists; with one, an
+ * agent may already have written them, and no trusted input remains to rebuild them from.
+ */
+async function restoreLocal(paths: Paths, cache: string, key: string): Promise<void> {
+  const common = resolve(cache, (await git(["rev-parse", "--git-common-dir"], { cwd: cache })).stdout.trim());
+  if (!existsSync(trustedConfigPath(key))) {
+    const under = (path: string) => {
+      try {
+        return realpathSync(path).startsWith(realpathSync(paths.work) + sep);
+      } catch {
+        return false;
+      }
+    };
+    const active = (await git(["worktree", "list", "--porcelain"], { cwd: cache })).stdout
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length))
+      .filter(under);
+    if (active.length)
+      throw new Error(
+        `no trusted git state for ${cache} while factory worktrees exist (remove them first): ${active.join(", ")}`,
+      );
+    captureShared(common, key);
+  }
+  restoreShared(common, key, false);
 }
 
 export interface Worktree {
@@ -283,15 +319,14 @@ export async function createWorktree(
     return { path, branch, baseSha: base.stdout.trim() || head.stdout.trim() };
   }
   return withRepoLock(cache, async () => {
+    // The shared repository's metadata is the factory's again before the checkout runs with it.
+    const key = trustedKey(paths, repo);
     if (repo.kind === "github") await restoreCache(cache, repo.url as string);
+    else await restoreLocal(paths, cache, key);
     const base = await git(["rev-parse", baseRef], { cwd: cache });
     await git(["worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
-    // A user's local repository keeps its own hooks, attributes and config; GitHub caches are ours.
-    const trust = await captureTrust(
-      path,
-      repo.kind === "github",
-      repo.kind === "github" ? trustedConfigPath(cache) : undefined,
-    );
+    // A user's local repository keeps its own hooks; GitHub caches are the factory's throughout.
+    const trust = await captureTrust(path, repo.kind === "github", key);
     return { path, branch, baseSha: base.stdout.trim(), trust };
   });
 }
@@ -413,19 +448,27 @@ export async function commitAll(cwd: string, message: string): Promise<string | 
 }
 
 /** Move the worktree's branch back to a known commit, discarding everything after it. */
-export async function resetTo(cwd: string, sha: string): Promise<void> {
+export async function resetTo(cwd: string, sha: string, env?: Record<string, string>): Promise<void> {
   await restoreCheckout(cwd);
-  await git(["reset", "--hard", "-q", sha], { cwd });
-  await git(["clean", "-fdq"], { cwd });
+  await git(["reset", "--hard", "-q", sha], { cwd, env });
+  await git(["clean", "-fdq"], { cwd, env });
 }
 
-/** Throw away any uncommitted changes (used after read-only stages). */
-/** `env` matters when the checkout's git config is untrusted: filters and drivers run with it. */
-export async function discardChanges(cwd: string, env?: Record<string, string>): Promise<boolean> {
+/**
+ * Throw away any uncommitted changes (used after read-only stages), and any commits past `head`, the
+ * recorded sha a read-only agent may have moved the branch from. `env` matters when the checkout's
+ * git config is untrusted: filters and drivers run with it. Nothing is written to a clean checkout,
+ * so concurrent readers (panel finders) sharing it do not collide on the index lock.
+ */
+export async function discardChanges(
+  cwd: string,
+  env?: Record<string, string>,
+  head = "HEAD",
+): Promise<boolean> {
   await restoreCheckout(cwd);
   const status = await git(["status", "--porcelain"], { cwd, env });
-  if (!status.stdout.trim()) return false;
-  await git(["reset", "--hard", "-q", "HEAD"], { cwd, env });
+  if (!status.stdout.trim() && (head === "HEAD" || (await headSha(cwd)) === head)) return false;
+  await git(["reset", "--hard", "-q", head], { cwd, env });
   await git(["clean", "-fdq"], { cwd, env });
   return true;
 }
@@ -444,14 +487,16 @@ export interface DiffInfo {
   removed: number;
 }
 
+/** `head` names the recorded commit under audit: repository code may have moved HEAD since. */
 export async function diffSince(
   cwd: string,
   baseSha: string,
   env?: Record<string, string>,
   threeDot = false,
+  head = "HEAD",
 ): Promise<DiffInfo> {
   await restoreCheckout(cwd);
-  const range = `${baseSha}${threeDot ? "..." : ".."}HEAD`;
+  const range = `${baseSha}${threeDot ? "..." : ".."}${head}`;
   const [patch, names, stat, numstat] = await Promise.all([
     git(["diff", ...RAW_DIFF, range], { cwd, env }),
     git(["diff", ...RAW_DIFF, "--name-status", range], { cwd, env }),
