@@ -690,6 +690,16 @@ export class EvalRunner {
               source:
                 store.getRepoBySlug(item.repo)?.url ?? store.getRepoBySlug(item.repo)?.localPath ?? item.repo,
             };
+      // Every target the trial may call, resolved now: later rounds' targets, then panel members.
+      const targets: (ModelTarget | null)[] = [target];
+      for (let last = targets.at(-1); last && targets.length < rounds; last = targets.at(-1)) {
+        try {
+          targets.push(nextImplementTarget(router, trial.details.switchChain, last, strategy) ?? null);
+        } catch {
+          targets.push(null);
+        }
+      }
+      if (panelTargets) targets.push(...panelTargets.finders, panelTargets.verifier);
       trial.cacheKey = cacheKey(
         model.id,
         harnessName,
@@ -698,13 +708,21 @@ export class EvalRunner {
         jsonSchema ?? {},
         trial.trial,
         rounds > 1
-          ? { ...repository, rounds, strategy, version: 2, switchChain: trial.details.switchChain }
+          ? {
+              ...repository,
+              rounds,
+              strategy,
+              version: 2,
+              switchChain: trial.details.switchChain,
+              // The later rounds' prompt template, which the initial prompt never renders.
+              retryPrompt:
+                "hidden" in effective && implementation
+                  ? implementRetryPrompt(effective, implementation, failedImplement("error"), 1)
+                  : null,
+            }
           : repository,
         trial.effort,
-        [target, ...(panelTargets ? [...panelTargets.finders, panelTargets.verifier] : [])].map((to) => [
-          to.provider,
-          to.model,
-        ]),
+        targets.map((to) => to && [to.provider, to.model, selectHarness(run.role, to).harnessName]),
       );
       if (predecessor?.cacheKey === trial.cacheKey) {
         const copy =

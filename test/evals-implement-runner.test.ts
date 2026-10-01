@@ -991,6 +991,47 @@ test("switch freezes policy order, ignores live headroom, records harness and ke
   }
 });
 
+test("resume reruns a multi-round trial whose switch target backend or retry prompt changed", async () => {
+  const f = await fixture();
+  const policy = f.factory.policy.implement.small;
+  const prompts = await import("../src/pipeline/prompts.ts");
+  const original = prompts.implementPrompt;
+  const retryRule = spyOn(prompts, "implementPrompt");
+  try {
+    const model = f.factory.router.model("candidate-b");
+    if (!model) throw new Error("missing target");
+    model.tier = 2;
+    f.factory.policy.implement.small = ["candidate-a", "candidate-b"];
+    f.respond((s) => ({ files: { answer: s.target.modelId === "candidate-a" ? "wrong" : "correct" } }));
+    const resume = async (id: string) => {
+      f.factory.store.updateEvalRun(id, "interrupted");
+      const resumed = f.factory.evals.resume(id);
+      await f.factory.evals.wait(resumed?.id ?? "");
+      return f.factory.evals.report(resumed?.id ?? "")?.trials[0];
+    };
+    const report = await f.run({ rounds: 2, strategy: "switch" });
+    expect(f.calls).toHaveLength(2);
+    const copied = await resume(report.run.id);
+    expect(f.calls).toHaveLength(2);
+    expect(copied?.details.resumedFrom).toBe(report.run.id);
+    model.model = "b-new-checkpoint";
+    const switched = await resume(copied?.evalRunId ?? "");
+    expect(f.calls.map((s) => s.target.model).slice(2)).toEqual([expect.any(String), "b-new-checkpoint"]);
+    expect(switched?.details.resumedFrom).toBeUndefined();
+    retryRule.mockImplementation(
+      (input) => `${original(input)}${input.round > 0 ? "\nA new retry rule." : ""}`,
+    );
+    const retried = await resume(switched?.evalRunId ?? "");
+    expect(f.calls).toHaveLength(6);
+    expect(f.calls.at(-1)?.prompt).toContain("A new retry rule.");
+    expect(retried?.details.resumedFrom).toBeUndefined();
+  } finally {
+    retryRule.mockRestore();
+    f.factory.policy.implement.small = policy;
+    await f.close();
+  }
+});
+
 test("switched retry rounds respect the eval concurrency on their destination provider", async () => {
   const f = await fixture();
   const policy = f.factory.policy.implement.small;

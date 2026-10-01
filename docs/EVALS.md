@@ -216,7 +216,8 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
   resubmits an interrupted or failed eval's stored request unchanged as a new run (linked both
   ways in reports). The new run copies a finished trial (passed, failed or errored, with its spend)
   only when its stored cache key equals the key the trial computes now (prompt, system additions,
-  schema, review system, panel identity, every target's provider and backend model, case content),
+  retry-round prompt, schema, review system, panel identity, the provider, backend model and harness
+  of every target including later rounds' switch targets, case content),
   and regrades the copy against the current labels. Every other trial, including preparation
   failures and trials whose key changed, runs again, so a resumed eval never mixes versions; its
   report counts the trials copied and run again. Its `maxUsd` covers the spend of the whole resume
