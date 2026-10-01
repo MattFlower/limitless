@@ -118,13 +118,13 @@ Why: same model, different transport, and the subscription has unused quota. The
 | `codex/luna@medium` | 71.1% (64/90) [61.0%, 79.5%] | 2.4% (2/84) | 5513 ms | $0 (subscription) |
 | `openrouter/gpt-6-luna@medium` | 76.7% (69/90) [67.0%, 84.2%] | 0.0% (0/84) | 4099 ms | $0.0189 |
 
-Paired difference -0.056, one-sided 95% lower bound -0.167. The same OpenRouter setting scored 78.9% on these cases two days earlier (eval-mump7s7re29l), so run-to-run variation is of the same order. Revisit if the field risk under-call rate rises.
+Paired difference -0.056, one-sided 95% lower bound -0.167. The same OpenRouter setting scored 78.9% on these cases two days earlier (eval-mump7s7re29l), so run-to-run variation is of the same order. Through Codex, Luna was less stable: its verdict flipped between trials on 7 of 30 cases (23%) against 3 of 30 (10%), and it used about 2.6 times the tokens ($0.0498 API-equivalent against $0.0189). Revisit if the field risk under-call rate rises.
 
 ## Owner decision: implement trial = `codex/sol-6.1@high` first below large (2026-10-01)
 
 `implement.trivial`, `implement.small` and `implement.medium` start with `codex/sol-6.1@high`, with `claude/opus` as the fallback. `implement.large` stays `claude/opus` then `codex/sol@medium`. This is a field trial, because the implement eval cannot rank models (every model scores 100%; see the implement decision below). It runs on factory work through 2026-10-05. Evidence will come from rounds to converge, verify first-pass rate, review findings and orchestrator review findings, compared with the preceding Opus-first runs. Known confound: verify avoids the implementer's vendor, so Sol-implemented runs are verified by `claude/sonnet` and Opus-implemented runs by `codex/sol`.
 
-Review follows the implementer: a reviewer avoids the implementer's vendor, so a Sol-implemented run is reviewed by the first non-OpenAI entry in `review.default`. That entry is now `claude/opus` instead of `claude/sonnet` (Sonnet 5). On review eval v2 (eval-munjly1s57xk, k=3), Opus 5.5 caught 23.0% of blocking defects with 3.0% clean false-blocks, against Sonnet 5's 10.5% and 9.1%. Runs implemented by Anthropic models still get `codex/sol-6.1` first.
+Review follows the implementer: a reviewer avoids the implementer's vendor, so a Sol-implemented run is reviewed by the first non-OpenAI entry in `review.default`. That entry is now `claude/opus` instead of `claude/sonnet` (Sonnet 5). On review eval v2 (eval-munjly1s57xk, k=3), Opus 5.5 caught 23.0% of blocking defects with 3.0% clean false-blocks, against Sonnet 5's 10.5% and 9.1%. Runs implemented by Anthropic models still get `codex/sol-6.1` first. With no implementer (the first review of a verify-change or Dependabot run), the first group is ordered by provider preference and headroom: `codex/sol-6.1` while Codex is preferred, `claude/opus` (previously Sonnet 5) otherwise.
 
 ## Owner decision: triage = `openrouter/gpt-6-luna@medium` first (2026-09-29)
 
