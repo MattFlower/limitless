@@ -1053,6 +1053,8 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
       while ((pids().length < 2 || (escaped && !existsSync(join(dir, "escaped")))) && Date.now() < until)
         await Bun.sleep(10);
       expect(pids().length).toBe(2);
+      // Fail loudly if the grandchild never escaped (e.g. no python3), rather than testing nothing.
+      if (escaped) expect(existsSync(join(dir, "escaped"))).toBe(true);
       if (!timed && !ownTimeout) child.kill(term ? "SIGTERM" : "SIGINT");
       if (mode.startsWith("second-")) {
         await Bun.sleep(150);

@@ -143,7 +143,11 @@ async function attempt(
   const finish = async (result: CheckResult) => {
     controller.abort();
     const closed = await closeChildren(scope.children);
-    return closed ? result : fail(`timeout ${timeoutMs}ms (attempt did not stop, not retried)`);
+    if (closed) return result;
+    // A final failure keeps its own reason (never retried); a passing check that left children open fails.
+    const stuck = " (attempt did not stop, not retried)";
+    if (result.status !== "fail" || !result.reason) return fail(`timeout ${timeoutMs}ms${stuck}`);
+    return fail(result.reason.endsWith(stuck) ? result.reason : `${result.reason}${stuck}`);
   };
   // Keep post-timeout inspection commands cancellable only by shutdown, not by the attempt.
   const run = processScope
@@ -183,7 +187,11 @@ export async function runChecks(
         if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
       } catch {}
     }
-    for (const dir of scope.scratchDirs) rmSync(dir, { recursive: true, force: true });
+    for (const dir of scope.scratchDirs) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
     process.exit(code);
   };
   let interrupted = false;
