@@ -5,6 +5,7 @@ export const processScope = new AsyncLocalStorage<{
   signal: AbortSignal;
   killGraceMs: number;
   children: Map<ChildProcess, Promise<void>>;
+  scratchDirs: Set<string>;
 }>();
 
 export interface ProcOptions {
@@ -119,16 +120,20 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       }
     };
     let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const terminate = () => {
+    const terminate = (graceMs = 5_000) => {
       if (killTimer) return;
       killTree("SIGTERM");
-      killTimer = setTimeout(() => killTree("SIGKILL"), scope?.killGraceMs ?? 5_000);
+      killTimer = setTimeout(() => killTree("SIGKILL"), graceMs);
       killTimer.unref?.();
     };
 
     const onAbort = () => {
       cancelled = true;
-      terminate();
+      if (scope) {
+        clearTimeout(killTimer);
+        killTimer = undefined;
+      }
+      terminate(scope?.killGraceMs);
     };
     if (opts.signal) {
       if (opts.signal.aborted) onAbort();

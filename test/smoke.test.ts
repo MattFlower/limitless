@@ -975,9 +975,14 @@ for (const outcome of [
   });
 }
 
-for (const mode of ["SIGINT", "SIGTERM", "stubborn", "probe", "timeout", "budget", "completed"] as const) {
+const processModes = ["SIGINT", "SIGTERM", "stubborn", "probe", "timeout", "budget", "completed"] as const;
+const interruptModes = ["escaped-SIGINT", "escaped-SIGTERM", "second-SIGINT", "second-SIGTERM"] as const;
+for (const mode of [...processModes, ...interruptModes, "escaped-timeout", "cli-timeout", "idle-timeout"]) {
   test(`smoke cleans CLI groups: ${mode}`, async () => {
     const dir = mkdtempSync(join(tmpdir(), "smoke-processes-"));
+    const escaped = mode.startsWith("escaped-") || mode.startsWith("second-");
+    const ownTimeout = mode === "cli-timeout" || mode === "idle-timeout";
+    const term = mode.endsWith("SIGTERM");
     const pids = () =>
       existsSync(join(dir, "pids"))
         ? readFileSync(join(dir, "pids"), "utf8").trim().split(/\s+/).map(Number).filter(Boolean)
@@ -985,11 +990,13 @@ for (const mode of ["SIGINT", "SIGTERM", "stubborn", "probe", "timeout", "budget
     const gone = () => {
       for (const pid of pids()) expect(() => process.kill(pid, 0)).toThrow();
     };
-    const timed = mode === "timeout" || mode === "budget";
+    const timed = mode === "timeout" || mode === "budget" || mode === "escaped-timeout";
     writeFileSync(
       join(dir, "claude"),
       `#!/bin/sh
-${mode === "stubborn" || timed ? "trap '' TERM" : ""}
+${mode === "stubborn" || timed || ownTimeout || escaped ? "trap '' TERM" : ""}
+${escaped ? `python3 -c "import os,time; os.setsid(); open('${dir}/escaped', 'w').write(str(os.getpid())); time.sleep(60)" &` : ""}
+printf '%s\n' "$PWD" "$TMPDIR" "$CLAUDE_CODE_TMPDIR" >> '${dir}/dirs'
 sleep 60 &
 echo "$$ $!" >> '${dir}/pids'
 wait
@@ -1006,17 +1013,19 @@ import { sh, runProcess } from ${JSON.stringify(join(process.cwd(), "src/util/pr
 import { readFileSync, appendFileSync } from 'node:fs';
 import { CodexReaderProbe } from ${JSON.stringify(join(process.cwd(), "src/harness/codex.ts"))};
 const kill = process.kill.bind(process);
-process.kill = (pid, signal) => { appendFileSync('${dir}/signals', pid + ' ' + signal + '\\n'); return kill(pid, signal); };
+process.kill = (pid, signal) => { appendFileSync('${dir}/signals', pid + ' ' + signal + ' ' + Date.now() + '\\n'); return kill(pid, signal); };
 const run = async (signal) => {
   if (${mode === "probe"}) { await new CodexReaderProbe().verify({cwd: '${dir}', signal}, runProcess); return {status: 'pass'}; }
   const previous = ${timed} ? readFileSync('${dir}/pids', 'utf8').trim().split(/\\s+/).map(Number).filter(Boolean) : [];
   for (const pid of previous) { try { kill(pid, 0); throw Error('previous attempt survived'); } catch (e) { if (e.code !== 'ESRCH') throw e; } }
-  try { await sh(['claude'], {cwd: '${dir}', signal}); return {status: 'pass'}; }
+  if (${mode === "idle-timeout"}) { const r = await runProcess({cmd: ['claude'], cwd: '${dir}', env: process.env, signal, idleTimeoutMs: 250}); return {status: r.idleTimedOut ? 'pass' : 'fail'}; }
+  try { await sh(['claude'], {cwd: '${dir}', signal, timeoutMs: ${ownTimeout ? 250 : 60000}}); return {status: 'pass'}; }
   catch (e) { if (!signal.aborted) throw e; return {status: 'fail', transient: 'timeout', reason: 'cancelled'}; }
 };
 process.exitCode = await reportChecks([
 ${mode === "completed" ? `{name: 'completed', run: async () => { await sh(['sh', '-c', "echo $$ > completed; exit 0"], {cwd: '${dir}'}); return {status: 'pass'};}},` : ""}
-{name: 'sleeping', timeoutMs: ${timed ? 250 : 60000}, run}
+{name: 'sleeping', timeoutMs: ${timed ? 250 : 60000}, run},
+${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'})},` : ""}
 ], console.log, {retryDelayMs: 0, stopGraceMs: 2000, budgetMs: ${mode === "budget" ? 2250 : 60000}});
 `,
     );
@@ -1024,7 +1033,7 @@ ${mode === "completed" ? `{name: 'completed', run: async () => { await sh(['sh',
     const child = Bun.spawn(
       [
         process.execPath,
-        ...(timed || mode === "completed" || mode === "probe"
+        ...(timed || ownTimeout || mode === "completed" || mode === "probe"
           ? [entry]
           : ["scripts/smoke.ts", "--models", mode === "SIGTERM" ? "codex/luna@low" : "claude/sonnet@low"]),
       ],
@@ -1036,16 +1045,45 @@ ${mode === "completed" ? `{name: 'completed', run: async () => { await sh(['sh',
     );
     try {
       const until = Date.now() + 3000;
-      while (pids().length < 2 && Date.now() < until) await Bun.sleep(10);
+      while ((pids().length < 2 || (escaped && !existsSync(join(dir, "escaped")))) && Date.now() < until)
+        await Bun.sleep(10);
       expect(pids().length).toBe(2);
-      if (!timed) child.kill(mode === "SIGTERM" ? "SIGTERM" : "SIGINT");
-      const code = await Promise.race([child.exited, Bun.sleep(4000).then(() => -1)]);
-      expect(code).toBe(timed ? 1 : mode === "SIGTERM" ? 143 : 130);
+      if (!timed && !ownTimeout) child.kill(term ? "SIGTERM" : "SIGINT");
+      if (mode.startsWith("second-")) {
+        await Bun.sleep(150);
+        child.kill(term ? "SIGTERM" : "SIGINT");
+      }
+      const code = await Promise.race([
+        child.exited,
+        Bun.sleep(ownTimeout ? 7000 : mode.startsWith("second-") ? 500 : timed ? 5000 : 2000).then(() => -1),
+      ]);
+      expect(code).toBe(ownTimeout ? (mode === "idle-timeout" ? 0 : 1) : timed ? 1 : term ? 143 : 130);
+      const dirs = readFileSync(join(dir, "dirs"), "utf8")
+        .trim()
+        .split("\n")
+        .filter((path) => /\/(limitless-smoke-|lr-)/.test(path))
+        .map((path) => path.replace(/\/claude-\d+$/, ""));
+      if (!timed && !ownTimeout && mode !== "completed" && mode !== "probe")
+        expect(dirs.length).toBeGreaterThan(0);
+      for (const path of dirs) expect(existsSync(path)).toBe(false);
       gone();
       const output = await new Response(child.stdout).text();
       if (timed) {
         expect(output).toContain("FAIL");
         expect(pids()).toHaveLength(mode === "timeout" ? 4 : 2);
+        if (escaped) {
+          expect(output).toContain("attempt did not stop, not retried");
+          expect(output).toMatch(/next\s+PASS/);
+        }
+      }
+      if (ownTimeout) {
+        const signals = readFileSync(join(dir, "signals"), "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => line.split(" "));
+        const sent = (signal: string) => Number(signals.find((parts) => parts[1] === signal)?.[2]);
+        expect(sent("SIGKILL") - sent("SIGTERM")).toBeGreaterThanOrEqual(4900);
+        expect(sent("SIGKILL") - sent("SIGTERM")).toBeLessThan(6500);
       }
       if (mode === "completed") {
         expect(output).toMatch(/completed\s+PASS/);
@@ -1059,12 +1097,15 @@ ${mode === "completed" ? `{name: 'completed', run: async () => { await sh(['sh',
     } finally {
       child.kill("SIGKILL");
       await child.exited;
-      for (const pid of pids()) {
+      for (const pid of [
+        ...pids(),
+        ...(existsSync(join(dir, "escaped")) ? [Number(readFileSync(join(dir, "escaped"), "utf8"))] : []),
+      ]) {
         try {
           process.kill(pid, "SIGKILL");
         } catch {}
       }
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 6000);
+  }, 12000);
 }
