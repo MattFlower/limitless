@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   backendChecks,
   type CheckResult,
@@ -1038,7 +1038,12 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
           : ["scripts/smoke.ts", "--models", mode === "SIGTERM" ? "codex/luna@low" : "claude/sonnet@low"]),
       ],
       {
-        env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+        env: {
+          ...process.env,
+          PATH: `${dir}:${process.env.PATH}`,
+          TMPDIR: dir,
+          CLAUDE_CODE_TMPDIR: dir,
+        },
         stdout: "pipe",
         stderr: "pipe",
       },
@@ -1061,8 +1066,8 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
       const dirs = readFileSync(join(dir, "dirs"), "utf8")
         .trim()
         .split("\n")
-        .filter((path) => /\/(limitless-smoke-|lr-)/.test(path))
-        .map((path) => path.replace(/\/claude-\d+$/, ""));
+        .map((path) => path.replace(/\/claude-\d+$/, ""))
+        .filter((path) => /^(limitless-smoke-|lr-)/.test(basename(path)));
       if (!timed && !ownTimeout && mode !== "completed" && mode !== "probe")
         expect(dirs.length).toBeGreaterThan(0);
       for (const path of dirs) expect(existsSync(path)).toBe(false);
