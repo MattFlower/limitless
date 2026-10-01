@@ -130,7 +130,7 @@ export class EvalRunner {
           }
         : { models: request.models.map((target) => explicit(target)) }),
     };
-    let trials: EvalTrial[] = [];
+    const trials: EvalTrial[] = [];
     const candidates =
       request.systems?.map((system) => ({ modelId: system.finders[0]?.target ?? "", system: system.name })) ??
       request.models.map((modelId) => ({ modelId, system: undefined }));
@@ -714,10 +714,13 @@ export class EvalRunner {
               strategy,
               version: 2,
               switchChain: trial.details.switchChain,
-              // The later rounds' prompt template, which the initial prompt never renders.
-              retryPrompt:
+              // Every later round's prompt template, which the initial prompt never renders and
+              // which may branch on the round number.
+              retryPrompts:
                 "hidden" in effective && implementation
-                  ? implementRetryPrompt(effective, implementation, failedImplement("error"), 1)
+                  ? Array.from({ length: rounds - 1 }, (_, round) =>
+                      implementRetryPrompt(effective, implementation, failedImplement("error"), round + 1),
+                    )
                   : null,
             }
           : repository,

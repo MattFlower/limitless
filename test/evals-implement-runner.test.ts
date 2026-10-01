@@ -1032,6 +1032,41 @@ test("resume reruns a multi-round trial whose switch target backend or retry pro
   }
 });
 
+test("resume reruns a three-round trial whose prompt changed only in its third round", async () => {
+  const f = await fixture();
+  const prompts = await import("../src/pipeline/prompts.ts");
+  const original = prompts.implementPrompt;
+  const thirdRoundRule = spyOn(prompts, "implementPrompt");
+  try {
+    f.respond(() => ({ files: { answer: "wrong" } }));
+    const resume = async (id: string) => {
+      f.factory.store.updateEvalRun(id, "interrupted");
+      const resumed = f.factory.evals.resume(id);
+      await f.factory.evals.wait(resumed?.id ?? "");
+      return f.factory.evals.report(resumed?.id ?? "")?.trials[0];
+    };
+    const report = await f.run({ rounds: 3 });
+    expect(f.calls).toHaveLength(3);
+    const copied = await resume(report.run.id);
+    expect(f.calls).toHaveLength(3);
+    expect(copied?.details.resumedFrom).toBe(report.run.id);
+    // A branch the first retry round never renders.
+    thirdRoundRule.mockImplementation(
+      (input) => `${original(input)}${input.round === 2 ? "\nA third-round rule." : ""}`,
+    );
+    const rerun = await resume(copied?.evalRunId ?? "");
+    expect(f.calls).toHaveLength(6);
+    expect(f.calls.map((s) => s.prompt.includes("A third-round rule."))).toEqual([
+      ...Array(5).fill(false),
+      true,
+    ]);
+    expect(rerun?.details.resumedFrom).toBeUndefined();
+  } finally {
+    thirdRoundRule.mockRestore();
+    await f.close();
+  }
+});
+
 test("resume reruns an effort trial whose later-round effort changed with the supported efforts", async () => {
   const f = await fixture();
   try {
