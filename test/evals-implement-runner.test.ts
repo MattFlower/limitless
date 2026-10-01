@@ -28,7 +28,8 @@ import { evalMatrix } from "../ui/lib/evals.ts";
 import { enableEfforts, evalFixture } from "./evals-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
-setDefaultTimeout(30_000);
+const TEST_TIMEOUT = 30_000;
+setDefaultTimeout(TEST_TIMEOUT);
 
 async function fixture(
   gate = "test ! -f broken",
@@ -514,14 +515,18 @@ for (const rounds of [1, 3])
       const f = await fixture();
       try {
         const started = join(f.home, "grading-started");
-        f.item.hidden.command = `test "$(cat answer)" = correct || exit 1; pwd -P > ${started}; sleep 10`;
+        f.item.hidden.command = `test "$(cat answer)" = correct || exit 1; pwd -P > ${started}.tmp && mv ${started}.tmp ${started}; sleep 10`;
         if (rounds > 1)
           f.respond(() => ({ files: { answer: f.calls.length === 1 ? "wrong" : "correct" }, costUsd: 0.1 }));
         f.save();
         const pending = f.run({ rounds });
-        for (let i = 0; i < 200 && !existsSync(started); i++)
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        const grading = readFileSync(started, "utf8").trim();
+        let grading = "";
+        const deadline = Date.now() + TEST_TIMEOUT / 2;
+        while (!grading && Date.now() < deadline) {
+          if (existsSync(started)) grading = readFileSync(started, "utf8").trim();
+          if (!grading) await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(grading).not.toBe("");
         const cwd = f.calls.at(-1)?.cwd;
         expect(existsSync(join(grading, "answer"))).toBe(true);
         expect(cwd && grading.startsWith(realpathSync(cwd))).toBe(false);
@@ -590,7 +595,8 @@ for (const strategy of ["retry", "effort", "switch"] as const)
           expect(s.target.effort).toBe(
             strategy === "switch" ? undefined : strategy === "effort" ? "high" : "low",
           );
-          expect(s.scratchDir).toBe(f.calls[0]?.scratchDir);
+          expect(s.scratchDir).not.toBe(f.calls[0]?.scratchDir);
+          expect(existsSync(f.calls[0]?.scratchDir ?? "")).toBe(false);
           expect(readFileSync(join(s.cwd, "answer"), "utf8")).toBe("wrong");
           expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("candidate");
           expect(statSync(join(s.cwd, "overwrite")).mode & 0o777).toBe(0o751);
@@ -1523,3 +1529,62 @@ for (const [outcome, reason] of [
       await f.close();
     }
   });
+
+for (const rounds of [1, 2])
+  test(`a committed Bun preload leaves no hidden copies in the worktree or scratch (rounds=${rounds})`, async () => {
+    const f = await fixture();
+    try {
+      f.item.hidden.command = `bun test candidate.test.ts && ${f.item.hidden.command}`;
+      f.save();
+      f.respond((s): FakeReply => {
+        if (f.calls.length === 1)
+          return {
+            files: {
+              answer: "wrong",
+              ".gitignore": "dist/\n",
+              "dist/output": "built",
+              "bunfig.toml": '[test]\npreload=["./steal.ts"]\n',
+              "candidate.test.ts":
+                'import { test, expect } from "bun:test"; test("candidate", () => expect(true).toBe(true));',
+              "steal.ts": `import { cpSync, existsSync } from "node:fs";
+          if (existsSync("hidden")) {
+            for (const dest of ${JSON.stringify([join(s.cwd, "stolen"), join(s.cwd, "dist/stolen"), join(s.scratchDir ?? "", "stolen")])}) cpSync("hidden", dest, { recursive: true });
+            cpSync("hidden/check.sh", ${JSON.stringify(join(s.cwd, "dist/output"))});
+            cpSync("hidden/check.sh", ${JSON.stringify(join(s.cwd, "overwrite"))});
+            console.log("copies created");
+          }`,
+            },
+          };
+        expect(existsSync(join(s.cwd, "stolen"))).toBe(false);
+        expect(existsSync(join(s.cwd, "dist/stolen"))).toBe(false);
+        expect(existsSync(join(s.cwd, "dist/output"))).toBe(false);
+        expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
+        expect(existsSync(f.calls[0]?.scratchDir ?? "")).toBe(false);
+        const prior = f.factory.store.listEvalTrials(f.factory.store.listEvalRuns()[0]?.id ?? "")[0];
+        expect(prior?.details.grade?.implement?.hidden?.output).toContain("copies created");
+        return { files: { answer: "correct", "steal.ts": "" } };
+      });
+      expect((await f.run({ rounds })).trials[0]?.pass).toBe(rounds === 2);
+      expect(f.calls).toHaveLength(rounds);
+      expect(f.calls.every((call) => !existsSync(call.scratchDir ?? ""))).toBe(true);
+    } finally {
+      await f.close();
+    }
+  });
+
+test("grading removes hidden tests even when candidate code makes checkout directories read-only", async () => {
+  const f = await fixture();
+  const allocated = spyOn(scratch, "createScratch");
+  try {
+    f.respond(() => ({ files: { answer: "correct", "lock.sh": "chmod 0555 hidden\n" } }));
+    f.item.hidden.command += "; result=$?; sh lock.sh; exit $result";
+    f.save();
+    expect((await f.run()).trials[0]?.pass).toBe(true);
+    const dirs = allocated.mock.results.map((r) => String(r.value));
+    expect(dirs).toHaveLength(3);
+    expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
+  } finally {
+    allocated.mockRestore();
+    await f.close();
+  }
+});

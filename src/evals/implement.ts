@@ -1,4 +1,15 @@
-import { chmodSync, lstatSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import type { EvalGrade, EvalStrategy, EvalTrial } from "../core/types.ts";
 import { auditDiff } from "../gates/audit.ts";
@@ -70,6 +81,62 @@ function inject(cwd: string, files: ReturnType<typeof hiddenContents>) {
   }
 }
 
+/** Fingerprint ignored and untracked entries without following symlinks or trusting directory metadata. */
+async function untrackedState(cwd: string, env: Record<string, string>, since: bigint) {
+  const state = new Map<string, string>();
+  const visit = (path: string) => {
+    const file = join(cwd, path);
+    const stat = lstatSync(file, { bigint: true, throwIfNoEntry: false });
+    if (!stat) return;
+    if (stat.isDirectory()) {
+      state.set(path, "directory");
+      for (const entry of readdirSync(file)) visit(`${path}/${entry}`);
+    } else {
+      const meta = `${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+      const body =
+        stat.ctimeNs < since
+          ? ""
+          : stat.isSymbolicLink()
+            ? readlinkSync(file)
+            : stat.isFile()
+              ? readFileSync(file)
+              : "";
+      state.set(path, `${meta}:${createHash("sha256").update(body).digest("hex")}`);
+    }
+  };
+  const out = await sh(["git", "ls-files", "-z", "-o"], { cwd, env });
+  for (const path of out.stdout.split("\0").filter(Boolean)) visit(path.replace(/\/$/, ""));
+  return state;
+}
+
+/** Refuse to remove through a parent replaced with a symlink. Cleanup failure stops recovery. */
+function removeWithin(root: string, path: string) {
+  let current = root;
+  for (const part of path.split("/").slice(0, -1)) {
+    current = join(current, part);
+    if (!lstatSync(current, { throwIfNoEntry: false })?.isDirectory()) return;
+  }
+  rmSync(join(root, path), { recursive: true, force: true });
+  for (let dir = dirname(join(root, path)); dir !== root && readdirSync(dir).length === 0; dir = dirname(dir))
+    rmSync(dir, { recursive: true });
+}
+
+async function restoreCandidate(
+  cwd: string,
+  env: Record<string, string>,
+  commit: string,
+  before: Map<string, string>,
+  since: bigint,
+) {
+  await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "-q", commit], { cwd, env });
+  await sh(["git", "clean", "-fdq"], { cwd, env });
+  const root = realpathSync(cwd);
+  for (const [path, fingerprint] of await untrackedState(cwd, env, since))
+    if (before.get(path) !== fingerprint) removeWithin(root, path);
+  for (const [path, fingerprint] of await untrackedState(cwd, env, since))
+    if (before.get(path) !== fingerprint) throw new Error(`Grading artifact remains: ${path}`);
+}
+
 export function failedImplement(reason: "timeout" | "error", error?: string): EvalGrade {
   return {
     pass: false,
@@ -122,6 +189,8 @@ export async function gradeImplement(
     hidden: null,
   };
   let checkout: string | undefined;
+  let before: Map<string, string> | undefined;
+  const since = BigInt(Date.now() - 5_000) * 1_000_000n;
   try {
     signal.throwIfAborted();
     await sh(["git", "add", "-A"], { cwd, env, signal });
@@ -145,6 +214,7 @@ export async function gradeImplement(
     );
     const commit = (await sh(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
     evidence.commit = commit;
+    before = await untrackedState(cwd, env, since);
     // Grade in a fresh repository outside the candidate's: hidden files never touch its checkout,
     // and its Git metadata (filters, drivers, hooks, index flags) has no say in grading. Fetching
     // only reads the candidate's objects; nothing in the grading repository points back at it.
@@ -218,7 +288,11 @@ export async function gradeImplement(
     evidence.error = (error as Error).message;
   } finally {
     // A failed removal throws: recovery must not continue while grading artifacts remain.
-    if (checkout) removeScratch(checkout);
+    try {
+      if (checkout) removeScratch(checkout);
+    } finally {
+      if (before && evidence.commit) await restoreCandidate(cwd, env, evidence.commit, before, since);
+    }
   }
   return {
     pass: evidence.reason === null,
