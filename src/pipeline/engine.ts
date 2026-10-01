@@ -574,10 +574,12 @@ async function spec(ctx: RunContext): Promise<void> {
         throw new Error(`structured output failed validation: invalid spec scope: ${offending}`);
       const retryCriteria: boolean = flagged.length > 0 && !criteriaRetried;
       if (!offending && !retryCriteria) {
-        if (flagged.length) {
-          s.acceptance_criteria = s.acceptance_criteria.filter((a) => !flagged.includes(a));
-          ctx.log(`Dropped out-of-run acceptance criteria: ${flagged.map((a) => a.id).join(", ")}`, "warn");
-        }
+        // Kept, not dropped: the match is a word list, and a wrongly dropped criterion weakens verify.
+        if (flagged.length)
+          ctx.log(
+            `Kept acceptance criteria that may depend on something outside the run: ${flagged.map((a) => a.id).join(", ")}`,
+            "warn",
+          );
         break;
       }
       const feedback = [
