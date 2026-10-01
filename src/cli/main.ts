@@ -15,7 +15,7 @@ Usage:
         [--no-baseline-cache]  Always execute the baseline gates; a passing one refreshes the cache
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
-        review only: --systems <file.json> instead of --models ({"systems": [ReviewSystem, ...]})
+        review only: --systems <file.json> [--replay-finders <evalId>] instead of --models
   limitless eval report <eval-id> [--json]
   limitless eval resume <eval-id>         Continue an interrupted or failed eval; unchanged finished trials carry over
   limitless eval cancel <eval-id>         Stop scheduling an eval's trials; it ends interrupted
@@ -173,6 +173,7 @@ async function main(): Promise<void> {
       evals: { type: "string" },
       models: { type: "string" },
       systems: { type: "string" },
+      "replay-finders": { type: "string" },
       k: { type: "string" },
       rounds: { type: "string" },
       strategy: { type: "string" },

@@ -93,6 +93,7 @@ export const ReviewSystemSchema = z
  */
 const RosterReferenceSchema = z.strictObject({
   name: z.string().trim().min(1, "system name must not be empty"),
+  replayFrom: z.string().trim().min(1).optional(),
   roster: z.enum(["quick", "standard", "deep"]),
   targets: z.array(TargetSchema).min(1),
   lenses: z.array(LensSchema).optional(),
@@ -103,6 +104,7 @@ const RosterReferenceSchema = z.strictObject({
 });
 export type RosterReference = z.infer<typeof RosterReferenceSchema>;
 export type EvalReviewSystem = ReviewSystem | RosterReference;
+const EvalSystemSchema = ReviewSystemSchema.safeExtend({ replayFrom: z.string().trim().min(1).optional() });
 
 /** Eval candidates: uniquely named, and every finder pinned so results never depend on live routing. */
 export const EvalReviewSystemsSchema = z
@@ -112,7 +114,7 @@ export const EvalReviewSystemsSchema = z
   .transform((items, ctx) =>
     items.flatMap((item, index): EvalReviewSystem[] => {
       const roster = !!item && typeof item === "object" && "roster" in item;
-      const parsed = (roster ? RosterReferenceSchema : ReviewSystemSchema).safeParse(item);
+      const parsed = (roster ? RosterReferenceSchema : EvalSystemSchema).safeParse(item);
       if (parsed.success) return [parsed.data];
       for (const issue of parsed.error.issues) ctx.addIssue({ ...issue, path: [index, ...issue.path] });
       return [];
@@ -156,7 +158,8 @@ export function expandRoster(
     throw new Error(
       `review system ${JSON.stringify(system.name)}: roster ${system.roster} has ${finders.length} finders with its lenses; give ${finders.length} targets, not ${system.targets.length}`,
     );
-  return ReviewSystemSchema.parse({
+  return EvalSystemSchema.parse({
+    replayFrom: system.replayFrom,
     name: system.name,
     mode: "panel",
     finders: finders.map((finder, i) => ({ ...finder, target: system.targets[i] })),
