@@ -63,7 +63,7 @@ evals/<role>/*.json ──► runner ──► role fn (same prompts/schemas) �
 | Role | Cases | Source | Grader | Primary metric (floor) |
 |---|---|---|---|---|
 | triage | 40 | own run prompts + boundary cases | exact match per field, cost-weighted | pass-rate Wilson lower bound ≥0.60; risk under-call rate ≤0.10 |
-| review | 34 | 23 real-defect diffs and 11 clean merged diffs (16 in snapshot mode); 42 required and 14 optional defects | round-1 blocking finding + file/line-window match, one finding per defect; production-derived verdict | blocking-recall Wilson lower bound ≥0.50; clean false-block Wilson upper bound ≤0.50 |
+| review | 53 | 23 real-defect diffs and 11 clean merged diffs (16 in snapshot mode), plus 19 held-out clean diffs `review-h01`..`review-h19` (18 in snapshot mode) for default decisions only; 42 required and 14 optional defects | round-1 blocking finding + file/line-window match, one finding per defect; production-derived verdict | blocking-recall Wilson lower bound ≥0.50; clean false-block Wilson upper bound ≤0.50 |
 | verify | 20 | labeled (criteria, diff, test output) triples, incl. "tests pass, criterion unmet" | per-criterion match | false-accept rate ≤0.10 |
 | holdout | 8 | sandbox tasks with reference solution + 3 mutants | execution | valid-on-reference × mutant kill rate |
 | implement | 12 | 8 sandbox replays + 4 small Limitless commits, stratified trivial/small/medium | hidden tests + gates + audit | resolve rate; $ and quota per task; wall time |
