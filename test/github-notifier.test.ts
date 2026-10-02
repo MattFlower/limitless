@@ -294,6 +294,11 @@ test("confirmed CLOSED PR blocks dependents, persists and applies to later creat
   const repo = run && store.getRepo(run.repoId);
   if (!repo) throw new Error("missing repo");
   const dependent = store.createRun(repo, { repo: repo.slug, prompt: "next", dependsOn: [id] });
+  const descendant = store.createRun(repo, {
+    repo: repo.slug,
+    prompt: "descendant",
+    dependsOn: [dependent.id],
+  });
   await reconcileMergedRuns(store, async () => ({
     url: prUrl,
     state: "CLOSED",
@@ -303,7 +308,12 @@ test("confirmed CLOSED PR blocks dependents, persists and applies to later creat
   store.close();
   store = new Store(join(dir, "store.db"));
   const later = store.createRun(repo, { repo: repo.slug, prompt: "later", dependsOn: [id] });
-  for (const blocked of [dependent.id, later.id]) {
+  const laterDescendant = store.createRun(repo, {
+    repo: repo.slug,
+    prompt: "later descendant",
+    dependsOn: [dependent.id],
+  });
+  for (const blocked of [dependent.id, descendant.id, later.id, laterDescendant.id]) {
     expect(store.getRun(blocked)).toMatchObject({
       status: "needs_human",
       startedAt: null,
