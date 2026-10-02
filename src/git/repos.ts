@@ -297,6 +297,10 @@ export async function exportCommit(
   }
 }
 
+export async function mergeBase(cwd: string, base: string, head: string): Promise<string> {
+  return (await sh(["git", "merge-base", base, head], { cwd })).stdout.trim();
+}
+
 export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
   const result = await sh(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
     cwd,
