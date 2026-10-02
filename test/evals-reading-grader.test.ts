@@ -3,9 +3,48 @@ import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema } from "../src/eva
 import { gradeReview } from "../src/evals/graders/review.ts";
 import { gradeVerify } from "../src/evals/graders/verify.ts";
 import { type Review, ReviewSchema, StoredReviewSchema, type Verify } from "../src/pipeline/schemas.ts";
+import { adversarialReviewFixtures, graderReports } from "./data/evals-review-adversarial.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 
 const fixturePath = new URL("./data/evals-verify.json", import.meta.url).pathname;
+test.each(adversarialReviewFixtures)(
+  "adversarial review grader: $name",
+  ({ gold, claims, mode, expected }) => {
+    const item: ReviewCase = { ...reviewCase, defects: gold.map((key) => graderReports[key].defect) };
+    const output: Review = {
+      ...reviewOutput(),
+      mode,
+      findings: claims.map(({ report, line, also, aliases, file, severity, verification }) => {
+        const { defect } = graderReports[report];
+        const [finding] = reviewOutput(line, severity ?? "major", file ?? defect.file).findings;
+        if (!finding) throw new Error("fixture");
+        const detail = also ? `${defect.summary}\n${graderReports[also].defect.summary}` : defect.summary;
+        return {
+          ...finding,
+          title: defect.summary,
+          detail,
+          verification: verification
+            ? {
+                verdict: verification,
+                severity: "high",
+                category: "correctness",
+                evidence: detail,
+                trigger: "t",
+              }
+            : undefined,
+          duplicates: aliases?.map((alias, finder) => ({
+            finder,
+            line: alias,
+            title: graderReports[report].paraphrase,
+            detail: graderReports[report].paraphrase,
+            suggestion: "Fix the reported behavior.",
+          })),
+        };
+      }),
+    };
+    expect(gradeReview(item, output)).toMatchObject(expected);
+  },
+);
 test("review location windows are inclusive, normalize ./, exclude nits and never match line zero numerically", () => {
   for (const [line, match] of [
     [4, false],
@@ -30,13 +69,17 @@ test("review location windows are inclusive, normalize ./, exclude nits and neve
   output.findings.push(...output.findings);
   expect(gradeReview(reviewCase, output).review?.requiredMatched).toBe(1);
 });
-test("a merged panel finding also covers the lines of the reports merged into it", () => {
+test("a merged panel finding's alternative locations credit at most one defect", () => {
   const [defect] = reviewCase.defects;
   const [finding] = reviewOutput(10).findings;
   if (!defect || !finding) throw new Error("fixture");
   const item = {
     ...reviewCase,
-    defects: [10, 28].map((line) => ({ ...defect, lines: [line, line + 1] as [number, number] })),
+    defects: [10, 28].map((line, index) => ({
+      ...defect,
+      severity: index === 0 ? ("major" as const) : ("blocker" as const),
+      lines: [line, line + 1] as [number, number],
+    })),
   };
   const verification = {
     verdict: "CONFIRMED",
@@ -53,10 +96,28 @@ test("a merged panel finding also covers the lines of the reports merged into it
     findings: [f],
   });
   expect(gradeReview(item, panel({ ...finding, verification, duplicates }))).toMatchObject({
-    pass: true,
-    review: { requiredMatched: 2, blockingFindings: 1 },
+    pass: false,
+    score: 0.5,
+    review: {
+      requiredMatched: 1,
+      recall: 0.5,
+      blockingFindings: 1,
+      bySeverity: {
+        high: { caught: 1, total: 1 },
+        medium: { caught: 0, total: 1 },
+        low: { caught: 0, total: 0 },
+      },
+    },
   });
   expect(gradeReview(item, panel({ ...finding, verification })).review?.requiredMatched).toBe(1);
+  expect(gradeReview(item, panel({ ...finding, line: 100, verification, duplicates })).review).toMatchObject({
+    requiredMatched: 1,
+    bySeverity: { high: { caught: 1, total: 1 } },
+  });
+  for (const severity of ["minor", "nit"] as const)
+    expect(
+      gradeReview(item, { ...reviewOutput(), findings: [{ ...finding, severity, duplicates }] }).review,
+    ).toMatchObject({ requiredMatched: 0, underRated: 1 });
 });
 test("review optional defects, returned verdict and clean blocking rules", () => {
   const optional = { ...reviewCase, defects: reviewCase.defects.map((d) => ({ ...d, required: false })) };
