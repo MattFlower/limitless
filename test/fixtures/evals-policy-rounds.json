@@ -1,0 +1,112 @@
+{
+  "rounds": [
+    {
+      "round": 0,
+      "modelId": "mtplx/qwen-27b",
+      "effort": "default",
+      "provider": "mtplx",
+      "status": "ok",
+      "reason": "hidden_tests",
+      "costUsd": 0.11,
+      "costEquivUsd": 0.25,
+      "tokensIn": 10,
+      "tokensOut": 20,
+      "durationMs": 100,
+      "pass": false
+    },
+    {
+      "round": 1,
+      "modelId": "codex/luna",
+      "effort": "high",
+      "provider": "codex",
+      "status": "ok",
+      "reason": null,
+      "costUsd": 0.73,
+      "costEquivUsd": 3.5,
+      "tokensIn": 30,
+      "tokensOut": 40,
+      "durationMs": 200,
+      "pass": true
+    }
+  ],
+  "legacyRounds": [
+    {
+      "round": 1,
+      "effort": "high",
+      "provider": "codex",
+      "status": "ok",
+      "reason": null,
+      "costUsd": 0.73,
+      "costEquivUsd": 3.5,
+      "tokensIn": 30,
+      "tokensOut": 40,
+      "durationMs": 200,
+      "pass": true
+    },
+    {
+      "round": 1,
+      "modelId": "codex/luna",
+      "provider": "codex",
+      "status": "ok",
+      "reason": null,
+      "costUsd": 0.73,
+      "costEquivUsd": 3.5,
+      "tokensIn": 30,
+      "tokensOut": 40,
+      "durationMs": 200,
+      "pass": true
+    },
+    {
+      "round": 1,
+      "modelId": "codex/luna",
+      "effort": "high",
+      "status": "ok",
+      "reason": null,
+      "costUsd": 0.73,
+      "costEquivUsd": 3.5,
+      "tokensIn": 30,
+      "tokensOut": 40,
+      "durationMs": 200,
+      "pass": true
+    },
+    {
+      "round": 1,
+      "modelId": "codex/luna",
+      "effort": "high",
+      "provider": "codex",
+      "status": "ok",
+      "reason": null,
+      "costUsd": 0.73,
+      "costEquivUsd": 3.5,
+      "tokensIn": 30,
+      "tokensOut": 40,
+      "durationMs": 200
+    },
+    {
+      "round": 1,
+      "modelId": "codex/luna",
+      "effort": "high",
+      "provider": "codex",
+      "status": "ok",
+      "reason": null,
+      "costEquivUsd": 3.5,
+      "tokensIn": 30,
+      "tokensOut": 40,
+      "durationMs": 200,
+      "pass": true
+    },
+    {
+      "round": 1,
+      "modelId": "codex/luna",
+      "effort": "high",
+      "provider": "codex",
+      "status": "ok",
+      "reason": null,
+      "costUsd": 0.73,
+      "tokensIn": 30,
+      "tokensOut": 40,
+      "durationMs": 200,
+      "pass": true
+    }
+  ]
+}

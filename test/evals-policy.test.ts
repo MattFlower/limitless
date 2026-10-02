@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { EvalRound } from "../src/core/types.ts";
 import { proposedOverlay, renderEvidence } from "../src/evals/evidence.ts";
 import { gradeReview } from "../src/evals/graders/review.ts";
 import { EVAL_ROLES, generatePolicy, selectEvidence } from "../src/evals/policy.ts";
@@ -10,6 +11,7 @@ import { parseTarget, recordedTarget } from "../src/router/targets.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
 import { evidence, input, local, metered, response, subscription } from "./evals-policy-support.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
+import roundFixture from "./fixtures/evals-policy-rounds.json";
 
 const first = (data: ReturnType<typeof input>) => {
   const candidate = generatePolicy(data).roles.flatMap((r) => r.candidates)[0];
@@ -779,7 +781,7 @@ test("implement rejects the exact non-inferiority margin and limits provider fal
   expect(renderEvidence(result)).toContain("lower=-0.1000");
 });
 
-test("implement effort recovery needs significant paired B1 evidence at no greater cost", () => {
+test("implement order follows single-shot costs without a paired B1 ordering input", () => {
   const low = "codex/luna@low";
   const high = "codex/luna@high";
   const row = evidence("implement", [low, high, metered]);
@@ -787,33 +789,118 @@ test("implement effort recovery needs significant paired B1 evidence at no great
     t.details.complexity = "small";
     if (recordedTarget(t) === high) t.costEquivUsd = 4;
   }
-  const base = {
-    complexity: "small" as const,
-    low,
-    high,
-    switch: metered,
-    pairedCases: 40,
-    lowerBound: 0.05,
-    effortCost: 0.2,
-    switchCost: 0.2,
-  };
   const ordinary = generatePolicy(input([row]));
   expect(ordinary.generated.implement?.small).toEqual([low, metered, high]);
-  const recovered = generatePolicy(input([row], { escalation: [base] }));
-  expect(recovered.generated.implement?.small).toEqual([low, high, metered]);
-  expect(renderEvidence(recovered)).toContain("B1 recovery lower=0.0500");
-  const costlier = generatePolicy(input([row], { escalation: [{ ...base, effortCost: 0.21 }] }));
-  expect(costlier.generated.implement?.small).toEqual([low, metered, high]);
-  const smallEvidence = renderEvidence(costlier).split("## implement.small")[1]?.split("## ")[0];
-  expect(smallEvidence).toContain(
-    `${low} → ${high} before ${metered} withheld: effort cost=0.2100 exceeds switch cost=0.2000`,
+  // Kept empty for one release so an older CLI can render the evaluation; nothing fills it.
+  expect(ordinary.roles.find((r) => r.role === "implement" && r.cell === "small")).toMatchObject({
+    escalation: [],
+    escalationRejections: [],
+  });
+  expect(renderEvidence(ordinary)).not.toContain("no qualifying B1 paired recovery evidence");
+});
+
+const switchEvidence = (options: Parameters<typeof evidence>[2] = {}) => {
+  const row = evidence("implement", [local], {
+    id: "B1",
+    finishedAt: 3000,
+    rounds: 2,
+    strategy: "switch",
+    ...options,
+  });
+  for (const t of row.trials) {
+    t.details.complexity = "small";
+    t.details.rounds = structuredClone(roundFixture.rounds) as EvalRound[];
+    t.details.roundsUsed = 2;
+    t.costUsd = 0.84;
+    t.costEquivUsd = 3.75;
+  }
+  return row;
+};
+
+test("switch recovery does not promote or displace the 30% single-shot starting model", () => {
+  const single = evidence("implement", [local], { id: "single", rounds: 1 });
+  for (const t of single.trials) {
+    t.details.complexity = "small";
+    t.pass = Number(t.caseId.slice(-2)) < 12;
+  }
+  const multi = switchEvidence();
+  for (const rows of [
+    [single, multi],
+    [multi, single],
+  ])
+    for (const evalIds of [undefined, ["B1", "single"], ["single", "B1"]]) {
+      expect(selectEvidence(rows, evalIds).map((e) => e.run.id)).toEqual(["single"]);
+      const result = generatePolicy(input(rows, { evalIds }));
+      expect(result.generated.implement).toBeUndefined();
+      const candidate = result.roles.find((r) => r.role === "implement" && r.cell === "small")?.candidates[0];
+      expect(candidate?.run.id).toBe("single");
+      expect(candidate?.summary.passRate).toBe(0.3);
+      expect(candidate?.summary.costUsd).toBeCloseTo(16);
+      const localRounds = result.rounds.filter((r) => r.modelId === local);
+      expect(localRounds).toHaveLength(40);
+      expect(localRounds.every((r) => r.pass === false && r.costUsd === 0.11)).toBe(true);
+      const recoveries = result.rounds.filter((r) => r.modelId === "codex/luna@high");
+      expect(recoveries).toHaveLength(40);
+      expect(recoveries.every((r) => r.pass === true && r.costEquivUsd === 3.5)).toBe(true);
+    }
+  expect(selectEvidence([multi], ["B1"])).toEqual([]);
+  expect(generatePolicy(input([multi])).generated.implement).toBeUndefined();
+  // Configured rounds determine the evidence kind even when every trial stops after round one.
+  for (const t of multi.trials) t.details.rounds = t.details.rounds?.slice(0, 1);
+  expect(selectEvidence([multi, single])[0]?.run.id).toBe("single");
+  delete single.run.rounds;
+  expect(selectEvidence([multi, single])[0]?.run.id).toBe("single");
+});
+
+test("round diagnostics use recorded targets, providers and incremental costs without aggregate fallback", () => {
+  const row = switchEvidence();
+  row.trials = row.trials.slice(0, 1);
+  const trial = row.trials[0];
+  const initial = trial?.details.rounds?.[0];
+  if (!trial || !initial) throw new Error("missing fixture");
+  initial.modelId = metered;
+  initial.provider = "openrouter";
+  trial.costUsd = 999;
+  trial.costEquivUsd = 888;
+  const models = MODELS.map((m) => (m.id === metered ? { ...m, provider: "twilight" } : m));
+  const result = generatePolicy(input([row], { models }));
+  expect(result.rounds).toMatchObject([
+    { modelId: metered, provider: "openrouter", pass: false, costUsd: 0.11, billing: "metered", cost: 0.11 },
+    {
+      modelId: "codex/luna@high",
+      provider: "codex",
+      effort: "high",
+      pass: true,
+      costUsd: 0.73,
+      costEquivUsd: 3.5,
+      billing: "subscription",
+      cost: 0.875,
+    },
+  ]);
+  const retry = switchEvidence({ id: "retry", rounds: 3, strategy: "retry" });
+  const diagnostics = generatePolicy(input([row, retry]));
+  expect(new Set(diagnostics.rounds.map((r) => `${r.runId}:${r.rounds}:${r.strategy}`))).toEqual(
+    new Set(["B1:2:switch", "retry:3:retry"]),
   );
-  expect(smallEvidence).toContain("despite significant B1 recovery (lower=0.0500, paired=40)");
-  expect(smallEvidence).not.toContain("no qualifying B1 paired recovery evidence");
-  for (const change of [{ lowerBound: 0 }, { pairedCases: 0 }, { effortCost: 0.21 }])
-    expect(
-      generatePolicy(input([row], { escalation: [{ ...base, ...change }] })).generated.implement?.small,
-    ).toEqual(ordinary.generated.implement?.small);
+  expect(generatePolicy(input([row, retry], { evalIds: ["B1"] })).rounds).toEqual(result.rounds);
+  const markdown = renderEvidence(diagnostics);
+  expect(markdown).toContain("B1 / small / 2 / switch");
+  expect(markdown).toContain("retry / small / 3 / retry");
+  expect(markdown).toContain("codex/luna@high / codex | true | 0.7300 / 3.5000 / 0.8750");
+  delete trial.details.rounds;
+  expect(generatePolicy(input([row])).rounds).toEqual([]);
+  trial.details.rounds = structuredClone(roundFixture.legacyRounds) as EvalRound[];
+  const legacy = generatePolicy(input([row])).rounds;
+  expect(legacy).toHaveLength(3); // No target attribution for missing model, effort or provider.
+  expect(legacy[0]?.pass).toBeNull();
+  expect(legacy[1]?.costUsd).toBeNull();
+  expect(legacy[2]?.costEquivUsd).toBeNull();
+  expect(legacy[2]?.cost).toBeNull();
+  for (const r of trial.details.rounds) {
+    r.costUsd = Number.NaN;
+    r.costEquivUsd = -1;
+  }
+  expect(generatePolicy(input([row])).rounds.every((r) => r.costUsd === null && r.cost === null)).toBe(true);
 });
 
 test("each uncovered provider contributes at most one availability fallback", () => {
