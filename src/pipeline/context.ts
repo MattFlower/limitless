@@ -443,7 +443,8 @@ export class RunContext {
         opts.complexity,
         this.routingConstraints({ ...opts.constraints, exclude: tried }),
       );
-      const target = decision.candidates.find((t) => !busy.has(t.targetId ?? t.modelId));
+      const candidates = decision.candidates.filter((t) => !busy.has(t.targetId ?? t.modelId));
+      const target = candidates[0];
       if (!target && lastResort) return useLastResort(lastResort, `No other model for ${opts.role}`);
       if (!target) {
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
@@ -456,25 +457,21 @@ export class RunContext {
       const harness = harnesses[harnessName];
       if (!harness) throw new Error(`No harness registered for ${harnessName}`);
 
-      const budget = Math.min((this.deps.cfg.waitBudgetS[opts.role] ?? Infinity) * 1000, left());
+      // With no alternative left, contention waits until a slot opens or the invocation deadline.
+      const seconds = candidates.length > 1 ? this.deps.cfg.waitBudgetS[opts.role] : undefined;
+      const budget = Math.min((seconds ?? Infinity) * 1000, left());
       let waitingAt: number | null = null;
-      let release: (() => void) | null;
-      try {
-        release = await tracker.acquire(
-          target.provider,
-          this.signal,
-          Number.isFinite(budget) ? budget : undefined,
-          (ahead) => {
-            waitingAt = tracker.now();
-            this.log(
-              `waiting for ${target.provider} slot (${ahead} ahead), up to ${Number.isFinite(budget) ? `${budget / 1000}s` : "unbounded"}`,
-            );
-          },
-        );
-      } catch (error) {
-        this.checkCancelled();
-        throw error;
-      }
+      const release = await tracker
+        .acquire(target.provider, this.signal, Number.isFinite(budget) ? budget : undefined, (ahead) => {
+          waitingAt = tracker.now();
+          this.log(
+            `waiting for ${target.provider} slot (${ahead} ahead), up to ${Number.isFinite(budget) ? `${budget / 1000}s` : "unbounded"}`,
+          );
+        })
+        .catch((error: unknown) => {
+          this.checkCancelled();
+          throw error;
+        });
       if (this.signal.aborted || left() <= 0) {
         release?.();
         this.checkCancelled();

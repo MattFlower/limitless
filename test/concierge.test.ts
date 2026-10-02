@@ -419,3 +419,35 @@ test("chat expires its slot budget and falls through without consuming an invoca
     release();
   }
 });
+
+test("chat with one eligible provider keeps waiting beyond its role budget", async () => {
+  const clock = waitClock();
+  const tracker = new ProviderTracker(
+    [{ id: "fake", label: "Fake", harness: "fake", billing: "subscription", maxConcurrent: 1 }],
+    f.factory.store,
+    f.factory.cfg.reserves,
+    {},
+    {},
+    clock.now,
+    fetch,
+    clock.timer,
+  );
+  f.factory.deps.tracker = tracker;
+  const release = await tracker.acquire("fake", new AbortController().signal);
+  try {
+    const pending = send("hi");
+    await clock.flush();
+    await clock.advance(40_000);
+    expect(f.specs).toHaveLength(0);
+    expect(clock.pending).toBe(0);
+    release();
+    expect((await pending).messages.at(-1)?.content).toBe("Hello");
+    expect(f.specs.map((s) => s.target.provider)).toEqual(["fake"]);
+    expect(f.factory.store.listEvents("chat:one").map((e) => e.message)).toEqual([
+      "waiting for fake slot (0 ahead), up to unbounded",
+    ]);
+    expect(tracker.status("fake")?.inFlight).toBe(0);
+  } finally {
+    release();
+  }
+});

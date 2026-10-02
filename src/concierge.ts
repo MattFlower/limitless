@@ -238,9 +238,10 @@ export class Concierge {
     const signal = AbortSignal.timeout(120_000);
     let failure = "No model available for chat";
     for (let attempt = 0; attempt < 3; attempt++) {
-      const target = router
+      const candidates = router
         .route("chat", "small", { exclude: tried })
-        .candidates.find((t) => !busy.has(t.targetId ?? t.modelId));
+        .candidates.filter((t) => !busy.has(t.targetId ?? t.modelId));
+      const target = candidates[0];
       if (!target) break;
       // Chat needs no tools, so it skips the agent CLI when the provider speaks plain HTTP.
       const { harnessName, noTools } = selectHarness("chat", target);
@@ -250,7 +251,7 @@ export class Concierge {
         failure = `No harness registered for ${harnessName}`;
         continue;
       }
-      const seconds = cfg.waitBudgetS.chat;
+      const seconds = candidates.length > 1 ? cfg.waitBudgetS.chat : undefined;
       const release = await tracker.acquire(
         target.provider,
         signal,
@@ -266,7 +267,6 @@ export class Concierge {
       if (!release) {
         if (signal.aborted) throw new Error("Chat request timed out");
         busy.add(target.targetId ?? target.modelId);
-        failure = "No provider capacity available for chat";
         attempt--;
         continue;
       }

@@ -6199,20 +6199,68 @@ describe("routing bounded slot waits", () => {
     expect(f.tracker.status("alpha")?.inFlight).toBe(0);
   });
 
-  test("all busy candidates return capacity error, including zero-budget fallthrough", async () => {
+  test.each([0, 20])("all busy candidates wait on the last candidate with a %ss budget", async (seconds) => {
     const f = fixture();
-    f.cfg.waitBudgetS.triage = 0;
+    f.cfg.waitBudgetS.triage = seconds;
     const slots = await Promise.all(
       providers.flatMap((p) =>
         Array.from({ length: p.maxConcurrent }, () => f.tracker.acquire(p.id, f.controller.signal)),
       ),
     );
-    await expect(f.invoke()).rejects.toBeInstanceOf(NoCapacityError);
+    const pending = f.invoke();
+    await f.clock.advance(seconds * 1000);
+    await f.clock.advance(60_000);
     expect(f.calls).toHaveLength(0);
     expect(f.context.store.listInvocations(f.run.id)).toHaveLength(0);
-    expect(f.events()).toHaveLength(2);
+    expect(f.events().map((e) => e.message)).toEqual([
+      `waiting for alpha slot (0 ahead), up to ${seconds}s`,
+      "waiting for beta slot (0 ahead), up to unbounded",
+    ]);
     expect(f.clock.pending).toBe(0);
+    slots[2]?.();
+    const outcome = await pending;
+    expect(f.calls.map((s) => s.target.provider)).toEqual(["beta"]);
+    expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+    expect(f.context.store.getInvocation(outcome.invocation.id)?.waitMs).toBe(60_000);
+    expect(f.events()).toHaveLength(2);
     for (const release of slots) release();
+  });
+
+  test.each(["release", "cancel", "deadline"])("a pinned candidate waits until %s", async (end) => {
+    const f = fixture(models, { ...policy, triage: { default: ["alpha/m"] } });
+    const now = spyOn(Date, "now").mockImplementation(f.clock.now);
+    const slots = await Promise.all(
+      Array.from({ length: 2 }, () => f.tracker.acquire("alpha", f.controller.signal)),
+    );
+    try {
+      const pending = f.invoke(end === "deadline" ? f.clock.now() + 60_000 : undefined);
+      const settled = pending.catch((error: unknown) => error);
+      await f.clock.advance(40_000);
+      expect(f.calls).toHaveLength(0);
+      expect(f.context.store.listInvocations(f.run.id)).toHaveLength(0);
+      expect(f.events().map((e) => e.message)).toEqual([
+        `waiting for alpha slot (0 ahead), up to ${end === "deadline" ? "60s" : "unbounded"}`,
+      ]);
+      if (end === "release") {
+        slots[0]?.();
+        const outcome = await pending;
+        expect(f.calls.map((s) => s.target.provider)).toEqual(["alpha"]);
+        expect(f.context.store.getInvocation(outcome.invocation.id)?.waitMs).toBe(40_000);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+      } else {
+        if (end === "cancel") f.controller.abort();
+        else await f.clock.advance(20_000);
+        expect(await settled).toBeInstanceOf(end === "cancel" ? CancelledError : NoCapacityError);
+        expect(f.calls).toHaveLength(0);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(0);
+      }
+      expect(f.events()).toHaveLength(1);
+      expect(f.clock.pending).toBe(0);
+    } finally {
+      now.mockRestore();
+      for (const release of slots) release();
+    }
+    expect(f.tracker.status("alpha")?.inFlight).toBe(0);
   });
 
   test("more than six busy candidates still allow all six actual invocation attempts", async () => {
