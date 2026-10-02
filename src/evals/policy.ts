@@ -356,6 +356,9 @@ export function generatePolicy(input: PolicyInput) {
       candidates,
       order,
       availabilityFallbacks: availability,
+      // Always empty: kept for one release so an older CLI can still render this evaluation.
+      escalation: [] as string[],
+      escalationRejections: [] as string[],
       decision: order.length
         ? `Update ${role}.${cell}: ${order.join(" → ")}${availability.length ? ` (availability fallbacks on other providers, clearing every floor but not non-inferior: ${availability.join(", ")})` : ""}`
         : candidates.length

@@ -791,9 +791,11 @@ test("implement order follows single-shot costs without a paired B1 ordering inp
   }
   const ordinary = generatePolicy(input([row]));
   expect(ordinary.generated.implement?.small).toEqual([low, metered, high]);
-  expect(ordinary.roles.find((r) => r.role === "implement" && r.cell === "small")).not.toHaveProperty(
-    "escalation",
-  );
+  // Kept empty for one release so an older CLI can render the evaluation; nothing fills it.
+  expect(ordinary.roles.find((r) => r.role === "implement" && r.cell === "small")).toMatchObject({
+    escalation: [],
+    escalationRejections: [],
+  });
   expect(renderEvidence(ordinary)).not.toContain("no qualifying B1 paired recovery evidence");
 });
 
