@@ -7,17 +7,20 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import * as cache from "../src/evals/cache.ts";
 import type { ImplementCase } from "../src/evals/cases.ts";
 import { formatEvalReport } from "../src/evals/format.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { runGates } from "../src/gates/run.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
+import * as scratch from "../src/harness/scratch.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../src/pipeline/prompts.ts";
 import { SpecSchema } from "../src/pipeline/schemas.ts";
 import { sh } from "../src/util/proc.ts";
@@ -25,7 +28,8 @@ import { evalMatrix } from "../ui/lib/evals.ts";
 import { enableEfforts, evalFixture } from "./evals-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
-setDefaultTimeout(30_000);
+const TEST_TIMEOUT = 30_000;
+setDefaultTimeout(TEST_TIMEOUT);
 
 async function fixture(
   gate = "test ! -f broken",
@@ -510,18 +514,22 @@ for (const rounds of [1, 3])
     test(`cancellation during hidden grading retains spend and removes trial resources (rounds=${rounds}, ${via})`, async () => {
       const f = await fixture();
       try {
-        f.item.hidden.command = 'test "$(cat answer)" = correct || exit 1; touch grading-started; sleep 10';
+        const started = join(f.home, "grading-started");
+        f.item.hidden.command = `test "$(cat answer)" = correct || exit 1; pwd -P > ${started}.tmp && mv ${started}.tmp ${started}; sleep 10`;
         if (rounds > 1)
           f.respond(() => ({ files: { answer: f.calls.length === 1 ? "wrong" : "correct" }, costUsd: 0.1 }));
         f.save();
         const pending = f.run({ rounds });
-        let cwd: string | undefined;
-        for (let i = 0; i < 200; i++) {
-          cwd = f.calls.at(-1)?.cwd;
-          if (cwd && existsSync(join(cwd, "grading-started"))) break;
-          await new Promise((resolve) => setTimeout(resolve, 10));
+        let grading = "";
+        const deadline = Date.now() + TEST_TIMEOUT / 2;
+        while (!grading && Date.now() < deadline) {
+          if (existsSync(started)) grading = readFileSync(started, "utf8").trim();
+          if (!grading) await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(cwd && existsSync(join(cwd, "grading-started"))).toBe(true);
+        expect(grading).not.toBe("");
+        const cwd = f.calls.at(-1)?.cwd;
+        expect(existsSync(join(grading, "answer"))).toBe(true);
+        expect(cwd && grading.startsWith(realpathSync(cwd))).toBe(false);
         expect(f.factory.store.listEvalRuns().map((r) => f.factory.store.evalSpend(r.id))).toEqual([
           rounds > 1 ? 0.2 : 0.1,
         ]);
@@ -555,6 +563,7 @@ for (const rounds of [1, 3])
         }
         expect(f.factory.store.cachedEvalTrials(report.trials[0]?.cacheKey ?? "")).toEqual([]);
         expect(cwd && existsSync(cwd)).toBe(false);
+        expect(existsSync(grading)).toBe(false);
         expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
       } finally {
         await f.close();
@@ -586,7 +595,8 @@ for (const strategy of ["retry", "effort", "switch"] as const)
           expect(s.target.effort).toBe(
             strategy === "switch" ? undefined : strategy === "effort" ? "high" : "low",
           );
-          expect(s.scratchDir).toBe(f.calls[0]?.scratchDir);
+          expect(s.scratchDir).not.toBe(f.calls[0]?.scratchDir);
+          expect(existsSync(f.calls[0]?.scratchDir ?? "")).toBe(false);
           expect(readFileSync(join(s.cwd, "answer"), "utf8")).toBe("wrong");
           expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("candidate");
           expect(statSync(join(s.cwd, "overwrite")).mode & 0o777).toBe(0o751);
@@ -660,6 +670,28 @@ test("single-round strategies share legacy inputs and cache; multi-round identit
       const cached = (await f.run({ rounds: 1, strategy })).trials[0];
       expect(cached?.cacheKey).toBe(first?.cacheKey);
       expect(cached?.details.cache).toBeDefined();
+    }
+    expect(f.calls).toHaveLength(1);
+    // Single-round identity keeps exactly the pre-isolation repository inputs.
+    const keyed = spyOn(cache, "cacheKey");
+    try {
+      await f.run({ rounds: 1, strategy: "retry" });
+      expect(Object.keys(keyed.mock.calls[0]?.[6] ?? {}).sort()).toEqual([
+        "base",
+        "caseSource",
+        "complexity",
+        "files",
+        "hidden",
+        "patch",
+        "prompt",
+        "repo",
+        "role",
+        "source",
+        "spec",
+      ]);
+      expect(keyed.mock.results[0]?.value).toBe(first?.cacheKey);
+    } finally {
+      keyed.mockRestore();
     }
     expect(f.calls).toHaveLength(1);
     const keys = new Set([first?.cacheKey]);
@@ -795,19 +827,28 @@ for (const succeeds of [true, false])
   });
 
 test("failed grading preserves ignored baseline dependencies and build outputs for recovery", async () => {
-  const f = await fixture("sh setup.sh", () => ({
+  const f = await fixture("sh setup.sh", (home) => ({
     ".gitignore": "node_modules/\nbuild/\n",
-    "setup.sh":
-      "test -f answer || { mkdir -p node_modules build; echo installed > node_modules/dependency; echo compiled > build/output; }\n",
+    "setup.sh": `test -d node_modules || { mkdir -p node_modules build; echo installed > node_modules/dependency; echo compiled > build/output; pwd -P >> ${join(home, "setups")}; }\n`,
   }));
   try {
+    f.item.hidden.command = `test -f node_modules/dependency && ${f.item.hidden.command}`;
+    f.save();
+    const stats: string[] = [];
     f.respond((s) => {
       expect(readFileSync(join(s.cwd, "node_modules/dependency"), "utf8")).toBe("installed\n");
       expect(readFileSync(join(s.cwd, "build/output"), "utf8")).toBe("compiled\n");
+      const stat = statSync(join(s.cwd, "node_modules/dependency"));
+      stats.push(`${stat.ino}:${stat.mode}:${stat.mtimeMs}`);
       return { files: { answer: f.calls.length === 1 ? "wrong" : "correct" } };
     });
     expect((await f.run({ rounds: 2 })).trials[0]?.pass).toBe(true);
     expect(f.calls).toHaveLength(2);
+    expect(stats[1]).toBe(stats[0]);
+    // The baseline installed into the candidate's checkout; each grading checkout installed its own.
+    const setups = readFileSync(join(f.home, "setups"), "utf8").trim().split("\n");
+    expect(setups).toHaveLength(3);
+    expect(new Set(setups).size).toBe(3);
   } finally {
     await f.close();
   }
@@ -1212,28 +1253,338 @@ for (const rounds of [1, 2])
       expect(paths).toHaveLength(2);
       expect(paths[0]).toBe(paths[1]);
       expect(paths.every((p) => !existsSync(p))).toBe(true);
-      expect(
-        copies.mock.calls.filter(
-          ([from]) => String(from).startsWith(`${f.calls[0]?.cwd}/`) && !String(from).endsWith("/.git"),
-        ),
-      ).toHaveLength(0);
-      if (rounds === 1)
-        expect(copies.mock.calls.filter(([from]) => String(from).endsWith("/.git"))).toHaveLength(0);
+      const harnessScratch = basename(dirname(f.calls[0]?.scratchDir ?? ""));
+      expect(paths.every((p) => !p.includes(`/${harnessScratch}/`))).toBe(true);
+      expect(copies).not.toHaveBeenCalled();
       const text = formatEvalReport(report);
       expect(text.includes("strategy=")).toBe(rounds > 1);
       expect(text.includes("recovery")).toBe(rounds > 1);
       expect(text.match(/pass@1 /g)).toHaveLength(1);
-      expect(copies.mock.calls.filter(([, to]) => to === join(f.calls[0]?.cwd ?? "", ".git"))).toHaveLength(
-        0,
-      );
-      copies.mockClear();
       f.respond(() => ({ files: { answer: "wrong" } }));
       await f.run({ rounds, cache: false });
-      expect(
-        copies.mock.calls.filter(([from]) => from === join(f.calls.at(-1)?.cwd ?? "", ".git")),
-      ).toHaveLength(rounds - 1);
+      expect(f.calls).toHaveLength(1 + rounds);
+      expect(copies).not.toHaveBeenCalled();
     } finally {
       copies.mockRestore();
       await f.close();
     }
   });
+
+/** A hidden-command prefix that records the grading checkout and commit, then waits for release. */
+function pauseGrading(f: Awaited<ReturnType<typeof fixture>>) {
+  const record = join(f.home, "grading");
+  const go = join(f.home, "go");
+  return {
+    prefix: `{ pwd -P; git rev-parse HEAD; } > ${record}.tmp && mv ${record}.tmp ${record}; while [ ! -f ${go} ]; do sleep 0.02; done; rm -f ${go}; `,
+    async paused() {
+      for (let i = 0; i < 1000 && !existsSync(record); i++) await new Promise((r) => setTimeout(r, 10));
+      const [dir = "", commit = ""] = readFileSync(record, "utf8").trim().split("\n");
+      rmSync(record);
+      return { dir, commit };
+    },
+    resume: () => writeFileSync(go, ""),
+  };
+}
+
+const commitAs = [
+  "git",
+  "-c",
+  "user.name=c",
+  "-c",
+  "user.email=c@example.invalid",
+  "-c",
+  "commit.gpgsign=false",
+];
+
+test("each round grades a distinct external checkout of its commit; the candidate never holds hidden bytes", async () => {
+  const f = await fixture("true");
+  const pause = pauseGrading(f);
+  try {
+    f.item.hidden.command = pause.prefix + f.item.hidden.command;
+    f.save();
+    f.respond(() => ({
+      files: { answer: f.calls.length === 1 ? "wrong" : "correct", protected: "changed" },
+    }));
+    const pending = f.run({ rounds: 2 });
+    const seen: { dir: string; commit: string }[] = [];
+    for (let round = 0; round < 2; round++) {
+      const graded = await pause.paused();
+      const cwd = realpathSync(f.calls.at(-1)?.cwd ?? "");
+      seen.push(graded);
+      expect(graded.dir.startsWith(`${cwd}/`) || cwd.startsWith(`${graded.dir}/`)).toBe(false);
+      expect((await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim()).toBe(graded.commit);
+      expect(readFileSync(join(graded.dir, "answer"), "utf8")).toBe(round ? "correct" : "wrong");
+      expect(readFileSync(join(graded.dir, "overwrite"), "utf8")).toBe("secret-hidden-overwrite");
+      expect(existsSync(join(cwd, "hidden"))).toBe(false);
+      expect(readFileSync(join(cwd, "overwrite"), "utf8")).toBe("original");
+      pause.resume();
+    }
+    const t = (await pending).trials[0];
+    expect(new Set(seen.map((s) => s.dir)).size).toBe(2);
+    expect(seen.every((s) => !existsSync(s.dir))).toBe(true);
+    expect(t?.details.grade?.implement?.commit).toBe(seen[1]?.commit);
+    expect(t?.details.rounds?.map((r) => r.reason)).toEqual(["audit", "audit"]);
+    expect(t?.details.grade?.implement?.auditBlocks.map((b) => b.file)).toContain("protected");
+  } finally {
+    await f.close();
+  }
+});
+
+test("a committed nested repository never receives hidden tests or grader copies", async () => {
+  const f = await fixture();
+  const pause = pauseGrading(f);
+  try {
+    f.item.hidden.command = `${pause.prefix}sh hidden/check.sh; result=$?; mkdir -p nested; cp hidden/check.sh nested/compiled; cp hidden/check.sh nested/own; exit $result`;
+    f.save();
+    f.respond(async (s): Promise<FakeReply> => {
+      const nested = join(s.cwd, "nested");
+      if (f.calls.length === 1) {
+        await sh(["git", "init", "-q", nested], { cwd: s.cwd });
+        writeFileSync(join(nested, "own"), "kept");
+        await sh([...commitAs, "add", "own"], { cwd: nested });
+        await sh([...commitAs, "commit", "-qm", "nested"], { cwd: nested });
+        return { files: { answer: "wrong" } };
+      }
+      expect(readdirSync(nested).sort()).toEqual([".git", "own"]);
+      expect(readFileSync(join(nested, "own"), "utf8")).toBe("kept");
+      return { files: { answer: "correct" } };
+    });
+    const pending = f.run({ rounds: 2 });
+    await pause.paused();
+    const cwd = f.calls[0]?.cwd ?? "";
+    expect((await sh(["git", "ls-tree", "HEAD", "nested"], { cwd })).stdout).toStartWith("160000 commit");
+    expect(readdirSync(join(cwd, "nested")).sort()).toEqual([".git", "own"]);
+    pause.resume();
+    await pause.paused();
+    pause.resume();
+    expect((await pending).trials[0]?.pass).toBe(true);
+    expect(f.calls).toHaveLength(2);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const kind of ["file", "parent"] as const)
+  test(`hidden injection rejects a committed ${kind} symlink before writing hidden bytes`, async () => {
+    const f = await fixture();
+    const writes = spyOn(fs, "writeFileSync");
+    try {
+      const outside = join(f.home, "outside");
+      writeFileSync(outside, "untouched");
+      f.respond((s) => {
+        if (kind === "file") {
+          rmSync(join(s.cwd, "overwrite"));
+          symlinkSync(outside, join(s.cwd, "overwrite"));
+        } else {
+          mkdirSync(join(s.cwd, "own"));
+          symlinkSync(join(realpathSync(s.cwd), "own"), join(s.cwd, "hidden"));
+        }
+        return { files: { answer: "correct" } };
+      });
+      writes.mockClear();
+      const t = (await f.run()).trials[0];
+      expect(t?.details.grade?.implement?.reason).toBe("error");
+      expect(t?.details.grade?.implement?.error).toContain("hidden destination symlink");
+      expect(writes.mock.calls.some(([, data]) => String(data).includes("secret-hidden"))).toBe(false);
+      expect(readFileSync(outside, "utf8")).toBe("untouched");
+    } finally {
+      writes.mockRestore();
+      await f.close();
+    }
+  });
+
+test("a candidate link to a completed grading checkout dangles before the next round", async () => {
+  const f = await fixture();
+  const graded = join(f.home, "graded");
+  try {
+    f.item.hidden.command += `; result=$?; pwd -P >> ${graded}; exit $result`;
+    f.save();
+    f.respond((s) => {
+      for (const [i, dir] of (existsSync(graded)
+        ? readFileSync(graded, "utf8").trim().split("\n")
+        : []
+      ).entries()) {
+        symlinkSync(dir, join(s.cwd, `peek-${f.calls.length}-${i}`));
+        expect(existsSync(join(s.cwd, `peek-${f.calls.length}-${i}`, "hidden"))).toBe(false);
+        expect(existsSync(dir)).toBe(false);
+      }
+      return { files: { answer: "wrong" } };
+    });
+    await f.run({ rounds: 3 });
+    expect(f.calls).toHaveLength(3);
+    expect(readFileSync(graded, "utf8").trim().split("\n")).toHaveLength(3);
+  } finally {
+    await f.close();
+  }
+});
+
+test("candidate git config, hooks, index flags and filters never reach grading", async () => {
+  const f = await fixture();
+  const log = join(f.home, "candidate-git-log");
+  const seen = join(f.home, "seen");
+  try {
+    f.item.hidden.command = `cat protected > ${seen}; ${f.item.hidden.command}`;
+    f.save();
+    f.respond(async (s): Promise<FakeReply> => {
+      const git = (...args: string[]) => sh([...commitAs, ...args], { cwd: s.cwd });
+      writeFileSync(join(s.cwd, "protected"), "changed");
+      await git("commit", "-qam", "protected");
+      await git("update-index", "--skip-worktree", "protected");
+      writeFileSync(join(s.cwd, "protected"), "original");
+      await git("config", "filter.spy.clean", `sh -c 'echo clean "$PWD" >> ${log}; tee -a ${log}'`);
+      await git("config", "filter.spy.smudge", `sh -c 'echo smudge "$PWD" >> ${log}; cat'`);
+      await git("config", "diff.spy.textconv", `sh -c 'echo textconv >> ${log}; cat "$0"'`);
+      await git("config", "diff.spy.command", `sh -c 'echo diff >> ${log}'`);
+      for (const hook of ["pre-commit", "post-commit", "post-checkout", "reference-transaction"]) {
+        writeFileSync(join(s.cwd, ".git/hooks", hook), `#!/bin/sh\necho hook >> ${log}\n`);
+        chmodSync(join(s.cwd, ".git/hooks", hook), 0o755);
+      }
+      return { files: { answer: "correct", ".gitattributes": "* filter=spy diff=spy\n" } };
+    });
+    const t = (await f.run()).trials[0];
+    expect(t?.details.grade?.implement?.reason).toBe("audit");
+    expect(t?.details.grade?.implement?.auditBlocks.map((b) => b.file)).toContain("protected");
+    expect(readFileSync(seen, "utf8")).toBe("changed");
+    // Only the factory's own commit ran the candidate's clean filter, before any hidden bytes existed.
+    const lines = readFileSync(log, "utf8").split("\n");
+    expect(lines.some((line) => line.startsWith("clean "))).toBe(true);
+    expect(lines.filter((line) => /^(smudge|textconv|diff|hook)\b/.test(line))).toEqual([]);
+    expect(readFileSync(log, "utf8")).not.toContain("secret-hidden");
+  } finally {
+    await f.close();
+  }
+});
+
+test("round-0 grading artifacts are gone before round 1 searches for them", async () => {
+  const f = await fixture();
+  const recorded = join(f.home, "grading-paths");
+  try {
+    f.item.hidden.command += `; result=$?; printf '%s\\n' "$PWD" "$HOME" "$TMPDIR" >> ${recorded}; cp hidden/check.sh "$HOME/copy"; cp hidden/check.sh "$TMPDIR/copy2"; cp hidden/check.sh stolen; git add -A; ${commitAs.join(" ")} commit -qm stolen; exit $result`;
+    f.save();
+    f.respond(async (s): Promise<FakeReply> => {
+      if (f.calls.length === 2) {
+        const paths = readFileSync(recorded, "utf8").trim().split("\n");
+        expect(paths).toHaveLength(3);
+        expect(paths.flatMap((p) => [p, dirname(p)]).filter((p) => existsSync(p))).toEqual([]);
+        const found = await sh(["grep", "-rl", "--exclude-dir=hidden", "secret-hidden", f.home], {
+          cwd: f.home,
+          allowFail: true,
+        });
+        expect(found.stdout).toBe("");
+        expect((await sh(["git", "log", "--all", "-p"], { cwd: s.cwd })).stdout).not.toContain(
+          "secret-hidden",
+        );
+        const worktrees = await sh(["git", "worktree", "list", "--porcelain"], { cwd: s.cwd });
+        expect(worktrees.stdout.match(/^worktree /gm)).toHaveLength(1);
+      }
+      return { files: { answer: f.calls.length === 1 ? "wrong" : "correct" } };
+    });
+    expect((await f.run({ rounds: 2 })).trials[0]?.pass).toBe(true);
+    expect(f.calls).toHaveLength(2);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const [outcome, reason] of [
+  ["success", null],
+  ["hidden-exit", "hidden_tests"],
+  ["setup", "gates"],
+  ["injection", "error"],
+  ["timeout", "timeout"],
+] as const)
+  test(`grading checkout and scratch are removed after ${outcome}`, async () => {
+    const f = await fixture();
+    const allocated = spyOn(scratch, "createScratch");
+    try {
+      if (outcome === "setup") {
+        writeFileSync(
+          join(f.source, ".limitless.toml"),
+          '[gates]\nsetup = ["test ! -f broken"]\nchecks = [{ name = "test", run = "true" }]\n',
+        );
+        await pinBase(f);
+      }
+      if (outcome === "timeout") {
+        f.item.hidden.command = "sleep 10";
+        f.item.hidden.timeoutSec = 0.05;
+        f.save();
+      }
+      f.respond((s) => {
+        if (outcome === "injection") symlinkSync(f.home, join(s.cwd, "hidden"));
+        return {
+          files: {
+            answer: outcome === "hidden-exit" ? "wrong" : "correct",
+            ...(outcome === "setup" ? { broken: "yes" } : {}),
+          },
+        };
+      });
+      const t = (await f.run()).trials[0];
+      expect(t?.details.grade?.implement?.reason).toBe(reason);
+      const dirs = allocated.mock.results.map((r) => String(r.value));
+      // The harness scratch, the grading checkout and, once injection succeeded, the hidden scratch.
+      expect(dirs).toHaveLength(outcome === "injection" ? 2 : 3);
+      expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
+    } finally {
+      allocated.mockRestore();
+      await f.close();
+    }
+  });
+
+for (const rounds of [1, 2])
+  test(`a committed Bun preload leaves no hidden copies in the worktree or scratch (rounds=${rounds})`, async () => {
+    const f = await fixture();
+    try {
+      f.item.hidden.command = `bun test candidate.test.ts && ${f.item.hidden.command}`;
+      f.save();
+      f.respond((s): FakeReply => {
+        if (f.calls.length === 1)
+          return {
+            files: {
+              answer: "wrong",
+              ".gitignore": "dist/\n",
+              "dist/output": "built",
+              "bunfig.toml": '[test]\npreload=["./steal.ts"]\n',
+              "candidate.test.ts":
+                'import { test, expect } from "bun:test"; test("candidate", () => expect(true).toBe(true));',
+              "steal.ts": `import { cpSync, existsSync } from "node:fs";
+          if (existsSync("hidden")) {
+            for (const dest of ${JSON.stringify([join(s.cwd, "stolen"), join(s.cwd, "dist/stolen"), join(s.scratchDir ?? "", "stolen")])}) cpSync("hidden", dest, { recursive: true });
+            cpSync("hidden/check.sh", ${JSON.stringify(join(s.cwd, "dist/output"))});
+            cpSync("hidden/check.sh", ${JSON.stringify(join(s.cwd, "overwrite"))});
+            console.log("copies created");
+          }`,
+            },
+          };
+        expect(existsSync(join(s.cwd, "stolen"))).toBe(false);
+        expect(existsSync(join(s.cwd, "dist/stolen"))).toBe(false);
+        expect(existsSync(join(s.cwd, "dist/output"))).toBe(false);
+        expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
+        expect(existsSync(f.calls[0]?.scratchDir ?? "")).toBe(false);
+        const prior = f.factory.store.listEvalTrials(f.factory.store.listEvalRuns()[0]?.id ?? "")[0];
+        expect(prior?.details.grade?.implement?.hidden?.output).toContain("copies created");
+        return { files: { answer: "correct", "steal.ts": "" } };
+      });
+      expect((await f.run({ rounds })).trials[0]?.pass).toBe(rounds === 2);
+      expect(f.calls).toHaveLength(rounds);
+      expect(f.calls.every((call) => !existsSync(call.scratchDir ?? ""))).toBe(true);
+    } finally {
+      await f.close();
+    }
+  });
+
+test("grading removes hidden tests even when candidate code makes checkout directories read-only", async () => {
+  const f = await fixture();
+  const allocated = spyOn(scratch, "createScratch");
+  try {
+    f.respond(() => ({ files: { answer: "correct", "lock.sh": "chmod 0555 hidden\n" } }));
+    f.item.hidden.command += "; result=$?; sh lock.sh; exit $result";
+    f.save();
+    expect((await f.run()).trials[0]?.pass).toBe(true);
+    const dirs = allocated.mock.results.map((r) => String(r.value));
+    expect(dirs).toHaveLength(3);
+    expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
+  } finally {
+    allocated.mockRestore();
+    await f.close();
+  }
+});
