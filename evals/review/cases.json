@@ -1,7 +1,7 @@
 {
   "role": "review",
   "version": 1,
-  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 are merged PRs with no known defect. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 stay clean, because their blocking findings are real but minor. v3 (2026-10-01): review-h01..h21 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days earlier, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike.",
+  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 are merged PRs with no known defect. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 stay clean, because their blocking findings are real but minor. v3 (2026-10-01): review-h01..h19 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days before 2026-10-01, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike; false blocks are reported per case (blocked in a majority of trials) as well as per trial.",
   "cases": [
     {
       "id": "review-001",
@@ -4879,125 +4879,9 @@
       "source": "PR #94 as landed (31a4b0a), run mukflebpi0tz; no later fix found as of 2026-10-01; held-out v3",
       "input": {
         "prompt": "# Run dependencies: start a run after another run's PR merges\n\n## Why\nThe orchestrator plans work as sequences (part A → part B) and has to wait to queue follow-ups, so free run slots go unused. Letting a queued run declare that it starts after another run's PR merges allows a whole plan to be queued at once.\n\n## Design\n- **Data.** `limitless run ... --after <run-id>[,<run-id>]` (also on the API and the MCP tool). Runs gain `dependsOn: string[]` (new migration; follow #47 if merged by then). A run with unmet dependencies has status `waiting`: the scheduler skips it, and the UI shows \"waiting for <run> to merge\".\n- **Satisfied** = every dependency run has `merged === true`. The existing merge polling or the owner merging the PR updates this; add a periodic `gh pr view --json state,mergeCommit` check for delivered PRs if none exists.\n- **Failed** = a dependency ends `failed`/`cancelled`, or its PR is closed unmerged. The waiting run then becomes `needs_human` with the reason and does not start.\n- Once satisfied, the run is queued normally and branches from the then-current base.\n\n## Acceptance\n- Store/scheduler tests:\n  - a waiting run doesn't start;\n  - it starts after the dependency is marked merged;\n  - a closed-unmerged dependency moves it to needs_human;\n  - dependency cycles and unknown ids are rejected at creation.\n- `bun run check` passes; under ~350 lines.\n\nNote: #39 (PR #87) has landed. Runs now have a `resolved` status and `mergedBy`/`mergedAt`, and a GitHub PR-state poller exists in src/integrations/github-notifier.ts. Build merge detection on that rather than adding a second poller. New schema changes go in src/db/migrations/<UTC YYYYMMDDTHHMM>-<slug>.sql (see its README).\n\nCloses #49",
-        "spec": {
-          "summary": "Add run dependencies so an orchestrator can submit a sequence of work immediately, with each run waiting until all prerequisite PRs merge. Persist dependencies, enforce them in scheduling, expose them through the CLI, HTTP API, MCP, and UI, and extend the existing GitHub poller to detect merges and closed PRs.",
-          "assumptions": [
-            "Dependencies are immutable after creation and reference existing runs; forward references and batch graph submission are unsupported.",
-            "Dependency IDs are global, so dependencies may span repositories. Each dependent still uses its own configured base branch.",
-            "Trim dependency IDs, remove duplicates, and reject blank IDs or non-string values. An omitted or empty dependency list preserves current behavior.",
-            "A confirmed merged flag satisfies a dependency even if its historical run status indicates failure. Otherwise failed, cancelled, or confirmed closed-unmerged dependencies block execution; needs_human alone does not.",
-            "A dependent moved to needs_human stays there until explicitly retried. Retrying creates a new run with the same dependencies and reevaluates them.",
-            "The approximately 350-line target is a scope guideline, not a reason to omit required behavior or meaningful tests."
-          ],
-          "requirements": [
-            "Add optional dependsOn: string[] to CreateRunRequest, required dependsOn: string[] to Run, and non-terminal waiting to RunStatus in src/core/types.ts. Keep waiting distinct from waiting_input.",
-            "Persist dependencies with an additive migration in src/db/migrations/<UTC YYYYMMDDTHHMM>-run-dependencies.sql, obtaining the timestamp with the date command. Default existing runs to an empty list; do not edit shipped migrations or the frozen legacy migration array.",
-            "Implement shared validation in Store.createRun so every creation path rejects malformed dependency lists, unknown IDs, self-dependencies, and dependency cycles before inserting or publishing a run. Traversal must terminate safely on cyclic graphs. Return actionable errors identifying offending IDs; use existing HTTP 400 and MCP error conventions.",
-            "Accept limitless run --after <run-id>[,<run-id>], translating it to dependsOn. Accept dependsOn on POST /api/runs and limitless_create_run for both MCP transports. Include dependencies in create/get/list responses, including the explicitly projected limitless_get_run response. Update CLI help and creation output to reflect waiting status.",
-            "Determine initial status before publishing creation: queued when every dependency is merged, waiting when any dependency is unmet, or needs_human when an unmerged dependency has already failed, been cancelled, or is known to have a closed-unmerged PR.",
-            "Reconcile waiting runs deterministically using the Store and scheduler. Release them to the ordinary priority/concurrency queue only when every dependency has merged === true. Reconcile on startup and subsequent scheduler activity without relying solely on new events; waiting runs must consume no execution slots and create no worktree, stage, or model invocation.",
-            "For an unmerged dependency that fails, is cancelled, or has its PR closed unmerged, move its waiting dependents to needs_human, set finishedAt and an actionable error identifying the prerequisite and cause, and publish the normal run/status updates. Preserve enough closure information for restart recovery and later dependent creation. Repeated reconciliation must be idempotent and must not revive cancelled or needs_human dependents.",
-            "Extend reconcileMergedRuns and startGitHubNotifier in src/integrations/github-notifier.ts rather than introducing another poller. Cover delivered, unmerged PRs on succeeded runs as well as existing needs_human runs, regardless of origin. Confirm the exact PR URL; distinguish MERGED, CLOSED, and OPEN. Lookup errors, missing responses, and mismatched URLs leave dependencies unresolved and retryable.",
-            "Preserve the existing needs_human-to-resolved merge behavior and its retained error/evidence. For succeeded runs whose PRs merge, persist merged, mergedBy, and mergedAt without changing succeeded to resolved. Existing pipeline updates setting merged: true must also release dependents. Retain the poller's startup pass, periodic checks, injected GitHubPrClient, and overlap protection.",
-            "Prepare released runs through the existing pipeline so ensureCache fetches and createWorktree selects the then-current base. Do not capture baseSha or create the dependent's branch while it is waiting.",
-            "Preserve dependsOn in Factory.retryRun. Waiting runs remain cancellable, and cancellation prevents subsequent dependency changes from scheduling them.",
-            "Add waiting to UI status labels, filtering, and MCP status schemas. Show 'waiting for <run> to merge' with identifiable dependency IDs in the run UI, accommodating multiple prerequisites; display dependency failure reasons through the existing error surface and update through existing SSE messages.",
-            "Keep the implementation focused and approximately under 350 lines. Use fake harnesses, local repositories, and injected GitHub clients in tests; never invoke paid models, the network, or gh. Run bun run check before completing implementation."
-          ],
-          "acceptance_criteria": [
-            {
-              "id": "AC-1",
-              "criterion": "Dependencies persist across Store reopen and migration upgrades; existing runs and requests without dependencies expose dependsOn: [] and retain normal queued behavior.",
-              "how_to_verify": "Extend test/migrations.test.ts with an upgrade containing an existing run and a create/reopen dependency round-trip; run bun test test/migrations.test.ts."
-            },
-            {
-              "id": "AC-2",
-              "criterion": "Creation rejects unknown IDs, malformed lists, self-dependencies, and cyclic dependency graphs without inserting or publishing a run; valid duplicate IDs are normalized.",
-              "how_to_verify": "Add Store tests in test/run-dependencies.test.ts. Exercise graph validation with a controlled candidate ID or seeded cyclic graph, since normal creation generates IDs and references only existing runs. Assert run counts and publication counts remain unchanged on rejection; run bun test test/run-dependencies.test.ts."
-            },
-            {
-              "id": "AC-3",
-              "criterion": "A waiting run never starts or occupies a slot, while unrelated queued work can start. With multiple prerequisites it remains waiting until all are merged, then starts exactly once; already-merged prerequisites allow immediate queuing.",
-              "how_to_verify": "Add fake-harness scheduler tests in test/run-dependencies.test.ts with constrained concurrency. Assert active run IDs, startedAt, stages, and worktree absence before release; mark prerequisites merged individually and repeat scheduler ticks to verify exactly one execution."
-            },
-            {
-              "id": "AC-4",
-              "criterion": "An unmerged failed, cancelled, or closed-unmerged prerequisite moves its dependent to needs_human with a specific reason and no execution. The result survives restart, applies to dependents created after the failure is known, and is not undone by later reconciliation.",
-              "how_to_verify": "Add table-driven Store/scheduler tests in test/run-dependencies.test.ts and a CLOSED response test using the injected client in test/github-notifier.test.ts. Reopen the database, create another dependent, and verify both remain unstarted; run bun test test/run-dependencies.test.ts test/github-notifier.test.ts."
-            },
-            {
-              "id": "AC-5",
-              "criterion": "The existing poller releases dependents after merges of succeeded or needs_human prerequisite PRs, records merge metadata, and preserves existing resolved semantics. OPEN, lookup failures, and mismatched URLs do not release or fail dependents.",
-              "how_to_verify": "Extend test/github-notifier.test.ts with injected MERGED, OPEN, CLOSED, null, mismatched-URL, and throwing responses. Verify succeeded remains succeeded, needs_human becomes resolved with evidence preserved, and repeated reconciliation produces no duplicate transitions; run bun test test/github-notifier.test.ts."
-            },
-            {
-              "id": "AC-6",
-              "criterion": "CLI --after, HTTP dependsOn, and MCP dependsOn create equivalent dependency-aware runs; create/get/list expose dependencies and waiting status, and invalid dependencies produce errors.",
-              "how_to_verify": "Add CLI request-capture coverage and direct HTTP route tests without network access; extend test/mcp.test.ts and test/mcp-proxy.test.ts using in-memory transports and injected fetch. Verify multiple IDs, normalization, unknown-ID errors, waiting filters, and limitless_get_run dependency output."
-            },
-            {
-              "id": "AC-7",
-              "criterion": "Waiting survives scheduler restart; cancellation prevents later release; retries preserve dependencies; and a released run branches from the base revision current when it starts.",
-              "how_to_verify": "Add local-repository tests in test/run-dependencies.test.ts: create a waiting run, advance the base with a local commit, restart scheduling, and mark its prerequisite merged. Assert the dependent's baseSha equals the new commit. Separately cancel and retry waiting/blocked runs and inspect their status and dependency lists."
-            },
-            {
-              "id": "AC-8",
-              "criterion": "The UI recognizes and filters waiting runs, identifies their merge prerequisites, and displays dependency failure reasons and subsequent status changes.",
-              "how_to_verify": "Add a focused UI test following test/resolved-surfaces.test.ts, covering waiting labels, filtering, multiple prerequisite IDs, and needs_human errors; inspect a fixture-driven run detail view before and after an SSE status update."
-            }
-          ],
-          "out_of_scope": [
-            "A second GitHub PR-state poller or changes to merge policy.",
-            "Automatically merging prerequisite PRs, retrying failed prerequisites, or overriding dependency failures.",
-            "Editing dependencies after creation, forward references, bulk graph creation, or a dependency graph editor.",
-            "Stacked PRs, branching from prerequisite feature branches, or dependencies satisfied merely by pipeline success.",
-            "Adding dependency inputs to chat, Discord, or the UI run-creation form.",
-            "Broad scheduler, pipeline, or persistence refactoring."
-          ],
-          "blocking_questions": []
-        },
-        "implementerReport": "Implemented dependencies across Store/migration, scheduler, existing GitHub poller, retry handling, CLI, MCP, and UI. Added validation, persistence, scheduling, API, and SSE regression tests.\n\nVerified:\n- `bun run check`: passed; 577 tests, 0 failures.\n- `git diff --check`: passed.\n\nAssumptions: dependencies are immutable existing run IDs; confirmed merges satisfy them regardless of historical status.\n\nNothing left undone. No commits or pushes.\n\n",
-        "gates": [
-          {
-            "name": "lint",
-            "verdict": "pass",
-            "blocking": false,
-            "result": {
-              "name": "lint",
-              "command": "bun run lint",
-              "ok": true,
-              "exitCode": 0,
-              "durationMs": 136,
-              "output": "Checked 209 files in 66ms. No fixes applied.\nFound 3 warnings.\nFound 1 info.\n\n$ biome check .\nbiome.json:7:13 deserialize  DEPRECATED  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n  i The use of the recommended field has been deprecated, and will removed in the next major version of Biome. Use preset instead.\n  \n     5 │   \"formatter\": { \"enabled\": true, \"indentStyle\": \"space\", \"indentWidth\": 2, \"lineWidth\": 110 },\n     6 │   \"javascript\": { \"formatter\": { \"quoteStyle\": \"double\", \"semicolons\": \"always\" } },\n   > 7 │   \"linter\": {\n       │             ^\n   > 8 │     \"enabled\": true,\n        ...\n  > 14 │     }\n  > 15 │   },\n       │   ^\n    16 │   \"assist\": { \"actions\": { \"source\": { \"organizeImports\": \"on\" } } }\n    17 │ }\n  \n  i Migrate the configuration with the proper command\n  \n  $ biome migrate\n  \n\nsrc/evals/policy.ts:153:17 lint/complexity/useOptionalChain  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n  ! Change to an optional chain.\n  \n    151 │                 ? `recorded with backend-default effort, but ${model.id} now defaults to ${model.effort}`\n    152 │                 : null\n  > 153 │               : !model || !model.supportedEfforts.includes(recordedEffort)\n        │                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    154 │                 ? `unsupported recorded effort ${recordedEffort}`\n    155 │                 : effortTransportError(\n  \n  i Unsafe fix: Change to an optional chain.\n  \n    151 151 │                   ? `recorded with backend-default effort, but ${model.id} now defaults to ${model.effort}`\n    152 152 │                   : null\n    153     │ - ··············:·!model·||·!model.supportedEfforts.includes(recordedEffort)\n        153 │ + ··············:·!model?.supportedEfforts.includes(recordedEffort)\n    154 154 │                   ? `unsupported recorded effort ${recordedEffort}`\n    155 155 │                   : effortTransportError(\n  \n\nui/styles.css:675:1 lint/style/noDescendingSpecificity ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n  ! Descending specificity selector found. This selector specificity is (0, 1, 1)\n  \n    673 │   text-align: right;\n    674 │ }\n  > 675 │ .empty-row td {\n        │ ^^^^^^^^^^^^^\n    676 │   color: var(--text-faint);\n    677 │   text-align: center;\n  \n  i This selector specificity is (0, 2, 3)\n  \n    665 │   background: var(--bg-hover);\n    666 │ }\n  > 667 │ .table tbody tr:last-child td {\n        │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    668 │   border-bottom: none;\n    669 │ }\n  \n  i Descending specificity selector may not be applied. Consider rearranging the order of the selectors. See MDN web docs for more details.\n  \n\nui/styles.css:1503:1 lint/style/noDescendingSpecificity ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n  ! Descending specificity selector found. This selector specificity is (0, 1, 1)\n  \n    1501 │ }\n    1502 │ .markdown th,\n  > 1503 │ .markdown td {\n         │ ^^^^^^^^^^^^\n    1504 │   border: 1px solid var(--border);\n    1505 │   padding: 5px 9px;\n  \n  i This selector specificity is (0, 2, 3)\n  \n    665 │   background: var(--bg-hover);\n    666 │ }\n  > 667 │ .table tbody tr:last-child td {\n        │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    668 │   border-bottom: none;\n    669 │ }\n  \n  i Descending specificity selector may not be applied. Consider rearranging the order of the selectors. See MDN web docs for more details."
-            }
-          },
-          {
-            "name": "typecheck",
-            "verdict": "pass",
-            "blocking": false,
-            "result": {
-              "name": "typecheck",
-              "command": "bun run typecheck",
-              "ok": true,
-              "exitCode": 0,
-              "durationMs": 355,
-              "output": "$ tsc --noEmit -p ."
-            }
-          },
-          {
-            "name": "test",
-            "verdict": "pass",
-            "blocking": false,
-            "result": {
-              "name": "test",
-              "command": "bun test",
-              "ok": true,
-              "exitCode": 0,
-              "durationMs": 135937,
-              "output": "wn persisted roles receive useful help [0.03ms]\n(pass) model labels show the recorded backend model and distinguish effort states [0.05ms]\n\ntest/cost-cell.test.ts:\n(pass) cost cells lead with equivalent work and bold meaningful paid spend [12.31ms]\n\ntest/quota-alerts.test.ts:\n(pass) threshold, exhaustion, and reset produce one alert per window with live updates [14.95ms]\n(pass) quota rejection alerts, but health failures and metered budgets do not [15.96ms]\n(pass) quota rejection names the exhausted seven-day window across five-hour reset [13.04ms]\n(pass) quota rejection with below-reserve windows uses a deduplicated hard limit [11.74ms]\n[discord] send: 23 |   async register(_guild: string, _definitions: readonly ApplicationCommandDataResolvable[]): Promise<void> {}\n24 |   async createThread(): Promise<string> {\n25 |     return \"thread\";\n26 |   }\n27 |   async sendMessage(channel: string, content: string): Promise<void> {\n28 |     if (this.fail) throw new Error(\"send failed\");\n                                  ^\nerror: send failed\n      at sendMessage (/Users/mflower/.limitless/work/mukflebpi0tz/test/quota-alerts.test.ts:28:30)\n\n(pass) Discord sends once across flapping and restart; failure leaves alert visible [15.19ms]\n(pass) disabled Discord and unavailable alternatives leave alerts in the API [12.23ms]\n(pass) hard-limit reset estimates deduplicate across concurrent results, flapping, and restart [19.91ms]\n(pass) an unknown hard-limit reset stays deduplicated when later rejections estimate a reset [16.80ms]\n(pass) quota rejection preserves a named window's unknown reset boundary [14.14ms]\n(pass) alerts API returns current alerts and store publishes dashboard changes [11.26ms]\n(pass) generic subscription windows use their configured reserves independently [13.09ms]\n(pass) fallback description respects the selected route constraints [8.29ms]\n(pass) existing alerts refresh fallback eligibility with Discord enabled [8.21ms]\n(pass) existing alerts refresh fallback eligibility with Discord disabled [7.38ms]\n[discord] send: 23 |   async register(_guild: string, _definitions: readonly ApplicationCommandDataResolvable[]): Promise<void> {}\n24 |   async createThread(): Promise<string> {\n25 |     return \"thread\";\n26 |   }\n27 |   async sendMessage(channel: string, content: string): Promise<void> {\n28 |     if (this.fail) throw new Error(\"send failed\");\n                                  ^\nerror: send failed\n      at sendMessage (/Users/mflower/.limitless/work/mukflebpi0tz/test/quota-alerts.test.ts:28:30)\n\n[discord] send: 23 |   async register(_guild: string, _definitions: readonly ApplicationCommandDataResolvable[]): Promise<void> {}\n24 |   async createThread(): Promise<string> {\n25 |     return \"thread\";\n26 |   }\n27 |   async sendMessage(channel: string, content: string): Promise<void> {\n28 |     if (this.fail) throw new Error(\"send failed\");\n                                  ^\nerror: send failed\n      at sendMessage (/Users/mflower/.limitless/work/mukflebpi0tz/test/quota-alerts.test.ts:28:30)\n\n(pass) existing alerts refresh fallback eligibility with Discord failing [6.54ms]\n(pass) the SSE endpoint streams exhaustion, fallback changes and timed clearing [7.40ms]\n\ntest/evals-reading-runner.test.ts:\n(pass) review uses the pipeline prompt, recomputed audit, detached seeded HEAD and agent harness [2457.82ms]\n(pass) verify uses pipeline schema, prompt, private session and head content, retaining per-criterion grades [962.57ms]\n(pass) audit uses gate configuration from base, so a change cannot disable its own findings [1428.20ms]\n(pass) rejects pins whose reachable history exposes eval labels or seed patches [1155.48ms]\n(pass) rejects a historical dataset on a merge parent whose merge kept the label-free tree [663.24ms]\n(pass) fetches missing branch and PR-only pins and invalidates same-stat repository changes [2286.01ms]\n(pass) preparation, patch, harness and output failures remove worktrees and release slots [1802.70ms]\n(pass) shutdown removes active and capacity-waiting worktrees [656.84ms]\n\ntest/provider-workload.test.ts:\n(pass) provider workload uses local calendar boundaries and adds chat calls once [5.59ms]\n(pass) recorded concierge duration contributes to workload [2.74ms]\n\ntest/evals-grader.test.ts:\n(pass) exact fields, alternatives, nulls, questions and risk weighting [0.15ms]\n(pass) null risk has no denominator; entirely ungraded cases remain unscored [0.04ms]\n\ntest/drain-http.test.ts:\n(pass) admin drain uses real loopback peers and existing mutation protections [99.22ms]\n(pass) health keeps the injected boot SHA after the checkout advances [118.79ms]\n\ntest/quota-format.test.ts:\n(pass) utilization display rounds upward and stays within 0 to 100 percent [0.09ms]\n(pass) observation age handles elapsed, missing and future readings [0.06ms]\n\ntest/report.test.ts:\n(pass) markdown tables are contiguous blocks [0.29ms]\n(pass) needs-human report says so [0.03ms]\n(pass) reports for runs started from an issue close it [0.04ms]\n(pass) report rows show low, high, none and unknown effort independently [0.32ms]\n(pass) blocked acceptance and holdout checks have a distinct marker, label, evidence and terminal reason [0.11ms]\n\ntest/run-dependencies.test.ts:\n(pass) shared validation rejects malformed, unknown, self and cyclic graphs without publications [55.61ms]\n(pass) waiting consumes no slot; all prerequisites must merge, then execution starts once on current base [223.87ms]\n(pass) failed dependencies fail durably and only explicit retry reevaluates [73.01ms]\n(pass) cancelled dependencies fail durably and only explicit retry reevaluates [77.20ms]\n(pass) closed dependencies fail durably and only explicit retry reevaluates [58.41ms]\n(pass) cancellation is permanent and retry preserves waiting dependencies across restart [60.84ms]\n(pass) CLI --after sends multiple prerequisite IDs and prints the waiting status [79.31ms]\n\n 580 pass\n 0 fail\n 1 snapshots, 6607 expect() calls\nRan 580 tests across 65 files. [135.92s]"
-            }
-          }
-        ]
+        "spec": null,
+        "implementerReport": "",
+        "gates": []
       },
       "defects": []
     },
@@ -5666,22 +5550,6 @@
     {
       "id": "review-h14",
       "repo": "MattFlower/limitless",
-      "base": "21482845dd29ff393fa0e5e4c23d45e262b345c8",
-      "head": "4311c20a05961c6c34636436f5348f8579dea442",
-      "snapshot": true,
-      "kind": "clean",
-      "source": "PR #151 as landed (4311c20), run mulw9cp656kt; no later fix found as of 2026-10-01; held-out v3",
-      "input": {
-        "prompt": "# Baseline gates: retry a failing check once; realistic timeouts for heavy eval tests\n\nIn 14 of 66 recent factory runs on this repo (21%), `prepare` reported \"failing on base: test\". Every sampled case was a timing flake: heavy implement-eval tests exceed Bun's default 5s test timeout under CPU load. Examples:\n- \"baseline gates are shared across repetitions and providers per case within each run\"\n- \"implement invokes once in edit mode with shared prompt…\"\n- \"cancellation during hidden grading retains spend…\"\n\nA check that fails on base is `still_failing` after the change, and that **never blocks**. So for those runs the test gate couldn't catch a regression at all. Post-change failures already get one retry (`retryRegressions`, flaky → non-blocking); baseline failures get none.\n\n1. **Baseline retry.** In `prepare`, rerun a failing baseline check once.\n   - If the rerun passes, the baseline records the check as passing, keeps the failed attempt as `firstAttempt`, and logs a `baseline <name>: flaky` event.\n   - If it fails again, behaviour is as today.\n   - Setup failures and timeouts keep today's handling.\n2. **Realistic timeouts.** Give the heavy eval/runner tests that run real gates an explicit per-test timeout, e.g. 30s. Prefer per-test timeouts over raising the global default, so genuine hangs elsewhere still fail fast.\n3. **Tests.** A baseline check that fails once and then passes is recorded as passing, and the later change's test regression then blocks. One that fails twice stays failing.\n\n`bun run check` passes. Small, focused change.\n\nCloses #140",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": []
-    },
-    {
-      "id": "review-h15",
-      "repo": "MattFlower/limitless",
       "base": "1d457ce0ea6792e9212fec8533a03573cb6aba2e",
       "head": "1b0b9936843a444398a3f722006f1548d1e3f032",
       "snapshot": true,
@@ -5696,7 +5564,7 @@
       "defects": []
     },
     {
-      "id": "review-h16",
+      "id": "review-h15",
       "repo": "MattFlower/limitless",
       "base": "67f37b616f01b7b169ffdb79b9b4e831ff00df02",
       "head": "8f83247af98d382a890942f54994aa60092cbd55",
@@ -5712,7 +5580,7 @@
       "defects": []
     },
     {
-      "id": "review-h17",
+      "id": "review-h16",
       "repo": "MattFlower/limitless",
       "base": "1b0b9936843a444398a3f722006f1548d1e3f032",
       "head": "38ca2c0c71317d00cbc06c7c341add64cd6a1206",
@@ -5728,7 +5596,7 @@
       "defects": []
     },
     {
-      "id": "review-h18",
+      "id": "review-h17",
       "repo": "MattFlower/limitless",
       "base": "6a8e4bcc5484845dcc9bb0c08f0900c3bd6f40c2",
       "head": "888ad276bd86c376b1c7b72b7d8f7df7a9d1087a",
@@ -5744,7 +5612,7 @@
       "defects": []
     },
     {
-      "id": "review-h19",
+      "id": "review-h18",
       "repo": "MattFlower/limitless",
       "base": "a8f206b3abbf978bd4007e6375223c14f6dda460",
       "head": "3c5991f27a206738bcc5f988d8a286e72ab72c87",
@@ -5760,7 +5628,7 @@
       "defects": []
     },
     {
-      "id": "review-h20",
+      "id": "review-h19",
       "repo": "MattFlower/limitless",
       "base": "9e1a33c5fb3a44dc5e8eeb9342e4310f16bc26ad",
       "head": "9982c84fe613b2c07af58397f43c0555a151c08d",
@@ -5769,22 +5637,6 @@
       "source": "PR #132 as landed (9982c84), run mula7u9p03um; no later fix found as of 2026-10-01; held-out v3",
       "input": {
         "prompt": "# Review eval v2: grade what production would block\n\nPart of #109. The review grader counts a defect as found when any blocker/major/**minor** finding lands near it, and passes a case on the *model's* verdict. In production a minor finding doesn't block, and the pipeline derives its own verdict (`src/pipeline/review.ts`). So the eval rewards exactly the under-rating that lets real defects ship: a reviewer that notices a bug but calls it minor scores a hit.\n\nChange `src/evals/graders/review.ts` (and reporting) so that:\n- **Blocking recall is the headline.** A required defect is *caught* only by a finding that would block under the production round-1 rule, using the same function the engine uses rather than a copy.\n- **Detected-but-not-blocking** is reported separately as \"under-rated\". Diagnostic only.\n- **Real cases pass** when every required defect is caught **and** the production-derived verdict is `request_changes`.\n- **Clean cases false-block** when the production-derived verdict is `request_changes`. Also report the count of blocking findings per clean case.\n- **Recall is broken down by the labelled defect severity** (high / medium / low) in `eval report`.\n- **The policy generator** uses blocking recall for `review_defect_recall`.\n\nAlso fix `docs/EVALS.md`:\n- The ceiling rule contradicts the code: the code uses the Wilson upper bound, so document that.\n- The suite table claims 30 cases; there are 15.\n\nKeep the case schema backward compatible. Existing trials regrade from their stored JSON.\n\nTests with fakes. `bun run check` passes; under ~300 lines.\n\nCloses #114",
-        "spec": null,
-        "implementerReport": "",
-        "gates": []
-      },
-      "defects": []
-    },
-    {
-      "id": "review-h21",
-      "repo": "MattFlower/limitless",
-      "base": "45912eeb71b1e08162fb3c85bb1a3f94eaaa14a5",
-      "head": "20e45a7795e252133ac4ecba7202842b20e853df",
-      "snapshot": true,
-      "kind": "clean",
-      "source": "PR #176 as landed (20e45a7), run muni1zmvsxqo; no later fix found as of 2026-10-01; held-out v3",
-      "input": {
-        "prompt": "Codex confined readers: verify the reader profile is enforced and fail closed\n\nHoldout authors and other confined readers (#153) run `codex exec` with a `limitless-reader` permissions profile. The profile allows reads of the reader's cwd and scratch, and nothing under the private roots.\n\nThe confinement depends on the installed `codex` CLI honouring that profile. With codex-cli 0.154.0, a read the profile denies succeeds. #162 found this when the deploy gate resolved an older `codex` from a parent directory's `node_modules/.bin`. The daemon itself resolved a current CLI, so production was not affected. Nothing in the harness notices the difference, though: confinement silently fails open on an older or different CLI, for example on a new machine.\n\n**Change**\n1. Before the first confined invocation per resolved `codex` binary (path plus `--version`, cached for the daemon's lifetime), probe the profile. Run `codex sandbox` with the same reader profile against a canary file outside the cwd, and require that the read is denied.\n2. If the probe does not confirm denial, confined invocations on that provider fail with a clear error. Routing then falls through to the next model for the role, and the provider card shows why. It never runs unconfined.\n3. Record the probe result, the CLI path and the version in the invocation or provider status, so a failure is visible.\n4. Tests: fake the sandbox probe for both outcomes. The existing real-sandbox test in `test/scratch.test.ts` stays as it is.\n\n**Out of scope:** Claude-harness confinement, and changing which CLI `PATH` resolves.\n\nKeep it under ~250 changed lines. `bun run check` must pass.\n\nCloses #163",
         "spec": null,
         "implementerReport": "",
         "gates": []
