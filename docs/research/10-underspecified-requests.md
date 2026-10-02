@@ -1,4 +1,4 @@
-<!-- Research synthesis produced on 2026-09-29 from three research passes (literature, industry practice, Limitless's own run data), edited by the orchestrator. Many sources are 2026 preprints or vendor documentation; the evidence strength is marked on each claim. Numbers are not comparable across benchmarks. Status: proposal, pending owner review. -->
+<!-- Research synthesis produced on 2026-09-29 from three research passes (literature, industry practice, Limitless's own run data), edited by the orchestrator. Many sources are 2026 preprints or vendor documentation; the evidence strength is marked on each claim. Numbers are not comparable across benchmarks. Status: research record; the proposal is not yet decided (see Status below). -->
 
 # Underspecified requests: when the factory should ask, assume or proceed (2026-09-29)
 
@@ -8,6 +8,10 @@
 - **[S]** strong: peer-reviewed work, a large benchmark with clear numbers, or official product documentation.
 - **[M]** moderate: a solid preprint with experiments, or a vendor post with specifics.
 - **[W]** weak: a small study, an inference, or a single-rater judgement on our data.
+
+## Status (2026-10-02)
+
+Merged as a research record. The proposal below is **not adopted yet**: the spec-time decision ledger, deterministic disposition, and "Decisions to confirm" at the top of PRs await an owner decision. Basis tags for acceptance criteria (11-spec-stage.md §3.1 item 3) depend on it. The factory's behaviour is unchanged: the clarify stage still asks only when the spec model raises blocking questions.
 
 ## 0. Bottom line
 
