@@ -6324,6 +6324,76 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     ]);
   });
 
+  test("a finder queued for a provider slot rechecks headroom once it holds the slot", async () => {
+    const toml = readFileSync(join(repoDir, ".limitless.toml"), "utf8");
+    const lens = `[review]\nlenses = [{ name = "ops", focus = "OPS", profiles = ["quick"] }]\n`;
+    writeFileSync(join(repoDir, ".limitless.toml"), `${toml}${lens}`);
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "lens"], {
+      cwd: repoDir,
+    });
+    const calls = newCalls();
+    let headroom = 1;
+    const f = start(
+      scenario(calls, (s) => {
+        // The first finder to hold the slot uses up the quota; the other is still waiting for it.
+        if (s.prompt.startsWith("You are a code reviewer")) headroom = 0.05;
+        return { structured: approve, costEquivUsd: 0.25, delayMs: 50 };
+      }),
+    );
+    f.deps.cfg.reviewShadow = "panel";
+    for (const id of ["alpha", "beta"]) Object.assign(f.tracker.def(id) ?? {}, { maxConcurrent: 1 });
+    spyOn(f.tracker, "headroom").mockImplementation(() => headroom);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(titles(f, run.id)).toEqual([["Single only"], []]);
+    expect([calls.shadow.length, calls.verifier.length]).toEqual([1, 0]);
+    expect(shadowOf(f, run.id, 0)).toMatchObject({
+      status: "skipped",
+      reason: "beta quota headroom is at or below 0.1",
+      usage: { invocations: 1, costEquivUsd: 0.25 },
+    });
+    expect(shadowOf(f, run.id, 1)).toMatchObject({ status: "skipped", usage: { invocations: 0 } });
+  });
+
+  test("failed and retried shadow attempts count once in shadow usage and run totals", async () => {
+    const run = async (failFirst: boolean) => {
+      const calls = newCalls();
+      let failed = false;
+      const f = start(
+        scenario(calls, (s) => {
+          if (!failFirst || failed || !s.prompt.startsWith("You are a code reviewer")) return undefined;
+          failed = true;
+          return { status: "error", error: "overloaded", costUsd: 0.02, costEquivUsd: 0.1 };
+        }),
+      );
+      f.deps.cfg.reviewShadow = "panel";
+      const created = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, created.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const result = {
+        calls,
+        cost: f.store.getRun(created.id)?.costEquivUsd ?? 0,
+        shadow: shadowOf(f, created.id, 0),
+        blocking: titles(f, created.id),
+      };
+      await f.stop();
+      f.store.close();
+      factory = null;
+      rmSync(home, { recursive: true, force: true });
+      home = mkdtempSync(join(tmpdir(), "limitless-e2e-"));
+      repoDir = await makeRepo();
+      return result;
+    };
+    const clean = await run(false);
+    const retried = await run(true);
+    expect(retried.blocking).toEqual(clean.blocking);
+    expect(retried.calls.shadow.length).toBe(clean.calls.shadow.length + 1);
+    expect(retried.shadow).toMatchObject({
+      status: "completed",
+      usage: { invocations: 2, costUsd: 0.02, costEquivUsd: 0.35 },
+    });
+    expect(retried.cost).toBeCloseTo(clean.cost + 0.1, 6);
+  });
+
   test.each(["same", "different"] as const)(
     "a restart reuses a completed shadow only for the %s reviewed revision",
     async (revision) => {

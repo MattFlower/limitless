@@ -538,18 +538,21 @@ the profile's panel (roster plus the base commit's lenses) reviews the same revi
 review of the complete diff. It records its findings, verdict, blocking findings, panel record and
 spend in `review-N.shadow.json`. It never blocks, never reaches the implementer and never affects
 routing. It costs roughly $0.65 API-equivalent per round on subscription models. It is skipped, or
-stops before its next call, when any enabled subscription provider's quota headroom is 0.1 or less.
-It never falls back to metered models. A failed or skipped shadow records why, with its spend so far.
+stops before its next model call (checked once that call holds its provider slot), when quota
+headroom is 0.1 or less: for any enabled subscription provider before it starts, and for the routed
+provider before each call. It stops rather than use a metered model. A failed or skipped shadow records why, with its spend so far.
 
 `limitless review shadow-report [--since <ISO-8601>]` compares single and panel blocking findings per
 round, for runs created at or after `--since`. It marks each panel-only finding:
 
-- `fixed`: a later PR commit names its file and title.
+- `fixed`: a later commit names its file and title, in the run's PR or the PR of a run depending on
+  it. Later means after the reviewed commit in PR order and after the shadow review in time.
 - `review-matched`: a later review names it. This can be a later round of the run, a run on the same
   PR or one depending on it, or a PR review or comment. A review match is not a fix.
 - `converged-without-fix`: the run succeeded, and the observed history has no match. This is a
   signal, not proof of a false positive.
-- `unknown`: the run is unfinished or its PR history is unavailable.
+- `unknown`: the run is unfinished, or some related PR history or review artifact is unavailable or
+  malformed (shown as "evidence incomplete").
 
 Editing the same file is never evidence. Skipped, failed, missing and malformed comparisons are
 listed rather than dropped. The report makes no model calls and changes nothing.

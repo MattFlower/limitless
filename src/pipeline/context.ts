@@ -168,6 +168,9 @@ export class NeedsHumanError extends Error {}
 
 export class NoCapacityError extends Error {}
 
+/** Shadow work: `stop` vetoes an attempt's provider once its slot is held; `ids` collects the attempts. */
+export const invokeGuard = new AsyncLocalStorage<{ stop(p: string): string | undefined; ids: number[] }>();
+
 export interface InvokeOptions {
   role: Role;
   stage: Stage;
@@ -471,6 +474,12 @@ export class RunContext {
         lastFailure = `${target.targetId ?? target.modelId}: no capacity after provider refresh`;
         continue;
       }
+      const guard = invokeGuard.getStore();
+      const stopped = guard?.stop(target.provider);
+      if (stopped) {
+        release();
+        throw new NoCapacityError(stopped);
+      }
       if (opts.role === "implement") {
         this.state.implementer = {
           modelId: target.modelId,
@@ -497,6 +506,7 @@ export class RunContext {
         modelId: target.modelId,
         effort: recordEffort(target.effort),
       });
+      guard?.ids.push(invocation.id);
       this.log(`${opts.role}: using ${target.targetId ?? target.modelId}`, "info", {
         invocationId: invocation.id,
         skipped: decision.skipped,

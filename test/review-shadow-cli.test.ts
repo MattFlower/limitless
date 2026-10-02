@@ -88,10 +88,10 @@ test("an empty selection says so", async () => {
 });
 
 test.each([
-  [["shadow-report", "--since", "yesterday"], "usage: limitless review shadow-report"],
-  [["shadow-report", "--since", "2026-13-45T00:00:00Z"], "--since: invalid timestamp"],
+  [["shadow-report", "--since", "yesterday"], "--since: invalid ISO-8601 timestamp yesterday"],
+  [["shadow-report", "--since", "2026-13-45T00:00:00Z"], "--since: invalid ISO-8601 timestamp"],
   [["shadow-report", "--since"], "--since"],
-  [["shadow-report", "--since", ""], "usage: limitless review shadow-report"],
+  [["shadow-report", "--since", ""], "--since: invalid ISO-8601 timestamp"],
   [["report"], "usage: limitless review shadow-report"],
 ])("rejects %j", async (args, message) => {
   const { stdout, stderr, exit } = await cli(...args);

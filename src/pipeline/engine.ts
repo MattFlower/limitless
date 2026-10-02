@@ -90,7 +90,7 @@ import {
   runReview,
   type VerifierRequest,
 } from "./review.ts";
-import { type ShadowGuard, shadowReview } from "./review-shadow.ts";
+import { shadowReview } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import {
   type Holdout,
@@ -1138,30 +1138,22 @@ async function oneRound(
         constraints: RouteConstraints,
         prefer: string | undefined,
         deadline?: number,
-        shadow?: ShadowGuard,
       ) => {
-        shadow?.check();
         const invoked = await ctx.invoke({
           role: "review",
           stage,
           mode: "readonly",
           complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
-          // A shadow never falls back to metered models to get around its quota floor.
-          constraints: {
-            ...(shadow ? { billing: "no_metered" as const } : {}),
-            ...constraints,
-            ...(prefer ? { prefer } : {}),
-          },
+          constraints: { ...constraints, ...(prefer ? { prefer } : {}) },
           ...request,
           ...(deadline ? { deadline } : {}),
           requireStructured: true,
         });
-        shadow?.spent.push(invoked.result);
         await discardChanges(cwd);
         return invoked;
       };
-      const reviewDeps = (system: ReviewSystem, shadow?: ShadowGuard) => {
-        const deps: ReviewDeps<InvokeOutcome> = {
+      const reviewDeps = (system: ReviewSystem): ReviewDeps<InvokeOutcome> => {
+        return {
           invoke: async (request, index) => {
             const finder = system.finders[index];
             const vendor = ctx.state.implementer?.vendor;
@@ -1172,7 +1164,7 @@ async function oneRound(
             // One deadline covers a local finder's slot waits and fallbacks; past it, the panel skips it.
             const deadline = finder?.local ? Date.now() + request.timeoutMs : undefined;
             try {
-              return await call(request, constraints, finder?.target, deadline, shadow);
+              return await call(request, constraints, finder?.target, deadline);
             } catch (error) {
               if (finder?.local && error instanceof NoCapacityError) throw new FinderSkipped(error.message);
               throw error;
@@ -1180,8 +1172,7 @@ async function oneRound(
           },
           verify: (request, avoidVendors, avoidModels) => {
             const constraints = verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer);
-            if (!system.verifier?.targets)
-              return call(request, constraints, system.verifier?.target, undefined, shadow);
+            if (!system.verifier?.targets) return call(request, constraints, system.verifier?.target);
             // Picked per batch, as evals do, and offered alone: a routed fallback could share its vendor.
             const listed = system.verifier.targets.map((target) => {
               const { model, targetId } = ctx.deps.router.resolve(target);
@@ -1189,11 +1180,10 @@ async function oneRound(
             });
             const identity = ctx.deps.router.checkpointIdentity;
             const only = pickVerifier(listed, avoidVendors, avoidModels, identity).targetId;
-            return call(request, { ...constraints, only }, undefined, undefined, shadow);
+            return call(request, { ...constraints, only }, undefined);
           },
-          warn: (message) => ctx.log(`${shadow ? "Shadow panel: " : ""}${message}`, "warn"),
+          warn: (message) => ctx.log(message, "warn"),
         };
-        return deps;
       };
       const { target, output, decision, panel } = await runReview(reviewDeps(system), input);
       if (!decision) throw output.error;

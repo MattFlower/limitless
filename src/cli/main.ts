@@ -414,13 +414,11 @@ async function main(): Promise<void> {
       return;
     }
     case "review": {
-      const since = values.since === undefined ? undefined : Date.parse(values.since);
-      if (
-        rest.join(" ") !== "shadow-report" ||
-        (since !== undefined && !/^\d{4}-\d\d-\d\d/.test(values.since ?? ""))
-      )
+      if (rest.join(" ") !== "shadow-report")
         throw new Error("usage: limitless review shadow-report [--since <ISO-8601 timestamp>]");
-      if (Number.isNaN(since)) throw new Error(`--since: invalid timestamp ${values.since}`);
+      const since = values.since === undefined ? undefined : Date.parse(values.since);
+      if (Number.isNaN(since) || !/^\d{4}-\d\d-\d\d/.test(values.since ?? "0000-00-00"))
+        throw new Error(`--since: invalid ISO-8601 timestamp ${values.since}`);
       const { formatShadowReport } = await import("../pipeline/shadow-report.ts");
       console.log(formatShadowReport(await api("/api/review/shadow-report"), since));
       return;
