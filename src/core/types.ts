@@ -154,6 +154,8 @@ export interface Run {
   startedAt: number | null;
   finishedAt: number | null;
   priority: number;
+  /** Execute the baseline gates and bypass the baseline cache (`--no-baseline-cache`). */
+  noBaselineCache?: boolean;
 }
 
 export interface Stage {
@@ -263,6 +265,24 @@ export interface ProviderStatus {
   inFlight: number;
   maxConcurrent: number;
   updatedAt: number;
+  /** Latest confined-reader sandbox probe of the provider's CLI (Codex). */
+  confinement?: ConfinementProbe;
+}
+
+/** Fixed probe diagnostics: the CLI's own output can echo config, including tokens. */
+export type ConfinementFailure =
+  | "reader profile not enforced"
+  | "probe inconclusive"
+  | "probe timed out"
+  | "codex sandbox failed to start";
+
+/** Whether a CLI's sandbox let a confined reader read its cwd but denied every private root. */
+export interface ConfinementProbe {
+  ok: boolean;
+  path: string | null;
+  version: string | null;
+  reason: ConfinementFailure | null;
+  exitCode: number | null;
 }
 
 export interface QuotaAlert {
@@ -288,6 +308,8 @@ export interface CreateRunRequest {
   baseBranch?: string;
   /** Existing same-repository PR head; accepted only from a verified GitHub webhook. */
   deliveryBranch?: string;
+  /** Execute the baseline gates and bypass the baseline cache for reads and writes. */
+  noBaselineCache?: boolean;
 }
 
 /** Messages pushed on the global SSE stream. */
@@ -370,7 +392,8 @@ export interface ChatConversation {
 
 export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 
-export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed";
+/** `interrupted`: stopped by a restart, a cancel or a resume; its partial results never feed policy. */
+export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed" | "interrupted";
 export type EvalStrategy = "retry" | "effort" | "switch";
 /** Panel finder prompts: coverage-first `standard`, `adversarial`, or one `careful` senior pass. */
 export type FinderPrompt = "standard" | "adversarial" | "careful";
@@ -381,14 +404,30 @@ export type FinderPrompt = "standard" | "adversarial" | "careful";
 export interface ReviewFinder {
   target?: string;
   prompt: FinderPrompt;
+  /** A lens finder: the standard prompt plus this focus. */
+  lens?: ReviewLens;
+  /** Routed finders avoid the implementer's vendor (`cross`); `implementer` is a fresh session from its family. */
+  family?: "cross" | "implementer";
+  /** Only a local (free) model, under a shorter timeout; skipped when none answers. */
+  local?: boolean;
+}
+export interface ReviewLens {
+  name: string;
+  focus: string;
+}
+/** A lens from the base commit's `.limitless.toml`, added as a finder in the listed profiles. */
+export interface RepoReviewLens extends ReviewLens {
+  profiles: ResolvedProfile[];
 }
 /** How a review is performed: one finder (`single`), or finders whose candidates a verifier checks (`panel`). */
 export interface ReviewSystem {
+  /** Eval only: the source panel system for stored finder replay. */
+  replayFrom?: string;
   name: string;
   mode: "single" | "panel";
   finders: ReviewFinder[];
   /** Panel only; production may omit `target` (routed), evals may not. */
-  verifier?: { target?: string };
+  verifier?: { target?: string; targets?: string[] };
   implementerReport: "include" | "omit";
 }
 /** Trials an eval runs at once per provider, capped at the provider's `maxConcurrent` − 1 (at least 1). */
@@ -412,6 +451,9 @@ export interface EvalRun {
   createdAt: number;
   finishedAt: number | null;
   error: string | null;
+  /** The interrupted eval this one resumed, and the eval that resumed this one. */
+  resumedFrom?: string;
+  resumedBy?: string;
 }
 export interface EvalGrade {
   pass: boolean | null;
@@ -492,6 +534,10 @@ export interface EvalTrial {
     decisionConfidence?: number;
     preparationFailed?: boolean;
     interrupted?: boolean;
+    /** Eval the trial ran in before a resume copied it; its spend was already charged to the provider there. */
+    resumedFrom?: string;
+    /** Panel verifier calls in order, retries included: the model each ran on and the candidates it was sent. */
+    verifiers?: { modelId: string; effort: RecordedEffort; candidates: string[] }[];
     cache?: {
       evalRunId: string;
       caseId: string;

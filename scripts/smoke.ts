@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import type { ChildProcess } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,47 +8,326 @@ import type { QuotaWindow } from "../src/core/types.ts";
 import { runClaude } from "../src/harness/claude.ts";
 import { runCodex } from "../src/harness/codex.ts";
 import { type DecisionAnswer, runDecisions } from "../src/harness/decisions.ts";
-import { withScratch } from "../src/harness/scratch.ts";
+import { scratchParent, withScratch as usingScratch } from "../src/harness/scratch.ts";
 import type { AgentEvent, AgentResult, Harness, ModelTarget } from "../src/harness/types.ts";
 import { MODELS, type ModelDef, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
 import { resolveTarget } from "../src/router/targets.ts";
-import { sh } from "../src/util/proc.ts";
+import { processScope, sh } from "../src/util/proc.ts";
 
-export type CheckResult = { status: "pass" | "fail" | "skip"; reason?: string };
-export type SmokeCheck = { name: string; run: () => Promise<CheckResult> };
-export type CheckRow = CheckResult & { name: string; durationMs: number };
+/**
+ * Why a failure may be retried: the provider was briefly unavailable. Anything else (a disclosed
+ * token, a tool call, a forbidden write, a wrong answer) is an assertion failure and is final. "model"
+ * means the model never ran the verify probe at all and left the worktree untouched.
+ */
+export type Transient = "timeout" | "provider" | "health" | "model";
+export type CheckResult = { status: "pass" | "fail" | "skip"; reason?: string; transient?: Transient };
+/**
+ * `timeoutMs` bounds each attempt; it defaults to DEFAULT_CHECK_TIMEOUT_MS. `signal` aborts when that
+ * bound expires, and the attempt must then settle so its assertions still count.
+ */
+export type SmokeCheck = {
+  name: string;
+  timeoutMs?: number;
+  run: (signal: AbortSignal) => Promise<CheckResult>;
+};
+export type CheckRow = CheckResult & {
+  name: string;
+  durationMs: number;
+  retried?: boolean;
+  retriedAfter?: string;
+};
+/** Time source for the smoke runner, so tests can drive budgets and timeouts deterministically. */
+export type Clock = {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  setTimeout: (fn: () => void, ms: number) => unknown;
+  clearTimeout: (handle: unknown) => void;
+};
+export const realClock: Clock = {
+  now: () => performance.now(),
+  sleep: (ms) => Bun.sleep(ms),
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout> | undefined),
+};
+export type RunOptions = {
+  /** Overall time for every attempt; an attempt is cut to the time left and a retry needs its full timeout. */
+  budgetMs?: number;
+  retryDelayMs?: number;
+  /** How long a timed-out attempt may take to settle after its signal aborts. */
+  stopGraceMs?: number;
+  /** Timers for attempt timeouts and the stop grace; also the default `now` and retry delay. */
+  clock?: Clock;
+  onStart?: (check: SmokeCheck) => void;
+  onRow?: (row: CheckRow) => void;
+};
 
-export async function runChecks(checks: SmokeCheck[], now = () => performance.now()): Promise<CheckRow[]> {
-  const rows: CheckRow[] = [];
-  for (const check of checks) {
-    const start = now();
-    try {
-      rows.push({ name: check.name, ...(await check.run()), durationMs: Math.round(now() - start) });
-    } catch (error) {
-      rows.push({
-        name: check.name,
-        status: "fail",
-        reason: String(error),
-        durationMs: Math.round(now() - start),
-      });
+const KILL_GRACE_MS = 1_000;
+const CLOSE_WAIT_MS = KILL_GRACE_MS + 500;
+function registerTemp(dir: string): string {
+  processScope.getStore()?.scratchDirs.add(dir);
+  return dir;
+}
+function withScratch<T>(cwd: string, run: (dir: string) => Promise<T>): Promise<T> {
+  return usingScratch(cwd, (dir) => {
+    registerTemp(scratchParent(dir));
+    return run(dir);
+  });
+}
+async function closeChildren(children: Map<ChildProcess, Promise<void>>): Promise<boolean> {
+  const closed = await within(
+    Promise.all(children.values()).then(() => true),
+    CLOSE_WAIT_MS,
+    realClock,
+  );
+  if (!closed) {
+    // Escaped descendants can retain pipes after the process group has been killed.
+    for (const child of children.keys()) {
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
     }
+  }
+  return closed === true;
+}
+
+const RETRY_DELAY_MS = 5_000;
+const STOP_GRACE_MS = 10_000;
+const DEFAULT_CHECK_TIMEOUT_MS = 120_000;
+/** The deploy gate kills smoke after 900 s; leave room for startup and reporting. */
+export const SMOKE_BUDGET_MS = 870_000;
+
+const PROVIDER_ERROR =
+  /(?:HTTP|status|code)\s*5\d\d|\b50[0-4]\b|rate.?limit|\b429\b|overloaded|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|stream disconnected|connection (?:refused|reset|closed|error|failed)|network error/i;
+const MALFORMED = /malformed/i;
+
+/** Classify a failure message explicitly; an unrecognized one is never retried. */
+export function transientReason(reason: string): Transient | undefined {
+  if (/health probe/i.test(reason)) return "health";
+  if (/\btimed out\b|\btimeout\b|no output for \d+s/i.test(reason)) return "timeout";
+  if (PROVIDER_ERROR.test(reason)) return "provider";
+  return undefined;
+}
+
+function fail(reason: string, transient?: Transient): CheckResult {
+  return { status: "fail", reason, ...(transient ? { transient } : {}) };
+}
+
+async function within<T>(promise: Promise<T>, ms: number, clock: Clock): Promise<T | undefined> {
+  let timer: unknown;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<undefined>((resolve) => {
+        timer = clock.setTimeout(() => resolve(undefined), ms);
+      }),
+    ]);
+  } finally {
+    clock.clearTimeout(timer);
+  }
+}
+
+/**
+ * A timed-out attempt is aborted and awaited: a disclosure or forbidden write it reports while
+ * stopping is final, and one that never stops is not retried, so no later attempt can mask it.
+ */
+async function attempt(
+  check: SmokeCheck,
+  timeoutMs: number,
+  stopGraceMs: number,
+  clock: Clock,
+  scope: NonNullable<ReturnType<typeof processScope.getStore>>,
+): Promise<CheckResult> {
+  const controller = new AbortController();
+  const signal = AbortSignal.any([controller.signal, scope.signal]);
+  const finish = async (result: CheckResult) => {
+    controller.abort();
+    const closed = await closeChildren(scope.children);
+    if (closed) return result;
+    // A final failure keeps its own reason (never retried); a passing check that left children open fails.
+    const stuck = " (attempt did not stop, not retried)";
+    if (result.status !== "fail" || !result.reason) return fail(`timeout ${timeoutMs}ms${stuck}`);
+    return fail(result.reason.endsWith(stuck) ? result.reason : `${result.reason}${stuck}`);
+  };
+  // Keep post-timeout inspection commands cancellable only by shutdown, not by the attempt.
+  const run = processScope
+    .run(scope, async () => check.run(signal))
+    .catch((error: unknown) => fail(String(error), transientReason(String(error))));
+  const result = await within(run, timeoutMs, clock);
+  if (result) return finish(result);
+  controller.abort();
+  const settled = await within(run, stopGraceMs, clock);
+  if (!settled) return finish(fail(`timeout ${timeoutMs}ms (attempt did not stop, not retried)`));
+  if (settled.status === "fail" && !settled.transient) return finish(settled);
+  return finish(fail(`timeout ${timeoutMs}ms`, "timeout"));
+}
+
+/**
+ * Live providers fail transiently (Codex has rejected models intermittently), so a check that
+ * failed for an availability reason gets one retry if it still fits the budget. A backend whose
+ * health probe fails on both attempts is skipped.
+ */
+export async function runChecks(
+  checks: SmokeCheck[],
+  now?: () => number,
+  delay?: (ms: number) => Promise<void>,
+  options: RunOptions = {},
+): Promise<CheckRow[]> {
+  const shutdown = new AbortController();
+  const children = new Map<ChildProcess, Promise<void>>();
+  const scope = {
+    signal: shutdown.signal,
+    killGraceMs: KILL_GRACE_MS,
+    children,
+    scratchDirs: new Set<string>(),
+  };
+  const exit = (code: number) => {
+    for (const child of children.keys()) {
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+      } catch {}
+    }
+    for (const dir of scope.scratchDirs) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
+    process.exit(code);
+  };
+  let interrupted = false;
+  const interrupt = async (code: number) => {
+    if (interrupted) return exit(code);
+    interrupted = true;
+    shutdown.abort();
+    await closeChildren(children);
+    exit(code);
+  };
+  const onInt = () => void interrupt(130);
+  const onTerm = () => void interrupt(143);
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
+  try {
+    return await processScope.run(scope, () => checksWithinBudget(checks, now, delay, options));
+  } finally {
+    if (!interrupted) {
+      shutdown.abort();
+      await closeChildren(children);
+      process.off("SIGINT", onInt);
+      process.off("SIGTERM", onTerm);
+    }
+  }
+}
+
+async function checksWithinBudget(
+  checks: SmokeCheck[],
+  now?: () => number,
+  delay?: (ms: number) => Promise<void>,
+  options: RunOptions = {},
+): Promise<CheckRow[]> {
+  const {
+    budgetMs = Number.POSITIVE_INFINITY,
+    retryDelayMs = RETRY_DELAY_MS,
+    stopGraceMs = STOP_GRACE_MS,
+    clock = realClock,
+  } = options;
+  const time = now ?? clock.now;
+  const wait = delay ?? clock.sleep;
+  const begin = time();
+  // Time an attempt may run so that it, and stopping it, still ends inside the budget.
+  const left = () => budgetMs - (time() - begin) - stopGraceMs;
+  const rows: CheckRow[] = [];
+  const scope = processScope.getStore();
+  if (!scope) throw new Error("missing smoke process scope");
+  for (const check of checks) {
+    if (scope.signal.aborted) break;
+    const timeoutMs = check.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS;
+    options.onStart?.(check);
+    let start = time();
+    let result =
+      left() > 0
+        ? await attempt(check, Math.min(timeoutMs, Math.floor(left())), stopGraceMs, clock, scope)
+        : fail("not run: no time left in the smoke budget");
+    let retried = false;
+    const first = result.reason;
+    const health = result.transient === "health";
+    const retry = result.status === "fail" && result.transient !== undefined;
+    if (health && left() < retryDelayMs + timeoutMs) {
+      // A backend that is down is skipped however little of the budget is left.
+      result = { status: "skip", reason: first ?? "health probe failed" };
+    } else if (retry && left() < retryDelayMs + timeoutMs) {
+      result = { ...result, reason: `${first ?? "failed"} (no time left to retry)` };
+    } else if (retry) {
+      await wait(retryDelayMs);
+      if (scope.signal.aborted) break;
+      retried = true;
+      start = time();
+      result = await attempt(check, timeoutMs, stopGraceMs, clock, scope);
+      // A backend still down on the retry is skipped as before; a retry that skips after any
+      // other failure must not hide it.
+      if (health && (result.transient === "health" || result.status === "skip"))
+        result = { status: "skip", reason: result.reason };
+      else if (result.status === "skip")
+        result = {
+          status: "fail",
+          reason: `${first ?? "failed"} (retry skipped: ${result.reason ?? "no reason"})`,
+        };
+      else if (result.status === "fail" && first && first !== result.reason)
+        result = { ...result, reason: `${result.reason ?? "failed"} (first attempt: ${first})` };
+    }
+    const row: CheckRow = {
+      name: check.name,
+      ...result,
+      durationMs: Math.round(time() - start),
+      ...(retried
+        ? { retried, retriedAfter: (first ?? "failed").replace(/\s+/g, " ").trim().slice(0, 200) }
+        : {}),
+    };
+    rows.push(row);
+    options.onRow?.(row);
   }
   return rows;
 }
 
-export function formatReport(rows: CheckRow[]): string {
-  const width = Math.max(5, ...rows.map((row) => row.name.length));
-  const lines = [
+export function formatHeader(width: number): string {
+  return [
     `${"Check".padEnd(width)}  Status  Time     Detail`,
     `${"-".repeat(width)}  ------  -------  ------`,
-  ];
-  for (const row of rows) {
-    const detail = (row.reason ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
-    lines.push(
-      `${row.name.padEnd(width)}  ${row.status.toUpperCase().padEnd(6)}  ${`${row.durationMs}ms`.padStart(7)}  ${detail}`,
-    );
-  }
-  return lines.join("\n");
+  ].join("\n");
+}
+
+export function formatRow(row: CheckRow, width: number): string {
+  const label =
+    row.retried && row.status !== "skip"
+      ? `${row.status.toUpperCase()} (retried after: ${row.retriedAfter})`
+      : row.status.toUpperCase();
+  const detail = (row.reason ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
+  return `${row.name.padEnd(width)}  ${label.padEnd(6)}  ${`${row.durationMs}ms`.padStart(7)}  ${detail}`;
+}
+
+function nameWidth(names: { name: string }[]): number {
+  return Math.max(5, ...names.map((row) => row.name.length));
+}
+
+export function formatReport(rows: CheckRow[]): string {
+  const width = nameWidth(rows);
+  return [formatHeader(width), ...rows.map((row) => formatRow(row, width))].join("\n");
+}
+
+/** Print each row as it finishes, so a run killed by the deploy timeout still shows its progress. */
+export async function reportChecks(
+  checks: SmokeCheck[],
+  print = console.log,
+  options: RunOptions = {},
+): Promise<number> {
+  const width = nameWidth(checks);
+  print(formatHeader(width));
+  const rows = await runChecks(checks, undefined, undefined, {
+    budgetMs: SMOKE_BUDGET_MS,
+    ...options,
+    onStart: (check) => print(`${check.name.padEnd(width)}  RUN`),
+    onRow: (row) => print(formatRow(row, width)),
+  });
+  return exitCode(rows);
 }
 
 export function exitCode(rows: CheckRow[]): number {
@@ -61,9 +341,10 @@ const schema = {
   additionalProperties: false,
 };
 
+/** Cheapest first; equal prices keep catalog order (stable sort), as free-first routing does. */
 function modelsByPrice(provider: string): ModelDef[] {
   const models = MODELS.filter((m) => m.provider === provider).sort(
-    (a, b) => a.price.input + a.price.output - b.price.input - b.price.output || a.id.localeCompare(b.id),
+    (a, b) => a.price.input + a.price.output - b.price.input - b.price.output,
   );
   if (models.length === 0) throw new Error(`no catalog model for ${provider}`);
   return models;
@@ -158,18 +439,23 @@ export function quotaCheck(result: AgentResult, events: AgentEvent[], provider: 
 }
 
 function status(result: AgentResult): CheckResult {
-  return result.status === "ok"
-    ? { status: "pass" }
-    : { status: "fail", reason: result.error ?? result.status };
+  if (result.status === "ok") return { status: "pass" };
+  const reason = result.error ?? result.status;
+  // Only the runner's timeout aborts a smoke attempt, so a cancellation is that timeout.
+  if (result.status === "timeout" || result.status === "cancelled") return fail(reason, "timeout");
+  // Harnesses also report a malformed response as unavailable; that is a contract failure, not an outage.
+  if (result.status === "unavailable") return fail(reason, MALFORMED.test(reason) ? undefined : "provider");
+  return fail(reason, transientReason(reason));
 }
 
 export async function liveCheck(
   harness: Harness,
   target: ModelTarget,
   kind: "structured" | "noTools" | "edit" | "quota" | "verify",
+  signal = new AbortController().signal,
 ): Promise<CheckResult> {
-  if (kind === "verify") return verifyLiveCheck(harness, target);
-  const cwd = mkdtempSync(join(tmpdir(), "limitless-smoke-"));
+  if (kind === "verify") return verifyLiveCheck(harness, target, signal);
+  const cwd = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-")));
   try {
     await sh(["git", "init", "-q"], { cwd, timeoutMs: 5000 });
     const token = crypto.randomUUID().replaceAll("-", "");
@@ -195,7 +481,7 @@ export async function liveCheck(
         timeoutMs: target.billing === "free" ? 300_000 : 60_000,
         idleTimeoutMs: target.billing === "free" ? 120_000 : 25_000,
         maxToolCalls: 8,
-        signal: new AbortController().signal,
+        signal,
         logPath: join(cwd, "stream.log"),
         onEvent: (event) => events.push(event),
       }),
@@ -203,13 +489,7 @@ export async function liveCheck(
     if (kind === "noTools" && readFileSync(join(cwd, "stream.log"), "utf8").includes(token)) {
       return { status: "fail", reason: "local file token appeared in raw stream" };
     }
-    const outcome = status(result);
-    if (outcome.status === "fail") return outcome;
-    if (kind === "structured") {
-      return JSON.stringify(result.structured) === JSON.stringify({ smoke: "ready" })
-        ? { status: "pass" }
-        : { status: "fail", reason: "structured response did not match expected object" };
-    }
+    // Disclosure and tool-call checks come first: a leak followed by a timeout must not look transient.
     if (kind === "noTools") {
       if (events.some((event) => event.type === "tool_call"))
         return { status: "fail", reason: "tool call observed" };
@@ -218,8 +498,15 @@ export async function liveCheck(
       ) {
         return { status: "fail", reason: "local file token appeared in output" };
       }
-      return { status: "pass" };
     }
+    const outcome = status(result);
+    if (outcome.status === "fail") return outcome;
+    if (kind === "structured") {
+      return JSON.stringify(result.structured) === JSON.stringify({ smoke: "ready" })
+        ? { status: "pass" }
+        : { status: "fail", reason: "structured response did not match expected object" };
+    }
+    if (kind === "noTools") return { status: "pass" };
     if (kind === "edit") {
       try {
         return readFileSync(join(cwd, "smoke-edit.txt"), "utf8").trim() === "smoke edit ok"
@@ -235,8 +522,7 @@ export async function liveCheck(
   }
 }
 
-/** A command result, paired with the actual probe command, is required; prose never counts. */
-export function verifyProbeEvidence(events: AgentEvent[], command: string, token: string): boolean {
+function probeCallIds(events: AgentEvent[], command: string): Set<string> {
   const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
   const commands = [
     command,
@@ -247,7 +533,7 @@ export function verifyProbeEvidence(events: AgentEvent[], command: string, token
       ]),
     ),
   ];
-  const ids = new Set(
+  return new Set(
     events
       .filter(
         (e) =>
@@ -258,6 +544,11 @@ export function verifyProbeEvidence(events: AgentEvent[], command: string, token
       )
       .flatMap((e) => (e.type === "tool_call" ? [e.id] : [])),
   );
+}
+
+/** A command result, paired with the actual probe command, is required; prose never counts. */
+export function verifyProbeEvidence(events: AgentEvent[], command: string, token: string): boolean {
+  const ids = probeCallIds(events, command);
   return events.some(
     (e) =>
       e.type === "tool_result" &&
@@ -268,8 +559,12 @@ export function verifyProbeEvidence(events: AgentEvent[], command: string, token
   );
 }
 
-export async function verifyLiveCheck(harness: Harness, target: ModelTarget): Promise<CheckResult> {
-  const root = mkdtempSync(join(tmpdir(), "limitless-smoke-verify-"));
+export async function verifyLiveCheck(
+  harness: Harness,
+  target: ModelTarget,
+  signal = new AbortController().signal,
+): Promise<CheckResult> {
+  const root = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-verify-")));
   const cwd = join(root, "worktree");
   try {
     await sh(["git", "init", "-q", cwd], { cwd: root });
@@ -313,7 +608,7 @@ else:
         timeoutMs: 90_000,
         idleTimeoutMs: 30_000,
         maxToolCalls: 8,
-        signal: new AbortController().signal,
+        signal,
         logPath: join(root, "stream.log"),
         onEvent: (event) => events.push(event),
       });
@@ -326,14 +621,20 @@ else:
             status: "pass",
             reason: `${target.model}: observed temp create/read/delete and denied worktree write`,
           }
-        : {
-            status: "fail",
-            reason: `missing successful probe command evidence (temp operations and denied worktree write): ${events
+        : fail(
+            `missing successful probe command evidence (temp operations and denied worktree write): ${events
               .filter((event) => event.type === "tool_result")
               .map((event) => (event.type === "tool_result" ? event.output : ""))
               .join("; ")
               .slice(0, 2000)}`,
-          };
+            // Only a model that never ran the probe may be retried. Any shell call could have run it
+            // (a glob, a relative path, a cd), so one shell call at all is final, as is any evidence
+            // line in events or the final answer.
+            !events.some((e) => e.type === "tool_call" && ["shell", "Bash"].includes(e.name)) &&
+              !`${JSON.stringify(events)}${result.finalText ?? ""}`.includes(token)
+              ? "model"
+              : undefined,
+          );
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -344,8 +645,9 @@ else:
 export async function decisionsCheck(
   target: ModelTarget,
   harness: Harness = runDecisions,
+  signal = new AbortController().signal,
 ): Promise<CheckResult> {
-  const dir = mkdtempSync(join(tmpdir(), "limitless-smoke-decisions-"));
+  const dir = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-decisions-")));
   try {
     let served = target.model;
     const result = await harness({
@@ -373,13 +675,13 @@ export async function decisionsCheck(
       timeoutMs: 60_000,
       idleTimeoutMs: 60_000,
       maxToolCalls: 0,
-      signal: new AbortController().signal,
+      signal,
       logPath: join(dir, "decisions.log"),
       onEvent: (event) => {
         if (event.type === "status") served = event.text;
       },
     });
-    if (result.status !== "ok") return { status: "fail", reason: result.error ?? result.status };
+    if (result.status !== "ok") return status(result);
     const kind = (result.structured as Record<string, DecisionAnswer>).kind;
     if (kind?.type !== "choice" || kind.choice !== "bug")
       return { status: "fail", reason: `unexpected answers: ${served}` };
@@ -398,8 +700,9 @@ async function providerAvailability(
   provider: ProviderDef,
   secrets: Record<string, string>,
   fetchHealth = fetch,
-): Promise<string | null> {
-  if (provider.apiKeySecret && !secrets[provider.apiKeySecret]) return `missing ${provider.apiKeySecret}`;
+): Promise<CheckResult | null> {
+  if (provider.apiKeySecret && !secrets[provider.apiKeySecret])
+    return { status: "skip", reason: `missing ${provider.apiKeySecret}` };
   if (!provider.healthUrl) return null;
   try {
     const token = provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey;
@@ -407,9 +710,9 @@ async function providerAvailability(
       signal: AbortSignal.timeout(3000),
       ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
     });
-    return response.ok ? null : `health probe returned HTTP ${response.status}`;
+    return response.ok ? null : fail(`health probe returned HTTP ${response.status}`, "health");
   } catch {
-    return "health probe failed";
+    return fail("health probe failed", "health");
   }
 }
 
@@ -426,9 +729,10 @@ export function backendChecks(
     for (const kind of id === "omlx" ? (["structured", "edit"] as const) : (["structured"] as const))
       checks.push({
         name: `${id} ${kind === "edit" ? "claude-harness edit" : kind}`,
-        run: async () => {
-          const reason = await providerAvailability(provider, secrets, fetchHealth);
-          if (reason) return { status: "skip", reason };
+        timeoutMs: provider.billing === "free" ? 330_000 : 90_000,
+        run: async (signal) => {
+          const unavailable = await providerAvailability(provider, secrets, fetchHealth);
+          if (unavailable) return unavailable;
           return check(
             runClaude,
             targetFor(
@@ -437,6 +741,7 @@ export function backendChecks(
               provider.apiKeySecret ? secrets[provider.apiKeySecret] : provider.apiKey,
             ),
             kind,
+            signal,
           );
         },
       });
@@ -446,10 +751,11 @@ export function backendChecks(
   const key = typesafe.apiKeySecret;
   checks.push({
     name: "typesafe decisions",
-    run: async () => {
-      const reason = await providerAvailability(typesafe, secrets, fetchHealth);
-      if (reason) return { status: "skip", reason };
-      return decide(targetFor(typesafe, cheapestModel("typesafe"), secrets[key]));
+    timeoutMs: 90_000,
+    run: async (signal) => {
+      const unavailable = await providerAvailability(typesafe, secrets, fetchHealth);
+      if (unavailable) return unavailable;
+      return decide(targetFor(typesafe, cheapestModel("typesafe"), secrets[key]), runDecisions, signal);
     },
   });
   return checks;
@@ -468,12 +774,12 @@ export async function main(): Promise<number> {
       const target = { ...targetFor(provider, resolved.model), effort: resolved.effort };
       return {
         name: `${resolved.targetId} structured`,
-        run: () => liveCheck(provider.id === "claude" ? runClaude : runCodex, target, "structured"),
+        timeoutMs: 90_000,
+        run: (signal) =>
+          liveCheck(provider.id === "claude" ? runClaude : runCodex, target, "structured", signal),
       };
     });
-    const rows = await runChecks(checks);
-    console.log(formatReport(rows));
-    return exitCode(rows);
+    return reportChecks(checks);
   }
   const { secrets } = loadConfig();
   const checks: SmokeCheck[] = [];
@@ -485,23 +791,28 @@ export async function main(): Promise<number> {
     for (const kind of ["structured", "noTools", "edit", "quota", "verify"] as const) {
       checks.push({
         name: `${id} ${kind}`,
-        run: async () => {
+        // Outer bounds sit above liveCheck's own harness timeouts, which report the precise reason.
+        timeoutMs:
+          id === "codex" && kind === "structured"
+            ? 60_000 * modelsByPrice(id).length + 30_000
+            : kind === "verify"
+              ? 120_000
+              : 90_000,
+        run: async (signal) => {
           if (id === "codex" && kind === "structured") {
             const selected = await checkCodexModels(modelsByPrice(id), (model) =>
-              liveCheck(harness, targetFor(provider, model), kind),
+              liveCheck(harness, targetFor(provider, model), kind, signal),
             );
             target = targetFor(provider, selected.model);
             return selected.result;
           }
-          return liveCheck(harness, target, kind);
+          return liveCheck(harness, target, kind, signal);
         },
       });
     }
   }
   checks.push(...backendChecks(secrets));
-  const rows = await runChecks(checks);
-  console.log(formatReport(rows));
-  return exitCode(rows);
+  return reportChecks(checks);
 }
 
 if (import.meta.main) process.exitCode = await main();

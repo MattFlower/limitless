@@ -7,7 +7,7 @@ How the factory runs day to day, where to look when something breaks, and how ch
 | Component | Where | Managed by | Logs |
 |---|---|---|---|
 | Daemon (API, UI, scheduler, pipeline) | Mac, `~/.limitless/app` (release checkout of `main`) | launchd `cc.mattflower.limitless` | `~/.limitless/logs/cc.mattflower.limitless.log` |
-| Local model (Swift-1.5 Qwen3.8 27B MTP) | Mac, `127.0.0.1:8989` | external: oMLX.app / `omlx start` | oMLX server logs |
+| Local model (Qwen3.8 Flash Next; Swift-1.5 27B opt-in) | Mac, `127.0.0.1:8989` | external: oMLX.app / `omlx start` | oMLX server logs |
 | GPU model (Qwen 3.8 27B, CUDA llama.cpp) | twilight, `:8080` (LAN, API key) | systemd user unit `limitless-llama` (linger on) | `journalctl --user -u limitless-llama` on twilight |
 | Public webhook tunnel | Cloudflare → `limitless.mattflower.cc/webhooks/*` | launchd `cc.mattflower.limitless-tunnel` (opt-in) | `~/.limitless/logs/cc.mattflower.limitless-tunnel.log` |
 | Data | `~/.limitless/` — `limitless.db`, `repos/` (bare caches), `work/` (worktrees), `runs/<id>/inv-*.log` (raw agent streams) | the daemon | — |
@@ -23,6 +23,7 @@ limitless providers                 # health + quota per provider
 limitless ls                        # recent runs
 limitless logs <run> -f             # follow a run
 limitless gc --dry-run              # preview hourly retention cleanup
+limitless gates clear-cache [--repo owner/name]  # drop cached passing baselines (all repos by default)
 limitless service status            # launchd units, release commit, health
 limitless deploy                    # ship origin/main (gated, auto-rollback)
 limitless deploy --smoke            # also run live CLI contract checks before restart
@@ -48,6 +49,10 @@ limitless deploy --smoke            # also run live CLI contract checks before r
    (the worktree and run state are persisted; a round whose implementation already committed
    goes straight to its checks).
 
+Releases before panel review rosters (#136) refuse to start when `config.toml` sets `[review] mode`
+or `[review.rosters]`. Leave both unset until the release that added them is known good: a rollback
+to an older release fails at startup until they are removed.
+
 Changing the launchd units themselves (PATH, arguments) needs `limitless service install`.
 An interrupted deploy logs `interrupted, rolling back...` and attempts to restore the previous
 checkout and resume the scheduler. If the process was killed during rollback, inspect
@@ -68,9 +73,18 @@ Codex no-tools calls ignore user configuration and disable MCP, plugins, apps, c
 sub-agents, image viewing, and web search; they retain session rollouts for quota inspection.
 If the ChatGPT account rejects the cheapest Codex model, the runner tries the next catalog model
 in price order and reports which model it used. Other CLI errors fail the check.
+A check that fails for a transient availability reason (a timeout, a provider or network error
+such as HTTP 5xx, a rate limit or a connection failure, or a failed health probe) is retried once,
+and a passing retry still reports the first attempt's reason. Assertion failures (a disclosed
+token, a tool call, a forbidden worktree write, wrong structured output) are never retried. Each
+check has its own timeout, cut to what is left of the smoke budget (inside the deploy gate's
+900 s); a retry is not started when the remaining budget is shorter than that timeout. A timed-out
+attempt is cancelled and awaited, so a leak it reports while stopping still fails the check, and
+one that does not stop is not retried. Each result line is printed as the check finishes, so a
+killed run still shows which checks passed and which one was running.
 
 The oMLX structured / Claude-harness edit and twilight checks are skipped when their required key is absent or their health probe
-fails. OpenRouter is skipped when `OPENROUTER_API_KEY` is absent from the Limitless secrets file or
+fails on both attempts. OpenRouter is skipped when `OPENROUTER_API_KEY` is absent from the Limitless secrets file or
 environment. An attempted check that fails exits nonzero; skips alone do not. Use
 `limitless deploy [ref] --smoke` to require these checks during deployment.
 
@@ -99,10 +113,11 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 
 - **Mac (oMLX):** start the server with oMLX.app / `omlx start`; Limitless does not manage it.
   Put `OMLX_API_KEY` in `~/.config/limitless/secrets.env` (used by both inference transports and
-  health probes). Select `omlx/qwen-27b`, backend `Swift-1.5-Qwen3.8-27b-oQ8e-mtp`.
+  health probes). The default is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-REAP-288-MLX-4bit`);
+  `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in and needs far more memory.
   Limitless allows 4 concurrent requests by default; override with `[providers.omlx]` and
   `max_concurrent = 8` in `config.toml`. This does not tune oMLX's own scheduler.
-  Use `omlx/qwen-27b@none` or `@high` for tool-free roles (thinking off/on); bare selections
+  Use `omlx/qwen-flash@none` or `@high` for tool-free roles (thinking off/on); bare selections
   preserve server-default thinking and are required for agentic roles such as review/verify.
   Built-in triage/summarize/chat prefer oMLX, but the committed `routing/policy.json` overlay
   remains authoritative where present until replaced by eval-backed policy.
@@ -135,15 +150,18 @@ Evaluations run in the daemon using its catalog, harness adapters, pipeline role
 provider tracker. Start the daemon first; the CLI only submits and reads HTTP requests:
 
 ```sh
-limitless eval run triage --models omlx/qwen-27b@none,omlx/qwen-27b@high,claude/haiku --k 2 --max-usd 1 --follow
+limitless eval run triage --models omlx/qwen-flash@none,omlx/qwen-flash@high,claude/haiku --k 2 --max-usd 1 --follow
 limitless eval run triage --models claude/haiku --cases triage-001,triage-002 --no-cache
 limitless eval run review --models openrouter/gpt-6-luna --follow
 limitless eval run review --systems systems.json --follow   # {"systems": [{name, mode: "single", finders: [{target, prompt: "standard"}], implementerReport}]}
 limitless eval run review --systems panel.json --follow     # mode "panel": parallel finders, prompt "standard" | "adversarial" | "careful", plus verifier: {target}
+limitless eval run review --systems roster.json --follow    # {name, roster: "standard", targets: [one per roster finder, then per lens], lenses?, verifier: {target}, implementerReport}
 limitless eval run verify --models openrouter/gpt-6-luna --follow
 limitless eval report <eval-id>
 limitless eval report <eval-id> --json
 limitless eval regrade <eval-id>   # review: recompute grades from stored outputs, no model calls
+limitless eval cancel <eval-id>    # stop a running eval; it ends interrupted
+limitless eval resume <eval-id>    # continue an interrupted or failed eval; changed trials run again
 ```
 
 Use catalog IDs shown by the daemon's `/api/models` endpoint. `triage`, `review`, and `verify` are supported, including models absent from the routing policy. Defaults
@@ -172,8 +190,8 @@ trials. Already-started calls finish and retain their full costs, so concurrent 
 threshold: by at most N−1 in-flight trials per provider group (N being that group's concurrency),
 plus whatever other provider groups have in flight. Failed calls also consume metered budget; API-equivalent subscription costs do not.
 
-The SHA-256 cache identity includes model ID, selected harness, prompt and system additions, strict
-JSON schema and trial index. Only schema-valid `ok` outputs are reusable, even when they failed
+The SHA-256 cache identity includes model ID, selected harness, each target's provider, backend
+model and effort, prompt and system additions, strict JSON schema and trial index. Only schema-valid `ok` outputs are reusable, even when they failed
 grading. Cache replay re-grades current gold, adds zero new cost/tokens, and leaves provider quota and
 health untouched (cached outputs remain usable when the provider is unavailable). Original cost, tokens and latency are retained in trial cache provenance. Gold-only
 changes do not invalidate the cache; `--no-cache` forces fresh calls. Historical reports use their
@@ -201,15 +219,20 @@ model. Denominators and comparison coverage are included in both text and JSON:
   in JSON and `n/a` in text.
 
 The API provides `POST /api/evals` with `{role, models | systems, k?, maxUsd?, concurrency?, caseIds?, cache?}` (202 with `{id}`),
-`GET /api/evals` to list runs, and `GET /api/evals/:id` for the run, summaries and trials. Mutations use
+`GET /api/evals` to list runs, `GET /api/evals/:id` for the run, summaries and trials,
+`POST /api/evals/:id/cancel` (returns `{id, status}`) and `POST /api/evals/:id/resume` with
+`{}` (202 with `{id, resumedFrom}`). Mutations use
 the usual local Origin and JSON content-type rules; Cloudflare tunnel requests are refused.
 
-Runs progress from `queued` to `running`, then `completed`, `budget_exhausted` or `failed`. Completed
-means execution ended, not that candidates passed. Trial errors and skips remain visible in partial
-reports. Daemon shutdown aborts active calls and releases slots; startup marks interrupted evals
-failed, retaining completed trials for cache reuse on a new submission. In-flight trials interrupted
-by a crash are errors with unknown final usage/latency; queued trials are skipped. Unknown latency is
-excluded from the p50. `--follow` polls until any
+Runs progress from `queued` to `running`, then `completed`, `budget_exhausted`, `failed` or
+`interrupted`. Completed means execution ended, not that candidates passed. Trial errors and skips
+remain visible in partial reports. Daemon shutdown and `limitless eval cancel <eval-id>` abort active
+calls, release slots and end the run `interrupted`; startup marks evals left queued or running by a
+crash `interrupted` too. Unfinished trials (queued, or in flight with unknown final usage/latency)
+are skipped and unscored. Nothing resumes automatically: `limitless eval resume <eval-id>`
+continues an interrupted or failed eval as a new linked run that copies finished trials whose cache
+key is unchanged and runs the rest again, against a `maxUsd` that covers the
+whole chain (see [EVALS.md](EVALS.md)). Unknown latency is excluded from the p50. `--follow` polls until any
 terminal state and prints a final report. The Evals UI lists runs, displays per-trial reports, and
 compares latest completed evidence in a roles-by-models eligibility matrix. Other role graders remain pending.
 

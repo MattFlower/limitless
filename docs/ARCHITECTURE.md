@@ -14,8 +14,11 @@ and delivers a pull request — while spending as little of your paid AI capacit
    factory does next. This makes runs debuggable, resumable and cheap. (Every competitor that
    let an LLM orchestrate — see research/01 pitfalls — got runaway loops and cost blowups.)
 2. **External verification beats self-assessment.** The implementer never grades its own work.
-   Gates are run by the factory, reviews are done by a *different vendor's* model, and acceptance
-   scenarios are written by an author who never sees the implementation (research/02 §1, §3, §4).
+   Gates are run by the factory, the review verdict comes from a *different vendor's* model where
+   one is available, and acceptance scenarios are written by an author who never sees the
+   implementation (research/02 §1, §3, §4). In panel review mode one finder is deliberately from
+   the implementer's family, possibly its own model in a fresh session (recorded in the panel
+   record); nothing it reports blocks until a verifier that did not raise it confirms it.
 3. **Spend is a first-class dimension.** Every invocation records tokens, $ (metered) and
    $-equivalent (subscription). Routing picks the cheapest model that is *capable enough* for the
    role, and quota headroom on subscriptions is tracked from live rate-limit telemetry.
@@ -102,6 +105,22 @@ Gate suites (baseline, post-change, post-rebase, eval trials) share a process-wi
 passed on the baseline, fails after the change, and whose output names no changed file is re-run
 once; a pass on retry is recorded as `flaky` (a non-blocking warning with both outputs kept).
 
+Prepare caches the baseline in `passing_baselines`, keyed by repo, base SHA, gate commands and an
+environment hash (lockfiles, Bun version, platform/arch, Limitless build SHA, and a digest of PATH
+and toolchain variables such as `npm_config_*`, `NODE_*`, `LD_*`, plus any names listed in
+`[gates] baseline_env`; values are hashed, never stored, and secret-looking names in the prefix
+families are excluded, while known settings such as `GOPRIVATE` and `NODE_TLS_REJECT_UNAUTHORIZED`
+and operator-listed names are always included).
+**Only a baseline where setup and every check passed is cached**: a failing base (possibly flaky,
+even after its retry) runs again on every run, so it can never turn a later regression into a
+non-blocking `still_failing`; a fresh failing baseline evicts any cached pass for its key instead.
+Cacheable lookups run in a per-key single flight, so concurrent runs on one base execute the
+baseline once; if the flight's baseline fails, its waiters run theirs concurrently. Entries record
+the writing run and time, expire after seven days (removed by `gc`), and can be dropped with
+`limitless gates clear-cache [--repo owner/name]`. `limitless run --no-baseline-cache` or
+`[gates] baseline_cache = false` skips the lookup and the single flight; a passing bypass baseline
+refreshes the entry. Without a known Limitless build SHA the cache is neither read nor written.
+
 The optional preview configuration is validated and saved from the base revision during prepare,
 before model calls. A matching committed diff starts an isolated preview immediately before a new
 verify attempt; reused round results do not start one. Build and seed use scratch HOME/TMPDIR,
@@ -143,7 +162,7 @@ lockfile edits outside dependency tasks, and files touched outside the planned s
 | 5 | Claude Fable 5.1, Claude Opus 5.5, GPT-6 Astra | (OpenRouter frontier — last resort) |
 | 4 | Claude Sonnet 5, GPT-6 Sol | Kimi / MiniMax / DeepSeek-class via OpenRouter |
 | 3 | GPT-6 Luna, Claude Haiku 4.5 | GLM Flash / DeepSeek Flash via OpenRouter |
-| 2 | — | Swift-1.5 Qwen3.8 27B MTP (`omlx/qwen-27b`, Mac), twilight llama.cpp models |
+| 2 | — | Qwen3.8 Flash Next (`omlx/qwen-flash`, Mac, default) and Swift-1.5 Qwen3.8 27B MTP (`omlx/qwen-27b`, opt-in), twilight llama.cpp models |
 
 The primary Mac backend is **oMLX**, managed externally by oMLX.app / `omlx start` at
 `http://127.0.0.1:8989` (port 8989). Set `OMLX_API_KEY` in
@@ -155,9 +174,11 @@ Limitless defaults to 4 concurrent oMLX requests; override in `config.toml` with
 max_concurrent = 8
 ```
 
-Select `omlx/qwen-27b` for backend `Swift-1.5-Qwen3.8-27b-oQ8e-mtp`. Tool-free roles accept
-`omlx/qwen-27b@none` / `omlx/qwen-27b@high` to turn thinking off/on; compare them with
-`limitless eval run triage --models omlx/qwen-27b@none,omlx/qwen-27b@high --follow`.
+The default local model is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-REAP-288-MLX-4bit`);
+`omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first routing
+among free models the policy does not name, take catalog order, so they use Flash. Tool-free roles accept
+`omlx/qwen-flash@none` / `omlx/qwen-flash@high` to turn thinking off/on; compare them with
+`limitless eval run triage --models omlx/qwen-flash@none,omlx/qwen-flash@high --follow`.
 Agentic roles require the bare ID, preserving server-default thinking. Built-in triage,
 summarize and chat prefer oMLX; the committed `routing/policy.json` overlay remains authoritative
 where present. `limitless local up|down|status` only reports Mac endpoint reachability, including
@@ -173,7 +194,9 @@ does not remove existing installations.
   rollout after every `codex exec`. Reserves are config (default: Codex stops at 90% to honor the
   "leave 10%" rule; Claude stops at 80% five-hour so your interactive use isn't starved),
 - **budget** — OpenRouter spend vs. the $50 cap (and per-run budgets),
-- **vendor constraints** — reviewer/verifier vendor ≠ implementer vendor.
+- **vendor constraints** — the reviewer avoids the implementer's vendor. A panel verifier never
+  reuses a model that raised the candidate; it prefers a vendor that neither raised it nor
+  implemented the change, then the implementer's, then a raising vendor.
 
 When two subscriptions can both serve a role, the router prefers the one with **more headroom**,
 spreading load across Claude and ChatGPT.

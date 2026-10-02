@@ -479,16 +479,20 @@ async function pinFixture(extra: [string, string][] = []) {
 test("policy CLI keeps committed owner pins for implement while unpinned cells update", async () => {
   const { io, files, writes, printed, local, subscription } = await pinFixture();
   const committed = JSON.parse(files.get("routing/policy.json") ?? "{}");
-  const pin = JSON.parse(files.get("routing/overrides.json") ?? "{}")["implement.medium"];
-  const message = `pinned by owner decision (${pin.decided}): ${pin.reason}`;
+  const pins = JSON.parse(files.get("routing/overrides.json") ?? "{}");
+  const pinned = (cell: string) =>
+    `pinned by owner decision (${pins[`implement.${cell}`].decided}): ${pins[`implement.${cell}`].reason}`;
+  const message = pinned("medium");
   await evalCommand(["policy"], {}, io);
   const preview = printed.join("\n");
   expect(writes).toEqual([]);
   expect(preview).toContain("@@ triage.default @@");
   expect(preview).not.toContain("@@ implement.");
-  expect(preview).not.toContain(subscription);
+  // The committed triage chain may name the evidence model; no proposed chain may.
+  const proposed = preview.split("\n").filter((line) => line.startsWith("+ "));
+  expect(proposed.join("\n")).not.toContain(subscription);
   expect(preview).toContain(`implement.medium: ${message}`);
-  expect(preview).toContain(`implement.large: ${message}`);
+  expect(preview).toContain(`implement.large: ${pinned("large")}`);
   printed.length = 0;
   await evalCommand(["policy"], { write: true }, io);
   expect(printed.slice(0, -1).join("\n")).toBe(preview);
@@ -496,7 +500,7 @@ test("policy CLI keeps committed owner pins for implement while unpinned cells u
   const written = JSON.parse(files.get("routing/policy.json") ?? "{}");
   expect(written).toEqual({ ...committed, triage: { ...committed.triage, default: [local] } });
   for (const cell of ["trivial", "small", "medium", "large"])
-    expect(written.implement[cell]).toEqual(["claude/opus", "codex/sol@medium"]);
+    expect(written.implement[cell]).toEqual(committed.implement[cell]);
   const report = files.get("routing/EVIDENCE.md") ?? "";
   const medium = report.slice(report.indexOf("## implement.medium"));
   expect(medium).toStartWith(`## implement.medium\n\n${message}\n\n`);
@@ -505,7 +509,7 @@ test("policy CLI keeps committed owner pins for implement while unpinned cells u
   expect(medium).toContain("pass rate: 1.0000");
   expect(report).not.toContain("Update implement.");
   expect(report).toContain("Update triage.default:");
-  expect(report).toContain(`## implement.large\n\n${message}\n`);
+  expect(report).toContain(`## implement.large\n\n${pinned("large")}\n`);
   expect(report.slice(report.indexOf("## implement.large"))).not.toContain("| Model / source");
 });
 
@@ -556,7 +560,7 @@ test.each([
   ["bad date format", JSON.stringify({ "implement.medium": { ...valid, decided: "2026-9-28" } })],
   ["impossible date", JSON.stringify({ "implement.medium": { ...valid, decided: "2026-02-30" } })],
   ["extra field", JSON.stringify({ "implement.medium": { ...valid, by: "me" } })],
-  ["no explicit chain", JSON.stringify({ "review.default": valid })],
+  ["no explicit chain", JSON.stringify({ "verify.default": valid })],
 ])("policy CLI rejects overrides with %s before writing", async (_name, text) => {
   const { io, writes } = await pinFixture([["routing/overrides.json", text]]);
   await expect(evalCommand(["policy"], { write: true }, io)).rejects.toThrow("routing/overrides.json");
@@ -626,6 +630,27 @@ test("policy CLI keeps the committed triage pin", async () => {
   files.set("routing/overrides.json", readFileSync(join(root, "routing/overrides.json"), "utf8"));
   const committed = JSON.parse(files.get("routing/policy.json") ?? "{}");
   await evalCommand(["policy"], { write: true }, io);
-  expect(printed.join("\n")).toContain("triage.default: pinned by owner decision (2026-09-29)");
+  const { decided } = JSON.parse(files.get("routing/overrides.json") ?? "{}")["triage.default"];
+  expect(printed.join("\n")).toContain(`triage.default: pinned by owner decision (${decided})`);
   expect(JSON.parse(files.get("routing/policy.json") ?? "{}")).toEqual(committed);
+});
+
+test("eval resume and cancel CLI print the new run ID and the cancelled status", async () => {
+  const printed: string[] = [];
+  const posted: string[] = [];
+  const io = {
+    async api<T>(path: string, init?: RequestInit): Promise<T> {
+      posted.push(`${init?.method} ${path}`);
+      return (
+        path.endsWith("/resume") ? { id: "eval-new", resumedFrom: "eval-old" } : { status: "interrupted" }
+      ) as T;
+    },
+    print: (text: string) => printed.push(text),
+    wait: async () => {},
+  };
+  await evalCommand(["resume", "eval-old"], {}, io);
+  await evalCommand(["cancel", "eval-old"], {}, io);
+  expect(posted).toEqual(["POST /api/evals/eval-old/resume", "POST /api/evals/eval-old/cancel"]);
+  expect(printed).toEqual(["eval-new (resumes eval-old)", "eval-old: interrupted"]);
+  await expect(evalCommand(["resume"], {}, io)).rejects.toThrow("eval resume <eval-id>");
 });

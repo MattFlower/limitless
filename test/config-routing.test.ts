@@ -1,9 +1,10 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import { DEFAULT_ROSTERS } from "../src/pipeline/review-system.ts";
 import { PROVIDERS } from "../src/router/catalog.ts";
 
 test("Dependabot routing defaults to free-first and accepts either configured mode", () => {
@@ -19,6 +20,30 @@ test("Dependabot routing defaults to free-first and accepts either configured mo
     }
     writeFileSync(join(configDir, "config.toml"), '[routing]\ndependabot = "other"\n');
     expect(config).toThrow('routing.dependabot must be "free_first" or "policy"');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the baseline cache kill switch defaults on and accepts only booleans", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-gates-config-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  try {
+    expect(config().baselineCache).toBe(true);
+    for (const value of [true, false]) {
+      writeFileSync(join(configDir, "config.toml"), `[gates]\nbaseline_cache = ${value}\n`);
+      expect(config().baselineCache).toBe(value);
+    }
+    writeFileSync(join(configDir, "config.toml"), '[gates]\nbaseline_cache = "no"\n');
+    expect(config).toThrow("gates.baseline_cache must be true or false");
+    rmSync(join(configDir, "config.toml"));
+    expect(config().baselineEnv).toEqual([]);
+    writeFileSync(join(configDir, "config.toml"), '[gates]\nbaseline_env = ["MY_GATE_FLAG"]\n');
+    expect(config().baselineEnv).toEqual(["MY_GATE_FLAG"]);
+    writeFileSync(join(configDir, "config.toml"), '[gates]\nbaseline_env = "MY_GATE_FLAG"\n');
+    expect(config).toThrow("gates.baseline_env must be an array");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -43,7 +68,9 @@ test("review implementer report defaults to include and accepts only include or 
     }
     // A misspelt key would otherwise silently keep the default.
     writeFileSync(join(configDir, "config.toml"), '[review]\nimplementer-report = "omit"\n');
-    expect(config).toThrow("review.implementer-report: unknown key (allowed: implementer_report)");
+    expect(config).toThrow(
+      "review.implementer-report: unknown key (allowed: implementer_report, mode, rosters)",
+    );
     writeFileSync(join(configDir, "config.toml"), 'review = "omit"\n');
     expect(config).toThrow("review must be a table");
   } finally {
@@ -97,6 +124,68 @@ test("invalid provider concurrency and unknown providers fail config loading", (
     writeFileSync(join(configDir, "config.toml"), "[providers.unknown]\nmax_concurrent = 2\n");
     expect(config).toThrow("providers.unknown: unknown provider");
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("review mode defaults to single; rosters default per profile and are validated", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-review-rosters-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  try {
+    expect(config()).toMatchObject({ reviewMode: "single", reviewRosters: DEFAULT_ROSTERS });
+    writeFileSync(
+      join(configDir, "config.toml"),
+      '[review]\nmode = "panel"\n[review.rosters]\nquick = [{ prompt = "careful", family = "implementer" }]\n',
+    );
+    expect(config()).toMatchObject({
+      reviewMode: "panel",
+      reviewRosters: { ...DEFAULT_ROSTERS, quick: [{ prompt: "careful", family: "implementer" }] },
+    });
+    for (const [toml, message] of [
+      ['mode = "triple"', 'review.mode must be "single" or "panel"'],
+      ["rosters = { quick = [] }", "a roster needs at least one finder"],
+      [
+        'rosters = { deep = [{ prompt = "adversarial", lens = { name = "a", focus = "b" } }] }',
+        "lens finder",
+      ],
+    ]) {
+      writeFileSync(join(configDir, "config.toml"), `[review]\n${toml}\n`);
+      expect(config).toThrow(message);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("roster targets are checked against the catalog at startup; single mode only warns", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-roster-targets-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  const start = (roster: string, mode = "panel") => {
+    const toml = `[review]\nmode = "${mode}"\n[review.rosters]\nstandard = [${roster}]\n`;
+    writeFileSync(join(configDir, "config.toml"), toml);
+    new Factory(loadConfig({ home: join(root, "data"), configDir })).store.close();
+  };
+  try {
+    start(
+      '{ prompt = "adversarial", target = "codex/sol" }, { prompt = "standard", local = true, target = "omlx/qwen-27b" }',
+    );
+    expect(() => start('{ prompt = "adversarial", target = "claude/opsu" }')).toThrow(
+      'review.rosters.standard[0].target claude/opsu: unknown model ID "claude/opsu"',
+    );
+    expect(() =>
+      start('{ prompt = "careful" }, { prompt = "standard", local = true, target = "claude/opus" }'),
+    ).toThrow("review.rosters.standard[1].target claude/opus: a local finder needs a free model");
+    // Single mode uses no roster: a pin a later release dropped must not stop the daemon.
+    expect(warn).not.toHaveBeenCalled();
+    start('{ prompt = "adversarial", target = "claude/opsu" }', "single");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("claude/opsu: unknown model ID"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("(ignored: [review] mode is single)"));
+  } finally {
+    warn.mockRestore();
     rmSync(root, { recursive: true, force: true });
   }
 });

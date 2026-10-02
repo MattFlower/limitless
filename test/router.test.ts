@@ -4,7 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/db/store.ts";
 import { type AgentResult, emptyUsage } from "../src/harness/types.ts";
-import { MODELS, type ModelDef, type Policy, PROVIDERS, type ProviderDef } from "../src/router/catalog.ts";
+import {
+  DEFAULT_POLICY,
+  MODELS,
+  type ModelDef,
+  type Policy,
+  PROVIDERS,
+  type ProviderDef,
+} from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 
@@ -89,6 +96,27 @@ function setup(secrets: Record<string, string> = {}) {
   const tracker = new ProviderTracker(providers, store, reserves, secrets, { openrouter: 50 });
   return { tracker, router: new Router(tracker, policy, models) };
 }
+
+test("verifier routing excludes checkpoints across backends, including pinned targets", () => {
+  const tracker = new ProviderTracker(PROVIDERS, store, reserves, { OMLX_API_KEY: "key" });
+  tracker.setHealthy("omlx", true);
+  tracker.setHealthy("mtplx", true);
+  const router = new Router(tracker, {
+    ...DEFAULT_POLICY,
+    review: { default: ["mtplx/qwen-27b", "omlx/qwen-flash"] },
+  });
+  expect(router.checkpointIdentity("omlx/qwen-27b@high")).toBe(
+    router.checkpointIdentity("mtplx/qwen-27b@none"),
+  );
+  expect(router.checkpointIdentity("omlx/qwen-flash@high")).toBe("omlx/qwen-flash");
+  const constraints = { avoidVendor: "qwen", excludeModels: ["omlx/qwen-27b@high"] };
+  expect(router.route("review", "small", constraints).candidates.map((t) => t.modelId)).toEqual([
+    "omlx/qwen-flash",
+  ]);
+  expect(router.route("review", "small", { ...constraints, only: "mtplx/qwen-27b" }).candidates).toEqual([]);
+  tracker.setHealthy("omlx", false);
+  expect(router.route("review", "small", constraints).candidates).toEqual([]);
+});
 
 test("quota windows keep independent observation times and reject older boundaries", () => {
   let now = 1_000_000;
@@ -782,4 +810,80 @@ test("oMLX catalog targets and authenticated health gate routing", async () => {
   await disabled.probe();
   expect(disabled.unavailableReason("omlx")).toBe("disabled");
   expect(calls).toBe(4);
+});
+
+test("preferVendor, preferNotVendor, free_only and independence-first order review candidates", () => {
+  const local: ProviderDef = {
+    id: "local",
+    label: "Local",
+    harness: "fake",
+    billing: "free",
+    maxConcurrent: 1,
+  };
+  const [sonnet] = models;
+  if (!sonnet) throw new Error("fixture");
+  const tracker = new ProviderTracker([...providers, local], store, reserves, { OPENROUTER_API_KEY: "k" });
+  const review = { review: { default: ["codex/sol|claude/sonnet", "openrouter/ds"] } } as unknown as Policy;
+  const all = [...models, { ...sonnet, id: "local/q", provider: "local", vendor: "qwen" as const }];
+  const router = new Router(tracker, review, all);
+  const ids = (c: Parameters<Router["route"]>[2]) =>
+    router.route("review", "small", c).candidates.map((t) => t.modelId);
+  expect(ids({ preferVendor: "anthropic" })).toEqual(["claude/sonnet", "codex/sol", "openrouter/ds"]);
+  expect(ids({ preferVendor: "openai" })).toEqual(["codex/sol", "claude/sonnet", "openrouter/ds"]);
+  // Other vendors, then the implementer's (preferNotVendor), then avoided ones, then last-resort models.
+  expect(ids({ avoidVendor: ["openai"], preferNotVendor: ["deepseek"] })).toEqual([
+    "claude/sonnet",
+    "openrouter/ds",
+    "codex/sol",
+  ]);
+  expect(ids({ preferNotModels: ["claude/sonnet"], avoidVendor: ["openai"] })).toEqual([
+    "openrouter/ds",
+    "codex/sol",
+    "claude/sonnet",
+  ]);
+  // free_only never offers a paid model, even a pinned one, and offers nothing when local is down.
+  expect(ids({ billing: "free_only", prefer: "codex/sol" })).toEqual(["local/q"]);
+  // Free-first ranks billing above independence unless independence comes first.
+  expect(ids({ billing: "free_first", avoidVendor: ["qwen"] })[0]).toBe("local/q");
+  expect(ids({ billing: "free_first", avoidVendor: ["qwen"], independenceFirst: true }).at(-1)).toBe(
+    "local/q",
+  );
+  expect(ids({ billing: "free_first", independenceFirst: true })[0]).toBe("local/q");
+  tracker.setHealthy("local", false);
+  expect(ids({ billing: "free_only" })).toEqual([]);
+});
+
+test("with the default policy, a verifier never reuses a raising model and prefers another vendor", async () => {
+  const { verifierConstraints } = await import("../src/pipeline/engine.ts");
+  const tracker = new ProviderTracker(PROVIDERS, store, reserves, {});
+  const router = new Router(tracker, DEFAULT_POLICY, MODELS);
+  const verifier = (
+    vendors: string[],
+    raisedBy: string[],
+    implementer = { vendor: "anthropic", modelId: "claude/opus" },
+  ) =>
+    router.route("review", "small", verifierConstraints(vendors, raisedBy, implementer)).candidates[0]
+      ?.modelId;
+  // Raised by an OpenAI finder only: the implementer's vendor, but not its model.
+  expect(verifier(["openai"], ["codex/sol"])).toBe("claude/sonnet");
+  // Raised by both vendors (adversarial and careful): no clean vendor, so another model, never a raiser.
+  tracker.observeWindows("codex", { seven_day: { utilization: 0.8, resetsAt: Date.now() + 86_400_000 } });
+  const both = verifier(["anthropic", "openai"], ["codex/sol", "claude/sonnet"]);
+  expect(both).toBeDefined();
+  expect(["codex/sol", "claude/sonnet", "claude/opus"]).not.toContain(both);
+  // Deep profile: adversarial on codex/astra, careful on the implementer's claude/opus. Both vendors
+  // raised it, so the one that did not implement verifies, even with more Claude headroom.
+  const deep = router.route(
+    "review",
+    "large",
+    verifierConstraints(["anthropic", "openai"], ["codex/astra", "claude/opus"], {
+      vendor: "anthropic",
+      modelId: "claude/opus",
+    }),
+  );
+  expect(deep.candidates[0]?.vendor).toBe("openai");
+  expect(deep.skipped).toContainEqual({
+    modelId: "claude/opus",
+    reason: "raised a candidate it would verify",
+  });
 });

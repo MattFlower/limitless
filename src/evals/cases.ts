@@ -2,11 +2,17 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { DEFAULT_EVAL_CONCURRENCY, type ReviewSystem } from "../core/types.ts";
-import { EvalReviewSystemsSchema } from "../pipeline/review-system.ts";
+import {
+  DEFAULT_EVAL_CONCURRENCY,
+  type ResolvedProfile,
+  type ReviewFinder,
+  type ReviewSystem,
+} from "../core/types.ts";
+import { mapVerifier } from "../pipeline/review.ts";
+import { DEFAULT_ROSTERS, EvalReviewSystemsSchema, expandRoster } from "../pipeline/review-system.ts";
 import { HoldoutSchema, SpecSchema, TriageSchema } from "../pipeline/schemas.ts";
 import type { Router } from "../router/router.ts";
-import { EFFORT_LEVELS } from "../router/targets.ts";
+import { EFFORT_LEVELS, parseTarget } from "../router/targets.ts";
 import { reviewSystemHash } from "./cache.ts";
 
 const nonempty = z.string().trim().min(1);
@@ -258,6 +264,7 @@ export const EvalRequestSchema = z
     role: z.enum(["triage", "review", "verify", "implement"]),
     models: z.array(z.string().min(1)).min(1).optional(),
     systems: EvalReviewSystemsSchema.optional(),
+    replayFinders: nonempty.optional(),
     k: z.number().int().positive().default(1),
     maxUsd: z.number().finite().nonnegative().default(1),
     caseIds: unique.optional(),
@@ -275,20 +282,40 @@ export const EvalRequestSchema = z
     "give exactly one of models or systems",
   )
   .refine((r) => r.systems === undefined || r.role === "review", "systems are a review-only option")
+  .refine(
+    (r) => r.replayFinders === undefined || (r.role === "review" && r.systems !== undefined),
+    "replayFinders requires review systems",
+  )
+  .refine(
+    (r) => r.systems?.every((s) => !!s.replayFrom === !!r.replayFinders) ?? true,
+    "every replay system needs replayFrom, only with replayFinders",
+  )
   .transform((r) =>
     r.role === "implement" ? { ...r, rounds: r.rounds ?? 1, strategy: r.strategy ?? "retry" } : r,
   );
 export type EvalRequest = z.infer<typeof EvalRequestSchema>;
-export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<Router, "resolveFor">) {
+/** `rosters`: the daemon's configured rosters, which roster references in `systems` expand to. */
+export function validateRequest(
+  input: unknown,
+  file: AnyCaseFile,
+  router: Pick<Router, "resolveFor" | "toTarget" | "checkpointIdentity">,
+  rosters: Record<ResolvedProfile, ReviewFinder[]> = DEFAULT_ROSTERS,
+) {
   const request = EvalRequestSchema.parse(input);
+  const requested = request.systems?.map((system) => expandRoster(system, rosters));
   if (request.role !== file.role) throw new Error("dataset role does not match request");
   // Report every bad reference at once so the operator fixes the whole list in one round trip.
   const problems: string[] = [];
   const resolved: string[] = [];
-  const vendors = new Map<string, string>();
+  const billing = new Map<string, string>();
   const resolve = (id: string): string => {
     try {
-      let target = router.resolveFor(request.role, id);
+      // `model@default` (a resume's stored form) pins an unset effort regardless of today's model default.
+      const parsed = parseTarget(id);
+      let target = router.resolveFor(
+        request.role,
+        parsed.effort === "default" ? { modelId: parsed.modelId, effort: null } : id,
+      );
       if (request.strategy === "effort") {
         const levels = EFFORT_LEVELS.filter((level) => target.model.supportedEfforts.includes(level));
         const effort = target.effort ?? levels[0];
@@ -297,7 +324,7 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
         target = router.resolveFor(request.role, { modelId: target.model.id, effort });
       }
       resolved.push(target.targetId);
-      vendors.set(target.targetId, target.model.vendor);
+      billing.set(target.targetId, router.toTarget(target.model).billing);
       return target.targetId;
     } catch (error) {
       problems.push(`${JSON.stringify(id)}: ${(error as Error).message}`);
@@ -305,23 +332,40 @@ export function validateRequest(input: unknown, file: AnyCaseFile, router: Pick<
     }
   };
   // Every finder and verifier target is resolved; a system's first finder names its candidate model.
-  const resolvedSystems = request.systems?.map((system) => ({
+  const resolvedSystems = requested?.map((system) => ({
     ...system,
-    finders: system.finders.map((finder) => ({ ...finder, target: resolve(finder.target ?? "") })),
-    ...(system.verifier
-      ? { verifier: { ...system.verifier, target: resolve(system.verifier.target ?? "") } }
-      : {}),
+    finders: system.finders.map((finder) => {
+      const target = resolve(finder.target ?? "");
+      // As in production, a local finder runs only on a free model.
+      if (finder.local && billing.has(target) && billing.get(target) !== "free")
+        problems.push(
+          `review system ${JSON.stringify(system.name)}: local finder ${target} is not a free model`,
+        );
+      return { ...finder, target };
+    }),
+    ...(system.verifier ? { verifier: mapVerifier(system.verifier, resolve) } : {}),
   }));
   for (const id of request.systems ? [] : (request.models ?? [])) resolve(id);
-  // A verifier checks candidates from another vendor, as production's avoidVendor routing guarantees.
+  // As in production, a verifier never reuses a finder's model; a shared vendor is recorded, not refused.
   for (const system of resolvedSystems ?? []) {
-    const verifier = system.verifier?.target;
-    const vendor = verifier === undefined ? undefined : vendors.get(verifier);
-    for (const finder of system.finders)
-      if (vendor !== undefined && vendors.get(finder.target) === vendor)
+    const finders = system.finders.map((finder) => router.checkpointIdentity(finder.target));
+    if (system.verifier?.targets) {
+      const models = system.verifier.targets.map((target) => parseTarget(target).modelId);
+      if (new Set(models).size !== models.length)
         problems.push(
-          `review system ${JSON.stringify(system.name)}: verifier ${verifier} shares vendor ${vendor} with finder ${finder.target}`,
+          `review system ${JSON.stringify(system.name)}: verifier targets must be unique by base model id`,
         );
+      if (!models.some((model) => !finders.includes(router.checkpointIdentity(model))))
+        problems.push(
+          `review system ${JSON.stringify(system.name)}: verifier targets must include at least one checkpoint that is not any finder's`,
+        );
+      continue;
+    }
+    const verifier = system.verifier?.target;
+    if (verifier && finders.includes(router.checkpointIdentity(verifier)))
+      problems.push(
+        `review system ${JSON.stringify(system.name)}: verifier ${verifier} is also one of its finders`,
+      );
   }
   const seen = new Set<string>();
   // Systems may share a target (e.g. include vs omit the implementer report); their names differ.

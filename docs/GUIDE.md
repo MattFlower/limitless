@@ -78,8 +78,9 @@ A few more details:
   stronger tier (or to any model not yet tried). The total number of rounds is
   `[limits].max_rounds + 2`, which is 5 by default. When the rounds run out, the run ends as
   `needs_human` and opens a draft PR titled `[needs human] ...`.
-- **Profiles today.** `quick` skips spec, holdout and verify. `deep` currently differs from
-  `standard` only in routing review to the `large` policy cell, which puts frontier models first.
+- **Profiles today.** `quick` skips spec, holdout and verify. `deep` differs from `standard` in
+  routing review to the `large` policy cell, which puts frontier models first, and in panel review
+  mode it adds the repository's review lenses (see [Review configuration](#review-configuration-and-lenses)).
   ARCHITECTURE describes a plan stage and plan review, but they are not implemented.
 - **Deterministic control flow.** The code, not a model, derives the review verdict from the
   findings. The model's own verdict is stored for inspection only.
@@ -160,7 +161,10 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[triage] decision_confidence` | `0.6` | A decision model's triage (e.g. `typesafe/jev-1.13`) is declined, and routing falls through to the next triage model, when any choice or score answer is less confident than this, when blocking questions are likely (P ≥ 0.5), or when ambiguity is high. If no other triage model can answer, a decline for low confidence alone is used with a warning; one that needs questions ends the run in `needs_human`. |
+| `[gates] baseline_cache` | `true` | `false` skips the per-base-commit baseline cache: every run executes its baseline (a passing one still refreshes the entry). Per run: `limitless run --no-baseline-cache`. |
+| `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
+| `[review] mode`, `[review.rosters]` | `"single"`, see below | `"panel"` reviews with a verified finder panel whose roster depends on the profile; see [Review configuration](#review-configuration-and-lenses). |
 | `[routing] exclude_origins` | unset | For example `["CN"]`. Excludes models by checkpoint origin from eval policy generation and the Evals matrix. Runtime routing is not affected. |
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |
 | `[local] twilight_model_path`, `twilight_host`, `twilight_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
@@ -435,14 +439,16 @@ skips them.
 its provider card (Dashboard or **Models** page). The setting persists across restarts. A provider
 whose API key is missing stays disabled.
 
-For the Mac, select `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`). Put `OMLX_API_KEY`
+For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-REAP-288-MLX-4bit`);
+`omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first
+routing among free models the policy does not name, take catalog order, so they use Flash. Put `OMLX_API_KEY`
 in `secrets.env`; inference and health probes authenticate with it. Default concurrency is 4;
 override using `[providers.omlx] max_concurrent = 8` in `config.toml`. Tool-free selections
-`omlx/qwen-27b@none` and `omlx/qwen-27b@high` switch thinking off/on; agentic selections must
+`omlx/qwen-flash@none` and `omlx/qwen-flash@high` switch thinking off/on; agentic selections must
 use the bare ID, preserving server-default thinking. Compare them with:
 
 ```sh
-limitless eval run triage --models omlx/qwen-27b@none,omlx/qwen-27b@high --follow
+limitless eval run triage --models omlx/qwen-flash@none,omlx/qwen-flash@high --follow
 ```
 
 The committed `routing/policy.json` overlay remains authoritative over built-in defaults.
@@ -477,6 +483,85 @@ listed per model on the Models page. Claude receives `--effort`, and Codex recei
 `model_reasoning_effort`. OpenRouter and local models carry effort only in the tool-free roles
 (triage, chat, summarize); effort-qualified references for them elsewhere are rejected. Details
 are in [REASONING_EFFORT](REASONING_EFFORT.md).
+
+### Review configuration and lenses
+
+By default a review is one routed finder (`[review] mode = "single"`). With `mode = "panel"`,
+several finders run in parallel, their reports are merged, and a verifier rules on each candidate
+before anything blocks. The verifier never runs on a model that raised the candidate. It prefers a
+vendor that neither raised it nor implemented the change, then the implementer's vendor, then a
+raising vendor, and takes the implementer's own model only as a last resort, even on free-first
+runs. When it has to share a vendor with a finder, the panel record says so. Panel mode is off by default until evals show it
+outperforms single mode. Runs prepared in single mode stay single; turning panel mode off takes
+effect at the next review of every run.
+
+A panel's finders depend on the run's profile:
+
+| Profile | Default roster |
+|---|---|
+| quick | One standard finder from a vendor other than the implementer's. |
+| standard | An adversarial finder from another vendor. A careful finder in a fresh session from the implementer's family. A standard finder on a local model with a removed-behaviour and failure-paths lens, only when a local model is available. |
+| deep | The standard roster plus the repository's lenses. |
+
+Override a profile's roster in `config.toml`. Profiles you leave out keep their defaults:
+
+```toml
+[review]
+mode = "panel"
+
+[review.rosters]
+standard = [{ prompt = "adversarial" }, { prompt = "careful", family = "implementer" }]
+```
+
+Each finder takes these keys:
+
+- `prompt`: `standard` (report everything, with confidence), `adversarial` (assume the change can
+  fail) or `careful` (one senior pass).
+- `target`: a pinned model such as `codex/sol`. Without it, the finder is routed by the review policy.
+- `family`: `cross` (the default) avoids the implementer's vendor; `implementer` prefers it, and
+  may run on the implementer's own model in a fresh session. The panel record marks such a finder
+  `implementerModel`.
+- `local = true`: only a free local model. One 15-minute limit covers waiting for a slot and every
+  fallback. When no local model answers in time, or its output is invalid, the finder is skipped and
+  the panel record says why.
+- `lens = { name = "...", focus = "..." }`: the standard prompt plus a focus. Only with
+  `prompt = "standard"`.
+
+A roster needs at least one finder that is not local. The daemon checks pinned targets against the
+catalog at startup; a local finder's target must be a free model.
+
+A repository adds its own lenses in `.limitless.toml`:
+
+```toml
+[[review.lenses]]
+name = "data-safety"
+focus = "Writes that can lose or corrupt stored data: partial updates, missing transactions, deletes without a guard."
+profiles = ["standard", "deep"]   # default ["deep"]
+
+[[review.lenses]]
+name = "public-api"
+focus = "Changes that break callers: renamed or removed fields, changed defaults, different error shapes."
+```
+
+Each lens adds a standard finder with its focus in the profiles it lists. A name is a lowercase
+slug, names are unique, and a focus is at most 2000 characters; the prompt quotes the focus as
+repository data. Lenses are read from the base commit when the run is prepared, so a change never
+adds, edits or removes the lenses that review it. An edit to `[review]` takes effect for runs
+started after it merges. Keys this release does not know are ignored with a warning in the run log.
+Lenses apply only in panel mode.
+
+To measure a roster, name it in an eval systems file:
+`{ "name": "...", "roster": "standard", "targets": [...], "verifier": { "target": "..." }, "implementerReport": "include" }`.
+It expands to the daemon's configured roster for that profile, with `targets` pinning each finder in
+order, then one per lens in an optional `lenses` list.
+
+Use a lens for judgement: a kind of defect that general review keeps missing in this repository.
+A mechanical rule belongs in `[gates] checks` instead, where it runs on every round and blocks
+when it fails. These are checks, not lenses:
+
+- every environment variable the code reads is declared in the deployment manifests;
+- container images come from an allowed registry;
+- files referenced by configuration exist.
 
 ### Evals and `routing/policy.json`
 

@@ -6,17 +6,24 @@ import { basename, dirname, join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus, StageName } from "../src/core/types.ts";
+import { gateSlots } from "../src/gates/slots.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
+import { githubRetry } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
+import { specPrompt } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
-import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
+import { LaterReviewSchema, ReviewSchema, renderSpec, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import { outOfRunCriteria } from "../src/pipeline/spec-criteria.ts";
+import { specScopeViolation } from "../src/pipeline/spec-scope.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
+import { reviewOutput } from "./evals-reading-support.ts";
 import { findingEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -180,6 +187,7 @@ function start(handler: Handler, effortRouting = false, freeProviders = false): 
           ]
         : models,
     policy: effortRouting ? { ...policy, implement: { default: ["alpha/m@high", "alpha/m@low"] } } : policy,
+    bootSha: "test-build",
   });
   factory.start();
   return factory;
@@ -214,6 +222,304 @@ afterEach(async () => {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each([
+    ["trivial", "1–2"],
+    ["small", "1–3"],
+    ["medium", "3–5"],
+    ["large", "5–8"],
+    [undefined, "2–8"],
+  ] as const)("spec prompt sizes criteria for %s complexity", (complexity, range) => {
+    const prompt = specPrompt({ prompt: "Add farewell", answers: [], complexity });
+    expect(prompt).toContain(`acceptance_criteria: ${range} observable`);
+    expect(prompt).toContain(
+      "Require a specific new test only where behavior is new or at risk of regression, not for every criterion",
+    );
+    expect(prompt).toContain("Each needs a concrete how_to_verify");
+  });
+
+  test.each([
+    ["small", 7, 3],
+    ["small", 7, 7],
+    ["trivial", 2, 2],
+    ["small", 3, 3],
+    ["medium", 5, 5],
+    ["large", 8, 8],
+  ] as const)("spec size retry: %s %i → %i", async (complexity, initialCount, finalCount) => {
+    const oversized = initialCount === 7;
+    const prompts: string[] = [];
+    const expected = {
+      ...spec,
+      summary: oversized ? "Retried farewell specification" : spec.summary,
+      acceptance_criteria: Array.from({ length: finalCount }, (_, i) => ({
+        id: `AC-${i + 1}`,
+        criterion: `Farewell behavior ${i + 1}`,
+        how_to_verify: "cat farewell.txt",
+      })),
+    };
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ complexity }) };
+      if (role === "spec") {
+        prompts.push(s.prompt);
+        return {
+          structured:
+            prompts.length === 1 && oversized
+              ? {
+                  ...expected,
+                  summary: "Initial farewell specification",
+                  acceptance_criteria: Array.from({ length: initialCount }, (_, i) => ({
+                    ...expected.acceptance_criteria[0],
+                    id: `AC-${i + 1}`,
+                  })),
+                }
+              : expected,
+        };
+      }
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify")
+        return {
+          structured: {
+            ...pass,
+            criteria: [
+              ...expected.acceptance_criteria.map((a) => ({
+                id: a.id,
+                status: "met",
+                evidence: "observed",
+                publicSummary: "",
+              })),
+              ...pass.criteria.filter((c) => !c.id.startsWith("AC-")),
+            ],
+          },
+        };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(prompts).toHaveLength(oversized ? 2 : 1);
+    if (oversized) expect(prompts[1]).toContain("For small complexity, use at most 3 criteria");
+    expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual(expected);
+    expect(f.store.getArtifact(run.id, "spec.md")).toContain(renderSpec(expected));
+    const warnings = f.store.listEvents(run.id).filter((e) => e.message?.startsWith("Kept oversized spec"));
+    expect(warnings).toHaveLength(oversized && finalCount === 7 ? 1 : 0);
+    if (warnings.length) expect(warnings[0]).toMatchObject({ level: "warn" });
+  });
+
+  test("spec prompt confines the read-only rule to investigation", () => {
+    const prompt = specPrompt({ prompt: "Add farewell", answers: [] });
+    expect(prompt).toContain("task below.\n\nYou are only writing the specification");
+    expect(prompt).toContain("while investigating the repository, read and search but do not edit files");
+    expect(prompt).toContain("change itself will be implemented later");
+    expect(prompt).not.toContain("DO NOT modify anything");
+    expect(prompt).toContain("verifiable inside the run's own checkout");
+    expect(prompt).toContain("using the repository's commands and tests");
+    expect(prompt).toContain(
+      "a person, the orchestrator, a browser, live external services, a deploy, or a later event",
+    );
+    expect(prompt).toContain("Put such concerns under assumptions or out_of_scope");
+  });
+
+  test.each(
+    "manual,manually,human,humans,owner,owners,orchestrator,reviewer approves,in a browser,visually,screenshot,screenshots,deploy,deploys,deployed,deploying,deployment,deployments,production,live API,after merge,wait for".split(
+      ",",
+    ),
+  )("out-of-run criteria match bounded phrases in how_to_verify only: %s", (phrase) => {
+    expect(
+      outOfRunCriteria({
+        ...spec,
+        acceptance_criteria: [
+          { id: "AC-1", criterion: `(${phrase})`, how_to_verify: "bun test test/page.test.ts" },
+        ],
+      }),
+    ).toEqual([]);
+    for (const text of [phrase, phrase.toUpperCase(), phrase.replaceAll(" ", "\n ")]) {
+      const criterion = { id: "AC-1", criterion: "Works", how_to_verify: `(${text})` };
+      expect(outOfRunCriteria({ ...spec, acceptance_criteria: [criterion] })).toEqual([criterion]);
+      expect(
+        outOfRunCriteria({
+          ...spec,
+          acceptance_criteria: [{ ...criterion, how_to_verify: `pre${text}post` }],
+        }),
+      ).toEqual([]);
+    }
+    expect(outOfRunCriteria(spec)).toEqual([]);
+    expect(
+      outOfRunCriteria({
+        ...spec,
+        acceptance_criteria: [
+          { id: "AC-1", criterion: "Test passes", how_to_verify: "bun test test/page.test.ts" },
+        ],
+      }),
+    ).toEqual([]);
+  });
+
+  test.each(["clean", "persistent", "empty", "invalid scope", "scope retry", "new dependency"])(
+    "out-of-run criteria retry: %s",
+    async (scenario) => {
+      const external = {
+        id: "AC-2",
+        criterion: "the page shows the farewell",
+        how_to_verify: "The owner opens the page in a browser",
+      };
+      const other = { id: "AC-3", criterion: "Page works", how_to_verify: "manual check" };
+      const initial = { ...spec, acceptance_criteria: [...spec.acceptance_criteria, external, other] };
+      if (scenario === "scope retry" || scenario === "new dependency") initial.summary = "No code changes.";
+      if (scenario === "new dependency") initial.acceptance_criteria = spec.acceptance_criteria;
+      const retry =
+        scenario === "clean"
+          ? { ...spec, summary: "Locally verifiable farewell" }
+          : scenario === "empty"
+            ? { ...spec, acceptance_criteria: [external, { ...other, id: "AC-4" }] }
+            : scenario === "invalid scope"
+              ? { ...spec, summary: "No code changes." }
+              : {
+                  ...spec,
+                  acceptance_criteria: [...spec.acceptance_criteria, external, { ...other, id: "AC-4" }],
+                };
+      // Flagged criteria that survive the retry are kept and logged, never dropped.
+      const expected = retry;
+      const prompts: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") {
+          prompts.push(s.prompt);
+          return { structured: prompts.length === 1 ? initial : retry };
+        }
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") {
+          // Every criterion in the stored spec, kept out-of-run ones included, is met.
+          const ids = (f.store.getRunState<RunState>(run.id)?.spec?.acceptance_criteria ?? []).map(
+            (a) => a.id,
+          );
+          const met = ids.map((id) => ({ id, status: "met", evidence: "observed", publicSummary: "" }));
+          return {
+            structured: {
+              ...pass,
+              criteria: [...met, ...pass.criteria.filter((c) => !c.id.startsWith("AC-"))],
+            },
+          };
+        }
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        scenario === "invalid scope" ? "failed" : "succeeded",
+      );
+      expect(prompts).toHaveLength(scenario === "invalid scope" || scenario === "new dependency" ? 3 : 2);
+      expect(prompts[scenario === "new dependency" ? 2 : 1]).toContain(
+        scenario === "new dependency" ? "AC-2, AC-4" : "AC-2, AC-3",
+      );
+      if (scenario === "scope retry") expect(prompts[1]).toContain("Invalid specification:");
+      if (scenario === "invalid scope") {
+        expect(f.store.getArtifact(run.id, "spec.md")).toBeNull();
+        expect(f.store.getRun(run.id)?.error).toContain("invalid spec scope");
+        return;
+      }
+      expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual(expected);
+      const artifact = f.store.getArtifact(run.id, "spec.md");
+      expect(artifact).toContain(expected.summary);
+      if (scenario !== "clean") expect(artifact).toContain(other.how_to_verify);
+      if (scenario !== "empty") expect(artifact).toContain("farewell.txt says goodbye");
+      const kept = f.store
+        .listEvents(run.id)
+        .filter((e) => e.message?.startsWith("Kept acceptance criteria that may depend"));
+      expect(kept.map((e) => e.message)).toEqual(
+        scenario === "clean"
+          ? []
+          : ["Kept acceptance criteria that may depend on something outside the run: AC-2, AC-4"],
+      );
+    },
+  );
+
+  test("spec scope phrases normalize punctuation and leave ordinary documentation work alone", () => {
+    for (const summary of [
+      "SPECIFICATION—ONLY task",
+      "Documentation  \nonly.",
+      "Do NOT modify source code.",
+      "No code changes.",
+      "Do not modify code in this task.",
+    ]) {
+      expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBe(summary);
+      expect(specScopeViolation({ ...spec, summary }, `${summary} Explain the behavior.`)).toBeNull();
+    }
+    for (const summary of [
+      "Add code and documentation.",
+      "Verify behavior without modifying fixtures.",
+      "Document the read-only API.",
+      "Do not change the code path for legacy users.",
+      "Do not modify code outside src/pipeline.",
+      "Must not edit the code generator output.",
+      "Do not change code in existing callers.",
+      "Existing plugins keep working without code changes.",
+      "Existing plugins require no code changes.",
+    ]) {
+      expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBeNull();
+      expect(specScopeViolation({ ...spec, summary: "No code changes." }, summary)).toBe("No code changes.");
+    }
+    // "X only" in ordinary prose is not a task restriction (a request that says it is still exempt).
+    for (const summary of [
+      "The README docs only list supported commands.",
+      "The spec only covers the CLI path; the UI is out of scope.",
+    ])
+      expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBeNull();
+    expect(
+      specScopeViolation(
+        {
+          ...spec,
+          acceptance_criteria: [{ id: "AC-1", criterion: "Works", how_to_verify: "Do not modify code" }],
+        },
+        "Add farewell",
+      ),
+    ).toBeNull();
+  });
+
+  test.each(["summary", "requirement", "criterion", "exhausted", "documentation"])(
+    "spec scope validation: %s",
+    async (scenario) => {
+      const sentence = "This is a specification-only task; do not modify code";
+      const invalid = { ...spec };
+      if (scenario === "requirement") invalid.requirements = [sentence];
+      else if (scenario === "criterion")
+        invalid.acceptance_criteria = [{ id: "AC-1", criterion: sentence, how_to_verify: "Inspect" }];
+      else invalid.summary = scenario === "documentation" ? "Documentation-only task" : sentence;
+      const prompts: string[] = [];
+      let implementCalls = 0;
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") {
+          prompts.push(s.prompt);
+          return { structured: prompts.length === 1 || scenario === "exhausted" ? invalid : spec };
+        }
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") return { structured: pass };
+        implementCalls++;
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const run = await f.createRun({
+        repo: repoDir,
+        prompt: scenario === "documentation" ? "Documentation only: add farewell" : "Add farewell",
+      });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        scenario === "exhausted" ? "failed" : "succeeded",
+      );
+      expect(prompts).toHaveLength(scenario === "documentation" ? 1 : 2);
+      if (scenario !== "documentation") expect(prompts[1]).toContain(JSON.stringify(sentence));
+      expect(implementCalls).toBe(scenario === "exhausted" ? 0 : 1);
+      if (scenario === "exhausted") {
+        expect(f.store.getArtifact(run.id, "spec.md")).toBeNull();
+        expect(f.store.getRunState<RunState>(run.id)?.spec).toBeUndefined();
+        expect(f.store.getRun(run.id)?.error).toContain("structured output failed validation");
+      } else
+        expect(f.store.getArtifact(run.id, "spec.md")).toContain(
+          scenario === "documentation" ? invalid.summary : spec.summary,
+        );
+    },
+  );
+
   test("prepare restart retains the reused worktree base after upstream advances", async () => {
     writeFileSync(
       join(repoDir, ".limitless.toml"),
@@ -503,6 +809,164 @@ esac
     },
   );
 
+  test("panel mode: the deep roster plus lenses from the base commit; an unavailable local finder is skipped", async () => {
+    const lens = (focus: string) => `[review]\nlenses = [{ name = "ops", focus = "${focus}" }]\n`;
+    const toml = readFileSync(join(repoDir, ".limitless.toml"), "utf8");
+    writeFileSync(join(repoDir, ".limitless.toml"), `${toml}${lens("BASE_FOCUS")}`);
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "lens"], {
+      cwd: repoDir,
+    });
+    const reviews: AgentSpec[] = [];
+    let verifications = 0;
+    let implementations = 0;
+    const f = start((s) => {
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        // R1's finding is real; R2's recheck finds it fixed.
+        const ruling = {
+          verdict: verifications++ ? "REFUTED" : "CONFIRMED",
+          severity: "high",
+          evidence: "a:1",
+        };
+        const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1]);
+        return {
+          structured: {
+            results: ids.map((id) => ({ id, ...ruling, category: "correctness", trigger: "x" })),
+          },
+        };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "deep" }) };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "verify") return { structured: pass };
+      if (role === "review") {
+        reviews.push(s);
+        const finding = {
+          ...findingEvidence,
+          severity: "major",
+          file: "farewell.txt",
+          line: 1,
+          title: "Terse",
+        };
+        const found = s.prompt.startsWith("You are an adversarial") && !s.prompt.includes("review R2");
+        const findings = found ? [{ ...finding, detail: "d", suggestion: "s", security: false }] : [];
+        return { structured: { ...approve, findings } };
+      }
+      // The change under review rewrites the lens; every review must keep the base's.
+      const farewell = implementations++ ? "goodbye!\n" : "goodbye\n";
+      return { files: { "farewell.txt": farewell, ".limitless.toml": `${toml}${lens("HEAD_FOCUS")}` } };
+    });
+    f.deps.cfg.reviewMode = "panel";
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "deep" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(f.store.getArtifact(run.id, "diff.patch")).toContain("HEAD_FOCUS");
+    const prompts = reviews.map((s) => s.prompt);
+    expect(prompts.filter((p) => p.includes("review R2"))).toHaveLength(3);
+    expect(prompts.filter((p) => p.includes("BASE_FOCUS"))).toHaveLength(2);
+    expect(prompts.some((p) => p.includes("HEAD_FOCUS"))).toBe(false);
+    // Adversarial avoids the implementer's vendor, careful takes its family, the lens finder is cross-vendor.
+    for (const review of [1, 2])
+      expect(JSON.parse(f.store.getArtifact(run.id, `review-${review}.json`) ?? "{}").panel.finders).toEqual([
+        { prompt: "adversarial", vendor: "openai" },
+        // The careful finder took the implementer's own model, in a fresh session.
+        { prompt: "careful", vendor: "anthropic", implementerModel: true },
+        {
+          prompt: "standard",
+          lens: "removed-behaviour-and-failure-paths",
+          vendor: null,
+          skipped: expect.stringContaining("No model available for review"),
+        },
+        { prompt: "standard", lens: "ops", vendor: "openai" },
+      ]);
+  });
+
+  test("panel mode: one deadline covers a local finder's fallbacks, and its skip says why", async () => {
+    const local: number[] = [];
+    const f = start(
+      (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: spec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "verify") return { structured: pass };
+        if (role !== "review") return { files: { "farewell.txt": "goodbye\n" } };
+        if (!s.prompt.includes("# Lens: removed-behaviour-and-failure-paths")) return { structured: approve };
+        local.push(s.timeoutMs);
+        return { fault: "timeout", delayMs: 50 };
+      },
+      false,
+      true,
+    );
+    f.deps.cfg.reviewMode = "panel";
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    // Both free models were tried, the second with only what was left of the first's time.
+    expect(local).toHaveLength(2);
+    const [first = 0, second = 0] = local;
+    expect(first).toBeLessThanOrEqual(LOCAL_FINDER_TIMEOUT_MS);
+    expect(second).toBeLessThanOrEqual(first - 50);
+    const finders = JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}").panel.finders;
+    expect(finders[2]).toMatchObject({ vendor: null, skipped: expect.stringContaining("harness timeout") });
+  });
+
+  test("panel mode on free-first runs: the verifier is independent of the implementer and the finder", async () => {
+    const calls: { role: string; model: string; vendor: string }[] = [];
+    let implementations = 0;
+    const f = start(
+      (s) => {
+        const verifier = s.prompt.startsWith("You are a code-review verifier");
+        const role = verifier ? "verifier" : roleOf(s);
+        calls.push({ role, model: s.target.modelId, vendor: s.target.vendor });
+        if (verifier) {
+          const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1]);
+          const ruling = {
+            verdict: "REFUTED",
+            severity: "low",
+            category: "correctness",
+            evidence: "a:1",
+            trigger: "x",
+          };
+          return { structured: { results: ids.map((id) => ({ id, ...ruling })) } };
+        }
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") {
+          const finding = {
+            ...findingEvidence,
+            severity: "major",
+            file: "farewell.txt",
+            line: 1,
+            title: "T",
+          };
+          return {
+            structured: {
+              ...approve,
+              findings: [{ ...finding, detail: "d", suggestion: "s", security: false }],
+            },
+          };
+        }
+        return { files: { "farewell.txt": implementations++ ? "goodbye!\n" : "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    f.deps.cfg.reviewMode = "panel";
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "quick",
+      requestedBy: "dependabot[bot]",
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const [implementer, finder, verifier] = ["implement", "review", "verifier"].map((role) =>
+      calls.find((c) => c.role === role),
+    );
+    // Free-first picks free models for the implementer and the finder, but not an unindependent verifier.
+    expect([implementer?.model, finder?.model]).toEqual(["gamma/m", "delta/m"]);
+    expect(verifier?.model).not.toBe(implementer?.model);
+    expect(verifier?.vendor).not.toBe(finder?.vendor);
+    expect(verifier?.model).toBe("alpha/m");
+  });
+
   test("Dependabot falls back when free providers are unavailable; owner keeps policy routing", async () => {
     const f = start(
       (s) => {
@@ -684,6 +1148,302 @@ esac
     expect(readFileSync(count, "utf8").trim().split("\n").length).toBe(3);
   });
 
+  describe("baseline cache", () => {
+    const lines = (path: string) =>
+      existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").length : 0;
+    const cacheRows = (f: Factory) =>
+      f.store.db.query("SELECT base_sha, gate_run, run_id, created_at FROM passing_baselines").all() as {
+        base_sha: string;
+        gate_run: string;
+        run_id: string;
+        created_at: number;
+      }[];
+    const quick = (s: AgentSpec): FakeReply => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    };
+    async function commitGates(toml: string): Promise<void> {
+      writeFileSync(join(repoDir, ".limitless.toml"), toml);
+      await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "gates"], {
+        cwd: repoDir,
+      });
+    }
+    async function finish(f: Factory, over: Partial<Parameters<Factory["createRun"]>[0]> = {}) {
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick", ...over });
+      await waitFor(f, run.id, ["succeeded", "failed", "needs_human", "cancelled"]);
+      return { run, state: f.store.getRunState<RunState>(run.id) };
+    }
+
+    test("a second run on the same base reuses a passing baseline", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const f = start(quick);
+      const first = await finish(f);
+      // Baseline and the post-implement gates.
+      expect(lines(count)).toBe(2);
+      expect(first.state?.baselineCached).toBe(false);
+      expect(cacheRows(f).map((r) => r.run_id)).toEqual([first.run.id]);
+      const second = await finish(f);
+      // Only the post-implement gates executed.
+      expect(lines(count)).toBe(3);
+      expect(second.state?.baselineCached).toBe(true);
+      expect(second.state?.baseline).toEqual(first.state?.baseline ?? null);
+      expect(f.store.getRun(second.run.id)?.status).toBe("succeeded");
+      const prepare = f.store.listStages(second.run.id).find((s) => s.name === "prepare");
+      expect(prepare?.summary).toContain("baseline reused from cache");
+      expect(f.store.listStages(first.run.id).find((s) => s.name === "prepare")?.summary).not.toContain(
+        "cache",
+      );
+      expect(JSON.parse(f.store.getArtifact(second.run.id, "baseline-gates.json") ?? "{}")).toEqual(
+        second.state?.baseline,
+      );
+    });
+
+    test("a flaky base that failed twice is not cached, so the next run blocks the regression", async () => {
+      const count = join(home, "gate-runs");
+      // Fails the first baseline and its retry; later it fails only once the change exists.
+      const check = `echo x >> '${count}'; test $(( $(wc -l < '${count}') )) -gt 2 || exit 1; test ! -f farewell.txt`;
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`);
+      const f = start(quick);
+      const first = await finish(f);
+      expect(first.state?.baseline?.checks[0]?.firstAttempt?.ok).toBe(false);
+      expect(first.state?.baseline?.checks[0]?.ok).toBe(false);
+      expect(cacheRows(f)).toEqual([]);
+      const second = await finish(f);
+      expect(second.state?.baselineCached).toBe(false);
+      expect(second.state?.baseline?.checks[0]?.ok).toBe(true);
+      expect(second.state?.lastGates?.map((g) => [g.name, g.verdict, g.blocking])).toEqual([
+        ["check", "regressed", true],
+      ]);
+      expect(f.store.getRun(second.run.id)?.status).not.toBe("succeeded");
+    });
+
+    test("concurrent runs on one base execute the baseline once", async () => {
+      const count = join(home, "gate-runs");
+      const check = `test -f farewell.txt || echo base >> '${count}'; sleep 1`;
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`);
+      const f = start(quick);
+      const [a, b] = await Promise.all([finish(f), finish(f)]);
+      expect(lines(count)).toBe(1);
+      expect([a.state?.baselineCached, b.state?.baselineCached].sort()).toEqual([false, true]);
+      expect(cacheRows(f)).toHaveLength(1);
+    });
+
+    describe("uncacheable baselines on one base", () => {
+      let slots = 1;
+      beforeEach(() => {
+        slots = gateSlots.limit;
+      });
+      afterEach(() => gateSlots.setLimit(slots));
+      // Each baseline attempt logs start and end around a sleep; adjacent starts mean overlap.
+      const overlapping = (log: string) => readFileSync(log, "utf8").includes("start\nstart\n");
+      const timed = (log: string, exit: number) =>
+        `test -f farewell.txt && exit 0; echo start >> '${log}'; sleep 1; echo end >> '${log}'; exit ${exit}`;
+
+      test("with the kill switch, same-base runs execute their baselines concurrently", async () => {
+        const log = join(home, "gate-log");
+        await commitGates(`[gates]\nchecks = [{ name = "check", run = "${timed(log, 0)}" }]\n`);
+        const f = start(quick);
+        f.cfg.baselineCache = false;
+        gateSlots.setLimit(3);
+        const runs = await Promise.all([finish(f), finish(f), finish(f)]);
+        expect(runs.map((r) => r.state?.baselineCached)).toEqual([false, false, false]);
+        expect(readFileSync(log, "utf8").split("\n").slice(0, 3)).toEqual(["start", "start", "start"]);
+      });
+
+      test("a failing flight releases its waiters to run concurrently", async () => {
+        const log = join(home, "gate-log");
+        await commitGates(`[gates]\nchecks = [{ name = "check", run = "${timed(log, 1)}" }]\n`);
+        const f = start(quick);
+        gateSlots.setLimit(3);
+        const runs = await Promise.all([finish(f), finish(f), finish(f)]);
+        expect(runs.map((r) => r.state?.baseline?.checks[0]?.ok)).toEqual([false, false, false]);
+        expect(cacheRows(f)).toEqual([]);
+        expect(overlapping(log)).toBe(true);
+      });
+    });
+
+    test("an unknown build SHA neither reads nor writes the cache", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const f = start(quick);
+      f.deps.buildSha = undefined;
+      await finish(f);
+      const second = await finish(f);
+      expect([lines(count), second.state?.baselineCached]).toEqual([4, false]);
+      expect(cacheRows(f)).toEqual([]);
+    });
+
+    test("a changed gate config or base commit misses", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const f = start(quick);
+      await finish(f);
+      expect(lines(count)).toBe(2);
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'; true" }]\n`);
+      const changedConfig = await finish(f);
+      expect([lines(count), changedConfig.state?.baselineCached]).toEqual([4, false]);
+      writeFileSync(join(repoDir, "greeting.txt"), "hello again\n");
+      await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "base"], {
+        cwd: repoDir,
+      });
+      const changedBase = await finish(f);
+      expect([lines(count), changedBase.state?.baselineCached]).toEqual([6, false]);
+      expect(cacheRows(f)).toHaveLength(3);
+    });
+
+    test("a changed gate environment misses", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const saved = { npm: process.env.npm_config_ignore_scripts, flag: process.env.MY_GATE_FLAG };
+      const restore = (k: string, v: string | undefined) => {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      };
+      try {
+        process.env.npm_config_ignore_scripts = "false";
+        process.env.MY_GATE_FLAG = "a";
+        const f = start(quick);
+        await finish(f);
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+        process.env.npm_config_ignore_scripts = "true";
+        expect((await finish(f)).state?.baselineCached).toBe(false);
+        // Undeclared variables don't key the cache; declared ones do.
+        process.env.MY_GATE_FLAG = "b";
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+        f.cfg.baselineEnv = ["MY_GATE_FLAG"];
+        expect((await finish(f)).state?.baselineCached).toBe(false);
+        process.env.MY_GATE_FLAG = "c";
+        expect((await finish(f)).state?.baselineCached).toBe(false);
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+      } finally {
+        restore("npm_config_ignore_scripts", saved.npm);
+        restore("MY_GATE_FLAG", saved.flag);
+      }
+    });
+
+    test("a changed nonsecret setting with a secret-looking name misses", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const names = ["GOPRIVATE", "NODE_TLS_REJECT_UNAUTHORIZED"] as const;
+      const saved = Object.fromEntries(names.map((k) => [k, process.env[k]]));
+      try {
+        process.env.GOPRIVATE = "example.com/*";
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = "1";
+        const f = start(quick);
+        await finish(f);
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+        process.env.GOPRIVATE = "other.example/*";
+        expect((await finish(f)).state?.baselineCached).toBe(false);
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+        expect((await finish(f)).state?.baselineCached).toBe(false);
+        expect((await finish(f)).state?.baselineCached).toBe(true);
+      } finally {
+        for (const k of names) {
+          if (saved[k] === undefined) delete process.env[k];
+          else process.env[k] = saved[k];
+        }
+      }
+    });
+
+    test("a timed-out or cancelled baseline is not cached", async () => {
+      const count = join(home, "gate-runs");
+      // The first execution outlasts its timeout; later ones pass.
+      const check = `echo x >> '${count}'; test $(( $(wc -l < '${count}') )) -ne 1 || sleep 5`;
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "${check}", timeoutSec = 1 }]\n`);
+      const f = start(quick);
+      const timedOut = await finish(f);
+      expect(timedOut.state?.baseline?.checks[0]?.timedOut).toBe(true);
+      expect(cacheRows(f)).toEqual([]);
+      const next = await finish(f);
+      expect(next.state?.baselineCached).toBe(false);
+      expect(next.state?.baseline?.checks[0]?.ok).toBe(true);
+      expect(cacheRows(f)).toHaveLength(1);
+
+      rmSync(count);
+      await commitGates(
+        `[gates]\nchecks = [{ name = "check", run = "${check.replace("sleep 5", "sleep 10")}" }]\n`,
+      );
+      const cancelled = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(count)) {
+        if (Date.now() > deadline) throw new Error("baseline never started");
+        await Bun.sleep(10);
+      }
+      f.cancelRun(cancelled.id);
+      expect(await waitFor(f, cancelled.id, ["cancelled", "failed"])).toBe("cancelled");
+      expect(cacheRows(f)).toHaveLength(1);
+      const after = await finish(f);
+      expect(after.state?.baselineCached).toBe(false);
+      // Cancelled baseline, then this run's baseline and post-implement gates.
+      expect(lines(count)).toBe(3);
+    });
+
+    test("a bypass run refreshes a passing entry and evicts it when the base fails", async () => {
+      const count = join(home, "gate-runs");
+      const broken = join(home, "broken");
+      await commitGates(
+        `[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'; test ! -f '${broken}'" }]\n`,
+      );
+      const f = start(quick);
+      const primed = await finish(f);
+      expect(cacheRows(f).map((r) => r.run_id)).toEqual([primed.run.id]);
+      const bypass = await finish(f, { noBaselineCache: true });
+      expect(f.store.getRun(bypass.run.id)?.noBaselineCache).toBe(true);
+      expect([lines(count), bypass.state?.baselineCached]).toEqual([4, false]);
+      expect(cacheRows(f).map((r) => r.run_id)).toEqual([bypass.run.id]);
+      const refreshed = cacheRows(f);
+
+      expect(refreshed).toHaveLength(1);
+
+      // A failing fresh baseline contradicts the cached pass, so it is evicted, not replaced.
+      writeFileSync(broken, "");
+      const failing = await finish(f, { noBaselineCache: true });
+      expect(failing.state?.baseline?.checks[0]?.ok).toBe(false);
+      expect(cacheRows(f)).toEqual([]);
+      const retried = await f.retryRun(failing.run.id);
+      expect(retried.noBaselineCache).toBe(true);
+      await waitFor(f, retried.id, ["succeeded", "failed", "needs_human"]);
+      expect(cacheRows(f)).toEqual([]);
+
+      // The config kill switch bypasses reads too, and still refreshes on a pass.
+      rmSync(broken);
+      f.cfg.baselineCache = false;
+      const before = lines(count);
+      const switchedOff = await finish(f);
+      expect([lines(count) - before, switchedOff.state?.baselineCached]).toEqual([2, false]);
+      expect(cacheRows(f).map((r) => r.run_id)).toEqual([switchedOff.run.id]);
+    });
+
+    test("post-rebase gates execute when prepare reused the cached baseline", async () => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const bare = await githubFixture();
+      let advance = false;
+      const f = start(async (s) => {
+        if (advance && roleOf(s) === "review") {
+          advance = false;
+          await advanceBase(bare, "base.txt", "new base\n");
+        }
+        return quick(s);
+      });
+      registerGithub(f, bare);
+      const first = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(lines(count)).toBe(2);
+      advance = true;
+      const second = await f.createRun({ repo: "test/repo", prompt: "Add farewell too", profile: "quick" });
+      expect(await waitFor(f, second.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(f.store.getRunState<RunState>(second.id)?.baselineCached).toBe(true);
+      // Post-implement gates, then the gates after merging the advanced base.
+      expect(lines(count)).toBe(4);
+      expect(f.store.listStages(second.id).filter((s) => s.name === "gates")).toHaveLength(2);
+    });
+  });
+
   // Same text git generates, so a fixture line can never stand in for a real marker.
   const fixture = "<<<<<<< HEAD\nexample\n=======\n>>>>>>> theirs\n";
 
@@ -775,6 +1535,39 @@ esac
     expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
     expect(f.store.getRunState<RunState>(run.id)?.pendingRebaseSha).toBeUndefined();
     expect(f.scheduler.parkedRunIds).toEqual([]);
+  });
+
+  test("post-merge gates slower than the GitHub retry budget still deliver", async () => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      '[gates]\nchecks = [{ name = "slow", run = "sleep 2" }]\n',
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "slow gate"], {
+      cwd: repoDir,
+    });
+    const bare = await githubFixture();
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    registerGithub(f, bare);
+    const budgetMs = githubRetry.budgetMs;
+    githubRetry.budgetMs = 1_500;
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    try {
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    } finally {
+      githubRetry.budgetMs = budgetMs;
+    }
+    expect(f.store.getRun(run.id)?.prUrl).toBe("https://github.com/test/repo/pull/1");
+    expect(f.store.listStages(run.id).filter((stage) => stage.name === "gates")).toHaveLength(2);
+    expect(readFileSync(join(home, "gh-calls"), "utf8").match(/^pr create/gm)).toHaveLength(1);
   });
 
   test("needs-human draft delivery continues during drain", async () => {
@@ -2631,16 +3424,23 @@ protected_paths = ["protected.txt"]
     const drive = (
       firstVerify: Record<string, unknown>,
       onImplement: (prompt: string, call: number) => void,
+      publicSpec = spec,
     ) => {
       let verifies = 0;
       let implementCalls = 0;
       const handler: Handler = (s) => {
         const role = roleOf(s);
         if (role === "triage") return { structured: triage() };
-        if (role === "spec") return { structured: { ...spec, out_of_scope: ["Delete the old parser"] } };
+        if (role === "spec")
+          return { structured: { ...publicSpec, out_of_scope: ["Delete the old parser"] } };
         if (role === "holdout") return { structured: privateHoldout };
         if (role === "review") return { structured: approve };
-        if (role === "verify") return { structured: ++verifies === 1 ? firstVerify : pass };
+        if (role === "verify") {
+          expect(s.prompt).toContain(
+            "A citation must be either at least three consecutive words quoted exactly, or one whole line of the request (a sentence or bullet) or one whole acceptance criterion, exactly as shown",
+          );
+          return { structured: ++verifies === 1 ? firstVerify : pass };
+        }
         onImplement(s.prompt, ++implementCalls);
         return { files: { "farewell.txt": "goodbye\n" } };
       };
@@ -2731,6 +3531,50 @@ protected_paths = ["protected.txt"]
         expect(first?.notes).toContain("requirement citation validation failed");
       },
     );
+
+    test.each([
+      ["Background\n\nOur service uses IPv4.\n\nRequirements\n\n- Support IPv6", "Background", false],
+      ["Background\n\nOur service uses IPv4.\n\nRequirements\n\n- Support IPv6", "Requirements", false],
+      ["Support IPv6\nKeep IPv4", "Support IPv6", true],
+      ["Support IPv6\nKeep IPv4", "Keep IPv4", true],
+      ["- Support IPv6", "Support IPv6", true],
+      ["Support IPv6 and IPv4", "Support IPv6", false],
+      ["Retry", "Retry", true],
+      ["Add a farewell file", "**AC-1** Done", true],
+    ] as const)("citation grounding in the fake pipeline: %s / %s", async (request, citation, grounded) => {
+      let checked = false;
+      const requirement = citation.startsWith("**AC-") ? "spec" : "request";
+      const { f, implementCalls } = drive(
+        unmetH2({ requirement, requirementCitation: citation }),
+        (prompt, call) => {
+          if (call !== 2) return;
+          const feedback = prompt.split("### Checks not met")[1] ?? "";
+          expect(feedback).not.toContain(secret);
+          expect(feedback).not.toContain("missing input");
+          if (grounded)
+            expect(feedback).toContain(
+              `violates this requirement of the ${requirement === "spec" ? "specification" : "original request"}:`,
+            );
+          else {
+            expect(feedback).toContain("the verifier's attribution could not be validated");
+            expect(feedback).not.toContain("the verifier's citation was not found in it");
+            expect(feedback).toContain("check them against the original request and specification above");
+          }
+          checked = true;
+        },
+        {
+          ...spec,
+          acceptance_criteria: [{ id: "AC-1", criterion: "Done", how_to_verify: "cat farewell.txt" }],
+        },
+      );
+      const run = await f.createRun({ repo: repoDir, prompt: request });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(checked).toBe(true);
+      expect(implementCalls()).toBe(2);
+      const first = f.store.getRunState<RunState>(run.id)?.verifyResults?.[0];
+      expect(first?.overall).toBe("fail");
+      expect(first?.notes.includes("citation is not a stated public requirement")).toBe(!grounded);
+    });
 
     test("an all-met verify with a non-enum requirement value succeeds instead of failing the invocation", async () => {
       const allMet = { ...pass, criteria: pass.criteria.map((c) => ({ ...c, requirement: "" })) };
@@ -4102,6 +4946,77 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
   });
 });
 
+for (const phase of ["clarify", "spec"] as const) {
+  test.each(["parked", "transition", "entering", "cancelled"] as const)(
+    `drain parks ${phase} answer waits (%s)`,
+    async (when) => {
+      const question = "Formal or casual farewell?";
+      const specPrompts: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage")
+          return {
+            structured: triage(
+              phase === "clarify" ? { ambiguity: "high", blocking_questions: [question] } : {},
+            ),
+          };
+        if (role === "spec") {
+          specPrompts.push(s.prompt);
+          return { structured: { ...spec, blocking_questions: phase === "spec" ? [question] : [] } };
+        }
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") return { structured: pass };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const unsubscribe = f.store.subscribe((msg) => {
+        if (when === "entering" && msg.kind === "run" && msg.run.status === "waiting_input")
+          f.scheduler.drain();
+      });
+      try {
+        const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+        if (when !== "entering") {
+          await waitFor(f, run.id, ["waiting_input"]);
+          f.scheduler.drain();
+        }
+        if (when === "transition") f.answer(run.id, "Casual", "tester");
+        if (when === "cancelled") f.cancelRun(run.id, "tester");
+        expect(await waitFor(f, run.id, ["queued", "cancelled"], 500)).toBe(
+          when === "cancelled" ? "cancelled" : "queued",
+        );
+        expect(f.scheduler.activeRunIds).toEqual([]);
+        if (when === "cancelled") {
+          expect(f.scheduler.parkedRunIds).toEqual([]);
+          expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+          expect(f.store.getRun(run.id)?.error).toBe("cancelled by tester");
+          return;
+        }
+        expect(f.store.getRun(run.id)?.stage).toBeNull();
+        expect(f.store.getRunState<RunState>(run.id)).toMatchObject({ phase, parked: true });
+        expect(f.scheduler.parkedRunIds).toEqual([run.id]);
+        if (when === "parked") {
+          f.scheduler.resume();
+          await waitFor(f, run.id, ["waiting_input"]);
+          expect(f.store.listQuestions(run.id)).toHaveLength(1);
+          f.scheduler.drain();
+          await waitFor(f, run.id, ["queued"], 500);
+        }
+        if (when !== "transition") f.answer(run.id, "Casual", "tester");
+        expect(f.store.listQuestions(run.id)[0]?.answer).toBe("Casual");
+        f.scheduler.tick();
+        expect(f.scheduler.activeRunIds).toEqual([]);
+        f.scheduler.resume();
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        expect(specPrompts.at(-1)).toContain("A: Casual");
+        expect(f.store.listQuestions(run.id)).toHaveLength(1);
+        expect(f.store.getRunState<RunState>(run.id)?.phase).toBe("done");
+      } finally {
+        unsubscribe();
+      }
+    },
+  );
+}
+
 test("drain blocks queued starts and parks the active run at its next boundary", async () => {
   let release = () => {};
   const held = new Promise<void>((resolve) => {
@@ -4920,62 +5835,137 @@ test("panel review: a verifier that omits candidates is retried once, then they 
   expect(warnings).toContainEqual(expect.stringContaining("Verifier gave no ruling for C2"));
 });
 
-test("panel review: a verifier left on the finder's vendor is logged as a warning", async () => {
-  const f = start((s) => {
-    if (s.prompt.startsWith("You are a code-review verifier")) {
-      const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
-      return {
-        structured: {
-          results: ids.map((id) => ({
-            id,
-            verdict: "PLAUSIBLE",
-            severity: "low",
-            category: "correctness",
-            evidence: "farewell.txt:1 `bye`",
-            trigger: "reading the file -> wrong farewell",
-          })),
-        },
-      };
-    }
-    const role = roleOf(s);
-    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
-    if (role === "review")
-      return {
-        structured: {
-          verdict: "approve",
-          summary: "One small note on the farewell text.",
-          findings: [
-            {
-              severity: "minor",
-              security: false,
-              ...findingEvidence,
-              file: "farewell.txt",
-              line: 1,
-              title: "Note",
-              detail: "d",
-              suggestion: "s",
-            },
-          ],
-        },
-      };
-    return { files: { "farewell.txt": "goodbye\n" } };
-  });
-  // Only one vendor is routable, so the verifier cannot avoid the finder's.
+test("panel review: a verifier left on the finder's vendor is another model, with a recorded warning", async () => {
+  const verifiers: string[] = [];
+  const f = start(
+    (s) => {
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        verifiers.push(s.target.modelId);
+        const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+        return {
+          structured: {
+            results: ids.map((id) => ({
+              id,
+              verdict: "PLAUSIBLE",
+              severity: "low",
+              category: "correctness",
+              evidence: "farewell.txt:1 `bye`",
+              trigger: "reading the file -> wrong farewell",
+            })),
+          },
+        };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review")
+        return {
+          structured: {
+            verdict: "approve",
+            summary: "One small note on the farewell text.",
+            findings: [
+              {
+                severity: "minor",
+                security: false,
+                ...findingEvidence,
+                file: "farewell.txt",
+                line: 1,
+                title: "Note",
+                detail: "d",
+                suggestion: "s",
+              },
+            ],
+          },
+        };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    },
+    false,
+    true,
+  );
+  // Only one vendor is routable, so the verifier cannot avoid the finder's; it may not reuse its model.
   f.tracker.record("beta", "quota", { exhaustedUntil: Date.now() + 3_600_000 });
   f.deps.reviewSystem = {
     name: "panel",
     mode: "panel",
     finders: [{ prompt: "standard" }],
-    verifier: {},
+    verifier: { target: "gamma/m" },
     implementerReport: "include",
   };
   const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
   expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-  const warnings = f.store
-    .listEvents(run.id)
-    .filter((e) => e.level === "warn")
-    .map((e) => e.message);
-  expect(warnings).toContainEqual(
-    expect.stringContaining("Verifier alpha/m shares vendor anthropic with a finder it checks"),
+  expect(verifiers).toEqual(["gamma/m"]);
+  const warning =
+    "Verifier gamma/m shares vendor anthropic with a finder it checks (C1); no other vendor was available";
+  expect(JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}").panel.warnings).toEqual([warning]);
+  expect(f.store.listEvents(run.id).map((e) => e.message)).toContain(warning);
+  // With nothing but the finder's own model, there is no verifier: the run goes to a human.
+  f.tracker.setEnabled("gamma", false);
+  const alone = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, alone.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  expect(verifiers).toEqual(["gamma/m"]);
+  expect(f.store.getRun(alone.id)?.error).toContain("alpha/m (raised a candidate it would verify)");
+  // A listed verifier is picked per batch, past the finder's own model, to one routing would not offer.
+  Object.assign(f.deps.reviewSystem ?? {}, { verifier: { targets: ["alpha/m", "delta/m"] } });
+  const listed = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, listed.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(verifiers).toEqual(["gamma/m", "delta/m"]);
+  // The picked target alone is offered: with it down, routing never falls back to an unlisted model.
+  f.tracker.setEnabled("gamma", true);
+  f.tracker.setEnabled("delta", false);
+  const down = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, down.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  expect(verifiers).toEqual(["gamma/m", "delta/m"]);
+  expect(f.store.getRun(down.id)?.error).toContain("delta/m (disabled)");
+  Object.assign(f.deps.reviewSystem ?? {}, { verifier: { targets: ["alpha/m"] } });
+  const noVerifier = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, noVerifier.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  expect(verifiers).toEqual(["gamma/m", "delta/m"]);
+  expect(f.store.getRun(noVerifier.id)?.error).toContain("raised a candidate it would check");
+});
+
+test("panel review: batches from different vendors go to different listed verifiers", async () => {
+  const verifiers: [string, string[]][] = [];
+  const f = start(
+    (s) => {
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+        verifiers.push([s.target.modelId, ids]);
+        return {
+          structured: {
+            results: ids.map((id) => ({
+              id,
+              verdict: "REFUTED",
+              severity: "low",
+              category: "correctness",
+              evidence: "Checked the farewell text",
+              trigger: "none",
+            })),
+          },
+        };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: reviewOutput(1, "minor", `${s.target.vendor}.txt`) };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    },
+    false,
+    true,
   );
+  f.deps.reviewSystem = {
+    name: "panel",
+    mode: "panel",
+    implementerReport: "include",
+    finders: ["alpha/m", "beta/m"].map((target) => ({ target, prompt: "standard" })),
+    verifier: { targets: ["gamma/m", "delta/m"] },
+  };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(verifiers).toEqual([
+    ["delta/m", ["C1"]],
+    ["gamma/m", ["C2"]],
+  ]);
+  expect(
+    JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}").panel.candidates.map(
+      (c: { vendor: string }) => c.vendor,
+    ),
+  ).toEqual(["anthropic", "openai"]);
 });

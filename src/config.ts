@@ -3,8 +3,10 @@ import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { ResolvedProfile, ReviewFinder } from "./core/types.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { defaultGateSlots } from "./gates/slots.ts";
+import { parseReviewRosters } from "./pipeline/review-system.ts";
 import { PROVIDERS } from "./router/catalog.ts";
 import { isLanAddress, isLoopback, publicOrigin } from "./server/access.ts";
 
@@ -42,6 +44,10 @@ export interface Config {
   providerMaxConcurrent: Record<string, number>;
   /** Gate suites (setup + checks) allowed to run at once across the whole process. */
   maxConcurrentGates: number;
+  /** `[gates] baseline_cache`: reuse passing baselines per base commit. Off, every baseline runs (and refreshes). */
+  baselineCache: boolean;
+  /** `[gates] baseline_env`: extra variable names whose values (hashed) key the baseline cache. */
+  baselineEnv: string[];
   maxRounds: number; // implement ⇄ feedback rounds before escalation
   openrouterBudgetUsd: number;
   reserves: Reserves;
@@ -50,6 +56,10 @@ export interface Config {
   dependabotRouting: "free_first" | "policy";
   /** Whether review prompts (production and eval) carry the implementer's self-report. */
   reviewImplementerReport: "include" | "omit";
+  /** `single` (production today) or a verified finder panel with the profile's roster. */
+  reviewMode: "single" | "panel";
+  /** Panel finders per profile, before repo lenses. */
+  reviewRosters: Record<ResolvedProfile, ReviewFinder[]>;
   /** Decision-model triage declines (falls through to the next model) below this answer confidence. */
   triageDecisionConfidence: number;
   githubOwner: string | null; // allowlisted GitHub login for triggers
@@ -83,7 +93,7 @@ function parseEnvFile(path: string): Record<string, string> {
 }
 
 /** `[review]` is validated strictly: a misspelt key would otherwise silently keep the default. */
-const REVIEW_KEYS = ["implementer_report"];
+const REVIEW_KEYS = ["implementer_report", "mode", "rosters"];
 const TRIAGE_KEYS = ["decision_confidence"];
 /** Provisional until calibrated on evals/triage (docs/research/09-jev-decisions.md). */
 export const DEFAULT_DECISION_CONFIDENCE = 0.6;
@@ -181,6 +191,8 @@ export function loadConfig(
     review.implementer_report !== "omit"
   )
     throw new Error('review.implementer_report must be "include" or "omit"');
+  if (review.mode !== undefined && review.mode !== "single" && review.mode !== "panel")
+    throw new Error('review.mode must be "single" or "panel"');
   const rawTriage = raw.triage ?? {};
   if (typeof rawTriage !== "object" || rawTriage === null || Array.isArray(rawTriage))
     throw new Error("triage must be a table");
@@ -192,6 +204,12 @@ export function loadConfig(
   if (typeof confidence !== "number" || !(confidence >= 0 && confidence <= 1))
     throw new Error("triage.decision_confidence must be a number from 0 to 1");
   const retention = (raw.retention ?? {}) as Record<string, unknown>;
+  const gates = (raw.gates ?? {}) as Record<string, unknown>;
+  if (gates.baseline_cache !== undefined && typeof gates.baseline_cache !== "boolean")
+    throw new Error("gates.baseline_cache must be true or false");
+  const baselineEnv = gates.baseline_env ?? [];
+  if (!Array.isArray(baselineEnv) || !baselineEnv.every((v) => typeof v === "string"))
+    throw new Error("gates.baseline_env must be an array of environment variable names");
   const port = overrides.port ?? num(Number(process.env.LIMITLESS_PORT) || server.port, 7400);
   const host = str(server.host, "127.0.0.1") as string;
 
@@ -229,6 +247,8 @@ export function loadConfig(
     maxConcurrentRuns: num(limits.max_concurrent_runs, 3),
     providerMaxConcurrent,
     maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
+    baselineCache: gates.baseline_cache !== false,
+    baselineEnv,
     maxRounds: num(limits.max_rounds, 3),
     openrouterBudgetUsd: num(limits.openrouter_budget_usd, 50),
     reserves: {
@@ -253,6 +273,8 @@ export function loadConfig(
       : [],
     dependabotRouting: routing.dependabot === "policy" ? "policy" : "free_first",
     reviewImplementerReport: review.implementer_report === "omit" ? "omit" : "include",
+    reviewMode: review.mode === "panel" ? "panel" : "single",
+    reviewRosters: parseReviewRosters(review.rosters),
     triageDecisionConfidence: confidence,
     githubOwner: str(owners.github, "MattFlower"),
     discordOwnerId: str(owners.discord, null),

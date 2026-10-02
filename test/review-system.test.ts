@@ -7,7 +7,16 @@ import type { EvalTrial, ReviewSystem } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { reviewSystemHash } from "../src/evals/cache.ts";
 import { validateRequest } from "../src/evals/cases.ts";
-import { parseEvalReviewSystems, productionReviewSystem } from "../src/pipeline/review-system.ts";
+import { pickVerifier } from "../src/pipeline/review.ts";
+import {
+  configuredReviewSystem,
+  DEFAULT_ROSTERS,
+  type EvalReviewSystem,
+  parseEvalReviewSystems,
+  productionReviewSystem,
+  readReviewLenses,
+} from "../src/pipeline/review-system.ts";
+import { MODELS, type ModelDef } from "../src/router/catalog.ts";
 import { enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
 
 const system = (over: Record<string, unknown> = {}) => ({
@@ -50,6 +59,9 @@ const invalid: [string, string][] = [
   [file(system({ verifier: { target: "candidate-b" } })), 'mode "single" takes no verifier'],
   [file(system({ mode: "panel", finders: [], verifier: { target: "candidate-b" } })), "at least one finder"],
   [file(system({ mode: "panel", verifier: {} })), "needs an explicit verifier target"],
+  [file(panel({ verifier: { target: "verifier-c", targets: ["verifier-c"] } })), '"targets", not both'],
+  [file(panel({ verifier: { targets: [] } })), "verifier targets must not be empty"],
+  [file(panel({ verifier: { targets: ["verifier-c", "x@"] } })), "expected model or model@effort"],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
     'finder prompt must be "standard", "adversarial" or "careful"',
@@ -63,6 +75,18 @@ const invalid: [string, string][] = [
   [file(system(), system()), 'duplicate review system name "with-report"'],
   [file(system({ name: "" })), "system name must not be empty"],
   [file(system({ implementerReport: "maybe" })), 'implementerReport must be "include" or "omit"'],
+  [
+    file(panel({ finders: [{ target: "candidate-a", prompt: "careful", lens: { name: "a", focus: "b" } }] })),
+    'a lens finder uses the "standard" prompt',
+  ],
+  [
+    file(system({ finders: [{ target: "candidate-a", prompt: "standard", local: true }] })),
+    'mode "single" uses the "standard" prompt, with no lens, family or local finder',
+  ],
+  [
+    file(panel({ finders: [{ target: "candidate-a", prompt: "standard", local: true }] })),
+    'mode "panel" needs at least one finder that is not local',
+  ],
 ];
 
 test("eval review systems reject unsupported shapes with clear errors", () => {
@@ -75,7 +99,64 @@ test("eval review systems reject unsupported shapes with clear errors", () => {
     target: "candidate-a",
     prompt,
   }));
-  expect(parseEvalReviewSystems(file(panel({ finders })), "s.json")[0]?.finders).toEqual(finders);
+  expect(parseEvalReviewSystems(file(panel({ finders })), "s.json")[0]).toMatchObject({ finders });
+});
+
+test("a batch's verifier is the first listed target independent of it, else the first other model", () => {
+  const t = (modelId: string, vendor: string) => ({ modelId, vendor });
+  const list = [t("a1", "a"), t("o1", "o"), t("a2", "a")];
+  expect(pickVerifier(list, ["o"], ["o2"]).modelId).toBe("a1");
+  expect(pickVerifier(list, ["a"], ["a1"]).modelId).toBe("o1");
+  expect(pickVerifier(list, ["a"], ["a3"]).modelId).toBe("o1");
+  expect(pickVerifier(list, ["a", "o"], ["a1", "o1"]).modelId).toBe("a2");
+  expect(() => pickVerifier(list, ["a"], ["a1", "a2", "o1"])).toThrow("raised a candidate it would check");
+});
+
+test("verifier lists require distinct base models and a model outside all finders", async () => {
+  const model = (id: string): ModelDef => ({
+    ...verifierModel,
+    id,
+    supportedEfforts: ["medium", "high"],
+    effort: undefined,
+  });
+  const f = await evalFixture([
+    model("claude/opus"),
+    model("codex/sol-6.1"),
+    model("codex/sol"),
+    ...MODELS.filter((m) => m.checkpoint).map((m) => ({ ...m, provider: "provider-b" })),
+  ]);
+  try {
+    const review = { ...f.dataset, role: "review" } as unknown as Parameters<typeof validateRequest>[1];
+    const validate = (targets: string[]) =>
+      validateRequest(
+        {
+          role: "review",
+          systems: [
+            panel({
+              finders: ["codex/sol-6.1", "claude/opus"].map((target) => ({ target, prompt: "standard" })),
+              verifier: { targets },
+            }),
+          ],
+        },
+        review,
+        f.factory.router,
+      );
+    expect(() => validate(["claude/opus", "codex/sol-6.1@high"])).toThrow("not any finder's");
+    expect(() => validate(["claude/opus", "claude/opus"])).toThrow("unique by base model id");
+    expect(() => validate(["codex/sol@medium", "codex/sol@high"])).toThrow("unique by base model id");
+    expect(
+      validate(["claude/opus", "codex/sol-6.1@medium", "codex/sol@medium"]).request.systems,
+    ).toHaveLength(1);
+    const alias = { modelId: "mtplx/qwen-27b", vendor: "qwen" };
+    const eligible = { modelId: "codex/sol", vendor: "qwen" };
+    const pick = (targets: (typeof alias)[]) =>
+      pickVerifier(targets, ["qwen"], ["omlx/qwen-27b"], f.factory.router.checkpointIdentity);
+    expect(() => pick([alias])).toThrow("raised a candidate it would check");
+    expect(pick([alias, eligible])).toBe(eligible);
+    expect(f.calls).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
 });
 
 test("production derives one routed standard finder from [review] implementer_report", () => {
@@ -95,9 +176,22 @@ test("system hash ignores key order and name but not behaviour", () => {
   ) as ReviewSystem;
   expect(reviewSystemHash(reordered)).toBe(reviewSystemHash(base));
   expect(reviewSystemHash({ ...base, implementerReport: "omit" })).not.toBe(reviewSystemHash(base));
+  // A panel's roster and lens text are part of what eval caches key on.
+  const lensed = (focus: string) =>
+    reviewSystemHash({ ...base, finders: [{ prompt: "standard", lens: { name: "ops", focus } }] });
+  expect(lensed("Rollback.")).not.toBe(lensed("Restart."));
   expect(reviewSystemHash({ ...base, finders: [{ target: "candidate-b", prompt: "standard" }] })).not.toBe(
     reviewSystemHash(base),
   );
+  // A lone verifier target keeps its hash; a list keys on its targets and their order.
+  const verified = (verifier: ReviewSystem["verifier"]) =>
+    reviewSystemHash({ ...base, mode: "panel", verifier });
+  expect(verified({ target: "verifier-c" })).toBe(
+    "9abea7c5ba7833dba2740b930f32b26b1aa2476852acf94916d829f964700c35",
+  );
+  const listed = verified({ targets: ["verifier-c", "candidate-b"] });
+  expect(listed).not.toBe(verified({ target: "verifier-c" }));
+  expect(listed).not.toBe(verified({ targets: ["candidate-b", "verifier-c"] }));
 });
 
 test("CLI validates --systems before submitting and keeps --models as one system per model", async () => {
@@ -204,6 +298,8 @@ test("request validation resolves systems, expands --models, and rejects bad sys
       { role: "review", systems: [system({ finders: [{ prompt: "standard" }] })] },
       { role: "review", systems: [system({ mode: "panel" })] },
       { role: "review", systems: [panel({ verifier: { target: "nope" } })] },
+      { role: "review", systems: [panel({ verifier: { targets: ["verifier-c", "nope"] } })] },
+      { role: "review", systems: [panel({ verifier: { targets: ["candidate-b"] } })] },
       // A verifier sharing a finder's vendor could not check that finder's candidates cross-vendor.
       { role: "review", systems: [panel({ verifier: { target: "candidate-b" } })] },
       { role: "review", systems: [system(), system()] },
@@ -302,6 +398,128 @@ test("eval policy counts only systems matching the daemon's [review] implementer
     expect(counted()).toEqual([["candidate-a", "with-report", 1]]);
     f.cfg.reviewImplementerReport = "omit";
     expect(counted()).toEqual([["candidate-a", "without", 0]]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("single mode keeps the production review; a panel takes the profile's roster and its base lenses", () => {
+  const lenses = readReviewLenses(
+    '[review]\nlenses = [\n  { name = "ops", focus = "Rollback." },\n  { name = "api", focus = "Callers.", profiles = ["standard", "deep"] },\n]\n',
+    () => {},
+  );
+  expect(lenses).toEqual([
+    { name: "ops", focus: "Rollback.", profiles: ["deep"] },
+    { name: "api", focus: "Callers.", profiles: ["standard", "deep"] },
+  ]);
+  const cfg = {
+    reviewImplementerReport: "omit",
+    reviewMode: "single",
+    reviewRosters: DEFAULT_ROSTERS,
+  } as const;
+  for (const profile of ["quick", "standard", "deep"] as const) {
+    expect(configuredReviewSystem(cfg, profile, lenses)).toEqual(productionReviewSystem(cfg));
+    // A run prepared in single mode read no lenses and stays single.
+    const panelMode = { ...cfg, reviewMode: "panel" } as const;
+    expect(configuredReviewSystem(panelMode, profile, undefined)).toEqual(productionReviewSystem(cfg));
+  }
+  const finders = (profile: "quick" | "standard" | "deep") =>
+    configuredReviewSystem({ ...cfg, reviewMode: "panel" }, profile, lenses).finders.map(
+      ({ prompt, lens, family, local }) => [prompt, lens?.name ?? null, family ?? null, local ?? false],
+    );
+  const standard = [
+    ["adversarial", null, null, false],
+    ["careful", null, "implementer", false],
+    ["standard", "removed-behaviour-and-failure-paths", null, true],
+  ];
+  expect(finders("quick")).toEqual([["standard", null, null, false]]);
+  expect(finders("standard")).toEqual([...standard, ["standard", "api", null, false]]);
+  expect(finders("deep")).toEqual([
+    ...standard,
+    ["standard", "ops", null, false],
+    ["standard", "api", null, false],
+  ]);
+  expect(configuredReviewSystem({ ...cfg, reviewMode: "panel" }, "deep", [])).toMatchObject({
+    name: "panel-deep",
+    mode: "panel",
+    verifier: {},
+    implementerReport: "omit",
+  });
+});
+
+test("repo lenses: none when absent; unknown keys ignored with a warning; known keys strict", () => {
+  const warnings: string[] = [];
+  const read = (toml: string | null) => readReviewLenses(toml, (message) => warnings.push(message));
+  expect(read(null)).toEqual([]);
+  expect(read('[gates]\nsetup = ["true"]\n')).toEqual([]);
+  expect(warnings).toEqual([]);
+  // A later release's keys must not fail this release's runs.
+  expect(
+    read('[review]\nsuppress = ["x"]\nlenses = [{ name = "ops", focus = "Rollback.", paths = ["src/"] }]'),
+  ).toEqual([{ name: "ops", focus: "Rollback.", profiles: ["deep"] }]);
+  expect(warnings).toEqual([
+    "Ignoring unknown .limitless.toml keys: review.suppress, review.lenses[0].paths",
+  ]);
+  for (const [toml, message] of [
+    ['[review]\nlenses = [{ name = "ops" }]', "lenses[0].focus"],
+    ['[review]\nlenses = [{ name = "ops", focus = "x", profiles = ["fast"] }]', "lenses[0].profiles[0]"],
+    ['[review]\nlenses = [{ name = "ops\\n\\n# Output", focus = "x" }]', "lowercase slug"],
+    [`[review]\nlenses = [{ name = "ops", focus = "${"x".repeat(2001)}" }]`, "at most 2000"],
+    ['[review]\nlenses = [{ name = "a", focus = "x" }, { name = "a", focus = "y" }]', "unique"],
+  ] as const)
+    expect(() => read(toml)).toThrow(message);
+});
+
+test("an eval system can name a configured roster; it expands to exactly the production finders", async () => {
+  const local = { ...verifierModel, id: "local-q", provider: "local", vendor: "meta" as const };
+  const f = await evalFixture(
+    [verifierModel, local],
+    [{ id: "local", label: "Local", harness: "fake", billing: "free", maxConcurrent: 1 }],
+  );
+  try {
+    const review = { ...f.dataset, role: "review" } as unknown as Parameters<typeof validateRequest>[1];
+    const reference = {
+      name: "standard-roster",
+      roster: "standard",
+      targets: ["candidate-a", "candidate-b", "local-q"],
+      verifier: { target: "verifier-c" },
+      implementerReport: "include",
+    };
+    expect(parseEvalReviewSystems(file(reference), "s.json")).toEqual([reference] as EvalReviewSystem[]);
+    const expanded = validateRequest({ role: "review", systems: [reference] }, review, f.factory.router);
+    expect(expanded.request.systems).toEqual([
+      {
+        name: "standard-roster",
+        mode: "panel",
+        finders: DEFAULT_ROSTERS.standard.map((finder, i) => ({ ...finder, target: reference.targets[i] })),
+        verifier: { target: "verifier-c" },
+        implementerReport: "include",
+      },
+    ]);
+    // The daemon's configured roster, plus inline lenses as a base `.limitless.toml` would add them.
+    const rosters = { ...DEFAULT_ROSTERS, quick: [{ prompt: "careful" as const }] };
+    const lens = { name: "ops", focus: "Rollback." };
+    const quick = { ...reference, roster: "quick", targets: ["candidate-a", "candidate-b"], lenses: [lens] };
+    expect(
+      validateRequest({ role: "review", systems: [quick] }, review, f.factory.router, rosters).request
+        .systems?.[0]?.finders,
+    ).toEqual([
+      { prompt: "careful", target: "candidate-a" },
+      { prompt: "standard", lens, target: "candidate-b" },
+    ]);
+    expect(() =>
+      validateRequest(
+        { role: "review", systems: [{ ...quick, lenses: [] }] },
+        review,
+        f.factory.router,
+        rosters,
+      ),
+    ).toThrow("roster quick has 1 finders with its lenses; give 1 targets, not 2");
+    // A local finder pins a free model, as production routes it.
+    const paid = { ...reference, targets: ["candidate-a", "candidate-b", "candidate-a"] };
+    expect(() => validateRequest({ role: "review", systems: [paid] }, review, f.factory.router)).toThrow(
+      'review system "standard-roster": local finder candidate-a is not a free model',
+    );
   } finally {
     await f.close();
   }

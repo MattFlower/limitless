@@ -215,11 +215,19 @@ test("policy rejects efforts the role's harness cannot deliver", () => {
 test("built-in local defaults preserve fallback order", () => {
   for (const role of ["triage", "summarize", "chat"] as const)
     expect(DEFAULT_POLICY[role].default).toEqual([
-      "omlx/qwen-27b",
+      "omlx/qwen-flash",
       "claude/haiku|codex/luna",
       ...(role === "chat" ? [] : ["openrouter/glm-5.3-flash"]),
     ]);
   expect(() => validatePolicy({ triage: { default: ["omlx/qwen-27b@low"] } }, MODELS)).toThrow(
     "Unsupported effort",
   );
+});
+
+test("the default local model comes first among free oMLX models", () => {
+  // Free models are tried in catalog order (smoke checks, free-first routing, local finders).
+  expect(MODELS.filter((m) => m.provider === "omlx").map((m) => m.id)).toEqual([
+    "omlx/qwen-flash",
+    "omlx/qwen-27b",
+  ]);
 });

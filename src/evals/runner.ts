@@ -16,7 +16,10 @@ import type { EngineDeps } from "../pipeline/context.ts";
 import { FACTORY_PREAMBLE } from "../pipeline/prompts.ts";
 import {
   combined,
+  FinderSkipped,
+  mapVerifier,
   panelIdentity,
+  pickVerifier,
   type ReviewRequest,
   runReview,
   type VerifierRequest,
@@ -41,12 +44,40 @@ import {
   implementRetryPrompt,
   nextImplementTarget,
   prepareImplement,
+  RETRY_FEEDBACK_GRADE,
 } from "./implement.ts";
 import { gradeCase, prepareCase, schemaFor, seedContent, storedSchemaFor } from "./prepare.ts";
+import { replayFinders, validateReplay } from "./replay.ts";
 import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
+
+/** The abort reason of `eval cancel`; any other abort is a daemon shutdown. */
+const CANCELLED = "cancelled";
+const stopReason = (signal: AbortSignal) => (signal.reason === CANCELLED ? CANCELLED : "daemon shutdown");
+
+type SwitchChain = NonNullable<EvalTrial["details"]["switchChain"]>;
+/** What `eval resume` replays: the explicit request and each implement case's frozen switch chain. */
+interface StoredEvalRequest {
+  request: Record<string, unknown>;
+  switchChains?: Record<string, SwitchChain>;
+}
+/** What `eval resume` continues from. */
+interface ResumeFrom {
+  from: string;
+  switchChains?: Record<string, SwitchChain>;
+}
+const trialKey = (trial: EvalTrial) =>
+  JSON.stringify([trial.caseId, recordedTarget(trial), trial.trial, trial.details.system ?? null]);
 
 /** Where Limitless keeps eval datasets; pins whose history touches these are rejected. */
 const LABEL_PATHS = ["evals/triage", "evals/review", "evals/verify", "evals/implement"];
+
+/** A stored trial graded against its case's current labels; null when its output no longer parses. */
+function regraded(item: Exclude<EvalCase, ImplementCase>, trial: EvalTrial): EvalTrial | null {
+  const output = storedSchemaFor(item).safeParse(trial.output);
+  if (!output.success) return null;
+  const grade = gradeCase(item, output.data);
+  return { ...trial, pass: grade.pass, score: grade.score, details: { ...trial.details, grade } };
+}
 
 export interface EvalRegradeResult {
   regraded: number;
@@ -76,14 +107,38 @@ export class EvalRunner {
     deps.store.recoverEvals();
   }
 
-  submit(input: unknown): EvalRun {
+  submit(input: unknown, resume?: ResumeFrom): EvalRun {
     if (this.stopping) throw new Error("daemon is stopping");
     // Reject unsupported roles before accessing any dataset or repository.
     const parsed = EvalRequestSchema.parse(input);
     const file = loadRoleCases(parsed.role, this.casePath);
     for (const item of file.cases)
       if ("defects" in item) seedContent(item, this.casePath ?? defaultCasePath(parsed.role));
-    const { request, cases } = validateRequest(input, file, this.deps.router);
+    const { request, cases } = validateRequest(input, file, this.deps.router, this.deps.cfg.reviewRosters);
+    if (request.replayFinders)
+      validateReplay(
+        this.deps.store,
+        request.replayFinders,
+        request.systems ?? [],
+        (id) => this.deps.router.model(parseTarget(id).modelId)?.vendor,
+      );
+    // The selected cases, resolved targets and expanded systems, so a resume replays exactly these
+    // trials; an unset effort is stored as `@default` so today's model default cannot change it.
+    const explicit = (target = "") =>
+      parseTarget(target).effort === undefined ? `${target}@default` : target;
+    const replay = {
+      ...parsed,
+      caseIds: cases.map((item) => item.id),
+      ...(parsed.systems
+        ? {
+            systems: request.systems?.map((system) => ({
+              ...system,
+              finders: system.finders.map((finder) => ({ ...finder, target: explicit(finder.target) })),
+              ...(system.verifier ? { verifier: mapVerifier(system.verifier, explicit) } : {}),
+            })),
+          }
+        : { models: request.models.map((target) => explicit(target)) }),
+    };
     const trials: EvalTrial[] = [];
     const candidates =
       request.systems?.map((system) => ({ modelId: system.finders[0]?.target ?? "", system: system.name })) ??
@@ -95,7 +150,11 @@ export class EvalRunner {
             evalRunId: "",
             caseId: item.id,
             modelId: parseTarget(modelId).modelId,
-            effort: recordEffort(this.deps.router.resolve(modelId).effort),
+            // A resolved target names its effort unless it is unset; never re-resolve today's default.
+            effort:
+              parseTarget(modelId).effort === undefined
+                ? "default"
+                : recordEffort(this.deps.router.resolve(modelId).effort),
             trial,
             cacheKey: "",
             harness: "",
@@ -111,12 +170,15 @@ export class EvalRunner {
                       complexity: item.complexity,
                       ...(request.strategy === "switch"
                         ? {
-                            switchChain: this.deps.router
-                              .policyTargets("implement", item.complexity)
-                              .sort((a, b) => a.tier - b.tier)
-                              .filter(
-                                (target, i, targets) => i === 0 || target.tier !== targets[i - 1]?.tier,
-                              ),
+                            // A resume keeps its predecessor's chain, which is part of the cache key.
+                            switchChain:
+                              resume?.switchChains?.[item.id] ??
+                              this.deps.router
+                                .policyTargets("implement", item.complexity)
+                                .sort((a, b) => a.tier - b.tier)
+                                .filter(
+                                  (target, i, targets) => i === 0 || target.tier !== targets[i - 1]?.tier,
+                                ),
                           }
                         : {}),
                     }
@@ -128,13 +190,74 @@ export class EvalRunner {
             durationMs: 0,
             createdAt: Date.now(),
           });
-    const run = this.deps.store.createEvalRun(request, trials);
+    // The resume chain's finished trials, latest first. A trial copies one only if its cache key is
+    // unchanged, so a resumed eval never mixes versions; preparation failures run again.
+    const predecessors = new Map<string, EvalTrial>();
+    for (let id = resume?.from; id; id = this.deps.store.getEvalRun(id)?.resumedFrom)
+      for (const trial of this.deps.store.listEvalTrials(id))
+        if ((trial.status === "ok" || trial.status === "error") && !trial.details.preparationFailed)
+          if (!predecessors.has(trialKey(trial))) predecessors.set(trialKey(trial), trial);
+    const switchChains = Object.fromEntries(
+      trials.flatMap((t) => (t.details.switchChain ? [[t.caseId, t.details.switchChain]] : [])),
+    );
+    const stored: StoredEvalRequest = {
+      request: replay,
+      ...(trials.some((t) => t.details.switchChain) ? { switchChains } : {}),
+    };
+    const run = this.deps.store.createEvalRun(request, trials, stored, resume?.from);
     const controller = new AbortController();
     const done = Promise.resolve()
-      .then(() => this.execute(run, file, cases, request.cache, controller.signal))
+      .then(() => this.execute(run, file, cases, request.cache, controller.signal, predecessors))
       .finally(() => this.active.delete(run.id));
     this.active.set(run.id, { controller, done });
     return run;
+  }
+
+  /**
+   * Resubmits an interrupted or failed eval's stored request unchanged as a new linked run that
+   * copies finished trials whose cache key is unchanged, regraded; the rest run again.
+   */
+  resume(id: string): EvalRun | null {
+    const run = this.deps.store.getEvalRun(id);
+    if (!run) return null;
+    if (this.active.has(id) || run.status === "queued" || run.status === "running")
+      throw new Error(`eval ${id} is still ${run.status}; cancel it before resuming`);
+    if (run.resumedBy) throw new Error(`eval ${id} was already resumed as ${run.resumedBy}`);
+    if (run.status !== "interrupted" && run.status !== "failed")
+      throw new Error(`eval ${id} is ${run.status}; only interrupted or failed evals can be resumed`);
+    // Written only by `submit`, so its shape is trusted; the request itself is revalidated below.
+    const stored = this.deps.store.evalRequest(id) as StoredEvalRequest | null;
+    if (!stored?.request)
+      throw new Error(
+        `eval ${id} predates stored eval requests and cannot be reconstructed; submit it again`,
+      );
+    if (stored.request.cache === false)
+      throw new Error(`eval ${id} ran with the cache disabled; submit it again for a fresh measurement`);
+    try {
+      for (const [caseId, chain] of Object.entries(stored.switchChains ?? {}))
+        for (const target of chain)
+          try {
+            this.deps.router.resolveFor("implement", target);
+          } catch (error) {
+            throw new Error(
+              `case ${caseId} switch chain target ${target.modelId}: ${(error as Error).message}`,
+            );
+          }
+      return this.submit(stored.request, { from: id, switchChains: stored.switchChains });
+    } catch (error) {
+      throw new Error(`cannot resume eval ${id}: ${(error as Error).message}`);
+    }
+  }
+
+  /** Stops scheduling an eval's trials; in-flight trials abort and the run ends interrupted. */
+  async cancel(id: string): Promise<EvalRun | null> {
+    const run = this.deps.store.getEvalRun(id);
+    const entry = this.active.get(id);
+    if (!run) return null;
+    if (!entry) throw new Error(`eval ${id} is ${run.status}, not running`);
+    entry.controller.abort(CANCELLED);
+    await entry.done;
+    return this.deps.store.getEvalRun(id);
   }
 
   report(id: string, options?: StatsOptions): EvalReport | null {
@@ -165,8 +288,8 @@ export class EvalRunner {
     for (const trial of this.deps.store.listEvalTrials(id)) {
       if (trial.status !== "ok" || !trial.details.grade?.review) continue;
       const item = cases.get(trial.caseId);
-      const output = item && storedSchemaFor(item).safeParse(trial.output);
-      if (!item || !output?.success) {
+      const updated = item && regraded(item, trial);
+      if (!item || !updated) {
         result.skipped.push({
           caseId: trial.caseId,
           modelId: recordedTarget(trial),
@@ -175,15 +298,9 @@ export class EvalRunner {
         });
         continue;
       }
-      const grade = gradeCase(item, output.data);
       result.regraded++;
-      if (JSON.stringify(grade) !== JSON.stringify(trial.details.grade)) result.changed++;
-      this.deps.store.recordEvalTrial({
-        ...trial,
-        pass: grade.pass,
-        score: grade.score,
-        details: { ...trial.details, grade },
-      });
+      if (JSON.stringify(updated.details.grade) !== JSON.stringify(trial.details.grade)) result.changed++;
+      this.deps.store.recordEvalTrial(updated);
     }
     return result;
   }
@@ -222,11 +339,12 @@ export class EvalRunner {
     cases: EvalCase[],
     cache: boolean,
     signal: AbortSignal,
+    predecessors: Map<string, EvalTrial>,
   ): Promise<void> {
     this.executing.set(run.id, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY);
     this.resizeEvalSlots();
     try {
-      await this.executeRun(run, file, cases, cache, signal);
+      await this.executeRun(run, file, cases, cache, signal, predecessors);
     } finally {
       this.executing.delete(run.id);
       this.resizeEvalSlots();
@@ -239,6 +357,7 @@ export class EvalRunner {
     cases: EvalCase[],
     cache: boolean,
     signal: AbortSignal,
+    predecessors: Map<string, EvalTrial>,
   ): Promise<void> {
     const { store, router } = this.deps;
     store.updateEvalRun(run.id, "running");
@@ -321,7 +440,7 @@ export class EvalRunner {
           const queue = models.flatMap((modelId) =>
             cases.flatMap((item) =>
               recorded
-                .filter((t) => recordedTarget(t) === modelId && t.caseId === item.id)
+                .filter((t) => t.status === "queued" && recordedTarget(t) === modelId && t.caseId === item.id)
                 .map((trial) => ({ trial, item })),
             ),
           );
@@ -332,7 +451,7 @@ export class EvalRunner {
           let next = 0;
           let failed = false;
           const worker = async () => {
-            while (!failed) {
+            while (!failed && !signal.aborted) {
               const index = next++;
               const entry = queue[index];
               if (!entry) return;
@@ -358,6 +477,7 @@ export class EvalRunner {
                   signal,
                   coordination,
                   hidden.get(entry.item.id),
+                  predecessors.get(trialKey(entry.trial)),
                 );
               } catch (error) {
                 // Like the sequential stream: an unexpected failure stops this provider's new trials.
@@ -375,11 +495,16 @@ export class EvalRunner {
         }),
       );
       const failed = outcomes.find((result) => result.status === "rejected");
-      if (signal.aborted) throw new Error("eval interrupted by daemon shutdown");
+      if (signal.aborted) throw new Error("eval aborted");
       if (failed?.status === "rejected") throw failed.reason;
       store.updateEvalRun(run.id, store.evalSpend(run.id) >= run.maxUsd ? "budget_exhausted" : "completed");
     } catch (error) {
-      store.interruptEval(run.id, (error as Error).message);
+      if (signal.aborted)
+        store.interruptEval(
+          run.id,
+          signal.reason === CANCELLED ? "eval cancelled" : "eval interrupted by daemon shutdown",
+        );
+      else store.interruptEval(run.id, (error as Error).message, "failed");
     }
   }
 
@@ -406,6 +531,7 @@ export class EvalRunner {
     signal: AbortSignal,
     coordination: TrialCoordination,
     hidden: ReturnType<typeof hiddenContents> = [],
+    predecessor?: EvalTrial,
   ): Promise<void> {
     const { store, router, tracker, harnesses, cfg } = this.deps;
     const rounds = run.rounds ?? 1;
@@ -421,26 +547,26 @@ export class EvalRunner {
     };
     const skip = (reason: string, preserveRound = false) => {
       if (!preserveRound) interruptRound(reason);
-      const interrupted = rounds > 1 && (trial.details.roundsUsed ?? 0) > 0;
+      const started = rounds > 1 && (trial.details.roundsUsed ?? 0) > 0;
+      // A cancel or shutdown leaves the trial unscored; its rounds and spend remain as evidence.
+      const interrupted = started && !signal.aborted;
+      const { grade, ...details } = trial.details;
       store.recordEvalTrial({
         ...trial,
         status: interrupted ? "error" : "skipped",
+        ...(signal.aborted ? { pass: null, score: null } : {}),
         details: {
-          ...trial.details,
+          ...details,
+          ...(grade && !signal.aborted ? { grade } : {}),
           ...("hidden" in item ? { roundsUsed: trial.details.roundsUsed ?? 0, stopReason: reason } : {}),
           reason,
-          ...(interrupted
-            ? {
-                interrupted: true,
-                stopReason: reason,
-                grade: trial.details.grade ?? failedImplement("error", reason),
-              }
-            : {}),
+          ...(started ? { interrupted: true, stopReason: reason } : {}),
+          ...(interrupted ? { grade: grade ?? failedImplement("error", reason) } : {}),
         },
       });
     };
     const budget = () => store.evalSpend(run.id) >= run.maxUsd;
-    if (signal.aborted) return skip("daemon shutdown");
+    if (signal.aborted) return skip(stopReason(signal));
     const system =
       trial.details.system === undefined
         ? undefined
@@ -456,8 +582,10 @@ export class EvalRunner {
         tracker.modelUnavailableReason(to.modelId)
       );
     };
-    const eligible = () => unavailable(target);
-    if (budget()) return skip("eval budget exhausted");
+    const replayId = (store.evalRequest(run.id) as StoredEvalRequest | null)?.request.replayFinders;
+    const eligible = () => (typeof replayId === "string" ? null : unavailable(target));
+    // A copy costs nothing, so the budget is checked once its cache key is known.
+    if (!predecessor && budget()) return skip("eval budget exhausted");
     if (!tracker.def(model.provider)) return skip("unknown provider");
     // Legacy queued trials (null) and "default" both leave the backend effort unset.
     const effort = trial.effort === null || trial.effort === "default" ? undefined : trial.effort;
@@ -478,6 +606,10 @@ export class EvalRunner {
     let scratch: string | undefined;
     let cleanup: (() => Promise<void>) | undefined;
     try {
+      const replay =
+        typeof replayId === "string" && system
+          ? replayFinders(store, replayId, system, item.id, trial.trial)
+          : undefined;
       // Inside the try: a missing pin or failed snapshot fails this case's preparation, not the run.
       const tree = "gold" in item && "prompt" in item ? await treeFor(item, labels) : "";
       mkdirSync(cfg.paths.runs, { recursive: true });
@@ -525,18 +657,27 @@ export class EvalRunner {
           ? { ...prepared.review, ...(system ? { system } : {}) }
           : undefined;
       const decisionTask = "decisionTask" in prepared ? prepared.decisionTask : undefined;
-      // Panel targets beyond the trial's own (its first finder) are pinned in the system.
-      const pinned = (id: string | undefined) => {
-        const { model: pinnedModel, effort: pinnedEffort } = router.resolve(id ?? "");
-        return router.toTarget(pinnedModel, pinnedEffort);
+      // Panel targets beyond the trial's own (its first finder) are pinned in the system. A bare
+      // target is an unset effort, which today's model default must not restore (as for the trial).
+      const pinned = (id = "") => {
+        const { model: pinnedModel, effort: pinnedEffort } = router.resolve(
+          parseTarget(id).effort === undefined ? { modelId: id, effort: null } : id,
+        );
+        return router.toTarget(pinnedModel, pinnedEffort ?? null);
       };
       const panelTargets =
         system?.mode === "panel"
           ? {
               finders: system.finders.slice(1).map((f) => pinned(f.target)),
-              verifier: pinned(system.verifier?.target),
+              verifiers: (system.verifier?.targets ?? [system.verifier?.target]).map((t) => pinned(t)),
             }
           : undefined;
+      // A replay makes no finder calls, so it waits on its verifiers instead of the trial's target:
+      // an unavailable one skips the trial (resumable) rather than failing it.
+      const gate = () =>
+        typeof replayId === "string"
+          ? ((panelTargets?.verifiers ?? []).map(unavailable).find(Boolean) ?? null)
+          : eligible();
       const schema = "hidden" in item ? undefined : schemaFor(item);
       const jsonSchema = schema ? toStrictJsonSchema(schema) : undefined;
       const repository =
@@ -562,6 +703,7 @@ export class EvalRunner {
                     })),
                   }
                 : { head: item.head, input: item.input }),
+              ...(replay ? { replay: replay.identity } : {}),
               ...(system ? { reviewSystem: reviewSystemHash(system) } : {}),
               ...(system?.mode === "panel" ? { panel: panelIdentity() } : {}),
               patch,
@@ -569,6 +711,16 @@ export class EvalRunner {
               source:
                 store.getRepoBySlug(item.repo)?.url ?? store.getRepoBySlug(item.repo)?.localPath ?? item.repo,
             };
+      // Every target the trial may call, resolved now: later rounds' targets, then panel members.
+      const targets: (ModelTarget | null)[] = [target];
+      for (let last = targets.at(-1); last && targets.length < rounds; last = targets.at(-1)) {
+        try {
+          targets.push(nextImplementTarget(router, trial.details.switchChain, last, strategy) ?? null);
+        } catch {
+          targets.push(null);
+        }
+      }
+      if (panelTargets) targets.push(...panelTargets.finders, ...panelTargets.verifiers);
       trial.cacheKey = cacheKey(
         model.id,
         harnessName,
@@ -577,12 +729,42 @@ export class EvalRunner {
         jsonSchema ?? {},
         trial.trial,
         rounds > 1
-          ? { ...repository, rounds, strategy, version: 2, switchChain: trial.details.switchChain }
+          ? {
+              ...repository,
+              rounds,
+              strategy,
+              version: 2,
+              switchChain: trial.details.switchChain,
+              // Every later round's prompt template, which the initial prompt never renders and
+              // which may branch on the round number.
+              retryPrompts:
+                "hidden" in effective && implementation
+                  ? Array.from({ length: rounds - 1 }, (_, round) =>
+                      [failedImplement("error"), RETRY_FEEDBACK_GRADE].map((grade) =>
+                        implementRetryPrompt(effective, implementation, grade, round + 1),
+                      ),
+                    )
+                  : null,
+            }
           : repository,
         trial.effort,
+        targets.map(
+          (to) => to && [to.provider, to.model, selectHarness(run.role, to).harnessName, to.effort ?? null],
+        ),
       );
+      if (predecessor?.cacheKey === trial.cacheKey) {
+        const copy =
+          predecessor.status === "ok" && !("hidden" in item)
+            ? (regraded(item, predecessor) ?? predecessor)
+            : predecessor;
+        return store.recordEvalTrial({
+          ...copy,
+          evalRunId: run.id,
+          details: { ...copy.details, resumedFrom: copy.details.resumedFrom ?? copy.evalRunId },
+        });
+      }
       if (cache) await coordination.keyed(trial.cacheKey);
-      if (signal.aborted) return skip("daemon shutdown");
+      if (signal.aborted) return skip(stopReason(signal));
       if (budget()) return skip("eval budget exhausted");
       // Decision calls cost ~$0.0001 and keep their declined status only when executed.
       if (cache && harnessName !== "decisions")
@@ -604,6 +786,7 @@ export class EvalRunner {
             details: {
               ...("hidden" in item ? source.details : {}),
               ...trial.details,
+              ...(source.details.verifiers ? { verifiers: source.details.verifiers } : {}),
               grade,
               cache: source.details.cache ?? {
                 evalRunId: source.evalRunId,
@@ -620,27 +803,29 @@ export class EvalRunner {
         }
       const toolCommands: string[] = [];
       let sessionId: string | undefined;
-      if (rounds > 1) scratch = createScratch(cwd);
       for (let round = 0; round < rounds; round++) {
-        if (signal.aborted) return skip("daemon shutdown");
+        if (scratch) removeScratch(scratch);
+        scratch = undefined;
+        if (signal.aborted) return skip(stopReason(signal));
         if (budget()) return skip("eval budget exhausted");
         ({ harnessName, noTools } = selectHarness(run.role, target));
         const harness = harnesses[harnessName];
         if (!harness) return skip(`No harness registered for ${harnessName}`);
-        const reason = eligible();
+        const reason = gate();
         if (reason)
           return skip(strategy === "switch" && round > 0 ? `Switch target unavailable: ${reason}` : reason);
-        const runSlot = await coordination.slot(target.provider);
+        const runSlot = replay ? () => {} : await coordination.slot(target.provider);
         release = runSlot;
-        const trackerSlot = await tracker.acquire(target.provider, signal);
+        const trackerSlot = replay ? () => {} : await tracker.acquire(target.provider, signal);
         release = () => {
           trackerSlot();
           runSlot();
         };
-        if (signal.aborted) return skip("daemon shutdown");
+        if (signal.aborted) return skip(stopReason(signal));
         if (budget()) return skip("eval budget exhausted");
-        const afterWait = eligible();
+        const afterWait = gate();
         if (afterWait) return skip(afterWait);
+        if (rounds > 1 || "hidden" in item) scratch = createScratch(cwd);
         if (round === 0) trial.createdAt = Date.now();
         roundStarted = Date.now();
         trial.harness = harnessName;
@@ -761,8 +946,22 @@ export class EvalRunner {
                   await runReview(
                     {
                       invoke: async (request, finder) => {
+                        if (replay) {
+                          release?.();
+                          release = undefined;
+                          const stored = replay.invoke(finder);
+                          const to = finder === 0 ? target : panelTargets?.finders[finder - 1];
+                          if (!to || !stored.vendor)
+                            throw new Error(`replay finder ${finder} identity missing`);
+                          return { result: stored.result, target: { ...to, vendor: stored.vendor } };
+                        }
                         const to = finder > 0 ? panelTargets?.finders[finder - 1] : undefined;
-                        if (to) return sendTo(request, to, `finder-${finder}`);
+                        // As in production, a local finder that cannot run is skipped, not a failed panel.
+                        if (to)
+                          return sendTo(request, to, `finder-${finder}`).catch((error: Error) => {
+                            if (signal.aborted || !system?.finders[finder]?.local) throw error;
+                            throw new FinderSkipped(error.message);
+                          });
                         try {
                           own = await send(request);
                           spent.push(own);
@@ -774,14 +973,15 @@ export class EvalRunner {
                         }
                         return { result: own, target };
                       },
-                      verify: async (request, avoidVendors) => {
+                      verify: async (request, avoidVendors, avoidModels, candidates) => {
                         if (!panelTargets) throw new Error("review system has no verifier");
-                        const { modelId, vendor } = panelTargets.verifier;
-                        if (avoidVendors.includes(vendor))
-                          throw new Error(
-                            `verifier ${modelId} shares vendor ${vendor} with a finder it checks`,
-                          );
-                        return sendTo(request, panelTargets.verifier, `verifier-${++verifications}`);
+                        // A shared vendor is allowed and recorded by the panel, as in production.
+                        const identity = this.deps.router.checkpointIdentity;
+                        const to = pickVerifier(panelTargets.verifiers, avoidVendors, avoidModels, identity);
+                        const { modelId, effort } = to;
+                        trial.details.verifiers ??= [];
+                        trial.details.verifiers.push({ modelId, effort: recordEffort(effort), candidates });
+                        return sendTo(request, to, `verifier-${++verifications}`);
                       },
                     },
                     reviewInput,
@@ -842,8 +1042,8 @@ export class EvalRunner {
           store.recordEvalTrial({ ...trial, status: "running" });
         }
         // A panel's combined result carries its last call's status; the trial's own call is recorded here.
-        observe(target, own ?? result);
-        if (signal.aborted) return skip("daemon shutdown");
+        if (!replay) observe(target, own ?? result);
+        if (signal.aborted) return skip(stopReason(signal));
         // A panel's result is its derived review, whose verification fields only the stored schema keeps;
         // anything without the panel's mark (e.g. one member's raw review) is not a panel result.
         const output = (
@@ -857,15 +1057,7 @@ export class EvalRunner {
         const grade =
           "hidden" in effective && implementation
             ? result.status === "ok"
-              ? await gradeImplement(
-                  effective,
-                  cwd,
-                  hidden,
-                  implementation,
-                  toolCommands,
-                  signal,
-                  round + 1 < rounds,
-                )
+              ? await gradeImplement(effective, cwd, hidden, implementation, toolCommands, signal)
               : failedImplement(result.status === "timeout" ? "timeout" : "error", result.error ?? undefined)
             : ok && output?.success && !("hidden" in item)
               ? gradeCase(item, output.data)
@@ -931,7 +1123,7 @@ export class EvalRunner {
         break;
       }
     } catch (error) {
-      if (signal.aborted) return skip("daemon shutdown");
+      if (signal.aborted) return skip(stopReason(signal));
       if (trial.details.grade) return skip((error as Error).message);
       interruptRound((error as Error).message);
       store.recordEvalTrial({

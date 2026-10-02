@@ -15,7 +15,7 @@ import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
 import type { Harness } from "./harness/types.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
-import { productionReviewSystem } from "./pipeline/review-system.ts";
+import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import {
   DEFAULT_POLICY,
   MODELS,
@@ -85,6 +85,7 @@ export class Factory {
       ...provider,
       maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
     }));
+    checkRosterTargets(cfg, this.models, this.providerDefs, (message) => console.warn(message));
     this.policy =
       opts.policy ??
       (opts.policyPath === undefined
@@ -112,6 +113,7 @@ export class Factory {
       cfg,
       faults: opts.faults,
       store: this.store,
+      buildSha: opts.bootSha,
       router: this.router,
       tracker: this.tracker,
       harnesses: opts.harnesses ?? {
@@ -244,6 +246,7 @@ export class Factory {
         ...(run.baseBranch ? { baseBranch: run.baseBranch } : {}),
         ...(run.deliveryBranch ? { deliveryBranch: run.deliveryBranch } : {}),
         ...(run.requestedBy ? { requestedBy: run.requestedBy } : {}),
+        ...(run.noBaselineCache ? { noBaselineCache: true } : {}),
       },
       run.githubWebhookVerified,
     );

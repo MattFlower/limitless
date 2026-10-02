@@ -3,11 +3,21 @@ import { join } from "node:path";
 import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
+import {
+  BASELINE_CACHE_TTL_MS,
+  baselineCacheKey,
+  cacheableBaseline,
+  gateEnvDigest,
+  lockfileHash,
+  singleFlight,
+} from "../gates/cache.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import {
   compareGates,
   type GateComparison,
   type GateHooks,
+  type GateRun,
+  gateEnv,
   retryBaselineFailures,
   retryRegressions,
   runGates,
@@ -22,7 +32,10 @@ import {
   ensureCache,
   exportCommit,
   fetchBase,
+  findPullRequest,
   formatTopLevel,
+  type GitHubBudget,
+  githubRetry,
   headSha,
   isAncestor,
   mergePullRequest,
@@ -32,8 +45,9 @@ import {
   remoteBranchSha,
   removeWorktree,
   resetTo,
+  withGitHubRetry,
 } from "../git/repos.ts";
-import { runGh } from "../integrations/github.ts";
+import { type GhRunner, runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
 import {
@@ -62,8 +76,10 @@ import {
 import { buildReport } from "./report.ts";
 import {
   blockingReviewFindings,
+  FinderSkipped,
   PANEL_REVIEWS,
   type PanelReview,
+  pickVerifier,
   type ReviewInput,
   type ReviewRequest,
   resolvedPriorFindings,
@@ -71,7 +87,7 @@ import {
   runReview,
   type VerifierRequest,
 } from "./review.ts";
-import { productionReviewSystem } from "./review-system.ts";
+import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import {
   type Holdout,
   HoldoutSchema,
@@ -86,6 +102,8 @@ import {
   VerifySchema,
 } from "./schemas.ts";
 import { createSnapshotParent } from "./snapshots.ts";
+import { outOfRunCriteria, specCriteriaRange } from "./spec-criteria.ts";
+import { specScopeViolation } from "./spec-scope.ts";
 import { triageDecisions } from "./triage-decisions.ts";
 import {
   blockedOnly,
@@ -102,6 +120,7 @@ export async function executeRun(
   runId: string,
   signal: AbortSignal,
   isDraining: () => boolean = () => false,
+  drainEvents?: EventTarget,
 ): Promise<RunStatus> {
   const run = deps.store.getRun(runId);
   if (!run) return "failed";
@@ -110,7 +129,7 @@ export async function executeRun(
     deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  const ctx = new RunContext(deps, run, repo, signal, isDraining);
+  const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
   ctx.state.parked = false;
   ctx.run = deps.store.updateRun(
     runId,
@@ -325,9 +344,11 @@ async function prepare(ctx: RunContext): Promise<void> {
     await discardChanges(wt.path);
     let gates: GateConfig;
     try {
-      ctx.state.previewConfig = readPreviewConfig(
-        await readFileAt(wt.path, verification?.baseSha ?? baseSha, ".limitless.toml"),
-      );
+      const repoConfig = await readFileAt(wt.path, verification?.baseSha ?? baseSha, ".limitless.toml");
+      ctx.state.previewConfig = readPreviewConfig(repoConfig);
+      // Review lenses come from the base commit, never from the change under review.
+      if (ctx.deps.cfg.reviewMode === "panel")
+        ctx.state.reviewLenses = readReviewLenses(repoConfig, (message) => ctx.log(message, "warn"));
       gates = detectGates(wt.path);
       ctx.state.gatesConfig = gates;
       ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
@@ -336,21 +357,57 @@ async function prepare(ctx: RunContext): Promise<void> {
       );
       await ctx.save();
       const { onWait } = gateEvents(ctx);
-      ctx.state.baseline =
-        gates.setup.length || gates.checks.length
-          ? await runGates(wt.path, gates, ctx.signal, { onWait })
-          : null;
-      ctx.checkCancelled();
-      // Retry before resetting, so a check sees the same build output as its first attempt.
-      if (ctx.state.baseline)
-        ctx.state.baseline = await retryBaselineFailures(
-          ctx.state.baseline,
-          wt.path,
+      const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
+      const runBaseline = async (): Promise<GateRun> => {
+        const run = await runGates(wt.path, gates, ctx.signal, { onWait });
+        ctx.checkCancelled();
+        // Retry before resetting, so a check sees the same build output as its first attempt.
+        const retried = await retryBaselineFailures(run, wt.path, gates, ctx.signal, onWait);
+        ctx.checkCancelled();
+        return retried;
+      };
+      ctx.state.baselineCached = false;
+      const buildSha = ctx.deps.buildSha;
+      if (!hasGates) ctx.state.baseline = null;
+      // Without a known build the gate environment can't be keyed: never read or write the cache.
+      else if (!buildSha) ctx.state.baseline = await runBaseline();
+      else {
+        // Keyed by the commit actually checked out, so verify-change caches its PR base.
+        const key = baselineCacheKey({
+          repoId: ctx.repo.id,
+          baseSha: await headSha(wt.path),
           gates,
-          ctx.signal,
-          onWait,
-        );
-      ctx.checkCancelled();
+          lockfileHash: lockfileHash(wt.path),
+          bunVersion: Bun.version,
+          platform: process.platform,
+          arch: process.arch,
+          buildSha,
+          envDigest: gateEnvDigest(gateEnv(), cfg.baselineEnv),
+        });
+        // A bypass still runs the baseline and refreshes the entry if it passes.
+        const bypass = ctx.run.noBaselineCache === true || !cfg.baselineCache;
+        const baseline = async (): Promise<GateRun> => {
+          const cached = bypass
+            ? null
+            : store.getBaselineCache<GateRun>(key, Date.now() - BASELINE_CACHE_TTL_MS);
+          if (cached && cacheableBaseline(cached, gates)) {
+            ctx.state.baselineCached = true;
+            ctx.log(`Baseline reused from cache (${key.baseSha.slice(0, 12)})`);
+            return cached;
+          }
+          const fresh = await runBaseline();
+          // Only a passing baseline is cached; a failure (maybe flaky) must run again next time,
+          // and it contradicts any cached pass for this key, so that entry goes.
+          if (cacheableBaseline(fresh, gates)) store.putBaselineCache(key, fresh, ctx.run.id);
+          else store.deleteBaselineCache(key);
+          return fresh;
+        };
+        // One cacheable baseline per key at a time: a concurrent run on the same base waits, then
+        // reuses it. A bypass can't reuse anything, so it never waits.
+        ctx.state.baseline = bypass
+          ? await baseline()
+          : await singleFlight(JSON.stringify(key), ctx.signal, baseline, (r) => cacheableBaseline(r, gates));
+      }
     } finally {
       if (verification) await resetTo(wt.path, verification.headSha);
       else await discardChanges(wt.path);
@@ -381,7 +438,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     await ctx.setPhase("triage");
     const failing = baseline ? baseline.checks.filter((c) => !c.ok).map((c) => c.name) : [];
     return {
-      summary: `worktree ${wt.branch}; ${gates.checks.length} checks${failing.length ? `, failing on base: ${failing.join(", ")}` : ""}`,
+      summary: `worktree ${wt.branch}; ${gates.checks.length} checks${failing.length ? `, failing on base: ${failing.join(", ")}` : ""}${ctx.state.baselineCached ? "; baseline reused from cache" : ""}`,
       value: undefined,
     };
   });
@@ -461,6 +518,9 @@ async function waitForAnswers(ctx: RunContext): Promise<void> {
       if (ctx.signal.aborted) {
         cleanup();
         reject(new CancelledError());
+      } else if (ctx.isDraining()) {
+        cleanup();
+        reject(new ParkedError());
       } else if (!pending().length) {
         cleanup();
         resolve();
@@ -471,9 +531,11 @@ async function waitForAnswers(ctx: RunContext): Promise<void> {
     });
     const onAbort = () => check();
     ctx.signal.addEventListener("abort", onAbort);
+    ctx.drainEvents?.addEventListener("drain", onAbort);
     const cleanup = () => {
       unsubscribe();
       ctx.signal.removeEventListener("abort", onAbort);
+      ctx.drainEvents?.removeEventListener("drain", onAbort);
     };
     check();
   });
@@ -495,19 +557,73 @@ async function clarify(ctx: RunContext): Promise<void> {
 
 async function spec(ctx: RunContext): Promise<void> {
   await ctx.stage("spec", async (stage) => {
-    const { result, target } = await ctx.invoke({
-      role: "spec",
+    // A resumed spec may already have asked questions before it parked.
+    if (ctx.store.listQuestions(ctx.run.id).length) {
+      await waitForAnswers(ctx);
+      ctx.state.answers = ctx.store
+        .listQuestions(ctx.run.id)
+        .map((q) => `Q: ${q.question}\n  A: ${q.answer}`);
+    }
+    const complexity = ctx.state.triage?.complexity ?? ctx.run.complexity ?? undefined;
+    const [, maxCriteria] = specCriteriaRange(complexity);
+    const invocation = {
+      role: "spec" as const,
       stage,
-      mode: "readonly",
+      mode: "readonly" as const,
       complexity: ctx.complexity,
-      prompt: specPrompt({ prompt: ctx.run.prompt, answers: ctx.state.answers }),
+      prompt: specPrompt({ prompt: ctx.run.prompt, answers: ctx.state.answers, complexity }),
       jsonSchema: toStrictJsonSchema(SpecSchema),
       schema: SpecSchema,
       requireStructured: true,
       maxToolCalls: 60,
-    });
+    };
+    let { result, target } = await ctx.invoke(invocation);
     await discardChanges(ctx.state.worktreePath as string);
-    const s = SpecSchema.parse(result.structured);
+    let s = SpecSchema.parse(result.structured);
+    let scopeRetried = false;
+    let criteriaRetried = false;
+    let sizeRetried = false;
+    for (;;) {
+      const offending = specScopeViolation(s, ctx.run.prompt);
+      const flagged = outOfRunCriteria(s);
+      if (offending && scopeRetried)
+        throw new Error(`structured output failed validation: invalid spec scope: ${offending}`);
+      const retryCriteria: boolean = flagged.length > 0 && !criteriaRetried;
+      const oversized = s.acceptance_criteria.length > maxCriteria;
+      const retrySize: boolean = oversized && !sizeRetried;
+      if (!offending && !retryCriteria && !retrySize) {
+        // Kept, not dropped: the match is a word list, and a wrongly dropped criterion weakens verify.
+        if (flagged.length)
+          ctx.log(
+            `Kept acceptance criteria that may depend on something outside the run: ${flagged.map((a) => a.id).join(", ")}`,
+            "warn",
+          );
+        if (oversized)
+          ctx.log(
+            `Kept oversized spec: ${s.acceptance_criteria.length} acceptance criteria exceed the ${complexity ?? "unknown"} limit of ${maxCriteria} after size retry`,
+            "warn",
+          );
+        break;
+      }
+      const feedback = [
+        offending
+          ? `\n\nInvalid specification: this sentence restricts the task beyond the request: ${JSON.stringify(offending)}\nThe read-only rule applies to your investigation only. Rewrite the spec to describe the requested change without this restriction.`
+          : "",
+        retryCriteria
+          ? `\n\nInvalid acceptance criteria: ${flagged.map((a) => a.id).join(", ")} depend on something outside the run. Replace them with criteria verifiable in the run's checkout using repository commands and tests; move external concerns to assumptions or out_of_scope.`
+          : "",
+        retrySize
+          ? `\n\nToo many acceptance criteria: ${s.acceptance_criteria.length}. For ${complexity ?? "unknown"} complexity, use at most ${maxCriteria} criteria. Consolidate the spec while preserving the requested behavior and concrete how_to_verify for every criterion.`
+          : "",
+      ].join("");
+      ctx.log(feedback.trim(), "warn");
+      scopeRetried ||= Boolean(offending);
+      criteriaRetried ||= retryCriteria;
+      sizeRetried ||= retrySize;
+      ({ result, target } = await ctx.invoke({ ...invocation, prompt: invocation.prompt + feedback }));
+      await discardChanges(ctx.state.worktreePath as string);
+      s = SpecSchema.parse(result.structured);
+    }
     ctx.store.putArtifact(ctx.run.id, "spec.md", "spec", `# ${ctx.run.title}\n\n${renderSpec(s)}\n`);
     const unanswered = s.blocking_questions.filter(Boolean);
     if (unanswered.length && ctx.state.answers.length === 0) {
@@ -766,6 +882,25 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
   );
 }
 
+/**
+ * A verifier never runs on a model that raised its candidates. It prefers a vendor that neither
+ * raised them nor implemented the change, then the implementer's, then a raising vendor (not the
+ * implementer's first), and the implementer's own model last; that outranks free-first billing.
+ */
+export function verifierConstraints(
+  avoidVendors: string[],
+  avoidModels: string[],
+  implementer?: { vendor: string; modelId: string },
+): RouteConstraints {
+  return {
+    avoidVendor: avoidVendors,
+    excludeModels: avoidModels,
+    excludedBecause: "raised a candidate it would verify",
+    ...(implementer ? { preferNotVendor: [implementer.vendor], preferNotModels: [implementer.modelId] } : {}),
+    independenceFirst: true,
+  };
+}
+
 /** Returns true when every gate passes. */
 async function oneRound(
   ctx: RunContext,
@@ -776,7 +911,8 @@ async function oneRound(
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
   const changeDiff = () => diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change");
-  const system = ctx.deps.reviewSystem ?? productionReviewSystem(ctx.deps.cfg);
+  const system =
+    ctx.deps.reviewSystem ?? configuredReviewSystem(ctx.deps.cfg, profile(ctx), ctx.state.reviewLenses);
   const resolution = ctx.state.conflictRound === round;
   // Panel reviews are numbered apart from implementation rounds (a gate-failed round reviews nothing,
   // a replayed round keeps its number); a conflict-resolution review is outside the count.
@@ -955,6 +1091,7 @@ async function oneRound(
         replayedFollowUps: replayed?.followUps,
         system,
         ...(panelRules ? { panelReview: panelRules } : {}),
+        ...(ctx.state.implementer ? { implementerModel: ctx.state.implementer.modelId } : {}),
         prompt: {
           prompt: ctx.run.prompt,
           spec: ctx.state.spec ?? null,
@@ -975,19 +1112,21 @@ async function oneRound(
         },
       };
       // TODO: parallel panel finders share this worktree, and each call discards changes when it ends,
-      // possibly while another finder still runs. Production reviews run a single finder.
+      // possibly while another finder still runs. Readers are read-only; single mode runs one finder.
       const call = async (
         request: ReviewRequest | VerifierRequest,
-        avoidVendor: string | string[] | undefined,
+        constraints: RouteConstraints,
         prefer: string | undefined,
+        deadline?: number,
       ) => {
         const invoked = await ctx.invoke({
           role: "review",
           stage,
           mode: "readonly",
           complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
-          constraints: { avoidVendor, ...(prefer ? { prefer } : {}) },
+          constraints: { ...constraints, ...(prefer ? { prefer } : {}) },
           ...request,
+          ...(deadline ? { deadline } : {}),
           requireStructured: true,
         });
         await discardChanges(cwd);
@@ -995,16 +1134,33 @@ async function oneRound(
       };
       const { target, output, decision, panel } = await runReview(
         {
-          invoke: (request, finder) =>
-            call(request, ctx.state.implementer?.vendor, system.finders[finder]?.target),
-          verify: async (request, avoidVendors) => {
-            const verified = await call(request, avoidVendors, system.verifier?.target);
-            if (avoidVendors.includes(verified.target.vendor))
-              ctx.log(
-                `Verifier ${verified.target.modelId} shares vendor ${verified.target.vendor} with a finder it checks (no cross-vendor verifier available)`,
-                "warn",
-              );
-            return verified;
+          invoke: async (request, index) => {
+            const finder = system.finders[index];
+            const vendor = ctx.state.implementer?.vendor;
+            const constraints: RouteConstraints = {
+              ...(finder?.family === "implementer" ? { preferVendor: vendor } : { avoidVendor: vendor }),
+              ...(finder?.local ? { billing: "free_only" as const } : {}),
+            };
+            // One deadline covers a local finder's slot waits and fallbacks; past it, the panel skips it.
+            const deadline = finder?.local ? Date.now() + request.timeoutMs : undefined;
+            try {
+              return await call(request, constraints, finder?.target, deadline);
+            } catch (error) {
+              if (finder?.local && error instanceof NoCapacityError) throw new FinderSkipped(error.message);
+              throw error;
+            }
+          },
+          verify: (request, avoidVendors, avoidModels) => {
+            const constraints = verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer);
+            if (!system.verifier?.targets) return call(request, constraints, system.verifier?.target);
+            // Picked per batch, as evals do, and offered alone: a routed fallback could share its vendor.
+            const listed = system.verifier.targets.map((target) => {
+              const { model, targetId } = ctx.deps.router.resolve(target);
+              return { vendor: model.vendor, modelId: model.id, targetId };
+            });
+            const identity = ctx.deps.router.checkpointIdentity;
+            const only = pickVerifier(listed, avoidVendors, avoidModels, identity).targetId;
+            return call(request, { ...constraints, only }, undefined);
           },
           warn: (message) => ctx.log(message, "warn"),
         },
@@ -1249,6 +1405,20 @@ async function recordVerified(ctx: RunContext, sha: string): Promise<void> {
   await ctx.save();
 }
 
+const deliveryBudgets = new WeakMap<RunContext, { round: number; budget: GitHubBudget }>();
+
+/**
+ * One in-memory GitHub retry budget per delivery attempt, fallback draft included. A resumed
+ * delivery runs in a new context and so starts fresh: downtime never counts against it.
+ */
+function deliveryBudget(ctx: RunContext): GitHubBudget {
+  const held = deliveryBudgets.get(ctx);
+  if (held?.round === ctx.state.round) return held.budget;
+  const budget = { leftMs: githubRetry.budgetMs };
+  deliveryBudgets.set(ctx, { round: ctx.state.round, budget });
+  return budget;
+}
+
 async function deliverVerifiedDraft(
   ctx: RunContext,
   sha: string,
@@ -1264,7 +1434,15 @@ async function deliverVerifiedDraft(
   const report = buildReport(ctx, false, { sha, stage, reason, base });
   ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
   ctx.checkCancelled();
-  await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal);
+  // The failed delivery may have opened its PR without hearing back, and its spent budget would
+  // keep the draft below from finding it.
+  if (!ctx.run.prUrl) {
+    const found = await findPullRequest(ctx.repo, branch, cwd, ctx.signal);
+    if (found) ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: found });
+  }
+  ctx.checkCancelled();
+  const budget = deliveryBudget(ctx);
+  await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
     branch,
@@ -1274,6 +1452,7 @@ async function deliverVerifiedDraft(
     cwd,
     draft: true,
     signal: ctx.signal,
+    budget,
   });
   await ctx.save("delivery-pr-created");
   ctx.checkCancelled();
@@ -1291,13 +1470,16 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     throw new Error("PR delivery base does not match the verified webhook head");
   const deliverStage = async () => {
     const cwd = ctx.state.worktreePath as string;
+    const budget = deliveryBudget(ctx);
+    const runner = ctx.deps.gh ?? runGh;
+    const gh: GhRunner = (args, signal) =>
+      withGitHubRetry(async () => (await runner(args, signal)) ?? "", { budget, signal });
     if (
       success &&
       ctx.repo.kind === "github" &&
       !ctx.run.deliveryBranch &&
       (ctx.run.prUrl || ctx.store.listStages(ctx.run.id).filter((s) => s.name === "deliver").length > 1)
     ) {
-      const gh = ctx.deps.gh ?? runGh;
       const raw = await gh(
         ctx.run.prUrl
           ? ["pr", "view", ctx.run.prUrl, "--repo", ctx.repo.slug, "--json", "state,url"]
@@ -1348,39 +1530,29 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         const report = buildReport(ctx, true);
         ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
         if (!ctx.state.verdictCommentPosted) {
-          const gh = ctx.deps.gh ?? runGh;
           const marker = `<!-- limitless-verification:${ctx.run.id} -->`;
           ctx.checkCancelled();
-          // A pending post may already exist remotely even when its local checkpoint was lost.
-          const comments = ctx.state.verdictCommentPending
-            ? await gh(
-                [
-                  "api",
-                  `repos/${ctx.repo.slug}/issues/${ctx.run.sourceRef?.number}/comments`,
-                  "--paginate",
-                  "--jq",
-                  ".[].body",
-                ],
-                ctx.signal,
-              )
-            : "";
-          if (!comments?.includes(marker)) {
-            ctx.state.verdictCommentPending = true;
-            await ctx.save("verification-comment-pending");
-            ctx.checkCancelled();
-            await gh(
-              [
-                "pr",
-                "comment",
-                String(ctx.run.sourceRef?.number),
-                "--repo",
-                ctx.repo.slug,
-                "--body",
-                `${marker}\n${report}`,
-              ],
-              ctx.signal,
-            );
-          }
+          const comments = [
+            "api",
+            `repos/${ctx.repo.slug}/issues/${ctx.run.sourceRef?.number}/comments`,
+            "--paginate",
+            "--jq",
+            ".[].body",
+          ];
+          const comment = ["pr", "comment", String(ctx.run.sourceRef?.number), "--repo", ctx.repo.slug];
+          await withGitHubRetry(
+            async () => {
+              // A pending post (an earlier attempt that failed late, or one whose checkpoint was
+              // lost) may already exist remotely: look for its marker before posting again.
+              if (ctx.state.verdictCommentPending && (await runner(comments, ctx.signal))?.includes(marker))
+                return;
+              ctx.state.verdictCommentPending = true;
+              await ctx.save("verification-comment-pending");
+              ctx.checkCancelled();
+              await runner([...comment, "--body", `${marker}\n${report}`], ctx.signal);
+            },
+            { budget, signal: ctx.signal },
+          );
           ctx.checkCancelled();
           ctx.state.verdictCommentPosted = true;
           await ctx.save("verification-comment-posted");
@@ -1401,7 +1573,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch) {
       const baseBranch = ctx.run.baseBranch as string;
-      const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch, ctx.signal);
+      const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch, ctx.signal, budget);
       const recorded = ctx.run.baseSha as string;
       const note = (why: string) => {
         ctx.state.rebaseNote = `Not merged with the latest ${baseBranch}: ${why}. Delivered on ${(ctx.run.baseSha as string).slice(0, 8)}.`;
@@ -1455,13 +1627,14 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       publish();
       if (!success) return { summary: "PR update needs human review; no push", value: undefined };
       ctx.checkCancelled();
-      if ((await remoteBranchSha(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.signal)) !== head)
+      if ((await remoteBranchSha(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.signal, budget)) !== head)
         await pushExistingBranch(
           ctx.repo,
           cwd,
           ctx.run.deliveryBranch,
           ctx.run.baseSha as string,
           ctx.signal,
+          budget,
         );
       if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number") {
         ctx.run = ctx.store.updateRun(ctx.run.id, {
@@ -1473,7 +1646,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       return { summary: `updated existing PR branch ${ctx.run.deliveryBranch}`, value: undefined };
     }
     ctx.checkCancelled();
-    await pushBranch(ctx.repo, cwd, ctx.run.branch as string, "HEAD", ctx.signal);
+    await pushBranch(ctx.repo, cwd, ctx.run.branch as string, "HEAD", ctx.signal, budget);
     ctx.checkCancelled();
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     const url = await createPullRequest(ctx.repo, {
@@ -1484,6 +1657,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       cwd,
       draft: !success,
       signal: ctx.signal,
+      budget,
     });
     await ctx.save("delivery-pr-created");
     ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
@@ -1499,10 +1673,10 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     let summary = `PR ${url}`;
     if (policy === "auto") {
       ctx.checkCancelled();
-      const outcome = await mergePullRequest(url, cwd, ctx.run.title, ctx.signal);
+      const outcome = await mergePullRequest(url, cwd, ctx.run.title, ctx.signal, budget);
       if (outcome === "merged") ctx.run = ctx.store.updateRun(ctx.run.id, { merged: true });
-      summary += ` — ${outcome === "merged" ? "merged" : outcome === "auto" ? "auto-merge enabled" : "merge failed (left open)"}`;
-      ctx.log(summary, outcome === "failed" ? "warn" : "info");
+      summary += ` — ${outcome === "merged" ? "merged" : outcome === "auto" ? "auto-merge enabled" : `merge failed (left open)${outcome === "unavailable" ? ": GitHub unavailable" : ""}`}`;
+      ctx.log(summary, outcome === "failed" || outcome === "unavailable" ? "warn" : "info");
     } else {
       summary += ` — left open (merge policy: ${policy})`;
     }

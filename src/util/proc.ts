@@ -1,4 +1,12 @@
-import { spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { type ChildProcess, spawn } from "node:child_process";
+
+export const processScope = new AsyncLocalStorage<{
+  signal: AbortSignal;
+  killGraceMs: number;
+  children: Map<ChildProcess, Promise<void>>;
+  scratchDirs: Set<string>;
+}>();
 
 export interface ProcOptions {
   cmd: string[];
@@ -57,6 +65,10 @@ function lineSplitter(onLine?: (line: string) => void) {
  * (agent CLIs spawn shells, MCP servers and test runners).
  */
 export function runProcess(opts: ProcOptions): Promise<ProcResult> {
+  const scope = processScope.getStore();
+  if (scope)
+    opts = { ...opts, signal: AbortSignal.any([scope.signal, ...(opts.signal ? [opts.signal] : [])]) };
+  if (scope) opts.signal?.throwIfAborted();
   const started = Date.now();
   return new Promise((resolve) => {
     const [bin, ...args] = opts.cmd;
@@ -67,6 +79,15 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    scope?.children.set(
+      child,
+      new Promise<void>((resolve) =>
+        child.once("close", () => {
+          scope.children.delete(child);
+          resolve();
+        }),
+      ),
+    );
 
     const limit = opts.tailLimit ?? DEFAULT_TAIL;
     let truncated = false;
@@ -98,14 +119,21 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
         }
       }
     };
-    const terminate = () => {
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const terminate = (graceMs = 5_000) => {
+      if (killTimer) return;
       killTree("SIGTERM");
-      setTimeout(() => killTree("SIGKILL"), 5_000).unref?.();
+      killTimer = setTimeout(() => killTree("SIGKILL"), graceMs);
+      killTimer.unref?.();
     };
 
     const onAbort = () => {
       cancelled = true;
-      terminate();
+      if (scope) {
+        clearTimeout(killTimer);
+        killTimer = undefined;
+      }
+      terminate(scope?.killGraceMs);
     };
     if (opts.signal) {
       if (opts.signal.aborted) onAbort();
@@ -155,6 +183,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     child.on("close", (code, sig) => {
       if (settled) return;
       settled = true;
+      clearTimeout(killTimer);
       out.flush();
       err.flush();
       for (const t of timers) clearTimeout(t);
@@ -186,6 +215,19 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
 
 const SH_OUTPUT_LIMIT = 50_000_000;
 
+/** A failed `sh` command, with its exit status kept structured for callers that classify failures. */
+export class CommandError extends Error {
+  constructor(
+    message: string,
+    readonly exitCode: number | null,
+    readonly stdout: string,
+    readonly stderr: string,
+    readonly timedOut: boolean,
+  ) {
+    super(message);
+  }
+}
+
 /** Convenience wrapper for short commands (git, gh). Throws on non-zero exit. */
 export async function sh(
   cmd: string[],
@@ -215,11 +257,15 @@ export async function sh(
     throw new Error(`Output of \`${cmd.join(" ")}\` exceeded ${SH_OUTPUT_LIMIT} characters`);
   }
   if (res.exitCode !== 0 && !opts.allowFail) {
-    throw new Error(
+    throw new CommandError(
       `Command failed (${res.exitCode ?? res.signal}): ${cmd.join(" ")}\n${res.stderr.trim() || res.stdout.trim()}`.slice(
         0,
         4000,
       ),
+      res.exitCode,
+      res.stdout,
+      res.stderr,
+      res.timedOut,
     );
   }
   return { stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode };

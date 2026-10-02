@@ -12,10 +12,13 @@ Usage:
   limitless serve                         Start the daemon (API, UI, scheduler)
   limitless run "<prompt>" --repo <repo>  Queue a run (repo: owner/name or a local path)
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
+        [--no-baseline-cache]  Always execute the baseline gates; a passing one refreshes the cache
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
-        review only: --systems <file.json> instead of --models ({"systems": [ReviewSystem, ...]})
+        review only: --systems <file.json> [--replay-finders <evalId>] instead of --models
   limitless eval report <eval-id> [--json]
+  limitless eval resume <eval-id>         Continue an interrupted or failed eval; unchanged finished trials carry over
+  limitless eval cancel <eval-id>         Stop scheduling an eval's trials; it ends interrupted
   limitless eval regrade <eval-id>        Recompute a review eval's grades from stored outputs (no model calls)
   limitless eval policy [--evals id,id] [--write]
   limitless ls [--status s1,s2] [-n 20]   List runs
@@ -25,7 +28,8 @@ Usage:
   limitless answer <run> "<text>"         Answer a run's open question(s)
   limitless providers                     Provider health and quota
   limitless providers enable|disable <id>  Change runtime provider availability
-  limitless gc [--dry-run]                Clean up expired worktrees, logs and debug events
+  limitless gc [--dry-run]                Clean up expired worktrees, logs, debug events and baseline cache
+  limitless gates clear-cache [--repo owner/name]  Drop cached passing baselines (all repos by default)
   limitless mcp                           MCP stdio proxy (daemon must be running)
   limitless integrations install [--write] Print setup; --write installs the Codex skill
   limitless service install [--tunnel] [--mtplx]   launchd agents: daemon (+ mtplx, tunnel)
@@ -169,6 +173,7 @@ async function main(): Promise<void> {
       evals: { type: "string" },
       models: { type: "string" },
       systems: { type: "string" },
+      "replay-finders": { type: "string" },
       k: { type: "string" },
       rounds: { type: "string" },
       strategy: { type: "string" },
@@ -176,6 +181,7 @@ async function main(): Promise<void> {
       "max-usd": { type: "string" },
       concurrency: { type: "string" },
       "no-cache": { type: "boolean" },
+      "no-baseline-cache": { type: "boolean" },
       json: { type: "boolean" },
       after: { type: "string" },
       repo: { type: "string", short: "r" },
@@ -256,6 +262,7 @@ async function main(): Promise<void> {
           ...(values.after !== undefined ? { dependsOn: values.after.split(",") } : {}),
           profile: (values.profile as Profile | undefined) ?? "auto",
           ...(values.title ? { title: values.title } : {}),
+          ...(values["no-baseline-cache"] ? { noBaselineCache: true } : {}),
           source: "cli",
           requestedBy: process.env.USER,
         }),
@@ -383,13 +390,23 @@ async function main(): Promise<void> {
         body: JSON.stringify({ dryRun: values["dry-run"] === true }),
       });
       console.log(
-        `${result.dryRun ? "Would clean" : "Cleaned"}: ${result.worktrees.length} worktrees, ${result.logs.length} logs, ${result.metadata.length} metadata entries, ${result.debugEvents} debug events`,
+        `${result.dryRun ? "Would clean" : "Cleaned"}: ${result.worktrees.length} worktrees, ${result.logs.length} logs, ${result.metadata.length} metadata entries, ${result.debugEvents} debug events, ${result.baselineCache} cached baselines`,
       );
       for (const path of result.worktrees) console.log(`  worktree ${path}`);
       for (const path of result.logs) console.log(`  log ${path}`);
       for (const entry of result.metadata) console.log(`  metadata ${entry}`);
       for (const error of result.errors) console.error(color.red(`  error ${error}`));
       if (result.errors.length) process.exitCode = 1;
+      return;
+    }
+    case "gates": {
+      if (rest.length !== 1 || rest[0] !== "clear-cache")
+        throw new Error("usage: limitless gates clear-cache [--repo owner/name]");
+      const { cleared } = await api<{ cleared: number }>("/api/gates/clear-cache", {
+        method: "POST",
+        body: JSON.stringify(values.repo === undefined ? {} : { repo: values.repo }),
+      });
+      console.log(`Cleared ${cleared} cached baselines`);
       return;
     }
     default:

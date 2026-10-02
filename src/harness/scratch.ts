@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AgentSpec } from "./types.ts";
@@ -49,10 +58,21 @@ export function scratchParent(scratchDir: string): string {
 }
 
 export function removeScratch(scratchDir: string): void {
-  rmSync(basename(scratchDir) === SCRATCH_NAME ? dirname(scratchDir) : scratchDir, {
-    recursive: true,
-    force: true,
-  });
+  const root = basename(scratchDir) === SCRATCH_NAME ? dirname(scratchDir) : scratchDir;
+  const remove = () => rmSync(root, { recursive: true, force: true });
+  try {
+    remove();
+  } catch {
+    // Candidate code can leave read-only directories. Never chmod through symlinks.
+    const writable = (path: string) => {
+      const stat = lstatSync(path, { throwIfNoEntry: false });
+      if (!stat?.isDirectory()) return;
+      chmodSync(path, stat.mode | 0o700);
+      for (const entry of readdirSync(path)) writable(join(path, entry));
+    };
+    writable(root);
+    remove();
+  }
 }
 
 export function scratchEnv(spec: AgentSpec): Record<string, string> {
@@ -68,7 +88,8 @@ export function validateScratch(spec: AgentSpec): string {
   return path;
 }
 
-function spellings(paths: string[]): string[] {
+/** Each path as given and, when it exists, canonical: what a confined profile actually denies. */
+export function spellings(paths: string[]): string[] {
   return [...new Set(paths.flatMap((p) => [resolve(p), ...(existsSync(p) ? [realpathSync(p)] : [])]))];
 }
 

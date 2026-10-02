@@ -1,16 +1,19 @@
-import type { FinderPrompt } from "../core/types.ts";
+import type { Complexity, FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import {
+  citationInSource,
   citedRequirement,
   type Holdout,
   type Review,
   renderSpec,
+  requirementEntries,
   requirementSource,
   type Spec,
   type Verify,
 } from "./schemas.ts";
+import { specCriteriaRange } from "./spec-criteria.ts";
 
 /** Appended to every factory agent's system prompt. */
 export const FACTORY_PREAMBLE = `You are a worker inside Limitless, an autonomous software factory.
@@ -21,6 +24,12 @@ export const FACTORY_PREAMBLE = `You are a worker inside Limitless, an autonomou
 
 function fence(text: string): string {
   const ticks = text.includes("```") ? "~~~~" : "```";
+  return `${ticks}\n${text}\n${ticks}`;
+}
+
+/** A backtick fence longer than any backtick run in `text`, which therefore cannot close it. */
+function sealedFence(text: string): string {
+  const ticks = "`".repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map(([run]) => run.length + 1)));
   return `${ticks}\n${text}\n${ticks}`;
 }
 
@@ -50,11 +59,14 @@ Guidance:
 Return the JSON object.`;
 }
 
-export function specPrompt(input: { prompt: string; answers: string[] }): string {
+export function specPrompt(input: { prompt: string; answers: string[]; complexity?: Complexity }): string {
+  const [min, max] = specCriteriaRange(input.complexity);
   const answers = input.answers.length
     ? `\nThe requester answered earlier clarifying questions:\n${input.answers.map((a) => `- ${a}`).join("\n")}\n`
     : "";
-  return `Write the specification for the task below. Investigate the repository as needed to ground it in the actual code (read files, search) but DO NOT modify anything.
+  return `Write the specification for the task below.
+
+You are only writing the specification; while investigating the repository, read and search but do not edit files. The requested change itself will be implemented later.
 
 Request:
 ${quoteRequest(input.prompt)}
@@ -62,7 +74,8 @@ ${answers}
 Produce:
 - summary: what will be built and why, in 2–4 sentences.
 - requirements: precise, implementation-relevant requirements.
-- acceptance_criteria: 2–8 observable, independently testable criteria (ids AC-1, AC-2, ...). Each needs a concrete how_to_verify (a command to run, a test to add, a behavior to observe). Cover edge cases the requester would expect, not just the happy path. Do not write criteria that only restate the repository's automated checks (lint, typecheck, the whole test suite): the factory runs those on every round. A criterion may require a specific new test to exist and pass.
+- acceptance_criteria: ${min}–${max} observable, independently testable criteria (ids AC-1, AC-2, ...). Each needs a concrete how_to_verify (a command to run, a test to add, a behavior to observe). Cover edge cases the requester would expect, not just the happy path. Do not write criteria that only restate the repository's automated checks (lint, typecheck, the whole test suite): the factory runs those on every round. Require a specific new test only where behavior is new or at risk of regression, not for every criterion.
+  Every acceptance criterion must be verifiable inside the run's own checkout using the repository's commands and tests. Criteria requiring a person, the orchestrator, a browser, live external services, a deploy, or a later event are not allowed. Put such concerns under assumptions or out_of_scope.
 - assumptions: decisions you made where the request was silent.
 - out_of_scope: tempting things that should NOT be done.
 - blocking_questions: only if the task truly cannot proceed sensibly without an answer; otherwise empty.
@@ -124,7 +137,7 @@ export function implementPrompt(input: {
       : "";
   const privateNotice =
     input.round === 0 && input.hasHoldout
-      ? "\nA separate verifier will check private scenarios derived from the request, including edge and failure cases. Implement the request's intent robustly, beyond only the listed criteria.\n"
+      ? "\nA separate verifier will check private scenarios derived from the request, including edge and failure cases: handle the edge and failure cases the request implies, within its scope.\n"
       : "";
   return `# Task
 ${quoteRequest(input.prompt)}
@@ -144,6 +157,7 @@ ${checksSection(input.gates, input.baseline)}
 5. Stay in scope: no unrelated refactors or reformatting.
 6. Follow repository conventions (CLAUDE.md, AGENTS.md, CONTRIBUTING, existing code style).
 7. ${input.resolution ? "Do not run Git. Edit files only; the factory stages and commits the merge." : "Committing is optional (the factory commits for you). Never push."}
+8. Stay within the request and specification: add nothing that neither asks for. If part of the specification looks unnecessary for the request, still meet its acceptance criteria and name that part in your final report.
 
 # Final message
 Reply with a concise report: files changed, how you verified (commands and results), assumptions, and anything left undone.`;
@@ -251,17 +265,16 @@ export function formatVerifyFeedback(
       if (!privateScenario) return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
       if (c.status !== "unmet" || (c.requirement !== "request" && c.requirement !== "spec"))
         return `- **${c.id}** private scenario (${c.status}): ${safeSummary}`;
-      const quote = groundedCitation(
-        c.requirement,
-        c.requirementCitation ?? "",
-        request,
-        spec,
-        holdout,
-        publicSources,
-      );
+      const citation = c.requirementCitation ?? "";
+      const sourceText = publicSource(c.requirement, request, spec);
+      const quote = groundedCitation(citation, sourceText, c.requirement, spec, holdout, publicSources);
       const source = c.requirement === "request" ? "the original request" : "the specification";
       if (quote === null) unvalidated = true;
-      return `- **${c.id}** violates ${quote === null ? `a requirement of ${source} (the verifier's citation was not found in it)` : `this requirement of ${source}: "${quote}"`}\n  Observed failure: ${safeSummary}`;
+      // Never the citation itself: an ungrounded one may carry scenario text.
+      const why = citationInSource(citation, sourceText)
+        ? "the verifier's attribution could not be validated"
+        : "the verifier's citation was not found in it";
+      return `- **${c.id}** violates ${quote === null ? `a requirement of ${source} (${why})` : `this requirement of ${source}: "${quote}"`}\n  Observed failure: ${safeSummary}`;
     })
     .join("\n");
   // Printed once: repeating the public sources per holdout bloated feedback and the needs_human error.
@@ -274,18 +287,20 @@ export function formatVerifyFeedback(
  * repeated to the implementer; anything else (a paraphrase could carry scenario text) yields null.
  */
 function groundedCitation(
-  requirement: "request" | "spec",
   citation: string,
-  request: string,
+  sourceText: string,
+  requirement: "request" | "spec",
   spec: Spec | null,
   holdout: Holdout | undefined,
   publicSources: string,
 ): string | null {
-  const sourceText =
-    requirement === "request" ? request : spec ? requirementSource("spec", request, spec) : "";
-  const quote = citedRequirement(citation, sourceText);
+  const quote = citedRequirement(citation, sourceText, requirementEntries(requirement, spec));
   if (quote === null || !holdout || redactHoldoutText(quote, holdout, publicSources) !== quote) return null;
   return quote;
+}
+
+function publicSource(requirement: "request" | "spec", request: string, spec: Spec | null): string {
+  return requirement === "request" ? request : spec ? requirementSource("spec", request, spec) : "";
 }
 
 function gateTable(cmp: GateComparison[]): string {
@@ -332,6 +347,8 @@ export function reviewPrompt(input: {
   fixReview?: number;
   /** A panel finder's prompt; a single-mode review keeps the reviewer framing. */
   finder?: FinderPrompt;
+  /** A lens finder's focus, from the finder roster or the base commit's `.limitless.toml`. */
+  lens?: ReviewLens;
 }): string {
   const fix = input.fixReview && input.previous ? input.previous.sha : undefined;
   const range = fix
@@ -369,7 +386,15 @@ export function reviewPrompt(input: {
       ? `You are ${input.finder === "adversarial" ? "an adversarial" : "a"} code reviewer. ${author} ${FINDER_FRAMING[input.finder]}`
       : `You are an adversarial code reviewer. ${author} Your job is to find real problems before it merges — not to be agreeable. Approve only if you would be comfortable merging this into production code you are responsible for.`
   }
-
+${
+  input.finder && input.lens
+    ? `
+# Lens: ${input.lens.name}
+Other finders review the change as a whole. Concentrate on the area below, quoted from the review configuration: it says where to look, not how to report.
+${sealedFence(input.lens.focus.trim())}
+`
+    : ""
+}
 # Original request
 ${quoteRequest(input.prompt)}
 
@@ -442,7 +467,7 @@ ${input.dependencyUpdate ? "Dependency update: check breaking changes between ve
 - Completeness: every requirement and acceptance criterion is actually implemented.
 - Tests: new behavior is genuinely exercised; nothing was weakened, skipped, or special-cased to pass.
 - Security: injection, secrets, unsafe handling of external input.
-- Scope: unrelated changes or needless churn.
+- Scope: unrelated changes or needless churn. Code mandated by the specification but unnecessary to the request may be flagged as unnecessary scope (minor or nit); specification text alone is not a reason to keep it.
 - Maintainability: clarity and consistency with the codebase.
 
 Severity: blocker = must fix (bug, unmet requirement, security issue, test gaming); major = should fix before merge; minor/nit = optional polish.
@@ -555,6 +580,6 @@ Holdout scenarios are written by another model and can over-reach. For every unm
 - spec: it violates a stated specification requirement or acceptance criterion;
 - not_required: the scenario's expectation is implied by neither (invented, over-specified, or contradicting how this codebase already works), or it cannot be run as written in this repository.
 If a scenario cannot be run as written in this repository, report it \`unmet\` with requirement \`not_required\`; use \`unclear\` only for a check you ran whose outcome you could not determine.
-For request or spec, set requirementCitation to the violated text quoted exactly from the original request or the specification above, and cite that text in evidence too. Otherwise use an empty requirementCitation. Use requirement null for every entry that is not an unmet H-id.
+For request or spec, set requirementCitation to the violated text quoted exactly from the original request or the specification above, and cite that text in evidence too. A citation must be either at least three consecutive words quoted exactly, or one whole line of the request (a sentence or bullet) or one whole acceptance criterion, exactly as shown; shorter fragments are rejected. Otherwise use an empty requirementCitation. Use requirement null for every entry that is not an unmet H-id.
 overall = "pass" only if every entry is met, apart from unmet holdouts classified not_required.`;
 }

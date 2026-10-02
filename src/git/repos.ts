@@ -3,9 +3,94 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { sh } from "../util/proc.ts";
+import { CommandError, sh } from "../util/proc.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
+
+/** Retry policy for GitHub and remote git (tests shorten it). */
+export const githubRetry = { attempts: 3, budgetMs: 60_000, baseDelayMs: 5_000 };
+/**
+ * In-memory GitHub time shared by every call in one delivery attempt. It only drains while a
+ * remote command or a backoff pause runs, so local work in between never eats into it. It bounds
+ * retries and their waits only: a call's first attempt always runs and keeps its own timeout.
+ */
+export interface GitHubBudget {
+  leftMs: number;
+}
+export class GitHubUnavailableError extends Error {}
+/** A retryable outcome that is not a failed command, e.g. a PR lookup lagging behind its create. */
+class RetryableError extends Error {}
+
+// Every pattern contains a space, which a branch name cannot, so echoed refs never look transient.
+const TRANSIENT = [
+  /\bHTTP (5\d\d|429)\b/i,
+  /error connecting to /i,
+  /non-200 OK status code: (5\d\d|429)\b/i,
+  /unable to access .*(Failed to connect|timed out|Recv failure|returned error: (5\d\d|429))/i,
+  /could not resolve host/i,
+  /ssh: connect to host .*(timed out|refused|unreachable)/i,
+  /kex_exchange_identification: |connection (reset|closed) by /i,
+  /i\/o timeout|TLS handshake timeout/i,
+  /(early|unexpected) EOF|": EOF\b/i,
+];
+
+/** Only a failed command's timeout or its stderr count; 4xx and anything else are final. */
+export function isTransient(error: unknown): boolean {
+  return error instanceof CommandError && (error.timedOut || TRANSIENT.some((re) => re.test(error.stderr)));
+}
+
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/** The single retry layer for GitHub and remote git: callers must never retry on top of it. */
+export async function withGitHubRetry<T>(
+  call: () => Promise<T>,
+  opts: { budget?: GitHubBudget; signal?: AbortSignal } = {},
+): Promise<T> {
+  const budget = opts.budget ?? { leftMs: githubRetry.budgetMs };
+  const charged = async <R>(work: () => Promise<R>): Promise<R> => {
+    const started = Date.now();
+    try {
+      return await work();
+    } finally {
+      budget.leftMs -= Date.now() - started;
+    }
+  };
+  for (let attempt = 1; ; attempt++) {
+    opts.signal?.throwIfAborted();
+    // Every call's first attempt runs, as on main: a slow or hung earlier call must not cost later
+    // calls (or the fallbacks) their one try. The budget only decides whether to retry.
+    if (attempt > 1 && budget.leftMs <= 0)
+      throw new GitHubUnavailableError("GitHub unavailable: delivery retry budget exhausted");
+    try {
+      return await charged(call);
+    } catch (error) {
+      if (!(isTransient(error) || error instanceof RetryableError) || opts.signal?.aborted) throw error;
+      const delay = githubRetry.baseDelayMs * 3 ** (attempt - 1);
+      if (attempt >= githubRetry.attempts || delay >= budget.leftMs)
+        throw new GitHubUnavailableError(`GitHub unavailable: ${(error as Error).message}`);
+      await charged(() => pause(delay, opts.signal));
+    }
+  }
+}
+
+type RemoteOpts = {
+  cwd: string;
+  stdin?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  budget?: GitHubBudget;
+};
+const remoteSh = (cmd: string[], opts: RemoteOpts) => withGitHubRetry(() => sh(cmd, opts), opts);
 
 export function slugify(text: string, max = 40): string {
   return (
@@ -50,7 +135,7 @@ export async function resolveRepo(store: Store, input: string): Promise<Repo> {
   const slug = `${m[1]}/${m[2]}`;
   const found = store.getRepoBySlug(slug);
   if (found) return found;
-  const view = await sh(["gh", "repo", "view", slug, "--json", "defaultBranchRef,sshUrl"], {
+  const view = await remoteSh(["gh", "repo", "view", slug, "--json", "defaultBranchRef,sshUrl"], {
     cwd: process.cwd(),
   });
   const info = JSON.parse(view.stdout) as { defaultBranchRef: { name: string } | null; sshUrl: string };
@@ -160,14 +245,16 @@ export async function fetchBase(
   repo: Repo,
   branch: string,
   signal?: AbortSignal,
+  budget?: GitHubBudget,
 ): Promise<string> {
   const cache = cachePath(paths, repo);
   return withRepoLock(cache, async () => {
     const ref = `refs/heads/${branch}`;
-    await sh(["git", "fetch", "origin", `+${ref}:refs/remotes/origin/${branch}`], {
+    await remoteSh(["git", "fetch", "origin", `+${ref}:refs/remotes/origin/${branch}`], {
       cwd: cache,
       timeoutMs: 300_000,
       signal,
+      budget,
     });
     return (
       await sh(["git", "rev-parse", `refs/remotes/origin/${branch}`], { cwd: cache, signal })
@@ -327,12 +414,14 @@ export async function pushBranch(
   branch: string,
   sha = "HEAD",
   signal?: AbortSignal,
+  budget?: GitHubBudget,
 ): Promise<void> {
   if (repo.kind !== "github" || !repo.url) return;
-  await sh(["git", "push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
+  await remoteSh(["git", "push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
     cwd,
     timeoutMs: 300_000,
     signal,
+    budget,
   });
 }
 
@@ -341,9 +430,14 @@ export async function remoteBranchSha(
   cwd: string,
   branch: string,
   signal?: AbortSignal,
+  budget?: GitHubBudget,
 ): Promise<string | null> {
   if (repo.kind !== "github" || !repo.url) return null;
-  const remote = await sh(["git", "ls-remote", repo.url, `refs/heads/${branch}`], { cwd, signal });
+  const remote = await remoteSh(["git", "ls-remote", repo.url, `refs/heads/${branch}`], {
+    cwd,
+    signal,
+    budget,
+  });
   return remote.stdout.split("\t")[0] || null;
 }
 
@@ -354,12 +448,13 @@ export async function pushExistingBranch(
   branch: string,
   baseSha: string,
   signal?: AbortSignal,
+  budget?: GitHubBudget,
 ): Promise<void> {
   if (repo.kind !== "github" || !repo.url) throw new Error("existing PR delivery requires a GitHub repo");
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") || branch.endsWith("/"))
     throw new Error("invalid PR head branch");
   const ref = `refs/heads/${branch}`;
-  const remote = await sh(["git", "ls-remote", repo.url, ref], { cwd, signal });
+  const remote = await remoteSh(["git", "ls-remote", repo.url, ref], { cwd, signal, budget });
   if (remote.stdout.split("\t")[0] !== baseSha) throw new Error("PR head moved since the run started");
   const ancestor = await sh(["git", "merge-base", "--is-ancestor", baseSha, "HEAD"], {
     cwd,
@@ -367,10 +462,11 @@ export async function pushExistingBranch(
     signal,
   });
   if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
-  await sh(["git", "push", `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
+  await remoteSh(["git", "push", `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
     cwd,
     timeoutMs: 300_000,
     signal,
+    budget,
   });
 }
 
@@ -384,57 +480,73 @@ export async function createPullRequest(
     cwd: string;
     draft?: boolean;
     signal?: AbortSignal;
+    budget?: GitHubBudget;
   },
 ): Promise<string> {
-  const existing = await sh(
-    [
-      "gh",
-      "pr",
-      "list",
-      "--repo",
-      repo.slug,
-      "--head",
-      opts.branch,
-      "--state",
-      "all",
-      "--json",
-      "url",
-      "--jq",
-      ".[0].url",
-    ],
-    { cwd: opts.cwd, allowFail: true, signal: opts.signal },
-  );
-  if (existing.stdout.trim()) {
-    await sh(["gh", "pr", "edit", existing.stdout.trim(), "--body-file", "-"], {
-      cwd: opts.cwd,
-      stdin: opts.body,
-      allowFail: true,
-      signal: opts.signal,
+  const { cwd, signal } = opts;
+  // A final lookup failure means "none found", as before; transient ones retry the attempt.
+  const find = () =>
+    sh(prLookup(repo, opts.branch), { cwd, signal }).then(
+      (r) => r.stdout.trim(),
+      (e) => (isTransient(e) || signal?.aborted ? Promise.reject(e) : ""),
+    );
+  let existing = false;
+  let reportedExisting = false;
+  // Look up before every create: a 5xx or timeout can hide a PR that was in fact opened.
+  const url = await withGitHubRetry(async () => {
+    const found = await find();
+    if (found) {
+      existing = true;
+      return found;
+    }
+    // GitHub said the PR exists but the lookup lags behind it: retry the lookup, not the create.
+    const lagging = () => new RetryableError(`a PR for ${opts.branch} already exists but was not found`);
+    if (reportedExisting) throw lagging();
+    const create = ["gh", "pr", "create", "--repo", repo.slug, "--head", opts.branch, "--base", opts.base];
+    const args = [...create, "--title", opts.title, "--body-file", "-", ...(opts.draft ? ["--draft"] : [])];
+    const res = await sh(args, { cwd, stdin: opts.body, signal }).catch(async (e) => {
+      if (!(e instanceof CommandError && e.stderr.includes("already exists"))) throw e;
+      reportedExisting = true;
+      const again = await find();
+      if (!again) throw lagging();
+      existing = true;
+      return { stdout: again };
     });
-    return existing.stdout.trim();
-  }
-  const res = await sh(
-    [
-      "gh",
-      "pr",
-      "create",
-      "--repo",
-      repo.slug,
-      "--head",
-      opts.branch,
-      "--base",
-      opts.base,
-      "--title",
-      opts.title,
-      "--body-file",
-      "-",
-      ...(opts.draft ? ["--draft"] : []),
-    ],
-    { cwd: opts.cwd, stdin: opts.body, signal: opts.signal },
-  );
-  const url = res.stdout.trim().split("\n").pop() ?? "";
-  if (!url.startsWith("http")) throw new Error(`gh pr create returned unexpected output: ${res.stdout}`);
+    return res.stdout.trim().split("\n").pop() ?? "";
+  }, opts);
+  if (!url.startsWith("http")) throw new Error(`gh pr create returned unexpected output: ${url}`);
+  if (existing)
+    await remoteSh(["gh", "pr", "edit", url, "--body-file", "-"], { ...opts, stdin: opts.body }).catch(
+      (e) => {
+        if (signal?.aborted) throw e;
+      },
+    );
   return url;
+}
+
+const prLookup = (repo: Repo, branch: string) => [
+  ...["gh", "pr", "list", "--repo", repo.slug, "--head", branch, "--state", "all"],
+  ...["--json", "url", "--jq", ".[0].url"],
+];
+
+/**
+ * One short lookup for this branch's PR, outside any retry budget: used before a fallback, which
+ * may have no budget left, so a PR that was in fact created still gets recorded.
+ */
+export async function findPullRequest(
+  repo: Repo,
+  branch: string,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const res = await sh(prLookup(repo, branch), { cwd, signal, timeoutMs: 15_000, allowFail: true }).catch(
+    (e) => {
+      if (signal?.aborted) throw e;
+      return null;
+    },
+  );
+  const url = res?.exitCode === 0 ? res.stdout.trim() : "";
+  return url.startsWith("http") ? url : null;
 }
 
 /** Merge now if possible; if branch protection requires checks, enable auto-merge instead. */
@@ -443,22 +555,47 @@ export async function mergePullRequest(
   cwd: string,
   title?: string,
   signal?: AbortSignal,
-): Promise<"merged" | "auto" | "failed"> {
+  budget?: GitHubBudget,
+): Promise<"merged" | "auto" | "failed" | "unavailable"> {
   // Squash with the PR title as the subject, not the first round's commit message.
   const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
   const subject = title ? ["--subject", number ? `${title} (#${number})` : title] : [];
-  const now = await sh(["gh", "pr", "merge", prUrl, "--squash", "--delete-branch", ...subject], {
-    cwd,
-    allowFail: true,
-    signal,
-  });
-  if (now.exitCode === 0) return "merged";
-  const auto = await sh(["gh", "pr", "merge", prUrl, "--squash", "--auto", "--delete-branch", ...subject], {
-    cwd,
-    allowFail: true,
-    signal,
-  });
-  return auto.exitCode === 0 ? "auto" : "failed";
+  // After a transient failure or timeout the merge may still have landed. Until a state lookup
+  // settles that, every attempt reconciles first; a failed lookup retries like any other call.
+  let unsure = false;
+  const landed = async () => {
+    const view = ["gh", "pr", "view", prUrl, "--json", "state", "--jq", ".state"];
+    const merged = (await sh(view, { cwd, signal })).stdout.trim() === "MERGED";
+    unsure = false;
+    return merged;
+  };
+  const merge = (extra: string[]) =>
+    withGitHubRetry(
+      async () => {
+        if (unsure && (await landed())) return "merged" as const;
+        const cmd = ["gh", "pr", "merge", prUrl, "--squash", ...extra, "--delete-branch", ...subject];
+        return sh(cmd, { cwd, signal }).then(
+          () => "ok" as const,
+          async (e) => {
+            if (signal?.aborted || !isTransient(e)) throw e;
+            unsure = true;
+            if (await landed()) return "merged" as const;
+            throw e;
+          },
+        );
+      },
+      { budget, signal },
+    ).catch((e) => {
+      if (signal?.aborted) throw e;
+      return e instanceof GitHubUnavailableError ? ("unavailable" as const) : ("failed" as const);
+    });
+  const now = await merge([]);
+  if (now === "ok" || now === "merged") return "merged";
+  // As on main, fall back to auto-merge; it shares the budget and reconciles an unsure merge first.
+  const auto = await merge(["--auto"]);
+  if (auto === "merged") return "merged";
+  if (auto === "ok") return "auto";
+  return now === "unavailable" || auto === "unavailable" ? "unavailable" : "failed";
 }
 
 /** Same stable top-level representation used in pipeline and eval prompts. */
