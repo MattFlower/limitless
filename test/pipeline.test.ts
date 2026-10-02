@@ -2743,6 +2743,14 @@ esac
     "empty",
     "restart-initial",
     "restart-repair",
+    "pending-comment",
+    "head-moved",
+    "head-lookup-failure",
+    "head-lookup-missing",
+    "head-lookup-malformed",
+    "base-script",
+    "pr-script",
+    "pr-script-removed",
   ])(
     "verify-change: %s",
     async (scenario) => {
@@ -2752,17 +2760,30 @@ esac
         await git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "fixture");
         return git("rev-parse", "HEAD");
       };
+      const scriptAudit = scenario.includes("script");
+      const prScript = scenario.startsWith("pr-script");
+      const stale = scenario.startsWith("head-");
       const records = join(home, "gate-revisions");
       writeFileSync(
         join(repoDir, ".limitless.toml"),
         `[gates]
-checks = [{ name = "test", run = "git rev-parse HEAD >> ${records}; echo generated > generated.txt; ! grep BAD greeting.txt" }]
+checks = [{ name = "test", run = "git rev-parse HEAD >> ${records}; echo generated > generated.txt; ! grep BAD greeting.txt" }${scriptAudit ? ', { name = "script", run = "bun run audit-check || true" }' : ""}]
 [policy]
 protected_paths = ["protected.txt"]
 `,
       );
       if (scenario === "baseline") writeFileSync(join(repoDir, "greeting.txt"), "BAD\n");
+      if (scriptAudit)
+        writeFileSync(
+          join(repoDir, "package.json"),
+          JSON.stringify({ scripts: { "audit-check": "exit 0" } }),
+        );
       const base = await commit();
+      if (prScript)
+        writeFileSync(
+          join(repoDir, "package.json"),
+          JSON.stringify({ scripts: scenario === "pr-script-removed" ? {} : { "audit-check": "echo pr" } }),
+        );
       if (scenario !== "empty") writeFileSync(join(repoDir, "version.txt"), "dependency 2\n");
       if (scenario === "gates") writeFileSync(join(repoDir, "greeting.txt"), "BAD\n");
       if (scenario === "repair-audit") writeFileSync(join(repoDir, "protected.txt"), "original\n");
@@ -2773,6 +2794,11 @@ protected_paths = ["protected.txt"]
       // The base tip is not an ancestor of the PR head: review must use the merge base.
       await git("reset", "--hard", base);
       writeFileSync(join(repoDir, "base-only.txt"), "base advancement\n");
+      if (scriptAudit)
+        writeFileSync(
+          join(repoDir, "package.json"),
+          JSON.stringify({ scripts: { "audit-check": "echo base" } }),
+        );
       const baseTip = await commit();
       await git("push", "--force", bare, "HEAD:refs/heads/main");
       const prompts: string[] = [];
@@ -2830,18 +2856,26 @@ protected_paths = ["protected.txt"]
                 ],
               },
             };
+          if (scenario === "head-moved") {
+            await git("reset", "--hard", head);
+            writeFileSync(join(repoDir, "competing.txt"), "another push\n");
+            await commit();
+            await git("push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2");
+          }
           return { structured: approve };
         }
         expect(role).toBe("implement");
         implementations++;
         expect(agent.prompt).toContain(
-          scenario === "gates"
-            ? "test"
-            : scenario === "empty"
-              ? "empty-diff"
-              : implementations > 1 && scenario === "repair-audit"
-                ? "Repair:"
-                : "Compatibility bug",
+          prScript
+            ? "gate-script-changed"
+            : scenario === "gates"
+              ? "test"
+              : scenario === "empty"
+                ? "empty-diff"
+                : implementations > 1 && scenario === "repair-audit"
+                  ? "Repair:"
+                  : "Compatibility bug",
         );
         if (scenario === "empty") return { text: "No changes" };
         return {
@@ -2856,7 +2890,21 @@ protected_paths = ["protected.txt"]
       const calls: string[][] = [];
       const gh = async (args: string[]) => {
         calls.push(args);
+        if (args[0] === "pr" && args[1] === "view") {
+          if (scenario === "head-lookup-failure") throw new Error("fixture lookup failed");
+          if (scenario === "head-lookup-missing") return "{}";
+          if (scenario === "head-lookup-malformed") return "invalid JSON";
+          return JSON.stringify({
+            headRefOid: (await git("ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).split("\t")[0],
+          });
+        }
+        if (args[0] === "api") return calls.find((call) => call[1] === "comment")?.at(-1) ?? "";
+        return "";
       };
+      if (scenario === "pending-comment")
+        f.deps.faults = {
+          "store:save": { action: "kill", when: (c) => c.checkpoint === "verification-comment-posted" },
+        };
       f.deps.gh = gh;
       let stopNotifier = startGitHubNotifier(
         f.store,
@@ -2890,6 +2938,20 @@ protected_paths = ["protected.txt"]
       );
       expect(response.status).toBe(201);
       const { runId } = (await response.json()) as { runId: string };
+      if (scenario === "pending-comment") {
+        const deadline = Date.now() + 10_000;
+        while (f.store.listStages(runId).at(-1)?.status !== "cancelled") {
+          if (Date.now() > deadline) throw new Error("comment interruption timed out");
+          await Bun.sleep(10);
+        }
+        stopNotifier();
+        await f.stop();
+        expect(f.store.getRunState<RunState>(runId)?.verdictCommentPending).toBe(true);
+        expect(f.store.getRunState<RunState>(runId)?.verdictCommentPosted).not.toBe(true);
+        f.store.close();
+        f = start(handler);
+        f.deps.gh = gh;
+      }
       if (scenario.startsWith("restart")) {
         for (let i = 0; !resume && i < 300; i++) await Bun.sleep(20);
         expect(resume).toBeDefined();
@@ -2912,9 +2974,9 @@ protected_paths = ["protected.txt"]
         expect(before?.verification?.headSha).toBe(head);
         if (scenario === "restart-repair") expect(before?.implementedRound).toBe(0);
       }
-      const blocked = ["persistent", "repair-audit", "empty"].includes(scenario);
-      expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human"])).toBe(
-        blocked ? "needs_human" : "succeeded",
+      const blocked = prScript || ["persistent", "repair-audit", "empty"].includes(scenario);
+      expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human", "cancelled"])).toBe(
+        scenario === "head-moved" ? "cancelled" : stale ? "failed" : blocked ? "needs_human" : "succeeded",
       );
       stopNotifier();
       const state = f.store.getRunState<RunState>(runId);
@@ -2925,16 +2987,45 @@ protected_paths = ["protected.txt"]
       const baseRuns = scenario === "baseline" ? [baseTip, baseTip] : [baseTip];
       expect(revisions.slice(0, baseRuns.length + 1)).toEqual([...baseRuns, head]);
       const remote = (await git("ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).split("\t")[0];
-      const unchanged = ["approve", "baseline", "restart-initial"].includes(scenario);
+      if (stale) {
+        expect(implementations).toBe(0);
+        expect(
+          calls.filter((call) => call[1] === "comment" && call.at(-1)?.includes("Verified by")),
+        ).toHaveLength(0);
+        const reason =
+          scenario === "head-moved"
+            ? `superseded: PR head moved from ${head} to ${remote}`
+            : "Unable to confirm PR head";
+        if (scenario === "head-moved") {
+          expect(calls.filter((call) => call[1] === "comment")).toHaveLength(0);
+          expect(f.store.listEvents(runId).some((event) => event.message === reason)).toBe(true);
+        }
+        expect(f.store.getRun(runId)?.error).toContain(reason);
+        expect(state?.terminalReason).toContain(reason);
+        expect(f.store.getArtifact(runId, "report.md")).toContain(reason);
+        expect(f.store.getArtifact(runId, "report.md")).not.toContain("Verified by");
+        return;
+      }
+      if (scriptAudit)
+        expect(
+          state?.lastAudit?.some((a) => a.rule === "gate-script-changed" && a.severity === "block"),
+        ).toBe(prScript);
+      const unchanged = ["approve", "baseline", "restart-initial", "pending-comment", "base-script"].includes(
+        scenario,
+      );
       expect(remote).toBe(unchanged || blocked ? head : (f.store.getRun(runId)?.headSha ?? "missing"));
       if (unchanged) {
         expect(implementations).toBe(0);
         expect(f.store.listStages(runId).some((stage) => stage.name === "implement")).toBe(false);
         expect(f.store.getRun(runId)?.headSha).toBe(head);
         expect(existsSync(state?.worktreePath ?? "missing")).toBe(false);
-        expect(calls).toHaveLength(1); // Evidence only: no creation comment and no second verdict.
-        expect(calls[0]?.slice(0, 3)).toEqual(["pr", "comment", "18"]);
-        expect(calls[0]?.at(-1)).not.toContain("generated.txt");
+        const comments = calls.filter((call) => call[1] === "comment");
+        expect(comments).toHaveLength(1);
+        expect(comments[0]?.slice(0, 3)).toEqual(["pr", "comment", "18"]);
+        expect(comments[0]?.at(-1)).not.toContain("generated.txt");
+        expect(comments[0]?.at(-1)).toContain(`Verified commit: \`${head}\``);
+        expect(f.store.getArtifact(runId, "report.md")).toContain(`Verified commit: \`${head}\``);
+        expect(comments[0]?.at(-1)).toContain(`<!-- limitless-verification:${runId} -->`);
         for (const text of [
           "Flow: verify-change",
           "| Check |",
@@ -2944,7 +3035,7 @@ protected_paths = ["protected.txt"]
           "spent",
           "subscriptions",
         ])
-          expect(calls[0]?.at(-1)).toContain(text);
+          expect(comments[0]?.at(-1)).toContain(text);
         expect(f.store.getArtifact(runId, "diff.patch")).toBe(
           (await sh(["git", "diff", `${baseTip}...${head}`], { cwd: repoDir })).stdout,
         );

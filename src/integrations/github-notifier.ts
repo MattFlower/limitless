@@ -93,6 +93,8 @@ export function startGitHubNotifier(
       typeof ref.number !== "number"
     )
       return;
+    if (ref.kind === "pull_request" && run.status === "cancelled" && run.error?.startsWith("superseded:"))
+      return;
     const terminal = TERMINAL_STATUSES.includes(run.status);
     if (terminal && store.getRunState<{ verdictCommentPosted?: boolean }>(run.id)?.verdictCommentPosted)
       return;
