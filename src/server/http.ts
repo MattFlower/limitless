@@ -369,7 +369,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     for (const [path, file] of Object.entries(extras.ui)) routes[path] = handle(() => new Response(file));
     const index = extras.ui["/index.html"];
     if (index)
-      for (const path of ["/", "/runs/*", "/new", "/models", "/chat", "/evals", "/evals/*"])
+      for (const path of ["/", "/runs/*", "/new", "/models", "/providers", "/chat", "/evals", "/evals/*"])
         routes[path] = handle(() => new Response(index));
   }
   routes["/*"] = handle((req) =>

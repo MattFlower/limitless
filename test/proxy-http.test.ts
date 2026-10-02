@@ -122,7 +122,7 @@ test("direct navigation to every UI route serves the SPA shell; unknown API path
     const declared = [...(await Bun.file("ui/main.tsx").text()).matchAll(/<Route path="([^"]+)"/g)].map(
       (m) => m[1] ?? "",
     );
-    expect(declared).toEqual(expect.arrayContaining(["/evals", "/evals/:id"]));
+    expect(declared).toEqual(expect.arrayContaining(["/evals", "/evals/:id", "/providers"]));
     const html = { accept: "text/html" };
     for (const path of declared.map((p) => p.replace(/:[^/]+/g, "abc-123")))
       for (const suffix of ["", "?tab=x"]) {
