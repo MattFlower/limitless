@@ -234,26 +234,53 @@ export class Concierge {
   private async interpret(conversationId: string, origin: ChatOrigin): Promise<ChatAction> {
     const { router, tracker, harnesses, cfg, store } = this.factory.deps;
     const tried: (string | ModelSelection)[] = [];
+    const busy = new Set<string>();
     const signal = AbortSignal.timeout(120_000);
     let failure = "No model available for chat";
     for (let attempt = 0; attempt < 3; attempt++) {
-      const target = router.route("chat", "small", { exclude: tried }).candidates[0];
+      const target = router
+        .route("chat", "small", { exclude: tried })
+        .candidates.find((t) => !busy.has(t.targetId ?? t.modelId));
       if (!target) break;
-      tried.push({ modelId: target.modelId, effort: target.effort ?? null });
       // Chat needs no tools, so it skips the agent CLI when the provider speaks plain HTTP.
       const { harnessName, noTools } = selectHarness("chat", target);
       const harness = harnesses[harnessName];
       if (!harness) {
+        busy.add(target.targetId ?? target.modelId);
         failure = `No harness registered for ${harnessName}`;
         continue;
       }
-      const release = await tracker.acquire(target.provider, signal);
+      const seconds = cfg.waitBudgetS.chat;
+      const release = await tracker.acquire(
+        target.provider,
+        signal,
+        seconds === undefined ? undefined : seconds * 1000,
+        (ahead) =>
+          store.addEvent({
+            runId: `chat:${conversationId}`,
+            type: "log",
+            level: "info",
+            message: `waiting for ${target.provider} slot (${ahead} ahead), up to ${seconds === undefined ? "unbounded" : `${seconds}s`}`,
+          }),
+      );
+      if (!release) {
+        if (signal.aborted) throw new Error("Chat request timed out");
+        busy.add(target.targetId ?? target.modelId);
+        failure = "No provider capacity available for chat";
+        attempt--;
+        continue;
+      }
       let directory: string | null = null;
       const startedAt = Date.now();
       let result: AgentResult;
       try {
         if (signal.aborted) throw new Error("Chat request timed out");
-        if (!(await tracker.preflight(target.provider))) continue;
+        if (!(await tracker.preflight(target.provider))) {
+          busy.add(target.targetId ?? target.modelId);
+          attempt--;
+          continue;
+        }
+        tried.push({ modelId: target.modelId, effort: target.effort ?? null });
         mkdirSync(cfg.paths.runs, { recursive: true });
         directory = mkdtempSync(join(cfg.paths.runs, "chat-"));
         result = await harness({

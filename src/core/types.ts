@@ -170,6 +170,7 @@ export interface Stage {
 }
 
 export interface Invocation {
+  waitMs: number;
   fast: boolean;
   fastModeState: string | null;
   fastModeDisabledReason: string | null;

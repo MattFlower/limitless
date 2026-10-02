@@ -189,3 +189,38 @@ test("roster targets are checked against the catalog at startup; single mode onl
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("routing wait budgets default by role and validate overrides", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-waits-config-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  const file = join(configDir, "config.toml");
+  try {
+    const defaults = {
+      triage: 20,
+      summarize: 20,
+      chat: 20,
+      review: 180,
+      verify: 180,
+      spec: 180,
+      holdout: 180,
+      implement: 300,
+    };
+    expect(config().waitBudgetS).toEqual(defaults);
+    writeFileSync(file, "[routing.wait_budget_s]\ntriage = 0\nimplement = 2\nplan = 4\nplan_review = 5\n");
+    expect(config().waitBudgetS).toEqual({ ...defaults, triage: 0, implement: 2, plan: 4, plan_review: 5 });
+    for (const value of ["-1", "1.5", '"20"', "true", "[]", "{}", "1e20"]) {
+      writeFileSync(file, `[routing.wait_budget_s]\nreview = ${value}\n`);
+      expect(config).toThrow("routing.wait_budget_s.review must be nonnegative integer seconds");
+    }
+    for (const value of ['"20"', "20", "[]"]) {
+      writeFileSync(file, `[routing]\nwait_budget_s = ${value}\n`);
+      expect(config).toThrow("routing.wait_budget_s must be a table");
+    }
+    writeFileSync(file, "[routing.wait_budget_s]\nunknown = 1\n");
+    expect(config).toThrow("unknown role");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

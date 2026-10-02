@@ -376,26 +376,49 @@ export class ProviderTracker {
 
   // ---- concurrency ---------------------------------------------------------
 
-  async acquire(id: string, signal: AbortSignal): Promise<() => void> {
+  acquire(id: string, signal: AbortSignal): Promise<() => void>;
+  acquire(
+    id: string,
+    signal: AbortSignal,
+    waitMs: number | undefined,
+    onWait?: (ahead: number) => void,
+  ): Promise<(() => void) | null>;
+  async acquire(
+    id: string,
+    signal: AbortSignal,
+    waitMs?: number,
+    onWait?: (ahead: number) => void,
+  ): Promise<(() => void) | null> {
     const p = this.providers.get(id);
     if (!p) throw new Error(`unknown provider ${id}`);
+    const end = waitMs === undefined ? Infinity : this.clock() + waitMs;
+    let notified = false;
     while (p.inFlight >= p.def.maxConcurrent) {
       if (signal.aborted) throw new Error("cancelled");
+      if (!notified) {
+        onWait?.(p.waiters.length);
+        notified = true;
+      }
+      if (signal.aborted) throw new Error("cancelled");
+      if (this.clock() >= end) return null;
       await new Promise<void>((resolve) => {
+        let timeout: ReturnType<typeof setInterval> | undefined;
         const wake = () => {
-          signal.removeEventListener("abort", onAbort);
-          resolve();
-        };
-        // A cancelled waiter must leave the queue, or a later release would wake a dead waiter
-        // and strand the live ones behind it.
-        const onAbort = () => {
+          if (timeout !== undefined) this.timer.clear(timeout);
+          signal.removeEventListener("abort", wake);
           const i = p.waiters.indexOf(wake);
           if (i >= 0) p.waiters.splice(i, 1);
           resolve();
         };
         p.waiters.push(wake);
-        signal.addEventListener("abort", onAbort, { once: true });
+        signal.addEventListener("abort", wake, { once: true });
+        if (Number.isFinite(end)) timeout = this.timer.set(wake, Math.min(end - this.clock(), 2_147_483_647));
       });
+    }
+    if (signal.aborted || (notified && this.clock() >= end)) {
+      p.waiters.shift()?.();
+      if (signal.aborted) throw new Error("cancelled");
+      return null;
     }
     p.inFlight++;
     this.publish(id);
