@@ -36,6 +36,25 @@ interface KeyReading {
   limit: number | null;
   remaining: number | null;
   reset: string | null;
+  monthlyPeriod: string | null;
+  monthlyResetAt: number | null;
+}
+
+function monthlyResetAt(value: unknown): number | null {
+  const at = typeof value === "string" ? Date.parse(value) : value;
+  if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) return null;
+  return typeof value === "number" && at < 1e12 ? at * 1000 : at;
+}
+
+function sameMonth(prior: KeyReading, next: KeyReading): boolean {
+  if (prior.monthlyPeriod !== null && next.monthlyPeriod !== null)
+    return prior.monthlyPeriod === next.monthlyPeriod;
+  if (prior.monthlyResetAt !== null && next.monthlyResetAt !== null)
+    return (
+      prior.monthlyResetAt === next.monthlyResetAt &&
+      !(prior.at < prior.monthlyResetAt && next.at >= prior.monthlyResetAt)
+    );
+  return new Date(prior.at).toISOString().slice(0, 7) === new Date(next.at).toISOString().slice(0, 7);
 }
 
 const CIRCUIT_THRESHOLD = 3;
@@ -93,6 +112,8 @@ export class ProviderTracker {
           limit: typeof row.key_limit === "number" ? row.key_limit : null,
           remaining: typeof row.limit_remaining === "number" ? row.limit_remaining : null,
           reset: typeof row.limit_reset === "string" ? row.limit_reset : null,
+          monthlyPeriod: typeof row.monthly_period === "string" ? row.monthly_period : null,
+          monthlyResetAt: typeof row.monthly_reset_at === "number" ? row.monthly_reset_at : null,
         };
       }
       const windows = row?.windows_json
@@ -187,15 +208,23 @@ export class ProviderTracker {
         (fields.limit_reset !== null && typeof fields.limit_reset !== "string")
       )
         return false;
+      const period = fields.usage_monthly_period ?? fields.monthly_period;
       const next: KeyReading = {
         usage: fields.usage_monthly as number,
         at: this.clock(),
         limit: fields.limit as number | null,
         remaining: fields.limit_remaining as number | null,
         reset: fields.limit_reset as string | null,
+        monthlyPeriod: typeof period === "string" && period.trim() ? period : null,
+        monthlyResetAt: monthlyResetAt(
+          fields.usage_monthly_reset_at ??
+            fields.usage_monthly_reset ??
+            fields.monthly_reset_at ??
+            fields.monthly_reset,
+        ),
       };
       const prior = this.reading;
-      if (prior && next.usage >= prior.usage && next.at > prior.at) {
+      if (prior && next.at > prior.at && sameMonth(prior, next)) {
         const reported = next.usage - prior.usage;
         const local = this.store.providerSpendBetween("openrouter", prior.at, next.at);
         const drift = Math.abs(reported - local);

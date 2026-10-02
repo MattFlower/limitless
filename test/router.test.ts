@@ -525,6 +525,13 @@ describe("OpenRouter reconciliation", () => {
     error: null,
     quota: null,
   });
+  const chatCall = (costUsd: number, startedAt = now, durationMs: number | null = 0) => {
+    store.db
+      .query(`INSERT INTO chat_calls
+        (conversation_id, provider, model_id, result_json, cost_usd, started_at, duration_ms)
+        VALUES ('chat', 'openrouter', 'openrouter/ds', ?, ?, ?, ?)`)
+      .run(JSON.stringify(result(costUsd)), costUsd, startedAt, durationMs);
+  };
   const make = (key = "sentinel-key") => {
     const fetchKey = (async (_url: string | URL | Request, init?: RequestInit) => {
       calls++;
@@ -650,7 +657,7 @@ describe("OpenRouter reconciliation", () => {
     expect(tracker.headroom("openrouter")).toBeLessThanOrEqual(0);
   });
 
-  test("warns only for material drift and ignores monthly reset", async () => {
+  test("warns only for material drift, including a same-month usage decrease", async () => {
     const tracker = make();
     await tracker.refreshOpenRouter();
     now += 1_000;
@@ -661,13 +668,13 @@ describe("OpenRouter reconciliation", () => {
     payload = reading(0);
     await tracker.refreshOpenRouter();
     now += 1_000;
-    store.recordChatCall("chat", "openrouter", "openrouter/ds", now, result(1));
+    chatCall(1);
     now += 1_000;
     payload = reading(1.05);
     await tracker.refreshOpenRouter();
     expect(store.listEvents("provider:openrouter")).toHaveLength(0);
     now += 1_000;
-    store.recordChatCall("chat", "openrouter", "openrouter/ds", now, result(1));
+    chatCall(1);
     now += 1_000;
     payload = reading(2.35);
     await tracker.refreshOpenRouter();
@@ -679,7 +686,171 @@ describe("OpenRouter reconciliation", () => {
     now += 1_000;
     payload = reading(0.01);
     await tracker.refreshOpenRouter();
-    expect(store.listEvents("provider:openrouter")).toHaveLength(1);
+    const decreased = store.listEvents("provider:openrouter");
+    expect(decreased).toHaveLength(2);
+    expect(decreased[1]?.data).toMatchObject({ localUsd: 0, reportedUsd: 0.01 - 2.35 });
+  });
+
+  for (const kind of ["invocation", "chat"] as const) {
+    test.each([
+      [0, 1, 0, 0],
+      [1_000, 0, 1, 0],
+      [1_500, 0, 1, 0],
+      [2_000, 0, 0, 1],
+    ])(`${kind} cost belongs to its finish interval (%i ms)`, async (offset, first, second, third) => {
+      const base = now;
+      const tracker = make();
+      await tracker.refreshOpenRouter();
+      if (kind === "chat") {
+        chatCall(1, base - 500, offset + 500);
+      } else {
+        const repo = store.upsertRepo({
+          slug: "local/spend",
+          kind: "local",
+          url: null,
+          localPath: dir,
+          defaultBranch: "main",
+          mergePolicy: "pr",
+        });
+        const run = store.createRun(repo, { repo: repo.slug, prompt: "spend test" });
+        const invocation = (startedAt: number) => {
+          const row = store.createInvocation({
+            runId: run.id,
+            stageId: null,
+            role: "implement",
+            harness: "fake",
+            provider: "openrouter",
+            model: "ds",
+            modelId: "openrouter/ds",
+          });
+          store.db.query("UPDATE invocations SET started_at = ? WHERE id = ?").run(startedAt, row.id);
+          return row;
+        };
+        store.updateInvocation(invocation(base - 500).id, {
+          finishedAt: base + offset,
+          status: "ok",
+          costUsd: 1,
+        });
+        store.updateInvocation(invocation(base + 500).id, { costUsd: 10 });
+      }
+      expect(store.providerSpendBetween("openrouter", base, base + 1_000)).toBe(first);
+      expect(store.providerSpendBetween("openrouter", base + 1_000, base + 2_000)).toBe(second);
+      expect(store.providerSpendBetween("openrouter", base + 2_000, base + 3_000)).toBe(third);
+      expect(store.providerSpendBetween("claude", base, base + 3_000)).toBe(0);
+      now = base + 1_000;
+      payload = reading(first);
+      expect(await tracker.refreshOpenRouter()).toBe(true);
+      now = base + 2_000;
+      payload = reading(first + second);
+      expect(await tracker.refreshOpenRouter()).toBe(true);
+      now = base + 3_000;
+      payload = reading(1);
+      expect(await tracker.refreshOpenRouter()).toBe(true);
+      expect(store.listEvents("provider:openrouter")).toHaveLength(0);
+    });
+  }
+
+  test("legacy chat calls without duration retain start-time attribution", () => {
+    chatCall(1, now + 1_000, null);
+    expect(store.providerSpendBetween("openrouter", now, now + 1_000)).toBe(0);
+    expect(store.providerSpendBetween("openrouter", now + 1_000, now + 2_000)).toBe(1);
+  });
+
+  test.each([
+    ["2026-09-30T23:59:59Z", "2026-10-01T00:00:01Z"],
+    ["2026-12-31T23:59:59Z", "2027-01-01T00:00:01Z"],
+  ])("recognizes higher monthly spend after restart across %s", async (before, after) => {
+    now = Date.parse(before);
+    let tracker = make();
+    payload = reading(0.8);
+    await tracker.refreshOpenRouter();
+    store.close();
+    store = new Store(join(dir, "db.sqlite"));
+    tracker = make();
+    now = Date.parse(after);
+    chatCall(1, now - 500);
+    payload = reading(1);
+    expect(await tracker.refreshOpenRouter()).toBe(true);
+    expect(store.listEvents("provider:openrouter")).toHaveLength(0);
+    now += 1_000;
+    payload = reading(2);
+    await tracker.refreshOpenRouter();
+    expect(store.listEvents("provider:openrouter")[0]?.data).toMatchObject({
+      reportedUsd: 1,
+      localUsd: 0,
+    });
+  });
+
+  test.each(["usage_monthly_period", "monthly_period"])(
+    "%s overrides calendar and usage changes and survives restart",
+    async (field) => {
+      now = Date.parse("2026-09-30T23:59:59Z");
+      let tracker = make();
+      payload = { data: { ...reading(0.8).data, [field]: "billing-period-a" } };
+      await tracker.refreshOpenRouter();
+      store.close();
+      store = new Store(join(dir, "db.sqlite"));
+      tracker = make();
+      now += 2_000;
+      payload = { data: { ...reading(0.1).data, [field]: "billing-period-a" } };
+      await tracker.refreshOpenRouter();
+      const events = store.listEvents("provider:openrouter");
+      expect(events).toHaveLength(1);
+      expect(events[0]?.data).toMatchObject({ reportedUsd: 0.1 - 0.8, localUsd: 0 });
+      now += 1_000;
+      payload = { data: { ...reading(1).data, [field]: "billing-period-b" } };
+      await tracker.refreshOpenRouter();
+      expect(store.listEvents("provider:openrouter")).toHaveLength(1);
+      now += 1_000;
+      payload = { data: { ...reading(2).data, [field]: "billing-period-b" } };
+      await tracker.refreshOpenRouter();
+      expect(store.listEvents("provider:openrouter")).toHaveLength(2);
+    },
+  );
+
+  test.each(["usage_monthly_reset_at", "usage_monthly_reset", "monthly_reset_at", "monthly_reset"])(
+    "%s identifies monthly periods independently of a daily key limit",
+    async (field) => {
+      now = Date.parse("2026-09-30T23:59:59Z");
+      let tracker = make();
+      const reset = Date.parse("2026-09-01T00:00:00Z");
+      payload = { data: { ...reading(0.8).data, [field]: new Date(reset).toISOString() } };
+      await tracker.refreshOpenRouter();
+      store.close();
+      store = new Store(join(dir, "db.sqlite"));
+      tracker = make();
+      now += 2_000;
+      payload = { data: { ...reading(0.1).data, [field]: reset / 1_000 } };
+      await tracker.refreshOpenRouter();
+      expect(store.listEvents("provider:openrouter")).toHaveLength(1);
+      now += 1_000;
+      payload = { data: { ...reading(1).data, [field]: Date.parse("2026-10-01T00:00:00Z") } };
+      await tracker.refreshOpenRouter();
+      expect(store.listEvents("provider:openrouter")).toHaveLength(1);
+    },
+  );
+
+  test("crossing a supplied upcoming monthly reset skips drift", async () => {
+    now = Date.parse("2026-09-15T11:59:59Z");
+    const tracker = make();
+    const reset = "2026-09-15T12:00:00Z";
+    payload = { data: { ...reading(0.8).data, usage_monthly_reset_at: reset } };
+    await tracker.refreshOpenRouter();
+    now += 2_000;
+    payload = { data: { ...reading(1).data, usage_monthly_reset_at: reset } };
+    await tracker.refreshOpenRouter();
+    expect(store.listEvents("provider:openrouter")).toHaveLength(0);
+  });
+
+  test("invalid monthly metadata falls back to UTC calendar months", async () => {
+    now = Date.parse("2026-09-30T23:59:59Z");
+    const tracker = make();
+    payload = { data: { ...reading(0.8).data, monthly_period: {}, monthly_reset_at: "daily" } };
+    await tracker.refreshOpenRouter();
+    now += 2_000;
+    payload = { data: { ...reading(1).data, monthly_period: "", monthly_reset_at: -1 } };
+    await tracker.refreshOpenRouter();
+    expect(store.listEvents("provider:openrouter")).toHaveLength(0);
   });
 });
 
