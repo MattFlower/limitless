@@ -107,6 +107,13 @@ export function getProviderWorkload(): Promise<ProviderWorkload[]> {
   return request<ProviderWorkload[]>("/api/stats/providers");
 }
 
+export function setProviderFast(id: string, on: boolean): Promise<ProviderStatus> {
+  return request(`/api/providers/${encodeURIComponent(id)}/fast`, {
+    method: "POST",
+    body: JSON.stringify({ on }),
+  });
+}
+
 export function setProviderEnabled(id: string, enabled: boolean): Promise<ProviderStatus> {
   return request<ProviderStatus>(
     `/api/providers/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}`,

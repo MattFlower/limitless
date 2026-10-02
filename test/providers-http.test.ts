@@ -1,4 +1,11 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadConfig } from "../src/config.ts";
+import { Store } from "../src/db/store.ts";
+import { PROVIDERS } from "../src/router/catalog.ts";
+import { ProviderTracker } from "../src/router/providers.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
@@ -47,6 +54,107 @@ test("provider mutations persist, publish, and use existing request guards", asy
       expect((await call(action, id, { "content-type": "text/plain" })).status).toBe(415);
       expect((await call(action, id, {})).status).toBe(415);
     }
+  } finally {
+    await f.close();
+  }
+});
+
+test("fast settings default off and survive Store/tracker restart independently of enablement", () => {
+  const dir = mkdtempSync(join(tmpdir(), "limitless-fast-"));
+  const path = join(dir, "db.sqlite");
+  const reserves = loadConfig().reserves;
+  let store = new Store(path);
+  try {
+    let tracker = new ProviderTracker(PROVIDERS, store, reserves, {});
+    for (const id of ["codex", "claude"]) {
+      expect(tracker.status(id)?.fast).toBe(false);
+      expect(tracker.status(id)?.supportsFast).toBe(true);
+      tracker.setEnabled(id, false);
+      tracker.setFast(id, true);
+      expect(tracker.isEnabled(id)).toBe(false);
+    }
+    store.close();
+    store = new Store(path);
+    tracker = new ProviderTracker(PROVIDERS, store, reserves, {});
+    for (const id of ["codex", "claude"]) {
+      expect(tracker.isFast(id)).toBe(true);
+      expect(tracker.isEnabled(id)).toBe(false);
+      tracker.setEnabled(id, true);
+      expect(tracker.isFast(id)).toBe(true);
+      tracker.setFast(id, false);
+      expect(tracker.isEnabled(id)).toBe(true);
+    }
+    store.close();
+    store = new Store(path);
+    tracker = new ProviderTracker(PROVIDERS, store, reserves, {});
+    expect(tracker.isFast("claude")).toBe(false);
+    expect(tracker.isEnabled("claude")).toBe(true);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fast API toggles native providers, publishes status, and rejects invalid requests without mutation", async () => {
+  const f = await fixture();
+  try {
+    const tracker = new ProviderTracker(PROVIDERS, f.factory.store, f.factory.cfg.reserves, {});
+    // The route uses the same tracker API with native provider definitions.
+    Object.defineProperty(f.factory, "tracker", { value: tracker });
+    const routes = createHttpRoutes(f.factory);
+    const route = (routes["/api/providers/:id/fast"] as { POST: Route }).POST;
+    const call = (id: string, value: unknown, headers = { "content-type": "application/json" }) =>
+      route(
+        requestWithParams(
+          `http://localhost:7400/api/providers/${id}/fast`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify(value),
+          },
+          { id },
+        ),
+        localServer,
+      );
+    const messages: unknown[] = [];
+    const unsubscribe = f.factory.store.subscribe((message) => messages.push(message));
+    for (const id of ["codex", "claude"]) {
+      for (const on of [true, false, true]) {
+        const response = await call(id, { on });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ id, fast: on, enabled: true, supportsFast: true });
+      }
+      const before = f.factory.store.getProviderRow(id);
+      for (const value of [null, {}, { on: "true" }, { on: 1 }, { on: null }, [], true]) {
+        expect((await call(id, value)).status).toBe(400);
+        expect(f.factory.store.getProviderRow(id)).toEqual(before);
+      }
+      for (const headers of [
+        { "content-type": "text/plain" },
+        { "content-type": "application/json", origin: "https://evil.example" },
+        { "content-type": "application/json", "cf-connecting-ip": "1.2.3.4" },
+      ]) {
+        expect((await call(id, { on: false }, headers)).status).toBe(
+          headers["content-type"] === "text/plain" ? 415 : 403,
+        );
+        expect(tracker.isFast(id)).toBe(true);
+      }
+    }
+    for (const id of ["unknown", "openrouter", "omlx"]) {
+      expect((await call(id, { on: true })).status).toBe(400);
+      expect(f.factory.store.getProviderRow(id)).toBeNull();
+    }
+    expect(messages.filter((message) => (message as { kind?: string }).kind === "provider")).toHaveLength(6);
+    unsubscribe();
+    tracker.observeFast("claude", true, {
+      fastModeState: "off",
+      fastModeDisabledReason: "extra_usage_disabled",
+    });
+    expect(tracker.status("claude")?.fastModeUnavailableReason).toBe("extra_usage_disabled");
+    tracker.observeFast("claude", false, {});
+    expect(tracker.status("claude")?.fastModeUnavailableReason).toBe("extra_usage_disabled");
+    tracker.observeFast("claude", true, {});
+    expect(tracker.status("claude")?.fastModeUnavailableReason).toBeNull();
   } finally {
     await f.close();
   }

@@ -170,6 +170,9 @@ export interface Stage {
 }
 
 export interface Invocation {
+  fast: boolean;
+  fastModeState: string | null;
+  fastModeDisabledReason: string | null;
   id: number;
   runId: string;
   stageId: number | null;
@@ -247,6 +250,9 @@ export interface QuotaWindow {
 }
 
 export interface ProviderStatus {
+  fast?: boolean;
+  supportsFast?: boolean;
+  fastModeUnavailableReason?: string | null;
   id: string;
   label: string;
   billing: Billing;
@@ -519,6 +525,7 @@ export interface EvalTrial {
   pass: boolean | null;
   score: number | null;
   details: {
+    fast?: boolean;
     /** Review system name; distinguishes candidates that share a target. */
     system?: string;
     switchChain?: (ModelSelection & { tier: number })[];

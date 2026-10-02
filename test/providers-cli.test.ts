@@ -71,3 +71,60 @@ test("provider CLI mutations use the daemon API and report its state", async () 
     expect(output).toContain(`claude: ${action === "disable" ? "disabled" : "ok"}`);
   }
 });
+
+test("fast CLI sends boolean on/off and reports invalid arguments and provider errors", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "limitless-fast-cli-"));
+  const preload = join(dir, "fetch.ts");
+  writeFileSync(
+    preload,
+    `globalThis.fetch = async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      console.log("REQUEST " + init.method + " " + path + " " + init.headers["content-type"]);
+      console.log("BODY " + init.body);
+      const id = path.split("/")[3];
+      if (id === "unknown") return Response.json({ error: "unknown provider unknown" }, { status: 400 });
+      if (id === "openrouter") return Response.json({ error: "fast mode unsupported for provider openrouter" }, { status: 400 });
+      return Response.json({ id, fast: JSON.parse(init.body).on });
+    };`,
+  );
+  try {
+    for (const id of ["claude", "codex", "unknown", "openrouter"]) {
+      for (const value of ["on", "off", "yes"]) {
+        const child = Bun.spawn(
+          [
+            process.execPath,
+            "--preload",
+            preload,
+            join(import.meta.dir, "../src/cli/main.ts"),
+            "providers",
+            "fast",
+            value,
+            id,
+          ],
+          { stdout: "pipe", stderr: "pipe" },
+        );
+        const output = await new Response(child.stdout).text();
+        const error = await new Response(child.stderr).text();
+        const supported = id === "claude" || id === "codex";
+        expect(await child.exited).toBe(value === "yes" || !supported ? 1 : 0);
+        if (value === "yes") {
+          expect(output).not.toContain("REQUEST");
+          expect(error).toContain("usage: limitless providers fast on|off <id>");
+        } else if (!supported) {
+          expect(output).toContain(`REQUEST POST /api/providers/${id}/fast application/json`);
+          expect(output).not.toContain(`${id}: fast`);
+          expect(error).toContain(
+            id === "unknown" ? "unknown provider unknown" : "fast mode unsupported for provider openrouter",
+          );
+        } else {
+          expect(error).toBe("");
+          expect(output).toContain(`REQUEST POST /api/providers/${id}/fast application/json`);
+          expect(output).toContain(`BODY {"on":${value === "on"}}`);
+          expect(output).toContain(`${id}: fast ${value}`);
+        }
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -340,6 +340,13 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     },
     "/api/providers": handle(() => json(factory.tracker.all())),
     "/api/stats/providers": handle(() => json(computeProviderWorkload(store))),
+    "/api/providers/:id/fast": {
+      POST: handle(async (req) => {
+        const data = await body<{ on?: unknown } | null>(req);
+        if (typeof data?.on !== "boolean") throw new Error("on must be a boolean");
+        return json(factory.tracker.setFast(req.params.id ?? "", data.on));
+      }),
+    },
     "/api/providers/:id/enable": {
       POST: handle((req) => json(factory.tracker.setEnabled(req.params.id ?? "", true))),
     },

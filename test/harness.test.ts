@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { ClaudeStreamParser } from "../src/harness/claude.ts";
-import { buildCodexArgs, CodexStreamParser, parseRateLimits } from "../src/harness/codex.ts";
+import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
+import { buildCodexArgs, CodexStreamParser, parseRateLimits, runCodex } from "../src/harness/codex.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import {
   type AgentEvent,
@@ -336,5 +336,109 @@ test("CLI arguments transmit the selected effort verbatim and reject backend Cla
     expect(buildClaudeArgs(spec, "session")).not.toContain("--effort");
     spec.target.effort = "high";
     expect(() => buildClaudeArgs(spec, "session")).toThrow("cannot set effort for the claude backend");
+  });
+});
+
+test("native fast flags cover edit, structured and isolated readers without leaking to backends", async () => {
+  await withScratch(import.meta.dir, async (scratchDir) => {
+    const base: AgentSpec = {
+      cwd: import.meta.dir,
+      scratchDir,
+      prompt: "ready",
+      mode: "readonly",
+      target: {
+        modelId: "test",
+        provider: "codex",
+        harness: "codex",
+        model: "test",
+        vendor: "other",
+        tier: 1,
+        billing: "subscription",
+      },
+      timeoutMs: 1000,
+      idleTimeoutMs: 1000,
+      maxToolCalls: 1,
+      signal: new AbortController().signal,
+      logPath: join(scratchDir, "log"),
+      onEvent: () => {},
+    };
+    for (const mode of ["readonly", "edit"] as const) {
+      for (const noTools of [false, true]) {
+        for (const fast of [false, true]) {
+          const spec = { ...base, mode, noTools, fast, jsonSchema: { type: "object" } };
+          const args = buildCodexArgs(spec);
+          expect(args.filter((a) => a === 'service_tier="fast"')).toHaveLength(fast ? 1 : 0);
+          if (noTools || mode === "readonly") expect(args).toContain("--ignore-user-config");
+          const claude = {
+            ...spec,
+            target: { ...base.target, provider: "claude", harness: "claude" as const },
+          };
+          const claudeArgs = buildClaudeArgs(claude, "session");
+          const settingsIndex = claudeArgs.indexOf("--settings");
+          const settings = settingsIndex < 0 ? {} : JSON.parse(claudeArgs[settingsIndex + 1] ?? "{}");
+          expect(settings.fastMode).toBe(fast ? true : undefined);
+          expect(claudeArgs.filter((a) => a === "--settings").length).toBeLessThanOrEqual(1);
+          if (!noTools && mode === "readonly") {
+            expect(settings.sandbox.enabled).toBe(true);
+            expect(settings.sandbox.filesystem.allowWrite).toEqual([scratchDir]);
+            expect(settings.disableAllHooks).toBe(true);
+          }
+          const backendArgs = buildClaudeArgs(
+            { ...claude, target: { ...claude.target, provider: "openrouter" } },
+            "session",
+          );
+          expect(backendArgs.join(" ")).not.toContain("fastMode");
+        }
+      }
+    }
+    const spec = {
+      ...base,
+      fast: true,
+      noTools: true,
+      target: { ...base.target, provider: "claude", harness: "claude" as const },
+    };
+    const outcome = await runClaude(spec, async (opts) => {
+      for (const line of fixture("claude-fast-off.jsonl")) opts.onStdoutLine?.(line);
+      return {
+        exitCode: 0,
+        signal: null,
+        truncated: false,
+        durationMs: 1,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        idleTimedOut: false,
+        cancelled: false,
+      };
+    });
+    expect(outcome.status).toBe("ok");
+    expect(outcome.fastModeState).toBe("off");
+    expect(outcome.fastModeDisabledReason).toBe("extra_usage_disabled");
+    let codexCalls = 0;
+    const rejected = await runCodex({ ...base, fast: true, noTools: true }, async (opts) => {
+      codexCalls++;
+      expect(opts.cmd).toContain('service_tier="fast"');
+      return {
+        exitCode: 1,
+        signal: null,
+        truncated: false,
+        durationMs: 1,
+        stdout: "",
+        stderr: "unsupported service_tier fast",
+        timedOut: false,
+        idleTimedOut: false,
+        cancelled: false,
+      };
+    });
+    expect(codexCalls).toBe(1);
+    expect(rejected.status).toBe("error");
+    expect(rejected.error).toContain("unsupported service_tier fast");
+    const parser = new ClaudeStreamParser(() => {});
+    parser.feed('{"type":"result","result":"ready"}');
+    expect(parser.fastModeState).toBeNull();
+    expect(parser.fastModeDisabledReason).toBeNull();
+    parser.feed('{"type":"result","fast_mode_state":"on"}');
+    expect(parser.fastModeState).toBe("on");
+    expect(parser.fastModeDisabledReason).toBeNull();
   });
 });

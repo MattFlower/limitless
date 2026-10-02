@@ -487,6 +487,7 @@ export class RunContext {
         }
       }
       const invocation = store.createInvocation({
+        fast: tracker.isFast(target.provider),
         runId: this.run.id,
         stageId: opts.stage.id,
         role: opts.role,
@@ -509,6 +510,7 @@ export class RunContext {
           : undefined;
       try {
         const spec: AgentSpec = {
+          fast: invocation.fast,
           cwd: opts.cwd ?? this.state.worktreePath ?? this.runDir,
           prompt: opts.prompt,
           systemAppend: [opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n"),
@@ -597,6 +599,8 @@ export class RunContext {
 
       const updated = store.updateInvocation(invocation.id, {
         status: result.status,
+        fastModeState: result.fastModeState ?? null,
+        fastModeDisabledReason: result.fastModeDisabledReason ?? null,
         costUsd: result.costUsd,
         costEquivUsd: result.costEquivUsd,
         inputTokens: result.usage.input + result.usage.cacheWrite,

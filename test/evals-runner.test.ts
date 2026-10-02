@@ -1295,3 +1295,38 @@ test("stored panel finder replay pairs candidates, bills only verifiers and surv
     await f.close();
   }
 }, 30_000);
+
+test("executed trials snapshot fast mode and cached trials retain it across toggles", async () => {
+  const f = await evalFixture(
+    [{ ...verifierModel, id: "fast-model", provider: "codex" }],
+    [{ id: "codex", label: "Codex", harness: "fake", billing: "subscription", maxConcurrent: 1 }],
+  );
+  try {
+    f.factory.tracker.setFast("codex", true);
+    f.respond((spec) => {
+      expect(spec.fast).toBe(true);
+      f.factory.tracker.setFast("codex", false);
+      return { structured: answer };
+    });
+    const first = f.factory.evals.submit({ role: "triage", models: ["fast-model"], caseIds: ["a"], k: 1 });
+    await f.factory.evals.wait(first.id);
+    const trial = f.factory.evals.report(first.id)?.trials[0];
+    expect(trial?.status).toBe("ok");
+    expect(trial?.details.fast).toBe(true);
+    const second = f.factory.evals.submit({ role: "triage", models: ["fast-model"], caseIds: ["a"], k: 1 });
+    await f.factory.evals.wait(second.id);
+    const reused = f.factory.evals.report(second.id)?.trials[0];
+    expect(f.calls).toHaveLength(1);
+    expect(reused?.cacheKey).toBe(trial?.cacheKey);
+    expect(reused?.details.fast).toBe(true);
+    const third = f.factory.evals.submit({ role: "triage", models: ["fast-model"], caseIds: ["b"], k: 1 });
+    f.respond((spec) => {
+      expect(spec.fast).toBe(false);
+      return { structured: answer };
+    });
+    await f.factory.evals.wait(third.id);
+    expect(f.factory.evals.report(third.id)?.trials[0]?.details.fast).toBe(false);
+  } finally {
+    await f.close();
+  }
+});

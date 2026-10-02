@@ -28,6 +28,7 @@ Usage:
   limitless answer <run> "<text>"         Answer a run's open question(s)
   limitless providers                     Provider health and quota
   limitless providers enable|disable <id>  Change runtime provider availability
+  limitless providers fast on|off <id>     Toggle native provider fast mode
   limitless gc [--dry-run]                Clean up expired worktrees, logs, debug events and baseline cache
   limitless gates clear-cache [--repo owner/name]  Drop cached passing baselines (all repos by default)
   limitless mcp                           MCP stdio proxy (daemon must be running)
@@ -352,6 +353,17 @@ async function main(): Promise<void> {
       });
     }
     case "providers": {
+      if (rest[0] === "fast") {
+        const [, value, id] = rest;
+        if (rest.length !== 3 || (value !== "on" && value !== "off") || !id)
+          throw new Error("usage: limitless providers fast on|off <id>");
+        const provider = await api<import("../core/types.ts").ProviderStatus>(
+          `/api/providers/${encodeURIComponent(id)}/fast`,
+          { method: "POST", body: JSON.stringify({ on: value === "on" }) },
+        );
+        console.log(`${provider.id}: fast ${provider.fast ? "on" : "off"}`);
+        return;
+      }
       if (rest.length) {
         const [action, id] = rest;
         if (rest.length !== 2 || (action !== "enable" && action !== "disable") || !id)

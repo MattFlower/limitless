@@ -3,7 +3,7 @@ import { createSignal, For, Show } from "solid-js";
 import { observationAge } from "../../src/core/quota-format.ts";
 import type { ProviderStatus } from "../../src/core/types.ts";
 import type { ProviderWorkload, WorkloadTotals } from "../../src/db/stats.ts";
-import { setProviderEnabled } from "../api.ts";
+import { setProviderEnabled, setProviderFast } from "../api.ts";
 import { compactNumber, duration, money, pct, resetsIn } from "../lib/format.ts";
 import { now } from "../lib/ticker.ts";
 import { windowLabel } from "../lib/window-label.ts";
@@ -55,11 +55,12 @@ const Gauge: Component<{
 export const ProviderCard: Component<{ provider: ProviderStatus; workload?: ProviderWorkload }> = (props) => {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
-  const toggle = async () => {
+  const toggle = async (fast = false) => {
     setBusy(true);
     setError("");
     try {
-      await setProviderEnabled(props.provider.id, !props.provider.enabled);
+      if (fast) await setProviderFast(props.provider.id, !props.provider.fast);
+      else await setProviderEnabled(props.provider.id, !props.provider.enabled);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Provider update failed");
     } finally {
@@ -76,6 +77,29 @@ export const ProviderCard: Component<{ provider: ProviderStatus; workload?: Prov
         <button type="button" class="btn btn-sm" disabled={busy()} onClick={() => void toggle()}>
           {busy() ? "Updating…" : props.provider.enabled ? "Disable" : "Enable"}
         </button>
+        <Show when={props.provider.supportsFast}>
+          <label>
+            <input
+              type="checkbox"
+              role="switch"
+              aria-checked={props.provider.fast ?? false}
+              checked={props.provider.fast ?? false}
+              disabled={busy()}
+              onChange={() => void toggle(true)}
+            />{" "}
+            Fast mode
+          </label>
+          <div class="provider-reason">
+            {props.provider.id === "codex"
+              ? "Requires Codex CLI >= 0.159.2"
+              : "Claude fast mode draws on paid extra usage."}
+          </div>
+          <Show when={props.provider.fastModeUnavailableReason}>
+            <div class="provider-reason">
+              fast mode unavailable: {props.provider.fastModeUnavailableReason}
+            </div>
+          </Show>
+        </Show>
         <Show when={error()}>
           <div class="provider-reason" role="alert">
             {error()}

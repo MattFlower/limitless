@@ -107,6 +107,9 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
     const invocations = (["low", "high", "none", "default", null] as const).map(
       (effort, id): import("../src/core/types.ts").Invocation => ({
         id,
+        fast: false,
+        fastModeState: null,
+        fastModeDisabledReason: null,
         effort,
         runId: "run",
         stageId: null,

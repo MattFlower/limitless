@@ -443,3 +443,128 @@ test("eval spend covers the resume chain without counting copied trials twice", 
     store.close();
   }
 });
+
+test("invocation fast selection and Claude diagnostics round trip with null defaults", () => {
+  const home = mkdtempSync(join(tmpdir(), "limitless-inv-fast-"));
+  const path = join(home, "db.sqlite");
+  let store = new Store(path);
+  try {
+    const repo = store.upsertRepo({
+      slug: "fast",
+      kind: "local",
+      localPath: home,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "fast" });
+    const ids = [undefined, true, false].map((fast) => {
+      const inv = store.createInvocation({
+        runId: run.id,
+        stageId: null,
+        role: "triage",
+        harness: "claude",
+        provider: "claude",
+        model: "test",
+        modelId: "test",
+        fast,
+      });
+      expect(inv.fast).toBe(fast ?? false);
+      expect(inv.fastModeState).toBeNull();
+      expect(inv.fastModeDisabledReason).toBeNull();
+      if (fast)
+        store.updateInvocation(inv.id, {
+          fastModeState: "off",
+          fastModeDisabledReason: "extra_usage_disabled",
+        });
+      return inv.id;
+    });
+    store.close();
+    store = new Store(path);
+    expect(store.getInvocation(ids[1] ?? 0)).toMatchObject({
+      fast: true,
+      fastModeState: "off",
+      fastModeDisabledReason: "extra_usage_disabled",
+    });
+    for (const index of [0, 2])
+      expect(store.getInvocation(ids[index] ?? 0)).toMatchObject({
+        fast: false,
+        fastModeState: null,
+        fastModeDisabledReason: null,
+      });
+  } finally {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("pipeline snapshots fast before execution and persists Claude diagnostics from the fake harness", async () => {
+  const { evalFixture, verifierModel, answer } = await import("./evals-support.ts");
+  const { RunContext } = await import("../src/pipeline/context.ts");
+  const { Router } = await import("../src/router/router.ts");
+  const { ProviderTracker } = await import("../src/router/providers.ts");
+  const f = await evalFixture(
+    [{ ...verifierModel, id: "fast-model", provider: "claude" }],
+    [{ id: "claude", label: "Claude", harness: "fake", billing: "subscription", maxConcurrent: 1 }],
+  );
+  try {
+    const tracker = f.factory.tracker;
+    tracker.setFast("claude", true);
+    const router = new Router(
+      tracker,
+      { ...f.factory.policy, triage: { default: ["fast-model"] } },
+      f.factory.models,
+    );
+    const repo = f.factory.store.upsertRepo({
+      slug: "fixture/repo",
+      kind: "local",
+      localPath: f.source,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = f.factory.store.createRun(repo, { repo: repo.slug, prompt: "fast" });
+    const context = new RunContext({ ...f.factory.deps, router }, run, repo, new AbortController().signal);
+    const stage = f.factory.store.startStage(run.id, "triage", 0);
+    f.respond((spec) => {
+      expect(spec.fast).toBe(true);
+      tracker.setFast("claude", false);
+      return {
+        stream: {
+          parser: "claude",
+          lines: [
+            JSON.stringify({
+              type: "result",
+              structured_output: answer,
+              fast_mode_state: "off",
+              fast_mode_disabled_reason: "extra_usage_disabled",
+            }),
+          ],
+        },
+      };
+    });
+    const result = await context.invoke({
+      role: "triage",
+      stage,
+      prompt: "fast",
+      mode: "readonly",
+      complexity: "small",
+      requireStructured: true,
+    });
+    expect(result.result.status).toBe("ok");
+    const invocation = f.factory.store.listInvocations(run.id)[0];
+    expect(invocation).toMatchObject({
+      fast: true,
+      fastModeState: "off",
+      fastModeDisabledReason: "extra_usage_disabled",
+    });
+    expect(tracker.isFast("claude")).toBe(false);
+    const def = tracker.def("claude");
+    if (!def) throw new Error("missing Claude provider");
+    const restarted = new ProviderTracker([def], f.factory.store, f.cfg.reserves, {});
+    restarted.setFast("claude", true);
+    expect(restarted.status("claude")?.fastModeUnavailableReason).toBe("extra_usage_disabled");
+  } finally {
+    await f.close();
+  }
+});

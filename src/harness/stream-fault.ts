@@ -16,6 +16,9 @@ export function parseFakeStream(stream: StreamFault, emit: (event: AgentEvent) =
     error: complete ? null : "malformed or truncated harness stream: missing successful completion",
     finalText: parser instanceof ClaudeStreamParser ? parser.finalText : parser.lastMessage,
     structured: parser instanceof ClaudeStreamParser ? parser.structured : extractJson(parser.lastMessage),
+    ...(parser instanceof ClaudeStreamParser
+      ? { fastModeState: parser.fastModeState, fastModeDisabledReason: parser.fastModeDisabledReason }
+      : {}),
     usage: parser.usage,
     sessionId: "fake-session",
     numTurns: 0,

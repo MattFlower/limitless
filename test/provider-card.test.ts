@@ -78,6 +78,25 @@ test("OpenRouter card keeps one budget gauge and reports only material differenc
     updatedAt: 1_000_000,
   };
   const html = renderToString(() => ProviderCard({ provider: status }));
+  expect(html).not.toContain('role="switch"');
+  for (const id of ["codex", "claude"]) {
+    const card = renderToString(() =>
+      ProviderCard({
+        provider: {
+          ...status,
+          id,
+          supportsFast: true,
+          fast: true,
+          fastModeUnavailableReason: id === "claude" ? "extra_usage_disabled" : null,
+        },
+      }),
+    );
+    expect(card).toContain('role="switch"');
+    expect(card).toContain('aria-checked="true"');
+    expect(card).toContain("Fast mode");
+    expect(card).toContain(id === "codex" ? "0.159.2" : "paid extra usage");
+    if (id === "claude") expect(card).toContain("fast mode unavailable: extra_usage_disabled");
+  }
   expect(html).toContain("30-day spend");
   expect(html).toContain("$10.00 / $50.00");
   expect(html).toContain("key $82.00 left of $100.00 · resets daily");

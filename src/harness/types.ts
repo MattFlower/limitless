@@ -39,6 +39,7 @@ export type AgentEvent =
   | { type: "status"; text: string };
 
 export interface AgentSpec {
+  fast?: boolean;
   cwd: string;
   /** Disposable write root owned by the invocation lifecycle, outside cwd. */
   scratchDir?: string;
@@ -84,6 +85,8 @@ export interface Usage {
 }
 
 export interface AgentResult {
+  fastModeState?: string | null;
+  fastModeDisabledReason?: string | null;
   status: InvocationStatus;
   finalText: string;
   structured: unknown;

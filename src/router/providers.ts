@@ -15,6 +15,8 @@ const RESET_JITTER_MS = 60_000;
 interface ProviderRuntime {
   def: ProviderDef;
   enabled: boolean;
+  fast: boolean;
+  fastModeUnavailableReason?: string | null;
   disabledReason: string | null;
   windows: Record<string, QuotaWindow>;
   windowObservedAt: Record<string, number>;
@@ -79,6 +81,7 @@ export class ProviderTracker {
         disabledReason = `missing ${def.apiKeySecret}`;
       }
       const row = store.getProviderRow(def.id);
+      const lastFast = def.id === "claude" ? store.latestFastInvocation(def.id) : null;
       if (
         def.id === "openrouter" &&
         typeof row?.reported_usage_usd === "number" &&
@@ -102,6 +105,8 @@ export class ProviderTracker {
       this.providers.set(def.id, {
         def,
         enabled,
+        fast: (def.id === "codex" || def.id === "claude") && row?.fast === 1,
+        fastModeUnavailableReason: lastFast?.fastModeState === "off" ? lastFast.fastModeDisabledReason : null,
         disabledReason,
         windows,
         windowObservedAt,
@@ -237,6 +242,32 @@ export class ProviderTracker {
 
   isEnabled(id: string): boolean {
     return this.providers.get(id)?.enabled ?? false;
+  }
+
+  isFast(id: string): boolean {
+    return this.providers.get(id)?.fast ?? false;
+  }
+
+  setFast(id: string, fast: boolean): ProviderStatus {
+    const p = this.providers.get(id);
+    if (!p) throw new Error(`unknown provider ${id}`);
+    if (id !== "codex" && id !== "claude") throw new Error(`fast mode unsupported for provider ${id}`);
+    this.store.setProviderFast(id, fast);
+    p.fast = fast;
+    this.publish(id);
+    return this.status(id) as ProviderStatus;
+  }
+
+  observeFast(
+    id: string,
+    requested: boolean,
+    result: { fastModeState?: string | null; fastModeDisabledReason?: string | null },
+  ): void {
+    const p = this.providers.get(id);
+    if (!p || id !== "claude" || !requested) return;
+    p.fastModeUnavailableReason =
+      result.fastModeState === "off" ? (result.fastModeDisabledReason ?? null) : null;
+    this.publish(id);
   }
 
   setEnabled(id: string, enabled: boolean): ProviderStatus {
@@ -560,6 +591,9 @@ export class ProviderTracker {
       label: p.def.label,
       billing: p.def.billing,
       enabled: p.enabled,
+      fast: p.fast,
+      supportsFast: id === "codex" || id === "claude",
+      fastModeUnavailableReason: p.fast ? (p.fastModeUnavailableReason ?? null) : null,
       state,
       reason,
       until: p.exhaustedUntil ?? p.circuitOpenUntil,

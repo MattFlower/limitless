@@ -48,6 +48,8 @@ export class ClaudeStreamParser {
   isError = false;
   subtype: string | null = null;
   gotResult = false;
+  fastModeState: string | null = null;
+  fastModeDisabledReason: string | null = null;
   windows: Record<string, QuotaWindow> = {};
   quotaRejectedUntil: number | null = null;
   quotaText = false;
@@ -118,6 +120,9 @@ export class ClaudeStreamParser {
       }
       case "result": {
         this.gotResult = true;
+        this.fastModeState = typeof e.fast_mode_state === "string" ? e.fast_mode_state : null;
+        this.fastModeDisabledReason =
+          typeof e.fast_mode_disabled_reason === "string" ? e.fast_mode_disabled_reason : null;
         this.subtype = (e.subtype as string) ?? null;
         this.isError = Boolean(e.is_error);
         this.sessionId = (e.session_id as string) ?? this.sessionId;
@@ -159,6 +164,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
     "--permission-mode",
     "dontAsk",
   ];
+  const fastSettings = spec.fast && t.provider === "claude" ? { fastMode: true } : {};
   const denied = ["Bash(git push:*)", "Bash(gh pr merge:*)", "Bash(gh repo delete:*)", "Bash(rm -rf /*)"];
   let readTools = ["Read", "Grep", "Glob"];
   if (spec.mode === "readonly" && !spec.noTools) {
@@ -180,6 +186,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
       '{"mcpServers":{}}',
       "--settings",
       JSON.stringify({
+        ...fastSettings,
         sandbox: {
           enabled: true,
           failIfUnavailable: true,
@@ -199,6 +206,8 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
       }),
     );
   }
+  if (spec.fast && t.provider === "claude" && (spec.mode !== "readonly" || spec.noTools))
+    args.push("--settings", JSON.stringify(fastSettings));
   if (spec.privateSession) args.push("--no-session-persistence");
   if (spec.noTools) {
     args.push("--tools", "");
@@ -316,6 +325,8 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const cost = priceOf(parser.usage, t.price);
   const metered = t.billing === "metered";
   const base: Omit<AgentResult, "status" | "error"> = {
+    fastModeState: parser.fastModeState,
+    fastModeDisabledReason: parser.fastModeDisabledReason,
     finalText: parser.finalText || parser.lastAssistantText,
     structured: parser.structured,
     sessionId: parser.sessionId ?? (spec.resumeSessionId || sessionId),
