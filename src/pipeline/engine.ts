@@ -197,8 +197,15 @@ export async function executeRun(
       return "queued";
     }
     const cancelled = (): RunStatus => {
-      deps.store.updateRun(runId, { status: "cancelled", finishedAt: Date.now() });
-      ctx.log("Run cancelled", "warn");
+      const reason = ctx.state.terminalReason?.startsWith("superseded:")
+        ? ctx.state.terminalReason
+        : undefined;
+      deps.store.updateRun(runId, {
+        status: "cancelled",
+        finishedAt: Date.now(),
+        ...(reason ? { error: reason } : {}),
+      });
+      ctx.log(reason ?? "Run cancelled", "warn");
       return "cancelled";
     };
     if (e instanceof CancelledError || signal.aborted) return cancelled();
@@ -1549,8 +1556,10 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             ".[].body",
           ];
           const comment = ["pr", "comment", String(ctx.run.sourceRef?.number), "--repo", ctx.repo.slug];
+          let confirmingHead = false;
           await withGitHubRetry(
             async () => {
+              confirmingHead = false;
               // A pending post (an earlier attempt that failed late, or one whose checkpoint was
               // lost) may already exist remotely: look for its marker before posting again.
               if (ctx.state.verdictCommentPending && (await runner(comments, ctx.signal))?.includes(marker))
@@ -1585,22 +1594,33 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
                 if (!verifiedSha || ctx.run.headSha !== verifiedSha)
                   reason = "Stale PR verification: worktree does not match the reviewed commit";
                 else if (data.headRefOid !== verifiedSha)
-                  reason = `Stale PR verification: reviewed ${verifiedSha}, current head ${data.headRefOid}`;
+                  reason = `superseded: PR head moved from ${verifiedSha} to ${data.headRefOid}`;
               } catch (error) {
+                if (error instanceof InjectedFault || error instanceof SimulatedTermination) throw error;
                 ctx.checkCancelled();
-                reason = `Unable to confirm PR head before verdict: ${(error as Error).message}`;
+                confirmingHead = true;
+                throw error;
               }
               if (reason) {
                 ctx.state.terminalReason = reason;
                 ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
                 await ctx.save("verification-stale");
-                throw new Error(reason);
+                throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
               ctx.checkCancelled();
               await runner([...comment, "--body", `${marker}\n${report}`], ctx.signal);
             },
             { budget, signal: ctx.signal },
-          );
+          ).catch(async (error: unknown) => {
+            if (error instanceof InjectedFault || error instanceof SimulatedTermination) throw error;
+            ctx.checkCancelled();
+            if (!confirmingHead) throw error;
+            const reason = `Unable to confirm PR head before verdict: ${(error as Error).message}`;
+            ctx.state.terminalReason = reason;
+            ctx.store.putArtifact(ctx.run.id, "report.md", "report", buildReport(ctx, false));
+            await ctx.save("verification-stale");
+            throw new Error(reason);
+          });
           ctx.checkCancelled();
           ctx.state.verdictCommentPosted = true;
           await ctx.save("verification-comment-posted");

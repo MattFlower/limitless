@@ -2950,8 +2950,8 @@ protected_paths = ["protected.txt"]
         if (scenario === "restart-repair") expect(before?.implementedRound).toBe(0);
       }
       const blocked = prScript || ["persistent", "repair-audit", "empty"].includes(scenario);
-      expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human"])).toBe(
-        stale ? "failed" : blocked ? "needs_human" : "succeeded",
+      expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human", "cancelled"])).toBe(
+        scenario === "head-moved" ? "cancelled" : stale ? "failed" : blocked ? "needs_human" : "succeeded",
       );
       stopNotifier();
       const state = f.store.getRunState<RunState>(runId);
@@ -2967,7 +2967,14 @@ protected_paths = ["protected.txt"]
         expect(
           calls.filter((call) => call[1] === "comment" && call.at(-1)?.includes("Verified by")),
         ).toHaveLength(0);
-        const reason = scenario === "head-moved" ? "Stale PR verification" : "Unable to confirm PR head";
+        const reason =
+          scenario === "head-moved"
+            ? `superseded: PR head moved from ${head} to ${remote}`
+            : "Unable to confirm PR head";
+        if (scenario === "head-moved") {
+          expect(calls.filter((call) => call[1] === "comment")).toHaveLength(0);
+          expect(f.store.listEvents(runId).some((event) => event.message === reason)).toBe(true);
+        }
         expect(f.store.getRun(runId)?.error).toContain(reason);
         expect(state?.terminalReason).toContain(reason);
         expect(f.store.getArtifact(runId, "report.md")).toContain(reason);
