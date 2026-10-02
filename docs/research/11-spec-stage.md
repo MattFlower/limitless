@@ -1,4 +1,4 @@
-<!-- Research synthesis produced on 2026-09-30 from two research passes (literature and industry practice; Limitless's own spec and run data), edited by the orchestrator. Many sources are 2026 preprints or vendor documentation; evidence strength is marked on each claim. Status: proposal for M4.6 (#193), pending owner review. -->
+<!-- Research synthesis produced on 2026-09-30 from two research passes (literature and industry practice; Limitless's own spec and run data), edited by the orchestrator. Many sources are 2026 preprints or vendor documentation; evidence strength is marked on each claim. Status: accepted by the owner as the basis for M4.6 (#193), 2026-10-01; see Status below. -->
 
 # The spec stage: how much specification, for which implementer (2026-09-30)
 
@@ -8,6 +8,21 @@
 - **[S] strong:** peer-reviewed work, a large benchmark, or official vendor documentation.
 - **[M] moderate:** a solid preprint or a specific vendor post.
 - **[W] weak:** a small study, a single rater, or a confounded comparison in our own data.
+
+## Status (2026-10-02)
+
+Owner-approved no-regret changes from §3.1 that have shipped:
+- **Item 1, the read-only leak** (#212 → PR #221). The spec prompt confines the read-only rule to the spec agent's own investigation. A spec that declares the task specification- or documentation-only gets one retry, then fails as invalid output, unless the request says so. The phrase match is anchored to clause ends.
+- **Item 2, the contradiction** (#213 → PR #218). The implement prompt no longer says "beyond only the listed criteria". It says to stay within the request and spec, still meet the acceptance criteria, and name spec parts that look unnecessary. Reviewers may flag spec-mandated code the request does not need, at minor or nit.
+- **Item 4, no out-of-run criteria** (#214 → PR #224). The prompt forbids them. A word-list match on `how_to_verify` asks for one rewrite, and a flagged criterion is kept and logged, never dropped. The words overlap this repository's own vocabulary (deploy, owner, orchestrator), so a wrongly dropped criterion would silently weaken verify.
+- **Item 5, criteria sized to the task** (#215 → PR #226). Trivial 1–2, small 1–3, medium 3–5, large 5–8 (2–8 when the complexity is unknown). An oversized spec gets one retry and is then kept and logged. Tests are required only where behaviour is new or at risk.
+
+Open:
+- **Item 3, basis tags,** depends on the decision ledger proposed in 10-underspecified-requests.md, which is not yet decided.
+- **Item 6, size estimate and split,** is #137.
+- **Item 7** shipped as part of #218.
+- **The §4 experiment** has not been run.
+- **The Sol 6.1 implement field trial** (2026-10-01 to 10-05) now produces data on spec author versus implementer tier, because Sol 6.1 (tier 4) implements trivial, small and medium tasks.
 
 ## 0. Bottom line
 
