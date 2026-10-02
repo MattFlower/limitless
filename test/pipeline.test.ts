@@ -18,7 +18,7 @@ import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
 import { specPrompt } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
-import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import { LaterReviewSchema, ReviewSchema, renderSpec, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 import { outOfRunCriteria } from "../src/pipeline/spec-criteria.ts";
 import { specScopeViolation } from "../src/pipeline/spec-scope.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
@@ -222,6 +222,89 @@ afterEach(async () => {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each([
+    ["trivial", "1–2"],
+    ["small", "1–3"],
+    ["medium", "3–5"],
+    ["large", "5–8"],
+    [undefined, "2–8"],
+  ] as const)("spec prompt sizes criteria for %s complexity", (complexity, range) => {
+    const prompt = specPrompt({ prompt: "Add farewell", answers: [], complexity });
+    expect(prompt).toContain(`acceptance_criteria: ${range} observable`);
+    expect(prompt).toContain(
+      "Require a specific new test only where behavior is new or at risk of regression, not for every criterion",
+    );
+    expect(prompt).toContain("Each needs a concrete how_to_verify");
+  });
+
+  test.each([
+    ["small", 7, 3],
+    ["small", 7, 7],
+    ["trivial", 2, 2],
+    ["small", 3, 3],
+    ["medium", 5, 5],
+    ["large", 8, 8],
+  ] as const)("spec size retry: %s %i → %i", async (complexity, initialCount, finalCount) => {
+    const oversized = initialCount === 7;
+    const prompts: string[] = [];
+    const expected = {
+      ...spec,
+      summary: oversized ? "Retried farewell specification" : spec.summary,
+      acceptance_criteria: Array.from({ length: finalCount }, (_, i) => ({
+        id: `AC-${i + 1}`,
+        criterion: `Farewell behavior ${i + 1}`,
+        how_to_verify: "cat farewell.txt",
+      })),
+    };
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ complexity }) };
+      if (role === "spec") {
+        prompts.push(s.prompt);
+        return {
+          structured:
+            prompts.length === 1 && oversized
+              ? {
+                  ...expected,
+                  summary: "Initial farewell specification",
+                  acceptance_criteria: Array.from({ length: initialCount }, (_, i) => ({
+                    ...expected.acceptance_criteria[0],
+                    id: `AC-${i + 1}`,
+                  })),
+                }
+              : expected,
+        };
+      }
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify")
+        return {
+          structured: {
+            ...pass,
+            criteria: [
+              ...expected.acceptance_criteria.map((a) => ({
+                id: a.id,
+                status: "met",
+                evidence: "observed",
+                publicSummary: "",
+              })),
+              ...pass.criteria.filter((c) => !c.id.startsWith("AC-")),
+            ],
+          },
+        };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(prompts).toHaveLength(oversized ? 2 : 1);
+    if (oversized) expect(prompts[1]).toContain("For small complexity, use at most 3 criteria");
+    expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual(expected);
+    expect(f.store.getArtifact(run.id, "spec.md")).toContain(renderSpec(expected));
+    const warnings = f.store.listEvents(run.id).filter((e) => e.message?.startsWith("Kept oversized spec"));
+    expect(warnings).toHaveLength(oversized && finalCount === 7 ? 1 : 0);
+    if (warnings.length) expect(warnings[0]).toMatchObject({ level: "warn" });
+  });
+
   test("spec prompt confines the read-only rule to investigation", () => {
     const prompt = specPrompt({ prompt: "Add farewell", answers: [] });
     expect(prompt).toContain("task below.\n\nYou are only writing the specification");
@@ -4862,6 +4945,77 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
     expect(f.store.getRun(run.id)?.error).toContain("Still failing");
   });
 });
+
+for (const phase of ["clarify", "spec"] as const) {
+  test.each(["parked", "transition", "entering", "cancelled"] as const)(
+    `drain parks ${phase} answer waits (%s)`,
+    async (when) => {
+      const question = "Formal or casual farewell?";
+      const specPrompts: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage")
+          return {
+            structured: triage(
+              phase === "clarify" ? { ambiguity: "high", blocking_questions: [question] } : {},
+            ),
+          };
+        if (role === "spec") {
+          specPrompts.push(s.prompt);
+          return { structured: { ...spec, blocking_questions: phase === "spec" ? [question] : [] } };
+        }
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") return { structured: pass };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const unsubscribe = f.store.subscribe((msg) => {
+        if (when === "entering" && msg.kind === "run" && msg.run.status === "waiting_input")
+          f.scheduler.drain();
+      });
+      try {
+        const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+        if (when !== "entering") {
+          await waitFor(f, run.id, ["waiting_input"]);
+          f.scheduler.drain();
+        }
+        if (when === "transition") f.answer(run.id, "Casual", "tester");
+        if (when === "cancelled") f.cancelRun(run.id, "tester");
+        expect(await waitFor(f, run.id, ["queued", "cancelled"], 500)).toBe(
+          when === "cancelled" ? "cancelled" : "queued",
+        );
+        expect(f.scheduler.activeRunIds).toEqual([]);
+        if (when === "cancelled") {
+          expect(f.scheduler.parkedRunIds).toEqual([]);
+          expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+          expect(f.store.getRun(run.id)?.error).toBe("cancelled by tester");
+          return;
+        }
+        expect(f.store.getRun(run.id)?.stage).toBeNull();
+        expect(f.store.getRunState<RunState>(run.id)).toMatchObject({ phase, parked: true });
+        expect(f.scheduler.parkedRunIds).toEqual([run.id]);
+        if (when === "parked") {
+          f.scheduler.resume();
+          await waitFor(f, run.id, ["waiting_input"]);
+          expect(f.store.listQuestions(run.id)).toHaveLength(1);
+          f.scheduler.drain();
+          await waitFor(f, run.id, ["queued"], 500);
+        }
+        if (when !== "transition") f.answer(run.id, "Casual", "tester");
+        expect(f.store.listQuestions(run.id)[0]?.answer).toBe("Casual");
+        f.scheduler.tick();
+        expect(f.scheduler.activeRunIds).toEqual([]);
+        f.scheduler.resume();
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        expect(specPrompts.at(-1)).toContain("A: Casual");
+        expect(f.store.listQuestions(run.id)).toHaveLength(1);
+        expect(f.store.getRunState<RunState>(run.id)?.phase).toBe("done");
+      } finally {
+        unsubscribe();
+      }
+    },
+  );
+}
 
 test("drain blocks queued starts and parks the active run at its next boundary", async () => {
   let release = () => {};

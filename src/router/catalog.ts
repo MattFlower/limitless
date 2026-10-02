@@ -24,6 +24,8 @@ export interface ProviderDef {
 
 export interface ModelDef {
   id: string; // "<provider>/<short>"
+  /** Shared checkpoint identity across backends; defaults to the catalog id. */
+  checkpoint?: string;
   provider: string;
   model: string; // name the backend understands
   vendor: Vendor;
@@ -442,6 +444,7 @@ export const MODELS: ModelDef[] = [
   },
   {
     id: "omlx/qwen-27b",
+    checkpoint: "qwen3.8-27b",
     provider: "omlx",
     model: "Swift-1.5-Qwen3.8-27b-oQ8e-mtp",
     vendor: "qwen",
@@ -455,6 +458,7 @@ export const MODELS: ModelDef[] = [
   },
   {
     id: "mtplx/qwen-27b",
+    checkpoint: "qwen3.8-27b",
     provider: "mtplx",
     model: "mtplx-qwen38-27b-optimized-quality",
     vendor: "qwen",

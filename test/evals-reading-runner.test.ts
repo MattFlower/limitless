@@ -1,7 +1,7 @@
 import { expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema } from "../src/evals/cases.ts";
+import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema, validateRequest } from "../src/evals/cases.ts";
 import { formatEvalReport } from "../src/evals/format.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { auditDiff } from "../src/gates/audit.ts";
@@ -11,11 +11,11 @@ import { readingTimeout } from "../src/pipeline/engine.ts";
 import { FACTORY_PREAMBLE, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
 import * as review from "../src/pipeline/review.ts";
 import { ReviewSchema, toStrictJsonSchema, VerifySchema } from "../src/pipeline/schemas.ts";
-import type { ModelDef, ProviderDef } from "../src/router/catalog.ts";
+import { MODELS, type ModelDef, type ProviderDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
-import { deferred, evalFixture, verifierModel } from "./evals-support.ts";
+import { deferred, enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -481,6 +481,30 @@ const panelSystem = {
   verifier: { target: "verifier-c" },
   implementerReport: "include",
 };
+test.each([
+  ["candidate-a@low", "candidate-a@high"],
+  ["omlx/qwen-27b", "mtplx/qwen-27b"],
+])("eval verifier validation excludes %s from verifying through %s", async (finder, target) => {
+  const aliases = MODELS.filter((m) => m.checkpoint).map((m) => ({ ...m, provider: "provider-b" }));
+  const f = await fixture("review", aliases);
+  try {
+    enableEfforts(f);
+    const input = (verifier: object) => ({
+      role: "review",
+      systems: [{ ...panelSystem, finders: [{ target: finder, prompt: "standard" }], verifier }],
+    });
+    for (const verifier of [{ target }, { targets: [target] }])
+      expect(() => f.factory.evals.submit(input(verifier))).toThrow("Invalid eval models");
+    const eligible = input({ targets: [target, "candidate-b"] });
+    expect(
+      validateRequest(eligible, loadRoleCases("review", f.casePath), f.factory.router).request.systems,
+    ).toHaveLength(1);
+    expect(f.factory.store.listEvalRuns()).toHaveLength(0);
+    expect(f.calls).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
+});
 const refuteAll = (s: { prompt: string }) => ({
   structured: {
     results: [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => ({

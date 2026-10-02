@@ -7,7 +7,7 @@ import { formatTarget, parseTarget, resolveTarget, transportError } from "./targ
 export interface RouteConstraints {
   /** Skip models from these vendors (cross-vendor review). Falls back to them only if nothing else is available. */
   avoidVendor?: string | string[];
-  /** Exclude model identities regardless of reasoning effort. */
+  /** Exclude checkpoints regardless of backend or reasoning effort. */
   excludeModels?: string[];
   /** Why `excludeModels` are skipped, for the run log (default "already tried"). */
   excludedBecause?: string;
@@ -57,6 +57,11 @@ export class Router {
   model(id: string): ModelDef | undefined {
     return this.models.get(id);
   }
+
+  checkpointIdentity = (reference: string): string => {
+    const { modelId } = parseTarget(reference);
+    return this.models.get(modelId)?.checkpoint ?? modelId;
+  };
 
   resolve(reference: string | ModelSelection) {
     return resolveTarget(reference, (id) => this.models.get(id));
@@ -193,6 +198,7 @@ export class Router {
       }
     };
     const excluded = new Set(c.exclude?.map(identity));
+    const excludedCheckpoints = new Set(c.excludeModels?.map(this.checkpointIdentity));
     const preference = c.prefer ? identity(c.prefer) : undefined;
 
     const avoid = [c.avoidVendor ?? []].flat();
@@ -215,7 +221,7 @@ export class Router {
         if (fromPolicy && this.tracker.def(m.provider)?.billing === "free") policyFreeModels.add(m.id);
         if (seen.has(id)) continue;
         seen.add(id);
-        if (excluded.has(id) || c.excludeModels?.includes(m.id)) {
+        if (excluded.has(id) || excludedCheckpoints.has(this.checkpointIdentity(m.id))) {
           skipped.push({
             modelId: id,
             reason: excluded.has(id) ? "already tried" : (c.excludedBecause ?? "already tried"),
