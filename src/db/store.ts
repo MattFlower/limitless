@@ -881,19 +881,29 @@ export class Store {
 
   private dependencyStatus(ids: string[]): RunPatch & { status: RunStatus } {
     let waiting = false;
-    for (const id of ids) {
+    const pending = [...ids];
+    const visited = new Set<string>();
+    for (const id of pending) {
+      if (visited.has(id)) continue;
+      visited.add(id);
       const run = this.getRun(id);
       if (run?.merged) continue;
+      // Preserve the original blocker, including after restart or a later ancestor merge.
+      if (run?.status === "needs_human" && !run.prUrl && run.error?.startsWith("Dependency "))
+        return { status: "needs_human", finishedAt: Date.now(), error: run.error };
       const cause = !run
         ? "is missing"
         : run.prClosedUnmerged
           ? "PR was closed unmerged"
           : run.status === "failed" || run.status === "cancelled"
             ? `run ${run.status}`
-            : null;
+            : run.status === "needs_human" && !run.prUrl
+              ? `run needs_human without PR${run.error ? `: ${run.error}` : ""}`
+              : null;
       if (cause)
         return { status: "needs_human", finishedAt: Date.now(), error: `Dependency ${id}: ${cause}` };
       waiting = true;
+      if (run?.status === "waiting") pending.push(...run.dependsOn);
     }
     return { status: waiting ? "waiting" : "queued" };
   }
