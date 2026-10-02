@@ -1,5 +1,5 @@
-import { existsSync, lstatSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { agentEnv, sh } from "../util/proc.ts";
 
 /** All merge lifecycle operations share hook suppression, identity and the agent's scrubbed env. */
@@ -37,6 +37,22 @@ export async function requireMerge(cwd: string, head: string, base: string): Pro
     throw new Error(`Merge HEAD changed: expected pre-merge commit ${head}`);
 }
 
+/** Keep the original conflicts outside the index, including in linked worktrees and on resume. */
+async function mergePaths(cwd: string, head: string, base: string, paths: string[]): Promise<string[]> {
+  const file = resolve(
+    cwd,
+    (await mergeGit(cwd, ["rev-parse", "--git-path", "limitless-merge-paths"])).stdout.trim(),
+  );
+  const [savedHead, savedBase, ...savedPaths] = existsSync(file)
+    ? readFileSync(file, "utf8").split("\0")
+    : [];
+  const original = savedHead === head && savedBase === base ? savedPaths : [];
+  const all = [...new Set([...original, ...paths])];
+  if (savedHead !== head || savedBase !== base || all.length !== original.length)
+    writeFileSync(file, [head, base, ...all].join("\0"));
+  return all;
+}
+
 /** Resume an existing preparation without resetting its index or worktree edits. */
 export async function prepareMerge(cwd: string, head: string, base: string): Promise<string[]> {
   if ((await mergeGit(cwd, ["rev-parse", "HEAD"])).stdout.trim() !== head) {
@@ -44,7 +60,7 @@ export async function prepareMerge(cwd: string, head: string, base: string): Pro
     return [];
   }
   if (!(await mergeHead(cwd))) {
-    // Two-way markers only, so conflicts are labelled exactly `HEAD` and the base sha.
+    // Keep two-way markers; Git may append paths to labels or use custom marker sizes.
     const result = await mergeGit(
       cwd,
       ["-c", "merge.conflictStyle=merge", "merge", "--no-ff", "--no-commit", "--", base],
@@ -57,44 +73,58 @@ export async function prepareMerge(cwd: string, head: string, base: string): Pro
     }
   }
   await requireMerge(cwd, head, base);
-  return (await mergeGit(cwd, ["diff", "--name-only", "--diff-filter=U", "-z"])).stdout
+  const paths = (await mergeGit(cwd, ["diff", "--name-only", "--diff-filter=U", "-z"])).stdout
     .split("\0")
     .filter(Boolean);
+  await mergePaths(cwd, head, base, paths);
+  return paths;
 }
 
-const count = (text: string, pattern: RegExp) => text.match(pattern)?.length ?? 0;
+function markerCounts(text: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const line of text.match(/^(?:<{7,}|={7,}|>{7,})(?: [^\r\n]*)?\r?$/gm) ?? []) {
+    const marker = line.replace(/\r$/, "");
+    // Bare separators also occur as standalone setext headings.
+    if (!/^=+$/.test(marker)) counts.set(marker, (counts.get(marker) ?? 0) + 1);
+  }
+  return counts;
+}
 
 /**
  * Conflict markers git generated and the resolver left behind, found by content rather than diff
- * output (binary attributes and modify/delete conflicts have no usable diff). `>>>>>>> <base>`
- * cannot occur in either parent, since a commit never contains its own sha. `<<<<<<< HEAD` lines
- * are allowed only up to the count already present in a parent, so fixtures and docs that show
- * markers don't block. Bare `=======` is ignored because it is also a setext heading.
+ * output (binary attributes and modify/delete conflicts have no usable diff). Allow each marker
+ * only up to its count in either parent, so fixtures and docs that show markers don't block.
  */
 async function leftoverMarkers(cwd: string, head: string, base: string, path: string): Promise<boolean> {
   const file = join(cwd, path);
   if (!existsSync(file) || !lstatSync(file).isFile()) return false;
-  const text = readFileSync(file).toString("latin1");
-  const theirs = new RegExp(`^>{7} ${base}$`, "m");
-  if (theirs.test(text)) return true;
-  const ours = /^<{7} HEAD$/gm;
+  const markers = markerCounts(readFileSync(file, "utf8"));
+  if (!markers.size) return false;
   const inParent = async (rev: string) =>
-    count((await mergeGit(cwd, ["cat-file", "blob", `${rev}:${path}`], true)).stdout, ours);
-  return count(text, ours) > Math.max(await inParent(head), await inParent(base));
+    markerCounts((await mergeGit(cwd, ["cat-file", "blob", `${rev}:${path}`], true)).stdout);
+  const ours = await inParent(head);
+  const theirs = await inParent(base);
+  return [...markers].some(([marker, n]) => n > Math.max(ours.get(marker) ?? 0, theirs.get(marker) ?? 0));
 }
 
 /** Never use commitAll: even a resolution identical to the first parent needs a merge commit. */
 export async function completeMerge(cwd: string, head: string, base: string): Promise<string> {
   await requireMerge(cwd, head, base);
   const list = async (args: string[]) => (await mergeGit(cwd, args)).stdout.split("\0").filter(Boolean);
-  // The file-only resolver leaves the unmerged index intact, including across restarts.
-  const unmerged = await list(["diff", "--name-only", "--diff-filter=U", "-z"]);
+  const unmerged = await mergePaths(
+    cwd,
+    head,
+    base,
+    await list(["diff", "--name-only", "--diff-filter=U", "-z"]),
+  );
   const untracked = await list(["ls-files", "-z", "--others", "--exclude-standard"]);
   const edited = (await list(["diff", "--name-only", "--diff-filter=MT", "-z"])).filter(
     (path) => !unmerged.includes(path),
   );
+  const touched = await list(["diff", "--name-only", "--no-renames", "-z", `${base}...HEAD`]);
+  const staged = await list(["diff", "--cached", "--name-only", "--no-renames", "-z"]);
   const markers: string[] = [];
-  for (const path of [...untracked, ...unmerged, ...edited])
+  for (const path of new Set([...untracked, ...unmerged, ...edited, ...touched, ...staged]))
     if (await leftoverMarkers(cwd, head, base, path)) markers.push(path);
   if (markers.length) throw new Error(`Unresolved conflict markers: ${markers.join(", ")}`);
   await mergeGit(cwd, ["add", "-A"]);
