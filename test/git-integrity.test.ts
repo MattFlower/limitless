@@ -199,6 +199,42 @@ test("conflict-resolution commits rebuild the linked index and include skip-work
   expect(readFileSync(join(seed, ".git/index"))).toEqual(seedIndex);
 });
 
+test("merge index rebuild preserves ignored tracked files and staged additions, but honors deletions", async () => {
+  const kept = "base [ignored]\nfile.txt";
+  const removed = "deleted.txt";
+  const staged = ":resolution.txt";
+  writeFileSync(join(seed, ".gitignore"), "*.txt\n");
+  writeFileSync(join(seed, kept), "from base\n");
+  writeFileSync(join(seed, removed), "remove in resolution\n");
+  writeFileSync(join(seed, "sample.test.ts"), "theirs\n");
+  await git(seed, "add", "-A");
+  await git(seed, "add", "-f", "--", `:(literal)${kept}`, removed);
+  await git(seed, "commit", "-qm", "base adds ignored files");
+  const nextBase = (await git(seed, "rev-parse", "HEAD")).stdout.trim();
+  writeFileSync(join(work, "sample.test.ts"), "ours\n");
+  const head = await commitAll(work, "worker conflict");
+  if (!head) throw new Error("expected worker commit");
+  expect(await prepareMerge(work, head, nextBase)).toEqual(["sample.test.ts"]);
+  expect(readFileSync(join(work, kept), "utf8")).toBe("from base\n");
+  writeFileSync(join(work, "sample.test.ts"), "resolved\n");
+  rmSync(join(work, removed));
+  writeFileSync(join(work, staged), "staged resolution\n");
+  writeFileSync(join(work, "untracked.txt"), "stay ignored\n");
+  await git(work, "add", "-f", "--", `:(literal)${staged}`);
+  const seedIndex = readFileSync(join(seed, ".git/index"));
+  const merged = await completeMerge(work, head, nextBase);
+  expect((await factory("rev-list", "--parents", "-n", "1", "HEAD")).stdout.trim()).toBe(
+    `${merged} ${head} ${nextBase}`,
+  );
+  expect(await readFileAt(work, "HEAD", "sample.test.ts")).toBe("resolved\n");
+  expect(await readFileAt(work, "HEAD", kept)).toBe("from base\n");
+  expect((await factory("show", `HEAD:${staged}`)).stdout).toBe("staged resolution\n");
+  const paths = (await factory("ls-tree", "-rz", "--name-only", "HEAD")).stdout.split("\0");
+  expect(paths).not.toContain(removed);
+  expect(paths).not.toContain("untracked.txt");
+  expect(readFileSync(join(seed, ".git/index"))).toEqual(seedIndex);
+});
+
 test("diff, log, names and statistics ignore external diff, textconv and global attributes", async () => {
   const marker = join(dir, "diff-ran");
   const blind = join(dir, "blind.sh");
