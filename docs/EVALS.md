@@ -266,6 +266,14 @@ list that relative path in `hidden.files`. Files are injected only after candida
 audit, preserving permission bits so executable commands such as `./run.sh` work. The command
 runs from the checkout root. Hidden contents and modes participate in cache identity.
 
+Grading runs in a separate checkout of the round's commit, outside the candidate's worktree, so a
+committed nested repository, the candidate's `.git` config, hooks and filters, or a leftover
+grading directory cannot expose hidden files. After grading, the candidate worktree is restored
+to its commit and checked for files that appeared, as before. Known limit until edit-mode agents
+and grading are sandboxed: gates and the hidden command run candidate code with ordinary file
+access, so that code can still write outside the checkout — into the candidate's `.git`
+directory, a tracked file marked skip-worktree, or through a smudge filter during the restore.
+
 Baseline gates run once per case/base within an eval run, shared across repetitions and models.
 A failed baseline setup or timed-out baseline check produces a preparation `error`, invokes no
 candidate, and is not cached. Ordinary baseline check failures remain eligible for comparison.
