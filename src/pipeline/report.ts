@@ -38,6 +38,7 @@ export interface ReportInput {
     | "lastAudit"
     | "rebaseNote"
     | "terminalReason"
+    | "reviewedSha"
   >;
   invocations: Invocation[];
   totals: { costUsd: number; costEquivUsd: number };
@@ -58,6 +59,9 @@ export function renderReport(input: ReportInput): string {
         : "Built by **Limitless** — every gate below passed."
       : "⚠️ Built by **Limitless** but it **needs a human**: the checks below did not all pass.",
     `Flow: ${state.flow ?? "build"}`,
+    ...(input.success && state.flow === "verify-change" && state.reviewedSha
+      ? [`Verified commit: \`${state.reviewedSha}\``]
+      : []),
     ...(state.rebaseNote ? [`> [!NOTE]\n> ${state.rebaseNote}`] : []),
     ...(state.terminalReason ? [`🚧 ${state.terminalReason}`] : []),
     ...(input.verifiedFailure

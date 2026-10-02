@@ -851,7 +851,12 @@ if(fail&&!fail.landed){end();process.exit(0);}
 if(process.argv[3]==="list" && existsSync(file)) { const url=readFileSync(file,"utf8"); out(process.argv.includes("--jq") ? url : JSON.stringify([{state:state(),url}])); }
 if(process.argv[3]==="create") { if(existsSync(file)) {console.error("a pull request for branch already exists");process.exit(9);} writeFileSync(file,"https://github.com/test/repo/pull/1"); out(readFileSync(file,"utf8")); }
 if(process.argv[3]==="merge") writeFileSync(file+".merged","");
-if(process.argv[3]==="view") out(process.argv.includes("--jq") ? state() : JSON.stringify({state:state(),url:readFileSync(file,"utf8")}));
+if(process.argv[3]==="view") {
+  if(process.argv.includes("headRefOid")) {
+    const head=Bun.spawnSync(["/usr/bin/git","--git-dir",${JSON.stringify(join(root, "remote.git"))},"rev-parse","refs/heads/pr-head"]);
+    out(JSON.stringify({headRefOid:head.stdout.toString().trim()}));
+  } else out(process.argv.includes("--jq") ? state() : JSON.stringify({state:state(),url:readFileSync(file,"utf8")}));
+}
 end();
 `,
     { mode: 0o755 },
@@ -1408,13 +1413,14 @@ test("verify-change reconciles a posted verification comment after its save is l
   const f = factory({
     "store:save": { action: "kill", when: (c) => c.checkpoint === "verification-comment-posted" },
   });
+  const { run, headSha, baseSha } = await externalChange(f);
   f.deps.gh = async (args) => {
     if (args[0] === "api") return comments.join("\n");
+    if (args[1] === "view") return JSON.stringify({ headRefOid: headSha });
     expect(args.slice(0, 3)).toEqual(["pr", "comment", "7"]);
     comments.push(args.at(-1) ?? "");
     return "";
   };
-  const { run, headSha, baseSha } = await externalChange(f);
   f.scheduler.start();
   await settled(f, run.id);
   expect(f.store.getRun(run.id)).toMatchObject({ status: "running", error: null });
@@ -1440,13 +1446,14 @@ test("verify-change reconciles a posted verification comment after its save is l
 test("verify-change does not post its comment twice when the post lands but answers 502", async () => {
   const comments: string[] = [];
   const f = factory();
+  const { run, headSha } = await externalChange(f);
   f.deps.gh = async (args) => {
     if (args[0] === "api") return comments.join("\n");
+    if (args[1] === "view") return JSON.stringify({ headRefOid: headSha });
     comments.push(args.at(-1) ?? "");
     if (comments.length === 1) throw new CommandError("gh failed", 1, "", "HTTP 502: Bad Gateway", false);
     return "";
   };
-  const { run } = await externalChange(f);
   f.scheduler.start();
   await settled(f, run.id);
   expect(f.store.getRun(run.id)?.status).toBe("succeeded");
