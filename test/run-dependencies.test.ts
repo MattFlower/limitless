@@ -3,6 +3,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CreateRunRequest } from "../src/core/types.ts";
 import { newId, Store } from "../src/db/store.ts";
+import { reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { Scheduler } from "../src/scheduler.ts";
 import { sh } from "../src/util/proc.ts";
 import { fixture } from "./mcp-support.ts";
@@ -102,6 +103,113 @@ test("waiting consumes no slot; all prerequisites must merge, then execution sta
   } finally {
     await scheduler.stop();
   }
+});
+
+for (const cause of ["failed", "cancelled", "closed", "needs_human"] as const) {
+  test(`${cause} ancestor blocks the whole chain in one pass with the original reason`, async () => {
+    const { store, scheduler } = f.factory;
+    const ancestor = await create();
+    store.updateRun(ancestor.id, { status: cause === "cancelled" ? "running" : "succeeded" });
+    const dependent = await create([ancestor.id]);
+    const descendant = await create([dependent.id]);
+    // Reconciliation visits the descendant first, before its parent is marked blocked.
+    for (const [index, run] of [ancestor, dependent, descendant].entries())
+      store.db.query("UPDATE runs SET created_at = ? WHERE id = ?").run(index, run.id);
+    expect(store.listRuns({ status: ["waiting"] }).map((run) => run.id)).toEqual([
+      descendant.id,
+      dependent.id,
+    ]);
+    if (cause === "cancelled") expect(f.factory.cancelRun(ancestor.id)).toBe(true);
+    else
+      store.updateRun(
+        ancestor.id,
+        cause === "closed" ? { prClosedUnmerged: true } : { status: cause, error: "original problem" },
+      );
+    const reason = `Dependency ${ancestor.id}: ${
+      cause === "closed"
+        ? "PR was closed unmerged"
+        : cause === "needs_human"
+          ? "run needs_human without PR: original problem"
+          : `run ${cause}`
+    }`;
+    const reopened = cause === "closed" ? new Store(f.factory.cfg.paths.db) : null;
+    try {
+      const reconciler = reopened ?? store;
+      reconciler.reconcileWaitingRuns();
+      for (const run of [dependent, descendant]) {
+        expect(store.getRun(run.id)).toMatchObject({
+          status: "needs_human",
+          error: reason,
+          finishedAt: expect.any(Number),
+        });
+        expect(store.listEvents(run.id).filter((event) => event.type === "status")).toMatchObject([
+          { message: reason, data: { from: "waiting", to: "needs_human" } },
+        ]);
+        unstarted(run.id);
+      }
+      const later = await create([dependent.id]);
+      expect(later).toMatchObject({ status: "needs_human", error: reason });
+      const blocked = [dependent, descendant, later].map((run) => store.getRun(run.id));
+      reconciler.reconcileWaitingRuns();
+      scheduler.tick();
+      expect(scheduler.activeRunIds).toEqual([]);
+      expect([dependent, descendant, later].map((run) => store.getRun(run.id))).toEqual(blocked);
+      store.updateRun(ancestor.id, { merged: true });
+      reconciler.reconcileWaitingRuns();
+      expect([dependent, descendant, later].map((run) => store.getRun(run.id))).toEqual(blocked);
+      expect(await create([dependent.id])).toMatchObject({ status: "needs_human", error: reason });
+    } finally {
+      reopened?.close();
+    }
+  });
+}
+
+test("creation inspects a blocked ancestor before its waiting parent is reconciled", async () => {
+  const { store } = f.factory;
+  const ancestor = await create();
+  const dependent = await create([ancestor.id]);
+  store.updateRun(ancestor.id, { status: "failed" });
+  expect(await create([dependent.id])).toMatchObject({
+    status: "needs_human",
+    error: `Dependency ${ancestor.id}: run failed`,
+  });
+  expect(store.getRun(dependent.id)?.status).toBe("waiting");
+});
+
+test("needs-human with an open PR remains waitable and confirmed merges release the chain", async () => {
+  const { store } = f.factory;
+  const ancestor = await create();
+  const prUrl = "https://github.com/example/repo/pull/1";
+  store.updateRun(ancestor.id, { status: "needs_human", prUrl, error: "review required" });
+  const dependent = await create([ancestor.id]);
+  const descendant = await create([dependent.id]);
+  await reconcileMergedRuns(store, async (url) => ({
+    url,
+    state: "OPEN",
+    mergedAt: null,
+    mergedBy: null,
+  }));
+  for (const run of [dependent, descendant]) {
+    expect(store.getRun(run.id)?.status).toBe("waiting");
+    unstarted(run.id);
+  }
+  const merged = async (url: string) => ({
+    url,
+    state: "MERGED",
+    mergedAt: new Date(123456).toISOString(),
+    mergedBy: null,
+  });
+  await reconcileMergedRuns(store, merged);
+  expect(store.getRun(ancestor.id)).toMatchObject({ status: "resolved", merged: true });
+  expect(store.getRun(dependent.id)?.status).toBe("queued");
+  expect(store.getRun(descendant.id)?.status).toBe("waiting");
+  store.updateRun(dependent.id, {
+    status: "succeeded",
+    prUrl: "https://github.com/example/repo/pull/2",
+  });
+  await reconcileMergedRuns(store, merged);
+  expect(store.getRun(descendant.id)?.status).toBe("queued");
+  for (const run of [dependent, descendant]) unstarted(run.id);
 });
 
 for (const cause of ["failed", "cancelled", "closed"] as const) {
