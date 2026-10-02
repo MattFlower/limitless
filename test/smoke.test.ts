@@ -1116,3 +1116,47 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
     }
   }, 12000);
 }
+
+test("fast smoke sends the option, validates Codex output, and reports Claude off without failure", async () => {
+  const target: ModelTarget = {
+    modelId: "test",
+    provider: "codex",
+    harness: "codex",
+    model: "test",
+    vendor: "other",
+    tier: 1,
+    billing: "subscription",
+  };
+  const harness: Harness = async (spec) => {
+    expect(spec.fast).toBe(true);
+    expect(spec.jsonSchema).toBeDefined();
+    return { ...result, structured: { smoke: "ready" } };
+  };
+  expect(await liveCheck(harness, target, "fast")).toEqual({ status: "pass" });
+  expect(
+    await liveCheck(
+      async (spec) => ({ ...(await harness(spec)), structured: { smoke: "wrong" } }),
+      target,
+      "fast",
+    ),
+  ).toEqual({ status: "fail", reason: "structured response did not match expected object" });
+  const claude = { ...target, provider: "claude", harness: "claude" as const };
+  expect(
+    await liveCheck(
+      async (spec) => ({
+        ...(await harness(spec)),
+        fastModeState: "off",
+        fastModeDisabledReason: "extra_usage_disabled",
+      }),
+      claude,
+      "fast",
+    ),
+  ).toEqual({ status: "pass", reason: "fast_mode_state: off (extra_usage_disabled)" });
+  expect(
+    await liveCheck(
+      async () => ({ ...result, status: "error", error: "CLI rejected option" }),
+      target,
+      "fast",
+    ),
+  ).toMatchObject({ status: "fail", reason: "CLI rejected option" });
+});

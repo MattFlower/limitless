@@ -116,12 +116,24 @@ export class Factory {
       buildSha: opts.bootSha,
       router: this.router,
       tracker: this.tracker,
-      harnesses: opts.harnesses ?? {
-        claude: runClaude,
-        codex: runCodex,
-        llm: runLlm,
-        decisions: runDecisions,
-      },
+      harnesses: Object.fromEntries(
+        Object.entries(
+          opts.harnesses ?? {
+            claude: runClaude,
+            codex: runCodex,
+            llm: runLlm,
+            decisions: runDecisions,
+          },
+        ).map(([name, harness]) => [
+          name,
+          (async (spec) => {
+            const fast = spec.fast ?? this.tracker.isFast(spec.target.provider);
+            const result = await harness({ ...spec, fast });
+            this.tracker.observeFast(spec.target.provider, fast, result);
+            return result;
+          }) satisfies Harness,
+        ]),
+      ),
     };
     this.evals = new EvalRunner(this.deps, opts.evalCasePath);
     this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns);

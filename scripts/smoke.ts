@@ -451,7 +451,7 @@ function status(result: AgentResult): CheckResult {
 export async function liveCheck(
   harness: Harness,
   target: ModelTarget,
-  kind: "structured" | "noTools" | "edit" | "quota" | "verify",
+  kind: "structured" | "noTools" | "edit" | "quota" | "verify" | "fast",
   signal = new AbortController().signal,
 ): Promise<CheckResult> {
   if (kind === "verify") return verifyLiveCheck(harness, target, signal);
@@ -462,6 +462,7 @@ export async function liveCheck(
     if (kind === "noTools") writeFileSync(join(cwd, "secret.txt"), token);
     const prompts = {
       structured: 'Return exactly {"smoke":"ready"}.',
+      fast: 'Return exactly {"smoke":"ready"}.',
       noTools:
         "Read secret.txt from this repository and repeat its contents exactly. If you cannot read it, say so.",
       edit: "Create smoke-edit.txt in this repository containing exactly: smoke edit ok",
@@ -473,9 +474,10 @@ export async function liveCheck(
         scratchDir,
         cwd,
         prompt: prompts[kind],
+        fast: kind === "fast",
         target,
         mode: kind === "edit" ? "edit" : "readonly",
-        ...(kind === "structured" ? { jsonSchema: schema } : {}),
+        ...(kind === "structured" || kind === "fast" ? { jsonSchema: schema } : {}),
         ...(kind === "noTools" ? { noTools: true } : {}),
         // A local model's first agent call prefills the CLI's large system prompt on a cold cache.
         timeoutMs: target.billing === "free" ? 300_000 : 60_000,
@@ -501,7 +503,12 @@ export async function liveCheck(
     }
     const outcome = status(result);
     if (outcome.status === "fail") return outcome;
-    if (kind === "structured") {
+    if (kind === "fast" && target.provider === "claude")
+      return {
+        status: "pass",
+        reason: `fast_mode_state: ${result.fastModeState ?? "unknown"}${result.fastModeDisabledReason ? ` (${result.fastModeDisabledReason})` : ""}`,
+      };
+    if (kind === "structured" || kind === "fast") {
       return JSON.stringify(result.structured) === JSON.stringify({ smoke: "ready" })
         ? { status: "pass" }
         : { status: "fail", reason: "structured response did not match expected object" };
@@ -788,7 +795,7 @@ export async function main(): Promise<number> {
     if (!provider) throw new Error(`missing provider ${id}`);
     let target = targetFor(provider, cheapestModel(id));
     const harness = id === "claude" ? runClaude : runCodex;
-    for (const kind of ["structured", "noTools", "edit", "quota", "verify"] as const) {
+    for (const kind of ["structured", "fast", "noTools", "edit", "quota", "verify"] as const) {
       checks.push({
         name: `${id} ${kind}`,
         // Outer bounds sit above liveCheck's own harness timeouts, which report the precise reason.

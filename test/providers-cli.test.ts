@@ -71,3 +71,35 @@ test("provider CLI mutations use the daemon API and report its state", async () 
     expect(output).toContain(`claude: ${action === "disable" ? "disabled" : "ok"}`);
   }
 });
+
+test("fast CLI sends boolean on/off for Codex and Claude and rejects malformed arguments", async () => {
+  for (const id of ["claude", "codex"]) {
+    for (const value of ["on", "off", "yes"]) {
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          "--preload",
+          join(import.meta.dir, "fixtures/providers-cli-preload.ts"),
+          join(import.meta.dir, "../src/cli/main.ts"),
+          "providers",
+          "fast",
+          value,
+          id,
+        ],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const output = await new Response(child.stdout).text();
+      const error = await new Response(child.stderr).text();
+      expect(await child.exited).toBe(value === "yes" ? 1 : 0);
+      if (value === "yes") {
+        expect(output).not.toContain("REQUEST");
+        expect(error).toContain("usage: limitless providers fast on|off <id>");
+      } else {
+        expect(error).toBe("");
+        expect(output).toContain(`REQUEST POST /api/providers/${id}/fast application/json`);
+        expect(output).toContain(`BODY {"on":${value === "on"}}`);
+        expect(output).toContain(`${id}: fast ${value}`);
+      }
+    }
+  }
+});

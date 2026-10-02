@@ -163,6 +163,9 @@ const toStage = (r: Row): Stage => ({
 });
 
 const toInvocation = (r: Row): Invocation => ({
+  fast: r.fast === 1,
+  fastModeState: (r.fast_mode_state as string) ?? null,
+  fastModeDisabledReason: (r.fast_mode_disabled_reason as string) ?? null,
   id: r.id as number,
   runId: r.run_id as string,
   stageId: (r.stage_id as number) ?? null,
@@ -259,6 +262,8 @@ const RUN_PATCH_COLUMNS: Record<keyof RunPatch, string> = {
 };
 
 export interface InvocationPatch {
+  fastModeState?: string | null;
+  fastModeDisabledReason?: string | null;
   status?: InvocationStatus;
   costUsd?: number;
   costEquivUsd?: number;
@@ -272,6 +277,8 @@ export interface InvocationPatch {
 }
 
 const INVOCATION_PATCH_COLUMNS: Record<keyof InvocationPatch, string> = {
+  fastModeState: "fast_mode_state",
+  fastModeDisabledReason: "fast_mode_disabled_reason",
   status: "status",
   costUsd: "cost_usd",
   costEquivUsd: "cost_equiv_usd",
@@ -1082,6 +1089,7 @@ export class Store {
   // ---- invocations ---------------------------------------------------------
 
   createInvocation(inv: {
+    fast?: boolean;
     runId: string;
     stageId: number | null;
     role: Role;
@@ -1093,8 +1101,8 @@ export class Store {
   }): Invocation {
     const res = this.db
       .query(
-        `INSERT INTO invocations (run_id, stage_id, role, harness, provider, model, model_id, status, started_at, effort)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)`,
+        `INSERT INTO invocations (run_id, stage_id, role, harness, provider, model, model_id, status, started_at, effort, fast)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)`,
       )
       .run(
         inv.runId,
@@ -1106,6 +1114,7 @@ export class Store {
         inv.modelId,
         Date.now(),
         inv.effort ?? null,
+        inv.fast ? 1 : 0,
       );
     const invocation = this.getInvocation(Number(res.lastInsertRowid)) as Invocation;
     this.publish({ kind: "invocation", invocation });
@@ -1119,6 +1128,13 @@ export class Store {
     const invocation = this.getInvocation(id) as Invocation;
     this.publish({ kind: "invocation", invocation });
     return invocation;
+  }
+
+  latestFastInvocation(provider: string): Invocation | null {
+    const row = this.db
+      .query("SELECT * FROM invocations WHERE provider = ? AND fast = 1 ORDER BY id DESC LIMIT 1")
+      .get(provider) as Row | null;
+    return row ? toInvocation(row) : null;
   }
 
   getInvocation(id: number): Invocation | null {
@@ -1440,6 +1456,13 @@ export class Store {
       .query("SELECT provider, window FROM quota_alerts WHERE active = 1 AND resets_at <= ?")
       .all(now) as Row[];
     for (const row of expired) this.clearAlert(row.provider as string, row.window as string);
+  }
+
+  setProviderFast(id: string, fast: boolean): void {
+    this.db
+      .query(`INSERT INTO provider_state (provider, state, updated_at, fast) VALUES (?, 'ok', ?, ?)
+      ON CONFLICT(provider) DO UPDATE SET fast = excluded.fast`)
+      .run(id, Date.now(), fast ? 1 : 0);
   }
 
   getProviderRow(provider: string): Row | null {

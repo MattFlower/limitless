@@ -612,6 +612,7 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
     "-c",
     'approval_policy="never"',
   ];
+  if (spec.fast && t.provider === "codex") args.push("-c", 'service_tier="fast"');
   if (t.effort) args.push("-c", `model_reasoning_effort="${t.effort}"`);
   if (spec.privateSession) args.push("--ephemeral");
   if (spec.privateSession || spec.noTools || spec.mode === "readonly") args.push("--ignore-user-config");

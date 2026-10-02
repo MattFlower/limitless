@@ -786,6 +786,7 @@ export class EvalRunner {
             details: {
               ...("hidden" in item ? source.details : {}),
               ...trial.details,
+              ...(source.details.fast === undefined ? {} : { fast: source.details.fast }),
               ...(source.details.verifiers ? { verifiers: source.details.verifiers } : {}),
               grade,
               cache: source.details.cache ?? {
@@ -868,8 +869,11 @@ export class EvalRunner {
               },
               to = { target, harness, noTools },
               log = logPath,
-            ) =>
-              to.harness({
+            ) => {
+              const fast = tracker.isFast(to.target.provider);
+              if (to.target.modelId === target.modelId) trial.details.fast = fast;
+              return to.harness({
+                fast,
                 scratchDir,
                 ...(sessionId ? { resumeSessionId: sessionId } : {}),
                 cwd,
@@ -896,6 +900,7 @@ export class EvalRunner {
                   if (event.type === "rate_limit") tracker.observeWindows(to.target.provider, event.windows);
                 },
               });
+            };
             const send = (
               request?: ReviewRequest | VerifierRequest,
               to = { target, harness, noTools },
