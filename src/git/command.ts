@@ -9,11 +9,14 @@ let gitVersion: Promise<void> | undefined;
 export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1]) {
   if (worktreeGitScope.getStore() === false) return sh(cmd, opts);
   opts.signal?.throwIfAborted();
-  gitVersion ??= sh(["git", "--version"], { ...opts, allowFail: false }).then(({ stdout }) => {
-    const version = stdout.match(/^git version (\d+)\.(\d+)/);
-    if (!version || Number(version[1]) < 2 || (Number(version[1]) === 2 && Number(version[2]) < 40))
-      throw new Error(`Limitless requires Git >= 2.40 for --attr-source; found ${stdout.trim()}`);
-  });
+  // Not bound to the first caller's signal: an aborted first call must not fail every later one.
+  gitVersion ??= sh(["git", "--version"], { ...opts, signal: undefined, allowFail: false }).then(
+    ({ stdout }) => {
+      const version = stdout.match(/^git version (\d+)\.(\d+)/);
+      if (!version || Number(version[1]) < 2 || (Number(version[1]) === 2 && Number(version[2]) < 40))
+        throw new Error(`Limitless requires Git >= 2.40 for --attr-source; found ${stdout.trim()}`);
+    },
+  );
   await gitVersion;
   let command = 1;
   while (cmd[command] === "-c") command += 2;
