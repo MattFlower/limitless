@@ -131,10 +131,11 @@ test("shared cache hooks from an earlier run cannot execute during fetch, worktr
     const cache = await ensureCache(cfg.paths, repo);
     const first = await createWorktree(cfg.paths, repo, "first", "first", "main");
     const marker = join(dir, "cache-hook-ran");
+    // Git 2.55 rejects a hook friendly-name equal to an event name, so planted hooks use their own names.
     for (const event of ["reference-transaction", "post-checkout", "post-index-change"]) {
-      await git(first.path, "config", `hook.${event}.command`, `echo '${event}' >> '${marker}'`);
-      await git(first.path, "config", `hook.${event}.event`, event);
-      await git(first.path, "config", `hook.${event}.enabled`, "true");
+      await git(first.path, "config", `hook.planted-${event}.command`, `echo '${event}' >> '${marker}'`);
+      await git(first.path, "config", `hook.planted-${event}.event`, event);
+      await git(first.path, "config", `hook.planted-${event}.enabled`, "true");
     }
     const config = readFileSync(join(cache, "config"));
     writeFileSync(join(seed, "next.txt"), "next\n");
