@@ -1160,3 +1160,62 @@ test("fast smoke sends the option, validates Codex output, and reports Claude of
     ),
   ).toMatchObject({ status: "fail", reason: "CLI rejected option" });
 });
+
+test("verify probe evidence accepts the exact command under any sh/bash/zsh wrapper path", async () => {
+  const { isProbeCommand } = await import("../scripts/smoke.ts");
+  const command = "python3 '/tmp/x/worktree/verify-probe.py'";
+  for (const shell of [
+    "/bin/zsh",
+    "/bin/bash",
+    "/bin/sh",
+    "/opt/homebrew/bin/bash",
+    "/usr/local/bin/zsh",
+    "bash",
+  ])
+    for (const flag of ["-lc", "-c"]) {
+      expect(isProbeCommand(`${shell} ${flag} ${JSON.stringify(command)}`, command)).toBe(true);
+      expect(isProbeCommand(`${shell} ${flag} '${command.replaceAll("'", "'\\''")}'`, command)).toBe(true);
+    }
+  expect(isProbeCommand(`  ${command}\n`, command)).toBe(true);
+  // Anything but the exact probe, or a non-shell wrapper, is not evidence.
+  for (const other of [
+    `/opt/homebrew/bin/bash -lc ${JSON.stringify(`echo ${command}`)}`,
+    `/opt/homebrew/bin/bash -lc ${JSON.stringify(`cd / && ${command}`)}`,
+    `/opt/homebrew/bin/python3 -c ${JSON.stringify(command)}`,
+    `/opt/homebrew/bin/bash -x ${JSON.stringify(command)}`,
+    `/opt/homebrew/bin/bash -lc ${JSON.stringify(command)} extra`,
+    `/opt/homebrew/bin/fish -c ${JSON.stringify(command)}`,
+  ])
+    expect(isProbeCommand(other, command)).toBe(false);
+});
+
+test("verify smoke passes when Codex reports a Homebrew bash wrapper", async () => {
+  const target: ModelTarget = {
+    modelId: "fake/m",
+    provider: "fake",
+    model: "m",
+    vendor: "fake",
+    tier: 4,
+    harness: "fake",
+    billing: "subscription",
+  };
+  const check = await verifyLiveCheck(async (spec) => {
+    const probe = readFileSync(join(spec.cwd, "verify-probe.py"), "utf8");
+    const token = probe.match(/print\("(.*):temp-created-read-deleted"/)?.[1];
+    const command = `python3 '${join(spec.cwd, "verify-probe.py")}'`;
+    spec.onEvent({
+      type: "tool_call",
+      id: "probe",
+      name: "shell",
+      input: { command: `/opt/homebrew/bin/bash -lc ${JSON.stringify(command)}` },
+    });
+    spec.onEvent({
+      type: "tool_result",
+      id: "probe",
+      output: `${token}:temp-created-read-deleted\n${token}:worktree-write-denied\n`,
+      isError: false,
+    });
+    return { ...result, finalText: "done" };
+  }, target);
+  expect(check.status).toBe("pass");
+});
