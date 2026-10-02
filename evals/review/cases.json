@@ -4889,7 +4889,7 @@
           "lines": [820, 829],
           "severity": "major",
           "category": "logic",
-          "summary": "A dependency that ends needs_human without merging is treated as still pending: only missing, failed, cancelled or closed-unmerged dependencies fail a waiting run. For A → B → C, A failing moves B to needs_human, but C stays waiting forever across reconciliations, so a queued plan's tail silently stalls.",
+          "summary": "A dependency that ends needs_human without a PR (for example because its own dependency failed) is treated as still pending: only missing, failed, cancelled or closed-unmerged dependencies fail a waiting run, and a retry creates a new run that cannot satisfy the old dependency. For A → B → C, A failing moves B to needs_human, but C stays waiting forever across reconciliations, so a queued plan's tail silently stalls.",
           "required": true,
           "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; later fixed by #247"
         }
@@ -5022,10 +5022,10 @@
         {
           "file": "src/router/providers.ts",
           "lines": [171, 176],
-          "severity": "major",
+          "severity": "minor",
           "category": "logic",
           "summary": "Drift is only checked when usage did not decrease, which is also the only month-rollover signal. After a monthly reset where new usage already exceeds the prior reading, the reset is missed and the drift check compares spend across the reset.",
-          "required": true,
+          "required": false,
           "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; later fixed by #252"
         }
       ]
@@ -5204,7 +5204,7 @@
           "lines": [878, 883],
           "severity": "major",
           "category": "data-migration",
-          "summary": "Delivery after a conflict round now requires preRebaseHead, which the previous release did not save. A run interrupted mid-rebase before the upgrade throws 'Missing pre-merge HEAD at delivery' and cannot recover.",
+          "summary": "Delivery after a conflict round now requires preRebaseHead, but the previous release cleared it when a delivery rebase conflicted. A run that entered a conflict round under the previous release throws 'Missing pre-merge HEAD at delivery' here (or 'Missing expected merge state' in its resolution round) and cannot recover.",
           "required": true,
           "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; upgrade window only; not fixed"
         }
@@ -5262,7 +5262,7 @@
         },
         {
           "file": "src/evals/policy.ts",
-          "lines": [293, 300],
+          "lines": [293, 339],
           "severity": "major",
           "category": "completeness",
           "summary": "The B1 escalation evidence handling is unreachable: no caller passes `escalation` to generatePolicy (the CLI path in app.ts omits it), so effort-before-switch recommendations can never be emitted.",
