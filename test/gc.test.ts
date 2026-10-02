@@ -122,6 +122,36 @@ test("log and debug event retention is selective, including active-run events", 
   expect(ids).toEqual([cutoffDebug.id, newDebug.id, info.id]);
 });
 
+test("baseline cache entries expire after seven days and each key component misses", async () => {
+  const key = { repoId: repo.id, baseSha: "a".repeat(40), gatesHash: "h", envHash: "e" };
+  const since = now - 7 * DAY;
+  store.putBaselineCache(key, { setupOk: true, setup: [], checks: [] }, "r1", now - 7 * DAY);
+  const young = { ...key, baseSha: "b".repeat(40) };
+  store.putBaselineCache(young, { setupOk: true, setup: [], checks: [] }, "r2", now - 7 * DAY + 1);
+  expect(store.getBaselineCache(key, since)).toBeNull();
+  expect(store.getBaselineCache<object>(young, since)).toEqual({ setupOk: true, setup: [], checks: [] });
+  for (const miss of [
+    { baseSha: "c".repeat(40) },
+    { gatesHash: "other" },
+    { envHash: "other" },
+    { repoId: "x" },
+  ])
+    expect(store.getBaselineCache({ ...young, ...miss }, since)).toBeNull();
+  const dry = await collectGarbage(store, cfg, { now, dryRun: true });
+  expect(dry.baselineCache).toBe(1);
+  expect(store.countExpiredBaselineCache(since)).toBe(1);
+  const actual = await collectGarbage(store, cfg, { now });
+  expect([actual.errors, actual.baselineCache]).toEqual([[], 1]);
+  expect(store.countExpiredBaselineCache(now)).toBe(1);
+  expect(store.getBaselineCache(young, since)).not.toBeNull();
+  expect(store.db.query("SELECT run_id, created_at FROM passing_baselines").all()).toEqual([
+    { run_id: "r2", created_at: now - 7 * DAY + 1 },
+  ]);
+  expect(store.clearBaselineCache("x")).toBe(0);
+  expect(store.clearBaselineCache(repo.id)).toBe(1);
+  expect(store.getBaselineCache(young, since)).toBeNull();
+});
+
 test("daemon API and CLI dry run leave Git, files and DB unchanged", async () => {
   const r = run("succeeded", 31);
   const path = await worktree(r.id);
@@ -155,6 +185,46 @@ test("daemon API and CLI dry run leave Git, files and DB unchanged", async () =>
     expect(existsSync(join(dir, "inv-2.log"))).toBe(true);
     expect(await listed()).toBe(before);
     expect(store.countOldDebugEvents(Date.now() - 14 * DAY)).toBe(1);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("gates clear-cache drops cached baselines for one repo or all of them", async () => {
+  const other = store.upsertRepo({
+    slug: "local/other",
+    kind: "local",
+    url: null,
+    localPath: root,
+    defaultBranch: repo.defaultBranch,
+    mergePolicy: "none",
+  });
+  const pass = { setupOk: true, setup: [], checks: [] };
+  const key = { repoId: repo.id, baseSha: "a".repeat(40), gatesHash: "h", envHash: "e" };
+  store.putBaselineCache(key, pass, "r");
+  store.putBaselineCache({ ...key, baseSha: "b".repeat(40) }, pass, "r");
+  store.putBaselineCache({ ...key, repoId: other.id }, pass, "r");
+  const count = () => store.db.query("SELECT repo_id FROM passing_baselines ORDER BY repo_id").all();
+  const factory = new Factory(cfg, { store, providers: [] });
+  const server = startHttp(factory);
+  const url = `http://127.0.0.1:${server.port}`;
+  const cli = (...args: string[]) =>
+    sh(["bun", "src/cli/main.ts", "gates", "clear-cache", ...args], {
+      cwd: process.cwd(),
+      env: { ...process.env, LIMITLESS_URL: url } as Record<string, string>,
+    });
+  try {
+    expect(count()).toHaveLength(3);
+    expect((await cli("--repo", repo.slug)).stdout).toContain("Cleared 2 cached baselines");
+    expect(count()).toEqual([{ repo_id: other.id }]);
+    const missing = await fetch(`${url}/api/gates/clear-cache`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "no/such" }),
+    });
+    expect(missing.status).toBe(404);
+    expect((await cli()).stdout).toContain("Cleared 1 cached baselines");
+    expect(count()).toEqual([]);
   } finally {
     await server.stop(true);
   }
@@ -246,6 +316,7 @@ test("startup and hourly passes do not overlap and shutdown clears the timer", a
     logs: [],
     metadata: [],
     debugEvents: 0,
+    baselineCache: 0,
     errors: [],
   };
   const factory = new Factory(cfg, {

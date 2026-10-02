@@ -24,6 +24,8 @@ export interface ProviderDef {
 
 export interface ModelDef {
   id: string; // "<provider>/<short>"
+  /** Shared checkpoint identity across backends; defaults to the catalog id. */
+  checkpoint?: string;
   provider: string;
   model: string; // name the backend understands
   vendor: Vendor;
@@ -230,7 +232,7 @@ export const MODELS: ModelDef[] = [
     tier: 4,
     effort: "medium",
     price: { input: 2, output: 10, cacheRead: 0.1 },
-    notes: "Needs Codex CLI >= 0.159 on ChatGPT sign-in; under evaluation (#133), not in the routing policy",
+    notes: "Needs Codex CLI >= 0.159 on ChatGPT sign-in; routes review (#189) and the implement trial (#216)",
   },
   // Metered open models via OpenRouter (tiers are provisional until the M4 eval suite calibrates them).
   {
@@ -425,19 +427,8 @@ export const MODELS: ModelDef[] = [
     price: { input: 0.042, output: 0 },
     notes: "Pinned version: confidence thresholds are tuned per version. Base model undisclosed.",
   },
-  // Free local models.
-  {
-    id: "omlx/qwen-27b",
-    provider: "omlx",
-    model: "Swift-1.5-Qwen3.8-27b-oQ8e-mtp",
-    vendor: "qwen",
-    origin: "CN",
-    baseOrigin: "CN",
-    supportedEfforts: ["none", "high"],
-    tier: 2,
-    price: { input: 0, output: 0 },
-    notes: "Local Swift-1.5 Qwen3.8 27B oQ8e MTP build, served by oMLX on this Mac",
-  },
+  // Free local models. Free models the policy does not name are tried in catalog order (as is the
+  // smoke check), so the one kept loaded comes first.
   {
     id: "omlx/qwen-flash",
     provider: "omlx",
@@ -449,10 +440,25 @@ export const MODELS: ModelDef[] = [
     tier: 2,
     price: { input: 0, output: 0 },
     notes:
-      "Local Qwen3.8 Flash Next (REAP-pruned, 4-bit MLX), served by oMLX on this Mac; on trial against omlx/qwen-27b",
+      "Local Qwen3.8 Flash Next (REAP-pruned, 4-bit MLX), served by oMLX on this Mac; the default local model",
+  },
+  {
+    id: "omlx/qwen-27b",
+    checkpoint: "qwen3.8-27b",
+    provider: "omlx",
+    model: "Swift-1.5-Qwen3.8-27b-oQ8e-mtp",
+    vendor: "qwen",
+    origin: "CN",
+    baseOrigin: "CN",
+    supportedEfforts: ["none", "high"],
+    tier: 2,
+    price: { input: 0, output: 0 },
+    notes:
+      "Local Swift-1.5 Qwen3.8 27B oQ8e MTP build, served by oMLX on this Mac; opt-in (it needs far more memory than Flash)",
   },
   {
     id: "mtplx/qwen-27b",
+    checkpoint: "qwen3.8-27b",
     provider: "mtplx",
     model: "mtplx-qwen38-27b-optimized-quality",
     vendor: "qwen",
@@ -484,9 +490,9 @@ export const MODELS: ModelDef[] = [
 export type Policy = Record<Role, Partial<Record<Complexity | "default", string[]>>>;
 
 export const DEFAULT_POLICY: Policy = {
-  triage: { default: ["omlx/qwen-27b", "claude/haiku|codex/luna", "openrouter/glm-5.3-flash"] },
-  summarize: { default: ["omlx/qwen-27b", "claude/haiku|codex/luna", "openrouter/glm-5.3-flash"] },
-  chat: { default: ["omlx/qwen-27b", "claude/haiku|codex/luna"] },
+  triage: { default: ["omlx/qwen-flash", "claude/haiku|codex/luna", "openrouter/glm-5.3-flash"] },
+  summarize: { default: ["omlx/qwen-flash", "claude/haiku|codex/luna", "openrouter/glm-5.3-flash"] },
+  chat: { default: ["omlx/qwen-flash", "claude/haiku|codex/luna"] },
   spec: {
     default: ["claude/sonnet|codex/sol|codex/sol-5.6", "claude/opus|codex/astra"],
     large: ["claude/opus|codex/astra", "claude/sonnet|codex/sol|codex/sol-5.6"],

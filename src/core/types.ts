@@ -154,6 +154,8 @@ export interface Run {
   startedAt: number | null;
   finishedAt: number | null;
   priority: number;
+  /** Execute the baseline gates and bypass the baseline cache (`--no-baseline-cache`). */
+  noBaselineCache?: boolean;
 }
 
 export interface Stage {
@@ -306,6 +308,8 @@ export interface CreateRunRequest {
   baseBranch?: string;
   /** Existing same-repository PR head; accepted only from a verified GitHub webhook. */
   deliveryBranch?: string;
+  /** Execute the baseline gates and bypass the baseline cache for reads and writes. */
+  noBaselineCache?: boolean;
 }
 
 /** Messages pushed on the global SSE stream. */
@@ -388,7 +392,8 @@ export interface ChatConversation {
 
 export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 
-export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed";
+/** `interrupted`: stopped by a restart, a cancel or a resume; its partial results never feed policy. */
+export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed" | "interrupted";
 export type EvalStrategy = "retry" | "effort" | "switch";
 /** Panel finder prompts: coverage-first `standard`, `adversarial`, or one `careful` senior pass. */
 export type FinderPrompt = "standard" | "adversarial" | "careful";
@@ -416,11 +421,13 @@ export interface RepoReviewLens extends ReviewLens {
 }
 /** How a review is performed: one finder (`single`), or finders whose candidates a verifier checks (`panel`). */
 export interface ReviewSystem {
+  /** Eval only: the source panel system for stored finder replay. */
+  replayFrom?: string;
   name: string;
   mode: "single" | "panel";
   finders: ReviewFinder[];
   /** Panel only; production may omit `target` (routed), evals may not. */
-  verifier?: { target?: string };
+  verifier?: { target?: string; targets?: string[] };
   implementerReport: "include" | "omit";
 }
 /** Trials an eval runs at once per provider, capped at the provider's `maxConcurrent` − 1 (at least 1). */
@@ -444,6 +451,9 @@ export interface EvalRun {
   createdAt: number;
   finishedAt: number | null;
   error: string | null;
+  /** The interrupted eval this one resumed, and the eval that resumed this one. */
+  resumedFrom?: string;
+  resumedBy?: string;
 }
 export interface EvalGrade {
   pass: boolean | null;
@@ -524,6 +534,10 @@ export interface EvalTrial {
     decisionConfidence?: number;
     preparationFailed?: boolean;
     interrupted?: boolean;
+    /** Eval the trial ran in before a resume copied it; its spend was already charged to the provider there. */
+    resumedFrom?: string;
+    /** Panel verifier calls in order, retries included: the model each ran on and the candidates it was sent. */
+    verifiers?: { modelId: string; effort: RecordedEffort; candidates: string[] }[];
     cache?: {
       evalRunId: string;
       caseId: string;

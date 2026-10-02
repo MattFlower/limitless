@@ -86,10 +86,26 @@ export async function evalCommand(
     }
     return;
   }
-  if (args.length !== 2 || !value || !["run", "report", "regrade"].includes(action ?? ""))
+  if (args.length !== 2 || !value || !["run", "report", "regrade", "resume", "cancel"].includes(action ?? ""))
     throw new Error(
-      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval run review --systems <file.json> | eval report <eval-id> [--json] | eval regrade <eval-id>",
+      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval run review --systems <file.json> | eval report <eval-id> [--json] | eval regrade <eval-id> | eval resume <eval-id> | eval cancel <eval-id>",
     );
+  if (action === "resume") {
+    const { id } = await io.api<{ id: string }>(`/api/evals/${encodeURIComponent(value)}/resume`, {
+      method: "POST",
+      body: "{}",
+    });
+    io.print(`${id} (resumes ${value})`);
+    return;
+  }
+  if (action === "cancel") {
+    const { status } = await io.api<{ status: string }>(`/api/evals/${encodeURIComponent(value)}/cancel`, {
+      method: "POST",
+      body: "{}",
+    });
+    io.print(`${value}: ${status}`);
+    return;
+  }
   if (action === "regrade") {
     const path = `/api/evals/${encodeURIComponent(value)}`;
     const result = await io.api<EvalRegradeResult>(`${path}/regrade`, { method: "POST", body: "{}" });
@@ -133,6 +149,7 @@ export async function evalCommand(
   };
   const request = {
     role: value,
+    replayFinders: flags["replay-finders"],
     ...(systems ? { systems } : { models: String(flags.models).split(",") }),
     k: numeric("k"),
     maxUsd: numeric("max-usd"),

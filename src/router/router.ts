@@ -7,17 +7,21 @@ import { formatTarget, parseTarget, resolveTarget, transportError } from "./targ
 export interface RouteConstraints {
   /** Skip models from these vendors (cross-vendor review). Falls back to them only if nothing else is available. */
   avoidVendor?: string | string[];
-  /** Exclude model identities regardless of reasoning effort. */
+  /** Exclude checkpoints regardless of backend or reasoning effort. */
   excludeModels?: string[];
+  /** Why `excludeModels` are skipped, for the run log (default "already tried"). */
+  excludedBecause?: string;
   /** Only consider models at or above this tier (escalation). */
   minTier?: number;
   /** Resolved targets to skip (already failed in this stage). */
   exclude?: (string | ModelSelection)[];
   /** Put this target first when it is available (stick with the current implementer). */
   prefer?: string | ModelSelection;
+  /** Offer this target and nothing else, policy included (a listed panel verifier never falls back). */
+  only?: string | ModelSelection;
   /** Put this vendor's models first, as if every other vendor were avoided. */
   preferVendor?: string;
-  /** Tried after other vendors but before `avoidVendor` (a verifier: the implementer's vendor). */
+  /** Ranked after the same vendor without it; below `avoidVendor` (a verifier: the implementer's vendor). */
   preferNotVendor?: string[];
   /** Model identities tried last of all (a verifier: the implementer's model). */
   preferNotModels?: string[];
@@ -53,6 +57,11 @@ export class Router {
   model(id: string): ModelDef | undefined {
     return this.models.get(id);
   }
+
+  checkpointIdentity = (reference: string): string => {
+    const { modelId } = parseTarget(reference);
+    return this.models.get(modelId)?.checkpoint ?? modelId;
+  };
 
   resolve(reference: string | ModelSelection) {
     return resolveTarget(reference, (id) => this.models.get(id));
@@ -189,17 +198,15 @@ export class Router {
       }
     };
     const excluded = new Set(c.exclude?.map(identity));
+    const excludedCheckpoints = new Set(c.excludeModels?.map(this.checkpointIdentity));
     const preference = c.prefer ? identity(c.prefer) : undefined;
 
     const avoid = [c.avoidVendor ?? []].flat();
+    // Additive, so an avoided vendor that is also the implementer's ranks below one that is not.
     const independence = (m: ModelTarget) =>
-      c.preferNotModels?.includes(m.modelId)
-        ? 3
-        : avoid.includes(m.vendor) || (c.preferVendor !== undefined && m.vendor !== c.preferVendor)
-          ? 2
-          : c.preferNotVendor?.includes(m.vendor)
-            ? 1
-            : 0;
+      (c.preferNotModels?.includes(m.modelId) ? 4 : 0) +
+      (avoid.includes(m.vendor) || (c.preferVendor !== undefined && m.vendor !== c.preferVendor) ? 2 : 0) +
+      (c.preferNotVendor?.includes(m.vendor) ? 1 : 0);
     const consider = (ids: (string | ModelSelection)[], fromPolicy = false) => {
       const group: ModelTarget[] = [];
       for (const reference of ids) {
@@ -214,8 +221,11 @@ export class Router {
         if (fromPolicy && this.tracker.def(m.provider)?.billing === "free") policyFreeModels.add(m.id);
         if (seen.has(id)) continue;
         seen.add(id);
-        if (excluded.has(id) || c.excludeModels?.includes(m.id)) {
-          skipped.push({ modelId: id, reason: "already tried" });
+        if (excluded.has(id) || excludedCheckpoints.has(this.checkpointIdentity(m.id))) {
+          skipped.push({
+            modelId: id,
+            reason: excluded.has(id) ? "already tried" : (c.excludedBecause ?? "already tried"),
+          });
           continue;
         }
         const transport = transportError(role, resolved, this.tracker.def(m.provider));
@@ -243,10 +253,14 @@ export class Router {
         const paid = c.billing !== undefined && m.billing !== "free" ? 1 : 0;
         if (paid && c.billing === "free_only") continue;
         const rank = independence(m);
-        ranked.push({ target: m, rank: c.independenceFirst ? rank * 2 + paid : paid * 4 + rank });
+        ranked.push({ target: m, rank: c.independenceFirst ? rank * 2 + paid : paid * 8 + rank });
       }
     };
 
+    if (c.only) {
+      consider([c.only]);
+      return { candidates: ranked.map((r) => r.target), skipped };
+    }
     for (const g of groups) consider(g.split("|"), true);
     // A persisted implementer can retain an explicit effort after the catalog default changes.
     if (c.prefer) consider([c.prefer]);

@@ -215,3 +215,19 @@ test("recovery checkpoints upgrade older state JSON without changing its evidenc
     reopened.close();
   });
 });
+
+test("the baseline cache ships as one migration with no unused table", () => {
+  temporary((_directory, path) => {
+    const store = new Store(path, MIGRATION_DIR);
+    expect(fileNames(store.db).filter((n) => n.startsWith("20260930T"))).toEqual([
+      "20260930T2017-baseline-cache.sql",
+    ]);
+    const tables = store.db
+      .query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('baseline_cache', 'passing_baselines')",
+      )
+      .all();
+    expect(tables).toEqual([{ name: "passing_baselines" }]);
+    store.close();
+  });
+});

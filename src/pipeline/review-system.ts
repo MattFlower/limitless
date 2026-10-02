@@ -44,12 +44,20 @@ const FinderSchema = z
     path: ["lens"],
     message: 'a lens finder uses the "standard" prompt',
   });
+const VerifierSchema = z
+  .strictObject({
+    target: TargetSchema.optional(),
+    targets: z.array(TargetSchema).min(1, "verifier targets must not be empty").optional(),
+  })
+  .refine((v) => v.target === undefined || v.targets === undefined, {
+    message: 'a verifier takes "target" or "targets", not both',
+  });
 export const ReviewSystemSchema = z
   .strictObject({
     name: z.string().trim().min(1, "system name must not be empty"),
     mode: z.enum(["single", "panel"], { error: 'unsupported review system mode; use "single" or "panel"' }),
     finders: z.array(FinderSchema),
-    verifier: z.strictObject({ target: TargetSchema.optional() }).optional(),
+    verifier: VerifierSchema.optional(),
     implementerReport: z.enum(["include", "omit"], {
       error: 'implementerReport must be "include" or "omit"',
     }),
@@ -85,14 +93,18 @@ export const ReviewSystemSchema = z
  */
 const RosterReferenceSchema = z.strictObject({
   name: z.string().trim().min(1, "system name must not be empty"),
+  replayFrom: z.string().trim().min(1).optional(),
   roster: z.enum(["quick", "standard", "deep"]),
   targets: z.array(TargetSchema).min(1),
   lenses: z.array(LensSchema).optional(),
-  verifier: z.strictObject({ target: TargetSchema }),
+  verifier: VerifierSchema.refine((v) => v.target !== undefined || v.targets !== undefined, {
+    message: 'a roster verifier needs "target" or "targets"',
+  }),
   implementerReport: z.enum(["include", "omit"]),
 });
 export type RosterReference = z.infer<typeof RosterReferenceSchema>;
 export type EvalReviewSystem = ReviewSystem | RosterReference;
+const EvalSystemSchema = ReviewSystemSchema.safeExtend({ replayFrom: z.string().trim().min(1).optional() });
 
 /** Eval candidates: uniquely named, and every finder pinned so results never depend on live routing. */
 export const EvalReviewSystemsSchema = z
@@ -102,7 +114,7 @@ export const EvalReviewSystemsSchema = z
   .transform((items, ctx) =>
     items.flatMap((item, index): EvalReviewSystem[] => {
       const roster = !!item && typeof item === "object" && "roster" in item;
-      const parsed = (roster ? RosterReferenceSchema : ReviewSystemSchema).safeParse(item);
+      const parsed = (roster ? RosterReferenceSchema : EvalSystemSchema).safeParse(item);
       if (parsed.success) return [parsed.data];
       for (const issue of parsed.error.issues) ctx.addIssue({ ...issue, path: [index, ...issue.path] });
       return [];
@@ -126,7 +138,7 @@ export const EvalReviewSystemsSchema = z
             path: [index, "finders", finder, "target"],
             message: `review system ${JSON.stringify(system.name)} needs an explicit finder target; routed finders are not allowed in evals`,
           });
-      if (system.verifier && system.verifier.target === undefined)
+      if (system.verifier && system.verifier.target === undefined && !system.verifier.targets)
         ctx.addIssue({
           code: "custom",
           path: [index, "verifier", "target"],
@@ -146,7 +158,8 @@ export function expandRoster(
     throw new Error(
       `review system ${JSON.stringify(system.name)}: roster ${system.roster} has ${finders.length} finders with its lenses; give ${finders.length} targets, not ${system.targets.length}`,
     );
-  return ReviewSystemSchema.parse({
+  return EvalSystemSchema.parse({
+    replayFrom: system.replayFrom,
     name: system.name,
     mode: "panel",
     finders: finders.map((finder, i) => ({ ...finder, target: system.targets[i] })),
@@ -214,13 +227,16 @@ const RostersSchema = z.strictObject({
 
 /**
  * Checked at startup, so a mistyped pin fails loudly instead of routing by policy: roster targets
- * must be catalog models the review role can run, and a local finder's must be free.
+ * must be catalog models the review role can run, and a local finder's must be free. Single mode
+ * uses no roster, so there a problem (e.g. a pinned model a later release dropped) only warns.
  */
 export function checkRosterTargets(
-  rosters: Record<ResolvedProfile, ReviewFinder[]>,
+  cfg: Pick<Config, "reviewMode" | "reviewRosters">,
   models: ModelDef[],
   providers: ProviderDef[],
+  warn: (message: string) => void,
 ): void {
+  const rosters = cfg.reviewRosters;
   const problems = Object.entries(rosters).flatMap(([profile, finders]) =>
     finders.flatMap(({ target, local }, i) => {
       if (target === undefined) return [];
@@ -236,7 +252,10 @@ export function checkRosterTargets(
       }
     }),
   );
-  if (problems.length) throw new Error(`Invalid review rosters: ${problems.join("; ")}`);
+  if (!problems.length) return;
+  const message = `Invalid review rosters: ${problems.join("; ")}`;
+  if (cfg.reviewMode === "panel") throw new Error(message);
+  warn(`${message} (ignored: [review] mode is single)`);
 }
 
 /** `[review.rosters]` from config.toml; a profile it leaves out keeps its default roster. */

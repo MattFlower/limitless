@@ -97,6 +97,27 @@ function setup(secrets: Record<string, string> = {}) {
   return { tracker, router: new Router(tracker, policy, models) };
 }
 
+test("verifier routing excludes checkpoints across backends, including pinned targets", () => {
+  const tracker = new ProviderTracker(PROVIDERS, store, reserves, { OMLX_API_KEY: "key" });
+  tracker.setHealthy("omlx", true);
+  tracker.setHealthy("mtplx", true);
+  const router = new Router(tracker, {
+    ...DEFAULT_POLICY,
+    review: { default: ["mtplx/qwen-27b", "omlx/qwen-flash"] },
+  });
+  expect(router.checkpointIdentity("omlx/qwen-27b@high")).toBe(
+    router.checkpointIdentity("mtplx/qwen-27b@none"),
+  );
+  expect(router.checkpointIdentity("omlx/qwen-flash@high")).toBe("omlx/qwen-flash");
+  const constraints = { avoidVendor: "qwen", excludeModels: ["omlx/qwen-27b@high"] };
+  expect(router.route("review", "small", constraints).candidates.map((t) => t.modelId)).toEqual([
+    "omlx/qwen-flash",
+  ]);
+  expect(router.route("review", "small", { ...constraints, only: "mtplx/qwen-27b" }).candidates).toEqual([]);
+  tracker.setHealthy("omlx", false);
+  expect(router.route("review", "small", constraints).candidates).toEqual([]);
+});
+
 test("quota windows keep independent observation times and reject older boundaries", () => {
   let now = 1_000_000;
   const tracker = new ProviderTracker(providers, store, reserves, {}, {}, () => now);
@@ -850,4 +871,19 @@ test("with the default policy, a verifier never reuses a raising model and prefe
   const both = verifier(["anthropic", "openai"], ["codex/sol", "claude/sonnet"]);
   expect(both).toBeDefined();
   expect(["codex/sol", "claude/sonnet", "claude/opus"]).not.toContain(both);
+  // Deep profile: adversarial on codex/astra, careful on the implementer's claude/opus. Both vendors
+  // raised it, so the one that did not implement verifies, even with more Claude headroom.
+  const deep = router.route(
+    "review",
+    "large",
+    verifierConstraints(["anthropic", "openai"], ["codex/astra", "claude/opus"], {
+      vendor: "anthropic",
+      modelId: "claude/opus",
+    }),
+  );
+  expect(deep.candidates[0]?.vendor).toBe("openai");
+  expect(deep.skipped).toContainEqual({
+    modelId: "claude/opus",
+    reason: "raised a candidate it would verify",
+  });
 });

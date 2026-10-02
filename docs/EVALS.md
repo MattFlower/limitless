@@ -166,6 +166,12 @@ does before implementation, compared against the scripts at the effective HEAD; 
 audit flags do not bypass the eval invocation. Review and verify retain the pipeline's scaled
 20/25-minute reading timeouts, 10-minute idle timeout, 150-tool limit and verify private sessions.
 
+Panel review systems can set verifier `targets` to an ordered list. Each batch uses the first
+target whose vendor raised none of its candidates, then the first model that raised none.
+Targets must be unique by base model id and include a model outside all finders. A selected
+listed target that is unavailable fails the call rather than trying the next one. The list
+path does not apply the implementer preference used by routed verification.
+
 ### Grading and reporting
 
 - Review grades what production would block in round 1, using the engine's own
@@ -210,6 +216,21 @@ audit flags do not bypass the eval invocation. Review and verify retain the pipe
   prediction coverage, explicit numerators/denominators, null (`n/a`) for empty denominators,
   skips, errors, cache hits, costs and invocation latency. Grades are persisted in existing trial
   JSON so label edits cannot rewrite historical reports; `eval regrade` is the explicit exception.
+- A daemon restart or `limitless eval cancel <eval-id>` stops an eval as `interrupted`: no new
+  trials start, in-flight trials abort, and unfinished trials stay unscored. Interrupted evals
+  never feed `eval policy`. Nothing resumes automatically; `limitless eval resume <eval-id>`
+  resubmits an interrupted or failed eval's stored request unchanged as a new run (linked both
+  ways in reports). The new run copies a finished trial (passed, failed or errored, with its spend)
+  only when its stored cache key equals the key the trial computes now (prompt, system additions,
+  every retry round's prompt, schema, review system, panel identity, the provider, backend model, harness
+  and effort of every target including later rounds' switch and effort targets, case content),
+  and regrades the copy against the current labels. Every other trial, including preparation
+  failures and trials whose key changed, runs again, so a resumed eval never mixes versions; its
+  report counts the trials copied and run again. Its `maxUsd` covers the spend of the whole resume
+  chain, counting each copy once; copies don't count toward provider budgets a second time. Resume
+  refuses legacy evals without a stored request, `--no-cache` evals and requests that no longer
+  validate against the current dataset, models or systems. A restart's message suggests `eval
+  resume` only for evals with a stored, cached request.
 
 Repository-reading cache identity additionally includes role, repository identity, pinned base
 and head, normal input and seed content. Same-stat code or patch changes invalidate it; temporary
@@ -244,6 +265,14 @@ Store each hidden file at `evals/implement/hidden/<case-id>/<repository-relative
 list that relative path in `hidden.files`. Files are injected only after candidate gates and
 audit, preserving permission bits so executable commands such as `./run.sh` work. The command
 runs from the checkout root. Hidden contents and modes participate in cache identity.
+
+Grading runs in a separate checkout of the round's commit, outside the candidate's worktree, so a
+committed nested repository, the candidate's `.git` config, hooks and filters, or a leftover
+grading directory cannot expose hidden files. After grading, the candidate worktree is restored
+to its commit and checked for files that appeared, as before. Known limit until edit-mode agents
+and grading are sandboxed: gates and the hidden command run candidate code with ordinary file
+access, so that code can still write outside the checkout — into the candidate's `.git`
+directory, a tracked file marked skip-worktree, or through a smudge filter during the restore.
 
 Baseline gates run once per case/base within an eval run, shared across repetitions and models.
 A failed baseline setup or timed-out baseline check produces a preparation `error`, invokes no
@@ -289,7 +318,7 @@ recovery feedback.
 `limitless eval policy` reads persisted evidence and effective settings through the daemon API;
 it never runs or regrades models. By default it selects the latest **completed** run independently
 for each triage/review/verify model, ordered by finishedAt, createdAt, then run ID (descending).
-Queued, running, failed and budget-exhausted runs are ignored. `--evals id,id` restricts the pool
+Queued, running, failed, interrupted and budget-exhausted runs are ignored. `--evals id,id` restricts the pool
 before the same selection; empty, unknown or non-completed IDs fail before any files are written.
 
 Configure the daemon in `~/.config/limitless/config.toml`:

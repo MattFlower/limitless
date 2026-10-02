@@ -1,16 +1,13 @@
 import { createHash } from "node:crypto";
 import {
   chmodSync,
-  cpSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -19,7 +16,7 @@ import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
 import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
-import { withScratch } from "../harness/scratch.ts";
+import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
 import type { ModelTarget } from "../harness/types.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../pipeline/prompts.ts";
 import type { Router } from "../router/router.ts";
@@ -84,61 +81,60 @@ function inject(cwd: string, files: ReturnType<typeof hiddenContents>) {
   }
 }
 
-/**
- * Every ignored entry, descending into directories Git reports unexpanded (nested repositories) so
- * each file beneath them is tracked on its own. Symlinks are never followed.
- */
-async function* ignoredEntries(cwd: string, env: Record<string, string>, signal: AbortSignal) {
-  const root = realpathSync(cwd);
-  const out = await sh(["git", "ls-files", "-z", "-o", "-i", "--exclude-standard"], { cwd, env, signal });
-  const pending = out.stdout
-    .split("\0")
-    .filter(Boolean)
-    .map((path) => path.replace(/\/$/, ""));
-  for (let path = pending.shift(); path !== undefined; path = pending.shift()) {
-    yield path;
-    const stat = lstatSync(join(root, path), { throwIfNoEntry: false });
-    if (stat?.isDirectory())
-      pending.unshift(...readdirSync(join(root, path)).map((entry) => `${path}/${entry}`));
-  }
+/** Fingerprint ignored and untracked entries without following symlinks or trusting directory metadata. */
+async function untrackedState(cwd: string, env: Record<string, string>, since: bigint) {
+  const state = new Map<string, string>();
+  const visit = (path: string) => {
+    const file = join(cwd, path);
+    const stat = lstatSync(file, { bigint: true, throwIfNoEntry: false });
+    if (!stat) return;
+    if (stat.isDirectory()) {
+      state.set(path, "directory");
+      for (const entry of readdirSync(file)) visit(`${path}/${entry}`);
+    } else {
+      const meta = `${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+      const body =
+        stat.ctimeNs < since
+          ? ""
+          : stat.isSymbolicLink()
+            ? readlinkSync(file)
+            : stat.isFile()
+              ? readFileSync(file)
+              : "";
+      state.set(path, `${meta}:${createHash("sha256").update(body).digest("hex")}`);
+    }
+  };
+  const out = await sh(["git", "ls-files", "-z", "-o"], { cwd, env });
+  for (const path of out.stdout.split("\0").filter(Boolean)) visit(path.replace(/\/$/, ""));
+  return state;
 }
 
-/**
- * Identify an ignored file's exact pre-grade state. ctime can't be forged by the grader, but coarse
- * filesystem clocks can hide a same-tick rewrite, so recently changed files also carry their contents.
- * Directories are compared by their entries, not their metadata: overwriting a child leaves it unchanged.
- */
-function fingerprint(root: string, path: string, since: bigint) {
-  const file = join(root, path);
-  const stat = lstatSync(file, { bigint: true, throwIfNoEntry: false });
-  if (!stat) return null;
-  if (stat.isDirectory()) return "directory";
-  const meta = `${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
-  if (stat.ctimeNs < since) return meta;
-  const body = stat.isSymbolicLink() ? readlinkSync(file) : stat.isFile() ? readFileSync(file) : "";
-  return `${meta}:${createHash("sha256").update(body).digest("hex")}`;
-}
-
-async function ignoredState(cwd: string, env: Record<string, string>, signal: AbortSignal) {
-  const root = realpathSync(cwd);
-  const since = BigInt(Date.now() - 5_000) * 1_000_000n;
-  const state = new Map<string, string | null>();
-  for await (const path of ignoredEntries(cwd, env, signal)) state.set(path, fingerprint(root, path, since));
-  return { since, state };
-}
-
-/** Remove a path without following symlinked parents, then prune directories it left empty. */
+/** Refuse to remove through a parent replaced with a symlink. Cleanup failure stops recovery. */
 function removeWithin(root: string, path: string) {
-  const parts = path.split("/");
   let current = root;
-  for (const part of parts.slice(0, -1)) {
+  for (const part of path.split("/").slice(0, -1)) {
     current = join(current, part);
-    const stat = lstatSync(current, { throwIfNoEntry: false });
-    if (!stat?.isDirectory()) return;
+    if (!lstatSync(current, { throwIfNoEntry: false })?.isDirectory()) return;
   }
   rmSync(join(root, path), { recursive: true, force: true });
   for (let dir = dirname(join(root, path)); dir !== root && readdirSync(dir).length === 0; dir = dirname(dir))
     rmSync(dir, { recursive: true });
+}
+
+async function restoreCandidate(
+  cwd: string,
+  env: Record<string, string>,
+  commit: string,
+  before: Map<string, string>,
+  since: bigint,
+) {
+  await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "-q", commit], { cwd, env });
+  await sh(["git", "clean", "-fdq"], { cwd, env });
+  const root = realpathSync(cwd);
+  for (const [path, fingerprint] of await untrackedState(cwd, env, since))
+    if (before.get(path) !== fingerprint) removeWithin(root, path);
+  for (const [path, fingerprint] of await untrackedState(cwd, env, since))
+    if (before.get(path) !== fingerprint) throw new Error(`Grading artifact remains: ${path}`);
 }
 
 export function failedImplement(reason: "timeout" | "error", error?: string): EvalGrade {
@@ -151,6 +147,29 @@ export function failedImplement(reason: "timeout" | "error", error?: string): Ev
   };
 }
 
+/** Exercise nonempty feedback branches when fingerprinting retry prompts, even before a failure. */
+export const RETRY_FEEDBACK_GRADE: EvalGrade = {
+  ...failedImplement("error"),
+  implement: {
+    reason: "gates",
+    commit: null,
+    gates: (["regressed", "new_failure"] as const).map((verdict) => ({
+      name: "CHECK",
+      verdict,
+      blocking: true,
+      result: { name: "CHECK", command: "COMMAND", ok: false, exitCode: 1, durationMs: 0, output: "OUTPUT" },
+    })),
+    auditBlocks: [undefined, "FILE"].map((file) => ({
+      rule: "RULE",
+      severity: "block",
+      file,
+      detail: "DETAIL",
+    })),
+    auditWarnings: [],
+    hidden: { exitCode: 1, timedOut: false, output: "" },
+  },
+};
+
 export async function gradeImplement(
   item: ImplementCase,
   cwd: string,
@@ -158,7 +177,6 @@ export async function gradeImplement(
   prepared: { gates: GateConfig; baseline: GateRun },
   toolCommands: string[],
   signal: AbortSignal,
-  restore = false,
 ): Promise<EvalGrade> {
   // The candidate controls .git/config and .gitattributes, so filters and diff drivers are its code.
   const env = agentEnv();
@@ -170,10 +188,9 @@ export async function gradeImplement(
     auditWarnings: [],
     hidden: null,
   };
-  const snapshot = restore ? mkdtempSync(join(dirname(cwd), "grade-")) : undefined;
-  let snapshotReady = false;
-  let ignoredBefore: Awaited<ReturnType<typeof ignoredState>> | undefined;
-  const modes = new Map<string, number>();
+  let checkout: string | undefined;
+  let before: Map<string, string> | undefined;
+  const since = BigInt(Date.now() - 5_000) * 1_000_000n;
   try {
     signal.throwIfAborted();
     await sh(["git", "add", "-A"], { cwd, env, signal });
@@ -195,20 +212,34 @@ export async function gradeImplement(
       ],
       { cwd, env, signal },
     );
-    evidence.commit = (await sh(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
-    if (snapshot) {
-      // Keep candidate Git metadata private: graders may commit hidden inputs.
-      // Reconstruct files only after failure; never copy the worktree (including dependencies).
-      cpSync(join(cwd, ".git"), join(snapshot, ".git"), { recursive: true, verbatimSymlinks: true });
-      for (const path of (await sh(["git", "ls-files", "-z"], { cwd, env, signal })).stdout
-        .split("\0")
-        .filter(Boolean))
-        if (!lstatSync(join(cwd, path)).isSymbolicLink()) modes.set(path, statSync(join(cwd, path)).mode);
-      snapshotReady = true;
-    }
-    const after = await runGates(cwd, prepared.gates, signal);
+    const commit = (await sh(["git", "rev-parse", "HEAD"], { cwd, env, signal })).stdout.trim();
+    evidence.commit = commit;
+    before = await untrackedState(cwd, env, since);
+    // Grade in a fresh repository outside the candidate's: hidden files never touch its checkout,
+    // and its Git metadata (filters, drivers, hooks, index flags) has no say in grading. Fetching
+    // only reads the candidate's objects; nothing in the grading repository points back at it.
+    checkout = createScratch(cwd);
+    const opts = { cwd: checkout, env, signal };
+    await sh(["git", "init", "-q"], opts);
+    await sh(["git", "fetch", "-q", "--no-tags", "--no-write-fetch-head", cwd, commit, item.base], opts);
+    await sh(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", commit], opts);
+    // Audit before gates run: their commands could move HEAD or rewrite the grading repository.
+    const names = gateScriptNames(prepared.gates);
+    const findings = auditDiff(await diffSince(checkout, item.base, env), {
+      taskClass: null,
+      protectedPaths: prepared.gates.protectedPaths,
+      toolCommands,
+      gateScripts: {
+        before: pickScripts(await readFileAt(checkout, item.base, "package.json", env), names),
+        after: pickScripts(await readFileAt(checkout, commit, "package.json", env), names),
+      },
+    });
+    evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");
+    evidence.auditWarnings = findings.filter((finding) => finding.severity === "warn");
+    const after = await runGates(checkout, prepared.gates, signal);
     signal.throwIfAborted();
-    await discardChanges(cwd, env);
+    await sh(["git", "reset", "--hard", "-q", commit], opts);
+    await sh(["git", "clean", "-fdq"], opts);
     evidence.gates = compareGates(prepared.baseline, after);
     const gateTimeout = [
       ...prepared.baseline.setup,
@@ -217,24 +248,12 @@ export async function gradeImplement(
       ...after.checks,
     ].some((g) => g.output.startsWith("[timed out]"));
     if (gateTimeout) evidence.reason = "timeout";
-    const names = gateScriptNames(prepared.gates);
-    const findings = auditDiff(await diffSince(cwd, item.base, env), {
-      taskClass: null,
-      protectedPaths: prepared.gates.protectedPaths,
-      toolCommands,
-      gateScripts: {
-        before: pickScripts(await readFileAt(cwd, item.base, "package.json", env), names),
-        after: pickScripts(await readFileAt(cwd, "HEAD", "package.json", env), names),
-      },
-    });
-    evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");
-    evidence.auditWarnings = findings.filter((finding) => finding.severity === "warn");
-    if (snapshot) ignoredBefore = await ignoredState(cwd, env, signal);
-    inject(cwd, files);
-    const hidden = await withScratch(cwd, (scratch) =>
+    inject(checkout, files);
+    const grading = checkout;
+    const hidden = await withScratch(grading, (scratch) =>
       runProcess({
         cmd: ["/bin/sh", "-c", item.hidden.command],
-        cwd,
+        cwd: grading,
         env: agentEnv({ HOME: scratch, TMPDIR: scratch, TMP: scratch, TEMP: scratch }),
         signal,
         timeoutMs: item.hidden.timeoutSec * 1000,
@@ -268,39 +287,11 @@ export async function gradeImplement(
     evidence.reason ??= "error";
     evidence.error = (error as Error).message;
   } finally {
-    if (snapshot) {
-      try {
-        if (snapshotReady && evidence.reason !== null && !signal.aborted) {
-          // Preserve ignored dependencies/build outputs across recovery rounds.
-          rmSync(join(cwd, ".git"), { recursive: true, force: true });
-          cpSync(join(snapshot, ".git"), join(cwd, ".git"), { recursive: true, verbatimSymlinks: true });
-          await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "HEAD"], {
-            cwd,
-            env,
-            signal,
-          });
-          await sh(["git", "clean", "-fd"], { cwd, env, signal });
-          // Ignore rules are candidate-controlled: drop hidden files and anything the grader created
-          // or rewrote, since a pre-existing ignored output may now hold hidden test contents.
-          if (ignoredBefore) {
-            const root = realpathSync(cwd);
-            for (const file of files) removeWithin(root, file.path);
-            for await (const path of ignoredEntries(cwd, env, signal)) {
-              const before = ignoredBefore.state.get(path);
-              if (before === undefined || before !== fingerprint(root, path, ignoredBefore.since))
-                removeWithin(root, path);
-            }
-            await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "HEAD"], {
-              cwd,
-              env,
-              signal,
-            });
-          }
-          for (const [path, mode] of modes) chmodSync(join(cwd, path), mode);
-        }
-      } finally {
-        rmSync(snapshot, { recursive: true, force: true });
-      }
+    // A failed removal throws: recovery must not continue while grading artifacts remain.
+    try {
+      if (checkout) removeScratch(checkout);
+    } finally {
+      if (before && evidence.commit) await restoreCandidate(cwd, env, evidence.commit, before, since);
     }
   }
   return {
