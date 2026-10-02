@@ -500,7 +500,7 @@ A panel's finders depend on the run's profile:
 | Profile | Default roster |
 |---|---|
 | quick | One standard finder from a vendor other than the implementer's. |
-| standard | An adversarial finder from another vendor. A careful finder in a fresh session from the implementer's family. A standard finder on a local model with a removed-behaviour and failure-paths lens, only when a local model is available. |
+| standard | An adversarial finder from another vendor. A careful finder in a fresh session from the implementer's family. |
 | deep | The standard roster plus the repository's lenses. |
 
 Override a profile's roster in `config.toml`. Profiles you leave out keep their defaults:
