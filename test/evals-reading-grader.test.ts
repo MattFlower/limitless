@@ -110,6 +110,13 @@ test("a merged panel finding's alternative locations credit at most one defect",
     },
   });
   expect(gradeReview(item, panel({ ...finding, verification })).review?.requiredMatched).toBe(1);
+  // A verbatim copy without aliases does not drop an earlier copy's alias, in either order.
+  const away = { ...finding, line: 100, verification };
+  for (const findings of [
+    [{ ...away, duplicates }, away],
+    [away, { ...away, duplicates }],
+  ])
+    expect(gradeReview(item, { ...panel(away), findings }).review?.requiredMatched).toBe(1);
   expect(gradeReview(item, panel({ ...finding, line: 100, verification, duplicates })).review).toMatchObject({
     requiredMatched: 1,
     bySeverity: { high: { caught: 1, total: 1 } },

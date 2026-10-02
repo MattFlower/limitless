@@ -45,11 +45,18 @@ export function gradeReview(item: ReviewCase, output: StoredReview): EvalGrade {
   const lands = (finding: Finding, defect: Defect) =>
     normalize(finding.file) === normalize(defect.file) &&
     (atLine(finding.line, defect) || (finding.duplicates ?? []).some((d) => atLine(d.line, defect)));
-  // Verbatim repeats are one finding. Aliases are alternative locations for that claim, never
-  // independent vertices: both blocking credit and under-rated detection have a one-claim limit.
-  const distinct = (findings: Finding[]) => [
-    ...new Map(findings.map((f) => [JSON.stringify([normalize(f.file), f.line, f.title]), f])).values(),
-  ];
+  // Verbatim repeats are one finding, keeping every copy's aliases. Aliases are alternative locations
+  // for that claim, never independent vertices: blocking credit and under-rated detection have a
+  // one-claim limit.
+  const distinct = (findings: Finding[]) => {
+    const byKey = new Map<string, Finding>();
+    for (const f of findings) {
+      const key = JSON.stringify([normalize(f.file), f.line, f.title]);
+      const seen = byKey.get(key)?.duplicates ?? [];
+      byKey.set(key, seen.length ? { ...f, duplicates: [...seen, ...(f.duplicates ?? [])] } : f);
+    }
+    return [...byKey.values()];
+  };
   // Most severe first, so an ambiguous assignment credits the defect that matters most.
   const required = item.defects
     .filter((defect) => defect.required)
