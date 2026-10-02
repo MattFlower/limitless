@@ -1,10 +1,11 @@
 import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { agentEnv, sh } from "../util/proc.ts";
+import { agentEnv } from "../util/proc.ts";
+import { worktreeGit } from "./command.ts";
 
 /** All merge lifecycle operations share hook suppression, identity and the agent's scrubbed env. */
 export function mergeGit(cwd: string, args: string[], allowFail = false) {
-  return sh(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], {
+  return worktreeGit(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], {
     cwd,
     allowFail,
     env: agentEnv({
