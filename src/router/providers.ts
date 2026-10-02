@@ -405,6 +405,36 @@ export class ProviderTracker {
 
   // ---- concurrency ---------------------------------------------------------
 
+  /** Race providers in preference order, releasing every unused reservation. */
+  async acquireFirst(
+    ids: string[],
+    signal: AbortSignal,
+    waitMs: number | undefined,
+    onWait: (id: string, ahead: number) => void,
+  ): Promise<{ provider: string; release: () => void } | null> {
+    const cancel = new AbortController();
+    const combined = AbortSignal.any([signal, cancel.signal]);
+    const pending = ids.map(async (provider) => ({
+      provider,
+      release: await this.acquire(provider, combined, waitMs, (ahead) => onWait(provider, ahead)),
+    }));
+    let failure: unknown;
+    await Promise.race(pending).catch((error: unknown) => {
+      failure = error;
+    });
+    cancel.abort();
+    const results = await Promise.allSettled(pending);
+    let chosen: { provider: string; release: () => void } | null = null;
+    for (const result of results) {
+      if (result.status !== "fulfilled" || !result.value.release) continue;
+      if (!chosen && !signal.aborted && !failure) chosen = { ...result.value, release: result.value.release };
+      else result.value.release();
+    }
+    if (signal.aborted) throw new Error("cancelled");
+    if (failure) throw failure;
+    return chosen;
+  }
+
   acquire(id: string, signal: AbortSignal): Promise<() => void>;
   acquire(
     id: string,

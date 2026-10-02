@@ -201,15 +201,12 @@ test("routing wait budgets default by role and validate overrides", () => {
       triage: 20,
       summarize: 20,
       chat: 20,
-      review: 180,
-      verify: 180,
-      spec: 180,
-      holdout: 180,
-      implement: 300,
     };
     expect(config().waitBudgetS).toEqual(defaults);
     writeFileSync(file, "[routing.wait_budget_s]\ntriage = 0\nimplement = 2\nplan = 4\nplan_review = 5\n");
     expect(config().waitBudgetS).toEqual({ ...defaults, triage: 0, implement: 2, plan: 4, plan_review: 5 });
+    writeFileSync(file, '[routing.wait_budget_s]\ntriage = "unbounded"\nreview = "unbounded"\n');
+    expect(config().waitBudgetS).toEqual({ summarize: 20, chat: 20 });
     for (const value of ["-1", "1.5", '"20"', "true", "[]", "{}", "1e20"]) {
       writeFileSync(file, `[routing.wait_budget_s]\nreview = ${value}\n`);
       expect(config).toThrow("routing.wait_budget_s.review must be nonnegative integer seconds");

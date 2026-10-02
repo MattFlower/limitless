@@ -256,16 +256,8 @@ export class Concierge {
         target.provider,
         signal,
         seconds === undefined ? undefined : seconds * 1000,
-        (ahead) =>
-          store.addEvent({
-            runId: `chat:${conversationId}`,
-            type: "log",
-            level: "info",
-            message: `waiting for ${target.provider} slot (${ahead} ahead), up to ${seconds === undefined ? "unbounded" : `${seconds}s`}`,
-          }),
       );
       if (!release) {
-        if (signal.aborted) throw new Error("Chat request timed out");
         busy.add(target.targetId ?? target.modelId);
         attempt--;
         continue;

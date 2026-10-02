@@ -183,18 +183,26 @@ export function loadConfig(
     triage: 20,
     summarize: 20,
     chat: 20,
-    review: 180,
-    verify: 180,
-    spec: 180,
-    holdout: 180,
-    implement: 300,
   };
   const waits = routing.wait_budget_s ?? {};
   if (typeof waits !== "object" || waits === null || Array.isArray(waits))
     throw new Error("routing.wait_budget_s must be a table");
-  const roles = [...Object.keys(waitBudgetS), "plan", "plan_review"];
+  const roles = [
+    ...Object.keys(waitBudgetS),
+    "review",
+    "verify",
+    "spec",
+    "holdout",
+    "implement",
+    "plan",
+    "plan_review",
+  ];
   for (const [role, seconds] of Object.entries(waits)) {
     if (!roles.includes(role)) throw new Error(`routing.wait_budget_s.${role}: unknown role`);
+    if (seconds === "unbounded") {
+      delete waitBudgetS[role as Role];
+      continue;
+    }
     if (typeof seconds !== "number" || !Number.isSafeInteger(seconds) || seconds < 0)
       throw new Error(`routing.wait_budget_s.${role} must be nonnegative integer seconds`);
     waitBudgetS[role as Role] = seconds;

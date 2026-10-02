@@ -411,9 +411,7 @@ test("chat expires its slot budget and falls through without consuming an invoca
     await clock.advance(20_000);
     expect((await pending).messages.at(-1)?.content).toBe("Hello");
     expect(f.specs.map((s) => s.target.provider)).toEqual(["next"]);
-    expect(f.factory.store.listEvents("chat:one").map((e) => e.message)).toEqual([
-      "waiting for fake slot (0 ahead), up to 20s",
-    ]);
+    expect(f.factory.store.listEvents("chat:one")).toHaveLength(0);
     expect(clock.pending).toBe(0);
   } finally {
     release();
@@ -443,9 +441,7 @@ test("chat with one eligible provider keeps waiting beyond its role budget", asy
     release();
     expect((await pending).messages.at(-1)?.content).toBe("Hello");
     expect(f.specs.map((s) => s.target.provider)).toEqual(["fake"]);
-    expect(f.factory.store.listEvents("chat:one").map((e) => e.message)).toEqual([
-      "waiting for fake slot (0 ahead), up to unbounded",
-    ]);
+    expect(f.factory.store.listEvents("chat:one")).toHaveLength(0);
     expect(tracker.status("fake")?.inFlight).toBe(0);
   } finally {
     release();

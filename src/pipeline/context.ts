@@ -420,6 +420,7 @@ export class RunContext {
     const { router, tracker, store, harnesses } = this.deps;
     const tried: (string | ModelSelection)[] = [...(opts.constraints?.exclude ?? [])];
     const busy = new Set<string>();
+    let waitMs = 0;
     let lastFailure: string | null = null;
     // An unsure (not question-needing) decline beats failing the stage when nothing else answers.
     let lastResort: InvokeOutcome | null = null;
@@ -443,8 +444,12 @@ export class RunContext {
         opts.complexity,
         this.routingConstraints({ ...opts.constraints, exclude: tried }),
       );
-      const candidates = decision.candidates.filter((t) => !busy.has(t.targetId ?? t.modelId));
-      const target = candidates[0];
+      const candidates = decision.candidates;
+      let target =
+        candidates.find((t) => {
+          const status = tracker.status(t.provider);
+          return !busy.has(t.provider) || (status && status.inFlight < status.maxConcurrent);
+        }) ?? candidates[0];
       if (!target && lastResort) return useLastResort(lastResort, `No other model for ${opts.role}`);
       if (!target) {
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
@@ -453,45 +458,59 @@ export class RunContext {
           `No model available for ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}. Skipped: ${why || "none configured"}`,
         );
       }
-      const { harnessName, noTools } = selectHarness(opts.role, target, opts.noTools);
-      const harness = harnesses[harnessName];
-      if (!harness) throw new Error(`No harness registered for ${harnessName}`);
-
       // With no alternative left, contention waits until a slot opens or the invocation deadline.
-      const seconds = candidates.length > 1 ? this.deps.cfg.waitBudgetS[opts.role] : undefined;
+      const providers = [...new Set(candidates.map((t) => t.provider))];
+      const allBusy = providers.every((id) => busy.has(id));
+      const seconds = providers.length > 1 && !allBusy ? this.deps.cfg.waitBudgetS[opts.role] : undefined;
       const budget = Math.min((seconds ?? Infinity) * 1000, left());
       let waitingAt: number | null = null;
-      const release = await tracker
-        .acquire(target.provider, this.signal, Number.isFinite(budget) ? budget : undefined, (ahead) => {
-          waitingAt = tracker.now();
-          this.log(
-            `waiting for ${target.provider} slot (${ahead} ahead), up to ${Number.isFinite(budget) ? `${budget / 1000}s` : "unbounded"}`,
-          );
-        })
-        .catch((error: unknown) => {
-          this.checkCancelled();
-          throw error;
-        });
+      const onWait = (provider: string, ahead: number) => {
+        waitingAt ??= tracker.now();
+        this.log(
+          `waiting for ${provider} slot (${ahead} ahead), up to ${Number.isFinite(budget) ? `${Math.ceil(budget / 1000)}s` : "unbounded"}`,
+        );
+      };
+      const limit = Number.isFinite(budget) ? budget : undefined;
+      const provider = target.provider;
+      const admission = await (allBusy
+        ? tracker.acquireFirst(providers, this.signal, limit, onWait)
+        : tracker
+            .acquire(provider, this.signal, busy.has(provider) ? 0 : limit, (ahead) =>
+              onWait(provider, ahead),
+            )
+            .then((release) => release && { provider, release })
+      ).catch((error: unknown) => {
+        this.checkCancelled();
+        throw error;
+      });
+      const release = admission?.release;
+      if (admission) target = candidates.find((t) => t.provider === admission.provider) ?? target;
+      waitMs += waitingAt === null ? 0 : Math.max(0, tracker.now() - waitingAt);
       if (this.signal.aborted || left() <= 0) {
         release?.();
         this.checkCancelled();
         throw new NoCapacityError(`${target.targetId ?? target.modelId}: busy until the deadline`);
       }
       if (!release) {
-        busy.add(target.targetId ?? target.modelId);
+        busy.add(target.provider);
         attempt--;
         continue;
       }
-      const waitMs = waitingAt === null ? 0 : Math.max(0, tracker.now() - waitingAt);
       if (!(await tracker.preflight(target.provider)) || tracker.modelUnavailableReason(target.modelId)) {
         release();
-        busy.add(target.targetId ?? target.modelId);
+        tried.push({ modelId: target.modelId, effort: target.effort ?? null });
         attempt--;
         lastFailure = `${target.targetId ?? target.modelId}: no capacity after provider refresh`;
         continue;
       }
       if (this.signal.aborted) release();
       this.checkCancelled();
+      const { harnessName, noTools } = selectHarness(opts.role, target, opts.noTools);
+      const harness = harnesses[harnessName];
+      if (!harness) {
+        release();
+        throw new Error(`No harness registered for ${harnessName}`);
+      }
       tried.push({ modelId: target.modelId, effort: target.effort ?? null });
       if (opts.role === "implement") {
         this.state.implementer = {
