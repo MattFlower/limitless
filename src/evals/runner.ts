@@ -803,8 +803,9 @@ export class EvalRunner {
         }
       const toolCommands: string[] = [];
       let sessionId: string | undefined;
-      if (rounds > 1) scratch = createScratch(cwd);
       for (let round = 0; round < rounds; round++) {
+        if (scratch) removeScratch(scratch);
+        scratch = undefined;
         if (signal.aborted) return skip(stopReason(signal));
         if (budget()) return skip("eval budget exhausted");
         ({ harnessName, noTools } = selectHarness(run.role, target));
@@ -824,6 +825,7 @@ export class EvalRunner {
         if (budget()) return skip("eval budget exhausted");
         const afterWait = gate();
         if (afterWait) return skip(afterWait);
+        if (rounds > 1 || "hidden" in item) scratch = createScratch(cwd);
         if (round === 0) trial.createdAt = Date.now();
         roundStarted = Date.now();
         trial.harness = harnessName;
@@ -1055,15 +1057,7 @@ export class EvalRunner {
         const grade =
           "hidden" in effective && implementation
             ? result.status === "ok"
-              ? await gradeImplement(
-                  effective,
-                  cwd,
-                  hidden,
-                  implementation,
-                  toolCommands,
-                  signal,
-                  round + 1 < rounds,
-                )
+              ? await gradeImplement(effective, cwd, hidden, implementation, toolCommands, signal)
               : failedImplement(result.status === "timeout" ? "timeout" : "error", result.error ?? undefined)
             : ok && output?.success && !("hidden" in item)
               ? gradeCase(item, output.data)
