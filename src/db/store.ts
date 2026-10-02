@@ -1179,17 +1179,17 @@ export class Store {
     return (r.s as number) + (chat.s as number) + (evals.s as number);
   }
 
-  /** Completed costs in (since, before], matching consecutive provider readings. */
+  /** Completed costs in [since, before); boundary completions belong to the next reading. */
   providerSpendBetween(provider: string, since: number, before: number): number {
     const invocation = this.db
       .query(
-        "SELECT COALESCE(SUM(cost_usd),0) AS s FROM invocations WHERE provider = ? AND finished_at > ? AND finished_at <= ?",
+        "SELECT COALESCE(SUM(cost_usd),0) AS s FROM invocations WHERE provider = ? AND finished_at >= ? AND finished_at < ?",
       )
       .get(provider, since, before) as Row;
     const chat = this.db
       .query(
         `SELECT COALESCE(SUM(cost_usd),0) AS s FROM chat_calls WHERE provider = ?
-         AND started_at + COALESCE(duration_ms, 0) > ? AND started_at + COALESCE(duration_ms, 0) <= ?`,
+         AND started_at + COALESCE(duration_ms, 0) >= ? AND started_at + COALESCE(duration_ms, 0) < ?`,
       )
       .get(provider, since, before) as Row;
     return (invocation.s as number) + (chat.s as number);

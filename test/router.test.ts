@@ -692,66 +692,68 @@ describe("OpenRouter reconciliation", () => {
   });
 
   for (const kind of ["invocation", "chat"] as const) {
-    test.each([1_000, 1_500, 2_000])(
-      `${kind} cost belongs to its finish interval (%i ms)`,
-      async (offset) => {
-        const base = now;
-        const tracker = make();
-        await tracker.refreshOpenRouter();
-        if (kind === "chat") {
-          chatCall(1, base - 500, offset + 500);
-        } else {
-          const repo = store.upsertRepo({
-            slug: "local/spend",
-            kind: "local",
-            url: null,
-            localPath: dir,
-            defaultBranch: "main",
-            mergePolicy: "pr",
+    test.each([
+      [0, 1, 0, 0],
+      [1_000, 0, 1, 0],
+      [1_500, 0, 1, 0],
+      [2_000, 0, 0, 1],
+    ])(`${kind} cost belongs to its finish interval (%i ms)`, async (offset, first, second, third) => {
+      const base = now;
+      const tracker = make();
+      await tracker.refreshOpenRouter();
+      if (kind === "chat") {
+        chatCall(1, base - 500, offset + 500);
+      } else {
+        const repo = store.upsertRepo({
+          slug: "local/spend",
+          kind: "local",
+          url: null,
+          localPath: dir,
+          defaultBranch: "main",
+          mergePolicy: "pr",
+        });
+        const run = store.createRun(repo, { repo: repo.slug, prompt: "spend test" });
+        const invocation = (startedAt: number) => {
+          const row = store.createInvocation({
+            runId: run.id,
+            stageId: null,
+            role: "implement",
+            harness: "fake",
+            provider: "openrouter",
+            model: "ds",
+            modelId: "openrouter/ds",
           });
-          const run = store.createRun(repo, { repo: repo.slug, prompt: "spend test" });
-          const invocation = (startedAt: number) => {
-            const row = store.createInvocation({
-              runId: run.id,
-              stageId: null,
-              role: "implement",
-              harness: "fake",
-              provider: "openrouter",
-              model: "ds",
-              modelId: "openrouter/ds",
-            });
-            store.db.query("UPDATE invocations SET started_at = ? WHERE id = ?").run(startedAt, row.id);
-            return row;
-          };
-          store.updateInvocation(invocation(base - 500).id, {
-            finishedAt: base + offset,
-            status: "ok",
-            costUsd: 1,
-          });
-          store.updateInvocation(invocation(base + 500).id, { costUsd: 10 });
-        }
-        const earlier = offset === 1_000 ? 1 : 0;
-        expect(store.providerSpendBetween("openrouter", base, base + 1_000)).toBe(earlier);
-        expect(store.providerSpendBetween("openrouter", base + 1_000, base + 2_000)).toBe(1 - earlier);
-        expect(store.providerSpendBetween("openrouter", base + 2_000, base + 3_000)).toBe(0);
-        expect(store.providerSpendBetween("claude", base, base + 3_000)).toBe(0);
-        now = base + 1_000;
-        payload = reading(earlier);
-        expect(await tracker.refreshOpenRouter()).toBe(true);
-        now = base + 2_000;
-        payload = reading(1);
-        expect(await tracker.refreshOpenRouter()).toBe(true);
-        now = base + 3_000;
-        expect(await tracker.refreshOpenRouter()).toBe(true);
-        expect(store.listEvents("provider:openrouter")).toHaveLength(0);
-      },
-    );
+          store.db.query("UPDATE invocations SET started_at = ? WHERE id = ?").run(startedAt, row.id);
+          return row;
+        };
+        store.updateInvocation(invocation(base - 500).id, {
+          finishedAt: base + offset,
+          status: "ok",
+          costUsd: 1,
+        });
+        store.updateInvocation(invocation(base + 500).id, { costUsd: 10 });
+      }
+      expect(store.providerSpendBetween("openrouter", base, base + 1_000)).toBe(first);
+      expect(store.providerSpendBetween("openrouter", base + 1_000, base + 2_000)).toBe(second);
+      expect(store.providerSpendBetween("openrouter", base + 2_000, base + 3_000)).toBe(third);
+      expect(store.providerSpendBetween("claude", base, base + 3_000)).toBe(0);
+      now = base + 1_000;
+      payload = reading(first);
+      expect(await tracker.refreshOpenRouter()).toBe(true);
+      now = base + 2_000;
+      payload = reading(first + second);
+      expect(await tracker.refreshOpenRouter()).toBe(true);
+      now = base + 3_000;
+      payload = reading(1);
+      expect(await tracker.refreshOpenRouter()).toBe(true);
+      expect(store.listEvents("provider:openrouter")).toHaveLength(0);
+    });
   }
 
   test("legacy chat calls without duration retain start-time attribution", () => {
     chatCall(1, now + 1_000, null);
-    expect(store.providerSpendBetween("openrouter", now, now + 1_000)).toBe(1);
-    expect(store.providerSpendBetween("openrouter", now + 1_000, now + 2_000)).toBe(0);
+    expect(store.providerSpendBetween("openrouter", now, now + 1_000)).toBe(0);
+    expect(store.providerSpendBetween("openrouter", now + 1_000, now + 2_000)).toBe(1);
   });
 
   test.each([
