@@ -2387,6 +2387,8 @@ esac
     "missing",
     "single-parent",
     "markers",
+    "resolver-error",
+    "resolver-timeout",
     "partial",
     "fixture",
     "stray",
@@ -2409,6 +2411,12 @@ esac
         calls++;
         if (calls === 1) return { files: { [file]: `${prefix}feature intent\n` } };
         before = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+        if (fault === "resolver-error" || fault === "resolver-timeout") {
+          expect(readFileSync(join(s.cwd, file), "utf8")).toContain("<<<<<<< HEAD");
+          // Even a failed resolver can have changed the index before it exits.
+          await mergeGit(s.cwd, ["add", file]);
+          return { status: fault === "resolver-error" ? "error" : "timeout", error: "resolver failed" };
+        }
         if (fault === "fixture") {
           expect(readFileSync(join(s.cwd, file), "utf8")).toBe(
             `${fixture}<<<<<<< HEAD\nfeature intent\n=======\nbase intent\n>>>>>>> ${base}\n`,
@@ -2462,7 +2470,10 @@ esac
           );
       } else {
         expect(result?.error).toContain(
-          fault === "markers" || fault === "partial"
+          fault === "markers" ||
+            fault === "partial" ||
+            fault === "resolver-error" ||
+            fault === "resolver-timeout"
             ? "Unresolved conflict markers: greeting.txt"
             : fault === "fixture"
               ? "Unresolved conflict markers: markers.fixture"
@@ -2470,6 +2481,20 @@ esac
                 ? "Unresolved conflict markers: new.txt, README.md"
                 : "MERGE_HEAD",
         );
+        if (fault === "resolver-error" || fault === "resolver-timeout") {
+          const cwd = f.store.getRunState<RunState>(run.id)?.worktreePath ?? "";
+          expect((await mergeGit(cwd, ["rev-parse", "HEAD"])).stdout.trim()).toBe(before);
+          expect((await mergeGit(cwd, ["rev-parse", "MERGE_HEAD"])).stdout.trim()).toBe(base);
+          expect(
+            (await mergeGit(cwd, ["rev-list", "--parents", "-n", "1", "HEAD"])).stdout
+              .trim()
+              .split(" ")
+              .slice(1),
+          ).toHaveLength(1);
+          expect(f.store.getRunState<RunState>(run.id)?.implementerIssue).toContain(
+            fault === "resolver-error" ? "error" : "timeout",
+          );
+        }
         const verified = f.store.getRunState<RunState>(run.id)?.lastVerifiedSha;
         expect(verified).toHaveLength(40);
         expect(
