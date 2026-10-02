@@ -231,7 +231,7 @@ const RostersSchema = z.strictObject({
  * uses no roster, so there a problem (e.g. a pinned model a later release dropped) only warns.
  */
 export function checkRosterTargets(
-  cfg: Pick<Config, "reviewMode" | "reviewRosters">,
+  cfg: Pick<Config, "reviewMode" | "reviewRosters" | "reviewShadow">,
   models: ModelDef[],
   providers: ProviderDef[],
   warn: (message: string) => void,
@@ -254,7 +254,7 @@ export function checkRosterTargets(
   );
   if (!problems.length) return;
   const message = `Invalid review rosters: ${problems.join("; ")}`;
-  if (cfg.reviewMode === "panel") throw new Error(message);
+  if (cfg.reviewMode === "panel" || cfg.reviewShadow === "panel") throw new Error(message);
   warn(`${message} (ignored: [review] mode is single)`);
 }
 

@@ -3,6 +3,8 @@ import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
 import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
+import { runGh } from "../integrations/github.ts";
+import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
 
 export interface HttpExtras {
@@ -206,6 +208,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         return json(await factory.gc(input.dryRun === true));
       }),
     },
+    "/api/review/shadow-report": handle(async () => json(await shadowReport(store, ghPrHistory(runGh)))),
     "/api/gates/clear-cache": {
       POST: handle(async (req) => {
         const input = await body<{ repo?: string }>(req);

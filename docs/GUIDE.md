@@ -165,6 +165,7 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
 | `[review] mode`, `[review.rosters]` | `"single"`, see below | `"panel"` reviews with a verified finder panel whose roster depends on the profile; see [Review configuration](#review-configuration-and-lenses). |
+| `[review] shadow` | `"off"` | `"panel"` also runs the profile's panel beside each single review, for comparison only; see [Shadow panel](#shadow-panel). Needs `mode = "single"`. |
 | `[routing] exclude_origins` | unset | For example `["CN"]`. Excludes models by checkpoint origin from eval policy generation and the Evals matrix. Runtime routing is not affected. |
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |
 | `[local] twilight_model_path`, `twilight_host`, `twilight_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
@@ -529,6 +530,29 @@ Each finder takes these keys:
 
 A roster needs at least one finder that is not local. The daemon checks pinned targets against the
 catalog at startup; a local finder's target must be a free model.
+
+### Shadow panel
+
+With `[review] shadow = "panel"`, single reviews still decide every round. After each single review,
+the profile's panel (roster plus the base commit's lenses) reviews the same revisions as a first
+review of the complete diff. It records its findings, verdict, blocking findings, panel record and
+spend in `review-N.shadow.json`. It never blocks, never reaches the implementer and never affects
+routing. It costs roughly $0.65 API-equivalent per round on subscription models. It is skipped, or
+stops before its next call, when any enabled subscription provider's quota headroom is 0.1 or less.
+It never falls back to metered models. A failed or skipped shadow records why, with its spend so far.
+
+`limitless review shadow-report [--since <ISO-8601>]` compares single and panel blocking findings per
+round, for runs created at or after `--since`. It marks each panel-only finding:
+
+- `fixed`: a later PR commit names its file and title.
+- `review-matched`: a later review names it. This can be a later round of the run, a run on the same
+  PR or one depending on it, or a PR review or comment. A review match is not a fix.
+- `converged-without-fix`: the run succeeded, and the observed history has no match. This is a
+  signal, not proof of a false positive.
+- `unknown`: the run is unfinished or its PR history is unavailable.
+
+Editing the same file is never evidence. Skipped, failed, missing and malformed comparisons are
+listed rather than dropped. The report makes no model calls and changes nothing.
 
 A repository adds its own lenses in `.limitless.toml`:
 

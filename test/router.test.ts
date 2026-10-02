@@ -1020,6 +1020,9 @@ test("preferVendor, preferNotVendor, free_only and independence-first order revi
     "local/q",
   );
   expect(ids({ billing: "free_first", independenceFirst: true })[0]).toBe("local/q");
+  // no_metered (shadow reviews) keeps policy order but never offers a metered model, even a pinned one.
+  expect(ids({ billing: "no_metered" })).toEqual(["codex/sol", "claude/sonnet"]);
+  expect(ids({ billing: "no_metered", prefer: "openrouter/ds" })).toEqual(["codex/sol", "claude/sonnet"]);
   tracker.setHealthy("local", false);
   expect(ids({ billing: "free_only" })).toEqual([]);
 });

@@ -21,6 +21,7 @@ Usage:
   limitless eval cancel <eval-id>         Stop scheduling an eval's trials; it ends interrupted
   limitless eval regrade <eval-id>        Recompute a review eval's grades from stored outputs (no model calls)
   limitless eval policy [--evals id,id] [--write]
+  limitless review shadow-report [--since <ISO-8601>]  Single vs shadow panel reviews, with later outcomes
   limitless ls [--status s1,s2] [-n 20]   List runs
   limitless show <run>                    Run details
   limitless logs <run> [-f]               Print (and follow) the run's event log
@@ -199,6 +200,7 @@ async function main(): Promise<void> {
       smoke: { type: "boolean" },
       "max-wait": { type: "string" },
       now: { type: "boolean" },
+      since: { type: "string" },
     },
   });
   const [cmd, ...rest] = positionals;
@@ -409,6 +411,18 @@ async function main(): Promise<void> {
       for (const entry of result.metadata) console.log(`  metadata ${entry}`);
       for (const error of result.errors) console.error(color.red(`  error ${error}`));
       if (result.errors.length) process.exitCode = 1;
+      return;
+    }
+    case "review": {
+      const since = values.since === undefined ? undefined : Date.parse(values.since);
+      if (
+        rest.join(" ") !== "shadow-report" ||
+        (since !== undefined && !/^\d{4}-\d\d-\d\d/.test(values.since ?? ""))
+      )
+        throw new Error("usage: limitless review shadow-report [--since <ISO-8601 timestamp>]");
+      if (Number.isNaN(since)) throw new Error(`--since: invalid timestamp ${values.since}`);
+      const { formatShadowReport } = await import("../pipeline/shadow-report.ts");
+      console.log(formatShadowReport(await api("/api/review/shadow-report"), since));
       return;
     }
     case "gates": {

@@ -6085,3 +6085,294 @@ test("panel review: batches from different vendors go to different listed verifi
     ),
   ).toEqual(["anthropic", "openai"]);
 });
+
+describe("review shadow panel: single reviews decide, the panel only records", () => {
+  type Calls = Record<"primary" | "shadow" | "verifier" | "implement", AgentSpec[]>;
+  const newCalls = (): Calls => ({ primary: [], shadow: [], verifier: [], implement: [] });
+  const finding = (title: string) => ({
+    severity: "major" as const,
+    security: false,
+    ...findingEvidence,
+    file: "farewell.txt",
+    line: 1,
+    title,
+    detail: title,
+    suggestion: "Fix",
+  });
+  const confirm = (s: AgentSpec): FakeReply => ({
+    structured: {
+      results: [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => ({
+        id: m[1],
+        verdict: "CONFIRMED",
+        severity: "high",
+        category: "correctness",
+        evidence: "farewell.txt:1",
+        trigger: "x",
+      })),
+    },
+    costEquivUsd: 0.1,
+  });
+  /**
+   * Round 0: the single review blocks on "Single only" while the panel approves. Round 1: the single
+   * review approves while the panel blocks on "Panel only". `onShadow` sees each shadow member call.
+   */
+  const scenario =
+    (calls: Calls, onShadow?: (s: AgentSpec) => FakeReply | undefined): Handler =>
+    (s) => {
+      const verifier = s.prompt.startsWith("You are a code-review verifier");
+      if (verifier || s.prompt.startsWith("You are a code reviewer")) {
+        (verifier ? calls.verifier : calls.shadow).push(s);
+        const override = onShadow?.(s);
+        if (override) return override;
+        if (verifier) return confirm(s);
+        const findings = calls.implement.length > 1 ? [finding("Panel only")] : [];
+        return { structured: { ...approve, findings }, costEquivUsd: 0.25 };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }), costEquivUsd: 0 };
+      if (role === "review") {
+        calls.primary.push(s);
+        const blocks = calls.implement.length === 1;
+        const structured = blocks
+          ? { verdict: "request_changes", summary: "Needs work", findings: [finding("Single only")] }
+          : approve;
+        return { structured, costEquivUsd: 1 };
+      }
+      calls.implement.push(s);
+      return { files: { "farewell.txt": `goodbye ${calls.implement.length}\n` }, costEquivUsd: 2 };
+    };
+  const shadowOf = (f: Factory, runId: string, round: number) =>
+    JSON.parse(f.store.getArtifact(runId, `review-${round}.shadow.json`) ?? "null");
+  // Runs differ only in commit SHAs and run ids.
+  const normalize = (specs: AgentSpec[], runId: string) =>
+    specs.map((s) => s.prompt.replaceAll(runId, "RUN").replace(/\b[0-9a-f]{40}\b/g, "SHA"));
+  const titles = (f: Factory, runId: string) =>
+    f.store.getRunState<RunState>(runId)?.reviewHistory?.map((e) => e.blocking.map((b) => b.title));
+
+  test("shadow off and on: the same primary reviews, targets, feedback and outcome; the panel disagrees both ways", async () => {
+    const outcomes = [];
+    for (const shadow of ["off", "panel"] as const) {
+      if (factory) {
+        await factory.stop();
+        factory.store.close();
+        factory = null;
+        rmSync(home, { recursive: true, force: true });
+        home = mkdtempSync(join(tmpdir(), "limitless-e2e-"));
+        repoDir = await makeRepo();
+      }
+      const calls = newCalls();
+      const f = start(scenario(calls));
+      if (shadow === "panel") f.deps.cfg.reviewShadow = "panel";
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const after = f.store.getRun(run.id);
+      outcomes.push({
+        calls,
+        primary: normalize(calls.primary, run.id),
+        implement: normalize(calls.implement, run.id),
+        targets: calls.primary.map((s) => s.target.modelId),
+        blocking: titles(f, run.id),
+        lastReview: f.store.getRunState<RunState>(run.id)?.lastReview?.verdict,
+        artifacts: f.store.listArtifacts(run.id).map((a) => a.name),
+        cost: after?.costEquivUsd ?? 0,
+        shadows: [0, 1].map((round) => shadowOf(f, run.id, round)),
+        sha: f.store.getRunState<RunState>(run.id)?.reviewHistory?.map((e) => e.sha),
+        baseSha: after?.baseSha,
+      });
+    }
+    const [off, on] = outcomes;
+    if (!off || !on) throw new Error("missing outcomes");
+    // Disabled: no shadow calls, artifacts or cost.
+    expect([off.calls.shadow.length, off.calls.verifier.length]).toEqual([0, 0]);
+    expect(off.shadows).toEqual([null, null]);
+    expect(off.artifacts.some((name) => name.includes("shadow"))).toBe(false);
+    // Enabled: the primary review sees and decides exactly what it did without the shadow.
+    expect(on.primary).toEqual(off.primary);
+    expect(on.implement).toEqual(off.implement);
+    expect(on.implement[1]).toContain("Single only");
+    expect(on.implement[1]).not.toContain("Panel only");
+    expect(on.targets).toEqual(off.targets);
+    expect(on.blocking).toEqual([["Single only"], []]);
+    expect(on.blocking).toEqual(off.blocking);
+    expect(on.lastReview).toBe("approve");
+    expect(on.artifacts.filter((name) => !name.includes("shadow")).sort()).toEqual([...off.artifacts].sort());
+    // Each shadow saw its single review's revisions: the panel approved where the single review blocked...
+    const [r0, r1] = on.shadows;
+    expect(r0).toMatchObject({
+      round: 0,
+      status: "completed",
+      system: "panel-quick",
+      baseSha: on.baseSha,
+      reviewedSha: on.sha?.[0],
+      range: `${on.baseSha}..${on.sha?.[0]}`,
+      review: { mode: "panel", verdict: "approve" },
+      blocking: [],
+      panel: { finders: [{ prompt: "standard", vendor: "openai" }] },
+      usage: { invocations: 1, costEquivUsd: 0.25 },
+    });
+    // ...and blocked where it approved, as a first review of the complete diff.
+    expect(r1).toMatchObject({
+      round: 1,
+      status: "completed",
+      reviewedSha: on.sha?.[1],
+      review: { verdict: "request_changes" },
+      blocking: [{ title: "Panel only" }],
+      usage: { invocations: 2, costEquivUsd: 0.35 },
+    });
+    expect(on.calls.shadow.map((s) => s.prompt.includes("Previous review"))).toEqual([false, false]);
+    expect(on.calls.shadow[1]?.prompt).toContain(on.baseSha ?? "missing");
+    expect(on.cost).toBeCloseTo(off.cost + 0.6, 6);
+  });
+
+  test.each([
+    [0.05, "skipped"],
+    [0.1, "skipped"],
+    [0.11, "completed"],
+  ] as const)("headroom %d: shadow work is %s at the 0.1 floor", async (headroom, status) => {
+    const calls = newCalls();
+    const f = start(scenario(calls));
+    f.deps.cfg.reviewShadow = "panel";
+    spyOn(f.tracker, "headroom").mockImplementation(() => headroom);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(titles(f, run.id)).toEqual([["Single only"], []]);
+    const shadows = [0, 1].map((round) => shadowOf(f, run.id, round));
+    expect(shadows.map((s) => s.status)).toEqual([status, status]);
+    if (status === "skipped") {
+      expect(calls.shadow.length + calls.verifier.length).toBe(0);
+      expect(shadows[0]).toMatchObject({
+        reason: "alpha quota headroom is at or below 0.1",
+        usage: { invocations: 0, costUsd: 0, costEquivUsd: 0 },
+      });
+    } else expect([calls.shadow.length, calls.verifier.length]).toEqual([2, 1]);
+  });
+
+  test("quota lost after a finder stops the verifier call; partial spend is recorded", async () => {
+    const calls = newCalls();
+    let headroom = 1;
+    const f = start(
+      scenario(calls, (s) => {
+        if (s.prompt.startsWith("You are a code reviewer") && calls.implement.length > 1) headroom = 0.05;
+        return undefined;
+      }),
+    );
+    f.deps.cfg.reviewShadow = "panel";
+    spyOn(f.tracker, "headroom").mockImplementation(() => headroom);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect([calls.shadow.length, calls.verifier.length]).toEqual([2, 0]);
+    expect(shadowOf(f, run.id, 0)).toMatchObject({ status: "completed" });
+    expect(shadowOf(f, run.id, 1)).toMatchObject({
+      status: "skipped",
+      reason: "alpha quota headroom is at or below 0.1",
+      usage: { invocations: 1, costEquivUsd: 0.25 },
+    });
+    expect(shadowOf(f, run.id, 1)).not.toHaveProperty("blocking");
+  });
+
+  test("a throwing shadow member leaves the single decision intact and records the error", async () => {
+    const calls = newCalls();
+    const f = start(scenario(calls));
+    f.deps.cfg.reviewShadow = "panel";
+    const acquire = f.tracker.acquire.bind(f.tracker);
+    // The verifier is the only call made after a panel finder reported something.
+    spyOn(f.tracker, "acquire").mockImplementation((provider, signal) => {
+      if (calls.shadow.length === 2 && calls.verifier.length === 0) throw new Error("member exploded");
+      return acquire(provider, signal);
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(titles(f, run.id)).toEqual([["Single only"], []]);
+    expect(f.store.getRunState<RunState>(run.id)?.lastReview?.verdict).toBe("approve");
+    expect(shadowOf(f, run.id, 1)).toMatchObject({
+      status: "error",
+      reason: "member exploded",
+      usage: { invocations: 1, costEquivUsd: 0.25 },
+    });
+    expect(f.store.listEvents(run.id).some((e) => e.message === "Shadow panel error: member exploded")).toBe(
+      true,
+    );
+  });
+
+  test("the shadow panel takes the profile's roster plus lenses from the base commit", async () => {
+    const lens = (focus: string) =>
+      `[review]\nlenses = [{ name = "ops", focus = "${focus}", profiles = ["quick"] }]\n`;
+    const toml = readFileSync(join(repoDir, ".limitless.toml"), "utf8");
+    writeFileSync(join(repoDir, ".limitless.toml"), `${toml}${lens("BASE_FOCUS")}`);
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "lens"], {
+      cwd: repoDir,
+    });
+    const calls = newCalls();
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        (s.prompt.startsWith("You are a code reviewer") ? calls.shadow : calls.primary).push(s);
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n", ".limitless.toml": `${toml}${lens("HEAD_FOCUS")}` } };
+    });
+    f.deps.cfg.reviewShadow = "panel";
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(calls.primary).toHaveLength(1);
+    expect(calls.shadow.filter((s) => s.prompt.includes("BASE_FOCUS"))).toHaveLength(1);
+    expect(calls.shadow.some((s) => s.prompt.includes("HEAD_FOCUS"))).toBe(false);
+    expect(shadowOf(f, run.id, 0).panel.finders).toEqual([
+      { prompt: "standard", vendor: "openai" },
+      { prompt: "standard", lens: "ops", vendor: "openai" },
+    ]);
+  });
+
+  test.each(["same", "different"] as const)(
+    "a restart reuses a completed shadow only for the %s reviewed revision",
+    async (revision) => {
+      const calls = newCalls();
+      const handler = scenario(calls);
+      const f = start(handler);
+      f.deps.cfg.reviewShadow = "panel";
+      const before: { range: string }[] = [];
+      f.deps.faults = {
+        "stage:review:after": {
+          action: "kill",
+          occurrence: 1,
+          onHit: ({ runId }) => {
+            const stored = shadowOf(f, runId, 0);
+            if (revision === "different")
+              f.store.putArtifact(
+                runId,
+                "review-0.shadow.json",
+                "review-shadow",
+                JSON.stringify({ ...stored, range: "elsewhere..head" }),
+              );
+            before.push(stored);
+          },
+        },
+      };
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      const deadline = Date.now() + 10_000;
+      while (f.store.listStages(run.id).at(-1)?.status !== "cancelled") {
+        if (Date.now() > deadline) throw new Error("review interruption timed out");
+        await Bun.sleep(10);
+      }
+      await f.stop();
+      f.store.close();
+      expect([calls.primary.length, calls.shadow.length]).toEqual([1, 1]);
+      const resumed = start(handler);
+      resumed.deps.cfg.reviewShadow = "panel";
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      // The single review replays; the shadow of the same revision does not, so neither does its spend.
+      const replays = revision === "same" ? 0 : 1;
+      expect([calls.primary.length, calls.shadow.length]).toEqual([3, 2 + replays]);
+      const r0 = shadowOf(resumed, run.id, 0);
+      if (revision === "same") expect(r0).toEqual(before[0]);
+      else expect(r0).toMatchObject({ status: "completed", range: before[0]?.range });
+      const shadowSpend = [0, 1].reduce(
+        (t, round) => t + shadowOf(resumed, run.id, round).usage.costEquivUsd,
+        0,
+      );
+      expect(shadowSpend).toBeCloseTo(0.25 + 0.35, 6);
+      expect(resumed.store.getRun(run.id)?.costEquivUsd).toBeCloseTo(2 * 2 + 3 * 1 + 0.6 + replays * 0.25, 6);
+    },
+  );
+});

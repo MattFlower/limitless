@@ -69,7 +69,7 @@ test("review implementer report defaults to include and accepts only include or 
     // A misspelt key would otherwise silently keep the default.
     writeFileSync(join(configDir, "config.toml"), '[review]\nimplementer-report = "omit"\n');
     expect(config).toThrow(
-      "review.implementer-report: unknown key (allowed: implementer_report, mode, rosters)",
+      "review.implementer-report: unknown key (allowed: implementer_report, mode, rosters, shadow)",
     );
     writeFileSync(join(configDir, "config.toml"), 'review = "omit"\n');
     expect(config).toThrow("review must be a table");
@@ -150,6 +150,36 @@ test("review mode defaults to single; rosters default per profile and are valida
         'rosters = { deep = [{ prompt = "adversarial", lens = { name = "a", focus = "b" } }] }',
         "lens finder",
       ],
+    ]) {
+      writeFileSync(join(configDir, "config.toml"), `[review]\n${toml}\n`);
+      expect(config).toThrow(message);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("review shadow is opt-in, takes an explicit off switch, and cannot shadow a blocking panel", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-review-shadow-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  try {
+    expect(config().reviewShadow).toBe("off");
+    for (const [toml, shadow] of [
+      ['shadow = "off"', "off"],
+      ['shadow = "panel"', "panel"],
+      ['mode = "single"\nshadow = "panel"', "panel"],
+      ['mode = "panel"\nshadow = "off"', "off"],
+    ] as const) {
+      writeFileSync(join(configDir, "config.toml"), `[review]\n${toml}\n`);
+      expect(config().reviewShadow).toBe(shadow);
+    }
+    for (const [toml, message] of [
+      ['shadow = "on"', 'review.shadow must be "off" or "panel"'],
+      ["shadow = true", 'review.shadow must be "off" or "panel"'],
+      ['shadow = "single"', 'review.shadow must be "off" or "panel"'],
+      ['mode = "panel"\nshadow = "panel"', 'review.shadow = "panel" needs review.mode = "single"'],
     ]) {
       writeFileSync(join(configDir, "config.toml"), `[review]\n${toml}\n`);
       expect(config).toThrow(message);

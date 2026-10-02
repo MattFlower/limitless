@@ -25,8 +25,8 @@ export interface RouteConstraints {
   preferNotVendor?: string[];
   /** Model identities tried last of all (a verifier: the implementer's model). */
   preferNotModels?: string[];
-  /** "free_first" tries free models first; "free_only" considers nothing else. */
-  billing?: "free_first" | "free_only";
+  /** "free_first" tries free models first; "free_only" considers nothing else; "no_metered" skips metered ones. */
+  billing?: "free_first" | "free_only" | "no_metered";
   /** Vendor independence outranks free-first billing (a verifier stays independent of free finders). */
   independenceFirst?: boolean;
 }
@@ -250,7 +250,8 @@ export class Router {
         (a, b) => pref(a) - pref(b) || this.tracker.headroom(b.provider) - this.tracker.headroom(a.provider),
       );
       for (const m of group) {
-        const paid = c.billing !== undefined && m.billing !== "free" ? 1 : 0;
+        if (c.billing === "no_metered" && m.billing === "metered") continue;
+        const paid = c.billing !== undefined && c.billing !== "no_metered" && m.billing !== "free" ? 1 : 0;
         if (paid && c.billing === "free_only") continue;
         const rank = independence(m);
         ranked.push({ target: m, rank: c.independenceFirst ? rank * 2 + paid : paid * 8 + rank });
@@ -264,7 +265,7 @@ export class Router {
     for (const g of groups) consider(g.split("|"), true);
     // A persisted implementer can retain an explicit effort after the catalog default changes.
     if (c.prefer) consider([c.prefer]);
-    if (c.billing !== undefined) {
+    if (c.billing === "free_first" || c.billing === "free_only") {
       for (const m of this.models.values())
         if (this.tracker.def(m.provider)?.billing === "free" && !policyFreeModels.has(m.id)) consider([m.id]);
     }

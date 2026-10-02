@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import { reviewSystemHash } from "../src/evals/cache.ts";
 import { validateRequest } from "../src/evals/cases.ts";
 import { pickVerifier } from "../src/pipeline/review.ts";
 import {
+  checkRosterTargets,
   configuredReviewSystem,
   DEFAULT_ROSTERS,
   type EvalReviewSystem,
@@ -16,7 +17,7 @@ import {
   productionReviewSystem,
   readReviewLenses,
 } from "../src/pipeline/review-system.ts";
-import { MODELS, type ModelDef } from "../src/router/catalog.ts";
+import { MODELS, type ModelDef, PROVIDERS } from "../src/router/catalog.ts";
 import { enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
 
 const system = (over: Record<string, unknown> = {}) => ({
@@ -445,6 +446,20 @@ test("single mode keeps the production review; a panel takes the profile's roste
     verifier: {},
     implementerReport: "omit",
   });
+});
+
+test("a shadow panel's roster pins are checked as strictly as a blocking panel's", () => {
+  const reviewRosters = {
+    ...DEFAULT_ROSTERS,
+    standard: [{ prompt: "adversarial" as const, target: "claude/opsu" }],
+  };
+  const warn = mock((_message: string) => {});
+  const check = (reviewShadow: "off" | "panel") =>
+    checkRosterTargets({ reviewMode: "single", reviewShadow, reviewRosters }, MODELS, PROVIDERS, warn);
+  expect(() => check("panel")).toThrow("review.rosters.standard[0].target claude/opsu: unknown model ID");
+  expect(warn).not.toHaveBeenCalled();
+  check("off");
+  expect(warn).toHaveBeenCalledWith(expect.stringContaining("(ignored: [review] mode is single)"));
 });
 
 test("repo lenses: none when absent; unknown keys ignored with a warning; known keys strict", () => {

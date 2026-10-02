@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
-import type { ResolvedProfile, RunStatus } from "../core/types.ts";
+import type { ResolvedProfile, ReviewSystem, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import {
   BASELINE_CACHE_TTL_MS,
@@ -54,6 +54,7 @@ import { formatTarget } from "../router/targets.ts";
 import {
   CancelledError,
   type EngineDeps,
+  type InvokeOutcome,
   NeedsHumanError,
   NoCapacityError,
   ParkedError,
@@ -81,6 +82,7 @@ import {
   PANEL_REVIEWS,
   type PanelReview,
   pickVerifier,
+  type ReviewDeps,
   type ReviewInput,
   type ReviewRequest,
   resolvedPriorFindings,
@@ -88,6 +90,7 @@ import {
   runReview,
   type VerifierRequest,
 } from "./review.ts";
+import { type ShadowGuard, shadowReview } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import {
   type Holdout,
@@ -355,7 +358,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       const repoConfig = await readFileAt(wt.path, verification?.baseSha ?? baseSha, ".limitless.toml");
       ctx.state.previewConfig = readPreviewConfig(repoConfig);
       // Review lenses come from the base commit, never from the change under review.
-      if (ctx.deps.cfg.reviewMode === "panel")
+      if (ctx.deps.cfg.reviewMode === "panel" || ctx.deps.cfg.reviewShadow === "panel")
         ctx.state.reviewLenses = readReviewLenses(repoConfig, (message) => ctx.log(message, "warn"));
       gates = detectGates(wt.path);
       ctx.state.gatesConfig = gates;
@@ -1135,22 +1138,30 @@ async function oneRound(
         constraints: RouteConstraints,
         prefer: string | undefined,
         deadline?: number,
+        shadow?: ShadowGuard,
       ) => {
+        shadow?.check();
         const invoked = await ctx.invoke({
           role: "review",
           stage,
           mode: "readonly",
           complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
-          constraints: { ...constraints, ...(prefer ? { prefer } : {}) },
+          // A shadow never falls back to metered models to get around its quota floor.
+          constraints: {
+            ...(shadow ? { billing: "no_metered" as const } : {}),
+            ...constraints,
+            ...(prefer ? { prefer } : {}),
+          },
           ...request,
           ...(deadline ? { deadline } : {}),
           requireStructured: true,
         });
+        shadow?.spent.push(invoked.result);
         await discardChanges(cwd);
         return invoked;
       };
-      const { target, output, decision, panel } = await runReview(
-        {
+      const reviewDeps = (system: ReviewSystem, shadow?: ShadowGuard) => {
+        const deps: ReviewDeps<InvokeOutcome> = {
           invoke: async (request, index) => {
             const finder = system.finders[index];
             const vendor = ctx.state.implementer?.vendor;
@@ -1161,7 +1172,7 @@ async function oneRound(
             // One deadline covers a local finder's slot waits and fallbacks; past it, the panel skips it.
             const deadline = finder?.local ? Date.now() + request.timeoutMs : undefined;
             try {
-              return await call(request, constraints, finder?.target, deadline);
+              return await call(request, constraints, finder?.target, deadline, shadow);
             } catch (error) {
               if (finder?.local && error instanceof NoCapacityError) throw new FinderSkipped(error.message);
               throw error;
@@ -1169,7 +1180,8 @@ async function oneRound(
           },
           verify: (request, avoidVendors, avoidModels) => {
             const constraints = verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer);
-            if (!system.verifier?.targets) return call(request, constraints, system.verifier?.target);
+            if (!system.verifier?.targets)
+              return call(request, constraints, system.verifier?.target, undefined, shadow);
             // Picked per batch, as evals do, and offered alone: a routed fallback could share its vendor.
             const listed = system.verifier.targets.map((target) => {
               const { model, targetId } = ctx.deps.router.resolve(target);
@@ -1177,12 +1189,13 @@ async function oneRound(
             });
             const identity = ctx.deps.router.checkpointIdentity;
             const only = pickVerifier(listed, avoidVendors, avoidModels, identity).targetId;
-            return call(request, { ...constraints, only }, undefined);
+            return call(request, { ...constraints, only }, undefined, undefined, shadow);
           },
-          warn: (message) => ctx.log(message, "warn"),
-        },
-        input,
-      );
+          warn: (message) => ctx.log(`${shadow ? "Shadow panel: " : ""}${message}`, "warn"),
+        };
+        return deps;
+      };
+      const { target, output, decision, panel } = await runReview(reviewDeps(system), input);
       if (!decision) throw output.error;
       // The model's verdict is kept for inspection only; control flow uses the derived one.
       const { review: r, modelVerdict, blocking, followUps } = decision;
@@ -1230,6 +1243,8 @@ async function oneRound(
           2,
         ),
       );
+      if (ctx.deps.cfg.reviewShadow === "panel" && system.mode === "single")
+        await shadowReview(ctx, { round, baseSha, reviewedSha, profile: profile(ctx), input }, reviewDeps);
       const serious = blocking.length;
       return {
         summary: `${r.verdict} by ${target.modelId}: ${serious} blocking, ${r.findings.length - serious} nonblocking`,
