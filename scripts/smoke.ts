@@ -529,13 +529,19 @@ export async function liveCheck(
   }
 }
 
-/** The exact probe command, bare or wrapped by sh/bash/zsh at any path (Codex reports its resolved shell). */
+/**
+ * The exact probe command, bare or wrapped by sh/bash/zsh from a system or Homebrew directory (Codex
+ * reports its resolved shell). Only fixed paths count: any other prefix could run shell code that
+ * prints the evidence without running the probe, or point at a fake shell planted in TMPDIR.
+ */
 export function isProbeCommand(candidate: string, command: string): boolean {
   const trimmed = candidate.trim();
   if (trimmed === command) return true;
-  const wrapped = trimmed.match(/^((?:\S*\/)?(?:sh|bash|zsh)) (-lc|-c) (.+)$/s);
+  const wrapped = trimmed.match(
+    /^(?:\/bin|\/usr\/bin|\/usr\/local\/bin|\/opt\/homebrew\/bin)\/(?:sh|bash|zsh) -l?c (.+)$/s,
+  );
   if (!wrapped) return false;
-  const quoted = wrapped[3];
+  const quoted = wrapped[1];
   return quoted === `'${command.replaceAll("'", "'\\''")}'` || quoted === JSON.stringify(command);
 }
 

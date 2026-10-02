@@ -1161,16 +1161,16 @@ test("fast smoke sends the option, validates Codex output, and reports Claude of
   ).toMatchObject({ status: "fail", reason: "CLI rejected option" });
 });
 
-test("verify probe evidence accepts the exact command under any sh/bash/zsh wrapper path", async () => {
+test("verify probe evidence accepts the exact command under a system or Homebrew sh/bash/zsh wrapper", async () => {
   const { isProbeCommand } = await import("../scripts/smoke.ts");
   const command = "python3 '/tmp/x/worktree/verify-probe.py'";
   for (const shell of [
     "/bin/zsh",
     "/bin/bash",
     "/bin/sh",
+    "/usr/bin/bash",
     "/opt/homebrew/bin/bash",
     "/usr/local/bin/zsh",
-    "bash",
   ])
     for (const flag of ["-lc", "-c"]) {
       expect(isProbeCommand(`${shell} ${flag} ${JSON.stringify(command)}`, command)).toBe(true);
@@ -1185,6 +1185,14 @@ test("verify probe evidence accepts the exact command under any sh/bash/zsh wrap
     `/opt/homebrew/bin/bash -x ${JSON.stringify(command)}`,
     `/opt/homebrew/bin/bash -lc ${JSON.stringify(command)} extra`,
     `/opt/homebrew/bin/fish -c ${JSON.stringify(command)}`,
+    // Shell code or an unfixed path before the wrapper could print the evidence without the probe.
+    `cat<<<T:temp-created-read-deleted;cat<<<T:worktree-write-denied;exit;/bin/bash -c '${command.replaceAll("'", "'\\''")}'`,
+    `$(echo)/bin/bash -c ${JSON.stringify(command)}`,
+    `$TMPDIR/bash -c ${JSON.stringify(command)}`,
+    `/tmp/x/bash -c ${JSON.stringify(command)}`,
+    `./bash -c ${JSON.stringify(command)}`,
+    `bash -c ${JSON.stringify(command)}`,
+    `/opt/homebrew/bin/../../tmp/bash -c ${JSON.stringify(command)}`,
   ])
     expect(isProbeCommand(other, command)).toBe(false);
 });
