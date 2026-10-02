@@ -15,11 +15,15 @@ import { githubWebhook } from "../src/integrations/github.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
+import { specPrompt } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
-import { LaterReviewSchema, ReviewSchema, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import { LaterReviewSchema, ReviewSchema, renderSpec, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import { outOfRunCriteria } from "../src/pipeline/spec-criteria.ts";
+import { specScopeViolation } from "../src/pipeline/spec-scope.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
+import { reviewOutput } from "./evals-reading-support.ts";
 import { findingEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -218,6 +222,304 @@ afterEach(async () => {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each([
+    ["trivial", "1–2"],
+    ["small", "1–3"],
+    ["medium", "3–5"],
+    ["large", "5–8"],
+    [undefined, "2–8"],
+  ] as const)("spec prompt sizes criteria for %s complexity", (complexity, range) => {
+    const prompt = specPrompt({ prompt: "Add farewell", answers: [], complexity });
+    expect(prompt).toContain(`acceptance_criteria: ${range} observable`);
+    expect(prompt).toContain(
+      "Require a specific new test only where behavior is new or at risk of regression, not for every criterion",
+    );
+    expect(prompt).toContain("Each needs a concrete how_to_verify");
+  });
+
+  test.each([
+    ["small", 7, 3],
+    ["small", 7, 7],
+    ["trivial", 2, 2],
+    ["small", 3, 3],
+    ["medium", 5, 5],
+    ["large", 8, 8],
+  ] as const)("spec size retry: %s %i → %i", async (complexity, initialCount, finalCount) => {
+    const oversized = initialCount === 7;
+    const prompts: string[] = [];
+    const expected = {
+      ...spec,
+      summary: oversized ? "Retried farewell specification" : spec.summary,
+      acceptance_criteria: Array.from({ length: finalCount }, (_, i) => ({
+        id: `AC-${i + 1}`,
+        criterion: `Farewell behavior ${i + 1}`,
+        how_to_verify: "cat farewell.txt",
+      })),
+    };
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ complexity }) };
+      if (role === "spec") {
+        prompts.push(s.prompt);
+        return {
+          structured:
+            prompts.length === 1 && oversized
+              ? {
+                  ...expected,
+                  summary: "Initial farewell specification",
+                  acceptance_criteria: Array.from({ length: initialCount }, (_, i) => ({
+                    ...expected.acceptance_criteria[0],
+                    id: `AC-${i + 1}`,
+                  })),
+                }
+              : expected,
+        };
+      }
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify")
+        return {
+          structured: {
+            ...pass,
+            criteria: [
+              ...expected.acceptance_criteria.map((a) => ({
+                id: a.id,
+                status: "met",
+                evidence: "observed",
+                publicSummary: "",
+              })),
+              ...pass.criteria.filter((c) => !c.id.startsWith("AC-")),
+            ],
+          },
+        };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(prompts).toHaveLength(oversized ? 2 : 1);
+    if (oversized) expect(prompts[1]).toContain("For small complexity, use at most 3 criteria");
+    expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual(expected);
+    expect(f.store.getArtifact(run.id, "spec.md")).toContain(renderSpec(expected));
+    const warnings = f.store.listEvents(run.id).filter((e) => e.message?.startsWith("Kept oversized spec"));
+    expect(warnings).toHaveLength(oversized && finalCount === 7 ? 1 : 0);
+    if (warnings.length) expect(warnings[0]).toMatchObject({ level: "warn" });
+  });
+
+  test("spec prompt confines the read-only rule to investigation", () => {
+    const prompt = specPrompt({ prompt: "Add farewell", answers: [] });
+    expect(prompt).toContain("task below.\n\nYou are only writing the specification");
+    expect(prompt).toContain("while investigating the repository, read and search but do not edit files");
+    expect(prompt).toContain("change itself will be implemented later");
+    expect(prompt).not.toContain("DO NOT modify anything");
+    expect(prompt).toContain("verifiable inside the run's own checkout");
+    expect(prompt).toContain("using the repository's commands and tests");
+    expect(prompt).toContain(
+      "a person, the orchestrator, a browser, live external services, a deploy, or a later event",
+    );
+    expect(prompt).toContain("Put such concerns under assumptions or out_of_scope");
+  });
+
+  test.each(
+    "manual,manually,human,humans,owner,owners,orchestrator,reviewer approves,in a browser,visually,screenshot,screenshots,deploy,deploys,deployed,deploying,deployment,deployments,production,live API,after merge,wait for".split(
+      ",",
+    ),
+  )("out-of-run criteria match bounded phrases in how_to_verify only: %s", (phrase) => {
+    expect(
+      outOfRunCriteria({
+        ...spec,
+        acceptance_criteria: [
+          { id: "AC-1", criterion: `(${phrase})`, how_to_verify: "bun test test/page.test.ts" },
+        ],
+      }),
+    ).toEqual([]);
+    for (const text of [phrase, phrase.toUpperCase(), phrase.replaceAll(" ", "\n ")]) {
+      const criterion = { id: "AC-1", criterion: "Works", how_to_verify: `(${text})` };
+      expect(outOfRunCriteria({ ...spec, acceptance_criteria: [criterion] })).toEqual([criterion]);
+      expect(
+        outOfRunCriteria({
+          ...spec,
+          acceptance_criteria: [{ ...criterion, how_to_verify: `pre${text}post` }],
+        }),
+      ).toEqual([]);
+    }
+    expect(outOfRunCriteria(spec)).toEqual([]);
+    expect(
+      outOfRunCriteria({
+        ...spec,
+        acceptance_criteria: [
+          { id: "AC-1", criterion: "Test passes", how_to_verify: "bun test test/page.test.ts" },
+        ],
+      }),
+    ).toEqual([]);
+  });
+
+  test.each(["clean", "persistent", "empty", "invalid scope", "scope retry", "new dependency"])(
+    "out-of-run criteria retry: %s",
+    async (scenario) => {
+      const external = {
+        id: "AC-2",
+        criterion: "the page shows the farewell",
+        how_to_verify: "The owner opens the page in a browser",
+      };
+      const other = { id: "AC-3", criterion: "Page works", how_to_verify: "manual check" };
+      const initial = { ...spec, acceptance_criteria: [...spec.acceptance_criteria, external, other] };
+      if (scenario === "scope retry" || scenario === "new dependency") initial.summary = "No code changes.";
+      if (scenario === "new dependency") initial.acceptance_criteria = spec.acceptance_criteria;
+      const retry =
+        scenario === "clean"
+          ? { ...spec, summary: "Locally verifiable farewell" }
+          : scenario === "empty"
+            ? { ...spec, acceptance_criteria: [external, { ...other, id: "AC-4" }] }
+            : scenario === "invalid scope"
+              ? { ...spec, summary: "No code changes." }
+              : {
+                  ...spec,
+                  acceptance_criteria: [...spec.acceptance_criteria, external, { ...other, id: "AC-4" }],
+                };
+      // Flagged criteria that survive the retry are kept and logged, never dropped.
+      const expected = retry;
+      const prompts: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") {
+          prompts.push(s.prompt);
+          return { structured: prompts.length === 1 ? initial : retry };
+        }
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") {
+          // Every criterion in the stored spec, kept out-of-run ones included, is met.
+          const ids = (f.store.getRunState<RunState>(run.id)?.spec?.acceptance_criteria ?? []).map(
+            (a) => a.id,
+          );
+          const met = ids.map((id) => ({ id, status: "met", evidence: "observed", publicSummary: "" }));
+          return {
+            structured: {
+              ...pass,
+              criteria: [...met, ...pass.criteria.filter((c) => !c.id.startsWith("AC-"))],
+            },
+          };
+        }
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        scenario === "invalid scope" ? "failed" : "succeeded",
+      );
+      expect(prompts).toHaveLength(scenario === "invalid scope" || scenario === "new dependency" ? 3 : 2);
+      expect(prompts[scenario === "new dependency" ? 2 : 1]).toContain(
+        scenario === "new dependency" ? "AC-2, AC-4" : "AC-2, AC-3",
+      );
+      if (scenario === "scope retry") expect(prompts[1]).toContain("Invalid specification:");
+      if (scenario === "invalid scope") {
+        expect(f.store.getArtifact(run.id, "spec.md")).toBeNull();
+        expect(f.store.getRun(run.id)?.error).toContain("invalid spec scope");
+        return;
+      }
+      expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual(expected);
+      const artifact = f.store.getArtifact(run.id, "spec.md");
+      expect(artifact).toContain(expected.summary);
+      if (scenario !== "clean") expect(artifact).toContain(other.how_to_verify);
+      if (scenario !== "empty") expect(artifact).toContain("farewell.txt says goodbye");
+      const kept = f.store
+        .listEvents(run.id)
+        .filter((e) => e.message?.startsWith("Kept acceptance criteria that may depend"));
+      expect(kept.map((e) => e.message)).toEqual(
+        scenario === "clean"
+          ? []
+          : ["Kept acceptance criteria that may depend on something outside the run: AC-2, AC-4"],
+      );
+    },
+  );
+
+  test("spec scope phrases normalize punctuation and leave ordinary documentation work alone", () => {
+    for (const summary of [
+      "SPECIFICATION—ONLY task",
+      "Documentation  \nonly.",
+      "Do NOT modify source code.",
+      "No code changes.",
+      "Do not modify code in this task.",
+    ]) {
+      expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBe(summary);
+      expect(specScopeViolation({ ...spec, summary }, `${summary} Explain the behavior.`)).toBeNull();
+    }
+    for (const summary of [
+      "Add code and documentation.",
+      "Verify behavior without modifying fixtures.",
+      "Document the read-only API.",
+      "Do not change the code path for legacy users.",
+      "Do not modify code outside src/pipeline.",
+      "Must not edit the code generator output.",
+      "Do not change code in existing callers.",
+      "Existing plugins keep working without code changes.",
+      "Existing plugins require no code changes.",
+    ]) {
+      expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBeNull();
+      expect(specScopeViolation({ ...spec, summary: "No code changes." }, summary)).toBe("No code changes.");
+    }
+    // "X only" in ordinary prose is not a task restriction (a request that says it is still exempt).
+    for (const summary of [
+      "The README docs only list supported commands.",
+      "The spec only covers the CLI path; the UI is out of scope.",
+    ])
+      expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBeNull();
+    expect(
+      specScopeViolation(
+        {
+          ...spec,
+          acceptance_criteria: [{ id: "AC-1", criterion: "Works", how_to_verify: "Do not modify code" }],
+        },
+        "Add farewell",
+      ),
+    ).toBeNull();
+  });
+
+  test.each(["summary", "requirement", "criterion", "exhausted", "documentation"])(
+    "spec scope validation: %s",
+    async (scenario) => {
+      const sentence = "This is a specification-only task; do not modify code";
+      const invalid = { ...spec };
+      if (scenario === "requirement") invalid.requirements = [sentence];
+      else if (scenario === "criterion")
+        invalid.acceptance_criteria = [{ id: "AC-1", criterion: sentence, how_to_verify: "Inspect" }];
+      else invalid.summary = scenario === "documentation" ? "Documentation-only task" : sentence;
+      const prompts: string[] = [];
+      let implementCalls = 0;
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") {
+          prompts.push(s.prompt);
+          return { structured: prompts.length === 1 || scenario === "exhausted" ? invalid : spec };
+        }
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") return { structured: pass };
+        implementCalls++;
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const run = await f.createRun({
+        repo: repoDir,
+        prompt: scenario === "documentation" ? "Documentation only: add farewell" : "Add farewell",
+      });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        scenario === "exhausted" ? "failed" : "succeeded",
+      );
+      expect(prompts).toHaveLength(scenario === "documentation" ? 1 : 2);
+      if (scenario !== "documentation") expect(prompts[1]).toContain(JSON.stringify(sentence));
+      expect(implementCalls).toBe(scenario === "exhausted" ? 0 : 1);
+      if (scenario === "exhausted") {
+        expect(f.store.getArtifact(run.id, "spec.md")).toBeNull();
+        expect(f.store.getRunState<RunState>(run.id)?.spec).toBeUndefined();
+        expect(f.store.getRun(run.id)?.error).toContain("structured output failed validation");
+      } else
+        expect(f.store.getArtifact(run.id, "spec.md")).toContain(
+          scenario === "documentation" ? invalid.summary : spec.summary,
+        );
+    },
+  );
+
   test("prepare restart retains the reused worktree base after upstream advances", async () => {
     writeFileSync(
       join(repoDir, ".limitless.toml"),
@@ -4644,6 +4946,77 @@ env = { LIMITLESS_HOME = "{scratch}/home", LIMITLESS_CONFIG_DIR = "{scratch}/con
   });
 });
 
+for (const phase of ["clarify", "spec"] as const) {
+  test.each(["parked", "transition", "entering", "cancelled"] as const)(
+    `drain parks ${phase} answer waits (%s)`,
+    async (when) => {
+      const question = "Formal or casual farewell?";
+      const specPrompts: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage")
+          return {
+            structured: triage(
+              phase === "clarify" ? { ambiguity: "high", blocking_questions: [question] } : {},
+            ),
+          };
+        if (role === "spec") {
+          specPrompts.push(s.prompt);
+          return { structured: { ...spec, blocking_questions: phase === "spec" ? [question] : [] } };
+        }
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") return { structured: pass };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const unsubscribe = f.store.subscribe((msg) => {
+        if (when === "entering" && msg.kind === "run" && msg.run.status === "waiting_input")
+          f.scheduler.drain();
+      });
+      try {
+        const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+        if (when !== "entering") {
+          await waitFor(f, run.id, ["waiting_input"]);
+          f.scheduler.drain();
+        }
+        if (when === "transition") f.answer(run.id, "Casual", "tester");
+        if (when === "cancelled") f.cancelRun(run.id, "tester");
+        expect(await waitFor(f, run.id, ["queued", "cancelled"], 500)).toBe(
+          when === "cancelled" ? "cancelled" : "queued",
+        );
+        expect(f.scheduler.activeRunIds).toEqual([]);
+        if (when === "cancelled") {
+          expect(f.scheduler.parkedRunIds).toEqual([]);
+          expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+          expect(f.store.getRun(run.id)?.error).toBe("cancelled by tester");
+          return;
+        }
+        expect(f.store.getRun(run.id)?.stage).toBeNull();
+        expect(f.store.getRunState<RunState>(run.id)).toMatchObject({ phase, parked: true });
+        expect(f.scheduler.parkedRunIds).toEqual([run.id]);
+        if (when === "parked") {
+          f.scheduler.resume();
+          await waitFor(f, run.id, ["waiting_input"]);
+          expect(f.store.listQuestions(run.id)).toHaveLength(1);
+          f.scheduler.drain();
+          await waitFor(f, run.id, ["queued"], 500);
+        }
+        if (when !== "transition") f.answer(run.id, "Casual", "tester");
+        expect(f.store.listQuestions(run.id)[0]?.answer).toBe("Casual");
+        f.scheduler.tick();
+        expect(f.scheduler.activeRunIds).toEqual([]);
+        f.scheduler.resume();
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        expect(specPrompts.at(-1)).toContain("A: Casual");
+        expect(f.store.listQuestions(run.id)).toHaveLength(1);
+        expect(f.store.getRunState<RunState>(run.id)?.phase).toBe("done");
+      } finally {
+        unsubscribe();
+      }
+    },
+  );
+}
+
 test("drain blocks queued starts and parks the active run at its next boundary", async () => {
   let release = () => {};
   const held = new Promise<void>((resolve) => {
@@ -5530,4 +5903,69 @@ test("panel review: a verifier left on the finder's vendor is another model, wit
   expect(await waitFor(f, alone.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
   expect(verifiers).toEqual(["gamma/m"]);
   expect(f.store.getRun(alone.id)?.error).toContain("alpha/m (raised a candidate it would verify)");
+  // A listed verifier is picked per batch, past the finder's own model, to one routing would not offer.
+  Object.assign(f.deps.reviewSystem ?? {}, { verifier: { targets: ["alpha/m", "delta/m"] } });
+  const listed = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, listed.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(verifiers).toEqual(["gamma/m", "delta/m"]);
+  // The picked target alone is offered: with it down, routing never falls back to an unlisted model.
+  f.tracker.setEnabled("gamma", true);
+  f.tracker.setEnabled("delta", false);
+  const down = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, down.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  expect(verifiers).toEqual(["gamma/m", "delta/m"]);
+  expect(f.store.getRun(down.id)?.error).toContain("delta/m (disabled)");
+  Object.assign(f.deps.reviewSystem ?? {}, { verifier: { targets: ["alpha/m"] } });
+  const noVerifier = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, noVerifier.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  expect(verifiers).toEqual(["gamma/m", "delta/m"]);
+  expect(f.store.getRun(noVerifier.id)?.error).toContain("raised a candidate it would check");
+});
+
+test("panel review: batches from different vendors go to different listed verifiers", async () => {
+  const verifiers: [string, string[]][] = [];
+  const f = start(
+    (s) => {
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        const ids = [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => m[1] ?? "");
+        verifiers.push([s.target.modelId, ids]);
+        return {
+          structured: {
+            results: ids.map((id) => ({
+              id,
+              verdict: "REFUTED",
+              severity: "low",
+              category: "correctness",
+              evidence: "Checked the farewell text",
+              trigger: "none",
+            })),
+          },
+        };
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: reviewOutput(1, "minor", `${s.target.vendor}.txt`) };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    },
+    false,
+    true,
+  );
+  f.deps.reviewSystem = {
+    name: "panel",
+    mode: "panel",
+    implementerReport: "include",
+    finders: ["alpha/m", "beta/m"].map((target) => ({ target, prompt: "standard" })),
+    verifier: { targets: ["gamma/m", "delta/m"] },
+  };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(verifiers).toEqual([
+    ["delta/m", ["C1"]],
+    ["gamma/m", ["C2"]],
+  ]);
+  expect(
+    JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}").panel.candidates.map(
+      (c: { vendor: string }) => c.vendor,
+    ),
+  ).toEqual(["anthropic", "openai"]);
 });

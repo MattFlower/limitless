@@ -239,6 +239,12 @@ describe("review prompt", () => {
     implementerReport: "IMPLEMENTER_CLAIMS_ALL_GOOD",
   };
 
+  test("spec-mandated extras may be flagged as unnecessary scope", () => {
+    expect(reviewPrompt(input)).toContain(
+      "Code mandated by the specification but unnecessary to the request may be flagged as unnecessary scope (minor or nit); specification text alone is not a reason to keep it.",
+    );
+  });
+
   test("factory checks are authoritative and failing targeted checks are findings", () => {
     const prompt = reviewPrompt(input);
     expect(prompt).toContain("already run by the factory on this HEAD");

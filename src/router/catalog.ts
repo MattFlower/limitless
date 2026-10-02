@@ -24,6 +24,8 @@ export interface ProviderDef {
 
 export interface ModelDef {
   id: string; // "<provider>/<short>"
+  /** Shared checkpoint identity across backends; defaults to the catalog id. */
+  checkpoint?: string;
   provider: string;
   model: string; // name the backend understands
   vendor: Vendor;
@@ -230,7 +232,7 @@ export const MODELS: ModelDef[] = [
     tier: 4,
     effort: "medium",
     price: { input: 2, output: 10, cacheRead: 0.1 },
-    notes: "Needs Codex CLI >= 0.159 on ChatGPT sign-in; under evaluation (#133), not in the routing policy",
+    notes: "Needs Codex CLI >= 0.159 on ChatGPT sign-in; routes review (#189) and the implement trial (#216)",
   },
   // Metered open models via OpenRouter (tiers are provisional until the M4 eval suite calibrates them).
   {
@@ -442,6 +444,7 @@ export const MODELS: ModelDef[] = [
   },
   {
     id: "omlx/qwen-27b",
+    checkpoint: "qwen3.8-27b",
     provider: "omlx",
     model: "Swift-1.5-Qwen3.8-27b-oQ8e-mtp",
     vendor: "qwen",
@@ -455,6 +458,7 @@ export const MODELS: ModelDef[] = [
   },
   {
     id: "mtplx/qwen-27b",
+    checkpoint: "qwen3.8-27b",
     provider: "mtplx",
     model: "mtplx-qwen38-27b-optimized-quality",
     vendor: "qwen",

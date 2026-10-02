@@ -1,4 +1,4 @@
-import type { FinderPrompt, ReviewLens } from "../core/types.ts";
+import type { Complexity, FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
@@ -13,6 +13,7 @@ import {
   type Spec,
   type Verify,
 } from "./schemas.ts";
+import { specCriteriaRange } from "./spec-criteria.ts";
 
 /** Appended to every factory agent's system prompt. */
 export const FACTORY_PREAMBLE = `You are a worker inside Limitless, an autonomous software factory.
@@ -58,11 +59,14 @@ Guidance:
 Return the JSON object.`;
 }
 
-export function specPrompt(input: { prompt: string; answers: string[] }): string {
+export function specPrompt(input: { prompt: string; answers: string[]; complexity?: Complexity }): string {
+  const [min, max] = specCriteriaRange(input.complexity);
   const answers = input.answers.length
     ? `\nThe requester answered earlier clarifying questions:\n${input.answers.map((a) => `- ${a}`).join("\n")}\n`
     : "";
-  return `Write the specification for the task below. Investigate the repository as needed to ground it in the actual code (read files, search) but DO NOT modify anything.
+  return `Write the specification for the task below.
+
+You are only writing the specification; while investigating the repository, read and search but do not edit files. The requested change itself will be implemented later.
 
 Request:
 ${quoteRequest(input.prompt)}
@@ -70,7 +74,8 @@ ${answers}
 Produce:
 - summary: what will be built and why, in 2–4 sentences.
 - requirements: precise, implementation-relevant requirements.
-- acceptance_criteria: 2–8 observable, independently testable criteria (ids AC-1, AC-2, ...). Each needs a concrete how_to_verify (a command to run, a test to add, a behavior to observe). Cover edge cases the requester would expect, not just the happy path. Do not write criteria that only restate the repository's automated checks (lint, typecheck, the whole test suite): the factory runs those on every round. A criterion may require a specific new test to exist and pass.
+- acceptance_criteria: ${min}–${max} observable, independently testable criteria (ids AC-1, AC-2, ...). Each needs a concrete how_to_verify (a command to run, a test to add, a behavior to observe). Cover edge cases the requester would expect, not just the happy path. Do not write criteria that only restate the repository's automated checks (lint, typecheck, the whole test suite): the factory runs those on every round. Require a specific new test only where behavior is new or at risk of regression, not for every criterion.
+  Every acceptance criterion must be verifiable inside the run's own checkout using the repository's commands and tests. Criteria requiring a person, the orchestrator, a browser, live external services, a deploy, or a later event are not allowed. Put such concerns under assumptions or out_of_scope.
 - assumptions: decisions you made where the request was silent.
 - out_of_scope: tempting things that should NOT be done.
 - blocking_questions: only if the task truly cannot proceed sensibly without an answer; otherwise empty.
@@ -132,7 +137,7 @@ export function implementPrompt(input: {
       : "";
   const privateNotice =
     input.round === 0 && input.hasHoldout
-      ? "\nA separate verifier will check private scenarios derived from the request, including edge and failure cases. Implement the request's intent robustly, beyond only the listed criteria.\n"
+      ? "\nA separate verifier will check private scenarios derived from the request, including edge and failure cases: handle the edge and failure cases the request implies, within its scope.\n"
       : "";
   return `# Task
 ${quoteRequest(input.prompt)}
@@ -152,6 +157,7 @@ ${checksSection(input.gates, input.baseline)}
 5. Stay in scope: no unrelated refactors or reformatting.
 6. Follow repository conventions (CLAUDE.md, AGENTS.md, CONTRIBUTING, existing code style).
 7. ${input.resolution ? "Do not run Git. Edit files only; the factory stages and commits the merge." : "Committing is optional (the factory commits for you). Never push."}
+8. Stay within the request and specification: add nothing that neither asks for. If part of the specification looks unnecessary for the request, still meet its acceptance criteria and name that part in your final report.
 
 # Final message
 Reply with a concise report: files changed, how you verified (commands and results), assumptions, and anything left undone.`;
@@ -461,7 +467,7 @@ ${input.dependencyUpdate ? "Dependency update: check breaking changes between ve
 - Completeness: every requirement and acceptance criterion is actually implemented.
 - Tests: new behavior is genuinely exercised; nothing was weakened, skipped, or special-cased to pass.
 - Security: injection, secrets, unsafe handling of external input.
-- Scope: unrelated changes or needless churn.
+- Scope: unrelated changes or needless churn. Code mandated by the specification but unnecessary to the request may be flagged as unnecessary scope (minor or nit); specification text alone is not a reason to keep it.
 - Maintainability: clarity and consistency with the codebase.
 
 Severity: blocker = must fix (bug, unmet requirement, security issue, test gaming); major = should fix before merge; minor/nit = optional polish.

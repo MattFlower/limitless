@@ -79,6 +79,7 @@ import {
   FinderSkipped,
   PANEL_REVIEWS,
   type PanelReview,
+  pickVerifier,
   type ReviewInput,
   type ReviewRequest,
   resolvedPriorFindings,
@@ -101,6 +102,8 @@ import {
   VerifySchema,
 } from "./schemas.ts";
 import { createSnapshotParent } from "./snapshots.ts";
+import { outOfRunCriteria, specCriteriaRange } from "./spec-criteria.ts";
+import { specScopeViolation } from "./spec-scope.ts";
 import { triageDecisions } from "./triage-decisions.ts";
 import {
   blockedOnly,
@@ -117,6 +120,7 @@ export async function executeRun(
   runId: string,
   signal: AbortSignal,
   isDraining: () => boolean = () => false,
+  drainEvents?: EventTarget,
 ): Promise<RunStatus> {
   const run = deps.store.getRun(runId);
   if (!run) return "failed";
@@ -125,7 +129,7 @@ export async function executeRun(
     deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  const ctx = new RunContext(deps, run, repo, signal, isDraining);
+  const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
   ctx.state.parked = false;
   ctx.run = deps.store.updateRun(
     runId,
@@ -514,6 +518,9 @@ async function waitForAnswers(ctx: RunContext): Promise<void> {
       if (ctx.signal.aborted) {
         cleanup();
         reject(new CancelledError());
+      } else if (ctx.isDraining()) {
+        cleanup();
+        reject(new ParkedError());
       } else if (!pending().length) {
         cleanup();
         resolve();
@@ -524,9 +531,11 @@ async function waitForAnswers(ctx: RunContext): Promise<void> {
     });
     const onAbort = () => check();
     ctx.signal.addEventListener("abort", onAbort);
+    ctx.drainEvents?.addEventListener("drain", onAbort);
     const cleanup = () => {
       unsubscribe();
       ctx.signal.removeEventListener("abort", onAbort);
+      ctx.drainEvents?.removeEventListener("drain", onAbort);
     };
     check();
   });
@@ -548,19 +557,73 @@ async function clarify(ctx: RunContext): Promise<void> {
 
 async function spec(ctx: RunContext): Promise<void> {
   await ctx.stage("spec", async (stage) => {
-    const { result, target } = await ctx.invoke({
-      role: "spec",
+    // A resumed spec may already have asked questions before it parked.
+    if (ctx.store.listQuestions(ctx.run.id).length) {
+      await waitForAnswers(ctx);
+      ctx.state.answers = ctx.store
+        .listQuestions(ctx.run.id)
+        .map((q) => `Q: ${q.question}\n  A: ${q.answer}`);
+    }
+    const complexity = ctx.state.triage?.complexity ?? ctx.run.complexity ?? undefined;
+    const [, maxCriteria] = specCriteriaRange(complexity);
+    const invocation = {
+      role: "spec" as const,
       stage,
-      mode: "readonly",
+      mode: "readonly" as const,
       complexity: ctx.complexity,
-      prompt: specPrompt({ prompt: ctx.run.prompt, answers: ctx.state.answers }),
+      prompt: specPrompt({ prompt: ctx.run.prompt, answers: ctx.state.answers, complexity }),
       jsonSchema: toStrictJsonSchema(SpecSchema),
       schema: SpecSchema,
       requireStructured: true,
       maxToolCalls: 60,
-    });
+    };
+    let { result, target } = await ctx.invoke(invocation);
     await discardChanges(ctx.state.worktreePath as string);
-    const s = SpecSchema.parse(result.structured);
+    let s = SpecSchema.parse(result.structured);
+    let scopeRetried = false;
+    let criteriaRetried = false;
+    let sizeRetried = false;
+    for (;;) {
+      const offending = specScopeViolation(s, ctx.run.prompt);
+      const flagged = outOfRunCriteria(s);
+      if (offending && scopeRetried)
+        throw new Error(`structured output failed validation: invalid spec scope: ${offending}`);
+      const retryCriteria: boolean = flagged.length > 0 && !criteriaRetried;
+      const oversized = s.acceptance_criteria.length > maxCriteria;
+      const retrySize: boolean = oversized && !sizeRetried;
+      if (!offending && !retryCriteria && !retrySize) {
+        // Kept, not dropped: the match is a word list, and a wrongly dropped criterion weakens verify.
+        if (flagged.length)
+          ctx.log(
+            `Kept acceptance criteria that may depend on something outside the run: ${flagged.map((a) => a.id).join(", ")}`,
+            "warn",
+          );
+        if (oversized)
+          ctx.log(
+            `Kept oversized spec: ${s.acceptance_criteria.length} acceptance criteria exceed the ${complexity ?? "unknown"} limit of ${maxCriteria} after size retry`,
+            "warn",
+          );
+        break;
+      }
+      const feedback = [
+        offending
+          ? `\n\nInvalid specification: this sentence restricts the task beyond the request: ${JSON.stringify(offending)}\nThe read-only rule applies to your investigation only. Rewrite the spec to describe the requested change without this restriction.`
+          : "",
+        retryCriteria
+          ? `\n\nInvalid acceptance criteria: ${flagged.map((a) => a.id).join(", ")} depend on something outside the run. Replace them with criteria verifiable in the run's checkout using repository commands and tests; move external concerns to assumptions or out_of_scope.`
+          : "",
+        retrySize
+          ? `\n\nToo many acceptance criteria: ${s.acceptance_criteria.length}. For ${complexity ?? "unknown"} complexity, use at most ${maxCriteria} criteria. Consolidate the spec while preserving the requested behavior and concrete how_to_verify for every criterion.`
+          : "",
+      ].join("");
+      ctx.log(feedback.trim(), "warn");
+      scopeRetried ||= Boolean(offending);
+      criteriaRetried ||= retryCriteria;
+      sizeRetried ||= retrySize;
+      ({ result, target } = await ctx.invoke({ ...invocation, prompt: invocation.prompt + feedback }));
+      await discardChanges(ctx.state.worktreePath as string);
+      s = SpecSchema.parse(result.structured);
+    }
     ctx.store.putArtifact(ctx.run.id, "spec.md", "spec", `# ${ctx.run.title}\n\n${renderSpec(s)}\n`);
     const unanswered = s.blocking_questions.filter(Boolean);
     if (unanswered.length && ctx.state.answers.length === 0) {
@@ -1087,12 +1150,18 @@ async function oneRound(
               throw error;
             }
           },
-          verify: (request, avoidVendors, avoidModels) =>
-            call(
-              request,
-              verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer),
-              system.verifier?.target,
-            ),
+          verify: (request, avoidVendors, avoidModels) => {
+            const constraints = verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer);
+            if (!system.verifier?.targets) return call(request, constraints, system.verifier?.target);
+            // Picked per batch, as evals do, and offered alone: a routed fallback could share its vendor.
+            const listed = system.verifier.targets.map((target) => {
+              const { model, targetId } = ctx.deps.router.resolve(target);
+              return { vendor: model.vendor, modelId: model.id, targetId };
+            });
+            const identity = ctx.deps.router.checkpointIdentity;
+            const only = pickVerifier(listed, avoidVendors, avoidModels, identity).targetId;
+            return call(request, { ...constraints, only }, undefined);
+          },
           warn: (message) => ctx.log(message, "warn"),
         },
         input,
