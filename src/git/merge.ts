@@ -93,9 +93,16 @@ function markerCounts(text: string): Map<string, number> {
 /**
  * Conflict markers git generated and the resolver left behind, found by content rather than diff
  * output (binary attributes and modify/delete conflicts have no usable diff). Allow each marker
- * only up to its count in either parent, so fixtures and docs that show markers don't block.
+ * up to the combined parent counts minus the common ancestor count, so independent additions
+ * of fixtures and docs that show markers don't block.
  */
-async function leftoverMarkers(cwd: string, head: string, base: string, path: string): Promise<boolean> {
+async function leftoverMarkers(
+  cwd: string,
+  head: string,
+  base: string,
+  mergeBase: string,
+  path: string,
+): Promise<boolean> {
   const file = join(cwd, path);
   if (!existsSync(file) || !lstatSync(file).isFile()) return false;
   const markers = markerCounts(readFileSync(file, "utf8"));
@@ -104,12 +111,16 @@ async function leftoverMarkers(cwd: string, head: string, base: string, path: st
     markerCounts((await mergeGit(cwd, ["cat-file", "blob", `${rev}:${path}`], true)).stdout);
   const ours = await inParent(head);
   const theirs = await inParent(base);
-  return [...markers].some(([marker, n]) => n > Math.max(ours.get(marker) ?? 0, theirs.get(marker) ?? 0));
+  const ancestor = await inParent(mergeBase);
+  return [...markers].some(
+    ([marker, n]) => n > (ours.get(marker) ?? 0) + (theirs.get(marker) ?? 0) - (ancestor.get(marker) ?? 0),
+  );
 }
 
 /** Never use commitAll: even a resolution identical to the first parent needs a merge commit. */
 export async function completeMerge(cwd: string, head: string, base: string): Promise<string> {
   await requireMerge(cwd, head, base);
+  const mergeBase = (await mergeGit(cwd, ["merge-base", "HEAD", "MERGE_HEAD"])).stdout.trim();
   const list = async (args: string[]) => (await mergeGit(cwd, args)).stdout.split("\0").filter(Boolean);
   const unmerged = await mergePaths(
     cwd,
@@ -125,7 +136,7 @@ export async function completeMerge(cwd: string, head: string, base: string): Pr
   const staged = await list(["diff", "--cached", "--name-only", "--no-renames", "-z"]);
   const markers: string[] = [];
   for (const path of new Set([...untracked, ...unmerged, ...edited, ...touched, ...staged]))
-    if (await leftoverMarkers(cwd, head, base, path)) markers.push(path);
+    if (await leftoverMarkers(cwd, head, base, mergeBase, path)) markers.push(path);
   if (markers.length) throw new Error(`Unresolved conflict markers: ${markers.join(", ")}`);
   await mergeGit(cwd, ["add", "-A"]);
   if ((await mergeGit(cwd, ["ls-files", "-u"])).stdout)

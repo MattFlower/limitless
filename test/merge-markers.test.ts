@@ -4,12 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
 
-async function conflict(setup: (dir: string, side: "ours" | "theirs") => Promise<void>) {
+async function conflict(
+  setup: (dir: string, side: "ours" | "theirs") => Promise<void>,
+  initialFiles: Record<string, string> = {},
+) {
   const dir = mkdtempSync(join(tmpdir(), "limitless-merge-"));
   await mergeGit(dir, ["init", "-q", "-b", "main"]);
   writeFileSync(join(dir, ".gitattributes"), "*.bin -diff\n");
   writeFileSync(join(dir, "f.bin"), "shared\n");
   writeFileSync(join(dir, "gone.txt"), "shared\n");
+  for (const [path, text] of Object.entries(initialFiles)) writeFileSync(join(dir, path), text);
   await mergeGit(dir, ["add", "-A"]);
   await mergeGit(dir, ["commit", "-qm", "init"]);
   await mergeGit(dir, ["checkout", "-qb", "feature"]);
@@ -39,6 +43,68 @@ async function assertCompleted(dir: string, head: string, base: string) {
   );
   expect((await mergeGit(dir, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], true)).exitCode).not.toBe(0);
 }
+
+const exampleBlock = "```text\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> example\n```\n";
+
+for (const [name, block] of [
+  ["separator", ">>>>>>>>>>>>>>>>>>>>>>>>\n"],
+  ["example-conflict block", exampleBlock],
+] as const) {
+  test(`both sides adding the same ${name} in different sections merge cleanly`, async () => {
+    const guide = "# Guide\n\n## First\nalpha\nbeta\ngamma\n\n## Second\ndelta\nepsilon\nzeta\n";
+    const add = (text: string, section: string) => text.replace(`## ${section}\n`, `## ${section}\n${block}`);
+    const { dir, head, base, paths } = await conflict(
+      async (dir, side) => {
+        writeFileSync(join(dir, "guide.md"), add(guide, side === "ours" ? "First" : "Second"));
+      },
+      { "guide.md": guide },
+    );
+    try {
+      expect(paths).toEqual([]);
+      expect((await mergeGit(dir, ["ls-files", "-u"])).stdout).toBe("");
+      const merged = add(add(guide, "First"), "Second");
+      expect(readFileSync(join(dir, "guide.md"), "utf8")).toBe(merged);
+      await assertCompleted(dir, head, base);
+      expect((await mergeGit(dir, ["show", "HEAD:guide.md"])).stdout).toBe(merged);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("an add/add conflict resolved by keeping both identical example blocks completes", async () => {
+  const { dir, head, base, paths } = await conflict(async (dir, side) => {
+    writeFileSync(join(dir, "guide.md"), `${side}\n${exampleBlock}`);
+  });
+  try {
+    expect(paths).toEqual(["guide.md"]);
+    await expect(completeMerge(dir, head, base)).rejects.toThrow("Unresolved conflict markers: guide.md");
+    const resolved = `ours\n${exampleBlock}theirs\n${exampleBlock}`;
+    writeFileSync(join(dir, "guide.md"), resolved);
+    await assertCompleted(dir, head, base);
+    expect((await mergeGit(dir, ["show", "HEAD:guide.md"])).stdout).toBe(resolved);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("common ancestor example blocks are counted only once in the allowed total", async () => {
+  const { dir, head, base } = await conflict(
+    async (dir, side) => {
+      writeFileSync(join(dir, "guide.md"), `${exampleBlock}${side}\n${exampleBlock}`);
+    },
+    { "guide.md": `${exampleBlock}shared\n` },
+  );
+  try {
+    writeFileSync(join(dir, "guide.md"), exampleBlock.repeat(4));
+    await expect(completeMerge(dir, head, base)).rejects.toThrow("Unresolved conflict markers: guide.md");
+    await assertPending(dir, head, base);
+    writeFileSync(join(dir, "guide.md"), exampleBlock.repeat(3));
+    await assertCompleted(dir, head, base);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("markers left in a file with -diff attributes block the merge", async () => {
   const { dir, head, base, paths } = await conflict(async (dir, side) => {
