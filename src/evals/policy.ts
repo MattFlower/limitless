@@ -20,20 +20,9 @@ export interface PolicyInput {
   evalIds?: string[];
   /** Production's `[review] implementer_report` (default "include"); see `selectEvidence`. */
   implementerReport?: ReviewSystem["implementerReport"];
-  /** B1 paired recovery comparison, when available from the escalation eval. */
-  escalation?: {
-    complexity: ImplementComplexity;
-    low: string;
-    high: string;
-    switch: string;
-    pairedCases: number;
-    lowerBound: number;
-    effortCost: number;
-    switchCost: number;
-  }[];
 }
 const compareId = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
-/** Newest completed evidence independently for each role/model; explicit IDs are fail-closed. */
+/** Newest completed single-shot evidence per role/complexity/target; explicit IDs are fail-closed. */
 export function selectEvidence(
   evidence: Evidence[],
   ids?: string[],
@@ -50,7 +39,12 @@ export function selectEvidence(
   }
   const selected = new Map<string, Evidence & { modelId: string; complexity?: ImplementComplexity }>();
   const ordered = evidence
-    .filter((e) => e.run.status === "completed" && (!ids || ids.includes(e.run.id)))
+    .filter(
+      (e) =>
+        e.run.status === "completed" &&
+        (!ids || ids.includes(e.run.id)) &&
+        (e.run.role !== "implement" || (e.run.rounds ?? 1) === 1),
+    )
     .sort(
       (a, b) =>
         (b.run.finishedAt ?? -Infinity) - (a.run.finishedAt ?? -Infinity) ||
@@ -330,53 +324,6 @@ export function generatePolicy(input: PolicyInput) {
           compareId(a.modelId, b.modelId),
       )
       .map((c) => c.modelId);
-    const escalation: string[] = [];
-    const escalationRejections: string[] = [];
-    if (role === "implement")
-      for (const result of input.escalation ?? []) {
-        if (
-          result.complexity !== cell ||
-          result.pairedCases < 1 ||
-          !Number.isFinite(result.lowerBound) ||
-          result.lowerBound <= 0 ||
-          !Number.isFinite(result.effortCost) ||
-          !Number.isFinite(result.switchCost)
-        )
-          continue;
-        const low = order.indexOf(result.low);
-        const high = order.indexOf(result.high);
-        const next = order.indexOf(result.switch);
-        const efforts = ["none", "low", "medium", "high", "xhigh", "max"];
-        const lowEffort = efforts.indexOf(parseTarget(result.low).effort ?? "");
-        const highEffort = efforts.indexOf(parseTarget(result.high).effort ?? "");
-        if (
-          low < 0 ||
-          high < 0 ||
-          next < 0 ||
-          low === high ||
-          result.switch === result.low ||
-          result.switch === result.high ||
-          lowEffort < 0 ||
-          highEffort <= lowEffort ||
-          result.low.split("@")[0] !== result.high.split("@")[0]
-        )
-          continue;
-        if (result.effortCost > result.switchCost) {
-          escalationRejections.push(
-            `${result.low} → ${result.high} before ${result.switch} withheld: effort cost=${result.effortCost.toFixed(4)} exceeds switch cost=${result.switchCost.toFixed(4)} despite significant B1 recovery (lower=${result.lowerBound.toFixed(4)}, paired=${result.pairedCases}).`,
-          );
-          continue;
-        }
-        if (low > next) {
-          order.splice(low, 1);
-          order.splice(order.indexOf(result.switch), 0, result.low);
-        }
-        order.splice(order.indexOf(result.high), 1);
-        order.splice(order.indexOf(result.low) + 1, 0, result.high);
-        escalation.push(
-          `${result.low} → ${result.high} before ${result.switch}: B1 recovery lower=${result.lowerBound.toFixed(4)}, paired=${result.pairedCases}, effort cost=${result.effortCost.toFixed(4)} ≤ switch cost=${result.switchCost.toFixed(4)}`,
-        );
-      }
     // Availability: eligible candidates often share a provider, so one outage takes the whole cell
     // down. For each provider the chain doesn't use yet, append its cheapest candidate that clears
     // every floor and ceiling and fails only non-inferiority — worse beats no capacity.
@@ -409,10 +356,8 @@ export function generatePolicy(input: PolicyInput) {
       candidates,
       order,
       availabilityFallbacks: availability,
-      escalation,
-      escalationRejections,
       decision: order.length
-        ? `Update ${role}.${cell}: ${order.join(" → ")}${availability.length ? ` (availability fallbacks on other providers, clearing every floor but not non-inferior: ${availability.join(", ")})` : ""}${escalation.length ? ` (effort recovery: ${escalation.join("; ")})` : ""}`
+        ? `Update ${role}.${cell}: ${order.join(" → ")}${availability.length ? ` (availability fallbacks on other providers, clearing every floor but not non-inferior: ${availability.join(", ")})` : ""}`
         : candidates.length
           ? `${role}${cell === "default" ? "" : `.${cell}`} unchanged: no eligible models (${candidates.map((c) => `${c.modelId}: ${c.reasons.join("; ")}`).join(" | ")})`
           : `${role}${cell === "default" ? "" : `.${cell}`} unchanged: no completed evidence`,
@@ -420,7 +365,56 @@ export function generatePolicy(input: PolicyInput) {
   });
   const generated: PolicyOverlay = {};
   for (const r of roles) if (r.order.length) generated[r.role] = { ...generated[r.role], [r.cell]: r.order };
-  return { roles, generated, settings };
+  // Recovery is diagnostic only. Never reconstruct missing round fields from a trial aggregate.
+  const rounds = input.evidence
+    .filter(
+      (e) =>
+        e.run.role === "implement" &&
+        e.run.status === "completed" &&
+        (e.run.rounds ?? 1) > 1 &&
+        (!input.evalIds || input.evalIds.includes(e.run.id)),
+    )
+    .sort((a, b) => compareId(a.run.id, b.run.id))
+    .flatMap(({ run, trials }) =>
+      trials.flatMap((trial) =>
+        (trial.details.rounds ?? []).flatMap((round) => {
+          if (!round.modelId || !round.provider || !round.effort) return [];
+          const billing = providers.find((p) => p.id === round.provider)?.billing ?? null;
+          const validCost = (cost: number) => (Number.isFinite(cost) && cost >= 0 ? cost : null);
+          const costUsd = validCost(round.costUsd);
+          const costEquivUsd = validCost(round.costEquivUsd);
+          const cost =
+            billing === "metered"
+              ? costUsd
+              : billing === "subscription"
+                ? costEquivUsd === null
+                  ? null
+                  : costEquivUsd * settings.subscription_weight
+                : billing === "free" && costUsd !== null && costEquivUsd !== null
+                  ? 0
+                  : null;
+          return [
+            {
+              ...round,
+              runId: run.id,
+              rounds: run.rounds,
+              strategy: run.strategy ?? "retry",
+              complexity: trial.details.complexity,
+              caseId: trial.caseId,
+              trial: trial.trial,
+              modelId: recordedTarget(round),
+              provider: round.provider,
+              pass: typeof round.pass === "boolean" ? round.pass : null,
+              costUsd,
+              costEquivUsd,
+              billing,
+              cost,
+            },
+          ];
+        }),
+      ),
+    );
+  return { roles, generated, settings, rounds };
 }
 export type PolicyEvaluation = ReturnType<typeof generatePolicy>;
 export interface EvalPolicyResponse {

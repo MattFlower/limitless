@@ -23,9 +23,6 @@ export function renderEvidence(evaluation: PolicyEvaluation): string {
   ];
   for (const role of evaluation.roles) {
     lines.push(`## ${role.role}${role.cell === "default" ? "" : `.${role.cell}`}`, "", role.decision, "");
-    for (const reason of role.escalationRejections ?? []) lines.push(reason, "");
-    if (role.role === "implement" && !role.escalation.length && !role.escalationRejections?.length)
-      lines.push("Effort-before-switch preference unchanged: no qualifying B1 paired recovery evidence.", "");
     if (!role.candidates.length) continue;
     lines.push(
       "| Model / source | Metrics: rate (numerator/denominator), Wilson 95% CI | Comparison | Cost/case | p50 latency | Eligibility / reasons |",
@@ -63,6 +60,21 @@ export function renderEvidence(evaluation: PolicyEvaluation): string {
         `| ${escapeCell(c.modelId)}; run=${escapeCell(c.run.id)}; created=${date(c.run.createdAt)}; finished=${date(c.run.finishedAt)}; k=${c.run.k} | ${metrics}; prediction coverage=${m.predictionTrials}/${m.scheduledTrials} (${number(m.predictionCoverage)}); errors=${m.errors}; skips=${m.skipped}; cached=${m.cached}; pending=${m.pending}; unscored=${m.unscored} | vs ${escapeCell(cmp.bestModel ?? "n/a")}; nonInferior=${cmp.nonInferior ?? "n/a"}; difference=${number(cmp.meanDifference)}; lower=${number(cmp.lowerBound)}; paired=${cmp.pairedCases}; complete candidate/reference=${cmp.candidateCompleteCases}/${cmp.bestCompleteCases} | ${number(c.costPerCase)} (${c.billing ?? "n/a"}; attempts=${c.costDenominator}); recorded metered=$${number(m.costUsd)}; API-equivalent=$${number(m.costEquivUsd)} | ${number(m.p50LatencyMs)} ms (n=${m.latencyDenominator}) | ${c.state}${c.reasons.length ? `: ${escapeCell(c.reasons.join("; "))}` : ""} |`,
       );
     }
+    lines.push("");
+  }
+  if (evaluation.rounds?.length) {
+    lines.push(
+      "## Multi-round implement diagnostics",
+      "",
+      "Single-shot evidence alone determines routing. Paired B1 recovery does not change policy order.",
+      "",
+      "| Run / complexity / rounds / strategy | Case / trial / round | Target / provider | Pass | Incremental metered / API-equivalent / weighted cost |",
+      "|---|---|---|---|---|",
+    );
+    for (const r of evaluation.rounds)
+      lines.push(
+        `| ${escapeCell(r.runId)} / ${r.complexity ?? "n/a"} / ${r.rounds} / ${r.strategy} | ${escapeCell(r.caseId)} / ${r.trial} / ${r.round} | ${escapeCell(r.modelId)} / ${escapeCell(r.provider)} | ${r.pass ?? "n/a"} | ${number(r.costUsd)} / ${number(r.costEquivUsd)} / ${number(r.cost)} (${r.billing ?? "n/a"}) |`,
+      );
     lines.push("");
   }
   return `${lines.join("\n")}\n`;
