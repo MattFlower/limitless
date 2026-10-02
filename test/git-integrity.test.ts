@@ -3,17 +3,23 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { loadConfig } from "../src/config.ts";
 import type { Repo } from "../src/core/types.ts";
+import { Store } from "../src/db/store.ts";
 import { auditDiff } from "../src/gates/audit.ts";
+import { collectGarbage } from "../src/gc.ts";
 import { worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
 import {
   commitAll,
+  createWorktree,
   diffSince,
   discardChanges,
+  ensureCache,
   headSha,
   pushBranch,
   readFileAt,
+  removeWorktree,
   resetTo,
 } from "../src/git/repos.ts";
 import { sh } from "../src/util/proc.ts";
@@ -56,6 +62,142 @@ async function audited(files = ["sample.test.ts"]) {
     expect(await readFileAt(work, "HEAD", file)).toBe(edited);
   }
 }
+
+test("committed -diff attributes cannot hide skipped tests, while 500 KB binaries stay compact", async () => {
+  writeFileSync(join(work, ".gitattributes"), "*.ts -diff\n*.png diff\n");
+  await commitAll(work, "attributes");
+  const before = await headSha(work);
+  const binary = Buffer.alloc(500_000, 0x61);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0]).copy(binary);
+  writeFileSync(join(work, "a.png"), binary);
+  writeFileSync(join(work, "sample.test.ts"), edited);
+  await commitAll(work, "binary and test edit");
+  expect((await git(work, "diff", before, "HEAD", "--", "sample.test.ts")).stdout).not.toContain(
+    "test.skip(",
+  );
+  const diff = await diffSince(work, before);
+  const binaryPatch = diff.patch.split("diff --git a/sample.test.ts")[0] ?? "";
+  expect(binaryPatch.trim().split("\n").at(-1)).toBe("Binary files /dev/null and b/a.png differ");
+  expect(binaryPatch).not.toContain("@@");
+  expect(diff.patch.length).toBeLessThan(1_000);
+  expect((await factory("log", "-p", "-1")).stdout).toContain("Binary files /dev/null and b/a.png differ");
+  expect((await factory("log", "-p", "-1")).stdout.length).toBeLessThan(2_000);
+  await audited();
+});
+
+test("Git version is checked once and unsupported versions fail before repository commands", async () => {
+  const bin = join(dir, "bin");
+  const calls = join(dir, "git-calls");
+  mkdirSync(bin);
+  const script = `import { worktreeGit } from ${JSON.stringify(resolve("src/git/command.ts"))};
+    for (let i = 0; i < 2; i++) await worktreeGit(["git", "diff"], { cwd: ${JSON.stringify(work)} });`;
+  for (const version of ["2.39.9", "1.99.0", "unknown", "2.40.0", "2.54.0 (Apple Git-1)", "3.0.0"]) {
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\ncase "$*" in\n--version) printf 'git version ${version}\\n';;\n*--get-regexp*) exit 1;;\nesac\n`,
+      { mode: 0o755 },
+    );
+    const result = await sh([process.execPath, "-e", script], {
+      cwd: work,
+      env: { ...(process.env as Record<string, string>), PATH: bin },
+      allowFail: true,
+    });
+    const commands = readFileSync(calls, "utf8").trim().split("\n");
+    expect(commands.filter((cmd) => cmd === "--version")).toHaveLength(1);
+    if (["2.39.9", "1.99.0", "unknown"].includes(version)) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("requires Git >= 2.40 for --attr-source");
+      expect(commands).toEqual(["--version"]);
+    } else {
+      expect(result.exitCode).toBe(0);
+      expect(commands.filter((cmd) => cmd.includes("--attr-source="))).toHaveLength(2);
+    }
+    rmSync(calls);
+  }
+});
+
+test("shared cache hooks from an earlier run cannot execute during fetch, worktree lifecycle or GC", async () => {
+  const cfg = loadConfig({ home: join(dir, "data"), configDir: join(dir, "config") });
+  const store = new Store(cfg.paths.db);
+  try {
+    const repo = store.upsertRepo({
+      slug: "owner/repo",
+      kind: "github",
+      url: seed,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const cache = await ensureCache(cfg.paths, repo);
+    const first = await createWorktree(cfg.paths, repo, "first", "first", "main");
+    const marker = join(dir, "cache-hook-ran");
+    for (const event of ["reference-transaction", "post-checkout", "post-index-change"]) {
+      await git(first.path, "config", `hook.${event}.command`, `echo '${event}' >> '${marker}'`);
+      await git(first.path, "config", `hook.${event}.event`, event);
+      await git(first.path, "config", `hook.${event}.enabled`, "true");
+    }
+    const config = readFileSync(join(cache, "config"));
+    writeFileSync(join(seed, "next.txt"), "next\n");
+    await git(seed, "add", "-A");
+    await git(seed, "commit", "-qm", "advance origin");
+    const tip = (await git(seed, "rev-parse", "HEAD")).stdout.trim();
+    await ensureCache(cfg.paths, repo);
+    expect(existsSync(marker)).toBe(false);
+    const second = await createWorktree(cfg.paths, repo, "second", "second", "main");
+    expect(second.baseSha).toBe(tip);
+    expect(await headSha(second.path)).toBe(tip);
+    expect(await createWorktree(cfg.paths, repo, "second", "second", "main")).toEqual(second);
+    expect(existsSync(marker)).toBe(false);
+    await removeWorktree(cfg.paths, repo, second.path);
+    expect(existsSync(second.path)).toBe(false);
+    for (const missing of [false, true]) {
+      const run = store.createRun(repo, { repo: repo.slug, prompt: "gc" });
+      store.updateRun(run.id, { status: "succeeded", finishedAt: 0 });
+      const tree = await createWorktree(cfg.paths, repo, run.id, "gc", "main");
+      if (missing) rmSync(tree.path, { recursive: true, force: true });
+      const result = await collectGarbage(store, cfg);
+      expect(result.errors).toEqual([]);
+      expect(existsSync(tree.path)).toBe(false);
+      expect(missing ? result.metadata.length : result.worktrees.length).toBe(1);
+    }
+    expect(existsSync(marker)).toBe(false);
+    expect(readFileSync(join(cache, "config"))).toEqual(config);
+    // Prove the configured hook is executable on Git versions supporting config hooks.
+    const version = (await git(cache, "--version")).stdout.match(/(\d+)\.(\d+)/);
+    if (version && (Number(version[1]) > 2 || Number(version[2]) >= 54)) {
+      await git(cache, "hook", "run", "post-checkout");
+      expect(readFileSync(marker, "utf8")).toContain("post-checkout");
+    }
+  } finally {
+    store.close();
+  }
+});
+
+test("conflict-resolution commits rebuild the linked index and include skip-worktree edits", async () => {
+  writeFileSync(join(seed, "sample.test.ts"), "theirs\n");
+  writeFileSync(join(seed, "base-only.txt"), "from base\n");
+  await git(seed, "add", "-A");
+  await git(seed, "commit", "-qm", "base conflict");
+  const nextBase = (await git(seed, "rev-parse", "HEAD")).stdout.trim();
+  writeFileSync(join(work, "sample.test.ts"), "ours\n");
+  const head = await commitAll(work, "worker conflict");
+  if (!head) throw new Error("expected worker commit");
+  expect(await prepareMerge(work, head, nextBase)).toEqual(["sample.test.ts"]);
+  writeFileSync(join(work, "sample.test.ts"), "resolved\n");
+  await git(work, "update-index", "--skip-worktree", "flag.test.ts");
+  writeFileSync(join(work, "flag.test.ts"), edited);
+  await git(work, "add", "-A");
+  expect((await git(work, "show", ":flag.test.ts")).stdout).toBe(original);
+  const seedIndex = readFileSync(join(seed, ".git/index"));
+  const merged = await completeMerge(work, head, nextBase);
+  expect((await factory("rev-list", "--parents", "-n", "1", "HEAD")).stdout.trim()).toBe(
+    `${merged} ${head} ${nextBase}`,
+  );
+  expect(await readFileAt(work, "HEAD", "sample.test.ts")).toBe("resolved\n");
+  expect(await readFileAt(work, "HEAD", "flag.test.ts")).toBe(edited);
+  expect(await readFileAt(work, "HEAD", "base-only.txt")).toBe("from base\n");
+  expect(readFileSync(join(seed, ".git/index"))).toEqual(seedIndex);
+});
 
 test("diff, log, names and statistics ignore external diff, textconv and global attributes", async () => {
   const marker = join(dir, "diff-ran");

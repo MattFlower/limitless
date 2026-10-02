@@ -3,10 +3,18 @@ import { CommandError, sh } from "../util/proc.ts";
 
 /** Local pipeline runs retain their existing git behavior; each run has its own scope. */
 export const worktreeGitScope = new AsyncLocalStorage<boolean>();
+let gitVersion: Promise<void> | undefined;
 
 /** Factory commands in agent-controlled worktrees, without changing any config files. */
 export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1]) {
   if (worktreeGitScope.getStore() === false) return sh(cmd, opts);
+  opts.signal?.throwIfAborted();
+  gitVersion ??= sh(["git", "--version"], { ...opts, allowFail: false }).then(({ stdout }) => {
+    const version = stdout.match(/^git version (\d+)\.(\d+)/);
+    if (!version || Number(version[1]) < 2 || (Number(version[1]) === 2 && Number(version[2]) < 40))
+      throw new Error(`Limitless requires Git >= 2.40 for --attr-source; found ${stdout.trim()}`);
+  });
+  await gitVersion;
   let command = 1;
   while (cmd[command] === "-c") command += 2;
   const prefix = [
@@ -35,9 +43,9 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
   for (const key of new Set(hooks.stdout.split("\0").filter(Boolean)))
     prefix.push(`--config-env=${key}=LIMITLESS_GIT_EMPTY_HOOK`);
   const env = { ...(opts.env ?? (process.env as Record<string, string>)), LIMITLESS_GIT_EMPTY_HOOK: "" };
-  const flags = ["diff", "log"].includes(cmd[command] ?? "")
-    ? ["--no-ext-diff", "--no-textconv", "--text"]
-    : [];
+  const inspection = ["diff", "log"].includes(cmd[command] ?? "");
+  if (inspection) prefix.push("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+  const flags = inspection ? ["--no-ext-diff", "--no-textconv"] : [];
   return sh([...prefix, ...cmd.slice(command, command + 1), ...flags, ...cmd.slice(command + 1)], {
     ...opts,
     env,

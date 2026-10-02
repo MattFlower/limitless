@@ -1,7 +1,7 @@
-import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { agentEnv } from "../util/proc.ts";
-import { worktreeGit } from "./command.ts";
+import { worktreeGit, worktreeGitScope } from "./command.ts";
 
 /** All merge lifecycle operations share hook suppression, identity and the agent's scrubbed env. */
 export function mergeGit(cwd: string, args: string[], allowFail = false) {
@@ -142,6 +142,12 @@ export async function completeMerge(cwd: string, head: string, base: string): Pr
   await mergeGit(cwd, ["add", "-A"]);
   if ((await mergeGit(cwd, ["ls-files", "-u"])).stdout)
     throw new Error("Merge index still contains unmerged entries");
+  if (worktreeGitScope.getStore() !== false) {
+    const index = await mergeGit(cwd, ["rev-parse", "--git-path", "index"]);
+    rmSync(resolve(cwd, index.stdout.trim()), { force: true });
+    await mergeGit(cwd, ["read-tree", "HEAD"]);
+    await mergeGit(cwd, ["add", "-A"]);
+  }
   await requireMerge(cwd, head, base);
   await mergeGit(cwd, ["commit", "-q", "-m", `limitless: merge base ${base}`]);
   return validateMerge(cwd, head, base);

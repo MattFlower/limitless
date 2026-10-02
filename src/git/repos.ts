@@ -182,12 +182,12 @@ export async function ensureCache(paths: Paths, repo: Repo, signal?: AbortSignal
       // Clone to a temporary path and rename, so a crash never leaves a half-configured cache.
       const tmp = `${cache}.tmp-${process.pid}-${Date.now()}`;
       try {
-        await sh(["git", "clone", "--bare", repo.url as string, tmp], {
+        await worktreeGit(["git", "clone", "--bare", repo.url as string, tmp], {
           cwd: paths.repos,
           timeoutMs: 600_000,
           signal,
         });
-        await sh(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
+        await worktreeGit(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
           cwd: tmp,
           signal,
         });
@@ -197,8 +197,8 @@ export async function ensureCache(paths: Paths, repo: Repo, signal?: AbortSignal
       }
     }
     // Agents run inside worktrees of this repo; make any push attempt from them fail.
-    await sh(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
-    await sh(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
+    await worktreeGit(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
+    await worktreeGit(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
     return cache;
   });
 }
@@ -217,25 +217,27 @@ export async function createWorktree(
   baseBranch: string,
 ): Promise<Worktree> {
   const cache = cachePath(paths, repo);
+  const git = repo.kind === "github" ? worktreeGit : sh;
   const path = join(paths.work, runId);
   const branch = `limitless/${runId}-${slugify(title, 30)}`;
   const baseRef = repo.kind === "github" ? `origin/${baseBranch}` : baseBranch;
   if (existsSync(path)) {
     // Resuming an interrupted run: reuse the worktree as-is.
     const head = await worktreeGit(["git", "rev-parse", "HEAD"], { cwd: path });
-    const base = await sh(["git", "rev-parse", baseRef], { cwd: cache });
+    const base = await git(["git", "rev-parse", baseRef], { cwd: cache });
     return { path, branch, baseSha: base.stdout.trim() || head.stdout.trim() };
   }
   return withRepoLock(cache, async () => {
-    const base = await sh(["git", "rev-parse", baseRef], { cwd: cache });
-    await sh(["git", "worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
+    const base = await git(["git", "rev-parse", baseRef], { cwd: cache });
+    await git(["git", "worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
     return { path, branch, baseSha: base.stdout.trim() };
   });
 }
 
 export async function removeWorktree(paths: Paths, repo: Repo, path: string): Promise<void> {
   if (!existsSync(path)) return;
-  await sh(["git", "worktree", "remove", "--force", path], { cwd: cachePath(paths, repo), allowFail: true });
+  const git = repo.kind === "github" ? worktreeGit : sh;
+  await git(["git", "worktree", "remove", "--force", path], { cwd: cachePath(paths, repo), allowFail: true });
 }
 
 export async function headSha(cwd: string): Promise<string> {
