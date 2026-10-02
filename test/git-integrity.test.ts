@@ -141,6 +141,7 @@ test("script and config hooks never execute during commit, merge, inspection, re
   const hooks = resolve(work, (await git(work, "rev-parse", "--git-path", "hooks")).stdout.trim());
   const scriptMarker = join(dir, "script-ran");
   const configMarker = join(dir, "config-ran");
+  const equalsMarker = join(dir, "equals-hook-ran");
   for (const name of [
     "pre-commit",
     "prepare-commit-msg",
@@ -155,20 +156,30 @@ test("script and config hooks never execute during commit, merge, inspection, re
   const fsmonitor = join(dir, "fsmonitor.sh");
   writeFileSync(fsmonitor, `#!/bin/sh\ntouch '${scriptMarker}'\nprintf 'token\\0'\n`, { mode: 0o755 });
   await git(work, "config", "core.fsmonitor", fsmonitor);
-  await git(work, "config", "hook.agent.command", `touch '${configMarker}'`);
-  await git(work, "config", "hook.agent.event", "post-commit");
-  await git(work, "config", "hook.agent.enabled", "true");
+  for (const name of ["agent", "a=b"]) {
+    await git(
+      work,
+      "config",
+      `hook.${name}.command`,
+      `touch '${name === "agent" ? configMarker : equalsMarker}'`,
+    );
+    await git(work, "config", `hook.${name}.event`, "post-commit");
+    await git(work, "config", `hook.${name}.enabled`, "true");
+  }
   const configPath = join(seed, ".git/config");
   const config = readFileSync(configPath);
   const version = (await git(work, "--version")).stdout.match(/(\d+)\.(\d+)/);
   if (version && (Number(version[1]) > 2 || Number(version[2]) >= 54)) {
     await git(work, "hook", "run", "post-commit");
     expect(existsSync(configMarker)).toBe(true);
+    expect(existsSync(equalsMarker)).toBe(true);
     rmSync(configMarker);
+    rmSync(equalsMarker);
     rmSync(scriptMarker);
   }
-  for (const key of ["hook.agent.command", "hook.agent.event", "hook.agent.enabled"])
-    expect((await factory("config", "--get", key)).stdout).toBe("\n");
+  for (const name of ["agent", "a=b"])
+    for (const field of ["command", "event", "enabled"])
+      expect((await factory("config", "--get", `hook.${name}.${field}`)).stdout).toBe("\n");
   writeFileSync(join(work, "sample.test.ts"), edited);
   const head = await commitAll(work, "factory edit");
   if (!head) throw new Error("expected edit commit");
@@ -198,6 +209,7 @@ test("script and config hooks never execute during commit, merge, inspection, re
   expect((await git(remote, "rev-parse", "refs/heads/delivered")).stdout.trim()).toBe(merged);
   expect(existsSync(scriptMarker)).toBe(false);
   expect(existsSync(configMarker)).toBe(false);
+  expect(existsSync(equalsMarker)).toBe(false);
   expect(readFileSync(configPath)).toEqual(config);
 });
 
@@ -230,6 +242,7 @@ test("effective hooks from system, global, includes and environment config are o
     GIT_CONFIG_VALUE_1: "post-commit",
     GIT_CONFIG_KEY_2: "hook.environment.enabled",
     GIT_CONFIG_VALUE_2: "true",
+    LIMITLESS_GIT_EMPTY_HOOK: `touch '${marker}'`,
   };
   const paths = [system, global, include, worktreeConfig];
   const configs = paths.map((path) => readFileSync(path));

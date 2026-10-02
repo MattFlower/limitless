@@ -31,9 +31,15 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
     if (error instanceof CommandError && error.exitCode === 1) return { stdout: "" };
     throw error;
   });
-  for (const key of new Set(hooks.stdout.split("\0").filter(Boolean))) prefix.push("-c", `${key}=`);
+  // --config-env splits at the last '=', so hook subsection names may themselves contain '='.
+  for (const key of new Set(hooks.stdout.split("\0").filter(Boolean)))
+    prefix.push(`--config-env=${key}=LIMITLESS_GIT_EMPTY_HOOK`);
+  const env = { ...(opts.env ?? (process.env as Record<string, string>)), LIMITLESS_GIT_EMPTY_HOOK: "" };
   const flags = ["diff", "log"].includes(cmd[command] ?? "")
     ? ["--no-ext-diff", "--no-textconv", "--text"]
     : [];
-  return sh([...prefix, ...cmd.slice(command, command + 1), ...flags, ...cmd.slice(command + 1)], opts);
+  return sh([...prefix, ...cmd.slice(command, command + 1), ...flags, ...cmd.slice(command + 1)], {
+    ...opts,
+    env,
+  });
 }
