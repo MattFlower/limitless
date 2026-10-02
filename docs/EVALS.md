@@ -353,6 +353,16 @@ evidence, never zero error. Role metrics retain pooled persisted labels across r
 disclose prediction coverage; failed/invalid calls contribute pass failures without prediction
 observations.
 
+Implement routing uses the newest completed single-shot run independently for each complexity
+and recorded target, including when `--evals` explicitly lists both single-shot and multi-round
+runs. A single-shot run has one configured round (legacy runs without a round count default to
+one); a run configured for more than one round remains multi-round even if a trial stops early.
+Multi-round evidence does not establish routing eligibility or replace single-shot evidence.
+Policy evidence reports it separately by run, configured round count, strategy and executed round,
+attributing each result and incremental cost to that round's recorded target and provider. Missing
+round fields remain unavailable; aggregate trial results and spend are never used to fill them in.
+Paired B1 recovery evidence does not currently change generated policy order; its unused input was removed.
+
 Comparisons are recomputed across the selected evidence. The reference has the highest observed
 pass rate among models with known catalog/provider metadata that are not origin-excluded (model-ID
 ascending tie-break), before floors and cost ordering. Matching role and case ID identify pairs;

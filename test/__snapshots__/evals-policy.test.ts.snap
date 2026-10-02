@@ -41,19 +41,13 @@ verify unchanged: no eligible models (codex/luna@medium: insufficient evidence: 
 
 implement.trivial unchanged: no completed evidence
 
-Effort-before-switch preference unchanged: no qualifying B1 paired recovery evidence.
-
 ## implement.small
 
 implement.small unchanged: no completed evidence
 
-Effort-before-switch preference unchanged: no qualifying B1 paired recovery evidence.
-
 ## implement.medium
 
 implement.medium unchanged: no completed evidence
-
-Effort-before-switch preference unchanged: no qualifying B1 paired recovery evidence.
 
 "
 `;

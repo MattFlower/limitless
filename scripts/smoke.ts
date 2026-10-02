@@ -529,17 +529,23 @@ export async function liveCheck(
   }
 }
 
+/**
+ * The exact probe command, bare or wrapped by sh/bash/zsh from a system or Homebrew directory (Codex
+ * reports its resolved shell). Only fixed paths count: any other prefix could run shell code that
+ * prints the evidence without running the probe, or point at a fake shell planted in TMPDIR.
+ */
+export function isProbeCommand(candidate: string, command: string): boolean {
+  const trimmed = candidate.trim();
+  if (trimmed === command) return true;
+  const wrapped = trimmed.match(
+    /^(?:\/bin|\/usr\/bin|\/usr\/local\/bin|\/opt\/homebrew\/bin)\/(?:sh|bash|zsh) -l?c (.+)$/s,
+  );
+  if (!wrapped) return false;
+  const quoted = wrapped[1];
+  return quoted === `'${command.replaceAll("'", "'\\''")}'` || quoted === JSON.stringify(command);
+}
+
 function probeCallIds(events: AgentEvent[], command: string): Set<string> {
-  const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
-  const commands = [
-    command,
-    ...["/bin/zsh", "/bin/bash", "/bin/sh"].flatMap((shell) =>
-      ["-lc", "-c"].flatMap((flag) => [
-        `${shell} ${flag} ${quote(command)}`,
-        `${shell} ${flag} ${JSON.stringify(command)}`,
-      ]),
-    ),
-  ];
   return new Set(
     events
       .filter(
@@ -547,7 +553,7 @@ function probeCallIds(events: AgentEvent[], command: string): Set<string> {
           e.type === "tool_call" &&
           ["shell", "Bash"].includes(e.name) &&
           typeof (e.input as { command?: unknown })?.command === "string" &&
-          commands.includes(String((e.input as { command: string }).command).trim()),
+          isProbeCommand(String((e.input as { command: string }).command), command),
       )
       .flatMap((e) => (e.type === "tool_call" ? [e.id] : [])),
   );
