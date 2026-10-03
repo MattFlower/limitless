@@ -307,6 +307,55 @@ test("attribute macros cannot claim a binary exemption for an unrelated matching
   expect(findings.some((f) => f.rule === "test-skipped")).toBe(true);
 });
 
+test("a text file renamed into an existing hiding rule blocks even when its head content is binary", async () => {
+  const notes = Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n");
+  writeFileSync(join(work, ".gitattributes"), "*.gen linguist-generated\n");
+  writeFileSync(join(work, "notes.txt"), `${notes}\n`);
+  writeFileSync(join(work, "blob.bin"), Buffer.from([0, 1, 2]));
+  await commitAll(work, "base rule and content");
+  const revision = await headSha(work);
+  await git(work, "mv", "blob.bin", "blob.gen");
+  await commitAll(work, "binary rename stays binary");
+  const control = await diffSince(work, revision);
+  expect(control.textPaths).toEqual([]);
+  expect(attributeRulesOf(auditDiff(control, { taskClass: null, protectedPaths: [] }))).toEqual([]);
+  await git(work, "mv", "notes.txt", "out.gen");
+  writeFileSync(join(work, "out.gen"), Buffer.concat([Buffer.from(`${notes}\n`), Buffer.from([0])]));
+  await commitAll(work, "text source renamed into a hidden binary");
+  const diff = await diffSince(work, revision);
+  expect(diff.files).toContainEqual(expect.objectContaining({ from: "notes.txt", path: "out.gen" }));
+  expect(diff.textPaths).toEqual(["out.gen"]);
+  expect(attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] }))).toContainEqual(
+    expect.objectContaining({
+      severity: "block",
+      file: "out.gen",
+      detail: expect.stringContaining("linguist-generated"),
+    }),
+  );
+});
+
+test("quoted attribute patterns keep their binary-only exemption when Git can decode them", async () => {
+  writeFileSync(join(work, "asset text.png"), "base text\n");
+  await commitAll(work, "base");
+  const revision = await headSha(work);
+  const cases: [string, Record<string, Buffer>, boolean][] = [
+    ['"asset image.png" binary', { "asset image.png": Buffer.from([0x89, 0, 1]) }, false],
+    ['"asset\\011tab.png" -diff', { "asset\ttab.png": Buffer.from([0x89, 0, 1]) }, false],
+    ['"asset text.png" binary', {}, true],
+    ['"asset image.png\\q" binary', { "asset image.png\\q": Buffer.from([0x89, 0, 1]) }, true],
+  ];
+  for (const [line, files, blocked] of cases) {
+    await git(work, "reset", "-q", "--hard", revision);
+    writeFileSync(join(work, ".gitattributes"), `${line}\n`);
+    for (const [path, content] of Object.entries(files)) writeFileSync(join(work, path), content);
+    await commitAll(work, line);
+    const findings = attributeRulesOf(
+      auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] }),
+    );
+    expect([line, findings.length > 0]).toEqual([line, blocked]);
+  }
+});
+
 test("Git version is checked once and unsupported versions fail before repository commands", async () => {
   const bin = join(dir, "bin");
   const calls = join(dir, "git-calls");

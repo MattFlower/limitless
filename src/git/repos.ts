@@ -477,26 +477,28 @@ async function attributeInfo(
   };
   // Text means no NUL in the first 8,000 bytes. The explicit empty attribute source applies
   // even where worktreeGit is unhardened, so the run's own attributes cannot classify content.
-  const textAt = async (pathspecs: string[]) => {
+  const textAt = async (tree: string, pathspecs: string[]) => {
     const text = new Set<string>();
-    for (const tree of [base, "HEAD"]) {
-      const args = ["--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", EMPTY_TREE, tree];
-      const out = await git([
-        `--attr-source=${EMPTY_TREE}`,
-        "-c",
-        NO_BIG_FILES,
-        "diff",
-        ...args,
-        "--",
-        ...pathspecs,
-      ]);
-      for (const entry of out.stdout.split("\0")) {
-        const match = entry.match(/^(\d+)\t\d+\t([\s\S]+)$/);
-        if (match?.[2]) text.add(match[2]);
-      }
+    if (!pathspecs.length) return text;
+    const args = ["--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", EMPTY_TREE, tree];
+    const out = await git([
+      `--attr-source=${EMPTY_TREE}`,
+      "-c",
+      NO_BIG_FILES,
+      "diff",
+      ...args,
+      "--",
+      ...pathspecs,
+    ]);
+    for (const entry of out.stdout.split("\0")) {
+      const match = entry.match(/^(\d+)\t\d+\t([\s\S]+)$/);
+      if (match?.[2]) text.add(match[2]);
     }
-    return [...text];
+    return text;
   };
+  const textAtEither = async (pathspecs: string[]) => [
+    ...new Set([...(await textAt(base, pathspecs)), ...(await textAt("HEAD", pathspecs))]),
+  ];
   try {
     // Attributes of a path edited in place only differ when an attribute file changed too.
     const queried = attributePatch ? changes : changes.filter((change) => change.from !== change.path);
@@ -508,16 +510,28 @@ async function attributeInfo(
         queried.map((change) => change.path),
       ),
     ]);
+    const baseOf = (from?: string) => (from === undefined ? undefined : before.get(from)) ?? {};
     const attributes = queried.map(({ path, from }) => ({
       path,
-      base: (from === undefined ? undefined : before.get(from)) ?? {},
+      base: baseOf(from),
       head: after.get(path) ?? {},
     }));
-    const hidden = attributes.filter((a) => newlyHidden(a.base, a.head).length);
-    const textPaths = hidden.length ? await textAt(hidden.map((a) => `:(literal)${a.path}`)) : [];
+    // A renamed path's base content lives at its source; text at either end counts for the destination.
+    const hidden = queried.filter(
+      ({ path, from }) => newlyHidden(baseOf(from), after.get(path) ?? {}).length,
+    );
+    const literal = (paths: (string | undefined)[]) =>
+      paths.flatMap((p) => (p === undefined ? [] : [`:(literal)${p}`]));
+    const [textBefore, textAfter] = await Promise.all([
+      textAt(base, literal(hidden.map((change) => change.from))),
+      textAt("HEAD", literal(hidden.map((change) => change.path))),
+    ]);
+    const textPaths = hidden
+      .filter(({ path, from }) => textAfter.has(path) || (from !== undefined && textBefore.has(from)))
+      .map((change) => change.path);
     const attributeMatches: Record<string, string[]> = {};
     for (const rule of attributeRules(attributePatch))
-      if (rule.exemptable) attributeMatches[rule.key] ??= await textAt([rule.pathspec]);
+      if (rule.exemptable) attributeMatches[rule.key] ??= await textAtEither([rule.pathspec]);
     return { attributePatch, attributes, textPaths, attributeMatches };
   } catch (error) {
     const reason = Date.now() >= deadline ? `timed out after ${timeoutMs} ms` : String(error).split("\n")[0];

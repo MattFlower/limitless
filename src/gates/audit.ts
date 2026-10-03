@@ -65,6 +65,19 @@ interface FilePatch {
   gitlink: boolean;
 }
 
+/** Git C-style unquoting (paths and .gitattributes patterns); null when Git would not produce it. */
+export function unquote(quoted: string): string | null {
+  if (!/^"(?:\\(?:[0-7]{3}|[abfnrtv"\\])|[^"\\])*"$/.test(quoted)) return null;
+  const escapes = "\x07\b\f\n\r\t\v";
+  const decoded = quoted
+    .slice(1, -1)
+    .replace(/\\([0-7]{3}|[abfnrtv"\\])/g, (_, c: string) =>
+      /^[0-7]/.test(c) ? String.fromCharCode(Number.parseInt(c, 8)) : (escapes["abfnrtv".indexOf(c)] ?? c),
+    );
+  const encoding = /\\[0-7]{3}/.test(quoted) ? "latin1" : "utf8";
+  return Buffer.from(decoded, encoding).toString("utf8");
+}
+
 export function splitPatch(patch: string): FilePatch[] {
   const files: FilePatch[] = [];
   let cur: FilePatch | null = null;
@@ -72,18 +85,7 @@ export function splitPatch(patch: string): FilePatch[] {
     if (line.startsWith("diff --git ")) {
       const m = line.match(/ (b\/.+|"b\/.+")$/);
       let path = m?.[1] ?? "";
-      if (path.startsWith('"')) {
-        const escapes = "\x07\b\f\n\r\t\v";
-        const decoded = path
-          .slice(1, -1)
-          .replace(/\\([0-7]{3}|[abfnrtv"\\])/g, (_, c: string) =>
-            /^[0-7]/.test(c)
-              ? String.fromCharCode(Number.parseInt(c, 8))
-              : (escapes["abfnrtv".indexOf(c)] ?? c),
-          );
-        const encoding = /\\[0-7]{3}/.test(path) ? "latin1" : "utf8";
-        path = Buffer.from(decoded, encoding).toString("utf8");
-      }
+      if (path.startsWith('"')) path = unquote(path) ?? path;
       cur = { path: path.slice(2), added: [], removed: [], gitlink: false };
       files.push(cur);
     } else if (cur && /^(new (file )?mode 160000|index .* 160000)$/.test(line)) {
@@ -137,20 +139,19 @@ export function attributeRules(patch: string) {
             return [name, value ?? ({ "-": "unset", "!": "unspecified" }[token[0] ?? ""] || "set")];
           }),
         );
-        let pattern = tokens[1] ?? "";
-        try {
-          if (pattern.startsWith('"')) pattern = JSON.parse(pattern) as string;
-        } catch {
-          /* Unknown quoting blocks conservatively. */
-        }
+        const raw = tokens[1] ?? "";
+        const decoded = raw.startsWith('"') ? unquote(raw) : raw;
+        const pattern = decoded ?? raw;
         // Attribute-file scope as a Git pathspec; icase over-matches, which only adds candidates.
         const directory = fp.path.slice(0, -".gitattributes".length).replace(/[*?[\\]/g, "\\$&");
         const glob = pattern.includes("/") ? pattern.replace(/^\//, "") : `**/${pattern}`;
         // binary/-diff on binary-only content hides nothing; macros and other attributes never qualify,
-        // nor do quoted patterns, whose Git C-style unquoting JSON.parse does not reproduce.
+        // nor does a quoted pattern Git could not have written, since its matches are unknown.
         const exemptable =
-          !/^("|\[attr\])/.test(tokens[1] ?? "") && found.every((a) => /^(binary|-diff|-text)$/.test(a));
-        const rule = { file: fp.path, key: `${fp.path}\0${tokens[1]}`, pattern, attributes: tokens[2] ?? "" };
+          decoded !== null &&
+          !decoded.startsWith("[attr]") &&
+          found.every((a) => /^(binary|-diff|-text)$/.test(a));
+        const rule = { file: fp.path, key: `${fp.path}\0${raw}`, pattern, attributes: tokens[2] ?? "" };
         return found.length ? [{ ...rule, exemptable, pathspec: `:(glob,icase)${directory}${glob}` }] : [];
       }),
     );

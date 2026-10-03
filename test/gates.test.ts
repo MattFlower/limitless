@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
-import { attributeRules, auditDiff, newlyHidden } from "../src/gates/audit.ts";
+import { attributeRules, auditDiff, newlyHidden, unquote } from "../src/gates/audit.ts";
 import {
   baselineCacheKey,
   cacheableBaseline,
@@ -331,6 +331,13 @@ describe("audit allowances and attribute rules", () => {
     expect(rules("*.png binary")).toEqual([["*.png", true]]);
     expect(rules("*.png -diff -text")).toEqual([["*.png", true]]);
     expect(rules("[attr]hidden -diff")).toEqual([["[attr]hidden", false]]);
+    expect(rules('"asset image.png" binary')).toEqual([["asset image.png", true]]);
+    expect(rules('"caf\\303\\251\\t\\"x\\"\\\\y.png" -diff')).toEqual([['café\t"x"\\y.png', true]]);
+    expect(rules('"[attr]quoted" binary')).toEqual([["[attr]quoted", false]]);
+    expect(rules('"bad\\q.png" binary')).toEqual([['"bad\\q.png"', false]]);
+    expect(rules('"unterminated binary')).toEqual([['"unterminated', false]]);
+    expect(unquote('"a\\u0041"')).toBeNull();
+    expect(unquote('"\\a\\b\\f\\n\\r\\v"')).toBe("\x07\b\f\n\r\v");
     expect(newlyHidden({ diff: "unspecified" }, { diff: "java", "linguist-generated": "set" })).toEqual([
       "linguist-generated",
     ]);
