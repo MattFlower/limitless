@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { installationUnits } from "../src/cli/service.ts";
 
 test("installation selects only explicitly requested rollback and tunnel agents", () => {
@@ -15,6 +18,13 @@ test("installation selects only explicitly requested rollback and tunnel agents"
     }
 });
 
+function isolatedConfig(): Record<string, string> {
+  const dir = mkdtempSync(join(tmpdir(), "limitless-service-cli-"));
+  mkdirSync(join(dir, "config"));
+  writeFileSync(join(dir, "config", "config.toml"), "[server]\nport = 9000\n");
+  return { LIMITLESS_HOME: join(dir, "home"), LIMITLESS_CONFIG_DIR: join(dir, "config") };
+}
+
 test("service CLI dispatches opt-in mtplx and advertises the new flag", async () => {
   for (const flags of [[], ["--mtplx", "--tunnel"], ["--help"]]) {
     const child = Bun.spawn(
@@ -27,34 +37,32 @@ test("service CLI dispatches opt-in mtplx and advertises the new flag", async ()
         "install",
         ...flags,
       ],
-      { env: { ...process.env, LIMITLESS_PORT: "" }, stdout: "pipe", stderr: "pipe" },
+      { env: { ...process.env, ...isolatedConfig(), LIMITLESS_PORT: "" }, stdout: "pipe", stderr: "pipe" },
     );
     const output = await new Response(child.stdout).text();
     expect(await child.exited).toBe(0);
     if (flags.includes("--help")) {
       expect(output).toContain("[--mtplx]");
       expect(output).not.toContain("--no-mtplx");
-    } else
-      expect(JSON.parse(output)).toEqual({
-        port: 9000,
-        opts: { tunnel: flags.length > 0, mtplx: flags.length > 0 },
-      });
+    } else expect(output).toContain(JSON.stringify({ tunnel: flags.length > 0, mtplx: flags.length > 0 }));
   }
 });
 
-test("service status and deploy CLI use config port with environment taking precedence", async () => {
-  for (const command of [["service", "status"], ["deploy"]])
+test("service install, status and deploy CLI use config port with environment taking precedence", async () => {
+  const preload = join(mkdtempSync(join(tmpdir(), "limitless-service-port-")), "preload.ts");
+  const service = JSON.stringify(join(import.meta.dir, "..", "src", "cli", "service.ts"));
+  const print = "async (port: number) => console.log(JSON.stringify({ port }))";
+  writeFileSync(
+    preload,
+    `import { mock } from "bun:test";\nmock.module(${service}, () => ({ install: ${print}, status: ${print}, deploy: ${print} }));\n`,
+  );
+  for (const command of [["service", "install"], ["service", "status"], ["deploy"]])
     for (const override of ["", "9100"]) {
-      const child = Bun.spawn(
-        [
-          process.execPath,
-          "--preload",
-          "./test/fixtures/service-cli-preload.ts",
-          "src/cli/main.ts",
-          ...command,
-        ],
-        { env: { ...process.env, LIMITLESS_PORT: override }, stdout: "pipe", stderr: "pipe" },
-      );
+      const child = Bun.spawn([process.execPath, "--preload", preload, "src/cli/main.ts", ...command], {
+        env: { ...process.env, ...isolatedConfig(), LIMITLESS_PORT: override },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
       const output = await new Response(child.stdout).text();
       expect(await child.exited).toBe(0);
       expect(JSON.parse(output)).toEqual({ port: override ? 9100 : 9000 });
