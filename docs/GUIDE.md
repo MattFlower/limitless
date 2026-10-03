@@ -166,6 +166,8 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
 | `[review] mode`, `[review.rosters]` | `"single"`, see below | `"panel"` reviews with a verified finder panel whose roster depends on the profile; see [Review configuration](#review-configuration-and-lenses). |
 | `[review] shadow` | `"off"` | `"panel"` also runs the profile's panel beside each single review, for comparison only; see [Shadow panel](#shadow-panel). Needs `mode = "single"`. |
+| `[review] shadow_grace_seconds` | `300` | How long a shadow panel may run after its single review finishes before it is aborted and recorded as `timeout`. `0` stops it as soon as the single review finishes. |
+| `[review] trusted_reviewers` | `[]` | GitHub logins, besides the repository owner, whose inline PR review comments count as evidence in `limitless review shadow-report`. |
 | `[routing] exclude_origins` | unset | For example `["CN"]`. Excludes models by checkpoint origin from eval policy generation and the Evals matrix. Runtime routing is not affected. |
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |
 | `[local] twilight_model_path`, `twilight_host`, `twilight_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
@@ -533,36 +535,48 @@ catalog at startup; a local finder's target must be a free model.
 
 ### Shadow panel
 
-With `[review] shadow = "panel"`, single reviews still decide every round. After each single review,
+With `[review] shadow = "panel"`, single reviews still decide every round. Beside each single review,
 the profile's panel (roster plus the base commit's lenses) reviews the same revisions as a first
 review of the complete diff. It records its findings, verdict, blocking findings, panel record and
-spend in `review-N.shadow.json`. It never blocks, never reaches the implementer and never affects
-routing. It costs roughly $0.65 API-equivalent per round on subscription models. It is skipped, or
-stops before its next model call (checked once that call holds its provider slot), when quota
-headroom is 0.1 or less: for any enabled subscription provider before it starts, and for the routed
-provider before each call. It stops rather than use a metered model. A failed or skipped shadow records why, with its spend so far.
+spend in `review-N.shadow.json`. It never blocks, never reaches the implementer, reports or review
+history, and never affects routing: its calls leave provider health, circuit breakers, model blocks
+and quota telemetry alone. They are recorded with the role `review_shadow`, left out of the work log
+and per-model review stats, and their spend appears as its own line under the report total. It costs
+roughly $0.65 API-equivalent per round on subscription models.
+
+The shadow only uses spare capacity. Each call takes a provider slot only if one is free at that
+moment and no production call is waiting for it; otherwise that finder is skipped, with the reason in
+the panel record. Once the single review finishes, the shadow has `shadow_grace_seconds` to finish; then it is
+aborted and recorded as `timeout` with the finders that had finished. The shadow is `skipped`, with
+its reason, when the base commit's `[review]` lenses are invalid, when its review system cannot be
+built, or when a subscription provider its roster, fallbacks or verifier can route to has headroom
+of 0.1 or less, or unknown headroom (no quota windows observed yet). It stops rather than use a
+metered model. A failed or skipped shadow records why, with its spend so far.
 
 `limitless review shadow-report [--since <ISO-8601>]` compares single and panel blocking findings per
-round, for runs created at or after `--since`. It marks each panel-only finding:
+round for the newest 200 runs created at or after `--since` (the daemon applies the cutoff, and the
+output says when the cap leaves runs out). Findings match by location, as the review grader does:
+the same file with lines at most 5 apart. Titles never matter, and a finding without a line matches nothing.
+A panel finding near a single one is shared. Each panel-only finding is marked:
 
-- `fixed`: a later commit explicitly states it fixes or resolves the named file and title and
-  changes that file. Diagnostic, deferred, or unresolved wording disqualifies the commit. In the
-  original or a stacked PR, the fix must follow the reviewed commit in PR order and the shadow
-  review in time. A distinct PR from an explicitly dependent run or a run referencing the original
-  PR can also supply fixes when both that run and its fix commits postdate the shadow review; it
-  need not contain the original SHA. Rewritten original PR histories lacking the reviewed commit
-  give no fix evidence and mark the evidence incomplete.
-- `review-matched`: a later review names it. This can be a later round of the run (the paired round
-  and earlier ones never count, even when a resume rewrote them), a run on the same PR or one
-  depending on it, or a PR review or comment. A review match is not a fix.
+- `fixed`: a later commit changes lines (added or removed, not unchanged diff context) within 5 lines
+  of it. In the original or a stacked PR, the commit must follow the reviewed commit in PR order and
+  the shadow review in time. A distinct PR from an explicitly dependent run or a run referencing the
+  original PR can also supply fixes when both that run and its commits postdate the shadow review.
+  Rewritten original PR histories lacking the reviewed commit give no fix evidence and mark the
+  evidence incomplete.
+- `review-matched`: a later review reports the same location. This can be a later round of the run
+  (the paired round and earlier ones never count, even when a resume rewrote them), a run on the same
+  PR or one depending on it, or an inline PR review comment by the repository owner or a
+  `trusted_reviewers` login. A review match is not a fix.
 - `converged-without-fix`: the run succeeded, and the observed history has no match. This is a
   signal, not proof of a false positive.
 - `unknown`: the run is unfinished, or the paired single review, some related PR history or a review
   artifact is unavailable or malformed (shown as "evidence incomplete").
 
-Editing the same file is never evidence. Skipped, failed, missing and malformed comparisons are
-listed rather than dropped. The report makes no model calls and changes nothing; it reads each PR
-with `gh pr view` and each of its commits with `gh api` (one read per commit, for the files it changes).
+Skipped, timed-out, failed, missing and malformed comparisons are listed rather than dropped. The
+report makes no model calls and changes nothing. It reads each related PR once per report with
+`gh pr view`, each of its commits' patches with `gh api`, and its inline review comments with `gh api`.
 
 A repository adds its own lenses in `.limitless.toml`:
 

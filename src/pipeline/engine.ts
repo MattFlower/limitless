@@ -59,6 +59,7 @@ import {
   ParkedError,
   RunContext,
   type RunState,
+  type ShadowInvoke,
 } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
@@ -88,7 +89,7 @@ import {
   runReview,
   type VerifierRequest,
 } from "./review.ts";
-import { type ShadowDeps, shadowReview } from "./review-shadow.ts";
+import { type ShadowDeps, startShadow } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import {
   type Holdout,
@@ -356,8 +357,15 @@ async function prepare(ctx: RunContext): Promise<void> {
       const repoConfig = await readFileAt(wt.path, verification?.baseSha ?? baseSha, ".limitless.toml");
       ctx.state.previewConfig = readPreviewConfig(repoConfig);
       // Review lenses come from the base commit, never from the change under review.
-      if (ctx.deps.cfg.reviewMode === "panel" || ctx.deps.cfg.reviewShadow === "panel")
+      if (ctx.deps.cfg.reviewMode === "panel")
         ctx.state.reviewLenses = readReviewLenses(repoConfig, (message) => ctx.log(message, "warn"));
+      // A shadow never fails a run: an invalid table only skips it.
+      else if (ctx.deps.cfg.reviewShadow === "panel")
+        try {
+          ctx.state.shadowLenses = readReviewLenses(repoConfig, (message) => ctx.log(message, "warn"));
+        } catch (error) {
+          ctx.state.shadowLenses = { error: String((error as Error).message).slice(0, 500) };
+        }
       gates = detectGates(wt.path);
       ctx.state.gatesConfig = gates;
       ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
@@ -1136,6 +1144,7 @@ async function oneRound(
         constraints: RouteConstraints,
         prefer: string | undefined,
         deadline?: number,
+        shadow?: ShadowInvoke,
       ) => {
         const invoked = await ctx.invoke({
           role: "review",
@@ -1145,13 +1154,15 @@ async function oneRound(
           constraints: { ...constraints, ...(prefer ? { prefer } : {}) },
           ...request,
           ...(deadline ? { deadline } : {}),
+          ...(shadow ? { shadow } : {}),
           requireStructured: true,
         });
         await discardChanges(cwd);
         return invoked;
       };
-      const reviewDeps: ShadowDeps = (system) => {
+      const reviewDeps: ShadowDeps = (system, shadow) => {
         return {
+          skipAny: !!shadow,
           invoke: async (request, index) => {
             const finder = system.finders[index];
             const vendor = ctx.state.implementer?.vendor;
@@ -1162,15 +1173,17 @@ async function oneRound(
             // One deadline covers a local finder's slot waits and fallbacks; past it, the panel skips it.
             const deadline = finder?.local ? Date.now() + request.timeoutMs : undefined;
             try {
-              return await call(request, constraints, finder?.target, deadline);
+              return await call(request, constraints, finder?.target, deadline, shadow);
             } catch (error) {
-              if (finder?.local && error instanceof NoCapacityError) throw new FinderSkipped(error.message);
+              if ((finder?.local || shadow) && error instanceof NoCapacityError)
+                throw new FinderSkipped(error.message);
               throw error;
             }
           },
           verify: (request, avoidVendors, avoidModels) => {
             const constraints = verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer);
-            if (!system.verifier?.targets) return call(request, constraints, system.verifier?.target);
+            if (!system.verifier?.targets)
+              return call(request, constraints, system.verifier?.target, undefined, shadow);
             // Picked per batch, as evals do, and offered alone: a routed fallback could share its vendor.
             const listed = system.verifier.targets.map((target) => {
               const { model, targetId } = ctx.deps.router.resolve(target);
@@ -1178,12 +1191,29 @@ async function oneRound(
             });
             const identity = ctx.deps.router.checkpointIdentity;
             const only = pickVerifier(listed, avoidVendors, avoidModels, identity).targetId;
-            return call(request, { ...constraints, only }, undefined);
+            return call(request, { ...constraints, only }, undefined, undefined, shadow);
           },
           warn: (message) => ctx.log(message, "warn"),
         };
       };
-      const { target, output, decision, panel } = await runReview(reviewDeps(system), input);
+      // The single review asks for its slot first; the shadow runs beside it, with a grace period that
+      // starts when the single review settles.
+      const reviewed = runReview(reviewDeps(system), input);
+      const shadowRun =
+        ctx.deps.cfg.reviewShadow === "panel" && system.mode === "single"
+          ? startShadow(ctx, { round, baseSha, reviewedSha, profile: profile(ctx), input }, reviewDeps)
+          : undefined;
+      const grace = ctx.deps.cfg.reviewShadowGraceSeconds * 1000;
+      const shadowDone =
+        shadowRun &&
+        reviewed.then(
+          () => shadowRun(grace),
+          () => shadowRun(0),
+        );
+      const { target, output, decision, panel } = await reviewed.catch(async (error) => {
+        await shadowDone;
+        throw error;
+      });
       if (!decision) throw output.error;
       // The model's verdict is kept for inspection only; control flow uses the derived one.
       const { review: r, modelVerdict, blocking, followUps } = decision;
@@ -1231,8 +1261,7 @@ async function oneRound(
           2,
         ),
       );
-      if (ctx.deps.cfg.reviewShadow === "panel" && system.mode === "single")
-        await shadowReview(ctx, { round, baseSha, reviewedSha, profile: profile(ctx), input }, reviewDeps);
+      await shadowDone;
       const serious = blocking.length;
       return {
         summary: `${r.verdict} by ${target.modelId}: ${serious} blocking, ${r.findings.length - serious} nonblocking`,

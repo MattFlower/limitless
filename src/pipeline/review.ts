@@ -263,6 +263,8 @@ export interface ReviewDeps<T extends Invoked> {
   ) => Promise<T>;
   /** Panel only: problems that degrade the review without failing it. */
   warn?: (message: string) => void;
+  /** Any finder, not just a local one, may throw FinderSkipped (a shadow panel without a free slot). */
+  skipAny?: boolean;
 }
 
 /**
@@ -435,7 +437,9 @@ async function runPanel<T extends Invoked>(
     }),
   );
   const skippable = (member: (typeof settled)[number], finder: number) =>
-    member.status === "rejected" && member.reason instanceof FinderSkipped && !!finders[finder]?.local;
+    member.status === "rejected" &&
+    member.reason instanceof FinderSkipped &&
+    !!(finders[finder]?.local || deps.skipAny);
   for (const [finder, member] of settled.entries())
     if (member.status === "rejected" && !skippable(member, finder)) throw member.reason;
   const results: AgentResult[] = settled.flatMap((m) =>
@@ -452,7 +456,7 @@ async function runPanel<T extends Invoked>(
     }
     found[finder] = undefined;
     const result = value?.invoked.result;
-    if (finders[finder]?.local) {
+    if (finders[finder]?.local || skippable(member, finder)) {
       const problem =
         member.status === "rejected"
           ? String((member.reason as Error).message)
@@ -475,7 +479,7 @@ async function runPanel<T extends Invoked>(
     };
   }
   const first = found.find((member) => member !== undefined);
-  if (!first) throw new Error('mode "panel" needs a finder that is not skipped');
+  if (!first) throw new Error(`mode "panel" needs a finder that is not skipped: ${[...skipped.values()]}`);
 
   const { fixReview, previous } = input.prompt;
   const priorBlocking = previous?.findings ?? [];

@@ -208,7 +208,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         return json(await factory.gc(input.dryRun === true));
       }),
     },
-    "/api/review/shadow-report": handle(async () => json(await shadowReport(store, ghPrHistory(runGh)))),
+    "/api/review/shadow-report": handle(async (req) => {
+      const since = Number(new URL(req.url).searchParams.get("since") ?? 0);
+      if (!Number.isFinite(since)) return error("since must be epoch milliseconds", 400);
+      const trusted = factory.cfg.reviewTrustedReviewers;
+      return json(await shadowReport(store, ghPrHistory(runGh), { since, trusted }));
+    }),
     "/api/gates/clear-cache": {
       POST: handle(async (req) => {
         const input = await body<{ repo?: string }>(req);

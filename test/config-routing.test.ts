@@ -69,7 +69,7 @@ test("review implementer report defaults to include and accepts only include or 
     // A misspelt key would otherwise silently keep the default.
     writeFileSync(join(configDir, "config.toml"), '[review]\nimplementer-report = "omit"\n');
     expect(config).toThrow(
-      "review.implementer-report: unknown key (allowed: implementer_report, mode, rosters, shadow)",
+      "review.implementer-report: unknown key (allowed: implementer_report, mode, rosters, shadow, shadow_grace_seconds, trusted_reviewers)",
     );
     writeFileSync(join(configDir, "config.toml"), 'review = "omit"\n');
     expect(config).toThrow("review must be a table");
@@ -180,6 +180,39 @@ test("review shadow is opt-in, takes an explicit off switch, and cannot shadow a
       ["shadow = true", 'review.shadow must be "off" or "panel"'],
       ['shadow = "single"', 'review.shadow must be "off" or "panel"'],
       ['mode = "panel"\nshadow = "panel"', 'review.shadow = "panel" needs review.mode = "single"'],
+    ]) {
+      writeFileSync(join(configDir, "config.toml"), `[review]\n${toml}\n`);
+      expect(config).toThrow(message);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("shadow grace defaults to 300 s and accepts zero; trusted reviewers default to none", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-review-grace-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  try {
+    expect([config().reviewShadowGraceSeconds, config().reviewTrustedReviewers]).toEqual([300, []]);
+    writeFileSync(
+      join(configDir, "config.toml"),
+      '[review]\nshadow_grace_seconds = 0\ntrusted_reviewers = ["alice", "bob-bot"]\n',
+    );
+    expect([config().reviewShadowGraceSeconds, config().reviewTrustedReviewers]).toEqual([
+      0,
+      ["alice", "bob-bot"],
+    ]);
+    writeFileSync(join(configDir, "config.toml"), "[review]\nshadow_grace_seconds = 12.5\n");
+    expect(config().reviewShadowGraceSeconds).toBe(12.5);
+    for (const [toml, message] of [
+      ["shadow_grace_seconds = -1", "review.shadow_grace_seconds must be a nonnegative number"],
+      ['shadow_grace_seconds = "300"', "review.shadow_grace_seconds must be a nonnegative number"],
+      ["shadow_grace_seconds = inf", "review.shadow_grace_seconds must be a nonnegative number"],
+      ['trusted_reviewers = "alice"', "review.trusted_reviewers must be a list of GitHub logins"],
+      ['trusted_reviewers = ["alice", 1]', "review.trusted_reviewers must be a list of GitHub logins"],
+      ['trusted_reviewers = [""]', "review.trusted_reviewers must be a list of GitHub logins"],
     ]) {
       writeFileSync(join(configDir, "config.toml"), `[review]\n${toml}\n`);
       expect(config).toThrow(message);

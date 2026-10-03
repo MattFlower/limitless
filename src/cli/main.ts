@@ -426,7 +426,11 @@ async function main(): Promise<void> {
         throw new Error("usage: limitless review shadow-report [--since <ISO-8601 timestamp>]");
       const since = values.since === undefined ? undefined : parseSince(values.since);
       const { formatShadowReport } = await import("../pipeline/shadow-report.ts");
-      console.log(formatShadowReport(await api("/api/review/shadow-report"), since));
+      console.log(
+        formatShadowReport(
+          await api(`/api/review/shadow-report${since === undefined ? "" : `?since=${since}`}`),
+        ),
+      );
       return;
     }
     case "gates": {

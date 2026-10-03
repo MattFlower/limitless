@@ -69,6 +69,8 @@ export interface RunState {
   previewConfig?: PreviewConfig | null;
   /** `[review] lenses` from the base commit, read at prepare in panel mode only (else single stays). */
   reviewLenses?: RepoReviewLens[];
+  /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
+  shadowLenses?: RepoReviewLens[] | { error: string };
   baseline?: GateRun | null;
   /** The baseline came from the per-base-commit cache instead of executing at prepare. */
   baselineCached?: boolean;
@@ -168,8 +170,15 @@ export class NeedsHumanError extends Error {}
 
 export class NoCapacityError extends Error {}
 
-/** Shadow work: `stop` vetoes an attempt's provider once its slot is held; `ids` collects the attempts. */
-export const invokeGuard = new AsyncLocalStorage<{ stop(p: string): string | undefined; ids: number[] }>();
+/**
+ * Shadow work: takes only a free slot, ends with `signal`, records as `review_shadow`, and leaves
+ * provider health and routing state alone. `stop` vetoes a provider; `ids` collects the attempts.
+ */
+export interface ShadowInvoke {
+  signal: AbortSignal;
+  stop(provider: string): string | undefined;
+  ids: number[];
+}
 
 export interface InvokeOptions {
   role: Role;
@@ -204,6 +213,7 @@ export interface InvokeOptions {
   noTools?: boolean;
   /** Typed questions for decision models; a decline falls through to the next candidate. */
   decisionTask?: DecisionTask;
+  shadow?: ShadowInvoke;
 }
 
 export interface InvokeOutcome {
@@ -421,6 +431,8 @@ export class RunContext {
    */
   async invoke(opts: InvokeOptions): Promise<InvokeOutcome> {
     const { router, tracker, store, harnesses } = this.deps;
+    const { shadow } = opts;
+    const signal = shadow?.signal ?? this.signal;
     const tried: (string | ModelSelection)[] = [...(opts.constraints?.exclude ?? [])];
     let lastFailure: string | null = null;
     // An unsure (not question-needing) decline beats failing the stage when nothing else answers.
@@ -436,6 +448,7 @@ export class RunContext {
     const left = () => (opts.deadline === undefined ? Number.POSITIVE_INFINITY : opts.deadline - Date.now());
     for (let attempt = 0; attempt < 6; attempt++) {
       this.checkCancelled();
+      if (signal.aborted) throw new CancelledError();
       if (left() <= 0)
         throw new NoCapacityError(
           `Timed out routing ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}`,
@@ -444,6 +457,7 @@ export class RunContext {
         opts.role,
         opts.complexity,
         this.routingConstraints({ ...opts.constraints, exclude: tried }),
+        !shadow,
       );
       const target = decision.candidates[0];
       if (!target && lastResort) return useLastResort(lastResort, `No other model for ${opts.role}`);
@@ -464,18 +478,20 @@ export class RunContext {
         : this.signal;
       let release: () => void;
       try {
-        release = await tracker.acquire(target.provider, wait);
+        const free = shadow && tracker.tryAcquire(target.provider);
+        if (shadow && !free) throw new NoCapacityError(`${target.provider}: no free slot`);
+        release = free || (await tracker.acquire(target.provider, wait));
       } catch (error) {
         if (this.signal.aborted || !wait.aborted) throw error;
         throw new NoCapacityError(`${target.targetId ?? target.modelId}: busy until the deadline`);
       }
-      if (!(await tracker.preflight(target.provider)) || tracker.modelUnavailableReason(target.modelId)) {
+      const ready = shadow ? tracker.isAvailable(target.provider) : await tracker.preflight(target.provider);
+      if (!ready || tracker.modelUnavailableReason(target.modelId)) {
         release();
         lastFailure = `${target.targetId ?? target.modelId}: no capacity after provider refresh`;
         continue;
       }
-      const guard = invokeGuard.getStore();
-      const stopped = guard?.stop(target.provider);
+      const stopped = shadow?.stop(target.provider);
       if (stopped) {
         release();
         throw new NoCapacityError(stopped);
@@ -499,14 +515,14 @@ export class RunContext {
         fast: tracker.isFast(target.provider),
         runId: this.run.id,
         stageId: opts.stage.id,
-        role: opts.role,
+        role: shadow ? "review_shadow" : opts.role,
         harness: harnessName,
         provider: target.provider,
         model: target.model,
         modelId: target.modelId,
         effort: recordEffort(target.effort),
       });
-      guard?.ids.push(invocation.id);
+      shadow?.ids.push(invocation.id);
       this.log(`${opts.role}: using ${target.targetId ?? target.modelId}`, "info", {
         invocationId: invocation.id,
         skipped: decision.skipped,
@@ -539,7 +555,7 @@ export class RunContext {
           // The private log sits in the shared temporary directory while a parallel implementer
           // runs as the same user, so it never holds the private text itself.
           redactOutput: opts.privateOutput ? withholdText : redact,
-          signal: this.signal,
+          signal,
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
           onEvent: opts.privateOutput
             ? () => {}
@@ -587,7 +603,7 @@ export class RunContext {
         if ((opts.role === "review" || opts.role === "verify") && this.state.worktreePath)
           await discardChanges(this.state.worktreePath);
       }
-      if (this.signal.aborted)
+      if (signal.aborted)
         result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };
       if (opts.requireStructured && result.status === "ok" && result.structured === null)
         result = { ...result, status: "error", error: "missing structured output" };
@@ -627,10 +643,11 @@ export class RunContext {
               : result.error,
         finishedAt: Date.now(),
       });
-      if (result.quota?.windows) tracker.observeWindows(target.provider, result.quota.windows);
-      if (result.confinement) tracker.observeConfinement(target.provider, result.confinement);
+      // Shadow outcomes never reach provider health, quota telemetry or model blocks.
+      if (result.quota?.windows && !shadow) tracker.observeWindows(target.provider, result.quota.windows);
+      if (result.confinement && !shadow) tracker.observeConfinement(target.provider, result.confinement);
       // An unconfinable CLI is no provider failure: unconfined roles still use it.
-      if (result.confinement?.ok !== false)
+      if (result.confinement?.ok !== false && !shadow)
         tracker.record(target.provider, result.status, {
           exhaustedUntil: result.quota?.exhaustedUntil ?? null,
           ...(result.modelCooldownMs === undefined
@@ -646,7 +663,7 @@ export class RunContext {
       this.run = store.refreshRunTotals(this.run.id);
 
       if (this.termination) throw this.termination;
-      if (result.status === "cancelled" || this.signal.aborted) throw new CancelledError();
+      if (result.status === "cancelled" || signal.aborted) throw new CancelledError();
       if (result.status === "declined") {
         // Not a failure and not a routing attempt: each decision model declines at most once.
         const reason = opts.privateOutput
@@ -668,12 +685,13 @@ export class RunContext {
       }
       if (result.status !== "ok" && MODEL_REJECTED.test(result.error ?? "")) {
         // A configuration problem with this model (e.g. not on the plan), not a task failure.
-        tracker.blockModel(
-          target.modelId,
-          opts.privateOutput
-            ? "private invocation rejected"
-            : (redact?.(result.error ?? "rejected") ?? result.error ?? "rejected"),
-        );
+        if (!shadow)
+          tracker.blockModel(
+            target.modelId,
+            opts.privateOutput
+              ? "private invocation rejected"
+              : (redact?.(result.error ?? "rejected") ?? result.error ?? "rejected"),
+          );
         lastFailure =
           `${target.targetId ?? target.modelId}: ${redact?.(result.error ?? "") ?? result.error ?? ""}`.slice(
             0,

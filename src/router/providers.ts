@@ -27,6 +27,8 @@ interface ProviderRuntime {
   healthy: boolean; // for local servers: last probe result
   inFlight: number;
   waiters: (() => void)[];
+  /** Waiters woken by a release that have not yet taken their slot: a shadow call never takes it first. */
+  waking: number;
   confinement?: ConfinementProbe;
 }
 
@@ -138,6 +140,7 @@ export class ProviderTracker {
         healthy: !def.healthUrl, // local servers start unknown→down until probed
         inFlight: 0,
         waiters: [],
+        waking: 0,
       });
     }
   }
@@ -410,22 +413,35 @@ export class ProviderTracker {
     if (!p) throw new Error(`unknown provider ${id}`);
     while (p.inFlight >= p.def.maxConcurrent) {
       if (signal.aborted) throw new Error("cancelled");
-      await new Promise<void>((resolve) => {
+      const woken = await new Promise<boolean>((resolve) => {
         const wake = () => {
           signal.removeEventListener("abort", onAbort);
-          resolve();
+          p.waking++;
+          resolve(true);
         };
         // A cancelled waiter must leave the queue, or a later release would wake a dead waiter
         // and strand the live ones behind it.
         const onAbort = () => {
           const i = p.waiters.indexOf(wake);
           if (i >= 0) p.waiters.splice(i, 1);
-          resolve();
+          resolve(false);
         };
         p.waiters.push(wake);
         signal.addEventListener("abort", onAbort, { once: true });
       });
+      if (woken) p.waking--;
     }
+    return this.hold(p);
+  }
+
+  /** A slot only if one is free now and nobody is queued for it; never waits. */
+  tryAcquire(id: string): (() => void) | null {
+    const p = this.providers.get(id);
+    return p && p.inFlight + p.waking < p.def.maxConcurrent && !p.waiters.length ? this.hold(p) : null;
+  }
+
+  private hold(p: ProviderRuntime): () => void {
+    const id = p.def.id;
     p.inFlight++;
     this.publish(id);
     let released = false;

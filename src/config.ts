@@ -60,6 +60,10 @@ export interface Config {
   reviewMode: "single" | "panel";
   /** `panel`: single reviews still decide, and the profile's panel also runs and records `review-N.shadow.json`. */
   reviewShadow: "off" | "panel";
+  /** How long a shadow panel may outlast its single review before it is aborted as a timeout. */
+  reviewShadowGraceSeconds: number;
+  /** Besides the repository owner, logins whose PR comments count as shadow-report evidence. */
+  reviewTrustedReviewers: string[];
   /** Panel finders per profile, before repo lenses. */
   reviewRosters: Record<ResolvedProfile, ReviewFinder[]>;
   /** Decision-model triage declines (falls through to the next model) below this answer confidence. */
@@ -95,7 +99,14 @@ function parseEnvFile(path: string): Record<string, string> {
 }
 
 /** `[review]` is validated strictly: a misspelt key would otherwise silently keep the default. */
-const REVIEW_KEYS = ["implementer_report", "mode", "rosters", "shadow"];
+const REVIEW_KEYS = [
+  "implementer_report",
+  "mode",
+  "rosters",
+  "shadow",
+  "shadow_grace_seconds",
+  "trusted_reviewers",
+];
 const TRIAGE_KEYS = ["decision_confidence"];
 /** Provisional until calibrated on evals/triage (docs/research/09-jev-decisions.md). */
 export const DEFAULT_DECISION_CONFIDENCE = 0.6;
@@ -199,6 +210,12 @@ export function loadConfig(
     throw new Error('review.shadow must be "off" or "panel"');
   if (review.shadow === "panel" && review.mode === "panel")
     throw new Error('review.shadow = "panel" needs review.mode = "single"; a panel cannot shadow itself');
+  const grace = review.shadow_grace_seconds ?? 300;
+  if (typeof grace !== "number" || !Number.isFinite(grace) || grace < 0)
+    throw new Error("review.shadow_grace_seconds must be a nonnegative number");
+  const trusted = review.trusted_reviewers ?? [];
+  if (!Array.isArray(trusted) || !trusted.every((login) => typeof login === "string" && login))
+    throw new Error("review.trusted_reviewers must be a list of GitHub logins");
   const rawTriage = raw.triage ?? {};
   if (typeof rawTriage !== "object" || rawTriage === null || Array.isArray(rawTriage))
     throw new Error("triage must be a table");
@@ -281,6 +298,8 @@ export function loadConfig(
     reviewImplementerReport: review.implementer_report === "omit" ? "omit" : "include",
     reviewMode: review.mode === "panel" ? "panel" : "single",
     reviewShadow: review.shadow === "panel" ? "panel" : "off",
+    reviewShadowGraceSeconds: grace,
+    reviewTrustedReviewers: trusted,
     reviewRosters: parseReviewRosters(review.rosters),
     triageDecisionConfidence: confidence,
     githubOwner: str(owners.github, "MattFlower"),

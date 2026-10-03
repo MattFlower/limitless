@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
 import type { Invocation } from "../src/core/types.ts";
+import { computeStats } from "../src/db/stats.ts";
+import { Store } from "../src/db/store.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { renderReport, verifiedFailureState } from "../src/pipeline/report.ts";
 
@@ -368,4 +370,72 @@ test("holdout counts separate blocking results from not-required follow-up notes
   expect(md).toContain("| H-4 | legacy result | unmet (unclassified) | wrong output |");
   expect(md).toContain("- H-2: invented flag — no such flag exists in this CLI");
   expect(md).not.toContain("- H-3: unicode input");
+});
+
+test("shadow review calls stay out of the work log and per-model review stats; their spend is its own line", () => {
+  const review: Invocation = { ...inv, id: 2, role: "review", modelId: "claude/opus", costEquivUsd: 1 };
+  const shadow: Invocation[] = [
+    { ...review, id: 3, role: "review_shadow", modelId: "codex/shadow-a", costUsd: 0.02, costEquivUsd: 0.25 },
+    {
+      ...review,
+      id: 4,
+      role: "review_shadow",
+      modelId: "codex/shadow-b",
+      costEquivUsd: 0.1,
+      status: "timeout",
+    },
+  ];
+  const md = renderReport({
+    success: true,
+    runId: "r1",
+    prompt: "x",
+    state: {},
+    invocations: [inv, review, ...shadow],
+    // Run totals include the shadow spend.
+    totals: { costUsd: 0.02, costEquivUsd: 2.85 },
+    runUrl: "u",
+  });
+  expect(md).toContain("| implement | `codex/astra` |");
+  expect(md).toContain("| review | `claude/opus` |");
+  expect(md).not.toContain("review_shadow");
+  expect(md).not.toContain("shadow-a");
+  expect(md).toContain("**Total:** $0.02 spent, $2.85 API-equivalent on subscriptions.");
+  expect(md).toContain(
+    "**Shadow review (included in total):** $0.02 spent, $0.35 API-equivalent on subscriptions.",
+  );
+  // Without shadow calls there is no shadow line.
+  const plain = renderReport({
+    success: true,
+    runId: "r1",
+    prompt: "x",
+    state: {},
+    invocations: [inv, review],
+    totals: { costUsd: 0, costEquivUsd: 2.5 },
+    runUrl: "u",
+  });
+  expect(plain).not.toContain("Shadow review");
+
+  const store = new Store(":memory:");
+  try {
+    store.db.exec("PRAGMA foreign_keys = OFF");
+    const insert = store.db.query(`INSERT INTO invocations
+      (run_id, role, harness, provider, model, model_id, status, started_at, finished_at, cost_equiv_usd)
+      VALUES ('r', ?, 'fake', 'p', 'm', ?, ?, ?, ?, ?)`);
+    const now = Date.now();
+    insert.run("review", "claude/opus", "ok", now, now + 10, 1);
+    insert.run("review_shadow", "claude/opus", "timeout", now, now + 10, 0.5);
+    insert.run("review_shadow", "codex/shadow-a", "ok", now, now + 10, 0.25);
+    expect(computeStats(store).models).toEqual([
+      expect.objectContaining({
+        modelId: "claude/opus",
+        role: "review",
+        invocations: 1,
+        ok: 1,
+        failed: 0,
+        costEquivUsd: 1,
+      }),
+    ]);
+  } finally {
+    store.close();
+  }
 });

@@ -2,6 +2,8 @@ import { expect, setSystemTime, test } from "bun:test";
 import { computeProviderWorkload } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import { emptyUsage } from "../src/harness/types.ts";
+import type { ProviderDef } from "../src/router/catalog.ts";
+import { ProviderTracker } from "../src/router/providers.ts";
 import { workloadFor } from "../ui/lib/provider-workload.ts";
 
 function localDay(dayOffset: number, hour = 0): number {
@@ -99,6 +101,46 @@ test("recorded concierge duration contributes to workload", () => {
     });
   } finally {
     setSystemTime();
+    store.close();
+  }
+});
+
+test("a shadow slot is taken only when free now: never queued, never ahead of a production waiter", async () => {
+  const store = new Store(":memory:");
+  try {
+    const reserves = { claudeFiveHour: 0.8, claudeSevenDay: 0.85, codexWeekly: 0.9, codexFiveHour: 0.9 };
+    const def: ProviderDef = {
+      id: "alpha",
+      label: "Alpha",
+      harness: "fake",
+      billing: "subscription",
+      maxConcurrent: 1,
+    };
+    const tracker = new ProviderTracker([def], store, reserves, {});
+    const signal = new AbortController().signal;
+    const shadow = tracker.tryAcquire("alpha");
+    expect(shadow).toBeFunction();
+    // Full: the next shadow attempt gets nothing at once, and production queues.
+    expect(tracker.tryAcquire("alpha")).toBeNull();
+    const order: string[] = [];
+    const production = tracker.acquire("alpha", signal).then((release) => {
+      order.push("production");
+      return release;
+    });
+    await Bun.sleep(0);
+    expect(tracker.tryAcquire("alpha")).toBeNull();
+    // Released: the woken production waiter gets the slot, even though a shadow asks first.
+    shadow?.();
+    expect(tracker.tryAcquire("alpha")).toBeNull();
+    const release = await production;
+    expect(order).toEqual(["production"]);
+    expect(tracker.tryAcquire("alpha")).toBeNull();
+    release();
+    const later = tracker.tryAcquire("alpha");
+    expect(later).toBeFunction();
+    later?.();
+    expect(tracker.tryAcquire("unknown")).toBeNull();
+  } finally {
     store.close();
   }
 });
