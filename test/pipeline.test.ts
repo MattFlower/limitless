@@ -6915,12 +6915,23 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     const calls = newCalls();
     const base = scenario(calls, () => ({ structured: approve, costEquivUsd: 0.25 }));
     const attempts = [deferred<void>(), deferred<void>()];
+    const unattempted: number[] = [];
     const f = start(async (s) => {
       // The artifact is written after production completes; wait for the slot attempt instead.
       if (roleOf(s) === "review" && !s.prompt.startsWith("You are a code")) {
-        const attempt = attempts[calls.primary.length];
+        const round = calls.primary.length;
+        const attempt = attempts[round];
         if (!attempt) throw new Error("unexpected production review round");
-        await attempt.promise;
+        // Bounded, so a shadow that skips or queues for its slot fails the test instead of hanging it.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const missed = new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            unattempted.push(round);
+            resolve();
+          }, 5_000);
+        });
+        await Promise.race([attempt.promise, missed]);
+        clearTimeout(timer);
       }
       return base(s);
     });
@@ -6936,7 +6947,10 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     const acquire = spyOn(f.tracker, "acquire");
     try {
       const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
-      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
+      // Rounds in which the shadow finder never tried beta's slot.
+      expect(unattempted).toEqual([]);
+      expect(status).toBe("succeeded");
       expect(titles(f, run.id)).toEqual([["Single only"], []]);
       expect(calls.shadow).toHaveLength(0);
       for (const round of [0, 1])
