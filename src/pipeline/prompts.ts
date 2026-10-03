@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import type { Complexity, FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
@@ -163,14 +164,23 @@ ${checksSection(input.gates, input.baseline)}
 Reply with a concise report: files changed, how you verified (commands and results), assumptions, and anything left undone.`;
 }
 
-export function formatGateFeedback(cmp: GateComparison[]): string {
+export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): string {
   const bad = cmp.filter((c) => c.blocking);
   if (!bad.length) return "";
   return bad
-    .map(
-      (c) =>
-        `### Check \`${c.name}\` ${c.verdict === "regressed" ? "now FAILS (it passed before your change)" : "FAILS"}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`,
-    )
+    .map((c) => {
+      if (c.result.timedOut) {
+        const limit = cfg?.checks.find((k) => k.name === c.name)?.timeoutSec ?? 900;
+        const output = stripVTControlCharacters(c.result.output);
+        const last = [
+          ...output.matchAll(
+            /^(?:\s*(?:RUN|# Subtest:)\s+(.+)|([^\n]+(?:\.test|\.spec)\.[cm]?[jt]sx?):\s*)$/gm,
+          ),
+        ].at(-1);
+        return `### Check \`${c.name}\` timed out after ${limit} s${c.firstAttempt?.timedOut ? " twice" : ""}${last ? `; the last test running was ${last[1] ?? last[2]}` : ""}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`;
+      }
+      return `### Check \`${c.name}\` ${c.verdict === "regressed" ? "now FAILS (it passed before your change)" : "FAILS"}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`;
+    })
     .join("\n\n");
 }
 

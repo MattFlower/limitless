@@ -32,6 +32,7 @@ export interface ReportInput {
     | "holdout"
     | "lastVerify"
     | "lastGates"
+    | "gateTimeoutReruns"
     | "lastReview"
     | "reviewFollowUps"
     | "reviewHistory"
@@ -148,6 +149,7 @@ export function renderReport(input: ReportInput): string {
   }
 
   blocks.push("## Checks");
+  if (state.gateTimeoutReruns) blocks.push(`Timeout-caused gate re-runs: ${state.gateTimeoutReruns}.`);
   if (state.lastGates?.length) {
     // PR verdict comments omit commands: they can name local paths and generated outputs.
     const commands = state.flow !== "verify-change";
@@ -157,7 +159,7 @@ export function renderReport(input: ReportInput): string {
         state.lastGates.map((g) => {
           const warn = g.verdict === "still_failing" || g.verdict === "flaky";
           const icon = g.blocking ? "❌" : warn ? "⚠️" : "✅";
-          const row = [g.name, `${icon} ${g.verdict.replace("_", " ")}`];
+          const row = [g.name, `${icon} ${g.result.timedOut ? "timed out" : g.verdict.replace("_", " ")}`];
           return commands ? [...row, `\`${escapeCell(g.result.command)}\``] : row;
         }),
       ),

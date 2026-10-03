@@ -12,7 +12,7 @@ export interface GateResult {
   output: string; // tail
   /** Set only when the process was killed for exceeding its timeout. */
   timedOut?: boolean;
-  /** Baseline only: the failed first attempt of a check that was re-run; this result is the re-run. */
+  /** The first attempt of a check that was re-run; this result is the re-run. */
   firstAttempt?: GateResult;
 }
 
@@ -180,7 +180,7 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     out.push({
       name: r.name,
       verdict,
-      blocking: verdict === "regressed" || verdict === "new_failure",
+      blocking: !!r.timedOut || verdict === "regressed" || verdict === "new_failure",
       result: r,
     });
   }
@@ -209,7 +209,7 @@ export async function retryRegressions(
 ): Promise<GateComparison[]> {
   // Matching the command too keeps a failed setup step (also "regressed") from being retried.
   const retryable = (c: GateComparison) =>
-    c.verdict === "regressed" && !pointsAt(c.result.output, changed)
+    c.verdict === "regressed" && !c.result.timedOut && !pointsAt(c.result.output, changed)
       ? cfg.checks.find((k) => k.name === c.name && k.run === c.result.command)
       : undefined;
   if (!cmp.some(retryable)) return cmp;
