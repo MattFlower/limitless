@@ -379,6 +379,80 @@ describe("local factory clones", () => {
     }
   });
 
+  test("source branch deletion and gc do not break subsequent local runs", async () => {
+    await git(repoDir, "checkout", "-qb", "temporary");
+    writeFileSync(join(repoDir, "temporary.txt"), "discarded branch\n");
+    await git(repoDir, "add", "temporary.txt");
+    await git(repoDir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "temporary");
+    const discarded = await git(repoDir, "rev-parse", "HEAD");
+    await git(repoDir, "checkout", "main");
+    const f = start(reply);
+    const first = await f.createRun({ repo: repoDir, prompt: "First run" });
+    expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const repo = f.store.getRepo(first.repoId);
+    if (!repo) throw new Error("missing repo");
+    const cache = cachePath(f.cfg.paths, repo);
+    expect(await git(cache, "for-each-ref", "--format=%(refname)", "refs/heads")).toBe(
+      `refs/heads/${f.store.getRun(first.id)?.branch}`,
+    );
+    expect(existsSync(join(cache, "objects/info/alternates"))).toBe(false);
+    await git(repoDir, "branch", "-D", "temporary");
+    await git(repoDir, "reflog", "expire", "--expire=now", "--all");
+    await git(repoDir, "gc", "--prune=now");
+    expect(
+      (await sh(["git", "cat-file", "-e", discarded], { cwd: repoDir, allowFail: true })).exitCode,
+    ).not.toBe(0);
+    const next = await f.createRun({ repo: repoDir, prompt: "Next run" });
+    expect(await waitFor(f, next.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(await git(cache, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/temporary")).toBe("");
+    expect(await git(repoDir, "rev-parse", `refs/heads/${f.store.getRun(next.id)?.branch}`)).toBe(
+      f.store.getRun(next.id)?.headSha ?? "",
+    );
+  });
+
+  test("source history rewrite and gc preserve an active run's base history", async () => {
+    let prepared = () => {};
+    const ready = new Promise<void>((resolve) => {
+      prepared = resolve;
+    });
+    let release = () => {};
+    const paused = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const f = start(async (s) => {
+      if (roleOf(s) === "triage" && s.prompt.includes("old base run")) {
+        prepared();
+        await paused;
+      }
+      return reply(s);
+    });
+    const base = await git(repoDir, "rev-parse", "HEAD");
+    const first = await f.createRun({ repo: repoDir, prompt: "old base run" });
+    try {
+      await ready;
+      await git(repoDir, "checkout", "--orphan", "replacement");
+      await git(repoDir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "rewrite base");
+      await git(repoDir, "branch", "-M", "main");
+      const rewritten = await git(repoDir, "rev-parse", "HEAD");
+      await git(repoDir, "reflog", "expire", "--expire=now", "--all");
+      await git(repoDir, "gc", "--prune=now");
+      expect(
+        (await sh(["git", "cat-file", "-e", base], { cwd: repoDir, allowFail: true })).exitCode,
+      ).not.toBe(0);
+      const next = await f.createRun({ repo: repoDir, prompt: "rewritten base run" });
+      expect(await waitFor(f, next.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(f.store.getRun(next.id)?.baseSha).toBe(rewritten);
+      release();
+      expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const result = f.store.getRun(first.id);
+      expect(result?.baseSha).toBe(base);
+      expect(await git(repoDir, "rev-parse", `refs/heads/${result?.branch}`)).toBe(result?.headSha ?? "");
+      expect(await git(repoDir, "rev-parse", `${result?.branch}^`)).toBe(base);
+    } finally {
+      release();
+    }
+  });
+
   test("an interrupted legacy worktree finishes in its owner while new runs use the clone", async () => {
     const f = start(reply);
     f.scheduler.drain();

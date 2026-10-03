@@ -189,12 +189,20 @@ async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Pro
           "git",
           "clone",
           "--bare",
-          ...(repo.kind === "local" ? ["--shared"] : []),
+          ...(repo.kind === "local" ? ["--shared", "--dissociate"] : []),
           (repo.kind === "local" ? repo.localPath : repo.url) as string,
           tmp,
         ],
         { cwd: paths.repos, timeoutMs: 600_000, signal },
       );
+      if (repo.kind === "local") {
+        // Own the objects so source gc cannot break retained runs; track source heads only via fetch.
+        const refs = await worktreeGit(["git", "for-each-ref", "--format=delete %(refname)", "refs/heads"], {
+          cwd: tmp,
+          signal,
+        });
+        await worktreeGit(["git", "update-ref", "--stdin"], { cwd: tmp, stdin: refs.stdout, signal });
+      }
       await worktreeGit(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
         cwd: tmp,
         signal,
@@ -211,6 +219,16 @@ async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Pro
   // Agents run inside worktrees of this repo; make any push attempt from them fail.
   await worktreeGit(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
   await worktreeGit(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
+  if (repo.kind === "local") {
+    // Keep bare HEAD usable without retaining copied source branches.
+    await worktreeGit(
+      ["git", "update-ref", "--no-deref", "HEAD", `refs/remotes/origin/${repo.defaultBranch}`],
+      {
+        cwd: cache,
+        signal,
+      },
+    );
+  }
   return cache;
 }
 
