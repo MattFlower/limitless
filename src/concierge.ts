@@ -21,6 +21,7 @@ export const ChatProposalSchema = z.strictObject({
   prompt: text,
   profile: z.enum(["auto", "quick", "standard", "deep"]),
   title: text.max(200),
+  allow: z.array(z.enum(["submodules", "gitattributes"])).default([]),
 });
 export const ChatRequestSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("text"), text }),
@@ -126,7 +127,13 @@ export class Concierge {
       case "propose_run":
         store.proposeChat(
           conversationId,
-          { repo: action.repo, prompt: action.prompt, profile: action.profile, title: action.title },
+          {
+            repo: action.repo,
+            prompt: action.prompt,
+            profile: action.profile,
+            title: action.title,
+            allow: action.allow,
+          },
           origin,
         );
         return;
@@ -143,6 +150,7 @@ export class Concierge {
             prompt: proposal.prompt,
             profile: proposal.profile,
             title: proposal.title,
+            allow: proposal.allow,
             source: proposal.origin.source,
             requestedBy: proposal.origin.requestedBy,
             sourceRef: {

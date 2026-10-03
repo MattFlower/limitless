@@ -435,7 +435,7 @@ test("authorized mentions share the concierge, display complete edited proposals
       await mention("build", "ignored", override);
     expect(f.specs).toHaveLength(0);
     const longPrompt = "all proposal details ".repeat(250);
-    f.action({ type: "propose_run", ...proposalFields, prompt: longPrompt });
+    f.action({ type: "propose_run", ...proposalFields, prompt: longPrompt, allow: ["gitattributes"] });
     await Promise.all([mention("build", "request-1"), mention("build", "request-1")]);
     expect(f.specs).toHaveLength(1);
     expect(f.factory.store.listRuns()).toHaveLength(0);
@@ -451,6 +451,7 @@ test("authorized mentions share the concierge, display complete edited proposals
     expect(details).toContain("Profile: auto");
     expect(details).toContain("Repo: local/test");
     expect(details).toContain(`Title: ${proposalFields.title}`);
+    expect(details).toContain("Allow: gitattributes");
     const oldId = proposal.id;
     const edited = { ...proposalFields, title: "Discord revised", profile: "deep" };
     await mention(`edit ${oldId} ${JSON.stringify(edited)}`, "edit-1");

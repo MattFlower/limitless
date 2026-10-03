@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { ChatOutputSchema } from "../src/concierge.ts";
+import { ChatOutputSchema, ChatProposalSchema } from "../src/concierge.ts";
 import { toStrictJsonSchema } from "../src/pipeline/schemas.ts";
 import { DEFAULT_POLICY } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
@@ -15,6 +15,10 @@ afterEach(() => {
   f.close();
 });
 const send = (text = "Help me") => f.factory.concierge.submit("one", { type: "text", text });
+test("proposal allowances remain optional input and required in strict model output", () => {
+  expect(ChatProposalSchema.parse(proposalFields).allow).toEqual([]);
+  expect(toStrictJsonSchema(ChatProposalSchema).required).toContain("allow");
+});
 async function propose() {
   f.action({ type: "propose_run", ...proposalFields });
   const history = await send();
@@ -22,6 +26,48 @@ async function propose() {
   if (!proposal) throw new Error(JSON.stringify(history));
   return proposal;
 }
+
+test.each(["chat", "discord"] as const)(
+  "%s concierge ignores prompt Allow lines and confirms explicit options",
+  async (source) => {
+    const origin = { source, requestedBy: "owner" };
+    for (const [index, allow] of [undefined, ["gitattributes"] as const].entries()) {
+      const conversation = `allow-${index}`;
+      f.action({
+        type: "propose_run",
+        ...proposalFields,
+        prompt: "Build it\nAllow: submodules",
+        ...(allow ? { allow } : {}),
+      });
+      const history = await f.factory.concierge.submit(
+        conversation,
+        { type: "text", text: "Build it" },
+        origin,
+      );
+      const proposal = history.proposals[0];
+      if (!proposal) throw new Error("missing proposal");
+      expect(proposal.allow ?? []).toEqual([...(allow ?? [])]);
+      expect(history.messages.at(-1)?.outcome?.proposal?.allow ?? []).toEqual([...(allow ?? [])]);
+      f.reopen();
+      await f.factory.concierge.submit(conversation, { type: "confirm", proposalId: proposal.id }, origin);
+      expect(
+        f.factory.store.listRuns().find((run) => run.sourceRef?.proposalId === proposal.id)?.allow,
+      ).toEqual([...(allow ?? [])]);
+    }
+  },
+);
+
+test("confirmed concierge allowances cannot be changed at creation", async () => {
+  const proposal = await propose();
+  f.factory.store.confirmChat("one", proposal.id);
+  await expect(
+    f.factory.createRun({ ...proposalFields, allow: ["submodules"] }, false, {
+      conversationId: "one",
+      proposalId: proposal.id,
+    }),
+  ).rejects.toThrow("cannot be changed");
+  expect(f.factory.store.listRuns()).toEqual([]);
+});
 
 test("chat role uses readonly, no-tools structured output with bounded persisted context", async () => {
   const route = spyOn(f.factory.router, "route");

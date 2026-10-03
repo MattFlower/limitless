@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { parseAllow } from "../core/allow.ts";
 import type { EvalGrade, EvalStrategy, EvalTrial } from "../core/types.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
@@ -226,6 +227,7 @@ export async function gradeImplement(
     // Audit before gates run: their commands could move HEAD or rewrite the grading repository.
     const names = gateScriptNames(prepared.gates);
     const findings = auditDiff(await diffSince(checkout, item.base, env), {
+      allow: parseAllow(item.prompt),
       taskClass: null,
       protectedPaths: prepared.gates.protectedPaths,
       toolCommands,

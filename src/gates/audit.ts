@@ -1,4 +1,4 @@
-import type { TaskClass } from "../core/types.ts";
+import type { AuditAllowance, TaskClass } from "../core/types.ts";
 import type { DiffInfo } from "../git/repos.ts";
 
 export interface AuditFinding {
@@ -62,6 +62,21 @@ interface FilePatch {
   path: string;
   added: string[];
   removed: string[];
+  gitlink: boolean;
+}
+
+/** Git C-style unquoting (paths and .gitattributes patterns); null when Git would not produce it. */
+export function unquote(quoted: string): string | null {
+  if (!/^"(?:\\(?:[0-7]{3}|[abfnrtv"\\])|[^"\\])*"$/.test(quoted)) return null;
+  const escapes = "\x07\b\f\n\r\t\v";
+  // Octal escapes encode bytes; literal Unicode must keep its UTF-8 encoding.
+  const bytes = Array.from(quoted.slice(1, -1).matchAll(/\\([0-7]{3}|[abfnrtv"\\])|[^\\]+/g), (m) => {
+    const c = m[1];
+    return c && /^[0-7]/.test(c)
+      ? Buffer.from([Number.parseInt(c, 8)])
+      : Buffer.from(c ? (escapes["abfnrtv".indexOf(c)] ?? c) : m[0], "utf8");
+  });
+  return Buffer.concat(bytes).toString("utf8");
 }
 
 export function splitPatch(patch: string): FilePatch[] {
@@ -69,17 +84,85 @@ export function splitPatch(patch: string): FilePatch[] {
   let cur: FilePatch | null = null;
   for (const line of patch.split("\n")) {
     if (line.startsWith("diff --git ")) {
-      const m = line.match(/ b\/(.+)$/);
-      cur = { path: m?.[1] ?? "", added: [], removed: [] };
+      const m = line.match(/ (b\/.+|"b\/.+")$/);
+      let path = m?.[1] ?? "";
+      if (path.startsWith('"')) path = unquote(path) ?? path;
+      cur = { path: path.slice(2), added: [], removed: [], gitlink: false };
       files.push(cur);
-    } else if (cur && line.startsWith("+") && !line.startsWith("+++")) {
+    } else if (cur && /^(new (file )?mode 160000|index .* 160000)$/.test(line)) {
+      cur.gitlink = true;
+    } else if (cur && line.startsWith("+") && !/^\+\+\+ ("?b\/|\/dev\/null$)/.test(line)) {
       cur.added.push(line.slice(1));
-    } else if (cur && line.startsWith("-") && !line.startsWith("---")) {
+    } else if (cur && line.startsWith("-") && !/^--- ("?a\/|\/dev\/null$)/.test(line)) {
       cur.removed.push(line.slice(1));
     }
   }
   return files;
 }
+
+const BUILTIN_DIFF_DRIVER =
+  /^(ada|bash|bibtex|cpp|csharp|css|dts|elixir|fortran|fountain|golang|html|java|kotlin|markdown|matlab|objc|pascal|perl|php|python|ruby|rust|scheme)$/;
+
+const HIDES: Record<string, (value: string) => boolean> = {
+  diff: (value) => value === "unset" || (value !== "set" && !BUILTIN_DIFF_DRIVER.test(value)),
+  text: (value) => value === "unset",
+  binary: (value) => value !== "unset",
+  filter: (value) => value !== "unset",
+  merge: (value) => value === "lfs",
+  "linguist-generated": (value) => value !== "unset" && value !== "false",
+};
+
+/** Hiding attributes (check-attr values: set, unset, unspecified or a string), as written in .gitattributes. */
+function hiding(attributes: [string, string][]): string[] {
+  return attributes
+    .filter(([name, value]) => value !== "unspecified" && HIDES[name]?.(value))
+    .map(([name, value]) => (value === "set" ? name : value === "unset" ? `-${name}` : `${name}=${value}`));
+}
+
+/** Hiding attributes effective at head that were not effective at base. */
+export function newlyHidden(base: Record<string, string>, head: Record<string, string>): string[] {
+  const before = hiding(Object.entries(base));
+  return hiding(Object.entries(head)).filter((attribute) => !before.includes(attribute));
+}
+
+export const isAttributeFile = (path: string) => path.split("/").at(-1)?.toLowerCase() === ".gitattributes";
+
+/** Added attribute lines that can hide text diffs, with the pathspec of the files they can match. */
+export function attributeRules(patch: string) {
+  return splitPatch(patch)
+    .filter((fp) => isAttributeFile(fp.path))
+    .flatMap((fp) =>
+      fp.added.flatMap((line) => {
+        const tokens = line.trim().match(/^("(?:\\.|[^"])*"|\S+)\s+(.+)$/);
+        if (!tokens || /^[#!]/.test(tokens[1] ?? "")) return [];
+        const found = (tokens[2] ?? "").split(/\s+/).filter((token) => {
+          const [name = "", value] = token.replace(/^[-!]/, "").split(/=(.*)/);
+          if (value !== undefined && (name === "filter" || name === "linguist-generated"))
+            return name === "filter" || value !== "false";
+          return hiding([[name, value ?? ({ "-": "unset", "!": "unspecified" }[token[0] ?? ""] || "set")]])
+            .length;
+        });
+        const raw = tokens[1] ?? "";
+        const decoded = raw.startsWith('"') ? unquote(raw) : raw;
+        const pattern = decoded ?? raw;
+        // Attribute-file scope as a Git pathspec; icase over-matches, which only adds candidates.
+        const directory = fp.path.slice(0, -".gitattributes".length).replace(/[*?[\\]/g, "\\$&");
+        const glob = pattern.includes("/") ? pattern.replace(/^\//, "") : `**/${pattern}`;
+        // Binary and LFS rules on binary-only content hide nothing; macros never qualify,
+        // nor does a quoted pattern Git could not have written, since its matches are unknown.
+        const exemptable =
+          decoded !== null &&
+          !decoded.startsWith("[attr]") &&
+          found.every((a) =>
+            /^(binary(=set)?|-diff|-text|(diff|text)=unset|(filter|diff|merge)=lfs)$/.test(a),
+          );
+        const rule = { file: fp.path, key: `${fp.path}\0${raw}`, pattern, attributes: tokens[2] ?? "" };
+        return found.length ? [{ ...rule, exemptable, pathspec: `:(glob,icase)${directory}${glob}` }] : [];
+      }),
+    );
+}
+
+const allowHint = (kind: AuditAllowance) => `If this is intended, add \`Allow: ${kind}\` to the request.`;
 
 /**
  * Deterministic checks for reward hacking and scope problems. Blocking findings send the work
@@ -98,6 +181,8 @@ export function auditDiff(
     protectedPaths: string[];
     toolCommands?: string[];
     gateScripts?: GateScripts;
+    /** Persisted requester opt-ins; never parsed from specs, commit messages or composed prompts. */
+    allow?: readonly AuditAllowance[];
   },
 ): AuditFinding[] {
   const findings: AuditFinding[] = [];
@@ -111,6 +196,38 @@ export function auditDiff(
   }
 
   const protectedRes = ctx.protectedPaths.map(globToRegex);
+  const patches = splitPatch(diff.patch);
+  for (const path of diff.gitlinks ?? patches.filter((p) => p.gitlink && p.added.length).map((p) => p.path)) {
+    if (!ctx.allow?.includes("submodules"))
+      findings.push({
+        rule: "gitlink",
+        severity: "block",
+        file: path,
+        detail: `${path}: nested repository contents are absent from the diff, so they cannot be reviewed. Remove the nested repository unless the request asks for it. ${allowHint("submodules")}`,
+      });
+  }
+  const hidden = (file: string | undefined, detail: string) =>
+    ctx.allow?.includes("gitattributes") ||
+    findings.push({
+      rule: "gitattributes",
+      severity: "block",
+      ...(file ? { file } : {}),
+      detail: `${detail} Remove the attribute change unless the request asks for it. ${allowHint("gitattributes")}`,
+    });
+  for (const { file, key, pattern, attributes, exemptable } of attributeRules(
+    diff.attributePatch ?? diff.patch,
+  )) {
+    const text = diff.attributeMatches?.[key];
+    if (!exemptable || text?.length !== 0)
+      hidden(file, `${file}: ${pattern} (${attributes}) can hide text diffs for ${text?.[0] ?? pattern}.`);
+  }
+  for (const { path, base, head } of diff.attributes ?? []) {
+    const added = newlyHidden(base, head).join(" ");
+    if (added && diff.textPaths?.includes(path))
+      hidden(path, `${path}: attributes at head (${added}) hide its diff.`);
+  }
+  for (const error of diff.attributeErrors ?? [])
+    hidden(undefined, `Hidden diffs cannot be ruled out because the ${error}.`);
   for (const f of diff.files) {
     const touched = f.from ? [f.from, f.path] : [f.path];
     const hit = touched.find((p) => protectedRes.some((re) => re.test(p)));
@@ -168,7 +285,7 @@ export function auditDiff(
 
   let assertionsAdded = 0;
   let assertionsRemoved = 0;
-  for (const fp of splitPatch(diff.patch)) {
+  for (const fp of patches) {
     const isTest = TEST_FILE.test(fp.path);
     for (const line of fp.added) {
       for (const [re, label] of SKIP_MARKERS) {

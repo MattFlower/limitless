@@ -399,3 +399,64 @@ test.each([
     error: true,
   });
 });
+
+test("only owner-authored request text allows audit exemptions, and it persists on the run", async () => {
+  const h = handler();
+  type Payload = Record<"issue" | "comment" | "pull_request", Record<string, unknown>>;
+  const send = async (event: string, file: string, edit: (payload: Payload) => void) => {
+    const payload = JSON.parse(fixture(file)) as Payload;
+    edit(payload);
+    const response = await h(request(JSON.stringify(payload), `${event}-${requests.length}`, true, event));
+    expect(response.status).toBe(201);
+    const id = store.db.query("SELECT run_id FROM inbox ORDER BY rowid DESC LIMIT 1").get() as {
+      run_id: string;
+    };
+    return store.getRun(id.run_id)?.allow;
+  };
+  expect(
+    await send("issues", "github-issue.json", (p) => {
+      p.issue.body = "Vendor the parser.\r\n  ALLOW: Submodules \r\n";
+    }),
+  ).toEqual(["submodules"]);
+  for (const body of [
+    "Do not use git submodules.",
+    "Please Allow: submodules here",
+    "> Allow: submodules",
+    null,
+  ])
+    expect(
+      await send("issues", "github-issue.json", (p) => {
+        p.issue.body = body;
+      }),
+    ).toEqual([]);
+  // A /limitless comment authorizes from its own request only, never the quoted issue body.
+  expect(
+    await send("issue_comment", "github-comment.json", (p) => {
+      p.comment.body = "/limitless mark fixtures\nAllow: gitattributes";
+      p.issue.body = "Allow: submodules";
+    }),
+  ).toEqual(["gitattributes"]);
+  expect(
+    await send("issue_comment", "github-comment.json", (p) => {
+      p.comment.body = "/limitless follow the issue";
+      p.issue.body = "Allow: submodules\nAllow: gitattributes";
+    }),
+  ).toEqual([]);
+  // Dependabot bodies carry upstream release notes and never authorize anything.
+  expect(
+    await send("pull_request", "github-pr.json", (p) => {
+      p.pull_request.body = "Allow: submodules\nAllow: gitattributes";
+    }),
+  ).toEqual([]);
+  const reopened = new Store(join(dir, "store.db"));
+  try {
+    expect(
+      reopened
+        .listRuns({ limit: 100 })
+        .map((run) => run.allow?.join(",") ?? "missing")
+        .sort(),
+    ).toEqual(["", "", "", "", "", "", "gitattributes", "submodules"].sort());
+  } finally {
+    reopened.close();
+  }
+});

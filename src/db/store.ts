@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { AUDIT_ALLOWANCES, parseAllow, validateAllow } from "../core/allow.ts";
 import { assertExistingBranchDelivery } from "../core/delivery.ts";
 import type {
   ArtifactMeta,
@@ -161,6 +162,7 @@ const toRun = (r: Row): Run => ({
   finishedAt: (r.finished_at as number) ?? null,
   priority: r.priority as number,
   ...(r.no_baseline_cache === 1 ? { noBaselineCache: true } : {}),
+  allow: AUDIT_ALLOWANCES.filter((kind) => parse<unknown[]>(r.audit_allow, []).includes(kind)),
 });
 
 const toStage = (r: Row): Stage => ({
@@ -795,10 +797,12 @@ export class Store {
         req.repo !== proposal.repo ||
         req.prompt !== proposal.prompt ||
         req.profile !== proposal.profile ||
-        req.title !== proposal.title
+        req.title !== proposal.title ||
+        json(validateAllow(req.allow)) !== json(validateAllow(proposal.allow))
       )
         throw new Error("Confirmed proposal fields cannot be changed");
-      const run = this.createRun(repo, req);
+      const input = { ...req, sourceRef: { ...req.sourceRef, proposalId } };
+      const run = this.createRun(repo, input);
       this.db
         .query("UPDATE chat_proposals SET state = 'consumed', run_id = ? WHERE id = ?")
         .run(run.id, proposalId);
@@ -900,10 +904,14 @@ export class Store {
     const dependsOn = this.validateDependencies(req.dependsOn, id);
     const dependency = this.dependencyStatus(dependsOn);
     const title = req.title ?? req.prompt.split("\n")[0]?.slice(0, 80) ?? "Untitled";
+    // Composed/model prompts cannot grant allowances; these sources use explicit options only.
+    const composed =
+      verifiedGitHubWebhook || ["github", "mcp"].includes(req.source ?? "") || !!req.sourceRef?.proposalId;
+    const allow = validateAllow([...validateAllow(req.allow), ...(composed ? [] : parseAllow(req.prompt))]);
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -924,6 +932,7 @@ export class Store {
         dependency.error ?? null,
         dependency.finishedAt ?? null,
         req.noBaselineCache === true ? 1 : 0,
+        json(allow),
       );
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });
