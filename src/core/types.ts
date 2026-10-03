@@ -328,7 +328,39 @@ export type StreamMessage =
   | { kind: "event"; event: RunEvent }
   | { kind: "provider"; provider: ProviderStatus }
   | { kind: "alert"; alert: QuotaAlert | null; provider: string; window: string; created: boolean }
-  | { kind: "question"; question: Question };
+  | { kind: "question"; question: Question }
+  | { kind: "feed"; item: FeedItem };
+
+export type FeedKind =
+  | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged"}`
+  | "eval.finished"
+  | "daemon.started";
+
+/** A durable item a client must act on; clients read everything after their cursor. */
+export interface FeedItem {
+  id: number;
+  ts: number;
+  kind: FeedKind;
+  runId: string | null;
+  evalId: string | null;
+  repo: string | null;
+  title: string;
+  summary: string;
+  data: Record<string, unknown>;
+}
+
+export interface FeedPage {
+  items: FeedItem[];
+  /** The cursor for the next read: the last returned id, or the effective cursor when empty. */
+  nextAfter: number;
+  /** True when retention removed items after the effective cursor. */
+  pruned: boolean;
+}
+
+export interface FeedAck {
+  consumer: string;
+  id: number;
+}
 
 /** Process-local scheduler state; active includes executions waiting for input or capacity. */
 export interface DrainState {

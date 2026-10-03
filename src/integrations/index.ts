@@ -19,7 +19,11 @@ export async function mountIntegrations(factory: Factory): Promise<Integrations>
   const stopNotifier = startGitHubNotifier(factory.store, runGh);
   return {
     routes: {
-      "/mcp": (req, server) => mcp.handle(req, server.requestIP(req)?.address ?? null),
+      "/mcp": (req, server) => {
+        // Covers limitless_feed's 60-second long poll.
+        server.timeout(req, 90);
+        return mcp.handle(req, server.requestIP(req)?.address ?? null);
+      },
       "/webhooks/github": githubWebhook(factory),
     },
     notes: [

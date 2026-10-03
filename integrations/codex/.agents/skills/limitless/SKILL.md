@@ -25,7 +25,7 @@ the factory choose a profile; `quick`, `standard`, and `deep` are available when
 Creation returns an id and current status immediately, before work finishes. Save that id and
 report it to the user. A successful create call does not establish successful execution.
 
-Follow up with all six tools as needed:
+Follow up with all eight tools as needed:
 
 - `limitless_get_run`: inspect id, status, nullable stage/prUrl, error, open questions and the latest
   20 non-debug events. Check periodically or on request; avoid tight polling.
@@ -41,6 +41,11 @@ Follow up with all six tools as needed:
   to explain queue delays or assess capacity. Missing telemetry stays null or empty.
 - `limitless_create_run`: queue new authorized work; do not automatically retry a mutation after
   a connection failure because it may already have taken effect.
+- `limitless_feed`: catch up on everything to act on across runs (PRs opened, questions,
+  needs_human, failures, merges, finished evals, daemon restarts) after your consumer's cursor;
+  `wait` (up to 60 s) long-polls. Prefer it over polling runs one by one.
+- `limitless_feed_ack`: acknowledge through `nextAfter` for your consumer only after you have
+  handled the items; reading never acknowledges.
 
 `queued`, `running`, and `waiting_input` are nonterminal. `succeeded`, `failed`, `cancelled`, and
 `needs_human` are terminal outcomes; read the evidence and error before reporting the result.

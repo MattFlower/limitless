@@ -1,7 +1,8 @@
+import { version } from "../package.json";
 import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
 import type { CreateRunRequest, Question, Run } from "./core/types.ts";
-import { Store } from "./db/store.ts";
+import { newId, Store } from "./db/store.ts";
 import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
 import { evalSettings } from "./evals/settings.ts";
@@ -65,6 +66,7 @@ export class Factory {
   readonly scheduler: Scheduler;
   readonly deps: EngineDeps;
   readonly startedAt = Date.now();
+  readonly bootId = newId("boot-");
   readonly bootSha: string;
   private readonly tunnels = new SshTunnels((msg) => console.warn(`[tunnel] ${msg}`));
   private readonly providerDefs: ProviderDef[];
@@ -173,6 +175,7 @@ export class Factory {
 
   start(): void {
     if (this.gcInterval) return;
+    this.store.daemonStarted(this.bootId, version, this.bootSha);
     // UI development against seeded data must never launch real (paid) runs.
     if (process.env.LIMITLESS_NO_SCHEDULER === "1") return;
     void this.gc()

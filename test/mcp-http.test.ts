@@ -51,7 +51,7 @@ test("mounted endpoint initializes, discovers and calls tools without sessions",
     ).status,
   ).toBe(202);
   const list = await route(rpc("tools/list"), localServer);
-  expect((await list.json()).result.tools).toHaveLength(6);
+  expect((await list.json()).result.tools).toHaveLength(8);
   const create = await route(
     rpc("tools/call", { name: "limitless_create_run", arguments: { repo: f.repo, prompt: "hello" } }),
     localServer,
@@ -151,4 +151,24 @@ test("protocol method errors and JSON guard are compatible with stateless MCP; R
     expect(res.status).toBe(init.expected);
   }
   expect(f.factory.store.listRuns()).toEqual([]);
+});
+
+test("the mounted endpoint serves the feed tools", async () => {
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "work" });
+  f.factory.store.updateRun(run.id, { status: "succeeded" });
+  const read = await route(
+    rpc("tools/call", { name: "limitless_feed", arguments: { consumer: "codex" } }),
+    localServer,
+  );
+  const page = JSON.parse((await read.json()).result.content[0].text);
+  expect(page).toEqual(f.factory.store.readFeed({ consumer: "codex" }));
+  const ack = await route(
+    rpc("tools/call", { name: "limitless_feed_ack", arguments: { consumer: "codex", id: page.nextAfter } }),
+    localServer,
+  );
+  expect(JSON.parse((await ack.json()).result.content[0].text)).toEqual({
+    consumer: "codex",
+    id: page.nextAfter,
+  });
+  expect(f.factory.store.feedCursor("codex")).toBe(page.nextAfter);
 });

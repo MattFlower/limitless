@@ -4,6 +4,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { z } from "zod";
 import type { Factory } from "../app.ts";
 import type { CreateRunRequest, RunStatus } from "../core/types.ts";
+import { FeedAckSchema, FeedQuerySchema, waitForFeed } from "../feed.ts";
 
 const nonblank = z.string().trim().min(1);
 const status = z.enum([
@@ -52,6 +53,22 @@ const eventSchema = z.object({
   message: z.string(),
   data: z.unknown(),
 });
+const feedItemSchema = z
+  .object({
+    id: z.number().int(),
+    kind: z.string(),
+    title: z.string(),
+    summary: z.string(),
+    data: z.unknown(),
+  })
+  .passthrough();
+const feedPageSchema = z.object({
+  items: z.array(feedItemSchema),
+  nextAfter: z.number().int(),
+  pruned: z.boolean(),
+});
+const feedQuerySchema = FeedQuerySchema.omit({ limit: true });
+type FeedArgs = z.output<typeof feedQuerySchema>;
 const detailSchema = z.object({ run: runSchema, questions: z.array(questionSchema) });
 const providersSchema = z.array(
   z.object({
@@ -86,6 +103,8 @@ export interface McpBackend {
   cancel(id: string): Promise<unknown>;
   answer(id: string, answer: string): Promise<unknown>;
   providers(): Promise<unknown>;
+  feed(query: FeedArgs): Promise<unknown>;
+  feedAck(consumer: string, id: number): Promise<unknown>;
 }
 
 export function factoryBackend(factory: Factory): McpBackend {
@@ -108,13 +127,15 @@ export function factoryBackend(factory: Factory): McpBackend {
       return factory.answer(id, answer, "mcp");
     },
     providers: async () => factory.tracker.all(),
+    feed: (query) => waitForFeed(factory.store, { ...query, limit: 100 }),
+    feedAck: async (consumer, id) => factory.store.ackFeed(consumer, id),
   };
 }
 
 export type Fetch = (url: string, init?: RequestInit) => Promise<Response>;
 
 export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
-  const api = async (path: string, body?: unknown): Promise<unknown> => {
+  const api = async (path: string, body?: unknown, timeoutMs = 30_000): Promise<unknown> => {
     let response: Response;
     try {
       response = await fetcher(`${base.replace(/\/$/, "")}${path}`, {
@@ -125,7 +146,7 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
               headers: { "content-type": "application/json" },
               body: JSON.stringify(body),
             }),
-        signal: AbortSignal.timeout(30_000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (e) {
       throw new Error(
@@ -158,6 +179,13 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
       return api(`${path(id)}/answer`, { answer, by: "mcp" });
     },
     providers: () => api("/api/providers"),
+    feed: ({ consumer, after, wait }) => {
+      const query = new URLSearchParams({ wait: String(wait) });
+      if (consumer !== undefined) query.set("consumer", consumer);
+      if (after !== undefined) query.set("after", String(after));
+      return api(`/api/feed?${query}`, undefined, (wait + 30) * 1000);
+    },
+    feedAck: (consumer, id) => api("/api/feed/ack", { consumer, id }),
   };
 }
 
@@ -250,6 +278,18 @@ export function createMcpServer(backend: McpBackend): Server {
       "Check capacity or diagnose delayed work before delegating. Takes no arguments. Returns each provider's enabled/state/reason, quota windows and reset times, spend/budget and concurrency as tracked by the daemon. Missing telemetry stays null or empty; no credentials are returned.",
       z.object({}).strict(),
       async () => providersSchema.parse(await backend.providers()),
+    ),
+    tool(
+      "limitless_feed",
+      "Catch up on what needs action (PRs opened, questions, failures, needs_human, merges, finished evals, daemon restarts) across all runs. Supply consumer (your stable name) to read after its acknowledged cursor, or after for an explicit cursor; wait (0–60 seconds) long-polls until a new item arrives. Returns {items, nextAfter, pruned} in ascending id order; pruned means retention removed items you never acknowledged. Reading never acknowledges: call limitless_feed_ack with nextAfter only after you have handled the items.",
+      feedQuerySchema,
+      async (input) => feedPageSchema.parse(await backend.feed(input)),
+    ),
+    tool(
+      "limitless_feed_ack",
+      "Acknowledge feed items through id for consumer. Call only after you have handled those items, since acknowledged items are no longer returned by default. The cursor never moves backwards. Returns {consumer, id} with the effective acknowledged id.",
+      FeedAckSchema,
+      async ({ consumer, id }) => FeedAckSchema.parse(await backend.feedAck(consumer, id)),
     ),
   ];
   const server = new Server({ name: "limitless", version: "0.1.0" }, { capabilities: { tools: {} } });
