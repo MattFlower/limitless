@@ -318,6 +318,7 @@ export class Store {
   private listeners = new Set<Listener>();
   private pendingPublications: StreamMessage[] | null = null;
   private feedPublished = 0;
+  private feedPublishing = false;
 
   constructor(path: string, migrationDir = MIGRATION_DIR) {
     this.db = new Database(path, { create: true, strict: true });
@@ -568,13 +569,24 @@ export class Store {
     return result;
   }
 
-  /** Publishes items committed since the last call; inside a transaction they wait for its commit. */
+  /**
+   * Publishes items committed since the last call; inside a transaction they wait for its commit.
+   * One row at a time behind a reentrancy guard: a subscriber that mutates the store while an item
+   * is being delivered must not start a nested pass, and its new items are picked up by this loop.
+   */
   private publishFeed(): void {
-    if (this.db.inTransaction) return;
-    const query = this.db.query(`${FEED_SELECT} WHERE id > ? ORDER BY id`);
-    for (const row of query.all(this.feedPublished) as Row[]) {
-      this.feedPublished = row.id as number;
-      this.publish({ kind: "feed", item: toFeedItem(row) });
+    if (this.db.inTransaction || this.feedPublishing) return;
+    this.feedPublishing = true;
+    try {
+      const query = this.db.query(`${FEED_SELECT} WHERE id > ? ORDER BY id LIMIT 1`);
+      let row = query.get(this.feedPublished) as Row | null;
+      while (row) {
+        this.feedPublished = row.id as number;
+        this.publish({ kind: "feed", item: toFeedItem(row) });
+        row = query.get(this.feedPublished) as Row | null;
+      }
+    } finally {
+      this.feedPublishing = false;
     }
   }
 

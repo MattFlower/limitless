@@ -88,6 +88,29 @@ test("a status change and its item roll back together and publish nothing; a ret
   }
 });
 
+test("a subscriber mutating the store during a multi-item publication sees every item exactly once, in order", () => {
+  const f = feedStore();
+  try {
+    const run = f.run("merged");
+    const other = f.run("other");
+    const seen = f.published();
+    let reacted = false;
+    f.store.subscribe((msg) => {
+      if (msg.kind !== "feed" || reacted) return;
+      reacted = true;
+      f.store.updateRun(other.id, { status: "failed", error: "reaction" });
+    });
+    // One commit, two items: the subscriber's reaction adds a third while the first is being delivered.
+    f.store.updateRun(run.id, { prUrl: "https://example.test/pr/1", merged: true });
+    const persisted = allItems(f.store);
+    expect(persisted.map((i) => i.kind).sort()).toEqual(["run.failed", "run.merged", "run.pr_opened"]);
+    expect(persisted.map((i) => i.id)).toHaveLength(3);
+    expect(seen.items.map((i) => i.id)).toEqual(persisted.map((i) => i.id));
+  } finally {
+    f.close();
+  }
+});
+
 test("a failure after a producer insert in an enclosing eval transaction rolls everything back", () => {
   const f = feedStore();
   try {
