@@ -27,20 +27,64 @@ export function localPath(value: unknown): string {
   return typeof value === "string" && /^\/(?![/\\]|login\b)[!-~]*$/.test(value) ? value : "/";
 }
 
-export function loginPage(next: string, message = "", status = 200, headers: Record<string, string> = {}) {
-  // A cross-site link arrives without the SameSite=Strict cookie; this same-site check finds it.
+/** Browser half of passkeys: base64url to bytes and back around navigator.credentials. */
+const WEBAUTHN_JS = `const b64 = (b) => btoa(String.fromCharCode(...new Uint8Array(b))).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+const bin = (s) => Uint8Array.from(atob(s.replaceAll("-", "+").replaceAll("_", "/")), (c) => c.charCodeAt(0));
+const ids = (list) => (list ?? []).map((c) => ({ ...c, id: bin(c.id) }));
+const json = (c, fields) => ({ id: c.id, rawId: b64(c.rawId), type: c.type, clientExtensionResults: c.getClientExtensionResults(),
+  response: Object.fromEntries(fields.map((f) => [f, c.response[f] && b64(c.response[f])])) });
+const post = async (path, data) => {
+  const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data) });
+  const body = await r.json();
+  if (!r.ok) throw new Error(body.error);
+  return body;
+};
+const run = (id, action) => document.getElementById(id).addEventListener("click", () =>
+  action().catch((e) => (document.querySelector("[role=alert]").textContent = e.message)));`;
+
+function page(body: string, status = 200, headers: Record<string, string> = {}) {
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark light">
 <title>Sign in · Limitless</title><style>body{font:15px system-ui,sans-serif;display:grid;place-items:center;
-min-height:90vh}form{display:grid;gap:12px;width:min(320px,90vw)}input,button{font:inherit;padding:8px;
-width:100%;box-sizing:border-box}p{color:#e55;margin:0}</style></head><body>
-<form method="post" action="/login"><h1>◆ limitless</h1><input type="hidden" name="next" value="${escapeHtml(next)}">
-<label>Username <input name="username" autocomplete="username" value="limitless" readonly></label>
-<label>Password <input type="password" name="password" autocomplete="current-password" required autofocus></label>
-${message ? `<p role="alert">${escapeHtml(message)}</p>` : ""}<button>Sign in</button></form>
-<script>fetch("/api/auth/session").then((r) => r.ok && location.replace(document.forms[0].next.value))</script>
-</body></html>`;
+min-height:90vh}form,main{display:grid;gap:12px;width:min(320px,90vw)}input,button{font:inherit;padding:8px;
+width:100%;box-sizing:border-box}p{margin:0}[role=alert]{color:#e55}</style></head><body>${body}</body></html>`;
   return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8", ...headers } });
+}
+
+export function loginPage(next: string, message = "", status = 200, headers: Record<string, string> = {}) {
+  // A cross-site link arrives without the SameSite=Strict cookie; the same-site session check finds it.
+  return page(
+    `<form method="post" action="/login"><h1>◆ limitless</h1>
+<button type="button" id="passkey">Sign in with a passkey</button>
+<input type="hidden" name="next" value="${escapeHtml(next)}">
+<label>Username <input name="username" autocomplete="username" value="limitless" readonly></label>
+<label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+<p role="alert">${escapeHtml(message)}</p><button>Sign in with password</button></form><script>${WEBAUTHN_JS}
+const back = () => location.replace(document.forms[0].next.value);
+fetch("/api/auth/session").then((r) => r.ok && back());
+run("passkey", async () => {
+  const o = await post("/api/auth/passkey/login/options", {});
+  const c = await navigator.credentials.get({ publicKey: { ...o, challenge: bin(o.challenge), allowCredentials: ids(o.allowCredentials) } });
+  await post("/api/auth/passkey/login", json(c, ["clientDataJSON", "authenticatorData", "signature", "userHandle"]));
+  back();
+});</script>`,
+    status,
+    headers,
+  );
+}
+
+export function enrollPage() {
+  return page(`<main><h1>◆ limitless</h1><p>Create a passkey to sign in to Limitless. This link works once.</p>
+<button id="enroll">Create passkey</button><p role="alert"></p></main><script>${WEBAUTHN_JS}
+run("enroll", async () => {
+  const token = location.hash.slice(1);
+  const o = await post("/api/auth/passkey/register/options", { token });
+  const c = await navigator.credentials.create({ publicKey: { ...o, challenge: bin(o.challenge), user: { ...o.user, id: bin(o.user.id) }, excludeCredentials: ids(o.excludeCredentials) } });
+  const response = json(c, ["clientDataJSON", "attestationObject"]);
+  response.response.transports = c.response.getTransports?.() ?? [];
+  await post("/api/auth/passkey/register", { token, response });
+  location.replace("/");
+});</script>`);
 }
 
 /** Failed sign-ins per source address: `max` within `windowMs`, then refused until the oldest ages out. */
