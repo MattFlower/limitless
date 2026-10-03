@@ -13,6 +13,8 @@ import type {
   FeedAck,
   FeedItem,
   FeedPage,
+  GitHubAccessProblem,
+  GitHubFeedItem,
   Invocation,
   InvocationStatus,
   Question,
@@ -27,6 +29,7 @@ import type {
   StageName,
   StageStatus,
   StreamMessage,
+  TrackedPr,
 } from "../core/types.ts";
 import { DEFAULT_EVAL_CONCURRENCY } from "../core/types.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
@@ -1674,6 +1677,105 @@ export class Store {
         "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       )
       .run(key, JSON.stringify(value));
+  }
+
+  // ---- GitHub poller -------------------------------------------------------
+
+  /** Open PRs that factory runs opened in configured repositories; PRs a run only verified are excluded. */
+  githubTracked(): TrackedPr[] {
+    const rows = this.db
+      .query(
+        `SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId,
+          max(r.status IN ('succeeded', 'needs_human')) AS delivered, g.node_id AS nodeId, g.snapshot,
+          coalesce(g.revision, 0) AS revision, coalesce(g.unknown_polls, 0) AS unknownPolls,
+          g.nudged_head AS nudgedHead, coalesce(g.terminal, 0) AS terminal
+        FROM runs r JOIN repos ON repos.id = r.repo_id LEFT JOIN github_prs g ON g.url = r.pr_url
+        WHERE repos.kind = 'github' AND r.pr_url GLOB 'https://github.com/' || repos.slug || '/pull/[1-9]*'
+          AND NOT r.merged AND NOT r.pr_closed_unmerged AND r.delivery_branch IS NULL
+          AND coalesce(json_extract(r.source_ref, '$.kind'), '') <> 'pull_request' AND coalesce(g.terminal, 0) = 0
+        GROUP BY r.pr_url ORDER BY repos.slug, r.pr_url`,
+      )
+      .all() as Row[];
+    return rows.map((r) => ({ ...r, delivered: r.delivered === 1, terminal: r.terminal === 1 }) as TrackedPr);
+  }
+
+  /** Advance a PR's bookkeeping and publish its feed items in one transaction. */
+  saveGithubPr(pr: TrackedPr, items: GitHubFeedItem[] = []): void {
+    this.db.transaction(() => {
+      this.db
+        .query(
+          `INSERT INTO github_prs VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (url) DO UPDATE SET
+          node_id = excluded.node_id, snapshot = excluded.snapshot, revision = excluded.revision,
+          unknown_polls = excluded.unknown_polls, nudged_head = excluded.nudged_head, terminal = excluded.terminal`,
+        )
+        .run(
+          pr.url,
+          pr.repo,
+          pr.nodeId,
+          pr.snapshot,
+          pr.revision,
+          pr.unknownPolls,
+          pr.nudgedHead,
+          pr.terminal,
+        );
+      this.addGithubFeed(items);
+    })();
+    this.publishFeed();
+  }
+
+  private addGithubFeed(items: GitHubFeedItem[]): void {
+    const insert = this.db.query(`INSERT INTO feed (ts, kind, run_id, repo, title, summary, data, dedupe_key)
+      VALUES (?, ?, ?, ?, substr(?, 1, 200), substr(?, 1, 500), ?, ?) ON CONFLICT (dedupe_key) DO NOTHING`);
+    for (const i of items)
+      insert.run(
+        Date.now(),
+        i.kind,
+        i.runId,
+        i.repo,
+        i.title,
+        i.summary,
+        JSON.stringify(i.data),
+        `${i.kind}:${i.key}`,
+      );
+  }
+
+  /** Open (once per episode) or clear a repository's access problem. */
+  setGithubAccess(
+    repo: string,
+    problem: { reason: string; detail: string; head: string | null } | null,
+  ): void {
+    this.db.transaction(() => {
+      const row = this.db
+        .query("SELECT reason, episode FROM github_access WHERE repo = ?")
+        .get(repo) as Row | null;
+      if (!problem) {
+        if (row?.reason) this.db.query("UPDATE github_access SET reason = NULL WHERE repo = ?").run(repo);
+        return;
+      }
+      if (row?.reason) return;
+      const episode = ((row?.episode as number | undefined) ?? 0) + 1;
+      this.db
+        .query("INSERT OR REPLACE INTO github_access VALUES (?, ?, ?, ?, ?)")
+        .run(repo, problem.reason, problem.detail, Date.now(), episode);
+      this.addGithubFeed([
+        {
+          kind: "github.access_problem",
+          runId: null,
+          repo,
+          title: `GitHub access problem: ${repo}`,
+          summary: problem.detail,
+          data: { reason: problem.reason, head: problem.head },
+          key: `${repo}:${episode}:${problem.head ?? "unknown-head"}`,
+        },
+      ]);
+    })();
+    this.publishFeed();
+  }
+
+  githubAccessProblems(): GitHubAccessProblem[] {
+    return this.db
+      .query("SELECT repo, reason, detail, since FROM github_access WHERE reason IS NOT NULL ORDER BY repo")
+      .all() as GitHubAccessProblem[];
   }
 
   getProviderEnabledOverride(id: string): boolean | null {

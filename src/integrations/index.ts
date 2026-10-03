@@ -3,6 +3,7 @@ import type { Factory } from "../app.ts";
 import { mountDiscord } from "./discord.ts";
 import { type GhRunner, githubWebhook, runGh } from "./github.ts";
 import { type GitHubPrClient, getGitHubPr, startGitHubNotifier } from "./github-notifier.ts";
+import { type GitHubClient, startGitHubPoller } from "./github-poller.ts";
 import { mountMcp } from "./mcp-http.ts";
 
 export interface Integrations {
@@ -16,6 +17,7 @@ export interface IntegrationDeps {
   toolVersions?: () => Promise<string[]>;
   gh?: GhRunner;
   prClient?: GitHubPrClient;
+  github?: GitHubClient;
 }
 
 /** Wire trigger integrations (GitHub webhooks, Discord, MCP) into the daemon. */
@@ -27,7 +29,12 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
     deps.gh ?? runGh,
     console.warn,
     deps.prClient ?? getGitHubPr,
+    !factory.cfg.githubPoll,
   );
+  const seconds = factory.cfg.githubPollSeconds;
+  const stopPoller = factory.cfg.githubPoll
+    ? startGitHubPoller(factory.store, { client: deps.github, seconds })
+    : () => {};
   return {
     routes: {
       "/mcp": (req, server) => {
@@ -43,9 +50,11 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
       factory.cfg.secrets.GITHUB_WEBHOOK_SECRET
         ? "GitHub webhooks enabled"
         : "GitHub webhooks disabled (GITHUB_WEBHOOK_SECRET is not configured)",
+      factory.cfg.githubPoll ? `GitHub PR polling every ${seconds}s` : "GitHub PR polling disabled",
     ],
     stop: async () => {
       stopNotifier();
+      stopPoller();
       await Promise.all([mcp.stop(), discord.stop()]);
     },
   };

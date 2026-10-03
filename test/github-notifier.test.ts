@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -359,4 +359,78 @@ test("startup polling includes succeeded PRs and never overlaps event-triggered 
     release();
     stop();
   }
+});
+
+test("with polling, observations reconcile runs: merged metadata, resolution, dependants and one run.merged", async () => {
+  const { pollerHarness } = await import("./github-poller-support.ts");
+  const h = pollerHarness();
+  try {
+    const human = h.factoryPr("o/r", 1, "needs_human");
+    h.store.updateRun(human.id, { error: "review required" });
+    h.store.putArtifact(human.id, "report", "markdown", "Human review required");
+    const done = h.factoryPr("o/r", 2);
+    const closed = h.factoryPr("o/r", 3);
+    const dependant = h.store.createRun(h.repo("o/r"), { repo: "o/r", prompt: "next", dependsOn: [done.id] });
+    expect(dependant.status).toBe("waiting");
+    const legacy = mock(async () => null);
+    const stopNotifier = startGitHubNotifier(
+      h.store,
+      async () => {},
+      () => {},
+      legacy,
+      false,
+    );
+    h.start();
+    await h.advance(0);
+    for (const n of [1, 2]) {
+      const node = h.node("o/r", n);
+      node.state = "MERGED";
+      node.mergedAt = "2026-10-03T05:00:00Z";
+      node.mergedBy = { login: "MattFlower" };
+    }
+    h.node("o/r", 3).state = "CLOSED";
+    await h.advance(15_000);
+    await h.advance(15_000);
+    stopNotifier();
+    expect(legacy).not.toHaveBeenCalled();
+    const mergedAt = Date.parse("2026-10-03T05:00:00Z");
+    expect(h.store.getRun(human.id)).toMatchObject({
+      status: "resolved",
+      merged: true,
+      mergedBy: "MattFlower",
+      mergedAt,
+    });
+    expect(h.store.getRun(human.id)?.error).toBe("review required");
+    expect(h.store.getArtifact(human.id, "report")).toBe("Human review required");
+    expect(h.store.getRun(done.id)).toMatchObject({
+      status: "succeeded",
+      merged: true,
+      mergedBy: "MattFlower",
+    });
+    expect(h.store.getRun(closed.id)).toMatchObject({ merged: false, prClosedUnmerged: true });
+    expect(h.store.getRun(dependant.id)?.status).toBe("queued");
+    const feed = h.store.readFeed({ limit: 1000 }).items;
+    expect(feed.filter((i) => i.kind === "run.merged").map((i) => i.runId)).toEqual([human.id, done.id]);
+    expect(feed.filter((i) => i.kind === "pr.merged")).toHaveLength(2);
+    expect(feed.filter((i) => i.kind === "pr.closed")).toHaveLength(1);
+  } finally {
+    h.close();
+  }
+});
+
+test("with polling on, the notifier never reads PRs itself", async () => {
+  const client = mock(async () => null);
+  needsHuman();
+  const stop = startGitHubNotifier(
+    store,
+    async () => {},
+    () => {},
+    client,
+    false,
+  );
+  await Bun.sleep(0);
+  needsHuman();
+  await Bun.sleep(0);
+  stop();
+  expect(client).not.toHaveBeenCalled();
 });

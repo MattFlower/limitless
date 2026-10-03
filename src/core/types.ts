@@ -334,7 +334,36 @@ export type StreamMessage =
 export type FeedKind =
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged"}`
   | "eval.finished"
-  | "daemon.started";
+  | "daemon.started"
+  | GitHubFeedKind;
+export type GitHubFeedKind =
+  | `pr.${"ci_passed" | "ci_failed" | "conflicting" | "behind" | "review" | "comment" | "merged" | "closed"}`
+  | "github.access_problem";
+export interface GitHubFeedItem {
+  kind: GitHubFeedKind;
+  runId: string | null;
+  repo: string;
+  title: string;
+  summary: string;
+  data: Record<string, unknown>;
+  /** Unique per kind; repeated keys are dropped. */
+  key: string;
+}
+/** A factory PR the poller observes, with its persisted bookkeeping. */
+export interface TrackedPr {
+  url: string;
+  repo: string;
+  runId: string;
+  /** A succeeded or needs_human run waits on this PR (it gets the fast cadence). */
+  delivered: boolean;
+  nodeId: string | null;
+  snapshot: string | null;
+  revision: number;
+  unknownPolls: number;
+  nudgedHead: string | null;
+  terminal: boolean;
+}
+export type GitHubAccessProblem = { repo: string; reason: string; detail: string; since: number };
 export interface FeedItem {
   id: number;
   ts: number;

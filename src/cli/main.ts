@@ -33,6 +33,7 @@ Usage:
   limitless providers                     Provider health and quota
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
+  limitless doctor                        Report GitHub access problems the PR poller recorded
   limitless gc [--dry-run]                Clean up expired worktrees, logs, debug events and baseline cache
   limitless gates clear-cache [--repo owner/name]  Drop cached passing baselines (all repos by default)
   limitless mcp                           MCP stdio proxy (daemon must be running)
@@ -404,6 +405,19 @@ async function main(): Promise<void> {
           `${p.id.padEnd(11)} ${p.state.padEnd(9)} maxConcurrent ${p.maxConcurrent} ${w} ${p.reason ? color.dim(p.reason) : ""}`,
         );
       }
+      return;
+    }
+    case "doctor": {
+      const [{ loadConfig }, { Store }, { githubDoctor }] = await Promise.all([
+        import("../config.ts"),
+        import("../db/store.ts"),
+        import("../integrations/github-poller.ts"),
+      ]);
+      const store = new Store(loadConfig().paths.db);
+      const lines = githubDoctor(store);
+      store.close();
+      for (const line of lines) console.log(line);
+      if (lines.length > 1) process.exitCode = 1;
       return;
     }
     case "gc": {

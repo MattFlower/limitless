@@ -119,6 +119,8 @@ test("mounting with fake dependencies spawns no processes, including notifier ac
   const gh = mock(async (_args: string[]) => {});
   const prClient = mock(async (_url: string) => null);
   let integrations: Integrations | undefined;
+  // The notifier's own PR checks run only with polling off.
+  cfg.githubPoll = false;
   try {
     const repo = store.getRepoBySlug("MattFlower/limitless");
     if (!repo) throw new Error("missing repo");
@@ -146,6 +148,36 @@ test("mounting with fake dependencies spawns no processes, including notifier ac
     spawn.mockRestore();
     spawnSync.mockRestore();
     nodeSpawn.mockRestore();
+  }
+});
+
+test("mounting with polling on observes PRs through the injected client, never the legacy PR client", async () => {
+  const prClient = mock(async (_url: string) => null);
+  const github = mock(async (path: string) =>
+    path === "graphql"
+      ? { status: 200, headers: new Headers(), body: { data: { nodes: [] } } }
+      : { status: 200, headers: new Headers(), body: { node_id: "PR_1" } },
+  );
+  const repo = store.getRepoBySlug("MattFlower/limitless");
+  if (!repo) throw new Error("missing repo");
+  const run = store.createRun(repo, { repo: repo.slug, prompt: "check PR" });
+  store.updateRun(run.id, {
+    status: "needs_human",
+    prUrl: "https://github.com/MattFlower/limitless/pull/42",
+  });
+  const integrations = await mountIntegrations({ cfg, store } as Factory, {
+    toolVersions: async () => [],
+    gh: async () => {},
+    prClient,
+    github,
+  });
+  try {
+    for (let i = 0; i < 5; i++) await Bun.sleep(1);
+    expect(integrations.notes).toContain("GitHub PR polling every 45s");
+    expect(github.mock.calls.map((c) => c[0])).toEqual(["repos/MattFlower/limitless/pulls/42", "graphql"]);
+    expect(prClient).not.toHaveBeenCalled();
+  } finally {
+    await integrations.stop();
   }
 });
 
