@@ -75,7 +75,7 @@ Add a GitHub webhook integration so runs can be triggered from GitHub.
 - Tests: signature verification (valid/invalid/missing), dedupe, owner filtering, each trigger
   mapping to the right CreateRunRequest, and that untrusted text is quoted. Use recorded sample
   payloads; never call GitHub in tests (inject the `gh` runner).
-- Document setup in README (webhook URL `https://limitless.mattflower.cc/webhooks/github`, content
+- Document setup in README (webhook URL `https://<your-host>/webhooks/github`, content
   type JSON, secret, events: Issues, Issue comments, Pull requests).
 
 ## 2. MCP server + skills

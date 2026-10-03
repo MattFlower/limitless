@@ -9,7 +9,7 @@ How the factory runs day to day, where to look when something breaks, and how ch
 | Daemon (API, UI, scheduler, pipeline) | Mac, `~/.limitless/app` (release checkout of `main`) | launchd `cc.mattflower.limitless` | `~/.limitless/logs/cc.mattflower.limitless.log` |
 | Local model (Qwen3.8 Flash Next; Swift-1.5 27B opt-in) | Mac, `127.0.0.1:8989` | external: oMLX.app / `omlx start` | oMLX server logs |
 | GPU model (Qwen 3.8 27B, CUDA llama.cpp) | twilight, `:8080` (LAN, API key) | systemd user unit `limitless-llama` (linger on) | `journalctl --user -u limitless-llama` on twilight |
-| Public webhook tunnel | Cloudflare → `limitless.mattflower.cc/webhooks/*` | launchd `cc.mattflower.limitless-tunnel` (opt-in) | `~/.limitless/logs/cc.mattflower.limitless-tunnel.log` |
+| Public webhook tunnel | Cloudflare → `<public_url host>/webhooks/*` | launchd `cc.mattflower.limitless-tunnel` (opt-in) | `~/.limitless/logs/cc.mattflower.limitless-tunnel.log` |
 | Data | `~/.limitless/` — `limitless.db`, `repos/` (bare caches), `work/` (worktrees), `runs/<id>/inv-*.log` (raw agent streams) | the daemon | — |
 | Config & secrets | `~/.config/limitless/config.toml`, `secrets.env` (chmod 600) | you | — |
 
@@ -295,9 +295,9 @@ fixed wired LAN IP and NPM's socket source IP):
 
 ```toml
 [server]
-listen_lan = "192.168.1.10"
-trusted_proxies = ["192.168.1.20"]
-public_origins = ["https://limitless.mattflower.net"]
+listen_lan = "10.0.0.10"
+trusted_proxies = ["10.0.0.20"]
+public_origins = ["https://limitless.example.test"]
 ```
 
 Restart the daemon; allow incoming connections for Bun/Limitless if macOS displays its
@@ -305,7 +305,7 @@ firewall prompt. The additional listener binds only `listen_lan`, on the configu
 `server.port` (default 7400); the loopback listener remains. Omit these keys for local-only
 operation. Do not use a wildcard address or change `server.host` to a LAN address.
 
-Create an NPM Proxy Host for `limitless.mattflower.net`, terminating TLS with the wildcard
+Create an NPM Proxy Host for your UI hostname (for example `limitless.example.test`), terminating TLS with the wildcard
 certificate and forwarding to `http://<mac>:7400`. Preserve the public `Host` header
 (`proxy_set_header Host $http_host;`), including any configured non-default port. Attach an
 Access List allowing only your LAN and WireGuard source ranges **and** requiring basic
