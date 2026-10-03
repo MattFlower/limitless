@@ -195,7 +195,7 @@ Sources: [checks.go](https://raw.githubusercontent.com/cli/cli/trunk/pkg/cmd/pr/
 The failure signature is the check name, the failing test or error lines, and the runner image version from the job log. Each step either handles the failure or passes it to the next one.
 
 1. **Is the main branch's latest run red on the same check?** If so, pause per-PR reactions and report one main failure. This covers infrastructure and workflow breakage, such as the `startup_failure` episode.
-2. **Is it a timeout, a start failure or a cancellation?** That means the job timed out, failed to start or was cancelled, or a test hit its per-test timeout ("timed out after"). If so, rerun once at the same SHA.
+2. **Is it a timeout, a start failure or a cancellation?** That means the job timed out, failed to start or was cancelled, or a test hit its per-test timeout ("timed out after"). If so, rerun once at the same SHA. A run cancelled because a newer push superseded it is not rerun.
    - **The rerun passes:** the same SHA has both passed and failed, which is evidence of nondeterminism. Record the signature in the flake ledger.
    - **The rerun fails the same way:** continue.
 3. **Is it a formatter or lint autofix failure?** If so, run the repository's configured fix command (for this repository, `biome check --write`). No model is needed.
