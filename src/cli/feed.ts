@@ -27,6 +27,7 @@ export async function pollFeed(
   let { after } = opts;
   let pruned = false;
   let backoff = 1000;
+  let reached = false;
   for (;;) {
     const wait = Math.min(MAX_FEED_WAIT_S, Math.max(0, deadline - now()) / 1000);
     const query = { wait: String(wait), consumer: opts.consumer, after: after?.toString() };
@@ -35,6 +36,7 @@ export async function pollFeed(
     try {
       page = await api<FeedPage>(`/api/feed?${new URLSearchParams(params)}`);
       backoff = 1000;
+      reached = true;
     } catch (error) {
       if (
         !(error instanceof ApiError) ||
@@ -43,7 +45,11 @@ export async function pollFeed(
       )
         throw error;
       await sleep(Math.min(backoff, Math.max(0, deadline - now())));
-      if (now() >= deadline) return { items: [], nextAfter: after ?? 0, pruned };
+      // Never invent a cursor: a wait that never reached the daemon reports why.
+      if (now() >= deadline) {
+        if (!reached) throw error;
+        return { items: [], nextAfter: after ?? 0, pruned };
+      }
       backoff = Math.min(backoff * 2, 15_000);
       continue;
     }

@@ -39,6 +39,23 @@ test("long polling retries connection errors and 5xx after daemon restarts with 
   expect(waits).toEqual(["10", "9", "7"]);
 });
 
+test("a wait that never reaches the daemon fails with the last error instead of inventing a cursor", async () => {
+  let clock = 0;
+  const api = async <T>(): Promise<T> => {
+    throw new ApiError("connection refused");
+  };
+  await expect(
+    pollFeed(
+      { consumer: "orchestrator", waitS: 5 },
+      api,
+      () => clock,
+      async (ms) => {
+        clock += ms;
+      },
+    ),
+  ).rejects.toThrow("connection refused");
+});
+
 test("retry backoff caps at 15 s and the total deadline returns the last cursor and pruning notice", async () => {
   let clock = 0;
   let calls = 0;

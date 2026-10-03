@@ -2,7 +2,7 @@ DROP TRIGGER feed_run_pr;
 DROP TRIGGER feed_run_merged;
 DROP TRIGGER feed_run_status;
 -- One trigger makes compound updates publish in causal order.
-CREATE TRIGGER feed_run_update AFTER UPDATE ON runs BEGIN
+CREATE TRIGGER feed_run_update AFTER UPDATE OF status, pr_url, merged ON runs BEGIN
   INSERT INTO feed_add SELECT 'run.pr_opened', NEW.id, NULL, 'PR opened: ' || NEW.title, NEW.pr_url,
     json_object('prUrl', NEW.pr_url, 'status', NEW.status), NEW.id
     WHERE coalesce(OLD.pr_url, '') = '' AND NEW.pr_url <> '';
