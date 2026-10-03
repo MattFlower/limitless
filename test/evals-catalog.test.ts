@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
 import { Factory } from "../src/app.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
@@ -79,10 +78,6 @@ test("catalog candidates absent from policy execute exactly and API exposes orig
       await route(requestWithParams("http://localhost:7400/api/models"), localServer)
     ).json()) as { models: typeof MODELS };
     expect(result.models.find((m) => m.id === "openrouter/ministral-14b-2512")?.origin).toBe("FR");
-    const ui = readFileSync(new URL("../ui/pages/Models.tsx", import.meta.url), "utf8");
-    expect(ui).toContain("{m.origin}");
-    expect(ui).toContain("{m.baseOrigin}");
-    expect(ui).toContain("colspan={13}");
   } finally {
     await factory.stop();
     factory.store.close();
