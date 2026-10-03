@@ -429,6 +429,8 @@ test("hidden grading scrubs secrets, bounds output, times out, and rejects desti
 
 test("candidate-configured git filters run without daemon secrets", async () => {
   const f = await fixture();
+  f.item.prompt += " using Git attributes";
+  f.save();
   const previous = process.env.LIMITLESS_EVAL_SECRET;
   process.env.LIMITLESS_EVAL_SECRET = "daemon-secret";
   const leak = join(f.home, "leak");
@@ -1334,6 +1336,7 @@ test("a committed nested repository never receives hidden tests or grader copies
   const f = await fixture();
   const pause = pauseGrading(f);
   try {
+    f.item.prompt += " and add a submodule";
     f.item.hidden.command = `${pause.prefix}sh hidden/check.sh; result=$?; mkdir -p nested; cp hidden/check.sh nested/compiled; cp hidden/check.sh nested/own; exit $result`;
     f.save();
     f.respond(async (s): Promise<FakeReply> => {

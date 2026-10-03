@@ -385,6 +385,10 @@ export interface DiffInfo {
   stat: string;
   added: number;
   removed: number;
+  gitlinks?: string[];
+  paths?: string[];
+  baseBinaryPaths?: string[];
+  attributePatch?: string;
 }
 
 export async function diffSince(
@@ -394,11 +398,12 @@ export async function diffSince(
   threeDot = false,
 ): Promise<DiffInfo> {
   const range = `${baseSha}${threeDot ? "..." : ".."}HEAD`;
-  const [patch, names, stat, numstat] = await Promise.all([
+  const [patch, names, stat, numstat, raw] = await Promise.all([
     worktreeGit(["git", "diff", range], { cwd, env }),
     worktreeGit(["git", "diff", "--name-status", range], { cwd, env }),
     worktreeGit(["git", "diff", "--stat", range], { cwd, env }),
     worktreeGit(["git", "diff", "--numstat", range], { cwd, env }),
+    worktreeGit(["git", "diff", "--raw", "-z", "--no-renames", range], { cwd, env }),
   ]);
   let added = 0;
   let removed = 0;
@@ -408,7 +413,42 @@ export async function diffSince(
     removed += Number(r) || 0;
   }
   const files = parseNameStatus(names.stdout);
-  return { patch: patch.stdout, files, stat: stat.stdout, added, removed };
+  const gitlinks: string[] = [];
+  const entries = raw.stdout.split("\0");
+  for (let i = 0; i + 1 < entries.length; i += 2)
+    if (entries[i]?.split(" ")[1] === "160000") gitlinks.push(entries[i + 1] ?? "");
+  const paths = entries.filter((entry, i) => i % 2 === 1 && entry);
+  const baseBinaryPaths: string[] = [];
+  let attributePatch: string | undefined;
+  if (paths.some((path) => /(^|\/)\.gitattributes$/.test(path))) {
+    // Attribute files must be inspected even if binary or renamed into place.
+    const args = ["--text", "--no-renames", range, "--", ".gitattributes", "**/.gitattributes"];
+    attributePatch = (await worktreeGit(["git", "diff", ...args], { cwd, env })).stdout;
+    const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
+    // Content classification uses the base, with attributes ignored, never the worker's attributes.
+    const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    const contents = await worktreeGit(
+      ["git", "diff", "--numstat", "-z", "--no-renames", emptyTree, revision],
+      { cwd, env },
+    );
+    for (const entry of contents.stdout.split("\0").filter(Boolean)) {
+      const match = entry.match(/^([^\t]+)\t[^\t]+\t([\s\S]*)$/);
+      if (!match) continue;
+      paths.push(match[2] ?? "");
+      if (match[1] === "-") baseBinaryPaths.push(match[2] ?? "");
+    }
+  }
+  return {
+    patch: patch.stdout,
+    files,
+    stat: stat.stdout,
+    added,
+    removed,
+    gitlinks,
+    paths,
+    baseBinaryPaths,
+    attributePatch,
+  };
 }
 
 export function parseNameStatus(text: string): DiffFile[] {

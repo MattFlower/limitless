@@ -292,6 +292,46 @@ function diff(patch: string, files: { status: string; path: string }[]): DiffInf
 }
 
 describe("auditDiff", () => {
+  test("original request exemptions are narrow, case insensitive and independent", () => {
+    const patch = [
+      "diff --git a/vendor/nested b/vendor/nested",
+      "new file mode 160000",
+      "index 0000000..1234567",
+      "+++ b/vendor/nested",
+      "+Subproject commit 1234567",
+      "diff --git a/.gitattributes b/.gitattributes",
+      "+++ b/.gitattributes",
+      "+*.ts -diff",
+      "diff --git a/a.test.ts b/a.test.ts",
+      "+++ b/a.test.ts",
+      '+test.skip("hidden", () => {});',
+    ].join("\n");
+    const changes = diff(patch, [
+      { status: "A", path: "vendor/nested" },
+      { status: "A", path: ".gitattributes" },
+      { status: "M", path: "a.test.ts" },
+    ]);
+    for (const [request, rules] of [
+      ["Fix the tests", ["gitlink", "gitattributes", "test-skipped"]],
+      ["Add a SUBMODULE", ["gitattributes", "test-skipped"]],
+      ["Configure Git Attributes", ["gitlink", "test-skipped"]],
+      ["Update .gitattributes", ["gitlink", "test-skipped"]],
+      ["Add submodules and gitattributes", ["test-skipped"]],
+      ["Update modules and attributes", ["gitlink", "gitattributes", "test-skipped"]],
+    ] as const) {
+      expect(auditDiff(changes, { taskClass: null, protectedPaths: [], request }).map((f) => f.rule)).toEqual(
+        [...rules],
+      );
+    }
+    expect(
+      auditDiff(changes, {
+        taskClass: null,
+        protectedPaths: [],
+        toolCommands: ["echo submodule .gitattributes"],
+      }).map((f) => f.rule),
+    ).toEqual(["gitlink", "gitattributes", "test-skipped"]);
+  });
+
   test("blocks an empty diff", () => {
     const f = auditDiff(diff("", []), { taskClass: "feature", protectedPaths: [] });
     expect(f).toEqual([

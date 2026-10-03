@@ -62,6 +62,7 @@ interface FilePatch {
   path: string;
   added: string[];
   removed: string[];
+  gitlink: boolean;
 }
 
 export function splitPatch(patch: string): FilePatch[] {
@@ -69,12 +70,27 @@ export function splitPatch(patch: string): FilePatch[] {
   let cur: FilePatch | null = null;
   for (const line of patch.split("\n")) {
     if (line.startsWith("diff --git ")) {
-      const m = line.match(/ b\/(.+)$/);
-      cur = { path: m?.[1] ?? "", added: [], removed: [] };
+      const m = line.match(/ (b\/.+|"b\/.+")$/);
+      let path = m?.[1] ?? "";
+      if (path.startsWith('"')) {
+        const escapes = "\x07\b\f\n\r\t\v";
+        const decoded = path
+          .slice(1, -1)
+          .replace(/\\([0-7]{3}|[abfnrtv"\\])/g, (_, c: string) =>
+            /^[0-7]/.test(c)
+              ? String.fromCharCode(Number.parseInt(c, 8))
+              : (escapes["abfnrtv".indexOf(c)] ?? c),
+          );
+        const encoding = /\\[0-7]{3}/.test(path) ? "latin1" : "utf8";
+        path = Buffer.from(decoded, encoding).toString("utf8");
+      }
+      cur = { path: path.slice(2), added: [], removed: [], gitlink: false };
       files.push(cur);
-    } else if (cur && line.startsWith("+") && !line.startsWith("+++")) {
+    } else if (cur && /^(new (file )?mode 160000|index .* 160000)$/.test(line)) {
+      cur.gitlink = true;
+    } else if (cur && line.startsWith("+") && !/^\+\+\+ ("?b\/|\/dev\/null$)/.test(line)) {
       cur.added.push(line.slice(1));
-    } else if (cur && line.startsWith("-") && !line.startsWith("---")) {
+    } else if (cur && line.startsWith("-") && !/^--- ("?a\/|\/dev\/null$)/.test(line)) {
       cur.removed.push(line.slice(1));
     }
   }
@@ -98,6 +114,7 @@ export function auditDiff(
     protectedPaths: string[];
     toolCommands?: string[];
     gateScripts?: GateScripts;
+    request?: string; // Original request only; generated specs and commit messages cannot exempt.
   },
 ): AuditFinding[] {
   const findings: AuditFinding[] = [];
@@ -111,6 +128,51 @@ export function auditDiff(
   }
 
   const protectedRes = ctx.protectedPaths.map(globToRegex);
+  // Small, case-insensitive phrase lists: submodule(s); .gitattributes,
+  // gitattributes, git attribute(s). Each request exemption applies only to its own rule.
+  const submodulesRequested = /\bsubmodules?\b/i.test(ctx.request ?? "");
+  const attributesRequested = /\bgitattributes\b|\bgit attributes?\b/i.test(ctx.request ?? "");
+  const patches = splitPatch(diff.patch);
+  for (const path of diff.gitlinks ?? patches.filter((p) => p.gitlink && p.added.length).map((p) => p.path)) {
+    if (!submodulesRequested)
+      findings.push({
+        rule: "gitlink",
+        severity: "block",
+        file: path,
+        detail: `${path}: nested repository contents are absent from the diff.`,
+      });
+  }
+  const binary = new Set(diff.baseBinaryPaths ?? []);
+  const paths = new Set(diff.paths ?? diff.files.map((f) => f.path));
+  for (const fp of splitPatch(diff.attributePatch ?? diff.patch)) {
+    if (attributesRequested || !/(^|\/)\.gitattributes$/.test(fp.path)) continue;
+    for (const line of fp.added) {
+      const tokens = line.trim().match(/^("(?:\\.|[^"])*"|\S+)\s+(.+)$/);
+      if (!tokens || /^[#!]/.test(tokens[1] ?? "")) continue;
+      if (!(tokens[2] ?? "").split(/\s+/).some((a) => /^(binary|-diff|-text|diff=.*|filter=.*)$/.test(a)))
+        continue;
+      let pattern = tokens[1] ?? "";
+      try {
+        if (pattern.startsWith('"')) pattern = JSON.parse(pattern) as string;
+      } catch {
+        /* Unknown quoting blocks conservatively. */
+      }
+      const directory = fp.path.slice(0, -".gitattributes".length);
+      const glob = new Bun.Glob(pattern.replace(/^\//, ""));
+      const matches = [...paths].filter(
+        (p) =>
+          p.startsWith(directory) &&
+          glob.match(pattern.includes("/") ? p.slice(directory.length) : (p.split("/").at(-1) ?? p)),
+      );
+      if (!/[{}]|\[attr\]/.test(pattern) && matches.length && matches.every((p) => binary.has(p))) continue;
+      findings.push({
+        rule: "gitattributes",
+        severity: "block",
+        file: fp.path,
+        detail: `${fp.path}: ${pattern} (${tokens[2]}) can hide text diffs for ${matches.find((p) => !binary.has(p)) ?? pattern}.`,
+      });
+    }
+  }
   for (const f of diff.files) {
     const touched = f.from ? [f.from, f.path] : [f.path];
     const hit = touched.find((p) => protectedRes.some((re) => re.test(p)));
@@ -168,7 +230,7 @@ export function auditDiff(
 
   let assertionsAdded = 0;
   let assertionsRemoved = 0;
-  for (const fp of splitPatch(diff.patch)) {
+  for (const fp of patches) {
     const isTest = TEST_FILE.test(fp.path);
     for (const line of fp.added) {
       for (const [re, label] of SKIP_MARKERS) {
