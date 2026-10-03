@@ -69,6 +69,23 @@ async function audited(files = ["sample.test.ts"]) {
   }
 }
 
+test("private strings in binary or -diff content block without bloating the review patch", async () => {
+  const configDir = join(dir, "config");
+  mkdirSync(configDir);
+  writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\n");
+  writeFileSync(join(work, ".gitattributes"), "*.dat -diff\n");
+  writeFileSync(join(work, "hidden.dat"), "SECRET-HOST.EXAMPLE\n");
+  writeFileSync(join(work, "blob.bin"), Buffer.from("\0\nsecret-host.example\n"));
+  await commitAll(work, "hidden content");
+  const diff = await diffSince(work, base);
+  expect(diff.patch).not.toContain("secret-host.example");
+  const findings = auditDiff(diff, { configDir, taskClass: null, protectedPaths: [] }).filter(
+    (f) => f.rule === "private-string",
+  );
+  expect(findings.map((f) => f.file).sort()).toEqual(["blob.bin", "hidden.dat"]);
+  expect(JSON.stringify(findings).toLowerCase()).not.toContain("secret-host.example");
+});
+
 test("committed -diff attributes cannot hide skipped tests, while 500 KB binaries stay compact", async () => {
   writeFileSync(join(work, ".gitattributes"), "*.ts -diff\n*.png diff\n");
   await commitAll(work, "attributes");

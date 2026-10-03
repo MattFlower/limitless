@@ -222,7 +222,7 @@ export function auditDiff(
       });
   };
   for (const f of diff.files) if (/^[ARC]/.test(f.status)) privateLine(f.path, f.path);
-  for (const fp of patches)
+  for (const fp of diff.textPatch === undefined ? patches : splitPatch(diff.textPatch))
     fp.added.forEach((text, i) => {
       privateLine(text, fp.path, fp.addedLines[i]);
     });

@@ -3458,6 +3458,7 @@ esac
     "base-script",
     "pr-script",
     "pr-script-removed",
+    "private-comment",
   ])(
     "verify-change: %s",
     async (scenario) => {
@@ -3569,6 +3570,8 @@ protected_paths = ["protected.txt"]
             await commit();
             await git("push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2");
           }
+          if (scenario === "private-comment")
+            return { structured: { ...approve, summary: `${approve.summary} Checked secret-host.example.` } };
           return { structured: approve };
         }
         expect(role).toBe("implement");
@@ -3594,6 +3597,10 @@ protected_paths = ["protected.txt"]
         };
       };
       let f = start(handler);
+      if (scenario === "private-comment") {
+        mkdirSync(f.cfg.paths.configDir, { recursive: true });
+        writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+      }
       const calls: string[][] = [];
       const gh = async (args: string[]) => {
         calls.push(args);
@@ -3681,7 +3688,8 @@ protected_paths = ["protected.txt"]
         expect(before?.verification?.headSha).toBe(head);
         if (scenario === "restart-repair") expect(before?.implementedRound).toBe(0);
       }
-      const blocked = prScript || ["persistent", "repair-audit", "empty"].includes(scenario);
+      const blocked =
+        prScript || ["persistent", "repair-audit", "empty", "private-comment"].includes(scenario);
       expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human", "cancelled"])).toBe(
         scenario === "head-moved" ? "cancelled" : stale ? "failed" : blocked ? "needs_human" : "succeeded",
       );
@@ -3694,6 +3702,15 @@ protected_paths = ["protected.txt"]
       const baseRuns = scenario === "baseline" ? [baseTip, baseTip] : [baseTip];
       expect(revisions.slice(0, baseRuns.length + 1)).toEqual([...baseRuns, head]);
       const remote = (await git("ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).split("\t")[0];
+      if (scenario === "private-comment") {
+        expect(calls.some((call) => call.at(-1)?.includes("limitless-verification"))).toBe(false);
+        expect(JSON.stringify(calls)).not.toContain("secret-host.example");
+        expect(remote).toBe(head);
+        expect(f.store.getRun(runId)?.error).toBe(
+          "PR comment contains a private string (entry 1 in private-strings.txt)",
+        );
+        return;
+      }
       if (stale) {
         expect(implementations).toBe(0);
         expect(

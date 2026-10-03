@@ -462,6 +462,8 @@ export interface DiffFile {
 
 export interface DiffInfo {
   patch: string;
+  /** The patch with binary and attribute-hidden content forced to text, for the private-string scan. */
+  textPatch?: string;
   files: DiffFile[];
   stat: string;
   added: number;
@@ -492,8 +494,9 @@ export async function diffSince(
   // Committed .gitmodules settings must not hide gitlinks from audit inputs.
   const diff = (...args: string[]) =>
     worktreeGit(["git", "diff", "--ignore-submodules=none", ...args], { cwd, env });
-  const [patch, names, stat, numstat, raw] = await Promise.all([
+  const [patch, textPatch, names, stat, numstat, raw] = await Promise.all([
     diff(range),
+    diff("--text", "--no-textconv", "--no-ext-diff", range),
     diff("--name-status", "-M", range),
     diff("--stat", range),
     diff("--numstat", range),
@@ -521,7 +524,16 @@ export async function diffSince(
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
   const inspection = await attributeInfo(cwd, env, range, revision, changes);
-  return { patch: patch.stdout, files, stat: stat.stdout, added, removed, gitlinks, ...inspection };
+  return {
+    patch: patch.stdout,
+    textPatch: textPatch.stdout,
+    files,
+    stat: stat.stdout,
+    added,
+    removed,
+    gitlinks,
+    ...inspection,
+  };
 }
 
 const LFS_POINTER = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:[0-9a-f]{64}\nsize \d+\n$/;

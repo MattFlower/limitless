@@ -1496,14 +1496,18 @@ function deliveryBudget(ctx: RunContext): GitHubBudget {
   return budget;
 }
 
-async function checkPublication(ctx: RunContext, sha: string, title: string, body: string) {
+/** Without `pr`, `body` is a PR comment and only its text is checked. */
+async function checkPublication(ctx: RunContext, body: string, pr?: { sha: string; title: string }) {
   const cwd = ctx.state.worktreePath as string;
   try {
     const entries = loadPrivateStrings(ctx.deps.cfg.paths.configDir);
     if (!entries.length) return;
-    checkPrivateText(title, "PR title", entries);
-    checkPrivateText(body, "PR body", entries);
-    const messages = await worktreeGit(["git", "log", "--format=%B", `${ctx.run.baseSha}..${sha}`], { cwd });
+    checkPrivateText(body, pr ? "PR body" : "PR comment", entries);
+    if (!pr) return;
+    checkPrivateText(pr.title, "PR title", entries);
+    const messages = await worktreeGit(["git", "log", "--format=%B", `${ctx.run.baseSha}..${pr.sha}`], {
+      cwd,
+    });
     checkPrivateText(messages.stdout, "Commit message", entries);
     const findings = auditDiff(await diffSince(cwd, ctx.run.baseSha as string), {
       configDir: ctx.deps.cfg.paths.configDir,
@@ -1541,7 +1545,7 @@ async function deliverVerifiedDraft(
   }
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
-  await checkPublication(ctx, sha, `[needs human] ${ctx.run.title}`, report);
+  await checkPublication(ctx, report, { sha, title: `[needs human] ${ctx.run.title}` });
   await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
@@ -1629,6 +1633,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         });
         const report = buildReport(ctx, true);
         if (!ctx.state.verdictCommentPosted) {
+          await checkPublication(ctx, report);
           const marker = `<!-- limitless-verification:${ctx.run.id} -->`;
           ctx.checkCancelled();
           const comments = [
@@ -1751,7 +1756,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     }
     const report = buildReport(ctx, success);
     const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
-    await checkPublication(ctx, await headSha(cwd), title, report);
+    await checkPublication(ctx, report, { sha: await headSha(cwd), title });
 
     const publish = () => {
       ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
