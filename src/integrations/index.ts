@@ -24,12 +24,13 @@ export interface IntegrationDeps {
 export async function mountIntegrations(factory: Factory, deps: IntegrationDeps = {}): Promise<Integrations> {
   const mcp = mountMcp(factory);
   const discord = mountDiscord(factory);
+  const prClient = deps.prClient ?? getGitHubPr;
   const stopNotifier = startGitHubNotifier(
     factory.store,
     deps.gh ?? runGh,
     console.warn,
-    // While polling, merge reconciliation reads the poller's observations instead of `gh pr view`.
-    factory.cfg.githubPoll ? observedPrs(factory.store) : (deps.prClient ?? getGitHubPr),
+    // While polling, merge reconciliation reads the poller's observations for the PRs it tracks.
+    factory.cfg.githubPoll ? observedPrs(factory.store, prClient) : prClient,
   );
   const seconds = factory.cfg.githubPollSeconds;
   const stopPoller = factory.cfg.githubPoll

@@ -350,6 +350,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         }),
       ),
     ),
+    "/api/github/access": handle(() => json(store.githubAccessProblems())),
     "/api/repos": {
       GET: handle(() => json(store.listRepos())),
     },

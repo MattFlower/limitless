@@ -9,7 +9,8 @@ import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Run } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { githubWebhook, mapGitHubEvent } from "../src/integrations/github.ts";
-import { type Integrations, mountIntegrations } from "../src/integrations/index.ts";
+import type { GitHubClient } from "../src/integrations/github-poller.ts";
+import { type IntegrationDeps, type Integrations, mountIntegrations } from "../src/integrations/index.ts";
 
 const fixture = (name: string): string => readFileSync(join(import.meta.dir, "data", name), "utf8").trim();
 let dir: string;
@@ -37,6 +38,25 @@ afterEach(() => {
   store.close();
   rmSync(dir, { recursive: true, force: true });
 });
+
+/** A GitHub API that knows no PRs; tests never reach the real one. */
+const noGitHub: GitHubClient = async (path, body) => {
+  const ids = (body as { variables?: { ids?: string[] } } | undefined)?.variables?.ids ?? [];
+  return path === "graphql"
+    ? { status: 200, headers: new Headers(), body: { data: { nodes: ids.map(() => null) } } }
+    : { status: 200, headers: new Headers(), body: { node_id: `PR_${path}` } };
+};
+
+/** Mounts with fake GitHub, gh and tool probes unless a test overrides one. */
+function mount(deps: IntegrationDeps = {}): Promise<Integrations> {
+  return mountIntegrations({ cfg, store } as Factory, {
+    toolVersions: async () => [],
+    gh: async () => {},
+    prClient: async () => null,
+    github: noGitHub,
+    ...deps,
+  });
+}
 
 function handler(): ReturnType<typeof githubWebhook> {
   const factory = {
@@ -72,11 +92,7 @@ test("disabled, missing, invalid and exact-body signatures", async () => {
   const body = fixture("github-issue.json");
   const h = handler();
   cfg.secrets.GITHUB_WEBHOOK_SECRET = "";
-  const integrations = await mountIntegrations({ cfg, store } as Factory, {
-    toolVersions: async () => [],
-    gh: async () => {},
-    prClient: async () => null,
-  });
+  const integrations = await mount();
   expect(integrations.notes.find((n) => n.startsWith("GitHub webhooks"))).toContain("disabled");
   await integrations.stop();
   await integrations.stop();
@@ -115,19 +131,40 @@ test("mounting with fake dependencies spawns no processes, including notifier ac
   const spawn = spyOn(Bun, "spawn").mockImplementation(unexpectedSpawn);
   const spawnSync = spyOn(Bun, "spawnSync").mockImplementation(unexpectedSpawn);
   const nodeSpawn = spyOn(childProcess, "spawn").mockImplementation(unexpectedSpawn);
+  const fetch = spyOn(globalThis, "fetch").mockImplementation((() => {
+    throw new Error("unexpected network request");
+  }) as unknown as typeof globalThis.fetch);
   const toolVersions = mock(async () => ["fake tool versions"]);
   const gh = mock(async (_args: string[]) => {});
   const prClient = mock(async (_url: string) => null);
+  const github = mock(noGitHub);
   let integrations: Integrations | undefined;
-  // The notifier's own PR checks run only with polling off.
-  cfg.githubPoll = false;
+  expect(cfg.githubPoll).toBe(true);
   try {
     const repo = store.getRepoBySlug("MattFlower/limitless");
     if (!repo) throw new Error("missing repo");
-    const run = store.createRun(repo, { repo: repo.slug, prompt: "check PR" });
+    // A PR-verification run's PR is not the poller's, so the notifier checks it with the per-run client.
+    const run = store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "check PR",
+      source: "github",
+      sourceRef: {
+        kind: "pull_request",
+        repo: repo.slug,
+        number: 42,
+        baseRef: "main",
+        baseSha: "b".repeat(40),
+      },
+    });
     const prUrl = "https://github.com/MattFlower/limitless/pull/42";
     store.updateRun(run.id, { status: "needs_human", prUrl });
-    integrations = await mountIntegrations({ cfg, store } as Factory, { toolVersions, gh, prClient });
+    // A factory PR is observed by the poller through the fake GitHub client instead.
+    const own = store.createRun(repo, { repo: repo.slug, prompt: "open PR" });
+    store.updateRun(own.id, {
+      status: "needs_human",
+      prUrl: "https://github.com/MattFlower/limitless/pull/43",
+    });
+    integrations = await mount({ toolVersions, gh, prClient, github });
     store.createRun(repo, {
       repo: repo.slug,
       prompt: "fix issue",
@@ -137,14 +174,18 @@ test("mounting with fake dependencies spawns no processes, including notifier ac
     await Bun.sleep(0);
     expect(integrations.notes[0]).toBe("fake tool versions");
     expect(toolVersions).toHaveBeenCalledTimes(1);
-    expect(prClient).toHaveBeenCalledWith(prUrl);
+    for (let i = 0; i < 5; i++) await Bun.sleep(1);
+    expect(prClient.mock.calls.map((c) => c[0])).toEqual([prUrl]);
+    expect(github.mock.calls.map((c) => c[0])).toEqual(["repos/MattFlower/limitless/pulls/43", "graphql"]);
     expect(gh).toHaveBeenCalledTimes(1);
     expect(gh.mock.calls[0]?.[0].slice(0, 5)).toEqual(["issue", "comment", "42", "--repo", repo.slug]);
     expect(spawn).not.toHaveBeenCalled();
     expect(spawnSync).not.toHaveBeenCalled();
     expect(nodeSpawn).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   } finally {
     await integrations?.stop();
+    fetch.mockRestore();
     spawn.mockRestore();
     spawnSync.mockRestore();
     nodeSpawn.mockRestore();
@@ -165,12 +206,7 @@ test("mounting with polling on observes PRs through the injected client, never t
     status: "needs_human",
     prUrl: "https://github.com/MattFlower/limitless/pull/42",
   });
-  const integrations = await mountIntegrations({ cfg, store } as Factory, {
-    toolVersions: async () => [],
-    gh: async () => {},
-    prClient,
-    github,
-  });
+  const integrations = await mount({ prClient, github });
   try {
     for (let i = 0; i < 5; i++) await Bun.sleep(1);
     expect(integrations.notes).toContain("GitHub PR polling every 45s");
@@ -195,10 +231,7 @@ test("default version probe yields while tools run and preserves startup notes",
   const spawnSync = spyOn(Bun, "spawnSync").mockImplementation(() => {
     throw new Error("version probe must not block");
   });
-  const mounting = mountIntegrations({ cfg, store } as Factory, {
-    gh: async () => {},
-    prClient: async () => null,
-  });
+  const mounting = mount({ toolVersions: undefined });
   let mounted = false;
   void mounting.then(() => {
     mounted = true;

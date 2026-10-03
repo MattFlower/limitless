@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
+import type { RunStatus } from "../src/core/types.ts";
 import { diffPr, githubDoctor, normalizePr } from "../src/integrations/github-poller.ts";
 import { type PrNode, pollerHarness, prNode, respond, SHA, url } from "./github-poller-support.ts";
 
@@ -186,24 +187,45 @@ test("each change produces exactly one feed item; repeats and non-changes produc
       },
       ["pr.behind"],
     ],
+    // reviewDecision stays null, as in repositories without required reviews.
     [
       "approved",
       (n) => {
-        n.reviewDecision = "APPROVED";
+        n.latestReviews.nodes = [{ state: "APPROVED", author: { login: "alice" } }];
       },
       ["pr.review"],
     ],
     [
-      "changes requested",
+      "changes requested by a second reviewer",
       (n) => {
-        n.reviewDecision = "CHANGES_REQUESTED";
+        n.latestReviews.nodes.push({ state: "CHANGES_REQUESTED", author: { login: "bob" } });
       },
       ["pr.review"],
     ],
     [
-      "review required",
+      "reordered, plus a comment-only review",
       (n) => {
-        n.reviewDecision = "REVIEW_REQUIRED";
+        n.latestReviews.nodes = [
+          { state: "COMMENTED", author: { login: "carol" } },
+          ...n.latestReviews.nodes.toReversed(),
+        ];
+      },
+      [],
+    ],
+    [
+      "bob approves",
+      (n) => {
+        n.latestReviews.nodes = [
+          { state: "APPROVED", author: { login: "alice" } },
+          { state: "APPROVED", author: { login: "bob" } },
+        ];
+      },
+      ["pr.review"],
+    ],
+    [
+      "dismissed",
+      (n) => {
+        n.latestReviews.nodes = [{ state: "DISMISSED", author: { login: "bob" } }];
       },
       [],
     ],
@@ -283,6 +305,8 @@ test("each change produces exactly one feed item; repeats and non-changes produc
     if (name === "review comment" || name === "older review's comment edited")
       expect(items[0]?.data.category).toBe("review_comment");
     if (name === "second review") expect(items[0]?.data.category).toBe("review");
+    if (name === "bob approves")
+      expect(items[0]?.data).toMatchObject({ reviewer: "bob", decision: "APPROVED" });
     await h.advance(15 * S);
     expect([name, kinds()]).toEqual([name, []]);
   }
@@ -294,18 +318,62 @@ test("each change produces exactly one feed item; repeats and non-changes produc
   expect(kinds()).toEqual([]);
 });
 
-test("closed without merge emits pr.closed and leaves the polling set", async () => {
+test("a closed PR is rechecked every 10 minutes; a reopen is observed and a later merge resolves once", async () => {
   h = pollerHarness();
   const run = h.factoryPr("o/r", 2);
+  h.factoryPr("o/r", 3); // an open PR in the same repository keeps the fast cadence
   h.start();
   await h.advance(0);
   h.node("o/r", 2).state = "CLOSED";
   await h.advance(15 * S);
   expect(kinds()).toEqual(["pr.closed"]);
   expect(h.store.getRun(run.id)?.prClosedUnmerged).toBe(true);
-  const calls = h.gh.calls.length;
+  const closedPolls = () => h.gh.graphql().filter((c) => c.ids?.includes("PR_o/r_2")).length;
+  // Still tracked after a restart; the restart observes it once, then it waits 10 minutes.
+  h.reopen();
+  h.start();
+  await h.advance(0);
+  const polls = closedPolls();
+  const open = h.gh.graphql().length;
+  for (let i = 0; i < 39; i++) await h.advance(15 * S);
+  expect(closedPolls()).toBe(polls);
+  expect(h.gh.graphql().length).toBe(open + 39);
+  h.node("o/r", 2).state = "OPEN";
+  await h.advance(15 * S);
+  expect(closedPolls()).toBe(polls + 1);
+  expect(h.store.getRun(run.id)?.prClosedUnmerged).toBe(false);
+  expect(kinds()).toEqual([]);
+  const node = h.node("o/r", 2);
+  node.state = "MERGED";
+  node.mergedAt = "2026-10-03T05:00:00Z";
+  await h.advance(15 * S);
+  expect(h.store.getRun(run.id)).toMatchObject({ merged: true, prClosedUnmerged: false });
+  expect(kinds()).toEqual(["pr.merged"]);
   await h.advance(3600 * S);
-  expect(h.gh.calls.length).toBe(calls);
+  expect(h.store.readFeed({ limit: 1000 }).items.filter((i) => i.kind === "run.merged")).toHaveLength(1);
+  expect(h.store.githubTracked().map((p) => p.url)).toEqual([url("o/r", 3)]);
+});
+
+test("tracking ends with the run; open PRs of runs failed or cancelled over 7 days ago expire", async () => {
+  h = pollerHarness();
+  const now = Date.now();
+  const DAY = 86_400_000;
+  const pr = (n: number, status: RunStatus, finishedAt: number | null) => {
+    const run = h.factoryPr("o/r", n, status);
+    h.store.updateRun(run.id, { finishedAt });
+    return run;
+  };
+  pr(1, "failed", now - 7 * DAY); // exactly 7 days: kept
+  pr(2, "failed", now - 7 * DAY - 1);
+  pr(3, "cancelled", now - 8 * DAY);
+  pr(4, "failed", null); // no completion time: kept
+  pr(5, "failed", now - 8 * DAY);
+  pr(5, "running", null); // another run shares the PR
+  const closed = pr(6, "cancelled", now - 30 * DAY);
+  h.store.updateRun(closed.id, { prClosedUnmerged: true }); // closed PRs wait for a reopen
+  expect(h.store.githubTracked(now).map((p) => p.url)).toEqual([1, 4, 5, 6].map((n) => url("o/r", n)));
+  h.store.db.query("DELETE FROM runs WHERE id = ?").run(closed.id);
+  expect(h.store.githubTracked(now).map((p) => p.url)).toEqual([1, 4, 5].map((n) => url("o/r", n)));
 });
 
 test("a missed poll is caught later; restarts, retries and same-head recurrences are exact", async () => {
@@ -444,7 +512,8 @@ test("rate limits honour Retry-After, else back off 60..900s, across repositorie
   h.gh.next.push(respond(403, { message: "rate" }, { "retry-after": "120" }));
   await h.advance(15 * S);
   let c = count();
-  expect(h.gh.calls.at(-1)?.ids).toEqual(["PR_o/r_1"]);
+  // Round robin: this pass starts with o/s, and its rate limit stops o/r too.
+  expect(h.gh.calls.at(-1)?.ids).toEqual(["PR_o/s_1"]);
   // A run update during the cooldown does not bypass it.
   h.factoryPr("o/s", 2);
   await h.advance(119 * S);
@@ -457,8 +526,8 @@ test("rate limits honour Retry-After, else back off 60..900s, across repositorie
 
   const limited = [
     respond(429, {}),
-    respond(403, {}),
-    respond(200, { errors: [{ type: "RATE_LIMITED", message: "You have exceeded a secondary rate limit" }] }),
+    respond(403, { message: "You have exceeded a secondary rate limit." }),
+    respond(200, { errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] }),
     respond(429, {}),
     respond(429, {}),
     respond(429, {}),
@@ -474,6 +543,8 @@ test("rate limits honour Retry-After, else back off 60..900s, across repositorie
     expect(count()).toBeGreaterThan(c);
   }
   expect(h.gh.next).toHaveLength(0);
+  // Each cooldown is logged once, not on every check while it lasts.
+  expect(h.logs.filter((l) => l.startsWith("GitHub rate limit"))).toHaveLength(7);
   // Success resets the backoff.
   await h.advance(15 * S);
   h.gh.next.push(respond(429, {}));
@@ -504,12 +575,18 @@ test("UNKNOWN mergeability gets one REST nudge after the third poll, then CONFLI
   pr.mergeable = "CONFLICTING";
   await h.advance(15 * S);
   expect(kinds()).toEqual(["pr.conflicting"]);
+  // A recurrence on the same head is not nudged again, even across a restart; a new head is.
   pr.mergeable = "UNKNOWN";
   for (let i = 0; i < 3; i++) await h.advance(15 * S);
-  expect(nudges()).toBe(2);
+  h.reopen();
+  h.start();
+  for (let i = 0; i < 3; i++) await h.advance(15 * S);
+  expect(nudges()).toBe(1);
   pr.headRefOid = "d".repeat(40);
   for (let i = 0; i < 3; i++) await h.advance(15 * S);
-  expect(nudges()).toBe(3);
+  expect(nudges()).toBe(2);
+  for (let i = 0; i < 5; i++) await h.advance(15 * S);
+  expect(nudges()).toBe(2);
 });
 
 test("an access failure during a nudge is kept for doctor; the cycle that hit it never clears it", async () => {
@@ -524,7 +601,7 @@ test("an access failure during a nudge is kept for doctor; the cycle that hit it
   expect(h.gh.rest().at(-1)?.path).toBe("repos/o/r/pulls/1");
   expect(kinds()).toEqual(["github.access_problem"]);
   expect(h.store.githubAccessProblems().map((p) => p.repo)).toEqual(["o/r"]);
-  expect(githubDoctor(h.store).join("\n")).toContain("o/r");
+  expect(githubDoctor(h.store.githubAccessProblems()).join("\n")).toContain("o/r");
   // The swallowed nudge is retried after the cooldown, and success clears the episode.
   const sent = h.gh.rest().length;
   await h.advance(59 * S);
@@ -680,10 +757,10 @@ test("an HTTP 404 from the observation query is an access problem, not a close, 
     merged: false,
     prClosedUnmerged: false,
   });
-  expect(githubDoctor(h.store).join("\n")).toMatch(/o\/r[\s\S]*gh auth refresh/);
+  expect(githubDoctor(h.store.githubAccessProblems()).join("\n")).toMatch(/o\/r[\s\S]*gh auth refresh/);
   await h.advance(15 * S);
   expect(h.store.githubAccessProblems()).toEqual([]);
-  expect(githubDoctor(h.store)).toEqual(["GitHub access: ok"]);
+  expect(githubDoctor(h.store.githubAccessProblems())).toEqual(["GitHub access: ok"]);
   h.gh.next.push(respond(404, { message: "Not Found" }));
   await h.advance(15 * S);
   expect(kinds()).toEqual(["github.access_problem"]);
@@ -738,4 +815,289 @@ test("a delivery adopts the 15 second cadence without waiting for the old deadli
   expect(h.gh.graphql()).toHaveLength(2);
   await h.advance(15 * S);
   expect(h.gh.graphql()).toHaveLength(3);
+});
+
+const merge = (node: PrNode) => {
+  node.state = "MERGED";
+  node.mergedAt = "2026-10-03T05:00:00Z";
+};
+
+test.each([
+  ["401", () => respond(401, { message: "Bad credentials" }), "auth"],
+  ["SSO", () => respond(403, { message: "SSO" }, { "x-github-sso": "required; url=https://idp" }), "sso"],
+  ["IP", () => respond(403, { message: "the `a` organization has an IP allow list enabled" }), "ip"],
+  ["generic 403", () => respond(403, { message: "Resource not accessible by integration" }), "forbidden"],
+])(
+  "a repository blocked by %s backs off alone; the others keep polling and merging",
+  async (_, deny, reason) => {
+    h = pollerHarness(["a/blocked", "b/ok"]);
+    h.factoryPr("a/blocked", 1);
+    const ok = h.factoryPr("b/ok", 1);
+    h.gh.deny.set("a/blocked", deny);
+    h.start();
+    await h.advance(0);
+    const blocked = () => h.gh.times.filter((_, i) => /a\/blocked/.test(JSON.stringify(h.gh.calls[i])));
+    for (let i = 0; i < 4 * 60; i++) {
+      if (i === 30) merge(h.node("b/ok", 1));
+      await h.advance(15 * S);
+    }
+    expect(h.store.getRun(ok.id)?.merged).toBe(true);
+    expect(h.store.readFeed({ limit: 1000 }).items.filter((i) => i.kind === "run.merged")).toHaveLength(1);
+    const times = blocked();
+    expect(times.slice(1, 6).map((t, i) => (t - (times[i] ?? 0)) / S)).toEqual([60, 120, 240, 480, 900]);
+    expect(times.slice(6).every((t, i) => t - (times[i + 5] ?? 0) === 900 * S)).toBe(true);
+    const problems = h.fresh().filter((i) => i.kind === "github.access_problem");
+    expect(problems.map((i) => [i.repo, i.data.reason])).toEqual([["a/blocked", reason]]);
+    if (reason === "auth") expect(problems[0]?.summary).toContain("gh auth refresh");
+    // Recovery clears the problem and resets the backoff.
+    h.gh.deny.delete("a/blocked");
+    await h.advance(900 * S);
+    expect(h.store.githubAccessProblems()).toEqual([]);
+    h.gh.deny.set("a/blocked", deny);
+    await h.advance(15 * S);
+    const failedAt = blocked().at(-1) ?? 0;
+    await h.advance(45 * S);
+    expect(blocked().at(-1)).toBe(failedAt);
+    await h.advance(15 * S);
+    expect(blocked().at(-1)).toBe(failedAt + 60 * S);
+    expect(h.logs.some((l) => l.startsWith("GitHub rate limit"))).toBe(false);
+  },
+);
+
+test("repositories are polled round robin, so a failing one is not always first", async () => {
+  h = pollerHarness(["a/r", "b/r", "c/r"]);
+  for (const repo of ["a/r", "b/r", "c/r"]) h.factoryPr(repo, 1);
+  h.start();
+  await h.advance(0);
+  for (let i = 0; i < 2; i++) await h.advance(15 * S);
+  const order = h.gh.graphql().map((c) => c.ids?.[0]?.split("_")[1]);
+  expect(order).toEqual(["a/r", "b/r", "c/r", "b/r", "c/r", "a/r", "c/r", "a/r", "b/r"]);
+  // A pass a rate limit interrupts resumes with the next repository.
+  h.gh.next.push(respond(429, {}));
+  await h.advance(15 * S);
+  await h.advance(60 * S);
+  expect(
+    h.gh
+      .graphql()
+      .map((c) => c.ids?.[0]?.split("_")[1])
+      .slice(9),
+  ).toEqual(["a/r", "b/r", "c/r", "a/r"]);
+});
+
+test.each([
+  [
+    "x-ratelimit-remaining: 0",
+    () => respond(403, {}, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "" }),
+  ],
+  ["REST secondary limit", () => respond(403, { message: "You have exceeded a secondary rate limit" })],
+  ["GraphQL RATE_LIMITED", () => respond(200, { errors: [{ type: "RATE_LIMITED", message: "limited" }] })],
+  ["Retry-After", () => respond(403, {}, { "retry-after": "300" })],
+])("%s pauses every repository until its deadline and is logged once", async (name, limit) => {
+  h = pollerHarness(["o/r", "o/s"]);
+  h.factoryPr("o/r", 1);
+  h.factoryPr("o/s", 1);
+  h.start();
+  await h.advance(0);
+  const response = limit();
+  // A usable reset deadline is honoured exactly.
+  if (name.startsWith("x-ratelimit"))
+    response.headers.set("x-ratelimit-reset", String(Math.floor((h.clock.now() + 315 * S) / 1000)));
+  h.gh.next.push(response);
+  await h.advance(15 * S);
+  const calls = h.gh.calls.length;
+  const wait = name === "Retry-After" || name.startsWith("x-ratelimit") ? 300 : 60;
+  const deadline = name.startsWith("x-ratelimit") ? Math.floor((h.clock.now() + 300 * S) / 1000) * 1000 : 0;
+  for (let t = 15; t < wait; t += 15) {
+    await h.advance(15 * S);
+    if (!deadline || h.clock.now() < deadline) expect([t, h.gh.calls.length]).toEqual([t, calls]);
+  }
+  await h.advance(15 * S);
+  expect(h.gh.calls.length).toBeGreaterThan(calls);
+  expect(h.logs.filter((l) => l.startsWith("GitHub rate limit"))).toHaveLength(1);
+});
+
+test("UNKNOWN keeps the last known mergeability and never makes a transition", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  const pr = h.node("o/r", 1);
+  pr.mergeable = "UNKNOWN";
+  pr.mergeStateStatus = "UNKNOWN";
+  h.start();
+  await h.advance(0);
+  const saved = () => JSON.parse(snapshotOf(url("o/r", 1)));
+  expect(saved()).toMatchObject({ mergeable: null, mergeStateStatus: null });
+  for (const [field, state, kind] of [
+    ["mergeable", "CONFLICTING", "pr.conflicting"],
+    ["mergeStateStatus", "BEHIND", "pr.behind"],
+  ] as const) {
+    pr[field] = state;
+    await h.advance(15 * S);
+    expect(kinds()).toEqual([kind]);
+    pr[field] = "UNKNOWN";
+    await h.advance(15 * S);
+    expect(saved()[field]).toBe(state);
+    h.reopen();
+    h.start();
+    await h.advance(0);
+    pr[field] = state;
+    await h.advance(15 * S);
+    expect(kinds()).toEqual([]);
+  }
+  // A new head that is still conflicting and behind is reported once more, with no UNKNOWN between.
+  pr.headRefOid = "e".repeat(40);
+  await h.advance(15 * S);
+  expect(kinds().toSorted()).toEqual(["pr.behind", "pr.conflicting"]);
+  pr.mergeable = "MERGEABLE";
+  await h.advance(15 * S);
+  pr.mergeable = "CONFLICTING";
+  await h.advance(15 * S);
+  expect(kinds()).toEqual([]);
+});
+
+test("deleting comments or reviews is not activity; additions and edits of older items are", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  const pr = h.node("o/r", 1);
+  const c = (id: string, updatedAt: string) => ({ id, updatedAt });
+  pr.comments.nodes = [c("C1", "t1"), c("C2", "t2"), c("C3", "t3")];
+  pr.reviews.nodes = [
+    { ...c("R1", "t1"), comments: { nodes: [] } },
+    { ...c("R2", "t2"), comments: { nodes: [] } },
+  ];
+  h.start();
+  await h.advance(0);
+  const steps: [() => void, string[]][] = [
+    [() => pr.comments.nodes.pop(), []],
+    [() => pr.reviews.nodes.pop(), []],
+    [() => (pr.comments.nodes = []), []],
+    [() => (pr.reviews.nodes = []), []],
+    [() => pr.comments.nodes.push(c("C4", "t4")), ["comment"]],
+    [() => pr.reviews.nodes.push({ ...c("R3", "t4"), comments: { nodes: [] } }), ["review"]],
+    [() => pr.comments.nodes.unshift(c("C0", "t0")), []],
+    [() => (pr.comments.nodes[0] = c("C0", "t5")), ["comment"]],
+  ];
+  for (const [i, [change, expected]] of steps.entries()) {
+    change();
+    await h.advance(15 * S);
+    expect([i, h.fresh().map((item) => item.data.category)]).toEqual([i, expected]);
+  }
+});
+
+test("node ids are queried at most 100 per request, serially, and resolved once", async () => {
+  for (const count of [100, 101, 201]) {
+    h = pollerHarness();
+    for (let n = 1; n <= count; n++) h.factoryPr("o/r", n);
+    h.start();
+    await h.advance(0);
+    const sizes = h.gh.graphql().map((c) => c.ids?.length);
+    expect(sizes).toEqual(count === 100 ? [100] : count === 101 ? [100, 1] : [100, 100, 1]);
+    expect(new Set(h.gh.graphql().flatMap((c) => c.ids)).size).toBe(count);
+    expect(h.gh.rest()).toHaveLength(count);
+    expect(h.gh.maxInFlight).toBe(1);
+    await h.advance(15 * S);
+    expect(h.gh.rest()).toHaveLength(count);
+    expect(h.gh.graphql()).toHaveLength(sizes.length * 2);
+    h.close();
+  }
+  h = pollerHarness();
+});
+
+test("a failing rollup with more than 100 contexts says its list is truncated", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  const pr = h.node("o/r", 1);
+  ci(pr, {
+    state: "FAILURE",
+    contexts: { pageInfo: { hasNextPage: true }, nodes: [{ name: "t", conclusion: "FAILURE" }] },
+  });
+  h.start();
+  await h.advance(0);
+  const [item] = h.fresh();
+  expect(item?.data).toMatchObject({ failing: [{ name: "t", url: null }], truncated: true });
+  expect(JSON.parse(snapshotOf(url("o/r", 1))).truncated).toBe(true);
+});
+
+test("store failures anywhere in a poll are logged and polling continues, without a tight loop", async () => {
+  h = pollerHarness();
+  const run = h.factoryPr("o/r", 1);
+  const store = h.store;
+  const tracked = store.githubTracked.bind(store);
+  let failPlan = 0;
+  store.githubTracked = (now?: number) => {
+    if (failPlan-- > 0) throw new Error("plan boom");
+    return tracked(now);
+  };
+  failPlan = 1; // the startup schedule itself fails
+  h.start();
+  expect(h.logs).toEqual([expect.stringContaining("plan boom")]);
+  await h.advance(60 * S);
+  expect(h.gh.graphql()).toHaveLength(1);
+  // plan() inside the tick and the schedule after it both fail.
+  failPlan = 2;
+  await h.advance(15 * S);
+  expect(h.logs.filter((l) => l.includes("plan boom"))).toHaveLength(3);
+  await h.advance(14 * S);
+  expect(h.gh.graphql()).toHaveLength(1);
+  await h.advance(46 * S);
+  expect(h.gh.graphql()).toHaveLength(2);
+  // Reconciliation fails once after a merge; the next poll reconciles.
+  const reconcile = store.reconcileWaitingRuns.bind(store);
+  let failReconcile = true;
+  store.reconcileWaitingRuns = () => {
+    if (failReconcile) {
+      failReconcile = false;
+      throw new Error("reconcile boom");
+    }
+    reconcile();
+  };
+  merge(h.node("o/r", 1));
+  await h.advance(15 * S);
+  expect(h.logs.at(-1)).toContain("reconcile boom");
+  await h.advance(15 * S);
+  expect(h.store.getRun(run.id)?.merged).toBe(true);
+  expect(h.store.readFeed({ limit: 1000 }).items.filter((i) => i.kind === "run.merged")).toHaveLength(1);
+});
+
+test("stop during a request aborts it and leaves no timer, request or further scheduling", async () => {
+  h = pollerHarness();
+  const run = h.factoryPr("o/r", 1);
+  const stop = h.start();
+  await h.advance(0);
+  h.gh.hold = new Promise(() => {});
+  await h.advance(15 * S);
+  expect(h.gh.inFlight).toBe(1);
+  const calls = h.gh.calls.length;
+  stop();
+  await h.advance(0);
+  expect(h.gh.signals.at(-1)?.aborted).toBe(true);
+  expect(h.gh.inFlight).toBe(0);
+  expect(h.clock.pending).toBe(0);
+  h.store.updateRun(run.id, { title: "a run update does not restart polling" });
+  await h.advance(3600 * S);
+  expect(h.gh.calls.length).toBe(calls);
+  expect(h.clock.pending).toBe(0);
+});
+
+test("config: a poll_seconds that is not a finite number is an error", () => {
+  const dir = mkdtempSync(join(tmpdir(), "github-poll-config-"));
+  const load = (toml: string) => {
+    writeFileSync(join(dir, "config.toml"), `[github]\n${toml}\n`);
+    return loadConfig({ home: dir, configDir: dir });
+  };
+  try {
+    for (const bad of [
+      'poll_seconds = "60"',
+      "poll_seconds = true",
+      "poll_seconds = [60]",
+      "poll_seconds = nan",
+      "poll_seconds = inf",
+    ])
+      expect(() => load(bad)).toThrow("github.poll_seconds");
+    expect(load("poll = true").githubPollSeconds).toBe(45);
+    expect(load("poll_seconds = 90").githubPollSeconds).toBe(90);
+    expect(load("poll_seconds = 1").githubPollSeconds).toBe(15);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  h = pollerHarness();
 });

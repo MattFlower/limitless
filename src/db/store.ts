@@ -1690,16 +1690,19 @@ export class Store {
 
   // ---- GitHub poller -------------------------------------------------------
 
-  /** Open PRs that factory runs opened in configured repositories; PRs a run only verified are excluded. */
-  githubTracked(): TrackedPr[] {
+  /** Unmerged PRs factory runs opened; PRs runs only verified, or abandoned over 7 days while open, are excluded. */
+  githubTracked(now = Date.now()): TrackedPr[] {
     const sql = `SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId, g.node_id AS nodeId, g.data,
         max(r.status IN ('succeeded', 'needs_human')) AS delivered
       FROM runs r JOIN repos ON repos.id = r.repo_id LEFT JOIN github_prs g ON g.url = r.pr_url
       WHERE repos.kind = 'github' AND r.pr_url IS NOT NULL
-        AND NOT r.merged AND NOT r.pr_closed_unmerged AND r.delivery_branch IS NULL AND NOT coalesce(g.terminal, 0)
+        AND NOT r.merged AND r.delivery_branch IS NULL AND coalesce(g.data ->> 'state', '') <> 'MERGED'
         AND coalesce(json_extract(r.source_ref, '$.kind'), '') <> 'pull_request'
-      GROUP BY r.pr_url ORDER BY repos.slug, r.pr_url`;
-    return (this.db.query(sql).all() as TrackedPr[]).filter((pr) => {
+      GROUP BY r.pr_url
+      HAVING max(r.status NOT IN ('failed', 'cancelled') OR coalesce(r.finished_at, ?1) >= ?1 - 604800000)
+        OR max(r.pr_closed_unmerged) OR coalesce(g.data ->> 'state', '') = 'CLOSED'
+      ORDER BY repos.slug, r.pr_url`;
+    return (this.db.query(sql).all(now) as TrackedPr[]).filter((pr) => {
       const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/.exec(pr.url);
       return match?.[1]?.toLowerCase() === pr.repo.toLowerCase();
     });

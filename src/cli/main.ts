@@ -413,10 +413,8 @@ async function main(): Promise<void> {
       return;
     }
     case "doctor": {
-      const { Store } = await import("../db/store.ts");
-      const store = new Store((await import("../config.ts")).loadConfig().paths.db);
-      const lines = (await import("../integrations/github-poller.ts")).githubDoctor(store);
-      store.close();
+      const problems = await api<import("../core/types.ts").GitHubAccessProblem[]>("/api/github/access");
+      const lines = (await import("../integrations/github-poller.ts")).githubDoctor(problems);
       console.log(lines.join("\n"));
       if (lines.length > 1) process.exitCode = 1;
       return;

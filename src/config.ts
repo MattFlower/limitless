@@ -238,6 +238,8 @@ export function loadConfig(
   const github = (raw.github ?? {}) as Record<string, unknown>;
   if (github.poll !== undefined && typeof github.poll !== "boolean")
     throw new Error("github.poll must be true or false");
+  if (github.poll_seconds !== undefined && !Number.isFinite(github.poll_seconds))
+    throw new Error("github.poll_seconds must be a number of seconds");
   const gates = (raw.gates ?? {}) as Record<string, unknown>;
   if (gates.baseline_cache !== undefined && typeof gates.baseline_cache !== "boolean")
     throw new Error("gates.baseline_cache must be true or false");

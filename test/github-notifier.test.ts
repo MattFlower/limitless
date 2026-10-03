@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +10,7 @@ import {
   startGitHubNotifier,
 } from "../src/integrations/github-notifier.ts";
 import { observedPrs } from "../src/integrations/github-poller.ts";
-import { pollerHarness } from "./github-poller-support.ts";
+import { pollerHarness, respond, SHA, url } from "./github-poller-support.ts";
 
 let dir: string;
 let store: Store;
@@ -474,6 +474,73 @@ test("a terminal observation whose feed write fails stays retryable and reconcil
     const kinds = h.store.readFeed({ limit: 1000 }).items.map((i) => i.kind);
     expect(kinds.filter((k) => k === "pr.merged" || k === "run.merged")).toEqual(["pr.merged", "run.merged"]);
     expect(h.store.getRun(run.id)?.merged).toBe(true);
+  } finally {
+    h.close();
+  }
+});
+
+test("with polling, PRs the poller does not track are reconciled through the per-run client, once", async () => {
+  const h = pollerHarness();
+  try {
+    // A Dependabot existing-branch verify run and a PR-verification run: neither PR is the poller's.
+    const dependabot = h.store.createRun(
+      h.repo("o/r"),
+      {
+        repo: "o/r",
+        prompt: "verify",
+        source: "github",
+        requestedBy: "dependabot[bot]",
+        baseBranch: "deps",
+        deliveryBranch: "deps",
+        sourceRef: {
+          kind: "pull_request",
+          repo: "o/r",
+          number: 7,
+          baseRef: "main",
+          baseSha: SHA,
+          headSha: SHA,
+        },
+      },
+      true,
+    );
+    h.store.updateRun(dependabot.id, { prUrl: url("o/r", 7), status: "succeeded" });
+    const verify = h.store.createRun(h.repo("o/r"), {
+      repo: "o/r",
+      prompt: "verify",
+      source: "github",
+      sourceRef: { kind: "pull_request", repo: "o/r", number: 8, baseRef: "main", baseSha: SHA },
+    });
+    h.store.updateRun(verify.id, { prUrl: url("o/r", 8), status: "needs_human" });
+    // The poller's own PR has no snapshot yet and then hits an access failure: never a fallback read.
+    const own = h.factoryPr("o/r", 1);
+    const fallback = mock(async (prUrl: string) => ({
+      url: prUrl,
+      state: "MERGED",
+      mergedAt: "2026-10-03T05:00:00Z",
+      mergedBy: { login: "dependabot[bot]" },
+    }));
+    const client = observedPrs(h.store, fallback);
+    await reconcileMergedRuns(h.store, client, () => {});
+    expect(fallback.mock.calls.map((c) => c[0]).toSorted()).toEqual([url("o/r", 7), url("o/r", 8)]);
+    const mergedAt = Date.parse("2026-10-03T05:00:00Z");
+    expect(h.store.getRun(dependabot.id)).toMatchObject({
+      merged: true,
+      mergedBy: "dependabot[bot]",
+      mergedAt,
+    });
+    expect(h.store.getRun(verify.id)).toMatchObject({ status: "resolved", merged: true, mergedAt });
+    expect(h.store.getRun(own.id)?.merged).toBe(false);
+    h.gh.deny.set("o/r", () => respond(403, { message: "SSO" }, { "x-github-sso": "required" }));
+    h.start();
+    await h.advance(0);
+    expect(h.store.githubAccessProblems().map((p) => p.repo)).toEqual(["o/r"]);
+    fallback.mockClear();
+    h.reopen();
+    await reconcileMergedRuns(h.store, observedPrs(h.store, fallback), () => {});
+    await reconcileMergedRuns(h.store, observedPrs(h.store, fallback), () => {});
+    expect(fallback).not.toHaveBeenCalled();
+    const merged = h.store.readFeed({ limit: 1000 }).items.filter((i) => i.kind === "run.merged");
+    expect(merged.map((i) => i.runId).toSorted()).toEqual([dependabot.id, verify.id].toSorted());
   } finally {
     h.close();
   }

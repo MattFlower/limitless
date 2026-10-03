@@ -35,24 +35,46 @@ export function prNode(repo: string, n: number) {
     commits: { nodes: [{ commit: { statusCheckRollup: null as unknown } }] },
     reviews: { nodes: [] as unknown[] },
     comments: { nodes: [] as unknown[] },
+    latestReviews: { nodes: [] as { state: string; author: { login: string } | null }[] },
   };
 }
 export type PrNode = ReturnType<typeof prNode>;
 
-/** Fake GitHub: serves PR nodes by id and REST pulls by number; `next` overrides the next responses. */
-export function fakeGitHub() {
+/** Rejects once `signal` aborts, as fetch does. */
+const aborted = (signal?: AbortSignal) =>
+  new Promise<never>((_, reject) => {
+    if (signal?.aborted) reject(signal.reason);
+    signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+
+/**
+ * Fake GitHub: serves PR nodes by id and REST pulls by number; `next` overrides the next responses and
+ * `deny` answers every request for a repository.
+ */
+export function fakeGitHub(now: () => number = Date.now) {
   const nodes = new Map<string, PrNode>();
   const calls: { path: string; ids?: string[] }[] = [];
+  const times: number[] = [];
+  const signals: AbortSignal[] = [];
   const next: (GitHubResponse | Error)[] = [];
   const restNext: (GitHubResponse | Error)[] = [];
+  const deny = new Map<string, () => GitHubResponse>();
   let inFlight = 0;
   let maxInFlight = 0;
-  const client: GitHubClient = async (path, body) => {
+  const client: GitHubClient = async (path, body, signal) => {
     const ids = (body as { variables?: { ids?: string[] } } | undefined)?.variables?.ids;
     calls.push(ids ? { path, ids } : { path });
+    times.push(now());
+    if (signal) signals.push(signal);
     maxInFlight = Math.max(maxInFlight, ++inFlight);
-    await (fake.hold ?? Promise.resolve());
-    inFlight--;
+    try {
+      await Promise.race([fake.hold ?? Promise.resolve(), aborted(signal)]);
+    } finally {
+      inFlight--;
+    }
+    const repo = ids ? ids[0]?.split("_")[1] : path.match(/^repos\/([^/]+\/[^/]+)\//)?.[1];
+    const denied = repo && deny.get(repo);
+    if (denied) return denied();
     const queued = (path === "graphql" ? undefined : restNext.shift()) ?? next.shift();
     if (queued instanceof Error) throw queued;
     if (queued) return queued;
@@ -66,12 +88,18 @@ export function fakeGitHub() {
     hold: null as Promise<void> | null,
     nodes,
     calls,
+    times,
+    signals,
+    deny,
     next,
     /** Overrides for REST calls only, consumed before `next`. */
     restNext,
     client,
     get maxInFlight() {
       return maxInFlight;
+    },
+    get inFlight() {
+      return inFlight;
     },
     add(repo: string, n: number) {
       const node = prNode(repo, n);
@@ -88,8 +116,8 @@ export function fakeGitHub() {
 export function pollerHarness(repos = ["o/r"]) {
   const dir = mkdtempSync(join(tmpdir(), "github-poller-"));
   const path = join(dir, "db.sqlite");
-  const gh = fakeGitHub();
   const clock = waitClock();
+  const gh = fakeGitHub(clock.now);
   const logs: string[] = [];
   let stop = () => {};
   const h = {
