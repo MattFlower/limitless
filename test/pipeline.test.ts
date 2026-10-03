@@ -581,7 +581,9 @@ describe("local factory clones", () => {
       if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL;
       else process.env.GIT_CONFIG_GLOBAL = previous;
     }
-    expect(await git(repoDir, "rev-parse", "refs/heads/redelivered")).toBe(await git(work, "rev-parse", "HEAD"));
+    expect(await git(repoDir, "rev-parse", "refs/heads/redelivered")).toBe(
+      await git(work, "rev-parse", "HEAD"),
+    );
     expect(await git(repoDir, "tag", "--list")).toBe("");
   });
 });
