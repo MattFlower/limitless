@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cacheKey } from "../src/evals/cache.ts";
@@ -13,6 +13,9 @@ import { StoredReviewSchema, TriageSchema, toStrictJsonSchema } from "../src/pip
 import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 import { answer, deferred, enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 test("3 cases x 2 exact models x k=2 use pinned bare inputs and shared invocation semantics", async () => {
   const f = await evalFixture();
