@@ -398,12 +398,15 @@ export async function diffSince(
   threeDot = false,
 ): Promise<DiffInfo> {
   const range = `${baseSha}${threeDot ? "..." : ".."}HEAD`;
+  // Committed .gitmodules settings must not hide gitlinks from audit inputs.
+  const diff = (...args: string[]) =>
+    worktreeGit(["git", "diff", "--ignore-submodules=none", ...args], { cwd, env });
   const [patch, names, stat, numstat, raw] = await Promise.all([
-    worktreeGit(["git", "diff", range], { cwd, env }),
-    worktreeGit(["git", "diff", "--name-status", range], { cwd, env }),
-    worktreeGit(["git", "diff", "--stat", range], { cwd, env }),
-    worktreeGit(["git", "diff", "--numstat", range], { cwd, env }),
-    worktreeGit(["git", "diff", "--raw", "-z", "--no-renames", range], { cwd, env }),
+    diff(range),
+    diff("--name-status", range),
+    diff("--stat", range),
+    diff("--numstat", range),
+    diff("--raw", "-z", "--no-renames", range),
   ]);
   let added = 0;
   let removed = 0;
@@ -423,14 +426,11 @@ export async function diffSince(
   if (paths.some((path) => /(^|\/)\.gitattributes$/.test(path))) {
     // Attribute files must be inspected even if binary or renamed into place.
     const args = ["--text", "--no-renames", range, "--", ".gitattributes", "**/.gitattributes"];
-    attributePatch = (await worktreeGit(["git", "diff", ...args], { cwd, env })).stdout;
+    attributePatch = (await diff(...args)).stdout;
     const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
     // Content classification uses the base, with attributes ignored, never the worker's attributes.
     const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-    const contents = await worktreeGit(
-      ["git", "diff", "--numstat", "-z", "--no-renames", emptyTree, revision],
-      { cwd, env },
-    );
+    const contents = await diff("--numstat", "-z", "--no-renames", emptyTree, revision);
     for (const entry of contents.stdout.split("\0").filter(Boolean)) {
       const match = entry.match(/^([^\t]+)\t[^\t]+\t([\s\S]*)$/);
       if (!match) continue;
@@ -438,17 +438,8 @@ export async function diffSince(
       if (match[1] === "-") baseBinaryPaths.push(match[2] ?? "");
     }
   }
-  return {
-    patch: patch.stdout,
-    files,
-    stat: stat.stdout,
-    added,
-    removed,
-    gitlinks,
-    paths,
-    baseBinaryPaths,
-    attributePatch,
-  };
+  const inspection = { gitlinks, paths, baseBinaryPaths, attributePatch };
+  return { patch: patch.stdout, files, stat: stat.stdout, added, removed, ...inspection };
 }
 
 export function parseNameStatus(text: string): DiffFile[] {

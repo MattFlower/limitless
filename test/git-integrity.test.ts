@@ -137,6 +137,43 @@ test("committed nested repositories and changed gitlink commits block, but reque
   ).toBe(false);
 });
 
+test("committed .gitmodules ignore=all cannot hide added or changed gitlinks", async () => {
+  const nested = join(work, "nested");
+  mkdirSync(nested);
+  await git(nested, "init", "-q", "-b", "main");
+  await git(nested, "config", "user.name", "Test");
+  await git(nested, "config", "user.email", "test@example.com");
+  writeFileSync(join(nested, "hidden.test.ts"), edited);
+  await git(nested, "add", "-A");
+  await git(nested, "commit", "-qm", "nested base");
+  writeFileSync(join(work, ".gitmodules"), '[submodule "nested"]\n\tpath = nested\n\tignore = all\n');
+  await commitAll(work, "ignored nested repository");
+  const first = await headSha(work);
+  const assertVisible = async (revision: string) => {
+    expect((await git(work, "diff", "--raw", revision, "HEAD")).stdout).not.toContain("nested");
+    const diff = await diffSince(work, revision);
+    expect(diff.gitlinks).toEqual(["nested"]);
+    expect(diff.files).toContainEqual({ status: revision === base ? "A" : "M", path: "nested" });
+    expect(diff.patch).toContain("Subproject commit");
+    expect(diff.patch).not.toContain("test.skip(");
+    expect(diff.stat).toContain("nested");
+    expect(diff.added).toBeGreaterThan(0);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toContainEqual({
+      rule: "gitlink",
+      severity: "block",
+      file: "nested",
+      detail: "nested: nested repository contents are absent from the diff.",
+    });
+  };
+  await assertVisible(base);
+  writeFileSync(join(nested, "hidden.test.ts"), `${edited}// next\n`);
+  await git(nested, "add", "-A");
+  await git(nested, "commit", "-qm", "advance ignored repository");
+  await git(work, "update-index", "--cacheinfo", `160000,${await headSha(nested)},nested`);
+  await git(work, "-c", "submodule.nested.ignore=none", "commit", "-qm", "advance ignored gitlink");
+  await assertVisible(first);
+});
+
 test("attribute audit exempts base binary content and ordinary eol changes, never base text", async () => {
   writeFileSync(join(work, "image.png"), Buffer.from([0x89, 0x50, 0, 0x47]));
   writeFileSync(join(work, "text.png"), "actually text\n");
