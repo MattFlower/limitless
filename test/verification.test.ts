@@ -546,6 +546,8 @@ test("a whole request line or acceptance criterion is grounded however short; a 
   ] as const)
     expect(citedRequirement(citation, request)).toBe(line);
   expect(citedRequirement("Support IPv6", "Support IPv6")).toBe("Support IPv6");
+  expect(citedRequirement("Retry", "Retry")).toBe("Retry");
+  expect(citedRequirement("Support IPv6", "Support IPv6 and IPv4")).toBeNull();
   // Headings label requirements rather than stating one: marked, punctuated, or a plain line
   // directly above its block ("Background" above prose, "Requirements" above a list).
   for (const citation of [

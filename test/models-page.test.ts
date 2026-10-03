@@ -61,6 +61,9 @@ test("Models table renders checkpoint origins with aligned loaded and loading ro
         expect(rows.find((row) => row.includes("ministral-14b-2512"))).toContain(">FR</td>");
         expect(rows.find((row) => row.includes("gpt-6-luna"))).toContain(">US</td>");
         expect(rows.find((row) => row.includes("qwen-27b"))).toContain(">CN</td>");
+        const jev = rows.find((row) => row.includes("typesafe/jev"));
+        expect(jev).toContain(">US</td>");
+        expect(jev).toContain(">unknown</td>");
         expect(html).toContain("codex/luna@low|claude/opus@high");
         expect(table).toContain("Supported efforts");
         expect(table).toContain("default: medium");
