@@ -363,13 +363,10 @@ async function main(): Promise<void> {
       const svc = await import("./service.ts");
       const port = Number(process.env.LIMITLESS_PORT ?? 7400);
       if (rest[0] === "install") {
-        const { loadConfig } = await import("../config.ts");
-        const cfg = loadConfig();
-        return svc.install(port, {
-          tunnel: values.tunnel === true,
-          mtplx: values.mtplx === true,
-          publicUrl: cfg.publicUrl,
-        });
+        const tunnel = values.tunnel === true;
+        // Only the tunnel needs the public host; plain installs never read config here.
+        const publicUrl = tunnel ? (await import("../config.ts")).loadConfig().publicUrl : null;
+        return svc.install(port, { tunnel, mtplx: values.mtplx === true, publicUrl });
       }
       if (rest[0] === "uninstall") return svc.uninstall();
       return svc.status(port);
