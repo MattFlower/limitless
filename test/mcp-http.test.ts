@@ -51,7 +51,7 @@ test("mounted endpoint initializes, discovers and calls tools without sessions",
     ).status,
   ).toBe(202);
   const list = await route(rpc("tools/list"), localServer);
-  expect((await list.json()).result.tools).toHaveLength(8);
+  expect((await list.json()).result.tools).toHaveLength(9);
   const create = await route(
     rpc("tools/call", { name: "limitless_create_run", arguments: { repo: f.repo, prompt: "hello" } }),
     localServer,
@@ -74,6 +74,18 @@ test("mounted endpoint initializes, discovers and calls tools without sessions",
     status: "waiting",
     dependsOn: [run.id],
   });
+  const resolve = (id: string) =>
+    route(
+      rpc("tools/call", { name: "limitless_resolve_run", arguments: { id, kind: "wont_do" } }),
+      localServer,
+    );
+  const queued = (await (await resolve(run.id)).json()).result;
+  expect(queued.isError).toBe(true);
+  expect(queued.content[0].text).toContain("run is queued");
+  const blocked = await f.factory.createRun({ repo: f.repo, prompt: "blocked" });
+  f.factory.store.updateRun(blocked.id, { status: "needs_human" });
+  const resolved = (await (await resolve(blocked.id)).json()).result;
+  expect(JSON.parse(resolved.content[0].text).resolution).toMatchObject({ kind: "wont_do", by: "human" });
 
   await mcp.stop();
   expect((await route(rpc("tools/list"), localServer)).status).toBe(503);

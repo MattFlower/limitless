@@ -20,7 +20,7 @@ test("proxy maps all six tools to REST and matches Factory results, including fi
   const fetcher: Fetch = async (url, init) => {
     requests.push({ url, init });
     const path = new URL(url).pathname;
-    const match = path.match(/^\/api\/runs\/([^/]+)(\/events|\/cancel|\/answer)?$/);
+    const match = path.match(/^\/api\/runs\/([^/]+)(\/events|\/cancel|\/answer|\/resolve)?$/);
     const key = match ? `/api/runs/:id${match[2] ?? ""}` : path;
     const entry = routes[key];
     const handler = (
@@ -114,10 +114,42 @@ test("proxy maps all six tools to REST and matches Factory results, including fi
     expect(resultValue<{ cancelled: boolean }>(await call("cancel_run", { id: run.id }))).toEqual({
       cancelled: false,
     });
-    for (const name of ["get_run", "cancel_run", "answer_question"]) {
+    // Cancelled is not resolvable; the daemon's 409 surfaces once, and manual merged never leaves the client.
+    const conflict = await call("resolve_run", { id: run.id, kind: "wont_do" });
+    expect(conflict.isError).toBe(true);
+    expect(JSON.stringify(conflict.content)).toContain("409");
+    const sent = requests.length;
+    expect((await call("resolve_run", { id: run.id, kind: "merged" })).isError).toBe(true);
+    expect(requests).toHaveLength(sent);
+    f.factory.store.updateRun(waiting.id, { status: "needs_human" });
+    const resolved = resultValue<Run>(
+      await call("resolve_run", { id: waiting.id, kind: "superseded", ref: run.id, note: "redone" }),
+    );
+    expect(resolved).toMatchObject({
+      status: "resolved",
+      resolution: { kind: "superseded", ref: run.id, note: "redone", by: "human" },
+    });
+    expect(requests.at(-1)?.url).toBe(`http://127.0.0.1:7400/api/runs/${waiting.id}/resolve`);
+    expect(requests.at(-1)?.init).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({ kind: "superseded", ref: run.id, note: "redone" }),
+    });
+    f.factory.store.updateRun(run.id, { status: "failed" });
+    const viaDirect = await direct.client.callTool({
+      name: "limitless_resolve_run",
+      arguments: { id: run.id, kind: "done_elsewhere" },
+    });
+    expect(resultValue<Run>(viaDirect).resolution).toMatchObject({ kind: "done_elsewhere", by: "human" });
+    const again = await direct.client.callTool({
+      name: "limitless_resolve_run",
+      arguments: { id: run.id, kind: "wont_do" },
+    });
+    expect(JSON.stringify(again.content)).toContain("run is resolved");
+    for (const name of ["get_run", "cancel_run", "answer_question", "resolve_run"]) {
       const result = await call(name, {
         id: "missing",
         ...(name === "answer_question" ? { answer: "x" } : {}),
+        ...(name === "resolve_run" ? { kind: "wont_do" } : {}),
       });
       expect(result.isError).toBe(true);
       expect(JSON.stringify(result.content)).toContain("not found");
@@ -144,6 +176,7 @@ test("ids are encoded in every proxy path", async () => {
   await backend.events(id);
   await backend.cancel(id);
   await backend.answer(id, "answer");
+  await backend.resolve(id, { kind: "wont_do" });
   expect(
     urls.every((url) => url.startsWith(`http://localhost:7400/api/runs/${encodeURIComponent(id)}`)),
   ).toBe(true);
@@ -176,7 +209,14 @@ test("connection, HTTP and malformed responses are MCP errors and mutations are 
       expect(result.isError).toBe(true);
       expect(JSON.stringify(result.content)).toContain(expected);
       expect(calls).toBe(1);
-      expect((await proxy.client.listTools()).tools).toHaveLength(8);
+      calls = 0;
+      const resolved = await proxy.client.callTool({
+        name: "limitless_resolve_run",
+        arguments: { id: "run", kind: "wont_do" },
+      });
+      expect(resolved.isError).toBe(true);
+      expect(calls).toBe(1);
+      expect((await proxy.client.listTools()).tools).toHaveLength(9);
     } finally {
       await proxy.close();
     }
@@ -221,7 +261,7 @@ test("stdio streams emit only protocol JSON and survive daemon errors", async ()
     expect(messages).toHaveLength(3);
     expect(messages.every((message) => message.jsonrpc === "2.0")).toBe(true);
     expect(messages.find((m) => m.id === 2).result.isError).toBe(true);
-    expect(messages.find((m) => m.id === 3).result.tools).toHaveLength(8);
+    expect(messages.find((m) => m.id === 3).result.tools).toHaveLength(9);
   } finally {
     await server.close();
     stdin.destroy();

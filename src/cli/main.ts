@@ -30,6 +30,8 @@ Usage:
   limitless logs <run> [-f]               Print (and follow) the run's event log
   limitless cancel <run>                  Cancel a run
   limitless answer <run> "<text>"         Answer a run's open question(s)
+  limitless resolve <run> --as done_elsewhere|superseded|wont_do|pr_closed [--ref <run|url>] [--note "..."]
+        Record that a needs_human or failed run was dealt with outside the factory
   limitless feed [--consumer <name>] [--after <id>] [--wait <seconds>] [--json]
         Items to act on after the consumer's cursor; --wait long-polls until one arrives
   limitless feed ack <id> --consumer <name>  Acknowledge items through id once handled
@@ -222,6 +224,9 @@ async function main(): Promise<void> {
       "max-wait": { type: "string" },
       now: { type: "boolean" },
       since: { type: "string" },
+      as: { type: "string" },
+      ref: { type: "string" },
+      note: { type: "string" },
     },
   });
   const [cmd, ...rest] = positionals;
@@ -360,6 +365,16 @@ async function main(): Promise<void> {
         body: JSON.stringify({ answer: text.join(" "), by: process.env.USER ?? "cli" }),
       });
       console.log("Answered");
+      return;
+    }
+    case "resolve": {
+      if (rest.length !== 1 || !values.as)
+        throw new Error('usage: limitless resolve <run> --as <kind> [--ref <run|url>] [--note "..."]');
+      const run = await api<Run>(`/api/runs/${encodeURIComponent(rest[0] as string)}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({ kind: values.as, ref: values.ref, note: values.note }),
+      });
+      console.log(`Resolved ${run.id} as ${run.resolution?.kind ?? values.as}`);
       return;
     }
     case "service": {

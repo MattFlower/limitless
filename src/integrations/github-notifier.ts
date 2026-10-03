@@ -40,7 +40,14 @@ export async function reconcileMergedRuns(
         else store.updateRun(run.id, { merged: true, mergedBy: pr.mergedBy?.login ?? null, mergedAt });
       } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
         const closed = pr.state === "CLOSED";
-        if (run.prClosedUnmerged !== closed) store.updateRun(run.id, { prClosedUnmerged: closed });
+        if (closed && !pr.mergedAt && run.status === "needs_human") {
+          const patch = { prClosedUnmerged: true };
+          store.resolveRun(
+            run.id,
+            { kind: "pr_closed", ref: pr.url, by: "github" },
+            { from: ["needs_human"], patch },
+          );
+        } else if (run.prClosedUnmerged !== closed) store.updateRun(run.id, { prClosedUnmerged: closed });
       }
     } catch (error) {
       log(`GitHub PR check failed for ${run.id}: ${String(error)}`);
@@ -93,6 +100,8 @@ export function startGitHubNotifier(
       typeof ref.number !== "number"
     )
       return;
+    // A resolution follows the terminal comment already posted for needs_human or failed.
+    if (run.status === "resolved") return;
     if (ref.kind === "pull_request" && run.status === "cancelled" && run.error?.startsWith("superseded:"))
       return;
     const terminal = TERMINAL_STATUSES.includes(run.status);
