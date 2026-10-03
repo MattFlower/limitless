@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Repo, Run } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
+import type { GhRunner } from "../src/integrations/github.ts";
 import {
   formatShadowReport,
+  ghPrHistory,
   type HistoryRecord,
   type ShadowRow,
   shadowReport,
@@ -54,11 +56,19 @@ const shadow = (blocking: unknown[], extra: Record<string, unknown> = {}) => ({
 const PR = "https://github.com/owner/a/pull/7";
 const FOLLOW_PR = "https://github.com/owner/a/pull/9";
 const basis = "names the file and title";
-const fix = (sha: string, h: number, text: string): HistoryRecord => ({
-  kind: "fix",
+const fixBasis = "names the file and title and changes the file";
+/** A PR commit at hour `h` changing `files` (by default the one file its message names). */
+const commit = (
+  sha: string,
+  h: number,
+  text: string,
+  files = text.match(/src\/\w\.ts/g) ?? [],
+): HistoryRecord => ({
+  kind: "commit",
   source: `commit ${sha}`,
   at: hour(h),
   text,
+  files,
 });
 
 function fixture() {
@@ -113,19 +123,24 @@ function fixture() {
       main.id,
       [
         // Committed before the shadow review: it cannot fix what the panel found later.
-        fix("early", 1, "Fix src/e.ts: Stale"),
+        commit("early", 1, "Fix src/e.ts: Stale"),
         // Precedes the reviewed commit in the PR, whatever its (rebased) commit time says.
-        fix("skew", 5, "Fix src/f.ts: Skewed"),
-        fix("head", 2, "Add work"),
-        fix("abc123", 4, "Fix src/a.ts: Null deref\n"),
+        commit("skew", 5, "Fix src/f.ts: Skewed"),
+        commit("head", 2, "Add work", ["src/a.ts", "src/b.ts", "src/c.ts"]),
+        commit("abc123", 4, "Fix src/a.ts: Null deref\n"),
         // Touches a panel-only finding's file without naming the finding.
-        fix("def456", 4, "Tidy src/c.ts formatting\n"),
+        commit("def456", 4, "Tidy src/c.ts formatting\n"),
+        // Names a panel-only finding without changing its file: a note, not a fix.
+        commit("docs-only", 4, "Document src/c.ts: Leak remains unfixed; no code change", ["docs/NOTES.md"]),
         { kind: "review", source: `${PR}#review-1`, at: hour(4), text: "Looks fine overall" },
       ],
     ],
     // Stacked on the reviewed commit: only commits after it in PR order can be fixes.
-    [dependent.id, [fix("head", 2, "Add work"), fix("f00d", 5, "Fix src/g.ts: Missing check")]],
-    [unrelated.id, [fix("bad", 5, "Fix src/d.ts: Overflow")]],
+    [
+      dependent.id,
+      [commit("head", 2, "Add work", ["src/a.ts"]), commit("f00d", 5, "Fix src/g.ts: Missing check")],
+    ],
+    [unrelated.id, [commit("bad", 5, "Fix src/d.ts: Overflow")]],
   ]);
   return { a, create, main, followUp, dependent, history };
 }
@@ -159,7 +174,7 @@ test("panel-only findings match later fixes and review findings from related his
     {
       finding: "src/a.ts: Null deref",
       outcome: "fixed",
-      evidence: [{ kind: "fix", source: "commit abc123", at: hour(4), basis }],
+      evidence: [{ kind: "commit", source: "commit abc123", at: hour(4), basis: fixBasis }],
     },
     {
       // A matching review finding is not a fix.
@@ -167,7 +182,7 @@ test("panel-only findings match later fixes and review findings from related his
       outcome: "review-matched",
       evidence: [{ kind: "review", source: `run ${followUp.id}/review-0.json`, at: hour(3), basis }],
     },
-    // A same-file edit is no evidence: the run converged without a matching fix.
+    // Neither a same-file edit nor a commit that only mentions it is evidence: converged without a fix.
     converged("src/c.ts: Leak"),
     // Matching text in an unrelated run or another repository's PR 7 is ignored.
     converged("src/d.ts: Overflow"),
@@ -178,7 +193,7 @@ test("panel-only findings match later fixes and review findings from related his
       // Fixed in the PR of a run that depends on this one.
       finding: "src/g.ts: Missing check",
       outcome: "fixed",
-      evidence: [{ kind: "fix", source: "commit f00d", at: hour(5), basis }],
+      evidence: [{ kind: "commit", source: "commit f00d", at: hour(5), basis: fixBasis }],
     },
   ]);
   expect(r1).toMatchObject({ reason: "alpha quota headroom is at or below 0.1", panelOnly: [] });
@@ -188,9 +203,9 @@ test("a rewritten history without the reviewed commit yields no fix and marks th
   const { main, followUp, history } = fixture();
   // Rebased after the review: every commit has a new id and a later committer time, the fix text unchanged.
   history.set(main.id, [
-    fix("early2", 6, "Fix src/e.ts: Stale"),
-    fix("head2", 6, "Add work"),
-    fix("abc456", 6, "Fix src/a.ts: Null deref\n"),
+    commit("early2", 6, "Fix src/e.ts: Stale"),
+    commit("head2", 6, "Add work", ["src/a.ts"]),
+    commit("abc456", 6, "Fix src/a.ts: Null deref\n"),
     // PR reviews and comments keep their times: still later evidence, but never a fix.
     { kind: "review", source: `${PR}#review-2`, at: hour(6), text: "src/c.ts: Leak is still here" },
   ]);
@@ -277,6 +292,11 @@ test("unfinished runs and unavailable history stay unknown; broken artifacts kee
   put(broken, "review-3.shadow.json", shadow([], { status: "error", reason: "member exploded" }));
   put(broken, "review-4.json", review([null]));
   put(broken, "review-4.shadow.json", shadow([null]));
+  // The paired single review has findings but no blocking list: no comparison, so nothing converged.
+  const noBlocking = create(a);
+  store.updateRun(noBlocking.id, { status: "succeeded", prUrl: "https://github.com/owner/a/pull/11" });
+  put(noBlocking, "review-0.json", { verdict: "approve", reviewedSha: "head", findings: [] });
+  put(noBlocking, "review-0.shadow.json", shadow([finding("src/i.ts", "Unchecked")]));
   // PR verification reviews before its first round, at round -1.
   const verification = create(a);
   store.updateRun(verification.id, { status: "succeeded" });
@@ -303,10 +323,23 @@ test("unfinished runs and unavailable history stay unknown; broken artifacts kee
   expect(of(broken)[1]?.panelOnly).toEqual([
     { finding: "src/g.ts: Bad shape", outcome: "unknown", evidence: [] },
   ]);
+  expect(of(noBlocking)).toEqual([
+    expect.objectContaining({
+      status: "completed",
+      reason: single,
+      history: false,
+      single: [],
+      panel: ["src/i.ts: Unchecked"],
+      panelOnly: [{ finding: "src/i.ts: Unchecked", outcome: "unknown", evidence: [] }],
+    }),
+  ]);
   expect(of(verification).map((r) => [r.round, r.status, r.panelOnly.length])).toEqual([
     ["-1", "completed", 1],
   ]);
   const text = formatShadowReport(rows);
+  expect(text).toContain(
+    `${noBlocking.id} owner/a https://github.com/owner/a/pull/11 round 0: completed (${single}); evidence incomplete`,
+  );
   expect(text).toContain(`${noHistory.id} owner/a round 0: completed; evidence incomplete`);
   expect(text).toContain(`${broken.id} owner/a round 0: malformed`);
   expect(text).toContain("  panel-only src/e.ts: Stale cache: unknown");
@@ -343,4 +376,51 @@ test("reporting reads only: no store writes, invocations or model calls", async 
   // Only the run's PR and its dependent's PR: runs without a PR of their own have no history to read.
   expect(reads.sort()).toEqual([main.id, dependent.id].sort());
   expect(JSON.stringify(store.getRunDetail(main.id))).toBe(before);
+});
+
+test("ghPrHistory reads the PR and each commit's files with gh only; any failure makes the history unavailable", async () => {
+  const { main, create, a } = fixture();
+  const calls: string[][] = [];
+  const pr: (HistoryRecord & { oid?: string })[] = [
+    {
+      kind: "commit",
+      oid: "abc123",
+      source: "commit abc123",
+      at: hour(4),
+      text: "Fix src/a.ts: Null deref\n",
+    },
+    {
+      kind: "commit",
+      oid: "d0c5",
+      source: "commit d0c5",
+      at: hour(4),
+      text: "Document src/a.ts: Null deref\n",
+    },
+    { kind: "review", source: `${PR}#review-1`, at: hour(4), text: "Looks fine overall" },
+  ];
+  const files: Record<string, string[]> = { abc123: ["src/a.ts", "test/a.test.ts"], d0c5: ["docs/NOTES.md"] };
+  const gh: GhRunner = async (args) => {
+    calls.push(args);
+    if (args[0] === "pr") return JSON.stringify(pr);
+    const sha = args[1]?.split("/").pop() ?? "";
+    if (!(sha in files)) throw new Error("gh: Not Found (HTTP 404)");
+    return JSON.stringify(files[sha]);
+  };
+  const read = ghPrHistory(gh);
+  const mainRun = store.getRun(main.id) as Run;
+  expect(await read(mainRun)).toEqual(pr.map((r) => (r.oid ? { ...r, files: files[r.oid] } : r)));
+  expect(calls.map((c) => c.slice(0, 3).join(" "))).toEqual([
+    `pr view ${PR}`,
+    "api repos/owner/a/commits/abc123 --jq",
+    "api repos/owner/a/commits/d0c5 --jq",
+  ]);
+  expect(calls.every((c) => ["view", "repos/"].some((ro) => c.join(" ").includes(ro)))).toBe(true);
+  // No PR: nothing to read. A failing read (here: the second commit vanished): unavailable, never partial.
+  expect(await read(create(a))).toBeNull();
+  delete files.d0c5;
+  expect(await read(mainRun)).toBeNull();
+  // The report then leaves panel-only findings unknown rather than converged.
+  const [r0] = (await shadowReport(store, read)).filter((r) => r.runId === main.id);
+  expect(r0?.history).toBe(false);
+  expect(new Set(r0?.panelOnly.map((p) => p.outcome))).toEqual(new Set(["unknown", "review-matched"]));
 });

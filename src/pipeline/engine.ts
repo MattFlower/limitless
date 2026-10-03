@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { assertExistingBranchDelivery, isBranchName } from "../core/delivery.ts";
-import type { ResolvedProfile, ReviewSystem, RunStatus } from "../core/types.ts";
+import type { ResolvedProfile, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import {
   BASELINE_CACHE_TTL_MS,
@@ -54,7 +54,6 @@ import { formatTarget } from "../router/targets.ts";
 import {
   CancelledError,
   type EngineDeps,
-  type InvokeOutcome,
   NeedsHumanError,
   NoCapacityError,
   ParkedError,
@@ -82,7 +81,6 @@ import {
   PANEL_REVIEWS,
   type PanelReview,
   pickVerifier,
-  type ReviewDeps,
   type ReviewInput,
   type ReviewRequest,
   resolvedPriorFindings,
@@ -90,7 +88,7 @@ import {
   runReview,
   type VerifierRequest,
 } from "./review.ts";
-import { shadowReview } from "./review-shadow.ts";
+import { type ShadowDeps, shadowReview } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import {
   type Holdout,
@@ -1152,7 +1150,7 @@ async function oneRound(
         await discardChanges(cwd);
         return invoked;
       };
-      const reviewDeps = (system: ReviewSystem): ReviewDeps<InvokeOutcome> => {
+      const reviewDeps: ShadowDeps = (system) => {
         return {
           invoke: async (request, index) => {
             const finder = system.finders[index];

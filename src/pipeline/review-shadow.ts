@@ -4,16 +4,18 @@ import { type ReviewDeps, type ReviewInput, runReview } from "./review.ts";
 import { configuredReviewSystem } from "./review-system.ts";
 import { parseArtifact } from "./shadow-report.ts";
 
-/** At or below this headroom a subscription provider has no room for shadow work. */
-export const SHADOW_MIN_HEADROOM = 0.1;
+const SHADOW_MIN_HEADROOM = 0.1; // at or below it a subscription provider has no room for shadow work
+
+/** The engine's review dependencies, with the finders of the given system. */
+export type ShadowDeps = (system: ReviewSystem) => ReviewDeps<InvokeOutcome>;
 
 /** Runs the profile's panel as a first review of what the single review saw; never affects the run. */
 export async function shadowReview(
   ctx: RunContext,
   opts: { round: number; baseSha: string; reviewedSha: string; profile: ResolvedProfile; input: ReviewInput },
-  deps: (system: ReviewSystem) => ReviewDeps<InvokeOutcome>,
+  deps: ShadowDeps,
 ): Promise<void> {
-  const { round, baseSha, reviewedSha } = opts;
+  const { round, baseSha, reviewedSha, profile, input } = opts;
   const range = `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`;
   const name = `review-${round}.shadow.json`;
   const prior = parseArtifact(ctx.store.getArtifact(ctx.run.id, name));
@@ -29,19 +31,15 @@ export async function shadowReview(
         ? `${id} quota headroom is at or below ${SHADOW_MIN_HEADROOM}`
         : undefined;
   const guard = { stop, ids: [] as number[] };
-  const system = configuredReviewSystem(
-    { ...cfg, reviewMode: "panel" },
-    opts.profile,
-    ctx.state.reviewLenses,
-  );
+  const system = configuredReviewSystem({ ...cfg, reviewMode: "panel" }, profile, ctx.state.reviewLenses);
   let record: Record<string, unknown>;
   try {
     if (system.mode !== "panel") throw new NoCapacityError("run prepared without base review lenses");
     const low = tracker.all().find((p) => p.enabled && p.billing === "subscription" && stop(p.id));
     if (low) throw new NoCapacityError(stop(low.id));
-    const { previous: _previous, fixReview: _fix, ...prompt } = opts.input.prompt;
-    const input = { ...opts.input, prompt, system, replayedFollowUps: undefined };
-    const { output, decision, panel } = await invokeGuard.run(guard, () => runReview(deps(system), input));
+    const { previous: _previous, fixReview: _fix, ...prompt } = input.prompt;
+    const request = { ...input, prompt, system, replayedFollowUps: undefined };
+    const { output, decision, panel } = await invokeGuard.run(guard, () => runReview(deps(system), request));
     if (!decision) throw output.error;
     record = { status: "completed", ...decision, panel };
   } catch (error) {

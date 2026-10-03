@@ -167,6 +167,14 @@ async function serve(): Promise<void> {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
+/** An ISO-8601 date or timestamp as ms. The calendar date must exist: Date.parse turns 02-30 into 03-02. */
+function parseSince(value: string): number {
+  const [since, day] = [Date.parse(value), value.slice(0, 10)];
+  const real = /^\d{4}-\d\d-\d\d(T|$)/.test(value) && !Number.isNaN(since);
+  if (real && new Date(`${day}T00:00:00Z`).toISOString().startsWith(day)) return since;
+  throw new Error(`--since: invalid ISO-8601 timestamp ${value}`);
+}
+
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({
     args: Bun.argv.slice(2),
@@ -416,9 +424,7 @@ async function main(): Promise<void> {
     case "review": {
       if (rest.join(" ") !== "shadow-report")
         throw new Error("usage: limitless review shadow-report [--since <ISO-8601 timestamp>]");
-      const since = values.since === undefined ? undefined : Date.parse(values.since);
-      if (Number.isNaN(since) || !/^\d{4}-\d\d-\d\d/.test(values.since ?? "0000-00-00"))
-        throw new Error(`--since: invalid ISO-8601 timestamp ${values.since}`);
+      const since = values.since === undefined ? undefined : parseSince(values.since);
       const { formatShadowReport } = await import("../pipeline/shadow-report.ts");
       console.log(formatShadowReport(await api("/api/review/shadow-report"), since));
       return;

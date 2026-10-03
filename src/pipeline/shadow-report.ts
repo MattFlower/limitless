@@ -2,25 +2,35 @@ import type { Run } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import type { GhRunner } from "../integrations/github.ts";
 
-/** A later fix (commit) or review finding/comment, cited by `source` at ISO time `at`. */
-export type HistoryRecord = { kind: "fix" | "review"; source: string; at: string; text: string };
+type Cited = Record<"source" | "at" | "text", string>;
+/** A later commit (with the `files` it changes) or review finding/comment, cited by `source` at ISO time `at`. */
+export type HistoryRecord = Cited & { kind: "commit" | "review"; files?: string[] };
 /** A run's PR history (commits in PR order first), or null when it has no PR or it is unavailable. */
 export type HistoryReader = (run: Run) => Promise<HistoryRecord[] | null>;
 export type Outcome = "fixed" | "review-matched" | "converged-without-fix" | "unknown";
-type Evidence = Omit<HistoryRecord, "text"> & { basis: string };
+type Evidence = Omit<HistoryRecord, "text" | "files"> & { basis: string };
+const BASIS = { commit: "names the file and title and changes the file", review: "names the file and title" };
 type PanelOnly = { finding: string; outcome: Outcome; evidence: Evidence[] };
 type Ids = Record<"runId" | "repo" | "round" | "status", string> & { pr: string | null; createdAt: number };
 /** `history` is false when some related history or review was unavailable: unmatched findings stay unknown. */
 type Results = Record<"single" | "panel" | "shared", string[]> & { history: boolean; panelOnly: PanelOnly[] };
 export type ShadowRow = Ids & Results & { reason?: string };
 
-const PR_HISTORY = `[(.commits[] | {kind: "fix", source: "commit \\(.oid)", at: .committedDate, text: "\\(.messageHeadline)\\n\\(.messageBody)"}), ((.reviews + .comments)[] | {kind: "review", source: .url, at: (.submittedAt // .createdAt), text: (.body // "")})]`;
+const PR_HISTORY = `[(.commits[] | {kind: "commit", oid: .oid, source: "commit \\(.oid)", at: .committedDate, text: "\\(.messageHeadline)\\n\\(.messageBody)"}), ((.reviews + .comments)[] | {kind: "review", source: .url, at: (.submittedAt // .createdAt), text: (.body // "")})]`;
+const VIEW = ["--json", "commits,reviews,comments", "--jq", PR_HISTORY];
 
-/** Read-only `gh pr view`: commits are fix records, reviews and comments review records. */
+/** Read-only `gh pr view`, plus one `gh api` read per commit for the files it changes. */
 export const ghPrHistory = (gh: GhRunner): HistoryReader => {
-  const fields = ["--json", "commits,reviews,comments", "--jq", PR_HISTORY];
-  const view = async (u: string) => JSON.parse(String(await gh(["pr", "view", u, ...fields])));
-  return async (r) => (r.prUrl ? view(r.prUrl).catch(() => null) : null);
+  const json = async (args: string[]) => JSON.parse(String(await gh(args)));
+  const view = async ({ prUrl, repoSlug }: Run): Promise<HistoryRecord[]> => {
+    const records: (HistoryRecord & { oid?: string })[] = await json(["pr", "view", `${prUrl}`, ...VIEW]);
+    for (const c of records.filter((c) => c.oid)) {
+      c.files = await json(["api", `repos/${repoSlug}/commits/${c.oid}`, "--jq", "[.files[].filename]"]);
+      if (!c.files?.every((f) => typeof f === "string")) throw new Error(`no file list for commit ${c.oid}`);
+    }
+    return records;
+  };
+  return async (r) => (r.prUrl ? view(r).catch(() => null) : null);
 };
 
 type Finding = { file: string; title: string };
@@ -76,14 +86,13 @@ export async function shadowReport(store: Store, readHistory: HistoryReader): Pr
       const panel = list(shadow?.blocking);
       const status = shadow === null ? "missing" : String(shadow?.status ?? "malformed");
       const reason = single ? shadow?.reason : "single review artifact missing or malformed";
-      // Commits are placed after the reviewed commit in PR order. A rewritten history lost that commit:
-      // rebased commits have new ids and times, so none is placed and the evidence is incomplete.
+      // Fixes follow the reviewed commit in PR order; a rebased history lacks it, so its evidence is incomplete.
       const sha = `commit ${String(shadow?.reviewedSha)}`;
       const placed = histories.map((h) => [h ?? [], h?.findIndex((r) => r.source === sha) ?? -1] as const);
       const row: ShadowRow = {
         ...{ runId: run.id, repo: run.repoSlug, pr: run.prUrl, createdAt: run.createdAt, round },
         ...{ status: status === "completed" && !panel ? "malformed" : status },
-        ...{ history: complete && placed.every(([, i]) => i >= 0) },
+        ...{ history: complete && single !== null && placed.every(([, i]) => i >= 0) },
         ...(reason ? { reason: String(reason) } : {}),
         ...{ single: (single ?? []).map(label), panel: [], shared: [], panelOnly: [] },
       };
@@ -98,10 +107,12 @@ export async function shadowReport(store: Store, readHistory: HistoryReader): Pr
       row.panel = panel.map(label);
       row.shared = row.panel.filter((p) => row.single.some((s) => norm(s) === norm(p)));
       for (const f of panel.filter((f) => !row.shared.includes(label(f)))) {
-        const evidence = records
+        // A fix is a commit that names the finding and changes its file; a mention or an edit alone is none.
+        const evidence: Evidence[] = records
           .filter((r) => norm(r.text).includes(norm(f.file)) && norm(r.text).includes(norm(f.title)))
-          .map(({ kind, source, at }) => ({ kind, source, at, basis: "names the file and title" }));
-        const fixed = evidence.some((e) => e.kind === "fix");
+          .filter((r) => r.kind === "review" || r.files?.includes(f.file))
+          .map(({ kind, source, at }) => ({ kind, source, at, basis: BASIS[kind] }));
+        const fixed = evidence.some((e) => e.kind === "commit");
         const noMatch = row.history && done ? "converged-without-fix" : "unknown";
         const outcome = fixed ? "fixed" : evidence.length ? "review-matched" : noMatch;
         row.panelOnly.push({ finding: label(f), outcome, evidence });
@@ -125,7 +136,7 @@ export function formatShadowReport(rows: ShadowRow[], since?: number): string {
         : []),
       ...r.panelOnly.flatMap((p) => [
         `  panel-only ${p.finding}: ${p.outcome}`,
-        ...p.evidence.map((e) => `    ${e.kind} ${e.source} @ ${e.at} (${e.basis})`),
+        ...p.evidence.map((e) => `    ${e.source} @ ${e.at} (${e.basis})`),
       ]),
     ])
     .join("\n");

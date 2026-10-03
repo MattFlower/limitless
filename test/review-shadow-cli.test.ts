@@ -22,10 +22,10 @@ const row = (runId: string, createdAt: number): ShadowRow => ({
       outcome: "fixed",
       evidence: [
         {
-          kind: "fix",
+          kind: "commit",
           source: "commit abc123",
           at: "2026-09-02T00:00:00Z",
-          basis: "names the file and title",
+          basis: "names the file and title and changes the file",
         },
       ],
     },
@@ -70,16 +70,21 @@ test("shadow-report prints every retained comparison without --since", async () 
   expect(stdout).toContain("  panel blocking: src/a.ts: Shared bug; src/b.ts: Race");
   expect(stdout).toContain("  shared: src/a.ts: Shared bug");
   expect(stdout).toContain("  panel-only src/b.ts: Race: fixed");
-  expect(stdout).toContain("    fix commit abc123 @ 2026-09-02T00:00:00Z (names the file and title)");
+  expect(stdout).toContain(
+    "    commit abc123 @ 2026-09-02T00:00:00Z (names the file and title and changes the file)",
+  );
 });
 
-test("--since keeps runs created at or after the cutoff", async () => {
-  const { stdout, exit } = await cli("shadow-report", "--since", "2026-09-01T00:00:00Z");
-  expect(exit).toBe(0);
-  expect(stdout).not.toContain("run-before");
-  expect(stdout).toContain("run-at owner/a");
-  expect(stdout).toContain("run-after owner/a");
-});
+test.each(["2026-09-01T00:00:00Z", "2026-09-01", "2026-09-01T02:00:00+02:00"])(
+  "--since %s keeps runs created at or after the cutoff",
+  async (since) => {
+    const { stdout, exit } = await cli("shadow-report", "--since", since);
+    expect(exit).toBe(0);
+    expect(stdout).not.toContain("run-before");
+    expect(stdout).toContain("run-at owner/a");
+    expect(stdout).toContain("run-after owner/a");
+  },
+);
 
 test("an empty selection says so", async () => {
   const { stdout, exit } = await cli("shadow-report", "--since", "2030-01-01T00:00:00Z");
@@ -90,6 +95,11 @@ test("an empty selection says so", async () => {
 test.each([
   [["shadow-report", "--since", "yesterday"], "--since: invalid ISO-8601 timestamp yesterday"],
   [["shadow-report", "--since", "2026-13-45T00:00:00Z"], "--since: invalid ISO-8601 timestamp"],
+  // Date.parse would silently read these as March 2.
+  [["shadow-report", "--since", "2026-02-30T00:00:00Z"], "--since: invalid ISO-8601 timestamp 2026-02-30"],
+  [["shadow-report", "--since", "2026-02-30"], "--since: invalid ISO-8601 timestamp 2026-02-30"],
+  [["shadow-report", "--since", "2026-09-01T25:00:00Z"], "--since: invalid ISO-8601 timestamp"],
+  [["shadow-report", "--since", "1756684800000"], "--since: invalid ISO-8601 timestamp"],
   [["shadow-report", "--since"], "--since"],
   [["shadow-report", "--since", ""], "--since: invalid ISO-8601 timestamp"],
   [["report"], "usage: limitless review shadow-report"],
