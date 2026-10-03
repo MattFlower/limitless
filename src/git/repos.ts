@@ -203,7 +203,15 @@ async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Pro
         // the empty template keeps init.templateDir hooks out.
         for (const dir of ["objects", "refs"]) mkdirSync(join(tmp, dir), { recursive: true });
         writeFileSync(join(tmp, "HEAD"), "ref: refs/heads/main\n");
-        await worktreeGit(["git", "init", "-q", "--bare", "--template="], { cwd: tmp, signal });
+        // Unlike clone, init doesn't adopt the source's hash (a SHA-256 source can't fetch into SHA-1).
+        const format = await worktreeGit(["git", "rev-parse", "--show-object-format"], {
+          cwd: repo.localPath as string,
+          signal,
+        });
+        await worktreeGit(
+          ["git", "init", "-q", "--bare", "--template=", `--object-format=${format.stdout.trim()}`],
+          { cwd: tmp, signal },
+        );
         await worktreeGit(["git", "config", "remote.origin.url", repo.localPath as string], {
           cwd: tmp,
           signal,
@@ -285,7 +293,13 @@ export async function createWorktree(
   return withRepoLock(cache, async () => {
     if (repo.kind === "local") await refreshCache(paths, repo);
     const base = await worktreeGit(["git", "rev-parse", baseRef], { cwd: cache });
-    await worktreeGit(["git", "worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
+    // Hooks are blanked where a command runs. `worktree add` would check out inside the new
+    // worktree, where includes conditional on its branch or git directory can first activate
+    // hooks; checking out from there instead lets the wrapper see exactly those.
+    await worktreeGit(["git", "worktree", "add", "--no-checkout", "-b", branch, path, base.stdout.trim()], {
+      cwd: cache,
+    });
+    await worktreeGit(["git", "reset", "--hard", "-q"], { cwd: path });
     return { path, branch, baseSha: base.stdout.trim() };
   });
 }

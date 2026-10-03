@@ -703,6 +703,60 @@ describe("local factory clones", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  test.each(["onbranch:limitless/**", "gitdir:**/worktrees/**"])(
+    "config hooks activated only inside the run's worktree (%s) never run",
+    async (condition) => {
+      const marker = join(home, "worktree-hook-ran");
+      const conditional = join(home, "worktree-hook.gitconfig");
+      const hook = "hook.worktree";
+      writeFileSync(
+        conditional,
+        `[${hook}]\n\tcommand = touch '${marker}'\n${["reference-transaction", "post-checkout", "pre-push"]
+          .map((event) => `\tevent = ${event}\n`)
+          .join("")}`,
+      );
+      const globalConfig = join(home, "worktree-includeif.gitconfig");
+      writeFileSync(globalConfig, `[includeIf "${condition}"]\n\tpath = ${conditional}\n`);
+      await withEnv("GIT_CONFIG_GLOBAL", globalConfig, async () => {
+        const f = start(reply);
+        const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        const repo = f.store.getRepo(run.repoId);
+        const result = f.store.getRun(run.id);
+        if (!repo) throw new Error("missing repo");
+        // Invisible from the clone, where the worktree is created; in force inside the worktree.
+        const lookup = ["config", "--get-regexp", "^hook\\."];
+        expect(
+          (await sh(["git", ...lookup], { cwd: cachePath(f.cfg.paths, repo), allowFail: true })).exitCode,
+        ).toBe(1);
+        expect(await git(join(f.cfg.paths.work, run.id), "config", `${hook}.command`)).toBe(
+          `touch '${marker}'`,
+        );
+        expect(await git(join(f.cfg.paths.work, run.id), "ls-files")).toContain("farewell.txt");
+        expect(await git(repoDir, "rev-parse", `refs/heads/${result?.branch}`)).toBe(result?.headSha ?? "");
+      });
+      expect(existsSync(marker)).toBe(false);
+    },
+  );
+
+  test("a SHA-256 source gets a SHA-256 clone and still receives its branch", async () => {
+    const source = join(home, "sha256");
+    mkdirSync(source);
+    writeFileSync(join(source, "greeting.txt"), "hello\n");
+    await git(source, "init", "-q", "-b", "main", "--object-format=sha256");
+    await git(source, "-c", "user.email=t@t", "-c", "user.name=t", "add", ".");
+    await git(source, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init");
+    const f = start(reply);
+    const run = await f.createRun({ repo: source, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const repo = f.store.getRepo(run.repoId);
+    const result = f.store.getRun(run.id);
+    if (!repo) throw new Error("missing repo");
+    expect(await git(cachePath(f.cfg.paths, repo), "rev-parse", "--show-object-format")).toBe("sha256");
+    expect(result?.headSha).toMatch(/^[a-f0-9]{64}$/);
+    expect(await git(source, "rev-parse", `refs/heads/${result?.branch}`)).toBe(result?.headSha ?? "");
+  });
+
   test("delivery push runs no maintenance or gc in the source repository", async () => {
     const f = start(reply);
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });

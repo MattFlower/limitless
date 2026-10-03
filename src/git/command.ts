@@ -37,7 +37,15 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
   prefix.push(...(await emptyHookFlags(prefix, opts)));
   const env = { ...(opts.env ?? (process.env as Record<string, string>)), LIMITLESS_GIT_EMPTY_HOOK: "" };
   const inspection = ["diff", "log"].includes(cmd[command] ?? "");
-  if (inspection) prefix.push("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+  if (inspection) {
+    // Attributes from the empty tree, whose id depends on the repository's object format.
+    const empty = await sh([...prefix, "hash-object", "-t", "tree", "--stdin"], {
+      ...opts,
+      env,
+      allowFail: false,
+    });
+    prefix.push(`--attr-source=${empty.stdout.trim()}`);
+  }
   const flags = inspection ? ["--no-ext-diff", "--no-textconv"] : [];
   return sh([...prefix, ...cmd.slice(command, command + 1), ...flags, ...cmd.slice(command + 1)], {
     ...opts,
