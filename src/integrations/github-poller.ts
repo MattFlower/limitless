@@ -23,8 +23,9 @@ export const OBSERVE_QUERY = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on Pu
   commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
     ... on CheckRun { name conclusion url: detailsUrl }
     ... on StatusContext { name: context state url: targetUrl } } } } } } }
-  reviews(last: 1) { nodes { id updatedAt comments(last: 1) { nodes { id updatedAt } } } }
-  comments(last: 1) { nodes { id updatedAt } } } } }`;
+  reviews(last: 10) { nodes { id updatedAt comments(last: 10) { nodes { id updatedAt } } } }
+  comments(last: 10) { nodes { id updatedAt } } } } }`;
+// Activity pages hold the newest few items so an edit to a recent older one still moves the marker.
 
 type Conn<T> = { nodes?: (T | null)[] } | null | undefined;
 type Activity = { id: string; updatedAt: string };
@@ -45,37 +46,45 @@ export type PrSnapshot = Base & {
 type Saved = PrSnapshot & { revision: number; unknown: number; nudged: string | null };
 const saved = (data: string | null | undefined) => (data ? (JSON.parse(data) as Saved) : null);
 const FAILING = new Set(["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
-const last = <T>(c: Conn<T>): T | null => c?.nodes?.at(-1) ?? null;
-const marker = (a: Activity | null | undefined) => (a ? `${a.id}@${a.updatedAt}` : null);
+const nodes = <T>(c: Conn<T>): T[] => (c?.nodes ?? []).filter((n): n is T => n !== null);
+/** `id@updatedAt` of the item created or edited last; ISO-8601 UTC timestamps order as strings. */
+const newest = (items: Activity[]) => {
+  const top = items.toSorted((a, b) => (a.updatedAt + a.id > b.updatedAt + b.id ? -1 : 1))[0];
+  return top ? `${top.id}@${top.updatedAt}` : null;
+};
 
 /** Null unless `node` is a complete PullRequest (with the expected id, when given). */
 export function normalizePr(node: unknown, id?: string | null): PrSnapshot | null {
   const pr = node as GqlPr | null;
   if (!pr || REQUIRED.some((k) => typeof pr[k] !== "string") || (id && pr.id !== id)) return null;
   const { commits, reviews, comments, ...base } = pr;
-  const rollup = last(commits)?.commit?.statusCheckRollup ?? null;
-  const [r, c] = [last(reviews), last(comments)];
-  const failing = (rollup?.contexts?.nodes ?? []).flatMap((x) =>
-    x?.name && FAILING.has(x.conclusion ?? x.state ?? "") ? [{ name: x.name, url: x.url ?? null }] : [],
+  const rollup = nodes(commits).at(-1)?.commit?.statusCheckRollup ?? null;
+  const all = nodes(reviews);
+  const failing = nodes(rollup?.contexts).flatMap((x) =>
+    x.name && FAILING.has(x.conclusion ?? x.state ?? "") ? [{ name: x.name, url: x.url ?? null }] : [],
   );
   return {
     ...base,
     ci: rollup?.state ?? null,
     failing: failing.sort((a, b) => a.name.localeCompare(b.name)),
-    activity: { review: marker(r), review_comment: marker(last(r?.comments)), comment: marker(c) },
+    activity: {
+      review: newest(all),
+      review_comment: newest(all.flatMap((r) => nodes(r.comments))),
+      comment: newest(nodes(comments)),
+    },
   };
 }
 
 type Change = { kind: GitHubFeedKind; key: string; data: Record<string, unknown>; summary: string };
 const OUTCOME: Record<string, string> = { SUCCESS: "passed", FAILURE: "failed", ERROR: "failed" };
-/** The feed-worthy changes from `prev` to `next`; a first observation is a baseline for CI and activity. */
+/** Changes from `prev` to `next`; a first observation reports the head's state but baselines activity. */
 export function diffPr(prev: PrSnapshot | null, next: PrSnapshot): Change[] {
   const out: Change[] = [];
   const at = `at ${next.headRefOid.slice(0, 12)}`;
   const add = (kind: GitHubFeedKind, key = "", data = {}, summary = `${kind} ${at}`) =>
     out.push({ kind, key, data, summary });
   const ci = OUTCOME[next.ci ?? ""];
-  if (prev && ci && (prev.headRefOid !== next.headRefOid || OUTCOME[prev.ci ?? ""] !== ci)) {
+  if (ci && (!prev || prev.headRefOid !== next.headRefOid || OUTCOME[prev.ci ?? ""] !== ci)) {
     const names = next.failing.map((f) => f.name).join(", ") || "unknown";
     if (ci === "passed") add("pr.ci_passed");
     else add("pr.ci_failed", "", { failing: next.failing }, `Failing ${at}: ${names}`);
@@ -94,13 +103,14 @@ export function diffPr(prev: PrSnapshot | null, next: PrSnapshot): Change[] {
 }
 
 const errorsOf = (res: GitHubResponse) => (res.body as { errors?: { type?: string }[] } | null)?.errors ?? [];
-/** SSO and IP-allow-list failures are access problems, never PR changes. */
-function accessProblem(res: GitHubResponse) {
+/** SSO, IP-allow-list and not-found failures for `subject` are access problems, never PR changes. */
+function accessProblem(res: GitHubResponse, subject: string) {
   const text = JSON.stringify(res.status === 200 ? errorsOf(res) : (res.body ?? ""));
   if (res.headers.get("x-github-sso") || /SAML|single sign-on/i.test(text))
     return { reason: "sso", detail: "The organization requires SSO authorization for the gh token" };
   if (/IP allow list|IP address/i.test(text))
     return { reason: "ip", detail: "The organization's IP allow list blocks this network" };
+  if (res.status === 404) return { reason: "not_found", detail: `The gh token cannot see ${subject}` };
   return null;
 }
 const isLimited = (res: GitHubResponse) =>
@@ -138,7 +148,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     }
     const retry = Number(res.headers.get("retry-after"));
     cooldownUntil = now() + (retry > 0 ? retry * 1000 : Math.min(60_000 * 2 ** failures++, 900_000));
-    const access = accessProblem(res);
+    const access = accessProblem(res, repo);
     if (access) store.setGithubAccess(repo, access);
     return null;
   };
@@ -186,19 +196,20 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
       const ids = known.map((p) => p.nodeId);
       const res = await call(repo, "graphql", { query: OBSERVE_QUERY, variables: { ids } });
       if (!res) return;
-      const access = accessProblem(res);
+      // An access failure of the whole query (SSO, IP allow list, HTTP 404) says nothing about any PR.
+      const access = accessProblem(res, repo);
       if (access) store.setGithubAccess(repo, access, headOf(known[0]));
-      const nodes = (res.body as { data?: { nodes?: unknown } } | null)?.data?.nodes;
+      const found = (res.body as { data?: { nodes?: unknown } } | null)?.data?.nodes;
       // Partial data is never trusted; only unresolvable node ids (NOT_FOUND) leave the rest usable.
       const failed = access || res.status !== 200 || errorsOf(res).some((e) => e.type !== "NOT_FOUND");
-      if (failed || !Array.isArray(nodes) || nodes.length !== known.length)
+      if (failed || !Array.isArray(found) || found.length !== known.length)
         return log(`GitHub observation of ${repo} failed with HTTP ${res.status}`);
       for (const [i, pr] of known.entries()) {
-        const snap = normalizePr(nodes[i], pr.nodeId);
+        const snap = normalizePr(found[i], pr.nodeId);
         const nudged = snap ? await record(pr, snap) : null;
         // A nudge that failed (perhaps an access problem) must not let this cycle clear an episode.
         if (nudged === null) complete = false;
-        if (nodes[i] === null || nudged?.status === 404) missing ??= pr;
+        if (found[i] === null || nudged?.status === 404) missing ??= pr;
       }
     }
     const notFound = missing && { reason: "not_found", detail: `The gh token cannot see ${missing.url}` };

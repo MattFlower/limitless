@@ -171,6 +171,24 @@ test("each change produces exactly one feed item; repeats and non-changes produc
       ["pr.comment"],
     ],
     [
+      "second review",
+      (n) => {
+        n.reviews.nodes.push({ id: "R2", updatedAt: "t2", comments: { nodes: [] } });
+      },
+      ["pr.comment"],
+    ],
+    [
+      "older review's comment edited",
+      (n) => {
+        n.reviews.nodes[0] = {
+          id: "R1",
+          updatedAt: "t1",
+          comments: { nodes: [{ id: "RC1", updatedAt: "t3" }] },
+        };
+      },
+      ["pr.comment"],
+    ],
+    [
       "issue comment",
       (n) => {
         n.comments.nodes = [{ id: "C1", updatedAt: "t1" }];
@@ -209,7 +227,9 @@ test("each change produces exactly one feed item; repeats and non-changes produc
         { name: "a-status", url: "https://ci/a" },
         { name: "b-test", url: "https://ci/b" },
       ]);
-    if (name === "review comment") expect(items[0]?.data.category).toBe("review_comment");
+    if (name === "review comment" || name === "older review's comment edited")
+      expect(items[0]?.data.category).toBe("review_comment");
+    if (name === "second review") expect(items[0]?.data.category).toBe("review");
     await h.advance(15 * S);
     expect([name, kinds()]).toEqual([name, []]);
   }
@@ -560,16 +580,61 @@ test("SSO, 404, IP restrictions and missing nodes are access problems, once per 
   expect(h.store.readFeed({ limit: 1000 }).items.some((i) => i.kind === "pr.closed")).toBe(false);
 });
 
-test("diff ignores marker deletion and baselines CI and activity on first sight", () => {
+test("diff reports a completed CI result on first sight, baselines activity, ignores marker deletion", () => {
   const node = prNode("o/r", 1);
-  ci(node, rollup("FAILURE", [{ name: "x", conclusion: "FAILURE" }]));
+  ci(node, rollup("FAILURE", [{ name: "x", conclusion: "FAILURE", url: "https://ci/x" }]));
+  node.reviewDecision = "APPROVED";
   node.comments.nodes = [{ id: "C", updatedAt: "t" }];
   const snap = normalizePr(node);
   if (!snap) throw new Error("bad node");
-  expect(diffPr(null, snap)).toEqual([]);
+  expect(diffPr(null, snap).map((c) => [c.kind, c.data])).toEqual([
+    ["pr.ci_failed", { failing: [{ name: "x", url: "https://ci/x" }] }],
+  ]);
+  expect(diffPr(null, { ...snap, ci: "SUCCESS", failing: [] }).map((c) => c.kind)).toEqual(["pr.ci_passed"]);
+  expect(diffPr(null, { ...snap, ci: null, failing: [] })).toEqual([]);
   expect(diffPr(snap, { ...snap, activity: { ...snap.activity, comment: null } })).toEqual([]);
   expect(normalizePr(null)).toBeNull();
   h = pollerHarness();
+});
+
+test("a PR first seen with CI already finished reports that result", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  ci(h.node("o/r", 1), rollup("SUCCESS", [{ name: "t", conclusion: "SUCCESS" }]));
+  h.start();
+  await h.advance(0);
+  expect(h.fresh().map((i) => [i.kind, i.data.head])).toEqual([["pr.ci_passed", SHA]]);
+  await h.advance(15 * S);
+  expect(kinds()).toEqual([]);
+});
+
+test("an HTTP 404 from the observation query is an access problem, not a close, until access returns", async () => {
+  h = pollerHarness();
+  const run = h.factoryPr("o/r", 1);
+  h.start();
+  await h.advance(0);
+  const before = snapshotOf(url("o/r", 1));
+  h.gh.next.push(respond(404, { message: "Not Found" }), respond(404, { message: "Not Found" }));
+  await h.advance(15 * S);
+  await h.advance(15 * S);
+  expect(h.gh.next).toHaveLength(0);
+  expect(h.fresh().map((i) => [i.kind, i.repo, i.data.reason, i.data.head])).toEqual([
+    ["github.access_problem", "o/r", "not_found", SHA],
+  ]);
+  expect(snapshotOf(url("o/r", 1))).toBe(before);
+  expect(h.store.getRun(run.id)).toMatchObject({
+    status: "succeeded",
+    merged: false,
+    prClosedUnmerged: false,
+  });
+  expect(githubDoctor(h.store).join("\n")).toMatch(/o\/r[\s\S]*gh auth refresh/);
+  await h.advance(15 * S);
+  expect(h.store.githubAccessProblems()).toEqual([]);
+  expect(githubDoctor(h.store)).toEqual(["GitHub access: ok"]);
+  h.gh.next.push(respond(404, { message: "Not Found" }));
+  await h.advance(15 * S);
+  expect(kinds()).toEqual(["github.access_problem"]);
+  expect(h.store.readFeed({ limit: 1000 }).items.some((i) => i.kind === "pr.closed")).toBe(false);
 });
 
 test("GraphQL partial errors never overwrite the last successful snapshot", async () => {
