@@ -6668,6 +6668,63 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     expect(f.store.listInvocations(run.id).filter((i) => i.role === "review_shadow")).toHaveLength(2);
   });
 
+  test("a timeout keeps completed verifier results beside the finder results", async () => {
+    const calls = newCalls();
+    const slow: AgentSpec[] = [];
+    let verified: () => void = () => {};
+    const firstVerified = new Promise<void>((resolve) => {
+      verified = resolve;
+    });
+    // Two files make two verifier batches: the first answers at once, the second hangs until aborted.
+    const handler: Handler = async (s) => {
+      if (s.prompt.startsWith("You are a code reviewer")) {
+        calls.shadow.push(s);
+        const findings = [finding("Fast"), { ...finding("Other"), file: "other.txt" }];
+        return { structured: { ...approve, findings }, costEquivUsd: 0.25 };
+      }
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        calls.verifier.push(s);
+        if (calls.verifier.length === 1) {
+          verified();
+          return confirm(s);
+        }
+        slow.push(s);
+        return new Promise<FakeReply>((resolve) =>
+          s.signal.addEventListener("abort", () => resolve({ structured: approve })),
+        );
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        calls.primary.push(s);
+        await firstVerified;
+        return { structured: approve, costEquivUsd: 1 };
+      }
+      calls.implement.push(s);
+      return { files: { "farewell.txt": "goodbye\n" } };
+    };
+    const f = start(handler);
+    shadowOn(f);
+    f.deps.cfg.reviewShadowGraceSeconds = 0.3;
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(JSON.parse(f.store.getArtifact(run.id, "review-0.json") ?? "{}")).toMatchObject({
+      verdict: "approve",
+    });
+    expect(slow[0]?.signal.aborted).toBe(true);
+    const shadow = JSON.parse(f.store.getArtifact(run.id, "review-0.shadow.json") ?? "null");
+    expect(shadow).toMatchObject({
+      status: "timeout",
+      finished: [
+        { finder: 0, status: "ok", review: { findings: [{ title: "Fast" }, { title: "Other" }] } },
+        { verifier: ["C1"], status: "ok", result: { results: [{ id: "C1", verdict: "CONFIRMED" }] } },
+      ],
+      usage: { invocations: 3 },
+    });
+    expect(shadow.finished).toHaveLength(2);
+    expect(shadow).not.toHaveProperty("blocking");
+  });
+
   test("a shadow call still running after its abort never holds the run past the grace period or touches its worktree", async () => {
     const calls = newCalls();
     const { handler, slow, release } = slowShadow(calls, Promise.resolve(), true);

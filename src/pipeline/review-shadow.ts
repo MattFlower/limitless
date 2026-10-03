@@ -37,7 +37,8 @@ export function startShadow(
   const unknown = (id: string) => !Object.keys(tracker.status(id)?.windows ?? {}).length;
   const abort = new AbortController();
   const shadow: ShadowInvoke = { signal: AbortSignal.any([ctx.signal, abort.signal]), stop, ids: [] };
-  const finished: { finder: number; status: string; review: unknown }[] = [];
+  // Every finder and verifier call that completed, in order: what a timeout or error still records.
+  const finished: Record<string, unknown>[] = [];
   let system: ReviewSystem | undefined;
   let written = false;
   const write = (record: Record<string, unknown>) => {
@@ -81,7 +82,19 @@ export function startShadow(
         finished.push({ finder, status: invoked.result.status, review: invoked.result.structured });
         return invoked;
       };
-      const { output, decision, panel } = await runReview({ ...panelDeps, invoke }, request);
+      const { verify: baseVerify } = panelDeps;
+      const verify: typeof baseVerify =
+        baseVerify &&
+        (async (req, vendors, models, candidates) => {
+          const invoked = await baseVerify(req, vendors, models, candidates);
+          finished.push({
+            verifier: candidates,
+            status: invoked.result.status,
+            result: invoked.result.structured,
+          });
+          return invoked;
+        });
+      const { output, decision, panel } = await runReview({ ...panelDeps, invoke, verify }, request);
       if (!decision) throw output.error;
       write({ status: "completed", ...decision, panel });
     } catch (error) {
