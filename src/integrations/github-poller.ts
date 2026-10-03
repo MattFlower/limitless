@@ -39,7 +39,7 @@ type GqlPr = Base & {
   comments?: Conn<Activity>;
   latestReviews?: Conn<{ state: string; author?: { login: string } | null }>;
 };
-/** A PR's normalized state; collections are reduced and sorted so reordering is not a change. */
+/** A PR's normalized state; `failing` is reduced and sorted so reordering is not a change. */
 const MERGE = ["mergeable", "mergeStateStatus"] as const; // null until GitHub reports other than UNKNOWN
 type Known = Omit<Base, (typeof MERGE)[number]> & Record<(typeof MERGE)[number], string | null>;
 export type PrSnapshot = Known & {
@@ -52,17 +52,20 @@ export type PrSnapshot = Known & {
 type Saved = PrSnapshot & { revision: number; unknown: number; nudged: string | null };
 const FAILING = new Set(["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const nodes = <T>(c: Conn<T>): T[] => (c?.nodes ?? []).filter((n): n is T => n !== null);
-/** Every item as `createdAt@updatedAt@id`, sorted, so the last entry is the newest creation known. */
+/** Every item as `createdAt@updatedAt@id`, in page (oldest first) order. */
 const mark = (a: Activity) => `${a.createdAt ?? a.updatedAt}@${a.updatedAt}@${a.id}`;
-const newest = (items: Activity[]) => items.map(mark).sort();
+const newest = (items: Activity[]) => items.map(mark);
 /**
- * A known id with another updatedAt was edited; an unknown one created no earlier than the newest known
- * item was added. A deletion, or an older item it lets the page backfill, never qualifies.
+ * A known id with another updatedAt was edited; an unknown one that follows a known item on the page,
+ * or was created after every known item, was added. A deletion, or an older item it lets the page
+ * backfill (even one created in the same second as the newest known), never qualifies.
  */
-const fresh = (m: string, old: string[]) => {
-  const part = (s: string | undefined, i: number) => s?.split("@")[i] ?? "";
-  const prior = old.find((o) => o.endsWith(m.slice(m.lastIndexOf("@"))));
-  return prior ? part(prior, 1) !== part(m, 1) : part(m, 0) >= part(old.at(-1), 0);
+const fresh = (m: string, before: string[], old: string[]) => {
+  const part = (s: string, i: number) => s.split("@")[i] ?? "";
+  const known = (x: string) => old.find((o) => o.endsWith(x.slice(x.lastIndexOf("@"))));
+  const prior = known(m);
+  if (prior) return part(prior, 1) !== part(m, 1);
+  return before.some(known) || old.every((o) => part(o, 0) < part(m, 0));
 };
 const saved = (data: string | null | undefined) => {
   const s = data ? (JSON.parse(data) as Saved) : null;
@@ -119,7 +122,10 @@ export function diffPr(prev: PrSnapshot | null, next: PrSnapshot): Change[] {
     if (prev?.reviews && !prev.reviews.includes(review) && /:(APPROVED|CHANGES_REQUESTED)$/.test(review))
       add("pr.review", review, { review });
   for (const [category, value] of Object.entries(next.activity))
-    if (prev && value.some((item) => fresh(item, prev.activity[category as keyof PrSnapshot["activity"]])))
+    if (
+      prev &&
+      value.some((m, i) => fresh(m, value.slice(0, i), prev.activity[category as keyof Saved["activity"]]))
+    )
       add("pr.comment", category, { category });
   if (next.state !== "OPEN" && next.state !== prev?.state)
     add(next.state === "MERGED" ? "pr.merged" : "pr.closed", "", { mergedBy: next.mergedBy?.login });

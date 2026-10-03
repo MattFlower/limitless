@@ -1041,6 +1041,34 @@ test("an older item a deletion lets the page backfill is not activity, even with
   }
 });
 
+test("a backfilled item created in the same second as the whole page is not activity", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  const pr = h.node("o/r", 1);
+  const t = "2026-10-02T00:00:00Z";
+  const c = (id: string, updatedAt = t) => ({ id, createdAt: t, updatedAt });
+  const burst = Array.from({ length: 11 }, (_, i) => c(`C${i}`)); // one second of bot comments
+  pr.comments.nodes = burst.slice(1);
+  const review = { ...c("R1"), comments: { nodes: burst.slice(1) } };
+  pr.reviews.nodes = [review];
+  h.start();
+  await h.advance(0);
+  const steps: [() => void, string[]][] = [
+    // Deleting the newest item lets C0, created and updated in the same second as every other, backfill.
+    [() => (pr.comments.nodes = burst.slice(0, 10)), []],
+    [() => (review.comments.nodes = burst.slice(0, 10)), []],
+    // An item appended in that same second is still new, and so is an edit of the backfilled one.
+    [() => pr.comments.nodes.push(c("C11")), ["comment"]],
+    [() => review.comments.nodes.push(c("RC11")), ["review_comment"]],
+    [() => (pr.comments.nodes[0] = c("C0", "2026-10-02T00:00:01Z")), ["comment"]],
+  ];
+  for (const [i, [change, expected]] of steps.entries()) {
+    change();
+    await h.advance(15 * S);
+    expect([i, h.fresh().map((item) => item.data.category)]).toEqual([i, expected]);
+  }
+});
+
 test("snapshots persisted with the previous activity markers are upgraded, not fatal", async () => {
   h = pollerHarness();
   const run = h.factoryPr("o/r", 1);
