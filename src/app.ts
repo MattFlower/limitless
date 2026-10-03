@@ -175,7 +175,7 @@ export class Factory {
 
   start(): void {
     if (this.gcInterval) return;
-    this.store.daemonStarted(this.bootId, version);
+    this.store.daemonStarted(this.bootId, version, this.bootSha);
     // UI development against seeded data must never launch real (paid) runs.
     if (process.env.LIMITLESS_NO_SCHEDULER === "1") return;
     void this.gc()

@@ -58,7 +58,9 @@ const feedPageSchema = z.object({
   nextAfter: z.number().int(),
   pruned: z.boolean(),
 });
-const feedArgsSchema = FeedQuerySchema.omit({ limit: true });
+const feedArgsSchema = FeedQuerySchema.omit({ limit: true }).extend({
+  wait: z.number().min(0).max(45).default(0),
+});
 const detailSchema = z.object({ run: runSchema, questions: z.array(questionSchema) });
 const providersSchema = z.array(
   z.object({
@@ -271,7 +273,7 @@ export function createMcpServer(backend: McpBackend): Server {
     ),
     tool(
       "limitless_feed",
-      "Catch up on what needs action (PRs opened, questions, failures, needs_human, merges, finished evals, daemon restarts) across all runs. Supply consumer (your stable name) to read after its acknowledged cursor, or after for an explicit cursor; wait (0–60 seconds) long-polls until a new item arrives. Returns {items, nextAfter, pruned} in ascending id order; pruned means retention removed items you never acknowledged. Reading never acknowledges: call limitless_feed_ack with nextAfter only after you have handled the items.",
+      "Catch up on what needs action (PRs opened, questions, failures, needs_human, merges, finished evals, daemon restarts) across all runs. Supply consumer (your stable name) to read after its acknowledged cursor, or after for an explicit cursor; wait (0–45 seconds, within client timeouts) long-polls until a new item arrives. Returns {items, nextAfter, pruned} in ascending id order; pruned means retention removed items you never acknowledged. Reading never acknowledges: call limitless_feed_ack with nextAfter only after you have handled the items.",
       feedArgsSchema,
       async (input, signal) => feedPageSchema.parse(await backend.feed(input, signal)),
     ),

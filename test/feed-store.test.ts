@@ -7,6 +7,35 @@ import { allItems, feedStore } from "./feed-support.ts";
 
 const DAY = 86_400_000;
 
+test("upgrading the existing feed preserves items and cursors and allows a later real cancellation", () => {
+  const f = feedStore();
+  try {
+    f.store.close();
+    rmSync(f.path);
+    const before = join(f.dir, "migrations-before-ordering");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-ordered-feed.sql"),
+    });
+    f.store = new Store(f.path, before);
+    const run = f.run();
+    f.store.updateRun(run.id, { status: "cancelled", finishedAt: 1 });
+    const original = allItems(f.store);
+    f.store.ackFeed("consumer", original[0]?.id ?? -1);
+    f.store.updateRun(run.id, { status: "queued", finishedAt: null });
+    f.reopen();
+    expect(allItems(f.store)).toEqual(original);
+    expect(f.store.readFeed({ consumer: "consumer" }).items).toEqual([]);
+    f.store.updateRun(run.id, { status: "cancelled", error: "cancelled by test", finishedAt: 2 });
+    const later = f.store.readFeed({ consumer: "consumer" });
+    expect(later.items).toMatchObject([{ kind: "run.cancelled", data: { reason: "cancelled by test" } }]);
+    expect(later.nextAfter).toBeGreaterThan(original[0]?.id ?? 0);
+    expect(allItems(f.store)).toHaveLength(2);
+  } finally {
+    f.close();
+  }
+});
+
 test("the additive migration keeps inbox rows; items and cursors survive reopening in exclusive id order", () => {
   const f = feedStore();
   try {
@@ -41,7 +70,11 @@ test("the additive migration keeps inbox rows; items and cursors survive reopeni
       f.store.db
         .query("INSERT INTO feed (ts, kind, title, summary, dedupe_key) VALUES (1, 'run.failed', 't', ?, ?)")
         .run(summary, key);
-    expect(() => insert("s", `run.failed:${runs[0]?.id}`)).toThrow(/UNIQUE/);
+    const key = f.store.db
+      .query<{ dedupe_key: string }, [number]>("SELECT dedupe_key FROM feed WHERE id = ?")
+      .get(items[0]?.id ?? -1)?.dedupe_key;
+    expect(key).toBeDefined();
+    expect(() => insert("s", key ?? "")).toThrow(/UNIQUE/);
     expect(() => insert("y".repeat(501), "other")).toThrow(/CHECK/);
 
     const first = f.store.readFeed({ consumer: "orchestrator", limit: 2 });
@@ -56,6 +89,29 @@ test("the additive migration keeps inbox rows; items and cursors survive reopeni
       nextAfter: second.nextAfter,
       pruned: false,
     });
+  } finally {
+    f.close();
+  }
+});
+
+test("Store publication inside an outer transaction never publishes rolled-back feed items", () => {
+  const f = feedStore();
+  try {
+    const run = f.run();
+    const seen = f.published();
+    expect(() =>
+      f.store.db.transaction(() => {
+        f.store.updateRun(run.id, { status: "failed", error: "uncommitted" });
+        expect(allItems(f.store)).toHaveLength(1);
+        expect(seen.items).toEqual([]);
+        throw new Error("rollback");
+      })(),
+    ).toThrow("rollback");
+    expect(allItems(f.store)).toEqual([]);
+    expect(seen.items).toEqual([]);
+    f.store.updateRun(run.id, { status: "failed", error: "committed" });
+    expect(seen.items).toEqual(allItems(f.store));
+    expect(seen.items).toMatchObject([{ kind: "run.failed", data: { error: "committed" } }]);
   } finally {
     f.close();
   }

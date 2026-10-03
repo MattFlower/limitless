@@ -43,7 +43,7 @@ Follow up with all eight tools as needed:
   a connection failure because it may already have taken effect.
 - `limitless_feed`: catch up on everything to act on across runs (PRs opened, questions,
   needs_human, failures, merges, finished evals, daemon restarts) after your consumer's cursor;
-  `wait` (up to 60 s) long-polls. Prefer it over polling runs one by one.
+  `wait` (up to 45 s, within MCP client timeouts) long-polls. Prefer it over polling runs one by one.
 - `limitless_feed_ack`: acknowledge through `nextAfter` for your consumer only after you have
   handled the items; reading never acknowledges.
 

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
-import { feedCommand, pollFeed } from "../src/cli/feed.ts";
+import { ApiError, feedCommand, pollFeed } from "../src/cli/feed.ts";
 import type { FeedItem, FeedPage } from "../src/core/types.ts";
 
 const feedItem = (id: number): FeedItem => ({
@@ -13,6 +13,79 @@ const feedItem = (id: number): FeedItem => ({
   title: `Run failed: task ${id}`,
   summary: "gates failed",
   data: { status: "failed" },
+});
+
+test("long polling retries connection errors and 5xx after daemon restarts with backoff", async () => {
+  let clock = 0;
+  const delays: number[] = [];
+  const waits: string[] = [];
+  const api = async <T>(path: string): Promise<T> => {
+    waits.push(new URL(path, "http://x").searchParams.get("wait") ?? "");
+    if (waits.length === 1) throw new ApiError("connection refused");
+    if (waits.length === 2) throw new ApiError("unavailable", 503);
+    return { items: [feedItem(5)], nextAfter: 5, pruned: false } as T;
+  };
+  const page = await pollFeed(
+    { after: 4, waitS: 10 },
+    api,
+    () => clock,
+    async (ms) => {
+      delays.push(ms);
+      clock += ms;
+    },
+  );
+  expect(page.items).toEqual([feedItem(5)]);
+  expect(delays).toEqual([1000, 2000]);
+  expect(waits).toEqual(["10", "9", "7"]);
+});
+
+test("retry backoff caps at 15 s and the total deadline returns the last cursor and pruning notice", async () => {
+  let clock = 0;
+  let calls = 0;
+  const delays: number[] = [];
+  const api = async <T>(): Promise<T> => {
+    if (++calls === 1) return { items: [], nextAfter: 4, pruned: true } as T;
+    throw new ApiError("unavailable", 500);
+  };
+  expect(
+    await pollFeed(
+      { waitS: 50 },
+      api,
+      () => clock,
+      async (ms) => {
+        delays.push(ms);
+        clock += ms;
+      },
+    ),
+  ).toEqual({ items: [], nextAfter: 4, pruned: true });
+  expect(delays).toEqual([1000, 2000, 4000, 8000, 15000, 15000, 5000]);
+  expect(clock).toBe(50_000);
+  expect(calls).toBe(8);
+});
+
+test("other errors and reads without a wait fail immediately", async () => {
+  for (const [error, waitS] of [
+    [new ApiError("bad request", 400), 10],
+    [new ApiError("unauthorized", 401), 10],
+    [new SyntaxError("invalid JSON"), 10],
+    [new ApiError("connection refused"), 0],
+  ] as const) {
+    let calls = 0;
+    await expect(
+      pollFeed(
+        { waitS },
+        async () => {
+          calls++;
+          throw error;
+        },
+        () => 0,
+        async () => {
+          throw new Error("unexpected sleep");
+        },
+      ),
+    ).rejects.toThrow(error.message);
+    expect(calls).toBe(1);
+  }
 });
 
 /** A fake daemon whose long polls take the full requested wait on an injected clock. */
@@ -142,6 +215,35 @@ test("the CLI binary waits through empty pages and prints parseable JSON", async
     ]);
     expect(await cli("feed", "ack", "3", "--consumer", "orchestrator")).toMatchObject({ exit: 0 });
     expect(bodies).toEqual([{ consumer: "orchestrator", id: 3 }]);
+  } finally {
+    server.stop();
+  }
+});
+
+test("the CLI binary retries two 5xx responses and then prints items", async () => {
+  let calls = 0;
+  const server = Bun.serve({
+    port: 0,
+    fetch: () =>
+      ++calls <= 2
+        ? Response.json({ error: "restarting" }, { status: 503 })
+        : Response.json({ items: [feedItem(1)], nextAfter: 1, pruned: false }),
+  });
+  try {
+    const child = Bun.spawn(["bun", "src/cli/main.ts", "feed", "--wait", "10", "--json"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, LIMITLESS_URL: `http://127.0.0.1:${server.port}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exit] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    expect({ exit, stderr }).toEqual({ exit: 0, stderr: "" });
+    expect(JSON.parse(stdout)).toEqual({ items: [feedItem(1)], nextAfter: 1, pruned: false });
+    expect(calls).toBe(3);
   } finally {
     server.stop();
   }

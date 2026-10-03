@@ -2,13 +2,14 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Factory } from "../src/app.ts";
 import type { EvalStatus, FeedItem, FeedKind } from "../src/core/types.ts";
 import type { Store } from "../src/db/store.ts";
+import { createHttpRoutes } from "../src/server/http.ts";
 import { allItems } from "./feed-support.ts";
-import { fixture } from "./mcp-support.ts";
+import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
 let store: Store;
 beforeEach(async () => {
-  f = await fixture();
+  f = await fixture("0123456789abcdef0123456789abcdef01234567");
   store = f.factory.store;
 });
 afterEach(async () => {
@@ -46,12 +47,70 @@ test("each run lifecycle transition records exactly one item with its context", 
   }
 });
 
-test("one mutation that opens and merges a PR records both kinds", async () => {
+test("one mutation orders PR opening, merge and success by id", async () => {
   const run = await create();
   const items = twice(() =>
     store.updateRun(run.id, { prUrl: "https://github.com/o/r/pull/2", merged: true, status: "succeeded" }),
   );
-  expect(kinds(items).sort()).toEqual(["run.merged", "run.pr_opened", "run.succeeded"]);
+  expect(kinds(items)).toEqual(["run.pr_opened", "run.merged", "run.succeeded"]);
+  expect(items[0]?.id).toBeLessThan(items[1]?.id ?? 0);
+  expect(items[1]?.id).toBeLessThan(items[2]?.id ?? 0);
+});
+
+test("scheduler shutdown re-queues directly; a later real cancel emits exactly once", async () => {
+  const run = await create();
+  const statuses: string[] = [];
+  store.subscribe((msg) => {
+    if (msg.kind === "run" && msg.run.id === run.id) statuses.push(msg.run.status);
+  });
+  const harness = f.factory.deps.harnesses.fake;
+  if (!harness) throw new Error("Missing fake harness");
+  let signal: AbortSignal | undefined;
+  f.factory.deps.harnesses.fake = async (spec) => {
+    signal = spec.signal;
+    return harness(spec);
+  };
+  f.factory.scheduler.tick();
+  for (let i = 0; i < 300 && !signal; i++) await Bun.sleep(10);
+  expect(signal).toBeDefined();
+  expect(store.listInvocations(run.id)).toHaveLength(1);
+  await f.factory.scheduler.stop();
+  expect(signal?.reason).toBeInstanceOf(Error);
+  expect(signal?.reason).toMatchObject({ message: "shutdown" });
+  expect(store.getRun(run.id)).toMatchObject({ status: "queued", finishedAt: null });
+  expect(statuses).not.toContain("cancelled");
+  expect(allItems(store)).toEqual([]);
+  expect(f.factory.scheduler.cancel(run.id, "test")).toBe(true);
+  expect(f.factory.scheduler.cancel(run.id, "test")).toBe(false);
+  expect(allItems(store)).toMatchObject([
+    { kind: "run.cancelled", runId: run.id, data: { reason: "cancelled by test" } },
+  ]);
+});
+
+test("re-entering terminal statuses emits distinct occurrences, even with the same finishedAt", async () => {
+  for (const status of ["cancelled", "failed", "succeeded", "needs_human"] as const) {
+    const run = await create();
+    twice(() => store.updateRun(run.id, { status, finishedAt: 1 }));
+    store.updateRun(run.id, { status: "queued", finishedAt: null });
+    twice(() => store.updateRun(run.id, { status, finishedAt: 1 }));
+    expect(
+      allItems(store)
+        .filter((i) => i.runId === run.id)
+        .map((i) => i.kind),
+    ).toEqual([`run.${status}`, `run.${status}`]);
+  }
+});
+
+test("a real cancel requested during shutdown stays cancelled", async () => {
+  const run = await create();
+  f.factory.scheduler.tick();
+  for (let i = 0; i < 300 && store.listInvocations(run.id).length === 0; i++) await Bun.sleep(10);
+  expect(store.listInvocations(run.id)).toHaveLength(1);
+  const stopped = f.factory.scheduler.stop();
+  expect(f.factory.scheduler.cancel(run.id, "test")).toBe(true);
+  await stopped;
+  expect(store.getRun(run.id)).toMatchObject({ status: "cancelled", error: "cancelled by test" });
+  expect(allItems(store)).toMatchObject([{ kind: "run.cancelled", data: { reason: "cancelled by test" } }]);
 });
 
 test("questions are distinct occurrences", async () => {
@@ -139,6 +198,12 @@ test("daemon.started is recorded per startup, not by opening the store", async (
     expect(kinds(items)).toEqual(["daemon.started", "daemon.started"]);
     expect(items.map((i) => i.data.bootId)).toEqual([f.factory.bootId, second.bootId]);
     expect(items[0]?.data.version).toBe((await import("../package.json")).version);
+    const health = createHttpRoutes(f.factory)["/api/health"] as Route;
+    const response = await health(requestWithParams("http://localhost:7400/api/health"), localServer);
+    const running = (await response.json()) as { sha: string };
+    expect(running.sha).toBe(f.factory.bootSha);
+    expect(items[0]?.data.sha).toBe(running.sha);
+    expect(items[0]?.summary).toContain(running.sha);
   } finally {
     if (previous === undefined) delete process.env.LIMITLESS_NO_SCHEDULER;
     else process.env.LIMITLESS_NO_SCHEDULER = previous;

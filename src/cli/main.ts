@@ -5,6 +5,7 @@ import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import type { Profile, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
+import { ApiError } from "./feed.ts";
 
 const USAGE = `limitless — personal software factory
 
@@ -48,15 +49,16 @@ const BASE = process.env.LIMITLESS_URL ?? `http://127.0.0.1:${process.env.LIMITL
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
+  let text: string;
   try {
     res = await fetch(`${BASE}${path}`, {
       ...init,
       headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
     });
+    text = await res.text();
   } catch {
-    throw new Error(`Cannot reach the Limitless daemon at ${BASE}. Start it with \`limitless serve\`.`);
+    throw new ApiError(`Cannot reach the Limitless daemon at ${BASE}. Start it with \`limitless serve\`.`);
   }
-  const text = await res.text();
   if (!res.ok) {
     let msg = text;
     try {
@@ -64,7 +66,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // not json
     }
-    throw new Error(`${res.status}: ${msg}`);
+    throw new ApiError(`${res.status}: ${msg}`, res.status);
   }
   return JSON.parse(text) as T;
 }

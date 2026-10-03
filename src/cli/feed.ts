@@ -3,6 +3,15 @@ import { MAX_FEED_WAIT_S } from "../feed.ts";
 
 type Api = <T>(path: string, init?: RequestInit) => Promise<T>;
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status = 0,
+  ) {
+    super(message);
+  }
+}
+
 const USAGE =
   "usage: limitless feed [--consumer <name>] [--after <id>] [--wait <seconds>] [--json] | feed ack <id> --consumer <name>";
 const feedId = (value = "") => (/^\d+$/.test(value) && Number.isSafeInteger(+value) ? +value : undefined);
@@ -12,15 +21,32 @@ export async function pollFeed(
   opts: { consumer?: string; after?: number; waitS: number },
   api: Api,
   now: () => number = Date.now,
+  sleep: (ms: number) => Promise<unknown> = Bun.sleep,
 ): Promise<FeedPage> {
   const deadline = now() + opts.waitS * 1000;
   let { after } = opts;
   let pruned = false;
+  let backoff = 1000;
   for (;;) {
     const wait = Math.min(MAX_FEED_WAIT_S, Math.max(0, deadline - now()) / 1000);
     const query = { wait: String(wait), consumer: opts.consumer, after: after?.toString() };
     const params = Object.entries(query).flatMap(([k, v]) => (v === undefined ? [] : [[k, v]]));
-    const page = await api<FeedPage>(`/api/feed?${new URLSearchParams(params)}`);
+    let page: FeedPage;
+    try {
+      page = await api<FeedPage>(`/api/feed?${new URLSearchParams(params)}`);
+      backoff = 1000;
+    } catch (error) {
+      if (
+        !(error instanceof ApiError) ||
+        (error.status !== 0 && !(error.status >= 500 && error.status < 600)) ||
+        opts.waitS === 0
+      )
+        throw error;
+      await sleep(Math.min(backoff, Math.max(0, deadline - now())));
+      if (now() >= deadline) return { items: [], nextAfter: after ?? 0, pruned };
+      backoff = Math.min(backoff * 2, 15_000);
+      continue;
+    }
     pruned ||= page.pruned;
     // Later requests keep the first request's effective cursor.
     after = page.nextAfter;

@@ -229,7 +229,7 @@ test("stdio streams emit only protocol JSON and survive daemon errors", async ()
   }
 });
 
-test("proxy feed tools match the direct backend and allow a 60-second long poll", async () => {
+test("proxy feed tools match the direct backend and allow a 45-second long poll", async () => {
   const routes = createHttpRoutes(f.factory);
   const fetcher: Fetch = async (url, init) => {
     const path = new URL(url).pathname as "/api/feed" | "/api/feed/ack";
@@ -248,10 +248,10 @@ test("proxy feed tools match the direct backend and allow a 60-second long poll"
     for (const args of [{ consumer: "proxy" }, { after: 1 }, {}])
       expect(resultValue(await read(proxy, args))).toEqual(resultValue(await read(direct, args)));
     timeouts.mockClear();
-    expect(resultValue(await read(proxy, { consumer: "proxy", wait: 60 }))).toEqual(
-      resultValue(await read(direct, { consumer: "proxy", wait: 60 })),
+    expect(resultValue(await read(proxy, { consumer: "proxy", wait: 45 }))).toEqual(
+      resultValue(await read(direct, { consumer: "proxy", wait: 45 })),
     );
-    expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([90_000]);
+    expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([75_000]);
     timeouts.mockClear();
     const ack = await proxy.client.callTool({
       name: "limitless_feed_ack",
@@ -264,7 +264,7 @@ test("proxy feed tools match the direct backend and allow a 60-second long poll"
     expect(resultValue(await read(proxy, { consumer: "proxy" }))).toEqual(
       resultValue(await read(direct, { consumer: "proxy" })),
     );
-    expect((await read(proxy, { wait: 61 })).isError).toBe(true);
+    expect((await read(proxy, { wait: 46 })).isError).toBe(true);
   } finally {
     timeouts.mockRestore();
     await proxy.close();
@@ -283,7 +283,7 @@ test("cancelling a proxied feed long poll aborts the daemon request", async () =
   try {
     const controller = new AbortController();
     const pending = proxy.client
-      .callTool({ name: "limitless_feed", arguments: { wait: 60 } }, undefined, { signal: controller.signal })
+      .callTool({ name: "limitless_feed", arguments: { wait: 45 } }, undefined, { signal: controller.signal })
       .catch(() => "cancelled");
     await Bun.sleep(20);
     expect(seen?.aborted).toBe(false);

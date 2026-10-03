@@ -294,15 +294,17 @@ test("feed tools bound cursors and waits, read without acknowledging and ack mon
   const ack = tools.find((t) => t.name === "limitless_feed_ack");
   expect(feed?.inputSchema).toMatchObject({
     additionalProperties: false,
-    properties: { wait: { minimum: 0, maximum: 60 }, after: { minimum: 0 }, consumer: { type: "string" } },
+    properties: { wait: { minimum: 0, maximum: 45 }, after: { minimum: 0 }, consumer: { type: "string" } },
   });
   expect(feed?.inputSchema.required ?? []).toEqual([]);
+  expect(feed?.description).toContain("0–45 seconds");
   expect(ack?.inputSchema.required).toEqual(["consumer", "id"]);
   for (const tool of [feed, ack]) expect(tool?.description).toContain("only after");
   const run = await create();
   f.factory.store.updateRun(run.id, { status: "failed", error: "boom" });
   const page = resultValue<FeedPage>(await call("feed", { consumer: "claude" }));
   expect(page.items.map((i) => [i.kind, i.runId, i.data.error])).toEqual([["run.failed", run.id, "boom"]]);
+  expect(resultValue<FeedPage>(await call("feed", { wait: 45 })).items).toEqual(page.items);
   expect(f.factory.store.feedCursor("claude")).toBe(0);
   expect(resultValue<unknown>(await call("feed_ack", { consumer: "claude", id: page.nextAfter }))).toEqual({
     consumer: "claude",
@@ -314,7 +316,7 @@ test("feed tools bound cursors and waits, read without acknowledging and ack mon
   });
   expect(resultValue<FeedPage>(await call("feed", { consumer: "claude", wait: 0.05 })).items).toEqual([]);
   for (const [name, args] of [
-    ["feed", { wait: 61 }],
+    ["feed", { wait: 46 }],
     ["feed", { after: -1 }],
     ["feed", { consumer: " " }],
     ["feed", { limit: 5 }],

@@ -584,10 +584,11 @@ export class Store {
     }
   }
 
-  daemonStarted(bootId: string, version: string): void {
+  daemonStarted(bootId: string, version: string, sha: string): void {
+    const data = json({ version, bootId, sha });
     this.db
       .query("INSERT INTO feed_add VALUES ('daemon.started', NULL, NULL, ?, ?, ?, ?)")
-      .run(`Limitless ${version} started`, `Daemon ${version} started`, json({ version, bootId }), bootId);
+      .run(`Limitless ${version} started`, `Daemon ${version} (${sha}) started`, data, bootId);
     this.publishFeed();
   }
 
