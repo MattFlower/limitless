@@ -486,8 +486,14 @@ export class RunContext {
       // Only this call: a production call that needs its slot aborts it, not the rest of the shadow.
       const preempted = new AbortController();
       const callSignal = shadow ? AbortSignal.any([signal, preempted.signal]) : signal;
+      // Decided when the preemption lands: the grace may expire before the aborted call settles.
+      let cause: Preempted | undefined;
+      const preempt = () => {
+        if (!signal.aborted) cause = new Preempted();
+        preempted.abort();
+      };
       try {
-        const free = shadow && tracker.tryAcquire(target.provider, () => preempted.abort());
+        const free = shadow && tracker.tryAcquire(target.provider, preempt);
         if (shadow && !free) throw new NoCapacityError(`${target.provider}: no free slot`);
         release = free || (await tracker.acquire(target.provider, wait));
       } catch (error) {
@@ -673,7 +679,7 @@ export class RunContext {
       this.run = store.refreshRunTotals(this.run.id);
 
       if (this.termination) throw this.termination;
-      if (preempted.signal.aborted && !signal.aborted) throw new Preempted();
+      if (cause) throw cause;
       if (result.status === "cancelled" || signal.aborted) throw new CancelledError();
       if (result.status === "declined") {
         // Not a failure and not a routing attempt: each decision model declines at most once.

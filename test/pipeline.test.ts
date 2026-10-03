@@ -13,7 +13,7 @@ import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
-import type { RunState } from "../src/pipeline/context.ts";
+import { invokeGuard, type RunState } from "../src/pipeline/context.ts";
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
 import { specPrompt } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
@@ -6984,6 +6984,53 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       },
       blocking: [{ title: "Fast" }],
     });
+  });
+
+  test("a preempted shadow finder stays recorded when the grace expires before its abort settles", async () => {
+    const calls = newCalls();
+    let gate: () => void = () => {};
+    const opened = new Promise<void>((resolve) => {
+      gate = resolve;
+    });
+    // The slow finder ignores its abort: it settles only when released, after the grace has run out.
+    const { handler, slow, release } = slowShadow(calls, opened, true);
+    let shadowSignal: AbortSignal | undefined;
+    const f = start(async (s) => {
+      if (s.prompt.includes("SLOW_FOCUS")) shadowSignal = invokeGuard.getStore()?.signal;
+      return handler(s);
+    });
+    shadowOn(f);
+    slowRoster(f);
+    f.deps.cfg.reviewShadowGraceSeconds = 0;
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    const deadline = Date.now() + 10_000;
+    while (!(slow.length && f.tracker.status("beta")?.inFlight === 2) && Date.now() < deadline)
+      await Bun.sleep(10);
+    const signal = new AbortController().signal;
+    const held = [await f.tracker.acquire("beta", signal), await f.tracker.acquire("beta", signal)];
+    // Saturated: a production call preempts the slow finder, whose slot it gets once that call settles.
+    const fifth = f.tracker.acquire("beta", signal);
+    while (!slow[0]?.signal.aborted && Date.now() < deadline) await Bun.sleep(10);
+    expect(slow[0]?.signal.aborted).toBe(true);
+    // The single review ends and the grace expires while the preempted call is still settling.
+    gate();
+    while (!shadowSignal?.aborted && Date.now() < deadline) await Bun.sleep(10);
+    expect(shadowSignal?.aborted).toBe(true);
+    for (const done of release) done();
+    held.push(await fifth);
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    for (const done of held) done();
+    const shadow = shadowOf(f, run.id, 0);
+    expect(shadow).toMatchObject({
+      status: "timeout",
+      finished: [
+        { finder: 0, status: "ok", review: { findings: [{ title: "Fast" }] } },
+        { finder: 1, skipped: "preempted" },
+      ],
+      usage: { invocations: 2 },
+    });
+    expect(shadow.usage).not.toHaveProperty("partial");
+    expect(f.tracker.status("beta")?.inFlight).toBe(0);
   });
 
   test("one run's shadow never delays another run's production implement call", async () => {
