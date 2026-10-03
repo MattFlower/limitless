@@ -6,6 +6,7 @@ export const worktreeGitScope = new AsyncLocalStorage<boolean>();
 let gitVersion: Promise<void> | undefined;
 /** Large files are otherwise reported as binary whatever their content. */
 export const NO_BIG_FILES = "core.bigFileThreshold=9223372036854775807";
+const SEPARATE_VALUE_OPTIONS = new Set(["-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix"]);
 
 /** Factory commands in agent-controlled worktrees, without changing any config files. */
 export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1]) {
@@ -21,8 +22,13 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
   );
   await gitVersion;
   let command = 1;
-  // Leading global options (`-c key=value`, `--attr-source=...`) stay before the injected ones.
-  while (cmd[command]?.startsWith("-")) command += cmd[command] === "-c" ? 2 : 1;
+  // Leading global options stay before the injected ones: `-c key=value` pairs and single-token
+  // `--opt=value` forms only. An option taking a separate value would swallow an injected flag.
+  while (cmd[command]?.startsWith("-")) {
+    if (SEPARATE_VALUE_OPTIONS.has(cmd[command] ?? ""))
+      throw new Error(`worktreeGit: pass ${cmd[command]} as a single --opt=value token`);
+    command += cmd[command] === "-c" ? 2 : 1;
+  }
   const prefix = [
     ...cmd.slice(0, command),
     "-c",
@@ -45,6 +51,7 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
     const empty = await sh([...prefix, "hash-object", "-t", "tree", "--stdin"], {
       ...opts,
       env,
+      stdin: "",
       allowFail: false,
     });
     prefix.push(`--attr-source=${empty.stdout.trim()}`);

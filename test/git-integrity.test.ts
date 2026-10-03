@@ -1099,3 +1099,16 @@ test("content classification is lazy, limited to pattern candidates, and bounded
     attributeLimits.timeoutMs = previous;
   }
 });
+
+test("worktreeGit rejects leading options that take a separate value", async () => {
+  await worktreeGitScope.run(true, async () => {
+    for (const option of ["-C", "--git-dir", "--work-tree", "--namespace"])
+      await expect(worktreeGit(["git", option, work, "status"], { cwd: work })).rejects.toThrow(
+        `worktreeGit: pass ${option} as a single --opt=value token`,
+      );
+    expect(
+      (await worktreeGit(["git", "-c", "advice.statusHints=false", "status", "--short"], { cwd: work }))
+        .exitCode,
+    ).toBe(0);
+  });
+});
