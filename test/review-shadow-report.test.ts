@@ -336,6 +336,24 @@ for (const relation of ["dependency", "PR reference"] as const) {
   });
 }
 
+test("a later-round commit stamped the same second as the shadow artifact is still a fix", async () => {
+  at(0);
+  const run = store.createRun(repoOf("owner/a"), { repo: "owner/a", prompt: "work" });
+  store.updateRun(run.id, { status: "succeeded", prUrl: PR });
+  // The artifact lands mid-second; Git records the round-1 commit at that second's start.
+  setSystemTime(new Date(Date.parse(hour(2)) + 500));
+  put(run, "review-0.json", review([]));
+  put(run, "review-0.shadow.json", shadow([finding("src/x.ts", 40, "Same-second fix")]));
+  const history = [commit("head", 1), commit("round-1", 2, [["src/x.ts", add(42)]])];
+  const { rows } = await shadowReport(store, async () => history);
+  expect(outcomes(rows[0])).toEqual({ "src/x.ts:40: Same-second fix": ["fixed", ["commit round-1"]] });
+  // Without the reviewed commit, PR order says nothing: the same-second time alone is not later.
+  const unordered = [commit("round-1", 2, [["src/x.ts", add(42)]])];
+  const [row] = (await shadowReport(store, async () => unordered)).rows;
+  expect(row?.history).toBe(false);
+  expect(outcomes(row)["src/x.ts:40: Same-second fix"]?.[0]).toBe("unknown");
+});
+
 test("replaying the paired or an earlier review never becomes later evidence", async () => {
   const { main, history } = fixture();
   // Resume rewrites review-0.json later, with a finding at a round-0 panel location.

@@ -149,12 +149,21 @@ export async function shadowReport(
       rows.push(row);
       if (row.status !== "completed" || !panel) continue;
       // Evidence follows the shadow review in time; own reviews also by round, since a replay moves their time.
+      // Commits after the reviewed one are later by PR order alone: Git stamps whole seconds, so their
+      // time can read as earlier than an artifact written in the same second.
+      const later = (r: { at: string }) => Date.parse(r.at) > after;
       const records = [
-        ...reviews.filter((r) => r.own > Number(round) || !r.source.startsWith(`run ${run.id}/`)),
-        ...placed.flatMap(([h, i]) =>
-          h.filter((r, j) => (r.kind === "review" ? trust.has(r.author?.toLowerCase()) : j > i)),
+        ...reviews.filter(
+          (r) => (r.own > Number(round) || !r.source.startsWith(`run ${run.id}/`)) && later(r),
         ),
-      ].filter((r) => Date.parse(r.at) > after);
+        ...placed.flatMap(([h, i]) =>
+          h.filter((r, j) =>
+            r.kind === "review"
+              ? trust.has(r.author?.toLowerCase()) && later(r)
+              : j > i && (i >= 0 || later(r)),
+          ),
+        ),
+      ];
       row.panel = panel.map(label);
       const shared = panel.filter((f) => (single ?? []).some((s) => near(f, s)));
       row.shared = shared.map(label);
