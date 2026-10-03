@@ -123,7 +123,8 @@ function fixture() {
         { kind: "review", source: `${PR}#review-1`, at: hour(4), text: "Looks fine overall" },
       ],
     ],
-    [dependent.id, [fix("f00d", 5, "Fix src/g.ts: Missing check")]],
+    // Stacked on the reviewed commit: only commits after it in PR order can be fixes.
+    [dependent.id, [fix("head", 2, "Add work"), fix("f00d", 5, "Fix src/g.ts: Missing check")]],
     [unrelated.id, [fix("bad", 5, "Fix src/d.ts: Overflow")]],
   ]);
   return { a, create, main, followUp, dependent, history };
@@ -181,6 +182,60 @@ test("panel-only findings match later fixes and review findings from related his
     },
   ]);
   expect(r1).toMatchObject({ reason: "alpha quota headroom is at or below 0.1", panelOnly: [] });
+});
+
+test("a rewritten history without the reviewed commit yields no fix and marks the evidence incomplete", async () => {
+  const { main, followUp, history } = fixture();
+  // Rebased after the review: every commit has a new id and a later committer time, the fix text unchanged.
+  history.set(main.id, [
+    fix("early2", 6, "Fix src/e.ts: Stale"),
+    fix("head2", 6, "Add work"),
+    fix("abc456", 6, "Fix src/a.ts: Null deref\n"),
+    // PR reviews and comments keep their times: still later evidence, but never a fix.
+    { kind: "review", source: `${PR}#review-2`, at: hour(6), text: "src/c.ts: Leak is still here" },
+  ]);
+  const [r0] = (await shadowReport(store, reader(history))).filter((r) => r.runId === main.id);
+  expect(r0?.history).toBe(false);
+  expect(r0?.panelOnly.map((p) => [p.finding, p.outcome, p.evidence.map((e) => e.source)])).toEqual([
+    ["src/a.ts: Null deref", "unknown", []],
+    ["src/b.ts: Race", "review-matched", [`run ${followUp.id}/review-0.json`]],
+    ["src/c.ts: Leak", "review-matched", [`${PR}#review-2`]],
+    ["src/d.ts: Overflow", "unknown", []],
+    ["src/e.ts: Stale", "unknown", []],
+    ["src/f.ts: Skewed", "unknown", []],
+    // The dependent PR still holds the reviewed commit, so its later fix stands.
+    ["src/g.ts: Missing check", "fixed", ["commit f00d"]],
+  ]);
+  expect(formatShadowReport([r0 as ShadowRow])).toContain("round 0: completed; evidence incomplete");
+});
+
+test("replaying the paired or an earlier review never becomes later evidence", async () => {
+  const { main, followUp, history } = fixture();
+  // Resume rewrites review-0.json and review-1.json later, with findings the panel raised at round 0.
+  at(6);
+  put(
+    main,
+    "review-0.json",
+    review([finding("src/a.ts", "Shared bug")], "head", [finding("src/c.ts", "Leak")]),
+  );
+  put(main, "review-1.json", review([], "head-1", [finding("src/d.ts", "Overflow")]));
+  // A genuinely later round naming a round-0 panel finding does count.
+  put(main, "review-2.json", review([], "head-2", [finding("src/e.ts", "Stale")]));
+  const rows = (await shadowReport(store, reader(history))).filter((r) => r.runId === main.id);
+  const outcomes = (round: string) =>
+    rows
+      .find((r) => r.round === round)
+      ?.panelOnly.map((p) => [p.finding, p.outcome, p.evidence.map((e) => e.source)]);
+  expect(outcomes("0")).toEqual([
+    ["src/a.ts: Null deref", "fixed", ["commit abc123"]],
+    ["src/b.ts: Race", "review-matched", [`run ${followUp.id}/review-0.json`]],
+    // The paired review's replay names it, yet it is the same round: no later evidence.
+    ["src/c.ts: Leak", "converged-without-fix", []],
+    ["src/d.ts: Overflow", "review-matched", [`run ${main.id}/review-1.json`]],
+    ["src/e.ts: Stale", "review-matched", [`run ${main.id}/review-2.json`]],
+    ["src/f.ts: Skewed", "converged-without-fix", []],
+    ["src/g.ts: Missing check", "fixed", ["commit f00d"]],
+  ]);
 });
 
 test("unavailable follow-up history leaves unmatched findings unknown", async () => {

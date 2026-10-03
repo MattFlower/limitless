@@ -546,9 +546,12 @@ provider before each call. It stops rather than use a metered model. A failed or
 round, for runs created at or after `--since`. It marks each panel-only finding:
 
 - `fixed`: a later commit names its file and title, in the run's PR or the PR of a run depending on
-  it. Later means after the reviewed commit in PR order and after the shadow review in time.
-- `review-matched`: a later review names it. This can be a later round of the run, a run on the same
-  PR or one depending on it, or a PR review or comment. A review match is not a fix.
+  it. Later means after the reviewed commit in PR order and after the shadow review in time. A PR
+  history that no longer contains the reviewed commit (rebased, so every commit has a new id and
+  time) gives no fix evidence and marks the evidence incomplete.
+- `review-matched`: a later review names it. This can be a later round of the run (the paired round
+  and earlier ones never count, even when a resume rewrote them), a run on the same PR or one
+  depending on it, or a PR review or comment. A review match is not a fix.
 - `converged-without-fix`: the run succeeded, and the observed history has no match. This is a
   signal, not proof of a false positive.
 - `unknown`: the run is unfinished, or some related PR history or review artifact is unavailable or

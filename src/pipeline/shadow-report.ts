@@ -17,14 +17,11 @@ export type ShadowRow = Ids & Results & { reason?: string };
 const PR_HISTORY = `[(.commits[] | {kind: "fix", source: "commit \\(.oid)", at: .committedDate, text: "\\(.messageHeadline)\\n\\(.messageBody)"}), ((.reviews + .comments)[] | {kind: "review", source: .url, at: (.submittedAt // .createdAt), text: (.body // "")})]`;
 
 /** Read-only `gh pr view`: commits are fix records, reviews and comments review records. */
-export const ghPrHistory =
-  (gh: GhRunner): HistoryReader =>
-  async (run) =>
-    run.prUrl
-      ? gh(["pr", "view", run.prUrl, "--json", "commits,reviews,comments", "--jq", PR_HISTORY])
-          .then((out) => JSON.parse(String(out)))
-          .catch(() => null)
-      : null;
+export const ghPrHistory = (gh: GhRunner): HistoryReader => {
+  const fields = ["--json", "commits,reviews,comments", "--jq", PR_HISTORY];
+  const view = async (u: string) => JSON.parse(String(await gh(["pr", "view", u, ...fields])));
+  return async (r) => (r.prUrl ? view(r.prUrl).catch(() => null) : null);
+};
 
 type Finding = { file: string; title: string };
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9/._-]+/g, " ");
@@ -39,8 +36,7 @@ export const parseArtifact = (text: string | null): Record<string, unknown> | nu
     return undefined;
   }
 };
-const roundOf = (name: string, suffix = "") =>
-  new RegExp(`^review-(-?\\d+)${suffix}\\.json$`).exec(name)?.[1];
+const roundOf = (name: string, tag = "") => new RegExp(`^review-(-?\\d+)${tag}\\.json$`).exec(name)?.[1];
 
 /**
  * Single vs shadow panel blocking findings per round, matched against later reviews and PR histories
@@ -52,27 +48,27 @@ export async function shadowReport(store: Store, readHistory: HistoryReader): Pr
   for (const run of runs) {
     const artifacts = store.listArtifacts(run.id);
     if (!artifacts.some((a) => roundOf(a.name, ".shadow"))) continue;
-    const pr = /\/pull\/(\d+)$/.exec(run.prUrl ?? "")?.[1];
-    const onPr = (r: Run) => r.sourceRef?.kind === "pull_request" && String(r.sourceRef.number) === pr;
+    const onPr = ({ sourceRef: s }: Run) =>
+      s?.kind === "pull_request" && run.prUrl?.endsWith(`/pull/${s.number}`);
     const related = runs.filter(
       (r) => r.repoId === run.repoId && (r.id === run.id || r.dependsOn.includes(run.id) || onPr(r)),
     );
     let complete = true;
     const reviews = related.flatMap((r) =>
-      store.listArtifacts(r.id).flatMap(({ name, createdAt }): HistoryRecord[] => {
-        if (roundOf(name) === undefined) return [];
+      store.listArtifacts(r.id).flatMap(({ name, createdAt }) => {
+        const round = roundOf(name);
+        if (round === undefined) return [];
         const found = list(parseArtifact(store.getArtifact(r.id, name))?.findings);
         if (!found) complete = false;
-        const [source, at] = [`run ${r.id}/${name}`, new Date(createdAt).toISOString()];
-        return (found ?? []).map((f) => ({ kind: "review", source, at, text: label(f) }));
+        const [source, at, own] = [`run ${r.id}/${name}`, new Date(createdAt).toISOString(), Number(round)];
+        return (found ?? []).map((f) => ({ kind: "review" as const, source, at, text: label(f), own }));
       }),
     );
     // One history per PR; this run's is needed even without a PR, as it can't be observed then.
     const byPr = new Map(related.filter((r) => r.prUrl || r.id === run.id).map((r) => [r.prUrl ?? r.id, r]));
     const histories = await Promise.all([...byPr.values()].map(readHistory));
     if (histories.includes(null)) complete = false;
-    const noMatch =
-      complete && (run.merged || run.status === "succeeded") ? "converged-without-fix" : "unknown";
+    const done = run.merged || run.status === "succeeded";
     const rounds = [...new Set(artifacts.flatMap((a) => roundOf(a.name.replace(".shadow", "")) ?? []))];
     for (const round of rounds.sort((a, b) => Number(a) - Number(b))) {
       const single = list(parseArtifact(store.getArtifact(run.id, `review-${round}.json`))?.blocking);
@@ -80,31 +76,33 @@ export async function shadowReport(store: Store, readHistory: HistoryReader): Pr
       const panel = list(shadow?.blocking);
       const status = shadow === null ? "missing" : String(shadow?.status ?? "malformed");
       const reason = single ? shadow?.reason : "single review artifact missing or malformed";
+      // Commits are placed after the reviewed commit in PR order. A rewritten history lost that commit:
+      // rebased commits have new ids and times, so none is placed and the evidence is incomplete.
+      const sha = `commit ${String(shadow?.reviewedSha)}`;
+      const placed = histories.map((h) => [h ?? [], h?.findIndex((r) => r.source === sha) ?? -1] as const);
       const row: ShadowRow = {
         ...{ runId: run.id, repo: run.repoSlug, pr: run.prUrl, createdAt: run.createdAt, round },
-        ...{ status: status === "completed" && !panel ? "malformed" : status, history: complete },
+        ...{ status: status === "completed" && !panel ? "malformed" : status },
+        ...{ history: complete && placed.every(([, i]) => i >= 0) },
         ...(reason ? { reason: String(reason) } : {}),
         ...{ single: (single ?? []).map(label), panel: [], shared: [], panelOnly: [] },
       };
       rows.push(row);
       if (row.status !== "completed" || !panel) continue;
-      // Evidence follows the reviewed commit in PR order, and the shadow review in time.
+      // Evidence follows the shadow review in time; own reviews also by round, since a replay moves their time.
       const after = artifacts.find((a) => a.name === `review-${round}.shadow.json`)?.createdAt ?? Infinity;
-      const reviewed = `commit ${String(shadow?.reviewedSha)}`;
       const records = [
-        ...reviews,
-        ...histories.flatMap((h) => h?.slice(h.findIndex((r) => r.source === reviewed) + 1) ?? []),
+        ...reviews.filter((r) => r.own > Number(round) || !r.source.startsWith(`run ${run.id}/`)),
+        ...placed.flatMap(([h, i]) => h.filter((r, j) => (i < 0 ? r.kind === "review" : j > i))),
       ].filter((r) => Date.parse(r.at) > after);
-      for (const f of panel) {
-        row.panel.push(label(f));
-        if (row.single.some((s) => norm(s) === norm(label(f)))) {
-          row.shared.push(label(f));
-          continue;
-        }
+      row.panel = panel.map(label);
+      row.shared = row.panel.filter((p) => row.single.some((s) => norm(s) === norm(p)));
+      for (const f of panel.filter((f) => !row.shared.includes(label(f)))) {
         const evidence = records
           .filter((r) => norm(r.text).includes(norm(f.file)) && norm(r.text).includes(norm(f.title)))
-          .map(({ text: _text, ...r }) => ({ ...r, basis: "names the file and title" }));
+          .map(({ kind, source, at }) => ({ kind, source, at, basis: "names the file and title" }));
         const fixed = evidence.some((e) => e.kind === "fix");
+        const noMatch = row.history && done ? "converged-without-fix" : "unknown";
         const outcome = fixed ? "fixed" : evidence.length ? "review-matched" : noMatch;
         row.panelOnly.push({ finding: label(f), outcome, evidence });
       }
