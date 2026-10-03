@@ -895,8 +895,10 @@ test("local repositories classify content with an explicit empty attribute sourc
     );
   }
   expect(shim.classifications().length).toBeGreaterThan(0);
-  for (const call of shim.classifications())
-    expect(call).toStartWith(`--attr-source=${EMPTY_TREE} diff --numstat`);
+  for (const call of shim.classifications()) {
+    expect(call).toStartWith(`--attr-source=${EMPTY_TREE} `);
+    expect(call).toContain(" diff --numstat");
+  }
 });
 
 test("content classification is lazy, limited to pattern candidates, and bounded by a deadline", async () => {

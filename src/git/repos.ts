@@ -481,7 +481,15 @@ async function attributeInfo(
     const text = new Set<string>();
     for (const tree of [base, "HEAD"]) {
       const args = ["--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", EMPTY_TREE, tree];
-      const out = await git([`--attr-source=${EMPTY_TREE}`, "-c", NO_BIG_FILES, "diff", ...args, "--", ...pathspecs]);
+      const out = await git([
+        `--attr-source=${EMPTY_TREE}`,
+        "-c",
+        NO_BIG_FILES,
+        "diff",
+        ...args,
+        "--",
+        ...pathspecs,
+      ]);
       for (const entry of out.stdout.split("\0")) {
         const match = entry.match(/^(\d+)\t\d+\t([\s\S]+)$/);
         if (match?.[2]) text.add(match[2]);
@@ -490,12 +498,17 @@ async function attributeInfo(
     return [...text];
   };
   try {
-    const sources = changes.flatMap((change) => (change.from === undefined ? [] : [change.from]));
+    // Attributes of a path edited in place only differ when an attribute file changed too.
+    const queried = attributePatch ? changes : changes.filter((change) => change.from !== change.path);
+    const sources = queried.flatMap((change) => (change.from === undefined ? [] : [change.from]));
     const [before, after] = await Promise.all([
       attributesAt(base, [...new Set(sources)]),
-      attributesAt("HEAD", changes.map((change) => change.path)),
+      attributesAt(
+        "HEAD",
+        queried.map((change) => change.path),
+      ),
     ]);
-    const attributes = changes.map(({ path, from }) => ({
+    const attributes = queried.map(({ path, from }) => ({
       path,
       base: (from === undefined ? undefined : before.get(from)) ?? {},
       head: after.get(path) ?? {},
