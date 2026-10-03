@@ -519,7 +519,7 @@ test("policy CLI without overrides regenerates every evidenced cell", async () =
   await evalCommand(["policy"], { write: true }, io);
   const written = JSON.parse(files.get("routing/policy.json") ?? "{}");
   expect(written.implement.medium[0]).toBe(subscription);
-  expect(written.implement.large).toEqual(["claude/opus", "codex/sol@medium"]);
+  expect(written.implement.large).toEqual(["codex/astra@high", "codex/sol-6.1@high", "claude/opus"]);
   expect(files.get("routing/EVIDENCE.md")).toContain("Update implement.medium:");
   expect(files.get("routing/EVIDENCE.md")).not.toContain("pinned by owner decision");
 });
