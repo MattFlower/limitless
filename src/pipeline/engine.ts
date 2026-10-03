@@ -1205,8 +1205,15 @@ async function oneRound(
               reviewed,
             ).catch((error) => ctx.log(`Shadow panel: ${error}`, "warn"))
           : undefined;
-      const { target, output, decision, panel } = await reviewed;
-      if (!decision) throw output.error;
+      // A failed production review still waits for the shadow (its grace is 0 then) before the stage fails.
+      const { target, output, decision, panel } = await reviewed.catch(async (error: unknown) => {
+        await shadowDone;
+        throw error;
+      });
+      if (!decision) {
+        await shadowDone;
+        throw output.error;
+      }
       // The model's verdict is kept for inspection only; control flow uses the derived one.
       const { review: r, modelVerdict, blocking, followUps } = decision;
       ctx.state.reviewHistory = [

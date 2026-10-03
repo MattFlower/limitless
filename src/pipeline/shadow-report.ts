@@ -176,11 +176,10 @@ export async function shadowReport(
   }
   return { rows, limit, capped: shadowed.length > limit };
 }
-export function formatShadowReport({ rows, limit, capped }: ShadowReport, since?: number): string {
+export function formatShadowReport({ rows, limit, capped }: ShadowReport): string {
   const join = (items: string[]) => items.join("; ") || "none";
-  const kept = rows.filter((r) => since === undefined || r.createdAt >= since);
-  if (!kept.length) return "No shadow review comparisons.";
-  const output = kept
+  if (!rows.length) return "No shadow review comparisons.";
+  const output = rows
     .flatMap((r) => [
       `${r.runId} ${r.repo}${r.pr ? ` ${r.pr}` : ""} round ${r.round}: ${r.status}${r.reason ? ` (${r.reason})` : ""}${r.history ? "" : "; evidence incomplete"}`,
       `  single blocking: ${join(r.single)}`,
