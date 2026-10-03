@@ -569,21 +569,15 @@ export class Store {
     return result;
   }
 
-  /**
-   * Publishes items committed since the last call; inside a transaction they wait for its commit.
-   * One row at a time behind a reentrancy guard: a subscriber that mutates the store while an item
-   * is being delivered must not start a nested pass, and its new items are picked up by this loop.
-   */
+  // Drain after commit, guarding reentrancy so subscriber mutations join this pass in id order.
   private publishFeed(): void {
     if (this.db.inTransaction || this.feedPublishing) return;
     this.feedPublishing = true;
     try {
-      const query = this.db.query(`${FEED_SELECT} WHERE id > ? ORDER BY id LIMIT 1`);
-      let row = query.get(this.feedPublished) as Row | null;
-      while (row) {
+      const query = this.db.query<Row, [number]>(`${FEED_SELECT} WHERE id > ? ORDER BY id LIMIT 1`);
+      for (let row = query.get(this.feedPublished); row; row = query.get(this.feedPublished)) {
         this.feedPublished = row.id as number;
         this.publish({ kind: "feed", item: toFeedItem(row) });
-        row = query.get(this.feedPublished) as Row | null;
       }
     } finally {
       this.feedPublishing = false;
@@ -597,7 +591,6 @@ export class Store {
     this.publishFeed();
   }
 
-  /** Items after the explicit cursor, else after the consumer's acknowledged id; never acknowledges. */
   readFeed(opts: { consumer?: string; after?: number; limit?: number } = {}): FeedPage {
     const after = opts.after ?? (opts.consumer === undefined ? 0 : this.feedCursor(opts.consumer));
     const query = this.db.query(`${FEED_SELECT} WHERE id > ? ORDER BY id LIMIT ?`);
@@ -618,7 +611,6 @@ export class Store {
     return (this.db.query(sql).get(...params) as { n: number } | null)?.n ?? 0;
   }
 
-  /** The cursor becomes max(previous, id); ids never issued are refused so no future item is skipped. */
   ackFeed(consumer: string, id: number): FeedAck {
     if (id > this.feedIssued()) throw new Error(`feed id ${id} has not been issued`);
     const upsert = `INSERT INTO feed_cursors VALUES (?, ?) ON CONFLICT (consumer)
@@ -626,7 +618,6 @@ export class Store {
     return { consumer, id: (this.db.query(upsert).get(consumer, id) as Row).acked_id as number };
   }
 
-  /** Removes items older than the cutoff, remembering the highest removed id for stale cursors. */
   pruneFeed(cutoff: number, dryRun = false): number {
     return this.db.transaction(() => {
       const old = this.db

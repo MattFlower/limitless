@@ -335,7 +335,6 @@ export type FeedKind =
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged"}`
   | "eval.finished"
   | "daemon.started";
-/** A durable item a client must act on; clients read everything after their cursor. */
 export interface FeedItem {
   id: number;
   ts: number;

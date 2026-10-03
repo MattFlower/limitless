@@ -8,14 +8,12 @@ export const FEED_RETENTION_DAYS = 30;
 const consumer = z.string().trim().min(1).max(200);
 const feedId = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 
-export const FeedQuerySchema = z
-  .object({
-    consumer: consumer.optional(),
-    after: feedId.optional(),
-    limit: z.number().int().min(1).max(1000).default(100),
-    wait: z.number().min(0).max(MAX_FEED_WAIT_S).default(0),
-  })
-  .strict();
+export const FeedQuerySchema = z.strictObject({
+  consumer: consumer.optional(),
+  after: feedId.optional(),
+  limit: z.number().int().min(1).max(1000).default(100),
+  wait: z.number().min(0).max(MAX_FEED_WAIT_S).default(0),
+});
 export const FeedAckSchema = z.object({ consumer, id: feedId }).strict();
 export type FeedQuery = z.output<typeof FeedQuerySchema>;
 

@@ -20,7 +20,6 @@ export async function mountIntegrations(factory: Factory): Promise<Integrations>
   return {
     routes: {
       "/mcp": (req, server) => {
-        // Covers limitless_feed's 60-second long poll.
         server.timeout(req, 90);
         return mcp.handle(req, server.requestIP(req)?.address ?? null);
       },

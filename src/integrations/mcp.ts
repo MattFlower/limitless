@@ -125,11 +125,7 @@ export function factoryBackend(factory: Factory): McpBackend {
 export type Fetch = (url: string, init?: RequestInit) => Promise<Response>;
 
 export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
-  const api = async (
-    path: string,
-    body?: unknown,
-    signal = AbortSignal.timeout(30_000),
-  ): Promise<unknown> => {
+  const api = async (path: string, body?: unknown, signal?: AbortSignal): Promise<unknown> => {
     let response: Response;
     try {
       response = await fetcher(`${base.replace(/\/$/, "")}${path}`, {
@@ -140,7 +136,7 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
               headers: { "content-type": "application/json" },
               body: JSON.stringify(body),
             }),
-        signal,
+        signal: signal ?? AbortSignal.timeout(30_000),
       });
     } catch (e) {
       throw new Error(

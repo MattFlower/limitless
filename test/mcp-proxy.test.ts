@@ -245,14 +245,20 @@ test("proxy feed tools match the direct backend and allow a 60-second long poll"
     f.factory.store.askQuestion(run.id, "Which name?");
     const read = (conn: typeof proxy, args: Record<string, unknown>) =>
       conn.client.callTool({ name: "limitless_feed", arguments: args });
-    for (const args of [{ consumer: "proxy" }, { after: 1 }, {}, { consumer: "proxy", wait: 60 }])
+    for (const args of [{ consumer: "proxy" }, { after: 1 }, {}])
       expect(resultValue(await read(proxy, args))).toEqual(resultValue(await read(direct, args)));
-    expect(timeouts.mock.calls.map(([ms]) => ms)).toContain(90_000);
+    timeouts.mockClear();
+    expect(resultValue(await read(proxy, { consumer: "proxy", wait: 60 }))).toEqual(
+      resultValue(await read(direct, { consumer: "proxy", wait: 60 })),
+    );
+    expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([90_000]);
+    timeouts.mockClear();
     const ack = await proxy.client.callTool({
       name: "limitless_feed_ack",
       arguments: { consumer: "proxy", id: 1 },
     });
     expect(resultValue<unknown>(ack)).toEqual({ consumer: "proxy", id: 1 });
+    expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([30_000]);
     const page = resultValue<{ items: { id: number }[] }>(await read(proxy, { consumer: "proxy" }));
     expect(page.items.map((i) => i.id)).toEqual([2]);
     expect(resultValue(await read(proxy, { consumer: "proxy" }))).toEqual(

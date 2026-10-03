@@ -40,8 +40,7 @@ export function mountMcp(factory: Factory) {
         );
       }
       const backend = factoryBackend(factory);
-      // The SDK's JSON-response transport never aborts a tool when the HTTP client disconnects,
-      // so a feed long poll would otherwise keep its listener until the wait ends.
+      // Propagate disconnects: the SDK's JSON transport does not abort tools itself.
       const server = createMcpServer({
         ...backend,
         feed: (query, signal) => backend.feed(query, AbortSignal.any([signal, req.signal])),
