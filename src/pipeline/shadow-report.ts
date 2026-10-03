@@ -3,10 +3,6 @@ import type { Store } from "../db/store.ts";
 import type { GhRunner } from "../integrations/github.ts";
 
 type Spot = { file: string; line?: number | null };
-/**
- * A PR commit with the lines it changed (a file whose patch GitHub omitted has a null line), or a
- * review comment (inline ones have a location).
- */
 export type HistoryRecord = Record<"source" | "at", string> & {
   kind: "commit" | "review";
   spots: Spot[];
@@ -79,10 +75,6 @@ export const parseArtifact = (text: string | null): Record<string, unknown> | nu
 };
 const roundOf = (name: string, tag = "") => new RegExp(`^review-(-?\\d+)${tag}\\.json$`).exec(name)?.[1];
 export type ShadowReport = { rows: ShadowRow[]; limit: number; capped: boolean };
-/**
- * The newest `limit` runs with shadow reviews created at or after `since`. Comments count only from the
- * repository owner and `trusted` logins; each PR's history is read at most once per report.
- */
 export async function shadowReport(
   store: Store,
   readHistory: HistoryReader,
@@ -153,9 +145,9 @@ export async function shadowReport(
       // time can read as earlier than an artifact written in the same second.
       const later = (r: { at: string }) => Date.parse(r.at) > after;
       const records = [
-        ...reviews.filter(
-          (r) => (r.own > Number(round) || !r.source.startsWith(`run ${run.id}/`)) && later(r),
-        ),
+        ...reviews
+          .filter((r) => r.own > Number(round) || !r.source.startsWith(`run ${run.id}/`))
+          .filter(later),
         ...placed.flatMap(([h, i]) =>
           h.filter((r, j) =>
             r.kind === "review"
@@ -165,10 +157,9 @@ export async function shadowReport(
         ),
       ];
       row.panel = panel.map(label);
-      const shared = panel.filter((f) => (single ?? []).some((s) => near(f, s)));
-      row.shared = shared.map(label);
+      row.shared = panel.filter((f) => (single ?? []).some((s) => near(f, s))).map(label);
       const settled = row.history && done;
-      for (const f of panel.filter((f) => !shared.includes(f))) {
+      for (const f of panel.filter((f) => !row.shared.includes(label(f)))) {
         const evidence: Evidence[] = records
           .filter((r) => r.spots.some((spot) => near(f, spot)))
           .map(({ kind, source, at }) => ({ kind, source, at, basis: BASIS[kind] }));
@@ -185,20 +176,22 @@ export async function shadowReport(
   }
   return { rows, limit, capped: shadowed.length > limit };
 }
-export function formatShadowReport({ rows, limit, capped }: ShadowReport): string {
+export function formatShadowReport({ rows, limit, capped }: ShadowReport, since?: number): string {
   const join = (items: string[]) => items.join("; ") || "none";
-  if (!rows.length) return "No shadow review comparisons.";
-  const cap = capped ? [`Showing the newest ${limit} runs; older runs were left out.`] : [];
-  const lines = rows.flatMap((r) => [
-    `${r.runId} ${r.repo}${r.pr ? ` ${r.pr}` : ""} round ${r.round}: ${r.status}${r.reason ? ` (${r.reason})` : ""}${r.history ? "" : "; evidence incomplete"}`,
-    `  single blocking: ${join(r.single)}`,
-    ...(r.status === "completed"
-      ? [`  panel blocking: ${join(r.panel)}`, `  shared: ${join(r.shared)}`]
-      : []),
-    ...r.panelOnly.flatMap((p) => [
-      `  panel-only ${p.finding}: ${p.outcome}`,
-      ...p.evidence.map((e) => `    ${e.source} @ ${e.at} (${e.basis})`),
-    ]),
-  ]);
-  return [...cap, ...lines].join("\n");
+  const kept = rows.filter((r) => since === undefined || r.createdAt >= since);
+  if (!kept.length) return "No shadow review comparisons.";
+  const output = kept
+    .flatMap((r) => [
+      `${r.runId} ${r.repo}${r.pr ? ` ${r.pr}` : ""} round ${r.round}: ${r.status}${r.reason ? ` (${r.reason})` : ""}${r.history ? "" : "; evidence incomplete"}`,
+      `  single blocking: ${join(r.single)}`,
+      ...(r.status === "completed"
+        ? [`  panel blocking: ${join(r.panel)}`, `  shared: ${join(r.shared)}`]
+        : []),
+      ...r.panelOnly.flatMap((p) => [
+        `  panel-only ${p.finding}: ${p.outcome}`,
+        ...p.evidence.map((e) => `    ${e.source} @ ${e.at} (${e.basis})`),
+      ]),
+    ])
+    .join("\n");
+  return (capped ? `Showing the newest ${limit} runs; older runs were left out.\n` : "") + output;
 }

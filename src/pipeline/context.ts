@@ -170,17 +170,13 @@ export class NeedsHumanError extends Error {}
 
 export class NoCapacityError extends Error {}
 
-/**
- * Shadow work: takes only a free slot, ends with `signal`, records as `review_shadow`, and leaves
- * provider health and routing state alone. `stop` vetoes a provider; `ids` collects the attempts.
- */
-export interface ShadowInvoke {
-  signal: AbortSignal;
-  /** Its own checkout, so calls still ending after the run moves on never touch the worktree. */
-  cwd?: string;
-  stop(provider: string): string | undefined;
+/** Shadow work carries its own cancellation, checkout and invocation ledger. */
+export const invokeGuard = new AsyncLocalStorage<{
+  stop(p: string): string | undefined;
   ids: number[];
-}
+  signal: AbortSignal;
+  cwd?: string;
+}>();
 
 export interface InvokeOptions {
   role: Role;
@@ -215,7 +211,7 @@ export interface InvokeOptions {
   noTools?: boolean;
   /** Typed questions for decision models; a decline falls through to the next candidate. */
   decisionTask?: DecisionTask;
-  shadow?: ShadowInvoke;
+  shadow?: ReturnType<typeof invokeGuard.getStore>;
 }
 
 export interface InvokeOutcome {
@@ -434,6 +430,7 @@ export class RunContext {
   async invoke(opts: InvokeOptions): Promise<InvokeOutcome> {
     const { router, tracker, store, harnesses } = this.deps;
     const { shadow } = opts;
+    const health = shadow ? undefined : tracker;
     const signal = shadow?.signal ?? this.signal;
     const tried: (string | ModelSelection)[] = [...(opts.constraints?.exclude ?? [])];
     let lastFailure: string | null = null;
@@ -493,7 +490,8 @@ export class RunContext {
         lastFailure = `${target.targetId ?? target.modelId}: no capacity after provider refresh`;
         continue;
       }
-      const stopped = shadow?.stop(target.provider);
+      const guard = shadow;
+      const stopped = guard?.stop(target.provider);
       if (stopped) {
         release();
         throw new NoCapacityError(stopped);
@@ -524,7 +522,7 @@ export class RunContext {
         modelId: target.modelId,
         effort: recordEffort(target.effort),
       });
-      shadow?.ids.push(invocation.id);
+      guard?.ids.push(invocation.id);
       this.log(`${opts.role}: using ${target.targetId ?? target.modelId}`, "info", {
         invocationId: invocation.id,
         skipped: decision.skipped,
@@ -646,11 +644,11 @@ export class RunContext {
         finishedAt: Date.now(),
       });
       // Shadow outcomes never reach provider health, quota telemetry or model blocks.
-      if (result.quota?.windows && !shadow) tracker.observeWindows(target.provider, result.quota.windows);
-      if (result.confinement && !shadow) tracker.observeConfinement(target.provider, result.confinement);
+      if (result.quota?.windows) health?.observeWindows(target.provider, result.quota.windows);
+      if (result.confinement) health?.observeConfinement(target.provider, result.confinement);
       // An unconfinable CLI is no provider failure: unconfined roles still use it.
-      if (result.confinement?.ok !== false && !shadow)
-        tracker.record(target.provider, result.status, {
+      if (result.confinement?.ok !== false)
+        health?.record(target.provider, result.status, {
           exhaustedUntil: result.quota?.exhaustedUntil ?? null,
           ...(result.modelCooldownMs === undefined
             ? {}
@@ -687,13 +685,12 @@ export class RunContext {
       }
       if (result.status !== "ok" && MODEL_REJECTED.test(result.error ?? "")) {
         // A configuration problem with this model (e.g. not on the plan), not a task failure.
-        if (!shadow)
-          tracker.blockModel(
-            target.modelId,
-            opts.privateOutput
-              ? "private invocation rejected"
-              : (redact?.(result.error ?? "rejected") ?? result.error ?? "rejected"),
-          );
+        health?.blockModel(
+          target.modelId,
+          opts.privateOutput
+            ? "private invocation rejected"
+            : (redact?.(result.error ?? "rejected") ?? result.error ?? "rejected"),
+        );
         lastFailure =
           `${target.targetId ?? target.modelId}: ${redact?.(result.error ?? "") ?? result.error ?? ""}`.slice(
             0,

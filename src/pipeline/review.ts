@@ -265,6 +265,7 @@ export interface ReviewDeps<T extends Invoked> {
   warn?: (message: string) => void;
   /** Any finder, not just a local one, may throw FinderSkipped (a shadow panel without a free slot). */
   skipAny?: boolean;
+  finished?: Record<string, unknown>[];
 }
 
 /**
@@ -430,6 +431,7 @@ async function runPanel<T extends Invoked>(
         prompt: { ...input.prompt, finder: prompt, ...(lens ? { lens } : {}) },
       });
       const invoked = await deps.invoke(request, finder);
+      deps.finished?.push({ finder, status: invoked.result.status, review: invoked.result.structured });
       const output = request.schema.safeParse(
         invoked.result.structured ?? extractJson(invoked.result.finalText),
       );
@@ -619,6 +621,11 @@ async function runPanel<T extends Invoked>(
         modelsOf(pending),
         pending.map((c) => c.id),
       );
+      deps.finished?.push({
+        verifier: pending.map((c) => c.id),
+        status: invoked.result.status,
+        result: invoked.result.structured,
+      });
       const shared = invoked.target?.vendor;
       if (shared && pending[0] && vendorsOf(pending[0]).includes(shared)) {
         const warning = `Verifier ${invoked.target?.modelId ?? "?"} shares vendor ${shared} with a finder it checks (${pending.map((c) => c.id).join(", ")}); no other vendor was available`;

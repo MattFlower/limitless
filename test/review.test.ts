@@ -1274,8 +1274,10 @@ describe("runReview panel", () => {
     const { confidence: _confidence, ...partial } = candidate("a", 1);
     const invalid = { ...valid, findings: [partial] };
     let verified = 0;
+    const finished: Record<string, unknown>[] = [];
     const out = await runReview(
       {
+        finished,
         invoke: async (_request, index) => {
           const reply = ok(index === 0 ? valid : null, "anthropic");
           return index === 0
@@ -1294,6 +1296,10 @@ describe("runReview panel", () => {
       },
     );
     expect(verified).toBe(0);
+    expect(finished).toEqual([
+      { finder: 0, status: "ok", review: valid },
+      { finder: 1, status: "ok", review: null },
+    ]);
     expect(out.decision).toBeUndefined();
     expect(out.output.success).toBe(false);
     expect(out.result).toMatchObject({ status: "error", finalText: "", structured: null, costUsd: 1 });

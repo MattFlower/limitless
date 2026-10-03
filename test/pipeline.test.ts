@@ -6300,6 +6300,28 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     );
   });
 
+  test("a failed shadow artifact write cannot fail the production review", async () => {
+    const calls = newCalls();
+    const f = start(scenario(calls));
+    shadowOn(f);
+    const put = f.store.putArtifact.bind(f.store);
+    const writes: string[] = [];
+    spyOn(f.store, "putArtifact").mockImplementation((...args) => {
+      if (args[1].endsWith(".shadow.json")) {
+        writes.push(args[1]);
+        throw new Error("shadow artifact unavailable");
+      }
+      return put(...args);
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(titles(f, run.id)).toEqual([["Single only"], []]);
+    expect(writes).toEqual(["review-0.shadow.json", "review-1.shadow.json"]);
+    expect(f.store.listEvents(run.id).some((e) => e.message.includes("shadow artifact unavailable"))).toBe(
+      true,
+    );
+  });
+
   test("the shadow panel takes the profile's roster plus lenses from the base commit", async () => {
     const lens = (focus: string) =>
       `[review]\nlenses = [{ name = "ops", focus = "${focus}", profiles = ["quick"] }]\n`;
