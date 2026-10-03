@@ -1,9 +1,12 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exportCommit } from "../src/git/repos.ts";
 import { sh } from "../src/util/proc.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 test("exportCommit extracts every tracked file of the commit, export-ignore included", async () => {
   const root = mkdtempSync(join(tmpdir(), "export-commit-"));
