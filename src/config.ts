@@ -38,6 +38,11 @@ export interface Config {
   listenLan: string | null;
   trustedProxies: string[];
   publicOrigins: string[];
+  /** `[server] auth`: "required" makes non-loopback UI/API access sign in; "proxy" leaves it to the proxy. */
+  auth: "required" | "proxy";
+  /** `[auth]` `idle_days` / `absolute_days`: when a sign-in session expires unused, and at the latest. */
+  sessionIdleDays: number;
+  sessionAbsoluteDays: number;
   publicUrl: string | null; // e.g. https://limitless.example.com (webhooks only)
   uiUrl: string; // where the UI is reachable locally, used in PR bodies
   maxConcurrentRuns: number;
@@ -287,12 +292,26 @@ export function loadConfig(
       );
   const origins = server.public_origins ?? [];
   if (!Array.isArray(origins)) throw new Error("server.public_origins must be an array of HTTP(S) origins");
+  if (server.auth !== undefined && server.auth !== "required" && server.auth !== "proxy")
+    throw new Error('server.auth must be "required" or "proxy"');
+  if (server.auth !== "proxy" && origins.some((o) => publicOrigin(o).startsWith("http:")))
+    throw new Error('server.auth = "required" needs https public_origins (the session cookie is Secure)');
+  const auth = (raw.auth ?? {}) as Record<string, unknown>;
+  const lifetime = (key: string, fallback: number) => {
+    const value = auth[key] ?? fallback;
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0)
+      throw new Error(`auth.${key} must be a positive number of days`);
+    return value;
+  };
 
   return {
     paths,
     listenLan,
     trustedProxies,
     publicOrigins: origins.map(publicOrigin),
+    auth: server.auth === "proxy" ? "proxy" : "required",
+    sessionIdleDays: lifetime("idle_days", 30),
+    sessionAbsoluteDays: lifetime("absolute_days", 180),
     retention: {
       worktreeDays: days(retention.worktree_days, 3),
       failedWorktreeDays: days(retention.failed_worktree_days, 7),
