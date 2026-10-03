@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,14 +9,16 @@ import { reviewSystemHash } from "../src/evals/cache.ts";
 import { validateRequest } from "../src/evals/cases.ts";
 import { pickVerifier } from "../src/pipeline/review.ts";
 import {
+  checkRosterTargets,
   configuredReviewSystem,
   DEFAULT_ROSTERS,
   type EvalReviewSystem,
+  expandRoster,
   parseEvalReviewSystems,
   productionReviewSystem,
   readReviewLenses,
 } from "../src/pipeline/review-system.ts";
-import { MODELS, type ModelDef } from "../src/router/catalog.ts";
+import { MODELS, type ModelDef, PROVIDERS } from "../src/router/catalog.ts";
 import { enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
 
 const system = (over: Record<string, unknown> = {}) => ({
@@ -100,6 +102,45 @@ test("eval review systems reject unsupported shapes with clear errors", () => {
     prompt,
   }));
   expect(parseEvalReviewSystems(file(panel({ finders })), "s.json")[0]).toMatchObject({ finders });
+});
+
+test("causal attribution is an opt-in panel option preserved by parsing and roster expansion", async () => {
+  const variant = panel({ causalAttribution: true });
+  expect(parseEvalReviewSystems(file(variant), "s.json")).toEqual([variant] as ReviewSystem[]);
+  for (const causalAttribution of [true, false])
+    expect(() => parseEvalReviewSystems(file(system({ causalAttribution })), "s.json")).toThrow();
+  const reference = {
+    name: "causal-roster",
+    roster: "standard",
+    targets: ["candidate-a", "candidate-b"],
+    verifier: { target: "verifier-c" },
+    implementerReport: "include",
+    causalAttribution: true,
+  };
+  const parsed = parseEvalReviewSystems(file(reference), "s.json")[0];
+  if (!parsed) throw new Error("missing system");
+  expect(expandRoster(parsed, DEFAULT_ROSTERS)).toMatchObject({ mode: "panel", causalAttribution: true });
+  expect(productionReviewSystem({ reviewImplementerReport: "include" })).not.toHaveProperty(
+    "causalAttribution",
+  );
+  const f = await evalFixture([verifierModel]);
+  try {
+    const review = { ...f.dataset, role: "review" } as unknown as Parameters<typeof validateRequest>[1];
+    const systems = validateRequest(
+      {
+        role: "review",
+        systems: parseEvalReviewSystems(file(panel({ name: "control" }), variant), "s.json"),
+      },
+      review,
+      f.factory.router,
+    ).request.systems;
+    expect(systems?.map((s) => s.causalAttribution)).toEqual([undefined, true]);
+    expect(systems?.[0] && reviewSystemHash(systems[0])).not.toBe(
+      systems?.[1] && reviewSystemHash(systems[1]),
+    );
+  } finally {
+    await f.close();
+  }
 });
 
 test("a batch's verifier is the first listed target independent of it, else the first other model", () => {
@@ -444,6 +485,33 @@ test("single mode keeps the production review; a panel takes the profile's roste
     verifier: {},
     implementerReport: "omit",
   });
+});
+
+test("a shadow panel's bad roster pin turns the shadow off with a warning; a blocking panel's fails", () => {
+  const reviewRosters = {
+    ...DEFAULT_ROSTERS,
+    standard: [{ prompt: "adversarial" as const, target: "claude/opsu" }],
+  };
+  const warn = mock((_message: string) => {});
+  const check = (reviewShadow: "off" | "panel", reviewMode: "single" | "panel" = "single") =>
+    checkRosterTargets({ reviewMode, reviewShadow, reviewRosters }, MODELS, PROVIDERS, warn);
+  expect(() => check("off", "panel")).toThrow(
+    "review.rosters.standard[0].target claude/opsu: unknown model ID",
+  );
+  expect(warn).not.toHaveBeenCalled();
+  expect(check("panel")).toBe(false);
+  expect(warn).toHaveBeenCalledWith(expect.stringContaining("claude/opsu: unknown model ID"));
+  expect(warn).toHaveBeenCalledWith(expect.stringContaining("shadow review disabled until fixed"));
+  expect(check("off")).toBe(true);
+  expect(warn).toHaveBeenLastCalledWith(expect.stringContaining("(ignored: [review] mode is single)"));
+  expect(
+    checkRosterTargets(
+      { reviewMode: "single", reviewShadow: "panel", reviewRosters: DEFAULT_ROSTERS },
+      MODELS,
+      PROVIDERS,
+      warn,
+    ),
+  ).toBe(true);
 });
 
 test("repo lenses: none when absent; unknown keys ignored with a warning; known keys strict", () => {

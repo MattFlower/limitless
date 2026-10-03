@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Server } from "bun";
@@ -7,6 +7,9 @@ import type { HealthResponse } from "../src/core/types.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 test("admin drain uses real loopback peers and existing mutation protections", async () => {
   const f = await fixture("boot-commit");
@@ -49,7 +52,7 @@ test("admin drain uses real loopback peers and existing mutation protections", a
     }
     for (const action of [drain, resume]) {
       f.factory.cfg.trustedProxies = ["192.168.1.1"];
-      f.factory.cfg.publicOrigins = ["https://limitless.mattflower.net"];
+      f.factory.cfg.publicOrigins = ["https://limitless.example.test"];
       for (const address of ["127.0.0.1", null, "192.168.1.1", "::ffff:192.168.1.1", "::2", "garbage"]) {
         expect(
           (

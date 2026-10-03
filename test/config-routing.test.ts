@@ -69,7 +69,7 @@ test("review implementer report defaults to include and accepts only include or 
     // A misspelt key would otherwise silently keep the default.
     writeFileSync(join(configDir, "config.toml"), '[review]\nimplementer-report = "omit"\n');
     expect(config).toThrow(
-      "review.implementer-report: unknown key (allowed: implementer_report, mode, rosters)",
+      "review.implementer-report: unknown key (allowed: implementer_report, mode, rosters, shadow, shadow_grace_seconds, trusted_reviewers)",
     );
     writeFileSync(join(configDir, "config.toml"), 'review = "omit"\n');
     expect(config).toThrow("review must be a table");
@@ -159,6 +159,69 @@ test("review mode defaults to single; rosters default per profile and are valida
   }
 });
 
+test("review shadow is opt-in, takes an explicit off switch, and cannot shadow a blocking panel", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-review-shadow-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  try {
+    expect(config().reviewShadow).toBe("off");
+    for (const [toml, shadow] of [
+      ['shadow = "off"', "off"],
+      ['shadow = "panel"', "panel"],
+      ['mode = "single"\nshadow = "panel"', "panel"],
+      ['mode = "panel"\nshadow = "off"', "off"],
+    ] as const) {
+      writeFileSync(join(configDir, "config.toml"), `[review]\n${toml}\n`);
+      expect(config().reviewShadow).toBe(shadow);
+    }
+    for (const [toml, message] of [
+      ['shadow = "on"', 'review.shadow must be "off" or "panel"'],
+      ["shadow = true", 'review.shadow must be "off" or "panel"'],
+      ['shadow = "single"', 'review.shadow must be "off" or "panel"'],
+      ['mode = "panel"\nshadow = "panel"', 'review.shadow = "panel" needs review.mode = "single"'],
+    ]) {
+      writeFileSync(join(configDir, "config.toml"), `[review]\n${toml}\n`);
+      expect(config).toThrow(message);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("shadow grace defaults to 300 s and accepts zero; trusted reviewers default to none", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-review-grace-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  try {
+    expect([config().reviewShadowGraceSeconds, config().reviewTrustedReviewers]).toEqual([300, []]);
+    writeFileSync(
+      join(configDir, "config.toml"),
+      '[review]\nshadow_grace_seconds = 0\ntrusted_reviewers = ["alice", "bob-bot"]\n',
+    );
+    expect([config().reviewShadowGraceSeconds, config().reviewTrustedReviewers]).toEqual([
+      0,
+      ["alice", "bob-bot"],
+    ]);
+    writeFileSync(join(configDir, "config.toml"), "[review]\nshadow_grace_seconds = 12.5\n");
+    expect(config().reviewShadowGraceSeconds).toBe(12.5);
+    for (const [toml, message] of [
+      ["shadow_grace_seconds = -1", "review.shadow_grace_seconds must be a nonnegative number"],
+      ['shadow_grace_seconds = "300"', "review.shadow_grace_seconds must be a nonnegative number"],
+      ["shadow_grace_seconds = inf", "review.shadow_grace_seconds must be a nonnegative number"],
+      ['trusted_reviewers = "alice"', "review.trusted_reviewers must be a list of GitHub logins"],
+      ['trusted_reviewers = ["alice", 1]', "review.trusted_reviewers must be a list of GitHub logins"],
+      ['trusted_reviewers = [""]', "review.trusted_reviewers must be a list of GitHub logins"],
+    ]) {
+      writeFileSync(join(configDir, "config.toml"), `[review]\n${toml}\n`);
+      expect(config).toThrow(message);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("roster targets are checked against the catalog at startup; single mode only warns", () => {
   const root = mkdtempSync(join(tmpdir(), "limitless-roster-targets-"));
   const configDir = join(root, "config");
@@ -184,6 +247,40 @@ test("roster targets are checked against the catalog at startup; single mode onl
     start('{ prompt = "adversarial", target = "claude/opsu" }', "single");
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("claude/opsu: unknown model ID"));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("(ignored: [review] mode is single)"));
+  } finally {
+    warn.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a stale pinned shadow roster target turns the shadow off with a warning; startup and production go on", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-shadow-roster-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  const start = (roster: string, mode = "single") => {
+    const toml = `[review]\nmode = "${mode}"\n${mode === "single" ? 'shadow = "panel"\n' : ""}[review.rosters]\nstandard = [${roster}]\n`;
+    writeFileSync(join(configDir, "config.toml"), toml);
+    const factory = new Factory(loadConfig({ home: join(root, "data"), configDir }));
+    factory.store.close();
+    return factory;
+  };
+  try {
+    const stale = start('{ prompt = "adversarial", target = "claude/opsu" }');
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("claude/opsu: unknown model ID"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("shadow review disabled until fixed"));
+    // The configured value stays visible; the engine never runs the shadow.
+    expect(stale.cfg.reviewShadow).toBe("panel");
+    expect(stale.deps.cfg.reviewShadow).toBe("off");
+    expect(stale.deps.cfg.reviewMode).toBe("single");
+    warn.mockClear();
+    // A valid shadow roster stays on, without a warning.
+    expect(start('{ prompt = "adversarial", target = "codex/sol" }').deps.cfg.reviewShadow).toBe("panel");
+    expect(warn).not.toHaveBeenCalled();
+    // A blocking panel's stale pin still fails startup.
+    expect(() => start('{ prompt = "adversarial", target = "claude/opsu" }', "panel")).toThrow(
+      'review.rosters.standard[0].target claude/opsu: unknown model ID "claude/opsu"',
+    );
   } finally {
     warn.mockRestore();
     rmSync(root, { recursive: true, force: true });

@@ -132,7 +132,7 @@ notify_all = false # optional: announce completed runs from other sources
 
 ### GitHub webhook
 
-Create a repository webhook at `https://limitless.mattflower.cc/webhooks/github` with
+Create a repository webhook at `https://<your-host>/webhooks/github` with
 content type `application/json`, a shared secret stored as `GITHUB_WEBHOOK_SECRET` in
 `~/.config/limitless/secrets.env`, and the **Issues**, **Issue comments**, and
 **Pull requests** events. The webhook is disabled until the secret is configured.

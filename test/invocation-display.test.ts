@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ROLE_DESCRIPTIONS, roleDescription } from "../src/core/role-descriptions.ts";
+import { ROLE_DESCRIPTIONS, roleDescription, roleLabel } from "../src/core/role-descriptions.ts";
 import type { Role } from "../src/core/types.ts";
 import { invocationModelLabel } from "../ui/lib/invocation-model.ts";
 
@@ -21,6 +21,14 @@ test("every invocation role explains both its work and purpose", () => {
     expect(ROLE_DESCRIPTIONS[role].length).toBeGreaterThan(30);
     expect(ROLE_DESCRIPTIONS[role]).toContain(" so ");
   }
+});
+
+test("shadow review calls are labelled and explained; other roles keep their names", () => {
+  expect(roleLabel("review_shadow")).toBe("shadow review");
+  expect(roleDescription("review_shadow")).not.toContain("does not recognize");
+  expect(roleDescription("review_shadow")).toContain("never decides");
+  for (const role of Object.keys(ROLE_DESCRIPTIONS)) expect(roleLabel(role)).toBe(role);
+  expect(roleLabel("synthesis_worker")).toBe("synthesis_worker");
 });
 
 test("unknown persisted roles receive useful help", () => {

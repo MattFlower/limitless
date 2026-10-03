@@ -158,6 +158,8 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[owners] discord` | unset | The only Discord user ID allowed to use the bot |
 | `[discord] channel_id` | unset | Text channel for run threads and quota alerts |
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
+| `[github] poll` | `true` | Observe the factory's own PRs (CI, conflicts, reviews, comments, merges) with one GraphQL query per repository and write changes to the feed. `false` restores per-run `gh pr view` merge checks. Access problems show in `limitless doctor`. |
+| `[github] poll_seconds` | `45` | Polling interval (minimum 15); repositories with a delivered, unmerged PR poll every 15 s |
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[routing] wait_budget_s` | `{ triage = 20, summarize = 20, chat = 20 }` | Per-role provider slot wait budgets in whole seconds. `0` falls through immediately; `"unbounded"` removes the limit. Omitted roles `review`, `verify`, `spec`, `holdout`, `implement`, `plan` and `plan_review` wait without limit. |
@@ -166,6 +168,9 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
 | `[review] mode`, `[review.rosters]` | `"single"`, see below | `"panel"` reviews with a verified finder panel whose roster depends on the profile; see [Review configuration](#review-configuration-and-lenses). |
+| `[review] shadow` | `"off"` | `"panel"` also runs the profile's panel beside each single review, for comparison only; see [Shadow panel](#shadow-panel). Needs `mode = "single"`. |
+| `[review] shadow_grace_seconds` | `300` | How long a shadow panel may run after its single review finishes before it is aborted and recorded as `timeout`. `0` stops it as soon as the single review finishes. |
+| `[review] trusted_reviewers` | `[]` | GitHub logins, besides the repository owner, whose inline PR review comments count as evidence in `limitless review shadow-report`. |
 | `[routing] exclude_origins` | unset | For example `["CN"]`. Excludes models by checkpoint origin from eval policy generation and the Evals matrix. Runtime routing is not affected. |
 | `[evals]`, `[evals.floors]` | see [EVALS](EVALS.md#policy-generation-and-review) | Thresholds for policy generation. Unknown keys and invalid values stop the daemon at startup. |
 | `[local] twilight_model_path`, `twilight_host`, `twilight_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
@@ -549,6 +554,67 @@ Each finder takes these keys:
 A roster needs at least one finder that is not local. The daemon checks pinned targets against the
 catalog at startup; a local finder's target must be a free model.
 
+### Shadow panel
+
+With `[review] shadow = "panel"`, single reviews still decide every round. Beside each single review,
+the profile's panel (roster plus the base commit's lenses) reviews the same revisions as a first
+review of the complete diff. It records its findings, verdict, blocking findings, panel record and
+spend in `review-N.shadow.json`. It never blocks, never reaches the implementer, reports or review
+history, and never affects routing: its calls leave provider health, circuit breakers, model blocks
+and quota telemetry alone. They are recorded with the role `review_shadow`, left out of the work log
+and per-model review stats, and their spend appears as its own line under the report total. It costs
+roughly $0.65 API-equivalent per round on subscription models.
+
+Production calls always come first. A shadow call takes a provider slot only if at least two are
+free at that moment (so it never takes a provider's last slot, and never runs on a provider with
+`max_concurrent = 1`) and no production call is queued for, has just been woken for, or is waiting
+on a preempted call's slot; it never waits. Otherwise that finder is skipped, with the reason in the
+panel record. A shadow call that holds a slot can still be preempted: when a production call (of any
+run, including implement calls and review fallbacks) finds the provider full, it aborts one shadow
+call on that provider, and that call's slot is reserved for it, ahead of any queued call (if another
+slot frees first, the earliest such production call takes that one instead). The abort is
+immediate; the slot changes hands once the aborted call stops. A preempted finder or verifier is
+recorded in `finished` as it stops, with `skipped: "preempted"` (a finder also in the panel record);
+the verifier's candidates stay
+unverified (`omitted`), and the shadow goes on with what it has. Once the single review finishes, the
+shadow has `shadow_grace_seconds` to finish; then it is aborted and recorded as `timeout` with the
+finders that had finished. Aborted calls then get up to 5 more seconds to end and record their spend;
+if one is still running after that, the artifact is written anyway with `usage.partial: true`.
+The shadow is `skipped`, with its reason, when the base commit's `[review]` lenses are invalid, when
+its review system cannot be built, or when a subscription provider its roster, fallbacks or verifier can route to has headroom
+of 0.1 or less, or unknown headroom (no quota windows observed yet). It stops rather than use a
+metered model. A failed or skipped shadow records why, with its spend so far. A roster pin the
+catalog doesn't have (e.g. a model a later release dropped) turns the shadow off at startup with a
+warning naming the target; production work goes on.
+
+`limitless review shadow-report [--since <ISO-8601>]` compares single and panel blocking findings per
+round for the newest 200 runs created at or after `--since` (the daemon applies the cutoff, and the
+output says when the cap leaves runs out). Findings match by location, as the review grader does:
+the same file with lines at most 5 apart. Titles never matter, and a finding without a line matches nothing.
+A panel finding near a single one is shared. Each panel-only finding is marked:
+
+- `fixed`: a later commit changes lines (added or removed, not unchanged diff context) within 5 lines
+  of it. In the original or a stacked PR, the commit must follow the reviewed commit in PR order; its
+  timestamp doesn't matter, since Git stamps whole seconds. A distinct PR from an explicitly dependent run or a run referencing the
+  original PR can also supply fixes when both that run and its commits postdate the shadow review.
+  Rewritten original PR histories lacking the reviewed commit give no fix evidence and mark the
+  evidence incomplete. Merge commits (two or more parents, such as the factory's `limitless: merge
+  base` commits) never count: GitHub reports their files against the first parent, so upstream
+  changes would look like fixes. A merge still marks the reviewed commit's place in PR order. A
+  commit whose file list GitHub truncates (over 3000 files) makes the evidence incomplete.
+- `review-matched`: a later review reports the same location. This can be a later round of the run
+  (the paired round and earlier ones never count, even when a resume rewrote them), a run on the same
+  PR or one depending on it, or an inline PR review comment by the repository owner or a
+  `trusted_reviewers` login. A review match is not a fix.
+- `converged-without-fix`: the run succeeded, and the observed history has no match. This is a
+  signal, not proof of a false positive.
+- `unknown`: the run is unfinished, or the paired single review, some related PR history or a review
+  artifact is unavailable or malformed (shown as "evidence incomplete").
+
+Skipped, timed-out, failed, missing and malformed comparisons are listed rather than dropped. The
+report makes no model calls and changes nothing. It reads each related PR once per report with
+`gh pr view`, each of its commits' patches with `gh api`, and its inline review comments with `gh api`.
+
 A repository adds its own lenses in `.limitless.toml`:
 
 ```toml
@@ -758,10 +824,9 @@ generated `~/.cloudflared/limitless.yml`. That requires tunnel credentials
 ingress forwards only paths matching `^/webhooks/` to the daemon and returns 404 for everything
 else.
 
-> [!NOTE]
-> The generated file currently hard-codes the maintainer's hostname (`limitless.mattflower.cc`).
-> For your own domain, run `cloudflared` yourself with an equivalent ingress rule: your hostname,
-> `path: ^/webhooks/`, service `http://127.0.0.1:7400`, then `http_status:404`.
+The tunnel's hostname comes from `[server] public_url` in `~/.config/limitless/config.toml`
+(for example `public_url = "https://limitless.example.com"`). Without it, `service install --tunnel`
+skips the tunnel and says what to set.
 
 ### Environment variables
 

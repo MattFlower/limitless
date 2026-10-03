@@ -35,9 +35,9 @@ function assign(defects: Defect[], findings: Finding[], lands: (f: Finding, d: D
  * finding, and the case verdict is derived from findings exactly as the engine does. The model's
  * verdict is never graded, so stored output without one is still evidence.
  */
-export function gradeReview(item: ReviewCase, output: StoredReview): EvalGrade {
+export function gradeReview(item: ReviewCase, output: StoredReview, causalAttribution = false): EvalGrade {
   const normalize = (file: string) => file.replace(/^(\.\/)+/, "");
-  const blocking = blockingReviewFindings(output);
+  const blocking = blockingReviewFindings(output, undefined, undefined, causalAttribution);
   const atLine = (line: number, defect: Defect) =>
     line === 0
       ? defect.category === "completeness"
@@ -78,7 +78,7 @@ export function gradeReview(item: ReviewCase, output: StoredReview): EvalGrade {
     group.total++;
     if (caught.has(index)) group.caught++;
   }
-  const requestChanges = reviewVerdict(output) === "request_changes";
+  const requestChanges = reviewVerdict(output, undefined, undefined, causalAttribution) === "request_changes";
   const falseBlock = item.kind === "clean" ? requestChanges : null;
   const pass = item.kind === "clean" ? !falseBlock : caught.size === required.length && requestChanges;
   return {

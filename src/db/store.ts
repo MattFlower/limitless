@@ -14,12 +14,12 @@ import type {
   FeedAck,
   FeedItem,
   FeedPage,
+  GitHubAccessProblem,
   Invocation,
   InvocationStatus,
   Question,
   QuotaAlert,
   Repo,
-  Role,
   Run,
   RunDetail,
   RunEvent,
@@ -28,6 +28,7 @@ import type {
   StageName,
   StageStatus,
   StreamMessage,
+  TrackedPr,
 } from "../core/types.ts";
 import { DEFAULT_EVAL_CONCURRENCY } from "../core/types.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
@@ -49,6 +50,7 @@ function json(v: unknown): string | null {
 
 const FEED_SELECT =
   "SELECT id, ts, kind, run_id AS runId, eval_id AS evalId, repo, title, summary, data FROM feed";
+type GitHubFeedInput = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
 const toFeedItem = (r: Row) => ({ ...r, data: parse(r.data, {}) }) as FeedItem;
 /** The highest id retention has removed, so a cursor before it is told items were pruned. */
 const FEED_PRUNED = "feed_pruned_through";
@@ -181,7 +183,7 @@ const toInvocation = (r: Row): Invocation => ({
   id: r.id as number,
   runId: r.run_id as string,
   stageId: (r.stage_id as number) ?? null,
-  role: r.role as Role,
+  role: r.role as Invocation["role"],
   harness: r.harness as string,
   provider: r.provider as string,
   model: r.model as string,
@@ -1192,7 +1194,7 @@ export class Store {
     fast?: boolean;
     runId: string;
     stageId: number | null;
-    role: Role;
+    role: Invocation["role"];
     harness: string;
     provider: string;
     model: string;
@@ -1683,6 +1685,68 @@ export class Store {
         "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       )
       .run(key, JSON.stringify(value));
+  }
+
+  // ---- GitHub poller -------------------------------------------------------
+
+  /** Unmerged PRs factory runs opened; PRs runs only verified, or abandoned over 7 days while open, are excluded. */
+  githubTracked(): TrackedPr[] {
+    const sql = `SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId, g.node_id AS nodeId, g.data,
+        max(r.status IN ('succeeded', 'needs_human')) AS delivered
+      FROM runs r JOIN repos ON repos.id = r.repo_id LEFT JOIN github_prs g ON g.url = r.pr_url
+      WHERE repos.kind = 'github' AND r.pr_url IS NOT NULL
+        AND NOT r.merged AND r.delivery_branch IS NULL AND coalesce(g.data ->> 'state', '') <> 'MERGED'
+        AND coalesce(json_extract(r.source_ref, '$.kind'), '') <> 'pull_request'
+        AND (r.status NOT IN ('failed', 'cancelled') OR coalesce(r.finished_at, ?1) >= ?1 - 604800000
+          OR r.pr_closed_unmerged OR g.data ->> 'state' = 'CLOSED')
+      GROUP BY r.pr_url ORDER BY repos.slug, r.pr_url`;
+    return (this.db.query(sql).all(Date.now()) as TrackedPr[]).filter((pr) => {
+      const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/.exec(pr.url);
+      return match?.[1]?.toLowerCase() === pr.repo.toLowerCase();
+    });
+  }
+
+  githubPrData(url: string): string | null {
+    const query = this.db.query<{ data: string }, [string]>("SELECT data FROM github_prs WHERE url = ?");
+    return query.get(url)?.data ?? null;
+  }
+
+  /** Advance a PR's saved state (when given) and write feed items in one transaction. */
+  saveGithubPr(pr: TrackedPr | null, terminal = false, items: GitHubFeedInput[] = []): void {
+    this.db.transaction(() => {
+      const save = this.db.query("INSERT OR REPLACE INTO github_prs VALUES (?, ?, ?, ?)");
+      if (pr) save.run(pr.url, pr.nodeId, pr.data, terminal);
+      const insert =
+        this.db.query(`INSERT INTO feed (ts, kind, run_id, repo, title, summary, data, dedupe_key)
+        VALUES (?, ?, ?, ?, substr(?, 1, 200), substr(?, 1, 500), ?, ?) ON CONFLICT (dedupe_key) DO NOTHING`);
+      for (const { kind, runId, repo, summary, data, key } of items) {
+        const title = `${kind}: ${String(data.url ?? repo)}`;
+        insert.run(Date.now(), kind, runId, repo, title, summary, JSON.stringify(data), `${kind}:${key}`);
+      }
+    })();
+    this.publishFeed();
+  }
+
+  /** Open (once per episode) or clear a repository's access problem; `head` is the last known PR head. */
+  setGithubAccess(repo: string, problem: { reason: string; detail: string } | null, head?: string | null) {
+    this.db.transaction(() => {
+      const row = this.db.query("SELECT * FROM github_access WHERE repo = ?").get(repo) as Row | null;
+      if (!problem === !row?.problem) return;
+      const episode = Number(row?.episode ?? 0) + (problem ? 1 : 0);
+      const saved = problem && JSON.stringify({ ...problem, since: Date.now() });
+      this.db.query("INSERT OR REPLACE INTO github_access VALUES (?, ?, ?)").run(repo, saved, episode);
+      if (!problem) return;
+      const [kind, key] = ["github.access_problem", `${repo}:${episode}:${head ?? "unknown-head"}`] as const;
+      const data = { reason: problem.reason, head: head ?? null };
+      this.saveGithubPr(null, false, [{ kind, runId: null, repo, summary: problem.detail, data, key }]);
+    })();
+    this.publishFeed();
+  }
+
+  githubAccessProblems(): GitHubAccessProblem[] {
+    const sql = `SELECT repo, problem ->> 'reason' AS reason, problem ->> 'detail' AS detail,
+      problem ->> 'since' AS since FROM github_access WHERE problem IS NOT NULL ORDER BY repo`;
+    return this.db.query(sql).all() as GitHubAccessProblem[];
   }
 
   getProviderEnabledOverride(id: string): boolean | null {

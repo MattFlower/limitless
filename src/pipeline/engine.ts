@@ -55,9 +55,11 @@ import { formatTarget } from "../router/targets.ts";
 import {
   CancelledError,
   type EngineDeps,
+  invokeGuard,
   NeedsHumanError,
   NoCapacityError,
   ParkedError,
+  Preempted,
   RunContext,
   type RunState,
 } from "./context.ts";
@@ -89,6 +91,7 @@ import {
   runReview,
   type VerifierRequest,
 } from "./review.ts";
+import { type ShadowDeps, shadowReview } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import {
   type Holdout,
@@ -372,6 +375,13 @@ async function prepare(ctx: RunContext): Promise<void> {
       // Review lenses come from the base commit, never from the change under review.
       if (ctx.deps.cfg.reviewMode === "panel")
         ctx.state.reviewLenses = readReviewLenses(repoConfig, (message) => ctx.log(message, "warn"));
+      // A shadow never fails a run: an invalid table only skips it.
+      else if (ctx.deps.cfg.reviewShadow === "panel")
+        try {
+          ctx.state.shadowLenses = readReviewLenses(repoConfig, (message) => ctx.log(message, "warn"));
+        } catch (error) {
+          ctx.state.shadowLenses = { error: String((error as Error).message).slice(0, 500) };
+        }
       gates = detectGates(wt.path);
       ctx.state.gatesConfig = gates;
       ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
@@ -1161,13 +1171,16 @@ async function oneRound(
           constraints: { ...constraints, ...(prefer ? { prefer } : {}) },
           ...request,
           ...(deadline ? { deadline } : {}),
+          shadow: invokeGuard.getStore(),
           requireStructured: true,
         });
-        await discardChanges(cwd);
+        await discardChanges(invokeGuard.getStore()?.cwd ?? cwd);
         return invoked;
       };
-      const { target, output, decision, panel } = await runReview(
-        {
+      const reviewDeps: ShadowDeps = (system) => {
+        const shadow = invokeGuard.getStore();
+        return {
+          skipAny: !!shadow,
           invoke: async (request, index) => {
             const finder = system.finders[index];
             const vendor = ctx.state.implementer?.vendor;
@@ -1180,13 +1193,19 @@ async function oneRound(
             try {
               return await call(request, constraints, finder?.target, deadline);
             } catch (error) {
-              if (finder?.local && error instanceof NoCapacityError) throw new FinderSkipped(error.message);
+              if ((finder?.local || shadow) && error instanceof NoCapacityError)
+                throw new FinderSkipped(error.message);
               throw error;
             }
           },
           verify: (request, avoidVendors, avoidModels) => {
             const constraints = verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer);
-            if (!system.verifier?.targets) return call(request, constraints, system.verifier?.target);
+            // A preempted shadow verifier leaves its batch unverified; the panel goes on.
+            const skip = (error: unknown): never => {
+              throw error instanceof Preempted ? new FinderSkipped(error.message) : error;
+            };
+            if (!system.verifier?.targets)
+              return call(request, constraints, system.verifier?.target).catch(skip);
             // Picked per batch, as evals do, and offered alone: a routed fallback could share its vendor.
             const listed = system.verifier.targets.map((target) => {
               const { model, targetId } = ctx.deps.router.resolve(target);
@@ -1194,13 +1213,30 @@ async function oneRound(
             });
             const identity = ctx.deps.router.checkpointIdentity;
             const only = pickVerifier(listed, avoidVendors, avoidModels, identity).targetId;
-            return call(request, { ...constraints, only }, undefined);
+            return call(request, { ...constraints, only }, undefined).catch(skip);
           },
           warn: (message) => ctx.log(message, "warn"),
-        },
-        input,
-      );
-      if (!decision) throw output.error;
+        };
+      };
+      const reviewed = runReview(reviewDeps(system), input);
+      const shadowDone =
+        ctx.deps.cfg.reviewShadow === "panel" && system.mode === "single"
+          ? shadowReview(
+              ctx,
+              { round, baseSha, reviewedSha, profile: profile(ctx), input },
+              reviewDeps,
+              reviewed,
+            ).catch((error) => ctx.log(`Shadow panel: ${error}`, "warn"))
+          : undefined;
+      // A failed production review still waits for the shadow (its grace is 0 then) before the stage fails.
+      const { target, output, decision, panel } = await reviewed.catch(async (error: unknown) => {
+        await shadowDone;
+        throw error;
+      });
+      if (!decision) {
+        await shadowDone;
+        throw output.error;
+      }
       // The model's verdict is kept for inspection only; control flow uses the derived one.
       const { review: r, modelVerdict, blocking, followUps } = decision;
       ctx.state.reviewHistory = [
@@ -1247,6 +1283,7 @@ async function oneRound(
           2,
         ),
       );
+      await shadowDone;
       const serious = blocking.length;
       return {
         summary: `${r.verdict} by ${target.modelId}: ${serious} blocking, ${r.findings.length - serious} nonblocking`,
@@ -1259,7 +1296,7 @@ async function oneRound(
   const reviewFeedback =
     review.verdict === "request_changes"
       ? formatReviewFeedback(
-          blockingReviewFindings(review, previousReview?.findings, panelRules),
+          blockingReviewFindings(review, previousReview?.findings, panelRules, system.causalAttribution),
           review.mode === "panel",
         )
       : "";

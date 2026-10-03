@@ -182,7 +182,8 @@ export interface Invocation {
   id: number;
   runId: string;
   stageId: number | null;
-  role: Role;
+  /** `review_shadow`: a shadow panel call, routed as `review` but kept out of review stats and work logs. */
+  role: Role | "review_shadow";
   harness: string;
   provider: string;
   model: string;
@@ -341,7 +342,17 @@ export type StreamMessage =
 export type FeedKind =
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged"}`
   | "eval.finished"
-  | "daemon.started";
+  | "daemon.started"
+  | GitHubFeedKind;
+export type GitHubFeedKind =
+  | `pr.${"ci_passed" | "ci_failed" | "conflicting" | "behind" | "review" | "comment" | "merged" | "closed"}`
+  | "github.access_problem";
+/** A factory PR the poller observes; `delivered` (0/1): a run waits on its merge; `data`: its saved state. */
+export type TrackedPr = { url: string; repo: string; runId: string; delivered: number } & {
+  nodeId: string | null;
+  data: string | null;
+};
+export type GitHubAccessProblem = { repo: string; reason: string; detail: string; since: number };
 export interface FeedItem {
   id: number;
   ts: number;
@@ -464,6 +475,8 @@ export interface ReviewSystem {
   /** Panel only; production may omit `target` (routed), evals may not. */
   verifier?: { target?: string; targets?: string[] };
   implementerReport: "include" | "omit";
+  /** Opt-in panel eval experiment: attribute verifier claims to the change. */
+  causalAttribution?: true;
 }
 /** Trials an eval runs at once per provider, capped at the provider's `maxConcurrent` − 1 (at least 1). */
 export const DEFAULT_EVAL_CONCURRENCY = 2;

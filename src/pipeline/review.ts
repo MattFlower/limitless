@@ -6,6 +6,7 @@ import { NoCapacityError } from "./context.ts";
 import { MERGE_RULES, mergeReports } from "./panel-merge.ts";
 import { reviewPrompt, verifierPrompt } from "./prompts.ts";
 import {
+  AttributionVerifierSchema,
   LaterReviewSchema,
   type Review,
   ReviewSchema,
@@ -16,6 +17,33 @@ import {
 } from "./schemas.ts";
 
 type Finding = Review["findings"][number];
+
+function coerceAttribution<T extends Verification>(ruling: T): T {
+  const evidence = ruling.attributionEvidence;
+  if (!evidence || !ruling.attribution) return ruling;
+  const reason =
+    evidence.base.setup === "failed"
+      ? "base_failed"
+      : evidence.base.setup === "not_run"
+        ? "base_not_run"
+        : [
+              evidence.change,
+              evidence.obligation,
+              evidence.obligationSource,
+              evidence.base.result,
+              evidence.head,
+            ].some((text) => !text.trim())
+          ? "blank_evidence"
+          : undefined;
+  return reason
+    ? {
+        ...ruling,
+        originalAttribution: ruling.attribution,
+        attributionCoercionReason: reason,
+        attribution: "unresolved",
+      }
+    : ruling;
+}
 
 /** Categories a panel neither verifies nor blocks on, except security findings; they go to the follow-up ledger. */
 const UNVERIFIED_CATEGORIES: readonly (Finding["category"] | undefined)[] = ["cleanup", "conventions"];
@@ -103,6 +131,7 @@ function panelBlocks(
   finding: Finding,
   priorBlocking: Review["findings"] | undefined,
   panelReview: PanelReview,
+  causalAttribution: boolean,
 ): boolean {
   const v = finding.verification;
   const cited = !!priorBlocking && citesPriorBlocking(finding, priorBlocking);
@@ -111,6 +140,13 @@ function panelBlocks(
   if (isSecurity(finding)) return true;
   if (UNVERIFIED_CATEGORIES.includes(v.category)) return false;
   if (!panelVerified(finding)) return false;
+  if (
+    causalAttribution &&
+    !cited &&
+    v.attribution &&
+    ["preexisting_unchanged", "intended_change", "environment_failure"].includes(v.attribution)
+  )
+    return false;
   const round = panelReview === "resolution" ? 2 : panelReview;
   if (!priorBlocking || round <= 1) return true;
   if (round >= PANEL_REVIEWS) return verifiedAtLeast(finding, "critical");
@@ -131,6 +167,7 @@ export function blockingReviewFindings(
   review: StoredReview,
   priorBlocking?: Review["findings"],
   panelReview?: PanelReview,
+  causalAttribution = false,
 ): Review["findings"] {
   const panel = review.mode === "panel";
   if (panel && priorBlocking && panelReview === undefined)
@@ -142,7 +179,7 @@ export function blockingReviewFindings(
   )
     throw new Error(`A panel review number is 1-${PANEL_REVIEWS} or "resolution", not ${panelReview}`);
   return review.findings.filter((finding) => {
-    if (panel) return panelBlocks(finding, priorBlocking, panelReview ?? 1);
+    if (panel) return panelBlocks(finding, priorBlocking, panelReview ?? 1, causalAttribution);
     if (!priorBlocking) return finding.severity === "blocker" || finding.severity === "major";
     if (finding.label === "regression") return true;
     if (citesPriorBlocking(finding, priorBlocking)) return true;
@@ -173,8 +210,11 @@ export function reviewVerdict(
   review: StoredReview,
   priorBlocking?: Review["findings"],
   panelReview?: PanelReview,
+  causalAttribution = false,
 ): Review["verdict"] {
-  return blockingReviewFindings(review, priorBlocking, panelReview).length ? "request_changes" : "approve";
+  return blockingReviewFindings(review, priorBlocking, panelReview, causalAttribution).length
+    ? "request_changes"
+    : "approve";
 }
 
 export interface ReviewInput {
@@ -183,7 +223,7 @@ export interface ReviewInput {
   /** Follow-ups already recorded for this round and commit, when a review is replayed after a restart. */
   replayedFollowUps?: Review["findings"];
   /** Defaults to one finder (`single`). */
-  system?: Pick<ReviewSystem, "mode" | "finders">;
+  system?: Pick<ReviewSystem, "mode" | "finders" | "causalAttribution">;
   /**
    * Panel only: which review this is (1–3, or "resolution"); decides what blocks and is required once
    * there is a previous review. `prompt.fixReview` scopes the diff.
@@ -211,7 +251,7 @@ export interface ReviewDecision {
 
 export interface VerifierRequest {
   prompt: string;
-  schema: typeof VerifierSchema;
+  schema: typeof VerifierSchema | typeof AttributionVerifierSchema;
   jsonSchema: Record<string, unknown>;
   timeoutMs: number;
 }
@@ -263,6 +303,9 @@ export interface ReviewDeps<T extends Invoked> {
   ) => Promise<T>;
   /** Panel only: problems that degrade the review without failing it. */
   warn?: (message: string) => void;
+  /** Any finder, not just a local one, may throw FinderSkipped (a shadow panel without a free slot). */
+  skipAny?: boolean;
+  finished?: Record<string, unknown>[];
 }
 
 /**
@@ -315,7 +358,7 @@ const TEMPLATE_INPUT: Parameters<typeof verifierPrompt>[0] = {
  * verifier prompt templates, the verifier schema, and the merge and batching policy. Eval caches key
  * panel trials on it.
  */
-export function panelIdentity(): string {
+export function panelIdentity(causalAttribution = false): string {
   return new Bun.CryptoHasher("sha256")
     .update(
       JSON.stringify([
@@ -326,9 +369,9 @@ export function panelIdentity(): string {
         reviewPrompt({ ...FINDER_TEMPLATE, finder: "standard", lens: { name: "LENS", focus: "FOCUS" } }),
         LOCAL_FINDER_TIMEOUT_MS,
         MERGE_RULES,
-        verifierPrompt(TEMPLATE_INPUT),
-        verifierPrompt({ ...TEMPLATE_INPUT, externalChange: true }),
-        toStrictJsonSchema(VerifierSchema),
+        verifierPrompt({ ...TEMPLATE_INPUT, causalAttribution }),
+        verifierPrompt({ ...TEMPLATE_INPUT, externalChange: true, causalAttribution }),
+        toStrictJsonSchema(causalAttribution ? AttributionVerifierSchema : VerifierSchema),
         PANEL_VERIFY_CAP,
         PANEL_BATCH_SIZE,
       ]),
@@ -366,8 +409,11 @@ export async function runReview<T extends Invoked>(
 
 function decide(input: ReviewInput, found: Review, modelVerdict: Review["verdict"]): ReviewDecision {
   const prior = input.prompt.previous?.findings;
-  const review: Review = { ...found, verdict: reviewVerdict(found, prior, input.panelReview) };
-  const blocking = blockingReviewFindings(review, prior, input.panelReview);
+  const review: Review = {
+    ...found,
+    verdict: reviewVerdict(found, prior, input.panelReview, input.system?.causalAttribution),
+  };
+  const blocking = blockingReviewFindings(review, prior, input.panelReview, input.system?.causalAttribution);
   // A panel's first round also has a ledger: whatever it does not block.
   const followUps =
     prior || review.mode === "panel"
@@ -418,6 +464,7 @@ async function runPanel<T extends Invoked>(
   input: ReviewInput,
   finders: ReviewFinder[],
 ): Promise<ReviewOutcome<T>> {
+  const verifierSchema = input.system?.causalAttribution ? AttributionVerifierSchema : VerifierSchema;
   // Finders run in parallel, each within its provider's limits. Every call settles before the panel
   // goes on or fails, so none outlives it and each one's spend is recorded.
   const settled = await Promise.allSettled(
@@ -427,7 +474,12 @@ async function runPanel<T extends Invoked>(
         timeoutMs: local ? Math.min(input.timeoutMs, LOCAL_FINDER_TIMEOUT_MS) : input.timeoutMs,
         prompt: { ...input.prompt, finder: prompt, ...(lens ? { lens } : {}) },
       });
-      const invoked = await deps.invoke(request, finder);
+      const invoked = await deps.invoke(request, finder).catch((error: unknown) => {
+        if (error instanceof FinderSkipped && (local || deps.skipAny))
+          deps.finished?.push({ finder, skipped: error.message.slice(0, 300) });
+        throw error;
+      });
+      deps.finished?.push({ finder, status: invoked.result.status, review: invoked.result.structured });
       const output = request.schema.safeParse(
         invoked.result.structured ?? extractJson(invoked.result.finalText),
       );
@@ -435,7 +487,9 @@ async function runPanel<T extends Invoked>(
     }),
   );
   const skippable = (member: (typeof settled)[number], finder: number) =>
-    member.status === "rejected" && member.reason instanceof FinderSkipped && !!finders[finder]?.local;
+    member.status === "rejected" &&
+    member.reason instanceof FinderSkipped &&
+    !!(finders[finder]?.local || deps.skipAny);
   for (const [finder, member] of settled.entries())
     if (member.status === "rejected" && !skippable(member, finder)) throw member.reason;
   const results: AgentResult[] = settled.flatMap((m) =>
@@ -452,7 +506,7 @@ async function runPanel<T extends Invoked>(
     }
     found[finder] = undefined;
     const result = value?.invoked.result;
-    if (finders[finder]?.local) {
+    if (finders[finder]?.local || skippable(member, finder)) {
       const problem =
         member.status === "rejected"
           ? String((member.reason as Error).message)
@@ -475,7 +529,7 @@ async function runPanel<T extends Invoked>(
     };
   }
   const first = found.find((member) => member !== undefined);
-  if (!first) throw new Error('mode "panel" needs a finder that is not skipped');
+  if (!first) throw new Error(`mode "panel" needs a finder that is not skipped: ${[...skipped.values()]}`);
 
   const { fixReview, previous } = input.prompt;
   const priorBlocking = previous?.findings ?? [];
@@ -583,14 +637,21 @@ async function runPanel<T extends Invoked>(
   const omitted: string[] = [];
   const warnings: string[] = [];
   let last = first.invoked.result;
+  // A skipped (shadow) verifier leaves its batch unverified: the panel goes on with what it has.
+  const verify = (...args: Parameters<NonNullable<typeof deps.verify>>) =>
+    deps.verify?.(...args).catch((error: unknown) => {
+      if (!(deps.skipAny && error instanceof FinderSkipped)) throw error;
+      deps.finished?.push({ verifier: args[3], skipped: error.message });
+    });
   for (const [index, batch] of batches.entries()) {
     if (!deps.verify) throw new Error('mode "panel" needs a verifier');
     // Candidates the verifier leaves out get one more call, then stay unverified follow-ups.
     let pending = batch;
     for (let attempt = 0; attempt < 2 && pending.length; attempt++) {
-      const invoked = await deps.verify(
+      const invoked = await verify(
         {
           prompt: verifierPrompt({
+            causalAttribution: input.system?.causalAttribution,
             prompt: input.prompt.prompt,
             spec: input.prompt.spec,
             baseSha: input.prompt.baseSha,
@@ -607,14 +668,20 @@ async function runPanel<T extends Invoked>(
             })),
             ...(verifierFix ? { fix: verifierFix } : {}),
           }),
-          schema: VerifierSchema,
-          jsonSchema: toStrictJsonSchema(VerifierSchema),
+          schema: verifierSchema,
+          jsonSchema: toStrictJsonSchema(verifierSchema),
           timeoutMs: input.timeoutMs,
         },
         pending[0] ? vendorsOf(pending[0]) : [],
         modelsOf(pending),
         pending.map((c) => c.id),
       );
+      if (!invoked) break;
+      deps.finished?.push({
+        verifier: pending.map((c) => c.id),
+        status: invoked.result.status,
+        result: invoked.result.structured,
+      });
       const shared = invoked.target?.vendor;
       if (shared && pending[0] && vendorsOf(pending[0]).includes(shared)) {
         const warning = `Verifier ${invoked.target?.modelId ?? "?"} shares vendor ${shared} with a finder it checks (${pending.map((c) => c.id).join(", ")}); no other vendor was available`;
@@ -623,7 +690,7 @@ async function runPanel<T extends Invoked>(
       }
       results.push(invoked.result);
       last = invoked.result;
-      const parsed = VerifierSchema.safeParse(
+      const parsed = verifierSchema.safeParse(
         invoked.result.structured ?? extractJson(invoked.result.finalText),
       );
       if (invoked.result.status !== "ok" || !parsed.success) {
@@ -640,7 +707,7 @@ async function runPanel<T extends Invoked>(
       // Only the first ruling per submitted id counts; ids from outside this call are ignored.
       for (const result of parsed.data.results)
         if (pending.some((c) => c.id === result.id) && !verdicts.has(result.id))
-          verdicts.set(result.id, result);
+          verdicts.set(result.id, coerceAttribution(result));
       pending = pending.filter((c) => !verdicts.has(c.id));
     }
     if (pending.length) {

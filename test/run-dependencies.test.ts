@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CreateRunRequest } from "../src/core/types.ts";
@@ -7,6 +7,9 @@ import { reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { Scheduler } from "../src/scheduler.ts";
 import { sh } from "../src/util/proc.ts";
 import { fixture } from "./mcp-support.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 let f: Awaited<ReturnType<typeof fixture>>;
 beforeEach(async () => {

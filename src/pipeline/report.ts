@@ -220,12 +220,18 @@ export function renderReport(input: ReportInput): string {
     );
   }
 
-  if (input.invocations.length) {
+  // Shadow review calls are observational: kept out of the work log, their spend shown on its own line.
+  const work = input.invocations.filter((inv) => inv.role !== "review_shadow");
+  const shadow = input.invocations.filter((inv) => inv.role === "review_shadow");
+  const spent = (key: "costUsd" | "costEquivUsd") =>
+    money(shadow.reduce((total, inv) => total + inv[key], 0));
+  const shadowSpend = `**Shadow review (included in total):** ${spent("costUsd")} spent, ${spent("costEquivUsd")} API-equivalent on subscriptions.`;
+  if (work.length) {
     blocks.push(
       "## Work log",
       table(
         ["Role", "Model", "Effort", "Status", "Tokens in / out", "Cost", "Duration"],
-        input.invocations.map((inv) => [
+        work.map((inv) => [
           inv.role,
           `\`${inv.modelId}\``,
           effortLabel(inv.effort),
@@ -236,6 +242,7 @@ export function renderReport(input: ReportInput): string {
         ]),
       ),
       `**Total:** ${money(input.totals.costUsd)} spent, ${money(input.totals.costEquivUsd)} API-equivalent on subscriptions.`,
+      ...(shadow.length ? [shadowSpend] : []),
     );
   }
 
