@@ -1,12 +1,14 @@
-import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { agentEnv, sh } from "../util/proc.ts";
+import { agentEnv } from "../util/proc.ts";
+import { worktreeGit, worktreeGitScope } from "./command.ts";
 
 /** All merge lifecycle operations share hook suppression, identity and the agent's scrubbed env. */
-export function mergeGit(cwd: string, args: string[], allowFail = false) {
-  return sh(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], {
+export function mergeGit(cwd: string, args: string[], allowFail = false, stdin?: string) {
+  return worktreeGit(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], {
     cwd,
     allowFail,
+    stdin,
     env: agentEnv({
       GIT_AUTHOR_NAME: "Limitless",
       GIT_AUTHOR_EMAIL: "limitless@localhost",
@@ -141,6 +143,25 @@ export async function completeMerge(cwd: string, head: string, base: string): Pr
   await mergeGit(cwd, ["add", "-A"]);
   if ((await mergeGit(cwd, ["ls-files", "-u"])).stdout)
     throw new Error("Merge index still contains unmerged entries");
+  if (worktreeGitScope.getStore() !== false) {
+    // HEAD alone lacks ignored files brought in by the base or staged during resolution.
+    const tracked = new Set([
+      ...(await list(["ls-files", "-z", "--cached"])),
+      ...(await list(["ls-tree", "-r", "-z", "--name-only", "MERGE_HEAD"])),
+    ]);
+    const present = [...tracked].filter((path) => lstatSync(join(cwd, path), { throwIfNoEntry: false }));
+    const index = await mergeGit(cwd, ["rev-parse", "--git-path", "index"]);
+    rmSync(resolve(cwd, index.stdout.trim()), { force: true });
+    await mergeGit(cwd, ["read-tree", "HEAD"]);
+    await mergeGit(cwd, ["add", "-A"]);
+    if (present.length)
+      await mergeGit(
+        cwd,
+        ["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        false,
+        present.map((path) => `:(literal)${path}\0`).join(""),
+      );
+  }
   await requireMerge(cwd, head, base);
   await mergeGit(cwd, ["commit", "-q", "-m", `limitless: merge base ${base}`]);
   return validateMerge(cwd, head, base);

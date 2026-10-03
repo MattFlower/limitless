@@ -22,6 +22,7 @@ import {
   retryRegressions,
   runGates,
 } from "../gates/run.ts";
+import { worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
   commitAll,
@@ -130,7 +131,14 @@ export async function executeRun(
     deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
+  return worktreeGitScope.run(repo.kind === "github", () =>
+    executeScopedRun(new RunContext(deps, run, repo, signal, isDraining, drainEvents), signal),
+  );
+}
+
+async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<RunStatus> {
+  const { deps, run } = ctx;
+  const runId = run.id;
   ctx.state.parked = false;
   ctx.run = deps.store.updateRun(
     runId,
