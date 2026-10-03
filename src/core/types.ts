@@ -355,6 +355,7 @@ export interface ChatProposalFields {
   prompt: string;
   profile: Profile;
   title: string;
+  allow?: AuditAllowance[];
 }
 
 export type ChatAction =

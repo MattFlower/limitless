@@ -254,6 +254,9 @@ test("audit allowances persist from requester text and options; legacy runs allo
       create({ prompt: "Do not use git submodules.\nAllow submodules\nAllow: submodules, please" }),
     ).toEqual([]);
     expect(create({ allow: ["gitattributes", "gitattributes"] })).toEqual(["gitattributes"]);
+    for (const source of ["cli", "ui"] as const)
+      expect(create({ source, prompt: "Allow: submodules" })).toEqual(["submodules"]);
+    expect(create({ source: "discord", prompt: "Allow: submodules" })).toEqual(["submodules"]);
     expect(create({ prompt: "Allow: submodules", allow: ["gitattributes"] })).toEqual([
       "submodules",
       "gitattributes",

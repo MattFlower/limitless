@@ -407,13 +407,12 @@ export async function diffSince(
   // Committed .gitmodules settings must not hide gitlinks from audit inputs.
   const diff = (...args: string[]) =>
     worktreeGit(["git", "diff", "--ignore-submodules=none", ...args], { cwd, env });
-  const [patch, names, stat, numstat, raw, moves] = await Promise.all([
+  const [patch, names, stat, numstat, raw] = await Promise.all([
     diff(range),
     diff("--name-status", range),
     diff("--stat", range),
     diff("--numstat", range),
     diff("--raw", "-z", "--no-renames", range),
-    diff("--name-status", "-z", "-M", range),
   ]);
   let added = 0;
   let removed = 0;
@@ -424,19 +423,14 @@ export async function diffSince(
   }
   const files = parseNameStatus(names.stdout);
   const gitlinks: string[] = [];
-  const entries = raw.stdout.split("\0");
-  for (let i = 0; i + 1 < entries.length; i += 2)
-    if (entries[i]?.split(" ")[1] === "160000") gitlinks.push(entries[i + 1] ?? "");
-  // Content at head is compared with its rename source at base; added and copied content has none,
-  // so existing rules covering a new location still count as newly hiding it.
   const changes: { path: string; from?: string }[] = [];
-  const z = moves.stdout.split("\0");
-  for (let i = 0; i + 1 < z.length; ) {
-    const status = z[i++] ?? "";
-    const from = /^[RC]/.test(status) ? z[i++] : undefined;
-    const path = z[i++] ?? "";
+  const entries = raw.stdout.split("\0");
+  for (let i = 0; i + 1 < entries.length; i += 2) {
+    if (entries[i]?.split(" ")[1] === "160000") gitlinks.push(entries[i + 1] ?? "");
+    const status = entries[i]?.split(" ").at(-1) ?? "";
+    const path = entries[i + 1] ?? "";
     if (status.startsWith("D")) continue;
-    changes.push({ path, ...(/^[AC]/.test(status) ? {} : { from: status.startsWith("R") ? from : path }) });
+    changes.push({ path, ...(status.startsWith("A") ? {} : { from: path }) });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
   const inspection = await attributeInfo(cwd, env, range, revision, changes);
@@ -502,7 +496,8 @@ async function attributeInfo(
   try {
     // Attributes of a path edited in place only differ when an attribute file changed too.
     const queried = attributePatch ? changes : changes.filter((change) => change.from !== change.path);
-    const sources = queried.flatMap((change) => (change.from === undefined ? [] : [change.from]));
+    // Compare the same head path in both trees, even when that path did not exist at base.
+    const sources = queried.map((change) => change.path);
     const [before, after] = await Promise.all([
       attributesAt(base, [...new Set(sources)]),
       attributesAt(
@@ -511,15 +506,12 @@ async function attributeInfo(
       ),
     ]);
     const baseOf = (from?: string) => (from === undefined ? undefined : before.get(from)) ?? {};
-    const attributes = queried.map(({ path, from }) => ({
+    const attributes = queried.map(({ path }) => ({
       path,
-      base: baseOf(from),
+      base: baseOf(path),
       head: after.get(path) ?? {},
     }));
-    // A renamed path's base content lives at its source; text at either end counts for the destination.
-    const hidden = queried.filter(
-      ({ path, from }) => newlyHidden(baseOf(from), after.get(path) ?? {}).length,
-    );
+    const hidden = queried.filter(({ path }) => newlyHidden(baseOf(path), after.get(path) ?? {}).length);
     const literal = (paths: (string | undefined)[]) =>
       paths.flatMap((p) => (p === undefined ? [] : [`:(literal)${p}`]));
     const [textBefore, textAfter] = await Promise.all([

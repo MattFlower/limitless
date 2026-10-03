@@ -715,10 +715,12 @@ export class Store {
         req.repo !== proposal.repo ||
         req.prompt !== proposal.prompt ||
         req.profile !== proposal.profile ||
-        req.title !== proposal.title
+        req.title !== proposal.title ||
+        json(validateAllow(req.allow)) !== json(validateAllow(proposal.allow))
       )
         throw new Error("Confirmed proposal fields cannot be changed");
-      const run = this.createRun(repo, req);
+      const input = { ...req, sourceRef: { ...req.sourceRef, proposalId } };
+      const run = this.createRun(repo, input);
       this.db
         .query("UPDATE chat_proposals SET state = 'consumed', run_id = ? WHERE id = ?")
         .run(run.id, proposalId);
@@ -820,9 +822,10 @@ export class Store {
     const dependsOn = this.validateDependencies(req.dependsOn, id);
     const dependency = this.dependencyStatus(dependsOn);
     const title = req.title ?? req.prompt.split("\n")[0]?.slice(0, 80) ?? "Untitled";
-    // GitHub prompts quote untrusted content; their requester-authored allow list arrives parsed.
-    const github = verifiedGitHubWebhook || req.source === "github";
-    const allow = validateAllow([...validateAllow(req.allow), ...(github ? [] : parseAllow(req.prompt))]);
+    // Composed/model prompts cannot grant allowances; these sources use explicit options only.
+    const composed =
+      verifiedGitHubWebhook || ["github", "mcp"].includes(req.source ?? "") || !!req.sourceRef?.proposalId;
+    const allow = validateAllow([...validateAllow(req.allow), ...(composed ? [] : parseAllow(req.prompt))]);
     this.db
       .query(
         `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow)

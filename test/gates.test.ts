@@ -328,8 +328,16 @@ describe("audit allowances and attribute rules", () => {
     expect(rules("*.java diff=javascript")).toEqual([["*.java", false]]);
     expect(rules("*.ts linguist-generated")).toEqual([["*.ts", false]]);
     expect(rules("*.ts linguist-generated=false")).toEqual([]);
+    for (const value of ["unset", "unspecified", "false", "set", "custom"])
+      expect(rules(`*.ts filter=${value}`)).toEqual([["*.ts", false]]);
+    for (const value of ["unset", "unspecified", "set", "true"])
+      expect(rules(`*.ts linguist-generated=${value}`)).toEqual([["*.ts", false]]);
+    expect(rules("*.ts -filter -linguist-generated")).toEqual([]);
+    for (const attr of ["filter", "diff", "merge"])
+      expect(rules(`*.png ${attr}=lfs`)).toEqual([["*.png", true]]);
     expect(rules("*.png binary")).toEqual([["*.png", true]]);
     expect(rules("*.png -diff -text")).toEqual([["*.png", true]]);
+    expect(rules("*.png binary=set diff=unset text=unset")).toEqual([["*.png", true]]);
     expect(rules("[attr]hidden -diff")).toEqual([["[attr]hidden", false]]);
     expect(rules('"asset image.png" binary')).toEqual([["asset image.png", true]]);
     expect(rules('"caf\\303\\251\\t\\"x\\"\\\\y.png" -diff')).toEqual([['café\t"x"\\y.png', true]]);

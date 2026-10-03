@@ -108,6 +108,7 @@ const HIDES: Record<string, (value: string) => boolean> = {
   text: (value) => value === "unset",
   binary: (value) => value !== "unset",
   filter: (value) => value !== "unset",
+  merge: (value) => value === "lfs",
   "linguist-generated": (value) => value !== "unset" && value !== "false",
 };
 
@@ -134,24 +135,27 @@ export function attributeRules(patch: string) {
       fp.added.flatMap((line) => {
         const tokens = line.trim().match(/^("(?:\\.|[^"])*"|\S+)\s+(.+)$/);
         if (!tokens || /^[#!]/.test(tokens[1] ?? "")) return [];
-        const found = hiding(
-          (tokens[2] ?? "").split(/\s+/).map((token) => {
-            const [name = "", value] = token.replace(/^[-!]/, "").split(/=(.*)/);
-            return [name, value ?? ({ "-": "unset", "!": "unspecified" }[token[0] ?? ""] || "set")];
-          }),
-        );
+        const found = (tokens[2] ?? "").split(/\s+/).filter((token) => {
+          const [name = "", value] = token.replace(/^[-!]/, "").split(/=(.*)/);
+          if (value !== undefined && (name === "filter" || name === "linguist-generated"))
+            return name === "filter" || value !== "false";
+          return hiding([[name, value ?? ({ "-": "unset", "!": "unspecified" }[token[0] ?? ""] || "set")]])
+            .length;
+        });
         const raw = tokens[1] ?? "";
         const decoded = raw.startsWith('"') ? unquote(raw) : raw;
         const pattern = decoded ?? raw;
         // Attribute-file scope as a Git pathspec; icase over-matches, which only adds candidates.
         const directory = fp.path.slice(0, -".gitattributes".length).replace(/[*?[\\]/g, "\\$&");
         const glob = pattern.includes("/") ? pattern.replace(/^\//, "") : `**/${pattern}`;
-        // binary/-diff on binary-only content hides nothing; macros and other attributes never qualify,
+        // Binary and LFS rules on binary-only content hide nothing; macros never qualify,
         // nor does a quoted pattern Git could not have written, since its matches are unknown.
         const exemptable =
           decoded !== null &&
           !decoded.startsWith("[attr]") &&
-          found.every((a) => /^(binary|-diff|-text)$/.test(a));
+          found.every((a) =>
+            /^(binary(=set)?|-diff|-text|(diff|text)=unset|(filter|diff|merge)=lfs)$/.test(a),
+          );
         const rule = { file: fp.path, key: `${fp.path}\0${raw}`, pattern, attributes: tokens[2] ?? "" };
         return found.length ? [{ ...rule, exemptable, pathspec: `:(glob,icase)${directory}${glob}` }] : [];
       }),
