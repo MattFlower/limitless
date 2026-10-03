@@ -27,15 +27,38 @@ test("service CLI dispatches opt-in mtplx and advertises the new flag", async ()
         "install",
         ...flags,
       ],
-      { stdout: "pipe", stderr: "pipe" },
+      { env: { ...process.env, LIMITLESS_PORT: "" }, stdout: "pipe", stderr: "pipe" },
     );
     const output = await new Response(child.stdout).text();
     expect(await child.exited).toBe(0);
     if (flags.includes("--help")) {
       expect(output).toContain("[--mtplx]");
       expect(output).not.toContain("--no-mtplx");
-    } else expect(output).toContain(JSON.stringify({ tunnel: flags.length > 0, mtplx: flags.length > 0 }));
+    } else
+      expect(JSON.parse(output)).toEqual({
+        port: 9000,
+        opts: { tunnel: flags.length > 0, mtplx: flags.length > 0 },
+      });
   }
+});
+
+test("service status and deploy CLI use config port with environment taking precedence", async () => {
+  for (const command of [["service", "status"], ["deploy"]])
+    for (const override of ["", "9100"]) {
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          "--preload",
+          "./test/fixtures/service-cli-preload.ts",
+          "src/cli/main.ts",
+          ...command,
+        ],
+        { env: { ...process.env, LIMITLESS_PORT: override }, stdout: "pipe", stderr: "pipe" },
+      );
+      const output = await new Response(child.stdout).text();
+      expect(await child.exited).toBe(0);
+      expect(JSON.parse(output)).toEqual({ port: override ? 9100 : 9000 });
+    }
 });
 
 interface ServiceResult {
@@ -81,9 +104,29 @@ test("fresh installs generate only requested neutral plists and matching stdout/
       for (const key of ["StandardOutPath", "StandardErrorPath"])
         expect(plist).toContain(`<key>${key}</key><string>/fake/home/.limitless/logs/${label}.log</string>`);
     }
+    expect(f.files[agentPath("dev.limitless.daemon")]).not.toContain("<key>LIMITLESS_PORT</key>");
     expect(f.files[agentPath("dev.limitless.daemon")]).toContain(
-      "<key>LIMITLESS_PORT</key><string>9000</string>",
+      "<key>LIMITLESS_STAGING_PORT</key><string>9001</string>",
     );
+  }
+});
+
+test("install preserves an explicit port override without pinning a config-derived port", async () => {
+  const f = await serviceFake({ port: 9000, envPort: "9000" });
+  expect(f.error).toBeUndefined();
+  expect(f.files[agentPath(newLabels[0])]).toContain("<key>LIMITLESS_PORT</key><string>9000</string>");
+  expect(f.calls).toContain("health 9000/api/health");
+});
+
+test("fresh and migrating mtplx units authenticate their health probes", async () => {
+  for (const labels of [[], [oldLabels[1]]]) {
+    const f = await serviceFake({ labels, mtplx: true });
+    expect(f.error).toBeUndefined();
+    expect(f.calls).toContain("authorization Bearer mtplx-local");
+    expect(f.calls).toContain("health 8000/v1/models");
+    if (labels.length) expect(f.calls).toContain("health 8001/v1/models");
+    expect(f.loaded).toContain(newLabels[1]);
+    expect(f.loaded).not.toContain(oldLabels[1]);
   }
 });
 

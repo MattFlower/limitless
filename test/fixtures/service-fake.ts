@@ -21,12 +21,15 @@ const scenario = JSON.parse(process.argv[2] ?? "{}") as {
   delayed?: boolean;
   missingPlist?: boolean;
   port?: number;
+  envPort?: string;
 };
 const daemon = "dev.limitless.daemon";
 const legacy = "cc.mattflower.limitless";
 const home = "/fake/home";
 const agents = `${home}/Library/LaunchAgents`;
 const port = scenario.port ?? 7400;
+delete process.env.LIMITLESS_PORT;
+if (scenario.envPort) process.env.LIMITLESS_PORT = scenario.envPort;
 const calls: string[] = [];
 const files = new Map<string, string>([[`${home}/.limitless/app/.git`, ""]]);
 const loaded = new Map((scenario.labels ?? []).map((label, i) => [label, i + 10]));
@@ -103,10 +106,15 @@ mock.module("../../src/util/proc.ts", () => ({
     return { exitCode, stdout, stderr: "" };
   },
 }));
-globalThis.fetch = (async (url: string | URL | Request) => {
+globalThis.fetch = (async (url: string | URL | Request, options?: RequestInit) => {
   const parsed = new URL(String(url));
   calls.push(`health ${parsed.port}${parsed.pathname}`);
   healthCalls++;
+  if (parsed.pathname === "/v1/models") {
+    const authorization = new Headers(options?.headers).get("authorization");
+    calls.push(`authorization ${authorization}`);
+    if (authorization !== "Bearer mtplx-local") return new Response(null, { status: 401 });
+  }
   const label =
     parsed.pathname === "/v1/models"
       ? "dev.limitless.mtplx"

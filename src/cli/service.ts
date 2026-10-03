@@ -200,7 +200,10 @@ async function health(port: number, waitMs = 30_000, label?: string, run: typeof
         await Bun.sleep(100);
         continue;
       }
-      const res = await fetch(`http://127.0.0.1:${port}${endpoint}`, { signal: AbortSignal.timeout(2000) });
+      const res = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
+        signal: AbortSignal.timeout(2000),
+        headers: label === MTPLX_LABEL ? { authorization: "Bearer mtplx-local" } : {},
+      });
       const body: { ok?: unknown; pid?: unknown } | null =
         label === LABEL && res.ok ? await res.json() : null;
       const ownerArgs = ["/usr/sbin/lsof", "-nPat", `-p${pid}`, `-iTCP:${port}`, "-sTCP:LISTEN"];
@@ -224,7 +227,7 @@ export function installationUnits(
     [
       LABEL,
       plist(LABEL, [join(home, ".bun", "bin", "bun"), join(appDir, "src", "cli", "main.ts"), "serve"], {
-        LIMITLESS_PORT: String(port),
+        ...(process.env.LIMITLESS_PORT ? { LIMITLESS_PORT: process.env.LIMITLESS_PORT } : {}),
         LIMITLESS_MIGRATE_FROM: LEGACY[LABEL] ?? "",
         LIMITLESS_STAGING_PORT: String(port + 1),
       }),

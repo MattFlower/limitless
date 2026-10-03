@@ -371,7 +371,7 @@ async function main(): Promise<void> {
     }
     case "service": {
       const svc = await import("./service.ts");
-      const port = Number(process.env.LIMITLESS_PORT ?? 7400);
+      const port = (await import("../config.ts")).loadConfig().port;
       if (rest[0] === "install") {
         return svc.install(port, { tunnel: values.tunnel === true, mtplx: values.mtplx === true });
       }
@@ -383,7 +383,7 @@ async function main(): Promise<void> {
       const svc = await import("./service.ts");
       if (rest.length > 1)
         throw new Error("usage: limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]");
-      return svc.deploy(Number(process.env.LIMITLESS_PORT ?? 7400), rest[0], values.smoke === true, {
+      return svc.deploy((await import("../config.ts")).loadConfig().port, rest[0], values.smoke === true, {
         maxWaitMs,
         now: values.now === true,
       });
