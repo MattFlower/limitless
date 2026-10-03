@@ -146,9 +146,10 @@ export function attributeRules(patch: string) {
         // Attribute-file scope as a Git pathspec; icase over-matches, which only adds candidates.
         const directory = fp.path.slice(0, -".gitattributes".length).replace(/[*?[\\]/g, "\\$&");
         const glob = pattern.includes("/") ? pattern.replace(/^\//, "") : `**/${pattern}`;
-        // binary/-diff on binary-only content hides nothing; macros and other attributes never qualify.
+        // binary/-diff on binary-only content hides nothing; macros and other attributes never qualify,
+        // nor do quoted patterns, whose Git C-style unquoting JSON.parse does not reproduce.
         const exemptable =
-          !pattern.startsWith("[attr]") && found.every((a) => /^(binary|-diff|-text)$/.test(a));
+          !/^("|\[attr\])/.test(tokens[1] ?? "") && found.every((a) => /^(binary|-diff|-text)$/.test(a));
         const rule = { file: fp.path, key: `${fp.path}\0${tokens[1]}`, pattern, attributes: tokens[2] ?? "" };
         return found.length ? [{ ...rule, exemptable, pathspec: `:(glob,icase)${directory}${glob}` }] : [];
       }),

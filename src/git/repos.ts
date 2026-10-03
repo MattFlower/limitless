@@ -3,9 +3,9 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { attributeRules, isAttributeFile, newlyHidden } from "../gates/audit.ts";
+import { attributeRules, newlyHidden } from "../gates/audit.ts";
 import { CommandError, sh } from "../util/proc.ts";
-import { worktreeGit, worktreeGitScope } from "./command.ts";
+import { NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -407,12 +407,13 @@ export async function diffSince(
   // Committed .gitmodules settings must not hide gitlinks from audit inputs.
   const diff = (...args: string[]) =>
     worktreeGit(["git", "diff", "--ignore-submodules=none", ...args], { cwd, env });
-  const [patch, names, stat, numstat, raw] = await Promise.all([
+  const [patch, names, stat, numstat, raw, moves] = await Promise.all([
     diff(range),
     diff("--name-status", range),
     diff("--stat", range),
     diff("--numstat", range),
     diff("--raw", "-z", "--no-renames", range),
+    diff("--name-status", "-z", "-M", range),
   ]);
   let added = 0;
   let removed = 0;
@@ -426,10 +427,19 @@ export async function diffSince(
   const entries = raw.stdout.split("\0");
   for (let i = 0; i + 1 < entries.length; i += 2)
     if (entries[i]?.split(" ")[1] === "160000") gitlinks.push(entries[i + 1] ?? "");
-  const paths = [...new Set(entries.filter((entry, i) => i % 2 === 1 && entry))];
-  // Attribute effects come only from attribute files in the trees, so unchanged ones need no queries.
-  const revision = threeDot && paths.some(isAttributeFile) ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
-  const inspection = paths.some(isAttributeFile) ? await attributeInfo(cwd, env, range, revision, paths) : {};
+  // Content at head is compared with its rename source at base; added and copied content has none,
+  // so existing rules covering a new location still count as newly hiding it.
+  const changes: { path: string; from?: string }[] = [];
+  const z = moves.stdout.split("\0");
+  for (let i = 0; i + 1 < z.length; ) {
+    const status = z[i++] ?? "";
+    const from = /^[RC]/.test(status) ? z[i++] : undefined;
+    const path = z[i++] ?? "";
+    if (status.startsWith("D")) continue;
+    changes.push({ path, ...(/^[AC]/.test(status) ? {} : { from: status.startsWith("R") ? from : path }) });
+  }
+  const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
+  const inspection = await attributeInfo(cwd, env, range, revision, changes);
   return { patch: patch.stdout, files, stat: stat.stdout, added, removed, gitlinks, ...inspection };
 }
 
@@ -442,7 +452,7 @@ async function attributeInfo(
   env: Record<string, string> | undefined,
   range: string,
   base: string,
-  paths: string[],
+  changes: { path: string; from?: string }[],
 ): Promise<Partial<DiffInfo>> {
   // Attribute files must be inspected even if binary or renamed into place.
   const pathspecs = [":(icase).gitattributes", ":(icase)**/.gitattributes"];
@@ -453,7 +463,8 @@ async function attributeInfo(
   const deadline = Date.now() + timeoutMs;
   const git = (args: string[], stdin?: string) =>
     worktreeGit(["git", ...args], { cwd, env, timeoutMs: Math.max(1, deadline - Date.now()), stdin });
-  const attributesAt = async (tree: string) => {
+  const attributesAt = async (tree: string, paths: string[]) => {
+    if (!paths.length) return new Map<string, Record<string, string>>();
     const names = ["diff", "binary", "text", "filter", "merge", "linguist-generated"];
     const query = await git(["check-attr", `--source=${tree}`, "-z", "--stdin", ...names], paths.join("\0"));
     const out = query.stdout.split("\0");
@@ -470,7 +481,7 @@ async function attributeInfo(
     const text = new Set<string>();
     for (const tree of [base, "HEAD"]) {
       const args = ["--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", EMPTY_TREE, tree];
-      const out = await git([`--attr-source=${EMPTY_TREE}`, "diff", ...args, "--", ...pathspecs]);
+      const out = await git([`--attr-source=${EMPTY_TREE}`, "-c", NO_BIG_FILES, "diff", ...args, "--", ...pathspecs]);
       for (const entry of out.stdout.split("\0")) {
         const match = entry.match(/^(\d+)\t\d+\t([\s\S]+)$/);
         if (match?.[2]) text.add(match[2]);
@@ -479,10 +490,14 @@ async function attributeInfo(
     return [...text];
   };
   try {
-    const [before, after] = await Promise.all([attributesAt(base), attributesAt("HEAD")]);
-    const attributes = paths.map((path) => ({
+    const sources = changes.flatMap((change) => (change.from === undefined ? [] : [change.from]));
+    const [before, after] = await Promise.all([
+      attributesAt(base, [...new Set(sources)]),
+      attributesAt("HEAD", changes.map((change) => change.path)),
+    ]);
+    const attributes = changes.map(({ path, from }) => ({
       path,
-      base: before.get(path) ?? {},
+      base: (from === undefined ? undefined : before.get(from)) ?? {},
       head: after.get(path) ?? {},
     }));
     const hidden = attributes.filter((a) => newlyHidden(a.base, a.head).length);

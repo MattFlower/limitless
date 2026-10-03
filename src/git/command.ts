@@ -4,6 +4,8 @@ import { CommandError, sh } from "../util/proc.ts";
 /** Local pipeline runs retain their existing git behavior; each run has its own scope. */
 export const worktreeGitScope = new AsyncLocalStorage<boolean>();
 let gitVersion: Promise<void> | undefined;
+/** Large files are otherwise reported as binary whatever their content. */
+export const NO_BIG_FILES = "core.bigFileThreshold=9223372036854775807";
 
 /** Factory commands in agent-controlled worktrees, without changing any config files. */
 export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1]) {
@@ -49,7 +51,7 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
   const env = { ...(opts.env ?? (process.env as Record<string, string>)), LIMITLESS_GIT_EMPTY_HOOK: "" };
   const inspection = ["diff", "log"].includes(cmd[command] ?? "");
   // Patch text is parsed by the audit, so repository config must not change its format.
-  const canonical = ["color.ui=never", "color.diff=never", "diff.submodule=short"].concat(
+  const canonical = ["color.ui=never", "color.diff=never", "diff.submodule=short", NO_BIG_FILES].concat(
     ["noprefix", "mnemonicPrefix", "relative"].map((key) => `diff.${key}=false`),
   );
   if (inspection) prefix.push("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904");
