@@ -325,8 +325,10 @@ exact setup. `--write` installs only the Codex skill at `~/.agents/skills/limitl
   `url = "http://127.0.0.1:7400/mcp"`. See [integrations/codex](../integrations/codex/README.md).
 
 The tools are `limitless_providers`, `limitless_create_run`, `limitless_get_run`,
-`limitless_list_runs`, `limitless_answer_question` and `limitless_cancel_run`. Creation returns
-immediately; poll with `limitless_get_run`. Use absolute paths for local repositories. The
+`limitless_list_runs`, `limitless_answer_question`, `limitless_cancel_run`, `limitless_feed` and
+`limitless_feed_ack`. Creation returns immediately; follow up with `limitless_get_run`, or catch up on
+everything that needs action with `limitless_feed` (acknowledge with `limitless_feed_ack` once handled).
+From a terminal, `limitless feed --consumer <name> --wait 3600` waits for the next item. Use absolute paths for local repositories. The
 [README](../README.md#delegate-and-follow-up) has a worked example.
 
 ## 4. Reading a run

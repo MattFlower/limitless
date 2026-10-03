@@ -30,7 +30,10 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
   );
   return {
     routes: {
-      "/mcp": (req, server) => mcp.handle(req, server.requestIP(req)?.address ?? null),
+      "/mcp": (req, server) => {
+        server.timeout(req, 90);
+        return mcp.handle(req, server.requestIP(req)?.address ?? null);
+      },
       "/webhooks/github": githubWebhook(factory),
     },
     notes: [

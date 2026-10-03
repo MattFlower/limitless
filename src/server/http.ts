@@ -3,6 +3,7 @@ import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
 import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
+import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { classifyRequest, publicHost } from "./access.ts";
 
 export interface HttpExtras {
@@ -255,6 +256,20 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         const input = await body<CreateRunRequest>(req);
         const run = await factory.createRun({ ...input, source: input.source ?? "ui" });
         return json(run, 201);
+      }),
+    },
+    "/api/feed": {
+      GET: handle(async (req, server) => {
+        const query = parseFeedParams(new URL(req.url).searchParams);
+        // Bun's default idle timeout would cut a long poll short.
+        server.timeout(req, Math.ceil(query.wait) + 30);
+        return json(await waitForFeed(store, query, req.signal));
+      }),
+    },
+    "/api/feed/ack": {
+      POST: handle(async (req) => {
+        const { consumer, id } = FeedAckSchema.parse(await body<unknown>(req));
+        return json(store.ackFeed(consumer, id));
       }),
     },
     "/api/runs/:id": handle((req) => {
