@@ -330,6 +330,9 @@ test("CLI --allow is repeatable, validated, and sent as the allow option", async
   const both = await cli("--allow", "gitattributes", "--allow", "submodules", "--allow", "submodules");
   expect(both.exit).toBe(0);
   expect(both.request.allow).toEqual(["submodules", "gitattributes"]);
+  const binary = await cli("--allow", "binary");
+  expect(binary.exit).toBe(0);
+  expect(binary.request.allow).toEqual(["binary"]);
   expect((await cli()).request.allow).toBeUndefined();
   const invalid = await cli("--allow", "everything");
   expect(invalid.exit).not.toBe(0);

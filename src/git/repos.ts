@@ -1,9 +1,11 @@
-import { existsSync, mkdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { attributeRules, newlyHidden } from "../gates/audit.ts";
+import { attributeRules, BINARY_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
 import { CommandError, sh } from "../util/proc.ts";
 import { emptyHookFlags, NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
 
@@ -473,6 +475,11 @@ export interface DiffInfo {
   /** Newly hidden changed paths that are text at base or head. */
   textPaths?: string[];
   attributeErrors?: string[];
+  binaryPaths?: string[];
+  binaryErrors?: string[];
+  headTextPaths?: string[];
+  existingRuleKeys?: Record<string, string[]>;
+  attributeUnmatched?: string[];
 }
 
 export async function diffSince(
@@ -487,7 +494,7 @@ export async function diffSince(
     worktreeGit(["git", "diff", "--ignore-submodules=none", ...args], { cwd, env });
   const [patch, names, stat, numstat, raw] = await Promise.all([
     diff(range),
-    diff("--name-status", range),
+    diff("--name-status", "-M", range),
     diff("--stat", range),
     diff("--numstat", range),
     diff("--raw", "-z", "--no-renames", range),
@@ -501,6 +508,7 @@ export async function diffSince(
   }
   const files = parseNameStatus(names.stdout);
   const gitlinks: string[] = [];
+  const origins = new Map(files.map((file) => [file.path, file.from]));
   const changes: { path: string; from?: string }[] = [];
   const entries = raw.stdout.split("\0");
   for (let i = 0; i + 1 < entries.length; i += 2) {
@@ -508,7 +516,8 @@ export async function diffSince(
     const status = entries[i]?.split(" ").at(-1) ?? "";
     const path = entries[i + 1] ?? "";
     if (status.startsWith("D")) continue;
-    changes.push({ path, ...(status.startsWith("A") ? {} : { from: path }) });
+    const from = origins.get(path);
+    changes.push({ path, ...(from ? { from } : status.startsWith("A") ? {} : { from: path }) });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
   const inspection = await attributeInfo(cwd, env, range, revision, changes);
@@ -550,53 +559,134 @@ async function attributeInfo(
   // Text means no NUL in the first 8,000 bytes. The explicit empty attribute source applies
   // even where worktreeGit is unhardened, so the run's own attributes cannot classify content.
   // The empty tree's id depends on the repository's object format (SHA-1 or SHA-256).
-  let emptyTree: string | undefined;
-  const textAt = async (tree: string, pathspecs: string[]) => {
-    const text = new Set<string>();
-    if (!pathspecs.length) return text;
-    emptyTree ??= (await git(["hash-object", "-t", "tree", "--stdin"], "")).stdout.trim();
-    const EMPTY_TREE = emptyTree;
-    const args = ["--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", EMPTY_TREE, tree];
-    const out = await git([
-      `--attr-source=${EMPTY_TREE}`,
-      "-c",
-      NO_BIG_FILES,
-      "diff",
-      ...args,
-      "--",
-      ...pathspecs,
-    ]);
-    for (const entry of out.stdout.split("\0")) {
-      const match = entry.match(/^(\d+)\t\d+\t([\s\S]+)$/);
-      if (match?.[2]) text.add(match[2]);
-    }
-    // A Git LFS pointer, which `git lfs` commits for a tracked file, stands for binary content.
-    const candidates = [...text].filter((path) => !path.includes("\n"));
-    if (candidates.length) {
-      const objects = candidates.map((path) => `${tree}:${path}\n`).join("");
-      const sizes = (await git(["cat-file", "--batch-check=%(objectsize)"], objects)).stdout.split("\n");
-      for (const [i, path] of candidates.entries()) {
-        const size = Number(sizes[i]);
-        if (!(size > 0 && size <= 200)) continue;
-        if (LFS_POINTER.test((await git(["cat-file", "-p", `${tree}:${path}`])).stdout)) text.delete(path);
+  let emptyTree: Promise<string> | undefined;
+  const emptyTreeOf = () =>
+    (emptyTree ??= git(["hash-object", "-t", "tree", "--stdin"], "").then(({ stdout }) => stdout.trim()));
+  const matches = new Set<string>();
+  const basePointers = new Set<string>();
+  const pointers = new Map<string, boolean>();
+  const scratch = mkdtempSync(join(tmpdir(), "limitless-classify-"));
+  let indexes = 0;
+  const scratchGit = (args: string[], stdin?: string, index = join(scratch, "index")) =>
+    worktreeGit(["git", `--git-dir=${scratch}`, ...args], {
+      cwd,
+      env: { ...(env ?? (process.env as Record<string, string>)), GIT_INDEX_FILE: index },
+      timeoutMs: Math.max(1, deadline - Date.now()),
+      stdin,
+    });
+  /** `raw` is every text path; `text` excludes LFS pointers standing in for binary files. */
+  const textAt = async (tree: string, pathspecs: string[], seen = matches) => {
+    const raw = new Set<string>();
+    if (!pathspecs.length) return { raw, text: raw };
+    const empty = await emptyTreeOf();
+    // A fresh index per query lets classifications run concurrently.
+    const index = join(scratch, `index-${indexes++}`);
+    const specs = `${pathspecs.join("\0")}\0`;
+    // --no-refresh: a refresh re-hashes worktree files, running their clean filters.
+    await scratchGit(
+      ["reset", "-q", "--no-refresh", tree, "--pathspec-from-file=-", "--pathspec-file-nul"],
+      specs,
+      index,
+    );
+    const flags = ["--cached", "--raw", "--numstat", "-z", "--no-abbrev", "--no-renames", "--no-ext-diff"];
+    const args = [`--attr-source=${empty}`, "-c", NO_BIG_FILES, "diff", ...flags, "--no-textconv", empty];
+    const out = await scratchGit(args, undefined, index);
+    rmSync(index, { force: true });
+    // Raw entries (blob id, then path) precede the numstat entries. Looking blobs up by id
+    // avoids a tree walk per `tree:path`, which dominates audits of many thousand files.
+    const blobs = new Map<string, string>();
+    const entries = out.stdout.split("\0");
+    for (let i = 0; i < entries.length; i++) {
+      const blob = entries[i]?.match(/^:\d+ \d+ \S+ (\S+) /);
+      if (blob?.[1]) {
+        blobs.set(entries[++i] ?? "", blob[1]);
+        continue;
+      }
+      const match = entries[i]?.match(/^(\d+|-)\t(?:\d+|-)\t([\s\S]+)$/);
+      if (match?.[2]) {
+        seen.add(match[2]);
+        if (match[1] !== "-") raw.add(match[2]);
       }
     }
-    return text;
+    // A Git LFS pointer, which `git lfs` commits for a tracked file, stands for binary content.
+    const text = new Set(raw);
+    const candidates = [...raw];
+    if (candidates.length) {
+      const input = candidates.map((path) => `${blobs.get(path)}\n`).join("");
+      const sizes = (
+        await git(["cat-file", "--batch-check=%(objectname) %(objectsize)"], input)
+      ).stdout.split("\n");
+      // The shortest strict pointer is 126 bytes; ordinary small text needs no blob read.
+      const sized = candidates.flatMap((path, i) => {
+        const [oid = "", bytes] = (sizes[i] ?? "").split(" ");
+        const size = Number(bytes);
+        return size >= 126 && size <= 200 ? [{ path, oid }] : [];
+      });
+      // One read for every blob not classified yet. These are text blobs of at most 200 bytes,
+      // so they hold no NUL and -Z output splits unambiguously; any misparse reads as no pointer.
+      const unread = [...new Set(sized.map(({ oid }) => oid))].filter((oid) => !pointers.has(oid));
+      if (unread.length) {
+        const records = (
+          await git(["cat-file", "--batch", "-Z"], unread.map((oid) => `${oid}\0`).join(""))
+        ).stdout.split("\0");
+        for (const [i, oid] of unread.entries())
+          pointers.set(
+            oid,
+            (records[2 * i] ?? "").startsWith(`${oid} blob `) && LFS_POINTER.test(records[2 * i + 1] ?? ""),
+          );
+      }
+      for (const { path, oid } of sized)
+        if (pointers.get(oid)) {
+          if (tree === base) basePointers.add(path);
+          if (!SOURCE_PATH.test(path)) text.delete(path);
+        }
+    }
+    return { raw, text };
   };
-  const textAtEither = async (pathspecs: string[]) => [
-    ...new Set([...(await textAt(base, pathspecs)), ...(await textAt("HEAD", pathspecs))]),
-  ];
+  const textAtEither = async (pathspecs: string[], seen: Set<string>) => {
+    const [before, after] = await Promise.all([
+      textAt(base, pathspecs, seen),
+      textAt("HEAD", pathspecs, seen),
+    ]);
+    return [...new Set([...before.text, ...after.text])];
+  };
   try {
+    mkdirSync(join(scratch, "refs"));
+    const [head, objectsPath] = await Promise.all([
+      git(["rev-parse", "HEAD"]),
+      git(["rev-parse", "--git-path", "objects"]),
+      emptyTreeOf(),
+    ]);
+    writeFileSync(join(scratch, "HEAD"), head.stdout);
+    const objects = resolve(cwd, objectsPath.stdout.trim());
+    mkdirSync(join(scratch, "objects", "info"), { recursive: true });
+    writeFileSync(join(scratch, "objects", "info", "alternates"), `${objects}\n`);
+    writeFileSync(
+      join(scratch, "config"),
+      `[core]\nattributesFile = /dev/null\nrepositoryformatversion = 1\n[extensions]\nobjectformat = ${base.length === 64 ? "sha256" : "sha1"}\n`,
+    );
     // Attributes of a path edited in place only differ when an attribute file changed too.
     const queried = attributePatch ? changes : changes.filter((change) => change.from !== change.path);
+    const literal = (paths: (string | undefined)[]) =>
+      paths.flatMap((p) => (p === undefined ? [] : [`:(literal)${p}`]));
+    const rules = attributeRules(attributePatch).filter((rule) => rule.exemptable);
+    const keys = [...new Map(rules.map((rule) => [rule.key, rule.pathspec])).entries()];
+    // Independent queries run concurrently; each classification uses its own scratch index.
     // Compare the same head path in both trees, even when that path did not exist at base.
     const sources = queried.map((change) => change.path);
-    const [before, after] = await Promise.all([
+    const audit = ["diff", "--ignore-submodules=none", "--no-ext-diff", "--no-textconv", range];
+    const [before, after, beforeText, afterText, found, patch] = await Promise.all([
       attributesAt(base, [...new Set(sources)]),
-      attributesAt(
-        "HEAD",
-        queried.map((change) => change.path),
+      attributesAt("HEAD", sources),
+      textAt(base, literal(changes.map((c) => c.from))),
+      textAt("HEAD", literal(changes.map((c) => c.path))),
+      Promise.all(
+        keys.map(async ([key, pathspec]) => {
+          const seen = new Set<string>();
+          return { key, text: await textAtEither([pathspec], seen), seen };
+        }),
       ),
+      emptyTreeOf().then((empty) => scratchGit([`--attr-source=${empty}`, ...audit])),
     ]);
     const baseOf = (from?: string) => (from === undefined ? undefined : before.get(from)) ?? {};
     const attributes = queried.map(({ path }) => ({
@@ -605,22 +695,77 @@ async function attributeInfo(
       head: after.get(path) ?? {},
     }));
     const hidden = queried.filter(({ path }) => newlyHidden(baseOf(path), after.get(path) ?? {}).length);
-    const literal = (paths: (string | undefined)[]) =>
-      paths.flatMap((p) => (p === undefined ? [] : [`:(literal)${p}`]));
-    const [textBefore, textAfter] = await Promise.all([
-      textAt(base, literal(hidden.map((change) => change.from))),
-      textAt("HEAD", literal(hidden.map((change) => change.path))),
-    ]);
+    const newPaths = new Set(queried.map((change) => change.path));
+    const existingRules = async () => {
+      if (!attributes.some(({ base }) => newlyHidden({}, base).length)) return [];
+      const rulePatch = await scratchGit(["diff", "--text", await emptyTreeOf(), base, "--", ...pathspecs]);
+      return Promise.all(
+        attributeRules(rulePatch.stdout).map(async (rule) => ({
+          label: `${rule.file}: ${rule.pattern} ${rule.attributes}`,
+          paths: (await textAt("HEAD", [rule.pathspec], new Set())).raw,
+        })),
+      );
+    };
+    const existing = await existingRules();
+    // Hidden paths are a subset of the changes classified above.
     const textPaths = hidden
-      .filter(({ path, from }) => textAfter.has(path) || (from !== undefined && textBefore.has(from)))
+      .filter(
+        ({ path, from }) => afterText.text.has(path) || (from !== undefined && beforeText.text.has(from)),
+      )
       .map((change) => change.path);
+    const binaryPaths = changes
+      .filter(
+        ({ path, from }) =>
+          matches.has(path) &&
+          !afterText.raw.has(path) &&
+          !basePointers.has(from ?? "") &&
+          (beforeText.text.has(from ?? "") || !BINARY_PATH.test(path)),
+      )
+      .map((c) => c.path);
     const attributeMatches: Record<string, string[]> = {};
-    for (const rule of attributeRules(attributePatch))
-      if (rule.exemptable) attributeMatches[rule.key] ??= await textAtEither([rule.pathspec]);
-    return { attributePatch, attributes, textPaths, attributeMatches };
+    const attributeUnmatched: string[] = [];
+    for (const { key, text, seen } of found) {
+      attributeMatches[key] = text;
+      if (!seen.size) attributeUnmatched.push(key);
+    }
+    const existingRuleKeys: Record<string, string[]> = {};
+    for (const { label, paths } of existing)
+      for (const path of paths)
+        if (newPaths.has(path)) existingRuleKeys[path] = [...(existingRuleKeys[path] ?? []), label];
+    return {
+      patch: patch.stdout,
+      attributePatch,
+      attributes,
+      textPaths,
+      headTextPaths: [...afterText.raw],
+      existingRuleKeys,
+      attributeMatches,
+      binaryPaths,
+      attributeUnmatched,
+    };
   } catch (error) {
-    const reason = Date.now() >= deadline ? `timed out after ${timeoutMs} ms` : String(error).split("\n")[0];
-    return { attributePatch, attributeErrors: [`attribute inspection ${reason}`] };
+    const message = error instanceof CommandError ? error.stderr.trim() : String(error);
+    const reason = Date.now() >= deadline ? `timed out after ${timeoutMs} ms` : message.split("\n")[0];
+    return {
+      attributePatch,
+      attributeErrors: [`attribute inspection ${reason}`],
+      binaryErrors: [`Binary content inspection failed: ${reason}. Content could not be classified.`],
+    };
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+/** Remove classification scratch left by a crashed audit; recent audits may still be running. */
+export function sweepClassificationScratch(root = tmpdir(), now = Date.now()): void {
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith("limitless-classify-")) continue;
+    try {
+      const path = join(root, entry.name);
+      if (fs.statSync(path).mtimeMs < now - 3_600_000) rmSync(path, { recursive: true, force: true });
+    } catch {
+      // Another process removed it, or a shared temporary directory belongs to another user.
+    }
   }
 }
 
@@ -629,7 +774,7 @@ export function parseNameStatus(text: string): DiffFile[] {
     .split("\n")
     .filter(Boolean)
     .map((l) => {
-      const [status = "", a = "", b] = l.split("\t");
+      const [status = "", a = "", b] = l.split("\t").map((p) => (p.startsWith('"') ? (unquote(p) ?? p) : p));
       return b !== undefined ? { status, path: b, from: a } : { status, path: a };
     });
 }

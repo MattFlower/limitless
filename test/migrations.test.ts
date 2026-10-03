@@ -254,6 +254,15 @@ test("audit allowances persist from requester text and options; legacy runs allo
       create({ prompt: "Do not use git submodules.\nAllow submodules\nAllow: submodules, please" }),
     ).toEqual([]);
     expect(create({ allow: ["gitattributes", "gitattributes"] })).toEqual(["gitattributes"]);
+    expect(create({ prompt: "Allow: binary" })).toEqual(["binary"]);
+    expect(create({ allow: ["binary", "binary"] })).toEqual(["binary"]);
+    for (const source of ["github", "mcp"] as const)
+      expect(create({ source, prompt: "Allow: binary" })).toEqual([]);
+    expect(create({ prompt: "Allow: binary" }, true)).toEqual([]);
+    expect(create({ prompt: "Allow: binary", sourceRef: { proposalId: "confirmed" } })).toEqual([]);
+    expect(create({ prompt: "quoted", source: "mcp", allow: ["binary"] })).toEqual(["binary"]);
+    const binaryRun = store.createRun(repo, { repo: repo.slug, prompt: "Allow: binary" });
+    expect(store.getRun(binaryRun.id)?.allow).toEqual(["binary"]);
     for (const source of ["cli", "ui"] as const)
       expect(create({ source, prompt: "Allow: submodules" })).toEqual(["submodules"]);
     expect(create({ source: "discord", prompt: "Allow: submodules" })).toEqual(["submodules"]);
