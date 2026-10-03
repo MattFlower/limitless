@@ -280,3 +280,71 @@ test("each preemptor receives the slot its own shadow releases, before other wai
     store.close();
   }
 });
+
+test("a woken production waiter that has not resumed keeps a shadow out, whatever else is free", async () => {
+  const { store, tracker } = tracked(4);
+  try {
+    const signal = new AbortController().signal;
+    const held = await Promise.all([1, 2, 3, 4].map(() => tracker.acquire("alpha", signal)));
+    let resumed = false;
+    const waiter = tracker.acquire("alpha", signal).then((release) => {
+      resumed = true;
+      return release;
+    });
+    await Bun.sleep(0);
+    // Three releases in one turn: the waiter is woken but has not run yet, and two slots are free.
+    for (const release of held.slice(0, 3)) release?.();
+    expect(resumed).toBe(false);
+    expect(tracker.tryAcquire("alpha", noop)).toBeNull();
+    (await waiter)();
+    const shadow = tracker.tryAcquire("alpha", noop);
+    expect(shadow).toBeFunction();
+    shadow?.();
+    held[3]?.();
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+  } finally {
+    store.close();
+  }
+});
+
+test("a waiter cancelled in the same turn as its slot frees never holds it", async () => {
+  const { store, tracker } = tracked(2);
+  try {
+    const signal = new AbortController().signal;
+    // A preemptor cancelled just before its shadow releases: the slot stays free, not leaked.
+    const shadow = tracker.tryAcquire("alpha", noop);
+    const busy = await tracker.acquire("alpha", signal);
+    const cancel = new AbortController();
+    const gone = tracker.acquire("alpha", cancel.signal).then(
+      () => "acquired",
+      (error: Error) => error.message,
+    );
+    cancel.abort();
+    shadow?.();
+    expect(await gone).toBe("cancelled");
+    expect(tracker.status("alpha")?.inFlight).toBe(1);
+
+    // A queued waiter cancelled right after its wake passes the slot on to the next in line.
+    const other = await tracker.acquire("alpha", signal);
+    const late = new AbortController();
+    const dropped = tracker.acquire("alpha", late.signal).then(
+      () => "acquired",
+      (error: Error) => error.message,
+    );
+    const order: string[] = [];
+    const next = tracker.acquire("alpha", signal).then((release) => {
+      order.push("next");
+      return release;
+    });
+    await Bun.sleep(0);
+    busy();
+    late.abort();
+    expect(await dropped).toBe("cancelled");
+    (await next)();
+    expect(order).toEqual(["next"]);
+    other();
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+  } finally {
+    store.close();
+  }
+});

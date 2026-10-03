@@ -94,11 +94,7 @@ export async function shadowReview(
   clearTimeout(timer);
   abort.abort();
   if (ctx.signal.aborted) return;
-  const settle = new Promise((resolve) => {
-    timer = setTimeout(resolve, SETTLE_MS);
-  });
-  await Promise.race([work, settle]);
-  clearTimeout(timer);
+  await Promise.race([work, new Promise((resolve) => setTimeout(resolve, SETTLE_MS).unref())]);
   if (record.status !== "completed") ctx.log(`Shadow panel ${record.status}: ${record.reason}`, "warn");
   const spent = guard.ids.flatMap((id) => store.getInvocation(id) ?? []);
   const cost = (key: "costUsd" | "costEquivUsd") => spent.reduce((total, i) => total + i[key], 0);

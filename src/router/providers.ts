@@ -427,7 +427,7 @@ export class ProviderTracker {
           resolve(true);
         };
         // A cancelled waiter must leave the queue, or a later release would wake a dead waiter
-        // and strand the live ones behind it. An abandoned reservation lapses to the queue.
+        // and strand the live ones behind it.
         const onAbort = () => {
           if (shadow?.heir === wake) shadow.heir = undefined;
           const i = p.waiters.indexOf(wake);
@@ -441,16 +441,19 @@ export class ProviderTracker {
       });
       if (woken) p.waking--;
     }
-    return this.hold(p);
+    const release = this.hold(p);
+    if (!signal.aborted) return release;
+    release(); // cancelled after its wake, or just before a release freed the slot: hand it on
+    throw new Error("cancelled");
   }
 
   /**
-   * A shadow call's slot: only while two are free and nobody is queued, so it never takes a provider's
-   * last slot, and never waits. A production acquire may later preempt it through `preempt`.
+   * A shadow call's slot: only while two are free and no production call is queued, waking or waiting on
+   * a preempted call, so it never takes the last slot and never waits. `preempt` lets production abort it.
    */
   tryAcquire(id: string, preempt: () => void): (() => void) | null {
     const p = this.providers.get(id);
-    if (!p || p.inFlight + p.waking + 2 > p.def.maxConcurrent || p.waiters.length) return null;
+    if (!p || p.inFlight + 2 > p.def.maxConcurrent || p.waiters.length || p.waking) return null;
     if ([...p.shadows].some((s) => s.heir)) return null;
     const shadow = { preempt };
     p.shadows.add(shadow);

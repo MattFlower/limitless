@@ -7036,6 +7036,52 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     expect(f.tracker.status("alpha")?.inFlight).toBe(0);
   });
 
+  test("one run's shadow never delays another run's production review call", async () => {
+    const calls = newCalls();
+    const { handler, slow } = slowShadow(calls, Promise.resolve());
+    let release: () => void = () => {};
+    const second = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reviews = 0;
+    const f = start(async (s) => {
+      if (roleOf(s) === "review" && !isShadowCall(s)) {
+        // The first run's single review waits until the second run's single review has started.
+        if (reviews++ === 0) await second;
+        else release();
+      }
+      return handler(s);
+    });
+    shadowOn(f);
+    slowRoster(f);
+    Object.assign(f.tracker.def("beta") ?? {}, { maxConcurrent: 5 });
+    const first = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    const deadline = Date.now() + 10_000;
+    // The first run's single review and its slow finder hold beta; the fast finder has answered.
+    while (!(slow.length && f.tracker.status("beta")?.inFlight === 2) && Date.now() < deadline)
+      await Bun.sleep(10);
+    const signal = new AbortController().signal;
+    const held = await Promise.all([1, 2, 3].map(() => f.tracker.acquire("beta", signal)));
+    // Saturated: the second run's single review must preempt the finder, or both runs wait forever.
+    const other = await f.createRun({ repo: repoDir, prompt: "Second farewell", profile: "quick" });
+    expect(await waitFor(f, other.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    for (const done of held) done();
+    expect(slow[0]?.signal.aborted).toBe(true);
+    expect(calls.primary.map((c) => c.target.modelId)).toEqual(["beta/m", "beta/m"]);
+    expect(shadowOf(f, first.id, 0)).toMatchObject({
+      status: "completed",
+      panel: {
+        finders: [
+          { prompt: "standard", vendor: "openai" },
+          { prompt: "standard", lens: "slow", vendor: null, skipped: "preempted" },
+        ],
+      },
+      blocking: [{ title: "Fast" }],
+    });
+    expect(f.tracker.status("beta")?.inFlight).toBe(0);
+  });
+
   test("a stale pinned shadow roster target leaves production running with no shadow calls", async () => {
     mkdirSync(join(home, "cfg"), { recursive: true });
     writeFileSync(
