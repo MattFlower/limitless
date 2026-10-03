@@ -65,6 +65,15 @@ test("only same-origin paths other than the login page are return targets", () =
     ["/login?next=/x", "/"],
     ["/a b", "/"],
     ["/caf\u00e9", "/"],
+    ["/a\\b", "/"],
+    ["/%5c%5cevil.test", "/"],
+    ["/%2F%2Fevil.test", "/"],
+    ["/%0d%0aLocation:evil", "/"],
+    ["/x%00", "/"],
+    ["/x%7f", "/"],
+    ["/x/../login", "/"],
+    ["/x/%2e%2e/login?next=/", "/"],
+    ["/a/./b/../c?tab=diff", "/a/c?tab=diff"],
     [null, "/"],
   ])
     expect(localPath(value)).toBe(expected as string);

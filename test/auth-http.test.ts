@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import type { Server } from "bun";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { fixture, type Route, requestWithParams } from "./mcp-support.ts";
@@ -146,10 +146,14 @@ test("revoked, idle and absolutely expired sessions are refused; sign-out ends o
   expect([await allowed(e), await allowed(g)]).toEqual([401, 401]);
 });
 
-test("repeated failed sign-ins from one address are refused for a while", async () => {
+test("concurrent wrong passwords from one address get exactly five tries, then even the right one waits", async () => {
   const { admin, signIn } = routes();
   await admin("/api/admin/auth/password", { password });
-  for (let i = 0; i < 5; i++) expect((await signIn("wrong password")).status).toBe(401);
+  const burst = await Promise.all(Array.from({ length: 20 }, () => signIn("wrong password")));
+  const statuses = burst.map((res) => res.status);
+  expect([statuses.filter((s) => s === 401).length, statuses.filter((s) => s === 429).length]).toEqual([
+    5, 15,
+  ]);
   const limited = await signIn(password);
   expect(limited.status).toBe(429);
   expect(Number(limited.headers.get("retry-after"))).toBeGreaterThan(800);
@@ -188,4 +192,22 @@ test("add-passkey's one-time link registers a passkey through the proxy, which t
   });
   const fresh = await (await post("/api/auth/passkey/login/options", {})).json();
   expect((await post("/api/auth/passkey/login", key.get(fresh))).status).toBe(401);
+});
+
+test("with no password set, sign-in checks a hash, answers like a wrong password, and counts toward the limit", async () => {
+  const unset = routes();
+  f.factory.store.setSetting("auth_password_hash", null);
+  const verify = spyOn(Bun.password, "verify");
+  const responses: Response[] = [];
+  try {
+    for (let i = 0; i < 6; i++) responses.push(await unset.signIn(password));
+    expect(verify).toHaveBeenCalledTimes(5);
+  } finally {
+    verify.mockRestore();
+  }
+  expect(responses.map((res) => res.status)).toEqual([401, 401, 401, 401, 401, 429]);
+  const set = routes();
+  await set.admin("/api/admin/auth/password", { password });
+  const wrong = await set.signIn("wrong password");
+  expect([responses[0]?.status, await responses[0]?.text()]).toEqual([wrong.status, await wrong.text()]);
 });

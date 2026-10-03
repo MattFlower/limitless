@@ -5,6 +5,9 @@ import type { Store } from "../db/store.ts";
 
 export const SESSION_COOKIE = "__Host-limitless-session";
 const PASSWORD_SETTING = "auth_password_hash";
+/** Verified when no password is set, so that answers like a wrong password and takes as long (same parameters). */
+const UNSET_HASH =
+  "$argon2id$v=19$m=65536,t=2,p=1$pJtok/xbOOc3m8AspqD4O9dnoplX0NzPVw1cBMixqss$3djx1O1qpCvtbR+fu9E/6pFCUqFHQ85IsUTwcjRcWoA";
 const DAY_MS = 86_400_000;
 /** Refresh last-seen at most this often, so streams and polling don't write on every request. */
 const TOUCH_MS = 60_000;
@@ -22,9 +25,20 @@ function cookie(headers: Headers, name: string): string | null {
   return null;
 }
 
-/** A same-origin path to return to after signing in; other hosts, schemes and the login page become `/`. */
+const LOCAL = "http://limitless.invalid";
+/**
+ * A same-origin path to return to after signing in, or `/`. Only printable ASCII, with no backslash and no
+ * encoded slash, backslash or control character; dot segments are resolved before the login page is refused.
+ */
 export function localPath(value: unknown): string {
-  return typeof value === "string" && /^\/(?![/\\]|login\b)[!-~]*$/.test(value) ? value : "/";
+  if (
+    typeof value !== "string" ||
+    !/^\/(?!\/)[!-~]*$/.test(value) ||
+    /\\|%(2f|5c|[01][0-9a-f]|7f)/i.test(value)
+  )
+    return "/";
+  const url = new URL(value, LOCAL);
+  return url.origin === LOCAL && !/^\/login(\/|$)/.test(url.pathname) ? url.pathname + url.search : "/";
 }
 
 /** Browser half of passkeys: base64url to bytes and back around navigator.credentials. */
@@ -165,7 +179,10 @@ export class Auth {
     this.store.setSetting(PASSWORD_SETTING, await Bun.password.hash(password, "argon2id"));
   }
 
-  /** The sign-in form's POST. Attempts count as failures until they succeed. */
+  /**
+   * The sign-in form's POST. An attempt counts as a failure from before its first await until it succeeds,
+   * so concurrent guesses can't outrun the limit, and an unset password fails exactly like a wrong one.
+   */
   async passwordSignIn(req: Request, address: string): Promise<Response> {
     const form = await req.formData();
     const next = localPath(form.get("next"));
@@ -174,12 +191,11 @@ export class Auth {
       const message = `Too many failed attempts. Try again in ${Math.ceil(wait / 60)} min.`;
       return loginPage(next, message, 429, { "retry-after": String(wait) });
     }
-    const hash = this.store.getSetting<string | null>(PASSWORD_SETTING, null);
-    if (!hash) return loginPage(next, "No password is set: run `limitless auth set-password`.", 401);
     this.limiter.fail(address);
+    const hash = this.store.getSetting<string | null>(PASSWORD_SETTING, null);
     const password = form.get("password");
-    if (typeof password !== "string" || !(await Bun.password.verify(password, hash)))
-      return loginPage(next, "Incorrect password.", 401);
+    const match = await Bun.password.verify(typeof password === "string" ? password : "", hash ?? UNSET_HASH);
+    if (!match || !hash) return loginPage(next, "Incorrect password.", 401);
     this.limiter.clear(address);
     const cookie = this.signIn("password", req.headers.get("user-agent") ?? "");
     return new Response(null, { status: 303, headers: { location: next, "set-cookie": cookie } });
