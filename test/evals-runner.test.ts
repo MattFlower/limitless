@@ -13,6 +13,7 @@ import { StoredReviewSchema, TriageSchema, toStrictJsonSchema } from "../src/pip
 import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 import { answer, deferred, enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
+import { attributionEvidence } from "./review-support.ts";
 
 test("3 cases x 2 exact models x k=2 use pinned bare inputs and shared invocation semantics", async () => {
   const f = await evalFixture();
@@ -1291,6 +1292,134 @@ test("stored panel finder replay pairs candidates, bills only verifiers and surv
     const blocked = await replay({ cache: false });
     expect(blocked.trials[0]).toMatchObject({ status: "skipped", pass: null });
     expect(f.calls).toHaveLength(beforeBlocked);
+  } finally {
+    await f.close();
+  }
+}, 30_000);
+
+test("control and causal replay share candidates and a pinned verifier but grade and cache independently", async () => {
+  const f = await evalFixture([verifierModel]);
+  try {
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+    const cases = [
+      {
+        ...reviewCase,
+        id: "introduced",
+        base: f.sha,
+        head,
+        input: { ...reviewCase.input, prompt: "INTRODUCED_GOLD" },
+      },
+      {
+        ...reviewCase,
+        id: "preexisting",
+        base: f.sha,
+        head,
+        input: { ...reviewCase.input, prompt: "PREEXISTING_GOLD" },
+      },
+      {
+        ...reviewCase,
+        id: "clean",
+        base: f.sha,
+        head,
+        kind: "clean",
+        defects: [],
+        input: { ...reviewCase.input, prompt: "CLEAN_CASE" },
+      },
+    ];
+    writeFileSync(f.casePath, JSON.stringify({ role: "review", version: 1, cases }));
+    const system = {
+      name: "source",
+      mode: "panel",
+      implementerReport: "include",
+      finders: ["candidate-a", "candidate-b"].map((target) => ({ target, prompt: "standard" })),
+      verifier: { target: "verifier-c" },
+    };
+    f.respond((s) =>
+      s.target.modelId.startsWith("candidate-")
+        ? { structured: reviewOutput(), costUsd: 1 }
+        : {
+            structured: {
+              results: [
+                {
+                  id: "C1",
+                  verdict: "CONFIRMED",
+                  severity: "high",
+                  category: "correctness",
+                  evidence: "src/a.ts:10",
+                  trigger: "missing input throws",
+                  attribution: s.prompt.includes("INTRODUCED_GOLD") ? "introduced" : "preexisting_unchanged",
+                  attributionEvidence,
+                },
+              ],
+            },
+            usage: { input: 7, output: 3, cacheRead: 0, cacheWrite: 0 },
+            costUsd: 0.02,
+          },
+    );
+    const source = await f.run({ role: "review", models: undefined, systems: [system], k: 1, maxUsd: 20 });
+    const control = { ...system, name: "control", replayFrom: "source" };
+    const variant = { ...control, name: "causal", causalAttribution: true };
+    const request = {
+      role: "review",
+      models: undefined,
+      systems: [control, variant],
+      maxUsd: 20,
+      k: 1,
+      replayFinders: source.run.id,
+    };
+    const calls = f.calls.length;
+    const paired = await f.run(request);
+    expect(f.calls.slice(calls).map((s) => s.target.modelId)).toEqual(Array(6).fill("verifier-c"));
+    expect(f.calls.slice(calls).filter((s) => s.prompt.includes("# Causal attribution"))).toHaveLength(3);
+    for (const item of cases) {
+      const a = paired.trials.find((t) => t.caseId === item.id && t.details.system === "control");
+      const b = paired.trials.find((t) => t.caseId === item.id && t.details.system === "causal");
+      const original = source.trials.find((t) => t.caseId === item.id);
+      if (!a || !b || !original || !b.details.grade) throw new Error("missing paired trial");
+      const candidates = StoredReviewSchema.parse(original.output).panel?.candidates;
+      expect(StoredReviewSchema.parse(a.output).panel?.candidates).toEqual(candidates);
+      expect(StoredReviewSchema.parse(b.output).panel?.candidates).toEqual(candidates);
+      expect(a.cacheKey).not.toBe(b.cacheKey);
+      expect(a.details.grade?.review?.blockingFindings).toBe(1);
+      expect(b.details.grade?.review?.blockingFindings).toBe(item.id === "introduced" ? 1 : 0);
+      expect(b.details.grade?.review?.requestChanges).toBe(item.id === "introduced");
+      expect([a.tokensIn, a.tokensOut, b.tokensIn, b.tokensOut]).toEqual([7, 3, 7, 3]);
+      if (item.id === "introduced") expect(b.details.grade?.review?.requiredMatched).toBe(1);
+      if (item.id === "preexisting")
+        expect(b.details.grade?.review).toMatchObject({ requiredMatched: 0, underRated: 1 });
+      if (item.id === "clean") {
+        expect(a.details.grade?.review?.falseBlock).toBe(true);
+        expect(b.details.grade?.review?.falseBlock).toBe(false);
+      }
+      expect(StoredReviewSchema.parse(b.output).findings[0]?.verification?.attribution).toBe(
+        item.id === "introduced" ? "introduced" : "preexisting_unchanged",
+      );
+      // Corrupt derived grades/verdicts to prove stored grading applies the selected rule afresh.
+      f.factory.store.recordEvalTrial({
+        ...b,
+        pass: !b.pass,
+        output: { ...StoredReviewSchema.parse(b.output), verdict: "request_changes" },
+        details: { ...b.details, grade: { ...b.details.grade, pass: !b.pass } },
+      });
+    }
+    expect(f.factory.evals.regrade(paired.run.id)).toMatchObject({ regraded: 6, changed: 3, skipped: [] });
+    const repeated = await f.run(request);
+    expect(f.calls).toHaveLength(calls + 6);
+    expect(repeated.trials.map((t) => [t.caseId, t.details.system, t.pass, t.details.grade?.review])).toEqual(
+      paired.trials.map((t) => [t.caseId, t.details.system, t.pass, t.details.grade?.review]),
+    );
+    // A completed prefix of an interrupted run is copied and regraded without verifier calls.
+    f.factory.store.updateEvalRun(paired.run.id, "interrupted");
+    const resumed = f.factory.evals.resume(paired.run.id);
+    if (!resumed) throw new Error("missing resumed eval");
+    await f.factory.evals.wait(resumed.id);
+    expect(resumed.systems?.find((s) => s.name === "causal")?.causalAttribution).toBe(true);
+    expect(
+      f.factory.evals
+        .report(resumed.id)
+        ?.trials.map((t) => [t.caseId, t.details.system, t.pass, t.details.grade?.review]),
+    ).toEqual(paired.trials.map((t) => [t.caseId, t.details.system, t.pass, t.details.grade?.review]));
+    expect(f.calls).toHaveLength(calls + 6);
   } finally {
     await f.close();
   }

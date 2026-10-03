@@ -177,11 +177,46 @@ const VerificationSchema = z.object({
   severity: z.enum(["critical", "high", "medium", "low"]),
   category: FindingCategoryEnum,
 });
-export type Verification = z.infer<typeof VerificationSchema>;
 
 export const VerifierSchema = z.object({
   results: z.array(VerificationSchema.extend({ id: z.string().describe("The candidate id, e.g. C3") })),
 });
+
+export const AttributionEnum = z.enum([
+  "introduced",
+  "newly_reachable_or_worse",
+  "new_feature_obligation",
+  "preexisting_unchanged",
+  "intended_change",
+  "environment_failure",
+  "unresolved",
+]);
+const attributionFields = {
+  attribution: AttributionEnum,
+  attributionEvidence: z.object({
+    change: z.string().trim().min(1),
+    obligation: z.string().trim().min(1),
+    obligationSource: z.string().trim().min(1),
+    base: z.object({
+      setup: z.enum(["ok", "failed", "not_run"]),
+      result: z.string().trim().min(1),
+    }),
+    head: z.string().trim().min(1),
+  }),
+};
+const AttributedVerificationSchema = VerificationSchema.extend(attributionFields).superRefine((v, ctx) => {
+  if (v.attributionEvidence.base.setup === "failed" && v.attribution !== "unresolved")
+    ctx.addIssue({
+      code: "custom",
+      path: ["attribution"],
+      message: "Base setup failure requires unresolved attribution",
+    });
+});
+export const AttributionVerifierSchema = z.object({
+  results: z.array(AttributedVerificationSchema.safeExtend({ id: z.string() })),
+});
+const StoredVerificationSchema = VerificationSchema.extend(z.object(attributionFields).partial().shape);
+export type Verification = z.infer<typeof StoredVerificationSchema>;
 
 // A merged report keeps what its own verification would need if its claim is split off again.
 const DuplicateSchema = z.object({
@@ -236,7 +271,7 @@ const StoredFindingSchema = reviewBase.shape.findings.element.extend({
   detail: z.string().default(""),
   suggestion: z.string().default(""),
   ...z.object(findingV2).partial().shape,
-  verification: VerificationSchema.optional(),
+  verification: StoredVerificationSchema.optional(),
   agreement: z.number().int().optional(),
   duplicates: z.array(DuplicateSchema).optional(),
 });
@@ -263,7 +298,7 @@ const StoredPanelSchema = z.object({
       raisedBy: z.array(z.number().int()).optional(),
     }),
   ),
-  verdicts: z.array(VerificationSchema.extend({ id: z.string() })),
+  verdicts: z.array(StoredVerificationSchema.extend({ id: z.string() })),
   refuted: z.array(z.string()),
   capped: z.array(z.string()),
   omitted: z.array(z.string()).default([]),

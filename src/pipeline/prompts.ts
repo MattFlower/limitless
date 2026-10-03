@@ -485,6 +485,7 @@ export function verifierPrompt(input: {
   headSha?: string;
   /** PR verification: the base may have moved past the fork point, so diff from the merge base as finders do. */
   externalChange?: boolean;
+  causalAttribution?: boolean;
   stat: string;
   candidates: {
     id: string;
@@ -544,7 +545,24 @@ ${fence(JSON.stringify(input.candidates, null, 2))}
 - low: minor inaccuracy or cosmetic.
 
 Return exactly one result per candidate id. evidence quotes the relevant code with file:line; trigger states the inputs or state and the wrong outcome they produce; category is one of correctness, security, reliability, data, concurrency, compatibility, test-gap, cleanup, conventions.
-Do not modify files. You may run read-only commands and targeted tests; create temporary files only under TMPDIR.`;
+Do not modify files. You may run read-only commands and targeted tests; create temporary files only under TMPDIR.${
+    input.causalAttribution
+      ? `
+
+# Causal attribution (separate from verdict, severity and category)
+Inspect both base and head code and compare the same trigger on each. Use the merge base for an external change; for a fix review compare the previously reviewed commit with head. Do not infer causation from a true claim or a finder's assertion.
+Return exactly one attribution per ruling:
+- introduced: the change creates a defect absent on base.
+- newly_reachable_or_worse: an existing defect becomes reachable on a new path or its consequences worsen.
+- new_feature_obligation: the new feature creates an obligation absent on base and head fails it.
+- preexisting_unchanged: the defect and reachability/consequences are unchanged from base.
+- intended_change: the behavior is required by the request/specification, not a violated obligation.
+- environment_failure: a head failure is caused by the environment rather than the change.
+- unresolved: comparison cannot establish attribution. If base setup fails, you MUST use unresolved, never introduced or environment_failure.
+attributionEvidence must record change (what changed, with base/head file:line evidence), obligation (the expected behavior), obligationSource (its request/specification or code contract citation), base (setup: ok, failed or not_run; result: observed behavior or why comparison failed), and head (observed behavior and supporting code/commands). A failing behavior on base is not introduced unless the change makes it reachable or worse. Keep claim truth in verdict and consequence in severity; attribution does not decide either.
+`
+      : ""
+  }`;
 }
 
 export function verifyPrompt(input: {

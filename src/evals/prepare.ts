@@ -131,8 +131,12 @@ export function schemaFor(item: Exclude<EvalCase, ImplementCase>) {
 export function storedSchemaFor(item: Exclude<EvalCase, ImplementCase>) {
   return "defects" in item ? StoredReviewSchema : schemaFor(item);
 }
-export function gradeCase(item: Exclude<EvalCase, ImplementCase>, output: unknown) {
+export function gradeCase(
+  item: Exclude<EvalCase, ImplementCase>,
+  output: unknown,
+  causalAttribution = false,
+) {
   if ("prompt" in item) return gradeTriage(item, TriageSchema.parse(output));
-  if ("defects" in item) return gradeReview(item, StoredReviewSchema.parse(output));
+  if ("defects" in item) return gradeReview(item, StoredReviewSchema.parse(output), causalAttribution);
   return gradeVerify(item, VerifySchema.parse(output));
 }

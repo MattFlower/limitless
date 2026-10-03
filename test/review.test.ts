@@ -17,6 +17,8 @@ import {
   type VerifierRequest,
 } from "../src/pipeline/review.ts";
 import {
+  AttributionEnum,
+  AttributionVerifierSchema,
   LaterReviewSchema,
   type Review,
   ReviewSchema,
@@ -25,7 +27,7 @@ import {
   type Verification,
   VerifierSchema,
 } from "../src/pipeline/schemas.ts";
-import { findingEvidence } from "./review-support.ts";
+import { attributionEvidence, findingEvidence } from "./review-support.ts";
 
 const finding = (severity: Review["findings"][number]["severity"], security = false) => ({
   severity,
@@ -437,6 +439,54 @@ describe("panel decision", () => {
     });
   }
 
+  for (const attribution of AttributionEnum.options) {
+    test(`causal blocking separates truth and attribution: ${attribution}`, () => {
+      const f = verified("CONFIRMED", "high");
+      f.verification = { ...f.verification, attribution, attributionEvidence } as Verification;
+      const review: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [f] };
+      const blocks = [
+        "introduced",
+        "newly_reachable_or_worse",
+        "new_feature_obligation",
+        "unresolved",
+      ].includes(attribution);
+      expect(blockingReviewFindings(review, undefined, undefined, true).length > 0).toBe(blocks);
+      expect(blockingReviewFindings(review)).toEqual([f]);
+      for (const round of [1, 2, 3, "resolution"] as const) {
+        const prior = [finding("major")];
+        expect(reviewVerdict(review, prior, round, true)).toBe(
+          blocks && round !== 3 ? "request_changes" : "approve",
+        );
+        const cited = { ...f, label: "unaddressed" as const, prior: "P1" };
+        const citedReview = { ...review, findings: [cited] };
+        expect(blockingReviewFindings(citedReview, prior, round, true)).toEqual(
+          blockingReviewFindings(citedReview, prior, round),
+        );
+        for (const special of [
+          { ...f, security: true },
+          { ...f, verification: { ...f.verification, category: "security" } } as typeof f,
+        ]) {
+          expect(blockingReviewFindings({ ...review, findings: [special] }, prior, round, true)).toEqual([
+            special,
+          ]);
+        }
+      }
+      for (const [verdict, severity, category] of [
+        ["REFUTED", "critical", "security"],
+        ["PLAUSIBLE", "medium", "correctness"],
+        ["CONFIRMED", "critical", "cleanup"],
+      ] as const) {
+        const nonblocking = {
+          ...f,
+          verification: { ...f.verification, verdict, severity, category },
+        } as typeof f;
+        expect(
+          blockingReviewFindings({ ...review, findings: [nonblocking] }, undefined, undefined, true),
+        ).toEqual([]);
+      }
+    });
+  }
+
   test("unverified panel findings block only as security findings or prior blocking findings (fail closed)", () => {
     const plain = finding("blocker");
     const security = { ...finding("nit", true), category: "cleanup" as const };
@@ -528,6 +578,20 @@ describe("panel decision", () => {
       expect(blockingReviewFindings(review, prior, "resolution").length > 0).toBe(r2);
       expect(blockingReviewFindings(review, prior, 3).length > 0).toBe(r3);
       expect(reviewVerdict(review, prior, 3)).toBe(r3 ? "request_changes" : "approve");
+      for (const attribution of ["introduced", "unresolved", "preexisting_unchanged"] as const) {
+        const attributed = {
+          ...f,
+          verification: { ...f.verification, attribution, attributionEvidence } as Verification,
+        };
+        for (const round of [1, 2, 3, "resolution"] as const) {
+          const underVariant = { ...review, findings: [attributed] };
+          const current = blockingReviewFindings(underVariant, prior, round);
+          const exempt = finderSecurity || category === "security" || label === "cited";
+          expect(blockingReviewFindings(underVariant, prior, round, true)).toEqual(
+            attribution === "preexisting_unchanged" && !exempt ? [] : current,
+          );
+        }
+      }
     });
   }
 
@@ -643,6 +707,131 @@ describe("runReview panel", () => {
     evidence: "src/a.ts:3 `a()`",
     trigger: "x -> y",
   } as const;
+
+  const causalSystem = { mode: "panel", finders: [{ prompt: "standard" }], causalAttribution: true } as const;
+  test("causal verifier requests require attribution and comparison evidence; control stays unchanged", async () => {
+    const control = await panel([[candidate("src/a.ts", 1)]], () => confirmed);
+    const variant = await panel(
+      [[candidate("src/a.ts", 1)]],
+      () => ({ ...confirmed, attribution: "preexisting_unchanged", attributionEvidence }),
+      { system: { ...causalSystem, finders: [...causalSystem.finders] } },
+    );
+    const request = variant.verifications[0]?.request;
+    expect(request?.schema).toBe(AttributionVerifierSchema);
+    expect(request?.prompt).toContain("Inspect both base and head");
+    expect(request?.prompt).toContain("If base setup fails, you MUST use unresolved");
+    for (const attribution of AttributionEnum.options) expect(request?.prompt).toContain(attribution);
+    expect(variant.out.decision?.blocking).toEqual([]);
+    expect(variant.out.decision?.followUps).toHaveLength(1);
+    expect(control.verifications[0]?.request.schema).toBe(VerifierSchema);
+    expect(control.verifications[0]?.request.prompt).not.toContain("# Causal attribution");
+    expect(control.out.decision?.blocking).toHaveLength(1);
+    const valid = {
+      id: "C1",
+      ...confirmed,
+      category: "correctness",
+      attribution: "introduced",
+      attributionEvidence,
+    };
+    for (const attribution of AttributionEnum.options)
+      expect(request?.schema.safeParse({ results: [{ ...valid, attribution }] }).success).toBe(true);
+    for (const invalid of [
+      { ...valid, attribution: undefined },
+      { ...valid, attribution: "other" },
+      { ...valid, attribution: ["introduced", "unresolved"] },
+      { ...valid, attributionEvidence: undefined },
+      { ...valid, attributionEvidence: { ...attributionEvidence, obligationSource: " " } },
+      {
+        ...valid,
+        attributionEvidence: {
+          ...attributionEvidence,
+          base: { setup: "failed", result: "dependency missing" },
+        },
+      },
+    ])
+      expect(request?.schema.safeParse({ results: [invalid] }).success).toBe(false);
+    const unresolved = {
+      ...valid,
+      attribution: "unresolved",
+      attributionEvidence: {
+        ...attributionEvidence,
+        base: { setup: "failed", result: "dependency missing" },
+      },
+    };
+    expect(request?.schema.safeParse({ results: [unresolved] }).success).toBe(true);
+    expect(StoredReviewSchema.parse(variant.out.result.structured).findings[0]?.verification).toMatchObject({
+      attribution: "preexisting_unchanged",
+      attributionEvidence,
+    });
+    const malformed = await panel([[candidate("src/a.ts", 1)]], () => confirmed, {
+      system: { ...causalSystem, finders: [...causalSystem.finders] },
+    });
+    expect(malformed.out.result.error).toContain("Invalid verifier output");
+    expect(malformed.out.output.success).toBe(false);
+    expect(malformed.out.decision).toBeUndefined();
+    const json = request?.jsonSchema as {
+      properties: {
+        results: {
+          items: {
+            required: string[];
+            properties: { attribution: { enum: string[] }; attributionEvidence: { required: string[] } };
+          };
+        };
+      };
+    };
+    expect(json.properties.results.items.required).toContain("attribution");
+    expect(json.properties.results.items.required).toContain("attributionEvidence");
+    expect(json.properties.results.items.properties.attribution.enum).toEqual(AttributionEnum.options);
+    expect(json.properties.results.items.properties.attributionEvidence.required).toEqual([
+      "change",
+      "obligation",
+      "obligationSource",
+      "base",
+      "head",
+    ]);
+    expect(panelIdentity(true)).not.toBe(panelIdentity());
+  });
+
+  test("causal panel keeps security and prior blockers outside the cap and fails closed on omitted rulings", async () => {
+    const prior = [finding("major")];
+    const found = [
+      ...Array.from({ length: PANEL_VERIFY_CAP + 1 }, (_, i) => ({
+        ...candidate("src/a.ts", i + 1),
+        label: "new",
+        prior: "",
+      })),
+      { ...candidate("src/a.ts", 100, "nit"), security: true, label: "new", prior: "" },
+      { ...candidate("src/a.ts", 101, "nit"), label: "unaddressed", prior: "P1" },
+    ];
+    for (const round of [2, 3] as const) {
+      for (const omitted of [false, true]) {
+        const { out, verifications } = await panel(
+          [found],
+          () =>
+            omitted
+              ? null
+              : {
+                  ...confirmed,
+                  severity: "critical",
+                  attribution: "preexisting_unchanged",
+                  attributionEvidence,
+                },
+          {
+            system: { ...causalSystem, finders: [...causalSystem.finders] },
+            panelReview: round,
+            prompt: { ...prompt, fixReview: round, previous: { sha: "old", findings: prior } },
+          },
+        );
+        expect(out.panel?.capped).toEqual([`C${PANEL_VERIFY_CAP + 1}`]);
+        expect(verifications.flatMap((v) => ids(v.request.prompt))).toEqual(
+          expect.arrayContaining(["C22", "C23"]),
+        );
+        expect(out.decision?.blocking.map((f) => f.line)).toEqual([100, 101]);
+        expect(out.decision?.followUps).toHaveLength(PANEL_VERIFY_CAP + 1);
+        expect(out.panel?.omitted.length).toBe(omitted ? PANEL_VERIFY_CAP + 2 : 0);
+      }
+    }
+  });
 
   test("batches by file and finder vendor, at most five per call, with only the allowed fields", async () => {
     const { out, verifications } = await panel(

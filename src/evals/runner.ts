@@ -72,10 +72,14 @@ const trialKey = (trial: EvalTrial) =>
 const LABEL_PATHS = ["evals/triage", "evals/review", "evals/verify", "evals/implement"];
 
 /** A stored trial graded against its case's current labels; null when its output no longer parses. */
-function regraded(item: Exclude<EvalCase, ImplementCase>, trial: EvalTrial): EvalTrial | null {
+function regraded(
+  item: Exclude<EvalCase, ImplementCase>,
+  trial: EvalTrial,
+  causalAttribution = false,
+): EvalTrial | null {
   const output = storedSchemaFor(item).safeParse(trial.output);
   if (!output.success) return null;
-  const grade = gradeCase(item, output.data);
+  const grade = gradeCase(item, output.data, causalAttribution);
   return { ...trial, pass: grade.pass, score: grade.score, details: { ...trial.details, grade } };
 }
 
@@ -288,7 +292,9 @@ export class EvalRunner {
     for (const trial of this.deps.store.listEvalTrials(id)) {
       if (trial.status !== "ok" || !trial.details.grade?.review) continue;
       const item = cases.get(trial.caseId);
-      const updated = item && regraded(item, trial);
+      const updated =
+        item &&
+        regraded(item, trial, run.systems?.find((s) => s.name === trial.details.system)?.causalAttribution);
       if (!item || !updated) {
         result.skipped.push({
           caseId: trial.caseId,
@@ -705,7 +711,7 @@ export class EvalRunner {
                 : { head: item.head, input: item.input }),
               ...(replay ? { replay: replay.identity } : {}),
               ...(system ? { reviewSystem: reviewSystemHash(system) } : {}),
-              ...(system?.mode === "panel" ? { panel: panelIdentity() } : {}),
+              ...(system?.mode === "panel" ? { panel: panelIdentity(system.causalAttribution) } : {}),
               patch,
               ...(item.snapshot ? { snapshot: true } : {}),
               source:
@@ -755,7 +761,7 @@ export class EvalRunner {
       if (predecessor?.cacheKey === trial.cacheKey) {
         const copy =
           predecessor.status === "ok" && !("hidden" in item)
-            ? (regraded(item, predecessor) ?? predecessor)
+            ? (regraded(item, predecessor, system?.causalAttribution) ?? predecessor)
             : predecessor;
         return store.recordEvalTrial({
           ...copy,
@@ -774,7 +780,8 @@ export class EvalRunner {
               ? { success: true, data: source.output }
               : storedSchemaFor(item).safeParse(source.output);
           if (!output?.success) continue;
-          const grade = "hidden" in item ? source.details.grade : gradeCase(item, output.data);
+          const grade =
+            "hidden" in item ? source.details.grade : gradeCase(item, output.data, system?.causalAttribution);
           if (!grade) continue;
           store.recordEvalTrial({
             ...trial,
@@ -1065,7 +1072,7 @@ export class EvalRunner {
               ? await gradeImplement(effective, cwd, hidden, implementation, toolCommands, signal)
               : failedImplement(result.status === "timeout" ? "timeout" : "error", result.error ?? undefined)
             : ok && output?.success && !("hidden" in item)
-              ? gradeCase(item, output.data)
+              ? gradeCase(item, output.data, system?.causalAttribution)
               : undefined;
         if (
           result.status === "ok" &&
