@@ -13,6 +13,8 @@ export interface HttpExtras {
   routes?: Record<string, (req: Request, server: Server<undefined>) => Response | Promise<Response>>;
   /** Bundled SPA files, served through the same authorization as the API. */
   ui?: Record<string, Blob>;
+  /** Overrides the configured port (a migrating daemon's staging listener). */
+  port?: number;
 }
 
 const json = (data: unknown, status = 200) =>
@@ -409,7 +411,7 @@ export function startHttp(factory: Factory, extras: HttpExtras = {}, serve = Bun
   const bind = (hostname: string) =>
     serve({
       hostname,
-      port: factory.cfg.port,
+      port: extras.port ?? factory.cfg.port,
       development: process.env.NODE_ENV !== "production" && process.env.LIMITLESS_DEV === "1",
       routes: routes as never,
       fetch: routes["/*"] as (req: Request, server: Server<undefined>) => Promise<Response>,

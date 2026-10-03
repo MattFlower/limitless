@@ -13,6 +13,8 @@ const scenario = JSON.parse(process.argv[2] ?? "{}") as {
     | "health"
     | "old-health"
     | "handoff"
+    | "stub"
+    | "staging"
     | "not-running"
     | "port-owner"
     | "bootout"
@@ -37,7 +39,6 @@ for (const label of [...loaded.keys(), ...(scenario.plists ?? [])])
   files.set(`${agents}/${label}.plist`, `legacy ${label}`);
 if (scenario.missingPlist) for (const label of loaded.keys()) files.delete(`${agents}/${label}.plist`);
 let pid = 100;
-let probeHealth: Promise<unknown> | undefined;
 let time = 0;
 let healthCalls = 0;
 let pending = 0;
@@ -127,7 +128,9 @@ globalThis.fetch = (async (url: string | URL | Request, options?: RequestInit) =
       scenario.failure === "not-running" ||
       (scenario.failure === "handoff" && parsed.port === String(port) && !loaded.has(legacy)));
   const responsePid = scenario.failure === "old-health" ? loaded.get(legacy) : loaded.get(label);
-  return Response.json({ ok: true, pid: responsePid }, { status: failed || !loaded.has(label) ? 503 : 200 });
+  const app = { ok: true, uptimeMs: 1, sha: "abc", draining: false, active: [] };
+  const body = scenario.failure === "stub" ? { ok: true, pid: responsePid } : { ...app, pid: responsePid };
+  return Response.json(body, { status: failed || !loaded.has(label) ? 503 : 200 });
 }) as typeof fetch;
 const { install, status, uninstall, awaitServiceHandoff } = await import("../../src/cli/service.ts");
 let error: string | undefined;
@@ -137,12 +140,11 @@ try {
   else if (scenario.action === "handoff") {
     process.env.LIMITLESS_MIGRATE_FROM = legacy;
     process.env.LIMITLESS_STAGING_PORT = String(port + 1);
-    Bun.serve = ((opts: { port: number; fetch: () => Response }) => {
-      calls.push(`probe ${opts.port}`);
-      probeHealth = opts.fetch().json();
-      return { stop: async () => calls.push("probe stop") };
-    }) as unknown as typeof Bun.serve;
-    await awaitServiceHandoff();
+    await awaitServiceHandoff((staging) => {
+      calls.push(`staging ${staging}`);
+      if (scenario.failure === "staging") throw new Error("replacement startup failed");
+      return { stop: async () => void calls.push("staging stop") };
+    });
   } else await install(port, { mtplx: scenario.mtplx, tunnel: scenario.tunnel });
 } catch (caught) {
   error = String(caught);
@@ -155,6 +157,5 @@ process.stdout.write(
     logs,
     error,
     healthCalls,
-    probeHealth: await probeHealth,
   }),
 );

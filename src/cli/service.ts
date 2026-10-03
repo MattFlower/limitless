@@ -150,15 +150,13 @@ async function installedLabel(label: string, command: typeof sh = sh, port = 740
   return (await loaded(label, command)) && (await health(unitPort, 2000, label, command)) ? label : old;
 }
 
-// Stand by without starting integrations or the scheduler while the old daemon owns the port.
-export async function awaitServiceHandoff(): Promise<void> {
+// Serve the fully built app (no integrations or scheduler) on the staging port until the old daemon unloads.
+export async function awaitServiceHandoff(start: (port: number) => { stop(force?: boolean): Promise<void> }) {
   const old = process.env.LIMITLESS_MIGRATE_FROM;
   if (!old || !(await loaded(old))) return;
-  const port = Number(process.env.LIMITLESS_STAGING_PORT);
-  const ready = () => Response.json({ ok: true, pid: process.pid });
-  const probe = Bun.serve({ hostname: "127.0.0.1", port, fetch: ready });
+  const staging = start(Number(process.env.LIMITLESS_STAGING_PORT));
   while (await loaded(old)) await Bun.sleep(100);
-  await probe.stop(true);
+  await staging.stop(true);
 }
 
 function tunnelConfig(port: number): string | null {
@@ -204,12 +202,12 @@ async function health(port: number, waitMs = 30_000, label?: string, run: typeof
         signal: AbortSignal.timeout(2000),
         headers: label === MTPLX_LABEL ? { authorization: "Bearer mtplx-local" } : {},
       });
-      const body: { ok?: unknown; pid?: unknown } | null =
-        label === LABEL && res.ok ? await res.json() : null;
+      // Only the replacement's real app reports a valid health body with its own pid.
+      const owned = label !== LABEL || (res.ok && validateHealth(await res.json()).pid === pid);
       const ownerArgs = ["/usr/sbin/lsof", "-nPat", `-p${pid}`, `-iTCP:${port}`, "-sTCP:LISTEN"];
       const ownsPort =
         !label || label === LABEL || (await run(ownerArgs, { cwd: home, allowFail: true })).exitCode === 0;
-      if (res.ok && ownsPort && (label !== LABEL || (body?.ok === true && body.pid === pid))) return true;
+      if (res.ok && ownsPort && owned) return true;
     } catch {
       // not up yet
     }

@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Server } from "bun";
+import { validateHealth } from "../src/cli/deploy-wait.ts";
 import { loadConfig } from "../src/config.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
 import { classifyRequest, publicHost } from "../src/server/access.ts";
@@ -107,6 +108,20 @@ test("config validates LAN settings; exact binds share routes, stop together and
     ).toThrow("bind failed");
     expect(stops.at(-1)).toHaveBeenCalledWith(true);
   } finally {
+    await f.close();
+  }
+});
+
+test("a staging port override serves the real health response with the daemon pid", async () => {
+  const f = await fixture();
+  f.factory.cfg.port = 1;
+  const server = startHttp(f.factory, { port: 0 });
+  try {
+    expect(server.port).not.toBe(1);
+    const health = validateHealth(await (await fetch(new URL("/api/health", server.url))).json());
+    expect(health.pid).toBe(process.pid);
+  } finally {
+    await server.stop(true);
     await f.close();
   }
 });

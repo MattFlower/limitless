@@ -151,20 +151,12 @@ async function serve(): Promise<void> {
     policyPath: join(import.meta.dir, "../../routing/policy.json"),
   });
   const ui = await (await import("../server/ui.ts")).buildUi();
-  await (await import("./service.ts")).awaitServiceHandoff();
+  // A migrating replacement proves its real app on the staging port before the old daemon stops.
+  await (await import("./service.ts")).awaitServiceHandoff((port) => startHttp(factory, { ui, port }));
   const orphans = sweepOrphanedSnapshots();
   if (orphans.length) console.log(`Removed ${orphans.length} holdout snapshot(s) left by a stopped daemon`);
   const integrations = await mountIntegrations(factory);
-  let server: ReturnType<typeof startHttp> | undefined;
-  for (let attempt = 0; !server; attempt++) {
-    try {
-      server = startHttp(factory, { ui, routes: integrations.routes });
-    } catch (error) {
-      if (!process.env.LIMITLESS_MIGRATE_FROM || attempt >= 100) throw error;
-      if (!(error instanceof Error) || !("code" in error) || error.code !== "EADDRINUSE") throw error;
-      await Bun.sleep(100);
-    }
-  }
+  const server = startHttp(factory, { ui, routes: integrations.routes });
   factory.start();
   console.log(`Limitless listening on http://${cfg.host}:${server.port}  (data: ${cfg.paths.home})`);
   if (cfg.listenLan) console.log(`LAN proxy listener: http://${cfg.listenLan}:${cfg.port}`);

@@ -75,7 +75,6 @@ interface ServiceResult {
   loaded: string[];
   logs: string[];
   error?: string;
-  probeHealth?: { ok: boolean; pid: number };
 }
 
 async function serviceFake(scenario: Record<string, unknown>): Promise<ServiceResult> {
@@ -156,7 +155,7 @@ test("migration verifies each staged replacement before retiring or deleting its
 });
 
 test("bootstrap, health and old-daemon health cannot retire a legacy unit", async () => {
-  for (const failure of ["bootstrap", "health", "old-health"]) {
+  for (const failure of ["bootstrap", "health", "old-health", "stub"]) {
     const f = await serviceFake({ labels: [oldLabels[0]], failure });
     expect(f.error).toContain("failed");
     expect(f.loaded).toContain("cc.mattflower.limitless");
@@ -214,13 +213,24 @@ test("omitted options preserve optional legacy installations", async () => {
   expect(f.calls).not.toContain(bootstrap("dev.limitless.tunnel"));
 });
 
-test("daemon handoff exposes separate readiness while waiting for the old label to unload", async () => {
+test("daemon handoff serves the real app on staging until the old label unloads", async () => {
   const f = await serviceFake({ action: "handoff", labels: [oldLabels[0]] });
   expect(f.error).toBeUndefined();
-  expect(f.calls).toContain("probe 7401");
-  expect(f.calls.at(-1)).toBe("probe stop");
-  expect(f.probeHealth?.ok).toBe(true);
-  expect(f.probeHealth?.pid).toBeGreaterThan(0);
+  expect(f.calls[1]).toBe("staging 7401");
+  expect(f.calls.at(-1)).toBe("staging stop");
+  expect(f.loaded).toEqual([]);
+});
+
+test("a replacement startup failure never stops the old daemon", async () => {
+  const handoff = await serviceFake({ action: "handoff", labels: [oldLabels[0]], failure: "staging" });
+  expect(handoff.error).toContain("replacement startup failed");
+  expect(handoff.calls).not.toContain("staging stop");
+  // Without the real app answering on staging, install never retires the old daemon.
+  const f = await serviceFake({ labels: [oldLabels[0]], failure: "stub" });
+  expect(f.error).toContain("dev.limitless.daemon bootstrap or health failed");
+  expect(f.calls).not.toContain(bootout(oldLabels[0]));
+  expect(f.calls).not.toContain("health 7400/api/health");
+  expect(f.loaded).toEqual([oldLabels[0]]);
 });
 
 test("a failed mtplx final bootstrap restores its legacy unit", async () => {
