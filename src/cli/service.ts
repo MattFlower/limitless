@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { sh } from "../util/proc.ts";
 import {
   bounded,
@@ -25,11 +25,10 @@ import {
   waitForHealthy,
 } from "./deploy-wait.ts";
 
-const LABEL = "cc.mattflower.limitless";
-const TUNNEL_LABEL = "cc.mattflower.limitless-tunnel";
-const MTPLX_LABEL = "cc.mattflower.limitless-mtplx";
+const LABEL = "dev.limitless.daemon";
+const TUNNEL_LABEL = "dev.limitless.tunnel";
+const MTPLX_LABEL = "dev.limitless.mtplx";
 const MTPLX_MODEL = process.env.LIMITLESS_MTPLX_MODEL ?? "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality";
-const ALL_LABELS = [LABEL, MTPLX_LABEL, TUNNEL_LABEL];
 const REPO_URL = "git@github.com:MattFlower/limitless.git";
 
 const home = homedir();
@@ -93,6 +92,7 @@ function plist(
 <plist version="1.0">
 <dict>
   <key>Label</key><string>${label}</string>
+  <key>LimitlessService</key><string>${label.split(".").at(-1)}</string>
   <key>ProgramArguments</key>
   <array>${args.map((a) => `\n    <string>${xml(a)}</string>`).join("")}
   </array>
@@ -138,6 +138,37 @@ async function loaded(label: string): Promise<boolean> {
   return (await launchctl(["print", `gui/${uid}/${label}`])).exitCode === 0;
 }
 
+type ServiceOptions = NonNullable<Parameters<typeof deploy>[3]>;
+export async function installedUnits(opts: ServiceOptions = {}) {
+  const dir = opts.agentsDir ?? agentsDir;
+  const release = opts.releaseDir ?? appDir;
+  const entry = join(release, "src", "cli", "main.ts");
+  const units = [] as { label: string; path: string; kind: string }[];
+  const run = opts.command ?? sh;
+  const options = { cwd: home, allowFail: true };
+  const config = join(home, ".cloudflared", "limitless.yml");
+  for (const file of existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".plist")) : []) {
+    const path = join(dir, file);
+    const result = await run(["plutil", "-convert", "json", "-o", "-", path], options);
+    if (result.exitCode !== 0) continue;
+    const data: Record<string, unknown> = JSON.parse(result.stdout);
+    if (!data || !Array.isArray(data.ProgramArguments) || typeof data.Label !== "string") continue;
+    const args = data.ProgramArguments;
+    const executable = basename(String(args[0]));
+    const is = (at: number, ...parts: string[]) => parts.every((part, i) => args[at + i] === part);
+    let kind = "";
+    if (executable === "bun" && is(args.indexOf(entry), entry, "serve")) kind = "daemon";
+    else if (data.WorkingDirectory === release) {
+      if (is(0, join(home, ".mtplx", "bin", "mtplx"), "serve")) kind = "mtplx";
+      if (executable === "cloudflared" && is(1, "tunnel", "--config", config, "run")) kind = "tunnel";
+    }
+    if (kind && (data.LimitlessService === undefined || data.LimitlessService === kind)) {
+      if (units.some((unit) => unit.kind === kind)) throw new Error(`multiple installed ${kind} agents`);
+      units.push({ label: data.Label, path, kind });
+    }
+  }
+  return units;
+}
 /** The cloudflared config: only `/webhooks/` on the configured public host reaches the daemon. */
 export function tunnelYaml(
   tunnelId: string,
@@ -213,40 +244,82 @@ export function installationUnits(
 
 export async function install(
   port: number,
-  opts: { tunnel?: boolean; mtplx?: boolean; publicUrl?: string | null } = {},
+  opts: { tunnel?: boolean; mtplx?: boolean; publicUrl?: string | null } & ServiceOptions = {},
 ): Promise<void> {
+  const command = opts.command ?? sh,
+    clock = opts.clock ?? deployClock;
+  const client = opts.client ?? localDeployClient(port);
+  const ctl = async (args: string[]) => command(["launchctl", ...args], { cwd: home, allowFail: true });
+  const isLoaded = async (label: string) => (await ctl(["print", `gui/${uid}/${label}`])).exitCode === 0;
+  const stop = async (label: string) => {
+    if (!(await isLoaded(label))) return;
+    const result = await ctl(["bootout", `gui/${uid}/${label}`]);
+    if (result.exitCode !== 0) throw new Error(`bootout ${label}: ${result.stderr}`);
+    for (let i = 0; i < 30 && (await isLoaded(label)); i++) await clock.sleep(500);
+    if (await isLoaded(label)) throw new Error(`agent still loaded: ${label}`);
+  };
+  const start = async (path: string) => {
+    const result = await ctl(["bootstrap", `gui/${uid}`, path]);
+    if (result.exitCode !== 0) throw new Error(`launchctl bootstrap failed for ${path}: ${result.stderr}`);
+  };
   mkdirSync(logDir, { recursive: true });
   mkdirSync(agentsDir, { recursive: true });
-  await ensureRelease();
-  await sh(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000 });
+  await ensureRelease(appDir, command);
+  await command(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000 });
+  const previous = await installedUnits({ command });
+  const target = (await command(["git", "rev-parse", "HEAD"], { cwd: appDir })).stdout.trim();
   // The public tunnel is opt-in: only once webhook authentication is in place.
   const tunnel = opts.tunnel ? tunnelConfig(port, opts.publicUrl ?? null) : null;
   if (opts.tunnel && !tunnel) console.warn("skipping tunnel: no cloudflared credentials or no public_url");
   const units = installationUnits(opts, tunnel);
   for (const [label, content] of units) {
     const path = join(agentsDir, `${label}.plist`);
-    if (await loaded(label)) {
-      await launchctl(["bootout", `gui/${uid}/${label}`]);
-      // bootout returns before the old instance is gone; bootstrapping too early fails with EIO.
-      for (let i = 0; i < 30 && (await loaded(label)); i++) await Bun.sleep(500);
+    const old = previous.find((unit) => `dev.limitless.${unit.kind}` === label);
+    if (existsSync(path) && old?.path !== path) throw new Error(`unrelated agent: ${path}`);
+    if (old?.label !== label && (await isLoaded(label))) throw new Error(`unrecognized agent: ${label}`);
+    const saved = old ? readFileSync(old.path) : null;
+    let drainAttempted = false;
+    try {
+      if (old && label === LABEL && (await isLoaded(old.label))) {
+        drainAttempted = true;
+        await requestAdmin(client, clock, "drain");
+        await waitForDrain(client, clock, DEFAULT_MAX_WAIT_MS, false, console.log);
+      }
+      if (old) await stop(old.label);
+    } catch (error) {
+      try {
+        if (drainAttempted && old && (await isLoaded(old.label))) await requestAdmin(client, clock, "resume");
+      } catch (resume) {
+        throw new Error(`${String(error)}\nResume scheduler failed: ${String(resume)}`, { cause: error });
+      }
+      throw error;
     }
-    writeFileSync(path, content);
-    let ok = false;
-    for (let attempt = 0; attempt < 5 && !ok; attempt++) {
-      if (attempt) await Bun.sleep(1000 * attempt);
-      ok = (await launchctl(["bootstrap", `gui/${uid}`, path])).exitCode === 0;
+    try {
+      if (old) unlinkSync(old.path);
+      writeFileSync(path, content);
+      await start(path);
+      if (label === LABEL) await waitForHealthy(client, clock, target);
+    } catch (error) {
+      try {
+        await stop(label);
+        if (existsSync(path)) unlinkSync(path);
+        if (old && saved) {
+          writeFileSync(old.path, saved);
+          await start(old.path);
+        }
+      } catch (restore) {
+        throw new Error(`${String(error)}\nRestoration failed: ${String(restore)}`, { cause: error });
+      }
+      throw error;
     }
-    if (!ok) throw new Error(`launchctl bootstrap failed for ${label}`);
     console.log(`installed ${label}`);
   }
-  console.log((await health(port)) ? "daemon healthy" : "daemon did not become healthy — check the log");
 }
 
 export async function uninstall(): Promise<void> {
-  for (const label of ALL_LABELS) {
-    if (await loaded(label)) await launchctl(["bootout", `gui/${uid}/${label}`]);
-    const path = join(agentsDir, `${label}.plist`);
-    if (existsSync(path)) unlinkSync(path);
+  for (const { label, path } of await installedUnits()) {
+    if (await loaded(label)) await launchctl(["bootout", `gui/${uid}/${label}`], false);
+    unlinkSync(path);
     console.log(`removed ${label}`);
   }
 }
@@ -334,6 +407,7 @@ export async function deploy(
   ref = "origin/main",
   smoke = false,
   opts: {
+    agentsDir?: string;
     releaseDir?: string;
     command?: typeof sh;
     client?: DeployClient;
@@ -352,7 +426,13 @@ export async function deploy(
   if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs < 0) throw new Error("invalid deployment wait budget");
   const client = opts.client ?? localDeployClient(port);
   const clock = opts.clock ?? deployClock;
-  const restart = opts.restart ?? (() => launchctl(["kickstart", "-k", `gui/${uid}/${LABEL}`], false));
+  const restart =
+    opts.restart ??
+    (async () => {
+      const agent = (await installedUnits(opts)).find((unit) => unit.kind === "daemon");
+      if (!agent) throw new Error("no installed daemon agent; run limitless service install");
+      return command(["launchctl", "kickstart", "-k", `gui/${uid}/${agent.label}`], { cwd: home });
+    });
   const log = opts.log ?? console.log;
   const unlock = acquireDeployLock(opts.lockPath ?? deployLock);
   let interrupted: Error | null = null;
@@ -475,7 +555,8 @@ export async function deploy(
 }
 
 export async function status(port: number): Promise<void> {
-  for (const label of ALL_LABELS) console.log(`${label}: ${(await loaded(label)) ? "loaded" : "not loaded"}`);
+  for (const { label } of await installedUnits())
+    console.log(`${label}: ${(await loaded(label)) ? "loaded" : "not loaded"}`);
   if (existsSync(join(appDir, ".git"))) {
     const head = (await sh(["git", "log", "-1", "--format=%h %s"], { cwd: appDir })).stdout.trim();
     console.log(`release: ${head}`);
