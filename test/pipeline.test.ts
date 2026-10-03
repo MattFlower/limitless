@@ -6334,7 +6334,20 @@ describe("review shadow panel: single reviews decide, the panel only records", (
 
   test("a shadow finder without a free provider slot is skipped at once and never queues", async () => {
     const calls = newCalls();
-    const f = start(scenario(calls, () => ({ structured: approve, costEquivUsd: 0.25 })));
+    const base = scenario(calls, () => ({ structured: approve, costEquivUsd: 0.25 }));
+    const ref: { f?: Factory } = {};
+    const f = start(async (s) => {
+      // The single review keeps its slot until the shadow has recorded this round.
+      if (roleOf(s) === "review" && !s.prompt.startsWith("You are a code")) {
+        const round = calls.primary.length;
+        const runId = ref.f?.store.listRuns({ limit: 1 })[0]?.id ?? "";
+        const deadline = Date.now() + 5_000;
+        while (!ref.f?.store.getArtifact(runId, `review-${round}.shadow.json`) && Date.now() < deadline)
+          await Bun.sleep(10);
+      }
+      return base(s);
+    });
+    ref.f = f;
     shadowOn(f);
     // One slot per provider: the single review holds beta's, which the shadow finder would route to.
     for (const id of ["alpha", "beta"]) Object.assign(f.tracker.def(id) ?? {}, { maxConcurrent: 1 });
@@ -6578,7 +6591,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
   });
 
   /** Quick roster: a finder that answers at once and a lens finder that waits until released or aborted. */
-  const slowShadow = (calls: Calls, gate: Promise<void>) => {
+  const slowShadow = (calls: Calls, gate: Promise<void>, ignoreAbort = false) => {
     const slow: AgentSpec[] = [];
     const release: (() => void)[] = [];
     let started: () => void = () => {};
@@ -6595,7 +6608,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
         return new Promise<FakeReply>((resolve) => {
           const done = () => resolve({ structured: approve, costEquivUsd: 0.5 });
           release.push(done);
-          s.signal.addEventListener("abort", done);
+          if (!ignoreAbort) s.signal.addEventListener("abort", done);
         });
       }
       if (s.prompt.startsWith("You are a code-review verifier")) return confirm(s);
@@ -6653,6 +6666,34 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     expect(f.store.getArtifact(run.id, "review-0.shadow.json")).toBe(stored);
     expect(f.tracker.status("beta")?.inFlight).toBe(0);
     expect(f.store.listInvocations(run.id).filter((i) => i.role === "review_shadow")).toHaveLength(2);
+  });
+
+  test("a shadow call still running after its abort never holds the run past the grace period or touches its worktree", async () => {
+    const calls = newCalls();
+    const { handler, slow, release } = slowShadow(calls, Promise.resolve(), true);
+    const f = start(handler);
+    shadowOn(f);
+    slowRoster(f);
+    f.deps.cfg.reviewShadowGraceSeconds = 0;
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const stage = f.store.listStages(run.id).find((st) => st.name === "review");
+    expect((stage?.finishedAt ?? Infinity) - (stage?.startedAt ?? 0)).toBeLessThan(3_000);
+    const stored = f.store.getArtifact(run.id, "review-0.shadow.json");
+    expect(JSON.parse(stored ?? "null")).toMatchObject({ status: "timeout" });
+    // The pending call reads its own checkout of the reviewed commit, not the run's worktree.
+    const worktree = f.store.getRunState<RunState>(run.id)?.worktreePath;
+    expect(slow[0]?.signal.aborted).toBe(true);
+    expect(slow[0]?.cwd).not.toBe(worktree);
+    expect(slow[0]?.cwd).not.toContain(worktree ?? "?");
+    for (const done of release) done();
+    const deadline = Date.now() + 5_000;
+    while ((f.tracker.status("beta")?.inFlight ?? 0) > 0 && Date.now() < deadline) await Bun.sleep(10);
+    expect(f.tracker.status("beta")?.inFlight).toBe(0);
+    expect(f.store.getArtifact(run.id, "review-0.shadow.json")).toBe(stored);
+    // Its checkout goes once its last call ends.
+    while (existsSync(slow[0]?.cwd ?? "") && Date.now() < deadline) await Bun.sleep(10);
+    expect(existsSync(slow[0]?.cwd ?? "")).toBe(false);
   });
 
   test("cancelling the run aborts the shadow while the single review waits on its grace period", async () => {

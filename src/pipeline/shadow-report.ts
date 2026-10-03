@@ -3,7 +3,10 @@ import type { Store } from "../db/store.ts";
 import type { GhRunner } from "../integrations/github.ts";
 
 type Spot = { file: string; line?: number | null };
-/** A PR commit with the lines it changed, or a review comment (inline ones have a location). */
+/**
+ * A PR commit with the lines it changed (a file whose patch GitHub omitted has a null line), or a
+ * review comment (inline ones have a location).
+ */
 export type HistoryRecord = Record<"source" | "at", string> & {
   kind: "commit" | "review";
   spots: Spot[];
@@ -34,7 +37,7 @@ const COMMENTS =
   ".[] | {author: .user.login, file: .path, line: (.line // .original_line), source: .html_url, at: .created_at}";
 const COMMITS = ["--json", "commits", "--jq", "[.commits[] | {oid, at: .committedDate}]"];
 const PATCHES = ["--jq", "[.files[] | {filename, patch}]"];
-type Patch = { filename: string; patch?: string };
+type Patch = { filename: string; patch?: string | null };
 export const ghPrHistory = (gh: GhRunner): HistoryReader => {
   const json = async (args: string[]) => JSON.parse(String(await gh(args)));
   const view = async ({ prUrl, repoSlug }: Run): Promise<HistoryRecord[]> => {
@@ -42,8 +45,10 @@ export const ghPrHistory = (gh: GhRunner): HistoryReader => {
     const records: HistoryRecord[] = [];
     for (const { oid, at } of commits) {
       const files: Patch[] = await json(["api", `repos/${repoSlug}/commits/${oid}`, ...PATCHES]);
-      const spots = files.flatMap((f) =>
-        changedLines(f.patch ?? "").map((line) => ({ file: f.filename, line })),
+      const spots = files.flatMap((f): Spot[] =>
+        f.patch === undefined || f.patch === null
+          ? [{ file: f.filename, line: null }]
+          : changedLines(f.patch).map((line) => ({ file: f.filename, line })),
       );
       records.push({ kind: "commit", source: `commit ${oid}`, at, spots });
     }
@@ -153,12 +158,17 @@ export async function shadowReport(
       row.panel = panel.map(label);
       const shared = panel.filter((f) => (single ?? []).some((s) => near(f, s)));
       row.shared = shared.map(label);
+      const settled = row.history && done;
       for (const f of panel.filter((f) => !shared.includes(f))) {
         const evidence: Evidence[] = records
           .filter((r) => r.spots.some((spot) => near(f, spot)))
           .map(({ kind, source, at }) => ({ kind, source, at, basis: BASIS[kind] }));
         const fixed = evidence.some((e) => e.kind === "commit");
-        const noMatch = row.history && done ? "converged-without-fix" : "unknown";
+        // A later commit changed this file but its patch is unavailable: no evidence either way.
+        const unseen = (s: Spot) => s.line == null && path(s.file) === path(f.file);
+        const blind = !fixed && records.some((r) => r.kind === "commit" && r.spots.some(unseen));
+        if (blind) row.history = false;
+        const noMatch = settled && !blind ? "converged-without-fix" : "unknown";
         const outcome = fixed ? "fixed" : evidence.length ? "review-matched" : noMatch;
         row.panelOnly.push({ finding: label(f), outcome, evidence });
       }

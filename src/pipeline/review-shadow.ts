@@ -1,11 +1,15 @@
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 import type { ResolvedProfile, ReviewSystem } from "../core/types.ts";
+import { addDetachedWorktree } from "../git/repos.ts";
+import { sh } from "../util/proc.ts";
 import { type InvokeOutcome, NoCapacityError, type RunContext, type ShadowInvoke } from "./context.ts";
 import { type ReviewDeps, type ReviewInput, runReview } from "./review.ts";
 import { configuredReviewSystem } from "./review-system.ts";
 import { parseArtifact } from "./shadow-report.ts";
+import { createSnapshotParent } from "./snapshots.ts";
 
 const SHADOW_MIN_HEADROOM = 0.1;
-const ABORT_SETTLE_MS = 10_000;
 export type ShadowDeps = (system: ReviewSystem, shadow?: ShadowInvoke) => ReviewDeps<InvokeOutcome>;
 
 /**
@@ -47,6 +51,7 @@ export function startShadow(
     const artifact = { round, system: system?.name, baseSha, reviewedSha, range, ...record, usage };
     store.putArtifact(ctx.run.id, name, "review-shadow", JSON.stringify(artifact, null, 2));
   };
+  let parent: string | undefined;
   const work = (async () => {
     try {
       const lenses = ctx.state.shadowLenses;
@@ -63,6 +68,11 @@ export function startShadow(
         .filter((id) => tracker.def(id)?.billing === "subscription" && tracker.isEnabled(id));
       const low = providers.find((id) => unknown(id) || stop(id));
       if (low) throw new NoCapacityError(unknown(low) ? `${low} quota headroom is unknown` : stop(low));
+      const worktree = ctx.state.worktreePath;
+      if (!worktree) throw new NoCapacityError("run has no worktree");
+      parent = createSnapshotParent();
+      shadow.cwd = join(parent, "shadow");
+      await addDetachedWorktree(worktree, reviewedSha, shadow.cwd, shadow.signal);
       const { previous: _previous, fixReview: _fix, ...prompt } = input.prompt;
       const request = { ...input, prompt, system: built, replayedFollowUps: undefined };
       const panelDeps = deps(built, shadow);
@@ -80,6 +90,11 @@ export function startShadow(
       const skipped = error instanceof NoCapacityError || !shadow.ids.length;
       const status = abort.signal.aborted ? "timeout" : skipped ? "skipped" : "error";
       write({ status, reason, finished });
+    } finally {
+      // Only now, after its last call ends, possibly after the run moved on.
+      if (parent) rmSync(parent, { recursive: true, force: true });
+      const { worktreePath: cwd } = ctx.state;
+      if (parent && cwd) await sh(["git", "worktree", "prune"], { cwd, allowFail: true });
     }
   })().catch(() => {}); // A failed artifact write must not fail the production review.
   const settle = async (ms: number) => {
@@ -91,8 +106,7 @@ export function startShadow(
     await settle(graceMs);
     if (written) return;
     abort.abort();
+    // Calls still ending work in the shadow's own checkout, so the run need not wait for them.
     write({ status: "timeout", reason: `running ${graceMs / 1000}s after the single review`, finished });
-    // Aborted calls still clean the worktree as they end; let them, briefly, before the run moves on.
-    await settle(ABORT_SETTLE_MS);
   };
 }

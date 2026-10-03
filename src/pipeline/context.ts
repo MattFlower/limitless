@@ -176,6 +176,8 @@ export class NoCapacityError extends Error {}
  */
 export interface ShadowInvoke {
   signal: AbortSignal;
+  /** Its own checkout, so calls still ending after the run moves on never touch the worktree. */
+  cwd?: string;
   stop(provider: string): string | undefined;
   ids: number[];
 }
@@ -537,7 +539,7 @@ export class RunContext {
       try {
         const spec: AgentSpec = {
           fast: invocation.fast,
-          cwd: opts.cwd ?? this.state.worktreePath ?? this.runDir,
+          cwd: opts.cwd ?? shadow?.cwd ?? this.state.worktreePath ?? this.runDir,
           prompt: opts.prompt,
           systemAppend: [opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n"),
           target,
@@ -600,8 +602,8 @@ export class RunContext {
       } finally {
         release();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
-        if ((opts.role === "review" || opts.role === "verify") && this.state.worktreePath)
-          await discardChanges(this.state.worktreePath);
+        const checkout = shadow?.cwd ?? this.state.worktreePath;
+        if ((opts.role === "review" || opts.role === "verify") && checkout) await discardChanges(checkout);
       }
       if (signal.aborted)
         result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };

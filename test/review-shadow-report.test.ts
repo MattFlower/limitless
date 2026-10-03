@@ -243,6 +243,37 @@ test.each([
   );
 });
 
+test("a later commit whose patch GitHub omitted for the finding's file leaves it unknown, history incomplete", async () => {
+  at(0);
+  const run = store.createRun(repoOf("owner/a"), { repo: "owner/a", prompt: "work" });
+  store.updateRun(run.id, { status: "succeeded", prUrl: PR });
+  at(2);
+  put(run, "review-0.json", review([]));
+  put(
+    run,
+    "review-0.shadow.json",
+    shadow([finding("src/a.ts", 40, "Big file"), finding("src/z.ts", 9, "Other")]),
+  );
+  const gh: GhRunner = async (args) => {
+    if (args[0] === "pr")
+      return JSON.stringify([
+        { oid: "head", at: hour(2) },
+        { oid: "later", at: hour(3) },
+      ]);
+    if (args.includes("--paginate")) return "";
+    return JSON.stringify(args[1]?.endsWith("/later") ? [{ filename: "src/a.ts", patch: null }] : []);
+  };
+  const [row] = (await shadowReport(store, ghPrHistory(gh))).rows;
+  expect(row?.history).toBe(false);
+  expect(outcomes(row)).toEqual({
+    "src/a.ts:40: Big file": ["unknown", []],
+    "src/z.ts:9: Other": ["converged-without-fix", []],
+  });
+  expect(formatShadowReport({ rows: row ? [row] : [], limit: 200, capped: false })).toContain(
+    "evidence incomplete",
+  );
+});
+
 test("changed lines count additions and deletions, never unchanged context", () => {
   const patch = [
     "@@ -10,6 +10,7 @@ function f() {",
@@ -492,7 +523,7 @@ test("ghPrHistory reads commit patches and inline review comments with gh only; 
     { oid: "abc123", at: hour(4) },
     { oid: "d0c5", at: hour(5) },
   ];
-  const files: Record<string, { filename: string; patch?: string }[]> = {
+  const files: Record<string, { filename: string; patch?: string | null }[]> = {
     abc123: [
       { filename: "src/a.ts", patch: "@@ -10,3 +10,3 @@\n same\n-old\n+new\n same" },
       { filename: "img.png" },
@@ -518,9 +549,11 @@ test("ghPrHistory reads commit patches and inline review comments with gh only; 
       kind: "commit",
       source: "commit abc123",
       at: hour(4),
+      // GitHub omits some patches (binaries, large diffs): the file changed, its lines are unknown.
       spots: [
         { file: "src/a.ts", line: 11 },
         { file: "src/a.ts", line: 11 },
+        { file: "img.png", line: null },
       ],
     },
     { kind: "commit", source: "commit d0c5", at: hour(5), spots: [{ file: "docs/NOTES.md", line: 1 }] },

@@ -1157,7 +1157,7 @@ async function oneRound(
           ...(shadow ? { shadow } : {}),
           requireStructured: true,
         });
-        await discardChanges(cwd);
+        await discardChanges(shadow?.cwd ?? cwd);
         return invoked;
       };
       const reviewDeps: ShadowDeps = (system, shadow) => {
