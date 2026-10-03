@@ -672,6 +672,37 @@ describe("local factory clones", () => {
     expect(existsSync(markers)).toBe(false);
   });
 
+  test("config hooks activated only by the factory clone's git directory never run", async () => {
+    const marker = join(home, "conditional-hook-ran");
+    const f = start(reply);
+    // Inactive wherever the factory discovers hooks before the clone exists; active inside it.
+    const conditional = join(home, "conditional.gitconfig");
+    const hook = "hook.conditional";
+    writeFileSync(
+      conditional,
+      `[${hook}]\n\tcommand = touch '${marker}'\n${["reference-transaction", "post-checkout", "pre-push"]
+        .map((event) => `\tevent = ${event}\n`)
+        .join("")}`,
+    );
+    mkdirSync(f.cfg.paths.repos, { recursive: true });
+    const globalConfig = join(home, "includeif.gitconfig");
+    writeFileSync(
+      globalConfig,
+      `[includeIf "gitdir:${realpathSync(f.cfg.paths.repos)}/"]\n\tpath = ${conditional}\n`,
+    );
+    await withEnv("GIT_CONFIG_GLOBAL", globalConfig, async () => {
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const repo = f.store.getRepo(run.repoId);
+      const result = f.store.getRun(run.id);
+      if (!repo) throw new Error("missing repo");
+      // The include is in force in the clone: only the factory's blanking keeps the hook quiet.
+      expect(await git(cachePath(f.cfg.paths, repo), "config", `${hook}.command`)).toBe(`touch '${marker}'`);
+      expect(await git(repoDir, "rev-parse", `refs/heads/${result?.branch}`)).toBe(result?.headSha ?? "");
+    });
+    expect(existsSync(marker)).toBe(false);
+  });
+
   test("delivery push runs no maintenance or gc in the source repository", async () => {
     const f = start(reply);
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });

@@ -195,25 +195,25 @@ async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Pro
     // Clone to a temporary path and rename, so a crash never leaves a half-configured cache.
     const tmp = `${cache}.tmp-${process.pid}-${Date.now()}`;
     try {
-      await worktreeGit(
-        [
-          "git",
-          "clone",
-          "--bare",
-          // An empty template keeps init.templateDir hooks out of the factory clone.
-          ...(repo.kind === "local" ? ["--shared", "--dissociate", "--template="] : []),
-          (repo.kind === "local" ? repo.localPath : repo.url) as string,
-          tmp,
-        ],
-        { cwd: paths.repos, timeoutMs: 600_000, signal },
-      );
       if (repo.kind === "local") {
-        // Own the objects so source gc cannot break retained runs; track source heads only via fetch.
-        const refs = await worktreeGit(["git", "for-each-ref", "--format=delete %(refname)", "refs/heads"], {
+        // Not `git clone`: config conditional on the new git directory (includeIf) can define hooks
+        // that clone, and even init, would run before any lookup could see them. A bare skeleton
+        // git already recognises lets every command, init included, discover and blank those hooks.
+        // The fetch below fills it, so it owns its objects (source gc cannot break retained runs);
+        // the empty template keeps init.templateDir hooks out.
+        for (const dir of ["objects", "refs"]) mkdirSync(join(tmp, dir), { recursive: true });
+        writeFileSync(join(tmp, "HEAD"), "ref: refs/heads/main\n");
+        await worktreeGit(["git", "init", "-q", "--bare", "--template="], { cwd: tmp, signal });
+        await worktreeGit(["git", "config", "remote.origin.url", repo.localPath as string], {
           cwd: tmp,
           signal,
         });
-        await worktreeGit(["git", "update-ref", "--stdin"], { cwd: tmp, stdin: refs.stdout, signal });
+      } else {
+        await worktreeGit(["git", "clone", "--bare", repo.url as string, tmp], {
+          cwd: paths.repos,
+          timeoutMs: 600_000,
+          signal,
+        });
       }
       await worktreeGit(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
         cwd: tmp,
