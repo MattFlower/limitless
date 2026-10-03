@@ -3,7 +3,7 @@ import type { Factory } from "../app.ts";
 import { mountDiscord } from "./discord.ts";
 import { type GhRunner, githubWebhook, runGh } from "./github.ts";
 import { type GitHubPrClient, getGitHubPr, startGitHubNotifier } from "./github-notifier.ts";
-import { type GitHubClient, startGitHubPoller } from "./github-poller.ts";
+import { type GitHubClient, observedPrs, startGitHubPoller } from "./github-poller.ts";
 import { mountMcp } from "./mcp-http.ts";
 
 export interface Integrations {
@@ -28,8 +28,8 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
     factory.store,
     deps.gh ?? runGh,
     console.warn,
-    deps.prClient ?? getGitHubPr,
-    !factory.cfg.githubPoll,
+    // While polling, merge reconciliation reads the poller's observations instead of `gh pr view`.
+    factory.cfg.githubPoll ? observedPrs(factory.store) : (deps.prClient ?? getGitHubPr),
   );
   const seconds = factory.cfg.githubPollSeconds;
   const stopPoller = factory.cfg.githubPoll

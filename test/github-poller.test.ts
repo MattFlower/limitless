@@ -15,12 +15,11 @@ const ci = (node: PrNode, rollup: unknown) => {
   const head = node.commits.nodes[0];
   if (head) head.commit.statusCheckRollup = rollup;
 };
-const snapshotOf = (prUrl: string) =>
-  (
-    h.store.db.query("SELECT snapshot FROM github_prs WHERE url = ?").get(prUrl) as {
-      snapshot: string | null;
-    }
-  )?.snapshot;
+const snapshotOf = (prUrl: string) => {
+  const data = h.store.githubPrData(prUrl);
+  if (!data) throw new Error(`no snapshot for ${prUrl}`);
+  return data;
+};
 const rollup = (state: string, contexts: Record<string, unknown>[] = []) => ({
   state,
   contexts: { nodes: contexts },
@@ -514,4 +513,54 @@ test("diff ignores marker deletion and baselines CI and activity on first sight"
   expect(diffPr(snap, { ...snap, activity: { ...snap.activity, comment: null } })).toEqual([]);
   expect(normalizePr(null)).toBeNull();
   h = pollerHarness();
+});
+
+test("GraphQL partial errors never overwrite the last successful snapshot", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  const pr = h.node("o/r", 1);
+  pr.reviewDecision = "APPROVED";
+  h.start();
+  await h.advance(0);
+  const before = snapshotOf(url("o/r", 1));
+  const partial = { ...pr, reviewDecision: null, mergeable: null };
+  h.gh.next.push(
+    respond(200, { data: { nodes: [partial] }, errors: [{ type: "FORBIDDEN", path: ["nodes", 0, "x"] }] }),
+    respond(200, { data: { nodes: [{ ...pr, headRefOid: null }] } }),
+  );
+  await h.advance(15 * S);
+  await h.advance(15 * S);
+  expect(snapshotOf(url("o/r", 1))).toBe(before);
+  await h.advance(15 * S);
+  expect(kinds()).toEqual([]);
+});
+
+test("an unsuccessful node lookup does not clear an unresolved access episode", async () => {
+  h = pollerHarness();
+  h.store.setGithubAccess("o/r", { reason: "sso", detail: "SSO" });
+  h.fresh();
+  h.factoryPr("o/r", 1);
+  h.gh.next.push(respond(500, { message: "boom" }));
+  h.start();
+  await h.advance(0);
+  expect(h.store.githubAccessProblems()).toHaveLength(1);
+  await h.advance(15 * S);
+  expect(h.store.githubAccessProblems()).toHaveLength(0);
+  h.store.setGithubAccess("o/r", { reason: "sso", detail: "SSO" });
+  expect(h.fresh().map((i) => i.kind)).toEqual(["github.access_problem"]);
+});
+
+test("a delivery adopts the 15 second cadence without waiting for the old deadline", async () => {
+  h = pollerHarness();
+  const run = h.factoryPr("o/r", 1, "running");
+  h.start();
+  await h.advance(0);
+  await h.advance(5 * S);
+  h.store.updateRun(run.id, { status: "succeeded" });
+  await h.advance(9 * S);
+  expect(h.gh.graphql()).toHaveLength(1);
+  await h.advance(S);
+  expect(h.gh.graphql()).toHaveLength(2);
+  await h.advance(15 * S);
+  expect(h.gh.graphql()).toHaveLength(3);
 });

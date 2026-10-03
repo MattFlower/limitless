@@ -64,10 +64,8 @@ export interface Config {
   /** Decision-model triage declines (falls through to the next model) below this answer confidence. */
   triageDecisionConfidence: number;
   githubOwner: string | null; // allowlisted GitHub login for triggers
-  /** `[github] poll`: observe factory PRs by polling; off restores the notifier's per-run PR checks. */
-  githubPoll: boolean;
-  /** `[github] poll_seconds`: the normal polling interval, at least 15. */
-  githubPollSeconds: number;
+  githubPoll: boolean; // [github] poll: observe factory PRs; off restores the notifier's per-run PR checks
+  githubPollSeconds: number; // [github] poll_seconds: the normal polling interval, at least 15
   discordOwnerId: string | null;
   discordChannelId: string | null;
   discordNotifyAll: boolean;

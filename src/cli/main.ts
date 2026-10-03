@@ -408,15 +408,11 @@ async function main(): Promise<void> {
       return;
     }
     case "doctor": {
-      const [{ loadConfig }, { Store }, { githubDoctor }] = await Promise.all([
-        import("../config.ts"),
-        import("../db/store.ts"),
-        import("../integrations/github-poller.ts"),
-      ]);
-      const store = new Store(loadConfig().paths.db);
-      const lines = githubDoctor(store);
+      const { Store } = await import("../db/store.ts");
+      const store = new Store((await import("../config.ts")).loadConfig().paths.db);
+      const lines = (await import("../integrations/github-poller.ts")).githubDoctor(store);
       store.close();
-      for (const line of lines) console.log(line);
+      console.log(lines.join("\n"));
       if (lines.length > 1) process.exitCode = 1;
       return;
     }

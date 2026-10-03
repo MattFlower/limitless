@@ -11,8 +11,8 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 test("doctor lists persisted access problems with the fix, from the database alone", () => {
   let store = new Store(join(dir, "db.sqlite"));
   expect(githubDoctor(store)).toEqual(["GitHub access: ok"]);
-  store.setGithubAccess("acme/app", { reason: "sso", detail: "SSO authorization required", head: null });
-  store.setGithubAccess("acme/ip", { reason: "ip", detail: "IP allow list", head: "a".repeat(40) });
+  store.setGithubAccess("acme/app", { reason: "sso", detail: "SSO authorization required" });
+  store.setGithubAccess("acme/ip", { reason: "ip", detail: "IP allow list" }, "a".repeat(40));
   store.close();
   store = new Store(join(dir, "db.sqlite"));
   const lines = githubDoctor(store).join("\n");

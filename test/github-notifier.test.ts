@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,8 @@ import {
   reconcileMergedRuns,
   startGitHubNotifier,
 } from "../src/integrations/github-notifier.ts";
+import { observedPrs } from "../src/integrations/github-poller.ts";
+import { pollerHarness } from "./github-poller-support.ts";
 
 let dir: string;
 let store: Store;
@@ -362,7 +364,6 @@ test("startup polling includes succeeded PRs and never overlaps event-triggered 
 });
 
 test("with polling, observations reconcile runs: merged metadata, resolution, dependants and one run.merged", async () => {
-  const { pollerHarness } = await import("./github-poller-support.ts");
   const h = pollerHarness();
   try {
     const human = h.factoryPr("o/r", 1, "needs_human");
@@ -372,13 +373,12 @@ test("with polling, observations reconcile runs: merged metadata, resolution, de
     const closed = h.factoryPr("o/r", 3);
     const dependant = h.store.createRun(h.repo("o/r"), { repo: "o/r", prompt: "next", dependsOn: [done.id] });
     expect(dependant.status).toBe("waiting");
-    const legacy = mock(async () => null);
+    // Wired as mountIntegrations does with polling on: the notifier reads observations, never GitHub.
     const stopNotifier = startGitHubNotifier(
       h.store,
       async () => {},
       () => {},
-      legacy,
-      false,
+      observedPrs(h.store),
     );
     h.start();
     await h.advance(0);
@@ -392,7 +392,6 @@ test("with polling, observations reconcile runs: merged metadata, resolution, de
     await h.advance(15_000);
     await h.advance(15_000);
     stopNotifier();
-    expect(legacy).not.toHaveBeenCalled();
     const mergedAt = Date.parse("2026-10-03T05:00:00Z");
     expect(h.store.getRun(human.id)).toMatchObject({
       status: "resolved",
@@ -413,24 +412,68 @@ test("with polling, observations reconcile runs: merged metadata, resolution, de
     expect(feed.filter((i) => i.kind === "run.merged").map((i) => i.runId)).toEqual([human.id, done.id]);
     expect(feed.filter((i) => i.kind === "pr.merged")).toHaveLength(2);
     expect(feed.filter((i) => i.kind === "pr.closed")).toHaveLength(1);
+    expect(h.gh.calls.every((c) => c.path === "graphql" || /^repos\/o\/r\/pulls\/\d$/.test(c.path))).toBe(
+      true,
+    );
   } finally {
     h.close();
   }
 });
 
-test("with polling on, the notifier never reads PRs itself", async () => {
-  const client = mock(async () => null);
-  needsHuman();
-  const stop = startGitHubNotifier(
-    store,
-    async () => {},
-    () => {},
-    client,
-    false,
-  );
-  await Bun.sleep(0);
-  needsHuman();
-  await Bun.sleep(0);
-  stop();
-  expect(client).not.toHaveBeenCalled();
+test("a terminal observation reconciles a run that finishes delivery later, including after a restart", async () => {
+  const h = pollerHarness();
+  try {
+    const run = h.factoryPr("o/r", 1, "running");
+    h.start();
+    await h.advance(0);
+    const node = h.node("o/r", 1);
+    node.state = "MERGED";
+    node.mergedAt = "2026-10-03T05:00:00Z";
+    await h.advance(45_000);
+    expect(h.store.getRun(run.id)?.merged).toBe(false);
+    const calls = h.gh.calls.length;
+    h.reopen();
+    const stopNotifier = startGitHubNotifier(
+      h.store,
+      async () => {},
+      () => {},
+      observedPrs(h.store),
+    );
+    h.start();
+    h.store.updateRun(run.id, { status: "succeeded" });
+    for (let i = 0; i < 20 && !h.store.getRun(run.id)?.merged; i++) await Bun.sleep(1);
+    stopNotifier();
+    expect(h.store.getRun(run.id)).toMatchObject({
+      merged: true,
+      mergedAt: Date.parse("2026-10-03T05:00:00Z"),
+    });
+    expect(h.store.readFeed({ limit: 1000 }).items.filter((i) => i.kind === "run.merged")).toHaveLength(1);
+    expect(h.gh.calls.length).toBe(calls);
+  } finally {
+    h.close();
+  }
+});
+
+test("a terminal observation whose feed write fails stays retryable and reconciles only once written", async () => {
+  const h = pollerHarness();
+  try {
+    const run = h.factoryPr("o/r", 1);
+    h.start();
+    await h.advance(0);
+    h.store.db.exec(
+      "CREATE TEMP TRIGGER boom BEFORE INSERT ON feed WHEN NEW.kind = 'pr.merged' BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    );
+    const node = h.node("o/r", 1);
+    node.state = "MERGED";
+    node.mergedAt = "2026-10-03T05:00:00Z";
+    await h.advance(15_000);
+    expect(h.store.getRun(run.id)?.merged).toBe(false);
+    h.store.db.exec("DROP TRIGGER boom");
+    await h.advance(15_000);
+    const kinds = h.store.readFeed({ limit: 1000 }).items.map((i) => i.kind);
+    expect(kinds.filter((k) => k === "pr.merged" || k === "run.merged")).toEqual(["pr.merged", "run.merged"]);
+    expect(h.store.getRun(run.id)?.merged).toBe(true);
+  } finally {
+    h.close();
+  }
 });

@@ -1,159 +1,117 @@
-import type { GitHubFeedItem, GitHubFeedKind, TrackedPr } from "../core/types.ts";
+import type { GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { sh } from "../util/proc.ts";
-import { reconcilePr } from "./github-notifier.ts";
+import { type GitHubPrClient, type GitHubPrState, reconcileMergedRuns } from "./github-notifier.ts";
 
-export interface GitHubResponse {
-  status: number;
-  headers: Headers;
-  body: unknown;
-}
+export type GitHubResponse = { status: number; headers: Headers; body: unknown };
 /** One authenticated GitHub API call: a GraphQL POST when `body` is given, else a REST GET. */
 export type GitHubClient = (path: string, body?: unknown) => Promise<GitHubResponse>;
 
-let token: string | null = null;
-/** Uses the gh CLI's OAuth token, so no webhook or GitHub App is needed. */
+/** Uses the gh CLI's OAuth token (read per request, so refreshes apply), so no webhook or App is needed. */
 export const ghClient: GitHubClient = async (path, body) => {
-  token ??= (await sh(["gh", "auth", "token"], { cwd: process.cwd(), timeoutMs: 30_000 })).stdout.trim();
+  const token = (await sh(["gh", "auth", "token"], { cwd: process.cwd(), timeoutMs: 30_000 })).stdout.trim();
   const res = await fetch(`https://api.github.com/${path}`, {
-    method: body === undefined ? "GET" : "POST",
     headers: { authorization: `bearer ${token}`, accept: "application/vnd.github+json" },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    ...(body === undefined ? {} : { method: "POST", body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(30_000),
   });
-  if (res.status === 401) token = null;
   return { status: res.status, headers: res.headers, body: await res.json().catch(() => null) };
 };
 
-const ACTIVITY = "nodes { id updatedAt }";
 export const OBSERVE_QUERY = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on PullRequest {
   id url headRefOid state mergeable mergeStateStatus reviewDecision updatedAt mergedAt mergedBy { login }
   commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
     ... on CheckRun { name conclusion url: detailsUrl }
     ... on StatusContext { name: context state url: targetUrl } } } } } } }
-  reviews(last: 1) { nodes { id updatedAt comments(last: 1) { ${ACTIVITY} } } }
-  comments(last: 1) { ${ACTIVITY} } } } }`;
+  reviews(last: 1) { nodes { id updatedAt comments(last: 1) { nodes { id updatedAt } } } }
+  comments(last: 1) { nodes { id updatedAt } } } } }`;
 
 type Conn<T> = { nodes?: (T | null)[] } | null | undefined;
 type Activity = { id: string; updatedAt: string };
 type Context = { name?: string; conclusion?: string | null; state?: string; url?: string | null };
-interface GqlPr {
-  id?: string;
-  url?: string;
-  headRefOid?: string;
-  state?: string;
-  mergeable?: string;
-  mergeStateStatus?: string;
-  reviewDecision?: string | null;
-  updatedAt?: string;
-  mergedAt?: string | null;
-  mergedBy?: { login: string } | null;
+const REQUIRED = ["id", "url", "headRefOid", "state", "mergeable", "mergeStateStatus", "updatedAt"] as const;
+type Base = Record<(typeof REQUIRED)[number], string> & GitHubPrState & { reviewDecision: string | null };
+type GqlPr = Base & {
   commits?: Conn<{ commit?: { statusCheckRollup?: { state: string; contexts?: Conn<Context> } | null } }>;
   reviews?: Conn<Activity & { comments?: Conn<Activity> }>;
   comments?: Conn<Activity>;
-}
-
+};
 /** A PR's normalized state; collections are reduced and sorted so reordering is not a change. */
-export interface PrSnapshot {
-  head: string;
-  state: string;
-  mergeable: string;
-  mergeState: string;
+export type PrSnapshot = Base & {
   ci: string | null;
   failing: { name: string; url: string | null }[];
-  review: string | null;
-  updatedAt: string;
-  mergedAt: string | null;
-  mergedBy: string | null;
-  activity: { review: string | null; review_comment: string | null; comment: string | null };
-}
-
+  activity: Record<"review" | "review_comment" | "comment", string | null>;
+};
+type Saved = PrSnapshot & { revision: number; unknown: number; nudged: string | null };
+const saved = (data: string | null | undefined) => (data ? (JSON.parse(data) as Saved) : null);
 const FAILING = new Set(["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const last = <T>(c: Conn<T>): T | null => c?.nodes?.at(-1) ?? null;
 const marker = (a: Activity | null | undefined) => (a ? `${a.id}@${a.updatedAt}` : null);
 
-export function normalizePr(node: unknown): PrSnapshot | null {
-  const pr = (node ?? {}) as GqlPr;
-  if (!pr.id || !pr.url || !pr.headRefOid || !pr.state) return null;
-  const rollup = last(pr.commits)?.commit?.statusCheckRollup ?? null;
-  const contexts = (rollup?.contexts?.nodes ?? []).filter((c): c is Context => !!c?.name);
-  const review = last(pr.reviews);
+/** Null unless `node` is a complete PullRequest (with the expected id, when given). */
+export function normalizePr(node: unknown, id?: string | null): PrSnapshot | null {
+  const pr = node as GqlPr | null;
+  if (!pr || REQUIRED.some((k) => typeof pr[k] !== "string") || (id && pr.id !== id)) return null;
+  const { commits, reviews, comments, ...base } = pr;
+  const rollup = last(commits)?.commit?.statusCheckRollup ?? null;
+  const [r, c] = [last(reviews), last(comments)];
+  const failing = (rollup?.contexts?.nodes ?? []).flatMap((x) =>
+    x?.name && FAILING.has(x.conclusion ?? x.state ?? "") ? [{ name: x.name, url: x.url ?? null }] : [],
+  );
   return {
-    head: pr.headRefOid,
-    state: pr.state,
-    mergeable: pr.mergeable ?? "UNKNOWN",
-    mergeState: pr.mergeStateStatus ?? "UNKNOWN",
+    ...base,
     ci: rollup?.state ?? null,
-    failing: contexts
-      .filter((c) => FAILING.has(c.conclusion ?? c.state ?? ""))
-      .map((c) => ({ name: c.name as string, url: c.url ?? null }))
-      .sort((a, b) => a.name.localeCompare(b.name)),
-    review: pr.reviewDecision ?? null,
-    updatedAt: pr.updatedAt ?? "",
-    mergedAt: pr.mergedAt ?? null,
-    mergedBy: pr.mergedBy?.login ?? null,
-    activity: {
-      review: marker(review),
-      review_comment: marker(last(review?.comments)),
-      comment: marker(last(pr.comments)),
-    },
+    failing: failing.sort((a, b) => a.name.localeCompare(b.name)),
+    activity: { review: marker(r), review_comment: marker(last(r?.comments)), comment: marker(c) },
   };
 }
 
-type Change = { kind: GitHubFeedKind; key: string; data: Record<string, unknown> };
-const outcome = (s: PrSnapshot) =>
-  s.ci === "SUCCESS" ? "passed" : s.ci === "FAILURE" || s.ci === "ERROR" ? "failed" : null;
-
+type Change = { kind: GitHubFeedKind; key: string; data: Record<string, unknown>; summary: string };
+const OUTCOME: Record<string, string> = { SUCCESS: "passed", FAILURE: "failed", ERROR: "failed" };
 /** The feed-worthy changes from `prev` to `next`; a first observation is a baseline for CI and activity. */
 export function diffPr(prev: PrSnapshot | null, next: PrSnapshot): Change[] {
   const out: Change[] = [];
-  const add = (kind: GitHubFeedKind, key = "", data: Record<string, unknown> = {}) =>
-    out.push({ kind, key, data });
-  const ci = outcome(next);
-  if (prev && ci && (prev.head !== next.head || outcome(prev) !== ci))
-    add(
-      ci === "passed" ? "pr.ci_passed" : "pr.ci_failed",
-      "",
-      ci === "failed" ? { failing: next.failing } : {},
-    );
+  const at = `at ${next.headRefOid.slice(0, 12)}`;
+  const add = (kind: GitHubFeedKind, key = "", data = {}, summary = `${kind} ${at}`) =>
+    out.push({ kind, key, data, summary });
+  const ci = OUTCOME[next.ci ?? ""];
+  if (prev && ci && (prev.headRefOid !== next.headRefOid || OUTCOME[prev.ci ?? ""] !== ci)) {
+    const names = next.failing.map((f) => f.name).join(", ") || "unknown";
+    if (ci === "passed") add("pr.ci_passed");
+    else add("pr.ci_failed", "", { failing: next.failing }, `Failing ${at}: ${names}`);
+  }
   if (next.mergeable === "CONFLICTING" && prev?.mergeable !== "CONFLICTING") add("pr.conflicting");
-  if (next.mergeState === "BEHIND" && prev?.mergeState !== "BEHIND") add("pr.behind");
-  if (
-    prev &&
-    next.review !== prev.review &&
-    (next.review === "APPROVED" || next.review === "CHANGES_REQUESTED")
-  )
-    add("pr.review", next.review, { decision: next.review });
+  if (next.mergeStateStatus === "BEHIND" && prev?.mergeStateStatus !== "BEHIND") add("pr.behind");
+  const decision = next.reviewDecision;
+  if (prev && decision !== prev.reviewDecision && /^(APPROVED|CHANGES_REQUESTED)$/.test(decision ?? ""))
+    add("pr.review", String(decision), { decision });
   for (const [category, value] of Object.entries(next.activity))
     if (prev && value && value !== prev.activity[category as keyof PrSnapshot["activity"]])
       add("pr.comment", category, { category });
-  if ((next.state === "MERGED" || next.state === "CLOSED") && next.state !== prev?.state)
-    add(next.state === "MERGED" ? "pr.merged" : "pr.closed", "", { mergedBy: next.mergedBy });
+  if (next.state !== "OPEN" && next.state !== prev?.state)
+    add(next.state === "MERGED" ? "pr.merged" : "pr.closed", "", { mergedBy: next.mergedBy?.login });
   return out;
 }
 
-type Problem = { reason: string; detail: string };
-const errorsOf = (body: unknown) => {
-  const errors = (body as { errors?: unknown } | null)?.errors;
-  return Array.isArray(errors) ? JSON.stringify(errors) : "";
-};
-
-/** SSO, IP-allow-list and 404 failures are access problems, never PR changes. */
-export function accessProblem(res: GitHubResponse): Problem | null {
-  const text = res.status === 200 ? errorsOf(res.body) : JSON.stringify(res.body ?? "");
+const errorsOf = (res: GitHubResponse) => (res.body as { errors?: { type?: string }[] } | null)?.errors ?? [];
+/** SSO and IP-allow-list failures are access problems, never PR changes. */
+function accessProblem(res: GitHubResponse) {
+  const text = JSON.stringify(res.status === 200 ? errorsOf(res) : (res.body ?? ""));
   if (res.headers.get("x-github-sso") || /SAML|single sign-on/i.test(text))
     return { reason: "sso", detail: "The organization requires SSO authorization for the gh token" };
   if (/IP allow list|IP address/i.test(text))
     return { reason: "ip", detail: "The organization's IP allow list blocks this network" };
-  if (res.status === 404) return { reason: "not_found", detail: "A factory PR returned 404" };
   return null;
 }
-
 const isLimited = (res: GitHubResponse) =>
-  res.status === 403 || res.status === 429 || /secondary rate limit|RATE_LIMITED/i.test(errorsOf(res.body));
-
-export const FAST_SECONDS = 15;
+  [403, 429].includes(res.status) || /secondary rate limit|RATE_LIMITED/i.test(JSON.stringify(errorsOf(res)));
 const pullPath = (pr: TrackedPr) => `repos/${pr.repo}/pulls/${pr.url.slice(pr.url.lastIndexOf("/") + 1)}`;
+const headOf = (pr: TrackedPr | undefined) => saved(pr?.data)?.headRefOid ?? null;
+
+/** Merge reconciliation's PR client while polling: the poller's last observations, never a GitHub read. */
+export function observedPrs(store: Store): GitHubPrClient {
+  return async (url) => saved(store.githubPrData(url));
+}
 
 export interface PollerOptions {
   client?: GitHubClient;
@@ -164,160 +122,118 @@ export interface PollerOptions {
 
 /** Observes factory PRs with one serial GraphQL query per repository and writes changes to the feed. */
 export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () => void {
-  const client = opts.client ?? ghClient;
-  const log = opts.log ?? console.warn;
-  const now = opts.clock?.now ?? Date.now;
-  const set = opts.clock?.set ?? setTimeout;
-  const clear = opts.clock?.clear ?? clearTimeout;
-  const normal = Math.max(FAST_SECONDS, opts.seconds ?? 45) * 1000;
-  const due = new Map<string, number>();
-  let cooldownUntil = 0;
-  let failures = 0;
-  let running = false;
-  let stopped = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-
-  const schedule = (at: number) => {
-    if (timer) clear(timer);
-    timer = stopped ? null : set(() => void tick(), Math.max(0, at - now()));
-  };
-  /** Null once a rate limit has started a cooldown; nothing else may be sent until it ends. */
+  const { client = ghClient, log = console.warn } = opts;
+  const { now, set, clear } = opts.clock ?? { now: Date.now, set: setTimeout, clear: clearTimeout };
+  const normal = Math.max(15, opts.seconds ?? 45) * 1000;
+  const observedAt = new Map<string, number>();
+  let [cooldownUntil, failures, running, stopped, settled] = [0, 0, false, false, false];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  /** Null during a rate-limit (or access-block) cooldown, which every request honours. */
   const call = async (repo: string, path: string, body?: unknown): Promise<GitHubResponse | null> => {
-    if (stopped) return null;
+    if (stopped || now() < cooldownUntil) return null;
     const res = await client(path, body);
     if (!isLimited(res)) {
       failures = 0;
       return res;
     }
     const retry = Number(res.headers.get("retry-after"));
-    const wait = retry > 0 ? retry * 1000 : Math.min(60_000 * 2 ** failures++, 900_000);
-    cooldownUntil = now() + wait;
+    cooldownUntil = now() + (retry > 0 ? retry * 1000 : Math.min(60_000 * 2 ** failures++, 900_000));
     const access = accessProblem(res);
-    if (access) store.setGithubAccess(repo, { ...access, head: null });
+    if (access) store.setGithubAccess(repo, access);
     return null;
   };
 
-  const record = async (pr: TrackedPr, snap: PrSnapshot): Promise<boolean> => {
-    const prev = pr.snapshot ? (JSON.parse(pr.snapshot) as PrSnapshot) : null;
-    const unknownPolls =
-      snap.mergeable !== "UNKNOWN"
-        ? 0
-        : prev?.head === snap.head && prev.mergeable === "UNKNOWN"
-          ? pr.unknownPolls + 1
-          : 1;
-    const nudge = unknownPolls >= 3 && pr.nudgedHead !== snap.head;
-    // Runs reconcile before the snapshot advances, so a crash in between replays the merge.
-    reconcilePr(store, {
-      url: pr.url,
-      state: snap.state,
-      mergedAt: snap.mergedAt,
-      mergedBy: snap.mergedBy ? { login: snap.mergedBy } : null,
-    });
+  const record = async (pr: TrackedPr, snap: PrSnapshot) => {
+    const prev = saved(pr.data);
+    const head = snap.headRefOid;
+    const same = prev?.headRefOid === head && prev.mergeable === "UNKNOWN";
+    const unknown = snap.mergeable !== "UNKNOWN" ? 0 : same ? (prev?.unknown ?? 0) + 1 : 1;
+    const nudge = unknown >= 3 && prev?.nudged !== head;
     const changes = diffPr(prev, snap);
-    const revision = pr.revision + (changes.length ? 1 : 0);
-    const items: GitHubFeedItem[] = changes.map((c) => ({
-      kind: c.kind,
-      runId: pr.runId,
-      repo: pr.repo,
-      title: `${c.kind}: ${pr.url}`,
-      summary:
-        c.kind === "pr.ci_failed"
-          ? `Failing: ${snap.failing.map((f) => f.name).join(", ") || "unknown"}`
-          : `${c.kind} at ${snap.head.slice(0, 12)}`,
-      data: { ...c.data, url: pr.url, head: snap.head },
-      key: `${pr.url}:${snap.head}:${revision}:${c.key}`,
-    }));
-    const terminal = snap.state === "MERGED" || snap.state === "CLOSED";
-    const nudgedHead = nudge ? snap.head : unknownPolls ? pr.nudgedHead : null;
-    store.saveGithubPr(
-      { ...pr, snapshot: JSON.stringify(snap), revision, unknownPolls, nudgedHead, terminal },
-      items,
-    );
+    const revision = (prev?.revision ?? 0) + (changes.length ? 1 : 0);
+    const items = changes.map((c) => {
+      const key = `${pr.url}:${head}:${revision}:${c.key}`;
+      return { ...c, runId: pr.runId, repo: pr.repo, data: { ...c.data, url: pr.url, head }, key };
+    });
+    const nudged = nudge ? head : unknown ? (prev?.nudged ?? null) : null;
+    const data = JSON.stringify({ ...snap, revision, unknown, nudged } satisfies Saved);
+    store.saveGithubPr({ ...pr, data }, snap.state !== "OPEN", items);
+    settled ||= snap.state !== "OPEN";
     // A REST read starts GitHub's lazy mergeability computation; the next GraphQL poll reports it.
-    return !nudge || (await call(pr.repo, pullPath(pr))) !== null;
+    if (nudge) await call(pr.repo, pullPath(pr));
   };
 
-  /** False when a rate limit interrupted the cycle. */
-  const observe = async (repo: string, prs: TrackedPr[]): Promise<boolean> => {
-    let missing: TrackedPr | null = null;
+  const observe = async (repo: string, prs: TrackedPr[]) => {
+    let missing: TrackedPr | undefined;
+    let complete = true;
     for (const pr of prs.filter((p) => !p.nodeId)) {
       const res = await call(repo, pullPath(pr));
-      if (!res) return false;
-      const nodeId = (res.body as { node_id?: unknown } | null)?.node_id;
-      if (res.status === 200 && typeof nodeId === "string") store.saveGithubPr({ ...pr, nodeId });
-      else if (res.status === 404) missing = pr;
-      pr.nodeId = typeof nodeId === "string" ? nodeId : null;
+      if (!res) return;
+      const nodeId = res.status === 200 && (res.body as { node_id?: unknown } | null)?.node_id;
+      if (typeof nodeId === "string") store.saveGithubPr(Object.assign(pr, { nodeId }));
+      else complete = false;
+      if (res.status === 404) missing ??= pr;
     }
     const known = prs.filter((p) => p.nodeId);
     if (known.length) {
-      const res = await call(repo, "graphql", {
-        query: OBSERVE_QUERY,
-        variables: { ids: known.map((p) => p.nodeId) },
-      });
-      if (!res) return false;
+      const ids = known.map((p) => p.nodeId);
+      const res = await call(repo, "graphql", { query: OBSERVE_QUERY, variables: { ids } });
+      if (!res) return;
       const access = accessProblem(res);
+      if (access) store.setGithubAccess(repo, access, headOf(known[0]));
       const nodes = (res.body as { data?: { nodes?: unknown } } | null)?.data?.nodes;
-      if (access || res.status !== 200 || !Array.isArray(nodes) || nodes.length !== known.length) {
-        if (access) store.setGithubAccess(repo, { ...access, head: headOf(known[0]) });
-        return true;
-      }
+      // Partial data is never trusted; only unresolvable node ids (NOT_FOUND) leave the rest usable.
+      const failed = access || res.status !== 200 || errorsOf(res).some((e) => e.type !== "NOT_FOUND");
+      if (failed || !Array.isArray(nodes) || nodes.length !== known.length)
+        return log(`GitHub observation of ${repo} failed with HTTP ${res.status}`);
       for (const [i, pr] of known.entries()) {
-        const snap = normalizePr(nodes[i]);
-        if (!snap) missing = pr;
-        else if (!(await record(pr, snap))) return false;
+        const snap = normalizePr(nodes[i], pr.nodeId);
+        if (snap) await record(pr, snap);
+        else complete = false;
+        if (nodes[i] === null) missing ??= pr;
       }
     }
-    store.setGithubAccess(
-      repo,
-      missing
-        ? {
-            reason: "not_found",
-            detail: `${missing.url} is not visible to the gh token`,
-            head: headOf(missing),
-          }
-        : null,
-    );
-    return true;
+    const notFound = missing && { reason: "not_found", detail: `The gh token cannot see ${missing.url}` };
+    if (missing || complete) store.setGithubAccess(repo, notFound ?? null, headOf(missing));
   };
-
+  /** Each repository with tracked PRs and when it is next due; delivered PRs use the fast cadence. */
+  const plan = () =>
+    [...Map.groupBy(store.githubTracked(), (pr) => pr.repo)].map(([repo, prs]) => {
+      const interval = prs.some((p) => p.delivered) ? 15_000 : normal;
+      return { repo, prs, due: (observedAt.get(repo) ?? -Infinity) + interval };
+    });
+  const schedule = () => {
+    clear(timer);
+    const next = Math.max(cooldownUntil, Math.min(...plan().map((r) => r.due)));
+    timer = stopped || next === Infinity ? undefined : set(() => void tick(), Math.max(0, next - now()));
+  };
   const tick = async () => {
-    timer = null;
     if (stopped || running) return;
-    if (now() < cooldownUntil) return schedule(cooldownUntil);
     running = true;
-    const byRepo = Map.groupBy(store.githubTracked(), (pr) => pr.repo);
-    for (const repo of due.keys()) if (!byRepo.has(repo)) due.delete(repo);
     try {
-      for (const [repo, prs] of byRepo) {
-        if (stopped || (due.get(repo) ?? 0) > now()) continue;
-        const ok = await observe(repo, prs).catch((error: unknown) => {
-          log(`GitHub poll failed for ${repo}: ${String(error)}`);
-          return true;
-        });
-        if (!ok) break;
-        due.set(repo, now() + (prs.some((p) => p.delivered) ? FAST_SECONDS * 1000 : normal));
+      for (const { repo, prs, due } of plan()) {
+        if (stopped || due > now() || now() < cooldownUntil) continue;
+        await observe(repo, prs).catch((e: unknown) => log(`GitHub poll of ${repo} failed: ${String(e)}`));
+        // A repository a rate limit interrupted is due again as soon as the cooldown ends.
+        if (now() >= cooldownUntil) observedAt.set(repo, now());
       }
+      if (settled) await reconcileMergedRuns(store, observedPrs(store), log);
+      settled = false;
     } finally {
       running = false;
     }
-    // Repositories not yet observed (e.g. interrupted by a rate limit) are due at once.
-    const next = Math.min(...[...byRepo.keys()].map((repo) => due.get(repo) ?? 0));
-    if (byRepo.size) schedule(Math.max(next, cooldownUntil));
+    schedule();
   };
-
   const unsubscribe = store.subscribe((msg) => {
-    if (msg.kind === "run" && msg.run.prUrl && !running) schedule(Math.max(now(), cooldownUntil));
+    if (msg.kind === "run" && msg.run.prUrl && !running) schedule();
   });
-  schedule(now());
+  schedule();
   return () => {
     stopped = true;
-    if (timer) clear(timer);
+    clear(timer);
     unsubscribe();
   };
 }
-
-const headOf = (pr: TrackedPr | null | undefined) =>
-  pr?.snapshot ? (JSON.parse(pr.snapshot) as PrSnapshot).head : null;
 
 /** `limitless doctor`: persisted repository access problems and how to fix them. */
 export function githubDoctor(store: Store): string[] {

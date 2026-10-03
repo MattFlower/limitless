@@ -1,4 +1,4 @@
-import { type Run, TERMINAL_STATUSES } from "../core/types.ts";
+import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { sh } from "../util/proc.ts";
 import type { GhRunner } from "./github.ts";
@@ -20,39 +20,28 @@ export const getGitHubPr: GitHubPrClient = async (url) => {
   return JSON.parse(stdout) as GitHubPrState;
 };
 
-const awaitingMerge = (store: Store): Run[] =>
-  store
-    .listRuns({ status: ["needs_human", "succeeded"], limit: Number.MAX_SAFE_INTEGER })
-    .filter((run) => run.prUrl && !(run.merged && run.status === "succeeded"));
-
-/** Apply an observed PR state to one run awaiting its merge. */
-function applyPrState(store: Store, run: Run, pr: GitHubPrState): void {
-  if (pr.url !== run.prUrl || store.getRun(run.id)?.prUrl !== pr.url) return;
-  const mergedAt = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
-  if (pr.state === "MERGED" && Number.isFinite(mergedAt)) {
-    if (run.status === "needs_human") store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
-    else store.updateRun(run.id, { merged: true, mergedBy: pr.mergedBy?.login ?? null, mergedAt });
-  } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
-    const closed = pr.state === "CLOSED";
-    if (run.prClosedUnmerged !== closed) store.updateRun(run.id, { prClosedUnmerged: closed });
-  }
-}
-
-/** Reconcile every run awaiting this PR from one observation (the poller's path). */
-export function reconcilePr(store: Store, pr: GitHubPrState): void {
-  for (const run of awaitingMerge(store)) if (run.prUrl === pr.url) applyPrState(store, run, pr);
-  store.reconcileWaitingRuns();
-}
-
 export async function reconcileMergedRuns(
   store: Store,
   client: GitHubPrClient,
   log: (message: string) => void = console.warn,
 ): Promise<void> {
-  for (const run of awaitingMerge(store)) {
+  for (const run of store.listRuns({
+    status: ["needs_human", "succeeded"],
+    limit: Number.MAX_SAFE_INTEGER,
+  })) {
+    if (!run.prUrl || (run.merged && run.status === "succeeded")) continue;
     try {
-      const pr = await client(run.prUrl as string);
-      if (pr) applyPrState(store, run, pr);
+      const pr = await client(run.prUrl);
+      if (!pr || pr.url !== run.prUrl || store.getRun(run.id)?.prUrl !== pr.url) continue;
+      const mergedAt = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
+      if (pr.state === "MERGED" && Number.isFinite(mergedAt)) {
+        if (run.status === "needs_human")
+          store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
+        else store.updateRun(run.id, { merged: true, mergedBy: pr.mergedBy?.login ?? null, mergedAt });
+      } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
+        const closed = pr.state === "CLOSED";
+        if (run.prClosedUnmerged !== closed) store.updateRun(run.id, { prClosedUnmerged: closed });
+      }
     } catch (error) {
       log(`GitHub PR check failed for ${run.id}: ${String(error)}`);
     }
@@ -60,20 +49,19 @@ export async function reconcileMergedRuns(
   store.reconcileWaitingRuns();
 }
 
-/** Factory-side comments for GitHub-originated runs; `checkPrs` is off while the poller observes PRs. */
+/** Factory-side comments for GitHub-originated runs. */
 export function startGitHubNotifier(
   store: Store,
   gh: GhRunner,
   log: (message: string) => void = console.warn,
   client: GitHubPrClient = getGitHubPr,
-  checkPrs = true,
 ): () => void {
   const seen = new Set<string>();
   let stopped = false;
   let checking = false;
   let pending = false;
   const check = async () => {
-    if (stopped || !checkPrs) return;
+    if (stopped) return;
     if (checking) {
       pending = true;
       return;
@@ -89,7 +77,7 @@ export function startGitHubNotifier(
       }
     }
   };
-  const timer = checkPrs ? setInterval(() => void check(), 5 * 60_000) : undefined;
+  const timer = setInterval(() => void check(), 5 * 60_000);
   void check();
   const unsubscribe = store.subscribe((msg) => {
     if (msg.kind !== "run") return;

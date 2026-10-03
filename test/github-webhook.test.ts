@@ -155,7 +155,7 @@ test("mounting with polling on observes PRs through the injected client, never t
   const prClient = mock(async (_url: string) => null);
   const github = mock(async (path: string) =>
     path === "graphql"
-      ? { status: 200, headers: new Headers(), body: { data: { nodes: [] } } }
+      ? { status: 200, headers: new Headers(), body: { data: { nodes: [null] } } }
       : { status: 200, headers: new Headers(), body: { node_id: "PR_1" } },
   );
   const repo = store.getRepoBySlug("MattFlower/limitless");
