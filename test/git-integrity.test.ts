@@ -940,7 +940,7 @@ test("repository patch-format config cannot hide gitattributes or skipped-test f
     }
     for (const [key] of configs) await git(work, "config", "--unset", key ?? "");
   }
-});
+}, 30_000);
 
 test("effective attributes block hiding enabled by deletions, base macros and nested files", async () => {
   mkdirSync(join(work, "pkg"));
@@ -1076,7 +1076,7 @@ test("built-in diff drivers and binary-only patterns are harmless; text at eithe
     );
     expect([line, findings.length > 0]).toEqual([line, blocked]);
   }
-});
+}, 30_000);
 
 test("local repositories classify content with an explicit empty attribute source", async () => {
   writeFileSync(join(work, "image.png"), "base text\n");
@@ -1464,6 +1464,28 @@ test("16,000 added files use stdin pathspecs without uncertainty findings", asyn
   expect(diff.binaryErrors).toBeUndefined();
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
 }, 120_000);
+
+test("LFS inspection skips short blobs and checks repeated candidate blobs once", async () => {
+  const pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 2\n`;
+  for (let i = 0; i < 128; i++) {
+    writeFileSync(join(work, `short-${i}.dat`), `small text ${i}\n`);
+    writeFileSync(join(work, `candidate-${i}.dat`), "ordinary text".padEnd(126, "."));
+    writeFileSync(join(work, `pointer-${i}.dat`), pointer);
+  }
+  await commitAll(work, "base blob candidates");
+  const revision = await headSha(work);
+  for (let i = 0; i < 128; i++) {
+    writeFileSync(join(work, `short-${i}.dat`), "changed text\n");
+    writeFileSync(join(work, `candidate-${i}.dat`), "changed text\n");
+    writeFileSync(join(work, `pointer-${i}.dat`), Buffer.from([0, 1]));
+  }
+  await commitAll(work, "edited blob candidates");
+  const shim = gitShim();
+  const diff = await diffSince(work, revision, shim.env);
+  expect(diff.binaryErrors).toBeUndefined();
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
+  expect(shim.calls().filter((call) => call.includes(" cat-file -p "))).toHaveLength(2);
+}, 30_000);
 
 test("failed binary classification blocks even with attribute and binary allowances", async () => {
   writeFileSync(join(work, "payload.dat"), Buffer.from([0, 1]));

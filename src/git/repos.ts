@@ -557,6 +557,7 @@ async function attributeInfo(
   let emptyTree: string | undefined;
   const matches = new Set<string>();
   const basePointers = new Set<string>();
+  const pointers = new Map<string, boolean>();
   const scratch = mkdtempSync(join(tmpdir(), "limitless-classify-"));
   const scratchGit = (args: string[], stdin?: string) => git([`--git-dir=${scratch}`, ...args], stdin);
   const textAt = async (tree: string, pathspecs: string[], lfs = true) => {
@@ -589,11 +590,20 @@ async function attributeInfo(
     const candidates = lfs ? [...text] : [];
     if (candidates.length) {
       const input = candidates.map((path) => `${tree}:${path}\0`).join("");
-      const sizes = (await git(["cat-file", "--batch-check=%(objectsize)", "-z"], input)).stdout.split("\n");
+      const sizes = (
+        await git(["cat-file", "--batch-check=%(objectname) %(objectsize)", "-z"], input)
+      ).stdout.split("\n");
       for (const [i, path] of candidates.entries()) {
-        const size = Number(sizes[i]);
-        if (!(size > 0 && size <= 200)) continue;
-        if (LFS_POINTER.test((await git(["cat-file", "-p", `${tree}:${path}`])).stdout)) {
+        const [oid = "", bytes] = (sizes[i] ?? "").split(" ");
+        // The shortest strict pointer is 126 bytes; ordinary small text needs no blob read.
+        const size = Number(bytes);
+        if (!(size >= 126 && size <= 200)) continue;
+        let pointer = pointers.get(oid);
+        if (pointer === undefined) {
+          pointer = LFS_POINTER.test((await git(["cat-file", "-p", oid])).stdout);
+          pointers.set(oid, pointer);
+        }
+        if (pointer) {
           if (tree === base) basePointers.add(path);
           if (!SOURCE_PATH.test(path)) text.delete(path);
         }
