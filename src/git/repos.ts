@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { attributeRules, BINARY_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
+import { attributeRules, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
 import { CommandError, sh } from "../util/proc.ts";
 import { emptyHookFlags, NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
 
@@ -576,7 +576,7 @@ async function attributeInfo(
       }
     }
     // A Git LFS pointer, which `git lfs` commits for a tracked file, stands for binary content.
-    const candidates = [...text].filter((path) => lfs && BINARY_PATH.test(path));
+    const candidates = [...text].filter((path) => lfs && !SOURCE_PATH.test(path));
     if (candidates.length) {
       const input = candidates.map((path) => `${tree}:${path}\0`).join("");
       const sizes = (await git(["cat-file", "--batch-check=%(objectsize)", "-z"], input)).stdout.split("\n");

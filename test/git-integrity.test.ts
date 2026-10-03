@@ -1270,13 +1270,16 @@ test.each([
 
 test.each([
   ["png", "valid", false],
+  ["psd", "valid", false],
+  ["onnx", "valid", false],
   ["\npointer.png", "valid", false],
   ["ts", "valid", true],
   ["png", "missing oid", true],
+  ["psd", "missing oid", true],
   ["png", "missing size", true],
   ["png", "invalid hash", true],
   ["png", "invalid size", true],
-])("LFS pointer %s (%s) receives only the binary-path exemption", async (extension, kind, blocks) => {
+])("LFS pointer %s (%s) receives only the non-source-path exemption", async (extension, kind, blocks) => {
   let pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 68\n`;
   if (kind === "missing oid") pointer = pointer.replace(/oid.*\n/, "");
   if (kind === "missing size") pointer = pointer.replace(/size.*\n/, "");
@@ -1285,7 +1288,7 @@ test.each([
   writeFileSync(join(work, `pointer.${extension}`), pointer);
   writeFileSync(
     join(work, ".gitattributes"),
-    `${extension.endsWith("png") ? "*.png" : "pointer.ts"} filter=lfs diff=lfs merge=lfs -text\n`,
+    `*.${extension.endsWith("png") ? "png" : extension} filter=lfs diff=lfs merge=lfs -text\n`,
   );
   // Bypass any globally installed clean filter; commit exactly these pointer bytes.
   await worktreeGit(["git", "-c", "filter.lfs.clean=cat", "-c", "filter.lfs.required=false", "add", "-A"], {
