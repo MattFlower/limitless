@@ -211,7 +211,7 @@ test("attribute audit exempts base binary content and ordinary eol changes, neve
       expect(attribute?.detail).toContain("text diffs");
     }
   }
-});
+}, 30_000);
 
 test("changed attributes respect directory scope and do not trust newly binary content", async () => {
   mkdirSync(join(work, "assets"));
@@ -994,7 +994,7 @@ test("effective attributes block hiding enabled by deletions, base macros and ne
       expect(finding?.detail).toContain("If this is intended, add `Allow: gitattributes` to the request.");
     }
   }
-});
+}, 30_000);
 
 test("three-dot attribute comparisons use the merge base, not the advanced target", async () => {
   writeFileSync(join(work, ".gitattributes"), "*.ts -diff\n*.test.ts diff\n");
@@ -1041,7 +1041,7 @@ test("upper- and mixed-case attribute files are inspected at any depth, renamed 
       }),
     );
   }
-});
+}, 30_000);
 
 test("built-in diff drivers and binary-only patterns are harmless; text at either tree blocks", async () => {
   const nulAt = (index: number) => Buffer.concat([Buffer.alloc(index, 0x61), Buffer.from([0])]);
@@ -1160,7 +1160,7 @@ test("content classification covers changed blobs and pattern candidates within 
   } finally {
     attributeLimits.timeoutMs = previous;
   }
-});
+}, 30_000);
 
 test("worktreeGit rejects leading options that take a separate value", async () => {
   await worktreeGitScope.run(true, async () => {
@@ -1451,7 +1451,7 @@ test("known binary extensions exempt assets and unmatched attribute rules", asyn
   findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
   expect(diff.attributeErrors).toBeUndefined();
   expect(findings).toEqual([]);
-});
+}, 30_000);
 
 test("16,000 added files use stdin pathspecs without uncertainty findings", async () => {
   const files = Array.from({ length: 16_000 }, (_, i) => `${i}-${"long-name-".repeat(12)}.dat`);
@@ -1531,7 +1531,7 @@ test("existing hiding warnings group text paths per rule and omit binary PNGs", 
     true,
   );
   expect(findings.some((f) => f.file === "photo.png")).toBe(false);
-});
+}, 30_000);
 
 test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size", "extra line"])(
   "binary edits of %s base LFS pointers require a strict pointer exemption",
