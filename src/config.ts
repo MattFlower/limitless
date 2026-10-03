@@ -70,6 +70,8 @@ export interface Config {
   /** Decision-model triage declines (falls through to the next model) below this answer confidence. */
   triageDecisionConfidence: number;
   githubOwner: string | null; // allowlisted GitHub login for triggers
+  githubPoll: boolean; // [github] poll: observe factory PRs; off restores the notifier's per-run PR checks
+  githubPollSeconds: number; // [github] poll_seconds: the normal polling interval, at least 15
   discordOwnerId: string | null;
   discordChannelId: string | null;
   discordNotifyAll: boolean;
@@ -256,6 +258,11 @@ export function loadConfig(
   if (typeof confidence !== "number" || !(confidence >= 0 && confidence <= 1))
     throw new Error("triage.decision_confidence must be a number from 0 to 1");
   const retention = (raw.retention ?? {}) as Record<string, unknown>;
+  const github = (raw.github ?? {}) as Record<string, unknown>;
+  if (github.poll !== undefined && typeof github.poll !== "boolean")
+    throw new Error("github.poll must be true or false");
+  if (github.poll_seconds !== undefined && !Number.isFinite(github.poll_seconds))
+    throw new Error("github.poll_seconds must be a number of seconds");
   const gates = (raw.gates ?? {}) as Record<string, unknown>;
   if (gates.baseline_cache !== undefined && typeof gates.baseline_cache !== "boolean")
     throw new Error("gates.baseline_cache must be true or false");
@@ -333,6 +340,8 @@ export function loadConfig(
     reviewRosters: parseReviewRosters(review.rosters),
     triageDecisionConfidence: confidence,
     githubOwner: str(owners.github, "MattFlower"),
+    githubPoll: github.poll !== false,
+    githubPollSeconds: Math.max(15, num(github.poll_seconds, 45)),
     discordOwnerId: str(owners.discord, null),
     discordChannelId: str(discord.channel_id, null),
     discordNotifyAll: discord.notify_all === true,

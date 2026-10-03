@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,8 @@ import {
   reconcileMergedRuns,
   startGitHubNotifier,
 } from "../src/integrations/github-notifier.ts";
+import { observedPrs } from "../src/integrations/github-poller.ts";
+import { pollerHarness, respond, SHA, url } from "./github-poller-support.ts";
 
 let dir: string;
 let store: Store;
@@ -358,5 +360,228 @@ test("startup polling includes succeeded PRs and never overlaps event-triggered 
   } finally {
     release();
     stop();
+  }
+});
+
+test("with polling, observations reconcile runs: merged metadata, resolution, dependants and one run.merged", async () => {
+  const h = pollerHarness();
+  try {
+    const human = h.factoryPr("o/r", 1, "needs_human");
+    h.store.updateRun(human.id, { error: "review required" });
+    h.store.putArtifact(human.id, "report", "markdown", "Human review required");
+    const done = h.factoryPr("o/r", 2);
+    const closed = h.factoryPr("o/r", 3);
+    const dependant = h.store.createRun(h.repo("o/r"), { repo: "o/r", prompt: "next", dependsOn: [done.id] });
+    expect(dependant.status).toBe("waiting");
+    // Wired as mountIntegrations does with polling on: the notifier reads observations, never GitHub.
+    const stopNotifier = startGitHubNotifier(
+      h.store,
+      async () => {},
+      () => {},
+      observedPrs(h.store),
+    );
+    h.start();
+    await h.advance(0);
+    for (const n of [1, 2]) {
+      const node = h.node("o/r", n);
+      node.state = "MERGED";
+      node.mergedAt = "2026-10-03T05:00:00Z";
+      node.mergedBy = { login: "MattFlower" };
+    }
+    h.node("o/r", 3).state = "CLOSED";
+    await h.advance(15_000);
+    await h.advance(15_000);
+    stopNotifier();
+    const mergedAt = Date.parse("2026-10-03T05:00:00Z");
+    expect(h.store.getRun(human.id)).toMatchObject({
+      status: "resolved",
+      merged: true,
+      mergedBy: "MattFlower",
+      mergedAt,
+    });
+    expect(h.store.getRun(human.id)?.error).toBe("review required");
+    expect(h.store.getArtifact(human.id, "report")).toBe("Human review required");
+    expect(h.store.getRun(done.id)).toMatchObject({
+      status: "succeeded",
+      merged: true,
+      mergedBy: "MattFlower",
+    });
+    expect(h.store.getRun(closed.id)).toMatchObject({ merged: false, prClosedUnmerged: true });
+    expect(h.store.getRun(dependant.id)?.status).toBe("queued");
+    const feed = h.store.readFeed({ limit: 1000 }).items;
+    const mergedRuns = feed.filter((i) => i.kind === "run.merged").map((i) => i.runId);
+    expect(mergedRuns.toSorted()).toEqual([human.id, done.id].toSorted());
+    expect(feed.filter((i) => i.kind === "pr.merged")).toHaveLength(2);
+    expect(feed.filter((i) => i.kind === "pr.closed")).toHaveLength(1);
+    expect(h.gh.calls.every((c) => c.path === "graphql" || /^repos\/o\/r\/pulls\/\d$/.test(c.path))).toBe(
+      true,
+    );
+  } finally {
+    h.close();
+  }
+});
+
+test("a terminal observation reconciles a run that finishes delivery later, including after a restart", async () => {
+  const h = pollerHarness();
+  try {
+    const run = h.factoryPr("o/r", 1, "running");
+    h.start();
+    await h.advance(0);
+    const node = h.node("o/r", 1);
+    node.state = "MERGED";
+    node.mergedAt = "2026-10-03T05:00:00Z";
+    await h.advance(45_000);
+    expect(h.store.getRun(run.id)?.merged).toBe(false);
+    const calls = h.gh.calls.length;
+    h.reopen();
+    const stopNotifier = startGitHubNotifier(
+      h.store,
+      async () => {},
+      () => {},
+      observedPrs(h.store),
+    );
+    h.start();
+    h.store.updateRun(run.id, { status: "succeeded" });
+    for (let i = 0; i < 20 && !h.store.getRun(run.id)?.merged; i++) await Bun.sleep(1);
+    stopNotifier();
+    expect(h.store.getRun(run.id)).toMatchObject({
+      merged: true,
+      mergedAt: Date.parse("2026-10-03T05:00:00Z"),
+    });
+    expect(h.store.readFeed({ limit: 1000 }).items.filter((i) => i.kind === "run.merged")).toHaveLength(1);
+    expect(h.gh.calls.length).toBe(calls);
+  } finally {
+    h.close();
+  }
+});
+
+test("a terminal observation whose feed write fails stays retryable and reconciles only once written", async () => {
+  const h = pollerHarness();
+  try {
+    const run = h.factoryPr("o/r", 1);
+    h.start();
+    await h.advance(0);
+    h.store.db.exec(
+      "CREATE TEMP TRIGGER boom BEFORE INSERT ON feed WHEN NEW.kind = 'pr.merged' BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    );
+    const node = h.node("o/r", 1);
+    node.state = "MERGED";
+    node.mergedAt = "2026-10-03T05:00:00Z";
+    await h.advance(15_000);
+    expect(h.store.getRun(run.id)?.merged).toBe(false);
+    h.store.db.exec("DROP TRIGGER boom");
+    await h.advance(15_000);
+    const kinds = h.store.readFeed({ limit: 1000 }).items.map((i) => i.kind);
+    expect(kinds.filter((k) => k === "pr.merged" || k === "run.merged")).toEqual(["pr.merged", "run.merged"]);
+    expect(h.store.getRun(run.id)?.merged).toBe(true);
+  } finally {
+    h.close();
+  }
+});
+
+test("with polling, PRs the poller does not track are reconciled through the per-run client, once", async () => {
+  const h = pollerHarness();
+  try {
+    // A Dependabot existing-branch verify run and a PR-verification run: neither PR is the poller's.
+    const dependabot = h.store.createRun(
+      h.repo("o/r"),
+      {
+        repo: "o/r",
+        prompt: "verify",
+        source: "github",
+        requestedBy: "dependabot[bot]",
+        baseBranch: "deps",
+        deliveryBranch: "deps",
+        sourceRef: {
+          kind: "pull_request",
+          repo: "o/r",
+          number: 7,
+          baseRef: "main",
+          baseSha: SHA,
+          headSha: SHA,
+        },
+      },
+      true,
+    );
+    h.store.updateRun(dependabot.id, { prUrl: url("o/r", 7), status: "succeeded" });
+    const verify = h.store.createRun(h.repo("o/r"), {
+      repo: "o/r",
+      prompt: "verify",
+      source: "github",
+      sourceRef: { kind: "pull_request", repo: "o/r", number: 8, baseRef: "main", baseSha: SHA },
+    });
+    h.store.updateRun(verify.id, { prUrl: url("o/r", 8), status: "needs_human" });
+    // The poller's own PR has no snapshot yet and then hits an access failure: never a fallback read.
+    const own = h.factoryPr("o/r", 1);
+    const fallback = mock(async (prUrl: string) => ({
+      url: prUrl,
+      state: "MERGED",
+      mergedAt: "2026-10-03T05:00:00Z",
+      mergedBy: { login: "dependabot[bot]" },
+    }));
+    const client = observedPrs(h.store, fallback);
+    await reconcileMergedRuns(h.store, client, () => {});
+    expect(fallback.mock.calls.map((c) => c[0]).toSorted()).toEqual([url("o/r", 7), url("o/r", 8)]);
+    const mergedAt = Date.parse("2026-10-03T05:00:00Z");
+    expect(h.store.getRun(dependabot.id)).toMatchObject({
+      merged: true,
+      mergedBy: "dependabot[bot]",
+      mergedAt,
+    });
+    expect(h.store.getRun(verify.id)).toMatchObject({ status: "resolved", merged: true, mergedAt });
+    expect(h.store.getRun(own.id)?.merged).toBe(false);
+    h.gh.deny.set("o/r", () => respond(403, { message: "SSO" }, { "x-github-sso": "required" }));
+    h.start();
+    await h.advance(0);
+    expect(h.store.githubAccessProblems().map((p) => p.repo)).toEqual(["o/r"]);
+    fallback.mockClear();
+    h.reopen();
+    await reconcileMergedRuns(h.store, observedPrs(h.store, fallback), () => {});
+    await reconcileMergedRuns(h.store, observedPrs(h.store, fallback), () => {});
+    expect(fallback).not.toHaveBeenCalled();
+    const merged = h.store.readFeed({ limit: 1000 }).items.filter((i) => i.kind === "run.merged");
+    expect(merged.map((i) => i.runId).toSorted()).toEqual([dependabot.id, verify.id].toSorted());
+  } finally {
+    h.close();
+  }
+});
+
+test("a stale snapshot never hides an untracked PR from the fallback; a merged one is authoritative", async () => {
+  const h = pollerHarness();
+  try {
+    // The factory run observed the PR open, then failed over 7 days ago, so the poller stopped tracking it.
+    const factory = h.factoryPr("o/r", 1);
+    const merged = h.factoryPr("o/r", 2);
+    h.start();
+    await h.advance(0);
+    h.store.updateRun(factory.id, { status: "failed", finishedAt: Date.now() - 8 * 86_400_000 });
+    const verify = h.store.createRun(h.repo("o/r"), {
+      repo: "o/r",
+      prompt: "verify",
+      source: "github",
+      sourceRef: { kind: "pull_request", repo: "o/r", number: 1, baseRef: "main", baseSha: SHA },
+    });
+    h.store.updateRun(verify.id, { prUrl: url("o/r", 1), status: "needs_human" });
+    expect(JSON.parse(h.store.githubPrData(url("o/r", 1)) ?? "null")?.state).toBe("OPEN");
+    expect(h.store.githubTracked().map((p) => p.url)).toEqual([url("o/r", 2)]);
+    // The poller then sees its other PR merge; that observation needs no fallback read.
+    const node = h.node("o/r", 2);
+    node.state = "MERGED";
+    node.mergedAt = "2026-10-03T04:00:00Z";
+    h.store.updateRun(merged.id, { status: "needs_human" });
+    await h.advance(15_000);
+    h.reopen();
+    const fallback = mock(async (prUrl: string) => ({
+      url: prUrl,
+      state: "MERGED",
+      mergedAt: "2026-10-03T05:00:00Z",
+      mergedBy: { login: "octocat" },
+    }));
+    await reconcileMergedRuns(h.store, observedPrs(h.store, fallback), () => {});
+    expect(fallback.mock.calls.map((c) => c[0])).toEqual([url("o/r", 1)]);
+    expect(h.store.getRun(verify.id)).toMatchObject({ merged: true, mergedBy: "octocat" });
+    expect(h.store.getRun(merged.id)).toMatchObject({ merged: true, mergedAt: Date.parse(node.mergedAt) });
+  } finally {
+    h.close();
   }
 });

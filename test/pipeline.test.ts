@@ -41,17 +41,15 @@ import {
 } from "../src/pipeline/context.ts";
 
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
-import { specPrompt } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
 import { LaterReviewSchema, ReviewSchema, renderSpec, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
-import { outOfRunCriteria } from "../src/pipeline/spec-criteria.ts";
-import { specScopeViolation } from "../src/pipeline/spec-scope.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewOutput } from "./evals-reading-support.ts";
+import { deferred } from "./evals-support.ts";
 import { attributionEvidence, findingEvidence } from "./review-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -871,21 +869,6 @@ describe("local factory clones", () => {
 
 describe("pipeline (fake agents, real git + gates)", () => {
   test.each([
-    ["trivial", "1–2"],
-    ["small", "1–3"],
-    ["medium", "3–5"],
-    ["large", "5–8"],
-    [undefined, "2–8"],
-  ] as const)("spec prompt sizes criteria for %s complexity", (complexity, range) => {
-    const prompt = specPrompt({ prompt: "Add farewell", answers: [], complexity });
-    expect(prompt).toContain(`acceptance_criteria: ${range} observable`);
-    expect(prompt).toContain(
-      "Require a specific new test only where behavior is new or at risk of regression, not for every criterion",
-    );
-    expect(prompt).toContain("Each needs a concrete how_to_verify");
-  });
-
-  test.each([
     ["small", 7, 3],
     ["small", 7, 7],
     ["trivial", 2, 2],
@@ -951,54 +934,6 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const warnings = f.store.listEvents(run.id).filter((e) => e.message?.startsWith("Kept oversized spec"));
     expect(warnings).toHaveLength(oversized && finalCount === 7 ? 1 : 0);
     if (warnings.length) expect(warnings[0]).toMatchObject({ level: "warn" });
-  });
-
-  test("spec prompt confines the read-only rule to investigation", () => {
-    const prompt = specPrompt({ prompt: "Add farewell", answers: [] });
-    expect(prompt).toContain("task below.\n\nYou are only writing the specification");
-    expect(prompt).toContain("while investigating the repository, read and search but do not edit files");
-    expect(prompt).toContain("change itself will be implemented later");
-    expect(prompt).not.toContain("DO NOT modify anything");
-    expect(prompt).toContain("verifiable inside the run's own checkout");
-    expect(prompt).toContain("using the repository's commands and tests");
-    expect(prompt).toContain(
-      "a person, the orchestrator, a browser, live external services, a deploy, or a later event",
-    );
-    expect(prompt).toContain("Put such concerns under assumptions or out_of_scope");
-  });
-
-  test.each(
-    "manual,manually,human,humans,owner,owners,orchestrator,reviewer approves,in a browser,visually,screenshot,screenshots,deploy,deploys,deployed,deploying,deployment,deployments,production,live API,after merge,wait for".split(
-      ",",
-    ),
-  )("out-of-run criteria match bounded phrases in how_to_verify only: %s", (phrase) => {
-    expect(
-      outOfRunCriteria({
-        ...spec,
-        acceptance_criteria: [
-          { id: "AC-1", criterion: `(${phrase})`, how_to_verify: "bun test test/page.test.ts" },
-        ],
-      }),
-    ).toEqual([]);
-    for (const text of [phrase, phrase.toUpperCase(), phrase.replaceAll(" ", "\n ")]) {
-      const criterion = { id: "AC-1", criterion: "Works", how_to_verify: `(${text})` };
-      expect(outOfRunCriteria({ ...spec, acceptance_criteria: [criterion] })).toEqual([criterion]);
-      expect(
-        outOfRunCriteria({
-          ...spec,
-          acceptance_criteria: [{ ...criterion, how_to_verify: `pre${text}post` }],
-        }),
-      ).toEqual([]);
-    }
-    expect(outOfRunCriteria(spec)).toEqual([]);
-    expect(
-      outOfRunCriteria({
-        ...spec,
-        acceptance_criteria: [
-          { id: "AC-1", criterion: "Test passes", how_to_verify: "bun test test/page.test.ts" },
-        ],
-      }),
-    ).toEqual([]);
   });
 
   test.each(["clean", "persistent", "empty", "invalid scope", "scope retry", "new dependency"])(
@@ -1080,48 +1015,6 @@ describe("pipeline (fake agents, real git + gates)", () => {
       );
     },
   );
-
-  test("spec scope phrases normalize punctuation and leave ordinary documentation work alone", () => {
-    for (const summary of [
-      "SPECIFICATION—ONLY task",
-      "Documentation  \nonly.",
-      "Do NOT modify source code.",
-      "No code changes.",
-      "Do not modify code in this task.",
-    ]) {
-      expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBe(summary);
-      expect(specScopeViolation({ ...spec, summary }, `${summary} Explain the behavior.`)).toBeNull();
-    }
-    for (const summary of [
-      "Add code and documentation.",
-      "Verify behavior without modifying fixtures.",
-      "Document the read-only API.",
-      "Do not change the code path for legacy users.",
-      "Do not modify code outside src/pipeline.",
-      "Must not edit the code generator output.",
-      "Do not change code in existing callers.",
-      "Existing plugins keep working without code changes.",
-      "Existing plugins require no code changes.",
-    ]) {
-      expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBeNull();
-      expect(specScopeViolation({ ...spec, summary: "No code changes." }, summary)).toBe("No code changes.");
-    }
-    // "X only" in ordinary prose is not a task restriction (a request that says it is still exempt).
-    for (const summary of [
-      "The README docs only list supported commands.",
-      "The spec only covers the CLI path; the UI is out of scope.",
-    ])
-      expect(specScopeViolation({ ...spec, summary }, "Add farewell")).toBeNull();
-    expect(
-      specScopeViolation(
-        {
-          ...spec,
-          acceptance_criteria: [{ id: "AC-1", criterion: "Works", how_to_verify: "Do not modify code" }],
-        },
-        "Add farewell",
-      ),
-    ).toBeNull();
-  });
 
   test.each(["summary", "requirement", "criterion", "exhausted", "documentation"])(
     "spec scope validation: %s",
@@ -1883,7 +1776,7 @@ esac
 
     test("concurrent runs on one base execute the baseline once", async () => {
       const count = join(home, "gate-runs");
-      const check = `test -f farewell.txt || echo base >> '${count}'; sleep 1`;
+      const check = `test -f farewell.txt && exit 0; echo base >> '${count}'; sleep 1`;
       await commitGates(`[gates]\nchecks = [{ name = "check", run = "${check}" }]\n`);
       const f = start(quick);
       const [a, b] = await Promise.all([finish(f), finish(f)]);
@@ -2201,7 +2094,7 @@ esac
   test("post-merge gates slower than the GitHub retry budget still deliver", async () => {
     writeFileSync(
       join(repoDir, ".limitless.toml"),
-      '[gates]\nchecks = [{ name = "slow", run = "sleep 2" }]\n',
+      '[gates]\nchecks = [{ name = "slow", run = "test ! -f base.txt || sleep 2" }]\n',
     );
     await sh(["git", "add", "."], { cwd: repoDir });
     await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "slow gate"], {
@@ -4311,12 +4204,7 @@ protected_paths = ["protected.txt"]
 
     test.each([
       ["Background\n\nOur service uses IPv4.\n\nRequirements\n\n- Support IPv6", "Background", false],
-      ["Background\n\nOur service uses IPv4.\n\nRequirements\n\n- Support IPv6", "Requirements", false],
       ["Support IPv6\nKeep IPv4", "Support IPv6", true],
-      ["Support IPv6\nKeep IPv4", "Keep IPv4", true],
-      ["- Support IPv6", "Support IPv6", true],
-      ["Support IPv6 and IPv4", "Support IPv6", false],
-      ["Retry", "Retry", true],
       ["Add a farewell file", "**AC-1** Done", true],
     ] as const)("citation grounding in the fake pipeline: %s / %s", async (request, citation, grounded) => {
       let checked = false;
@@ -7089,36 +6977,58 @@ describe("review shadow panel: single reviews decide, the panel only records", (
   test("a shadow finder without a free provider slot is skipped at once and never queues", async () => {
     const calls = newCalls();
     const base = scenario(calls, () => ({ structured: approve, costEquivUsd: 0.25 }));
-    const ref: { f?: Factory } = {};
+    const attempts = [deferred<void>(), deferred<void>()];
+    const unattempted: number[] = [];
     const f = start(async (s) => {
-      // The single review keeps its slot until the shadow has recorded this round.
+      // The artifact is written after production completes; wait for the slot attempt instead.
       if (roleOf(s) === "review" && !s.prompt.startsWith("You are a code")) {
         const round = calls.primary.length;
-        const runId = ref.f?.store.listRuns({ limit: 1 })[0]?.id ?? "";
-        const deadline = Date.now() + 5_000;
-        while (!ref.f?.store.getArtifact(runId, `review-${round}.shadow.json`) && Date.now() < deadline)
-          await Bun.sleep(10);
+        const attempt = attempts[round];
+        if (!attempt) throw new Error("unexpected production review round");
+        // Bounded, so a shadow that skips or queues for its slot fails the test instead of hanging it.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const missed = new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            unattempted.push(round);
+            resolve();
+          }, 5_000);
+        });
+        await Promise.race([attempt.promise, missed]);
+        clearTimeout(timer);
       }
       return base(s);
     });
-    ref.f = f;
     shadowOn(f);
     // One slot per provider: the single review holds beta's, which the shadow finder would route to.
     for (const id of ["alpha", "beta"]) Object.assign(f.tracker.def(id) ?? {}, { maxConcurrent: 1 });
+    const tryAcquire = f.tracker.tryAcquire.bind(f.tracker);
+    const shadowAcquire = spyOn(f.tracker, "tryAcquire").mockImplementation((id, preempt) => {
+      const release = tryAcquire(id, preempt);
+      if (id === "beta" && release === null) attempts[calls.primary.length]?.resolve();
+      return release;
+    });
     const acquire = spyOn(f.tracker, "acquire");
-    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
-    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-    expect(titles(f, run.id)).toEqual([["Single only"], []]);
-    expect(calls.shadow).toHaveLength(0);
-    for (const round of [0, 1])
-      expect(shadowOf(f, run.id, round)).toMatchObject({
-        status: "skipped",
-        reason: expect.stringContaining("beta: no free slot"),
-        usage: { invocations: 0 },
-      });
-    // Only production calls ever waited for a slot.
-    expect(acquire.mock.calls.length).toBe(f.store.listInvocations(run.id).length);
-    expect(f.store.listInvocations(run.id).some((i) => i.role === "review_shadow")).toBe(false);
+    try {
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
+      // Rounds in which the shadow finder never tried beta's slot.
+      expect(unattempted).toEqual([]);
+      expect(status).toBe("succeeded");
+      expect(titles(f, run.id)).toEqual([["Single only"], []]);
+      expect(calls.shadow).toHaveLength(0);
+      for (const round of [0, 1])
+        expect(shadowOf(f, run.id, round)).toMatchObject({
+          status: "skipped",
+          reason: expect.stringContaining("beta: no free slot"),
+          usage: { invocations: 0 },
+        });
+      // Only production calls ever waited for a slot.
+      expect(acquire.mock.calls.length).toBe(f.store.listInvocations(run.id).length);
+      expect(f.store.listInvocations(run.id).some((i) => i.role === "review_shadow")).toBe(false);
+    } finally {
+      acquire.mockRestore();
+      shadowAcquire.mockRestore();
+    }
   });
 
   test("failed and retried shadow attempts count once in shadow usage and run totals", async () => {

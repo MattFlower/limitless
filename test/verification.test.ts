@@ -546,6 +546,9 @@ test("a whole request line or acceptance criterion is grounded however short; a 
   ] as const)
     expect(citedRequirement(citation, request)).toBe(line);
   expect(citedRequirement("Support IPv6", "Support IPv6")).toBe("Support IPv6");
+  expect(citedRequirement("Retry", "Retry")).toBe("Retry");
+  expect(citedRequirement("Support IPv6", "Support IPv6 and IPv4")).toBeNull();
+  expect(citedRequirement("Keep IPv4", "Support IPv6\nKeep IPv4")).toBe("Keep IPv4");
   // Headings label requirements rather than stating one: marked, punctuated, or a plain line
   // directly above its block ("Background" above prose, "Requirements" above a list).
   for (const citation of [
@@ -569,6 +572,10 @@ test("a whole request line or acceptance criterion is grounded however short; a 
   const plain = "Background\nOur service uses IPv4.\n\nRequirements\n- Support IPv6";
   for (const citation of ["Background", "Requirements"]) expect(citedRequirement(citation, plain)).toBeNull();
   expect(citedRequirement("Support IPv6", plain)).toBe("Support IPv6");
+  // Labels set apart by blank lines are still headings.
+  const spaced = "Background\n\nOur service uses IPv4.\n\nRequirements\n\n- Support IPv6";
+  for (const citation of ["Background", "Requirements"])
+    expect(citedRequirement(citation, spaced)).toBeNull();
   for (const citation of ["**AC-1** Paginated.", "AC-1: Paginated", "- **AC-1** Paginated."])
     expect(citedRequirement(citation, source, entries)).toBe("Paginated");
   const verify = unmetHoldout({

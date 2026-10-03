@@ -158,6 +158,8 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[owners] discord` | unset | The only Discord user ID allowed to use the bot |
 | `[discord] channel_id` | unset | Text channel for run threads and quota alerts |
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
+| `[github] poll` | `true` | Observe the factory's own PRs (CI, conflicts, reviews, comments, merges) with one GraphQL query per repository and write changes to the feed. `false` restores per-run `gh pr view` merge checks. Access problems show in `limitless doctor`. |
+| `[github] poll_seconds` | `45` | Polling interval (minimum 15); repositories with a delivered, unmerged PR poll every 15 s |
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[routing] wait_budget_s` | `{ triage = 20, summarize = 20, chat = 20 }` | Per-role provider slot wait budgets in whole seconds. `0` falls through immediately; `"unbounded"` removes the limit. Omitted roles `review`, `verify`, `spec`, `holdout`, `implement`, `plan` and `plan_review` wait without limit. |
