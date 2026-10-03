@@ -1,10 +1,10 @@
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { existsSync, mkdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { CommandError, sh } from "../util/proc.ts";
-import { worktreeGit, worktreeGitScope } from "./command.ts";
+import { emptyHookFlags, worktreeGit, worktreeGitScope } from "./command.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -152,15 +152,15 @@ export async function resolveRepo(store: Store, input: string): Promise<Repo> {
 }
 
 export function cachePath(paths: Paths, repo: Repo): string {
-  if (repo.kind === "local") return repo.localPath as string;
+  if (repo.kind === "local") return join(paths.repos, `local-${repo.id}.git`);
   return join(paths.repos, `${repo.slug.replace("/", "__")}.git`);
 }
 
-/** Make sure a fresh bare mirror exists (GitHub repos) and is fetched. */
 const cacheLocks = new Map<string, Promise<unknown>>();
 
 /** Serialize work on one repo cache (clone/fetch/worktree add) across concurrent runs. */
-export async function withRepoLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+export async function withRepoLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+  const key = lockKey(path);
   const previous = cacheLocks.get(key) ?? Promise.resolve();
   const next = previous.catch(() => undefined).then(fn);
   cacheLocks.set(key, next);
@@ -171,36 +171,98 @@ export async function withRepoLock<T>(key: string, fn: () => Promise<T>): Promis
   }
 }
 
-/** Make sure a fresh bare mirror exists (GitHub repos) and is fetched. */
+/** Symlinked and real spellings of one repository must share a lock, even before it exists. */
+function lockKey(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    const parent = dirname(path);
+    return parent === path ? path : join(lockKey(parent), basename(path));
+  }
+}
+
+/** Make sure a factory-owned bare clone exists and is fetched. */
 export async function ensureCache(paths: Paths, repo: Repo, signal?: AbortSignal): Promise<string> {
   const cache = cachePath(paths, repo);
-  if (repo.kind === "local") return cache;
-  return withRepoLock(cache, async () => {
-    signal?.throwIfAborted();
-    if (!existsSync(cache)) {
-      mkdirSync(paths.repos, { recursive: true });
-      // Clone to a temporary path and rename, so a crash never leaves a half-configured cache.
-      const tmp = `${cache}.tmp-${process.pid}-${Date.now()}`;
-      try {
+  return withRepoLock(cache, () => refreshCache(paths, repo, signal));
+}
+
+async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Promise<string> {
+  const cache = cachePath(paths, repo);
+  signal?.throwIfAborted();
+  if (!existsSync(cache)) {
+    mkdirSync(paths.repos, { recursive: true });
+    // Clone to a temporary path and rename, so a crash never leaves a half-configured cache.
+    const tmp = `${cache}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      if (repo.kind === "local") {
+        // Not `git clone`: config conditional on the new git directory (includeIf) can define hooks
+        // that clone, and even init, would run before any lookup could see them. A bare skeleton
+        // git already recognises lets every command, init included, discover and blank those hooks.
+        // The fetch below fills it, so it owns its objects (source gc cannot break retained runs);
+        // the empty template keeps init.templateDir hooks out.
+        for (const dir of ["objects", "refs"]) mkdirSync(join(tmp, dir), { recursive: true });
+        writeFileSync(join(tmp, "HEAD"), "ref: refs/heads/main\n");
+        // Unlike clone, init doesn't adopt the source's hash (a SHA-256 source can't fetch into SHA-1).
+        const format = await worktreeGit(["git", "rev-parse", "--show-object-format"], {
+          cwd: repo.localPath as string,
+          signal,
+        });
+        await worktreeGit(
+          ["git", "init", "-q", "--bare", "--template=", `--object-format=${format.stdout.trim()}`],
+          { cwd: tmp, signal },
+        );
+        await worktreeGit(["git", "config", "remote.origin.url", repo.localPath as string], {
+          cwd: tmp,
+          signal,
+        });
+      } else {
         await worktreeGit(["git", "clone", "--bare", repo.url as string, tmp], {
           cwd: paths.repos,
           timeoutMs: 600_000,
           signal,
         });
-        await worktreeGit(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
-          cwd: tmp,
-          signal,
-        });
-        renameSync(tmp, cache);
-      } finally {
-        rmSync(tmp, { recursive: true, force: true });
       }
+      await worktreeGit(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
+        cwd: tmp,
+        signal,
+      });
+      renameSync(tmp, cache);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
     }
-    // Agents run inside worktrees of this repo; make any push attempt from them fail.
-    await worktreeGit(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
-    await worktreeGit(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
-    return cache;
+  }
+  if (repo.kind === "local") {
+    await worktreeGit(["git", "config", "user.name", "Limitless"], { cwd: cache });
+    await worktreeGit(["git", "config", "user.email", "limitless@localhost"], { cwd: cache });
+  }
+  // Agents run inside worktrees of this repo; make any push attempt from them fail.
+  await worktreeGit(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
+  // Local clones mirror the source's tags, including deleted and moved ones.
+  const tags = repo.kind === "local" ? ["--prune-tags", "--force"] : [];
+  await worktreeGit(["git", "fetch", "origin", "--prune", ...tags], {
+    cwd: cache,
+    timeoutMs: 300_000,
+    signal,
   });
+  if (repo.kind === "local") {
+    // Keep bare HEAD usable without retaining copied source branches. Best-effort: the recorded
+    // default branch may be gone from the source while a run's explicit base branch still exists.
+    await worktreeGit(
+      ["git", "update-ref", "--no-deref", "HEAD", `refs/remotes/origin/${repo.defaultBranch}`],
+      { cwd: cache, signal, allowFail: true },
+    );
+  }
+  return cache;
+}
+
+/** The owning common directory also works as a git cwd for legacy linked worktrees. */
+export async function worktreeOwner(path: string): Promise<string> {
+  return (
+    await worktreeGit(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      cwd: path,
+    })
+  ).stdout.trim();
 }
 
 export interface Worktree {
@@ -217,19 +279,27 @@ export async function createWorktree(
   baseBranch: string,
 ): Promise<Worktree> {
   const cache = cachePath(paths, repo);
-  const git = repo.kind === "github" ? worktreeGit : sh;
   const path = join(paths.work, runId);
   const branch = `limitless/${runId}-${slugify(title, 30)}`;
-  const baseRef = repo.kind === "github" ? `origin/${baseBranch}` : baseBranch;
+  const baseRef = `refs/remotes/origin/${baseBranch}`;
   if (existsSync(path)) {
     // Resuming an interrupted run: reuse the worktree as-is.
     const head = await worktreeGit(["git", "rev-parse", "HEAD"], { cwd: path });
-    const base = await git(["git", "rev-parse", baseRef], { cwd: cache });
+    const owner = await worktreeOwner(path);
+    const base =
+      repo.kind === "local" ? head : await worktreeGit(["git", "rev-parse", baseRef], { cwd: owner });
     return { path, branch, baseSha: base.stdout.trim() || head.stdout.trim() };
   }
   return withRepoLock(cache, async () => {
-    const base = await git(["git", "rev-parse", baseRef], { cwd: cache });
-    await git(["git", "worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
+    if (repo.kind === "local") await refreshCache(paths, repo);
+    const base = await worktreeGit(["git", "rev-parse", baseRef], { cwd: cache });
+    // Hooks are blanked where a command runs. `worktree add` would check out inside the new
+    // worktree, where includes conditional on its branch or git directory can first activate
+    // hooks; checking out from there instead lets the wrapper see exactly those.
+    await worktreeGit(["git", "worktree", "add", "--no-checkout", "-b", branch, path, base.stdout.trim()], {
+      cwd: cache,
+    });
+    await worktreeGit(["git", "reset", "--hard", "-q"], { cwd: path });
     return { path, branch, baseSha: base.stdout.trim() };
   });
 }
@@ -237,7 +307,10 @@ export async function createWorktree(
 export async function removeWorktree(paths: Paths, repo: Repo, path: string): Promise<void> {
   if (!existsSync(path)) return;
   const git = repo.kind === "github" ? worktreeGit : sh;
-  await git(["git", "worktree", "remove", "--force", path], { cwd: cachePath(paths, repo), allowFail: true });
+  const cache = repo.kind === "local" ? await worktreeOwner(path) : cachePath(paths, repo);
+  await withRepoLock(cache, () =>
+    git(["git", "worktree", "remove", "--force", path], { cwd: cache, allowFail: true }),
+  );
 }
 
 export async function headSha(cwd: string): Promise<string> {
@@ -429,7 +502,41 @@ export async function pushBranch(
   signal?: AbortSignal,
   budget?: GitHubBudget,
 ): Promise<void> {
-  if (repo.kind !== "github" || !repo.url) return;
+  if (repo.kind === "local") {
+    if (!repo.localPath) throw new Error("local repository path is missing");
+    // Legacy worktrees already own the delivered branch in the source repository.
+    if ((await worktreeOwner(cwd)) === (await worktreeOwner(repo.localPath))) return;
+    // An earlier push may have landed before its delivery was recorded; the user may have built on it.
+    const head = (await worktreeGit(["git", "rev-parse", `${sha}^{commit}`], { cwd, signal })).stdout.trim();
+    if (await isAncestor(repo.localPath, head, `refs/heads/${branch}`)) return;
+    // core.hooksPath doesn't cover config-defined hooks; blank the ones the source repository sees.
+    const quote = (arg: string) => `'${arg.replaceAll("'", "'\\''")}'`;
+    const receiveHooks = (await emptyHookFlags(["git"], { cwd: repo.localPath, signal }))
+      .map(quote)
+      .join(" ");
+    await worktreeGit(
+      [
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--no-verify",
+        // An explicit refspec doesn't disable push.followTags; deleted source tags must stay deleted.
+        "--no-follow-tags",
+        `--receive-pack=git -c core.hooksPath=/dev/null -c receive.denyCurrentBranch=refuse -c receive.autogc=false ${receiveHooks} receive-pack`,
+        repo.localPath,
+        `${sha}:refs/heads/${branch}`,
+      ],
+      {
+        cwd,
+        timeoutMs: 300_000,
+        signal,
+        env: { ...(process.env as Record<string, string>), LIMITLESS_GIT_EMPTY_HOOK: "" },
+      },
+    );
+    return;
+  }
+  if (!repo.url) return;
   await remoteSh(["git", "push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
     cwd,
     timeoutMs: 300_000,

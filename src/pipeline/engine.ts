@@ -131,7 +131,8 @@ export async function executeRun(
     deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  return worktreeGitScope.run(repo.kind === "github", () =>
+  // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
+  return worktreeGitScope.run(true, () =>
     executeScopedRun(new RunContext(deps, run, repo, signal, isDraining, drainEvents), signal),
   );
 }
@@ -346,7 +347,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       ctx.state.verification = { baseSha: ref.baseSha, headSha: ref.headSha };
       await ctx.save();
     }
-    await ensureCache(cfg.paths, ctx.repo);
+    if (ctx.repo.kind === "github") await ensureCache(cfg.paths, ctx.repo);
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
     const reusingWorktree = existsSync(join(cfg.paths.work, ctx.run.id));
     const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base);
@@ -1702,7 +1703,10 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     };
 
     if (ctx.repo.kind !== "github") {
+      await pushBranch(ctx.repo, cwd, ctx.run.branch as string, head, ctx.signal);
       publish();
+      ctx.state.deliveryComplete = true;
+      await ctx.save("delivery-complete");
       ctx.log(`Local repo: work is on branch ${ctx.run.branch}`);
       return { summary: `branch ${ctx.run.branch} ready in ${ctx.repo.localPath}`, value: undefined };
     }
