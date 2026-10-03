@@ -585,18 +585,20 @@ test("UNKNOWN mergeability gets one REST nudge after the third poll, then CONFLI
   pr.mergeable = "CONFLICTING";
   await h.advance(15 * S);
   expect(kinds()).toEqual(["pr.conflicting"]);
-  // A recurrence on the same head is not nudged again, even across a restart; a new head is.
+  // A known value ends the episode: a later UNKNOWN on the same head (the base moved) is nudged
+  // once more, and not again within that episode, even across a restart; a new head is.
   pr.mergeable = "UNKNOWN";
   for (let i = 0; i < 3; i++) await h.advance(15 * S);
+  expect(nudges()).toBe(2);
   h.reopen();
   h.start();
   for (let i = 0; i < 3; i++) await h.advance(15 * S);
-  expect(nudges()).toBe(1);
+  expect(nudges()).toBe(2);
   pr.headRefOid = "d".repeat(40);
   for (let i = 0; i < 3; i++) await h.advance(15 * S);
-  expect(nudges()).toBe(2);
+  expect(nudges()).toBe(3);
   for (let i = 0; i < 5; i++) await h.advance(15 * S);
-  expect(nudges()).toBe(2);
+  expect(nudges()).toBe(3);
 });
 
 test("an access failure during a nudge is kept for doctor; the cycle that hit it never clears it", async () => {

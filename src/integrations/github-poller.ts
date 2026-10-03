@@ -235,7 +235,8 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
       const data = JSON.stringify({ ...snap, revision, unknown, nudged } satisfies Saved);
       store.saveGithubPr({ ...pr, data }, snap.state !== "OPEN", feed);
     };
-    save(prev?.nudged ?? null);
+    // One nudge per UNKNOWN episode on a head: a known value ends the episode.
+    save(unknown ? (prev?.nudged ?? null) : null);
     settled ||= snap.state !== (prev?.state ?? "OPEN");
     if (!nudge) return undefined;
     // A REST read starts GitHub's lazy mergeability computation; the next GraphQL poll reports it.
