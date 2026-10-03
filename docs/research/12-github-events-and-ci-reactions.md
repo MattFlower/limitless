@@ -1,4 +1,4 @@
-<!-- Research synthesis produced on 2026-10-03 from two research passes: (1) GitHub API documentation plus read-only measurements against a public repository, together with a survey of agent tools that react to CI failures, merge conflicts and review comments; (2) Limitless's own CI, merge and review history from 2026-09-26 to 2026-10-03 (456 Actions runs, 159 PRs, 150 daemon runs). Edited by the orchestrator. Evidence tags as in 11-spec-stage.md. Status: input to M5.5 (docs/PLAN.md). -->
+<!-- Research synthesis produced on 2026-10-03 from two research passes: (1) GitHub API documentation plus read-only measurements against a public repository, together with a survey of agent tools that react to CI failures, merge conflicts and review comments; (2) Limitless's own CI, merge and review history from 2026-09-26 to 2026-10-03 (456 Actions runs, 159 PRs, 150 daemon runs). Dates are UTC. Edited by the orchestrator. Evidence tags as in 11-spec-stage.md. Status: input to M5.5 (docs/PLAN.md). -->
 
 # Reacting to GitHub without webhooks: events, CI failures and conflicts (2026-10-03)
 
@@ -18,7 +18,7 @@ It must do this in environments where the user can neither create webhooks nor i
 ## 0. Bottom line
 
 1. **Poll state with GraphQL, not per-PR REST.** One query per repository returns every open PR's mergeability, merge state and CI rollup, and costs 1 point for 50 PRs. At a 30–60 s cadence that is 60–120 of the 5,000 points per hour [M: measured `rateLimit(dryRun:true)`]. REST conditional requests (`If-None-Match` → 304) are free, but a PR payload embeds both repository objects, so its ETag will likely change on unrelated pushes and stars [W]. Fetch comment bodies and logs by REST only when the GraphQL state shows a change.
-2. **The notifications endpoint cannot be the catch-all.** A user's own actions never notify them, and Limitless acts as the user. `ci_activity` covers only Actions runs the user triggered, and those are opt-in [S]. The owner's last 50 notifications had no `ci_activity` at all, although the factory pushed constantly [M]. It remains a cheap signal for other people's reviews and comments.
+2. **The notifications endpoint cannot be the catch-all.** A user's own actions never notify them, and Limitless acts as the user. `ci_activity` covers only Actions runs the user triggered, and those are opt-in [S] ([notifications](https://docs.github.com/en/rest/activity/notifications), [Actions notifications](https://docs.github.com/en/actions/concepts/workflows-and-actions/notifications-for-workflow-runs)). The owner's last 50 notifications had no `ci_activity` at all, although the factory pushed constantly [M]. It remains a cheap signal for other people's reviews and comments.
 3. **"CI red → send it back to implement" is the wrong default.** Of our 16 failed factory CI runs, only 3 were fixable inside the PR's own code [S: our data]. The rest were:
    - 7 environment or version differences;
    - 2 caused by main moving;
@@ -33,7 +33,7 @@ It must do this in environments where the user can neither create webhooks nor i
    4. Is the fix mechanical (formatter)?
 
    Only what remains goes to a capped fix round.
-5. **PR latency is mostly waiting.** 78% of the time a factory PR was open was idle, mostly waiting for the orchestrator [S: our data, estimated]. A landing queue and feed-driven review save more time than faster models do.
+5. **PR latency is mostly waiting.** 78% of the time a factory PR was open was idle, mostly waiting for the orchestrator [M: our data, estimated]. A landing queue and feed-driven review save more time than faster models do.
 
 ## 1. Reading GitHub state without webhooks
 
@@ -54,7 +54,7 @@ All measurements are read-only GETs with a `gh` OAuth token, made 2026-10-03.
 **Unreliable signals:**
 - **Combined status** reports `state: pending, total_count: 0` on an Actions-only repository whose 25 check runs all passed [M]. It only covers the legacy Status API.
 - **Check suites** can include phantom suites that stay `queued` with `latest_check_runs_count: 0` (left by installed apps), so "all suites completed" never becomes true [M]. Use check runs, or GraphQL `statusCheckRollup`, which reported `SUCCESS` for the same commit.
-- **`mergeable` is computed lazily.** A `null` value means "GitHub has initiated a background job" ([pulls](https://docs.github.com/en/rest/pulls/pulls)). The PR list endpoint omits it. GitHub emits no webhook when the base branch advances into a conflict ([Claude Code docs](https://code.claude.com/docs/en/claude-code-on-the-web)), so even webhook users must poll mergeability.
+- **`mergeable` is computed lazily.** A `null` value means "GitHub has started a background job" ([pulls](https://docs.github.com/en/rest/pulls/pulls)). The PR list endpoint omits it. GitHub emits no webhook when the base branch advances into a conflict ([Claude Code docs](https://code.claude.com/docs/en/claude-code-on-the-web)), so webhook users must also re-check mergeability, for example on base `push` events.
 - **The Events API** is "not built to serve real-time use cases… latency can be anywhere from 30s to 6h" ([events](https://docs.github.com/en/rest/activity/events)).
 
 ### 1.2 GraphQL [M]
@@ -76,7 +76,7 @@ From the REST rate-limit docs ([rate limits](https://docs.github.com/en/rest/usi
 - **Primary limit:** 5,000 requests per hour per user, shared by all of the user's tokens.
 - **Secondary limits:**
   - at most 100 concurrent requests;
-  - at most 900 points per minute per REST endpoint and 2,000 for GraphQL;
+  - at most 900 points per minute for REST API endpoints and 2,000 for GraphQL (a GET costs 1 point, a write 5);
   - 80 content-creating requests per minute and 500 per hour;
   - "subject to change without notice".
 - **On 403 or 429:** honour `retry-after`. Otherwise wait at least a minute and back off exponentially.
@@ -88,16 +88,16 @@ From the REST rate-limit docs ([rate limits](https://docs.github.com/en/rest/usi
 - **OAuth app restrictions don't block `gh`.** GitHub CLI is a privileged OAuth app that users can authorize even when an organization restricts OAuth apps ([privileged apps](https://docs.github.com/en/apps/oauth-apps/using-oauth-apps/privileged-oauth-apps)).
 - **With SAML SSO:**
   - Authorization needs an active SSO session, so sign in to the identity provider, then run `gh auth login --web` or `gh auth refresh`.
-  - A missing authorization shows up as **403 with an `X-GitHub-SSO` header**, or as a 404 ([SAML](https://docs.github.com/en/authentication/authenticating-with-saml-single-sign-on/about-authentication-with-saml-single-sign-on)).
+  - A missing authorization shows up as **403 with an `X-GitHub-SSO` header**, or as a 404. This is documented for classic personal access tokens ([REST authentication](https://docs.github.com/en/rest/authentication/authenticating-to-the-rest-api)); for the `gh` OAuth token the same responses are likely but unverified [W].
   - So a 404 must not be read as "PR deleted" without first ruling out SSO.
-- **Network restrictions:** IP allow lists and conditional-access policies can reject a token when the laptop is off VPN.
+- **Network restrictions:** IP allow lists and conditional-access policies can reject a token when the laptop is off VPN ([IP allow lists](https://docs.github.com/en/enterprise-cloud@latest/organizations/keeping-your-organization-secure/managing-security-settings-for-your-organization/managing-allowed-ip-addresses-for-your-organization)).
 
 ### 1.5 How local tools poll [M]
 
 | Tool | Interval | Method |
 |---|---|---|
 | `gh pr checks --watch` | 10 s | Re-fetches GraphQL `statusCheckRollup` |
-| `gh run watch` | 3 s | Two REST calls per tick, no conditional requests (about 2,400 requests per hour) |
+| `gh run watch` | 3 s | 2–3 REST calls per tick, no conditional requests (2,400 or more requests per hour) |
 | gh-dash | 30 min | Refresh |
 | Gitify | 60 s | Notifications, honouring `X-Poll-Interval` |
 
@@ -117,10 +117,10 @@ Sources: [checks.go](https://raw.githubusercontent.com/cli/cli/trunk/pkg/cmd/pr/
 | Flaky | 2 | 5 s per-test timeouts; the same webhook test also failed on a docs-only PR |
 | Infra | 2 | Workflow `startup_failure` after the repository went public, fixed by pinning actions to SHAs |
 
-- **Reruns:** 2 of 2 passed. One followed a 15-minute hang; the other was an ordering flake later fixed.
+- **Reruns:** no factory-branch run was ever rerun. On orchestrator branches, 3 of 3 reruns passed: a 15-minute hang, an ordering flake later fixed, and the webhook-test timeout on #264.
 - **Hangs:** the 4 timed-out jobs left no logs, only an annotation.
 - **CI is getting slower:** median CI time rose from 23 s to about 200 s in a week.
-- **A runner image change is due** (Ubuntu 26 from 2026-10-19). It will fail every open PR the same way at once.
+- **A runner image change is due.** `ubuntu-latest` moves to Ubuntu 26 gradually from 2026-10-19 to 11-19 ([runner-images#14748](https://github.com/actions/runner-images/issues/14748)). For about a month, jobs will land on either image, so image-dependent failures will look flaky. The runner image version belongs in the failure signature, or the workflow can pin `ubuntu-24.04`.
 
 ### 2.2 Merging main and conflicts
 
@@ -141,7 +141,7 @@ Sources: [checks.go](https://raw.githubusercontent.com/cli/cli/trunk/pkg/cmd/pr/
 
 | Tool | Reacts to | Guardrails |
 |---|---|---|
-| GitHub Copilot cloud agent | CI failure (one-click from the log), `@copilot` requests on a PR, conflicts (mobile, VS Code preview) | Only users with write access trigger it; comments from others never reach the agent; hidden characters filtered; pushes only to its own branch; workflows wait for human approval (optional since 2026) ([risks](https://docs.github.com/en/copilot/concepts/agents/cloud-agent/risks-and-mitigations)) |
+| GitHub Copilot cloud agent | CI failure (one-click from the log), `@copilot` requests on a PR, conflicts (mobile, VS Code preview) | Only users with write access trigger it; comments from others never reach the agent; hidden characters filtered; pushes only to its own branch; workflows wait for human approval, which can now be skipped ([risks](https://docs.github.com/en/copilot/concepts/agents/cloud-agent/risks-and-mitigations), [changelog](https://github.blog/changelog/2026-03-13-optionally-skip-approval-for-copilot-coding-agent-actions-workflows/)) |
 | Claude Code (cloud auto-fix) | CI failures and review comments through the Claude GitHub App (webhooks) | Pushes clear fixes; asks when a change is ambiguous or architectural; cannot react to merge conflicts (no webhook for base drift) ([docs](https://code.claude.com/docs/en/claude-code-on-the-web)) |
 | `claude-code-action` examples | `workflow_run` failures | Same-repo PRs only; skips its own fix branches to avoid loops; restricted tools; the actor needs write access ([examples](https://github.com/anthropics/claude-code-action/tree/main/examples), [security](https://github.com/anthropics/claude-code-action/blob/main/docs/security.md)) |
 | Cursor cloud agents | CI failures on PRs they created | Stop after 10 CI follow-ups; skip after a human commit or message; skip when the same check fails on the base commit; per-PR off switch ([capabilities](https://cursor.com/docs/cloud-agent/capabilities)) |
@@ -170,7 +170,7 @@ Sources: [checks.go](https://raw.githubusercontent.com/cli/cli/trunk/pkg/cmd/pr/
 
 ### 4.1 Poller → the feed (#265)
 
-- **One GraphQL query per configured repository** covers the open PRs the factory opened, identified from its own run records, never from branch names, so discreet mode leaves no marks. It returns `headRefOid`, `mergeable`, `mergeStateStatus`, `statusCheckRollup` (state and contexts), `reviewDecision`, `updatedAt` and review and comment counts.
+- **One GraphQL query per configured repository** (`nodes(ids:)` over the tracked PRs' node ids, so busy repositories don't push them out of a first-N page) covers the open PRs the factory opened, identified from its own run records, never from branch names, so discreet mode leaves no marks. It returns `headRefOid`, `mergeable`, `mergeStateStatus`, `statusCheckRollup` (state and contexts), `reviewDecision`, `updatedAt` and review and comment counts.
 - **Cadence:**
   - every 30–60 s while any tracked PR is open;
   - every 15 s while a landing waits on CI;
@@ -184,23 +184,40 @@ Sources: [checks.go](https://raw.githubusercontent.com/cli/cli/trunk/pkg/cmd/pr/
   - `pr.merged` and `pr.closed`.
 
   Because the poller compares state, a missed poll is caught on the next one.
-- **Only on a change**, fetch details by REST with `If-None-Match`: comment bodies (filtered to authors with write access), and failed-job logs keyed on `(fail)`, `error: script`, `× Formatter would have printed` and `error TS`.
+- **Only on a change**, fetch details by REST with `If-None-Match`: comment bodies (filtered to authors with write access, tracked by id and `updatedAt` rather than counts), and failed-job logs keyed on `(fail)`, `error: script`, `× Formatter would have printed` and `error TS`.
 - **When `mergeable` stays `UNKNOWN`** for more than two polls, send one single-PR REST GET to start the computation.
 - **Optionally poll `/notifications`** with `If-Modified-Since`, honouring `X-Poll-Interval`, as a hint for other people's activity.
+- **It replaces today's per-run `gh pr view` merge checks**, which already use GraphQL points.
 - **`doctor` detects SSO and network problems:** an `X-GitHub-SSO` header, a 404 on a known PR, or IP-restriction errors. It shows the fix rather than treating the PR as gone.
 
 ### 4.2 Classifying a CI failure (deterministic)
 
-1. **Is the main branch's latest run red on the same check?** If so, pause per-PR reactions and report one main failure. This covers a runner image change.
+The failure signature is the check name, the failing test or error lines, and the runner image version from the job log.
+
+1. **Is the main branch's latest run red on the same check?** If so, pause per-PR reactions and report one main failure. This covers infrastructure and workflow breakage, such as the `startup_failure` episode.
 2. **Did the job time out, fail to start or get cancelled?** If so, rerun once at the same SHA.
-3. **Did the failed test fail before on an unrelated PR or commit** (a flake ledger keyed by test name)? If so, rerun once and count it toward quarantine.
-4. **Is it a formatter or lint autofix failure?** If so, apply `biome --write`, the repository's configured fix command. No model is needed.
-5. **Does it pass on the branch head but fail on the merge ref?** If so, it is a merge-with-main problem; go to 4.3.
+3. **Has the same signature failed before on an unrelated PR or commit** (a flake ledger)? If so, rerun once and count it toward quarantine.
+4. **Is it a formatter or lint autofix failure?** If so, run the repository's configured fix command (for this repository, `biome check --write`). No model is needed.
+5. **Reproduce locally.** Run the failing check on the PR head, and on the head merged with the base SHA that CI tested.
+   - **It fails on the merge only:** it is a merge-with-main problem; go to 4.3.
+   - **It fails on both:** go to step 6.
+   - **It passes on both, but CI fails:** it is an environment or version difference (CI's git, runner config, a slower runner). Report it, with the signature and the runner image, and do not attempt a fix. This was the largest class in our history (7 of 16).
 6. **Otherwise**, start a fix round on the same PR, with the failing excerpt passed as quoted data. Cap it at 2 attempts per PR and failure signature.
    - Skip the round when a human has pushed to the branch since the failure.
-   - The round must not weaken or delete the failing test or a security check; the existing audit already flags weakened gates.
-   - It must not touch paths outside the PR's diff unless the failure names them.
    - A docs-only PR never gets a code fix.
+   - After the round, the deterministic diff audit enforces two rules: the round may not weaken or delete a failing test, a gate or a security check, and it may not touch paths outside the PR's existing diff unless the failure names them. A violation ends the round as `needs_human`.
+
+**Backtest on our 16 failures:**
+
+| Step | Failures it would have caught |
+|---|---|
+| 1 | The 2 infra runs (main was also failing) |
+| 2 and 3 | The 2 flaky timeouts |
+| 5, merge-only | The 2 caused by main moving |
+| 5, environment | The 7 environment runs: the git version difference, the runner's git-lfs config and the 4-run wall-clock budget test. The local gates had passed |
+| 6 | The 3 real defects |
+
+The model would have run only where the PR's own code was wrong.
 
 ### 4.3 Conflicts and drift
 
