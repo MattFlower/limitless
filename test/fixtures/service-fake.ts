@@ -18,7 +18,8 @@ const scenario = JSON.parse(process.argv[2] ?? "{}") as {
     | "not-running"
     | "port-owner"
     | "bootout"
-    | "final-bootstrap";
+    | "final-bootstrap"
+    | "production";
   failLabel?: string;
   delayed?: boolean;
   missingPlist?: boolean;
@@ -27,6 +28,7 @@ const scenario = JSON.parse(process.argv[2] ?? "{}") as {
 };
 const daemon = "dev.limitless.daemon";
 const legacy = "cc.mattflower.limitless";
+const legacyMtplx = "cc.mattflower.limitless-mtplx";
 const home = "/fake/home";
 const agents = `${home}/Library/LaunchAgents`;
 const port = scenario.port ?? 7400;
@@ -35,6 +37,10 @@ if (scenario.envPort) process.env.LIMITLESS_PORT = scenario.envPort;
 const calls: string[] = [];
 const files = new Map<string, string>([[`${home}/.limitless/app/.git`, ""]]);
 const loaded = new Map((scenario.labels ?? []).map((label, i) => [label, i + 10]));
+const legacyOf: Record<string, string> = { [daemon]: legacy, "dev.limitless.mtplx": legacyMtplx };
+/** Whichever unit was loaded first owns a shared production port until it is booted out. */
+const holder = (label: string) =>
+  [...loaded.keys()].find((l) => l === label || l === legacyOf[label]) ?? label;
 for (const label of [...loaded.keys(), ...(scenario.plists ?? [])])
   files.set(`${agents}/${label}.plist`, `legacy ${label}`);
 if (scenario.missingPlist) for (const label of loaded.keys()) files.delete(`${agents}/${label}.plist`);
@@ -42,6 +48,7 @@ let pid = 100;
 let time = 0;
 let healthCalls = 0;
 let pending = 0;
+let bootstraps = 0;
 const logs: string[] = [];
 console.log = (...args: unknown[]) => logs.push(args.join(" "));
 Date.now = () => time;
@@ -71,29 +78,24 @@ mock.module("../../src/util/proc.ts", () => ({
     calls.push(args.join(" "));
     let exitCode = 0;
     let stdout = "";
-    if (args[0] === "/usr/sbin/lsof" && scenario.failure === "port-owner") exitCode = 1;
+    if (args[0] === "/usr/sbin/lsof") {
+      const owner = args[3] === "-iTCP:8000" ? loaded.get(holder("dev.limitless.mtplx")) : undefined;
+      const ownedByOther = owner !== undefined && `-p${owner}` !== args[2];
+      if (scenario.failure === "port-owner" || ownedByOther) exitCode = 1;
+    }
     const target = args.at(-1) ?? "";
     const label = target.slice(target.lastIndexOf("/") + 1).replace(/\.plist$/, "");
     if (args[0] === "launchctl") {
       if (args[1] === "print") {
-        if (
-          scenario.action === "handoff" &&
-          label === legacy &&
-          calls.filter((c) => c.endsWith(legacy)).length > 3
-        )
-          loaded.delete(legacy);
         exitCode = loaded.has(label) ? 0 : 1;
         stdout =
           loaded.has(label) && pending-- <= 0
             ? `state = running\n pid = ${loaded.get(label)}\n`
             : "state = waiting";
       } else if (args[1] === "bootstrap") {
-        if (
-          (scenario.failure === "bootstrap" ||
-            (scenario.failure === "final-bootstrap" && !loaded.has("cc.mattflower.limitless-mtplx"))) &&
-          label === (scenario.failLabel ?? daemon)
-        )
-          exitCode = 5;
+        const failing = label === (scenario.failLabel ?? daemon);
+        if (failing && scenario.failure === "bootstrap") exitCode = 5;
+        else if (failing && scenario.failure === "final-bootstrap" && ++bootstraps > 1) exitCode = 5;
         else {
           loaded.set(label, ++pid);
           pending = scenario.delayed ? 2 : 0;
@@ -127,12 +129,14 @@ globalThis.fetch = (async (url: string | URL | Request, options?: RequestInit) =
     (scenario.failure === "health" ||
       scenario.failure === "not-running" ||
       (scenario.failure === "handoff" && parsed.port === String(port) && !loaded.has(legacy)));
-  const responsePid = scenario.failure === "old-health" ? loaded.get(legacy) : loaded.get(label);
+  const shared = parsed.port === String(port) || parsed.port === "8000";
+  const responder = scenario.failure === "old-health" ? legacy : shared ? holder(label) : label;
   const app = { ok: true, uptimeMs: 1, sha: "abc", draining: false, active: [] };
+  const responsePid = loaded.get(responder);
   const body = scenario.failure === "stub" ? { ok: true, pid: responsePid } : { ...app, pid: responsePid };
-  return Response.json(body, { status: failed || !loaded.has(label) ? 503 : 200 });
+  return Response.json(body, { status: failed || !loaded.has(responder) ? 503 : 200 });
 }) as typeof fetch;
-const { install, status, uninstall, awaitServiceHandoff } = await import("../../src/cli/service.ts");
+const { install, status, uninstall, serveWithHandoff } = await import("../../src/cli/service.ts");
 let error: string | undefined;
 try {
   if (scenario.action === "status") await status(port);
@@ -140,11 +144,18 @@ try {
   else if (scenario.action === "handoff") {
     process.env.LIMITLESS_MIGRATE_FROM = legacy;
     process.env.LIMITLESS_STAGING_PORT = String(port + 1);
-    await awaitServiceHandoff((staging) => {
-      calls.push(`staging ${staging}`);
-      if (scenario.failure === "staging") throw new Error("replacement startup failed");
-      return { stop: async () => void calls.push("staging stop") };
+    let attempts = 0;
+    await serveWithHandoff((listen) => {
+      calls.push(`listen ${listen ?? port}`);
+      if (scenario.failure === "staging" && listen) throw new Error("replacement startup failed");
+      if (scenario.failure === "production" && !listen) throw new Error("LAN listener failed");
+      // The old daemon releases the production port a few polls after it is booted out.
+      if (!listen && loaded.has(legacy) && ++attempts < 3)
+        throw Object.assign(new Error("Failed to start server. Is port in use?"), { code: "EADDRINUSE" });
+      if (!listen) loaded.delete(legacy);
+      return { stop: async () => void calls.push(`stop ${listen ?? port}`) };
     });
+    calls.push("serving");
   } else await install(port, { mtplx: scenario.mtplx, tunnel: scenario.tunnel });
 } catch (caught) {
   error = String(caught);

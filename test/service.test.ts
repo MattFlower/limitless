@@ -148,6 +148,8 @@ test("migration verifies each staged replacement before retiring or deleting its
       i === 0 ? "health 7401/api/health" : i === 1 ? "health 8001/v1/models" : "health 7402/ready";
     expect(f.calls.indexOf(bootstrap(current))).toBeLessThan(f.calls.indexOf(ready));
     expect(f.calls.indexOf(ready)).toBeLessThan(f.calls.indexOf(bootout(old)));
+    // Every bootstrap of the replacement, including the production mtplx unit, precedes the retirement.
+    expect(f.calls.lastIndexOf(bootstrap(current))).toBeLessThan(f.calls.indexOf(bootout(old)));
     expect(f.calls.indexOf(bootout(old))).toBeLessThan(f.calls.indexOf(`unlink ${agentPath(old)}`));
     expect(f.files[agentPath(old)]).toBeUndefined();
   }
@@ -192,10 +194,21 @@ test("a fresh unhealthy daemon makes install fail", async () => {
 });
 
 test("status reports the installed labels and logs; uninstall cleans legacy, neutral and mixed units", async () => {
-  for (const labels of [oldLabels, newLabels, [...oldLabels, ...newLabels]]) {
+  // In a mixed installation the unit loaded first still owns its port, so status reports that one;
+  // the tunnel has no shared port, so its verified replacement wins.
+  const cases: [readonly string[], readonly string[]][] = [
+    [oldLabels, oldLabels],
+    [newLabels, newLabels],
+    [[...newLabels, ...oldLabels], newLabels],
+    [
+      [...oldLabels, ...newLabels],
+      [oldLabels[0], oldLabels[1], newLabels[2]],
+    ],
+  ];
+  for (const [labels, reported] of cases) {
     const f = await serviceFake({ action: "status", labels });
     expect(f.error).toBeUndefined();
-    for (const label of labels === oldLabels ? oldLabels : newLabels)
+    for (const label of reported)
       expect(f.logs).toContain(`${label}: loaded; log: /fake/home/.limitless/logs/${label}.log`);
     const removed = await serviceFake({ action: "uninstall", labels });
     expect(removed.error).toBeUndefined();
@@ -213,18 +226,37 @@ test("omitted options preserve optional legacy installations", async () => {
   expect(f.calls).not.toContain(bootstrap("dev.limitless.tunnel"));
 });
 
-test("daemon handoff serves the real app on staging until the old label unloads", async () => {
+const listens = (f: ServiceResult) =>
+  f.calls.filter((c) => /^(listen|stop|serving)/.test(c) || c.startsWith("launchctl boot"));
+
+test("daemon handoff serves staging until the production port is released, then stops staging", async () => {
   const f = await serviceFake({ action: "handoff", labels: [oldLabels[0]] });
   expect(f.error).toBeUndefined();
-  expect(f.calls[1]).toBe("staging 7401");
-  expect(f.calls.at(-1)).toBe("staging stop");
-  expect(f.loaded).toEqual([]);
+  expect(listens(f)).toEqual([
+    "listen 7401",
+    "listen 7400",
+    "listen 7400",
+    "listen 7400",
+    "stop 7401",
+    "serving",
+  ]);
+  // Once migrated (or never migrating) the daemon binds the production port directly.
+  for (const labels of [[], [newLabels[0]]]) {
+    const direct = await serviceFake({ action: "handoff", labels });
+    expect(direct.error).toBeUndefined();
+    expect(listens(direct)).toEqual(["listen 7400", "serving"]);
+  }
 });
 
 test("a replacement startup failure never stops the old daemon", async () => {
-  const handoff = await serviceFake({ action: "handoff", labels: [oldLabels[0]], failure: "staging" });
-  expect(handoff.error).toContain("replacement startup failed");
-  expect(handoff.calls).not.toContain("staging stop");
+  const staging = await serviceFake({ action: "handoff", labels: [oldLabels[0]], failure: "staging" });
+  expect(staging.error).toContain("replacement startup failed");
+  expect(listens(staging)).toEqual(["listen 7401"]);
+  expect(staging.loaded).toEqual([oldLabels[0]]);
+  const production = await serviceFake({ action: "handoff", labels: [oldLabels[0]], failure: "production" });
+  expect(production.error).toContain("LAN listener failed");
+  expect(listens(production)).toEqual(["listen 7401", "listen 7400", "stop 7401"]);
+  expect(production.loaded).toEqual([oldLabels[0]]);
   // Without the real app answering on staging, install never retires the old daemon.
   const f = await serviceFake({ labels: [oldLabels[0]], failure: "stub" });
   expect(f.error).toContain("dev.limitless.daemon bootstrap or health failed");
@@ -233,17 +265,30 @@ test("a replacement startup failure never stops the old daemon", async () => {
   expect(f.loaded).toEqual([oldLabels[0]]);
 });
 
-test("a failed mtplx final bootstrap restores its legacy unit", async () => {
+test("a failed mtplx production bootstrap leaves its legacy unit running", async () => {
   const f = await serviceFake({
     labels: [oldLabels[1]],
     mtplx: true,
     failure: "final-bootstrap",
     failLabel: newLabels[1],
   });
-  expect(f.error).toContain("failure");
+  expect(f.error).toContain("launchctl bootstrap failed for dev.limitless.mtplx");
+  expect(f.calls).toContain("health 8001/v1/models");
+  expect(f.calls).not.toContain("health 8000/v1/models");
+  expect(f.calls).not.toContain(bootout(oldLabels[1]));
   expect(f.loaded).toContain(oldLabels[1]);
   expect(f.loaded).not.toContain(newLabels[1]);
   expect(f.files[agentPath(oldLabels[1])]).toBeDefined();
+});
+
+test("mtplx health on the production port is only accepted once the legacy unit released it", async () => {
+  const f = await serviceFake({ labels: [oldLabels[1]], mtplx: true });
+  expect(f.error).toBeUndefined();
+  const production = f.calls.indexOf("health 8000/v1/models");
+  expect(production).toBeGreaterThan(f.calls.indexOf(bootout(oldLabels[1])));
+  expect(f.calls.slice(production)).toContainEqual(expect.stringMatching(/^\/usr\/sbin\/lsof .*-iTCP:8000/));
+  expect(f.loaded).toContain(newLabels[1]);
+  expect(f.loaded).not.toContain(oldLabels[1]);
 });
 
 test("an absent legacy plist aborts migration before the running service is stopped", async () => {

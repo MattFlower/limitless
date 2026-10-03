@@ -57,6 +57,7 @@ Changing the launchd units themselves (PATH, arguments) needs `limitless service
 Existing installations should run `limitless service install` once to migrate to the neutral
 `dev.limitless` labels. Add `--mtplx` and/or `--tunnel` to migrate those optional agents.
 The replacement is checked before retiring its predecessor; a failed check keeps the previous agent.
+The daemon takes over its port without dropping requests; a migrating mtplx agent reloads its model once.
 Deploy and status also recognize installations that have not migrated yet.
 An interrupted deploy logs `interrupted, rolling back...` and attempts to restore the previous
 checkout and resume the scheduler. If the process was killed during rollback, inspect

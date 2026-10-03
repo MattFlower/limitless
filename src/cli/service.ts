@@ -150,13 +150,29 @@ async function installedLabel(label: string, command: typeof sh = sh, port = 740
   return (await loaded(label, command)) && (await health(unitPort, 2000, label, command)) ? label : old;
 }
 
-// Serve the fully built app (no integrations or scheduler) on the staging port until the old daemon unloads.
-export async function awaitServiceHandoff(start: (port: number) => { stop(force?: boolean): Promise<void> }) {
+/**
+ * A fully started migrating daemon serves the staging port until its predecessor releases the
+ * production port, which it then binds before the staging listener stops.
+ */
+export async function serveWithHandoff<T extends { stop(force?: boolean): Promise<void> }>(
+  start: (port?: number) => T,
+): Promise<T> {
   const old = process.env.LIMITLESS_MIGRATE_FROM;
-  if (!old || !(await loaded(old))) return;
-  const staging = start(Number(process.env.LIMITLESS_STAGING_PORT));
-  while (await loaded(old)) await Bun.sleep(100);
-  await staging.stop(true);
+  const staging = Number(process.env.LIMITLESS_STAGING_PORT);
+  if (!old || !staging || !(await loaded(old))) return start();
+  const fallback = start(staging);
+  try {
+    for (;;) {
+      try {
+        return start();
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "EADDRINUSE")) throw error;
+      }
+      await Bun.sleep(100);
+    }
+  } finally {
+    await fallback.stop(true);
+  }
 }
 
 function tunnelConfig(port: number): string | null {
@@ -260,32 +276,36 @@ export async function install(port: number, opts: { tunnel?: boolean; mtplx?: bo
     const migrating = !!old && (await loaded(old));
     const servicePort = label === LABEL ? port : label === MTPLX_LABEL ? 8000 : port + 2;
     const probePort = label === LABEL ? port + 1 : label === MTPLX_LABEL ? 8001 : servicePort;
-    const staged = migrating && label === MTPLX_LABEL ? mtplxPlist(probePort) : content;
+    // Loading a large model takes far longer than the daemon's startup.
+    const waitMs = label === MTPLX_LABEL ? 300_000 : 30_000;
     if (migrating && !existsSync(oldPath)) throw new Error(`missing legacy plist: ${oldPath}`);
-    if (await loaded(label)) {
-      await launchctl(["bootout", `gui/${uid}/${label}`], false);
-      // bootout returns before the old instance is gone; bootstrapping too early fails with EIO.
-      for (let i = 0; i < 30 && (await loaded(label)); i++) await Bun.sleep(500);
-    }
-    writeFileSync(path, staged);
-    let ok = false;
-    for (let attempt = 0; attempt < 5 && !ok; attempt++) {
-      if (attempt) await Bun.sleep(1000 * attempt);
-      ok = (await launchctl(["bootstrap", `gui/${uid}`, path])).exitCode === 0;
-    }
-    if (!ok || !(await health(migrating ? probePort : servicePort, 30_000, label))) {
+    const bootstrap = async (plist: string) => {
+      if (await loaded(label)) {
+        await launchctl(["bootout", `gui/${uid}/${label}`], false);
+        // bootout returns before the old instance is gone; bootstrapping too early fails with EIO.
+        for (let i = 0; i < 30 && (await loaded(label)); i++) await Bun.sleep(500);
+      }
+      writeFileSync(path, plist);
+      let ok = false;
+      for (let attempt = 0; attempt < 5 && !ok; attempt++) {
+        if (attempt) await Bun.sleep(1000 * attempt);
+        ok = (await launchctl(["bootstrap", `gui/${uid}`, path])).exitCode === 0;
+      }
+      if (!ok) throw new Error(`launchctl bootstrap failed for ${label}`);
+    };
+    // The daemon hands its port over itself (serveWithHandoff); mtplx binds a fixed port, so it is
+    // first proven on a staging port and its production unit is bootstrapped before the old one stops.
+    const staged = migrating && label === MTPLX_LABEL ? mtplxPlist(probePort) : content;
+    await bootstrap(staged);
+    if (!(await health(migrating ? probePort : servicePort, waitMs, label))) {
       if (migrating) await launchctl(["bootout", `gui/${uid}/${label}`]);
       throw new Error(`${label} bootstrap or health failed; check ${join(logDir, `${label}.log`)}`);
     }
     if (migrating) {
       try {
+        if (staged !== content) await bootstrap(content);
         await launchctl(["bootout", `gui/${uid}/${old}`], false);
-        if (label === MTPLX_LABEL) {
-          await launchctl(["bootout", `gui/${uid}/${label}`], false);
-          writeFileSync(path, content);
-          await launchctl(["bootstrap", `gui/${uid}`, path], false);
-        }
-        if (!(await health(servicePort, 30_000, label))) throw new Error(`${label} handoff failed`);
+        if (!(await health(servicePort, waitMs, label))) throw new Error(`${label} handoff failed`);
         if (existsSync(oldPath)) unlinkSync(oldPath);
       } catch (error) {
         await launchctl(["bootout", `gui/${uid}/${label}`]);
