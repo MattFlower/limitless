@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,9 @@ import { collectGarbage, type GcResult } from "../src/gc.ts";
 import { cachePath, createWorktree } from "../src/git/repos.ts";
 import { startHttp } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
+
+// These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
+setDefaultTimeout(30_000);
 
 const DAY = 86_400_000;
 const now = 2_000_000_000_000;
