@@ -120,6 +120,18 @@ Why: same model, different transport, and the subscription has unused quota. The
 
 Paired difference -0.056, one-sided 95% lower bound -0.167. The same OpenRouter setting scored 78.9% on these cases two days earlier (eval-mump7s7re29l), so run-to-run variation is of the same order. Through Codex, Luna was less stable: its verdict flipped between trials on 7 of 30 cases (23%) against 3 of 30 (10%), and it used about 2.6 times the tokens ($0.0498 API-equivalent against $0.0189). Revisit if the field risk under-call rate rises.
 
+## Owner decision: implement = Codex first in every cell while banked Codex resets last (2026-10-03)
+
+Every implement cell now starts on Codex:
+- `trivial`, `small` and `medium` start with `codex/sol-6.1@high`, then `codex/astra@high`, then `claude/opus`;
+- `large` starts with `codex/astra@high`, then `codex/sol-6.1@high`, then `claude/opus`.
+
+Escalation after a failed round moves to the next tier, so a Sol run escalates to Astra before any Claude model. Before this change, in the two days up to 2026-10-03, 46 of 91 implement invocations ran on Claude (`claude/opus` and `claude/fable`): large runs started on Opus, and escalation went Sol → Opus → Fable. Meanwhile the Codex weekly window stayed about two-thirds used, with banked resets expiring unused.
+
+`[routing] prefer = ["codex"]` could not do this, because it only reorders interchangeable `a|b` groups and the implement cells are explicit orders. Review still avoids the implementer's vendor, so Codex-implemented runs keep a Claude reviewer (`claude/opus`).
+
+Revisit when the banked resets are gone, or if the Sol trial summary (below) or review findings show worse outcomes for Codex-implemented large runs. The trial comparison uses runs started before this change.
+
 ## Owner decision: implement trial = `codex/sol-6.1@high` first below large (2026-10-01)
 
 `implement.trivial`, `implement.small` and `implement.medium` start with `codex/sol-6.1@high`, with `claude/opus` as the fallback. `implement.large` stays `claude/opus` then `codex/sol@medium`. This is a field trial, because the implement eval cannot rank models (every model scores 100%; see the implement decision below). It runs on factory work through 2026-10-05. Evidence will come from rounds to converge, verify first-pass rate, review findings and orchestrator review findings, compared with the preceding Opus-first runs. Known confound: verify avoids the implementer's vendor, so Sol-implemented runs are verified by `claude/sonnet` and Opus-implemented runs by `codex/sol`.
