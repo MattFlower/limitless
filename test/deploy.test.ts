@@ -690,7 +690,7 @@ test("an unknown daemon SHA cannot use the target checkout as proof of deploymen
       f.client.health = async (signal) => ({ ...(await health(signal)), sha }) as unknown as HealthResponse;
       const listeners = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
       await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow(
-        /daemon boot SHA is unknown.*launchctl kickstart -k gui\/\d+\/cc\.mattflower\.limitless or limitless service install/,
+        /daemon boot SHA is unknown.*launchctl kickstart -k gui\/\d+\/dev\.limitless\.daemon or limitless service install/,
       );
       expect(f.calls).toEqual([
         "health",
@@ -876,4 +876,81 @@ test("replacement with the wrong commit fails and restores the old release", asy
   expect(f.selected()).toBe("previous");
   expect(f.calls.at(-1)).toBe("resume");
   expect(f.logs).not.toContain("daemon after: next");
+});
+
+for (const label of ["cc.mattflower.limitless", "dev.limitless.daemon"]) {
+  test(`deploy and rollback default restart select the loaded ${label}`, async () => {
+    for (const rollback of [false, true]) {
+      const f = setup();
+      const base = f.opts.command;
+      let restarts = 0;
+      f.opts.command = async (args, options) => {
+        if (args[0] !== "launchctl") return base(args, options);
+        f.calls.push(args.join(" "));
+        const selected = args.at(-1)?.endsWith(`/${label}`) === true;
+        if (args[1] === "print") return { stdout: "", stderr: "", exitCode: selected ? 0 : 1 };
+        expect(args.slice(0, 3)).toEqual(["launchctl", "kickstart", "-k"]);
+        expect(selected).toBe(true);
+        if (!selected) throw new Error("wrong label");
+        restarts++;
+        return { stdout: "", stderr: "", exitCode: 0 };
+      };
+      f.client.health = async () => ({
+        ok: true,
+        uptimeMs: 1,
+        sha: restarts ? (rollback ? "wrong" : "next") : "previous",
+        draining: restarts === 0,
+        active: [],
+      });
+      const opts = { ...f.opts, restart: undefined };
+      if (rollback) await expect(deploy(7400, "feature", false, opts)).rejects.toThrow("rollback attempted");
+      else await deploy(7400, "feature", false, opts);
+      expect(restarts).toBe(rollback ? 2 : 1);
+      expect(f.calls.filter((call) => call.startsWith("launchctl kickstart"))).toEqual(
+        Array.from({ length: restarts }, () => `launchctl kickstart -k gui/${process.getuid?.()}/${label}`),
+      );
+    }
+  });
+
+  test(`deploy recovery guidance names the loaded ${label}`, async () => {
+    const f = setup();
+    const base = f.opts.command;
+    f.opts.command = async (args, options) =>
+      args[0] === "launchctl"
+        ? { stdout: "", stderr: "", exitCode: args.at(-1)?.endsWith(`/${label}`) ? 0 : 1 }
+        : base(args, options);
+    f.setSelected("next");
+    f.client.health = async () => ({ ok: true, uptimeMs: 1, sha: "unknown", draining: false, active: [] });
+    await expect(deploy(7400, "feature", false, { ...f.opts, restart: undefined })).rejects.toThrow(
+      `launchctl kickstart -k gui/${process.getuid?.()}/${label}`,
+    );
+  });
+}
+
+test("rollback resolves the daemon again if its installed label changes during deploy", async () => {
+  const f = setup();
+  const base = f.opts.command;
+  let loaded = "cc.mattflower.limitless";
+  const labels: string[] = [];
+  f.opts.command = async (args, options) => {
+    if (args[0] !== "launchctl") return base(args, options);
+    if (args[1] === "print")
+      return { stdout: "", stderr: "", exitCode: args.at(-1)?.endsWith(`/${loaded}`) ? 0 : 1 };
+    const target = args.at(-1) ?? "";
+    expect(target).toEndWith(`/${loaded}`);
+    labels.push(loaded);
+    loaded = "dev.limitless.daemon";
+    return { stdout: "", stderr: "", exitCode: 0 };
+  };
+  f.client.health = async () => ({
+    ok: true,
+    uptimeMs: 1,
+    sha: labels.length ? "wrong" : "previous",
+    draining: true,
+    active: [],
+  });
+  await expect(deploy(7400, "feature", false, { ...f.opts, restart: undefined })).rejects.toThrow(
+    "rollback attempted",
+  );
+  expect(labels).toEqual(["cc.mattflower.limitless", "dev.limitless.daemon"]);
 });

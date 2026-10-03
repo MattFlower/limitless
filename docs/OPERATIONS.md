@@ -6,10 +6,10 @@ How the factory runs day to day, where to look when something breaks, and how ch
 
 | Component | Where | Managed by | Logs |
 |---|---|---|---|
-| Daemon (API, UI, scheduler, pipeline) | Mac, `~/.limitless/app` (release checkout of `main`) | launchd `cc.mattflower.limitless` | `~/.limitless/logs/cc.mattflower.limitless.log` |
+| Daemon (API, UI, scheduler, pipeline) | Mac, `~/.limitless/app` (release checkout of `main`) | launchd `dev.limitless.daemon` | `~/.limitless/logs/dev.limitless.daemon.log` |
 | Local model (Qwen3.8 Flash Next; Swift-1.5 27B opt-in) | Mac, `127.0.0.1:8989` | external: oMLX.app / `omlx start` | oMLX server logs |
 | GPU model (Qwen 3.8 27B, CUDA llama.cpp) | twilight, `:8080` (LAN, API key) | systemd user unit `limitless-llama` (linger on) | `journalctl --user -u limitless-llama` on twilight |
-| Public webhook tunnel | Cloudflare → `limitless.mattflower.cc/webhooks/*` | launchd `cc.mattflower.limitless-tunnel` (opt-in) | `~/.limitless/logs/cc.mattflower.limitless-tunnel.log` |
+| Public webhook tunnel | Cloudflare → `limitless.mattflower.cc/webhooks/*` | launchd `dev.limitless.tunnel` (opt-in) | `~/.limitless/logs/dev.limitless.tunnel.log` |
 | Data | `~/.limitless/` — `limitless.db`, `repos/` (bare caches), `work/` (worktrees), `runs/<id>/inv-*.log` (raw agent streams) | the daemon | — |
 | Config & secrets | `~/.config/limitless/config.toml`, `secrets.env` (chmod 600) | you | — |
 
@@ -54,11 +54,15 @@ or `[review.rosters]`. Leave both unset until the release that added them is kno
 to an older release fails at startup until they are removed.
 
 Changing the launchd units themselves (PATH, arguments) needs `limitless service install`.
+Existing installations should run `limitless service install` once to migrate to the neutral
+`dev.limitless` labels. Add `--mtplx` and/or `--tunnel` to migrate those optional agents.
+The replacement is checked before retiring its predecessor; a failed check keeps the previous agent.
+Deploy and status also recognize installations that have not migrated yet.
 An interrupted deploy logs `interrupted, rolling back...` and attempts to restore the previous
 checkout and resume the scheduler. If the process was killed during rollback, inspect
 `limitless service status` and the release checkout before retrying `limitless deploy`. If the
 daemon has no boot SHA while the checkout already matches the target, restart it with
-`launchctl kickstart -k gui/$UID/cc.mattflower.limitless` (or `limitless service install`),
+`launchctl kickstart -k gui/$UID/dev.limitless.daemon` (or `limitless service install`),
 then retry. A second interrupt exits immediately; recovery may then require those manual steps.
 
 ## Live CLI smoke checks
@@ -121,7 +125,8 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
   preserve server-default thinking and are required for agentic roles such as review/verify.
   Built-in triage/summarize/chat prefer oMLX, but the committed `routing/policy.json` overlay
   remains authoritative where present until replaced by eval-backed policy.
-  For rollback, `limitless service install --mtplx` installs the old agent on port 8000;
+  For rollback, `limitless service install --mtplx` installs `dev.limitless.mtplx` on port 8000
+  (logs: `~/.limitless/logs/dev.limitless.mtplx.log`);
   enable `mtplx` explicitly if disabled and select `mtplx/qwen-27b`. Existing agents are not
   automatically removed; `LIMITLESS_MTPLX_MODEL` still overrides the rollback model at install.
 - **twilight:** `systemctl --user stop limitless-llama` frees the GPU (e.g. for Unsloth Studio);

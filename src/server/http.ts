@@ -198,6 +198,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/api/health": handle(() =>
       json({
         ok: true,
+        pid: process.pid,
         uptimeMs: Date.now() - factory.startedAt,
         sha: factory.bootSha,
         ...drainState(),

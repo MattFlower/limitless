@@ -25,11 +25,16 @@ import {
   waitForHealthy,
 } from "./deploy-wait.ts";
 
-const LABEL = "cc.mattflower.limitless";
-const TUNNEL_LABEL = "cc.mattflower.limitless-tunnel";
-const MTPLX_LABEL = "cc.mattflower.limitless-mtplx";
+const LABEL = "dev.limitless.daemon";
+const TUNNEL_LABEL = "dev.limitless.tunnel";
+const MTPLX_LABEL = "dev.limitless.mtplx";
 const MTPLX_MODEL = process.env.LIMITLESS_MTPLX_MODEL ?? "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality";
 const ALL_LABELS = [LABEL, MTPLX_LABEL, TUNNEL_LABEL];
+const LEGACY: Record<string, string> = {
+  [LABEL]: "cc.mattflower.limitless",
+  [TUNNEL_LABEL]: "cc.mattflower.limitless-tunnel",
+  [MTPLX_LABEL]: "cc.mattflower.limitless-mtplx",
+};
 const REPO_URL = "git@github.com:MattFlower/limitless.git";
 
 const home = homedir();
@@ -112,7 +117,7 @@ function plist(
 `;
 }
 
-export function mtplxPlist(): string {
+export function mtplxPlist(port = 8000): string {
   return plist(MTPLX_LABEL, [
     join(home, ".mtplx", "bin", "mtplx"),
     "serve",
@@ -121,7 +126,7 @@ export function mtplxPlist(): string {
     "--host",
     "127.0.0.1",
     "--port",
-    "8000",
+    String(port),
     "--api-key",
     "mtplx-local",
     "--batching-preset",
@@ -130,12 +135,30 @@ export function mtplxPlist(): string {
   ]);
 }
 
-async function launchctl(args: string[], allowFail = true) {
-  return sh(["launchctl", ...args], { cwd: home, allowFail });
+async function launchctl(args: string[], allowFail = true, command: typeof sh = sh) {
+  return command(["launchctl", ...args], { cwd: home, allowFail });
 }
 
-async function loaded(label: string): Promise<boolean> {
-  return (await launchctl(["print", `gui/${uid}/${label}`])).exitCode === 0;
+async function loaded(label: string, command: typeof sh = sh): Promise<boolean> {
+  return (await launchctl(["print", `gui/${uid}/${label}`], true, command)).exitCode === 0;
+}
+
+async function installedLabel(label: string, command: typeof sh = sh, port = 7400): Promise<string> {
+  const old = LEGACY[label];
+  if (!old || !(await loaded(old, command))) return label;
+  const unitPort = label === LABEL ? port : label === MTPLX_LABEL ? 8000 : port + 2;
+  return (await loaded(label, command)) && (await health(unitPort, 2000, label, command)) ? label : old;
+}
+
+// Stand by without starting integrations or the scheduler while the old daemon owns the port.
+export async function awaitServiceHandoff(): Promise<void> {
+  const old = process.env.LIMITLESS_MIGRATE_FROM;
+  if (!old || !(await loaded(old))) return;
+  const port = Number(process.env.LIMITLESS_STAGING_PORT);
+  const ready = () => Response.json({ ok: true, pid: process.pid });
+  const probe = Bun.serve({ hostname: "127.0.0.1", port, fetch: ready });
+  while (await loaded(old)) await Bun.sleep(100);
+  await probe.stop(true);
 }
 
 function tunnelConfig(port: number): string | null {
@@ -166,12 +189,24 @@ async function ensureRelease(dir = appDir, command: typeof sh = sh): Promise<voi
   }
 }
 
-async function health(port: number, timeoutMs = 30_000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
+async function health(port: number, waitMs = 30_000, label?: string, run: typeof sh = sh): Promise<boolean> {
+  const deadline = Date.now() + waitMs;
+  const endpoint = label === TUNNEL_LABEL ? "/ready" : label === MTPLX_LABEL ? "/v1/models" : "/api/health";
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(2000) });
-      if (res.ok) return true;
+      const state = label ? await launchctl(["print", `gui/${uid}/${label}`], true, run) : null;
+      const pid = Number(state?.stdout.match(/\bpid = (\d+)/)?.[1]);
+      if (label && (state?.exitCode !== 0 || !pid)) {
+        await Bun.sleep(100);
+        continue;
+      }
+      const res = await fetch(`http://127.0.0.1:${port}${endpoint}`, { signal: AbortSignal.timeout(2000) });
+      const body: { ok?: unknown; pid?: unknown } | null =
+        label === LABEL && res.ok ? await res.json() : null;
+      const ownerArgs = ["/usr/sbin/lsof", "-nPat", `-p${pid}`, `-iTCP:${port}`, "-sTCP:LISTEN"];
+      const ownsPort =
+        !label || label === LABEL || (await run(ownerArgs, { cwd: home, allowFail: true })).exitCode === 0;
+      if (res.ok && ownsPort && (label !== LABEL || (body?.ok === true && body.pid === pid))) return true;
     } catch {
       // not up yet
     }
@@ -183,17 +218,26 @@ async function health(port: number, timeoutMs = 30_000): Promise<boolean> {
 export function installationUnits(
   opts: { mtplx?: boolean } = {},
   tunnel: string | null = null,
+  port = 7400,
 ): [string, string][] {
   const units: [string, string][] = [
-    [LABEL, plist(LABEL, [join(home, ".bun", "bin", "bun"), join(appDir, "src", "cli", "main.ts"), "serve"])],
+    [
+      LABEL,
+      plist(LABEL, [join(home, ".bun", "bin", "bun"), join(appDir, "src", "cli", "main.ts"), "serve"], {
+        LIMITLESS_PORT: String(port),
+        LIMITLESS_MIGRATE_FROM: LEGACY[LABEL] ?? "",
+        LIMITLESS_STAGING_PORT: String(port + 1),
+      }),
+    ],
   ];
   if (opts.mtplx === true) {
     units.push([MTPLX_LABEL, mtplxPlist()]);
   }
   if (tunnel) {
+    const metrics = ["--metrics", `127.0.0.1:${port + 2}`];
     units.push([
       TUNNEL_LABEL,
-      plist(TUNNEL_LABEL, ["/opt/homebrew/bin/cloudflared", "tunnel", "--config", tunnel, "run"]),
+      plist(TUNNEL_LABEL, ["/opt/homebrew/bin/cloudflared", "tunnel", ...metrics, "--config", tunnel, "run"]),
     ]);
   }
   return units;
@@ -207,29 +251,55 @@ export async function install(port: number, opts: { tunnel?: boolean; mtplx?: bo
   // The public tunnel is opt-in: only once webhook authentication is in place.
   const tunnel = opts.tunnel ? tunnelConfig(port) : null;
   if (opts.tunnel && !tunnel) console.warn("no cloudflared credentials found; skipping tunnel");
-  const units = installationUnits(opts, tunnel);
+  const units = installationUnits(opts, tunnel, port);
   for (const [label, content] of units) {
     const path = join(agentsDir, `${label}.plist`);
+    const old = LEGACY[label];
+    const oldPath = join(agentsDir, `${old}.plist`);
+    const migrating = !!old && (await loaded(old));
+    const servicePort = label === LABEL ? port : label === MTPLX_LABEL ? 8000 : port + 2;
+    const probePort = label === LABEL ? port + 1 : label === MTPLX_LABEL ? 8001 : servicePort;
+    const staged = migrating && label === MTPLX_LABEL ? mtplxPlist(probePort) : content;
+    if (migrating && !existsSync(oldPath)) throw new Error(`missing legacy plist: ${oldPath}`);
     if (await loaded(label)) {
-      await launchctl(["bootout", `gui/${uid}/${label}`]);
+      await launchctl(["bootout", `gui/${uid}/${label}`], false);
       // bootout returns before the old instance is gone; bootstrapping too early fails with EIO.
       for (let i = 0; i < 30 && (await loaded(label)); i++) await Bun.sleep(500);
     }
-    writeFileSync(path, content);
+    writeFileSync(path, staged);
     let ok = false;
     for (let attempt = 0; attempt < 5 && !ok; attempt++) {
       if (attempt) await Bun.sleep(1000 * attempt);
       ok = (await launchctl(["bootstrap", `gui/${uid}`, path])).exitCode === 0;
     }
-    if (!ok) throw new Error(`launchctl bootstrap failed for ${label}`);
+    if (!ok || !(await health(migrating ? probePort : servicePort, 30_000, label))) {
+      if (migrating) await launchctl(["bootout", `gui/${uid}/${label}`]);
+      throw new Error(`${label} bootstrap or health failed; check ${join(logDir, `${label}.log`)}`);
+    }
+    if (migrating) {
+      try {
+        await launchctl(["bootout", `gui/${uid}/${old}`], false);
+        if (label === MTPLX_LABEL) {
+          await launchctl(["bootout", `gui/${uid}/${label}`], false);
+          writeFileSync(path, content);
+          await launchctl(["bootstrap", `gui/${uid}`, path], false);
+        }
+        if (!(await health(servicePort, 30_000, label))) throw new Error(`${label} handoff failed`);
+        if (existsSync(oldPath)) unlinkSync(oldPath);
+      } catch (error) {
+        await launchctl(["bootout", `gui/${uid}/${label}`]);
+        if (!(await loaded(old))) await launchctl(["bootstrap", `gui/${uid}`, oldPath], false);
+        throw error;
+      }
+    }
+    if (!migrating && existsSync(oldPath)) unlinkSync(oldPath);
     console.log(`installed ${label}`);
   }
-  console.log((await health(port)) ? "daemon healthy" : "daemon did not become healthy — check the log");
 }
 
 export async function uninstall(): Promise<void> {
-  for (const label of ALL_LABELS) {
-    if (await loaded(label)) await launchctl(["bootout", `gui/${uid}/${label}`]);
+  for (const label of [...ALL_LABELS, ...Object.values(LEGACY)]) {
+    if (await loaded(label)) await launchctl(["bootout", `gui/${uid}/${label}`], false);
     const path = join(agentsDir, `${label}.plist`);
     if (existsSync(path)) unlinkSync(path);
     console.log(`removed ${label}`);
@@ -337,7 +407,13 @@ export async function deploy(
   if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs < 0) throw new Error("invalid deployment wait budget");
   const client = opts.client ?? localDeployClient(port);
   const clock = opts.clock ?? deployClock;
-  const restart = opts.restart ?? (() => launchctl(["kickstart", "-k", `gui/${uid}/${LABEL}`], false));
+  let label = opts.restart ? LABEL : await installedLabel(LABEL, command, port);
+  const restart =
+    opts.restart ??
+    (async () => {
+      label = await installedLabel(LABEL, command, port);
+      return launchctl(["kickstart", "-k", `gui/${uid}/${label}`], false, command);
+    });
   const log = opts.log ?? console.log;
   const unlock = acquireDeployLock(opts.lockPath ?? deployLock);
   let interrupted: Error | null = null;
@@ -383,7 +459,7 @@ export async function deploy(
     const target = (await run(["git", "rev-parse", `${ref}^{commit}`], { cwd: dir })).stdout.trim();
     if (running.sha === "unknown" && checkout === target) {
       throw new Error(
-        `daemon boot SHA is unknown and checkout already matches target; recover with launchctl kickstart -k gui/${uid}/${LABEL} or limitless service install`,
+        `daemon boot SHA is unknown and checkout already matches target; recover with launchctl kickstart -k gui/${uid}/${label} or limitless service install`,
       );
     }
     // Legacy upgrades can use the checkout for rollback, but never as proof of completion.
@@ -460,7 +536,11 @@ export async function deploy(
 }
 
 export async function status(port: number): Promise<void> {
-  for (const label of ALL_LABELS) console.log(`${label}: ${(await loaded(label)) ? "loaded" : "not loaded"}`);
+  for (const unit of ALL_LABELS) {
+    const label = await installedLabel(unit, sh, port);
+    const state = (await loaded(label)) ? "loaded" : "not loaded";
+    console.log(`${label}: ${state}; log: ${join(logDir, `${label}.log`)}`);
+  }
   if (existsSync(join(appDir, ".git"))) {
     const head = (await sh(["git", "log", "-1", "--format=%h %s"], { cwd: appDir })).stdout.trim();
     console.log(`release: ${head}`);

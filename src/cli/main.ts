@@ -145,16 +145,26 @@ async function serve(): Promise<void> {
   const { mountIntegrations } = await import("../integrations/index.ts");
   const { sweepOrphanedSnapshots } = await import("../pipeline/snapshots.ts");
   const cfg = loadConfig();
-  const orphans = sweepOrphanedSnapshots();
-  if (orphans.length) console.log(`Removed ${orphans.length} holdout snapshot(s) left by a stopped daemon`);
   const bootSha = await resolveBootSha(join(import.meta.dir, "../.."));
   const factory = new Factory(cfg, {
     bootSha,
     policyPath: join(import.meta.dir, "../../routing/policy.json"),
   });
   const ui = await (await import("../server/ui.ts")).buildUi();
+  await (await import("./service.ts")).awaitServiceHandoff();
+  const orphans = sweepOrphanedSnapshots();
+  if (orphans.length) console.log(`Removed ${orphans.length} holdout snapshot(s) left by a stopped daemon`);
   const integrations = await mountIntegrations(factory);
-  const server = startHttp(factory, { ui, routes: integrations.routes });
+  let server: ReturnType<typeof startHttp> | undefined;
+  for (let attempt = 0; !server; attempt++) {
+    try {
+      server = startHttp(factory, { ui, routes: integrations.routes });
+    } catch (error) {
+      if (!process.env.LIMITLESS_MIGRATE_FROM || attempt >= 100) throw error;
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "EADDRINUSE") throw error;
+      await Bun.sleep(100);
+    }
+  }
   factory.start();
   console.log(`Limitless listening on http://${cfg.host}:${server.port}  (data: ${cfg.paths.home})`);
   if (cfg.listenLan) console.log(`LAN proxy listener: http://${cfg.listenLan}:${cfg.port}`);
