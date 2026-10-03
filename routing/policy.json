@@ -13,10 +13,10 @@
     ]
   },
   "implement": {
-    "trivial": ["codex/sol-6.1@high", "claude/opus"],
-    "small": ["codex/sol-6.1@high", "claude/opus"],
-    "medium": ["codex/sol-6.1@high", "claude/opus"],
-    "large": ["claude/opus", "codex/sol@medium"]
+    "trivial": ["codex/sol-6.1@high", "codex/astra@high", "claude/opus"],
+    "small": ["codex/sol-6.1@high", "codex/astra@high", "claude/opus"],
+    "medium": ["codex/sol-6.1@high", "codex/astra@high", "claude/opus"],
+    "large": ["codex/astra@high", "codex/sol-6.1@high", "claude/opus"]
   },
   "review": {
     "default": [
