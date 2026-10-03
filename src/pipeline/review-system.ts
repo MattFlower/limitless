@@ -228,8 +228,7 @@ const RostersSchema = z.strictObject({
 /**
  * Checked at startup, so a mistyped pin fails loudly instead of routing by policy: roster targets
  * must be catalog models the review role can run, and a local finder's must be free. Single mode
- * uses no roster, so there a problem (e.g. a pinned model a later release dropped) only warns; with
- * a shadow panel it also returns false, so the caller turns the shadow off rather than fail startup.
+ * only warns; returning false tells the caller to disable an invalid shadow panel.
  */
 export function checkRosterTargets(
   cfg: Pick<Config, "reviewMode" | "reviewRosters" | "reviewShadow">,

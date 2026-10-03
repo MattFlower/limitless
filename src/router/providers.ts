@@ -447,10 +447,7 @@ export class ProviderTracker {
     throw new Error("cancelled");
   }
 
-  /**
-   * A shadow call's slot: only while two are free and no production call is queued, waking or waiting on
-   * a preempted call, so it never takes the last slot and never waits. `preempt` lets production abort it.
-   */
+  /** Shadow admission needs two free slots and no waiting production; `preempt` cancels this call. */
   tryAcquire(id: string, preempt: () => void): (() => void) | null {
     const p = this.providers.get(id);
     if (!p || p.inFlight + 2 > p.def.maxConcurrent || p.waiters.length || p.waking) return null;

@@ -16,7 +16,6 @@ export const ROLE_DESCRIPTIONS: Record<Role, string> = {
   chat: "Handles conversation with the user so requests and status questions can be understood.",
 };
 
-/** How the UI names a recorded role; shadow review calls are recorded as `review_shadow`. */
 export const roleLabel = (role: string): string => (role === "review_shadow" ? "shadow review" : role);
 
 export function roleDescription(role: string): string {
