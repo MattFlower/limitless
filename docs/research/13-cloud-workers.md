@@ -263,7 +263,11 @@ That comes to **about 5–7 minutes, and it doesn't grow with the number of acti
 
 **Capacity:** 20 concurrent jobs, one per check, is about 6 concurrent gate rounds with the three-check matrix, or 20 if only `test` goes remote.
 
-Measured on this document's own PR: TBD.
+**Measured on this document's own PR** (#309) [M]:
+- the push took 1.9 s;
+- the CI run was created 4 s after the PR opened, and its job started 3 s later;
+- `bun run check` took 343 s;
+- the green result came 5 min 55 s after the PR opened.
 
 ### 3.5 Reliability and risks
 
