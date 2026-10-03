@@ -39,7 +39,13 @@ export function mountMcp(factory: Factory) {
           { status: 405, headers: { Allow: "POST" } },
         );
       }
-      const server = createMcpServer(factoryBackend(factory));
+      const backend = factoryBackend(factory);
+      // The SDK's JSON-response transport never aborts a tool when the HTTP client disconnects,
+      // so a feed long poll would otherwise keep its listener until the wait ends.
+      const server = createMcpServer({
+        ...backend,
+        feed: (query, signal) => backend.feed(query, AbortSignal.any([signal, req.signal])),
+      });
       const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
       active.add(server);
       try {

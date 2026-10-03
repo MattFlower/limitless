@@ -172,3 +172,29 @@ test("the mounted endpoint serves the feed tools", async () => {
   });
   expect(f.factory.store.feedCursor("codex")).toBe(page.nextAfter);
 });
+
+test("an HTTP client disconnecting from a feed long poll releases its listener", async () => {
+  const listeners = () => (f.factory.store as unknown as { listeners: Set<unknown> }).listeners.size;
+  const idle = listeners();
+  const controller = new AbortController();
+  const req = requestWithParams("http://127.0.0.1:7400/mcp", {
+    method: "POST",
+    headers,
+    signal: controller.signal,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "limitless_feed", arguments: { wait: 30 } },
+    }),
+  });
+  const started = Date.now();
+  const pending = route(req, localServer).catch(() => "aborted");
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle + 1);
+  controller.abort();
+  await pending;
+  expect(Date.now() - started).toBeLessThan(5_000);
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle);
+});
