@@ -69,13 +69,14 @@ interface FilePatch {
 export function unquote(quoted: string): string | null {
   if (!/^"(?:\\(?:[0-7]{3}|[abfnrtv"\\])|[^"\\])*"$/.test(quoted)) return null;
   const escapes = "\x07\b\f\n\r\t\v";
-  const decoded = quoted
-    .slice(1, -1)
-    .replace(/\\([0-7]{3}|[abfnrtv"\\])/g, (_, c: string) =>
-      /^[0-7]/.test(c) ? String.fromCharCode(Number.parseInt(c, 8)) : (escapes["abfnrtv".indexOf(c)] ?? c),
-    );
-  const encoding = /\\[0-7]{3}/.test(quoted) ? "latin1" : "utf8";
-  return Buffer.from(decoded, encoding).toString("utf8");
+  // Octal escapes encode bytes; literal Unicode must keep its UTF-8 encoding.
+  const bytes = Array.from(quoted.slice(1, -1).matchAll(/\\([0-7]{3}|[abfnrtv"\\])|[^\\]+/g), (m) => {
+    const c = m[1];
+    return c && /^[0-7]/.test(c)
+      ? Buffer.from([Number.parseInt(c, 8)])
+      : Buffer.from(c ? (escapes["abfnrtv".indexOf(c)] ?? c) : m[0], "utf8");
+  });
+  return Buffer.concat(bytes).toString("utf8");
 }
 
 export function splitPatch(patch: string): FilePatch[] {

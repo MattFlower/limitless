@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import type { Repo } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
-import { auditDiff } from "../src/gates/audit.ts";
+import { attributeRules, auditDiff } from "../src/gates/audit.ts";
 import { collectGarbage } from "../src/gc.ts";
 import { worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
@@ -353,6 +353,37 @@ test("quoted attribute patterns keep their binary-only exemption when Git can de
       auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] }),
     );
     expect([line, findings.length > 0]).toEqual([line, blocked]);
+  }
+});
+
+test("mixed literal UTF-8 and octal attribute patterns cannot exempt existing text", async () => {
+  const paths = ["café notes.txt", "文書 📄 notes.txt"] as const;
+  for (const path of paths) writeFileSync(join(work, path), "existing text\n");
+  await commitAll(work, "existing Unicode text paths");
+  const revision = await headSha(work);
+  for (const [pattern, path] of [
+    ['"café\\040notes.txt"', paths[0]],
+    ['"caf\\303\\251 notes.txt"', paths[0]],
+    ['"文書 📄\\040notes.txt"', paths[1]],
+  ] as const) {
+    await git(work, "reset", "-q", "--hard", revision);
+    writeFileSync(join(work, ".gitattributes"), `${pattern} -diff\n`);
+    await commitAll(work, "hide existing text with a quoted pattern");
+    expect((await git(work, "check-attr", "--source=HEAD", "-z", "diff", "--", path)).stdout).toBe(
+      `${path}\0diff\0unset\0`,
+    );
+    const diff = await diffSince(work, revision);
+    expect(diff.files.map((file) => file.path)).toEqual([".gitattributes"]);
+    expect(attributeRules(diff.attributePatch ?? diff.patch).map((rule) => rule.pattern)).toEqual([path]);
+    expect(Object.values(diff.attributeMatches ?? {})).toEqual([[path]]);
+    expect(attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] }))).toContainEqual(
+      expect.objectContaining({
+        rule: "gitattributes",
+        severity: "block",
+        file: ".gitattributes",
+        detail: expect.stringContaining(path),
+      }),
+    );
   }
 });
 
