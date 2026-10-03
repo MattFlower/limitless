@@ -401,6 +401,39 @@ test.each([
   expect(attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] })).length > 0).toBe(text);
 });
 
+test("an LFS pointer committed for a tracked binary keeps the LFS exemption; a fake pointer path in text does not", async () => {
+  // What `git lfs track "*.png"` plus `git add` commits when git-lfs is installed: a pointer.
+  // Hermetic: a runner's global LFS filter would rewrite the pointer-like text below too.
+  const saved = { global: process.env.GIT_CONFIG_GLOBAL, system: process.env.GIT_CONFIG_NOSYSTEM };
+  process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+  process.env.GIT_CONFIG_NOSYSTEM = "1";
+  try {
+    const pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 68\n`;
+    writeFileSync(join(work, "icon.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2]));
+    await commitAll(work, "binary base");
+    const revision = await headSha(work);
+    writeFileSync(join(work, "icon.png"), pointer);
+    writeFileSync(join(work, ".gitattributes"), "*.png filter=lfs diff=lfs merge=lfs -text\n");
+    await commitAll(work, "track with LFS");
+    const audit = (rev: string) =>
+      diffSince(work, rev).then((diff) =>
+        attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] })),
+      );
+    expect(await audit(revision)).toEqual([]);
+    // A text file that only looks pointer-like (extra content) is still text, so the rule blocks.
+    writeFileSync(join(work, "icon.png"), `${pointer}console.log("hidden")\n`);
+    await commitAll(work, "pointer-like text");
+    expect((await audit(revision)).length).toBeGreaterThan(0);
+  } finally {
+    for (const [key, value] of [
+      ["GIT_CONFIG_GLOBAL", saved.global],
+      ["GIT_CONFIG_NOSYSTEM", saved.system],
+    ] as const)
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+  }
+});
+
 test("quoted attribute patterns keep their binary-only exemption when Git can decode them", async () => {
   writeFileSync(join(work, "asset text.png"), "base text\n");
   await commitAll(work, "base");

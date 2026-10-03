@@ -510,6 +510,7 @@ export async function diffSince(
   return { patch: patch.stdout, files, stat: stat.stdout, added, removed, gitlinks, ...inspection };
 }
 
+const LFS_POINTER = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:[0-9a-f]{64}\nsize \d+\n$/;
 /** Deadline for attribute queries and content classification; missing it blocks the audit. */
 export const attributeLimits = { timeoutMs: 60_000 };
 
@@ -563,6 +564,17 @@ async function attributeInfo(
     for (const entry of out.stdout.split("\0")) {
       const match = entry.match(/^(\d+)\t\d+\t([\s\S]+)$/);
       if (match?.[2]) text.add(match[2]);
+    }
+    // A Git LFS pointer, which `git lfs` commits for a tracked file, stands for binary content.
+    const candidates = [...text].filter((path) => !path.includes("\n"));
+    if (candidates.length) {
+      const objects = candidates.map((path) => `${tree}:${path}\n`).join("");
+      const sizes = (await git(["cat-file", "--batch-check=%(objectsize)"], objects)).stdout.split("\n");
+      for (const [i, path] of candidates.entries()) {
+        const size = Number(sizes[i]);
+        if (!(size > 0 && size <= 200)) continue;
+        if (LFS_POINTER.test((await git(["cat-file", "-p", `${tree}:${path}`])).stdout)) text.delete(path);
+      }
     }
     return text;
   };
