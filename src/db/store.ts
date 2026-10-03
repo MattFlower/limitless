@@ -19,7 +19,6 @@ import type {
   Question,
   QuotaAlert,
   Repo,
-  Role,
   Run,
   RunDetail,
   RunEvent,
@@ -181,7 +180,7 @@ const toInvocation = (r: Row): Invocation => ({
   id: r.id as number,
   runId: r.run_id as string,
   stageId: (r.stage_id as number) ?? null,
-  role: r.role as Role,
+  role: r.role as Invocation["role"],
   harness: r.harness as string,
   provider: r.provider as string,
   model: r.model as string,
@@ -1192,7 +1191,7 @@ export class Store {
     fast?: boolean;
     runId: string;
     stageId: number | null;
-    role: Role;
+    role: Invocation["role"];
     harness: string;
     provider: string;
     model: string;

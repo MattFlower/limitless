@@ -27,8 +27,14 @@ interface ProviderRuntime {
   healthy: boolean; // for local servers: last probe result
   inFlight: number;
   waiters: (() => void)[];
+  /** Waiters woken by a release that have not yet taken their slot: no later caller takes it first. */
+  waking: number;
+  /** Shadow calls holding a slot; a production waiter aborts one and becomes heir to its slot. */
+  shadows: Set<ShadowHold>;
   confinement?: ConfinementProbe;
 }
+
+type ShadowHold = { preempt: () => void; heir?: () => void };
 
 interface KeyReading {
   usage: number;
@@ -138,6 +144,8 @@ export class ProviderTracker {
         healthy: !def.healthUrl, // local servers start unknown→down until probed
         inFlight: 0,
         waiters: [],
+        waking: 0,
+        shadows: new Set(),
       });
     }
   }
@@ -452,7 +460,7 @@ export class ProviderTracker {
     if (!p) throw new Error(`unknown provider ${id}`);
     const end = waitMs === undefined ? Infinity : this.clock() + waitMs;
     let notified = false;
-    while (p.inFlight >= p.def.maxConcurrent) {
+    while (p.inFlight + p.waking >= p.def.maxConcurrent) {
       if (signal.aborted) throw new Error("cancelled");
       if (!notified) {
         onWait?.(p.waiters.length);
@@ -460,33 +468,74 @@ export class ProviderTracker {
       }
       if (signal.aborted) throw new Error("cancelled");
       if (this.clock() >= end) return null;
-      await new Promise<void>((resolve) => {
+      // Production never waits behind a shadow call: abort one, and take its slot ahead of the queue.
+      const shadow = [...p.shadows].find((s) => !s.heir);
+      const woken = await new Promise<boolean>((resolve) => {
         let timeout: ReturnType<typeof setInterval> | undefined;
         const wake = () => {
           if (timeout !== undefined) this.timer.clear(timeout);
-          signal.removeEventListener("abort", wake);
+          signal.removeEventListener("abort", leave);
+          p.waking++;
+          resolve(true);
+        };
+        // A cancelled or expired waiter must leave the queue, or a later release would wake a dead
+        // waiter and strand the live ones behind it. A claim on a shadow's slot passes to the head of
+        // the queue, so a newcomer cannot take it ahead of an older waiter.
+        const leave = () => {
+          if (timeout !== undefined) this.timer.clear(timeout);
+          signal.removeEventListener("abort", leave);
+          for (const held of p.shadows) if (held.heir === wake) held.heir = p.waiters.shift();
           const i = p.waiters.indexOf(wake);
           if (i >= 0) p.waiters.splice(i, 1);
-          resolve();
+          resolve(false);
         };
-        p.waiters.push(wake);
-        signal.addEventListener("abort", wake, { once: true });
-        if (Number.isFinite(end)) timeout = this.timer.set(wake, Math.min(end - this.clock(), 2_147_483_647));
+        if (shadow) shadow.heir = wake;
+        else p.waiters.push(wake);
+        signal.addEventListener("abort", leave, { once: true });
+        if (Number.isFinite(end))
+          timeout = this.timer.set(leave, Math.min(end - this.clock(), 2_147_483_647));
+        shadow?.preempt();
       });
+      if (woken) p.waking--;
     }
-    if (signal.aborted || (notified && this.clock() >= end)) {
-      p.waiters.shift()?.();
-      if (signal.aborted) throw new Error("cancelled");
+    const release = this.hold(p);
+    // Cancelled after its wake, or past the deadline when the slot freed: hand the slot on.
+    if (signal.aborted) {
+      release();
+      throw new Error("cancelled");
+    }
+    if (notified && this.clock() >= end) {
+      release();
       return null;
     }
+    return release;
+  }
+
+  /** Shadow admission needs two free slots and no waiting production; `preempt` cancels this call. */
+  tryAcquire(id: string, preempt: () => void): (() => void) | null {
+    const p = this.providers.get(id);
+    if (!p || p.inFlight + 2 > p.def.maxConcurrent || p.waiters.length || p.waking) return null;
+    if ([...p.shadows].some((s) => s.heir)) return null;
+    const shadow = { preempt };
+    p.shadows.add(shadow);
+    return this.hold(p, shadow);
+  }
+
+  private hold(p: ProviderRuntime, shadow?: ShadowHold): () => void {
+    const id = p.def.id;
     p.inFlight++;
     this.publish(id);
     let released = false;
     return () => {
       if (released) return;
       released = true;
+      if (shadow) p.shadows.delete(shadow);
       p.inFlight--;
-      p.waiters.shift()?.();
+      // A preempted shadow's slot goes to its heir; any other free slot to the earliest pending heir.
+      const heir = shadow?.heir ? shadow : [...p.shadows].find((s) => s.heir);
+      const next = heir?.heir ?? p.waiters.shift();
+      if (heir) heir.heir = undefined;
+      next?.();
       this.publish(id);
     };
   }

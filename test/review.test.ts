@@ -915,6 +915,45 @@ describe("runReview panel", () => {
     expect(settled).toBe(1);
   });
 
+  test("a preempted shadow finder is recorded as it settles, though a sibling fails or hangs", async () => {
+    const system = {
+      mode: "panel" as const,
+      finders: [{ prompt: "standard" as const }, { prompt: "careful" as const }],
+    };
+    // A sibling cancelled at the grace deadline fails the panel; the preempted finder stays recorded.
+    const finished: Record<string, unknown>[] = [];
+    const run = runReview(
+      {
+        invoke: async (_request, finder) => {
+          if (finder === 0) throw new FinderSkipped("preempted");
+          await Bun.sleep(5);
+          throw new Error("cancelled");
+        },
+        verify: async () => ok({ results: [] }, "google"),
+        skipAny: true,
+        finished,
+      },
+      { prompt, timeoutMs: 1, system },
+    );
+    await expect(run).rejects.toThrow("cancelled");
+    expect(finished).toEqual([{ finder: 0, skipped: "preempted" }]);
+    // A hanging sibling holds the panel open, but the record is already there to be read.
+    const pending: Record<string, unknown>[] = [];
+    void runReview(
+      {
+        invoke: async (_request, finder) => {
+          if (finder === 0) throw new FinderSkipped("preempted");
+          return new Promise<ReturnType<typeof ok>>(() => {});
+        },
+        skipAny: true,
+        finished: pending,
+      },
+      { prompt, timeoutMs: 1, system },
+    );
+    await Bun.sleep(5);
+    expect(pending).toEqual([{ finder: 0, skipped: "preempted" }]);
+  });
+
   test("a lens finder gets its focus; a local finder that finds no model in time or fails is skipped", async () => {
     const timedOut = {
       ...ok(null, "qwen"),
@@ -1274,8 +1313,10 @@ describe("runReview panel", () => {
     const { confidence: _confidence, ...partial } = candidate("a", 1);
     const invalid = { ...valid, findings: [partial] };
     let verified = 0;
+    const finished: Record<string, unknown>[] = [];
     const out = await runReview(
       {
+        finished,
         invoke: async (_request, index) => {
           const reply = ok(index === 0 ? valid : null, "anthropic");
           return index === 0
@@ -1294,6 +1335,10 @@ describe("runReview panel", () => {
       },
     );
     expect(verified).toBe(0);
+    expect(finished).toEqual([
+      { finder: 0, status: "ok", review: valid },
+      { finder: 1, status: "ok", review: null },
+    ]);
     expect(out.decision).toBeUndefined();
     expect(out.output.success).toBe(false);
     expect(out.result).toMatchObject({ status: "error", finalText: "", structured: null, costUsd: 1 });

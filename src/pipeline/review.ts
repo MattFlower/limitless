@@ -263,6 +263,9 @@ export interface ReviewDeps<T extends Invoked> {
   ) => Promise<T>;
   /** Panel only: problems that degrade the review without failing it. */
   warn?: (message: string) => void;
+  /** Any finder, not just a local one, may throw FinderSkipped (a shadow panel without a free slot). */
+  skipAny?: boolean;
+  finished?: Record<string, unknown>[];
 }
 
 /**
@@ -427,7 +430,12 @@ async function runPanel<T extends Invoked>(
         timeoutMs: local ? Math.min(input.timeoutMs, LOCAL_FINDER_TIMEOUT_MS) : input.timeoutMs,
         prompt: { ...input.prompt, finder: prompt, ...(lens ? { lens } : {}) },
       });
-      const invoked = await deps.invoke(request, finder);
+      const invoked = await deps.invoke(request, finder).catch((error: unknown) => {
+        if (error instanceof FinderSkipped && (local || deps.skipAny))
+          deps.finished?.push({ finder, skipped: error.message.slice(0, 300) });
+        throw error;
+      });
+      deps.finished?.push({ finder, status: invoked.result.status, review: invoked.result.structured });
       const output = request.schema.safeParse(
         invoked.result.structured ?? extractJson(invoked.result.finalText),
       );
@@ -435,7 +443,9 @@ async function runPanel<T extends Invoked>(
     }),
   );
   const skippable = (member: (typeof settled)[number], finder: number) =>
-    member.status === "rejected" && member.reason instanceof FinderSkipped && !!finders[finder]?.local;
+    member.status === "rejected" &&
+    member.reason instanceof FinderSkipped &&
+    !!(finders[finder]?.local || deps.skipAny);
   for (const [finder, member] of settled.entries())
     if (member.status === "rejected" && !skippable(member, finder)) throw member.reason;
   const results: AgentResult[] = settled.flatMap((m) =>
@@ -452,7 +462,7 @@ async function runPanel<T extends Invoked>(
     }
     found[finder] = undefined;
     const result = value?.invoked.result;
-    if (finders[finder]?.local) {
+    if (finders[finder]?.local || skippable(member, finder)) {
       const problem =
         member.status === "rejected"
           ? String((member.reason as Error).message)
@@ -475,7 +485,7 @@ async function runPanel<T extends Invoked>(
     };
   }
   const first = found.find((member) => member !== undefined);
-  if (!first) throw new Error('mode "panel" needs a finder that is not skipped');
+  if (!first) throw new Error(`mode "panel" needs a finder that is not skipped: ${[...skipped.values()]}`);
 
   const { fixReview, previous } = input.prompt;
   const priorBlocking = previous?.findings ?? [];
@@ -583,12 +593,18 @@ async function runPanel<T extends Invoked>(
   const omitted: string[] = [];
   const warnings: string[] = [];
   let last = first.invoked.result;
+  // A skipped (shadow) verifier leaves its batch unverified: the panel goes on with what it has.
+  const verify = (...args: Parameters<NonNullable<typeof deps.verify>>) =>
+    deps.verify?.(...args).catch((error: unknown) => {
+      if (!(deps.skipAny && error instanceof FinderSkipped)) throw error;
+      deps.finished?.push({ verifier: args[3], skipped: error.message });
+    });
   for (const [index, batch] of batches.entries()) {
     if (!deps.verify) throw new Error('mode "panel" needs a verifier');
     // Candidates the verifier leaves out get one more call, then stay unverified follow-ups.
     let pending = batch;
     for (let attempt = 0; attempt < 2 && pending.length; attempt++) {
-      const invoked = await deps.verify(
+      const invoked = await verify(
         {
           prompt: verifierPrompt({
             prompt: input.prompt.prompt,
@@ -615,6 +631,12 @@ async function runPanel<T extends Invoked>(
         modelsOf(pending),
         pending.map((c) => c.id),
       );
+      if (!invoked) break;
+      deps.finished?.push({
+        verifier: pending.map((c) => c.id),
+        status: invoked.result.status,
+        result: invoked.result.structured,
+      });
       const shared = invoked.target?.vendor;
       if (shared && pending[0] && vendorsOf(pending[0]).includes(shared)) {
         const warning = `Verifier ${invoked.target?.modelId ?? "?"} shares vendor ${shared} with a finder it checks (${pending.map((c) => c.id).join(", ")}); no other vendor was available`;

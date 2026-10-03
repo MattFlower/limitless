@@ -134,7 +134,8 @@ export function computeStats(store: Store, days = 14): Stats {
               SUM(cost_usd) AS cost_usd, SUM(cost_equiv_usd) AS cost_equiv_usd,
               AVG(COALESCE(finished_at, started_at) - started_at) AS avg_ms,
               SUM(input_tokens + cache_read_tokens) AS tin, SUM(output_tokens) AS tout
-         FROM invocations WHERE started_at >= ? GROUP BY model_id, role ORDER BY n DESC`,
+         FROM invocations WHERE started_at >= ? AND role != 'review_shadow'
+        GROUP BY model_id, role ORDER BY n DESC`,
     )
     .all(since) as Record<string, number | string>[];
   const totals = store.db

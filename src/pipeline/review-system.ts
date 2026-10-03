@@ -221,14 +221,14 @@ const RostersSchema = z.strictObject({
 /**
  * Checked at startup, so a mistyped pin fails loudly instead of routing by policy: roster targets
  * must be catalog models the review role can run, and a local finder's must be free. Single mode
- * uses no roster, so there a problem (e.g. a pinned model a later release dropped) only warns.
+ * only warns; returning false tells the caller to disable an invalid shadow panel.
  */
 export function checkRosterTargets(
-  cfg: Pick<Config, "reviewMode" | "reviewRosters">,
+  cfg: Pick<Config, "reviewMode" | "reviewRosters" | "reviewShadow">,
   models: ModelDef[],
   providers: ProviderDef[],
   warn: (message: string) => void,
-): void {
+): boolean {
   const rosters = cfg.reviewRosters;
   const problems = Object.entries(rosters).flatMap(([profile, finders]) =>
     finders.flatMap(({ target, local }, i) => {
@@ -245,10 +245,14 @@ export function checkRosterTargets(
       }
     }),
   );
-  if (!problems.length) return;
+  if (!problems.length) return true;
   const message = `Invalid review rosters: ${problems.join("; ")}`;
   if (cfg.reviewMode === "panel") throw new Error(message);
-  warn(`${message} (ignored: [review] mode is single)`);
+  const shadow = cfg.reviewShadow === "panel";
+  warn(
+    `${message} (ignored: [review] mode is single${shadow ? "; shadow review disabled until fixed" : ""})`,
+  );
+  return !shadow;
 }
 
 /** `[review.rosters]` from config.toml; a profile it leaves out keeps its default roster. */
