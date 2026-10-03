@@ -866,7 +866,7 @@ end();
   );
   writeFileSync(
     join(bin, "git"),
-    `#!/bin/sh\nif [ "$1" = push ]; then printf '%s\\n' "$@" >> '${join(root, "pushes")}'; exit 0; fi\nexec /usr/bin/git "$@"\n`,
+    `#!/bin/sh\ncommand=$(while [ "$1" = -c ]; do shift 2; done; printf '%s' "$1")\nif [ "$command" = push ]; then printf '%s\\n' "$@" >> '${join(root, "pushes")}'; exit 0; fi\nexec /usr/bin/git "$@"\n`,
     { mode: 0o755 },
   );
   const oldPath = process.env.PATH;
@@ -929,8 +929,9 @@ for (const operation of [
         writeFileSync(
           path,
           `#!/bin/sh
-printf '%s\\n' "${bin} $*" >> '${calls}'
-case "${bin} $*" in
+args=$(while [ "$1" = -c ]; do shift 2; done; printf '%s' "$*")
+printf '%s\\n' "${bin} $args" >> '${calls}'
+case "${bin} $args" in
   ${pattern
     .split("*")
     .map((part) => `'${part}'`)
@@ -1811,9 +1812,13 @@ test("GitHub retries SSH temporary DNS failures", async () => {
 test("the budget bounds retries and waits, never a call's first attempt or a healthy slow call", async () => {
   const restore = fakeGh(join(root, "pr"));
   // A healthy push that takes longer than the budget left still completes on its own timeout.
-  writeFileSync(join(root, "bin", "git"), `#!/bin/sh\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`, {
-    mode: 0o755,
-  });
+  writeFileSync(
+    join(root, "bin", "git"),
+    `#!/bin/sh\ncommand=$(while [ "$1" = -c ]; do shift 2; done; printf '%s' "$1")\nif [ "$command" = config ]; then exec /usr/bin/git "$@"; fi\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
+    {
+      mode: 0o755,
+    },
+  );
   const repo = { kind: "github", url: "https://github.com/test/repo.git" } as Parameters<
     typeof pushBranch
   >[0];
