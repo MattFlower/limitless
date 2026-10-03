@@ -38,7 +38,7 @@ export interface Config {
   listenLan: string | null;
   trustedProxies: string[];
   publicOrigins: string[];
-  publicUrl: string | null; // e.g. https://limitless.mattflower.cc (webhooks only)
+  publicUrl: string | null; // e.g. https://limitless.example.com (webhooks only)
   uiUrl: string; // where the UI is reachable locally, used in PR bodies
   maxConcurrentRuns: number;
   providerMaxConcurrent: Record<string, number>;
@@ -59,6 +59,12 @@ export interface Config {
   reviewImplementerReport: "include" | "omit";
   /** `single` (production today) or a verified finder panel with the profile's roster. */
   reviewMode: "single" | "panel";
+  /** `panel`: single reviews still decide, and the profile's panel also runs and records `review-N.shadow.json`. */
+  reviewShadow: "off" | "panel";
+  /** How long a shadow panel may outlast its single review before it is aborted as a timeout. */
+  reviewShadowGraceSeconds: number;
+  /** Besides the repository owner, logins whose PR comments count as shadow-report evidence. */
+  reviewTrustedReviewers: string[];
   /** Panel finders per profile, before repo lenses. */
   reviewRosters: Record<ResolvedProfile, ReviewFinder[]>;
   /** Decision-model triage declines (falls through to the next model) below this answer confidence. */
@@ -96,7 +102,14 @@ function parseEnvFile(path: string): Record<string, string> {
 }
 
 /** `[review]` is validated strictly: a misspelt key would otherwise silently keep the default. */
-const REVIEW_KEYS = ["implementer_report", "mode", "rosters"];
+const REVIEW_KEYS: readonly string[] = [
+  "implementer_report",
+  "mode",
+  "rosters",
+  "shadow",
+  "shadow_grace_seconds",
+  "trusted_reviewers",
+];
 const TRIAGE_KEYS = ["decision_confidence"];
 /** Provisional until calibrated on evals/triage (docs/research/09-jev-decisions.md). */
 export const DEFAULT_DECISION_CONFIDENCE = 0.6;
@@ -224,6 +237,16 @@ export function loadConfig(
     throw new Error('review.implementer_report must be "include" or "omit"');
   if (review.mode !== undefined && review.mode !== "single" && review.mode !== "panel")
     throw new Error('review.mode must be "single" or "panel"');
+  if (review.shadow !== undefined && review.shadow !== "off" && review.shadow !== "panel")
+    throw new Error('review.shadow must be "off" or "panel"');
+  if (review.shadow === "panel" && review.mode === "panel")
+    throw new Error('review.shadow = "panel" needs review.mode = "single"; a panel cannot shadow itself');
+  const grace = review.shadow_grace_seconds ?? 300;
+  if (typeof grace !== "number" || !Number.isFinite(grace) || grace < 0)
+    throw new Error("review.shadow_grace_seconds must be a nonnegative number");
+  const trusted = review.trusted_reviewers ?? [];
+  if (!Array.isArray(trusted) || !trusted.every((login) => typeof login === "string" && login))
+    throw new Error("review.trusted_reviewers must be a list of GitHub logins");
   const rawTriage = raw.triage ?? {};
   if (typeof rawTriage !== "object" || rawTriage === null || Array.isArray(rawTriage))
     throw new Error("triage must be a table");
@@ -311,6 +334,9 @@ export function loadConfig(
     dependabotRouting: routing.dependabot === "policy" ? "policy" : "free_first",
     reviewImplementerReport: review.implementer_report === "omit" ? "omit" : "include",
     reviewMode: review.mode === "panel" ? "panel" : "single",
+    reviewShadow: review.shadow === "panel" ? "panel" : "off",
+    reviewShadowGraceSeconds: grace,
+    reviewTrustedReviewers: trusted,
     reviewRosters: parseReviewRosters(review.rosters),
     triageDecisionConfidence: confidence,
     githubOwner: str(owners.github, "MattFlower"),

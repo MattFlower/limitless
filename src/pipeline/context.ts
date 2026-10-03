@@ -68,6 +68,8 @@ export interface RunState {
   previewConfig?: PreviewConfig | null;
   /** `[review] lenses` from the base commit, read at prepare in panel mode only (else single stays). */
   reviewLenses?: RepoReviewLens[];
+  /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
+  shadowLenses?: RepoReviewLens[] | { error: string };
   baseline?: GateRun | null;
   /** The baseline came from the per-base-commit cache instead of executing at prepare. */
   baselineCached?: boolean;
@@ -166,6 +168,21 @@ export class NeedsHumanError extends Error {}
 
 export class NoCapacityError extends Error {}
 
+/** A production call took this shadow call's provider slot. */
+export class Preempted extends NoCapacityError {
+  constructor() {
+    super("preempted");
+  }
+}
+
+/** Shadow work carries its own cancellation, checkout and invocation ledger. */
+export const invokeGuard = new AsyncLocalStorage<{
+  stop(p: string): string | undefined;
+  ids: number[];
+  signal: AbortSignal;
+  cwd?: string;
+}>();
+
 export interface InvokeOptions {
   role: Role;
   stage: Stage;
@@ -199,6 +216,7 @@ export interface InvokeOptions {
   noTools?: boolean;
   /** Typed questions for decision models; a decline falls through to the next candidate. */
   decisionTask?: DecisionTask;
+  shadow?: ReturnType<typeof invokeGuard.getStore>;
 }
 
 export interface InvokeOutcome {
@@ -412,6 +430,9 @@ export class RunContext {
    */
   async invoke(opts: InvokeOptions): Promise<InvokeOutcome> {
     const { router, tracker, store, harnesses } = this.deps;
+    const { shadow } = opts;
+    const health = shadow ? undefined : tracker;
+    const signal = shadow?.signal ?? this.signal;
     const tried: (string | ModelSelection)[] = [...(opts.constraints?.exclude ?? [])];
     const busy = new Set<string>();
     let waitMs = 0;
@@ -429,6 +450,7 @@ export class RunContext {
     const left = () => (opts.deadline === undefined ? Number.POSITIVE_INFINITY : opts.deadline - Date.now());
     for (let attempt = 0; attempt < 6; attempt++) {
       this.checkCancelled();
+      if (signal.aborted) throw new CancelledError();
       if (left() <= 0)
         throw new NoCapacityError(
           `Timed out routing ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}`,
@@ -437,6 +459,7 @@ export class RunContext {
         opts.role,
         opts.complexity,
         this.routingConstraints({ ...opts.constraints, exclude: tried }),
+        !shadow,
       );
       const candidates = decision.candidates;
       let target =
@@ -465,18 +488,35 @@ export class RunContext {
         );
       };
       const limit = Number.isFinite(budget) ? budget : undefined;
-      const provider = target.provider;
-      const admission = await (allBusy
-        ? tracker.acquireFirst(providers, this.signal, limit, onWait)
-        : tracker
-            .acquire(provider, this.signal, busy.has(provider) ? 0 : limit, (ahead) =>
-              onWait(provider, ahead),
-            )
-            .then((release) => release && { provider, release })
-      ).catch((error: unknown) => {
-        this.checkCancelled();
-        throw error;
-      });
+      // Only this call: a production call that needs its slot aborts it, not the rest of the shadow.
+      const preempted = new AbortController();
+      const callSignal = shadow ? AbortSignal.any([signal, preempted.signal]) : signal;
+      // Decided when the preemption lands: the grace may expire before the aborted call settles.
+      let cause: Preempted | undefined;
+      const preempt = () => {
+        if (!signal.aborted) cause = new Preempted();
+        preempted.abort();
+      };
+      let admission: { provider: string; release: () => void } | null;
+      if (shadow) {
+        // A shadow call never waits: it takes a spare slot now, or the member is skipped.
+        const free = tracker.tryAcquire(target.provider, preempt);
+        if (!free) throw new NoCapacityError(`${target.provider}: no free slot`);
+        admission = { provider: target.provider, release: free };
+      } else {
+        const provider = target.provider;
+        admission = await (allBusy
+          ? tracker.acquireFirst(providers, this.signal, limit, onWait)
+          : tracker
+              .acquire(provider, this.signal, busy.has(provider) ? 0 : limit, (ahead) =>
+                onWait(provider, ahead),
+              )
+              .then((release) => release && { provider, release })
+        ).catch((error: unknown) => {
+          this.checkCancelled();
+          throw error;
+        });
+      }
       const release = admission?.release;
       if (admission) target = candidates.find((t) => t.provider === admission.provider) ?? target;
       waitMs += waitingAt === null ? 0 : Math.max(0, tracker.now() - waitingAt);
@@ -490,7 +530,8 @@ export class RunContext {
         attempt--;
         continue;
       }
-      if (!(await tracker.preflight(target.provider)) || tracker.modelUnavailableReason(target.modelId)) {
+      const ready = shadow ? tracker.isAvailable(target.provider) : await tracker.preflight(target.provider);
+      if (!ready || tracker.modelUnavailableReason(target.modelId)) {
         release();
         tried.push({ modelId: target.modelId, effort: target.effort ?? null });
         attempt--;
@@ -499,6 +540,12 @@ export class RunContext {
       }
       if (this.signal.aborted) release();
       this.checkCancelled();
+      const guard = shadow;
+      const stopped = guard?.stop(target.provider);
+      if (stopped) {
+        release();
+        throw new NoCapacityError(stopped);
+      }
       const { harnessName, noTools } = selectHarness(opts.role, target, opts.noTools);
       const harness = harnesses[harnessName];
       if (!harness) {
@@ -526,13 +573,14 @@ export class RunContext {
         fast: tracker.isFast(target.provider),
         runId: this.run.id,
         stageId: opts.stage.id,
-        role: opts.role,
+        role: shadow ? "review_shadow" : opts.role,
         harness: harnessName,
         provider: target.provider,
         model: target.model,
         modelId: target.modelId,
         effort: recordEffort(target.effort),
       });
+      guard?.ids.push(invocation.id);
       this.log(`${opts.role}: using ${target.targetId ?? target.modelId}`, "info", {
         invocationId: invocation.id,
         skipped: decision.skipped,
@@ -547,7 +595,7 @@ export class RunContext {
       try {
         const spec: AgentSpec = {
           fast: invocation.fast,
-          cwd: opts.cwd ?? this.state.worktreePath ?? this.runDir,
+          cwd: opts.cwd ?? shadow?.cwd ?? this.state.worktreePath ?? this.runDir,
           prompt: opts.prompt,
           systemAppend: [opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n"),
           target,
@@ -565,7 +613,7 @@ export class RunContext {
           // The private log sits in the shared temporary directory while a parallel implementer
           // runs as the same user, so it never holds the private text itself.
           redactOutput: opts.privateOutput ? withholdText : redact,
-          signal: this.signal,
+          signal: callSignal,
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
           onEvent: opts.privateOutput
             ? () => {}
@@ -610,10 +658,10 @@ export class RunContext {
       } finally {
         release();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
-        if ((opts.role === "review" || opts.role === "verify") && this.state.worktreePath)
-          await discardChanges(this.state.worktreePath);
+        const checkout = shadow?.cwd ?? this.state.worktreePath;
+        if ((opts.role === "review" || opts.role === "verify") && checkout) await discardChanges(checkout);
       }
-      if (this.signal.aborted)
+      if (callSignal.aborted)
         result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };
       if (opts.requireStructured && result.status === "ok" && result.structured === null)
         result = { ...result, status: "error", error: "missing structured output" };
@@ -653,11 +701,12 @@ export class RunContext {
               : result.error,
         finishedAt: Date.now(),
       });
-      if (result.quota?.windows) tracker.observeWindows(target.provider, result.quota.windows);
-      if (result.confinement) tracker.observeConfinement(target.provider, result.confinement);
+      // Shadow outcomes never reach provider health, quota telemetry or model blocks.
+      if (result.quota?.windows) health?.observeWindows(target.provider, result.quota.windows);
+      if (result.confinement) health?.observeConfinement(target.provider, result.confinement);
       // An unconfinable CLI is no provider failure: unconfined roles still use it.
       if (result.confinement?.ok !== false)
-        tracker.record(target.provider, result.status, {
+        health?.record(target.provider, result.status, {
           exhaustedUntil: result.quota?.exhaustedUntil ?? null,
           ...(result.modelCooldownMs === undefined
             ? {}
@@ -672,7 +721,8 @@ export class RunContext {
       this.run = store.refreshRunTotals(this.run.id);
 
       if (this.termination) throw this.termination;
-      if (result.status === "cancelled" || this.signal.aborted) throw new CancelledError();
+      if (cause) throw cause;
+      if (result.status === "cancelled" || signal.aborted) throw new CancelledError();
       if (result.status === "declined") {
         // Not a failure and not a routing attempt: each decision model declines at most once.
         const reason = opts.privateOutput
@@ -694,7 +744,7 @@ export class RunContext {
       }
       if (result.status !== "ok" && MODEL_REJECTED.test(result.error ?? "")) {
         // A configuration problem with this model (e.g. not on the plan), not a task failure.
-        tracker.blockModel(
+        health?.blockModel(
           target.modelId,
           opts.privateOutput
             ? "private invocation rejected"

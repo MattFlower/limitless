@@ -168,8 +168,9 @@ export class Router {
   }
 
   /** Ordered, available candidates for a role. Never empty unless nothing at all is usable. */
-  route(role: Role, complexity: Complexity, c: RouteConstraints = {}): RouteDecision {
+  route(role: Role, complexity: Complexity, c: RouteConstraints = {}, observe = true): RouteDecision {
     const decision = this.decideRoute(role, complexity, c);
+    if (!observe) return decision;
     const selected = decision.candidates[0];
     if (selected)
       this.lastRoute.set(selected.provider, {

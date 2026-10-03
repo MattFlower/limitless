@@ -182,7 +182,8 @@ export interface Invocation {
   id: number;
   runId: string;
   stageId: number | null;
-  role: Role;
+  /** `review_shadow`: a shadow panel call, routed as `review` but kept out of review stats and work logs. */
+  role: Role | "review_shadow";
   harness: string;
   provider: string;
   model: string;

@@ -82,7 +82,7 @@ test("mounted endpoint initializes, discovers and calls tools without sessions",
 
 test("all methods reject tunnel, non-loopback, untrusted origin and rebinding host before dispatch", async () => {
   f.factory.cfg.trustedProxies = ["192.0.2.10"];
-  f.factory.cfg.publicOrigins = ["https://limitless.mattflower.net"];
+  f.factory.cfg.publicOrigins = ["https://limitless.example.test"];
   for (const method of ["POST", "GET", "DELETE", "PUT", "OPTIONS", "HEAD"]) {
     for (const extra of [
       { "cf-connecting-ip": "198.51.100.1" },

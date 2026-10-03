@@ -49,7 +49,7 @@ test("admin drain uses real loopback peers and existing mutation protections", a
     }
     for (const action of [drain, resume]) {
       f.factory.cfg.trustedProxies = ["192.168.1.1"];
-      f.factory.cfg.publicOrigins = ["https://limitless.mattflower.net"];
+      f.factory.cfg.publicOrigins = ["https://limitless.example.test"];
       for (const address of ["127.0.0.1", null, "192.168.1.1", "::ffff:192.168.1.1", "::2", "garbage"]) {
         expect(
           (

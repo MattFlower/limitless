@@ -4,6 +4,8 @@ import { ChatRequestSchema } from "../concierge.ts";
 import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
+import { runGh } from "../integrations/github.ts";
+import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
 
 export interface HttpExtras {
@@ -207,6 +209,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         return json(await factory.gc(input.dryRun === true));
       }),
     },
+    "/api/review/shadow-report": handle(async (req) => {
+      const since = Number(new URL(req.url).searchParams.get("since") ?? 0);
+      if (!Number.isFinite(since)) return error("since must be epoch milliseconds", 400);
+      const trusted = factory.cfg.reviewTrustedReviewers;
+      return json(await shadowReport(store, ghPrHistory(runGh), { since, trusted }));
+    }),
     "/api/gates/clear-cache": {
       POST: handle(async (req) => {
         const input = await body<{ repo?: string }>(req);

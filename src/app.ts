@@ -87,7 +87,7 @@ export class Factory {
       ...provider,
       maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
     }));
-    checkRosterTargets(cfg, this.models, this.providerDefs, (message) => console.warn(message));
+    const shadowOk = checkRosterTargets(cfg, this.models, this.providerDefs, console.warn);
     this.policy =
       opts.policy ??
       (opts.policyPath === undefined
@@ -112,7 +112,7 @@ export class Factory {
       this.router.describeFallback(provider, exhausted),
     );
     this.deps = {
-      cfg,
+      cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },
       faults: opts.faults,
       store: this.store,
       buildSha: opts.bootSha,
