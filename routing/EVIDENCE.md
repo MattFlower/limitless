@@ -126,9 +126,9 @@ Every implement cell now starts on Codex:
 - `trivial`, `small` and `medium` start with `codex/sol-6.1@high`, then `codex/astra@high`, then `claude/opus`;
 - `large` starts with `codex/astra@high`, then `codex/sol-6.1@high`, then `claude/opus`.
 
-Escalation after a failed round moves to the next tier, so a Sol run escalates to Astra before any Claude model. Before this change, in the two days up to 2026-10-03, 46 of 91 implement invocations ran on Claude (`claude/opus` and `claude/fable`): large runs started on Opus, and escalation went Sol → Opus → Fable. Meanwhile the Codex weekly window stayed about two-thirds used, with banked resets expiring unused.
+Escalation happens after two rounds on one implementer and raises the minimum tier, capped at 5, so a Sol run escalates to Astra before any Claude model. If no eligible candidate remains, the constraints relax. Before this change, in the two days up to 2026-10-03, 46 of 91 implement invocations ran on Claude (`claude/opus` and `claude/fable`): large runs started on Opus, and escalation went Sol → Opus → Fable. Meanwhile the Codex weekly window stayed about two-thirds used, with banked resets expiring unused.
 
-`[routing] prefer = ["codex"]` could not do this, because it only reorders interchangeable `a|b` groups and the implement cells are explicit orders. Review still avoids the implementer's vendor, so Codex-implemented runs keep a Claude reviewer (`claude/opus`).
+`[routing] prefer = ["codex"]` could not do this, because it only reorders interchangeable `a|b` groups and the implement cells are explicit orders. Review still avoids the implementer's vendor, so Codex-implemented runs keep a Claude reviewer (`claude/opus`). The avoidance is soft: with no other vendor available, a Codex-implemented run can get an OpenAI reviewer. Dependabot runs in the default free-first mode can still put free local models ahead of Codex.
 
 Revisit when the banked resets are gone, or if the Sol trial summary (below) or review findings show worse outcomes for Codex-implemented large runs. The trial comparison uses runs started before this change.
 
