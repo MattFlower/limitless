@@ -478,6 +478,8 @@ export async function pushBranch(
       [
         "git",
         "push",
+        // An explicit refspec doesn't disable push.followTags; deleted source tags must stay deleted.
+        "--no-follow-tags",
         "--receive-pack=git -c core.hooksPath=/dev/null -c receive.denyCurrentBranch=refuse receive-pack",
         repo.localPath,
         `${sha}:refs/heads/${branch}`,

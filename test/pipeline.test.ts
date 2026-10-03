@@ -560,6 +560,30 @@ describe("local factory clones", () => {
     await expect(pushBranch(repo, work, "conflicting")).rejects.toThrow();
     expect(await git(repoDir, "rev-parse", "conflicting")).toBe(conflicting);
   });
+
+  test("delivery does not restore a source tag deleted during the run, even with push.followTags", async () => {
+    await git(repoDir, "-c", "user.name=t", "-c", "user.email=t@t", "tag", "-a", "obsolete", "-m", "old");
+    const f = start(reply);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("missing repo");
+    const work = join(f.cfg.paths.work, run.id);
+    expect(await git(work, "tag", "--list")).toContain("obsolete");
+    await git(repoDir, "tag", "-d", "obsolete");
+    const previous = process.env.GIT_CONFIG_GLOBAL;
+    const globalConfig = join(f.cfg.paths.work, "follow-tags.gitconfig");
+    writeFileSync(globalConfig, "[push]\n\tfollowTags = true\n");
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      await pushBranch(repo, work, "redelivered");
+    } finally {
+      if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = previous;
+    }
+    expect(await git(repoDir, "rev-parse", "refs/heads/redelivered")).toBe(await git(work, "rev-parse", "HEAD"));
+    expect(await git(repoDir, "tag", "--list")).toBe("");
+  });
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
