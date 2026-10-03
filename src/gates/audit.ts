@@ -1,5 +1,6 @@
 import type { AuditAllowance, TaskClass } from "../core/types.ts";
 import type { DiffInfo } from "../git/repos.ts";
+import { loadPrivateStrings, privateMatches, privateReason, redactPrivate } from "./private.ts";
 
 export interface AuditFinding {
   rule: string;
@@ -61,6 +62,7 @@ function globToRegex(glob: string): RegExp {
 interface FilePatch {
   path: string;
   added: string[];
+  addedLines: number[];
   removed: string[];
   gitlink: boolean;
 }
@@ -82,20 +84,25 @@ export function unquote(quoted: string): string | null {
 export function splitPatch(patch: string): FilePatch[] {
   const files: FilePatch[] = [];
   let cur: FilePatch | null = null;
+  let number = 0;
   for (const line of patch.split("\n")) {
     if (line.startsWith("diff --git ")) {
       const m = line.match(/ (b\/.+|"b\/.+")$/);
       let path = m?.[1] ?? "";
       if (path.startsWith('"')) path = unquote(path) ?? path;
-      cur = { path: path.slice(2), added: [], removed: [], gitlink: false };
+      cur = { path: path.slice(2), added: [], addedLines: [], removed: [], gitlink: false };
       files.push(cur);
+      number = 0;
+    } else if (cur && line.startsWith("@@ ")) {
+      number = Number(line.match(/\+(\d+)/)?.[1] ?? 0);
     } else if (cur && /^(new (file )?mode 160000|index .* 160000)$/.test(line)) {
       cur.gitlink = true;
-    } else if (cur && line.startsWith("+") && !/^\+\+\+ ("?b\/|\/dev\/null$)/.test(line)) {
+    } else if (cur && line.startsWith("+") && (number > 0 || !/^\+\+\+ ("?b\/|\/dev\/null$)/.test(line))) {
       cur.added.push(line.slice(1));
+      cur.addedLines.push(number++);
     } else if (cur && line.startsWith("-") && !/^--- ("?a\/|\/dev\/null$)/.test(line)) {
       cur.removed.push(line.slice(1));
-    }
+    } else if (cur && line.startsWith(" ")) number++;
   }
   return files;
 }
@@ -182,6 +189,7 @@ export interface GateScripts {
 export function auditDiff(
   diff: DiffInfo,
   ctx: {
+    configDir?: string;
     taskClass: TaskClass | null;
     protectedPaths: string[];
     toolCommands?: string[];
@@ -190,6 +198,7 @@ export function auditDiff(
     allow?: readonly AuditAllowance[];
   },
 ): AuditFinding[] {
+  const entries = loadPrivateStrings(ctx.configDir);
   const findings: AuditFinding[] = [];
   if (diff.files.length === 0 && ctx.taskClass !== "question") {
     findings.push({
@@ -202,6 +211,21 @@ export function auditDiff(
 
   const protectedRes = ctx.protectedPaths.map(globToRegex);
   const patches = splitPatch(diff.patch);
+  const privateLine = (text: string, path: string, line?: number) => {
+    const file = privateMatches(path, entries).length ? "[redacted filename]" : path;
+    for (const { entry } of privateMatches(text, entries))
+      findings.push({
+        rule: "private-string",
+        severity: "block",
+        file,
+        detail: privateReason(line === undefined ? file : `${file}:${line}`, entry),
+      });
+  };
+  for (const f of diff.files) if (/^[ARC]/.test(f.status)) privateLine(f.path, f.path);
+  for (const fp of patches)
+    fp.added.forEach((text, i) => {
+      privateLine(text, fp.path, fp.addedLines[i]);
+    });
   for (const path of diff.gitlinks ?? patches.filter((p) => p.gitlink && p.added.length).map((p) => p.path)) {
     if (!ctx.allow?.includes("submodules"))
       findings.push({
@@ -371,12 +395,19 @@ export function auditDiff(
       });
     }
   }
-  return dedupe(findings);
+  return dedupe(
+    findings.map((f) => ({
+      ...f,
+      ...(f.file && privateMatches(f.file, entries).length ? { file: "[redacted filename]" } : {}),
+      detail: redactPrivate(f.detail, entries),
+    })),
+  );
 }
 
 function dedupe(findings: AuditFinding[]): AuditFinding[] {
   const seen = new Set<string>();
   return findings.filter((f) => {
+    if (f.rule === "private-string") return true;
     const key = `${f.rule}|${f.file ?? ""}|${f.detail}`;
     if (seen.has(key)) return false;
     seen.add(key);

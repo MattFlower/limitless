@@ -12,6 +12,7 @@ import {
   singleFlight,
 } from "../gates/cache.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
+import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
 import {
   compareGates,
   type GateComparison,
@@ -22,7 +23,7 @@ import {
   retryRegressions,
   runGates,
 } from "../gates/run.ts";
-import { worktreeGitScope } from "../git/command.ts";
+import { worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
   commitAll,
@@ -241,7 +242,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       (!ctx.run.prUrl || !!ctx.state.needsHumanReason) &&
       (ctx.state.phase === "deliver" || ctx.state.conflictRound !== undefined);
     const needsHuman = e instanceof NeedsHumanError || e instanceof NoCapacityError || !!verifiedFailure;
-    const message = (e as Error).message;
+    let message = (e as Error).message;
     const failureStage =
       ctx.state.conflictRound !== undefined
         ? "conflict resolution"
@@ -274,6 +275,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           (err instanceof SimulatedTermination || ctx.termination || err instanceof InjectedFault)
         )
           return "running";
+        if (err instanceof NeedsHumanError) message = err.message;
         ctx.log(`Could not open verified-work draft PR: ${(err as Error).message}`, "warn");
       }
     } else if (
@@ -297,6 +299,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           return "running";
         // Cancellation or shutdown during the draft must not be recorded as the original failure.
         if (err instanceof CancelledError || signal.aborted) return cancelled();
+        if (err instanceof NeedsHumanError) message = err.message;
         ctx.log(`Could not open draft PR: ${(err as Error).message}`, "warn");
       }
     }
@@ -1028,6 +1031,7 @@ async function oneRound(
     "audit",
     async () => {
       const findings = auditDiff(diff, {
+        configDir: ctx.deps.cfg.paths.configDir,
         allow: ctx.run.allow ?? [],
         taskClass: ctx.state.verification && ctx.run.taskClass === "question" ? null : ctx.run.taskClass,
         protectedPaths: gates.protectedPaths,
@@ -1051,6 +1055,7 @@ async function oneRound(
         if (repairs.files.length)
           findings.push(
             ...auditDiff(repairs, {
+              configDir: ctx.deps.cfg.paths.configDir,
               allow: ctx.run.allow ?? [],
               taskClass: ctx.run.taskClass,
               protectedPaths: gates.protectedPaths,
@@ -1092,6 +1097,7 @@ async function oneRound(
       ? `### Your previous session ended early\n${ctx.state.implementerIssue}\nKeep the next attempt focused and finish by running the checks.`
       : "";
     ctx.state.feedback = [issue, gateFeedback, auditFeedback].filter(Boolean).join("\n\n");
+    ctx.state.feedback = redactPrivate(ctx.state.feedback, loadPrivateStrings(ctx.deps.cfg.paths.configDir));
     await ctx.save();
     ctx.log("Deterministic checks failed; sending feedback to implementer", "warn");
     return false;
@@ -1490,6 +1496,28 @@ function deliveryBudget(ctx: RunContext): GitHubBudget {
   return budget;
 }
 
+async function checkPublication(ctx: RunContext, sha: string, title: string, body: string) {
+  const cwd = ctx.state.worktreePath as string;
+  try {
+    const entries = loadPrivateStrings(ctx.deps.cfg.paths.configDir);
+    if (!entries.length) return;
+    checkPrivateText(title, "PR title", entries);
+    checkPrivateText(body, "PR body", entries);
+    const messages = await worktreeGit(["git", "log", "--format=%B", `${ctx.run.baseSha}..${sha}`], { cwd });
+    checkPrivateText(messages.stdout, "Commit message", entries);
+    const findings = auditDiff(await diffSince(cwd, ctx.run.baseSha as string), {
+      configDir: ctx.deps.cfg.paths.configDir,
+      taskClass: ctx.run.taskClass,
+      protectedPaths: [],
+    });
+    const hit = findings.find((f) => f.rule === "private-string");
+    if (hit) throw new PrivateError(hit.detail);
+  } catch (error) {
+    const reason = error instanceof PrivateError ? error.message : "Private-string check blocked";
+    throw new NeedsHumanError(reason);
+  }
+}
+
 async function deliverVerifiedDraft(
   ctx: RunContext,
   sha: string,
@@ -1513,6 +1541,7 @@ async function deliverVerifiedDraft(
   }
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
+  await checkPublication(ctx, sha, `[needs human] ${ctx.run.title}`, report);
   await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
@@ -1721,6 +1750,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         note("the branch does not contain the recorded base");
     }
     const report = buildReport(ctx, success);
+    const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
+    await checkPublication(ctx, await headSha(cwd), title, report);
 
     const publish = () => {
       ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
@@ -1774,7 +1805,6 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     ctx.checkCancelled();
     await pushBranch(ctx.repo, cwd, ctx.run.branch as string, "HEAD", ctx.signal, budget);
     ctx.checkCancelled();
-    const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     const url = await createPullRequest(ctx.repo, {
       branch: ctx.run.branch as string,
       base: ctx.run.baseBranch as string,
