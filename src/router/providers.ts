@@ -27,8 +27,10 @@ interface ProviderRuntime {
   healthy: boolean; // for local servers: last probe result
   inFlight: number;
   waiters: (() => void)[];
-  /** Waiters woken by a release that have not yet taken their slot: a shadow call never takes it first. */
+  /** Waiters woken by a release that have not yet taken their slot: no later caller takes it first. */
   waking: number;
+  /** Preempt callbacks of shadow calls holding a slot; a production waiter aborts one to take its slot. */
+  shadows: Set<() => void>;
   confinement?: ConfinementProbe;
 }
 
@@ -141,6 +143,7 @@ export class ProviderTracker {
         inFlight: 0,
         waiters: [],
         waking: 0,
+        shadows: new Set(),
       });
     }
   }
@@ -411,8 +414,11 @@ export class ProviderTracker {
   async acquire(id: string, signal: AbortSignal): Promise<() => void> {
     const p = this.providers.get(id);
     if (!p) throw new Error(`unknown provider ${id}`);
-    while (p.inFlight >= p.def.maxConcurrent) {
+    while (p.inFlight + p.waking >= p.def.maxConcurrent) {
       if (signal.aborted) throw new Error("cancelled");
+      // Production never waits behind a shadow call: abort one, and take its slot ahead of the queue.
+      const preempt = p.shadows.values().next().value;
+      if (preempt) p.shadows.delete(preempt);
       const woken = await new Promise<boolean>((resolve) => {
         const wake = () => {
           signal.removeEventListener("abort", onAbort);
@@ -426,21 +432,28 @@ export class ProviderTracker {
           if (i >= 0) p.waiters.splice(i, 1);
           resolve(false);
         };
-        p.waiters.push(wake);
+        if (preempt) p.waiters.unshift(wake);
+        else p.waiters.push(wake);
         signal.addEventListener("abort", onAbort, { once: true });
+        preempt?.();
       });
       if (woken) p.waking--;
     }
     return this.hold(p);
   }
 
-  /** A slot only if one is free now and nobody is queued for it; never waits. */
-  tryAcquire(id: string): (() => void) | null {
+  /**
+   * A shadow call's slot: only while two are free and nobody is queued, so it never takes a provider's
+   * last slot, and never waits. A production acquire may later preempt it through `preempt`.
+   */
+  tryAcquire(id: string, preempt: () => void): (() => void) | null {
     const p = this.providers.get(id);
-    return p && p.inFlight + p.waking < p.def.maxConcurrent && !p.waiters.length ? this.hold(p) : null;
+    if (!p || p.inFlight + p.waking + 2 > p.def.maxConcurrent || p.waiters.length) return null;
+    p.shadows.add(preempt);
+    return this.hold(p, preempt);
   }
 
-  private hold(p: ProviderRuntime): () => void {
+  private hold(p: ProviderRuntime, preempt?: () => void): () => void {
     const id = p.def.id;
     p.inFlight++;
     this.publish(id);
@@ -448,6 +461,7 @@ export class ProviderTracker {
     return () => {
       if (released) return;
       released = true;
+      if (preempt) p.shadows.delete(preempt);
       p.inFlight--;
       p.waiters.shift()?.();
       this.publish(id);

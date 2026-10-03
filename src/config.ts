@@ -99,8 +99,14 @@ function parseEnvFile(path: string): Record<string, string> {
 }
 
 /** `[review]` is validated strictly: a misspelt key would otherwise silently keep the default. */
-const REVIEW_KEYS = ["implementer_report", "mode", "rosters", "shadow"];
-REVIEW_KEYS.push("shadow_grace_seconds", "trusted_reviewers");
+const REVIEW_KEYS: readonly string[] = [
+  "implementer_report",
+  "mode",
+  "rosters",
+  "shadow",
+  "shadow_grace_seconds",
+  "trusted_reviewers",
+];
 const TRIAGE_KEYS = ["decision_confidence"];
 /** Provisional until calibrated on evals/triage (docs/research/09-jev-decisions.md). */
 export const DEFAULT_DECISION_CONFIDENCE = 0.6;

@@ -252,3 +252,37 @@ test("roster targets are checked against the catalog at startup; single mode onl
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a stale pinned shadow roster target turns the shadow off with a warning; startup and production go on", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-shadow-roster-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  const start = (roster: string, mode = "single") => {
+    const toml = `[review]\nmode = "${mode}"\n${mode === "single" ? 'shadow = "panel"\n' : ""}[review.rosters]\nstandard = [${roster}]\n`;
+    writeFileSync(join(configDir, "config.toml"), toml);
+    const factory = new Factory(loadConfig({ home: join(root, "data"), configDir }));
+    factory.store.close();
+    return factory;
+  };
+  try {
+    const stale = start('{ prompt = "adversarial", target = "claude/opsu" }');
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("claude/opsu: unknown model ID"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("shadow review disabled until fixed"));
+    // The configured value stays visible; the engine never runs the shadow.
+    expect(stale.cfg.reviewShadow).toBe("panel");
+    expect(stale.deps.cfg.reviewShadow).toBe("off");
+    expect(stale.deps.cfg.reviewMode).toBe("single");
+    warn.mockClear();
+    // A valid shadow roster stays on, without a warning.
+    expect(start('{ prompt = "adversarial", target = "codex/sol" }').deps.cfg.reviewShadow).toBe("panel");
+    expect(warn).not.toHaveBeenCalled();
+    // A blocking panel's stale pin still fails startup.
+    expect(() => start('{ prompt = "adversarial", target = "claude/opsu" }', "panel")).toThrow(
+      'review.rosters.standard[0].target claude/opsu: unknown model ID "claude/opsu"',
+    );
+  } finally {
+    warn.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

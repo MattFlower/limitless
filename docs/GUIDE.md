@@ -544,14 +544,25 @@ and quota telemetry alone. They are recorded with the role `review_shadow`, left
 and per-model review stats, and their spend appears as its own line under the report total. It costs
 roughly $0.65 API-equivalent per round on subscription models.
 
-The shadow only uses spare capacity. Each call takes a provider slot only if one is free at that
-moment and no production call is waiting for it; otherwise that finder is skipped, with the reason in
-the panel record. Once the single review finishes, the shadow has `shadow_grace_seconds` to finish; then it is
-aborted and recorded as `timeout` with the finders that had finished. The shadow is `skipped`, with
-its reason, when the base commit's `[review]` lenses are invalid, when its review system cannot be
-built, or when a subscription provider its roster, fallbacks or verifier can route to has headroom
+Production calls always come first. A shadow call takes a provider slot only if at least two are
+free at that moment (so it never takes a provider's last slot, and never runs on a provider with
+`max_concurrent = 1`) and no production call is queued for, or has just been woken for, a slot; it
+never waits. Otherwise that finder is skipped, with the reason in the panel record. A shadow call
+that holds a slot can still be preempted: when a production call (of any run, including implement
+calls and review fallbacks) finds the provider full, it aborts one shadow call on that provider and
+takes its slot as soon as the call ends, ahead of any queued call. The abort is immediate; the slot
+changes hands once the aborted call stops. A preempted finder is recorded in the panel record and a
+preempted verifier in `finished`, each with `skipped: "preempted"`; the verifier's candidates stay
+unverified (`omitted`), and the shadow goes on with what it has. Once the single review finishes, the
+shadow has `shadow_grace_seconds` to finish; then it is aborted and recorded as `timeout` with the
+finders that had finished. Aborted calls then get up to 5 more seconds to end and record their spend;
+if one is still running after that, the artifact is written anyway with `usage.partial: true`.
+The shadow is `skipped`, with its reason, when the base commit's `[review]` lenses are invalid, when
+its review system cannot be built, or when a subscription provider its roster, fallbacks or verifier can route to has headroom
 of 0.1 or less, or unknown headroom (no quota windows observed yet). It stops rather than use a
-metered model. A failed or skipped shadow records why, with its spend so far.
+metered model. A failed or skipped shadow records why, with its spend so far. A roster pin the
+catalog doesn't have (e.g. a model a later release dropped) turns the shadow off at startup with a
+warning naming the target; production work goes on.
 
 `limitless review shadow-report [--since <ISO-8601>]` compares single and panel blocking findings per
 round for the newest 200 runs created at or after `--since` (the daemon applies the cutoff, and the
@@ -560,11 +571,14 @@ the same file with lines at most 5 apart. Titles never matter, and a finding wit
 A panel finding near a single one is shared. Each panel-only finding is marked:
 
 - `fixed`: a later commit changes lines (added or removed, not unchanged diff context) within 5 lines
-  of it. In the original or a stacked PR, the commit must follow the reviewed commit in PR order and
-  the shadow review in time. A distinct PR from an explicitly dependent run or a run referencing the
+  of it. In the original or a stacked PR, the commit must follow the reviewed commit in PR order; its
+  timestamp doesn't matter, since Git stamps whole seconds. A distinct PR from an explicitly dependent run or a run referencing the
   original PR can also supply fixes when both that run and its commits postdate the shadow review.
   Rewritten original PR histories lacking the reviewed commit give no fix evidence and mark the
-  evidence incomplete.
+  evidence incomplete. Merge commits (two or more parents, such as the factory's `limitless: merge
+  base` commits) never count: GitHub reports their files against the first parent, so upstream
+  changes would look like fixes. A merge still marks the reviewed commit's place in PR order. A
+  commit whose file list GitHub truncates (over 3000 files) makes the evidence incomplete.
 - `review-matched`: a later review reports the same location. This can be a later round of the run
   (the paired round and earlier ones never count, even when a resume rewrote them), a run on the same
   PR or one depending on it, or an inline PR review comment by the repository owner or a

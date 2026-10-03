@@ -170,6 +170,13 @@ export class NeedsHumanError extends Error {}
 
 export class NoCapacityError extends Error {}
 
+/** A production call took this shadow call's provider slot. */
+export class Preempted extends NoCapacityError {
+  constructor() {
+    super("preempted");
+  }
+}
+
 /** Shadow work carries its own cancellation, checkout and invocation ledger. */
 export const invokeGuard = new AsyncLocalStorage<{
   stop(p: string): string | undefined;
@@ -476,8 +483,11 @@ export class RunContext {
         ? AbortSignal.any([this.signal, AbortSignal.timeout(Math.max(1, left()))])
         : this.signal;
       let release: () => void;
+      // Only this call: a production call that needs its slot aborts it, not the rest of the shadow.
+      const preempted = new AbortController();
+      const callSignal = shadow ? AbortSignal.any([signal, preempted.signal]) : signal;
       try {
-        const free = shadow && tracker.tryAcquire(target.provider);
+        const free = shadow && tracker.tryAcquire(target.provider, () => preempted.abort());
         if (shadow && !free) throw new NoCapacityError(`${target.provider}: no free slot`);
         release = free || (await tracker.acquire(target.provider, wait));
       } catch (error) {
@@ -555,7 +565,7 @@ export class RunContext {
           // The private log sits in the shared temporary directory while a parallel implementer
           // runs as the same user, so it never holds the private text itself.
           redactOutput: opts.privateOutput ? withholdText : redact,
-          signal,
+          signal: callSignal,
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
           onEvent: opts.privateOutput
             ? () => {}
@@ -603,7 +613,7 @@ export class RunContext {
         const checkout = shadow?.cwd ?? this.state.worktreePath;
         if ((opts.role === "review" || opts.role === "verify") && checkout) await discardChanges(checkout);
       }
-      if (signal.aborted)
+      if (callSignal.aborted)
         result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };
       if (opts.requireStructured && result.status === "ok" && result.structured === null)
         result = { ...result, status: "error", error: "missing structured output" };
@@ -663,6 +673,7 @@ export class RunContext {
       this.run = store.refreshRunTotals(this.run.id);
 
       if (this.termination) throw this.termination;
+      if (preempted.signal.aborted && !signal.aborted) throw new Preempted();
       if (result.status === "cancelled" || signal.aborted) throw new CancelledError();
       if (result.status === "declined") {
         // Not a failure and not a routing attempt: each decision model declines at most once.

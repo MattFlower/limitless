@@ -7,6 +7,8 @@ export type HistoryRecord = Record<"source" | "at", string> & {
   kind: "commit" | "review";
   spots: Spot[];
   author?: string | null;
+  /** A commit whose file list GitHub cut short: any file may have changed. */
+  blind?: boolean;
 };
 export type HistoryReader = (run: Run) => Promise<HistoryRecord[] | null>;
 export type Outcome = "fixed" | "review-matched" | "converged-without-fix" | "unknown";
@@ -32,21 +34,29 @@ export function changedLines(patch: string): number[] {
 const COMMENTS =
   ".[] | {author: .user.login, file: .path, line: (.line // .original_line), source: .html_url, at: .created_at}";
 const COMMITS = ["--json", "commits", "--jq", "[.commits[] | {oid, at: .committedDate}]"];
-const PATCHES = ["--jq", "[.files[] | {filename, patch}]"];
+// One line per page: GitHub pages a commit's files 300 at a time, up to 3000 in all.
+const PAGE = "{parents: (.parents | length), files: [.files[]? | {filename, patch}]}";
+const PATCHES = ["--paginate", "--jq", PAGE];
+const MAX_FILES = 3000;
 type Patch = { filename: string; patch?: string | null };
+type Page = { parents: number; files: Patch[] };
 export const ghPrHistory = (gh: GhRunner): HistoryReader => {
   const json = async (args: string[]) => JSON.parse(String(await gh(args)));
   const view = async ({ prUrl, repoSlug }: Run): Promise<HistoryRecord[]> => {
     const commits: { oid: string; at: string }[] = await json(["pr", "view", `${prUrl}`, ...COMMITS]);
     const records: HistoryRecord[] = [];
     for (const { oid, at } of commits) {
-      const files: Patch[] = await json(["api", `repos/${repoSlug}/commits/${oid}`, ...PATCHES]);
+      const out = String(await gh(["api", `repos/${repoSlug}/commits/${oid}`, ...PATCHES])).split("\n");
+      const pages: Page[] = out.flatMap((line) => (line ? [JSON.parse(line)] : []));
+      // A merge's files are its first-parent diff: upstream changes, not fixes. It still marks PR order.
+      const files = (pages[0]?.parents ?? 0) >= 2 ? [] : pages.flatMap((page) => page.files);
       const spots = files.flatMap((f): Spot[] =>
         f.patch === undefined || f.patch === null
           ? [{ file: f.filename, line: null }]
           : changedLines(f.patch).map((line) => ({ file: f.filename, line })),
       );
-      records.push({ kind: "commit", source: `commit ${oid}`, at, spots });
+      const blind = files.length >= MAX_FILES || !pages.length;
+      records.push({ kind: "commit", source: `commit ${oid}`, at, spots, ...(blind ? { blind } : {}) });
     }
     const pr = `repos/${repoSlug}/pulls/${prUrl?.split("/pull/")[1]}/comments`;
     const comments = String(await gh(["api", "--paginate", pr, "--jq", COMMENTS])).split("\n");
@@ -166,7 +176,7 @@ export async function shadowReport(
         const fixed = evidence.some((e) => e.kind === "commit");
         // A later commit changed this file but its patch is unavailable: no evidence either way.
         const unseen = (s: Spot) => s.line == null && path(s.file) === path(f.file);
-        const blind = !fixed && records.some((r) => r.kind === "commit" && r.spots.some(unseen));
+        const blind = !fixed && records.some((r) => r.kind === "commit" && (r.blind || r.spots.some(unseen)));
         if (blind) row.history = false;
         const noMatch = settled && !blind ? "converged-without-fix" : "unknown";
         const outcome = fixed ? "fixed" : evidence.length ? "review-matched" : noMatch;

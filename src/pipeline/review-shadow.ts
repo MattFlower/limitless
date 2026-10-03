@@ -10,6 +10,8 @@ import { parseArtifact } from "./shadow-report.ts";
 import { createSnapshotParent } from "./snapshots.ts";
 
 const SHADOW_MIN_HEADROOM = 0.1;
+/** How long aborted calls get to record their spend before the artifact is written without it. */
+const SETTLE_MS = 5_000;
 export type ShadowDeps = (system: ReviewSystem) => ReviewDeps<InvokeOutcome>;
 
 export async function shadowReview(
@@ -62,7 +64,7 @@ export async function shadowReview(
         const request = { ...input, prompt, system, replayedFollowUps: undefined };
         const { output, decision, panel } = await runReview({ ...deps(system), finished }, request);
         if (!decision) throw output.error;
-        return { status: "completed", ...decision, panel };
+        return { status: "completed", ...decision, panel, finished };
       } catch (error) {
         const reason = String((error as Error | undefined)?.message).slice(0, 500);
         const skipped = error instanceof NoCapacityError || !guard.ids.length;
@@ -92,10 +94,17 @@ export async function shadowReview(
   clearTimeout(timer);
   abort.abort();
   if (ctx.signal.aborted) return;
+  const settle = new Promise((resolve) => {
+    timer = setTimeout(resolve, SETTLE_MS);
+  });
+  await Promise.race([work, settle]);
+  clearTimeout(timer);
   if (record.status !== "completed") ctx.log(`Shadow panel ${record.status}: ${record.reason}`, "warn");
   const spent = guard.ids.flatMap((id) => store.getInvocation(id) ?? []);
   const cost = (key: "costUsd" | "costEquivUsd") => spent.reduce((total, i) => total + i[key], 0);
   const usage = { invocations: spent.length, costUsd: cost("costUsd"), costEquivUsd: cost("costEquivUsd") };
+  // A call still running past the settle wait may yet add spend the artifact never sees.
+  if (spent.some((i) => i.status === "running")) Object.assign(usage, { partial: true });
   const artifact = { round, system: system?.name, baseSha, reviewedSha, range, ...record, usage };
   ctx.store.putArtifact(ctx.run.id, name, "review-shadow", JSON.stringify(artifact, null, 2));
 }

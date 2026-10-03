@@ -448,18 +448,31 @@ test("single mode keeps the production review; a panel takes the profile's roste
   });
 });
 
-test("a shadow panel's roster pins are checked as strictly as a blocking panel's", () => {
+test("a shadow panel's bad roster pin turns the shadow off with a warning; a blocking panel's fails", () => {
   const reviewRosters = {
     ...DEFAULT_ROSTERS,
     standard: [{ prompt: "adversarial" as const, target: "claude/opsu" }],
   };
   const warn = mock((_message: string) => {});
-  const check = (reviewShadow: "off" | "panel") =>
-    checkRosterTargets({ reviewMode: "single", reviewShadow, reviewRosters }, MODELS, PROVIDERS, warn);
-  expect(() => check("panel")).toThrow("review.rosters.standard[0].target claude/opsu: unknown model ID");
+  const check = (reviewShadow: "off" | "panel", reviewMode: "single" | "panel" = "single") =>
+    checkRosterTargets({ reviewMode, reviewShadow, reviewRosters }, MODELS, PROVIDERS, warn);
+  expect(() => check("off", "panel")).toThrow(
+    "review.rosters.standard[0].target claude/opsu: unknown model ID",
+  );
   expect(warn).not.toHaveBeenCalled();
-  check("off");
-  expect(warn).toHaveBeenCalledWith(expect.stringContaining("(ignored: [review] mode is single)"));
+  expect(check("panel")).toBe(false);
+  expect(warn).toHaveBeenCalledWith(expect.stringContaining("claude/opsu: unknown model ID"));
+  expect(warn).toHaveBeenCalledWith(expect.stringContaining("shadow review disabled until fixed"));
+  expect(check("off")).toBe(true);
+  expect(warn).toHaveBeenLastCalledWith(expect.stringContaining("(ignored: [review] mode is single)"));
+  expect(
+    checkRosterTargets(
+      { reviewMode: "single", reviewShadow: "panel", reviewRosters: DEFAULT_ROSTERS },
+      MODELS,
+      PROVIDERS,
+      warn,
+    ),
+  ).toBe(true);
 });
 
 test("repo lenses: none when absent; unknown keys ignored with a warning; known keys strict", () => {

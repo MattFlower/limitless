@@ -6282,9 +6282,9 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     shadowOn(f);
     const acquire = f.tracker.tryAcquire.bind(f.tracker);
     // The verifier is the only call made after a panel finder reported something.
-    spyOn(f.tracker, "tryAcquire").mockImplementation((provider) => {
+    spyOn(f.tracker, "tryAcquire").mockImplementation((provider, preempt) => {
       if (calls.shadow.length === 2 && calls.verifier.length === 0) throw new Error("member exploded");
-      return acquire(provider);
+      return acquire(provider, preempt);
     });
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
@@ -6727,6 +6727,8 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     };
     const f = start(handler);
     shadowOn(f);
+    // The verifier shares beta with the single review: a shadow call never takes a provider's last slot.
+    for (const id of ["alpha", "beta"]) Object.assign(f.tracker.def(id) ?? {}, { maxConcurrent: 3 });
     f.deps.cfg.reviewShadowGraceSeconds = 0.3;
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
@@ -6757,9 +6759,14 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     const stage = f.store.listStages(run.id).find((st) => st.name === "review");
-    expect((stage?.finishedAt ?? Infinity) - (stage?.startedAt ?? 0)).toBeLessThan(3_000);
+    // Past the grace, aborted calls get at most 5 s to record their spend; this one never does.
+    expect((stage?.finishedAt ?? Infinity) - (stage?.startedAt ?? 0)).toBeLessThan(8_000);
     const stored = f.store.getArtifact(run.id, "review-0.shadow.json");
-    expect(JSON.parse(stored ?? "null")).toMatchObject({ status: "timeout" });
+    expect(JSON.parse(stored ?? "null")).toMatchObject({
+      status: "timeout",
+      finished: [{ finder: 0, status: "ok" }],
+      usage: { invocations: 2, partial: true },
+    });
     // The pending call reads its own checkout of the reviewed commit, not the run's worktree.
     const worktree = f.store.getRunState<RunState>(run.id)?.worktreePath;
     expect(slow[0]?.signal.aborted).toBe(true);
@@ -6773,6 +6780,285 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     // Its checkout goes once its last call ends.
     while (existsSync(slow[0]?.cwd ?? "") && Date.now() < deadline) await Bun.sleep(10);
     expect(existsSync(slow[0]?.cwd ?? "")).toBe(false);
+  }, 20_000);
+
+  test("an aborted shadow call that settles soon after has its final spend in the artifact", async () => {
+    const calls = newCalls();
+    const { handler, slow, release } = slowShadow(calls, Promise.resolve(), true);
+    const f = start(handler);
+    shadowOn(f);
+    slowRoster(f);
+    f.deps.cfg.reviewShadowGraceSeconds = 0;
+    // The slow finder ignores the abort but answers 300 ms later, reporting its 0.5 cost then.
+    const fake = f.deps.harnesses.fake;
+    if (fake)
+      f.deps.harnesses.fake = async (s) => {
+        const result = await fake(s);
+        return s.prompt.includes("SLOW_FOCUS") ? { ...result, costEquivUsd: 0.5 } : result;
+      };
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    const deadline = Date.now() + 10_000;
+    while (!slow[0]?.signal.aborted && Date.now() < deadline) await Bun.sleep(10);
+    expect(f.store.getArtifact(run.id, "review-0.shadow.json")).toBeNull();
+    await Bun.sleep(300);
+    for (const done of release) done();
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const shadow = JSON.parse(f.store.getArtifact(run.id, "review-0.shadow.json") ?? "null");
+    expect(shadow).toMatchObject({ status: "timeout", usage: { invocations: 2 } });
+    // The fast finder's default 0.001 plus the slow one's 0.5, recorded after its abort.
+    expect(shadow.usage.costEquivUsd).toBeCloseTo(0.501, 6);
+    expect(shadow.usage).not.toHaveProperty("partial");
+    const stage = f.store.listStages(run.id).find((st) => st.name === "review");
+    expect((stage?.finishedAt ?? Infinity) - (stage?.startedAt ?? 0)).toBeLessThan(5_000);
+  }, 20_000);
+
+  /**
+   * The single review fails over from beta to alpha; the shadow finder (beta) reports, so its verifier
+   * wants alpha. `verifier` decides how that call behaves; `primary` gates the production review.
+   */
+  const fallbackScenario = (
+    calls: Calls,
+    times: Record<string, number>,
+    verifier: (s: AgentSpec) => Promise<FakeReply>,
+    primary: (s: AgentSpec) => Promise<void> = () => Bun.sleep(500),
+  ): Handler => {
+    return async (s) => {
+      if (s.prompt.startsWith("You are a code reviewer")) {
+        calls.shadow.push(s);
+        return { structured: { ...approve, findings: [finding("Fast")] } };
+      }
+      if (s.prompt.startsWith("You are a code-review verifier")) {
+        calls.verifier.push(s);
+        return verifier(s);
+      }
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        calls.primary.push(s);
+        if (s.target.provider === "alpha") {
+          times.fallback = Date.now();
+          return { structured: approve };
+        }
+        await primary(s);
+        times.failed = Date.now();
+        return { status: "unavailable", error: "overloaded" };
+      }
+      calls.implement.push(s);
+      return { files: { "farewell.txt": "goodbye\n" } };
+    };
+  };
+
+  test("a one-slot fallback provider never admits shadow work: the production fallback starts at once", async () => {
+    const outcome = async (shadow: boolean) => {
+      await reset();
+      const calls = newCalls();
+      const times: Record<string, number> = {};
+      // Were the verifier admitted, it would hold alpha's only slot for 3 s.
+      const verifier = async (s: AgentSpec) => {
+        await Bun.sleep(3_000);
+        return confirm(s);
+      };
+      const f = start(fallbackScenario(calls, times, verifier));
+      shadowOn(f);
+      if (!shadow) f.deps.cfg.reviewShadow = "off";
+      Object.assign(f.tracker.def("alpha") ?? {}, { maxConcurrent: 1 });
+      Object.assign(f.tracker.def("beta") ?? {}, { maxConcurrent: 3 });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      return {
+        gap: (times.fallback ?? Infinity) - (times.failed ?? 0),
+        targets: calls.primary.map((c) => c.target.modelId),
+        verifier: calls.verifier.length,
+        shadow: shadowOf(f, run.id, 0),
+      };
+    };
+    const off = await outcome(false);
+    const on = await outcome(true);
+    expect(on.targets).toEqual(off.targets);
+    expect(on.targets).toEqual(["beta/m", "alpha/m"]);
+    expect(off.gap).toBeLessThan(1_000);
+    expect(on.gap).toBeLessThan(1_000);
+    expect(on.verifier).toBe(0);
+    expect(on.shadow).toMatchObject({
+      status: "skipped",
+      reason: expect.stringContaining("alpha: no free slot"),
+    });
+  });
+
+  test("a saturated provider preempts the shadow verifier: the fallback starts before it would end, and the panel goes on", async () => {
+    const calls = newCalls();
+    const times: Record<string, number> = {};
+    const held: (() => void)[] = [];
+    let verifying: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      verifying = resolve;
+    });
+    let natural = false;
+    const ref: { f?: Factory } = {};
+    const f = start(
+      fallbackScenario(
+        calls,
+        times,
+        (s) =>
+          new Promise<FakeReply>((resolve) => {
+            verifying();
+            // Natural completion would take 10 s; only an abort ends it sooner.
+            const timer = setTimeout(() => {
+              natural = true;
+              resolve(confirm(s));
+            }, 10_000);
+            s.signal.addEventListener("abort", () => {
+              clearTimeout(timer);
+              resolve({ structured: null });
+            });
+          }),
+        async () => {
+          // Another production call fills alpha's other slot once the shadow verifier holds one.
+          await started;
+          const tracker = ref.f?.tracker;
+          if (tracker) held.push(await tracker.acquire("alpha", new AbortController().signal));
+        },
+      ),
+    );
+    ref.f = f;
+    shadowOn(f);
+    Object.assign(f.tracker.def("beta") ?? {}, { maxConcurrent: 3 });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(natural).toBe(false);
+    expect((times.fallback ?? Infinity) - (times.failed ?? 0)).toBeLessThan(2_000);
+    expect(calls.primary.map((c) => c.target.modelId)).toEqual(["beta/m", "alpha/m"]);
+    expect(calls.verifier[0]?.signal.aborted).toBe(true);
+    const shadow = shadowOf(f, run.id, 0);
+    // The finder's report stays; the preempted verifier leaves its candidate unverified.
+    expect(shadow).toMatchObject({
+      status: "completed",
+      panel: { finders: [{ prompt: "standard", vendor: "openai" }], omitted: ["C1"] },
+      finished: [
+        { finder: 0, status: "ok", review: { findings: [{ title: "Fast" }] } },
+        { verifier: ["C1"], skipped: "preempted" },
+      ],
+    });
+    expect(shadow.usage).toMatchObject({ invocations: 2 });
+    for (const release of held) release();
+    expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+  });
+
+  test("a production call preempts a shadow finder; the panel goes on with the finder that finished", async () => {
+    const calls = newCalls();
+    const { handler, slow } = slowShadow(calls, Promise.resolve());
+    let gate: () => void = () => {};
+    const opened = new Promise<void>((resolve) => {
+      gate = resolve;
+    });
+    const f = start(async (s) => {
+      if (roleOf(s) === "review" && !isShadowCall(s)) await opened;
+      return handler(s);
+    });
+    shadowOn(f);
+    slowRoster(f);
+    Object.assign(f.tracker.def("beta") ?? {}, { maxConcurrent: 5 });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    const deadline = Date.now() + 10_000;
+    // The single review and the slow finder hold beta; the fast finder has answered.
+    while (!(slow.length && f.tracker.status("beta")?.inFlight === 2) && Date.now() < deadline)
+      await Bun.sleep(10);
+    const signal = new AbortController().signal;
+    const held = [await f.tracker.acquire("beta", signal), await f.tracker.acquire("beta", signal)];
+    held.push(await f.tracker.acquire("beta", signal));
+    // Saturated: another production call aborts the slow finder and takes its slot.
+    const waited = Date.now();
+    held.push(await f.tracker.acquire("beta", signal));
+    expect(Date.now() - waited).toBeLessThan(2_000);
+    expect(slow[0]?.signal.aborted).toBe(true);
+    for (const release of held) release();
+    gate();
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(shadowOf(f, run.id, 0)).toMatchObject({
+      status: "completed",
+      panel: {
+        finders: [
+          { prompt: "standard", vendor: "openai" },
+          { prompt: "standard", lens: "slow", vendor: null, skipped: "preempted" },
+        ],
+      },
+      blocking: [{ title: "Fast" }],
+    });
+  });
+
+  test("one run's shadow never delays another run's production implement call", async () => {
+    const calls = newCalls();
+    let verifying: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      verifying = resolve;
+    });
+    let release: () => void = () => {};
+    const second = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const implemented: Record<string, number> = {};
+    const f = start(async (s) => {
+      if (s.prompt.startsWith("You are a code reviewer"))
+        return { structured: { ...approve, findings: [finding("Fast")] } };
+      if (s.prompt.startsWith("You are a code-review verifier"))
+        return new Promise<FakeReply>((resolve) => {
+          verifying();
+          s.signal.addEventListener("abort", () => resolve({ structured: null }));
+        });
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        // The first run's single review waits until the second run has implemented.
+        if (calls.primary.push(s) === 1) await second;
+        return { structured: approve };
+      }
+      calls.implement.push(s);
+      implemented[s.prompt.includes("Second") ? "second" : "first"] = Date.now();
+      if (s.prompt.includes("Second")) release();
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    shadowOn(f);
+    f.deps.cfg.reviewShadowGraceSeconds = 0;
+    Object.assign(f.tracker.def("beta") ?? {}, { maxConcurrent: 3 });
+    const first = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    await started;
+    // The first run's shadow verifier holds one of alpha's two slots; another production call holds the other.
+    const held = await f.tracker.acquire("alpha", new AbortController().signal);
+    const queued = Date.now();
+    const other = await f.createRun({ repo: repoDir, prompt: "Second farewell", profile: "quick" });
+    expect(await waitFor(f, other.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    held();
+    expect(implemented.second).toBeGreaterThan(queued);
+    expect(shadowOf(f, first.id, 0)).toMatchObject({
+      finished: expect.arrayContaining([{ verifier: ["C1"], skipped: "preempted" }]),
+    });
+    expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+  });
+
+  test("a stale pinned shadow roster target leaves production running with no shadow calls", async () => {
+    mkdirSync(join(home, "cfg"), { recursive: true });
+    writeFileSync(
+      join(home, "cfg", "config.toml"),
+      '[review]\nshadow = "panel"\n[review.rosters]\nquick = [{ prompt = "standard", target = "gone/model" }]\n',
+    );
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const calls = newCalls();
+      const f = start(scenario(calls));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("gone/model"));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("shadow review disabled until fixed"));
+      for (const id of ["alpha", "beta"])
+        f.tracker.observeWindows(id, { five_hour: { utilization: 0, resetsAt: null } });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(titles(f, run.id)).toEqual([["Single only"], []]);
+      expect([calls.shadow.length, calls.verifier.length]).toEqual([0, 0]);
+      expect(f.store.listInvocations(run.id).some((i) => i.role === "review_shadow")).toBe(false);
+      expect(f.store.listArtifacts(run.id).some((a) => a.name.includes("shadow"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test("cancelling the run aborts the shadow while the single review waits on its grace period", async () => {

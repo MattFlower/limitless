@@ -466,6 +466,7 @@ async function runPanel<T extends Invoked>(
             ? `${result.status}: ${result.error ?? "no output"}`
             : "invalid review output";
       skipped.set(finder, problem.slice(0, 300));
+      if (member.status === "rejected") deps.finished?.push({ finder, skipped: skipped.get(finder) });
       deps.warn?.(`Local finder ${finder} skipped: ${problem}`);
       continue;
     }
@@ -589,12 +590,18 @@ async function runPanel<T extends Invoked>(
   const omitted: string[] = [];
   const warnings: string[] = [];
   let last = first.invoked.result;
+  // A skipped (shadow) verifier leaves its batch unverified: the panel goes on with what it has.
+  const verify = (...args: Parameters<NonNullable<typeof deps.verify>>) =>
+    deps.verify?.(...args).catch((error: unknown) => {
+      if (!(deps.skipAny && error instanceof FinderSkipped)) throw error;
+      deps.finished?.push({ verifier: args[3], skipped: error.message });
+    });
   for (const [index, batch] of batches.entries()) {
     if (!deps.verify) throw new Error('mode "panel" needs a verifier');
     // Candidates the verifier leaves out get one more call, then stay unverified follow-ups.
     let pending = batch;
     for (let attempt = 0; attempt < 2 && pending.length; attempt++) {
-      const invoked = await deps.verify(
+      const invoked = await verify(
         {
           prompt: verifierPrompt({
             prompt: input.prompt.prompt,
@@ -621,6 +628,7 @@ async function runPanel<T extends Invoked>(
         modelsOf(pending),
         pending.map((c) => c.id),
       );
+      if (!invoked) break;
       deps.finished?.push({
         verifier: pending.map((c) => c.id),
         status: invoked.result.status,

@@ -85,7 +85,10 @@ export class Factory {
       ...provider,
       maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
     }));
-    checkRosterTargets(cfg, this.models, this.providerDefs, (message) => console.warn(message));
+    // A shadow-only problem never blocks production work: the shadow is turned off instead.
+    const shadowOk = checkRosterTargets(cfg, this.models, this.providerDefs, (message) =>
+      console.warn(message),
+    );
     this.policy =
       opts.policy ??
       (opts.policyPath === undefined
@@ -110,7 +113,7 @@ export class Factory {
       this.router.describeFallback(provider, exhausted),
     );
     this.deps = {
-      cfg,
+      cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },
       faults: opts.faults,
       store: this.store,
       buildSha: opts.bootSha,

@@ -58,6 +58,7 @@ import {
   NeedsHumanError,
   NoCapacityError,
   ParkedError,
+  Preempted,
   RunContext,
   type RunState,
 } from "./context.ts";
@@ -1182,7 +1183,12 @@ async function oneRound(
           },
           verify: (request, avoidVendors, avoidModels) => {
             const constraints = verifierConstraints(avoidVendors, avoidModels, ctx.state.implementer);
-            if (!system.verifier?.targets) return call(request, constraints, system.verifier?.target);
+            // A preempted shadow verifier leaves its batch unverified; the panel goes on.
+            const skip = (error: unknown): never => {
+              throw error instanceof Preempted ? new FinderSkipped(error.message) : error;
+            };
+            if (!system.verifier?.targets)
+              return call(request, constraints, system.verifier?.target).catch(skip);
             // Picked per batch, as evals do, and offered alone: a routed fallback could share its vendor.
             const listed = system.verifier.targets.map((target) => {
               const { model, targetId } = ctx.deps.router.resolve(target);
@@ -1190,7 +1196,7 @@ async function oneRound(
             });
             const identity = ctx.deps.router.checkpointIdentity;
             const only = pickVerifier(listed, avoidVendors, avoidModels, identity).targetId;
-            return call(request, { ...constraints, only }, undefined);
+            return call(request, { ...constraints, only }, undefined).catch(skip);
           },
           warn: (message) => ctx.log(message, "warn"),
         };

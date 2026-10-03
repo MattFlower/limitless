@@ -164,6 +164,10 @@ function fixture(relation: "dependency" | "PR reference" = "dependency") {
   return { a, create, main, dependent, unrelated, history };
 }
 
+/** One page of `gh api --paginate` commit output: its parent count and files, as one JSON line. */
+const page = (files: { filename: string; patch?: string | null }[], parents = 1) =>
+  `${JSON.stringify({ parents, files })}\n`;
+
 const reader = (history: Map<string, HistoryRecord[] | null>) => async (run: Run) =>
   history.has(run.id) ? (history.get(run.id) ?? null) : [];
 const outcomes = (row: ShadowRow | undefined) =>
@@ -260,8 +264,8 @@ test("a later commit whose patch GitHub omitted for the finding's file leaves it
         { oid: "head", at: hour(2) },
         { oid: "later", at: hour(3) },
       ]);
-    if (args.includes("--paginate")) return "";
-    return JSON.stringify(args[1]?.endsWith("/later") ? [{ filename: "src/a.ts", patch: null }] : []);
+    if (args.some((arg) => arg.includes("/pulls/"))) return "";
+    return page(args[1]?.endsWith("/later") ? [{ filename: "src/a.ts", patch: null }] : []);
   };
   const [row] = (await shadowReport(store, ghPrHistory(gh))).rows;
   expect(row?.history).toBe(false);
@@ -555,10 +559,10 @@ test("ghPrHistory reads commit patches and inline review comments with gh only; 
   const gh: GhRunner = async (args) => {
     calls.push(args);
     if (args[0] === "pr") return JSON.stringify(commits);
-    if (args.includes("--paginate")) return comments.map((c) => JSON.stringify(c)).join("\n");
+    if (args.some((arg) => arg.includes("/pulls/"))) return comments.map((c) => JSON.stringify(c)).join("\n");
     const sha = args[1]?.split("/").pop() ?? "";
     if (!(sha in files)) throw new Error("gh: Not Found (HTTP 404)");
-    return JSON.stringify(files[sha]);
+    return page(files[sha] ?? []);
   };
   const read = ghPrHistory(gh);
   const mainRun = store.getRun(main.id) as Run;
@@ -580,8 +584,8 @@ test("ghPrHistory reads commit patches and inline review comments with gh only; 
   expect(await read(mainRun)).toEqual(expected);
   expect(calls.map((c) => c.slice(0, 3).join(" "))).toEqual([
     `pr view ${PR}`,
-    "api repos/owner/a/commits/abc123 --jq",
-    "api repos/owner/a/commits/d0c5 --jq",
+    "api repos/owner/a/commits/abc123 --paginate",
+    "api repos/owner/a/commits/d0c5 --paginate",
     "api --paginate repos/owner/a/pulls/7/comments",
   ]);
   // The inline-comment query keeps author, path and line.
@@ -594,4 +598,86 @@ test("ghPrHistory reads commit patches and inline review comments with gh only; 
   const r0 = (await shadowReport(store, read)).rows.find((r) => r.runId === main.id);
   expect(r0?.history).toBe(false);
   expect(new Set(r0?.panelOnly.map((p) => p.outcome))).toEqual(new Set(["unknown", "review-matched"]));
+});
+
+let prs = 100;
+/** A succeeded run on its own PR whose shadow, reviewing `reviewedSha`, blocks on `panel`; `gh` serves commits. */
+async function ghRow(
+  reviewedSha: string,
+  panel: ReturnType<typeof finding>[],
+  commits: [sha: string, pages: string | Error][],
+) {
+  at(0);
+  const run = store.createRun(repoOf("owner/a"), { repo: "owner/a", prompt: "work" });
+  store.updateRun(run.id, { status: "succeeded", prUrl: `https://github.com/owner/a/pull/${prs++}` });
+  at(2);
+  put(run, "review-0.json", review([]));
+  put(run, "review-0.shadow.json", shadow(panel, { reviewedSha }));
+  const gh: GhRunner = async (args) => {
+    if (args[0] === "pr") return JSON.stringify(commits.map(([oid]) => ({ oid, at: hour(1) })));
+    if (args.some((arg) => arg.includes("/pulls/"))) return "";
+    const pages = commits.find(([oid]) => args[1]?.endsWith(`/${oid}`))?.[1];
+    if (pages === undefined || pages instanceof Error) throw pages ?? new Error("gh: Not Found (HTTP 404)");
+    return pages;
+  };
+  return (await shadowReport(store, ghPrHistory(gh))).rows.find((r) => r.runId === run.id);
+}
+const files = (n: number, from = 0) =>
+  Array.from({ length: n }, (_, i) => ({ filename: `gen/${from + i}.ts`, patch: add(1) }));
+
+test("a merge commit's first-parent changes are never a fix; later commits still are, even after a merged reviewed commit", async () => {
+  const panel = [finding("src/x.ts", 40, "Upstream only"), finding("src/y.ts", 10, "Fixed later")];
+  // The factory's base merge brings upstream changes at the finding's lines; GitHub lists them as its files.
+  const row = await ghRow("head", panel, [
+    ["head", page([])],
+    ["merge", page([{ filename: "src/x.ts", patch: add(41) }], 2)],
+    ["fix", page([{ filename: "src/y.ts", patch: del(12) }])],
+  ]);
+  expect(row?.history).toBe(true);
+  expect(outcomes(row)).toEqual({
+    "src/x.ts:40: Upstream only": ["converged-without-fix", []],
+    "src/y.ts:10: Fixed later": ["fixed", ["commit fix"]],
+  });
+  // The reviewed commit is itself a merge: it still anchors PR order, and its own files never count.
+  const merged = await ghRow("merge-head", panel, [
+    ["merge-head", page([{ filename: "src/y.ts", patch: add(10) }], 3)],
+    ["fix", page([{ filename: "src/x.ts", patch: add(40) }])],
+  ]);
+  expect(merged?.history).toBe(true);
+  expect(outcomes(merged)).toEqual({
+    "src/x.ts:40: Upstream only": ["fixed", ["commit fix"]],
+    "src/y.ts:10: Fixed later": ["converged-without-fix", []],
+  });
+});
+
+test("a commit's files beyond GitHub's first page of 300 are read; a truncated or failed list is never convergence", async () => {
+  const panel = [finding("src/x.ts", 40, "Deep in a big commit")];
+  // 301 files: the match is on the second page.
+  const paged = await ghRow("head", panel, [
+    ["head", page([])],
+    ["big", page(files(300)) + page([{ filename: "src/x.ts", patch: add(40) }])],
+  ]);
+  expect(paged?.history).toBe(true);
+  expect(outcomes(paged)).toEqual({ "src/x.ts:40: Deep in a big commit": ["fixed", ["commit big"]] });
+  // Exactly one full page and no next page: complete, and nothing matched.
+  const full = await ghRow("head", panel, [
+    ["head", page([])],
+    ["full", page(files(300))],
+  ]);
+  expect(full?.history).toBe(true);
+  expect(outcomes(full)).toEqual({ "src/x.ts:40: Deep in a big commit": ["converged-without-fix", []] });
+  // GitHub's 3000-file cap: the list may be cut short, so any file may have changed.
+  const capped = await ghRow("head", panel, [
+    ["head", page([])],
+    ["huge", Array.from({ length: 10 }, (_, i) => page(files(300, i * 300))).join("")],
+  ]);
+  expect(capped?.history).toBe(false);
+  expect(outcomes(capped)).toEqual({ "src/x.ts:40: Deep in a big commit": ["unknown", []] });
+  // A later page fails: gh fails the whole read, so the history is unavailable.
+  const failed = await ghRow("head", panel, [
+    ["head", page([])],
+    ["big", new Error("gh: HTTP 502 on page 2")],
+  ]);
+  expect(failed?.history).toBe(false);
+  expect(outcomes(failed)).toEqual({ "src/x.ts:40: Deep in a big commit": ["unknown", []] });
 });
