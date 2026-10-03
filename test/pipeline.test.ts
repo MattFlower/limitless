@@ -809,7 +809,7 @@ esac
     },
   );
 
-  test("panel mode: the deep roster plus lenses from the base commit; an unavailable local finder is skipped", async () => {
+  test.each([false, true])("panel mode: deep roster plus base lenses, local=%s", async (configuredLocal) => {
     const lens = (focus: string) => `[review]\nlenses = [{ name = "ops", focus = "${focus}" }]\n`;
     const toml = readFileSync(join(repoDir, ".limitless.toml"), "utf8");
     writeFileSync(join(repoDir, ".limitless.toml"), `${toml}${lens("BASE_FOCUS")}`);
@@ -857,6 +857,11 @@ esac
       return { files: { "farewell.txt": farewell, ".limitless.toml": `${toml}${lens("HEAD_FOCUS")}` } };
     });
     f.deps.cfg.reviewMode = "panel";
+    if (configuredLocal)
+      f.deps.cfg.reviewRosters.deep = [
+        ...f.deps.cfg.reviewRosters.deep,
+        { prompt: "standard", lens: { name: "failure-paths", focus: "Failure paths." }, local: true },
+      ];
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "deep" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(f.store.getArtifact(run.id, "diff.patch")).toContain("HEAD_FOCUS");
@@ -870,12 +875,16 @@ esac
         { prompt: "adversarial", vendor: "openai" },
         // The careful finder took the implementer's own model, in a fresh session.
         { prompt: "careful", vendor: "anthropic", implementerModel: true },
-        {
-          prompt: "standard",
-          lens: "removed-behaviour-and-failure-paths",
-          vendor: null,
-          skipped: expect.stringContaining("No model available for review"),
-        },
+        ...(configuredLocal
+          ? [
+              {
+                prompt: "standard",
+                lens: "failure-paths",
+                vendor: null,
+                skipped: expect.stringContaining("No model available for review"),
+              },
+            ]
+          : []),
         { prompt: "standard", lens: "ops", vendor: "openai" },
       ]);
   });
@@ -890,7 +899,7 @@ esac
         if (role === "holdout") return { structured: holdout };
         if (role === "verify") return { structured: pass };
         if (role !== "review") return { files: { "farewell.txt": "goodbye\n" } };
-        if (!s.prompt.includes("# Lens: removed-behaviour-and-failure-paths")) return { structured: approve };
+        if (!s.prompt.includes("# Lens: failure-paths")) return { structured: approve };
         local.push(s.timeoutMs);
         return { fault: "timeout", delayMs: 50 };
       },
@@ -898,6 +907,10 @@ esac
       true,
     );
     f.deps.cfg.reviewMode = "panel";
+    f.deps.cfg.reviewRosters.standard = [
+      ...f.deps.cfg.reviewRosters.standard,
+      { prompt: "standard", lens: { name: "failure-paths", focus: "Failure paths." }, local: true },
+    ];
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     // Both free models were tried, the second with only what was left of the first's time.
