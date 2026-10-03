@@ -4,12 +4,8 @@ import { type ReviewDeps, type ReviewInput, runReview } from "./review.ts";
 import { configuredReviewSystem } from "./review-system.ts";
 import { parseArtifact } from "./shadow-report.ts";
 
-const SHADOW_MIN_HEADROOM = 0.1; // at or below it a subscription provider has no room for shadow work
-
-/** The engine's review dependencies, with the finders of the given system. */
+const SHADOW_MIN_HEADROOM = 0.1;
 export type ShadowDeps = (system: ReviewSystem) => ReviewDeps<InvokeOutcome>;
-
-/** Runs the profile's panel as a first review of what the single review saw; never affects the run. */
 export async function shadowReview(
   ctx: RunContext,
   opts: { round: number; baseSha: string; reviewedSha: string; profile: ResolvedProfile; input: ReviewInput },
@@ -19,11 +15,9 @@ export async function shadowReview(
   const range = `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`;
   const name = `review-${round}.shadow.json`;
   const prior = parseArtifact(ctx.store.getArtifact(ctx.run.id, name));
-  // The range names both reviewed revisions and the diff scope; a malformed record is replaced.
   if (prior?.status === "completed" && prior.range === range) return;
   const { tracker, store, cfg } = ctx.deps;
-  // Checked before starting and by ctx.invoke for each attempt's target once its slot is held and
-  // telemetry refreshed. Metered models never stand in for exhausted subscriptions.
+  // Checked before starting and after acquiring each provider slot and refreshing telemetry.
   const stop = (id: string) =>
     tracker.def(id)?.billing === "metered"
       ? `${id} is metered`
@@ -48,7 +42,6 @@ export async function shadowReview(
     record = { status: error instanceof NoCapacityError ? "skipped" : "error", reason };
   }
   if (record.status !== "completed") ctx.log(`Shadow panel ${record.status}: ${record.reason}`, "warn");
-  // Every attempt, failed or retried, from the persisted invocation rows that already count in run totals.
   const spent = guard.ids.flatMap((id) => store.getInvocation(id) ?? []);
   const cost = (key: "costUsd" | "costEquivUsd") => spent.reduce((total, i) => total + i[key], 0);
   const usage = { invocations: spent.length, costUsd: cost("costUsd"), costEquivUsd: cost("costEquivUsd") };

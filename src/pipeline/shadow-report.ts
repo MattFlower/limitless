@@ -3,23 +3,17 @@ import type { Store } from "../db/store.ts";
 import type { GhRunner } from "../integrations/github.ts";
 
 type Cited = Record<"source" | "at" | "text", string>;
-/** A later commit (with the `files` it changes) or review finding/comment, cited by `source` at ISO time `at`. */
 export type HistoryRecord = Cited & { kind: "commit" | "review"; files?: string[] };
-/** A run's PR history (commits in PR order first), or null when it has no PR or it is unavailable. */
 export type HistoryReader = (run: Run) => Promise<HistoryRecord[] | null>;
 export type Outcome = "fixed" | "review-matched" | "converged-without-fix" | "unknown";
 type Evidence = Omit<HistoryRecord, "text" | "files"> & { basis: string };
-const BASIS = { commit: "names the file and title and changes the file", review: "names the file and title" };
+const BASIS = { commit: "explicit fix, file/title and file change", review: "names the file and title" };
 type PanelOnly = { finding: string; outcome: Outcome; evidence: Evidence[] };
 type Ids = Record<"runId" | "repo" | "round" | "status", string> & { pr: string | null; createdAt: number };
-/** `history` is false when some related history or review was unavailable: unmatched findings stay unknown. */
 type Results = Record<"single" | "panel" | "shared", string[]> & { history: boolean; panelOnly: PanelOnly[] };
 export type ShadowRow = Ids & Results & { reason?: string };
-
 const PR_HISTORY = `[(.commits[] | {kind: "commit", oid: .oid, source: "commit \\(.oid)", at: .committedDate, text: "\\(.messageHeadline)\\n\\(.messageBody)"}), ((.reviews + .comments)[] | {kind: "review", source: .url, at: (.submittedAt // .createdAt), text: (.body // "")})]`;
 const VIEW = ["--json", "commits,reviews,comments", "--jq", PR_HISTORY];
-
-/** Read-only `gh pr view`, plus one `gh api` read per commit for the files it changes. */
 export const ghPrHistory = (gh: GhRunner): HistoryReader => {
   const json = async (args: string[]) => JSON.parse(String(await gh(args)));
   const view = async ({ prUrl, repoSlug }: Run): Promise<HistoryRecord[]> => {
@@ -32,13 +26,19 @@ export const ghPrHistory = (gh: GhRunner): HistoryReader => {
   };
   return async (r) => (r.prUrl ? view(r).catch(() => null) : null);
 };
-
 type Finding = { file: string; title: string };
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9/._-]+/g, " ");
 const label = (f: Finding) => `${f.file}: ${f.title}`;
+const names = (text: string, f: Finding) => [f.file, f.title].every((s) => norm(text).includes(norm(s)));
+const UNFIXED =
+  /\b(not|never|unfixed|unresolved|defer(?:red)?|diagnostics?|pending|remains?|still|later|planned|todo)\b/i;
+const fixes = (text: string, f: Finding) =>
+  !UNFIXED.test(text) &&
+  text
+    .split(/[\n;]+/)
+    .some((line) => /^(fix(?:es|ed)?|resolve[sd]?)(\([^)]*\))?:?\s/i.test(line.trim()) && names(line, f));
 const list = (v: unknown): Finding[] | null =>
   Array.isArray(v) && v.every((f) => typeof f?.file === "string" && typeof f.title === "string") ? v : null;
-/** null for a missing artifact, undefined for a malformed one. */
 export const parseArtifact = (text: string | null): Record<string, unknown> | null | undefined => {
   try {
     return text === null ? null : JSON.parse(text);
@@ -47,11 +47,6 @@ export const parseArtifact = (text: string | null): Record<string, unknown> | nu
   }
 };
 const roundOf = (name: string, tag = "") => new RegExp(`^review-(-?\\d+)${tag}\\.json$`).exec(name)?.[1];
-
-/**
- * Single vs shadow panel blocking findings per round, matched against later reviews and PR histories
- * of the run and runs depending on it or its PR. Reads only; never writes or calls a model.
- */
 export async function shadowReport(store: Store, readHistory: HistoryReader): Promise<ShadowRow[]> {
   const runs = store.listRuns({ limit: Number.MAX_SAFE_INTEGER });
   const rows: ShadowRow[] = [];
@@ -59,7 +54,7 @@ export async function shadowReport(store: Store, readHistory: HistoryReader): Pr
     const artifacts = store.listArtifacts(run.id);
     if (!artifacts.some((a) => roundOf(a.name, ".shadow"))) continue;
     const onPr = ({ sourceRef: s }: Run) =>
-      s?.kind === "pull_request" && run.prUrl?.endsWith(`/pull/${s.number}`);
+      s?.kind === "pull_request" && s.repo === run.repoSlug && run.prUrl?.endsWith(`/pull/${s.number}`);
     const related = runs.filter(
       (r) => r.repoId === run.repoId && (r.id === run.id || r.dependsOn.includes(run.id) || onPr(r)),
     );
@@ -76,8 +71,9 @@ export async function shadowReport(store: Store, readHistory: HistoryReader): Pr
     );
     // One history per PR; this run's is needed even without a PR, as it can't be observed then.
     const byPr = new Map(related.filter((r) => r.prUrl || r.id === run.id).map((r) => [r.prUrl ?? r.id, r]));
-    const histories = await Promise.all([...byPr.values()].map(readHistory));
-    if (histories.includes(null)) complete = false;
+    const histories = await Promise.all(
+      [...byPr.values()].map(async (r) => [r, await readHistory(r).catch(() => null)] as const),
+    );
     const done = run.merged || run.status === "succeeded";
     const rounds = [...new Set(artifacts.flatMap((a) => roundOf(a.name.replace(".shadow", "")) ?? []))];
     for (const round of rounds.sort((a, b) => Number(a) - Number(b))) {
@@ -86,31 +82,35 @@ export async function shadowReport(store: Store, readHistory: HistoryReader): Pr
       const panel = list(shadow?.blocking);
       const status = shadow === null ? "missing" : String(shadow?.status ?? "malformed");
       const reason = single ? shadow?.reason : "single review artifact missing or malformed";
-      // Fixes follow the reviewed commit in PR order; a rebased history lacks it, so its evidence is incomplete.
+      const after = artifacts.find((a) => a.name === `review-${round}.shadow.json`)?.createdAt ?? Infinity;
+      // Original/stacked PRs use commit order; distinct follow-ups need a later run and commit time.
       const sha = `commit ${String(shadow?.reviewedSha)}`;
-      const placed = histories.map((h) => [h ?? [], h?.findIndex((r) => r.source === sha) ?? -1] as const);
+      const placed = histories.map(([owner, h]) => {
+        if (!h) complete = false;
+        const i = h?.findIndex((r) => r.source === sha) ?? -1;
+        const follow = owner.prUrl !== run.prUrl && owner.createdAt > after;
+        return [h ?? [], i >= 0 ? i : follow ? -1 : Infinity] as const;
+      });
       const row: ShadowRow = {
         ...{ runId: run.id, repo: run.repoSlug, pr: run.prUrl, createdAt: run.createdAt, round },
         ...{ status: status === "completed" && !panel ? "malformed" : status },
-        ...{ history: complete && single !== null && placed.every(([, i]) => i >= 0) },
+        ...{ history: complete && single !== null && placed.every(([, i]) => i !== Infinity) },
         ...(reason ? { reason: String(reason) } : {}),
         ...{ single: (single ?? []).map(label), panel: [], shared: [], panelOnly: [] },
       };
       rows.push(row);
       if (row.status !== "completed" || !panel) continue;
       // Evidence follows the shadow review in time; own reviews also by round, since a replay moves their time.
-      const after = artifacts.find((a) => a.name === `review-${round}.shadow.json`)?.createdAt ?? Infinity;
       const records = [
         ...reviews.filter((r) => r.own > Number(round) || !r.source.startsWith(`run ${run.id}/`)),
-        ...placed.flatMap(([h, i]) => h.filter((r, j) => (i < 0 ? r.kind === "review" : j > i))),
+        ...placed.flatMap(([h, i]) => h.filter((r, j) => r.kind === "review" || j > i)),
       ].filter((r) => Date.parse(r.at) > after);
       row.panel = panel.map(label);
       row.shared = row.panel.filter((p) => row.single.some((s) => norm(s) === norm(p)));
       for (const f of panel.filter((f) => !row.shared.includes(label(f)))) {
-        // A fix is a commit that names the finding and changes its file; a mention or an edit alone is none.
         const evidence: Evidence[] = records
-          .filter((r) => norm(r.text).includes(norm(f.file)) && norm(r.text).includes(norm(f.title)))
-          .filter((r) => r.kind === "review" || r.files?.includes(f.file))
+          .filter((r) => names(r.text, f))
+          .filter((r) => r.kind === "review" || (r.files?.includes(f.file) && fixes(r.text, f)))
           .map(({ kind, source, at }) => ({ kind, source, at, basis: BASIS[kind] }));
         const fixed = evidence.some((e) => e.kind === "commit");
         const noMatch = row.history && done ? "converged-without-fix" : "unknown";
@@ -121,8 +121,6 @@ export async function shadowReport(store: Store, readHistory: HistoryReader): Pr
   }
   return rows;
 }
-
-/** Rows for runs created at or after `since` (ms), as text. */
 export function formatShadowReport(rows: ShadowRow[], since?: number): string {
   const join = (items: string[]) => items.join("; ") || "none";
   const kept = rows.filter((r) => since === undefined || r.createdAt >= since);

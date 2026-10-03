@@ -56,7 +56,7 @@ const shadow = (blocking: unknown[], extra: Record<string, unknown> = {}) => ({
 const PR = "https://github.com/owner/a/pull/7";
 const FOLLOW_PR = "https://github.com/owner/a/pull/9";
 const basis = "names the file and title";
-const fixBasis = "names the file and title and changes the file";
+const fixBasis = "explicit fix, file/title and file change";
 /** A PR commit at hour `h` changing `files` (by default the one file its message names). */
 const commit = (
   sha: string,
@@ -71,7 +71,7 @@ const commit = (
   files,
 });
 
-function fixture() {
+function fixture(relation: "dependency" | "PR reference" = "dependency") {
   at(0);
   const a = repoOf("owner/a");
   const b = repoOf("owner/b");
@@ -107,7 +107,12 @@ function fixture() {
   const followUp = create(a, { sourceRef: { kind: "pull_request", repo: "owner/a", number: 7 } });
   put(followUp, "review-0.json", review([], "follow-sha", [finding("src/b.ts", "Race")]));
   // A dependent run delivers its own PR, which fixes one panel-only finding.
-  const dependent = create(a, { dependsOn: [main.id] });
+  const dependent = create(
+    a,
+    relation === "dependency"
+      ? { dependsOn: [main.id] }
+      : { sourceRef: { kind: "pull_request", repo: "owner/a", number: 7 } },
+  );
   store.updateRun(dependent.id, { status: "succeeded", prUrl: FOLLOW_PR });
   // Same finding text in an unrelated run of the repo and on PR 7 of another repo: never evidence.
   const unrelated = create(a);
@@ -115,6 +120,8 @@ function fixture() {
   put(unrelated, "review-0.json", review([finding("src/d.ts", "Overflow")]));
   const otherRepo = create(b, { sourceRef: { kind: "pull_request", repo: "owner/b", number: 7 } });
   put(otherRepo, "review-0.json", review([finding("src/d.ts", "Overflow")]));
+  const foreignRef = create(a, { sourceRef: { kind: "pull_request", repo: "owner/b", number: 7 } });
+  put(foreignRef, "review-0.json", review([finding("src/d.ts", "Overflow")]));
   // Legacy run: no shadow artifacts at all.
   const legacy = create(a);
   put(legacy, "review-0.json", review([]));
@@ -224,6 +231,57 @@ test("a rewritten history without the reviewed commit yields no fix and marks th
   expect(formatShadowReport([r0 as ShadowRow])).toContain("round 0: completed; evidence incomplete");
 });
 
+for (const relation of ["dependency", "PR reference"] as const) {
+  test(`a non-stacked follow-up linked by ${relation} supplies later fixes without the original SHA`, async () => {
+    const { main, dependent: follow, history } = fixture(relation);
+    history.set(follow.id, [
+      commit("old", 1, "Fix src/e.ts: Stale"),
+      commit("same-time", 2, "Fix src/f.ts: Skewed"),
+      commit("follow-fix", 5, "fix(review): src/g.ts: Missing check"),
+      commit("follow-comment", 5, "Add diagnostics for src/c.ts: Leak; this bug remains unfixed"),
+    ]);
+    const row = (await shadowReport(store, reader(history))).find((r) => r.runId === main.id);
+    expect(row?.history).toBe(true);
+    expect(row?.panelOnly.find((p) => p.finding === "src/g.ts: Missing check")).toEqual({
+      finding: "src/g.ts: Missing check",
+      outcome: "fixed",
+      evidence: [{ kind: "commit", source: "commit follow-fix", at: hour(5), basis: fixBasis }],
+    });
+    for (const file of ["c", "e", "f"])
+      expect(row?.panelOnly.find((p) => p.finding.startsWith(`src/${file}.ts:`))).toMatchObject({
+        outcome: "converged-without-fix",
+        evidence: [],
+      });
+    // A later commit timestamp alone cannot establish a follow-up when its run predates the review.
+    store.db.run("UPDATE runs SET created_at = ? WHERE id = ?", [Date.parse(hour(1)), follow.id]);
+    const earlier = (await shadowReport(store, reader(history))).find((r) => r.runId === main.id);
+    expect(earlier?.history).toBe(false);
+    expect(earlier?.panelOnly.find((p) => p.finding.startsWith("src/g.ts:"))).toMatchObject({
+      outcome: "unknown",
+      evidence: [],
+    });
+  });
+}
+
+test.each([
+  "Add diagnostics for src/a.ts: Null deref; this bug remains unfixed",
+  "Add diagnostics for src/a.ts: Null deref",
+  "Defer src/a.ts: Null deref",
+  "Fix src/a.ts: Null deref; this bug remains unresolved",
+  "Fix src/a.ts: Null deref later",
+  "Fix src/a.ts: Null deref\nThis does not fix the bug",
+  "Fix src/b.ts: Race\nAdd diagnostics for src/a.ts: Null deref",
+])("a same-file commit does not establish a fix: %s", async (message) => {
+  const { main, history } = fixture();
+  history.set(main.id, [commit("head", 2, "Add work"), commit("diagnostic", 4, message, ["src/a.ts"])]);
+  const row = (await shadowReport(store, reader(history))).find((r) => r.runId === main.id);
+  expect(row?.panelOnly.find((p) => p.finding === "src/a.ts: Null deref")).toEqual({
+    finding: "src/a.ts: Null deref",
+    outcome: "converged-without-fix",
+    evidence: [],
+  });
+});
+
 test("replaying the paired or an earlier review never becomes later evidence", async () => {
   const { main, followUp, history } = fixture();
   // Resume rewrites review-0.json and review-1.json later, with findings the panel raised at round 0.
@@ -253,21 +311,29 @@ test("replaying the paired or an earlier review never becomes later evidence", a
   ]);
 });
 
-test("unavailable follow-up history leaves unmatched findings unknown", async () => {
-  const { main, dependent, history } = fixture();
-  history.set(dependent.id, null);
-  const [r0] = (await shadowReport(store, reader(history))).filter((r) => r.runId === main.id);
-  expect(r0?.history).toBe(false);
-  expect(r0?.panelOnly.map((p) => [p.finding, p.outcome])).toEqual([
-    ["src/a.ts: Null deref", "fixed"],
-    ["src/b.ts: Race", "review-matched"],
-    ["src/c.ts: Leak", "unknown"],
-    ["src/d.ts: Overflow", "unknown"],
-    ["src/e.ts: Stale", "unknown"],
-    ["src/f.ts: Skewed", "unknown"],
-    ["src/g.ts: Missing check", "unknown"],
-  ]);
-});
+test.each([false, true])(
+  "unavailable follow-up history leaves unmatched findings unknown (throws=%s)",
+  async (throws) => {
+    const { main, dependent, history } = fixture();
+    history.set(dependent.id, null);
+    const [r0] = (
+      await shadowReport(store, async (run) => {
+        if (throws && run.id === dependent.id) throw new Error("history unavailable");
+        return reader(history)(run);
+      })
+    ).filter((r) => r.runId === main.id);
+    expect(r0?.history).toBe(false);
+    expect(r0?.panelOnly.map((p) => [p.finding, p.outcome])).toEqual([
+      ["src/a.ts: Null deref", "fixed"],
+      ["src/b.ts: Race", "review-matched"],
+      ["src/c.ts: Leak", "unknown"],
+      ["src/d.ts: Overflow", "unknown"],
+      ["src/e.ts: Stale", "unknown"],
+      ["src/f.ts: Skewed", "unknown"],
+      ["src/g.ts: Missing check", "unknown"],
+    ]);
+  },
+);
 
 test("unfinished runs and unavailable history stay unknown; broken artifacts keep valid rows", async () => {
   const { a, create, history } = fixture();

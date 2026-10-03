@@ -545,11 +545,13 @@ provider before each call. It stops rather than use a metered model. A failed or
 `limitless review shadow-report [--since <ISO-8601>]` compares single and panel blocking findings per
 round, for runs created at or after `--since`. It marks each panel-only finding:
 
-- `fixed`: a later commit names its file and title and changes that file, in the run's PR or the PR
-  of a run depending on it. Later means after the reviewed commit in PR order and after the shadow
-  review in time. A commit that only mentions the finding (say, to note it stays open) is no fix. A
-  PR history that no longer contains the reviewed commit (rebased, so every commit has a new id and
-  time) gives no fix evidence and marks the evidence incomplete.
+- `fixed`: a later commit explicitly states it fixes or resolves the named file and title and
+  changes that file. Diagnostic, deferred, or unresolved wording disqualifies the commit. In the
+  original or a stacked PR, the fix must follow the reviewed commit in PR order and the shadow
+  review in time. A distinct PR from an explicitly dependent run or a run referencing the original
+  PR can also supply fixes when both that run and its fix commits postdate the shadow review; it
+  need not contain the original SHA. Rewritten original PR histories lacking the reviewed commit
+  give no fix evidence and mark the evidence incomplete.
 - `review-matched`: a later review names it. This can be a later round of the run (the paired round
   and earlier ones never count, even when a resume rewrote them), a run on the same PR or one
   depending on it, or a PR review or comment. A review match is not a fix.
