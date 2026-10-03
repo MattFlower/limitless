@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveBootSha } from "../src/cli/boot-sha.ts";
@@ -690,7 +690,7 @@ test("an unknown daemon SHA cannot use the target checkout as proof of deploymen
       f.client.health = async (signal) => ({ ...(await health(signal)), sha }) as unknown as HealthResponse;
       const listeners = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
       await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow(
-        /daemon boot SHA is unknown.*launchctl kickstart -k gui\/\d+\/cc\.mattflower\.limitless or limitless service install/,
+        /daemon boot SHA is unknown.*launchctl kickstart -k gui\/\d+\/dev\.limitless\.daemon or limitless service install/,
       );
       expect(f.calls).toEqual([
         "health",
@@ -886,4 +886,42 @@ test("the tunnel config names the configured public host and exposes only webhoo
   );
   expect(yaml).toContain("  - service: http_status:404\n");
   expect(yaml).not.toMatch(/mattflower/i);
+});
+
+test("deploy restarts the discovered daemon label and ignores unrelated marked agents", async () => {
+  const f = setup();
+  const agentsDir = join(f.opts.releaseDir, "LaunchAgents");
+  mkdirSync(agentsDir);
+  const installed = {
+    Label: "arbitrary.pre.migration.daemon",
+    ProgramArguments: ["/custom/bin/bun", join(f.opts.releaseDir, "src", "cli", "main.ts"), "serve"],
+  };
+  const unrelated = {
+    Label: "unrelated.daemon",
+    LimitlessService: "daemon",
+    ProgramArguments: ["bun", "/different/install/src/cli/main.ts", "serve"],
+  };
+  writeFileSync(join(agentsDir, "installed.plist"), JSON.stringify(installed));
+  const unrelatedPath = join(agentsDir, "unrelated.plist");
+  writeFileSync(unrelatedPath, JSON.stringify(unrelated));
+  const command: typeof sh = async (args, opts) => {
+    if (args[0] === "plutil")
+      return {
+        stdout: readFileSync(args.at(-1) ?? "", "utf8"),
+        stderr: "",
+        exitCode: 0,
+      };
+    if (args[0] === "launchctl") {
+      f.calls.push(args.join(" "));
+      await f.opts.restart();
+      return { stdout: "", stderr: "", exitCode: 0 };
+    }
+    return f.opts.command(args, opts);
+  };
+  await deploy(7400, "feature", false, { ...f.opts, agentsDir, command, restart: undefined });
+  const launches = f.calls.filter((call) => call.startsWith("launchctl"));
+  expect(launches).toHaveLength(1);
+  expect(launches[0]).toMatch(/^launchctl kickstart -k gui\/\d+\/arbitrary\.pre\.migration\.daemon$/);
+  expect(readFileSync(unrelatedPath, "utf8")).toBe(JSON.stringify(unrelated));
+  expect(f.calls.indexOf("drain")).toBeLessThan(f.calls.indexOf(launches[0] ?? ""));
 });
