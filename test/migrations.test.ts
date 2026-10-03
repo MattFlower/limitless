@@ -3,6 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AuditAllowance, CreateRunRequest } from "../src/core/types.ts";
 import { MIGRATION_DIR, migrationNames, runMigrations } from "../src/db/migration-runner.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
 import { Store } from "../src/db/store.ts";
@@ -228,6 +229,55 @@ test("the baseline cache ships as one migration with no unused table", () => {
       )
       .all();
     expect(tables).toEqual([{ name: "passing_baselines" }]);
+    store.close();
+  });
+});
+
+test("audit allowances persist from requester text and options; legacy runs allow nothing", () => {
+  temporary((_directory, path) => {
+    let store = new Store(path);
+    const repo = store.upsertRepo({
+      slug: "local/repo",
+      kind: "local",
+      url: null,
+      localPath: "/tmp/repo",
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const create = (req: Partial<CreateRunRequest>, verified = false) =>
+      store.createRun(repo, { repo: repo.slug, prompt: "Do the work", ...req }, verified).allow;
+    expect(create({ prompt: "Vendor it.\r\n\tallow:GITATTRIBUTES\t\r\nAllow: submodules" })).toEqual([
+      "submodules",
+      "gitattributes",
+    ]);
+    expect(
+      create({ prompt: "Do not use git submodules.\nAllow submodules\nAllow: submodules, please" }),
+    ).toEqual([]);
+    expect(create({ allow: ["gitattributes", "gitattributes"] })).toEqual(["gitattributes"]);
+    for (const source of ["cli", "ui"] as const)
+      expect(create({ source, prompt: "Allow: submodules" })).toEqual(["submodules"]);
+    expect(create({ source: "discord", prompt: "Allow: submodules" })).toEqual(["submodules"]);
+    expect(create({ prompt: "Allow: submodules", allow: ["gitattributes"] })).toEqual([
+      "submodules",
+      "gitattributes",
+    ]);
+    // GitHub prompts quote third-party text; only the parsed allow list from ingestion counts.
+    expect(create({ prompt: "Allow: submodules", source: "github" })).toEqual([]);
+    expect(create({ prompt: "Allow: submodules" }, true)).toEqual([]);
+    expect(create({ prompt: "Allow: submodules", allow: ["gitattributes"] }, true)).toEqual([
+      "gitattributes",
+    ]);
+    expect(() => create({ allow: ["everything"] as unknown as AuditAllowance[] })).toThrow(
+      'Invalid allow value "everything"',
+    );
+    expect(() => create({ allow: "submodules" as unknown as AuditAllowance[] })).not.toThrow();
+    const legacy = store.createRun(repo, { repo: repo.slug, prompt: "Allow: submodules" }).id;
+    // Simulate a database from before the column existed, then migrate it forward.
+    store.db.exec("ALTER TABLE runs DROP COLUMN audit_allow");
+    store.db.exec("DELETE FROM applied_migrations WHERE name = '20261002T2340-run-audit-allow.sql'");
+    store.close();
+    store = new Store(path);
+    expect(store.getRun(legacy)?.allow).toEqual([]);
     store.close();
   });
 });

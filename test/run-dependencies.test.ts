@@ -299,3 +299,37 @@ test("CLI --after sends multiple prerequisite IDs and prints the waiting status"
   });
   expect(output).toContain("waiting");
 });
+
+test("CLI --allow is repeatable, validated, and sent as the allow option", async () => {
+  const cli = async (...args: string[]) => {
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        "--preload",
+        join(import.meta.dir, "fixtures/dependencies-cli-preload.ts"),
+        join(import.meta.dir, "../src/cli/main.ts"),
+        "run",
+        "vendor it",
+        "--repo",
+        "local/repo",
+        ...args,
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const [output, error, exit] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    const request = output.split("\n").find((line) => line.startsWith("REQUEST "));
+    return { exit, error, request: request ? JSON.parse(request.slice(8)) : null };
+  };
+  const both = await cli("--allow", "gitattributes", "--allow", "submodules", "--allow", "submodules");
+  expect(both.exit).toBe(0);
+  expect(both.request.allow).toEqual(["submodules", "gitattributes"]);
+  expect((await cli()).request.allow).toBeUndefined();
+  const invalid = await cli("--allow", "everything");
+  expect(invalid.exit).not.toBe(0);
+  expect(invalid.request).toBeNull();
+  expect(invalid.error).toContain('Invalid allow value "everything"');
+});

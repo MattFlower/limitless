@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { DEFAULT_DECISION_CONFIDENCE } from "../config.ts";
+import { parseAllow } from "../core/allow.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { diffSince, readFileAt } from "../git/repos.ts";
@@ -98,6 +99,7 @@ export async function prepareCase(
     const gates = await gatesAt(cwd, item.base, signal);
     const names = gateScriptNames(gates);
     const audit = auditDiff(diff, {
+      allow: parseAllow(item.input.prompt),
       taskClass: null,
       protectedPaths: gates.protectedPaths,
       toolCommands: [],
