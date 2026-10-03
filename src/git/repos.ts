@@ -3,6 +3,7 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { attributeRules, isAttributeFile, newlyHidden } from "../gates/audit.ts";
 import { CommandError, sh } from "../util/proc.ts";
 import { worktreeGit, worktreeGitScope } from "./command.ts";
 
@@ -386,9 +387,14 @@ export interface DiffInfo {
   added: number;
   removed: number;
   gitlinks?: string[];
-  paths?: string[];
-  baseBinaryPaths?: string[];
   attributePatch?: string;
+  /** Text paths each exemptable attribute rule matches at base or head, keyed by rule. */
+  attributeMatches?: Record<string, string[]>;
+  /** Effective attributes of every changed path at base and head. */
+  attributes?: { path: string; base: Record<string, string>; head: Record<string, string> }[];
+  /** Newly hidden changed paths that are text at base or head. */
+  textPaths?: string[];
+  attributeErrors?: string[];
 }
 
 export async function diffSince(
@@ -420,26 +426,75 @@ export async function diffSince(
   const entries = raw.stdout.split("\0");
   for (let i = 0; i + 1 < entries.length; i += 2)
     if (entries[i]?.split(" ")[1] === "160000") gitlinks.push(entries[i + 1] ?? "");
-  const paths = entries.filter((entry, i) => i % 2 === 1 && entry);
-  const baseBinaryPaths: string[] = [];
-  let attributePatch: string | undefined;
-  if (paths.some((path) => /(^|\/)\.gitattributes$/.test(path))) {
-    // Attribute files must be inspected even if binary or renamed into place.
-    const args = ["--text", "--no-renames", range, "--", ".gitattributes", "**/.gitattributes"];
-    attributePatch = (await diff(...args)).stdout;
-    const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
-    // Content classification uses the base, with attributes ignored, never the worker's attributes.
-    const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-    const contents = await diff("--numstat", "-z", "--no-renames", emptyTree, revision);
-    for (const entry of contents.stdout.split("\0").filter(Boolean)) {
-      const match = entry.match(/^([^\t]+)\t[^\t]+\t([\s\S]*)$/);
-      if (!match) continue;
-      paths.push(match[2] ?? "");
-      if (match[1] === "-") baseBinaryPaths.push(match[2] ?? "");
+  const paths = [...new Set(entries.filter((entry, i) => i % 2 === 1 && entry))];
+  // Attribute effects come only from attribute files in the trees, so unchanged ones need no queries.
+  const revision = threeDot && paths.some(isAttributeFile) ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
+  const inspection = paths.some(isAttributeFile) ? await attributeInfo(cwd, env, range, revision, paths) : {};
+  return { patch: patch.stdout, files, stat: stat.stdout, added, removed, gitlinks, ...inspection };
+}
+
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/** Deadline for attribute queries and content classification; missing it blocks the audit. */
+export const attributeLimits = { timeoutMs: 60_000 };
+
+async function attributeInfo(
+  cwd: string,
+  env: Record<string, string> | undefined,
+  range: string,
+  base: string,
+  paths: string[],
+): Promise<Partial<DiffInfo>> {
+  // Attribute files must be inspected even if binary or renamed into place.
+  const pathspecs = [":(icase).gitattributes", ":(icase)**/.gitattributes"];
+  const attributePatch = (
+    await worktreeGit(["git", "diff", "--text", "--no-renames", range, "--", ...pathspecs], { cwd, env })
+  ).stdout;
+  const timeoutMs = attributeLimits.timeoutMs;
+  const deadline = Date.now() + timeoutMs;
+  const git = (args: string[], stdin?: string) =>
+    worktreeGit(["git", ...args], { cwd, env, timeoutMs: Math.max(1, deadline - Date.now()), stdin });
+  const attributesAt = async (tree: string) => {
+    const names = ["diff", "binary", "text", "filter", "merge", "linguist-generated"];
+    const query = await git(["check-attr", `--source=${tree}`, "-z", "--stdin", ...names], paths.join("\0"));
+    const out = query.stdout.split("\0");
+    const result = new Map<string, Record<string, string>>();
+    for (let i = 0; i + 2 < out.length; i += 3) {
+      const path = out[i] ?? "";
+      result.set(path, { ...result.get(path), [out[i + 1] ?? ""]: out[i + 2] ?? "" });
     }
+    return result;
+  };
+  // Text means no NUL in the first 8,000 bytes. The explicit empty attribute source applies
+  // even where worktreeGit is unhardened, so the run's own attributes cannot classify content.
+  const textAt = async (pathspecs: string[]) => {
+    const text = new Set<string>();
+    for (const tree of [base, "HEAD"]) {
+      const args = ["--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", EMPTY_TREE, tree];
+      const out = await git([`--attr-source=${EMPTY_TREE}`, "diff", ...args, "--", ...pathspecs]);
+      for (const entry of out.stdout.split("\0")) {
+        const match = entry.match(/^(\d+)\t\d+\t([\s\S]+)$/);
+        if (match?.[2]) text.add(match[2]);
+      }
+    }
+    return [...text];
+  };
+  try {
+    const [before, after] = await Promise.all([attributesAt(base), attributesAt("HEAD")]);
+    const attributes = paths.map((path) => ({
+      path,
+      base: before.get(path) ?? {},
+      head: after.get(path) ?? {},
+    }));
+    const hidden = attributes.filter((a) => newlyHidden(a.base, a.head).length);
+    const textPaths = hidden.length ? await textAt(hidden.map((a) => `:(literal)${a.path}`)) : [];
+    const attributeMatches: Record<string, string[]> = {};
+    for (const rule of attributeRules(attributePatch))
+      if (rule.exemptable) attributeMatches[rule.key] ??= await textAt([rule.pathspec]);
+    return { attributePatch, attributes, textPaths, attributeMatches };
+  } catch (error) {
+    const reason = Date.now() >= deadline ? `timed out after ${timeoutMs} ms` : String(error).split("\n")[0];
+    return { attributePatch, attributeErrors: [`attribute inspection ${reason}`] };
   }
-  const inspection = { gitlinks, paths, baseBinaryPaths, attributePatch };
-  return { patch: patch.stdout, files, stat: stat.stdout, added, removed, ...inspection };
 }
 
 export function parseNameStatus(text: string): DiffFile[] {

@@ -152,3 +152,25 @@ test("protocol method errors and JSON guard are compatible with stateless MCP; R
   }
   expect(f.factory.store.listRuns()).toEqual([]);
 });
+
+test("REST run creation accepts the allow option and prompt directives, and retries keep them", async () => {
+  const rest = (createHttpRoutes(f.factory)["/api/runs"] as { POST: Route }).POST;
+  const post = (payload: Record<string, unknown>) =>
+    rest(
+      requestWithParams("http://127.0.0.1:7400/api/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repo: f.repo, ...payload }),
+      }),
+      localServer,
+    );
+  const option = await post({ prompt: "vendor", allow: ["submodules"] });
+  expect(option.status).toBe(201);
+  const directive = await post({ prompt: "mark fixtures\nAllow: gitattributes" });
+  const created = [(await option.json()).id, (await directive.json()).id] as string[];
+  expect(created.map((id) => f.factory.store.getRun(id)?.allow)).toEqual([["submodules"], ["gitattributes"]]);
+  expect((await f.factory.retryRun(created[0] ?? "")).allow).toEqual(["submodules"]);
+  const invalid = await post({ prompt: "vendor", allow: ["submodules", "secrets"] });
+  expect(invalid.status).toBeGreaterThanOrEqual(400);
+  expect(await invalid.text()).toContain('Invalid allow value \\"secrets\\"');
+});

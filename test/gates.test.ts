@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { auditDiff } from "../src/gates/audit.ts";
+import { parseAllow, validateAllow } from "../src/core/allow.ts";
+import { attributeRules, auditDiff, newlyHidden } from "../src/gates/audit.ts";
 import {
   baselineCacheKey,
   cacheableBaseline,
@@ -291,8 +292,54 @@ function diff(patch: string, files: { status: string; path: string }[]): DiffInf
   return { patch, files, stat: "", added: 0, removed: 0 };
 }
 
+describe("audit allowances and attribute rules", () => {
+  test("only standalone Allow lines count, each kind independently", () => {
+    expect(parseAllow("Vendor it\r\n  ALLOW:  Submodules \r\nmore")).toEqual(["submodules"]);
+    expect(parseAllow("allow:gitattributes\nAllow: submodules\nAllow: submodules")).toEqual([
+      "submodules",
+      "gitattributes",
+    ]);
+    for (const text of [
+      "do not use git submodules",
+      "Please Allow: submodules",
+      "> Allow: submodules",
+      "Allow: submodules, gitattributes",
+      "Allow: everything",
+      "Allow submodules",
+    ])
+      expect(parseAllow(text)).toEqual([]);
+    expect(validateAllow(undefined)).toEqual([]);
+    expect(validateAllow(["gitattributes", "submodules", "gitattributes"])).toEqual([
+      "submodules",
+      "gitattributes",
+    ]);
+    expect(() => validateAllow(["submodules", "Submodules"])).toThrow('Invalid allow value "Submodules"');
+    expect(() => validateAllow([1])).toThrow("expected submodules or gitattributes");
+  });
+
+  test("built-in diff drivers are harmless alone but not beside a hiding attribute", () => {
+    const rules = (line: string) =>
+      attributeRules(`diff --git a/.gitattributes b/.gitattributes\n+++ b/.gitattributes\n+${line}`).map(
+        (rule) => [rule.pattern, rule.exemptable],
+      );
+    for (const driver of ["java", "markdown", "golang", "rust", "scheme", "cpp"])
+      expect(rules(`*.x diff=${driver}`)).toEqual([]);
+    expect(rules("*.java diff=java filter=custom")).toEqual([["*.java", false]]);
+    expect(rules("*.java diff=javascript")).toEqual([["*.java", false]]);
+    expect(rules("*.ts linguist-generated")).toEqual([["*.ts", false]]);
+    expect(rules("*.ts linguist-generated=false")).toEqual([]);
+    expect(rules("*.png binary")).toEqual([["*.png", true]]);
+    expect(rules("*.png -diff -text")).toEqual([["*.png", true]]);
+    expect(rules("[attr]hidden -diff")).toEqual([["[attr]hidden", false]]);
+    expect(newlyHidden({ diff: "unspecified" }, { diff: "java", "linguist-generated": "set" })).toEqual([
+      "linguist-generated",
+    ]);
+    expect(newlyHidden({ diff: "unset" }, { diff: "unset" })).toEqual([]);
+  });
+});
+
 describe("auditDiff", () => {
-  test("original request exemptions are narrow, case insensitive and independent", () => {
+  test("explicit allowances are narrow and independent; request wording never exempts", () => {
     const patch = [
       "diff --git a/vendor/nested b/vendor/nested",
       "new file mode 160000",
@@ -311,18 +358,23 @@ describe("auditDiff", () => {
       { status: "A", path: ".gitattributes" },
       { status: "M", path: "a.test.ts" },
     ]);
-    for (const [request, rules] of [
-      ["Fix the tests", ["gitlink", "gitattributes", "test-skipped"]],
-      ["Add a SUBMODULE", ["gitattributes", "test-skipped"]],
-      ["Configure Git Attributes", ["gitlink", "test-skipped"]],
-      ["Update .gitattributes", ["gitlink", "test-skipped"]],
-      ["Add submodules and gitattributes", ["test-skipped"]],
-      ["Update modules and attributes", ["gitlink", "gitattributes", "test-skipped"]],
+    for (const [allow, rules] of [
+      [[], ["gitlink", "gitattributes", "test-skipped"]],
+      [["submodules"], ["gitattributes", "test-skipped"]],
+      [["gitattributes"], ["gitlink", "test-skipped"]],
+      [["submodules", "gitattributes"], ["test-skipped"]],
     ] as const) {
-      expect(auditDiff(changes, { taskClass: null, protectedPaths: [], request }).map((f) => f.rule)).toEqual(
-        [...rules],
-      );
+      expect(auditDiff(changes, { taskClass: null, protectedPaths: [], allow }).map((f) => f.rule)).toEqual([
+        ...rules,
+      ]);
     }
+    const findings = auditDiff(changes, { taskClass: null, protectedPaths: [] });
+    expect(findings.find((f) => f.rule === "gitlink")?.detail).toContain(
+      "Remove the nested repository unless the request asks for it. If this is intended, add `Allow: submodules` to the request.",
+    );
+    expect(findings.find((f) => f.rule === "gitattributes")?.detail).toContain(
+      "Remove the attribute change unless the request asks for it. If this is intended, add `Allow: gitattributes` to the request.",
+    );
     expect(
       auditDiff(changes, {
         taskClass: null,

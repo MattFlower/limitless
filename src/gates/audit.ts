@@ -1,4 +1,4 @@
-import type { TaskClass } from "../core/types.ts";
+import type { AuditAllowance, TaskClass } from "../core/types.ts";
 import type { DiffInfo } from "../git/repos.ts";
 
 export interface AuditFinding {
@@ -97,6 +97,66 @@ export function splitPatch(patch: string): FilePatch[] {
   return files;
 }
 
+const BUILTIN_DIFF_DRIVER =
+  /^(ada|bash|bibtex|cpp|csharp|css|dts|elixir|fortran|fountain|golang|html|java|kotlin|markdown|matlab|objc|pascal|perl|php|python|ruby|rust|scheme)$/;
+
+const HIDES: Record<string, (value: string) => boolean> = {
+  diff: (value) => value === "unset" || (value !== "set" && !BUILTIN_DIFF_DRIVER.test(value)),
+  text: (value) => value === "unset",
+  binary: (value) => value !== "unset",
+  filter: (value) => value !== "unset",
+  "linguist-generated": (value) => value !== "unset" && value !== "false",
+};
+
+/** Hiding attributes (check-attr values: set, unset, unspecified or a string), as written in .gitattributes. */
+function hiding(attributes: [string, string][]): string[] {
+  return attributes
+    .filter(([name, value]) => value !== "unspecified" && HIDES[name]?.(value))
+    .map(([name, value]) => (value === "set" ? name : value === "unset" ? `-${name}` : `${name}=${value}`));
+}
+
+/** Hiding attributes effective at head that were not effective at base. */
+export function newlyHidden(base: Record<string, string>, head: Record<string, string>): string[] {
+  const before = hiding(Object.entries(base));
+  return hiding(Object.entries(head)).filter((attribute) => !before.includes(attribute));
+}
+
+export const isAttributeFile = (path: string) => path.split("/").at(-1)?.toLowerCase() === ".gitattributes";
+
+/** Added attribute lines that can hide text diffs, with the pathspec of the files they can match. */
+export function attributeRules(patch: string) {
+  return splitPatch(patch)
+    .filter((fp) => isAttributeFile(fp.path))
+    .flatMap((fp) =>
+      fp.added.flatMap((line) => {
+        const tokens = line.trim().match(/^("(?:\\.|[^"])*"|\S+)\s+(.+)$/);
+        if (!tokens || /^[#!]/.test(tokens[1] ?? "")) return [];
+        const found = hiding(
+          (tokens[2] ?? "").split(/\s+/).map((token) => {
+            const [name = "", value] = token.replace(/^[-!]/, "").split(/=(.*)/);
+            return [name, value ?? ({ "-": "unset", "!": "unspecified" }[token[0] ?? ""] || "set")];
+          }),
+        );
+        let pattern = tokens[1] ?? "";
+        try {
+          if (pattern.startsWith('"')) pattern = JSON.parse(pattern) as string;
+        } catch {
+          /* Unknown quoting blocks conservatively. */
+        }
+        // Attribute-file scope as a Git pathspec; icase over-matches, which only adds candidates.
+        const directory = fp.path.slice(0, -".gitattributes".length).replace(/[*?[\\]/g, "\\$&");
+        const glob = pattern.includes("/") ? pattern.replace(/^\//, "") : `**/${pattern}`;
+        // binary/-diff on binary-only content hides nothing; macros and other attributes never qualify.
+        const exemptable =
+          !pattern.startsWith("[attr]") && found.every((a) => /^(binary|-diff|-text)$/.test(a));
+        const rule = { file: fp.path, key: `${fp.path}\0${tokens[1]}`, pattern, attributes: tokens[2] ?? "" };
+        return found.length ? [{ ...rule, exemptable, pathspec: `:(glob,icase)${directory}${glob}` }] : [];
+      }),
+    );
+}
+
+const allowHint = (kind: AuditAllowance) => `If this is intended, add \`Allow: ${kind}\` to the request.`;
+
 /**
  * Deterministic checks for reward hacking and scope problems. Blocking findings send the work
  * back to the implementer; warnings are handed to the reviewer as things to scrutinize.
@@ -114,7 +174,8 @@ export function auditDiff(
     protectedPaths: string[];
     toolCommands?: string[];
     gateScripts?: GateScripts;
-    request?: string; // Original request only; generated specs and commit messages cannot exempt.
+    /** Persisted requester opt-ins; never parsed from specs, commit messages or composed prompts. */
+    allow?: readonly AuditAllowance[];
   },
 ): AuditFinding[] {
   const findings: AuditFinding[] = [];
@@ -128,51 +189,38 @@ export function auditDiff(
   }
 
   const protectedRes = ctx.protectedPaths.map(globToRegex);
-  // Small, case-insensitive phrase lists: submodule(s); .gitattributes,
-  // gitattributes, git attribute(s). Each request exemption applies only to its own rule.
-  const submodulesRequested = /\bsubmodules?\b/i.test(ctx.request ?? "");
-  const attributesRequested = /\bgitattributes\b|\bgit attributes?\b/i.test(ctx.request ?? "");
   const patches = splitPatch(diff.patch);
   for (const path of diff.gitlinks ?? patches.filter((p) => p.gitlink && p.added.length).map((p) => p.path)) {
-    if (!submodulesRequested)
+    if (!ctx.allow?.includes("submodules"))
       findings.push({
         rule: "gitlink",
         severity: "block",
         file: path,
-        detail: `${path}: nested repository contents are absent from the diff.`,
+        detail: `${path}: nested repository contents are absent from the diff, so they cannot be reviewed. Remove the nested repository unless the request asks for it. ${allowHint("submodules")}`,
       });
   }
-  const binary = new Set(diff.baseBinaryPaths ?? []);
-  const paths = new Set(diff.paths ?? diff.files.map((f) => f.path));
-  for (const fp of splitPatch(diff.attributePatch ?? diff.patch)) {
-    if (attributesRequested || !/(^|\/)\.gitattributes$/.test(fp.path)) continue;
-    for (const line of fp.added) {
-      const tokens = line.trim().match(/^("(?:\\.|[^"])*"|\S+)\s+(.+)$/);
-      if (!tokens || /^[#!]/.test(tokens[1] ?? "")) continue;
-      if (!(tokens[2] ?? "").split(/\s+/).some((a) => /^(binary|-diff|-text|diff=.*|filter=.*)$/.test(a)))
-        continue;
-      let pattern = tokens[1] ?? "";
-      try {
-        if (pattern.startsWith('"')) pattern = JSON.parse(pattern) as string;
-      } catch {
-        /* Unknown quoting blocks conservatively. */
-      }
-      const directory = fp.path.slice(0, -".gitattributes".length);
-      const glob = new Bun.Glob(pattern.replace(/^\//, ""));
-      const matches = [...paths].filter(
-        (p) =>
-          p.startsWith(directory) &&
-          glob.match(pattern.includes("/") ? p.slice(directory.length) : (p.split("/").at(-1) ?? p)),
-      );
-      if (!/[{}]|\[attr\]/.test(pattern) && matches.length && matches.every((p) => binary.has(p))) continue;
-      findings.push({
-        rule: "gitattributes",
-        severity: "block",
-        file: fp.path,
-        detail: `${fp.path}: ${pattern} (${tokens[2]}) can hide text diffs for ${matches.find((p) => !binary.has(p)) ?? pattern}.`,
-      });
-    }
+  const hidden = (file: string | undefined, detail: string) =>
+    ctx.allow?.includes("gitattributes") ||
+    findings.push({
+      rule: "gitattributes",
+      severity: "block",
+      ...(file ? { file } : {}),
+      detail: `${detail} Remove the attribute change unless the request asks for it. ${allowHint("gitattributes")}`,
+    });
+  for (const { file, key, pattern, attributes, exemptable } of attributeRules(
+    diff.attributePatch ?? diff.patch,
+  )) {
+    const text = diff.attributeMatches?.[key];
+    if (!exemptable || text?.length !== 0)
+      hidden(file, `${file}: ${pattern} (${attributes}) can hide text diffs for ${text?.[0] ?? pattern}.`);
   }
+  for (const { path, base, head } of diff.attributes ?? []) {
+    const added = newlyHidden(base, head).join(" ");
+    if (added && diff.textPaths?.includes(path))
+      hidden(path, `${path}: attributes at head (${added}) hide its diff.`);
+  }
+  for (const error of diff.attributeErrors ?? [])
+    hidden(undefined, `Hidden diffs cannot be ruled out because the ${error}.`);
   for (const f of diff.files) {
     const touched = f.from ? [f.from, f.path] : [f.path];
     const hit = touched.find((p) => protectedRes.some((re) => re.test(p)));

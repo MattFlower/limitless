@@ -156,7 +156,12 @@ export interface Run {
   priority: number;
   /** Execute the baseline gates and bypass the baseline cache (`--no-baseline-cache`). */
   noBaselineCache?: boolean;
+  /** Persisted at creation from requester-authored text or options only; legacy runs allow nothing. */
+  allow?: AuditAllowance[];
 }
+
+/** Blocking audit rules a requester may explicitly allow. */
+export type AuditAllowance = "submodules" | "gitattributes";
 
 export interface Stage {
   id: number;
@@ -317,6 +322,8 @@ export interface CreateRunRequest {
   deliveryBranch?: string;
   /** Execute the baseline gates and bypass the baseline cache for reads and writes. */
   noBaselineCache?: boolean;
+  /** Audit exemptions the requester explicitly allows (`--allow`); also parsed from CLI/API/UI prompts. */
+  allow?: AuditAllowance[];
 }
 
 /** Messages pushed on the global SSE stream. */

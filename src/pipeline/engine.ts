@@ -1011,7 +1011,7 @@ async function oneRound(
     "audit",
     async () => {
       const findings = auditDiff(diff, {
-        request: ctx.run.prompt,
+        allow: ctx.run.allow ?? [],
         taskClass: ctx.state.verification && ctx.run.taskClass === "question" ? null : ctx.run.taskClass,
         protectedPaths: gates.protectedPaths,
         toolCommands: ctx.state.toolCommands,
@@ -1034,7 +1034,7 @@ async function oneRound(
         if (repairs.files.length)
           findings.push(
             ...auditDiff(repairs, {
-              request: ctx.run.prompt,
+              allow: ctx.run.allow ?? [],
               taskClass: ctx.run.taskClass,
               protectedPaths: gates.protectedPaths,
               gateScripts: {

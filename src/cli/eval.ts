@@ -30,7 +30,7 @@ export interface EvalCliIO {
 }
 export async function evalCommand(
   args: string[],
-  flags: Record<string, string | boolean | undefined>,
+  flags: Record<string, string | string[] | boolean | undefined>,
   io: EvalCliIO,
 ): Promise<void> {
   const [action, value] = args;

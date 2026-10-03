@@ -259,6 +259,7 @@ export class Factory {
         ...(run.deliveryBranch ? { deliveryBranch: run.deliveryBranch } : {}),
         ...(run.requestedBy ? { requestedBy: run.requestedBy } : {}),
         ...(run.noBaselineCache ? { noBaselineCache: true } : {}),
+        ...(run.allow?.length ? { allow: run.allow } : {}),
       },
       run.githubWebhookVerified,
     );

@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { AUDIT_ALLOWANCES, parseAllow, validateAllow } from "../core/allow.ts";
 import { assertExistingBranchDelivery } from "../core/delivery.ts";
 import type {
   ArtifactMeta,
@@ -149,6 +150,7 @@ const toRun = (r: Row): Run => ({
   finishedAt: (r.finished_at as number) ?? null,
   priority: r.priority as number,
   ...(r.no_baseline_cache === 1 ? { noBaselineCache: true } : {}),
+  allow: AUDIT_ALLOWANCES.filter((kind) => parse<unknown[]>(r.audit_allow, []).includes(kind)),
 });
 
 const toStage = (r: Row): Stage => ({
@@ -818,10 +820,13 @@ export class Store {
     const dependsOn = this.validateDependencies(req.dependsOn, id);
     const dependency = this.dependencyStatus(dependsOn);
     const title = req.title ?? req.prompt.split("\n")[0]?.slice(0, 80) ?? "Untitled";
+    // GitHub prompts quote untrusted content; their requester-authored allow list arrives parsed.
+    const github = verifiedGitHubWebhook || req.source === "github";
+    const allow = validateAllow([...validateAllow(req.allow), ...(github ? [] : parseAllow(req.prompt))]);
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -842,6 +847,7 @@ export class Store {
         dependency.error ?? null,
         dependency.finishedAt ?? null,
         req.noBaselineCache === true ? 1 : 0,
+        json(allow),
       );
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });

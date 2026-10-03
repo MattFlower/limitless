@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { validateAllow } from "../core/allow.ts";
 import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import type { Profile, Run, RunDetail, RunEvent } from "../core/types.ts";
@@ -13,6 +14,7 @@ Usage:
   limitless run "<prompt>" --repo <repo>  Queue a run (repo: owner/name or a local path)
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
         [--no-baseline-cache]  Always execute the baseline gates; a passing one refreshes the cache
+        [--allow submodules|gitattributes]  Allow that blocked audit change (repeatable)
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
         review only: --systems <file.json> [--replay-finders <evalId>] instead of --models
@@ -183,6 +185,7 @@ async function main(): Promise<void> {
       concurrency: { type: "string" },
       "no-cache": { type: "boolean" },
       "no-baseline-cache": { type: "boolean" },
+      allow: { type: "string", multiple: true },
       json: { type: "boolean" },
       after: { type: "string" },
       repo: { type: "string", short: "r" },
@@ -255,6 +258,7 @@ async function main(): Promise<void> {
     case "run": {
       const prompt = rest.join(" ").trim() || (await Bun.stdin.text()).trim();
       if (!prompt || !values.repo) throw new Error('usage: limitless run "<prompt>" --repo <repo>');
+      const allow = validateAllow(values.allow);
       const run = await api<Run>("/api/runs", {
         method: "POST",
         body: JSON.stringify({
@@ -264,6 +268,7 @@ async function main(): Promise<void> {
           profile: (values.profile as Profile | undefined) ?? "auto",
           ...(values.title ? { title: values.title } : {}),
           ...(values["no-baseline-cache"] ? { noBaselineCache: true } : {}),
+          ...(allow.length ? { allow } : {}),
           source: "cli",
           requestedBy: process.env.USER,
         }),

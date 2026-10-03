@@ -19,7 +19,8 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
   );
   await gitVersion;
   let command = 1;
-  while (cmd[command] === "-c") command += 2;
+  // Leading global options (`-c key=value`, `--attr-source=...`) stay before the injected ones.
+  while (cmd[command]?.startsWith("-")) command += cmd[command] === "-c" ? 2 : 1;
   const prefix = [
     ...cmd.slice(0, command),
     "-c",
@@ -47,8 +48,15 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
     prefix.push(`--config-env=${key}=LIMITLESS_GIT_EMPTY_HOOK`);
   const env = { ...(opts.env ?? (process.env as Record<string, string>)), LIMITLESS_GIT_EMPTY_HOOK: "" };
   const inspection = ["diff", "log"].includes(cmd[command] ?? "");
+  // Patch text is parsed by the audit, so repository config must not change its format.
+  const canonical = ["color.ui=never", "color.diff=never", "diff.submodule=short"].concat(
+    ["noprefix", "mnemonicPrefix", "relative"].map((key) => `diff.${key}=false`),
+  );
   if (inspection) prefix.push("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904");
-  const flags = inspection ? ["--no-ext-diff", "--no-textconv"] : [];
+  if (inspection) prefix.push(...canonical.flatMap((c) => ["-c", c]));
+  const indicators = ["new=+", "old=-", "context= "].map((value) => `--output-indicator-${value}`);
+  const format = ["--no-color", "--src-prefix=a/", "--dst-prefix=b/", ...indicators];
+  const flags = inspection ? ["--no-ext-diff", "--no-textconv", ...format] : [];
   return sh([...prefix, ...cmd.slice(command, command + 1), ...flags, ...cmd.slice(command + 1)], {
     ...opts,
     env,
