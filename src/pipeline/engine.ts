@@ -22,6 +22,7 @@ import {
   retryRegressions,
   runGates,
 } from "../gates/run.ts";
+import { worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
   commitAll,
@@ -133,7 +134,14 @@ export async function executeRun(
     deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
+  return worktreeGitScope.run(repo.kind === "github", () =>
+    executeScopedRun(new RunContext(deps, run, repo, signal, isDraining, drainEvents), signal),
+  );
+}
+
+async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<RunStatus> {
+  const { deps, run } = ctx;
+  const runId = run.id;
   ctx.state.parked = false;
   ctx.run = deps.store.updateRun(
     runId,
@@ -203,13 +211,19 @@ export async function executeRun(
       const reason = ctx.state.terminalReason?.startsWith("superseded:")
         ? ctx.state.terminalReason
         : undefined;
+      const shutdown =
+        signal.reason instanceof Error &&
+        signal.reason.message === "shutdown" &&
+        !reason &&
+        !deps.store.getRun(runId)?.error?.startsWith("cancelled by");
+      const status = shutdown ? "queued" : "cancelled";
       deps.store.updateRun(runId, {
-        status: "cancelled",
-        finishedAt: Date.now(),
+        status,
+        finishedAt: shutdown ? null : Date.now(),
         ...(reason ? { error: reason } : {}),
       });
-      ctx.log(reason ?? "Run cancelled", "warn");
-      return "cancelled";
+      ctx.log(reason ?? (shutdown ? "Daemon shutdown; run re-queued to resume" : "Run cancelled"), "warn");
+      return status;
     };
     if (e instanceof CancelledError || signal.aborted) return cancelled();
     if (e instanceof ParkedError) {

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { PassThrough } from "node:stream";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Question, Run } from "../src/core/types.ts";
@@ -176,7 +176,7 @@ test("connection, HTTP and malformed responses are MCP errors and mutations are 
       expect(result.isError).toBe(true);
       expect(JSON.stringify(result.content)).toContain(expected);
       expect(calls).toBe(1);
-      expect((await proxy.client.listTools()).tools).toHaveLength(6);
+      expect((await proxy.client.listTools()).tools).toHaveLength(8);
     } finally {
       await proxy.close();
     }
@@ -221,10 +221,77 @@ test("stdio streams emit only protocol JSON and survive daemon errors", async ()
     expect(messages).toHaveLength(3);
     expect(messages.every((message) => message.jsonrpc === "2.0")).toBe(true);
     expect(messages.find((m) => m.id === 2).result.isError).toBe(true);
-    expect(messages.find((m) => m.id === 3).result.tools).toHaveLength(6);
+    expect(messages.find((m) => m.id === 3).result.tools).toHaveLength(8);
   } finally {
     await server.close();
     stdin.destroy();
     stdout.destroy();
+  }
+});
+
+test("proxy feed tools match the direct backend and allow a 45-second long poll", async () => {
+  const routes = createHttpRoutes(f.factory);
+  const fetcher: Fetch = async (url, init) => {
+    const path = new URL(url).pathname as "/api/feed" | "/api/feed/ack";
+    const handler = (routes[path] as Record<string, Route>)[init?.method ?? "GET"] as Route;
+    return handler(requestWithParams(url, init), localServer);
+  };
+  const proxy = await connect(httpBackend("http://127.0.0.1:7400", fetcher));
+  const direct = await connect(factoryBackend(f.factory));
+  const timeouts = spyOn(AbortSignal, "timeout");
+  try {
+    const run = await f.factory.createRun({ repo: f.repo, prompt: "work" });
+    f.factory.store.updateRun(run.id, { status: "needs_human", error: "pick a name" });
+    f.factory.store.askQuestion(run.id, "Which name?");
+    const read = (conn: typeof proxy, args: Record<string, unknown>) =>
+      conn.client.callTool({ name: "limitless_feed", arguments: args });
+    for (const args of [{ consumer: "proxy" }, { after: 1 }, {}])
+      expect(resultValue(await read(proxy, args))).toEqual(resultValue(await read(direct, args)));
+    timeouts.mockClear();
+    expect(resultValue(await read(proxy, { consumer: "proxy", wait: 45 }))).toEqual(
+      resultValue(await read(direct, { consumer: "proxy", wait: 45 })),
+    );
+    expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([75_000]);
+    timeouts.mockClear();
+    const ack = await proxy.client.callTool({
+      name: "limitless_feed_ack",
+      arguments: { consumer: "proxy", id: 1 },
+    });
+    expect(resultValue<unknown>(ack)).toEqual({ consumer: "proxy", id: 1 });
+    expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([30_000]);
+    const page = resultValue<{ items: { id: number }[] }>(await read(proxy, { consumer: "proxy" }));
+    expect(page.items.map((i) => i.id)).toEqual([2]);
+    expect(resultValue(await read(proxy, { consumer: "proxy" }))).toEqual(
+      resultValue(await read(direct, { consumer: "proxy" })),
+    );
+    expect((await read(proxy, { wait: 46 })).isError).toBe(true);
+  } finally {
+    timeouts.mockRestore();
+    await proxy.close();
+    await direct.close();
+  }
+});
+
+test("cancelling a proxied feed long poll aborts the daemon request", async () => {
+  let seen: AbortSignal | undefined;
+  const fetcher: Fetch = (_url, init) =>
+    new Promise((_, reject) => {
+      seen = init?.signal ?? undefined;
+      seen?.addEventListener("abort", () => reject(seen?.reason));
+    });
+  const proxy = await connect(httpBackend("http://127.0.0.1:7400", fetcher));
+  try {
+    const controller = new AbortController();
+    const pending = proxy.client
+      .callTool({ name: "limitless_feed", arguments: { wait: 45 } }, undefined, { signal: controller.signal })
+      .catch(() => "cancelled");
+    await Bun.sleep(20);
+    expect(seen?.aborted).toBe(false);
+    controller.abort();
+    expect(await pending).toBe("cancelled");
+    await Bun.sleep(20);
+    expect(seen?.aborted).toBe(true);
+  } finally {
+    await proxy.close();
   }
 });

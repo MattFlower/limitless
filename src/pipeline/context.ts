@@ -1,10 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
 import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import type { ZodType } from "zod";
 import type { Config } from "../config.ts";
 import type {
@@ -24,6 +22,7 @@ import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
+import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
 import type { DecisionTask } from "../harness/decisions.ts";
 import { withScratch } from "../harness/scratch.ts";
@@ -147,7 +146,6 @@ export interface RunState {
 
 const MODEL_REJECTED =
   /model[^.]{0,80}(is not supported|not found|does not exist|not available)|unknown model|invalid model|model_not_found/i;
-const execFileAsync = promisify(execFile);
 const MAX_PUBLIC_SOURCE_BYTES = 16 * 1024 * 1024;
 const MAX_PUBLIC_SOURCE_FILES = 2_000;
 
@@ -314,11 +312,7 @@ export class RunContext {
     const cwd = this.state.worktreePath;
     if (cwd) {
       try {
-        const { stdout } = await execFileAsync("git", ["ls-files", "-z"], {
-          cwd,
-          maxBuffer: 16 * 1024 * 1024,
-          encoding: "utf8",
-        });
+        const { stdout } = await worktreeGit(["git", "ls-files", "-z"], { cwd });
         const files = stdout.split("\0").filter(Boolean);
         let bytesRead = 0;
         for (const file of files.slice(0, MAX_PUBLIC_SOURCE_FILES)) {
@@ -440,6 +434,8 @@ export class RunContext {
     const health = shadow ? undefined : tracker;
     const signal = shadow?.signal ?? this.signal;
     const tried: (string | ModelSelection)[] = [...(opts.constraints?.exclude ?? [])];
+    const busy = new Set<string>();
+    let waitMs = 0;
     let lastFailure: string | null = null;
     // An unsure (not question-needing) decline beats failing the stage when nothing else answers.
     let lastResort: InvokeOutcome | null = null;
@@ -465,7 +461,12 @@ export class RunContext {
         this.routingConstraints({ ...opts.constraints, exclude: tried }),
         !shadow,
       );
-      const target = decision.candidates[0];
+      const candidates = decision.candidates;
+      let target =
+        candidates.find((t) => {
+          const status = tracker.status(t.provider);
+          return !busy.has(t.provider) || (status && status.inFlight < status.maxConcurrent);
+        }) ?? candidates[0];
       if (!target && lastResort) return useLastResort(lastResort, `No other model for ${opts.role}`);
       if (!target) {
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
@@ -474,15 +475,19 @@ export class RunContext {
           `No model available for ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}. Skipped: ${why || "none configured"}`,
         );
       }
-      tried.push({ modelId: target.modelId, effort: target.effort ?? null });
-      const { harnessName, noTools } = selectHarness(opts.role, target, opts.noTools);
-      const harness = harnesses[harnessName];
-      if (!harness) throw new Error(`No harness registered for ${harnessName}`);
-
-      const wait = Number.isFinite(left())
-        ? AbortSignal.any([this.signal, AbortSignal.timeout(Math.max(1, left()))])
-        : this.signal;
-      let release: () => void;
+      // With no alternative left, contention waits until a slot opens or the invocation deadline.
+      const providers = [...new Set(candidates.map((t) => t.provider))];
+      const allBusy = providers.every((id) => busy.has(id));
+      const seconds = providers.length > 1 && !allBusy ? this.deps.cfg.waitBudgetS[opts.role] : undefined;
+      const budget = Math.min((seconds ?? Infinity) * 1000, left());
+      let waitingAt: number | null = null;
+      const onWait = (provider: string, ahead: number) => {
+        waitingAt ??= tracker.now();
+        this.log(
+          `waiting for ${provider} slot (${ahead} ahead), up to ${Number.isFinite(budget) ? `${Math.ceil(budget / 1000)}s` : "unbounded"}`,
+        );
+      };
+      const limit = Number.isFinite(budget) ? budget : undefined;
       // Only this call: a production call that needs its slot aborts it, not the rest of the shadow.
       const preempted = new AbortController();
       const callSignal = shadow ? AbortSignal.any([signal, preempted.signal]) : signal;
@@ -492,26 +497,62 @@ export class RunContext {
         if (!signal.aborted) cause = new Preempted();
         preempted.abort();
       };
-      try {
-        const free = shadow && tracker.tryAcquire(target.provider, preempt);
-        if (shadow && !free) throw new NoCapacityError(`${target.provider}: no free slot`);
-        release = free || (await tracker.acquire(target.provider, wait));
-      } catch (error) {
-        if (this.signal.aborted || !wait.aborted) throw error;
+      let admission: { provider: string; release: () => void } | null;
+      if (shadow) {
+        // A shadow call never waits: it takes a spare slot now, or the member is skipped.
+        const free = tracker.tryAcquire(target.provider, preempt);
+        if (!free) throw new NoCapacityError(`${target.provider}: no free slot`);
+        admission = { provider: target.provider, release: free };
+      } else {
+        const provider = target.provider;
+        admission = await (allBusy
+          ? tracker.acquireFirst(providers, this.signal, limit, onWait)
+          : tracker
+              .acquire(provider, this.signal, busy.has(provider) ? 0 : limit, (ahead) =>
+                onWait(provider, ahead),
+              )
+              .then((release) => release && { provider, release })
+        ).catch((error: unknown) => {
+          this.checkCancelled();
+          throw error;
+        });
+      }
+      const release = admission?.release;
+      if (admission) target = candidates.find((t) => t.provider === admission.provider) ?? target;
+      waitMs += waitingAt === null ? 0 : Math.max(0, tracker.now() - waitingAt);
+      if (this.signal.aborted || left() <= 0) {
+        release?.();
+        this.checkCancelled();
         throw new NoCapacityError(`${target.targetId ?? target.modelId}: busy until the deadline`);
+      }
+      if (!release) {
+        busy.add(target.provider);
+        attempt--;
+        continue;
       }
       const ready = shadow ? tracker.isAvailable(target.provider) : await tracker.preflight(target.provider);
       if (!ready || tracker.modelUnavailableReason(target.modelId)) {
         release();
+        tried.push({ modelId: target.modelId, effort: target.effort ?? null });
+        attempt--;
         lastFailure = `${target.targetId ?? target.modelId}: no capacity after provider refresh`;
         continue;
       }
+      if (this.signal.aborted) release();
+      this.checkCancelled();
       const guard = shadow;
       const stopped = guard?.stop(target.provider);
       if (stopped) {
         release();
         throw new NoCapacityError(stopped);
       }
+      const { harnessName, noTools } = selectHarness(opts.role, target, opts.noTools);
+      const harness = harnesses[harnessName];
+      if (!harness) {
+        release();
+        throw new Error(`No harness registered for ${harnessName}`);
+      }
+      tried.push({ modelId: target.modelId, effort: target.effort ?? null });
       if (opts.role === "implement") {
         this.state.implementer = {
           modelId: target.modelId,
@@ -528,6 +569,7 @@ export class RunContext {
         }
       }
       const invocation = store.createInvocation({
+        waitMs,
         fast: tracker.isFast(target.provider),
         runId: this.run.id,
         stageId: opts.stage.id,

@@ -199,16 +199,9 @@ export function productionReviewSystem(cfg: Pick<Config, "reviewImplementerRepor
   });
 }
 
-/** Removed behaviour and failure paths: a mechanism lens a small local model can check cheaply. */
-const LOCAL_LENS = {
-  name: "removed-behaviour-and-failure-paths",
-  focus:
-    "Behaviour the change removes or narrows (deleted branches, cases, options, fields or checks) that callers still rely on, and failure paths: errors swallowed or misreported, partial writes left behind, cleanup skipped, and retries that repeat side effects.",
-};
 const STANDARD_ROSTER: ReviewFinder[] = [
   { prompt: "adversarial" },
   { prompt: "careful", family: "implementer" },
-  { prompt: "standard", lens: LOCAL_LENS, local: true },
 ];
 /** Panel finders per profile; `deep` also gets the repo lenses, which default to it. */
 export const DEFAULT_ROSTERS: Record<ResolvedProfile, ReviewFinder[]> = {

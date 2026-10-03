@@ -4,6 +4,7 @@ import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { CommandError, sh } from "../util/proc.ts";
+import { worktreeGit, worktreeGitScope } from "./command.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -90,7 +91,8 @@ type RemoteOpts = {
   timeoutMs?: number;
   budget?: GitHubBudget;
 };
-const remoteSh = (cmd: string[], opts: RemoteOpts) => withGitHubRetry(() => sh(cmd, opts), opts);
+const remoteSh = (cmd: string[], opts: RemoteOpts) =>
+  withGitHubRetry(() => (cmd[0] === "git" ? worktreeGit(cmd, opts) : sh(cmd, opts)), opts);
 
 export function slugify(text: string, max = 40): string {
   return (
@@ -180,12 +182,12 @@ export async function ensureCache(paths: Paths, repo: Repo, signal?: AbortSignal
       // Clone to a temporary path and rename, so a crash never leaves a half-configured cache.
       const tmp = `${cache}.tmp-${process.pid}-${Date.now()}`;
       try {
-        await sh(["git", "clone", "--bare", repo.url as string, tmp], {
+        await worktreeGit(["git", "clone", "--bare", repo.url as string, tmp], {
           cwd: paths.repos,
           timeoutMs: 600_000,
           signal,
         });
-        await sh(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
+        await worktreeGit(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
           cwd: tmp,
           signal,
         });
@@ -195,8 +197,8 @@ export async function ensureCache(paths: Paths, repo: Repo, signal?: AbortSignal
       }
     }
     // Agents run inside worktrees of this repo; make any push attempt from them fail.
-    await sh(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
-    await sh(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
+    await worktreeGit(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
+    await worktreeGit(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
     return cache;
   });
 }
@@ -215,29 +217,31 @@ export async function createWorktree(
   baseBranch: string,
 ): Promise<Worktree> {
   const cache = cachePath(paths, repo);
+  const git = repo.kind === "github" ? worktreeGit : sh;
   const path = join(paths.work, runId);
   const branch = `limitless/${runId}-${slugify(title, 30)}`;
   const baseRef = repo.kind === "github" ? `origin/${baseBranch}` : baseBranch;
   if (existsSync(path)) {
     // Resuming an interrupted run: reuse the worktree as-is.
-    const head = await sh(["git", "rev-parse", "HEAD"], { cwd: path });
-    const base = await sh(["git", "rev-parse", baseRef], { cwd: cache });
+    const head = await worktreeGit(["git", "rev-parse", "HEAD"], { cwd: path });
+    const base = await git(["git", "rev-parse", baseRef], { cwd: cache });
     return { path, branch, baseSha: base.stdout.trim() || head.stdout.trim() };
   }
   return withRepoLock(cache, async () => {
-    const base = await sh(["git", "rev-parse", baseRef], { cwd: cache });
-    await sh(["git", "worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
+    const base = await git(["git", "rev-parse", baseRef], { cwd: cache });
+    await git(["git", "worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
     return { path, branch, baseSha: base.stdout.trim() };
   });
 }
 
 export async function removeWorktree(paths: Paths, repo: Repo, path: string): Promise<void> {
   if (!existsSync(path)) return;
-  await sh(["git", "worktree", "remove", "--force", path], { cwd: cachePath(paths, repo), allowFail: true });
+  const git = repo.kind === "github" ? worktreeGit : sh;
+  await git(["git", "worktree", "remove", "--force", path], { cwd: cachePath(paths, repo), allowFail: true });
 }
 
 export async function headSha(cwd: string): Promise<string> {
-  return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+  return (await worktreeGit(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
 }
 
 export async function fetchBase(
@@ -257,7 +261,7 @@ export async function fetchBase(
       budget,
     });
     return (
-      await sh(["git", "rev-parse", `refs/remotes/origin/${branch}`], { cwd: cache, signal })
+      await worktreeGit(["git", "rev-parse", `refs/remotes/origin/${branch}`], { cwd: cache, signal })
     ).stdout.trim();
   });
 }
@@ -268,9 +272,9 @@ export async function readFileAt(
   path: string,
   env?: Record<string, string>,
 ): Promise<string | null> {
-  const entry = await sh(["git", "ls-tree", "--name-only", revision, "--", path], { cwd, env });
+  const entry = await worktreeGit(["git", "ls-tree", "--name-only", revision, "--", path], { cwd, env });
   if (!entry.stdout.trim()) return null;
-  return (await sh(["git", "show", `${revision}:${path}`], { cwd, env })).stdout;
+  return (await worktreeGit(["git", "show", `${revision}:${path}`], { cwd, env })).stdout;
 }
 
 /** Extract the files of `sha` (no .git, no history, no working state) into the empty directory `dest`. */
@@ -285,8 +289,8 @@ export async function exportCommit(
   const index = `${dest}.index`;
   const env = { ...(process.env as Record<string, string>), GIT_INDEX_FILE: index };
   try {
-    await sh(["git", "read-tree", `${sha}^{commit}`], { cwd, env, signal, timeoutMs: 300_000 });
-    await sh(["git", "checkout-index", "--all", `--prefix=${dest}/`], {
+    await worktreeGit(["git", "read-tree", `${sha}^{commit}`], { cwd, env, signal, timeoutMs: 300_000 });
+    await worktreeGit(["git", "checkout-index", "--all", `--prefix=${dest}/`], {
       cwd,
       env,
       signal,
@@ -303,11 +307,11 @@ export async function addDetachedWorktree(cwd: string, sha: string, dest: string
 }
 
 export async function mergeBase(cwd: string, base: string, head: string): Promise<string> {
-  return (await sh(["git", "merge-base", base, head], { cwd })).stdout.trim();
+  return (await worktreeGit(["git", "merge-base", base, head], { cwd })).stdout.trim();
 }
 
 export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
-  const result = await sh(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
+  const result = await worktreeGit(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
     cwd,
     allowFail: true,
   });
@@ -315,7 +319,7 @@ export async function isAncestor(cwd: string, ancestor: string, descendant: stri
 }
 
 export async function rebaseOnto(cwd: string, baseSha: string): Promise<"clean" | "conflict"> {
-  const result = await sh(
+  const result = await worktreeGit(
     ["git", "-c", "user.name=Limitless", "-c", "user.email=limitless@localhost", "rebase", baseSha],
     {
       cwd,
@@ -323,49 +327,54 @@ export async function rebaseOnto(cwd: string, baseSha: string): Promise<"clean" 
     },
   );
   if (result.exitCode === 0) return "clean";
-  const state = await sh(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
-  const apply = await sh(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
+  const state = await worktreeGit(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
+  const apply = await worktreeGit(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
   if (!existsSync(resolve(cwd, state.stdout.trim())) && !existsSync(resolve(cwd, apply.stdout.trim())))
     throw new Error(`rebase failed: ${result.stderr || result.stdout}`);
-  await sh(["git", "rebase", "--abort"], { cwd });
+  await worktreeGit(["git", "rebase", "--abort"], { cwd });
   if (existsSync(resolve(cwd, state.stdout.trim())) || existsSync(resolve(cwd, apply.stdout.trim())))
     throw new Error("rebase abort left worktree in rebase state");
   return "conflict";
 }
 
 export async function clearInterruptedRebase(cwd: string, expected: boolean): Promise<void> {
-  const state = await sh(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
-  const apply = await sh(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
+  const state = await worktreeGit(["git", "rev-parse", "--git-path", "rebase-merge"], { cwd });
+  const apply = await worktreeGit(["git", "rev-parse", "--git-path", "rebase-apply"], { cwd });
   if (!existsSync(resolve(cwd, state.stdout.trim())) && !existsSync(resolve(cwd, apply.stdout.trim())))
     return;
   if (!expected) throw new Error("worktree has an unexpected rebase in progress");
-  await sh(["git", "rebase", "--abort"], { cwd });
+  await worktreeGit(["git", "rebase", "--abort"], { cwd });
   if (existsSync(resolve(cwd, state.stdout.trim())) || existsSync(resolve(cwd, apply.stdout.trim())))
     throw new Error("interrupted rebase could not be aborted");
 }
 
 /** Commit everything in the worktree. Returns the new sha, or null when there was nothing to commit. */
 export async function commitAll(cwd: string, message: string): Promise<string | null> {
-  await sh(["git", "add", "-A"], { cwd });
-  const status = await sh(["git", "status", "--porcelain"], { cwd });
+  if (worktreeGitScope.getStore() !== false) {
+    const index = await worktreeGit(["git", "rev-parse", "--git-path", "index"], { cwd });
+    rmSync(resolve(cwd, index.stdout.trim()), { force: true });
+    await worktreeGit(["git", "read-tree", "HEAD"], { cwd });
+  }
+  await worktreeGit(["git", "add", "-A"], { cwd });
+  const status = await worktreeGit(["git", "status", "--porcelain"], { cwd });
   if (!status.stdout.trim()) return null;
-  await sh(["git", "commit", "--no-verify", "-q", "-m", message], { cwd });
+  await worktreeGit(["git", "commit", "--no-verify", "-q", "-m", message], { cwd });
   return headSha(cwd);
 }
 
 /** Move the worktree's branch back to a known commit, discarding everything after it. */
 export async function resetTo(cwd: string, sha: string): Promise<void> {
-  await sh(["git", "reset", "--hard", "-q", sha], { cwd });
-  await sh(["git", "clean", "-fdq"], { cwd });
+  await worktreeGit(["git", "reset", "--hard", "-q", sha], { cwd });
+  await worktreeGit(["git", "clean", "-fdq"], { cwd });
 }
 
 /** Throw away any uncommitted changes (used after read-only stages). */
 /** `env` matters when the checkout's git config is untrusted: filters and drivers run with it. */
 export async function discardChanges(cwd: string, env?: Record<string, string>): Promise<boolean> {
-  const status = await sh(["git", "status", "--porcelain"], { cwd, env });
+  const status = await worktreeGit(["git", "status", "--porcelain"], { cwd, env });
   if (!status.stdout.trim()) return false;
-  await sh(["git", "reset", "--hard", "-q", "HEAD"], { cwd, env });
-  await sh(["git", "clean", "-fdq"], { cwd, env });
+  await worktreeGit(["git", "reset", "--hard", "-q", "HEAD"], { cwd, env });
+  await worktreeGit(["git", "clean", "-fdq"], { cwd, env });
   return true;
 }
 
@@ -391,10 +400,10 @@ export async function diffSince(
 ): Promise<DiffInfo> {
   const range = `${baseSha}${threeDot ? "..." : ".."}HEAD`;
   const [patch, names, stat, numstat] = await Promise.all([
-    sh(["git", "diff", range], { cwd, env }),
-    sh(["git", "diff", "--name-status", range], { cwd, env }),
-    sh(["git", "diff", "--stat", range], { cwd, env }),
-    sh(["git", "diff", "--numstat", range], { cwd, env }),
+    worktreeGit(["git", "diff", range], { cwd, env }),
+    worktreeGit(["git", "diff", "--name-status", range], { cwd, env }),
+    worktreeGit(["git", "diff", "--stat", range], { cwd, env }),
+    worktreeGit(["git", "diff", "--numstat", range], { cwd, env }),
   ]);
   let added = 0;
   let removed = 0;
@@ -465,7 +474,7 @@ export async function pushExistingBranch(
   const ref = `refs/heads/${branch}`;
   const remote = await remoteSh(["git", "ls-remote", repo.url, ref], { cwd, signal, budget });
   if (remote.stdout.split("\t")[0] !== baseSha) throw new Error("PR head moved since the run started");
-  const ancestor = await sh(["git", "merge-base", "--is-ancestor", baseSha, "HEAD"], {
+  const ancestor = await worktreeGit(["git", "merge-base", "--is-ancestor", baseSha, "HEAD"], {
     cwd,
     allowFail: true,
     signal,

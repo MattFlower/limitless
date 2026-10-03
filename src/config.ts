@@ -3,7 +3,7 @@ import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import type { ResolvedProfile, ReviewFinder } from "./core/types.ts";
+import type { ResolvedProfile, ReviewFinder, Role } from "./core/types.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { defaultGateSlots } from "./gates/slots.ts";
 import { parseReviewRosters } from "./pipeline/review-system.ts";
@@ -53,6 +53,7 @@ export interface Config {
   reserves: Reserves;
   /** Providers to try first among interchangeable models (e.g. use up a subscription). */
   preferProviders: string[];
+  waitBudgetS: Partial<Record<Role, number>>;
   dependabotRouting: "free_first" | "policy";
   /** Whether review prompts (production and eval) carry the implementer's self-report. */
   reviewImplementerReport: "include" | "omit";
@@ -191,6 +192,34 @@ export function loadConfig(
     routing.dependabot !== "policy"
   )
     throw new Error('routing.dependabot must be "free_first" or "policy"');
+  const waitBudgetS: Partial<Record<Role, number>> = {
+    triage: 20,
+    summarize: 20,
+    chat: 20,
+  };
+  const waits = routing.wait_budget_s ?? {};
+  if (typeof waits !== "object" || waits === null || Array.isArray(waits))
+    throw new Error("routing.wait_budget_s must be a table");
+  const roles = [
+    ...Object.keys(waitBudgetS),
+    "review",
+    "verify",
+    "spec",
+    "holdout",
+    "implement",
+    "plan",
+    "plan_review",
+  ];
+  for (const [role, seconds] of Object.entries(waits)) {
+    if (!roles.includes(role)) throw new Error(`routing.wait_budget_s.${role}: unknown role`);
+    if (seconds === "unbounded") {
+      delete waitBudgetS[role as Role];
+      continue;
+    }
+    if (typeof seconds !== "number" || !Number.isSafeInteger(seconds) || seconds < 0)
+      throw new Error(`routing.wait_budget_s.${role} must be nonnegative integer seconds`);
+    waitBudgetS[role as Role] = seconds;
+  }
   const rawReview = raw.review ?? {};
   if (typeof rawReview !== "object" || rawReview === null || Array.isArray(rawReview))
     throw new Error("review must be a table");
@@ -294,6 +323,7 @@ export function loadConfig(
     preferProviders: Array.isArray(routing.prefer)
       ? routing.prefer.filter((p): p is string => typeof p === "string")
       : [],
+    waitBudgetS,
     dependabotRouting: routing.dependabot === "policy" ? "policy" : "free_first",
     reviewImplementerReport: review.implementer_report === "omit" ? "omit" : "include",
     reviewMode: review.mode === "panel" ? "panel" : "single",

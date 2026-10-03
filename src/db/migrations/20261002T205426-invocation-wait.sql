@@ -1,0 +1,1 @@
+ALTER TABLE invocations ADD COLUMN wait_ms INTEGER NOT NULL DEFAULT 0 CHECK (wait_ms >= 0);

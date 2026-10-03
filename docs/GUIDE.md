@@ -160,6 +160,7 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
+| `[routing] wait_budget_s` | `{ triage = 20, summarize = 20, chat = 20 }` | Per-role provider slot wait budgets in whole seconds. `0` falls through immediately; `"unbounded"` removes the limit. Omitted roles `review`, `verify`, `spec`, `holdout`, `implement`, `plan` and `plan_review` wait without limit. |
 | `[triage] decision_confidence` | `0.6` | A decision model's triage (e.g. `typesafe/jev-1.13`) is declined, and routing falls through to the next triage model, when any choice or score answer is less confident than this, when blocking questions are likely (P ≥ 0.5), or when ambiguity is high. If no other triage model can answer, a decline for low confidence alone is used with a warning; one that needs questions ends the run in `needs_human`. |
 | `[gates] baseline_cache` | `true` | `false` skips the per-base-commit baseline cache: every run executes its baseline (a passing one still refreshes the entry). Per run: `limitless run --no-baseline-cache`. |
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
@@ -327,8 +328,10 @@ exact setup. `--write` installs only the Codex skill at `~/.agents/skills/limitl
   `url = "http://127.0.0.1:7400/mcp"`. See [integrations/codex](../integrations/codex/README.md).
 
 The tools are `limitless_providers`, `limitless_create_run`, `limitless_get_run`,
-`limitless_list_runs`, `limitless_answer_question` and `limitless_cancel_run`. Creation returns
-immediately; poll with `limitless_get_run`. Use absolute paths for local repositories. The
+`limitless_list_runs`, `limitless_answer_question`, `limitless_cancel_run`, `limitless_feed` and
+`limitless_feed_ack`. Creation returns immediately; follow up with `limitless_get_run`, or catch up on
+everything that needs action with `limitless_feed` (acknowledge with `limitless_feed_ack` once handled).
+From a terminal, `limitless feed --consumer <name> --wait 3600` waits for the next item. Use absolute paths for local repositories. The
 [README](../README.md#delegate-and-follow-up) has a worked example.
 
 ## 4. Reading a run
@@ -475,6 +478,17 @@ Quota or availability failures fall through to the next candidate without counti
 task. Review, verify and holdout avoid the relevant vendor where possible. Escalation adds any
 remaining catalog model at the required tier.
 
+A slot wait budget is spent once per provider in an invocation, across all its models. An expired
+provider stays eligible if its slot opens later. If every provider is busy after the budgets expire,
+Limitless waits on them together and takes the first free slot, preferring routing order for ties.
+With only one eligible provider, it waits without limit. Invocation deadlines and cancellation
+still bound these waits. Configure budgets with, for example:
+
+```toml
+[routing]
+wait_budget_s = { triage = 0, review = "unbounded", implement = 60 }
+```
+
 The **Models** page shows the catalog (tier, vendor, origin, prices, supported efforts) and the
 effective policy. Each run's event log records why candidates were skipped.
 
@@ -503,7 +517,7 @@ A panel's finders depend on the run's profile:
 | Profile | Default roster |
 |---|---|
 | quick | One standard finder from a vendor other than the implementer's. |
-| standard | An adversarial finder from another vendor. A careful finder in a fresh session from the implementer's family. A standard finder on a local model with a removed-behaviour and failure-paths lens, only when a local model is available. |
+| standard | An adversarial finder from another vendor. A careful finder in a fresh session from the implementer's family. |
 | deep | The standard roster plus the repository's lenses. |
 
 Override a profile's roster in `config.toml`. Profiles you leave out keep their defaults:

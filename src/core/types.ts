@@ -170,6 +170,7 @@ export interface Stage {
 }
 
 export interface Invocation {
+  waitMs: number;
   fast: boolean;
   fastModeState: string | null;
   fastModeDisabledReason: string | null;
@@ -328,7 +329,27 @@ export type StreamMessage =
   | { kind: "event"; event: RunEvent }
   | { kind: "provider"; provider: ProviderStatus }
   | { kind: "alert"; alert: QuotaAlert | null; provider: string; window: string; created: boolean }
-  | { kind: "question"; question: Question };
+  | { kind: "question"; question: Question }
+  | { kind: "feed"; item: FeedItem };
+
+export type FeedKind =
+  | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged"}`
+  | "eval.finished"
+  | "daemon.started";
+export interface FeedItem {
+  id: number;
+  ts: number;
+  kind: FeedKind;
+  runId: string | null;
+  evalId: string | null;
+  repo: string | null;
+  title: string;
+  summary: string;
+  data: Record<string, unknown>;
+}
+/** `nextAfter`: the last returned id, else the effective cursor. `pruned`: retention removed items after it. */
+export type FeedPage = { items: FeedItem[]; nextAfter: number; pruned: boolean };
+export type FeedAck = { consumer: string; id: number };
 
 /** Process-local scheduler state; active includes executions waiting for input or capacity. */
 export interface DrainState {

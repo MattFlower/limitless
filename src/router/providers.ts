@@ -413,22 +413,75 @@ export class ProviderTracker {
 
   // ---- concurrency ---------------------------------------------------------
 
-  async acquire(id: string, signal: AbortSignal): Promise<() => void> {
+  /** Race providers in preference order, releasing every unused reservation. */
+  async acquireFirst(
+    ids: string[],
+    signal: AbortSignal,
+    waitMs: number | undefined,
+    onWait: (id: string, ahead: number) => void,
+  ): Promise<{ provider: string; release: () => void } | null> {
+    const cancel = new AbortController();
+    const combined = AbortSignal.any([signal, cancel.signal]);
+    const pending = ids.map(async (provider) => ({
+      provider,
+      release: await this.acquire(provider, combined, waitMs, (ahead) => onWait(provider, ahead)),
+    }));
+    let failure: unknown;
+    await Promise.race(pending).catch((error: unknown) => {
+      failure = error;
+    });
+    cancel.abort();
+    const results = await Promise.allSettled(pending);
+    let chosen: { provider: string; release: () => void } | null = null;
+    for (const result of results) {
+      if (result.status !== "fulfilled" || !result.value.release) continue;
+      if (!chosen && !signal.aborted && !failure) chosen = { ...result.value, release: result.value.release };
+      else result.value.release();
+    }
+    if (signal.aborted) throw new Error("cancelled");
+    if (failure) throw failure;
+    return chosen;
+  }
+
+  acquire(id: string, signal: AbortSignal): Promise<() => void>;
+  acquire(
+    id: string,
+    signal: AbortSignal,
+    waitMs: number | undefined,
+    onWait?: (ahead: number) => void,
+  ): Promise<(() => void) | null>;
+  async acquire(
+    id: string,
+    signal: AbortSignal,
+    waitMs?: number,
+    onWait?: (ahead: number) => void,
+  ): Promise<(() => void) | null> {
     const p = this.providers.get(id);
     if (!p) throw new Error(`unknown provider ${id}`);
+    const end = waitMs === undefined ? Infinity : this.clock() + waitMs;
+    let notified = false;
     while (p.inFlight + p.waking >= p.def.maxConcurrent) {
       if (signal.aborted) throw new Error("cancelled");
+      if (!notified) {
+        onWait?.(p.waiters.length);
+        notified = true;
+      }
+      if (this.clock() >= end) return null;
       // Production never waits behind a shadow call: abort one, and take its slot ahead of the queue.
       const shadow = [...p.shadows].find((s) => !s.heir);
       const woken = await new Promise<boolean>((resolve) => {
+        let timeout: ReturnType<typeof setInterval> | undefined;
         const wake = () => {
-          signal.removeEventListener("abort", onAbort);
+          if (timeout !== undefined) this.timer.clear(timeout);
+          signal.removeEventListener("abort", leave);
           p.waking++;
           resolve(true);
         };
-        // A cancelled waiter must leave the queue, or a later release would wake a dead waiter
-        // and strand the live ones behind it.
-        const onAbort = () => {
+        // A cancelled or expired waiter must leave the queue (and give up any claim on a shadow's
+        // slot), or a later release would wake a dead waiter and strand the live ones behind it.
+        const leave = () => {
+          if (timeout !== undefined) this.timer.clear(timeout);
+          signal.removeEventListener("abort", leave);
           if (shadow?.heir === wake) shadow.heir = undefined;
           const i = p.waiters.indexOf(wake);
           if (i >= 0) p.waiters.splice(i, 1);
@@ -436,15 +489,24 @@ export class ProviderTracker {
         };
         if (shadow) shadow.heir = wake;
         else p.waiters.push(wake);
-        signal.addEventListener("abort", onAbort, { once: true });
+        signal.addEventListener("abort", leave, { once: true });
+        if (Number.isFinite(end))
+          timeout = this.timer.set(leave, Math.min(end - this.clock(), 2_147_483_647));
         shadow?.preempt();
       });
       if (woken) p.waking--;
     }
     const release = this.hold(p);
-    if (!signal.aborted) return release;
-    release(); // cancelled after its wake, or just before a release freed the slot: hand it on
-    throw new Error("cancelled");
+    // Cancelled after its wake, or past the deadline when the slot freed: hand the slot on.
+    if (signal.aborted) {
+      release();
+      throw new Error("cancelled");
+    }
+    if (notified && this.clock() >= end) {
+      release();
+      return null;
+    }
+    return release;
   }
 
   /** Shadow admission needs two free slots and no waiting production; `preempt` cancels this call. */

@@ -431,7 +431,6 @@ test("single mode keeps the production review; a panel takes the profile's roste
   const standard = [
     ["adversarial", null, null, false],
     ["careful", null, "implementer", false],
-    ["standard", "removed-behaviour-and-failure-paths", null, true],
   ];
   expect(finders("quick")).toEqual([["standard", null, null, false]]);
   expect(finders("standard")).toEqual([...standard, ["standard", "api", null, false]]);
@@ -509,7 +508,7 @@ test("an eval system can name a configured roster; it expands to exactly the pro
     const reference = {
       name: "standard-roster",
       roster: "standard",
-      targets: ["candidate-a", "candidate-b", "local-q"],
+      targets: ["candidate-a", "candidate-b"],
       verifier: { target: "verifier-c" },
       implementerReport: "include",
     };
@@ -544,10 +543,19 @@ test("an eval system can name a configured roster; it expands to exactly the pro
       ),
     ).toThrow("roster quick has 1 finders with its lenses; give 1 targets, not 2");
     // A local finder pins a free model, as production routes it.
-    const paid = { ...reference, targets: ["candidate-a", "candidate-b", "candidate-a"] };
-    expect(() => validateRequest({ role: "review", systems: [paid] }, review, f.factory.router)).toThrow(
-      'review system "standard-roster": local finder candidate-a is not a free model',
-    );
+    const localRosters = {
+      ...DEFAULT_ROSTERS,
+      standard: [...DEFAULT_ROSTERS.standard, { prompt: "standard" as const, local: true }],
+    };
+    const free = { ...reference, targets: ["candidate-a", "candidate-b", "local-q"] };
+    expect(
+      validateRequest({ role: "review", systems: [free] }, review, f.factory.router, localRosters).request
+        .systems?.[0]?.finders[2],
+    ).toEqual({ prompt: "standard", local: true, target: "local-q" });
+    const paid = { ...free, targets: ["candidate-a", "candidate-b", "candidate-a"] };
+    expect(() =>
+      validateRequest({ role: "review", systems: [paid] }, review, f.factory.router, localRosters),
+    ).toThrow('review system "standard-roster": local finder candidate-a is not a free model');
   } finally {
     await f.close();
   }
