@@ -37,7 +37,6 @@ const COMMITS = ["--json", "commits", "--jq", "[.commits[] | {oid, at: .committe
 // One line per page: GitHub pages a commit's files 300 at a time, up to 3000 in all.
 const PAGE = "{parents: (.parents | length), files: [.files[]? | {filename, patch}]}";
 const PATCHES = ["--paginate", "--jq", PAGE];
-const MAX_FILES = 3000;
 type Patch = { filename: string; patch?: string | null };
 type Page = { parents: number; files: Patch[] };
 export const ghPrHistory = (gh: GhRunner): HistoryReader => {
@@ -55,7 +54,7 @@ export const ghPrHistory = (gh: GhRunner): HistoryReader => {
           ? [{ file: f.filename, line: null }]
           : changedLines(f.patch).map((line) => ({ file: f.filename, line })),
       );
-      const blind = files.length >= MAX_FILES || !pages.length;
+      const blind = files.length >= 3000 || !pages.length;
       records.push({ kind: "commit", source: `commit ${oid}`, at, spots, ...(blind ? { blind } : {}) });
     }
     const pr = `repos/${repoSlug}/pulls/${prUrl?.split("/pull/")[1]}/comments`;

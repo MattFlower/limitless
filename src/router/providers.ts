@@ -29,10 +29,12 @@ interface ProviderRuntime {
   waiters: (() => void)[];
   /** Waiters woken by a release that have not yet taken their slot: no later caller takes it first. */
   waking: number;
-  /** Preempt callbacks of shadow calls holding a slot; a production waiter aborts one to take its slot. */
-  shadows: Set<() => void>;
+  /** Shadow calls holding a slot; a production waiter aborts one and becomes heir to its slot. */
+  shadows: Set<ShadowHold>;
   confinement?: ConfinementProbe;
 }
+
+type ShadowHold = { preempt: () => void; heir?: () => void };
 
 interface KeyReading {
   usage: number;
@@ -417,8 +419,7 @@ export class ProviderTracker {
     while (p.inFlight + p.waking >= p.def.maxConcurrent) {
       if (signal.aborted) throw new Error("cancelled");
       // Production never waits behind a shadow call: abort one, and take its slot ahead of the queue.
-      const preempt = p.shadows.values().next().value;
-      if (preempt) p.shadows.delete(preempt);
+      const shadow = [...p.shadows].find((s) => !s.heir);
       const woken = await new Promise<boolean>((resolve) => {
         const wake = () => {
           signal.removeEventListener("abort", onAbort);
@@ -426,16 +427,17 @@ export class ProviderTracker {
           resolve(true);
         };
         // A cancelled waiter must leave the queue, or a later release would wake a dead waiter
-        // and strand the live ones behind it.
+        // and strand the live ones behind it. An abandoned reservation lapses to the queue.
         const onAbort = () => {
+          if (shadow?.heir === wake) shadow.heir = undefined;
           const i = p.waiters.indexOf(wake);
           if (i >= 0) p.waiters.splice(i, 1);
           resolve(false);
         };
-        if (preempt) p.waiters.unshift(wake);
+        if (shadow) shadow.heir = wake;
         else p.waiters.push(wake);
         signal.addEventListener("abort", onAbort, { once: true });
-        preempt?.();
+        shadow?.preempt();
       });
       if (woken) p.waking--;
     }
@@ -449,11 +451,13 @@ export class ProviderTracker {
   tryAcquire(id: string, preempt: () => void): (() => void) | null {
     const p = this.providers.get(id);
     if (!p || p.inFlight + p.waking + 2 > p.def.maxConcurrent || p.waiters.length) return null;
-    p.shadows.add(preempt);
-    return this.hold(p, preempt);
+    if ([...p.shadows].some((s) => s.heir)) return null;
+    const shadow = { preempt };
+    p.shadows.add(shadow);
+    return this.hold(p, shadow);
   }
 
-  private hold(p: ProviderRuntime, preempt?: () => void): () => void {
+  private hold(p: ProviderRuntime, shadow?: ShadowHold): () => void {
     const id = p.def.id;
     p.inFlight++;
     this.publish(id);
@@ -461,9 +465,13 @@ export class ProviderTracker {
     return () => {
       if (released) return;
       released = true;
-      if (preempt) p.shadows.delete(preempt);
+      if (shadow) p.shadows.delete(shadow);
       p.inFlight--;
-      p.waiters.shift()?.();
+      // A preempted shadow's slot goes to its heir; any other free slot to the earliest pending heir.
+      const heir = shadow?.heir ? shadow : [...p.shadows].find((s) => s.heir);
+      const next = heir?.heir ?? p.waiters.shift();
+      if (heir) heir.heir = undefined;
+      next?.();
       this.publish(id);
     };
   }

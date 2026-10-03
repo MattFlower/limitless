@@ -546,13 +546,15 @@ roughly $0.65 API-equivalent per round on subscription models.
 
 Production calls always come first. A shadow call takes a provider slot only if at least two are
 free at that moment (so it never takes a provider's last slot, and never runs on a provider with
-`max_concurrent = 1`) and no production call is queued for, or has just been woken for, a slot; it
-never waits. Otherwise that finder is skipped, with the reason in the panel record. A shadow call
-that holds a slot can still be preempted: when a production call (of any run, including implement
-calls and review fallbacks) finds the provider full, it aborts one shadow call on that provider and
-takes its slot as soon as the call ends, ahead of any queued call. The abort is immediate; the slot
-changes hands once the aborted call stops. A preempted finder is recorded in the panel record and a
-preempted verifier in `finished`, each with `skipped: "preempted"`; the verifier's candidates stay
+`max_concurrent = 1`) and no production call is queued for, has just been woken for, or is waiting
+on a preempted call's slot; it never waits. Otherwise that finder is skipped, with the reason in the
+panel record. A shadow call that holds a slot can still be preempted: when a production call (of any
+run, including implement calls and review fallbacks) finds the provider full, it aborts one shadow
+call on that provider, and that call's slot is reserved for it, ahead of any queued call (if another
+slot frees first, the earliest such production call takes that one instead). The abort is
+immediate; the slot changes hands once the aborted call stops. A preempted finder or verifier is
+recorded in `finished` as it stops, with `skipped: "preempted"` (a finder also in the panel record);
+the verifier's candidates stay
 unverified (`omitted`), and the shadow goes on with what it has. Once the single review finishes, the
 shadow has `shadow_grace_seconds` to finish; then it is aborted and recorded as `timeout` with the
 finders that had finished. Aborted calls then get up to 5 more seconds to end and record their spend;

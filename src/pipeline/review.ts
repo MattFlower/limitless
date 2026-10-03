@@ -430,7 +430,11 @@ async function runPanel<T extends Invoked>(
         timeoutMs: local ? Math.min(input.timeoutMs, LOCAL_FINDER_TIMEOUT_MS) : input.timeoutMs,
         prompt: { ...input.prompt, finder: prompt, ...(lens ? { lens } : {}) },
       });
-      const invoked = await deps.invoke(request, finder);
+      const invoked = await deps.invoke(request, finder).catch((error: unknown) => {
+        if (error instanceof FinderSkipped && (local || deps.skipAny))
+          deps.finished?.push({ finder, skipped: error.message.slice(0, 300) });
+        throw error;
+      });
       deps.finished?.push({ finder, status: invoked.result.status, review: invoked.result.structured });
       const output = request.schema.safeParse(
         invoked.result.structured ?? extractJson(invoked.result.finalText),
@@ -466,7 +470,6 @@ async function runPanel<T extends Invoked>(
             ? `${result.status}: ${result.error ?? "no output"}`
             : "invalid review output";
       skipped.set(finder, problem.slice(0, 300));
-      if (member.status === "rejected") deps.finished?.push({ finder, skipped: skipped.get(finder) });
       deps.warn?.(`Local finder ${finder} skipped: ${problem}`);
       continue;
     }

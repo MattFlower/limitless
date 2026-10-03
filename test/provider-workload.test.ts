@@ -218,3 +218,65 @@ test("a production call preempts a shadow holder and takes its slot ahead of the
     store.close();
   }
 });
+
+test("each preemptor receives the slot its own shadow releases, before other waiters", async () => {
+  const { store, tracker } = tracked(4);
+  try {
+    const signal = new AbortController().signal;
+    const preempted: string[] = [];
+    const first = tracker.tryAcquire("alpha", () => preempted.push("s1"));
+    const second = tracker.tryAcquire("alpha", () => preempted.push("s2"));
+    const held = await Promise.all([1, 2].map(() => tracker.acquire("alpha", signal)));
+    const order: string[] = [];
+    const take = (name: string, s = signal) =>
+      tracker.acquire("alpha", s).then((release) => {
+        order.push(name);
+        return release;
+      });
+    const p1 = take("first");
+    const p2 = take("second");
+    const queued = take("queued");
+    expect(preempted).toEqual(["s1", "s2"]);
+    // No free slot is ever offered to a shadow while a preemptor waits.
+    expect(tracker.tryAcquire("alpha", noop)).toBeNull();
+    // Each shadow's release goes to the preemptor that aborted it, whatever order they finish in.
+    first?.();
+    await Bun.sleep(0);
+    expect(order).toEqual(["first"]);
+    second?.();
+    await Bun.sleep(0);
+    expect(order).toEqual(["first", "second"]);
+    (await p1)();
+    (await p2)();
+    (await queued)();
+    for (const release of held) release();
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+
+    // A production release goes to the earliest preemptor; that one's shadow then serves the next.
+    order.length = 0;
+    const s3 = tracker.tryAcquire("alpha", noop);
+    const s4 = tracker.tryAcquire("alpha", noop);
+    const busy = await Promise.all([1, 2].map(() => tracker.acquire("alpha", signal)));
+    const cancel = new AbortController();
+    const a = take("a");
+    const gone = take("gone", cancel.signal).catch((error: Error) => error.message);
+    const tail = take("tail");
+    // The cancelled preemptor's reservation lapses: its shadow's release serves the queue.
+    cancel.abort();
+    expect(await gone).toBe("cancelled");
+    busy[0]?.();
+    await Bun.sleep(0);
+    expect(order).toEqual(["a"]);
+    s4?.();
+    await Bun.sleep(0);
+    expect(order).toEqual(["a", "tail"]);
+    s3?.();
+    s3?.();
+    (await a)();
+    (await tail)();
+    busy[1]?.();
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+  } finally {
+    store.close();
+  }
+});
