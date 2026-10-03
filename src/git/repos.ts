@@ -1,9 +1,10 @@
-import { existsSync, mkdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { attributeRules, newlyHidden } from "../gates/audit.ts";
+import { attributeRules, BINARY_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
 import { CommandError, sh } from "../util/proc.ts";
 import { emptyHookFlags, NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
 
@@ -468,6 +469,8 @@ export interface DiffInfo {
   /** Newly hidden changed paths that are text at base or head. */
   textPaths?: string[];
   attributeErrors?: string[];
+  binaryPaths?: string[];
+  attributeUnmatched?: string[];
 }
 
 export async function diffSince(
@@ -503,7 +506,8 @@ export async function diffSince(
     const status = entries[i]?.split(" ").at(-1) ?? "";
     const path = entries[i + 1] ?? "";
     if (status.startsWith("D")) continue;
-    changes.push({ path, ...(status.startsWith("A") ? {} : { from: path }) });
+    const from = files.find((f) => f.path === path)?.from;
+    changes.push({ path, ...(from ? { from } : status.startsWith("A") ? {} : { from: path }) });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
   const inspection = await attributeInfo(cwd, env, range, revision, changes);
@@ -546,13 +550,16 @@ async function attributeInfo(
   // even where worktreeGit is unhardened, so the run's own attributes cannot classify content.
   // The empty tree's id depends on the repository's object format (SHA-1 or SHA-256).
   let emptyTree: string | undefined;
-  const textAt = async (tree: string, pathspecs: string[]) => {
+  const matches = new Set<string>();
+  const scratch = mkdtempSync(join(tmpdir(), "limitless-classify-"));
+  const textAt = async (tree: string, pathspecs: string[], lfs = true) => {
     const text = new Set<string>();
     if (!pathspecs.length) return text;
     emptyTree ??= (await git(["hash-object", "-t", "tree", "--stdin"], "")).stdout.trim();
     const EMPTY_TREE = emptyTree;
     const args = ["--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", EMPTY_TREE, tree];
     const out = await git([
+      `--git-dir=${scratch}`,
       `--attr-source=${EMPTY_TREE}`,
       "-c",
       NO_BIG_FILES,
@@ -562,14 +569,17 @@ async function attributeInfo(
       ...pathspecs,
     ]);
     for (const entry of out.stdout.split("\0")) {
-      const match = entry.match(/^(\d+)\t\d+\t([\s\S]+)$/);
-      if (match?.[2]) text.add(match[2]);
+      const match = entry.match(/^(\d+|-)\t(?:\d+|-)\t([\s\S]+)$/);
+      if (match?.[2]) {
+        matches.add(match[2]);
+        if (match[1] !== "-") text.add(match[2]);
+      }
     }
     // A Git LFS pointer, which `git lfs` commits for a tracked file, stands for binary content.
-    const candidates = [...text].filter((path) => !path.includes("\n"));
+    const candidates = [...text].filter((path) => lfs && BINARY_PATH.test(path));
     if (candidates.length) {
-      const objects = candidates.map((path) => `${tree}:${path}\n`).join("");
-      const sizes = (await git(["cat-file", "--batch-check=%(objectsize)"], objects)).stdout.split("\n");
+      const input = candidates.map((path) => `${tree}:${path}\0`).join("");
+      const sizes = (await git(["cat-file", "--batch-check=%(objectsize)", "-z"], input)).stdout.split("\n");
       for (const [i, path] of candidates.entries()) {
         const size = Number(sizes[i]);
         if (!(size > 0 && size <= 200)) continue;
@@ -582,6 +592,15 @@ async function attributeInfo(
     ...new Set([...(await textAt(base, pathspecs)), ...(await textAt("HEAD", pathspecs))]),
   ];
   try {
+    mkdirSync(join(scratch, "refs"));
+    writeFileSync(join(scratch, "HEAD"), (await git(["rev-parse", "HEAD"])).stdout);
+    const objects = resolve(cwd, (await git(["rev-parse", "--git-path", "objects"])).stdout.trim());
+    mkdirSync(join(scratch, "objects", "info"), { recursive: true });
+    writeFileSync(join(scratch, "objects", "info", "alternates"), `${objects}\n`);
+    writeFileSync(
+      join(scratch, "config"),
+      `[core]\nattributesFile = /dev/null\nrepositoryformatversion = 1\n[extensions]\nobjectformat = ${base.length === 64 ? "sha256" : "sha1"}\n`,
+    );
     // Attributes of a path edited in place only differ when an attribute file changed too.
     const queried = attributePatch ? changes : changes.filter((change) => change.from !== change.path);
     // Compare the same head path in both trees, even when that path did not exist at base.
@@ -609,13 +628,30 @@ async function attributeInfo(
     const textPaths = hidden
       .filter(({ path, from }) => textAfter.has(path) || (from !== undefined && textBefore.has(from)))
       .map((change) => change.path);
+    const beforeText = await textAt(base, literal(changes.map((c) => c.from)), false);
+    const afterText = await textAt("HEAD", literal(changes.map((c) => c.path)), false);
+    const binaryPaths = changes
+      .filter(
+        ({ path, from }) =>
+          matches.has(path) &&
+          !afterText.has(path) &&
+          (beforeText.has(from ?? "") || (from !== path && SOURCE_PATH.test(path))),
+      )
+      .map((c) => c.path);
     const attributeMatches: Record<string, string[]> = {};
-    for (const rule of attributeRules(attributePatch))
-      if (rule.exemptable) attributeMatches[rule.key] ??= await textAtEither([rule.pathspec]);
-    return { attributePatch, attributes, textPaths, attributeMatches };
+    const attributeUnmatched: string[] = [];
+    for (const rule of attributeRules(attributePatch)) {
+      if (!rule.exemptable || attributeMatches[rule.key]) continue;
+      matches.clear();
+      attributeMatches[rule.key] = await textAtEither([rule.pathspec]);
+      if (!matches.size) attributeUnmatched.push(rule.key);
+    }
+    return { attributePatch, attributes, textPaths, attributeMatches, binaryPaths, attributeUnmatched };
   } catch (error) {
     const reason = Date.now() >= deadline ? `timed out after ${timeoutMs} ms` : String(error).split("\n")[0];
     return { attributePatch, attributeErrors: [`attribute inspection ${reason}`] };
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
 }
 
@@ -624,7 +660,7 @@ export function parseNameStatus(text: string): DiffFile[] {
     .split("\n")
     .filter(Boolean)
     .map((l) => {
-      const [status = "", a = "", b] = l.split("\t");
+      const [status = "", a = "", b] = l.split("\t").map((p) => (p.startsWith('"') ? (unquote(p) ?? p) : p));
       return b !== undefined ? { status, path: b, from: a } : { status, path: a };
     });
 }

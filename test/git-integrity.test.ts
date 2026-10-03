@@ -4,7 +4,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, w
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import type { Repo } from "../src/core/types.ts";
+import { parseAllow } from "../src/core/allow.ts";
+import type { AuditAllowance, Repo } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { attributeRules, auditDiff } from "../src/gates/audit.ts";
 import { collectGarbage } from "../src/gc.ts";
@@ -192,8 +193,8 @@ test("attribute audit exempts base binary content and ordinary eol changes, neve
     ["*.ts -text", true],
     ["*.ts diff=custom", true],
     ["*.ts filter=custom", true],
-    // A rule that matches no file at base or head hides nothing; a matching text file blocks.
-    ["new.test.ts -diff", false],
+    // Unmatched source rules can hide files added in later runs.
+    ["new.test.ts -diff", true],
     ["sample.test.ts -diff", true],
     ["# *.ts -diff", false],
   ] as const) {
@@ -318,18 +319,18 @@ test("renaming into an existing hiding rule does not block; changing that rule s
   await commitAll(work, "binary rename stays binary");
   const control = await diffSince(work, revision);
   expect(control.textPaths).toEqual([]);
-  expect(attributeRulesOf(auditDiff(control, { taskClass: null, protectedPaths: [] }))).toEqual([]);
+  expect(attributeBlocksOf(auditDiff(control, { taskClass: null, protectedPaths: [] }))).toEqual([]);
   await git(work, "mv", "notes.txt", "out.gen");
   writeFileSync(join(work, "out.gen"), Buffer.concat([Buffer.from(`${notes}\n`), Buffer.from([0])]));
   await commitAll(work, "text source renamed into a hidden binary");
   const diff = await diffSince(work, revision);
   expect(diff.files).toContainEqual(expect.objectContaining({ from: "notes.txt", path: "out.gen" }));
   expect(diff.textPaths).toEqual([]);
-  expect(attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] }))).toEqual([]);
+  expect(attributeBlocksOf(auditDiff(diff, { taskClass: null, protectedPaths: [] }))).toEqual([]);
   writeFileSync(join(work, ".gitattributes"), "*.gen linguist-generated=true\n");
   await commitAll(work, "change hiding rule");
   expect(
-    attributeRulesOf(auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] })),
+    attributeBlocksOf(auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] })),
   ).toContainEqual(
     expect.objectContaining({
       severity: "block",
@@ -359,7 +360,19 @@ test.each([
   expect(attributes).toBeDefined();
   expect(attributes?.base).toEqual(attributes?.head);
   expect(shim.calls()).toContainEqual(expect.stringContaining(`check-attr --source=${revision}`));
-  expect(attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] }))).toEqual([]);
+  const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+  expect(attributeBlocksOf(findings)).toEqual([]);
+  expect(findings).toContainEqual(
+    expect.objectContaining({
+      rule: "gitattributes",
+      severity: "warn",
+      file: path,
+      detail: expect.stringContaining("already effective at base"),
+    }),
+  );
+  expect(findings.find((f) => f.file === path && f.rule === "gitattributes")?.detail).toContain(
+    rule.split(" ").slice(1).join(" "),
+  );
 });
 
 test.each(["filter=unset", "linguist-generated=unset"])("literal %s is a hiding attribute", async (attr) => {
@@ -374,7 +387,7 @@ test.each(["filter=unset", "linguist-generated=unset"])("literal %s is a hiding 
   expect(
     diff.attributes?.find((entry) => entry.path === "sample.test.ts")?.head[attr.split("=")[0] ?? ""],
   ).toBe("unset");
-  expect(attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] }))).toContainEqual(
+  expect(attributeBlocksOf(auditDiff(diff, { taskClass: null, protectedPaths: [] }))).toContainEqual(
     expect.objectContaining({ file: ".gitattributes", severity: "block" }),
   );
   expect(existsSync(marker)).toBe(false);
@@ -398,7 +411,7 @@ test.each([
   writeFileSync(join(work, ".gitattributes"), `${pattern} filter=lfs diff=lfs merge=lfs -text\n`);
   await commitAll(work, "LFS tracking attributes");
   const diff = await diffSince(work, revision);
-  expect(attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] })).length > 0).toBe(text);
+  expect(attributeBlocksOf(auditDiff(diff, { taskClass: null, protectedPaths: [] })).length > 0).toBe(text);
 });
 
 test("an LFS pointer committed for a tracked binary keeps the LFS exemption; a fake pointer path in text does not", async () => {
@@ -417,7 +430,7 @@ test("an LFS pointer committed for a tracked binary keeps the LFS exemption; a f
     await commitAll(work, "track with LFS");
     const audit = (rev: string) =>
       diffSince(work, rev).then((diff) =>
-        attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] })),
+        attributeBlocksOf(auditDiff(diff, { taskClass: null, protectedPaths: [] })),
       );
     expect(await audit(revision)).toEqual([]);
     // A text file that only looks pointer-like (extra content) is still text, so the rule blocks.
@@ -449,7 +462,7 @@ test("quoted attribute patterns keep their binary-only exemption when Git can de
     writeFileSync(join(work, ".gitattributes"), `${line}\n`);
     for (const [path, content] of Object.entries(files)) writeFileSync(join(work, path), content);
     await commitAll(work, line);
-    const findings = attributeRulesOf(
+    const findings = attributeBlocksOf(
       auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] }),
     );
     expect([line, findings.length > 0]).toEqual([line, blocked]);
@@ -476,7 +489,7 @@ test("mixed literal UTF-8 and octal attribute patterns cannot exempt existing te
     expect(diff.files.map((file) => file.path)).toEqual([".gitattributes"]);
     expect(attributeRules(diff.attributePatch ?? diff.patch).map((rule) => rule.pattern)).toEqual([path]);
     expect(Object.values(diff.attributeMatches ?? {})).toEqual([[path]]);
-    expect(attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] }))).toContainEqual(
+    expect(attributeBlocksOf(auditDiff(diff, { taskClass: null, protectedPaths: [] }))).toContainEqual(
       expect.objectContaining({
         rule: "gitattributes",
         severity: "block",
@@ -866,8 +879,8 @@ test("local pipeline scope retains original git settings and index behavior", as
 });
 
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-const attributeRulesOf = (findings: { rule: string; file?: string; detail: string }[]) =>
-  findings.filter((f) => f.rule === "gitattributes");
+const attributeBlocksOf = (findings: { rule: string; severity: string; file?: string; detail: string }[]) =>
+  findings.filter((f) => f.rule === "gitattributes" && f.severity === "block");
 
 /** A `git` on PATH that logs every argv and can stall content classification. */
 function gitShim(stall = false) {
@@ -966,7 +979,7 @@ test("effective attributes block hiding enabled by deletions, base macros and ne
       expect(Object.keys(tree ?? {}).sort()).toEqual(
         ["binary", "diff", "filter", "linguist-generated", "merge", "text"].sort(),
       );
-    const finding = attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] })).find(
+    const finding = attributeBlocksOf(auditDiff(diff, { taskClass: null, protectedPaths: [] })).find(
       (f) => f.file === changed,
     );
     if (hidden === null) expect(finding).toBeUndefined();
@@ -993,7 +1006,7 @@ test("three-dot attribute comparisons use the merge base, not the advanced targe
     taskClass: null,
     protectedPaths: [],
   });
-  expect(attributeRulesOf(findings)).toContainEqual(expect.objectContaining({ file: "sample.test.ts" }));
+  expect(attributeBlocksOf(findings)).toContainEqual(expect.objectContaining({ file: "sample.test.ts" }));
 });
 
 test("upper- and mixed-case attribute files are inspected at any depth, renamed or binary", async () => {
@@ -1014,7 +1027,7 @@ test("upper- and mixed-case attribute files are inspected at any depth, renamed 
     const diff = await diffSince(work, revision);
     const rule = rename ? "*.ts filter=x" : "*.ts -diff";
     expect(diff.attributePatch).toContain(`+${rule}`);
-    expect(attributeRulesOf(auditDiff(diff, { taskClass: null, protectedPaths: [] }))).toContainEqual(
+    expect(attributeBlocksOf(auditDiff(diff, { taskClass: null, protectedPaths: [] }))).toContainEqual(
       expect.objectContaining({
         severity: "block",
         file: path,
@@ -1052,7 +1065,7 @@ test("built-in diff drivers and binary-only patterns are harmless; text at eithe
     writeFileSync(join(work, ".gitattributes"), `${line}\n`);
     for (const [path, content] of Object.entries(files)) writeFileSync(join(work, path), content);
     await commitAll(work, line);
-    const findings = attributeRulesOf(
+    const findings = attributeBlocksOf(
       auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] }),
     );
     expect([line, findings.length > 0]).toEqual([line, blocked]);
@@ -1070,18 +1083,22 @@ test("local repositories classify content with an explicit empty attribute sourc
     const findings = await worktreeGitScope.run(false, async () =>
       auditDiff(await diffSince(work, revision, shim.env), { taskClass: null, protectedPaths: [] }),
     );
-    expect(attributeRulesOf(findings)).toContainEqual(
+    expect(attributeBlocksOf(findings)).toContainEqual(
       expect.objectContaining({ severity: "block", detail: expect.stringContaining("image.png") }),
     );
   }
   expect(shim.classifications().length).toBeGreaterThan(0);
   for (const call of shim.classifications()) {
-    expect(call).toStartWith(`--attr-source=${EMPTY_TREE} `);
+    expect(call).toStartWith("--git-dir=");
+    expect(call).toContain(` --attr-source=${EMPTY_TREE} `);
+    const scratch = call.match(/^--git-dir=(\S+)/)?.[1];
+    expect(scratch).toBeDefined();
+    expect(scratch && existsSync(scratch)).toBe(false);
     expect(call).toContain(" diff --numstat");
   }
 });
 
-test("content classification is lazy, limited to pattern candidates, and bounded by a deadline", async () => {
+test("content classification covers changed blobs and pattern candidates within a deadline", async () => {
   mkdirSync(join(work, "assets"));
   for (let i = 0; i < 20; i++) writeFileSync(join(work, `unrelated-${i}.ts`), `export const x${i} = ${i};\n`);
   writeFileSync(join(work, "assets", "icon.png"), Buffer.from([0x89, 0, 1]));
@@ -1089,7 +1106,7 @@ test("content classification is lazy, limited to pattern candidates, and bounded
   await commitAll(work, "base");
   const revision = await headSha(work);
   const audit = async (env: Record<string, string>) =>
-    attributeRulesOf(
+    attributeBlocksOf(
       auditDiff(await diffSince(work, revision, env), { taskClass: null, protectedPaths: [] }),
     );
 
@@ -1098,20 +1115,25 @@ test("content classification is lazy, limited to pattern candidates, and bounded
   await commitAll(work, "ordinary edit");
   expect(await audit(shim.env)).toEqual([]);
   expect(shim.calls().some((call) => call.includes("check-attr"))).toBe(false);
-  expect(shim.classifications()).toEqual([]);
+  expect(shim.classifications()).toHaveLength(2);
+  for (const call of shim.classifications()) expect(call).not.toContain("unrelated-");
 
   shim = gitShim();
   writeFileSync(join(work, ".gitattributes"), "*.java diff=java\n");
   await commitAll(work, "driver only");
   expect(await audit(shim.env)).toEqual([]);
-  expect(shim.classifications()).toEqual([]);
+  expect(shim.classifications()).toHaveLength(2);
+  for (const call of shim.classifications()) expect(call).not.toContain("unrelated-");
 
   shim = gitShim();
   writeFileSync(join(work, ".gitattributes"), "*.java diff=java\nassets/icon.png binary\n");
   await commitAll(work, "narrow binary rule");
   expect(await audit(shim.env)).toEqual([]);
-  expect(shim.classifications()).toHaveLength(2);
-  for (const call of shim.classifications()) expect(call).toEndWith(" -- :(glob,icase)assets/icon.png");
+  expect(shim.classifications()).toHaveLength(4);
+  const patterns = shim.classifications().filter((call) => call.includes(":(glob,icase)"));
+  expect(patterns).toHaveLength(2);
+  for (const call of patterns) expect(call).toEndWith(" -- :(glob,icase)assets/icon.png");
+  for (const call of shim.classifications()) expect(call).not.toContain("unrelated-");
 
   shim = gitShim(true);
   const previous = attributeLimits.timeoutMs;
@@ -1144,4 +1166,208 @@ test("worktreeGit rejects leading options that take a separate value", async () 
         .exitCode,
     ).toBe(0);
   });
+});
+
+test.each(["nul.test.ts", "sample.test.ts", "nul\ttest.test.ts", "nul\ntest.test.ts"])(
+  "binary bytes block hidden test content in %s; only the binary allowance suppresses it",
+  async (path) => {
+    writeFileSync(join(work, path), `// \0\n${edited}${original}`);
+    await commitAll(work, "test with NUL");
+    const diff = await diffSince(work, base);
+    expect(diff.patch).toContain("Binary files");
+    expect(diff.patch).not.toContain("test.skip(");
+    for (const allow of [
+      [],
+      ["submodules"],
+      ["gitattributes"],
+      ["submodules", "gitattributes"],
+      parseAllow("Please Allow: binary"),
+      parseAllow("> Allow: binary"),
+      parseAllow("Allow: binary, please"),
+      parseAllow("  ALLOW: Binary\r\n"),
+    ] as AuditAllowance[][]) {
+      const findings = auditDiff(diff, { taskClass: null, protectedPaths: [], allow });
+      const binary = findings.filter((f) => f.rule === "binary-content");
+      if (allow.includes("binary")) expect(binary).toEqual([]);
+      else {
+        expect(binary).toEqual([expect.objectContaining({ file: path, severity: "block" })]);
+        expect(binary[0]?.detail).toContain("NUL");
+        expect(binary[0]?.detail).toContain("hide the content from review");
+        expect(binary[0]?.detail).toContain("Allow: binary");
+      }
+    }
+  },
+);
+
+test.each([
+  ["unknown.blob", false, false],
+  ["added.png", false, false],
+  ["text.png", true, true],
+  ["binary.ts", true, false],
+])("binary content in %s uses its base classification (%s)", async (path, exists, blocks) => {
+  if (exists) {
+    writeFileSync(join(work, path), path === "binary.ts" ? Buffer.from([0, 1]) : "base text\n");
+    await commitAll(work, "base blob");
+  }
+  const revision = await headSha(work);
+  writeFileSync(join(work, path), Buffer.from([0, 2]));
+  await commitAll(work, "binary blob");
+  const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
+  expect(findings.some((f) => f.rule === "binary-content" && f.severity === "block")).toBe(blocks);
+});
+
+test("attributes cannot force a binary-content finding for text", async () => {
+  writeFileSync(join(work, ".gitattributes"), "*.ts binary\n");
+  writeFileSync(join(work, "sample.test.ts"), edited);
+  await commitAll(work, "hidden text");
+  const findings = await worktreeGitScope.run(false, async () =>
+    auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] }),
+  );
+  expect(attributeBlocksOf(findings).length).toBeGreaterThan(0);
+  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+});
+
+test("a rename from text to a binary image keeps its text origin", async () => {
+  const text = Array.from({ length: 200 }, (_, i) => `original line ${i}\n`).join("");
+  writeFileSync(join(work, "origin.txt"), text);
+  await commitAll(work, "text origin");
+  const revision = await headSha(work);
+  await git(work, "mv", "origin.txt", "moved.png");
+  writeFileSync(join(work, "moved.png"), `\0${text}`);
+  await commitAll(work, "renamed binary");
+  const diff = await diffSince(work, revision);
+  expect(diff.files).toContainEqual(expect.objectContaining({ path: "moved.png", from: "origin.txt" }));
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toContainEqual(
+    expect.objectContaining({ rule: "binary-content", severity: "block", file: "moved.png" }),
+  );
+});
+
+test.each([
+  ["src/**/*.impl.ts -diff", "block"],
+  ["*.png -diff", "warn"],
+  ["*.zip binary", "warn"],
+  ["*.woff2 -diff", "warn"],
+  ["*.mp4 -diff", "warn"],
+  ["*.unknown -diff", "block"],
+  ["* -diff", "block"],
+])("unmatched hiding rule %s produces a %s", async (line, severity) => {
+  writeFileSync(join(work, ".gitattributes"), `${line}\n`);
+  await commitAll(work, "unmatched rule");
+  const findings = auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] });
+  expect(findings).toContainEqual(
+    expect.objectContaining({
+      rule: "gitattributes",
+      severity,
+      file: ".gitattributes",
+      detail: expect.stringContaining(line.split(" ")[0] ?? ""),
+    }),
+  );
+  if (severity === "warn") {
+    expect(attributeBlocksOf(findings)).toEqual([]);
+    expect(findings[0]?.detail).toContain("matches no files yet");
+  }
+});
+
+test.each([
+  ["png", "valid", false],
+  ["\npointer.png", "valid", false],
+  ["ts", "valid", true],
+  ["png", "missing oid", true],
+  ["png", "missing size", true],
+  ["png", "invalid hash", true],
+  ["png", "invalid size", true],
+])("LFS pointer %s (%s) receives only the binary-path exemption", async (extension, kind, blocks) => {
+  let pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 68\n`;
+  if (kind === "missing oid") pointer = pointer.replace(/oid.*\n/, "");
+  if (kind === "missing size") pointer = pointer.replace(/size.*\n/, "");
+  if (kind === "invalid hash") pointer = pointer.replace("a".repeat(64), "bad");
+  if (kind === "invalid size") pointer = pointer.replace("size 68", "size -1");
+  writeFileSync(join(work, `pointer.${extension}`), pointer);
+  writeFileSync(
+    join(work, ".gitattributes"),
+    `${extension.endsWith("png") ? "*.png" : "pointer.ts"} filter=lfs diff=lfs merge=lfs -text\n`,
+  );
+  // Bypass any globally installed clean filter; commit exactly these pointer bytes.
+  await worktreeGit(["git", "-c", "filter.lfs.clean=cat", "-c", "filter.lfs.required=false", "add", "-A"], {
+    cwd: work,
+  });
+  await factory("commit", "-qm", "LFS pointer fixture");
+  const findings = auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] });
+  expect(attributeBlocksOf(findings).length > 0).toBe(blocks);
+  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+});
+
+test.each(["diff", "-diff"])(
+  "info attributes (%s) cannot alter binary-content classification",
+  async (attr) => {
+    const info = resolve(work, (await git(work, "rev-parse", "--git-path", "info/attributes")).stdout.trim());
+    writeFileSync(info, `*.ts ${attr}\n`);
+    writeFileSync(join(work, "sample.test.ts"), `// \0\n${edited}`);
+    await commitAll(work, "binary with info attributes");
+    const findings = auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] });
+    expect(findings).toContainEqual(
+      expect.objectContaining({
+        rule: "binary-content",
+        severity: "block",
+        file: "sample.test.ts",
+      }),
+    );
+  },
+);
+
+test("binary-content classification works for SHA-256 repositories", async () => {
+  const repo = join(dir, "sha256");
+  mkdirSync(repo);
+  await git(repo, "init", "-q", "--object-format=sha256");
+  await git(repo, "config", "user.name", "Test");
+  await git(repo, "config", "user.email", "test@example.com");
+  writeFileSync(join(repo, "old.txt"), "base text\n");
+  await git(repo, "add", "-A");
+  await git(repo, "commit", "-qm", "base");
+  const revision = await headSha(repo);
+  writeFileSync(join(repo, "old.txt"), "base\0text\n");
+  writeFileSync(join(repo, "new.ts"), "// \0\n");
+  await commitAll(repo, "binary");
+  expect(
+    auditDiff(await diffSince(repo, revision), { taskClass: null, protectedPaths: [] })
+      .filter((f) => f.rule === "binary-content")
+      .map((f) => f.file)
+      .sort(),
+  ).toEqual(["new.ts", "old.txt"]);
+});
+
+test.each(["diff", "-diff"])(
+  "global attributes (%s) cannot alter local binary classification",
+  async (attr) => {
+    const config = join(dir, "global.config");
+    const attrs = join(dir, "global.attributes");
+    writeFileSync(config, `[core]\nattributesFile = ${attrs}\n`);
+    writeFileSync(attrs, `*.ts ${attr}\n`);
+    writeFileSync(join(work, "sample.test.ts"), `// \0\n${edited}`);
+    await commitAll(work, "binary with global attributes");
+    const env = { ...(process.env as Record<string, string>), GIT_CONFIG_GLOBAL: config };
+    const findings = await worktreeGitScope.run(false, async () =>
+      auditDiff(await diffSince(work, base, env), { taskClass: null, protectedPaths: [] }),
+    );
+    expect(findings).toContainEqual(
+      expect.objectContaining({
+        rule: "binary-content",
+        severity: "block",
+        file: "sample.test.ts",
+      }),
+    );
+  },
+);
+
+test("moving an existing binary into a new source path blocks", async () => {
+  writeFileSync(join(work, "image.png"), Buffer.from([0, 1, 2]));
+  await commitAll(work, "binary base");
+  const revision = await headSha(work);
+  await git(work, "mv", "image.png", "hidden.test.ts");
+  await commitAll(work, "new source path");
+  const diff = await diffSince(work, revision);
+  expect(diff.files).toContainEqual(expect.objectContaining({ from: "image.png", path: "hidden.test.ts" }));
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toContainEqual(
+    expect.objectContaining({ rule: "binary-content", severity: "block", file: "hidden.test.ts" }),
+  );
 });

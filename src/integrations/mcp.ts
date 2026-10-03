@@ -214,7 +214,7 @@ export function createMcpServer(backend: McpBackend): Server {
           repo: nonblank,
           prompt: nonblank,
           title: nonblank.optional(),
-          allow: z.array(z.enum(["submodules", "gitattributes"])).optional(),
+          allow: z.array(z.enum(["submodules", "gitattributes", "binary"])).optional(),
           dependsOn: z.array(nonblank).optional(),
           profile: profile.default("auto"),
         })

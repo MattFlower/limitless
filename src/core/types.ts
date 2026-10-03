@@ -161,7 +161,7 @@ export interface Run {
 }
 
 /** Blocking audit rules a requester may explicitly allow. */
-export type AuditAllowance = "submodules" | "gitattributes";
+export type AuditAllowance = "submodules" | "gitattributes" | "binary";
 
 export interface Stage {
   id: number;

@@ -170,6 +170,13 @@ test("REST run creation accepts the allow option and prompt directives, and retr
   const created = [(await option.json()).id, (await directive.json()).id] as string[];
   expect(created.map((id) => f.factory.store.getRun(id)?.allow)).toEqual([["submodules"], ["gitattributes"]]);
   expect((await f.factory.retryRun(created[0] ?? "")).allow).toEqual(["submodules"]);
+  for (const payload of [{ prompt: "binary fixture", allow: ["binary"] }, { prompt: "Allow: binary" }]) {
+    const response = await post(payload);
+    expect(response.status).toBe(201);
+    const id = (await response.json()).id as string;
+    expect(f.factory.store.getRun(id)?.allow).toEqual(["binary"]);
+    expect((await f.factory.retryRun(id)).allow).toEqual(["binary"]);
+  }
   const invalid = await post({ prompt: "vendor", allow: ["submodules", "secrets"] });
   expect(invalid.status).toBeGreaterThanOrEqual(400);
   expect(await invalid.text()).toContain('Invalid allow value \\"secrets\\"');

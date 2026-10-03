@@ -314,7 +314,7 @@ describe("audit allowances and attribute rules", () => {
       "gitattributes",
     ]);
     expect(() => validateAllow(["submodules", "Submodules"])).toThrow('Invalid allow value "Submodules"');
-    expect(() => validateAllow([1])).toThrow("expected submodules or gitattributes");
+    expect(() => validateAllow([1])).toThrow("expected submodules,gitattributes,binary");
   });
 
   test("built-in diff drivers are harmless alone but not beside a hiding attribute", () => {
