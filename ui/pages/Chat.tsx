@@ -77,6 +77,7 @@ export const Chat: Component = () => {
       prompt: proposal.prompt,
       profile: proposal.profile,
       title: proposal.title,
+      allow: proposal.allow,
     });
     setEditing(proposal);
   };
@@ -109,6 +110,7 @@ export const Chat: Component = () => {
               Repo: {proposal.repo} · Profile: {proposal.profile} · {proposal.state}
             </div>
             <p style={{ "white-space": "pre-wrap", "overflow-wrap": "anywhere" }}>{proposal.prompt}</p>
+            <p>Allow: {proposal.allow?.join(", ") || "none"}</p>
             <Show when={proposal.runId}>
               <a href={`/runs/${proposal.runId}`}>View created run</a>
             </Show>

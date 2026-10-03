@@ -3,8 +3,9 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { attributeRules, newlyHidden } from "../gates/audit.ts";
 import { CommandError, sh } from "../util/proc.ts";
-import { emptyHookFlags, worktreeGit, worktreeGitScope } from "./command.ts";
+import { emptyHookFlags, NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -458,6 +459,15 @@ export interface DiffInfo {
   stat: string;
   added: number;
   removed: number;
+  gitlinks?: string[];
+  attributePatch?: string;
+  /** Text paths each exemptable attribute rule matches at base or head, keyed by rule. */
+  attributeMatches?: Record<string, string[]>;
+  /** Effective attributes of every changed path at base and head. */
+  attributes?: { path: string; base: Record<string, string>; head: Record<string, string> }[];
+  /** Newly hidden changed paths that are text at base or head. */
+  textPaths?: string[];
+  attributeErrors?: string[];
 }
 
 export async function diffSince(
@@ -467,11 +477,15 @@ export async function diffSince(
   threeDot = false,
 ): Promise<DiffInfo> {
   const range = `${baseSha}${threeDot ? "..." : ".."}HEAD`;
-  const [patch, names, stat, numstat] = await Promise.all([
-    worktreeGit(["git", "diff", range], { cwd, env }),
-    worktreeGit(["git", "diff", "--name-status", range], { cwd, env }),
-    worktreeGit(["git", "diff", "--stat", range], { cwd, env }),
-    worktreeGit(["git", "diff", "--numstat", range], { cwd, env }),
+  // Committed .gitmodules settings must not hide gitlinks from audit inputs.
+  const diff = (...args: string[]) =>
+    worktreeGit(["git", "diff", "--ignore-submodules=none", ...args], { cwd, env });
+  const [patch, names, stat, numstat, raw] = await Promise.all([
+    diff(range),
+    diff("--name-status", range),
+    diff("--stat", range),
+    diff("--numstat", range),
+    diff("--raw", "-z", "--no-renames", range),
   ]);
   let added = 0;
   let removed = 0;
@@ -481,7 +495,128 @@ export async function diffSince(
     removed += Number(r) || 0;
   }
   const files = parseNameStatus(names.stdout);
-  return { patch: patch.stdout, files, stat: stat.stdout, added, removed };
+  const gitlinks: string[] = [];
+  const changes: { path: string; from?: string }[] = [];
+  const entries = raw.stdout.split("\0");
+  for (let i = 0; i + 1 < entries.length; i += 2) {
+    if (entries[i]?.split(" ")[1] === "160000") gitlinks.push(entries[i + 1] ?? "");
+    const status = entries[i]?.split(" ").at(-1) ?? "";
+    const path = entries[i + 1] ?? "";
+    if (status.startsWith("D")) continue;
+    changes.push({ path, ...(status.startsWith("A") ? {} : { from: path }) });
+  }
+  const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
+  const inspection = await attributeInfo(cwd, env, range, revision, changes);
+  return { patch: patch.stdout, files, stat: stat.stdout, added, removed, gitlinks, ...inspection };
+}
+
+const LFS_POINTER = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:[0-9a-f]{64}\nsize \d+\n$/;
+/** Deadline for attribute queries and content classification; missing it blocks the audit. */
+export const attributeLimits = { timeoutMs: 60_000 };
+
+async function attributeInfo(
+  cwd: string,
+  env: Record<string, string> | undefined,
+  range: string,
+  base: string,
+  changes: { path: string; from?: string }[],
+): Promise<Partial<DiffInfo>> {
+  // Attribute files must be inspected even if binary or renamed into place.
+  const pathspecs = [":(icase).gitattributes", ":(icase)**/.gitattributes"];
+  const attributePatch = (
+    await worktreeGit(["git", "diff", "--text", "--no-renames", range, "--", ...pathspecs], { cwd, env })
+  ).stdout;
+  const timeoutMs = attributeLimits.timeoutMs;
+  const deadline = Date.now() + timeoutMs;
+  const git = (args: string[], stdin?: string) =>
+    worktreeGit(["git", ...args], { cwd, env, timeoutMs: Math.max(1, deadline - Date.now()), stdin });
+  const attributesAt = async (tree: string, paths: string[]) => {
+    if (!paths.length) return new Map<string, Record<string, string>>();
+    const names = ["diff", "binary", "text", "filter", "merge", "linguist-generated"];
+    const query = await git(["check-attr", `--source=${tree}`, "-z", "--stdin", ...names], paths.join("\0"));
+    const out = query.stdout.split("\0");
+    const result = new Map<string, Record<string, string>>();
+    for (let i = 0; i + 2 < out.length; i += 3) {
+      const path = out[i] ?? "";
+      result.set(path, { ...result.get(path), [out[i + 1] ?? ""]: out[i + 2] ?? "" });
+    }
+    return result;
+  };
+  // Text means no NUL in the first 8,000 bytes. The explicit empty attribute source applies
+  // even where worktreeGit is unhardened, so the run's own attributes cannot classify content.
+  // The empty tree's id depends on the repository's object format (SHA-1 or SHA-256).
+  let emptyTree: string | undefined;
+  const textAt = async (tree: string, pathspecs: string[]) => {
+    const text = new Set<string>();
+    if (!pathspecs.length) return text;
+    emptyTree ??= (await git(["hash-object", "-t", "tree", "--stdin"], "")).stdout.trim();
+    const EMPTY_TREE = emptyTree;
+    const args = ["--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", EMPTY_TREE, tree];
+    const out = await git([
+      `--attr-source=${EMPTY_TREE}`,
+      "-c",
+      NO_BIG_FILES,
+      "diff",
+      ...args,
+      "--",
+      ...pathspecs,
+    ]);
+    for (const entry of out.stdout.split("\0")) {
+      const match = entry.match(/^(\d+)\t\d+\t([\s\S]+)$/);
+      if (match?.[2]) text.add(match[2]);
+    }
+    // A Git LFS pointer, which `git lfs` commits for a tracked file, stands for binary content.
+    const candidates = [...text].filter((path) => !path.includes("\n"));
+    if (candidates.length) {
+      const objects = candidates.map((path) => `${tree}:${path}\n`).join("");
+      const sizes = (await git(["cat-file", "--batch-check=%(objectsize)"], objects)).stdout.split("\n");
+      for (const [i, path] of candidates.entries()) {
+        const size = Number(sizes[i]);
+        if (!(size > 0 && size <= 200)) continue;
+        if (LFS_POINTER.test((await git(["cat-file", "-p", `${tree}:${path}`])).stdout)) text.delete(path);
+      }
+    }
+    return text;
+  };
+  const textAtEither = async (pathspecs: string[]) => [
+    ...new Set([...(await textAt(base, pathspecs)), ...(await textAt("HEAD", pathspecs))]),
+  ];
+  try {
+    // Attributes of a path edited in place only differ when an attribute file changed too.
+    const queried = attributePatch ? changes : changes.filter((change) => change.from !== change.path);
+    // Compare the same head path in both trees, even when that path did not exist at base.
+    const sources = queried.map((change) => change.path);
+    const [before, after] = await Promise.all([
+      attributesAt(base, [...new Set(sources)]),
+      attributesAt(
+        "HEAD",
+        queried.map((change) => change.path),
+      ),
+    ]);
+    const baseOf = (from?: string) => (from === undefined ? undefined : before.get(from)) ?? {};
+    const attributes = queried.map(({ path }) => ({
+      path,
+      base: baseOf(path),
+      head: after.get(path) ?? {},
+    }));
+    const hidden = queried.filter(({ path }) => newlyHidden(baseOf(path), after.get(path) ?? {}).length);
+    const literal = (paths: (string | undefined)[]) =>
+      paths.flatMap((p) => (p === undefined ? [] : [`:(literal)${p}`]));
+    const [textBefore, textAfter] = await Promise.all([
+      textAt(base, literal(hidden.map((change) => change.from))),
+      textAt("HEAD", literal(hidden.map((change) => change.path))),
+    ]);
+    const textPaths = hidden
+      .filter(({ path, from }) => textAfter.has(path) || (from !== undefined && textBefore.has(from)))
+      .map((change) => change.path);
+    const attributeMatches: Record<string, string[]> = {};
+    for (const rule of attributeRules(attributePatch))
+      if (rule.exemptable) attributeMatches[rule.key] ??= await textAtEither([rule.pathspec]);
+    return { attributePatch, attributes, textPaths, attributeMatches };
+  } catch (error) {
+    const reason = Date.now() >= deadline ? `timed out after ${timeoutMs} ms` : String(error).split("\n")[0];
+    return { attributePatch, attributeErrors: [`attribute inspection ${reason}`] };
+  }
 }
 
 export function parseNameStatus(text: string): DiffFile[] {

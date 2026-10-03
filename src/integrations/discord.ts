@@ -493,7 +493,7 @@ export class DiscordIntegration {
             const proposal = reply.outcome?.proposal;
             let content = reply.content;
             if (proposal?.state === "pending")
-              content += `\nProposal: ${proposal.id}\nRepo: ${proposal.repo}\nTitle: ${proposal.title}\nProfile: ${proposal.profile}\nPrompt: ${proposal.prompt}\nMention me with: confirm ${proposal.id}\nTo edit, mention me with: edit ${proposal.id} {"repo":"...","prompt":"...","profile":"auto","title":"..."}\nEdits require fresh confirmation.`;
+              content += `\nProposal: ${proposal.id}\nRepo: ${proposal.repo}\nTitle: ${proposal.title}\nProfile: ${proposal.profile}\nPrompt: ${proposal.prompt}${proposal.allow?.length ? `\nAllow: ${proposal.allow.join(", ")}` : ""}\nMention me with: confirm ${proposal.id}\nTo edit, mention me with: edit ${proposal.id} {"repo":"...","prompt":"...","profile":"auto","title":"..."}\nEdits require fresh confirmation.`;
             if (reply.runId) content += `\n${this.runUrl(reply.runId)}`;
             for (let offset = 0; offset < content.length; offset += 1900)
               this.enqueue(message.channelId, content.slice(offset, offset + 1900));

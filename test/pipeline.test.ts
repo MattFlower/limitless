@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
-import type { Repo, Role, RunStatus, StageName } from "../src/core/types.ts";
+import type { CreateRunRequest, Repo, Role, RunStatus, StageName } from "../src/core/types.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
 import {
@@ -29,7 +29,7 @@ import {
 } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
-import { githubWebhook } from "../src/integrations/github.ts";
+import { githubWebhook, mapGitHubEvent } from "../src/integrations/github.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
 import { CancelledError, NoCapacityError, RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
@@ -7091,4 +7091,140 @@ describe("routing bounded slot waits", () => {
       for (const release of slots) release();
     }
   });
+});
+
+describe("audit allowances (fake agents, real git)", () => {
+  /** Commits a nested repository into the implementer's worktree, which Git records as a gitlink. */
+  const nestedRepository = async (cwd: string) => {
+    const nested = join(cwd, "vendor");
+    mkdirSync(nested, { recursive: true });
+    const git = (...args: string[]) =>
+      sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd: nested });
+    await git("init", "-q", "-b", "main");
+    writeFileSync(join(nested, "lib.txt"), `vendored ${Date.now()}\n`);
+    await git("add", ".");
+    await git("commit", "-qm", "vendored");
+  };
+  const audits = (f: Factory, runId: string) =>
+    f.store
+      .listEvents(runId)
+      .filter((event) => event.type === "audit" && event.level === "error")
+      .map((event) => event.message);
+
+  for (const [name, request, skip, blocked] of [
+    ["no opt-in", {}, false, ["gitlink", "gitattributes"]],
+    [
+      "inline mention",
+      { prompt: "Vendor the parser; do not use git submodules or gitattributes" },
+      false,
+      ["gitlink", "gitattributes"],
+    ],
+    ["submodules only", { prompt: "Vendor the parser\nAllow: submodules" }, false, ["gitattributes"]],
+    ["gitattributes option only", { allow: ["gitattributes"] }, false, ["gitlink"]],
+    ["both", { prompt: "Vendor the parser\r\nallow: SUBMODULES", allow: ["gitattributes"] }, false, []],
+    ["both with a skipped test", { allow: ["submodules", "gitattributes"] }, true, ["test-skipped"]],
+  ] as [string, Partial<CreateRunRequest>, boolean, string[]][]) {
+    test(`engine audit honors persisted allowances: ${name}`, async () => {
+      const prompts: string[] = [];
+      const f = start(async (s): Promise<FakeReply> => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        prompts.push(s.prompt);
+        await nestedRepository(s.cwd);
+        return {
+          files: {
+            ".gitattributes": "*.txt -diff\n",
+            "greeting.txt": `vendored ${prompts.length}\n`,
+            ...(skip ? { "a.test.ts": 'test.skip("hidden", () => {});\n' } : {}),
+          },
+        };
+      });
+      f.cfg.maxRounds = 1;
+      const run = await f.createRun({
+        repo: repoDir,
+        prompt: "Vendor the parser",
+        profile: "quick",
+        ...request,
+      });
+      const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
+      expect(status).toBe(blocked.length ? "needs_human" : "succeeded");
+      const messages = audits(f, run.id);
+      for (const rule of ["gitlink", "gitattributes", "test-skipped"])
+        expect([rule, messages.some((m) => m.startsWith(`[${rule}]`))]).toEqual([
+          rule,
+          blocked.includes(rule),
+        ]);
+      if (blocked.includes("gitlink")) {
+        expect(messages.find((m) => m.startsWith("[gitlink]"))).toContain("Remove the nested repository");
+        expect(prompts[1]).toContain("If this is intended, add `Allow: submodules` to the request.");
+      }
+      if (blocked.includes("gitattributes"))
+        expect(prompts[1]).toContain("If this is intended, add `Allow: gitattributes` to the request.");
+    });
+  }
+
+  for (const allowed of [true, false])
+    test(`verification repair audits honor persisted allowances: ${allowed ? "allowed" : "not allowed"}`, async () => {
+      const bare = join(home, "github.git");
+      await sh(["git", "clone", "-q", "--bare", repoDir, bare], { cwd: home });
+      const baseSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+      writeFileSync(join(repoDir, "version.txt"), "dependency 2\n");
+      await sh(["git", "add", "."], { cwd: repoDir });
+      await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "bump"], {
+        cwd: repoDir,
+      });
+      const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+      await sh(["git", "push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2"], { cwd: repoDir });
+      let implementations = 0;
+      const f = start(async (s): Promise<FakeReply> => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ task_class: "dependency_update" }) };
+        if (role === "review") {
+          const findings = implementations
+            ? []
+            : [
+                {
+                  severity: "major",
+                  file: "version.txt",
+                  line: 1,
+                  title: "Needs repair",
+                  detail: "Repair the update",
+                  suggestion: "Vendor the fixed parser",
+                  security: false,
+                  ...findingEvidence,
+                },
+              ];
+          return { structured: { ...approve, findings } };
+        }
+        implementations++;
+        await nestedRepository(s.cwd);
+        return { text: "Vendored the parser" };
+      });
+      f.deps.gh = async () => {};
+      f.cfg.maxRounds = 1;
+      f.store.upsertRepo({
+        slug: "MattFlower/limitless",
+        kind: "github",
+        url: bare,
+        localPath: null,
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const payload = JSON.parse(readFileSync(join(import.meta.dir, "data/github-pr.json"), "utf8"));
+      payload.pull_request.base.sha = baseSha;
+      payload.pull_request.head.sha = head;
+      const { request } = mapGitHubEvent("pull_request", payload, "MattFlower");
+      if (!request) throw new Error("fixture PR was not mapped");
+      // Dependabot never authorizes itself; this persisted allow list stands in for an owner opt-in.
+      expect(request.allow).toBeUndefined();
+      const run = await f.createRun({ ...request, ...(allowed ? { allow: ["submodules"] } : {}) }, true);
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        allowed ? "succeeded" : "needs_human",
+      );
+      expect(f.store.getRunState<RunState>(run.id)?.flow).toBe("verify-change");
+      const messages = audits(f, run.id);
+      expect(messages.some((m) => m.startsWith("[gitlink] vendor: Repair: vendor"))).toBe(!allowed);
+      expect(messages.some((m) => m.startsWith("[gitlink] vendor: vendor"))).toBe(!allowed);
+    });
 });

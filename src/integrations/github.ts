@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Factory } from "../app.ts";
+import { parseAllow } from "../core/allow.ts";
 import { isBranchName } from "../core/delivery.ts";
 import type { CreateRunRequest } from "../core/types.ts";
 import { inAnyCidr } from "../util/cidr.ts";
@@ -93,6 +94,7 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
         title,
         requestedBy: owner,
         sourceRef: { kind: "issue", repo: fullName, number: id },
+        allow: parseAllow(`${title}\n${string(issue?.body) ?? ""}`), // Owner-authored issue.
         prompt: `${GITHUB_PREFACES.issue}\n\n${quoted({ title, body: issue?.body ?? "" })}`,
       },
     };
@@ -113,6 +115,7 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
         title: `Issue #${id}: ${title}`,
         requestedBy: owner,
         sourceRef: { kind: "issue", repo: fullName, number: id },
+        allow: parseAllow(body.slice(11)), // The owner's request only, never the quoted issue.
         prompt: `${GITHUB_PREFACES.comment}\n\n${quoted({ request: body.slice(11), issueTitle: title, issueBody: issue?.body ?? "" })}`,
       },
     };
