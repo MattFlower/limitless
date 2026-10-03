@@ -4,7 +4,7 @@ import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { CommandError, sh } from "../util/proc.ts";
-import { worktreeGit, worktreeGitScope } from "./command.ts";
+import { emptyHookFlags, worktreeGit, worktreeGitScope } from "./command.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -495,6 +495,11 @@ export async function pushBranch(
     // An earlier push may have landed before its delivery was recorded; the user may have built on it.
     const head = (await worktreeGit(["git", "rev-parse", `${sha}^{commit}`], { cwd, signal })).stdout.trim();
     if (await isAncestor(repo.localPath, head, `refs/heads/${branch}`)) return;
+    // core.hooksPath doesn't cover config-defined hooks; blank the ones the source repository sees.
+    const quote = (arg: string) => `'${arg.replaceAll("'", "'\\''")}'`;
+    const receiveHooks = (await emptyHookFlags(["git"], { cwd: repo.localPath, signal }))
+      .map(quote)
+      .join(" ");
     await worktreeGit(
       [
         "git",
@@ -504,11 +509,16 @@ export async function pushBranch(
         "--no-verify",
         // An explicit refspec doesn't disable push.followTags; deleted source tags must stay deleted.
         "--no-follow-tags",
-        "--receive-pack=git -c core.hooksPath=/dev/null -c receive.denyCurrentBranch=refuse -c receive.autogc=false receive-pack",
+        `--receive-pack=git -c core.hooksPath=/dev/null -c receive.denyCurrentBranch=refuse -c receive.autogc=false ${receiveHooks} receive-pack`,
         repo.localPath,
         `${sha}:refs/heads/${branch}`,
       ],
-      { cwd, timeoutMs: 300_000, signal },
+      {
+        cwd,
+        timeoutMs: 300_000,
+        signal,
+        env: { ...(process.env as Record<string, string>), LIMITLESS_GIT_EMPTY_HOOK: "" },
+      },
     );
     return;
   }

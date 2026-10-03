@@ -688,6 +688,26 @@ describe("local factory clones", () => {
     expect(await git(repoDir, "rev-parse", "refs/heads/traced")).toBe(await git(work, "rev-parse", "HEAD"));
   });
 
+  test("config-defined receive hooks in the source repository never run during delivery", async () => {
+    const f = start(reply);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("missing repo");
+    const work = join(f.cfg.paths.work, run.id);
+    const marker = join(home, "config-hook-ran");
+    // Only the source sees these; the quote and '=' exercise the receive-pack shell quoting.
+    const name = "hook.source's x=y";
+    await git(repoDir, "config", `${name}.command`, `touch '${marker}'`);
+    for (const event of ["pre-receive", "update", "reference-transaction", "post-receive", "post-update"])
+      await git(repoDir, "config", "--add", `${name}.event`, event);
+    await pushBranch(repo, work, "config-hooked");
+    expect(existsSync(marker)).toBe(false);
+    expect(await git(repoDir, "rev-parse", "refs/heads/config-hooked")).toBe(
+      await git(work, "rev-parse", "HEAD"),
+    );
+  });
+
   test("delivery from a legacy worktree pushes nothing: the branch already lives in the source", async () => {
     const legacy = join(home, "legacy-work");
     await git(repoDir, "worktree", "add", "-q", "-b", "legacy-branch", legacy);
@@ -5633,13 +5653,21 @@ for (const phase of ["clarify", "spec"] as const) {
         if (role === "verify") return { structured: pass };
         return { files: { "farewell.txt": "goodbye\n" } };
       });
+      let drained = () => {};
+      const entered = new Promise<void>((resolve) => {
+        drained = resolve;
+      });
       const unsubscribe = f.store.subscribe((msg) => {
-        if (when === "entering" && msg.kind === "run" && msg.run.status === "waiting_input")
+        if (when === "entering" && msg.kind === "run" && msg.run.status === "waiting_input") {
           f.scheduler.drain();
+          drained();
+        }
       });
       try {
         const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
-        if (when !== "entering") {
+        // The parking deadline starts at the drain, not at run startup (clone, fetch, triage).
+        if (when === "entering") await entered;
+        else {
           await waitFor(f, run.id, ["waiting_input"]);
           f.scheduler.drain();
         }

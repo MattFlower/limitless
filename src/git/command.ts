@@ -34,17 +34,7 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
     "core.useReplaceRefs=false",
   ];
   // Discover includes, worktree, global, system and environment config with the same options.
-  // Config lookup cannot run hooks; errors other than "no matching keys" must fail closed.
-  const hooks = await sh([...prefix, "config", "--null", "--name-only", "--get-regexp", "^hook\\."], {
-    ...opts,
-    allowFail: false,
-  }).catch((error: unknown) => {
-    if (error instanceof CommandError && error.exitCode === 1) return { stdout: "" };
-    throw error;
-  });
-  // --config-env splits at the last '=', so hook subsection names may themselves contain '='.
-  for (const key of new Set(hooks.stdout.split("\0").filter(Boolean)))
-    prefix.push(`--config-env=${key}=LIMITLESS_GIT_EMPTY_HOOK`);
+  prefix.push(...(await emptyHookFlags(prefix, opts)));
   const env = { ...(opts.env ?? (process.env as Record<string, string>)), LIMITLESS_GIT_EMPTY_HOOK: "" };
   const inspection = ["diff", "log"].includes(cmd[command] ?? "");
   if (inspection) prefix.push("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904");
@@ -53,4 +43,20 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
     ...opts,
     env,
   });
+}
+
+/** Flags blanking every config-defined hook git sees as `git` in `opts.cwd`; needs LIMITLESS_GIT_EMPTY_HOOK="". */
+export async function emptyHookFlags(git: string[], opts: Parameters<typeof sh>[1]): Promise<string[]> {
+  // Config lookup cannot run hooks; errors other than "no matching keys" must fail closed.
+  const hooks = await sh([...git, "config", "--null", "--name-only", "--get-regexp", "^hook\\."], {
+    ...opts,
+    allowFail: false,
+  }).catch((error: unknown) => {
+    if (error instanceof CommandError && error.exitCode === 1) return { stdout: "" };
+    throw error;
+  });
+  // --config-env splits at the last '=', so hook subsection names may themselves contain '='.
+  return [...new Set(hooks.stdout.split("\0").filter(Boolean))].map(
+    (key) => `--config-env=${key}=LIMITLESS_GIT_EMPTY_HOOK`,
+  );
 }
