@@ -47,6 +47,7 @@ import { LaterReviewSchema, ReviewSchema, renderSpec, toStrictJsonSchema } from 
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
+import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewOutput } from "./evals-reading-support.ts";
 import { deferred } from "./evals-support.ts";
@@ -1594,6 +1595,176 @@ esac
       expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       expect(f.store.listInvocations(run.id).map((i) => i.provider)).toEqual(["alpha", "alpha", "beta"]);
       expect(f.store.getArtifact(run.id, "report.md")).not.toContain("Routing: free-first");
+    }
+  });
+
+  test.each([
+    "passes",
+    "twice",
+    "base",
+    "slot",
+    "cancel slot",
+    "cancel retry",
+    "mixed",
+    "unflagged",
+    "setup",
+    "retry setup failure",
+  ])("gate timeout: %s", async (scenario) => {
+    const limit = scenario === "twice" ? 37 : 900;
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\n${scenario.includes("setup") ? 'setup = ["fake-setup"]\n' : ""}checks = [{ name = "test", run = "fake-test", timeoutSec = ${limit} }${scenario === "mixed" ? ', { name = "lint", run = "fake-lint" }' : ""}]\n`,
+    );
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "timeout fixture"], {
+      cwd: repoDir,
+    });
+    const clock = waitClock();
+    const scheduled = [deferred<void>(), deferred<void>()];
+    const queued = deferred<void>();
+    const prompts: string[] = [];
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      prompts.push(s.prompt);
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const previous = gateSlots.limit;
+    gateSlots.setLimit(1);
+    let held: Promise<() => void> | undefined;
+    let release: (() => void) | undefined;
+    let calls = 0;
+    let waits = 0;
+    const realProcess = proc.runProcess;
+    const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
+      opts.signal?.throwIfAborted();
+      const attempt = calls++;
+      const isLint = opts.cmd[2] === "fake-lint";
+      const timeout =
+        scenario === "base"
+          ? attempt < 2
+          : attempt ===
+              (scenario === "mixed" || scenario === "setup"
+                ? 2
+                : scenario === "retry setup failure"
+                  ? 3
+                  : 1) ||
+            (["twice", "cancel retry"].includes(scenario) && attempt === 2);
+      const fail = (isLint && attempt === 3) || (scenario === "retry setup failure" && attempt === 4);
+      if (timeout && scenario !== "unflagged") {
+        if (scenario === "slot" || scenario === "cancel slot")
+          held = gateSlots.acquire(new AbortController().signal);
+        await new Promise<void>((resolve, reject) => {
+          const timer = clock.timer.set(resolve, opts.timeoutMs ?? 900_000);
+          opts.signal?.addEventListener(
+            "abort",
+            () => {
+              clock.timer.clear(timer);
+              reject(opts.signal?.reason);
+            },
+            { once: true },
+          );
+          scheduled[waits++]?.resolve();
+        });
+        opts.signal?.throwIfAborted();
+      }
+      return {
+        exitCode: timeout || fail ? 1 : 0,
+        signal: null,
+        cancelled: false,
+        timedOut: timeout && scenario !== "unflagged",
+        idleTimedOut: false,
+        truncated: false,
+        stdout: timeout
+          ? `${scenario === "unflagged" ? "[timed out] from nested tool\n" : ""}RUN slow acceptance test\nfarewell.txt:12\n`
+          : fail
+            ? "farewell.txt:12: lint error"
+            : "passed",
+        stderr: "",
+        durationMs: timeout ? (opts.timeoutMs ?? 900_000) : 1,
+      };
+    });
+    const addEvent = f.store.addEvent.bind(f.store);
+    const eventSpy = spyOn(f.store, "addEvent").mockImplementation((event) => {
+      if (event.message?.startsWith("Waiting for a gate slot")) queued.resolve();
+      return addEvent(event);
+    });
+    try {
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      if (scenario !== "unflagged") {
+        await scheduled[0]?.promise;
+        await clock.advance(900_000);
+        if (scenario === "base" || scenario === "twice") {
+          await scheduled[1]?.promise;
+          await clock.advance(900_000);
+        }
+      }
+      if (scenario === "slot" || scenario === "cancel slot") {
+        await queued.promise;
+        release = await held;
+        expect(calls).toBe(2);
+        if (scenario === "cancel slot") f.cancelRun(run.id);
+        release?.();
+      }
+      if (scenario === "cancel retry") {
+        await scheduled[1]?.promise;
+        f.cancelRun(run.id);
+      }
+      const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human", "cancelled"]);
+      const state = f.store.getRunState<RunState>(run.id);
+      if (scenario.startsWith("cancel")) {
+        expect(status).toBe("cancelled");
+        expect(prompts).toHaveLength(1);
+        expect(state?.gateTimeoutReruns).toBe(1);
+        expect(clock.pending).toBe(0);
+      } else if (scenario === "base") {
+        expect(status).toBe("needs_human");
+        expect(f.store.getRun(run.id)?.error).toBe("gate timed out on the base revision too");
+        expect(prompts).toHaveLength(1);
+        expect(calls).toBe(2);
+        expect(state?.feedback).toBeNull();
+        expect(f.store.getArtifact(run.id, "gates-0.json")).toContain('"timedOut": true');
+      } else {
+        expect(status).toBe("succeeded");
+        const retries = ["mixed", "unflagged", "setup"].includes(scenario) ? 0 : 1;
+        expect(state?.gateTimeoutReruns ?? 0).toBe(retries);
+        expect(prompts).toHaveLength(
+          ["twice", "mixed", "unflagged", "setup", "retry setup failure"].includes(scenario) ? 2 : 1,
+        );
+        if (scenario === "passes" || scenario === "slot") {
+          expect(state?.round).toBe(0);
+          expect(state?.feedback).toBeNull();
+        }
+        if (scenario === "twice") {
+          expect(prompts[1]).toContain("Check `test` timed out after 37 s twice");
+          expect(prompts[1]).toContain("the last test running was slow acceptance test");
+          expect(prompts[1]).not.toContain("now FAILS");
+          expect(calls).toBe(4);
+        }
+        if (retries) {
+          const evidence = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "[]");
+          if (scenario === "retry setup failure") {
+            expect(calls).toBe(7);
+            expect(prompts[1]).toContain("Check `setup` now FAILS");
+            expect(f.store.getArtifact(run.id, "gates-timeout-0.json")).toContain('"timedOut":true');
+          } else expect(evidence[0]?.firstAttempt?.timedOut).toBe(true);
+          expect(evidence[0]?.result.timedOut ?? false).toBe(scenario === "twice");
+          expect(f.store.getArtifact(run.id, "report.md")).toContain("Timeout-caused gate re-runs: 1");
+          expect(
+            f.store
+              .readFeed({ limit: 1000 })
+              .items.filter((item) => item.runId === run.id && item.kind === "run.gate_timeout_retry"),
+          ).toMatchObject([{ summary: "Timeout-caused gate re-runs: 1", data: { gateTimeoutReruns: 1 } }]);
+        }
+      }
+    } finally {
+      release?.();
+      if (held) (await held)();
+      await f.stop();
+      processSpy.mockRestore();
+      eventSpy.mockRestore();
+      gateSlots.setLimit(previous);
     }
   });
 
