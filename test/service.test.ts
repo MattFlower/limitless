@@ -69,6 +69,7 @@ type MigrationResult = {
   error: string;
   calls: string[];
   loaded: string[];
+  draining: boolean;
   old: string;
   time: number;
   files: Record<string, string>;
@@ -132,7 +133,15 @@ for (const scenario of ["bootstrap", "partial", "health", "wrong-sha"]) {
   });
 }
 
-for (const scenario of ["drain", "bootout", "stuck", "collision", "duplicate"]) {
+for (const scenario of [
+  "drain",
+  "drain-health",
+  "unsupported",
+  "bootout",
+  "stuck",
+  "collision",
+  "duplicate",
+]) {
   test(`${scenario} failure preserves the installed agent and avoids bootstrap`, async () => {
     const { result: r } = await migration(scenario);
     expect(r.error).not.toBe("");
@@ -140,8 +149,24 @@ for (const scenario of ["drain", "bootout", "stuck", "collision", "duplicate"]) 
     expect(r.loaded).toContain("arbitrary.installed.daemon");
     expect(r.calls.some((call) => call.startsWith("bootstrap"))).toBe(false);
     expect(r.files["dev.limitless.daemon.plist"]).toBeUndefined();
+    if (["drain", "drain-health", "unsupported", "bootout", "stuck"].includes(scenario))
+      expect(r.calls.at(-1)).toBe("resume");
+    else expect(r.calls).not.toContain("resume");
+    expect(r.draining).toBe(false);
+    expect(r.files["unrelated.plist"]).toBe(r.unrelated);
   });
 }
+
+test("a failed resume reports both the original failure and the cleanup failure", async () => {
+  const { result: r } = await migration("resume-failure");
+  expect(r.error).toContain("drain failed");
+  expect(r.error).toContain("Resume scheduler failed: Error: resume failed");
+  expect(r.calls).toEqual(["drain", "resume"]);
+  expect(r.draining).toBe(true);
+  expect(r.files["original.plist"]).toBe(r.old);
+  expect(r.loaded).toContain("arbitrary.installed.daemon");
+  expect(r.files["dev.limitless.daemon.plist"]).toBeUndefined();
+});
 
 test("rollback reports both the replacement and restoration failures", async () => {
   const { result: r } = await migration("restore");

@@ -278,11 +278,22 @@ export async function install(
     if (existsSync(path) && old?.path !== path) throw new Error(`unrelated agent: ${path}`);
     if (old?.label !== label && (await isLoaded(label))) throw new Error(`unrecognized agent: ${label}`);
     const saved = old ? readFileSync(old.path) : null;
-    if (old && label === LABEL && (await isLoaded(old.label))) {
-      await requestAdmin(client, clock, "drain");
-      await waitForDrain(client, clock, DEFAULT_MAX_WAIT_MS, false, console.log);
+    let drainAttempted = false;
+    try {
+      if (old && label === LABEL && (await isLoaded(old.label))) {
+        drainAttempted = true;
+        await requestAdmin(client, clock, "drain");
+        await waitForDrain(client, clock, DEFAULT_MAX_WAIT_MS, false, console.log);
+      }
+      if (old) await stop(old.label);
+    } catch (error) {
+      try {
+        if (drainAttempted && old && (await isLoaded(old.label))) await requestAdmin(client, clock, "resume");
+      } catch (resume) {
+        throw new Error(`${String(error)}\nResume scheduler failed: ${String(resume)}`, { cause: error });
+      }
+      throw error;
     }
-    if (old) await stop(old.label);
     try {
       if (old) unlinkSync(old.path);
       writeFileSync(path, content);

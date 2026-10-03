@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import * as os from "node:os";
 import { join } from "node:path";
 import type { DeployClient, DeployClock } from "../../src/cli/deploy-wait.ts";
+import { DrainUnsupportedError } from "../../src/cli/deploy-wait.ts";
 import type { sh } from "../../src/util/proc.ts";
 
 const home = process.env.SERVICE_TEST_HOME;
@@ -125,12 +126,16 @@ const command: typeof sh = async (argv) => {
 const client: DeployClient = {
   async admin(action) {
     calls.push(action);
+    if (action === "resume" && scenario === "resume-failure") throw new Error("resume failed");
     draining = action === "drain";
-    if (scenario === "drain") throw new Error("drain failed");
+    if (action === "drain" && ["drain", "resume-failure"].includes(scenario)) throw new Error("drain failed");
+    if (action === "drain" && scenario === "unsupported")
+      throw new DrainUnsupportedError("no drain endpoint");
     return { draining, active: [] };
   },
   async health() {
     calls.push(`health ${draining ? "draining" : "fresh"}`);
+    if (draining && scenario === "drain-health") throw new Error("drain health failed");
     if (["health", "wrong-sha"].includes(scenario) && loaded.has(neutral)) {
       if (scenario === "health") throw new Error("replacement health failed");
       return { ok: true, uptimeMs: 1, sha: "wrong", draining: false, active: [] };
@@ -172,6 +177,7 @@ console.log(
     error,
     calls,
     loaded: [...loaded],
+    draining,
     old,
     time,
     files: Object.fromEntries(
