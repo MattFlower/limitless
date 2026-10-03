@@ -1,7 +1,7 @@
 import type { Component } from "solid-js";
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { roleDescription } from "../../src/core/role-descriptions.ts";
-import type { Invocation, Role } from "../../src/core/types.ts";
+import { roleDescription, roleLabel } from "../../src/core/role-descriptions.ts";
+import type { Invocation } from "../../src/core/types.ts";
 import { compactNumber, duration, truncate } from "../lib/format.ts";
 import { invocationModelLabel } from "../lib/invocation-model.ts";
 import { now } from "../lib/ticker.ts";
@@ -19,7 +19,7 @@ const STATUS_BADGE: Record<string, string> = {
   running: "info",
 };
 
-const RoleHelp: Component<{ role: Role; id: number }> = (props) => {
+const RoleHelp: Component<{ role: Invocation["role"]; id: number }> = (props) => {
   const [open, setOpen] = createSignal(false);
   const [position, setPosition] = createSignal({ top: 0, left: 0 });
   let button: HTMLButtonElement | undefined;
@@ -46,7 +46,7 @@ const RoleHelp: Component<{ role: Role; id: number }> = (props) => {
         ref={button}
         type="button"
         class="role-help-button"
-        aria-label={`About ${props.role} role`}
+        aria-label={`About ${roleLabel(props.role)} role`}
         aria-describedby={open() ? `role-help-${props.id}` : undefined}
         aria-expanded={open()}
         onPointerEnter={show}
@@ -122,7 +122,7 @@ export const InvocationsTable: Component<{
               title="Click to filter the event log to this invocation"
             >
               <td class="mono">
-                {inv.role} <RoleHelp role={inv.role} id={inv.id} />
+                {roleLabel(inv.role)} <RoleHelp role={inv.role} id={inv.id} />
               </td>
               <td class="mono text-accent">{invocationModelLabel(inv)}</td>
               <td class="mono text-faint">{inv.provider}</td>

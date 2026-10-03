@@ -16,7 +16,11 @@ export const ROLE_DESCRIPTIONS: Record<Role, string> = {
   chat: "Handles conversation with the user so requests and status questions can be understood.",
 };
 
+export const roleLabel = (role: string): string => (role === "review_shadow" ? "shadow review" : role);
+
 export function roleDescription(role: string): string {
+  if (role === "review_shadow")
+    return "Runs the review panel beside the single review so its findings can be compared; it never decides the run.";
   return Object.hasOwn(ROLE_DESCRIPTIONS, role)
     ? ROLE_DESCRIPTIONS[role as Role]
     : "This invocation has a role this version of Limitless does not recognize. Its purpose is unavailable here.";

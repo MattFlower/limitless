@@ -1106,7 +1106,7 @@ describe("bounded provider waits", () => {
     expect(tracker.status("claude")?.inFlight).toBe(0);
   });
 
-  test("requeued admission emits one event and retains the original budget", async () => {
+  test("a released slot goes to the woken budgeted waiter before a newcomer; one wait event", async () => {
     const { clock, tracker, signal } = fixture();
     const release = await tracker.acquire("claude", signal);
     const positions: number[] = [];
@@ -1115,13 +1115,101 @@ describe("bounded provider waits", () => {
     });
     await clock.advance(40);
     release();
-    const stolen = await tracker.acquire("claude", signal);
-    await clock.flush();
+    // Before the woken waiter has taken its slot, a newcomer queues behind it instead of taking it.
+    let newcomerAdmitted = false;
+    const newcomer = tracker.acquire("claude", signal).then((done) => {
+      newcomerAdmitted = true;
+      return done;
+    });
+    const admitted = await pending;
+    expect(admitted).not.toBeNull();
+    expect(newcomerAdmitted).toBe(false);
     expect(positions).toEqual([0]);
-    await clock.advance(60);
-    expect(await pending).toBeNull();
+    admitted?.();
+    (await newcomer)();
+    await clock.flush();
     expect(clock.pending).toBe(0);
-    stolen();
+    expect(tracker.status("claude")?.inFlight).toBe(0);
+  });
+
+  test("a budgeted production waiter preempts a shadow call and takes its slot", async () => {
+    const { clock, tracker, signal } = fixture();
+    let preempted = 0;
+    let shadowRelease: (() => void) | null = null;
+    shadowRelease = tracker.tryAcquire("openrouter", () => {
+      preempted++;
+      // The aborted call stops shortly after the preemption, freeing its slot.
+      queueMicrotask(() => shadowRelease?.());
+    });
+    expect(shadowRelease).toBeFunction();
+    const busy = await tracker.acquire("openrouter", signal);
+    const admitted = await tracker.acquire("openrouter", signal, 100);
+    expect(admitted).toBeFunction();
+    expect(preempted).toBe(1);
+    expect(tracker.status("openrouter")?.inFlight).toBe(2);
+    admitted?.();
+    busy();
+    await clock.flush();
+    expect(clock.pending).toBe(0);
+    expect(tracker.status("openrouter")?.inFlight).toBe(0);
+  });
+
+  test("an expired heir gives up its claim; the next waiter preempts again and takes the slot", async () => {
+    const { clock, tracker, signal } = fixture();
+    let preempted = 0;
+    // A shadow call that is slow to stop after its preemption.
+    const shadowRelease = tracker.tryAcquire("openrouter", () => {
+      preempted++;
+    });
+    const busy = await tracker.acquire("openrouter", signal);
+    const expired = tracker.acquire("openrouter", signal, 100);
+    await clock.advance(100);
+    expect(await expired).toBeNull();
+    expect(preempted).toBe(1);
+    const next = tracker.acquire("openrouter", signal);
+    await clock.flush();
+    expect(preempted).toBe(2);
+    shadowRelease?.();
+    const admitted = await next;
+    expect(tracker.status("openrouter")?.inFlight).toBe(2);
+    admitted();
+    busy();
+    expect(clock.pending).toBe(0);
+    expect(tracker.status("openrouter")?.inFlight).toBe(0);
+  });
+
+  test("a given-up claim on a shadow's slot passes to the oldest waiter, not a newcomer", async () => {
+    const { clock, tracker, signal } = fixture();
+    const shadowRelease = tracker.tryAcquire("openrouter", () => {});
+    const busy = await tracker.acquire("openrouter", signal);
+    const order: string[] = [];
+    const first = tracker.acquire("openrouter", signal, 20);
+    const queued = tracker.acquire("openrouter", signal).then((release) => {
+      order.push("queued");
+      return release;
+    });
+    await clock.advance(20);
+    expect(await first).toBeNull();
+    const newcomer = tracker.acquire("openrouter", signal).then((release) => {
+      order.push("newcomer");
+      return release;
+    });
+    shadowRelease?.();
+    (await queued)();
+    (await newcomer)();
+    busy();
+    expect(order).toEqual(["queued", "newcomer"]);
+    expect(clock.pending).toBe(0);
+    expect(tracker.status("openrouter")?.inFlight).toBe(0);
+  });
+
+  test("a waiter whose wait notice aborts it leaves at once", async () => {
+    const { tracker, signal } = fixture();
+    const busy = await tracker.acquire("claude", signal);
+    const cancel = new AbortController();
+    const rejected = tracker.acquire("claude", cancel.signal, undefined, () => cancel.abort());
+    expect(await rejected.catch((error: Error) => error.message)).toBe("cancelled");
+    busy();
     expect(tracker.status("claude")?.inFlight).toBe(0);
   });
 

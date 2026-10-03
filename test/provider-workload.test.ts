@@ -2,6 +2,8 @@ import { expect, setSystemTime, test } from "bun:test";
 import { computeProviderWorkload } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import { emptyUsage } from "../src/harness/types.ts";
+import type { ProviderDef } from "../src/router/catalog.ts";
+import { ProviderTracker } from "../src/router/providers.ts";
 import { workloadFor } from "../ui/lib/provider-workload.ts";
 
 function localDay(dayOffset: number, hour = 0): number {
@@ -99,6 +101,250 @@ test("recorded concierge duration contributes to workload", () => {
     });
   } finally {
     setSystemTime();
+    store.close();
+  }
+});
+
+const tracked = (maxConcurrent: number) => {
+  const store = new Store(":memory:");
+  const reserves = { claudeFiveHour: 0.8, claudeSevenDay: 0.85, codexWeekly: 0.9, codexFiveHour: 0.9 };
+  const def: ProviderDef = {
+    id: "alpha",
+    label: "Alpha",
+    harness: "fake",
+    billing: "subscription",
+    maxConcurrent,
+  };
+  return { store, tracker: new ProviderTracker([def], store, reserves, {}) };
+};
+const noop = () => {};
+
+test("a shadow slot needs two free slots and nobody queued: never the last slot, never queued", async () => {
+  const single = tracked(1);
+  try {
+    // A one-slot provider never admits shadow work, even idle.
+    expect(single.tracker.tryAcquire("alpha", noop)).toBeNull();
+    expect(single.tracker.tryAcquire("unknown", noop)).toBeNull();
+  } finally {
+    single.store.close();
+  }
+  const { store, tracker } = tracked(3);
+  try {
+    const signal = new AbortController().signal;
+    const shadows = [tracker.tryAcquire("alpha", noop), tracker.tryAcquire("alpha", noop)];
+    expect(shadows).toEqual([expect.any(Function), expect.any(Function)]);
+    // One of three free: a third shadow call would take the last slot, so it gets nothing at once.
+    expect(tracker.tryAcquire("alpha", noop)).toBeNull();
+    for (const release of shadows) {
+      release?.();
+      release?.(); // a repeated release frees nothing more
+    }
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+    const held = await Promise.all([1, 2, 3].map(() => tracker.acquire("alpha", signal)));
+    expect(tracker.status("alpha")?.inFlight).toBe(3);
+    const order: string[] = [];
+    const waiter = tracker.acquire("alpha", signal).then((release) => {
+      order.push("waiter");
+      return release;
+    });
+    await Bun.sleep(0);
+    // A release wakes the waiter; a fresh production call doesn't take the slot reserved for it.
+    held[0]?.();
+    const fresh = tracker.acquire("alpha", signal).then((release) => {
+      order.push("fresh");
+      return release;
+    });
+    // Both released slots are reserved for woken waiters until they take them: none for a shadow.
+    held[1]?.();
+    expect(tracker.tryAcquire("alpha", noop)).toBeNull();
+    (await waiter)();
+    (await fresh)();
+    expect(order).toEqual(["waiter", "fresh"]);
+    held[2]?.();
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+    const later = tracker.tryAcquire("alpha", noop);
+    expect(later).toBeFunction();
+    later?.();
+  } finally {
+    store.close();
+  }
+});
+
+test("a production call preempts a shadow holder and takes its slot ahead of the queue", async () => {
+  const { store, tracker } = tracked(3);
+  try {
+    const signal = new AbortController().signal;
+    const preempted: string[] = [];
+    const shadow = tracker.tryAcquire("alpha", () => preempted.push("shadow"));
+    expect(shadow).toBeFunction();
+    const held = await Promise.all([1, 2].map(() => tracker.acquire("alpha", signal)));
+    const order: string[] = [];
+    const take = (name: string, s = signal) =>
+      tracker.acquire("alpha", s).then((release) => {
+        order.push(name);
+        return release;
+      });
+    // Saturated: the next production call aborts the shadow call at once, through its own callback.
+    const priority = take("priority");
+    expect(preempted).toEqual(["shadow"]);
+    // No other shadow to preempt: this one queues behind.
+    const queued = take("queued");
+    await Bun.sleep(0);
+    expect(preempted).toEqual(["shadow"]);
+    shadow?.();
+    shadow?.();
+    (await priority)();
+    expect(order).toEqual(["priority"]);
+    (await queued)();
+    for (const release of held) release();
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+
+    // A cancelled priority waiter leaves the queue: the shadow's release goes to the next waiter.
+    const again: string[] = [];
+    const second = tracker.tryAcquire("alpha", () => again.push("shadow"));
+    const busy = await Promise.all([1, 2].map(() => tracker.acquire("alpha", signal)));
+    const cancel = new AbortController();
+    const gone = take("gone", cancel.signal).catch((error: Error) => error.message);
+    const next = take("next");
+    expect(again).toEqual(["shadow"]);
+    cancel.abort();
+    expect(await gone).toBe("cancelled");
+    second?.();
+    (await next)();
+    expect(order).toEqual(["priority", "queued", "next"]);
+    for (const release of busy) release();
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+  } finally {
+    store.close();
+  }
+});
+
+test("each preemptor receives the slot its own shadow releases, before other waiters", async () => {
+  const { store, tracker } = tracked(4);
+  try {
+    const signal = new AbortController().signal;
+    const preempted: string[] = [];
+    const first = tracker.tryAcquire("alpha", () => preempted.push("s1"));
+    const second = tracker.tryAcquire("alpha", () => preempted.push("s2"));
+    const held = await Promise.all([1, 2].map(() => tracker.acquire("alpha", signal)));
+    const order: string[] = [];
+    const take = (name: string, s = signal) =>
+      tracker.acquire("alpha", s).then((release) => {
+        order.push(name);
+        return release;
+      });
+    const p1 = take("first");
+    const p2 = take("second");
+    const queued = take("queued");
+    expect(preempted).toEqual(["s1", "s2"]);
+    // No free slot is ever offered to a shadow while a preemptor waits.
+    expect(tracker.tryAcquire("alpha", noop)).toBeNull();
+    // Each shadow's release goes to the preemptor that aborted it, whatever order they finish in.
+    first?.();
+    await Bun.sleep(0);
+    expect(order).toEqual(["first"]);
+    second?.();
+    await Bun.sleep(0);
+    expect(order).toEqual(["first", "second"]);
+    (await p1)();
+    (await p2)();
+    (await queued)();
+    for (const release of held) release();
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+
+    // A production release goes to the earliest preemptor; that one's shadow then serves the next.
+    order.length = 0;
+    const s3 = tracker.tryAcquire("alpha", noop);
+    const s4 = tracker.tryAcquire("alpha", noop);
+    const busy = await Promise.all([1, 2].map(() => tracker.acquire("alpha", signal)));
+    const cancel = new AbortController();
+    const a = take("a");
+    const gone = take("gone", cancel.signal).catch((error: Error) => error.message);
+    const tail = take("tail");
+    // The cancelled preemptor's reservation lapses: its shadow's release serves the queue.
+    cancel.abort();
+    expect(await gone).toBe("cancelled");
+    busy[0]?.();
+    await Bun.sleep(0);
+    expect(order).toEqual(["a"]);
+    s4?.();
+    await Bun.sleep(0);
+    expect(order).toEqual(["a", "tail"]);
+    s3?.();
+    s3?.();
+    (await a)();
+    (await tail)();
+    busy[1]?.();
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+  } finally {
+    store.close();
+  }
+});
+
+test("a woken production waiter that has not resumed keeps a shadow out, whatever else is free", async () => {
+  const { store, tracker } = tracked(4);
+  try {
+    const signal = new AbortController().signal;
+    const held = await Promise.all([1, 2, 3, 4].map(() => tracker.acquire("alpha", signal)));
+    let resumed = false;
+    const waiter = tracker.acquire("alpha", signal).then((release) => {
+      resumed = true;
+      return release;
+    });
+    await Bun.sleep(0);
+    // Three releases in one turn: the waiter is woken but has not run yet, and two slots are free.
+    for (const release of held.slice(0, 3)) release?.();
+    expect(resumed).toBe(false);
+    expect(tracker.tryAcquire("alpha", noop)).toBeNull();
+    (await waiter)();
+    const shadow = tracker.tryAcquire("alpha", noop);
+    expect(shadow).toBeFunction();
+    shadow?.();
+    held[3]?.();
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+  } finally {
+    store.close();
+  }
+});
+
+test("a waiter cancelled in the same turn as its slot frees never holds it", async () => {
+  const { store, tracker } = tracked(2);
+  try {
+    const signal = new AbortController().signal;
+    // A preemptor cancelled just before its shadow releases: the slot stays free, not leaked.
+    const shadow = tracker.tryAcquire("alpha", noop);
+    const busy = await tracker.acquire("alpha", signal);
+    const cancel = new AbortController();
+    const gone = tracker.acquire("alpha", cancel.signal).then(
+      () => "acquired",
+      (error: Error) => error.message,
+    );
+    cancel.abort();
+    shadow?.();
+    expect(await gone).toBe("cancelled");
+    expect(tracker.status("alpha")?.inFlight).toBe(1);
+
+    // A queued waiter cancelled right after its wake passes the slot on to the next in line.
+    const other = await tracker.acquire("alpha", signal);
+    const late = new AbortController();
+    const dropped = tracker.acquire("alpha", late.signal).then(
+      () => "acquired",
+      (error: Error) => error.message,
+    );
+    const order: string[] = [];
+    const next = tracker.acquire("alpha", signal).then((release) => {
+      order.push("next");
+      return release;
+    });
+    await Bun.sleep(0);
+    busy();
+    late.abort();
+    expect(await dropped).toBe("cancelled");
+    (await next)();
+    expect(order).toEqual(["next"]);
+    other();
+    expect(tracker.status("alpha")?.inFlight).toBe(0);
+  } finally {
     store.close();
   }
 });
