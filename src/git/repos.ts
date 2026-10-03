@@ -554,40 +554,44 @@ async function attributeInfo(
   // Text means no NUL in the first 8,000 bytes. The explicit empty attribute source applies
   // even where worktreeGit is unhardened, so the run's own attributes cannot classify content.
   // The empty tree's id depends on the repository's object format (SHA-1 or SHA-256).
-  let emptyTree: string | undefined;
+  let emptyTree: Promise<string> | undefined;
+  const emptyTreeOf = () =>
+    (emptyTree ??= git(["hash-object", "-t", "tree", "--stdin"], "").then(({ stdout }) => stdout.trim()));
   const matches = new Set<string>();
   const basePointers = new Set<string>();
   const pointers = new Map<string, boolean>();
   const scratch = mkdtempSync(join(tmpdir(), "limitless-classify-"));
-  const scratchGit = (args: string[], stdin?: string) => git([`--git-dir=${scratch}`, ...args], stdin);
-  const textAt = async (tree: string, pathspecs: string[], lfs = true) => {
-    const text = new Set<string>();
-    if (!pathspecs.length) return text;
-    emptyTree ??= (await git(["hash-object", "-t", "tree", "--stdin"], "")).stdout.trim();
-    const EMPTY_TREE = emptyTree;
-    await scratchGit(["read-tree", EMPTY_TREE]);
-    await scratchGit(
-      ["reset", "-q", tree, "--pathspec-from-file=-", "--pathspec-file-nul"],
-      `${pathspecs.join("\0")}\0`,
-    );
+  let indexes = 0;
+  const scratchGit = (args: string[], stdin?: string, index = join(scratch, "index")) =>
+    worktreeGit(["git", `--git-dir=${scratch}`, ...args], {
+      cwd,
+      env: { ...(env ?? (process.env as Record<string, string>)), GIT_INDEX_FILE: index },
+      timeoutMs: Math.max(1, deadline - Date.now()),
+      stdin,
+    });
+  /** `raw` is every text path; `text` excludes LFS pointers standing in for binary files. */
+  const textAt = async (tree: string, pathspecs: string[], seen = matches) => {
+    const raw = new Set<string>();
+    if (!pathspecs.length) return { raw, text: raw };
+    const EMPTY_TREE = await emptyTreeOf();
+    // A fresh index per query lets classifications run concurrently.
+    const index = join(scratch, `index-${indexes++}`);
+    const specs = `${pathspecs.join("\0")}\0`;
+    await scratchGit(["reset", "-q", tree, "--pathspec-from-file=-", "--pathspec-file-nul"], specs, index);
     const flags = ["--cached", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv"];
-    const out = await scratchGit([
-      `--attr-source=${EMPTY_TREE}`,
-      "-c",
-      NO_BIG_FILES,
-      "diff",
-      ...flags,
-      EMPTY_TREE,
-    ]);
+    const args = [`--attr-source=${EMPTY_TREE}`, "-c", NO_BIG_FILES, "diff", ...flags, EMPTY_TREE];
+    const out = await scratchGit(args, undefined, index);
+    rmSync(index, { force: true });
     for (const entry of out.stdout.split("\0")) {
       const match = entry.match(/^(\d+|-)\t(?:\d+|-)\t([\s\S]+)$/);
       if (match?.[2]) {
-        matches.add(match[2]);
-        if (match[1] !== "-") text.add(match[2]);
+        seen.add(match[2]);
+        if (match[1] !== "-") raw.add(match[2]);
       }
     }
     // A Git LFS pointer, which `git lfs` commits for a tracked file, stands for binary content.
-    const candidates = lfs ? [...text] : [];
+    const text = new Set(raw);
+    const candidates = [...raw];
     if (candidates.length) {
       const input = candidates.map((path) => `${tree}:${path}\0`).join("");
       const sizes = (
@@ -609,15 +613,24 @@ async function attributeInfo(
         }
       }
     }
-    return text;
+    return { raw, text };
   };
-  const textAtEither = async (pathspecs: string[]) => [
-    ...new Set([...(await textAt(base, pathspecs)), ...(await textAt("HEAD", pathspecs))]),
-  ];
+  const textAtEither = async (pathspecs: string[], seen: Set<string>) => {
+    const [before, after] = await Promise.all([
+      textAt(base, pathspecs, seen),
+      textAt("HEAD", pathspecs, seen),
+    ]);
+    return [...new Set([...before.text, ...after.text])];
+  };
   try {
     mkdirSync(join(scratch, "refs"));
-    writeFileSync(join(scratch, "HEAD"), (await git(["rev-parse", "HEAD"])).stdout);
-    const objects = resolve(cwd, (await git(["rev-parse", "--git-path", "objects"])).stdout.trim());
+    const [head, objectsPath] = await Promise.all([
+      git(["rev-parse", "HEAD"]),
+      git(["rev-parse", "--git-path", "objects"]),
+      emptyTreeOf(),
+    ]);
+    writeFileSync(join(scratch, "HEAD"), head.stdout);
+    const objects = resolve(cwd, objectsPath.stdout.trim());
     mkdirSync(join(scratch, "objects", "info"), { recursive: true });
     writeFileSync(join(scratch, "objects", "info", "alternates"), `${objects}\n`);
     writeFileSync(
@@ -626,14 +639,26 @@ async function attributeInfo(
     );
     // Attributes of a path edited in place only differ when an attribute file changed too.
     const queried = attributePatch ? changes : changes.filter((change) => change.from !== change.path);
+    const literal = (paths: (string | undefined)[]) =>
+      paths.flatMap((p) => (p === undefined ? [] : [`:(literal)${p}`]));
+    const rules = attributeRules(attributePatch).filter((rule) => rule.exemptable);
+    const keys = [...new Map(rules.map((rule) => [rule.key, rule.pathspec])).entries()];
+    // Independent queries run concurrently; each classification uses its own scratch index.
     // Compare the same head path in both trees, even when that path did not exist at base.
     const sources = queried.map((change) => change.path);
-    const [before, after] = await Promise.all([
+    const audit = ["diff", "--ignore-submodules=none", "--no-ext-diff", "--no-textconv", range];
+    const [before, after, beforeText, afterText, found, patch] = await Promise.all([
       attributesAt(base, [...new Set(sources)]),
-      attributesAt(
-        "HEAD",
-        queried.map((change) => change.path),
+      attributesAt("HEAD", sources),
+      textAt(base, literal(changes.map((c) => c.from))),
+      textAt("HEAD", literal(changes.map((c) => c.path))),
+      Promise.all(
+        keys.map(async ([key, pathspec]) => {
+          const seen = new Set<string>();
+          return { key, text: await textAtEither([pathspec], seen), seen };
+        }),
       ),
+      emptyTreeOf().then((empty) => scratchGit([`--attr-source=${empty}`, ...audit])),
     ]);
     const baseOf = (from?: string) => (from === undefined ? undefined : before.get(from)) ?? {};
     const attributes = queried.map(({ path }) => ({
@@ -642,57 +667,49 @@ async function attributeInfo(
       head: after.get(path) ?? {},
     }));
     const hidden = queried.filter(({ path }) => newlyHidden(baseOf(path), after.get(path) ?? {}).length);
-    const literal = (paths: (string | undefined)[]) =>
-      paths.flatMap((p) => (p === undefined ? [] : [`:(literal)${p}`]));
-    const textBefore = await textAt(base, literal(hidden.map((change) => change.from)));
-    const textAfter = await textAt("HEAD", literal(hidden.map((change) => change.path)));
+    const newPaths = new Set(queried.map((change) => change.path));
+    const existingRules = async () => {
+      if (!attributes.some(({ base }) => newlyHidden({}, base).length)) return [];
+      const rulePatch = await scratchGit(["diff", "--text", await emptyTreeOf(), base, "--", ...pathspecs]);
+      return Promise.all(
+        attributeRules(rulePatch.stdout).map(async (rule) => ({
+          label: `${rule.file}: ${rule.pattern} ${rule.attributes}`,
+          paths: (await textAt("HEAD", [rule.pathspec], new Set())).raw,
+        })),
+      );
+    };
+    const existing = await existingRules();
+    // Hidden paths are a subset of the changes classified above.
     const textPaths = hidden
-      .filter(({ path, from }) => textAfter.has(path) || (from !== undefined && textBefore.has(from)))
+      .filter(
+        ({ path, from }) => afterText.text.has(path) || (from !== undefined && beforeText.text.has(from)),
+      )
       .map((change) => change.path);
-    const beforeText = await textAt(base, literal(changes.map((c) => c.from)));
-    const afterText = await textAt("HEAD", literal(changes.map((c) => c.path)), false);
     const binaryPaths = changes
       .filter(
         ({ path, from }) =>
           matches.has(path) &&
-          !afterText.has(path) &&
+          !afterText.raw.has(path) &&
           !basePointers.has(from ?? "") &&
-          (beforeText.has(from ?? "") || !BINARY_PATH.test(path)),
+          (beforeText.text.has(from ?? "") || !BINARY_PATH.test(path)),
       )
       .map((c) => c.path);
     const attributeMatches: Record<string, string[]> = {};
     const attributeUnmatched: string[] = [];
-    for (const rule of attributeRules(attributePatch)) {
-      if (!rule.exemptable || attributeMatches[rule.key]) continue;
-      matches.clear();
-      attributeMatches[rule.key] = await textAtEither([rule.pathspec]);
-      if (!matches.size) attributeUnmatched.push(rule.key);
+    for (const { key, text, seen } of found) {
+      attributeMatches[key] = text;
+      if (!seen.size) attributeUnmatched.push(key);
     }
     const existingRuleKeys: Record<string, string[]> = {};
-    const newPaths = new Set(queried.map((change) => change.path));
-    if (attributes.some(({ base }) => newlyHidden({}, base).length)) {
-      const patch = await scratchGit(["diff", "--text", emptyTree ?? base, base, "--", ...pathspecs]);
-      for (const rule of attributeRules(patch.stdout)) {
-        const label = `${rule.file}: ${rule.pattern} ${rule.attributes}`;
-        for (const path of await textAt("HEAD", [rule.pathspec], false))
-          if (newPaths.has(path)) existingRuleKeys[path] = [...(existingRuleKeys[path] ?? []), label];
-      }
-    }
-    emptyTree ??= (await git(["hash-object", "-t", "tree", "--stdin"], "")).stdout.trim();
-    const patch = await scratchGit([
-      `--attr-source=${emptyTree}`,
-      "diff",
-      "--ignore-submodules=none",
-      "--no-ext-diff",
-      "--no-textconv",
-      range,
-    ]);
+    for (const { label, paths } of existing)
+      for (const path of paths)
+        if (newPaths.has(path)) existingRuleKeys[path] = [...(existingRuleKeys[path] ?? []), label];
     return {
       patch: patch.stdout,
       attributePatch,
       attributes,
       textPaths,
-      headTextPaths: [...afterText],
+      headTextPaths: [...afterText.raw],
       existingRuleKeys,
       attributeMatches,
       binaryPaths,
