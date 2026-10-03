@@ -577,7 +577,12 @@ async function attributeInfo(
     // A fresh index per query lets classifications run concurrently.
     const index = join(scratch, `index-${indexes++}`);
     const specs = `${pathspecs.join("\0")}\0`;
-    await scratchGit(["reset", "-q", tree, "--pathspec-from-file=-", "--pathspec-file-nul"], specs, index);
+    // --no-refresh: a refresh re-hashes worktree files, running their clean filters.
+    await scratchGit(
+      ["reset", "-q", "--no-refresh", tree, "--pathspec-from-file=-", "--pathspec-file-nul"],
+      specs,
+      index,
+    );
     const flags = ["--cached", "--raw", "--numstat", "-z", "--no-abbrev", "--no-renames", "--no-ext-diff"];
     const args = [`--attr-source=${empty}`, "-c", NO_BIG_FILES, "diff", ...flags, "--no-textconv", empty];
     const out = await scratchGit(args, undefined, index);
@@ -606,21 +611,30 @@ async function attributeInfo(
       const sizes = (
         await git(["cat-file", "--batch-check=%(objectname) %(objectsize)"], input)
       ).stdout.split("\n");
-      for (const [i, path] of candidates.entries()) {
+      // The shortest strict pointer is 126 bytes; ordinary small text needs no blob read.
+      const sized = candidates.flatMap((path, i) => {
         const [oid = "", bytes] = (sizes[i] ?? "").split(" ");
-        // The shortest strict pointer is 126 bytes; ordinary small text needs no blob read.
         const size = Number(bytes);
-        if (!(size >= 126 && size <= 200)) continue;
-        let pointer = pointers.get(oid);
-        if (pointer === undefined) {
-          pointer = LFS_POINTER.test((await git(["cat-file", "-p", oid])).stdout);
-          pointers.set(oid, pointer);
-        }
-        if (pointer) {
+        return size >= 126 && size <= 200 ? [{ path, oid }] : [];
+      });
+      // One read for every blob not classified yet. These are text blobs of at most 200 bytes,
+      // so they hold no NUL and -Z output splits unambiguously; any misparse reads as no pointer.
+      const unread = [...new Set(sized.map(({ oid }) => oid))].filter((oid) => !pointers.has(oid));
+      if (unread.length) {
+        const records = (
+          await git(["cat-file", "--batch", "-Z"], unread.map((oid) => `${oid}\0`).join(""))
+        ).stdout.split("\0");
+        for (const [i, oid] of unread.entries())
+          pointers.set(
+            oid,
+            (records[2 * i] ?? "").startsWith(`${oid} blob `) && LFS_POINTER.test(records[2 * i + 1] ?? ""),
+          );
+      }
+      for (const { path, oid } of sized)
+        if (pointers.get(oid)) {
           if (tree === base) basePointers.add(path);
           if (!SOURCE_PATH.test(path)) text.delete(path);
         }
-      }
     }
     return { raw, text };
   };

@@ -1104,6 +1104,46 @@ test("local repositories classify content with an explicit empty attribute sourc
   }
 });
 
+test("pointer candidates are read in one batch per tree, and multi-byte text cannot misalign it", async () => {
+  // Distinct text blobs of 126-200 bytes are LFS pointer candidates: per-blob reads timed out on
+  // a few thousand of them. The pointer comes after 300 multi-byte UTF-8 blobs in the same batch.
+  const pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 42\n`;
+  for (let i = 0; i < 300; i++) writeFileSync(join(work, `text-${i}.txt`), `${"é".repeat(65)} ${i}\n`);
+  writeFileSync(join(work, "zz-asset.png"), pointer);
+  await commitAll(work, "pointer candidates");
+  const revision = await headSha(work);
+  for (let i = 0; i < 300; i++) writeFileSync(join(work, `text-${i}.txt`), `${"é".repeat(65)} ${i}!\n`);
+  writeFileSync(join(work, "zz-asset.png"), Buffer.from([0x89, 0, 1]));
+  await commitAll(work, "candidate edits");
+  const shim = gitShim();
+  const findings = await worktreeGitScope.run(false, async () =>
+    auditDiff(await diffSince(work, revision, shim.env), { taskClass: null, protectedPaths: [] }),
+  );
+  // Still recognized as a strict pointer, the edited base pointer keeps its exemption.
+  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+  expect(shim.calls().filter((call) => ` ${call} `.includes(" cat-file -p "))).toEqual([]);
+  expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(2);
+});
+
+test("content classification never runs the worktree's clean filters", async () => {
+  const marker = join(dir, "filter-ran");
+  const filter = join(dir, "marker-filter.sh");
+  writeFileSync(filter, `#!/bin/sh\necho ran >> '${marker}'\ncat\n`, { mode: 0o755 });
+  const config = join(dir, "marker.gitconfig");
+  writeFileSync(config, `[filter "marker"]\n\tclean = ${filter}\n`);
+  writeFileSync(join(work, ".gitattributes"), "*.txt filter=marker\n");
+  writeFileSync(join(work, "a.txt"), "base\n");
+  await commitAll(work, "filtered base");
+  const revision = await headSha(work);
+  writeFileSync(join(work, "a.txt"), "head\n");
+  await commitAll(work, "filtered edit");
+  const env = { ...(process.env as Record<string, string>), GIT_CONFIG_GLOBAL: config };
+  await worktreeGitScope.run(false, async () =>
+    auditDiff(await diffSince(work, revision, env), { taskClass: null, protectedPaths: [] }),
+  );
+  expect(existsSync(marker)).toBe(false);
+});
+
 test("content classification covers changed blobs and pattern candidates within a deadline", async () => {
   mkdirSync(join(work, "assets"));
   for (let i = 0; i < 20; i++) writeFileSync(join(work, `unrelated-${i}.ts`), `export const x${i} = ${i};\n`);
@@ -1299,9 +1339,22 @@ test.each([
     `*.${extension.endsWith("png") ? "png" : extension} filter=lfs diff=lfs merge=lfs -text\n`,
   );
   // Bypass any globally installed clean filter; commit exactly these pointer bytes.
-  await worktreeGit(["git", "-c", "filter.lfs.clean=cat", "-c", "filter.lfs.required=false", "add", "-A"], {
-    cwd: work,
-  });
+  await worktreeGit(
+    [
+      "git",
+      "-c",
+      "filter.lfs.process=",
+      "-c",
+      "filter.lfs.clean=cat",
+      "-c",
+      "filter.lfs.required=false",
+      "add",
+      "-A",
+    ],
+    {
+      cwd: work,
+    },
+  );
   await factory("commit", "-qm", "LFS pointer fixture");
   const findings = auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] });
   expect(attributeBlocksOf(findings).length > 0).toBe(blocks);
@@ -1484,7 +1537,9 @@ test("LFS inspection skips short blobs and checks repeated candidate blobs once"
   const diff = await diffSince(work, revision, shim.env);
   expect(diff.binaryErrors).toBeUndefined();
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
-  expect(shim.calls().filter((call) => call.includes(" cat-file -p "))).toHaveLength(2);
+  // The two distinct candidate blobs at base are read in one batch; head has no candidates.
+  expect(shim.calls().filter((call) => ` ${call} `.includes(" cat-file -p "))).toEqual([]);
+  expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(1);
 }, 30_000);
 
 test("failed binary classification blocks even with attribute and binary allowances", async () => {
@@ -1545,16 +1600,42 @@ test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size
     for (const path of ["tracked.png", "tracked.dat", "tracked.ts"]) writeFileSync(join(work, path), pointer);
     writeFileSync(join(work, ".gitattributes"), "tracked.* filter=lfs diff=lfs merge=lfs -text\n");
     // Disable LFS explicitly: neither clean nor smudge may need git-lfs installed.
-    await worktreeGit(["git", "-c", "filter.lfs.clean=cat", "-c", "filter.lfs.required=false", "add", "-A"], {
-      cwd: work,
-    });
+    await worktreeGit(
+      [
+        "git",
+        "-c",
+        "filter.lfs.process=",
+        "-c",
+        "filter.lfs.clean=cat",
+        "-c",
+        "filter.lfs.required=false",
+        "add",
+        "-A",
+      ],
+      {
+        cwd: work,
+      },
+    );
     await factory("commit", "-qm", "base LFS pointer");
     const revision = await headSha(work);
     for (const path of ["tracked.png", "tracked.dat", "tracked.ts"])
       writeFileSync(join(work, path), Buffer.from([0, 1]));
-    await worktreeGit(["git", "-c", "filter.lfs.clean=cat", "-c", "filter.lfs.required=false", "add", "-A"], {
-      cwd: work,
-    });
+    await worktreeGit(
+      [
+        "git",
+        "-c",
+        "filter.lfs.process=",
+        "-c",
+        "filter.lfs.clean=cat",
+        "-c",
+        "filter.lfs.required=false",
+        "add",
+        "-A",
+      ],
+      {
+        cwd: work,
+      },
+    );
     await factory("commit", "-qm", "binary LFS edit");
     const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
     expect(findings.filter((f) => f.rule === "binary-content").length).toBe(kind === "valid" ? 0 : 3);
