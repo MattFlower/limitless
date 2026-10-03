@@ -18,6 +18,33 @@ import {
 
 type Finding = Review["findings"][number];
 
+function coerceAttribution<T extends Verification>(ruling: T): T {
+  const evidence = ruling.attributionEvidence;
+  if (!evidence || !ruling.attribution) return ruling;
+  const reason =
+    evidence.base.setup === "failed"
+      ? "base_failed"
+      : evidence.base.setup === "not_run"
+        ? "base_not_run"
+        : [
+              evidence.change,
+              evidence.obligation,
+              evidence.obligationSource,
+              evidence.base.result,
+              evidence.head,
+            ].some((text) => !text.trim())
+          ? "blank_evidence"
+          : undefined;
+  return reason
+    ? {
+        ...ruling,
+        originalAttribution: ruling.attribution,
+        attributionCoercionReason: reason,
+        attribution: "unresolved",
+      }
+    : ruling;
+}
+
 /** Categories a panel neither verifies nor blocks on, except security findings; they go to the follow-up ledger. */
 const UNVERIFIED_CATEGORIES: readonly (Finding["category"] | undefined)[] = ["cleanup", "conventions"];
 const FINDER_SEVERITY_RANK = { blocker: 0, major: 1, minor: 2, nit: 3 } as const;
@@ -680,7 +707,7 @@ async function runPanel<T extends Invoked>(
       // Only the first ruling per submitted id counts; ids from outside this call are ignored.
       for (const result of parsed.data.results)
         if (pending.some((c) => c.id === result.id) && !verdicts.has(result.id))
-          verdicts.set(result.id, result);
+          verdicts.set(result.id, coerceAttribution(result));
       pending = pending.filter((c) => !verdicts.has(c.id));
     }
     if (pending.length) {

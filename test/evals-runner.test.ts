@@ -1403,6 +1403,20 @@ test("control and causal replay share candidates and a pinned verifier but grade
       });
     }
     expect(f.factory.evals.regrade(paired.run.id)).toMatchObject({ regraded: 6, changed: 3, skipped: [] });
+    const regraded = f.factory.evals.report(paired.run.id)?.trials ?? [];
+    for (const item of cases) {
+      const trial = regraded.find((t) => t.caseId === item.id && t.details.system === "causal");
+      expect(trial?.details.grade?.review).toMatchObject({
+        blockingFindings: item.id === "introduced" ? 1 : 0,
+        requestChanges: item.id === "introduced",
+      });
+      expect(trial?.details.grade).toEqual(
+        paired.trials.find((t) => t.caseId === item.id && t.details.system === "causal")?.details.grade,
+      );
+      expect(trial?.pass).toBe(
+        paired.trials.find((t) => t.caseId === item.id && t.details.system === "causal")?.pass,
+      );
+    }
     const repeated = await f.run(request);
     expect(f.calls).toHaveLength(calls + 6);
     expect(repeated.trials.map((t) => [t.caseId, t.details.system, t.pass, t.details.grade?.review])).toEqual(

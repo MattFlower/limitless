@@ -191,31 +191,34 @@ export const AttributionEnum = z.enum([
   "environment_failure",
   "unresolved",
 ]);
+// Keep nonblank evidence in the strict model schema; parse blanks so one ruling cannot lose the panel.
+const attributionText = z.string().trim().meta({ minLength: 1 });
 const attributionFields = {
   attribution: AttributionEnum,
   attributionEvidence: z.object({
-    change: z.string().trim().min(1),
-    obligation: z.string().trim().min(1),
-    obligationSource: z.string().trim().min(1),
+    change: attributionText,
+    obligation: attributionText,
+    obligationSource: attributionText,
     base: z.object({
       setup: z.enum(["ok", "failed", "not_run"]),
-      result: z.string().trim().min(1),
+      result: attributionText,
     }),
-    head: z.string().trim().min(1),
+    head: attributionText,
   }),
 };
-const AttributedVerificationSchema = VerificationSchema.extend(attributionFields).superRefine((v, ctx) => {
-  if (v.attributionEvidence.base.setup === "failed" && v.attribution !== "unresolved")
-    ctx.addIssue({
-      code: "custom",
-      path: ["attribution"],
-      message: "Base setup failure requires unresolved attribution",
-    });
-});
 export const AttributionVerifierSchema = z.object({
-  results: z.array(AttributedVerificationSchema.safeExtend({ id: z.string() })),
+  results: z.array(
+    VerificationSchema.extend(attributionFields).extend({
+      id: z.string().describe("The candidate id, e.g. C3"),
+    }),
+  ),
 });
-const StoredVerificationSchema = VerificationSchema.extend(z.object(attributionFields).partial().shape);
+const StoredVerificationSchema = VerificationSchema.extend(
+  z.object(attributionFields).partial().shape,
+).extend({
+  originalAttribution: AttributionEnum.optional(),
+  attributionCoercionReason: z.enum(["base_failed", "base_not_run", "blank_evidence"]).optional(),
+});
 export type Verification = z.infer<typeof StoredVerificationSchema>;
 
 // A merged report keeps what its own verification would need if its claim is split off again.

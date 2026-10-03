@@ -550,7 +550,7 @@ Do not modify files. You may run read-only commands and targeted tests; create t
       ? `
 
 # Causal attribution (separate from verdict, severity and category)
-Inspect both base and head code and compare the same trigger on each. Use the merge base for an external change; for a fix review compare the previously reviewed commit with head. Do not infer causation from a true claim or a finder's assertion.
+Inspect both base and head code and compare the same trigger on each. For attribution in every review round, including fix reviews, compare the PR base ${input.baseSha} with head ${input.headSha ?? "HEAD"} using \`git diff ${input.baseSha}${input.externalChange ? "..." : ".."}${input.headSha ?? "HEAD"}\`; use the merge base for an external change. A defect introduced by the PR remains introduced even if the fix diff did not touch it. Do not infer causation from a true claim or a finder's assertion.
 Return exactly one attribution per ruling:
 - introduced: the change creates a defect absent on base.
 - newly_reachable_or_worse: an existing defect becomes reachable on a new path or its consequences worsen.
