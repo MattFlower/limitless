@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -305,8 +305,7 @@ test("each change produces exactly one feed item; repeats and non-changes produc
     if (name === "review comment" || name === "older review's comment edited")
       expect(items[0]?.data.category).toBe("review_comment");
     if (name === "second review") expect(items[0]?.data.category).toBe("review");
-    if (name === "bob approves")
-      expect(items[0]?.data).toMatchObject({ reviewer: "bob", decision: "APPROVED" });
+    if (name === "bob approves") expect(items[0]?.data).toMatchObject({ review: "bob:APPROVED" });
     await h.advance(15 * S);
     expect([name, kinds()]).toEqual([name, []]);
   }
@@ -357,6 +356,7 @@ test("a closed PR is rechecked every 10 minutes; a reopen is observed and a late
 test("tracking ends with the run; open PRs of runs failed or cancelled over 7 days ago expire", async () => {
   h = pollerHarness();
   const now = Date.now();
+  setSystemTime(now); // the age rule reads the wall clock
   const DAY = 86_400_000;
   const pr = (n: number, status: RunStatus, finishedAt: number | null) => {
     const run = h.factoryPr("o/r", n, status);
@@ -371,9 +371,13 @@ test("tracking ends with the run; open PRs of runs failed or cancelled over 7 da
   pr(5, "running", null); // another run shares the PR
   const closed = pr(6, "cancelled", now - 30 * DAY);
   h.store.updateRun(closed.id, { prClosedUnmerged: true }); // closed PRs wait for a reopen
-  expect(h.store.githubTracked(now).map((p) => p.url)).toEqual([1, 4, 5, 6].map((n) => url("o/r", n)));
-  h.store.db.query("DELETE FROM runs WHERE id = ?").run(closed.id);
-  expect(h.store.githubTracked(now).map((p) => p.url)).toEqual([1, 4, 5].map((n) => url("o/r", n)));
+  try {
+    expect(h.store.githubTracked().map((p) => p.url)).toEqual([1, 4, 5, 6].map((n) => url("o/r", n)));
+    h.store.db.query("DELETE FROM runs WHERE id = ?").run(closed.id);
+    expect(h.store.githubTracked().map((p) => p.url)).toEqual([1, 4, 5].map((n) => url("o/r", n)));
+  } finally {
+    setSystemTime();
+  }
 });
 
 test("a missed poll is caught later; restarts, retries and same-head recurrences are exact", async () => {
@@ -722,7 +726,7 @@ test("diff reports a completed CI result on first sight, baselines activity, ign
   ]);
   expect(diffPr(null, { ...snap, ci: "SUCCESS", failing: [] }).map((c) => c.kind)).toEqual(["pr.ci_passed"]);
   expect(diffPr(null, { ...snap, ci: null, failing: [] })).toEqual([]);
-  expect(diffPr(snap, { ...snap, activity: { ...snap.activity, comment: null } })).toEqual([]);
+  expect(diffPr(snap, { ...snap, activity: { ...snap.activity, comment: [] } })).toEqual([]);
   expect(normalizePr(null)).toBeNull();
   h = pollerHarness();
 });
@@ -892,6 +896,7 @@ test.each([
   ["REST secondary limit", () => respond(403, { message: "You have exceeded a secondary rate limit" })],
   ["GraphQL RATE_LIMITED", () => respond(200, { errors: [{ type: "RATE_LIMITED", message: "limited" }] })],
   ["Retry-After", () => respond(403, {}, { "retry-after": "300" })],
+  ["Retry-After HTTP date", () => respond(403, {}, { "retry-after": "" })],
 ])("%s pauses every repository until its deadline and is logged once", async (name, limit) => {
   h = pollerHarness(["o/r", "o/s"]);
   h.factoryPr("o/r", 1);
@@ -902,11 +907,14 @@ test.each([
   // A usable reset deadline is honoured exactly.
   if (name.startsWith("x-ratelimit"))
     response.headers.set("x-ratelimit-reset", String(Math.floor((h.clock.now() + 315 * S) / 1000)));
+  if (name.endsWith("date"))
+    response.headers.set("retry-after", new Date(h.clock.now() + 315 * S).toUTCString());
   h.gh.next.push(response);
   await h.advance(15 * S);
   const calls = h.gh.calls.length;
-  const wait = name === "Retry-After" || name.startsWith("x-ratelimit") ? 300 : 60;
-  const deadline = name.startsWith("x-ratelimit") ? Math.floor((h.clock.now() + 300 * S) / 1000) * 1000 : 0;
+  const dated = name.startsWith("x-ratelimit") || name.endsWith("date");
+  const wait = name === "Retry-After" || dated ? 300 : 60;
+  const deadline = dated ? Math.floor((h.clock.now() + 300 * S) / 1000) * 1000 : 0;
   for (let t = 15; t < wait; t += 15) {
     await h.advance(15 * S);
     if (!deadline || h.clock.now() < deadline) expect([t, h.gh.calls.length]).toEqual([t, calls]);
@@ -952,6 +960,16 @@ test("UNKNOWN keeps the last known mergeability and never makes a transition", a
   pr.mergeable = "CONFLICTING";
   await h.advance(15 * S);
   expect(kinds()).toEqual([]);
+  // A new head whose mergeability is not known yet reports nothing until GitHub computes it.
+  pr.headRefOid = "f".repeat(40);
+  pr.mergeable = "UNKNOWN";
+  pr.mergeStateStatus = "UNKNOWN";
+  await h.advance(15 * S);
+  expect(kinds()).toEqual([]);
+  expect(saved()).toMatchObject({ headRefOid: pr.headRefOid, mergeable: null, mergeStateStatus: null });
+  pr.mergeable = "CONFLICTING";
+  await h.advance(15 * S);
+  expect(kinds()).toEqual(["pr.conflicting"]);
 });
 
 test("deleting comments or reviews is not activity; additions and edits of older items are", async () => {
@@ -975,6 +993,9 @@ test("deleting comments or reviews is not activity; additions and edits of older
     [() => pr.reviews.nodes.push({ ...c("R3", "t4"), comments: { nodes: [] } }), ["review"]],
     [() => pr.comments.nodes.unshift(c("C0", "t0")), []],
     [() => (pr.comments.nodes[0] = c("C0", "t5")), ["comment"]],
+    // A new item in the same second as the newest is still new.
+    [() => pr.comments.nodes.push(c("C9", "t5")), ["comment"]],
+    [() => pr.comments.nodes.pop(), []],
   ];
   for (const [i, [change, expected]] of steps.entries()) {
     change();
@@ -1002,19 +1023,23 @@ test("node ids are queried at most 100 per request, serially, and resolved once"
   h = pollerHarness();
 });
 
-test("a failing rollup with more than 100 contexts says its list is truncated", async () => {
+test("a failing rollup that fills the 100 fetched contexts says its list may be truncated", async () => {
   h = pollerHarness();
   h.factoryPr("o/r", 1);
   const pr = h.node("o/r", 1);
-  ci(pr, {
-    state: "FAILURE",
-    contexts: { pageInfo: { hasNextPage: true }, nodes: [{ name: "t", conclusion: "FAILURE" }] },
-  });
+  const passing = Array.from({ length: 99 }, (_, i) => ({ name: `ok${i}`, conclusion: "SUCCESS" }));
+  ci(pr, rollup("FAILURE", [...passing, { name: "t", conclusion: "FAILURE" }]));
   h.start();
   await h.advance(0);
   const [item] = h.fresh();
   expect(item?.data).toMatchObject({ failing: [{ name: "t", url: null }], truncated: true });
   expect(JSON.parse(snapshotOf(url("o/r", 1))).truncated).toBe(true);
+  // A shorter list is complete.
+  pr.headRefOid = "c".repeat(40);
+  ci(pr, rollup("FAILURE", [{ name: "t", conclusion: "FAILURE" }]));
+  await h.advance(15 * S);
+  expect(h.fresh()[0]?.data.truncated).toBeUndefined();
+  expect(JSON.parse(snapshotOf(url("o/r", 1))).truncated).toBeUndefined();
 });
 
 test("store failures anywhere in a poll are logged and polling continues, without a tight loop", async () => {
@@ -1023,23 +1048,33 @@ test("store failures anywhere in a poll are logged and polling continues, withou
   const store = h.store;
   const tracked = store.githubTracked.bind(store);
   let failPlan = 0;
-  store.githubTracked = (now?: number) => {
+  store.githubTracked = () => {
     if (failPlan-- > 0) throw new Error("plan boom");
-    return tracked(now);
+    return tracked();
   };
   failPlan = 1; // the startup schedule itself fails
   h.start();
   expect(h.logs).toEqual([expect.stringContaining("plan boom")]);
   await h.advance(60 * S);
   expect(h.gh.graphql()).toHaveLength(1);
-  // plan() inside the tick and the schedule after it both fail.
+  // plan() inside the tick fails, then again on the retry, which backs off.
+  const booms = () => h.logs.filter((l) => l.includes("plan boom")).length;
   failPlan = 2;
   await h.advance(15 * S);
-  expect(h.logs.filter((l) => l.includes("plan boom"))).toHaveLength(3);
-  await h.advance(14 * S);
+  expect(booms()).toBe(2);
+  await h.advance(15 * S);
+  expect(booms()).toBe(3);
+  await h.advance(29 * S);
   expect(h.gh.graphql()).toHaveLength(1);
-  await h.advance(46 * S);
+  await h.advance(S);
   expect(h.gh.graphql()).toHaveLength(2);
+  // A run update whose scheduling fails is logged; polling resumes within a minute.
+  failPlan = 1;
+  h.store.updateRun(run.id, { title: "renamed" });
+  expect(booms()).toBe(4);
+  expect(h.clock.pending).toBe(1);
+  await h.advance(60 * S);
+  expect(h.gh.graphql()).toHaveLength(3);
   // Reconciliation fails once after a merge; the next poll reconciles.
   const reconcile = store.reconcileWaitingRuns.bind(store);
   let failReconcile = true;
@@ -1053,6 +1088,9 @@ test("store failures anywhere in a poll are logged and polling continues, withou
   merge(h.node("o/r", 1));
   await h.advance(15 * S);
   expect(h.logs.at(-1)).toContain("reconcile boom");
+  // Nothing is left to observe, but the failed reconciliation still has its retry timer.
+  expect(h.store.githubTracked()).toEqual([]);
+  expect(h.clock.pending).toBe(1);
   await h.advance(15 * S);
   expect(h.store.getRun(run.id)?.merged).toBe(true);
   expect(h.store.readFeed({ limit: 1000 }).items.filter((i) => i.kind === "run.merged")).toHaveLength(1);

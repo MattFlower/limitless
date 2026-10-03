@@ -545,3 +545,43 @@ test("with polling, PRs the poller does not track are reconciled through the per
     h.close();
   }
 });
+
+test("a stale snapshot never hides an untracked PR from the fallback; a merged one is authoritative", async () => {
+  const h = pollerHarness();
+  try {
+    // The factory run observed the PR open, then failed over 7 days ago, so the poller stopped tracking it.
+    const factory = h.factoryPr("o/r", 1);
+    const merged = h.factoryPr("o/r", 2);
+    h.start();
+    await h.advance(0);
+    h.store.updateRun(factory.id, { status: "failed", finishedAt: Date.now() - 8 * 86_400_000 });
+    const verify = h.store.createRun(h.repo("o/r"), {
+      repo: "o/r",
+      prompt: "verify",
+      source: "github",
+      sourceRef: { kind: "pull_request", repo: "o/r", number: 1, baseRef: "main", baseSha: SHA },
+    });
+    h.store.updateRun(verify.id, { prUrl: url("o/r", 1), status: "needs_human" });
+    expect(JSON.parse(h.store.githubPrData(url("o/r", 1)) ?? "null")?.state).toBe("OPEN");
+    expect(h.store.githubTracked().map((p) => p.url)).toEqual([url("o/r", 2)]);
+    // The poller then sees its other PR merge; that observation needs no fallback read.
+    const node = h.node("o/r", 2);
+    node.state = "MERGED";
+    node.mergedAt = "2026-10-03T04:00:00Z";
+    h.store.updateRun(merged.id, { status: "needs_human" });
+    await h.advance(15_000);
+    h.reopen();
+    const fallback = mock(async (prUrl: string) => ({
+      url: prUrl,
+      state: "MERGED",
+      mergedAt: "2026-10-03T05:00:00Z",
+      mergedBy: { login: "octocat" },
+    }));
+    await reconcileMergedRuns(h.store, observedPrs(h.store, fallback), () => {});
+    expect(fallback.mock.calls.map((c) => c[0])).toEqual([url("o/r", 1)]);
+    expect(h.store.getRun(verify.id)).toMatchObject({ merged: true, mergedBy: "octocat" });
+    expect(h.store.getRun(merged.id)).toMatchObject({ merged: true, mergedAt: Date.parse(node.mergedAt) });
+  } finally {
+    h.close();
+  }
+});
