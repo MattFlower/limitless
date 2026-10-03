@@ -328,6 +328,12 @@ test("a closed PR is rechecked every 10 minutes; a reopen is observed and a late
   expect(kinds()).toEqual(["pr.closed"]);
   expect(h.store.getRun(run.id)?.prClosedUnmerged).toBe(true);
   const closedPolls = () => h.gh.graphql().filter((c) => c.ids?.includes("PR_o/r_2")).length;
+  // The observation that saw the close counts as its last one: no immediate re-observation.
+  expect(closedPolls()).toBe(2);
+  await h.advance(0);
+  await h.advance(15 * S);
+  expect(closedPolls()).toBe(2);
+  expect(h.gh.graphql().length).toBe(3);
   // Still tracked after a restart; the restart observes it once, then it waits 10 minutes.
   h.reopen();
   h.start();
@@ -1002,6 +1008,81 @@ test("deleting comments or reviews is not activity; additions and edits of older
     await h.advance(15 * S);
     expect([i, h.fresh().map((item) => item.data.category)]).toEqual([i, expected]);
   }
+});
+
+test("an older item a deletion lets the page backfill is not activity, even with a tied timestamp", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  const pr = h.node("o/r", 1);
+  const c = (id: string, createdAt: string, updatedAt = createdAt) => ({ id, createdAt, updatedAt });
+  const old = c("C0", "2026-10-01T00:00:00Z", "2026-10-03T00:00:00Z"); // edited when C10 was created
+  const page = Array.from({ length: 10 }, (_, i) =>
+    c(`C${i + 1}`, `2026-10-02T00:00:${String(i).padStart(2, "0")}Z`),
+  );
+  const last = page[9];
+  if (!last) throw new Error("no page");
+  last.createdAt = last.updatedAt = "2026-10-03T00:00:00Z";
+  pr.comments.nodes = page;
+  const review = { ...c("R1", "2026-10-01T00:00:00Z"), comments: { nodes: page.map((x) => ({ ...x })) } };
+  pr.reviews.nodes = [review];
+  h.start();
+  await h.advance(0);
+  const steps: [() => void, string[]][] = [
+    [() => (pr.comments.nodes = [old, ...page.slice(0, 9)]), []],
+    [() => (review.comments.nodes = [old, ...page.slice(0, 9)]), []],
+    // Created in the same second as the newest known item: still new.
+    [() => pr.comments.nodes.push(c("C11", "2026-10-02T00:00:08Z")), ["comment"]],
+    [() => (pr.comments.nodes[0] = c("C0", "2026-10-01T00:00:00Z", "2026-10-04T00:00:00Z")), ["comment"]],
+  ];
+  for (const [i, [change, expected]] of steps.entries()) {
+    change();
+    await h.advance(15 * S);
+    expect([i, h.fresh().map((item) => item.data.category)]).toEqual([i, expected]);
+  }
+});
+
+test("snapshots persisted with the previous activity markers are upgraded, not fatal", async () => {
+  h = pollerHarness();
+  const run = h.factoryPr("o/r", 1);
+  h.factoryPr("o/r", 2); // a later PR in the same batch must still be observed
+  const pr = h.node("o/r", 1);
+  const c = (id: string, createdAt: string, updatedAt = createdAt) => ({ id, createdAt, updatedAt });
+  pr.comments.nodes = [
+    c("C1", "2026-10-01T00:00:00Z"),
+    c("C2", "2026-10-02T00:00:00Z", "2026-10-02T01:00:00Z"),
+  ];
+  const full = normalizePr(pr);
+  if (!full) throw new Error("bad node");
+  const { reviews: _, ...snap } = full;
+  // The previous release kept each category's newest item as `id@updatedAt`, or null, and no reviews.
+  const activity = { review: null, review_comment: null, comment: "C2@2026-10-02T01:00:00Z" };
+  const data = JSON.stringify({ ...snap, activity, revision: 0, unknown: 0, nudged: null });
+  h.store.saveGithubPr({ url: url("o/r", 1), repo: "o/r", runId: run.id, delivered: 1, nodeId: pr.id, data });
+  // A review arrived while the daemon was down: the first upgraded observation reports it, and only it.
+  const review = { ...c("R1", "2026-10-02T02:00:00Z"), comments: { nodes: [] as ReturnType<typeof c>[] } };
+  pr.reviews.nodes = [review];
+  h.start();
+  await h.advance(0);
+  expect(h.logs).toEqual([]);
+  expect(h.fresh().map((i) => i.data.category)).toEqual(["review"]);
+  expect(h.store.githubPrData(url("o/r", 2))).not.toBeNull();
+  await h.advance(15 * S);
+  expect(kinds()).toEqual([]);
+  pr.comments.nodes.push(c("C3", "2026-10-03T00:00:00Z"));
+  review.comments.nodes.push(c("RC1", "2026-10-03T00:00:00Z"));
+  pr.latestReviews.nodes = [{ state: "APPROVED", author: { login: "alice" } }];
+  await h.advance(15 * S);
+  expect(
+    h
+      .fresh()
+      .map((i) => i.data.category ?? i.kind)
+      .sort(),
+  ).toEqual(["comment", "pr.review", "review_comment"]);
+  pr.state = "MERGED";
+  pr.mergedAt = "2026-10-03T02:00:00Z";
+  await h.advance(15 * S);
+  expect(kinds()).toEqual(["pr.merged"]);
+  expect(h.store.getRun(run.id)?.merged).toBe(true);
 });
 
 test("node ids are queried at most 100 per request, serially, and resolved once", async () => {

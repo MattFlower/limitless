@@ -24,12 +24,12 @@ export const OBSERVE_QUERY = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on Pu
     ... on CheckRun { name conclusion url: detailsUrl }
     ... on StatusContext { name: context state url: targetUrl } } } } } } }
   latestReviews(first: 20) { nodes { state author { login } } }
-  reviews(last: 10) { nodes { id updatedAt comments(last: 10) { nodes { id updatedAt } } } }
-  comments(last: 10) { nodes { id updatedAt } } } } }`;
+  reviews(last: 10) { nodes { id createdAt updatedAt comments(last: 10) { nodes { id createdAt updatedAt } } } }
+  comments(last: 10) { nodes { id createdAt updatedAt } } } } }`;
 // Activity pages hold the newest few items so an edit to a recent older one still moves the marker.
 
 type Conn<T> = { nodes?: (T | null)[] } | null | undefined;
-type Activity = { id: string; updatedAt: string };
+type Activity = { id: string; createdAt?: string; updatedAt: string }; // createdAt: absent only in old markers
 type Context = { name?: string; conclusion?: string | null; state?: string; url?: string | null };
 const REQUIRED = ["id", "url", "headRefOid", "state", "mergeable", "mergeStateStatus", "updatedAt"] as const;
 type Base = Record<(typeof REQUIRED)[number], string> & GitHubPrState & { reviewDecision: string | null };
@@ -50,15 +50,29 @@ export type PrSnapshot = Known & {
   activity: Record<"review" | "review_comment" | "comment", string[]>;
 };
 type Saved = PrSnapshot & { revision: number; unknown: number; nudged: string | null };
-const saved = (data: string | null | undefined) => (data ? (JSON.parse(data) as Saved) : null);
 const FAILING = new Set(["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const nodes = <T>(c: Conn<T>): T[] => (c?.nodes ?? []).filter((n): n is T => n !== null);
-/** Every item as `updatedAt@id`, newest last; ISO-8601 UTC timestamps order as strings. */
-const newest = (items: Activity[]) => {
-  return items.map((a) => `${a.updatedAt}@${a.id}`).sort();
+/** Every item as `createdAt@updatedAt@id`, sorted, so the last entry is the newest creation known. */
+const mark = (a: Activity) => `${a.createdAt ?? a.updatedAt}@${a.updatedAt}@${a.id}`;
+const newest = (items: Activity[]) => items.map(mark).sort();
+/**
+ * A known id with another updatedAt was edited; an unknown one created no earlier than the newest known
+ * item was added. A deletion, or an older item it lets the page backfill, never qualifies.
+ */
+const fresh = (m: string, old: string[]) => {
+  const part = (s: string | undefined, i: number) => s?.split("@")[i] ?? "";
+  const prior = old.find((o) => o.endsWith(m.slice(m.lastIndexOf("@"))));
+  return prior ? part(prior, 1) !== part(m, 1) : part(m, 0) >= part(old.at(-1), 0);
 };
-/** An item missing from `old` and no older than its newest was added or edited; a deletion never qualifies. */
-const fresh = (m: string, old: string[]) => !old.includes(m) && m >= (old.at(-1)?.split("@")[0] ?? "");
+const saved = (data: string | null | undefined) => {
+  const s = data ? (JSON.parse(data) as Saved) : null;
+  // Snapshots from before this format kept only each category's newest item, as `id@updatedAt` or null;
+  // such an item counts as created at its last update, so items created since are new.
+  for (const [k, v] of Object.entries(s?.activity ?? {}) as [keyof Saved["activity"], unknown][])
+    if (s && !Array.isArray(v))
+      s.activity[k] = typeof v === "string" ? [v.replace(/^(.*)@(.*)$/, "$2@$2@$1")] : [];
+  return s;
+};
 
 /** Null unless `node` is a complete PullRequest (with the expected id, when given). */
 export function normalizePr(node: unknown, id?: string | null): PrSnapshot | null {
@@ -256,7 +270,10 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     [...Map.groupBy(store.githubTracked(), (pr) => pr.repo)].map(([repo, prs]) => {
       const interval = prs.some((p) => p.delivered && !closed(p)) ? 15_000 : normal;
       const key = (p: TrackedPr) => (closed(p) ? p.url : repo); // open PRs share a deadline and a query
-      const at = (p: TrackedPr) => (observedAt.get(key(p)) ?? -Infinity) + (closed(p) ? 600_000 : interval);
+      const last = (k: string) => observedAt.get(k) ?? -Infinity;
+      // A PR also keeps its own time, so closing or reopening it never makes it due at once.
+      const at = (p: TrackedPr) =>
+        closed(p) ? last(p.url) + 600_000 : Math.max(last(p.url), last(repo)) + interval;
       const due = Math.max(blocks.get(repo)?.until ?? 0, Math.min(...prs.map(at)));
       return { repo, key, due, prs: prs.filter((p) => at(p) <= now()) };
     });
@@ -281,7 +298,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         if (stopped || due > now() || now() < cooldownUntil) continue;
         await observe(repo, prs).catch((e: unknown) => log(`GitHub poll of ${repo} failed: ${String(e)}`));
         // A repository a rate limit interrupted is due again as soon as the cooldown ends.
-        if (now() >= cooldownUntil) for (const pr of prs) observedAt.set(key(pr), now());
+        if (now() >= cooldownUntil) for (const pr of prs) observedAt.set(pr.url, now()).set(key(pr), now());
       }
       if (settled) await reconcileMergedRuns(store, observedPrs(store), log);
       [settled, crashes, retryAt] = [false, 0, 0];
