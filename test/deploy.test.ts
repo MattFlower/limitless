@@ -29,6 +29,7 @@ function setup() {
   const logs: string[] = [];
   const sleeps: number[] = [];
   const timeouts: number[] = [];
+  const commandTimeouts = new Map<string, number | undefined>();
   let time = 0;
   let selected = "previous";
   let draining = false;
@@ -48,9 +49,10 @@ function setup() {
       };
     },
   };
-  const command: typeof sh = async (args) => {
+  const command: typeof sh = async (args, opts) => {
     const line = args.join(" ");
     calls.push(line);
+    commandTimeouts.set(line, opts?.timeoutMs);
     if (args[1] === "checkout") selected = args[4] ?? selected;
     return {
       stdout: args[1] === "rev-parse" ? (args[2] === "HEAD" ? selected : "next") : "",
@@ -86,6 +88,7 @@ function setup() {
   };
   return {
     calls,
+    commandTimeouts,
     logs,
     sleeps,
     timeouts,
@@ -131,6 +134,12 @@ test("deploy gates, drains, refreshes stages and restarts once after completion"
     "bun scripts/smoke.ts",
   ]);
   expect(f.calls[10]).toBe("drain");
+  // The full suite outgrew 10 minutes on a busy machine; lint and typecheck keep the shorter bound.
+  expect([...f.commandTimeouts].filter(([line]) => /^bun (run|test)/.test(line))).toEqual([
+    ["bun run lint", 600_000],
+    ["bun run typecheck", 600_000],
+    ["bun test", 1_200_000],
+  ]);
   expect(f.calls.filter((c) => c === "restart")).toHaveLength(1);
   expect(f.sleeps).toEqual([5000, 5000]);
   expect(f.logs.join("\n")).toContain("run-a (implement)");
