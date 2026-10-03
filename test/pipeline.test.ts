@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -8,7 +16,14 @@ import { loadConfig } from "../src/config.ts";
 import type { RunStatus, StageName } from "../src/core/types.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
-import { githubRetry } from "../src/git/repos.ts";
+import {
+  cachePath,
+  githubRetry,
+  pushBranch,
+  removeWorktree,
+  slugify,
+  worktreeOwner,
+} from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
@@ -219,6 +234,248 @@ afterEach(async () => {
   factory?.store.close();
   factory = null;
   rmSync(home, { recursive: true, force: true });
+});
+
+describe("local factory clones", () => {
+  const reply: Handler = (s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review") return { structured: approve };
+    if (role === "verify") return { structured: pass };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  };
+  const git = async (cwd: string, ...args: string[]) => (await sh(["git", ...args], { cwd })).stdout.trim();
+  const snapshot = () =>
+    Object.fromEntries(
+      [
+        "greeting.txt",
+        ".limitless.toml",
+        "staged.txt",
+        "untracked.txt",
+        ".git/HEAD",
+        ".git/index",
+        ".git/config",
+        ...readdirSync(join(repoDir, ".git/hooks")).map((name) => `.git/hooks/${name}`),
+      ].map((path) => [path, readFileSync(join(repoDir, path))]),
+    );
+
+  test.each([false, true])(
+    "full delivery preserves the source, with concurrent config edits=%s",
+    async (editConfig) => {
+      await git(repoDir, "config", "user.email", "original@example.test");
+      await git(repoDir, "remote", "add", "original", "/unused/original");
+      writeFileSync(join(repoDir, "staged.txt"), "staged input\n");
+      await git(repoDir, "add", "staged.txt");
+      writeFileSync(join(repoDir, "greeting.txt"), "dirty input\n");
+      writeFileSync(join(repoDir, "untracked.txt"), "untracked input\n");
+      const marker = join(repoDir, "hook-ran");
+      writeFileSync(join(repoDir, ".git/hooks/pre-receive"), `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, {
+        mode: 0o755,
+      });
+      let prepared = () => {};
+      const ready = new Promise<void>((resolve) => {
+        prepared = resolve;
+      });
+      let release = () => {};
+      const paused = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const f = start(async (s) => {
+        if (roleOf(s) === "triage") {
+          prepared();
+          await paused;
+        }
+        return reply(s);
+      });
+      const before = snapshot();
+      const current = await git(repoDir, "symbolic-ref", "HEAD");
+      const base = await git(repoDir, "rev-parse", "HEAD");
+      const sourceTrees = await git(repoDir, "worktree", "list", "--porcelain");
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+      try {
+        await ready;
+        const repo = f.store.getRepo(run.repoId);
+        if (!repo) throw new Error("missing repo");
+        const work = f.store.getRunState<RunState>(run.id)?.worktreePath;
+        if (!work) throw new Error("missing worktree");
+        const cache = cachePath(f.cfg.paths, repo);
+        expect(await git(repoDir, "worktree", "list", "--porcelain")).toBe(sourceTrees);
+        expect(await git(cache, "worktree", "list", "--porcelain")).toContain(work);
+        expect(await worktreeOwner(work)).toBe(await worktreeOwner(cache));
+        expect(snapshot()).toEqual(before);
+        if (editConfig) {
+          await git(repoDir, "remote", "add", "during-run", "/unused/during-run");
+          await git(repoDir, "config", "user.email", "added@example.test");
+        }
+        const expected = snapshot();
+        release();
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        const result = f.store.getRun(run.id);
+        expect(await git(repoDir, "rev-parse", `refs/heads/${result?.branch}`)).toBe(result?.headSha ?? "");
+        expect(await git(repoDir, "symbolic-ref", "HEAD")).toBe(current);
+        expect(await git(repoDir, "rev-parse", "HEAD")).toBe(base);
+        expect(await git(repoDir, "worktree", "list", "--porcelain")).toBe(sourceTrees);
+        expect(snapshot()).toEqual(expected);
+        expect(existsSync(marker)).toBe(false);
+        expect(existsSync(join(repoDir, "farewell.txt"))).toBe(false);
+        if (editConfig) {
+          expect(await git(repoDir, "remote", "get-url", "during-run")).toBe("/unused/during-run");
+          expect(await git(repoDir, "config", "user.email")).toBe("added@example.test");
+        }
+        await removeWorktree(f.cfg.paths, repo, work);
+        expect(await git(repoDir, "worktree", "list", "--porcelain")).toBe(sourceTrees);
+        expect(snapshot()).toEqual(expected);
+      } finally {
+        release();
+      }
+    },
+  );
+
+  test("later and concurrent runs fetch the current recorded base into one clone", async () => {
+    let prepared = () => {};
+    const ready = new Promise<void>((resolve) => {
+      prepared = resolve;
+    });
+    let release = () => {};
+    const paused = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const f = start(async (s) => {
+      if (roleOf(s) === "triage" && s.prompt.includes("first local run")) {
+        prepared();
+        await paused;
+      }
+      return reply(s);
+    });
+    const base = await git(repoDir, "rev-parse", "HEAD");
+    const first = await f.createRun({ repo: repoDir, prompt: "first local run" });
+    try {
+      await ready;
+      writeFileSync(join(repoDir, "upstream.txt"), "new base\n");
+      await git(repoDir, "add", "upstream.txt");
+      await git(repoDir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "advance base");
+      const advanced = await git(repoDir, "rev-parse", "HEAD");
+      release();
+      expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const later = await Promise.all(
+        ["second", "third"].map((prompt) => f.createRun({ repo: repoDir, prompt })),
+      );
+      const repo = f.store.getRepo(first.repoId);
+      if (!repo) throw new Error("missing repo");
+      const cache = cachePath(f.cfg.paths, repo);
+      for (const run of later) {
+        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        expect(f.store.getRun(run.id)?.baseSha).toBe(advanced);
+        expect(await worktreeOwner(join(f.cfg.paths.work, run.id))).toBe(await worktreeOwner(cache));
+      }
+      expect(f.store.getRun(first.id)?.baseSha).toBe(base);
+      expect(readdirSync(f.cfg.paths.repos)).toEqual([basename(cache)]);
+      expect(await git(cache, "rev-parse", "--is-bare-repository")).toBe("true");
+      expect(await git(repoDir, "worktree", "list", "--porcelain")).not.toContain(f.cfg.paths.work);
+    } finally {
+      release();
+    }
+  });
+
+  test("an interrupted legacy worktree finishes in its owner while new runs use the clone", async () => {
+    const f = start(reply);
+    f.scheduler.drain();
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("missing repo");
+    const work = join(f.cfg.paths.work, run.id);
+    const branch = `limitless/${run.id}-${slugify(run.title, 30)}`;
+    const baseSha = await git(repoDir, "rev-parse", "HEAD");
+    await git(repoDir, "worktree", "add", "-b", branch, work, baseSha);
+    f.store.updateRun(run.id, { status: "running", baseSha, branch }, {
+      phase: "prepare",
+      worktreePath: work,
+      answers: [],
+      round: 0,
+      roundsOnImplementer: 0,
+      triedImplementers: [],
+      feedback: null,
+      toolCommands: [],
+    } satisfies RunState);
+    const owner = await worktreeOwner(work);
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("succeeded");
+    expect(await worktreeOwner(work)).toBe(owner);
+    expect(await git(repoDir, "rev-parse", `refs/heads/${branch}`)).toBe(
+      f.store.getRun(run.id)?.headSha ?? "",
+    );
+    expect(existsSync(cachePath(f.cfg.paths, repo))).toBe(false);
+    const fresh = await f.createRun({ repo: repoDir, prompt: "New run" });
+    expect(await executeRun(f.deps, fresh.id, new AbortController().signal)).toBe("succeeded");
+    expect(await worktreeOwner(join(f.cfg.paths.work, fresh.id))).toBe(
+      await worktreeOwner(cachePath(f.cfg.paths, repo)),
+    );
+    expect(await git(repoDir, "rev-parse", `refs/heads/${f.store.getRun(fresh.id)?.branch}`)).toBe(
+      f.store.getRun(fresh.id)?.headSha ?? "",
+    );
+    await removeWorktree(f.cfg.paths, repo, work);
+    expect(await git(repoDir, "worktree", "list", "--porcelain")).not.toContain(work);
+  });
+
+  test("needs-human delivery keeps the existing local branch-only policy", async () => {
+    const f = start((s) => (roleOf(s) === "implement" ? { files: { "farewell.txt": "BAD\n" } } : reply(s)));
+    f.cfg.maxRounds = 1;
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+    const result = f.store.getRun(run.id);
+    expect(await git(repoDir, "rev-parse", `refs/heads/${result?.branch}`)).toBe(result?.headSha ?? "");
+    expect(await git(repoDir, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+    expect(result?.prUrl).toBeNull();
+    expect(result?.merged).toBe(false);
+  });
+
+  test("local commits do not depend on the source or global git identity", async () => {
+    const previous = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+    try {
+      await git(repoDir, "config", "user.name", "Source Owner");
+      await git(repoDir, "config", "user.email", "source@example.test");
+      const f = start(reply);
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const branch = f.store.getRun(run.id)?.branch ?? "";
+      expect(await git(repoDir, "show", "-s", "--format=%ae", branch)).toBe("limitless@localhost");
+      expect(await git(repoDir, "config", "user.email")).toBe("source@example.test");
+    } finally {
+      if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = previous;
+    }
+  });
+
+  test("delivery refuses a conflicting branch and a checked-out branch even with updateInstead", async () => {
+    const f = start(reply);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("missing repo");
+    const work = join(f.cfg.paths.work, run.id);
+    await git(repoDir, "config", "receive.denyCurrentBranch", "updateInstead");
+    const before = readFileSync(join(repoDir, ".git/index"));
+    await expect(pushBranch(repo, work, "main")).rejects.toThrow();
+    expect(readFileSync(join(repoDir, ".git/index"))).toEqual(before);
+    expect(existsSync(join(repoDir, "farewell.txt"))).toBe(false);
+    await git(
+      repoDir,
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+      "commit",
+      "--allow-empty",
+      "-qm",
+      "unrelated",
+    );
+    await git(repoDir, "branch", "conflicting");
+    const conflicting = await git(repoDir, "rev-parse", "conflicting");
+    await expect(pushBranch(repo, work, "conflicting")).rejects.toThrow();
+    expect(await git(repoDir, "rev-parse", "conflicting")).toBe(conflicting);
+  });
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {

@@ -235,8 +235,9 @@ detection, per-invocation budget, process-group kill on cancel.
 
 - Bare repo cache `~/.limitless/repos/<owner>__<name>.git`, fetched before each run.
 - One worktree per run at `~/.limitless/work/<run-id>` on branch `limitless/<run-id>-<slug>`.
-- Local-only (non-GitHub) repos are supported: worktrees come straight from the local clone and
-  delivery leaves a branch instead of a PR.
+- Local-only (non-GitHub) repos use a factory-owned shared bare clone, fetched from the source
+  before each new run. Delivery pushes only the run branch back to the source. Legacy worktrees
+  attached to the source remain there until they finish.
 - Agents run with the CLIs' own sandboxes (Seatbelt on macOS) where they're compatible with the
   repo's toolchain; secrets for Discord/GitHub/OpenRouter are scrubbed from agent environments.
 - Triggers are **allowlisted** (your GitHub login, `dependabot[bot]`, your Discord user id).

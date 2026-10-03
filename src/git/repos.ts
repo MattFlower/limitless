@@ -152,11 +152,10 @@ export async function resolveRepo(store: Store, input: string): Promise<Repo> {
 }
 
 export function cachePath(paths: Paths, repo: Repo): string {
-  if (repo.kind === "local") return repo.localPath as string;
+  if (repo.kind === "local") return join(paths.repos, `local-${repo.id}.git`);
   return join(paths.repos, `${repo.slug.replace("/", "__")}.git`);
 }
 
-/** Make sure a fresh bare mirror exists (GitHub repos) and is fetched. */
 const cacheLocks = new Map<string, Promise<unknown>>();
 
 /** Serialize work on one repo cache (clone/fetch/worktree add) across concurrent runs. */
@@ -171,36 +170,57 @@ export async function withRepoLock<T>(key: string, fn: () => Promise<T>): Promis
   }
 }
 
-/** Make sure a fresh bare mirror exists (GitHub repos) and is fetched. */
+/** Make sure a factory-owned bare clone exists and is fetched. */
 export async function ensureCache(paths: Paths, repo: Repo, signal?: AbortSignal): Promise<string> {
   const cache = cachePath(paths, repo);
-  if (repo.kind === "local") return cache;
-  return withRepoLock(cache, async () => {
-    signal?.throwIfAborted();
-    if (!existsSync(cache)) {
-      mkdirSync(paths.repos, { recursive: true });
-      // Clone to a temporary path and rename, so a crash never leaves a half-configured cache.
-      const tmp = `${cache}.tmp-${process.pid}-${Date.now()}`;
-      try {
-        await worktreeGit(["git", "clone", "--bare", repo.url as string, tmp], {
-          cwd: paths.repos,
-          timeoutMs: 600_000,
-          signal,
-        });
-        await worktreeGit(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
-          cwd: tmp,
-          signal,
-        });
-        renameSync(tmp, cache);
-      } finally {
-        rmSync(tmp, { recursive: true, force: true });
-      }
+  return withRepoLock(cache, () => refreshCache(paths, repo, signal));
+}
+
+async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Promise<string> {
+  const cache = cachePath(paths, repo);
+  signal?.throwIfAborted();
+  if (!existsSync(cache)) {
+    mkdirSync(paths.repos, { recursive: true });
+    // Clone to a temporary path and rename, so a crash never leaves a half-configured cache.
+    const tmp = `${cache}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      await worktreeGit(
+        [
+          "git",
+          "clone",
+          "--bare",
+          ...(repo.kind === "local" ? ["--shared"] : []),
+          (repo.kind === "local" ? repo.localPath : repo.url) as string,
+          tmp,
+        ],
+        { cwd: paths.repos, timeoutMs: 600_000, signal },
+      );
+      await worktreeGit(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
+        cwd: tmp,
+        signal,
+      });
+      renameSync(tmp, cache);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
     }
-    // Agents run inside worktrees of this repo; make any push attempt from them fail.
-    await worktreeGit(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
-    await worktreeGit(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
-    return cache;
-  });
+  }
+  if (repo.kind === "local") {
+    await worktreeGit(["git", "config", "user.name", "Limitless"], { cwd: cache });
+    await worktreeGit(["git", "config", "user.email", "limitless@localhost"], { cwd: cache });
+  }
+  // Agents run inside worktrees of this repo; make any push attempt from them fail.
+  await worktreeGit(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
+  await worktreeGit(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
+  return cache;
+}
+
+/** The owning common directory also works as a git cwd for legacy linked worktrees. */
+export async function worktreeOwner(path: string): Promise<string> {
+  return (
+    await worktreeGit(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      cwd: path,
+    })
+  ).stdout.trim();
 }
 
 export interface Worktree {
@@ -220,14 +240,16 @@ export async function createWorktree(
   const git = repo.kind === "github" ? worktreeGit : sh;
   const path = join(paths.work, runId);
   const branch = `limitless/${runId}-${slugify(title, 30)}`;
-  const baseRef = repo.kind === "github" ? `origin/${baseBranch}` : baseBranch;
+  const baseRef = `refs/remotes/origin/${baseBranch}`;
   if (existsSync(path)) {
     // Resuming an interrupted run: reuse the worktree as-is.
     const head = await worktreeGit(["git", "rev-parse", "HEAD"], { cwd: path });
-    const base = await git(["git", "rev-parse", baseRef], { cwd: cache });
+    const owner = await worktreeOwner(path);
+    const base = repo.kind === "local" ? head : await git(["git", "rev-parse", baseRef], { cwd: owner });
     return { path, branch, baseSha: base.stdout.trim() || head.stdout.trim() };
   }
   return withRepoLock(cache, async () => {
+    if (repo.kind === "local") await refreshCache(paths, repo);
     const base = await git(["git", "rev-parse", baseRef], { cwd: cache });
     await git(["git", "worktree", "add", "-b", branch, path, base.stdout.trim()], { cwd: cache });
     return { path, branch, baseSha: base.stdout.trim() };
@@ -237,7 +259,10 @@ export async function createWorktree(
 export async function removeWorktree(paths: Paths, repo: Repo, path: string): Promise<void> {
   if (!existsSync(path)) return;
   const git = repo.kind === "github" ? worktreeGit : sh;
-  await git(["git", "worktree", "remove", "--force", path], { cwd: cachePath(paths, repo), allowFail: true });
+  const cache = repo.kind === "local" ? await worktreeOwner(path) : cachePath(paths, repo);
+  await withRepoLock(cache, () =>
+    git(["git", "worktree", "remove", "--force", path], { cwd: cache, allowFail: true }),
+  );
 }
 
 export async function headSha(cwd: string): Promise<string> {
@@ -429,7 +454,23 @@ export async function pushBranch(
   signal?: AbortSignal,
   budget?: GitHubBudget,
 ): Promise<void> {
-  if (repo.kind !== "github" || !repo.url) return;
+  if (repo.kind === "local") {
+    if (!repo.localPath) throw new Error("local repository path is missing");
+    // Legacy worktrees already own the delivered branch in the source repository.
+    if ((await worktreeOwner(cwd)) === (await worktreeOwner(repo.localPath))) return;
+    await worktreeGit(
+      [
+        "git",
+        "push",
+        "--receive-pack=git -c core.hooksPath=/dev/null -c receive.denyCurrentBranch=refuse receive-pack",
+        repo.localPath,
+        `${sha}:refs/heads/${branch}`,
+      ],
+      { cwd, timeoutMs: 300_000, signal },
+    );
+    return;
+  }
+  if (!repo.url) return;
   await remoteSh(["git", "push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
     cwd,
     timeoutMs: 300_000,
