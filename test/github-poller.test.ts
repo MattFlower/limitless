@@ -63,6 +63,59 @@ test("tracks only factory PRs from run records, one nodes(ids:) query per reposi
   expect(h.gh.graphql()).toHaveLength(2);
 });
 
+test.each([
+  ["octocat/hello-world", "Octocat/Hello-World"],
+  ["Octocat/Hello-World", "octocat/hello-world"],
+])("tracks %s PRs with URL spelling %s through restart and merge", async (repo, spelling) => {
+  h = pollerHarness([repo]);
+  const run = h.factoryPr(repo, 1);
+  const prUrl = url(spelling, 1);
+  h.store.updateRun(run.id, { prUrl });
+  const pr = h.node(repo, 1);
+  pr.url = prUrl;
+  h.gh.restNext.push(respond(200, { node_id: pr.id }));
+  expect(h.store.githubTracked().map((p) => p.url)).toEqual([prUrl]);
+  h.start();
+  await h.advance(0);
+  expect(h.gh.rest()).toEqual([{ path: `repos/${repo}/pulls/1` }]);
+  expect(h.gh.graphql().map((c) => c.ids)).toEqual([[pr.id]]);
+  expect(JSON.parse(snapshotOf(prUrl)).url).toBe(prUrl);
+  h.reopen();
+  h.gh.calls.length = 0;
+  pr.state = "MERGED";
+  pr.mergedAt = pr.updatedAt;
+  pr.mergedBy = { login: "octocat" };
+  h.start();
+  await h.advance(0);
+  expect(h.gh.rest()).toHaveLength(0);
+  expect(h.gh.graphql().map((c) => c.ids)).toEqual([[pr.id]]);
+  expect(h.store.getRun(run.id)?.merged).toBe(true);
+  expect(kinds()).toEqual(["pr.merged"]);
+  expect(h.store.readFeed().items.filter((i) => i.kind === "run.merged")).toHaveLength(1);
+});
+
+test("rejects mismatched repositories and malformed PR numbers", async () => {
+  h = pollerHarness(["octocat/hello-world"]);
+  const invalid = [
+    "https://github.com/other/hello-world/pull/1",
+    "https://github.com/octocat/other/pull/1",
+    "https://github.com/octocat/hello-world/pull/1extra",
+    "https://github.com/octocat/hello-world/pull/1/files",
+    "https://github.com/octocat/hello-world/pull/0",
+    "https://github.com/octocat/hello-world/pull/-1",
+    "https://github.com/octocat/hello-world/pull/1.5",
+    "https://github.com.evil/octocat/hello-world/pull/1",
+  ];
+  for (const [i, prUrl] of invalid.entries()) {
+    const run = h.factoryPr("octocat/hello-world", i + 1);
+    h.store.updateRun(run.id, { prUrl });
+  }
+  expect(h.store.githubTracked()).toEqual([]);
+  h.start();
+  await h.advance(0);
+  expect(h.gh.calls).toEqual([]);
+});
+
 test("each change produces exactly one feed item; repeats and non-changes produce none", async () => {
   h = pollerHarness();
   h.factoryPr("o/r", 1);

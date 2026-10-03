@@ -1686,11 +1686,14 @@ export class Store {
     const sql = `SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId, g.node_id AS nodeId, g.data,
         max(r.status IN ('succeeded', 'needs_human')) AS delivered
       FROM runs r JOIN repos ON repos.id = r.repo_id LEFT JOIN github_prs g ON g.url = r.pr_url
-      WHERE repos.kind = 'github' AND r.pr_url GLOB 'https://github.com/' || repos.slug || '/pull/[1-9]*'
+      WHERE repos.kind = 'github' AND r.pr_url IS NOT NULL
         AND NOT r.merged AND NOT r.pr_closed_unmerged AND r.delivery_branch IS NULL AND NOT coalesce(g.terminal, 0)
         AND coalesce(json_extract(r.source_ref, '$.kind'), '') <> 'pull_request'
       GROUP BY r.pr_url ORDER BY repos.slug, r.pr_url`;
-    return this.db.query(sql).all() as TrackedPr[];
+    return (this.db.query(sql).all() as TrackedPr[]).filter((pr) => {
+      const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/.exec(pr.url);
+      return match?.[1]?.toLowerCase() === pr.repo.toLowerCase();
+    });
   }
 
   githubPrData(url: string): string | null {
