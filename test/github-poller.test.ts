@@ -1069,6 +1069,53 @@ test("a backfilled item created in the same second as the whole page is not acti
   }
 });
 
+test.each([false, true])(
+  "review-comment backfills use their own review's ordering (legacy=%s)",
+  async (legacy) => {
+    h = pollerHarness();
+    const run = h.factoryPr("o/r", 1);
+    const pr = h.node("o/r", 1);
+    const c = (id: string, updatedAt = "t1") => ({ id, createdAt: "t1", updatedAt });
+    const page = Array.from({ length: 11 }, (_, i) => c(`C${i}`));
+    const first = { ...c("R1"), comments: { nodes: [c("other")] } };
+    const second = { ...c("R2"), comments: { nodes: page.slice(1) } };
+    pr.reviews.nodes = [first, second];
+    h.start();
+    await h.advance(0);
+    expect(kinds()).toEqual([]);
+    if (legacy) {
+      const data = JSON.parse(snapshotOf(pr.url));
+      delete data.reviewComments;
+      h.store.saveGithubPr({
+        url: pr.url,
+        repo: "o/r",
+        runId: run.id,
+        delivered: 1,
+        nodeId: pr.id,
+        data: JSON.stringify(data),
+      });
+    }
+    h.reopen();
+    // Deleting C10 backfills C0. The first review's known comment proves nothing about C0's order.
+    second.comments.nodes = page.slice(0, 10);
+    h.start();
+    await h.advance(0);
+    expect(kinds()).toEqual([]);
+    const steps: [() => void, string[]][] = [
+      [() => pr.reviews.nodes.unshift({ ...c("R0"), comments: { nodes: [c("backfilled")] } }), []],
+      [() => pr.reviews.nodes.reverse(), []],
+      [() => second.comments.nodes.push(c("C11")), ["review_comment"]],
+      [() => (second.comments.nodes[0] = c("C0", "t2")), ["review_comment"]],
+      [() => (second.comments.nodes = []), []],
+    ];
+    for (const [change, expected] of steps) {
+      change();
+      await h.advance(15 * S);
+      expect(h.fresh().map((item) => item.data.category)).toEqual(expected);
+    }
+  },
+);
+
 test("snapshots persisted with the previous activity markers are upgraded, not fatal", async () => {
   h = pollerHarness();
   const run = h.factoryPr("o/r", 1);

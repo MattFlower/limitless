@@ -47,6 +47,7 @@ export type PrSnapshot = Known & {
   failing: { name: string; url: string | null }[];
   truncated?: boolean; // all 100 fetched check contexts were used, so there may be more
   reviews?: string[]; // `login:state` of each reviewer's latest review
+  reviewComments?: Record<string, string[]>; // each review connection has its own oldest-first order
   activity: Record<"review" | "review_comment" | "comment", string[]>;
 };
 type Saved = PrSnapshot & { revision: number; unknown: number; nudged: string | null };
@@ -93,6 +94,7 @@ export function normalizePr(node: unknown, id?: string | null): PrSnapshot | nul
     failing: failing.sort((a, b) => a.name.localeCompare(b.name)),
     truncated: nodes(rollup?.contexts).length >= 100 || undefined,
     reviews: nodes(latestReviews).map((r) => `${r.author?.login ?? "ghost"}:${r.state}`),
+    reviewComments: Object.fromEntries(all.map((r) => [r.id, newest(nodes(r.comments))])),
     activity: {
       review: newest(all),
       review_comment: newest(all.flatMap((r) => nodes(r.comments))),
@@ -121,12 +123,19 @@ export function diffPr(prev: PrSnapshot | null, next: PrSnapshot): Change[] {
   for (const review of next.reviews ?? [])
     if (prev?.reviews && !prev.reviews.includes(review) && /:(APPROVED|CHANGES_REQUESTED)$/.test(review))
       add("pr.review", review, { review });
-  for (const [category, value] of Object.entries(next.activity))
+  for (const [category, value] of Object.entries(next.activity)) {
+    const pages = category === "review_comment" ? next.reviewComments : undefined;
     if (
       prev &&
-      value.some((m, i) => fresh(m, value.slice(0, i), prev.activity[category as keyof Saved["activity"]]))
+      Object.entries(pages ?? { [category]: value }).some(([id, markers]) => {
+        const old =
+          (pages ? prev.reviewComments?.[id] : undefined) ??
+          prev.activity[category as keyof Saved["activity"]];
+        return markers.some((m, i) => fresh(m, markers.slice(0, i), old));
+      })
     )
       add("pr.comment", category, { category });
+  }
   if (next.state !== "OPEN" && next.state !== prev?.state)
     add(next.state === "MERGED" ? "pr.merged" : "pr.closed", "", { mergedBy: next.mergedBy?.login });
   return out;
