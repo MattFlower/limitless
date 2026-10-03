@@ -353,7 +353,13 @@ async function main(): Promise<void> {
       const svc = await import("./service.ts");
       const port = Number(process.env.LIMITLESS_PORT ?? 7400);
       if (rest[0] === "install") {
-        return svc.install(port, { tunnel: values.tunnel === true, mtplx: values.mtplx === true });
+        const { loadConfig } = await import("../config.ts");
+        const cfg = loadConfig();
+        return svc.install(port, {
+          tunnel: values.tunnel === true,
+          mtplx: values.mtplx === true,
+          publicUrl: cfg.publicUrl,
+        });
       }
       if (rest[0] === "uninstall") return svc.uninstall();
       return svc.status(port);

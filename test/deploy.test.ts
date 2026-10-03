@@ -877,3 +877,13 @@ test("replacement with the wrong commit fails and restores the old release", asy
   expect(f.calls.at(-1)).toBe("resume");
   expect(f.logs).not.toContain("daemon after: next");
 });
+
+test("the tunnel config names the configured public host and exposes only webhooks", async () => {
+  const { tunnelYaml } = await import("../src/cli/service.ts");
+  const yaml = tunnelYaml("0000-tunnel", "/creds.json", "hooks.example.com", 7400);
+  expect(yaml).toContain(
+    "  - hostname: hooks.example.com\n    path: ^/webhooks/\n    service: http://127.0.0.1:7400\n",
+  );
+  expect(yaml).toContain("  - service: http_status:404\n");
+  expect(yaml).not.toMatch(/mattflower/i);
+});

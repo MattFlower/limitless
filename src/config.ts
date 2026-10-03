@@ -38,7 +38,7 @@ export interface Config {
   listenLan: string | null;
   trustedProxies: string[];
   publicOrigins: string[];
-  publicUrl: string | null; // e.g. https://limitless.mattflower.cc (webhooks only)
+  publicUrl: string | null; // e.g. https://limitless.example.com (webhooks only)
   uiUrl: string; // where the UI is reachable locally, used in PR bodies
   maxConcurrentRuns: number;
   providerMaxConcurrent: Record<string, number>;
