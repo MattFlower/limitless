@@ -325,3 +325,29 @@ test("feed tools bound cursors and waits, read without acknowledging and ack mon
     expect((await call(name, args)).isError).toBe(true);
   expect(f.factory.store.feedCursor("claude")).toBe(page.nextAfter);
 });
+
+test("cancelling a feed long poll or closing the connection releases its listener", async () => {
+  const listeners = () => (f.factory.store as unknown as { listeners: Set<unknown> }).listeners.size;
+  const idle = listeners();
+  const controller = new AbortController();
+  const cancelled = connection.client
+    .callTool({ name: "limitless_feed", arguments: { wait: 30 } }, undefined, { signal: controller.signal })
+    .catch(() => "cancelled");
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle + 1);
+  controller.abort();
+  expect(await cancelled).toBe("cancelled");
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle);
+
+  const other = await connect(factoryBackend(f.factory));
+  const closed = other.client
+    .callTool({ name: "limitless_feed", arguments: { wait: 30 } })
+    .catch(() => "closed");
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle + 1);
+  await other.close();
+  expect(await closed).toBe("closed");
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle);
+});

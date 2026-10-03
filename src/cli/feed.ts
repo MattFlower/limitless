@@ -5,12 +5,7 @@ type Api = <T>(path: string, init?: RequestInit) => Promise<T>;
 
 const USAGE =
   "usage: limitless feed [--consumer <name>] [--after <id>] [--wait <seconds>] [--json] | feed ack <id> --consumer <name>";
-
-function feedId(value: string | undefined): number {
-  const id = Number(value);
-  if (!value || !/^\d+$/.test(value) || !Number.isSafeInteger(id)) throw new Error(USAGE);
-  return id;
-}
+const feedId = (value = "") => (/^\d+$/.test(value) && Number.isSafeInteger(+value) ? +value : undefined);
 
 /** Long-polls in requests of at most 60 s until a page has items or the total wait ends; never acknowledges. */
 export async function pollFeed(
@@ -19,14 +14,13 @@ export async function pollFeed(
   now: () => number = Date.now,
 ): Promise<FeedPage> {
   const deadline = now() + opts.waitS * 1000;
-  let after = opts.after;
+  let { after } = opts;
   let pruned = false;
   for (;;) {
     const wait = Math.min(MAX_FEED_WAIT_S, Math.max(0, deadline - now()) / 1000);
-    const query = new URLSearchParams({ wait: String(wait) });
-    if (opts.consumer !== undefined) query.set("consumer", opts.consumer);
-    if (after !== undefined) query.set("after", String(after));
-    const page = await api<FeedPage>(`/api/feed?${query}`);
+    const query = { wait: String(wait), consumer: opts.consumer, after: after?.toString() };
+    const params = Object.entries(query).flatMap(([k, v]) => (v === undefined ? [] : [[k, v]]));
+    const page = await api<FeedPage>(`/api/feed?${new URLSearchParams(params)}`);
     pruned ||= page.pruned;
     // Later requests keep the first request's effective cursor.
     after = page.nextAfter;
@@ -39,27 +33,17 @@ export async function feedCommand(
   values: { consumer?: string; after?: string; wait?: string; json?: boolean },
   deps: { api: Api; print: (line: string) => void; now?: () => number },
 ): Promise<void> {
+  const id = feedId(rest[1] ?? values.after);
   if (rest[0] === "ack") {
-    if (rest.length !== 2 || !values.consumer) throw new Error(USAGE);
-    const ack = await deps.api<FeedAck>("/api/feed/ack", {
-      method: "POST",
-      body: JSON.stringify({ consumer: values.consumer, id: feedId(rest[1]) }),
-    });
-    deps.print(values.json ? JSON.stringify(ack) : `${ack.consumer} acknowledged through ${ack.id}`);
-    return;
+    if (rest.length !== 2 || !values.consumer || id === undefined) throw new Error(USAGE);
+    const body = JSON.stringify({ consumer: values.consumer, id });
+    const ack = await deps.api<FeedAck>("/api/feed/ack", { method: "POST", body });
+    return deps.print(values.json ? JSON.stringify(ack) : `${ack.consumer} acknowledged through ${ack.id}`);
   }
   const waitS = Number(values.wait ?? 0);
-  if (rest.length || values.wait?.trim() === "" || !Number.isFinite(waitS) || waitS < 0)
-    throw new Error(USAGE);
-  const page = await pollFeed(
-    {
-      ...(values.consumer === undefined ? {} : { consumer: values.consumer }),
-      ...(values.after === undefined ? {} : { after: feedId(values.after) }),
-      waitS,
-    },
-    deps.api,
-    deps.now,
-  );
+  if (rest.length || values.wait?.trim() === "" || !(waitS >= 0 && waitS < Infinity)) throw new Error(USAGE);
+  if (values.after !== undefined && id === undefined) throw new Error(USAGE);
+  const page = await pollFeed({ consumer: values.consumer, after: id, waitS }, deps.api, deps.now);
   if (values.json) return deps.print(JSON.stringify(page));
   if (page.pruned)
     deps.print("Note: retention pruned items after this cursor before they were acknowledged.");

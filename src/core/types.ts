@@ -335,7 +335,6 @@ export type FeedKind =
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged"}`
   | "eval.finished"
   | "daemon.started";
-
 /** A durable item a client must act on; clients read everything after their cursor. */
 export interface FeedItem {
   id: number;
@@ -348,19 +347,9 @@ export interface FeedItem {
   summary: string;
   data: Record<string, unknown>;
 }
-
-export interface FeedPage {
-  items: FeedItem[];
-  /** The cursor for the next read: the last returned id, or the effective cursor when empty. */
-  nextAfter: number;
-  /** True when retention removed items after the effective cursor. */
-  pruned: boolean;
-}
-
-export interface FeedAck {
-  consumer: string;
-  id: number;
-}
+/** `nextAfter`: the last returned id, else the effective cursor. `pruned`: retention removed items after it. */
+export type FeedPage = { items: FeedItem[]; nextAfter: number; pruned: boolean };
+export type FeedAck = { consumer: string; id: number };
 
 /** Process-local scheduler state; active includes executions waiting for input or capacity. */
 export interface DrainState {

@@ -12,7 +12,6 @@ import type {
   EventType,
   FeedAck,
   FeedItem,
-  FeedKind,
   FeedPage,
   Invocation,
   InvocationStatus,
@@ -46,6 +45,12 @@ export function newId(prefix = ""): string {
 function json(v: unknown): string | null {
   return v === undefined || v === null ? null : JSON.stringify(v);
 }
+
+const FEED_SELECT =
+  "SELECT id, ts, kind, run_id AS runId, eval_id AS evalId, repo, title, summary, data FROM feed";
+const toFeedItem = (r: Row) => ({ ...r, data: parse(r.data, {}) }) as FeedItem;
+/** The highest id retention has removed, so a cursor before it is told items were pruned. */
+const FEED_PRUNED = "feed_pruned_through";
 
 function parse<T>(v: unknown, fallback: T): T {
   if (typeof v !== "string") return fallback;
@@ -154,33 +159,6 @@ const toRun = (r: Row): Run => ({
   priority: r.priority as number,
   ...(r.no_baseline_cache === 1 ? { noBaselineCache: true } : {}),
 });
-
-const toFeedItem = (r: Row): FeedItem => ({
-  id: r.id as number,
-  ts: r.ts as number,
-  kind: r.kind as FeedKind,
-  runId: (r.run_id as string) ?? null,
-  evalId: (r.eval_id as string) ?? null,
-  repo: (r.repo as string) ?? null,
-  title: r.title as string,
-  summary: r.summary as string,
-  data: parse(r.data, {}),
-});
-
-/** Clip by code point so the stored text never splits a surrogate pair. */
-function clip(text: string, max: number): string {
-  const chars = [...text];
-  return chars.length <= max ? text : `${chars.slice(0, max - 1).join("")}…`;
-}
-
-/** The highest id retention has removed, so a stale cursor can be told items were pruned. */
-const FEED_PRUNED = "feed_pruned_through";
-const RUN_STATUS_FEED: Partial<Record<RunStatus, FeedKind>> = {
-  needs_human: "run.needs_human",
-  failed: "run.failed",
-  succeeded: "run.succeeded",
-  cancelled: "run.cancelled",
-};
 
 const toStage = (r: Row): Stage => ({
   id: r.id as number,
@@ -339,6 +317,7 @@ export class Store {
   readonly db: Database;
   private listeners = new Set<Listener>();
   private pendingPublications: StreamMessage[] | null = null;
+  private feedPublished = 0;
 
   constructor(path: string, migrationDir = MIGRATION_DIR) {
     this.db = new Database(path, { create: true, strict: true });
@@ -348,6 +327,7 @@ export class Store {
     this.db.exec("PRAGMA busy_timeout = 5000");
     try {
       runMigrations(this.db, migrationDir);
+      this.feedPublished = this.feedIssued();
     } catch (error) {
       this.db.close();
       throw error;
@@ -380,7 +360,7 @@ export class Store {
       finishedAt: null,
       error: null,
     };
-    this.atomic(() => {
+    this.db.transaction(() => {
       this.db
         .query("INSERT INTO eval_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .run(
@@ -412,38 +392,20 @@ export class Store {
           .run(run.id, resumedFrom);
         if (linked.changes !== 1) throw new Error(`eval ${resumedFrom} was already resumed`);
         // The predecessor keeps its error for diagnosis.
-        const before = this.getEvalRun(resumedFrom)?.status;
         this.db.query("UPDATE eval_runs SET status = 'interrupted' WHERE id = ?").run(resumedFrom);
-        this.evalFinished(resumedFrom, before);
       }
       for (const trial of trials) this.recordEvalTrial({ ...trial, evalRunId: run.id });
-    });
+    })();
+    this.publishFeed();
     return run;
   }
 
   updateEvalRun(id: string, status: EvalRun["status"], error: string | null = null): void {
     const finished = status === "queued" || status === "running" ? null : Date.now();
-    this.atomic(() => {
-      const before = this.getEvalRun(id)?.status;
-      this.db
-        .query("UPDATE eval_runs SET status = ?, finished_at = ?, error = ? WHERE id = ?")
-        .run(status, finished, error, id);
-      this.evalFinished(id, before);
-    });
-  }
-
-  /** Records `eval.finished` when an eval enters a terminal status. */
-  private evalFinished(id: string, before: EvalRun["status"] | undefined): void {
-    const run = this.getEvalRun(id);
-    if (!run || run.status === before || run.status === "queued" || run.status === "running") return;
-    this.addFeed({
-      kind: "eval.finished",
-      key: id,
-      evalId: id,
-      title: `Eval ${id} ${run.status}`,
-      summary: run.error ?? `${run.role} eval ${run.status}`,
-      data: { status: run.status, role: run.role, error: run.error, finishedAt: run.finishedAt },
-    });
+    this.db
+      .query("UPDATE eval_runs SET status = ?, finished_at = ?, error = ? WHERE id = ?")
+      .run(status, finished, error, id);
+    this.publishFeed();
   }
 
   getEvalRun(id: string): EvalRun | null {
@@ -534,7 +496,7 @@ export class Store {
 
   /** Ends a run's unfinished trials unscored: an interrupted trial is neither a pass nor a failure. */
   interruptEval(id: string, reason: string, status: "interrupted" | "failed" = "interrupted"): void {
-    this.atomic(() => {
+    this.db.transaction(() => {
       for (const trial of this.listEvalTrials(id)) {
         if (trial.status === "queued" || trial.status === "running")
           this.recordEvalTrial({
@@ -550,7 +512,8 @@ export class Store {
           });
       }
       this.updateEvalRun(id, status, reason);
-    });
+    })();
+    this.publishFeed();
   }
 
   recoverEvals(): void {
@@ -579,6 +542,7 @@ export class Store {
       this.pendingPublications.push(msg);
       return;
     }
+    if (msg.kind !== "feed") this.publishFeed();
     for (const l of this.listeners) {
       try {
         l(msg);
@@ -589,7 +553,7 @@ export class Store {
   }
 
   /** Publish only after commit, including the run and its proposal linkage. */
-  private atomic<T>(fn: () => T): T {
+  private chatTransaction<T>(fn: () => T): T {
     if (this.pendingPublications) return fn();
     const messages: StreamMessage[] = [];
     this.pendingPublications = messages;
@@ -600,129 +564,67 @@ export class Store {
       this.pendingPublications = null;
     }
     for (const message of messages) this.publish(message);
+    this.publishFeed();
     return result;
   }
 
-  // ---- feed ----------------------------------------------------------------
-
-  /** Once per dedupe key, in the caller's transaction; a pruned key is only re-added by a new transition. */
-  private addFeed(
-    input: Pick<FeedItem, "kind" | "title" | "summary" | "data"> &
-      Partial<Pick<FeedItem, "runId" | "evalId" | "repo">> & { key: string },
-  ): void {
-    this.atomic(() => {
-      const row = this.db
-        .query(
-          `INSERT INTO feed (ts, kind, run_id, eval_id, repo, title, summary, data, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
-        )
-        .get(
-          Date.now(),
-          input.kind,
-          input.runId ?? null,
-          input.evalId ?? null,
-          input.repo ?? null,
-          clip(input.title, 200),
-          clip(input.summary, 500),
-          JSON.stringify(input.data),
-          `${input.kind}:${input.key}`,
-        ) as Row | null;
-      if (row) this.publish({ kind: "feed", item: toFeedItem(row) });
-    });
+  /** Publishes items committed since the last call; inside a transaction they wait for its commit. */
+  private publishFeed(): void {
+    if (this.db.inTransaction) return;
+    const query = this.db.query(`${FEED_SELECT} WHERE id > ? ORDER BY id`);
+    for (const row of query.all(this.feedPublished) as Row[]) {
+      this.feedPublished = row.id as number;
+      this.publish({ kind: "feed", item: toFeedItem(row) });
+    }
   }
 
-  /** Feed items for a run's transitions; `before` is null for a new run. */
-  private runFeed(before: Run | null, run: Run): void {
-    const { status, error, prUrl, mergedBy } = run;
-    const add = (kind: FeedKind, title: string, summary: string, data: Record<string, unknown>) =>
-      this.addFeed({
-        kind,
-        key: run.id,
-        runId: run.id,
-        repo: run.repoSlug,
-        title: `${title}: ${run.title}`,
-        summary,
-        data,
-      });
-    if (prUrl && !before?.prUrl) add("run.pr_opened", "PR opened", prUrl, { prUrl, status });
-    const kind = RUN_STATUS_FEED[status];
-    if (kind && status !== before?.status)
-      add(kind, `Run ${status}`, error ?? `Run ${status}${prUrl ? `: ${prUrl}` : ""}`, {
-        status,
-        error,
-        prUrl,
-        ...(status === "needs_human" ? { reason: error } : {}),
-      });
-    // Only dependency reconciliation moves a run out of waiting.
-    if (before?.status === "waiting" && status === "queued")
-      add("run.released", "Released", `Dependencies merged (${run.dependsOn.join(", ")}); run queued`, {
-        dependsOn: run.dependsOn,
-        status,
-      });
-    if (run.merged && !before?.merged)
-      add("run.merged", "Merged", `${prUrl ?? "Run"} merged${mergedBy ? ` by ${mergedBy}` : ""}`, {
-        prUrl,
-        mergedBy,
-        mergedAt: run.mergedAt,
-        status,
-      });
-  }
-
-  daemonStarted(bootId: string, version: string, sha: string): void {
-    this.addFeed({
-      kind: "daemon.started",
-      key: bootId,
-      title: `Limitless ${version} started`,
-      summary: `Daemon ${version} started at ${sha}`,
-      data: { version, sha, bootId },
-    });
+  daemonStarted(bootId: string, version: string): void {
+    this.db
+      .query("INSERT INTO feed_add VALUES ('daemon.started', NULL, NULL, ?, ?, ?, ?)")
+      .run(`Limitless ${version} started`, `Daemon ${version} started`, json({ version, bootId }), bootId);
+    this.publishFeed();
   }
 
   /** Items after the explicit cursor, else after the consumer's acknowledged id; never acknowledges. */
   readFeed(opts: { consumer?: string; after?: number; limit?: number } = {}): FeedPage {
     const after = opts.after ?? (opts.consumer === undefined ? 0 : this.feedCursor(opts.consumer));
-    const items = (
-      this.db
-        .query("SELECT * FROM feed WHERE id > ? ORDER BY id LIMIT ?")
-        .all(after, opts.limit ?? 100) as Row[]
-    ).map(toFeedItem);
+    const query = this.db.query(`${FEED_SELECT} WHERE id > ? ORDER BY id LIMIT ?`);
+    const items = (query.all(after, opts.limit ?? 100) as Row[]).map(toFeedItem);
     return { items, nextAfter: items.at(-1)?.id ?? after, pruned: this.getSetting(FEED_PRUNED, 0) > after };
   }
 
   feedCursor(consumer: string): number {
-    const row = this.db.query("SELECT acked_id FROM feed_cursors WHERE consumer = ?").get(consumer) as {
-      acked_id: number;
-    } | null;
-    return row?.acked_id ?? 0;
+    return this.feedNumber("SELECT acked_id AS n FROM feed_cursors WHERE consumer = ?", consumer);
   }
 
-  /** Monotonic: the cursor becomes max(previous, id). Ids never issued are refused so no future item is skipped. */
+  /** The highest id ever issued, counting AUTOINCREMENT gaps and pruned items. */
+  private feedIssued(): number {
+    return this.feedNumber("SELECT seq AS n FROM sqlite_sequence WHERE name = 'feed'");
+  }
+
+  private feedNumber(sql: string, ...params: string[]): number {
+    return (this.db.query(sql).get(...params) as { n: number } | null)?.n ?? 0;
+  }
+
+  /** The cursor becomes max(previous, id); ids never issued are refused so no future item is skipped. */
   ackFeed(consumer: string, id: number): FeedAck {
-    return this.atomic(() => {
-      const issued = this.db.query("SELECT seq FROM sqlite_sequence WHERE name = 'feed'").get() as {
-        seq: number;
-      } | null;
-      if (id > (issued?.seq ?? 0)) throw new Error(`feed id ${id} has not been issued`);
-      const row = this.db
-        .query(
-          `INSERT INTO feed_cursors VALUES (?, ?, ?) ON CONFLICT (consumer)
-           DO UPDATE SET acked_id = max(acked_id, excluded.acked_id), updated_at = excluded.updated_at RETURNING acked_id`,
-        )
-        .get(consumer, id, Date.now()) as { acked_id: number };
-      return { consumer, id: row.acked_id };
-    });
+    if (id > this.feedIssued()) throw new Error(`feed id ${id} has not been issued`);
+    const upsert = `INSERT INTO feed_cursors VALUES (?, ?) ON CONFLICT (consumer)
+      DO UPDATE SET acked_id = max(acked_id, excluded.acked_id) RETURNING acked_id`;
+    return { consumer, id: (this.db.query(upsert).get(consumer, id) as Row).acked_id as number };
   }
 
-  /** Removes items older than the cutoff and remembers the highest removed id for stale cursors. */
+  /** Removes items older than the cutoff, remembering the highest removed id for stale cursors. */
   pruneFeed(cutoff: number, dryRun = false): number {
-    return this.atomic(() => {
-      const query = "SELECT count(*) AS n, max(id) AS top FROM feed WHERE ts < ?";
-      const { n, top } = this.db.query(query).get(cutoff) as { n: number; top: number | null };
-      if (dryRun || top === null) return n;
+    return this.db.transaction(() => {
+      const old = this.db
+        .query("SELECT count(*) AS n, max(id) AS top FROM feed WHERE ts < ?")
+        .get(cutoff) as Row;
+      if (dryRun || old.top === null) return old.n as number;
       this.db.query("DELETE FROM feed WHERE ts < ?").run(cutoff);
-      this.setSetting(FEED_PRUNED, Math.max(this.getSetting(FEED_PRUNED, 0), top));
-      return n;
-    });
+      this.setSetting(FEED_PRUNED, Math.max(this.getSetting(FEED_PRUNED, 0), old.top as number));
+      return old.n as number;
+    })();
   }
 
   listChatMessages(conversationId: string, after = 0): ChatMessage[] {
@@ -806,7 +708,7 @@ export class Store {
   }
 
   proposeChat(conversationId: string, fields: ChatProposalFields, origin: ChatOrigin): ChatProposal {
-    return this.atomic(() => {
+    return this.chatTransaction(() => {
       const current = this.listChatProposals(conversationId).find(
         (p) => p.state === "pending" || p.state === "confirmed",
       );
@@ -841,7 +743,7 @@ export class Store {
   }
 
   confirmChat(conversationId: string, id: string): ChatProposal {
-    return this.atomic(() => {
+    return this.chatTransaction(() => {
       const proposal = this.chatProposal(conversationId, id);
       if (proposal.state === "superseded")
         throw new Error("Proposal has been superseded; confirm the current proposal");
@@ -856,7 +758,7 @@ export class Store {
   }
 
   resetChatConfirmation(conversationId: string, id: string): void {
-    this.atomic(() => {
+    this.chatTransaction(() => {
       const proposal = this.chatProposal(conversationId, id);
       // Creation can fail before consumption; never undo a committed run linkage.
       if (proposal.state !== "confirmed" || proposal.runId) return;
@@ -873,7 +775,7 @@ export class Store {
   }
 
   createChatRun(repo: Repo, req: CreateRunRequest, conversationId: string, proposalId: string): Run {
-    return this.atomic(() => {
+    return this.chatTransaction(() => {
       const proposal = this.chatProposal(conversationId, proposalId);
       if (proposal.state === "consumed" && proposal.runId) {
         const run = this.getRun(proposal.runId);
@@ -986,14 +888,6 @@ export class Store {
 
   // Provenance is an internal argument, never taken from the public request object.
   createRun(repo: Repo, req: CreateRunRequest, verifiedGitHubWebhook = false): Run {
-    return this.atomic(() => {
-      const run = this.insertRun(repo, req, verifiedGitHubWebhook);
-      this.runFeed(null, run);
-      return run;
-    });
-  }
-
-  private insertRun(repo: Repo, req: CreateRunRequest, verifiedGitHubWebhook: boolean): Run {
     assertExistingBranchDelivery(repo, { ...req, githubWebhookVerified: verifiedGitHubWebhook });
     const id = newId();
     const dependsOn = this.validateDependencies(req.dependsOn, id);
@@ -1181,21 +1075,16 @@ export class Store {
       sets.push("state_json = ?");
       values.push(json(state));
     }
-    return this.atomic(() => {
-      const before = this.getRun(id);
-      if (sets.length)
-        this.db.query(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
-      const run = this.getRun(id) as Run;
-      this.publish({ kind: "run", run });
-      this.runFeed(before, run);
-      return run;
-    });
+    if (sets.length)
+      this.db.query(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
+    const run = this.getRun(id) as Run;
+    this.publish({ kind: "run", run });
+    return run;
   }
 
   /** Resolve once after GitHub confirms a merge; keep the original terminal evidence. */
   resolveMergedRun(id: string, mergedBy: string | null, mergedAt: number): boolean {
-    return this.atomic(() => {
-      const before = this.getRun(id);
+    return this.chatTransaction(() => {
       const changed = this.db
         .query(
           "UPDATE runs SET status = 'resolved', merged = 1, merged_by = ?, merged_at = ? WHERE id = ? AND status = 'needs_human' AND pr_url IS NOT NULL",
@@ -1210,7 +1099,6 @@ export class Store {
       });
       const run = this.getRun(id);
       if (run) this.publish({ kind: "run", run });
-      if (run) this.runFeed(before, run);
       return true;
     });
   }
@@ -1540,24 +1428,12 @@ export class Store {
   // ---- questions -----------------------------------------------------------
 
   askQuestion(runId: string, question: string): Question {
-    return this.atomic(() => {
-      const res = this.db
-        .query("INSERT INTO questions (run_id, question, asked_at) VALUES (?, ?, ?)")
-        .run(runId, question, Date.now());
-      const q = this.getQuestion(Number(res.lastInsertRowid)) as Question;
-      this.publish({ kind: "question", question: q });
-      const run = this.getRun(runId);
-      this.addFeed({
-        kind: "run.question",
-        key: String(q.id),
-        runId,
-        ...(run ? { repo: run.repoSlug } : {}),
-        title: `Question: ${run?.title ?? runId}`,
-        summary: question,
-        data: { questionId: q.id, question },
-      });
-      return q;
-    });
+    const res = this.db
+      .query("INSERT INTO questions (run_id, question, asked_at) VALUES (?, ?, ?)")
+      .run(runId, question, Date.now());
+    const q = this.getQuestion(Number(res.lastInsertRowid)) as Question;
+    this.publish({ kind: "question", question: q });
+    return q;
   }
 
   answerQuestion(id: number, answer: string, by: string): Question {

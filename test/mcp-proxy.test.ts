@@ -265,3 +265,27 @@ test("proxy feed tools match the direct backend and allow a 60-second long poll"
     await direct.close();
   }
 });
+
+test("cancelling a proxied feed long poll aborts the daemon request", async () => {
+  let seen: AbortSignal | undefined;
+  const fetcher: Fetch = (_url, init) =>
+    new Promise((_, reject) => {
+      seen = init?.signal ?? undefined;
+      seen?.addEventListener("abort", () => reject(seen?.reason));
+    });
+  const proxy = await connect(httpBackend("http://127.0.0.1:7400", fetcher));
+  try {
+    const controller = new AbortController();
+    const pending = proxy.client
+      .callTool({ name: "limitless_feed", arguments: { wait: 60 } }, undefined, { signal: controller.signal })
+      .catch(() => "cancelled");
+    await Bun.sleep(20);
+    expect(seen?.aborted).toBe(false);
+    controller.abort();
+    expect(await pending).toBe("cancelled");
+    await Bun.sleep(20);
+    expect(seen?.aborted).toBe(true);
+  } finally {
+    await proxy.close();
+  }
+});

@@ -144,3 +144,15 @@ test("daemon.started is recorded per startup, not by opening the store", async (
     else process.env.LIMITLESS_NO_SCHEDULER = previous;
   }
 });
+
+test("resuming a finished eval after its item was pruned records no second completion", () => {
+  const input = { role: "triage" as const, models: ["m"], k: 1, maxUsd: 1 };
+  const failed = store.createEvalRun(input, [], { request: {} });
+  store.updateEvalRun(failed.id, "failed", "boom");
+  expect(allItems(store).map((i) => [i.kind, i.evalId])).toEqual([["eval.finished", failed.id]]);
+  store.pruneFeed(Date.now() + 1);
+  expect(allItems(store)).toEqual([]);
+  store.createEvalRun(input, [], { request: {} }, failed.id);
+  expect(store.getEvalRun(failed.id)?.status).toBe("interrupted");
+  expect(allItems(store)).toEqual([]);
+});
