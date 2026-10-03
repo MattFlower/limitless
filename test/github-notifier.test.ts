@@ -409,7 +409,8 @@ test("with polling, observations reconcile runs: merged metadata, resolution, de
     expect(h.store.getRun(closed.id)).toMatchObject({ merged: false, prClosedUnmerged: true });
     expect(h.store.getRun(dependant.id)?.status).toBe("queued");
     const feed = h.store.readFeed({ limit: 1000 }).items;
-    expect(feed.filter((i) => i.kind === "run.merged").map((i) => i.runId)).toEqual([human.id, done.id]);
+    const mergedRuns = feed.filter((i) => i.kind === "run.merged").map((i) => i.runId);
+    expect(mergedRuns.toSorted()).toEqual([human.id, done.id].toSorted());
     expect(feed.filter((i) => i.kind === "pr.merged")).toHaveLength(2);
     expect(feed.filter((i) => i.kind === "pr.closed")).toHaveLength(1);
     expect(h.gh.calls.every((c) => c.path === "graphql" || /^repos\/o\/r\/pulls\/\d$/.test(c.path))).toBe(

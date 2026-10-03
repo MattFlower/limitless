@@ -44,6 +44,7 @@ export function fakeGitHub() {
   const nodes = new Map<string, PrNode>();
   const calls: { path: string; ids?: string[] }[] = [];
   const next: (GitHubResponse | Error)[] = [];
+  const restNext: (GitHubResponse | Error)[] = [];
   let inFlight = 0;
   let maxInFlight = 0;
   const client: GitHubClient = async (path, body) => {
@@ -52,7 +53,7 @@ export function fakeGitHub() {
     maxInFlight = Math.max(maxInFlight, ++inFlight);
     await (fake.hold ?? Promise.resolve());
     inFlight--;
-    const queued = next.shift();
+    const queued = (path === "graphql" ? undefined : restNext.shift()) ?? next.shift();
     if (queued instanceof Error) throw queued;
     if (queued) return queued;
     if (ids) return respond(200, { data: { nodes: ids.map((id) => nodes.get(id) ?? null) } });
@@ -66,6 +67,8 @@ export function fakeGitHub() {
     nodes,
     calls,
     next,
+    /** Overrides for REST calls only, consumed before `next`. */
+    restNext,
     client,
     get maxInFlight() {
       return maxInFlight;

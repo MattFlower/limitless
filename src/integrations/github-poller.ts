@@ -143,6 +143,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     return null;
   };
 
+  /** Saves the observation; returns the mergeability nudge's response (null: not sent) or undefined. */
   const record = async (pr: TrackedPr, snap: PrSnapshot) => {
     const prev = saved(pr.data);
     const head = snap.headRefOid;
@@ -155,12 +156,18 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
       const key = `${pr.url}:${head}:${revision}:${c.key}`;
       return { ...c, runId: pr.runId, repo: pr.repo, data: { ...c.data, url: pr.url, head }, key };
     });
-    const nudged = nudge ? head : unknown ? (prev?.nudged ?? null) : null;
-    const data = JSON.stringify({ ...snap, revision, unknown, nudged } satisfies Saved);
-    store.saveGithubPr({ ...pr, data }, snap.state !== "OPEN", items);
+    const save = (nudged: string | null, feed = items) => {
+      const data = JSON.stringify({ ...snap, revision, unknown, nudged } satisfies Saved);
+      store.saveGithubPr({ ...pr, data }, snap.state !== "OPEN", feed);
+    };
+    save(unknown ? (prev?.nudged ?? null) : null);
     settled ||= snap.state !== "OPEN";
+    if (!nudge) return undefined;
     // A REST read starts GitHub's lazy mergeability computation; the next GraphQL poll reports it.
-    if (nudge) await call(pr.repo, pullPath(pr));
+    // Only a sent request counts: one a cooldown or rate limit swallowed is retried next cycle.
+    const res = await call(pr.repo, pullPath(pr));
+    if (res) save(head, []);
+    return res;
   };
 
   const observe = async (repo: string, prs: TrackedPr[]) => {
@@ -188,9 +195,10 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         return log(`GitHub observation of ${repo} failed with HTTP ${res.status}`);
       for (const [i, pr] of known.entries()) {
         const snap = normalizePr(nodes[i], pr.nodeId);
-        if (snap) await record(pr, snap);
-        else complete = false;
-        if (nodes[i] === null) missing ??= pr;
+        const nudged = snap ? await record(pr, snap) : null;
+        // A nudge that failed (perhaps an access problem) must not let this cycle clear an episode.
+        if (nudged === null) complete = false;
+        if (nodes[i] === null || nudged?.status === 404) missing ??= pr;
       }
     }
     const notFound = missing && { reason: "not_found", detail: `The gh token cannot see ${missing.url}` };

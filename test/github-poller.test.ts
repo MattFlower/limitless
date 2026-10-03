@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { diffPr, normalizePr } from "../src/integrations/github-poller.ts";
+import { diffPr, githubDoctor, normalizePr } from "../src/integrations/github-poller.ts";
 import { type PrNode, pollerHarness, prNode, respond, SHA, url } from "./github-poller-support.ts";
 
 let h: ReturnType<typeof pollerHarness>;
@@ -437,6 +437,63 @@ test("UNKNOWN mergeability gets one REST nudge after the third poll, then CONFLI
   pr.headRefOid = "d".repeat(40);
   for (let i = 0; i < 3; i++) await h.advance(15 * S);
   expect(nudges()).toBe(3);
+});
+
+test("an access failure during a nudge is kept for doctor; the cycle that hit it never clears it", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  h.node("o/r", 1).mergeable = "UNKNOWN";
+  h.start();
+  await h.advance(0);
+  await h.advance(15 * S);
+  h.gh.restNext.push(respond(403, { message: "SSO" }, { "x-github-sso": "required; url=https://idp" }));
+  await h.advance(15 * S);
+  expect(h.gh.rest().at(-1)?.path).toBe("repos/o/r/pulls/1");
+  expect(kinds()).toEqual(["github.access_problem"]);
+  expect(h.store.githubAccessProblems().map((p) => p.repo)).toEqual(["o/r"]);
+  expect(githubDoctor(h.store).join("\n")).toContain("o/r");
+  // The swallowed nudge is retried after the cooldown, and success clears the episode.
+  const sent = h.gh.rest().length;
+  await h.advance(59 * S);
+  expect(h.gh.rest()).toHaveLength(sent);
+  await h.advance(S);
+  expect(h.gh.rest()).toHaveLength(sent + 1);
+  expect(h.store.githubAccessProblems()).toEqual([]);
+  await h.advance(15 * S);
+  expect(h.gh.rest()).toHaveLength(sent + 1);
+});
+
+test("nudges a rate limit interrupted stay pending for every PR, across the cooldown and a restart", async () => {
+  h = pollerHarness();
+  for (const n of [1, 2]) {
+    h.factoryPr("o/r", n);
+    h.node("o/r", n).mergeable = "UNKNOWN";
+  }
+  h.start();
+  await h.advance(0);
+  await h.advance(15 * S);
+  const nudges = () =>
+    h.gh.rest().filter((c) => c.path === "repos/o/r/pulls/1" || c.path === "repos/o/r/pulls/2");
+  expect(nudges()).toHaveLength(2); // node id lookups
+  h.gh.restNext.push(respond(429, {}));
+  await h.advance(15 * S);
+  // The first nudge was rate limited; the second was never sent.
+  expect(nudges().map((c) => c.path)).toEqual([
+    "repos/o/r/pulls/1",
+    "repos/o/r/pulls/2",
+    "repos/o/r/pulls/1",
+  ]);
+  h.reopen();
+  h.start();
+  await h.advance(0);
+  expect(
+    nudges()
+      .slice(3)
+      .map((c) => c.path),
+  ).toEqual(["repos/o/r/pulls/1", "repos/o/r/pulls/2"]);
+  await h.advance(15 * S);
+  await h.advance(15 * S);
+  expect(nudges()).toHaveLength(5);
 });
 
 test("SSO, 404, IP restrictions and missing nodes are access problems, once per episode, never pr.closed", async () => {
