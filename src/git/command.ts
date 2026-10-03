@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { CommandError, sh } from "../util/proc.ts";
 
-/** Local pipeline runs retain their existing git behavior; each run has its own scope. */
+/** Each pipeline run has its own scope; `false` opts out of the hardened git wrapper. */
 export const worktreeGitScope = new AsyncLocalStorage<boolean>();
 let gitVersion: Promise<void> | undefined;
 

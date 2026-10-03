@@ -239,8 +239,13 @@ limitless run "Add a --version flag that prints the package version" \
 `-f` follows the event log until the run finishes and prints the PR URL. Open
 http://127.0.0.1:7400 to watch the same run in the UI, and see
 [Reading a run](#4-reading-a-run). `--repo` also accepts a local path (absolute, `~/...` or
-`./...`). Local repositories are worked on straight from the clone and deliver a branch
-(`limitless/<run>-<slug>`) instead of a PR.
+`./...`). Local repositories are worked on in a factory-owned clone
+(`~/.limitless/repos/local-<repo-id>.git`) and deliver a branch (`limitless/<run>-<slug>`) to your
+repository instead of a PR. Failed and cancelled local runs push nothing: their commits stay on that
+branch in the factory clone. To get them, run
+`git fetch ~/.limitless/repos/local-<repo-id>.git limitless/<run>-<slug>` in your repository and
+check out `FETCH_HEAD`, or open the worktree at `~/.limitless/work/<run>` while it is retained.
+Git LFS objects are not copied into the factory clone.
 
 ## 3. Starting work
 
@@ -391,7 +396,7 @@ attempt is still blocked, the run stops as `needs_human` with
 | `No model available for <role> ...` / `Gave up routing <role>` | No provider had capacity: quota, reserve, down, disabled or budget. The skipped list says why for each model. | Wait for the window reset shown in `limitless providers`, enable another provider, or adjust a reserve, then Retry. No draft PR is opened. |
 
 For round exhaustion and environment blocks, the factory pushes the branch and opens a **draft**
-PR titled `[needs human] ...` with the full report. Local repositories keep the branch instead.
+PR titled `[needs human] ...` with the full report. Local repositories receive the branch instead.
 No draft is opened when capacity ran out or when a rebase-conflict round failed (see the
 [FAQ](#8-troubleshooting-faq)). The worktree stays at `~/.limitless/work/<run>` for
 `failed_worktree_days`.

@@ -119,6 +119,23 @@ test("cleanup for new runs leaves unrelated source worktree metadata untouched",
   expect((await sh(["git", "worktree", "list", "--porcelain"], { cwd: repoDir })).stdout).toBe(before);
 });
 
+test("cleanup refuses a run path that is a worktree of an unrelated repository", async () => {
+  const unrelated = join(root, "unrelated");
+  mkdirSync(unrelated);
+  await sh(["git", "init", "-q"], { cwd: unrelated });
+  await sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"], {
+    cwd: unrelated,
+  });
+  const stray = join(cfg.paths.work, run("succeeded", 4).id);
+  await sh(["git", "worktree", "add", "--detach", stray], { cwd: unrelated });
+  writeFileSync(join(stray, "uncommitted.txt"), "keep me");
+  const result = await collectGarbage(store, cfg, { now });
+  expect(result.errors.join("\n")).toContain("worktree is not registered to local/test");
+  expect(result.worktrees).toEqual([]);
+  expect(readFileSync(join(stray, "uncommitted.txt"), "utf8")).toBe("keep me");
+  expect((await sh(["git", "worktree", "list", "--porcelain"], { cwd: unrelated })).stdout).toContain(stray);
+});
+
 test("log and debug event retention is selective, including active-run events", async () => {
   const old = run("succeeded", 30);
   const young = run("succeeded", 30 - 1 / DAY);

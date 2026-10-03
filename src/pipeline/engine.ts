@@ -131,7 +131,8 @@ export async function executeRun(
     deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  return worktreeGitScope.run(repo.kind === "github", () =>
+  // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
+  return worktreeGitScope.run(true, () =>
     executeScopedRun(new RunContext(deps, run, repo, signal, isDraining, drainEvents), signal),
   );
 }

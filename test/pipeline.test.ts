@@ -6,14 +6,16 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
-import type { Role, RunStatus, StageName } from "../src/core/types.ts";
+import type { Repo, Role, RunStatus, StageName } from "../src/core/types.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
 import {
@@ -22,6 +24,7 @@ import {
   pushBranch,
   removeWorktree,
   slugify,
+  withRepoLock,
   worktreeOwner,
 } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
@@ -250,19 +253,36 @@ describe("local factory clones", () => {
     return { files: { "farewell.txt": "goodbye\n" } };
   };
   const git = async (cwd: string, ...args: string[]) => (await sh(["git", ...args], { cwd })).stdout.trim();
-  const snapshot = () =>
-    Object.fromEntries(
+  const files = (dir: string): string[] =>
+    existsSync(join(repoDir, dir))
+      ? readdirSync(join(repoDir, dir), { recursive: true, withFileTypes: true })
+          .filter((entry) => entry.isFile())
+          .map((entry) => join(entry.parentPath, entry.name).slice(repoDir.length + 1))
+      : [];
+  /** Every tracked and untracked file outside .git, hashed together. */
+  const workingTree = () => {
+    const hash = new Bun.CryptoHasher("sha256");
+    for (const path of files("")
+      .filter((path) => !path.startsWith(".git/"))
+      .sort())
+      hash
+        .update(`${path}\0`)
+        .update(readFileSync(join(repoDir, path)))
+        .update("\0");
+    return hash.digest("hex");
+  };
+  const snapshot = (): Record<string, Buffer | string> => ({
+    ...Object.fromEntries(
       [
-        "greeting.txt",
-        ".limitless.toml",
-        "staged.txt",
-        "untracked.txt",
         ".git/HEAD",
         ".git/index",
         ".git/config",
-        ...readdirSync(join(repoDir, ".git/hooks")).map((name) => `.git/hooks/${name}`),
+        ...["packed-refs"].filter((name) => existsSync(join(repoDir, ".git", name))).map((n) => `.git/${n}`),
+        ...["hooks", "refs", "logs", "info"].flatMap((dir) => files(`.git/${dir}`)),
       ].map((path) => [path, readFileSync(join(repoDir, path))]),
-    );
+    ),
+    workingTree: workingTree(),
+  });
 
   test.each([false, true])(
     "full delivery preserves the source, with concurrent config edits=%s",
@@ -296,6 +316,7 @@ describe("local factory clones", () => {
       const current = await git(repoDir, "symbolic-ref", "HEAD");
       const base = await git(repoDir, "rev-parse", "HEAD");
       const sourceTrees = await git(repoDir, "worktree", "list", "--porcelain");
+      const refsBefore = await git(repoDir, "for-each-ref", "--format=%(refname)");
       const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
       try {
         await ready;
@@ -320,7 +341,19 @@ describe("local factory clones", () => {
         expect(await git(repoDir, "symbolic-ref", "HEAD")).toBe(current);
         expect(await git(repoDir, "rev-parse", "HEAD")).toBe(base);
         expect(await git(repoDir, "worktree", "list", "--porcelain")).toBe(sourceTrees);
-        expect(snapshot()).toEqual(expected);
+        const delivered = snapshot();
+        expect(
+          Object.keys(delivered)
+            .filter((path) => !(path in expected))
+            .sort(),
+        ).toEqual([`.git/logs/refs/heads/${result?.branch}`, `.git/refs/heads/${result?.branch}`]);
+        const unchanged = { ...delivered };
+        delete unchanged[`.git/refs/heads/${result?.branch}`];
+        delete unchanged[`.git/logs/refs/heads/${result?.branch}`];
+        expect(unchanged).toEqual(expected);
+        expect(await git(repoDir, "for-each-ref", "--format=%(refname)")).toBe(
+          [...refsBefore.split("\n"), `refs/heads/${result?.branch}`].sort().join("\n"),
+        );
         expect(existsSync(marker)).toBe(false);
         expect(existsSync(join(repoDir, "farewell.txt"))).toBe(false);
         if (editConfig) {
@@ -329,7 +362,7 @@ describe("local factory clones", () => {
         }
         await removeWorktree(f.cfg.paths, repo, work);
         expect(await git(repoDir, "worktree", "list", "--porcelain")).toBe(sourceTrees);
-        expect(snapshot()).toEqual(expected);
+        expect(snapshot()).toEqual(delivered);
       } finally {
         release();
       }
@@ -588,6 +621,138 @@ describe("local factory clones", () => {
       await git(work, "rev-parse", "HEAD"),
     );
     expect(await git(repoDir, "tag", "--list")).toBe("");
+  });
+
+  const withEnv = async <T>(name: string, value: string, fn: () => Promise<T>): Promise<T> => {
+    const previous = process.env[name];
+    process.env[name] = value;
+    try {
+      return await fn();
+    } finally {
+      if (previous === undefined) delete process.env[name];
+      else process.env[name] = previous;
+    }
+  };
+  const localRepo = (): Repo => ({
+    id: "legacy",
+    slug: "local/legacy",
+    kind: "local",
+    url: null,
+    localPath: repoDir,
+    defaultBranch: "main",
+    mergePolicy: "none",
+    createdAt: 0,
+  });
+
+  test("hooks from init.templateDir or placed in the clone never run, including delivery", async () => {
+    const markers = join(home, "markers");
+    const template = join(home, "template");
+    mkdirSync(join(template, "hooks"), { recursive: true });
+    const hook = (name: string) => `#!/bin/sh\nmkdir -p '${markers}' && touch '${markers}/${name}'\n`;
+    for (const name of ["pre-push", "post-checkout"])
+      writeFileSync(join(template, "hooks", name), hook(name), { mode: 0o755 });
+    const globalConfig = join(home, "template.gitconfig");
+    writeFileSync(globalConfig, `[init]\n\ttemplateDir = ${template}\n`);
+    await withEnv("GIT_CONFIG_GLOBAL", globalConfig, async () => {
+      const f = start(reply);
+      const first = await f.createRun({ repo: repoDir, prompt: "First run" });
+      expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const repo = f.store.getRepo(first.repoId);
+      if (!repo) throw new Error("missing repo");
+      const cache = cachePath(f.cfg.paths, repo);
+      expect(existsSync(join(cache, "hooks", "pre-push"))).toBe(false);
+      mkdirSync(join(cache, "hooks"), { recursive: true });
+      for (const name of ["pre-push", "post-checkout"])
+        writeFileSync(join(cache, "hooks", name), hook(name), { mode: 0o755 });
+      const next = await f.createRun({ repo: repoDir, prompt: "Next run" });
+      expect(await waitFor(f, next.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const result = f.store.getRun(next.id);
+      expect(await git(repoDir, "rev-parse", `refs/heads/${result?.branch}`)).toBe(result?.headSha ?? "");
+    });
+    expect(existsSync(markers)).toBe(false);
+  });
+
+  test("delivery push runs no maintenance or gc in the source repository", async () => {
+    const f = start(reply);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("missing repo");
+    const work = join(f.cfg.paths.work, run.id);
+    await git(repoDir, "config", "gc.auto", "1");
+    const trace = join(home, "push.trace");
+    await withEnv("GIT_TRACE", trace, () => pushBranch(repo, work, "traced"));
+    const log = readFileSync(trace, "utf8");
+    expect(log).toContain("receive-pack");
+    expect(log).not.toMatch(/\b(maintenance|gc)\b/);
+    expect(await git(repoDir, "rev-parse", "refs/heads/traced")).toBe(await git(work, "rev-parse", "HEAD"));
+  });
+
+  test("delivery from a legacy worktree pushes nothing: the branch already lives in the source", async () => {
+    const legacy = join(home, "legacy-work");
+    await git(repoDir, "worktree", "add", "-q", "-b", "legacy-branch", legacy);
+    await pushBranch(localRepo(), legacy, "would-be-created");
+    const refs = await git(repoDir, "for-each-ref", "--format=%(refname)", "refs/heads");
+    expect(refs).toContain("refs/heads/legacy-branch");
+    expect(refs).not.toContain("would-be-created");
+  });
+
+  test("redelivery succeeds when the source branch already contains the run head", async () => {
+    const f = start(reply);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const repo = f.store.getRepo(run.repoId);
+    const result = f.store.getRun(run.id);
+    if (!repo || !result?.branch || !result.headSha) throw new Error("missing run");
+    const ref = `refs/heads/${result.branch}`;
+    const user = ["-c", "user.name=t", "-c", "user.email=t@t"];
+    const built = await git(repoDir, ...user, "commit-tree", `${ref}^{tree}`, "-p", ref, "-m", "user work");
+    await git(repoDir, "update-ref", ref, built);
+    await pushBranch(repo, join(f.cfg.paths.work, run.id), result.branch, result.headSha);
+    expect(await git(repoDir, "rev-parse", ref)).toBe(built);
+  });
+
+  test("the clone's tags follow the source's, including deleted and moved tags", async () => {
+    const user = ["-c", "user.name=t", "-c", "user.email=t@t"];
+    await git(repoDir, ...user, "tag", "-a", "obsolete", "-m", "old");
+    await git(repoDir, "tag", "moved");
+    const f = start(reply);
+    const first = await f.createRun({ repo: repoDir, prompt: "First run" });
+    expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    const repo = f.store.getRepo(first.repoId);
+    if (!repo) throw new Error("missing repo");
+    const tags = (cwd: string) => git(cwd, "for-each-ref", "--format=%(refname) %(objectname)", "refs/tags");
+    expect(await tags(cachePath(f.cfg.paths, repo))).toBe(await tags(repoDir));
+    await git(repoDir, "tag", "-d", "obsolete");
+    await git(repoDir, ...user, "commit", "-q", "--allow-empty", "-m", "advance");
+    await git(repoDir, "tag", "-f", "moved");
+    await git(repoDir, "tag", "fresh");
+    const next = await f.createRun({ repo: repoDir, prompt: "Next run" });
+    expect(await waitFor(f, next.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(await tags(cachePath(f.cfg.paths, repo))).toBe(await tags(repoDir));
+  });
+
+  test("a lock taken through a symlinked path serializes with its real path", async () => {
+    const real = join(home, "real");
+    mkdirSync(real);
+    symlinkSync(real, join(home, "link"));
+    const order: string[] = [];
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const first = withRepoLock(join(home, "link", "repos", "local-x.git"), async () => {
+      order.push("first:start");
+      await held;
+      order.push("first:end");
+    });
+    const second = withRepoLock(join(realpathSync(real), "repos", "local-x.git"), async () => {
+      order.push("second");
+    });
+    await Bun.sleep(20);
+    release();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first:start", "first:end", "second"]);
   });
 });
 
