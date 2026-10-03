@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import type { ChildProcess } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import type { QuotaWindow } from "../src/core/types.ts";
@@ -451,10 +451,11 @@ function status(result: AgentResult): CheckResult {
 export async function liveCheck(
   harness: Harness,
   target: ModelTarget,
-  kind: "structured" | "noTools" | "edit" | "quota" | "verify" | "fast",
+  kind: "structured" | "noTools" | "edit" | "quota" | "verify" | "fast" | "confine",
   signal = new AbortController().signal,
 ): Promise<CheckResult> {
   if (kind === "verify") return verifyLiveCheck(harness, target, signal);
+  if (kind === "confine") return confineLiveCheck(harness, target, signal);
   const cwd = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-")));
   try {
     await sh(["git", "init", "-q"], { cwd, timeoutMs: 5000 });
@@ -560,16 +561,127 @@ function probeCallIds(events: AgentEvent[], command: string): Set<string> {
 }
 
 /** A command result, paired with the actual probe command, is required; prose never counts. */
-export function verifyProbeEvidence(events: AgentEvent[], command: string, token: string): boolean {
+export function verifyProbeEvidence(
+  events: AgentEvent[],
+  command: string,
+  token: string,
+  markers = ["temp-created-read-deleted", "worktree-write-denied"],
+): boolean {
   const ids = probeCallIds(events, command);
   return events.some(
     (e) =>
       e.type === "tool_result" &&
       ids.has(e.id) &&
       !e.isError &&
-      e.output.includes(`${token}:temp-created-read-deleted`) &&
-      e.output.includes(`${token}:worktree-write-denied`),
+      markers.every((marker) => e.output.includes(`${token}:${marker}`)),
   );
+}
+
+const CONFINE_MARKERS = [
+  "worktree-written",
+  "scratch-written",
+  "cache-write-denied",
+  "sibling-write-denied",
+  "home-write-denied",
+];
+
+/**
+ * An edit-mode agent runs a probe that writes its worktree and scratch and is denied writes to the
+ * repository's shared git directory, a sibling worktree and a home canary. The owned canaries are
+ * inspected afterwards, independently of anything the agent reports.
+ */
+export async function confineLiveCheck(
+  harness: Harness,
+  target: ModelTarget,
+  signal = new AbortController().signal,
+  home = homedir(),
+): Promise<CheckResult> {
+  const root = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-confine-")));
+  // Like the reader probe's home canary: the factory's own directory when present.
+  const homeRoot = existsSync(join(home, ".limitless")) ? join(home, ".limitless") : home;
+  const homeDir = registerTemp(mkdtempSync(join(homeRoot, "limitless-smoke-canary-")));
+  const cache = join(root, "cache");
+  const cwd = join(root, "worktree");
+  const sibling = join(root, "sibling");
+  try {
+    const git = (dir: string, ...args: string[]) =>
+      sh(["git", "-c", "user.name=smoke", "-c", "user.email=smoke@localhost", ...args], { cwd: dir });
+    await sh(["git", "init", "-q", cache], { cwd: root });
+    await git(cache, "commit", "-q", "--allow-empty", "-m", "base");
+    for (const dir of [cwd, sibling]) await git(cache, "worktree", "add", "-q", "--detach", dir);
+    const token = crypto.randomUUID();
+    mkdirSync(join(cache, ".git", "info"), { recursive: true });
+    const canaries = {
+      cache: join(cache, ".git", "info", "attributes"),
+      sibling: join(sibling, "canary"),
+      home: join(homeDir, "canary"),
+    };
+    for (const file of Object.values(canaries)) writeFileSync(file, `canary-${token}`);
+    const probe = join(cwd, "confine-probe.py");
+    writeFileSync(
+      probe,
+      `import os, errno, pathlib
+worktree = pathlib.Path(__file__).resolve().parent
+for label, path in [("worktree", worktree / "confine-allowed"), ("scratch", pathlib.Path(os.environ["TMPDIR"]) / "confine-allowed")]:
+    path.write_text("${token}")
+    assert path.read_text() == "${token}"
+    print("${token}:" + label + "-written", flush=True)
+for label, path in [${Object.entries(canaries)
+        .map(([label, file]) => `("${label}", ${JSON.stringify(file)})`)
+        .join(", ")}]:
+    try:
+        with open(path, "a") as f:
+            f.write("escaped")
+    except OSError as e:
+        if e.errno not in (errno.EPERM, errno.EACCES, errno.EROFS): raise
+        print("${token}:" + label + "-write-denied", flush=True)
+    else:
+        raise RuntimeError(label + " write succeeded")
+`,
+    );
+    const command = `python3 '${probe.replaceAll("'", "'\\''")}'`;
+    const events: AgentEvent[] = [];
+    return await withScratch(cwd, async (scratchDir) => {
+      const result = await harness({
+        cwd,
+        scratchDir,
+        target,
+        mode: "edit",
+        prompt: `Check the sandbox by executing exactly this Bash command:\n${command}\nThe probe writes in this worktree and its temporary directory, and intentionally attempts writes elsewhere that must be denied. Do not edit files or replace the command with a claim. Report the command output.`,
+        timeoutMs: 90_000,
+        idleTimeoutMs: 30_000,
+        maxToolCalls: 8,
+        signal,
+        logPath: join(root, "stream.log"),
+        onEvent: (event) => events.push(event),
+      });
+      // The owned canaries are the evidence that counts; inspect them before any cleanup.
+      const changed = Object.entries(canaries).filter(
+        ([, file]) => readFileSync(file, "utf8") !== `canary-${token}`,
+      );
+      if (changed.length)
+        return { status: "fail", reason: `write escaped to ${changed.map(([l]) => l).join(", ")}` };
+      if (result.status !== "ok") return status(result);
+      const allowed = join(cwd, "confine-allowed");
+      if (!existsSync(allowed) || readFileSync(allowed, "utf8") !== token)
+        return { status: "fail", reason: "worktree write did not land" };
+      return verifyProbeEvidence(events, command, token, CONFINE_MARKERS)
+        ? {
+            status: "pass",
+            reason: `${target.model}: worktree and scratch writable; cache, sibling and home denied`,
+          }
+        : fail(
+            "missing successful probe command evidence (allowed writes and denied cache, sibling and home writes)",
+            !events.some((e) => e.type === "tool_call" && ["shell", "Bash"].includes(e.name)) &&
+              !`${JSON.stringify(events)}${result.finalText ?? ""}`.includes(token)
+              ? "model"
+              : undefined,
+          );
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
+  }
 }
 
 export async function verifyLiveCheck(
@@ -801,14 +913,14 @@ export async function main(): Promise<number> {
     if (!provider) throw new Error(`missing provider ${id}`);
     let target = targetFor(provider, cheapestModel(id));
     const harness = id === "claude" ? runClaude : runCodex;
-    for (const kind of ["structured", "fast", "noTools", "edit", "quota", "verify"] as const) {
+    for (const kind of ["structured", "fast", "noTools", "edit", "quota", "verify", "confine"] as const) {
       checks.push({
         name: `${id} ${kind}`,
         // Outer bounds sit above liveCheck's own harness timeouts, which report the precise reason.
         timeoutMs:
           id === "codex" && kind === "structured"
             ? 60_000 * modelsByPrice(id).length + 30_000
-            : kind === "verify"
+            : kind === "verify" || kind === "confine"
               ? 120_000
               : 90_000,
         run: async (signal) => {

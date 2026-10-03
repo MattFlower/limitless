@@ -427,7 +427,7 @@ test("hidden grading scrubs secrets, bounds output, times out, and rejects desti
   }
 });
 
-test("candidate-configured git filters run without daemon secrets", async () => {
+test("candidate-configured git filters never run in the factory's git", async () => {
   const f = await fixture();
   f.item.prompt += "\nAllow: gitattributes";
   f.save();
@@ -449,9 +449,8 @@ test("candidate-configured git filters run without daemon secrets", async () => 
     });
     const trial = (await f.run()).trials[0];
     expect(trial?.pass).toBe(true);
-    // The filter did run, so the empty result proves the secret was withheld rather than unused.
-    expect(existsSync(leak)).toBe(true);
-    expect(readFileSync(leak, "utf8")).toBe("");
+    // Neither the factory's commit nor the grading checkout ran the candidate's filter.
+    expect(existsSync(leak)).toBe(false);
   } finally {
     if (previous === undefined) delete process.env.LIMITLESS_EVAL_SECRET;
     else process.env.LIMITLESS_EVAL_SECRET = previous;
@@ -459,9 +458,9 @@ test("candidate-configured git filters run without daemon secrets", async () => 
   }
 });
 
-test("baseline-gate-configured git filters run without daemon secrets during cleanup", async () => {
-  // The gate itself runs scrubbed; the leak would come from the Git cleanup after it, which runs
-  // the freshly installed clean filter on the dirtied tracked file while computing status.
+test("baseline gates cannot install a git filter for the cleanup after them", async () => {
+  // The gate runs confined (the checkout's .git is read-only), and the Git cleanup after it would
+  // otherwise run a freshly installed clean filter on the dirtied tracked file while computing status.
   const f = await fixture("sh baseline-gate.sh", (home) => ({
     "baseline-gate.sh": [
       `git config filter.leak.clean "sh -c 'printf %s \\"\\$LIMITLESS_EVAL_SECRET\\" >> ${join(home, "leak")}; cat'"`,
@@ -474,9 +473,8 @@ test("baseline-gate-configured git filters run without daemon secrets during cle
   const leak = join(f.home, "leak");
   try {
     f.respond((s) => {
-      // The baseline cleanup already ran the filter before the candidate was invoked.
-      expect(existsSync(leak)).toBe(true);
-      expect(readFileSync(leak, "utf8")).toBe("");
+      // The baseline cleanup ran before the candidate was invoked, without any filter.
+      expect(existsSync(leak)).toBe(false);
       expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
       return { files: { answer: "correct" } };
     });
@@ -484,7 +482,7 @@ test("baseline-gate-configured git filters run without daemon secrets during cle
     expect(trial?.status).toBe("ok");
     expect(trial?.pass).toBe(true);
     expect(f.calls).toHaveLength(1);
-    expect(readFileSync(leak, "utf8")).toBe("");
+    expect(existsSync(leak)).toBe(false);
   } finally {
     if (previous === undefined) delete process.env.LIMITLESS_EVAL_SECRET;
     else process.env.LIMITLESS_EVAL_SECRET = previous;
@@ -1448,11 +1446,8 @@ test("candidate git config, hooks, index flags and filters never reach grading",
     expect(t?.details.grade?.implement?.reason).toBe("audit");
     expect(t?.details.grade?.implement?.auditBlocks.map((b) => b.file)).toContain("protected");
     expect(readFileSync(seen, "utf8")).toBe("changed");
-    // Only the factory's own commit ran the candidate's clean filter, before any hidden bytes existed.
-    const lines = readFileSync(log, "utf8").split("\n");
-    expect(lines.some((line) => line.startsWith("clean "))).toBe(true);
-    expect(lines.filter((line) => /^(smudge|textconv|diff|hook)\b/.test(line))).toEqual([]);
-    expect(readFileSync(log, "utf8")).not.toContain("secret-hidden");
+    // Not even the factory's own commit runs the candidate's filters, drivers or hooks.
+    expect(existsSync(log)).toBe(false);
   } finally {
     await f.close();
   }
@@ -1524,8 +1519,10 @@ for (const [outcome, reason] of [
       const t = (await f.run()).trials[0];
       expect(t?.details.grade?.implement?.reason).toBe(reason);
       const dirs = allocated.mock.results.map((r) => String(r.value));
-      // The harness scratch, the grading checkout and, once injection succeeded, the hidden scratch.
-      expect(dirs).toHaveLength(outcome === "injection" ? 2 : 3);
+      // The harness scratch, the grading checkout and, once injection succeeded, the hidden scratch,
+      // plus one confined scratch per gate command run: baseline and grading (setup stops at setup).
+      const gateCommands = outcome === "setup" ? 3 : 2;
+      expect(dirs).toHaveLength((outcome === "injection" ? 2 : 3) + gateCommands);
       expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
     } finally {
       allocated.mockRestore();
@@ -1584,7 +1581,8 @@ test("grading removes hidden tests even when candidate code makes checkout direc
     f.save();
     expect((await f.run()).trials[0]?.pass).toBe(true);
     const dirs = allocated.mock.results.map((r) => String(r.value));
-    expect(dirs).toHaveLength(3);
+    // Harness, grading checkout and hidden scratch, plus the baseline and grading gate commands'.
+    expect(dirs).toHaveLength(5);
     expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
   } finally {
     allocated.mockRestore();

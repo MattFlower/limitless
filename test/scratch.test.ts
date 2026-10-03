@@ -29,6 +29,7 @@ import {
   SCRATCH_NAME,
   scratchEnv,
   withScratch,
+  writeRoots,
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
@@ -1334,4 +1335,250 @@ test("scratch still fails when no base is writable", () => {
     chmodSync(denied, 0o700);
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+/** A linked worktree of an owned repository, with a sibling, and a scratch for the first. */
+function editFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "edit-roots-")));
+  const git = (...args: string[]) => {
+    const proc = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: root });
+    if (proc.exitCode !== 0) throw new Error(proc.stderr.toString());
+  };
+  const cache = join(root, "cache");
+  git("init", "-q", cache);
+  git("-C", cache, "commit", "-q", "--allow-empty", "-m", "base");
+  const cwd = join(root, "work");
+  git("-C", cache, "worktree", "add", "-q", "--detach", cwd);
+  git("-C", cache, "worktree", "add", "-q", "--detach", join(root, "sibling"));
+  const scratchDir = createScratch(cwd);
+  const spec: AgentSpec = { ...specFor(cwd, scratchDir), mode: "edit", logPath: join(root, "log") };
+  cleanups.push(() => {
+    removeScratch(scratchDir);
+    rmSync(root, { recursive: true, force: true });
+  });
+  return {
+    root,
+    cache,
+    cwd,
+    scratchDir,
+    spec,
+    common: join(cache, ".git"),
+    admin: join(cache, ".git/worktrees/work"),
+  };
+}
+
+test("write roots are the worktree, its own admin directory and scratch; never the common dir", () => {
+  const { root, cwd, scratchDir, common, admin } = editFixture();
+  const roots = writeRoots(cwd, scratchDir);
+  expect(roots.write.sort()).toEqual([cwd, admin, realpathSync(scratchDir)].sort());
+  expect(roots.protect).toEqual([join(cwd, ".git")]);
+  expect(roots.write).not.toContain(common);
+  // A symlinked spelling is granted alongside the canonical path, never its parent.
+  symlinkSync(cwd, join(root, "alias"));
+  const aliased = writeRoots(join(root, "alias"), scratchDir);
+  expect(aliased.write).toContain(join(root, "alias"));
+  expect(aliased.write).toContain(cwd);
+  expect(aliased.write).not.toContain(root);
+  // A .git redirected at another worktree's or the shared directory is refused.
+  for (const target of [join(common, "worktrees/sibling"), common, join(root, "sibling")]) {
+    writeFileSync(join(cwd, ".git"), `gitdir: ${target}\n`);
+    expect(() => writeRoots(cwd, scratchDir)).toThrow("own linked worktree directory");
+  }
+  rmSync(join(cwd, ".git"));
+  symlinkSync(admin, join(cwd, ".git"));
+  expect(() => writeRoots(cwd, scratchDir)).toThrow("file or directory");
+});
+
+const codexFilesystem = (args: string[]) =>
+  Object.fromEntries(
+    [
+      ...(profileArgs(args)
+        .join("")
+        .match(/("(?:[^"\\]|\\.)*")="(\w+)"/g) ?? []),
+    ].map((entry) => {
+      const [, path = "", access = ""] = entry.match(/^("(?:[^"\\]|\\.)*")="(\w+)"$/) ?? [];
+      return [JSON.parse(path) as string, access];
+    }),
+  );
+
+test("codex editors get an explicit write profile, fresh or resumed, and nothing more", () => {
+  const { cwd, scratchDir, spec, common, admin } = editFixture();
+  for (const resume of [undefined, "thread-1"]) {
+    const args = buildCodexArgs({ ...spec, ...(resume ? { resumeSessionId: resume } : {}) });
+    expect(codexFilesystem(args)).toEqual({
+      "/": "read",
+      [cwd]: "write",
+      [admin]: "write",
+      [realpathSync(scratchDir)]: "write",
+      [join(cwd, ".git")]: "read",
+    });
+    expect(profileArgs(args).join("")).toContain("network={enabled=true}");
+    for (const flag of ["--ignore-user-config", "--ignore-rules", "--strict-config"])
+      expect(args).toContain(flag);
+    expect(args).not.toContain("workspace-write");
+    expect(args).not.toContain("--add-dir");
+    expect(JSON.stringify(args)).not.toContain(`"${common}"`);
+    if (resume) expect(args.slice(-3)).toEqual(["resume", resume, "-"]);
+  }
+  expect(() => buildCodexArgs({ ...spec, addDirs: [common] })).toThrow("cannot grant additional directories");
+  expect(() => buildCodexArgs({ ...spec, scratchDir: undefined })).toThrow("requires a scratch");
+});
+
+test("claude editors confine Bash and native edits to the same roots; project settings cannot widen them", () => {
+  const { cwd, scratchDir, spec, admin } = editFixture();
+  // Project settings an agent could commit: exclusions, hooks and broad permissions.
+  mkdirSync(join(cwd, ".claude"));
+  writeFileSync(
+    join(cwd, ".claude/settings.json"),
+    JSON.stringify({
+      sandbox: { excludedCommands: ["sh"], allowUnsandboxedCommands: true },
+      permissions: { allow: ["Edit(//**)"] },
+      hooks: { SessionStart: [{ hooks: [{ type: "command", command: "touch /tmp/pwned" }] }] },
+    }),
+  );
+  for (const variant of [{}, { fast: true }, { resumeSessionId: "s-1" }]) {
+    const t = { ...spec.target, provider: "claude" };
+    const args = buildClaudeArgs({ ...spec, ...variant, target: t }, "session");
+    expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
+    expect(args).toContain("--strict-mcp-config");
+    const settings = args.flatMap((a, i) => (args[i - 1] === "--settings" ? [JSON.parse(a)] : []));
+    expect(settings).toHaveLength(1);
+    const { sandbox, disableAllHooks, fastMode } = settings[0];
+    expect(fastMode).toBe("fast" in variant ? true : undefined);
+    expect(disableAllHooks).toBe(true);
+    expect(sandbox).toMatchObject({
+      enabled: true,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+      excludedCommands: [],
+      filesystem: { denyWrite: [join(cwd, ".git")], disabled: false },
+    });
+    expect(sandbox.filesystem.allowWrite.sort()).toEqual([cwd, admin, realpathSync(scratchDir)].sort());
+    const allowed = args.slice(args.indexOf("--allowedTools") + 1, args.indexOf("--disallowedTools"));
+    for (const bare of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) expect(allowed).not.toContain(bare);
+    expect(allowed).toContain(`Edit(/${cwd}/**)`);
+    expect(allowed.filter((a) => a.startsWith("Edit("))).toHaveLength(3);
+    expect(args).toContain(`Edit(/${join(cwd, ".git")}/**)`);
+    if ("resumeSessionId" in variant) expect(args.slice(-2)).toEqual(["--resume", "s-1"]);
+  }
+  expect(() => buildClaudeArgs({ ...spec, addDirs: ["/"] }, "s")).toThrow(
+    "cannot grant additional directories",
+  );
+});
+
+/** A fake `codex sandbox` honouring (or, when leaky, ignoring) the editor profile's most specific entry. */
+function editCodex(behaviour: "enforcing" | "leaky" | "timeout" = "enforcing") {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "edit-probe-roots-")));
+  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  const calls: string[][] = [];
+  const cli = { version: "codex-cli 0.160.0" };
+  const runner = async (opts: ProcOptions): Promise<ProcResult> => {
+    calls.push(opts.cmd);
+    if (opts.cmd[1] === "--version") return { ...procResult, stdout: `${cli.version}\n` };
+    if (opts.cmd[1] !== "sandbox") {
+      opts.onStdoutLine?.('{"type":"turn.completed","usage":{}}');
+      return procResult;
+    }
+    if (behaviour === "timeout") return { ...procResult, exitCode: null, timedOut: true };
+    const [token = "", file = ""] = opts.cmd.slice(-2);
+    const entries = Object.entries(codexFilesystem(opts.cmd)).filter(
+      ([path]) => file === path || file.startsWith(`${path === "/" ? "" : path}/`),
+    );
+    const access = entries.sort(([a], [b]) => b.length - a.length)[0]?.[1];
+    if (behaviour === "leaky" || access === "write") {
+      writeFileSync(file, token);
+      return procResult;
+    }
+    return { ...procResult, exitCode: 1, stderr: `sh: ${file}: Operation not permitted` };
+  };
+  const probe = new CodexReaderProbe(() => CODEX, { canaryRoots: () => [root], backoffMs: 0 });
+  const execs = () => calls.filter((c) => c[1] === "exec");
+  const sandboxes = () => calls.filter((c) => c[1] === "sandbox");
+  return { runner, probe, execs, sandboxes, cli, root };
+}
+
+test("codex editors run only after a probe writes cwd and scratch and is denied a canary and .git", async () => {
+  const { spec } = editFixture();
+  const fake = editCodex();
+  const result = await runCodex(spec, fake.runner, fake.probe);
+  expect(result.status).toBe("ok");
+  expect(result.confinement).toMatchObject({ ok: true, version: "codex-cli 0.160.0" });
+  // Negative canary, the probe's own .git, then cwd and scratch writes.
+  expect(fake.sandboxes()).toHaveLength(4);
+  expect(fake.execs()).toHaveLength(1);
+  expect(readdirSync(fake.root)).toEqual([]);
+  // Cached for this CLI and version; a new version is probed again.
+  await runCodex(spec, fake.runner, fake.probe);
+  expect(fake.sandboxes()).toHaveLength(4);
+  fake.cli.version = "codex-cli 0.161.0";
+  await runCodex(spec, fake.runner, fake.probe);
+  expect(fake.sandboxes()).toHaveLength(8);
+});
+
+for (const behaviour of ["leaky", "timeout"] as const)
+  test(`a ${behaviour} editor probe never starts exec`, async () => {
+    const { spec } = editFixture();
+    const fake = editCodex(behaviour);
+    for (let i = 0; i < 2; i++) {
+      const result = await runCodex(spec, fake.runner, fake.probe);
+      expect(result.status).toBe("unavailable");
+      expect(result.error).toContain("Codex write confinement not verified");
+      expect(result.confinement?.reason).toBe(
+        behaviour === "leaky" ? "write profile not enforced" : "probe timed out",
+      );
+    }
+    expect(fake.execs()).toHaveLength(0);
+    // A definitive leak is cached; a timeout is probed again.
+    expect(fake.sandboxes()).toHaveLength(behaviour === "leaky" ? 1 : 2);
+    expect(readdirSync(fake.root)).toEqual([]);
+  });
+
+test("a cancelled editor probe removes its files and never starts exec", async () => {
+  const { spec } = editFixture();
+  const fake = editCodex();
+  const abort = new AbortController();
+  const runner = async (opts: ProcOptions) => {
+    if (opts.cmd[1] === "sandbox") abort.abort();
+    return fake.runner(opts);
+  };
+  const result = await runCodex({ ...spec, signal: abort.signal }, runner, fake.probe);
+  expect(result.status).toBe("cancelled");
+  expect(fake.execs()).toHaveLength(0);
+  await Bun.sleep(10);
+  expect(readdirSync(fake.root)).toEqual([]);
+});
+
+test.skipIf(codexSkip !== null)("the real Codex sandbox enforces the editor profile", () => {
+  const { root, cwd, scratchDir, spec, common, admin } = editFixture();
+  const profile = buildCodexArgs(spec).filter(
+    (arg, i, all) => all[i - 1] === "-c" && /permissions/.test(arg),
+  );
+  const write = (file: string) =>
+    Bun.spawnSync(
+      [
+        "codex",
+        "sandbox",
+        ...profile.flatMap((p) => ["-c", p]),
+        "--",
+        "/bin/sh",
+        "-c",
+        'sh -c "printf x >> \\"$1\\"" _ "$1"',
+        "_",
+        file,
+      ],
+      { cwd, env: { ...process.env, TMPDIR: scratchDir }, stdout: "ignore", stderr: "ignore" },
+    ).exitCode === 0;
+  for (const allowed of [join(cwd, "a"), join(admin, "probe"), join(scratchDir, "s")])
+    expect(write(allowed)).toBe(true);
+  const config = readFileSync(join(common, "config"), "utf8");
+  for (const denied of [
+    join(common, "config"),
+    join(common, "info/attributes"),
+    join(root, "sibling/x"),
+    join(cwd, ".git"),
+    join(root, "outside"),
+  ])
+    expect(write(denied)).toBe(false);
+  expect(readFileSync(join(common, "config"), "utf8")).toBe(config);
+  expect(existsSync(join(common, "info/attributes"))).toBe(false);
 });

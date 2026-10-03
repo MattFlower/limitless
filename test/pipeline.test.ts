@@ -28,6 +28,7 @@ import {
   worktreeOwner,
 } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
+import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook, mapGitHubEvent } from "../src/integrations/github.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
@@ -237,6 +238,8 @@ async function waitFor(
 
 beforeEach(async () => {
   home = mkdtempSync(join(tmpdir(), "limitless-e2e-"));
+  // Gate commands here count their runs in files under home; confinement itself is tested elsewhere.
+  observerRoots.add(realpathSync(home));
   repoDir = await makeRepo();
 });
 
@@ -246,6 +249,7 @@ afterEach(async () => {
   factory?.store.close();
   factory = null;
   rmSync(home, { recursive: true, force: true });
+  observerRoots.clear();
 });
 
 describe("local factory clones", () => {
@@ -6116,7 +6120,8 @@ for (const scenario of [
       if (role === "triage") return { structured: triage() };
       if (role === "spec") return { structured: spec };
       if (role === "holdout") return { structured: holdout };
-      if (role === "review" || role === "verify") {
+      // Readers and edit-mode implementers alike get a scratch owned and removed by their call.
+      if (role === "review" || role === "verify" || role === "implement") {
         expect(s.scratchDir).toBeDefined();
         const scratch = s.scratchDir as string;
         expect(existsSync(scratch)).toBe(true);
@@ -6784,6 +6789,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
         factory = null;
         rmSync(home, { recursive: true, force: true });
         home = mkdtempSync(join(tmpdir(), "limitless-e2e-"));
+        observerRoots.add(realpathSync(home));
         repoDir = await makeRepo();
       }
       const calls = newCalls();
@@ -7056,6 +7062,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       factory = null;
       rmSync(home, { recursive: true, force: true });
       home = mkdtempSync(join(tmpdir(), "limitless-e2e-"));
+      observerRoots.add(realpathSync(home));
       repoDir = await makeRepo();
       return result;
     };
@@ -7129,6 +7136,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     factory = null;
     rmSync(home, { recursive: true, force: true });
     home = mkdtempSync(join(tmpdir(), "limitless-e2e-"));
+    observerRoots.add(realpathSync(home));
     repoDir = await makeRepo();
   };
   const isShadowCall = (s: AgentSpec) =>

@@ -1,5 +1,6 @@
 import { basename } from "node:path";
-import { agentEnv, runProcess } from "../util/proc.ts";
+import { runConfined } from "../harness/sandbox.ts";
+import { agentEnv } from "../util/proc.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { gateSlots } from "./slots.ts";
 
@@ -52,9 +53,10 @@ const OUTPUT_TAIL = 6_000;
 /** Gates execute code the agent wrote; give them the same scrubbed environment as agents. */
 export const gateEnv = (): Record<string, string> => agentEnv({ CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" });
 
+/** Gates run confined to the checkout; a ConfinementError propagates so it can never grade a check. */
 async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promise<GateResult> {
-  const res = await runProcess({
-    cmd: ["/bin/sh", "-c", cmd.run],
+  const res = await runConfined({
+    command: cmd.run,
     cwd,
     env: gateEnv(),
     signal,

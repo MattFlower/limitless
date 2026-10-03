@@ -13,6 +13,7 @@ import { worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
 import {
   attributeLimits,
+  checkoutCommitted,
   commitAll,
   createWorktree,
   diffSince,
@@ -395,7 +396,8 @@ test.each(["filter=unset", "linguist-generated=unset"])("literal %s is a hiding 
     expect.objectContaining({ file: ".gitattributes", severity: "block" }),
   );
   expect(existsSync(marker)).toBe(false);
-  expect(filteredOnAdd).toBe(attr === "filter=unset");
+  // The factory's add runs no filter driver, whatever attributes select.
+  expect(filteredOnAdd).toBe(false);
 });
 
 test.each([
@@ -1683,4 +1685,68 @@ test("UTF-16 source content remains blocked", async () => {
   expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toContainEqual(
     expect.objectContaining({ rule: "binary-content", file: "unicode.ts", severity: "block" }),
   );
+});
+
+test("a global LFS-like driver never filters factory commits or checkouts, and bad config fails closed", async () => {
+  const marker = join(dir, "filtered");
+  const driver = join(dir, "driver.sh");
+  writeFileSync(
+    driver,
+    `#!/bin/sh\necho "$0 $*" >> '${marker}'\necho 'version https://git-lfs.github.com/spec/v1'\n`,
+    {
+      mode: 0o755,
+    },
+  );
+  const included = join(dir, "included.gitconfig");
+  writeFileSync(included, `[filter "inc"]\n\tclean = ${driver}\n\tsmudge = ${driver}\n\trequired = true\n`);
+  const global = join(dir, "global.gitconfig");
+  writeFileSync(
+    global,
+    `[filter "lfs"]\n\tclean = ${driver}\n\tsmudge = ${driver}\n\tprocess = ${driver}\n\trequired = true\n[include]\n\tpath = ${included}\n`,
+  );
+  const previous = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = global;
+  try {
+    const code = "module.exports = () => { require('child_process').execSync('id'); };\n";
+    mkdirSync(join(work, "lib"));
+    writeFileSync(join(work, ".gitattributes"), "*.dat filter=lfs\n*.inc filter=inc\n");
+    writeFileSync(join(work, "lib", "helper.dat"), code);
+    writeFileSync(join(work, "lib", "more.inc"), code);
+    const head = await commitAll(work, "helper");
+    expect(head).not.toBeNull();
+    expect(await readFileAt(work, "HEAD", "lib/helper.dat")).toBe(code);
+    expect(await readFileAt(work, "HEAD", "lib/more.inc")).toBe(code);
+    rmSync(join(work, "lib"), { recursive: true });
+    await checkoutCommitted(work);
+    expect(readFileSync(join(work, "lib", "helper.dat"), "utf8")).toBe(code);
+    await resetTo(work, base);
+    await resetTo(work, head as string);
+    expect(readFileSync(join(work, "lib", "more.inc"), "utf8")).toBe(code);
+    expect(existsSync(marker)).toBe(false);
+    // The audit sees the real bytes, not a pointer.
+    const diff = await diffSince(work, base);
+    expect(diff.patch).toContain("+module.exports");
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toContainEqual(
+      expect.objectContaining({ rule: "gitattributes", file: ".gitattributes" }),
+    );
+    // A config file discovery cannot parse stops the factory instead of running unfiltered-or-not.
+    writeFileSync(global, '[filter "lfs"\n\tclean = broken');
+    writeFileSync(join(work, "lib", "helper.dat"), "changed");
+    await expect(commitAll(work, "after bad config")).rejects.toThrow();
+    expect(existsSync(marker)).toBe(false);
+  } finally {
+    if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = previous;
+  }
+});
+
+test("a filter selected by in-tree attributes and repository config does not run on add", async () => {
+  const marker = join(dir, "filtered");
+  await git(work, "config", "filter.spy.clean", `touch '${marker}'; echo pointer`);
+  await git(work, "config", "filter.spy.required", "true");
+  writeFileSync(join(work, ".gitattributes"), "*.ts filter=spy\n");
+  writeFileSync(join(work, "sample.test.ts"), edited);
+  await commitAll(work, "filtered");
+  expect(existsSync(marker)).toBe(false);
+  await audited();
 });

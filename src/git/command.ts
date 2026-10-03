@@ -70,10 +70,14 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
   });
 }
 
-/** Flags blanking every config-defined hook git sees as `git` in `opts.cwd`; needs LIMITLESS_GIT_EMPTY_HOOK="". */
+/**
+ * Flags blanking every config-defined hook and filter driver git sees as `git` in `opts.cwd`; needs
+ * LIMITLESS_GIT_EMPTY_HOOK="". An empty clean/smudge/process runs nothing and an empty `required`
+ * is false, so what is committed or checked out is exactly the bytes, whatever attributes select.
+ */
 export async function emptyHookFlags(git: string[], opts: Parameters<typeof sh>[1]): Promise<string[]> {
   // Config lookup cannot run hooks; errors other than "no matching keys" must fail closed.
-  const hooks = await sh([...git, "config", "--null", "--name-only", "--get-regexp", "^hook\\."], {
+  const hooks = await sh([...git, "config", "--null", "--name-only", "--get-regexp", "^(hook|filter)\\."], {
     ...opts,
     allowFail: false,
   }).catch((error: unknown) => {

@@ -635,7 +635,8 @@ export class RunContext {
         const stream = await this.faults.hit("harness:stream", faultContext, this.signal);
         this.checkCancelled();
         if (stream) result = parseFakeStream(stream, spec.onEvent);
-        else if (opts.mode === "readonly" && !noTools) {
+        else if (!noTools) {
+          // Every tool-enabled call is confined to its cwd plus a scratch this call owns.
           result = await withScratch(spec.cwd, (scratchDir) => harness({ ...spec, scratchDir }));
         } else result = await harness(spec);
       } catch (e) {

@@ -25,6 +25,7 @@ import {
 import { worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
+  checkoutCommitted,
   commitAll,
   createPullRequest,
   createWorktree,
@@ -981,7 +982,7 @@ async function oneRound(
       const events = gateEvents(ctx);
       let cmp: GateComparison[];
       try {
-        await discardChanges(cwd);
+        await checkoutCommitted(cwd);
         const after = await runGates(cwd, gates, ctx.signal, events);
         ctx.checkCancelled();
         const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
@@ -1863,8 +1864,7 @@ async function mergeForDelivery(
   }
   if ((await headSha(cwd)) === before) await completeMerge(cwd, before, fetched);
   await validateMerge(cwd, before, fetched);
-  await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
-  await mergeGit(cwd, ["clean", "-fdq"]);
+  await checkoutCommitted(cwd);
   const previous = ctx.state.preRebaseGates ?? [];
   try {
     await ctx.stage(
