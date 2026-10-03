@@ -466,6 +466,7 @@ export class ProviderTracker {
         onWait?.(p.waiters.length);
         notified = true;
       }
+      if (signal.aborted) throw new Error("cancelled");
       if (this.clock() >= end) return null;
       // Production never waits behind a shadow call: abort one, and take its slot ahead of the queue.
       const shadow = [...p.shadows].find((s) => !s.heir);
@@ -477,12 +478,13 @@ export class ProviderTracker {
           p.waking++;
           resolve(true);
         };
-        // A cancelled or expired waiter must leave the queue (and give up any claim on a shadow's
-        // slot), or a later release would wake a dead waiter and strand the live ones behind it.
+        // A cancelled or expired waiter must leave the queue, or a later release would wake a dead
+        // waiter and strand the live ones behind it. A claim on a shadow's slot passes to the head of
+        // the queue, so a newcomer cannot take it ahead of an older waiter.
         const leave = () => {
           if (timeout !== undefined) this.timer.clear(timeout);
           signal.removeEventListener("abort", leave);
-          if (shadow?.heir === wake) shadow.heir = undefined;
+          for (const held of p.shadows) if (held.heir === wake) held.heir = p.waiters.shift();
           const i = p.waiters.indexOf(wake);
           if (i >= 0) p.waiters.splice(i, 1);
           resolve(false);

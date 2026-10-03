@@ -1178,6 +1178,41 @@ describe("bounded provider waits", () => {
     expect(tracker.status("openrouter")?.inFlight).toBe(0);
   });
 
+  test("a given-up claim on a shadow's slot passes to the oldest waiter, not a newcomer", async () => {
+    const { clock, tracker, signal } = fixture();
+    const shadowRelease = tracker.tryAcquire("openrouter", () => {});
+    const busy = await tracker.acquire("openrouter", signal);
+    const order: string[] = [];
+    const first = tracker.acquire("openrouter", signal, 20);
+    const queued = tracker.acquire("openrouter", signal).then((release) => {
+      order.push("queued");
+      return release;
+    });
+    await clock.advance(20);
+    expect(await first).toBeNull();
+    const newcomer = tracker.acquire("openrouter", signal).then((release) => {
+      order.push("newcomer");
+      return release;
+    });
+    shadowRelease?.();
+    (await queued)();
+    (await newcomer)();
+    busy();
+    expect(order).toEqual(["queued", "newcomer"]);
+    expect(clock.pending).toBe(0);
+    expect(tracker.status("openrouter")?.inFlight).toBe(0);
+  });
+
+  test("a waiter whose wait notice aborts it leaves at once", async () => {
+    const { tracker, signal } = fixture();
+    const busy = await tracker.acquire("claude", signal);
+    const cancel = new AbortController();
+    const rejected = tracker.acquire("claude", cancel.signal, undefined, () => cancel.abort());
+    expect(await rejected.catch((error: Error) => error.message)).toBe("cancelled");
+    busy();
+    expect(tracker.status("claude")?.inFlight).toBe(0);
+  });
+
   test("no budget waits indefinitely and immediate admission accepts a zero budget", async () => {
     const { clock, tracker, signal } = fixture();
     const release = await tracker.acquire("claude", signal, 0);
