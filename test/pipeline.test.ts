@@ -50,7 +50,7 @@ import { Router } from "../src/router/router.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewOutput } from "./evals-reading-support.ts";
 import { deferred } from "./evals-support.ts";
-import { findingEvidence } from "./review-support.ts";
+import { attributionEvidence, findingEvidence } from "./review-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -6438,6 +6438,69 @@ test("panel review: a refuted blocker doesn't block, a CONFIRMED low does, and v
   const report = f.store.getArtifact(run.id, "report.md") ?? "";
   expect(report).toContain("- medium: `farewell.txt:1` Plausible medium");
   expect(report).not.toContain("Refuted blocker");
+});
+
+test("causal panel feedback includes exactly the decision's blockers", async () => {
+  const implementPrompts: string[] = [];
+  const f = start((s) => {
+    if (s.prompt.startsWith("You are a code-review verifier")) {
+      const fix = s.prompt.includes("the fix diff only");
+      return {
+        structured: {
+          results: [...s.prompt.matchAll(/"id": "(C\d+)"/g)].map((m) => ({
+            id: m[1],
+            verdict: fix ? "REFUTED" : "CONFIRMED",
+            severity: "high",
+            category: "correctness",
+            evidence: "farewell.txt:1 wrong text",
+            trigger: "read -> wrong result",
+            attribution: m[1] === "C2" ? "preexisting_unchanged" : "introduced",
+            attributionEvidence,
+          })),
+        },
+      };
+    }
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review")
+      return {
+        structured: {
+          verdict: "request_changes",
+          summary: "Inspected the farewell text and its input handling.",
+          findings: s.prompt.includes("# Previous review")
+            ? []
+            : ["Introduced defect", "Old defect"].map((title, i) => ({
+                severity: "major",
+                security: false,
+                ...findingEvidence,
+                file: "farewell.txt",
+                line: i + 1,
+                title,
+                detail: title,
+                suggestion: "Fix it",
+              })),
+        },
+      };
+    implementPrompts.push(s.prompt);
+    return { files: { "farewell.txt": `goodbye ${implementPrompts.length}\n` } };
+  });
+  f.deps.reviewSystem = {
+    name: "causal",
+    mode: "panel",
+    causalAttribution: true,
+    finders: [{ prompt: "standard" }],
+    verifier: {},
+    implementerReport: "include",
+  };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  const artifact = JSON.parse(f.store.getArtifact(run.id, "review-1.json") ?? "{}");
+  expect(artifact.verdict).toBe("request_changes");
+  expect(artifact.blocking.map((b: { title: string }) => b.title)).toEqual(["Introduced defect"]);
+  expect(implementPrompts).toHaveLength(2);
+  expect(implementPrompts[1]).toContain("Introduced defect");
+  expect(implementPrompts[1]).not.toContain("Old defect");
+  expect(f.store.getRunState<RunState>(run.id)?.reviewFollowUps?.map((f) => f.title)).toEqual(["Old defect"]);
 });
 
 test("panel review: a verifier that omits candidates is retried once, then they stay unverified follow-ups", async () => {

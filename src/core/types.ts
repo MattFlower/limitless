@@ -475,6 +475,8 @@ export interface ReviewSystem {
   /** Panel only; production may omit `target` (routed), evals may not. */
   verifier?: { target?: string; targets?: string[] };
   implementerReport: "include" | "omit";
+  /** Opt-in panel eval experiment: attribute verifier claims to the change. */
+  causalAttribution?: true;
 }
 /** Trials an eval runs at once per provider, capped at the provider's `maxConcurrent` − 1 (at least 1). */
 export const DEFAULT_EVAL_CONCURRENCY = 2;

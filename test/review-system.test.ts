@@ -13,6 +13,7 @@ import {
   configuredReviewSystem,
   DEFAULT_ROSTERS,
   type EvalReviewSystem,
+  expandRoster,
   parseEvalReviewSystems,
   productionReviewSystem,
   readReviewLenses,
@@ -101,6 +102,45 @@ test("eval review systems reject unsupported shapes with clear errors", () => {
     prompt,
   }));
   expect(parseEvalReviewSystems(file(panel({ finders })), "s.json")[0]).toMatchObject({ finders });
+});
+
+test("causal attribution is an opt-in panel option preserved by parsing and roster expansion", async () => {
+  const variant = panel({ causalAttribution: true });
+  expect(parseEvalReviewSystems(file(variant), "s.json")).toEqual([variant] as ReviewSystem[]);
+  for (const causalAttribution of [true, false])
+    expect(() => parseEvalReviewSystems(file(system({ causalAttribution })), "s.json")).toThrow();
+  const reference = {
+    name: "causal-roster",
+    roster: "standard",
+    targets: ["candidate-a", "candidate-b"],
+    verifier: { target: "verifier-c" },
+    implementerReport: "include",
+    causalAttribution: true,
+  };
+  const parsed = parseEvalReviewSystems(file(reference), "s.json")[0];
+  if (!parsed) throw new Error("missing system");
+  expect(expandRoster(parsed, DEFAULT_ROSTERS)).toMatchObject({ mode: "panel", causalAttribution: true });
+  expect(productionReviewSystem({ reviewImplementerReport: "include" })).not.toHaveProperty(
+    "causalAttribution",
+  );
+  const f = await evalFixture([verifierModel]);
+  try {
+    const review = { ...f.dataset, role: "review" } as unknown as Parameters<typeof validateRequest>[1];
+    const systems = validateRequest(
+      {
+        role: "review",
+        systems: parseEvalReviewSystems(file(panel({ name: "control" }), variant), "s.json"),
+      },
+      review,
+      f.factory.router,
+    ).request.systems;
+    expect(systems?.map((s) => s.causalAttribution)).toEqual([undefined, true]);
+    expect(systems?.[0] && reviewSystemHash(systems[0])).not.toBe(
+      systems?.[1] && reviewSystemHash(systems[1]),
+    );
+  } finally {
+    await f.close();
+  }
 });
 
 test("a batch's verifier is the first listed target independent of it, else the first other model", () => {
