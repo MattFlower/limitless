@@ -17,6 +17,7 @@ Read `docs/ARCHITECTURE.md` before changing anything structural.
 
 ## Rules
 - Run `bun run check` (biome lint, `tsc --noEmit`, `bun test`) before finishing. All three must pass.
+- Before adding or changing tests, read `test/AGENTS.md` (what is worth testing, and keeping tests fast).
 - The pipeline is deterministic code; LLMs only work *inside* stages. Don't add LLM-decided control flow.
 - Anything that talks to a paid model must be testable with the fake harness (`src/harness/fake.ts`).
   Tests must never call real LLMs, the network, or `gh`.
