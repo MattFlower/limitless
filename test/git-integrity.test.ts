@@ -23,6 +23,7 @@ import {
   readFileAt,
   removeWorktree,
   resetTo,
+  sweepClassificationScratch,
 } from "../src/git/repos.ts";
 import { sh } from "../src/util/proc.ts";
 
@@ -883,22 +884,27 @@ const attributeBlocksOf = (findings: { rule: string; severity: string; file?: st
   findings.filter((f) => f.rule === "gitattributes" && f.severity === "block");
 
 /** A `git` on PATH that logs every argv and can stall content classification. */
-function gitShim(stall = false) {
+function gitShim(stall: boolean | "fail" = false) {
   const bin = join(dir, "shim");
   const log = join(dir, "git.log");
+  const inputLog = join(dir, "pathspecs.log");
   mkdirSync(bin, { recursive: true });
   writeFileSync(log, "");
+  writeFileSync(inputLog, "");
   const script = [
     "#!/bin/sh",
     `printf '%s\\n' "$*" >> '${log}'`,
-    stall ? `case "$* " in *" ${EMPTY_TREE} "*) sleep 30;; esac` : "",
+    stall
+      ? `case "$* " in *" --cached --numstat "*) ${stall === "fail" ? "echo classification-broke >&2; exit 1" : "sleep 30"};; esac`
+      : "",
+    `case "$* " in *" --pathspec-from-file=- "*) cat > '${inputLog}'.$$; cat '${inputLog}'.$$ >> '${inputLog}'; exec '${Bun.which("git")}' "$@" < '${inputLog}'.$$;; esac`,
     `exec '${Bun.which("git")}' "$@"`,
   ].join("\n");
   writeFileSync(join(bin, "git"), script, { mode: 0o755 });
   const env = { ...(process.env as Record<string, string>), PATH: `${bin}:${process.env.PATH}` };
   const calls = () => readFileSync(log, "utf8").split("\n").filter(Boolean);
-  const classifications = () => calls().filter((call) => call.includes(` ${EMPTY_TREE} `));
-  return { env, calls, classifications };
+  const classifications = () => calls().filter((call) => call.includes(" --cached --numstat "));
+  return { env, calls, classifications, pathspecs: () => readFileSync(inputLog, "utf8").split("\0") };
 }
 
 test("repository patch-format config cannot hide gitattributes or skipped-test findings", async () => {
@@ -1094,7 +1100,7 @@ test("local repositories classify content with an explicit empty attribute sourc
     const scratch = call.match(/^--git-dir=(\S+)/)?.[1];
     expect(scratch).toBeDefined();
     expect(scratch && existsSync(scratch)).toBe(false);
-    expect(call).toContain(" diff --numstat");
+    expect(call).toContain(" diff --cached --numstat");
   }
 });
 
@@ -1130,9 +1136,10 @@ test("content classification covers changed blobs and pattern candidates within 
   await commitAll(work, "narrow binary rule");
   expect(await audit(shim.env)).toEqual([]);
   expect(shim.classifications()).toHaveLength(4);
-  const patterns = shim.classifications().filter((call) => call.includes(":(glob,icase)"));
-  expect(patterns).toHaveLength(2);
-  for (const call of patterns) expect(call).toEndWith(" -- :(glob,icase)assets/icon.png");
+  expect(shim.pathspecs().filter((path) => path === ":(glob,icase)assets/icon.png")).toHaveLength(2);
+  for (const call of shim.classifications()) expect(call).not.toContain(":(glob,icase)");
+  for (const call of shim.calls().filter((call) => call.includes(" reset ")))
+    expect(call).toContain("--pathspec-from-file=- --pathspec-file-nul");
   for (const call of shim.classifications()) expect(call).not.toContain("unrelated-");
 
   shim = gitShim(true);
@@ -1200,10 +1207,10 @@ test.each(["nul.test.ts", "sample.test.ts", "nul\ttest.test.ts", "nul\ntest.test
 );
 
 test.each([
-  ["unknown.blob", false, false],
+  ["unknown.blob", false, true],
   ["added.png", false, false],
   ["text.png", true, true],
-  ["binary.ts", true, false],
+  ["binary.ts", true, true],
 ])("binary content in %s uses its base classification (%s)", async (path, exists, blocks) => {
   if (exists) {
     writeFileSync(join(work, path), path === "binary.ts" ? Buffer.from([0, 1]) : "base text\n");
@@ -1232,6 +1239,7 @@ test("a rename from text to a binary image keeps its text origin", async () => {
   writeFileSync(join(work, "origin.txt"), text);
   await commitAll(work, "text origin");
   const revision = await headSha(work);
+  await git(work, "config", "diff.renames", "false");
   await git(work, "mv", "origin.txt", "moved.png");
   writeFileSync(join(work, "moved.png"), `\0${text}`);
   await commitAll(work, "renamed binary");
@@ -1372,5 +1380,201 @@ test("moving an existing binary into a new source path blocks", async () => {
   expect(diff.files).toContainEqual(expect.objectContaining({ from: "image.png", path: "hidden.test.ts" }));
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toContainEqual(
     expect.objectContaining({ rule: "binary-content", severity: "block", file: "hidden.test.ts" }),
+  );
+});
+
+test.each(["nul.test.mts", "nul.cts", "nul.jsx", "lib/helper.dat", "script", "state.snap"])(
+  "new and edited binary head content blocks in %s",
+  async (path) => {
+    mkdirSync(join(work, path, ".."), { recursive: true });
+    writeFileSync(join(work, path), "text\0hidden\n");
+    await commitAll(work, "binary addition");
+    for (const revision of [base, await headSha(work)]) {
+      writeFileSync(join(work, path), "changed\0hidden\n");
+      await commitAll(work, "binary edit");
+      const diff = await diffSince(work, revision);
+      expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toContainEqual(
+        expect.objectContaining({ rule: "binary-content", file: path, severity: "block" }),
+      );
+      expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+    }
+    writeFileSync(join(work, path), "ordinary text\n");
+    await commitAll(work, "text base");
+    const textBase = await headSha(work);
+    writeFileSync(join(work, path), "changed\0hidden\n");
+    await commitAll(work, "text to binary edit");
+    expect(
+      auditDiff(await diffSince(work, textBase), { taskClass: null, protectedPaths: [] }),
+    ).toContainEqual(expect.objectContaining({ rule: "binary-content", file: path, severity: "block" }));
+  },
+);
+
+const assetExtensions = [
+  "png",
+  "pdf",
+  "woff2",
+  "jar",
+  "war",
+  "apk",
+  "whl",
+  "docx",
+  "xlsx",
+  "pptx",
+  "odt",
+  "psd",
+  "ai",
+  "heic",
+  "wasm",
+  "so",
+  "dll",
+  "dylib",
+  "exe",
+  "class",
+  "pyc",
+  "sqlite",
+  "db",
+  "glb",
+  "fbx",
+  "blend",
+];
+test("known binary extensions exempt assets and unmatched attribute rules", async () => {
+  writeFileSync(join(work, ".gitattributes"), assetExtensions.map((ext) => `*.${ext} binary\n`).join(""));
+  await commitAll(work, "unmatched asset rules");
+  let diff = await diffSince(work, base);
+  let findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+  expect(findings.filter((f) => f.severity === "block")).toEqual([]);
+  expect(findings).toHaveLength(assetExtensions.length);
+  const revision = await headSha(work);
+  for (const ext of assetExtensions) writeFileSync(join(work, `asset.${ext}`), Buffer.from([0, 1, 2]));
+  await commitAll(work, "ordinary assets");
+  diff = await diffSince(work, revision);
+  findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+  expect(diff.attributeErrors).toBeUndefined();
+  expect(findings).toEqual([]);
+});
+
+test("16,000 added files use stdin pathspecs without uncertainty findings", async () => {
+  const files = Array.from({ length: 16_000 }, (_, i) => `${i}-${"long-name-".repeat(12)}.dat`);
+  for (const path of files) writeFileSync(join(work, path), "new text\n");
+  await commitAll(work, "large addition");
+  const diff = await diffSince(work, base);
+  expect(diff.files).toHaveLength(files.length);
+  expect(diff.headTextPaths).toHaveLength(files.length);
+  expect(diff.attributeErrors).toBeUndefined();
+  expect(diff.binaryErrors).toBeUndefined();
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
+}, 120_000);
+
+test("failed binary classification blocks even with attribute and binary allowances", async () => {
+  writeFileSync(join(work, "payload.dat"), Buffer.from([0, 1]));
+  await commitAll(work, "payload");
+  const shim = gitShim("fail");
+  const diff = await diffSince(work, base, shim.env);
+  for (const allow of [["gitattributes"], ["gitattributes", "binary"]] as AuditAllowance[][]) {
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [], allow });
+    expect(findings).toContainEqual(
+      expect.objectContaining({
+        rule: "binary-content",
+        severity: "block",
+        detail: expect.stringContaining("classification-broke"),
+      }),
+    );
+  }
+});
+
+test("existing hiding warnings group text paths per rule and omit binary PNGs", async () => {
+  writeFileSync(
+    join(work, ".gitattributes"),
+    "gen/** linguist-generated\nother/** linguist-generated\n*.png binary\n",
+  );
+  await commitAll(work, "base hiding rules");
+  const revision = await headSha(work);
+  for (const directory of ["gen", "other"]) mkdirSync(join(work, directory));
+  for (let i = 0; i < 312; i++) writeFileSync(join(work, "gen", `${i}.dat`), "generated text\n");
+  for (let i = 0; i < 2; i++) writeFileSync(join(work, "other", `${i}.dat`), "other generated text\n");
+  writeFileSync(join(work, "photo.png"), Buffer.from([0, 1]));
+  await commitAll(work, "generated text and binary asset");
+  const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
+  expect(findings).toHaveLength(2);
+  expect(findings).toContainEqual(
+    expect.objectContaining({
+      severity: "warn",
+      detail: expect.stringContaining("312"),
+    }),
+  );
+  expect(findings.map((f) => f.detail).some((detail) => detail.includes("gen/** linguist-generated"))).toBe(
+    true,
+  );
+  expect(findings.map((f) => f.detail).some((detail) => detail.includes("other/** linguist-generated"))).toBe(
+    true,
+  );
+  expect(findings.some((f) => f.file === "photo.png")).toBe(false);
+});
+
+test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size", "extra line"])(
+  "binary edits of %s base LFS pointers require a strict pointer exemption",
+  async (kind) => {
+    let pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 2\n`;
+    if (kind === "missing oid") pointer = pointer.replace(/oid.*\n/, "");
+    if (kind === "missing size") pointer = pointer.replace(/size.*\n/, "");
+    if (kind === "invalid hash") pointer = pointer.replace("a".repeat(64), "bad");
+    if (kind === "invalid size") pointer = pointer.replace("size 2", "size -1");
+    if (kind === "extra line") pointer += "extra\n";
+    for (const path of ["tracked.png", "tracked.dat", "tracked.ts"]) writeFileSync(join(work, path), pointer);
+    writeFileSync(join(work, ".gitattributes"), "tracked.* filter=lfs diff=lfs merge=lfs -text\n");
+    // Disable LFS explicitly: neither clean nor smudge may need git-lfs installed.
+    await worktreeGit(["git", "-c", "filter.lfs.clean=cat", "-c", "filter.lfs.required=false", "add", "-A"], {
+      cwd: work,
+    });
+    await factory("commit", "-qm", "base LFS pointer");
+    const revision = await headSha(work);
+    for (const path of ["tracked.png", "tracked.dat", "tracked.ts"])
+      writeFileSync(join(work, path), Buffer.from([0, 1]));
+    await worktreeGit(["git", "-c", "filter.lfs.clean=cat", "-c", "filter.lfs.required=false", "add", "-A"], {
+      cwd: work,
+    });
+    await factory("commit", "-qm", "binary LFS edit");
+    const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
+    expect(findings.filter((f) => f.rule === "binary-content").length).toBe(kind === "valid" ? 0 : 3);
+  },
+);
+
+test("startup sweep removes only classification directories older than one hour", () => {
+  const now = Date.now();
+  const paths = [
+    "limitless-classify-old",
+    "limitless-classify-recent",
+    "limitless-classify-boundary",
+    "unrelated-old",
+  ];
+  for (const name of paths) mkdirSync(join(dir, name));
+  for (const name of [paths[0], paths[3]])
+    utimesSync(join(dir, name ?? ""), new Date(now - 3_600_001), new Date(now - 3_600_001));
+  utimesSync(join(dir, paths[2] ?? ""), new Date(now - 3_600_000), new Date(now - 3_600_000));
+  writeFileSync(join(dir, "limitless-classify-file"), "keep");
+  sweepClassificationScratch(dir, now);
+  expect(existsSync(join(dir, paths[0] ?? ""))).toBe(false);
+  for (const name of paths.slice(1)) expect(existsSync(join(dir, name))).toBe(true);
+  expect(existsSync(join(dir, "limitless-classify-file"))).toBe(true);
+});
+
+test("info attributes cannot hide text edits from the main audit patch", async () => {
+  const info = resolve(work, (await git(work, "rev-parse", "--git-path", "info/attributes")).stdout.trim());
+  writeFileSync(info, "*.ts -diff\n");
+  writeFileSync(join(work, "sample.test.ts"), edited);
+  await commitAll(work, "text edit hidden by info attributes");
+  expect((await git(work, "diff", base, "HEAD")).stdout).not.toContain("test.skip(");
+  const diff = await diffSince(work, base);
+  expect(diff.patch).toContain(`+${edited.trim()}`);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toContainEqual(
+    expect.objectContaining({ rule: "test-skipped", severity: "block", file: "sample.test.ts" }),
+  );
+});
+
+test("UTF-16 source content remains blocked", async () => {
+  writeFileSync(join(work, "unicode.ts"), Buffer.from("export const hidden = 1;\n", "utf16le"));
+  await commitAll(work, "UTF-16 source");
+  expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toContainEqual(
+    expect.objectContaining({ rule: "binary-content", file: "unicode.ts", severity: "block" }),
   );
 });

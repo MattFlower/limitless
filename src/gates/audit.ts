@@ -103,7 +103,7 @@ export function splitPatch(patch: string): FilePatch[] {
 export const SOURCE_PATH =
   /\.(ts|tsx|js|mjs|cjs|json|toml|yml|yaml|md|sh|py|go|rs|java|kt|rb|php|cs|c|h|cpp|swift|sql|html|css)$/i;
 export const BINARY_PATH =
-  /\.(png|jpe?g|gif|bmp|ico|webp|avif|tiff?|pdf|zip|gz|bz2|xz|7z|rar|tar|zst|woff2?|ttf|otf|eot|mp3|mp4|m4a|mkv|mov|avi|webm|ogg|wav|flac|aac)$/i;
+  /\.(png|jpe?g|gif|bmp|ico|webp|avif|tiff?|pdf|zip|gz|bz2|xz|7z|rar|tar|zst|woff2?|ttf|otf|eot|mp3|mp4|m4a|mkv|mov|avi|webm|ogg|wav|flac|aac|jar|war|apk|whl|docx|xlsx|pptx|odt|psd|ai|heic|wasm|so|dll|dylib|exe|class|pyc|sqlite|db|glb|fbx|blend)$/i;
 
 const BUILTIN_DIFF_DRIVER =
   /^(ada|bash|bibtex|cpp|csharp|css|dts|elixir|fortran|fountain|golang|html|java|kotlin|markdown|matlab|objc|pascal|perl|php|python|ruby|rust|scheme)$/;
@@ -230,6 +230,9 @@ export function auditDiff(
       hidden(file, `${file}: ${pattern} (${attributes}) can hide text diffs for ${text?.[0] ?? pattern}.`);
     else if (unmatched) warn(file, `${file}: new ${pattern} (${attributes}) rule matches no files yet.`);
   }
+  const warnings = new Map<string, string[]>();
+  const headText = new Set(diff.headTextPaths);
+  const addedPaths = new Set(diff.files.filter((f) => /^[ARC]/.test(f.status)).map((f) => f.path));
   for (const { path, base, head } of diff.attributes ?? []) {
     const added = newlyHidden(base, head).join(" ");
     if (added && diff.textPaths?.includes(path))
@@ -237,9 +240,14 @@ export function auditDiff(
     const existing = newlyHidden({}, base)
       .filter((a) => newlyHidden({}, head).includes(a))
       .join(" ");
-    if (existing && diff.files.some((f) => f.path === path && /^[ARC]/.test(f.status)))
-      warn(path, `${path}: added or moved under a hiding rule already effective at base (${existing}).`);
+    if (existing && headText.has(path) && addedPaths.has(path))
+      for (const rule of diff.existingRuleKeys?.[path] ?? [existing])
+        warnings.set(rule, [...(warnings.get(rule) ?? []), path]);
   }
+  for (const [rule, paths] of warnings)
+    warn(paths[0] ?? "", `${paths.length} new/moved files under ${rule} (already effective at base).`);
+  for (const detail of diff.binaryErrors ?? [])
+    findings.push({ rule: "binary-content", severity: "block", detail });
   for (const error of diff.attributeErrors ?? [])
     hidden(undefined, `Hidden diffs cannot be ruled out because the ${error}.`);
   for (const file of diff.binaryPaths ?? [])
