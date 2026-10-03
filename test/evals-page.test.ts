@@ -106,6 +106,7 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
     )) as typeof import("../ui/components/InvocationsTable.tsx");
     const invocations = (["low", "high", "none", "default", null] as const).map(
       (effort, id): import("../src/core/types.ts").Invocation => ({
+        waitMs: 0,
         id,
         fast: false,
         fastModeState: null,
