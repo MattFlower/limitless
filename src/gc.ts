@@ -4,6 +4,7 @@ import type { Config } from "./config.ts";
 import type { Repo, Run } from "./core/types.ts";
 import type { Store } from "./db/store.ts";
 import { BASELINE_CACHE_TTL_MS } from "./gates/cache.ts";
+import { worktreeGit } from "./git/command.ts";
 import { cachePath, withRepoLock } from "./git/repos.ts";
 import { sh } from "./util/proc.ts";
 
@@ -95,6 +96,7 @@ export async function collectGarbage(
     try {
       const path = child(workRoot, run.id);
       const cache = cachePath(cfg.paths, repo);
+      const git = repo.kind === "github" ? worktreeGit : sh;
       if (repo.kind === "github" && !resolve(cache).startsWith(resolve(cfg.paths.repos) + sep)) {
         throw new Error(`repository cache outside ${cfg.paths.repos}`);
       }
@@ -104,10 +106,10 @@ export async function collectGarbage(
           throw new Error(`worktree path is not a directory: ${path}`);
         }
         const listed = worktreePaths(
-          (await sh(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout,
+          (await git(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout,
         );
         if (realpathSync(path).startsWith(realpathSync(workRoot) + sep) && listed.has(canonical(path))) {
-          if (!dryRun) await sh(["git", "worktree", "remove", "--force", path], { cwd: cache });
+          if (!dryRun) await git(["git", "worktree", "remove", "--force", path], { cwd: cache });
           result.worktrees.push(path);
         } else {
           throw new Error(`worktree is not registered to ${repo.slug}: ${path}`);
@@ -130,6 +132,7 @@ export async function collectGarbage(
   }
   for (const repo of relevantRepos.values()) {
     const cache = cachePath(cfg.paths, repo);
+    const git = repo.kind === "github" ? worktreeGit : sh;
     try {
       await withRepoLock(cache, async () => {
         const eligible = new Set(
@@ -147,19 +150,19 @@ export async function collectGarbage(
             )
             .map((run) => canonical(child(workRoot, run.id))),
         );
-        const listed = (await sh(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout;
+        const listed = (await git(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout;
         const prunable = prunablePaths(listed);
         const unrelated = prunable.filter((path) => !eligible.has(path));
         if (unrelated.length)
           throw new Error(`prune would affect unrelated worktrees: ${unrelated.join(", ")}`);
-        const output = await sh(["git", "worktree", "prune", "--expire", "now", "--dry-run", "--verbose"], {
+        const output = await git(["git", "worktree", "prune", "--expire", "now", "--dry-run", "--verbose"], {
           cwd: cache,
         });
         const entries = `${output.stdout}\n${output.stderr}`.split("\n").filter((line) => line.trim());
         if (entries.length !== prunable.length) {
           throw new Error("prune reported metadata that could not be matched to eligible worktrees");
         }
-        if (!dryRun) await sh(["git", "worktree", "prune", "--expire", "now"], { cwd: cache });
+        if (!dryRun) await git(["git", "worktree", "prune", "--expire", "now"], { cwd: cache });
         for (const entry of entries) result.metadata.push(`${repo.slug}: ${entry.trim()}`);
       });
     } catch (error) {

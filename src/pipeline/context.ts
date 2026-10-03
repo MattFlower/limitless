@@ -1,10 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
 import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import type { ZodType } from "zod";
 import type { Config } from "../config.ts";
 import type {
@@ -24,6 +22,7 @@ import type { Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
+import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
 import type { DecisionTask } from "../harness/decisions.ts";
 import { withScratch } from "../harness/scratch.ts";
@@ -145,7 +144,6 @@ export interface RunState {
 
 const MODEL_REJECTED =
   /model[^.]{0,80}(is not supported|not found|does not exist|not available)|unknown model|invalid model|model_not_found/i;
-const execFileAsync = promisify(execFile);
 const MAX_PUBLIC_SOURCE_BYTES = 16 * 1024 * 1024;
 const MAX_PUBLIC_SOURCE_FILES = 2_000;
 
@@ -296,11 +294,7 @@ export class RunContext {
     const cwd = this.state.worktreePath;
     if (cwd) {
       try {
-        const { stdout } = await execFileAsync("git", ["ls-files", "-z"], {
-          cwd,
-          maxBuffer: 16 * 1024 * 1024,
-          encoding: "utf8",
-        });
+        const { stdout } = await worktreeGit(["git", "ls-files", "-z"], { cwd });
         const files = stdout.split("\0").filter(Boolean);
         let bytesRead = 0;
         for (const file of files.slice(0, MAX_PUBLIC_SOURCE_FILES)) {
