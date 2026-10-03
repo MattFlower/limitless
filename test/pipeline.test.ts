@@ -410,6 +410,16 @@ describe("local factory clones", () => {
     );
   });
 
+  test("an explicit base branch runs after the recorded default branch is renamed", async () => {
+    const f = start(reply);
+    const first = await f.createRun({ repo: repoDir, prompt: "First run" });
+    expect(await waitFor(f, first.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    await git(repoDir, "branch", "-m", "main", "trunk");
+    const next = await f.createRun({ repo: repoDir, prompt: "Next run", baseBranch: "trunk" });
+    expect(await waitFor(f, next.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(f.store.getRun(next.id)?.baseSha).toBe(await git(repoDir, "rev-parse", "trunk"));
+  });
+
   test("source history rewrite and gc preserve an active run's base history", async () => {
     let prepared = () => {};
     const ready = new Promise<void>((resolve) => {

@@ -220,13 +220,11 @@ async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Pro
   await worktreeGit(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
   await worktreeGit(["git", "fetch", "origin", "--prune"], { cwd: cache, timeoutMs: 300_000, signal });
   if (repo.kind === "local") {
-    // Keep bare HEAD usable without retaining copied source branches.
+    // Keep bare HEAD usable without retaining copied source branches. Best-effort: the recorded
+    // default branch may be gone from the source while a run's explicit base branch still exists.
     await worktreeGit(
       ["git", "update-ref", "--no-deref", "HEAD", `refs/remotes/origin/${repo.defaultBranch}`],
-      {
-        cwd: cache,
-        signal,
-      },
+      { cwd: cache, signal, allowFail: true },
     );
   }
   return cache;
