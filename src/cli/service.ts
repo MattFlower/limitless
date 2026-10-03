@@ -138,24 +138,36 @@ async function loaded(label: string): Promise<boolean> {
   return (await launchctl(["print", `gui/${uid}/${label}`])).exitCode === 0;
 }
 
-function tunnelConfig(port: number): string | null {
+/** The cloudflared config: only `/webhooks/` on the configured public host reaches the daemon. */
+export function tunnelYaml(
+  tunnelId: string,
+  credentialsFile: string,
+  hostname: string,
+  port: number,
+): string {
+  return `# Managed by \`limitless service install\`. Only webhooks are exposed publicly.
+tunnel: ${tunnelId}
+credentials-file: ${credentialsFile}
+ingress:
+  - hostname: ${hostname}
+    path: ^/webhooks/
+    service: http://127.0.0.1:${port}
+  - service: http_status:404
+`;
+}
+
+function tunnelConfig(port: number, publicUrl: string | null): string | null {
   const dir = join(home, ".cloudflared");
   if (!existsSync(dir)) return null;
   const creds = readdirSync(dir).find((f) => /^[0-9a-f-]{36}\.json$/.test(f));
   if (!creds) return null;
+  const hostname = publicUrl ? URL.parse(publicUrl)?.hostname : undefined;
+  if (!hostname) {
+    console.warn('set [server] public_url (e.g. "https://limitless.example.com") to name the tunnel host');
+    return null;
+  }
   const path = join(dir, "limitless.yml");
-  writeFileSync(
-    path,
-    `# Managed by \`limitless service install\`. Only webhooks are exposed publicly.
-tunnel: ${creds.replace(".json", "")}
-credentials-file: ${join(dir, creds)}
-ingress:
-  - hostname: limitless.mattflower.cc
-    path: ^/webhooks/
-    service: http://127.0.0.1:${port}
-  - service: http_status:404
-`,
-  );
+  writeFileSync(path, tunnelYaml(creds.replace(".json", ""), join(dir, creds), hostname, port));
   return path;
 }
 
@@ -199,14 +211,17 @@ export function installationUnits(
   return units;
 }
 
-export async function install(port: number, opts: { tunnel?: boolean; mtplx?: boolean } = {}): Promise<void> {
+export async function install(
+  port: number,
+  opts: { tunnel?: boolean; mtplx?: boolean; publicUrl?: string | null } = {},
+): Promise<void> {
   mkdirSync(logDir, { recursive: true });
   mkdirSync(agentsDir, { recursive: true });
   await ensureRelease();
   await sh(["bun", "install", "--frozen-lockfile"], { cwd: appDir, timeoutMs: 300_000 });
   // The public tunnel is opt-in: only once webhook authentication is in place.
-  const tunnel = opts.tunnel ? tunnelConfig(port) : null;
-  if (opts.tunnel && !tunnel) console.warn("no cloudflared credentials found; skipping tunnel");
+  const tunnel = opts.tunnel ? tunnelConfig(port, opts.publicUrl ?? null) : null;
+  if (opts.tunnel && !tunnel) console.warn("skipping tunnel: no cloudflared credentials or no public_url");
   const units = installationUnits(opts, tunnel);
   for (const [label, content] of units) {
     const path = join(agentsDir, `${label}.plist`);

@@ -822,10 +822,9 @@ generated `~/.cloudflared/limitless.yml`. That requires tunnel credentials
 ingress forwards only paths matching `^/webhooks/` to the daemon and returns 404 for everything
 else.
 
-> [!NOTE]
-> The generated file currently hard-codes the maintainer's hostname (`limitless.mattflower.cc`).
-> For your own domain, run `cloudflared` yourself with an equivalent ingress rule: your hostname,
-> `path: ^/webhooks/`, service `http://127.0.0.1:7400`, then `http_status:404`.
+The tunnel's hostname comes from `[server] public_url` in `~/.config/limitless/config.toml`
+(for example `public_url = "https://limitless.example.com"`). Without it, `service install --tunnel`
+skips the tunnel and says what to set.
 
 ### Environment variables
 
