@@ -342,7 +342,17 @@ export type StreamMessage =
 export type FeedKind =
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged"}`
   | "eval.finished"
-  | "daemon.started";
+  | "daemon.started"
+  | GitHubFeedKind;
+export type GitHubFeedKind =
+  | `pr.${"ci_passed" | "ci_failed" | "conflicting" | "behind" | "review" | "comment" | "merged" | "closed"}`
+  | "github.access_problem";
+/** A factory PR the poller observes; `delivered` (0/1): a run waits on its merge; `data`: its saved state. */
+export type TrackedPr = { url: string; repo: string; runId: string; delivered: number } & {
+  nodeId: string | null;
+  data: string | null;
+};
+export type GitHubAccessProblem = { repo: string; reason: string; detail: string; since: number };
 export interface FeedItem {
   id: number;
   ts: number;
