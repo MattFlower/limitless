@@ -27,10 +27,10 @@ It must do this in environments where the user can neither create webhooks nor i
 
    Several automatic "fixes" would have done harm: weakening a security test, loosening a timing assertion, or editing a docs-only PR.
 4. **Classify failures deterministically before any model runs.**
-   1. Is the base commit also red?
-   2. Does a rerun at the same SHA pass?
-   3. Does the failure reproduce on the branch head, or only on the merge with main?
-   4. Is the fix mechanical (formatter)?
+   1. Is main red on the same check?
+   2. For a timeout, does a rerun at the same SHA pass?
+   3. Is the fix mechanical (formatter)?
+   4. Does the failure reproduce locally on the head, only on the merge with main, or not at all (environment)?
 
    Only what remains goes to a capped fix round.
 5. **PR latency is mostly waiting.** 78% of the time a factory PR was open was idle, mostly waiting for the orchestrator [M: our data, estimated]. A landing queue and feed-driven review save more time than faster models do.
@@ -192,32 +192,36 @@ Sources: [checks.go](https://raw.githubusercontent.com/cli/cli/trunk/pkg/cmd/pr/
 
 ### 4.2 Classifying a CI failure (deterministic)
 
-The failure signature is the check name, the failing test or error lines, and the runner image version from the job log.
+The failure signature is the check name, the failing test or error lines, and the runner image version from the job log. Each step either handles the failure or passes it to the next one.
 
 1. **Is the main branch's latest run red on the same check?** If so, pause per-PR reactions and report one main failure. This covers infrastructure and workflow breakage, such as the `startup_failure` episode.
-2. **Did the job time out, fail to start or get cancelled?** If so, rerun once at the same SHA.
-3. **Has the same signature failed before on an unrelated PR or commit** (a flake ledger)? If so, rerun once and count it toward quarantine.
-4. **Is it a formatter or lint autofix failure?** If so, run the repository's configured fix command (for this repository, `biome check --write`). No model is needed.
-5. **Reproduce locally.** Run the failing check on the PR head, and on the head merged with the base SHA that CI tested.
+2. **Is it a timeout, a start failure or a cancellation?** That means the job timed out, failed to start or was cancelled, or a test hit its per-test timeout ("timed out after"). If so, rerun once at the same SHA.
+   - **The rerun passes:** the same SHA has both passed and failed, which is evidence of nondeterminism. Record the signature in the flake ledger.
+   - **The rerun fails the same way:** continue.
+3. **Is it a formatter or lint autofix failure?** If so, run the repository's configured fix command (for this repository, `biome check --write`). No model is needed.
+4. **Reproduce locally.** Run the failing check on the PR head, and on the head merged with the base SHA that CI tested.
    - **It fails on the merge only:** it is a merge-with-main problem; go to 4.3.
-   - **It fails on both:** go to step 6.
-   - **It passes on both, but CI fails:** it is an environment or version difference (CI's git, runner config, a slower runner). Report it, with the signature and the runner image, and do not attempt a fix. This was the largest class in our history (7 of 16).
-6. **Otherwise**, start a fix round on the same PR, with the failing excerpt passed as quoted data. Cap it at 2 attempts per PR and failure signature.
+   - **It passes on both, but CI fails:** it is an environment or version difference (CI's git, runner config, a slower runner). Report it, with the signature and the runner image, and do not attempt a fix. This was the largest class in our history.
+   - **It fails on both:** continue.
+5. **Start a fix round** on the same PR, with the failing excerpt passed as quoted data. Cap it at 2 attempts per PR and failure signature.
    - Skip the round when a human has pushed to the branch since the failure.
    - A docs-only PR never gets a code fix.
    - After the round, the deterministic diff audit enforces two rules: the round may not weaken or delete a failing test, a gate or a security check, and it may not touch paths outside the PR's existing diff unless the failure names them. A violation ends the round as `needs_human`.
 
-**Backtest on our 16 failures:**
+**The flake ledger** records signatures with evidence of nondeterminism only, meaning the same SHA or tree both passed and failed ([GitHub](https://github.blog/engineering/engineering-principles/reducing-flaky-builds-by-18x/)). A signature that recurs across PRs is not evidence by itself: environment failures also recur, such as the git 2.55 hook-name failure on two PRs 11 minutes apart. The ledger feeds a "recurring flake" report and an issue. It never quarantines a test automatically, and it never touches security tests.
+
+**Backtest on our 16 failures** (by inspection [W]; step 4 was not re-run at those SHAs):
 
 | Step | Failures it would have caught |
 |---|---|
-| 1 | The 2 infra runs (main was also failing) |
-| 2 and 3 | The 2 flaky timeouts |
-| 5, merge-only | The 2 caused by main moving |
-| 5, environment | The 7 environment runs: the git version difference, the runner's git-lfs config and the 4-run wall-clock budget test. The local gates had passed |
-| 6 | The 3 real defects |
+| 1 | The 2 infra runs (main's latest run was the same `startup_failure`) |
+| 2 | The 2 per-test timeouts, likely passing on rerun |
+| 3 | The formatter defect (1 run) |
+| 4, merge-only | The 2 caused by main moving |
+| 4, environment | The 7 environment runs: the git version difference, the runner's git-lfs config and the 4-run wall-clock budget test. The local gates had passed |
+| 5 | The shared-fixture defect (2 runs on one PR). Because it is order-dependent, step 4 might report it as an environment difference instead, which is safe |
 
-The model would have run only where the PR's own code was wrong.
+The model would have run at most for the one defect in the PR's own code.
 
 ### 4.3 Conflicts and drift
 
