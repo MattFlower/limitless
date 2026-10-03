@@ -305,7 +305,8 @@ async function gates(run: typeof sh, dir: string, smoke: boolean): Promise<void>
       [`Command failed (${res.exitCode ?? "killed or timed out"}): ${args.join(" ")}`, ...tail].join("\n"),
     );
   };
-  for (const args of GATES) await gate(args, 600_000);
+  // The full suite takes 8–11 minutes alone and longer while runs use the machine.
+  for (const args of GATES) await gate(args, args.includes("test") ? 1_200_000 : 600_000);
   if (smoke) await gate(SMOKE, 900_000);
 }
 
