@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import type { ProviderStatus, Question, Run, RunEvent } from "../src/core/types.ts";
+import type { FeedPage, ProviderStatus, Question, Run, RunEvent } from "../src/core/types.ts";
 import { factoryBackend } from "../src/integrations/mcp.ts";
 import { connect, fixture, resultValue } from "./mcp-support.ts";
 
@@ -18,12 +18,19 @@ const call = (name: string, args: Record<string, unknown> = {}) =>
 const create = async (args: Record<string, unknown> = {}) =>
   resultValue<Run>(await call("create_run", { repo: f.repo, prompt: "Add a greeting", ...args }));
 
-test("six discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
+test("eight discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
   const { tools } = await connection.client.listTools();
   expect(tools.map((t) => t.name).sort()).toEqual(
-    ["answer_question", "cancel_run", "create_run", "get_run", "list_runs", "providers"].map(
-      (s) => `limitless_${s}`,
-    ),
+    [
+      "answer_question",
+      "cancel_run",
+      "create_run",
+      "feed",
+      "feed_ack",
+      "get_run",
+      "list_runs",
+      "providers",
+    ].map((s) => `limitless_${s}`),
   );
   for (const tool of tools) {
     expect(tool.inputSchema.type).toBe("object");
@@ -279,4 +286,70 @@ test("dependencies appear in create, get and waiting filters with shared validat
   expect(invalid.isError).toBe(true);
   expect(JSON.stringify(invalid.content)).toContain("unknown");
   expect((await call("create_run", { repo: f.repo, prompt: "bad", dependsOn: [1] })).isError).toBe(true);
+});
+
+test("feed tools bound cursors and waits, read without acknowledging and ack monotonically", async () => {
+  const { tools } = await connection.client.listTools();
+  const feed = tools.find((t) => t.name === "limitless_feed");
+  const ack = tools.find((t) => t.name === "limitless_feed_ack");
+  expect(feed?.inputSchema).toMatchObject({
+    additionalProperties: false,
+    properties: { wait: { minimum: 0, maximum: 45 }, after: { minimum: 0 }, consumer: { type: "string" } },
+  });
+  expect(feed?.inputSchema.required ?? []).toEqual([]);
+  expect(feed?.description).toContain("0–45 seconds");
+  expect(ack?.inputSchema.required).toEqual(["consumer", "id"]);
+  for (const tool of [feed, ack]) expect(tool?.description).toContain("only after");
+  const run = await create();
+  f.factory.store.updateRun(run.id, { status: "failed", error: "boom" });
+  const page = resultValue<FeedPage>(await call("feed", { consumer: "claude" }));
+  expect(page.items.map((i) => [i.kind, i.runId, i.data.error])).toEqual([["run.failed", run.id, "boom"]]);
+  expect(resultValue<FeedPage>(await call("feed", { wait: 45 })).items).toEqual(page.items);
+  expect(f.factory.store.feedCursor("claude")).toBe(0);
+  expect(resultValue<unknown>(await call("feed_ack", { consumer: "claude", id: page.nextAfter }))).toEqual({
+    consumer: "claude",
+    id: page.nextAfter,
+  });
+  expect(resultValue<unknown>(await call("feed_ack", { consumer: "claude", id: 0 }))).toEqual({
+    consumer: "claude",
+    id: page.nextAfter,
+  });
+  expect(resultValue<FeedPage>(await call("feed", { consumer: "claude", wait: 0.05 })).items).toEqual([]);
+  for (const [name, args] of [
+    ["feed", { wait: 46 }],
+    ["feed", { after: -1 }],
+    ["feed", { consumer: " " }],
+    ["feed", { limit: 5 }],
+    ["feed_ack", { consumer: "claude" }],
+    ["feed_ack", { consumer: "claude", id: 1.5 }],
+    ["feed_ack", { consumer: "claude", id: page.nextAfter + 1 }],
+  ] as const)
+    expect((await call(name, args)).isError).toBe(true);
+  expect(f.factory.store.feedCursor("claude")).toBe(page.nextAfter);
+});
+
+test("cancelling a feed long poll or closing the connection releases its listener", async () => {
+  const listeners = () => (f.factory.store as unknown as { listeners: Set<unknown> }).listeners.size;
+  const idle = listeners();
+  const controller = new AbortController();
+  const cancelled = connection.client
+    .callTool({ name: "limitless_feed", arguments: { wait: 30 } }, undefined, { signal: controller.signal })
+    .catch(() => "cancelled");
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle + 1);
+  controller.abort();
+  expect(await cancelled).toBe("cancelled");
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle);
+
+  const other = await connect(factoryBackend(f.factory));
+  const closed = other.client
+    .callTool({ name: "limitless_feed", arguments: { wait: 30 } })
+    .catch(() => "closed");
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle + 1);
+  await other.close();
+  expect(await closed).toBe("closed");
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle);
 });

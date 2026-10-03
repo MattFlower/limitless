@@ -209,13 +209,19 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       const reason = ctx.state.terminalReason?.startsWith("superseded:")
         ? ctx.state.terminalReason
         : undefined;
+      const shutdown =
+        signal.reason instanceof Error &&
+        signal.reason.message === "shutdown" &&
+        !reason &&
+        !deps.store.getRun(runId)?.error?.startsWith("cancelled by");
+      const status = shutdown ? "queued" : "cancelled";
       deps.store.updateRun(runId, {
-        status: "cancelled",
-        finishedAt: Date.now(),
+        status,
+        finishedAt: shutdown ? null : Date.now(),
         ...(reason ? { error: reason } : {}),
       });
-      ctx.log(reason ?? "Run cancelled", "warn");
-      return "cancelled";
+      ctx.log(reason ?? (shutdown ? "Daemon shutdown; run re-queued to resume" : "Run cancelled"), "warn");
+      return status;
     };
     if (e instanceof CancelledError || signal.aborted) return cancelled();
     if (e instanceof ParkedError) {

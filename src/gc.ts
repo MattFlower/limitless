@@ -3,6 +3,7 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import type { Config } from "./config.ts";
 import type { Repo, Run } from "./core/types.ts";
 import type { Store } from "./db/store.ts";
+import { FEED_RETENTION_DAYS } from "./feed.ts";
 import { BASELINE_CACHE_TTL_MS } from "./gates/cache.ts";
 import { worktreeGit } from "./git/command.ts";
 import { cachePath, withRepoLock, worktreeOwner } from "./git/repos.ts";
@@ -17,6 +18,7 @@ export interface GcResult {
   metadata: string[];
   debugEvents: number;
   baselineCache: number;
+  feedItems: number;
   errors: string[];
 }
 
@@ -75,6 +77,7 @@ export async function collectGarbage(
     metadata: [],
     debugEvents: 0,
     baselineCache: 0,
+    feedItems: 0,
     errors: [],
   };
   const finished = store.finishedRuns();
@@ -223,6 +226,12 @@ export async function collectGarbage(
       : store.deleteExpiredBaselineCache(cutoff);
   } catch (error) {
     result.errors.push(`baseline cache: ${(error as Error).message}`);
+  }
+
+  try {
+    result.feedItems = store.pruneFeed(now - FEED_RETENTION_DAYS * DAY, dryRun);
+  } catch (error) {
+    result.errors.push(`feed: ${(error as Error).message}`);
   }
   return result;
 }

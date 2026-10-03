@@ -3,7 +3,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { Factory } from "../app.ts";
-import type { CreateRunRequest, RunStatus } from "../core/types.ts";
+import type { CreateRunRequest, FeedAck, RunStatus } from "../core/types.ts";
+import { FeedAckSchema, FeedQuerySchema, waitForFeed } from "../feed.ts";
 
 const nonblank = z.string().trim().min(1);
 const status = z.enum([
@@ -52,6 +53,14 @@ const eventSchema = z.object({
   message: z.string(),
   data: z.unknown(),
 });
+const feedPageSchema = z.object({
+  items: z.array(z.object({ id: z.number().int(), kind: z.string(), title: z.string() }).passthrough()),
+  nextAfter: z.number().int(),
+  pruned: z.boolean(),
+});
+const feedArgsSchema = FeedQuerySchema.omit({ limit: true }).extend({
+  wait: z.number().min(0).max(45).default(0),
+});
 const detailSchema = z.object({ run: runSchema, questions: z.array(questionSchema) });
 const providersSchema = z.array(
   z.object({
@@ -86,6 +95,8 @@ export interface McpBackend {
   cancel(id: string): Promise<unknown>;
   answer(id: string, answer: string): Promise<unknown>;
   providers(): Promise<unknown>;
+  feed(query: z.output<typeof feedArgsSchema>, signal: AbortSignal): Promise<unknown>;
+  feedAck(ack: FeedAck): Promise<unknown>;
 }
 
 export function factoryBackend(factory: Factory): McpBackend {
@@ -108,13 +119,15 @@ export function factoryBackend(factory: Factory): McpBackend {
       return factory.answer(id, answer, "mcp");
     },
     providers: async () => factory.tracker.all(),
+    feed: (query, signal) => waitForFeed(factory.store, { ...query, limit: 100 }, signal),
+    feedAck: async ({ consumer, id }) => factory.store.ackFeed(consumer, id),
   };
 }
 
 export type Fetch = (url: string, init?: RequestInit) => Promise<Response>;
 
 export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
-  const api = async (path: string, body?: unknown): Promise<unknown> => {
+  const api = async (path: string, body?: unknown, signal?: AbortSignal): Promise<unknown> => {
     let response: Response;
     try {
       response = await fetcher(`${base.replace(/\/$/, "")}${path}`, {
@@ -125,7 +138,7 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
               headers: { "content-type": "application/json" },
               body: JSON.stringify(body),
             }),
-        signal: AbortSignal.timeout(30_000),
+        signal: signal ?? AbortSignal.timeout(30_000),
       });
     } catch (e) {
       throw new Error(
@@ -158,6 +171,13 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
       return api(`${path(id)}/answer`, { answer, by: "mcp" });
     },
     providers: () => api("/api/providers"),
+    feed: (query, signal) => {
+      const params = Object.entries(query).flatMap(([k, v]) => (v === undefined ? [] : [[k, String(v)]]));
+      // The daemon holds a long poll for up to `wait` seconds; cancellation still ends it early.
+      const timeout = AbortSignal.timeout((query.wait + 30) * 1000);
+      return api(`/api/feed?${new URLSearchParams(params)}`, undefined, AbortSignal.any([timeout, signal]));
+    },
+    feedAck: (ack) => api("/api/feed/ack", ack),
   };
 }
 
@@ -167,16 +187,16 @@ export function createMcpServer(backend: McpBackend): Server {
     name: string,
     description: string,
     schema: S,
-    execute: (input: z.output<S>) => Promise<unknown>,
+    execute: (input: z.output<S>, signal: AbortSignal) => Promise<unknown>,
   ) {
     return {
       name,
       description,
       inputSchema: z.toJSONSchema(schema, { io: "input" }),
-      execute: async (input: unknown) => {
+      execute: async (input: unknown, signal: AbortSignal) => {
         const args = schema.parse(input);
         try {
-          return await execute(args);
+          return await execute(args, signal);
         } catch (e) {
           if (e instanceof z.ZodError) throw new Error(`Malformed backend response: ${e.message}`);
           throw e;
@@ -251,16 +271,28 @@ export function createMcpServer(backend: McpBackend): Server {
       z.object({}).strict(),
       async () => providersSchema.parse(await backend.providers()),
     ),
+    tool(
+      "limitless_feed",
+      "Catch up on what needs action (PRs opened, questions, failures, needs_human, merges, finished evals, daemon restarts) across all runs. Supply consumer (your stable name) to read after its acknowledged cursor, or after for an explicit cursor; wait (0–45 seconds, within client timeouts) long-polls until a new item arrives. Returns {items, nextAfter, pruned} in ascending id order; pruned means retention removed items you never acknowledged. Reading never acknowledges: call limitless_feed_ack with nextAfter only after you have handled the items.",
+      feedArgsSchema,
+      async (input, signal) => feedPageSchema.parse(await backend.feed(input, signal)),
+    ),
+    tool(
+      "limitless_feed_ack",
+      "Acknowledge feed items through id for consumer. Call only after you have handled those items, since acknowledged items are no longer returned by default. The cursor never moves backwards. Returns {consumer, id} with the effective acknowledged id.",
+      FeedAckSchema,
+      async (input) => FeedAckSchema.parse(await backend.feedAck(input)),
+    ),
   ];
   const server = new Server({ name: "limitless", version: "0.1.0" }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
   }));
-  server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
+  server.setRequestHandler(CallToolRequestSchema, async ({ params }, { signal }) => {
     try {
       const tool = tools.find((tool) => tool.name === params.name);
       if (!tool) throw new Error(`Unknown tool: ${params.name}`);
-      const result = await tool.execute(params.arguments ?? {});
+      const result = await tool.execute(params.arguments ?? {}, signal);
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (e) {
       return { isError: true, content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }] };

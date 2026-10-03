@@ -39,7 +39,12 @@ export function mountMcp(factory: Factory) {
           { status: 405, headers: { Allow: "POST" } },
         );
       }
-      const server = createMcpServer(factoryBackend(factory));
+      const backend = factoryBackend(factory);
+      // Propagate disconnects: the SDK's JSON transport does not abort tools itself.
+      const server = createMcpServer({
+        ...backend,
+        feed: (query, signal) => backend.feed(query, AbortSignal.any([signal, req.signal])),
+      });
       const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
       active.add(server);
       try {

@@ -366,6 +366,7 @@ test("startup and hourly passes do not overlap and shutdown clears the timer", a
     metadata: [],
     debugEvents: 0,
     baselineCache: 0,
+    feedItems: 0,
     errors: [],
   };
   const factory = new Factory(cfg, {
@@ -402,4 +403,22 @@ test("startup and hourly passes do not overlap and shutdown clears the timer", a
   resolvePass?.(empty);
   await stopping;
   expect(tick).toBeDefined();
+});
+
+test("feed items strictly older than 30 days are pruned; dry-run only counts them", async () => {
+  for (const ageMs of [30 * DAY + 1, 30 * DAY, 0]) {
+    const record = store.createRun(repo, { prompt: "feed", repo: repo.slug });
+    store.updateRun(record.id, { status: "failed" });
+    const id = store.readFeed().nextAfter;
+    store.db.query("UPDATE feed SET ts = ? WHERE id = ?").run(now - ageMs, id);
+  }
+  const ids = store.readFeed().items.map((i) => i.id);
+  const dry = await collectGarbage(store, cfg, { now, dryRun: true });
+  expect([dry.errors, dry.feedItems]).toEqual([[], 1]);
+  expect(store.readFeed().items).toHaveLength(3);
+  const actual = await collectGarbage(store, cfg, { now });
+  expect([actual.errors, actual.feedItems]).toEqual([[], 1]);
+  expect(store.readFeed().items.map((i) => i.id)).toEqual(ids.slice(1));
+  expect(store.readFeed().pruned).toBe(true);
+  expect(store.readFeed({ after: ids[0] }).pruned).toBe(false);
 });

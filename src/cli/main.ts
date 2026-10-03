@@ -5,6 +5,7 @@ import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
 import type { Profile, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
+import { ApiError } from "./feed.ts";
 
 const USAGE = `limitless — personal software factory
 
@@ -26,6 +27,9 @@ Usage:
   limitless logs <run> [-f]               Print (and follow) the run's event log
   limitless cancel <run>                  Cancel a run
   limitless answer <run> "<text>"         Answer a run's open question(s)
+  limitless feed [--consumer <name>] [--after <id>] [--wait <seconds>] [--json]
+        Items to act on after the consumer's cursor; --wait long-polls until one arrives
+  limitless feed ack <id> --consumer <name>  Acknowledge items through id once handled
   limitless providers                     Provider health and quota
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
@@ -45,15 +49,16 @@ const BASE = process.env.LIMITLESS_URL ?? `http://127.0.0.1:${process.env.LIMITL
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
+  let text: string;
   try {
     res = await fetch(`${BASE}${path}`, {
       ...init,
       headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
     });
+    text = await res.text();
   } catch {
-    throw new Error(`Cannot reach the Limitless daemon at ${BASE}. Start it with \`limitless serve\`.`);
+    throw new ApiError(`Cannot reach the Limitless daemon at ${BASE}. Start it with \`limitless serve\`.`);
   }
-  const text = await res.text();
   if (!res.ok) {
     let msg = text;
     try {
@@ -61,7 +66,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // not json
     }
-    throw new Error(`${res.status}: ${msg}`);
+    throw new ApiError(`${res.status}: ${msg}`, res.status);
   }
   return JSON.parse(text) as T;
 }
@@ -185,6 +190,8 @@ async function main(): Promise<void> {
       "no-baseline-cache": { type: "boolean" },
       json: { type: "boolean" },
       after: { type: "string" },
+      consumer: { type: "string" },
+      wait: { type: "string" },
       repo: { type: "string", short: "r" },
       profile: { type: "string", short: "p" },
       title: { type: "string", short: "t" },
@@ -210,6 +217,10 @@ async function main(): Promise<void> {
     case "eval": {
       const { evalCommand } = await import("./eval.ts");
       return evalCommand(rest, values, { api, print: console.log, wait: (ms) => Bun.sleep(ms) });
+    }
+    case "feed": {
+      const { feedCommand } = await import("./feed.ts");
+      return feedCommand(rest, values, { api, print: console.log });
     }
     case "serve":
       return serve();
@@ -402,7 +413,7 @@ async function main(): Promise<void> {
         body: JSON.stringify({ dryRun: values["dry-run"] === true }),
       });
       console.log(
-        `${result.dryRun ? "Would clean" : "Cleaned"}: ${result.worktrees.length} worktrees, ${result.logs.length} logs, ${result.metadata.length} metadata entries, ${result.debugEvents} debug events, ${result.baselineCache} cached baselines`,
+        `${result.dryRun ? "Would clean" : "Cleaned"}: ${result.worktrees.length} worktrees, ${result.logs.length} logs, ${result.metadata.length} metadata entries, ${result.debugEvents} debug events, ${result.baselineCache} cached baselines, ${result.feedItems} feed items`,
       );
       for (const path of result.worktrees) console.log(`  worktree ${path}`);
       for (const path of result.logs) console.log(`  log ${path}`);
