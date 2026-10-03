@@ -11,6 +11,9 @@ import type {
   EvalRun,
   EvalTrial,
   EventType,
+  FeedAck,
+  FeedItem,
+  FeedPage,
   Invocation,
   InvocationStatus,
   Question,
@@ -43,6 +46,12 @@ export function newId(prefix = ""): string {
 function json(v: unknown): string | null {
   return v === undefined || v === null ? null : JSON.stringify(v);
 }
+
+const FEED_SELECT =
+  "SELECT id, ts, kind, run_id AS runId, eval_id AS evalId, repo, title, summary, data FROM feed";
+const toFeedItem = (r: Row) => ({ ...r, data: parse(r.data, {}) }) as FeedItem;
+/** The highest id retention has removed, so a cursor before it is told items were pruned. */
+const FEED_PRUNED = "feed_pruned_through";
 
 function parse<T>(v: unknown, fallback: T): T {
   if (typeof v !== "string") return fallback;
@@ -310,6 +319,8 @@ export class Store {
   readonly db: Database;
   private listeners = new Set<Listener>();
   private pendingPublications: StreamMessage[] | null = null;
+  private feedPublished = 0;
+  private feedPublishing = false;
 
   constructor(path: string, migrationDir = MIGRATION_DIR) {
     this.db = new Database(path, { create: true, strict: true });
@@ -319,6 +330,7 @@ export class Store {
     this.db.exec("PRAGMA busy_timeout = 5000");
     try {
       runMigrations(this.db, migrationDir);
+      this.feedPublished = this.feedIssued();
     } catch (error) {
       this.db.close();
       throw error;
@@ -387,6 +399,7 @@ export class Store {
       }
       for (const trial of trials) this.recordEvalTrial({ ...trial, evalRunId: run.id });
     })();
+    this.publishFeed();
     return run;
   }
 
@@ -395,6 +408,7 @@ export class Store {
     this.db
       .query("UPDATE eval_runs SET status = ?, finished_at = ?, error = ? WHERE id = ?")
       .run(status, finished, error, id);
+    this.publishFeed();
   }
 
   getEvalRun(id: string): EvalRun | null {
@@ -502,6 +516,7 @@ export class Store {
       }
       this.updateEvalRun(id, status, reason);
     })();
+    this.publishFeed();
   }
 
   recoverEvals(): void {
@@ -530,6 +545,7 @@ export class Store {
       this.pendingPublications.push(msg);
       return;
     }
+    if (msg.kind !== "feed") this.publishFeed();
     for (const l of this.listeners) {
       try {
         l(msg);
@@ -551,7 +567,70 @@ export class Store {
       this.pendingPublications = null;
     }
     for (const message of messages) this.publish(message);
+    this.publishFeed();
     return result;
+  }
+
+  // Drain after commit, guarding reentrancy so subscriber mutations join this pass in id order.
+  private publishFeed(): void {
+    if (this.db.inTransaction || this.feedPublishing) return;
+    this.feedPublishing = true;
+    try {
+      const query = this.db.query<Row, [number]>(`${FEED_SELECT} WHERE id > ? ORDER BY id LIMIT 1`);
+      for (let row = query.get(this.feedPublished); row; row = query.get(this.feedPublished)) {
+        this.feedPublished = row.id as number;
+        this.publish({ kind: "feed", item: toFeedItem(row) });
+      }
+    } finally {
+      this.feedPublishing = false;
+    }
+  }
+
+  daemonStarted(bootId: string, version: string, sha: string): void {
+    const data = json({ version, bootId, sha });
+    this.db
+      .query("INSERT INTO feed_add VALUES ('daemon.started', NULL, NULL, ?, ?, ?, ?)")
+      .run(`Limitless ${version} started`, `Daemon ${version} (${sha}) started`, data, bootId);
+    this.publishFeed();
+  }
+
+  readFeed(opts: { consumer?: string; after?: number; limit?: number } = {}): FeedPage {
+    const after = opts.after ?? (opts.consumer === undefined ? 0 : this.feedCursor(opts.consumer));
+    const query = this.db.query(`${FEED_SELECT} WHERE id > ? ORDER BY id LIMIT ?`);
+    const items = (query.all(after, opts.limit ?? 100) as Row[]).map(toFeedItem);
+    return { items, nextAfter: items.at(-1)?.id ?? after, pruned: this.getSetting(FEED_PRUNED, 0) > after };
+  }
+
+  feedCursor(consumer: string): number {
+    return this.feedNumber("SELECT acked_id AS n FROM feed_cursors WHERE consumer = ?", consumer);
+  }
+
+  /** The highest id ever issued, counting AUTOINCREMENT gaps and pruned items. */
+  private feedIssued(): number {
+    return this.feedNumber("SELECT seq AS n FROM sqlite_sequence WHERE name = 'feed'");
+  }
+
+  private feedNumber(sql: string, ...params: string[]): number {
+    return (this.db.query(sql).get(...params) as { n: number } | null)?.n ?? 0;
+  }
+
+  ackFeed(consumer: string, id: number): FeedAck {
+    if (id > this.feedIssued()) throw new Error(`feed id ${id} has not been issued`);
+    const upsert = `INSERT INTO feed_cursors VALUES (?, ?) ON CONFLICT (consumer)
+      DO UPDATE SET acked_id = max(acked_id, excluded.acked_id) RETURNING acked_id`;
+    return { consumer, id: (this.db.query(upsert).get(consumer, id) as Row).acked_id as number };
+  }
+
+  pruneFeed(cutoff: number, dryRun = false): number {
+    return this.db.transaction(() => {
+      const old = this.db
+        .query("SELECT count(*) AS n, max(id) AS top FROM feed WHERE ts < ?")
+        .get(cutoff) as Row;
+      if (dryRun || old.top === null) return old.n as number;
+      this.db.query("DELETE FROM feed WHERE ts < ?").run(cutoff);
+      this.setSetting(FEED_PRUNED, Math.max(this.getSetting(FEED_PRUNED, 0), old.top as number));
+      return old.n as number;
+    })();
   }
 
   listChatMessages(conversationId: string, after = 0): ChatMessage[] {

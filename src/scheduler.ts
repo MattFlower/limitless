@@ -117,15 +117,7 @@ export class Scheduler {
         })
         .finally(() => {
           this.active.delete(run.id);
-          if (this.stopping) {
-            const r = this.deps.store.getRun(run.id);
-            // Runs interrupted by shutdown go back to the queue instead of staying cancelled.
-            if (r?.status === "cancelled" && !r.error?.startsWith("cancelled by")) {
-              this.deps.store.updateRun(run.id, { status: "queued", finishedAt: null });
-            }
-          } else {
-            this.tick();
-          }
+          if (!this.stopping) this.tick();
         });
       this.active.set(run.id, { controller, done });
     }
@@ -153,7 +145,7 @@ export class Scheduler {
     if (this.probeTimer) clearInterval(this.probeTimer);
     this.unsubscribe?.();
     if (this.timer) clearInterval(this.timer);
-    for (const { controller } of this.active.values()) controller.abort();
+    for (const { controller } of this.active.values()) controller.abort(new Error("shutdown"));
     await Promise.allSettled([...this.active.values()].map((a) => a.done));
     await Promise.allSettled(this.probes);
   }

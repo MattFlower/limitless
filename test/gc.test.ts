@@ -7,7 +7,7 @@ import { type Config, loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { collectGarbage, type GcResult } from "../src/gc.ts";
-import { createWorktree } from "../src/git/repos.ts";
+import { cachePath, createWorktree } from "../src/git/repos.ts";
 import { startHttp } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
 
@@ -57,7 +57,7 @@ async function worktree(id: string): Promise<string> {
 }
 
 async function listed(): Promise<string> {
-  return (await sh(["git", "worktree", "list", "--porcelain"], { cwd: repoDir })).stdout;
+  return (await sh(["git", "worktree", "list", "--porcelain"], { cwd: cachePath(cfg.paths, repo) })).stdout;
 }
 
 test("terminal worktrees use exact 3/7 day boundaries and preserve nonterminal worktrees", async () => {
@@ -85,6 +85,55 @@ test("terminal worktrees use exact 3/7 day boundaries and preserve nonterminal w
   }
   expect(gitList).not.toContain(missing);
   expect(result.worktrees).toHaveLength(4);
+});
+
+test("cleanup removes legacy and cloned worktrees through their owners and prunes both", async () => {
+  const legacyRun = run("succeeded", 4);
+  const legacy = join(cfg.paths.work, legacyRun.id);
+  await sh(["git", "worktree", "add", "-b", "legacy", legacy], { cwd: repoDir });
+  const staleRun = run("succeeded", 4);
+  const stale = join(cfg.paths.work, staleRun.id);
+  await sh(["git", "worktree", "add", "-b", "legacy-stale", stale], { cwd: repoDir });
+  rmSync(stale, { recursive: true, force: true });
+  const cloned = await worktree(run("succeeded", 4).id);
+  const active = await worktree(run("running", 10).id);
+  const result = await collectGarbage(store, cfg, { now });
+  expect(result.errors).toEqual([]);
+  expect(result.worktrees.sort()).toEqual([legacy, cloned].sort());
+  expect(result.metadata).toHaveLength(1);
+  const source = (await sh(["git", "worktree", "list", "--porcelain"], { cwd: repoDir })).stdout;
+  expect(source).not.toContain(legacy);
+  expect(source).not.toContain(stale);
+  expect(await listed()).not.toContain(cloned);
+  expect(await listed()).toContain(active);
+});
+
+test("cleanup for new runs leaves unrelated source worktree metadata untouched", async () => {
+  const outside = join(root, "user-worktree");
+  await sh(["git", "worktree", "add", "--detach", outside], { cwd: repoDir });
+  rmSync(outside, { recursive: true, force: true });
+  const before = (await sh(["git", "worktree", "list", "--porcelain"], { cwd: repoDir })).stdout;
+  await worktree(run("succeeded", 4).id);
+  const result = await collectGarbage(store, cfg, { now });
+  expect(result.errors).toEqual([]);
+  expect((await sh(["git", "worktree", "list", "--porcelain"], { cwd: repoDir })).stdout).toBe(before);
+});
+
+test("cleanup refuses a run path that is a worktree of an unrelated repository", async () => {
+  const unrelated = join(root, "unrelated");
+  mkdirSync(unrelated);
+  await sh(["git", "init", "-q"], { cwd: unrelated });
+  await sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"], {
+    cwd: unrelated,
+  });
+  const stray = join(cfg.paths.work, run("succeeded", 4).id);
+  await sh(["git", "worktree", "add", "--detach", stray], { cwd: unrelated });
+  writeFileSync(join(stray, "uncommitted.txt"), "keep me");
+  const result = await collectGarbage(store, cfg, { now });
+  expect(result.errors.join("\n")).toContain("worktree is not registered to local/test");
+  expect(result.worktrees).toEqual([]);
+  expect(readFileSync(join(stray, "uncommitted.txt"), "utf8")).toBe("keep me");
+  expect((await sh(["git", "worktree", "list", "--porcelain"], { cwd: unrelated })).stdout).toContain(stray);
 });
 
 test("log and debug event retention is selective, including active-run events", async () => {
@@ -274,7 +323,7 @@ test("missing worktree parent is tolerated in dry run and pruned without affecti
   rmSync(cfg.paths.work, { recursive: true, force: true });
   const outside = join(root, "outside", "unrelated");
   mkdirSync(join(root, "outside"));
-  await sh(["git", "worktree", "add", "--detach", outside], { cwd: repoDir });
+  await sh(["git", "worktree", "add", "--detach", outside], { cwd: cachePath(cfg.paths, repo) });
   rmSync(outside, { recursive: true, force: true });
 
   const dry = await collectGarbage(store, cfg, { now, dryRun: true });
@@ -285,7 +334,7 @@ test("missing worktree parent is tolerated in dry run and pruned without affecti
   expect(await listed()).toContain(otherPath);
   expect(await listed()).toContain(outside);
 
-  await sh(["git", "worktree", "prune", "--expire", "now"], { cwd: repoDir });
+  await sh(["git", "worktree", "prune", "--expire", "now"], { cwd: cachePath(cfg.paths, repo) });
   // Create fresh eligible stale entries after clearing the unrelated entry.
   const freshA = run("succeeded", 4);
   const freshB = run("succeeded", 4);
@@ -317,6 +366,7 @@ test("startup and hourly passes do not overlap and shutdown clears the timer", a
     metadata: [],
     debugEvents: 0,
     baselineCache: 0,
+    feedItems: 0,
     errors: [],
   };
   const factory = new Factory(cfg, {
@@ -353,4 +403,22 @@ test("startup and hourly passes do not overlap and shutdown clears the timer", a
   resolvePass?.(empty);
   await stopping;
   expect(tick).toBeDefined();
+});
+
+test("feed items strictly older than 30 days are pruned; dry-run only counts them", async () => {
+  for (const ageMs of [30 * DAY + 1, 30 * DAY, 0]) {
+    const record = store.createRun(repo, { prompt: "feed", repo: repo.slug });
+    store.updateRun(record.id, { status: "failed" });
+    const id = store.readFeed().nextAfter;
+    store.db.query("UPDATE feed SET ts = ? WHERE id = ?").run(now - ageMs, id);
+  }
+  const ids = store.readFeed().items.map((i) => i.id);
+  const dry = await collectGarbage(store, cfg, { now, dryRun: true });
+  expect([dry.errors, dry.feedItems]).toEqual([[], 1]);
+  expect(store.readFeed().items).toHaveLength(3);
+  const actual = await collectGarbage(store, cfg, { now });
+  expect([actual.errors, actual.feedItems]).toEqual([[], 1]);
+  expect(store.readFeed().items.map((i) => i.id)).toEqual(ids.slice(1));
+  expect(store.readFeed().pruned).toBe(true);
+  expect(store.readFeed({ after: ids[0] }).pruned).toBe(false);
 });

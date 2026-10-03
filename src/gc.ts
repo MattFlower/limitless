@@ -3,9 +3,10 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import type { Config } from "./config.ts";
 import type { Repo, Run } from "./core/types.ts";
 import type { Store } from "./db/store.ts";
+import { FEED_RETENTION_DAYS } from "./feed.ts";
 import { BASELINE_CACHE_TTL_MS } from "./gates/cache.ts";
 import { worktreeGit } from "./git/command.ts";
-import { cachePath, withRepoLock } from "./git/repos.ts";
+import { cachePath, withRepoLock, worktreeOwner } from "./git/repos.ts";
 import { sh } from "./util/proc.ts";
 
 const DAY = 86_400_000;
@@ -17,6 +18,7 @@ export interface GcResult {
   metadata: string[];
   debugEvents: number;
   baselineCache: number;
+  feedItems: number;
   errors: string[];
 }
 
@@ -75,6 +77,7 @@ export async function collectGarbage(
     metadata: [],
     debugEvents: 0,
     baselineCache: 0,
+    feedItems: 0,
     errors: [],
   };
   const finished = store.finishedRuns();
@@ -95,13 +98,22 @@ export async function collectGarbage(
     }
     try {
       const path = child(workRoot, run.id);
-      const cache = cachePath(cfg.paths, repo);
+      const cache =
+        repo.kind === "local" && existsSync(path) ? await worktreeOwner(path) : cachePath(cfg.paths, repo);
       const git = repo.kind === "github" ? worktreeGit : sh;
       if (repo.kind === "github" && !resolve(cache).startsWith(resolve(cfg.paths.repos) + sep)) {
         throw new Error(`repository cache outside ${cfg.paths.repos}`);
       }
       await withRepoLock(cache, async () => {
         if (!existsSync(path)) return;
+        if (repo.kind === "local") {
+          const owned = cachePath(cfg.paths, repo);
+          if (
+            canonical(cache) !== canonical(owned) &&
+            (!repo.localPath || cache !== (await worktreeOwner(repo.localPath)))
+          )
+            throw new Error(`worktree is not registered to ${repo.slug}: ${path}`);
+        }
         if (lstatSync(path).isSymbolicLink() || !lstatSync(path).isDirectory()) {
           throw new Error(`worktree path is not a directory: ${path}`);
         }
@@ -130,8 +142,12 @@ export async function collectGarbage(
     const repo = repos.get(run.repoId);
     if (repo && due(run, now, days)) relevantRepos.set(repo.id, repo);
   }
-  for (const repo of relevantRepos.values()) {
-    const cache = cachePath(cfg.paths, repo);
+  const caches = [...relevantRepos.values()].flatMap((repo) =>
+    [cachePath(cfg.paths, repo), ...(repo.kind === "local" && repo.localPath ? [repo.localPath] : [])]
+      .filter(existsSync)
+      .map((cache) => ({ repo, cache })),
+  );
+  for (const { repo, cache } of caches) {
     const git = repo.kind === "github" ? worktreeGit : sh;
     try {
       await withRepoLock(cache, async () => {
@@ -152,6 +168,8 @@ export async function collectGarbage(
         );
         const listed = (await git(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout;
         const prunable = prunablePaths(listed);
+        // Only prune the source when an eligible legacy worktree left stale metadata there.
+        if (cache === repo.localPath && !prunable.some((path) => eligible.has(path))) return;
         const unrelated = prunable.filter((path) => !eligible.has(path));
         if (unrelated.length)
           throw new Error(`prune would affect unrelated worktrees: ${unrelated.join(", ")}`);
@@ -208,6 +226,12 @@ export async function collectGarbage(
       : store.deleteExpiredBaselineCache(cutoff);
   } catch (error) {
     result.errors.push(`baseline cache: ${(error as Error).message}`);
+  }
+
+  try {
+    result.feedItems = store.pruneFeed(now - FEED_RETENTION_DAYS * DAY, dryRun);
+  } catch (error) {
+    result.errors.push(`feed: ${(error as Error).message}`);
   }
   return result;
 }

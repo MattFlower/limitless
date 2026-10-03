@@ -51,7 +51,7 @@ test("mounted endpoint initializes, discovers and calls tools without sessions",
     ).status,
   ).toBe(202);
   const list = await route(rpc("tools/list"), localServer);
-  expect((await list.json()).result.tools).toHaveLength(6);
+  expect((await list.json()).result.tools).toHaveLength(8);
   const create = await route(
     rpc("tools/call", { name: "limitless_create_run", arguments: { repo: f.repo, prompt: "hello" } }),
     localServer,
@@ -173,4 +173,50 @@ test("REST run creation accepts the allow option and prompt directives, and retr
   const invalid = await post({ prompt: "vendor", allow: ["submodules", "secrets"] });
   expect(invalid.status).toBeGreaterThanOrEqual(400);
   expect(await invalid.text()).toContain('Invalid allow value \\"secrets\\"');
+});
+
+test("the mounted endpoint serves the feed tools", async () => {
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "work" });
+  f.factory.store.updateRun(run.id, { status: "succeeded" });
+  const read = await route(
+    rpc("tools/call", { name: "limitless_feed", arguments: { consumer: "codex" } }),
+    localServer,
+  );
+  const page = JSON.parse((await read.json()).result.content[0].text);
+  expect(page).toEqual(f.factory.store.readFeed({ consumer: "codex" }));
+  const ack = await route(
+    rpc("tools/call", { name: "limitless_feed_ack", arguments: { consumer: "codex", id: page.nextAfter } }),
+    localServer,
+  );
+  expect(JSON.parse((await ack.json()).result.content[0].text)).toEqual({
+    consumer: "codex",
+    id: page.nextAfter,
+  });
+  expect(f.factory.store.feedCursor("codex")).toBe(page.nextAfter);
+});
+
+test("an HTTP client disconnecting from a feed long poll releases its listener", async () => {
+  const listeners = () => (f.factory.store as unknown as { listeners: Set<unknown> }).listeners.size;
+  const idle = listeners();
+  const controller = new AbortController();
+  const req = requestWithParams("http://127.0.0.1:7400/mcp", {
+    method: "POST",
+    headers,
+    signal: controller.signal,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "limitless_feed", arguments: { wait: 30 } },
+    }),
+  });
+  const started = Date.now();
+  const pending = route(req, localServer).catch(() => "aborted");
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle + 1);
+  controller.abort();
+  await pending;
+  expect(Date.now() - started).toBeLessThan(5_000);
+  await Bun.sleep(20);
+  expect(listeners()).toBe(idle);
 });
