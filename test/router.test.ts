@@ -14,6 +14,7 @@ import {
 } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
+import { waitClock } from "./wait-clock.ts";
 
 const providers: ProviderDef[] = [
   { id: "claude", label: "Claude", harness: "claude", billing: "subscription", maxConcurrent: 1 },
@@ -1056,5 +1057,102 @@ test("with the default policy, a verifier never reuses a raising model and prefe
   expect(deep.skipped).toContainEqual({
     modelId: "claude/opus",
     reason: "raised a candidate it would verify",
+  });
+});
+
+describe("bounded provider waits", () => {
+  function fixture() {
+    const clock = waitClock();
+    const tracker = new ProviderTracker(providers, store, reserves, {}, {}, clock.now, fetch, clock.timer);
+    return { clock, tracker, signal: new AbortController().signal };
+  }
+
+  test.each(["cancelled", "expired"])(
+    "%s waiter leaves the queue and a live waiter takes the next slot",
+    async (reason) => {
+      const { clock, tracker, signal } = fixture();
+      const release = await tracker.acquire("claude", signal);
+      const cancel = new AbortController();
+      const dead = tracker.acquire("claude", cancel.signal, 100);
+      const result = dead.catch((error: Error) => error.message);
+      const live = tracker.acquire("claude", signal, 200);
+      if (reason === "cancelled") cancel.abort();
+      else await clock.advance(100);
+      expect(await result).toBe(reason === "cancelled" ? "cancelled" : null);
+      expect(clock.pending).toBe(1);
+      expect(tracker.status("claude")?.inFlight).toBe(1);
+      release();
+      const done = await live;
+      expect(done).not.toBeNull();
+      done?.();
+      expect(clock.pending).toBe(0);
+      expect(tracker.status("claude")?.inFlight).toBe(0);
+    },
+  );
+
+  test("cancellation after wake hands the free slot to the next live waiter", async () => {
+    const { clock, tracker, signal } = fixture();
+    const release = await tracker.acquire("claude", signal);
+    const cancel = new AbortController();
+    const dead = tracker.acquire("claude", cancel.signal, 100).catch((error: Error) => error.message);
+    const live = tracker.acquire("claude", signal, 200);
+    release();
+    cancel.abort();
+    expect(await dead).toBe("cancelled");
+    const done = await live;
+    expect(done).not.toBeNull();
+    done?.();
+    expect(clock.pending).toBe(0);
+    expect(tracker.status("claude")?.inFlight).toBe(0);
+  });
+
+  test("requeued admission emits one event and retains the original budget", async () => {
+    const { clock, tracker, signal } = fixture();
+    const release = await tracker.acquire("claude", signal);
+    const positions: number[] = [];
+    const pending = tracker.acquire("claude", signal, 100, (ahead) => {
+      positions.push(ahead);
+    });
+    await clock.advance(40);
+    release();
+    const stolen = await tracker.acquire("claude", signal);
+    await clock.flush();
+    expect(positions).toEqual([0]);
+    await clock.advance(60);
+    expect(await pending).toBeNull();
+    expect(clock.pending).toBe(0);
+    stolen();
+    expect(tracker.status("claude")?.inFlight).toBe(0);
+  });
+
+  test("no budget waits indefinitely and immediate admission accepts a zero budget", async () => {
+    const { clock, tracker, signal } = fixture();
+    const release = await tracker.acquire("claude", signal, 0);
+    expect(release).not.toBeNull();
+    let admitted = false;
+    const waiting = tracker.acquire("claude", signal).then((done) => {
+      admitted = true;
+      return done;
+    });
+    await clock.advance(1_000_000);
+    expect(admitted).toBe(false);
+    expect(clock.pending).toBe(0);
+    release?.();
+    (await waiting)();
+  });
+
+  test("a released slot at expiry goes to the live waiter; cancelled free admission stays cancelled", async () => {
+    const { clock, tracker, signal } = fixture();
+    const release = await tracker.acquire("claude", signal);
+    const expired = tracker.acquire("claude", signal, 100);
+    const live = tracker.acquire("claude", signal, 200);
+    await clock.advance(100);
+    release();
+    expect(await expired).toBeNull();
+    (await live)?.();
+    const cancel = new AbortController();
+    cancel.abort();
+    await expect(tracker.acquire("claude", cancel.signal)).rejects.toThrow("cancelled");
+    expect(tracker.status("claude")?.inFlight).toBe(0);
   });
 });

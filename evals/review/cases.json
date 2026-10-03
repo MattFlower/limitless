@@ -1,7 +1,7 @@
 {
   "role": "review",
   "version": 1,
-  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 are merged PRs with no known defect. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 stay clean, because their blocking findings are real but minor. v3 (2026-10-01): review-h01..h19 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days before 2026-10-01, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike; false blocks are reported per case (blocked in a majority of trials) as well as per trial.",
+  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 are merged PRs with no known defect. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 stay clean, because their blocking findings are real but minor. v3 (2026-10-01): review-h01..h19 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days before 2026-10-01, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike; false blocks are reported per case (blocked in a majority of trials) as well as per trial. v3.1 (2026-10-02): the pre-registered audit of the held-out validation run (eval-mur0xwft29pa) reproduced real defects of at least medium consequence in review-h04, h05, h07, h08, h09 and h10, so they are relabelled real; 13 held-out cases stay clean. Defects that only affect runs saved by the previous release (upgrade window) count, because they fail any such run after the deploy that ships the change.",
   "cases": [
     {
       "id": "review-001",
@@ -4875,15 +4875,25 @@
       "base": "7636df23d19694becc9c7e2a05df6fd68055944e",
       "head": "31a4b0ad409c724247ebc61dce70e0ef99ac9b26",
       "snapshot": true,
-      "kind": "clean",
-      "source": "PR #94 as landed (31a4b0a), run mukflebpi0tz; no later fix found as of 2026-10-01; held-out v3",
+      "kind": "real",
+      "source": "PR #94 as landed (31a4b0a), run mukflebpi0tz; no later fix found as of 2026-10-01; held-out v3; relabelled real 2026-10-02 by the pre-registered held-out audit (eval-mur0xwft29pa)",
       "input": {
         "prompt": "# Run dependencies: start a run after another run's PR merges\n\n## Why\nThe orchestrator plans work as sequences (part A → part B) and has to wait to queue follow-ups, so free run slots go unused. Letting a queued run declare that it starts after another run's PR merges allows a whole plan to be queued at once.\n\n## Design\n- **Data.** `limitless run ... --after <run-id>[,<run-id>]` (also on the API and the MCP tool). Runs gain `dependsOn: string[]` (new migration; follow #47 if merged by then). A run with unmet dependencies has status `waiting`: the scheduler skips it, and the UI shows \"waiting for <run> to merge\".\n- **Satisfied** = every dependency run has `merged === true`. The existing merge polling or the owner merging the PR updates this; add a periodic `gh pr view --json state,mergeCommit` check for delivered PRs if none exists.\n- **Failed** = a dependency ends `failed`/`cancelled`, or its PR is closed unmerged. The waiting run then becomes `needs_human` with the reason and does not start.\n- Once satisfied, the run is queued normally and branches from the then-current base.\n\n## Acceptance\n- Store/scheduler tests:\n  - a waiting run doesn't start;\n  - it starts after the dependency is marked merged;\n  - a closed-unmerged dependency moves it to needs_human;\n  - dependency cycles and unknown ids are rejected at creation.\n- `bun run check` passes; under ~350 lines.\n\nNote: #39 (PR #87) has landed. Runs now have a `resolved` status and `mergedBy`/`mergedAt`, and a GitHub PR-state poller exists in src/integrations/github-notifier.ts. Build merge detection on that rather than adding a second poller. New schema changes go in src/db/migrations/<UTC YYYYMMDDTHHMM>-<slug>.sql (see its README).\n\nCloses #49",
         "spec": null,
         "implementerReport": "",
         "gates": []
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/db/store.ts",
+          "lines": [820, 829],
+          "severity": "major",
+          "category": "logic",
+          "summary": "A dependency that ends needs_human without a PR (for example because its own dependency failed) is treated as still pending: only missing, failed, cancelled or closed-unmerged dependencies fail a waiting run, and a retry creates a new run that cannot satisfy the old dependency. For A → B → C, A failing moves B to needs_human, but C stays waiting forever across reconciliations, so a queued plan's tail silently stalls.",
+          "required": true,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; later fixed by #247"
+        }
+      ]
     },
     {
       "id": "review-h05",
@@ -4891,8 +4901,8 @@
       "base": "9b1f341ad97161e447e47ca4d902ab71b2708831",
       "head": "f95fd79a1006e15e84086e3f06a85908274088cf",
       "snapshot": true,
-      "kind": "clean",
-      "source": "PR #11 as landed (f95fd79), run muizqrwcq63n; no later fix found as of 2026-10-01; held-out v3",
+      "kind": "real",
+      "source": "PR #11 as landed (f95fd79), run muizqrwcq63n; no later fix found as of 2026-10-01; held-out v3; relabelled real 2026-10-02 by the pre-registered held-out audit (eval-mur0xwft29pa)",
       "input": {
         "prompt": "OpenRouter spend reconciliation\n\nToday the OpenRouter budget (limits.openrouter_budget_usd, default $50) is enforced only on locally\nestimated spend (token counts × catalog price, rolling 30 days, see ProviderTracker.headroom and\nStore.providerSpendSince). Reconcile it against OpenRouter's own numbers.\n\n- Poll `GET https://openrouter.ai/api/v1/key` (Bearer OPENROUTER_API_KEY) every 10 minutes while the\n  provider is enabled, and before a metered OpenRouter invocation when the last reading is older than\n  2 minutes. The response is `{ data: { usage, usage_daily, usage_weekly, usage_monthly, limit,\n  limit_remaining, limit_reset, ... } }` (USD). Note `limit` resets on `limit_reset` (currently\n  \"daily\" on our key), so `limit_remaining` is NOT the budget; the configured budget is.\n- Budget enforcement uses the larger of the local 30-day estimate and `usage_monthly` (fail safe:\n  never let a missing or failed reading loosen the budget; treat `limit_remaining <= 0` as exhausted\n  until the next reading).\n- Surface `reportedUsageUsd` (monthly), `reportedAt`, and the key's `limit`/`limitRemaining`/\n  `limitReset` on the OpenRouter entry of `/api/providers` and in the UI provider card; show\n  \"estimated vs reported\" spend.\n- Drift check: when the reported usage delta since the previous reading differs from the locally\n  recorded cost of OpenRouter invocations in the same interval by more than 20% (and more than\n  $0.05 absolute), write a warn event with both numbers.\n- Never log or expose the key or the `label` field.\n- Tests with an injected fetch and fake clock: budget uses the larger number, failed readings don't\n  loosen it, drift warning fires only above both thresholds, polling interval respected.\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). Keep changes consistent with the existing architecture and code style, and make `bun run check` pass. `bun run smoke` exercises the real agent CLIs if you change harness code (optional, spends a little quota).",
         "spec": {
@@ -4999,7 +5009,26 @@
           }
         ]
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/db/store.ts",
+          "lines": [779, 790],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "providerSpendBetween attributes local cost to a reading window by started_at, so a call that starts before an OpenRouter reading and finishes after it is counted in the wrong window (or an in-flight call is missed), producing false spend-drift warnings.",
+          "required": true,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; later fixed by #252"
+        },
+        {
+          "file": "src/router/providers.ts",
+          "lines": [171, 176],
+          "severity": "minor",
+          "category": "logic",
+          "summary": "Drift is only checked when usage did not decrease, which is also the only month-rollover signal. After a monthly reset where new usage already exceeds the prior reading, the reset is missed and the drift check compares spend across the reset.",
+          "required": false,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; later fixed by #252"
+        }
+      ]
     },
     {
       "id": "review-h06",
@@ -5143,15 +5172,43 @@
       "base": "81609e277d7ee9eda6cc6a4954e2ddb1f6b1d589",
       "head": "96966a7aac9aad360b2fc04a11d16852b3aa2b0e",
       "snapshot": true,
-      "kind": "clean",
-      "source": "PR #90 as landed (96966a7), run mukddauva0wm; no later fix found as of 2026-10-01; held-out v3",
+      "kind": "real",
+      "source": "PR #90 as landed (96966a7), run mukddauva0wm; no later fix found as of 2026-10-01; held-out v3; relabelled real 2026-10-02 by the pre-registered held-out audit (eval-mur0xwft29pa)",
       "input": {
         "prompt": "# Conflict-resolution round must produce a real merge commit (factory merges, agent resolves)\n\n## Bug\nRun mukacfa88tqj (#61, PR #81): the delivery rebase conflicted, so the engine scheduled a resolution round whose feedback tells the implementer to `git merge origin/<base>` and resolve. The resulting commit `efb08dd` was a **single-parent** commit containing 1,442 lines of `main`'s changes across 21 files. The merge parent was lost, probably because the agent sandbox can't write the worktree's git metadata (it lives outside the worktree), so the agent applied `main`'s changes by hand.\n\nEffects:\n- GitHub showed other PRs' work as this PR's changes (38 files instead of 19), which misleads review.\n- If `main` has moved further on those files, landing risks conflicts or confusing 3-way merges.\n- The orchestrator had to reconstruct the merge by hand.\nParallel runs make delivery conflicts common, so this recurs.\n\n## Design\n- The **factory** performs the merge in the worktree (it has permission to write git metadata): `git merge --no-ff --no-commit origin/<base>` with hooks disabled and the scrubbed env.\n  - Clean: commit it as a merge commit (two parents), re-run gates and continue to delivery; no agent needed.\n  - Conflicted: leave conflict markers and `MERGE_HEAD` in place. The resolution round tells the agent: \"resolve the conflict markers in these files, preserving both intents; do not run git\". The factory then verifies no markers remain, stages, and commits with `MERGE_HEAD` (a real merge commit).\n- If the agent's result has no `MERGE_HEAD`, or the commit has fewer than two parents, fail the round with a clear error instead of delivering.\n- The audit and review diff for the resolution round is against the new base tip, so reviewers see the resolution, not `main`'s changes.\n- Reuse the same helper for #46's refresh runs.\n\n## Acceptance\n- Real-git tests (temp repos, no network):\n  - a conflicting base advance produces a two-parent merge commit on the run branch, with conflicts resolved by a fake agent editing files only;\n  - a clean advance merges without an agent round;\n  - an agent result without a merge parent fails the round;\n  - the PR diff (`git diff base...branch`) contains only the run's own changes.\n- `bun run check` passes; under ~350 lines.\n\nCloses #85",
         "spec": null,
         "implementerReport": "",
         "gates": []
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/git/merge.ts",
+          "lines": [78, 84],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "Leftover conflict markers are detected only as exactly `<<<<<<< HEAD` and `>>>>>>> <base>`. Markers with a path suffix (`<<<<<<< HEAD:f.txt`, e.g. after a rename) or a configured conflict-marker-size are missed, so a merge is committed with conflict markers in it.",
+          "required": true,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; later fixed by #248"
+        },
+        {
+          "file": "src/git/merge.ts",
+          "lines": [91, 97],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "completeMerge scans only unmerged, untracked and worktree-modified files. A file the resolver already staged with markers still in it shows no worktree diff and escapes the scan, so the unresolved file is committed.",
+          "required": true,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; later fixed by #248"
+        },
+        {
+          "file": "src/pipeline/engine.ts",
+          "lines": [878, 883],
+          "severity": "major",
+          "category": "data-migration",
+          "summary": "Delivery after a conflict round now requires preRebaseHead, but the previous release cleared it when a delivery rebase conflicted. A run that entered a conflict round under the previous release throws 'Missing pre-merge HEAD at delivery' here (or 'Missing expected merge state' in its resolution round) and cannot recover.",
+          "required": true,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; upgrade window only; not fixed"
+        }
+      ]
     },
     {
       "id": "review-h08",
@@ -5159,15 +5216,25 @@
       "base": "2773ae26bd0362f243a726aa07b0b962fb413d11",
       "head": "8ce5e004d47a2cc4f4c2cd72a053f16df190339b",
       "snapshot": true,
-      "kind": "clean",
-      "source": "PR #26 as landed (8ce5e00), run muk23n2c1w2m; no later fix found as of 2026-10-01; held-out v3",
+      "kind": "real",
+      "source": "PR #26 as landed (8ce5e00), run muk23n2c1w2m; no later fix found as of 2026-10-01; held-out v3; relabelled real 2026-10-02 by the pre-registered held-out audit (eval-mur0xwft29pa)",
       "input": {
         "prompt": "Later-round reviews don't move the goalposts\n\nFrom the 2026-09-27 needs-human analysis: on large runs, each review round raised new edge cases\n(eval part 2 had four request-changes rounds, each with fresh findings), so runs ran out of rounds\nwhile converging. Fixing what was asked for should end the loop.\n\n- From round 2 on, the reviewer receives the previous round's findings and the diff since the last\n  reviewed commit, and must label each finding: `unaddressed` (a prior finding not fixed),\n  `regression` (introduced by the latest changes), or `new`.\n- Only unaddressed, regression, or new *blocker*/security findings can block; other new findings are\n  recorded as follow-ups in the PR report (and can be filed as backlog items) instead of forcing\n  another round.\n- The verdict is derived deterministically from those labels (as with verify), not taken from the\n  model's own verdict field.\n- Tests with the fake harness: a new major non-security finding in round 3 does not trigger\n  another implement round and appears under follow-ups; an unaddressed prior finding or a regression\n  still blocks.\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). Keep changes consistent with the existing architecture and code style, and make `bun run check` pass. Keep the change focused (aim for under ~500 changed lines).",
         "spec": null,
         "implementerReport": "",
         "gates": []
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/pipeline/engine.ts",
+          "lines": [573, 574],
+          "severity": "major",
+          "category": "data-migration",
+          "summary": "A run saved by the previous release has lastReview but no reviewHistory, so at its next review it throws 'Previous review has no round history' and ends needs_human. A deploy restarts the daemon, so every run past its first review at upgrade time is affected (reproduced by resuming a restart-during-verify run with reviewHistory stripped).",
+          "required": true,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; upgrade window only; not fixed"
+        }
+      ]
     },
     {
       "id": "review-h09",
@@ -5175,15 +5242,34 @@
       "base": "8520e6b870693548a4adb7d960971a7f28794c40",
       "head": "b4aea403149cbf44a65843a6a0f916624e1b496d",
       "snapshot": true,
-      "kind": "clean",
-      "source": "PR #88 as landed (b4aea40), run mukasd5d2lll; no later fix found as of 2026-10-01; held-out v3",
+      "kind": "real",
+      "source": "PR #88 as landed (b4aea40), run mukasd5d2lll; no later fix found as of 2026-10-01; held-out v3; relabelled real 2026-10-02 by the pre-registered held-out audit (eval-mur0xwft29pa)",
       "input": {
         "prompt": "# Implement evals part B2: routing policy cells for implement\n\nPart B2 of #41. Extend the policy generator (`limitless eval policy`, `src/evals/policy.ts`) to emit `implement` cells per complexity (`trivial`, `small`, `medium`; keep `large` as the current policy unless there is evidence) from implement eval results. Use the same rules as triage:\n- floors on the Wilson lower bound of pass rate;\n- paired bootstrap non-inferiority (δ = 0.10) against the best candidate on that complexity;\n- cost ordering with the existing cost model (local $0, metered actual, subscription equivalent × 0.25);\n- one availability fallback per uncovered provider.\n\nInclude the escalation strategy from B1 when there is evidence. For example, if `effort` recovers significantly more than `switch` at no worse cost, emit `model@low → model@high` before the next model. The PR diff to `routing/policy.json` and `routing/EVIDENCE.md` is the approval step.\n\n## Acceptance\n- Unit tests with synthetic implement results: eligible, floor-failing and non-inferiority-failing candidates; per-complexity ordering; the availability fallback; and no implement cell when evidence is insufficient (the policy keeps the default).\n- `bun run check` passes; under ~300 lines.\n\nCloses #68",
         "spec": null,
         "implementerReport": "",
         "gates": []
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/evals/policy.ts",
+          "lines": [117, 121],
+          "severity": "major",
+          "category": "logic",
+          "summary": "Implement evidence is attributed to the run's starting target: a multi-round trial that only passed after an effort raise or a model switch counts as a pass for the starting model, so the policy generator can qualify a model on passes it did not earn.",
+          "required": true,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; later fixed by #253"
+        },
+        {
+          "file": "src/evals/policy.ts",
+          "lines": [293, 339],
+          "severity": "major",
+          "category": "completeness",
+          "summary": "The B1 escalation evidence handling is unreachable: no caller passes `escalation` to generatePolicy (the CLI path in app.ts omits it), so effort-before-switch recommendations can never be emitted.",
+          "required": true,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; later fixed by #253"
+        }
+      ]
     },
     {
       "id": "review-h10",
@@ -5191,15 +5277,43 @@
       "base": "96966a7aac9aad360b2fc04a11d16852b3aa2b0e",
       "head": "9d1f85ee78e03ce9ba186c8cff929b5678841a3a",
       "snapshot": true,
-      "kind": "clean",
-      "source": "PR #96 as landed (9d1f85e), run mukehly9lr4a; no later fix found as of 2026-10-01; held-out v3",
+      "kind": "real",
+      "source": "PR #96 as landed (9d1f85e), run mukehly9lr4a; no later fix found as of 2026-10-01; held-out v3; relabelled real 2026-10-02 by the pre-registered held-out audit (eval-mur0xwft29pa)",
       "input": {
         "prompt": "# Verify-first flow for existing changes (Dependabot PRs)\n\n## Why\nThe Dependabot runs on limitless-sandbox PRs #5 and #6 (mukca2jfk1x1, mukc9x9tvelu) followed the build flow:\n1. triage: `dependency_update, trivial, risk low → quick`;\n2. implement: \"no changes\";\n3. gates pass;\n4. the **audit blocks** with `empty-diff`.\nThe run then loops back to implement until it runs out of rounds and ends needs-human. For verifying an existing change, \"nothing to change\" is success. Stages are only partly dynamic today: profiles drop or add stages, but every flow is implement-first.\n\nAlso, for existing-branch runs the worktree base is the PR head (`engine.ts:180`). So the reviewer never sees the change being verified (the bump itself), only the run's own edits.\n\n## Design\nKeep control flow deterministic: choose a named flow from the run's source and triage class, never from an LLM.\n- **Flow `verify-change`:** used for `pull_request` source refs (today: Dependabot), and for any run whose triage `task_class` is `dependency_update` and that carries a PR source ref.\n  1. **Prepare:** check out the PR head. Record the PR's base: add `baseRef` and `baseSha` from the webhook payload's `pull_request.base` to `sourceRef`; that's JSON, so no migration.\n  2. **Baseline gates** on the PR base, then **gates on the PR head** (the actual test: does the change break anything?).\n  3. **Audit and review of the PR's own diff** (`baseSha...headSha`). The review prompt gains a short dependency-update rubric: breaking changes between versions (changelog/release notes quoted in the PR body), permission or pinning changes in CI config, lockfile consistency, and anything that runs code at install.\n  4. **Gates pass and review approves:** success with no implement stage. Deliver by posting the verdict as a PR comment (gates table, review summary, models used, cost). Push nothing.\n  5. **Gates regress or review blocks:** an implement round to fix it, with the gate/review feedback. Then gates → review of the combined diff → push to the PR branch (existing delivery). Normal round limits apply.\n- **Audit:** `empty-diff` doesn't apply to the run's own changes in `verify-change`. The audit runs on the PR diff, and on the fix diff when there is one.\n- The report and UI show the flow name, and the stage timeline naturally shows no implement stage when none ran.\n- Keep the existing build flows unchanged.\n\n## Acceptance\n- Fake-harness pipeline tests:\n  - Dependabot PR with gates passing and review approving: no implement invocation; the run succeeds; a PR comment is posted through the fake `gh`; nothing is pushed.\n  - Gates failing on the PR head: one implement round fixes it, then it pushes to the PR branch.\n  - Review blocking with gates passing: an implement round, then re-review.\n  - The review prompt receives the PR's own diff (base...head), not an empty diff.\n  - Build-flow runs are unchanged (existing tests).\n- `bun run check` passes; under ~500 lines.\n\nCloses #86",
         "spec": null,
         "implementerReport": "",
         "gates": []
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/pipeline/engine.ts",
+          "lines": [971, 990],
+          "severity": "major",
+          "category": "concurrency",
+          "summary": "The verify-first flow posts its success verdict on the PR without rechecking the PR's current head, so a push after verification started gets an approval comment for code that was never verified.",
+          "required": true,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; later fixed by #249"
+        },
+        {
+          "file": "src/pipeline/engine.ts",
+          "lines": [668, 671],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "The audit compares gate scripts against the base branch tip instead of the PR's merge base. When the base changed a gate script after the PR branched, a PR that never touched package.json gets a blocking gate-script-changed finding and ends needs_human.",
+          "required": true,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; later fixed by #249"
+        },
+        {
+          "file": "src/pipeline/engine.ts",
+          "lines": [191, 200],
+          "severity": "major",
+          "category": "data-migration",
+          "summary": "Prepare now requires sourceRef.baseRef and baseSha for verify-change runs. A PR run queued before the upgrade has neither and fails with 'Verification requires valid PR baseRef' and no model calls.",
+          "required": true,
+          "foundBy": "held-out validation audit (eval-mur0xwft29pa), reproduced by the orchestrator; upgrade window only; not fixed"
+        }
+      ]
     },
     {
       "id": "review-h11",

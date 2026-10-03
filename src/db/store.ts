@@ -163,6 +163,7 @@ const toStage = (r: Row): Stage => ({
 });
 
 const toInvocation = (r: Row): Invocation => ({
+  waitMs: r.wait_ms as number,
   fast: r.fast === 1,
   fastModeState: (r.fast_mode_state as string) ?? null,
   fastModeDisabledReason: (r.fast_mode_disabled_reason as string) ?? null,
@@ -1099,6 +1100,7 @@ export class Store {
   // ---- invocations ---------------------------------------------------------
 
   createInvocation(inv: {
+    waitMs?: number;
     fast?: boolean;
     runId: string;
     stageId: number | null;
@@ -1111,8 +1113,8 @@ export class Store {
   }): Invocation {
     const res = this.db
       .query(
-        `INSERT INTO invocations (run_id, stage_id, role, harness, provider, model, model_id, status, started_at, effort, fast)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)`,
+        `INSERT INTO invocations (run_id, stage_id, role, harness, provider, model, model_id, status, started_at, effort, fast, wait_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)`,
       )
       .run(
         inv.runId,
@@ -1125,6 +1127,7 @@ export class Store {
         Date.now(),
         inv.effort ?? null,
         inv.fast ? 1 : 0,
+        Math.max(0, inv.waitMs ?? 0),
       );
     const invocation = this.getInvocation(Number(res.lastInsertRowid)) as Invocation;
     this.publish({ kind: "invocation", invocation });

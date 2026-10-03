@@ -4,6 +4,7 @@ import type { RunState } from "../src/pipeline/context.ts";
 import { renderReport, verifiedFailureState } from "../src/pipeline/report.ts";
 
 const inv: Invocation = {
+  waitMs: 0,
   fast: false,
   fastModeState: null,
   fastModeDisabledReason: null,
