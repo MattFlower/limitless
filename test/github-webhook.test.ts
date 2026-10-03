@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import * as childProcess from "node:child_process";
 import { createHmac } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,7 +9,7 @@ import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Run } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { githubWebhook, mapGitHubEvent } from "../src/integrations/github.ts";
-import { mountIntegrations } from "../src/integrations/index.ts";
+import { type Integrations, mountIntegrations } from "../src/integrations/index.ts";
 
 const fixture = (name: string): string => readFileSync(join(import.meta.dir, "data", name), "utf8").trim();
 let dir: string;
@@ -19,6 +20,7 @@ let cfg: ReturnType<typeof loadConfig>;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "github-webhook-"));
   cfg = loadConfig({ home: dir, configDir: dir });
+  cfg.secrets.DISCORD_BOT_TOKEN = "";
   cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
   store = new Store(join(dir, "store.db"));
   store.upsertRepo({
@@ -70,7 +72,11 @@ test("disabled, missing, invalid and exact-body signatures", async () => {
   const body = fixture("github-issue.json");
   const h = handler();
   cfg.secrets.GITHUB_WEBHOOK_SECRET = "";
-  const integrations = await mountIntegrations({ cfg, store } as Factory);
+  const integrations = await mountIntegrations({ cfg, store } as Factory, {
+    toolVersions: async () => [],
+    gh: async () => {},
+    prClient: async () => null,
+  });
   expect(integrations.notes.find((n) => n.startsWith("GitHub webhooks"))).toContain("disabled");
   await integrations.stop();
   await integrations.stop();
@@ -100,6 +106,96 @@ test("disabled, missing, invalid and exact-body signatures", async () => {
   expect((await h(request("{broken", "e"))).status).toBe(200);
   expect((await h(new Request("http://localhost/webhooks/github"))).status).toBe(405);
   expect(requests).toHaveLength(2);
+});
+
+test("mounting with fake dependencies spawns no processes, including notifier activity", async () => {
+  const unexpectedSpawn = () => {
+    throw new Error("unexpected process spawn");
+  };
+  const spawn = spyOn(Bun, "spawn").mockImplementation(unexpectedSpawn);
+  const spawnSync = spyOn(Bun, "spawnSync").mockImplementation(unexpectedSpawn);
+  const nodeSpawn = spyOn(childProcess, "spawn").mockImplementation(unexpectedSpawn);
+  const toolVersions = mock(async () => ["fake tool versions"]);
+  const gh = mock(async (_args: string[]) => {});
+  const prClient = mock(async (_url: string) => null);
+  let integrations: Integrations | undefined;
+  try {
+    const repo = store.getRepoBySlug("MattFlower/limitless");
+    if (!repo) throw new Error("missing repo");
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "check PR" });
+    const prUrl = "https://github.com/MattFlower/limitless/pull/42";
+    store.updateRun(run.id, { status: "needs_human", prUrl });
+    integrations = await mountIntegrations({ cfg, store } as Factory, { toolVersions, gh, prClient });
+    store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "fix issue",
+      source: "github",
+      sourceRef: { kind: "issue", repo: repo.slug, number: 42 },
+    });
+    await Bun.sleep(0);
+    expect(integrations.notes[0]).toBe("fake tool versions");
+    expect(toolVersions).toHaveBeenCalledTimes(1);
+    expect(prClient).toHaveBeenCalledWith(prUrl);
+    expect(gh).toHaveBeenCalledTimes(1);
+    expect(gh.mock.calls[0]?.[0].slice(0, 5)).toEqual(["issue", "comment", "42", "--repo", repo.slug]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(spawnSync).not.toHaveBeenCalled();
+    expect(nodeSpawn).not.toHaveBeenCalled();
+  } finally {
+    await integrations?.stop();
+    spawn.mockRestore();
+    spawnSync.mockRestore();
+    nodeSpawn.mockRestore();
+  }
+});
+
+test("default version probe yields while tools run and preserves startup notes", async () => {
+  const which = spyOn(Bun, "which").mockImplementation((bin) => (bin === "gh" ? null : `/tools/${bin}`));
+  const exited = Promise.withResolvers<number>();
+  const spawn = spyOn(Bun, "spawn").mockImplementation(
+    () =>
+      ({
+        stdout: new Blob(["v1.0\nextra line\n"]).stream(),
+        stderr: new Blob(["ignored stderr"]).stream(),
+        exited: exited.promise,
+      }) as unknown as ReturnType<typeof Bun.spawn>,
+  );
+  const spawnSync = spyOn(Bun, "spawnSync").mockImplementation(() => {
+    throw new Error("version probe must not block");
+  });
+  const mounting = mountIntegrations({ cfg, store } as Factory, {
+    gh: async () => {},
+    prClient: async () => null,
+  });
+  let mounted = false;
+  void mounting.then(() => {
+    mounted = true;
+  });
+  try {
+    await Bun.sleep(0);
+    expect(mounted).toBe(false);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    exited.resolve(0);
+    const integrations = await mounting;
+    expect(integrations.notes.slice(0, 4)).toEqual([
+      "claude: v1.0 (/tools/claude)",
+      "codex: v1.0 (/tools/codex)",
+      "gh: NOT FOUND on PATH",
+      "git: v1.0 (/tools/git)",
+    ]);
+    expect(spawn.mock.calls.map(([cmd]) => cmd)).toEqual([
+      ["/tools/claude", "--version"],
+      ["/tools/codex", "--version"],
+      ["/tools/git", "--version"],
+    ]);
+    expect(spawnSync).not.toHaveBeenCalled();
+  } finally {
+    exited.resolve(0);
+    await (await mounting).stop();
+    which.mockRestore();
+    spawn.mockRestore();
+    spawnSync.mockRestore();
+  }
 });
 
 test("processing failure is audited as error", async () => {

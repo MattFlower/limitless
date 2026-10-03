@@ -38,20 +38,25 @@ function assign(defects: Defect[], findings: Finding[], lands: (f: Finding, d: D
 export function gradeReview(item: ReviewCase, output: StoredReview): EvalGrade {
   const normalize = (file: string) => file.replace(/^(\.\/)+/, "");
   const blocking = blockingReviewFindings(output);
+  const atLine = (line: number, defect: Defect) =>
+    line === 0
+      ? defect.category === "completeness"
+      : line > 0 && line >= defect.lines[0] - 5 && line <= defect.lines[1] + 5;
   const lands = (finding: Finding, defect: Defect) =>
     normalize(finding.file) === normalize(defect.file) &&
-    (finding.line === 0
-      ? defect.category === "completeness"
-      : finding.line > 0 && finding.line >= defect.lines[0] - 5 && finding.line <= defect.lines[1] + 5);
-  // A finding repeated verbatim is still one finding. A merged panel finding also covers the lines of
-  // the reports merged into it, since production sends them all back for fixing.
-  const distinct = (findings: Finding[]) => [
-    ...new Map(
-      findings
-        .flatMap((f) => [f, ...(f.duplicates ?? []).map((d) => ({ ...f, line: d.line, title: d.title }))])
-        .map((f) => [JSON.stringify([normalize(f.file), f.line, f.title]), f]),
-    ).values(),
-  ];
+    (atLine(finding.line, defect) || (finding.duplicates ?? []).some((d) => atLine(d.line, defect)));
+  // Verbatim repeats are one finding, keeping every copy's aliases. Aliases are alternative locations
+  // for that claim, never independent vertices: blocking credit and under-rated detection have a
+  // one-claim limit.
+  const distinct = (findings: Finding[]) => {
+    const byKey = new Map<string, Finding>();
+    for (const f of findings) {
+      const key = JSON.stringify([normalize(f.file), f.line, f.title]);
+      const seen = byKey.get(key)?.duplicates ?? [];
+      byKey.set(key, seen.length ? { ...f, duplicates: [...seen, ...(f.duplicates ?? [])] } : f);
+    }
+    return [...byKey.values()];
+  };
   // Most severe first, so an ambiguous assignment credits the defect that matters most.
   const required = item.defects
     .filter((defect) => defect.required)

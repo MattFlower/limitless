@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { ChatOutputSchema } from "../src/concierge.ts";
 import { toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import { DEFAULT_POLICY } from "../src/router/catalog.ts";
+import { ProviderTracker } from "../src/router/providers.ts";
+import { Router } from "../src/router/router.ts";
 import { chatFixture, proposalFields } from "./chat-support.ts";
+import { waitClock } from "./wait-clock.ts";
 
 let f: ReturnType<typeof chatFixture>;
 beforeEach(() => {
@@ -370,4 +374,76 @@ test("latest full user message and current proposal are supplied as context data
   expect(f.specs.at(-1)?.prompt).toContain(latest);
   expect(f.specs.at(-1)?.prompt).toContain(proposal.id);
   expect(f.specs.at(-1)?.prompt).toContain(proposal.prompt);
+});
+
+test("chat expires its slot budget and falls through without consuming an invocation attempt", async () => {
+  const clock = waitClock();
+  const providers = ["fake", "next"].map((id) => ({
+    id,
+    label: id,
+    harness: "fake" as const,
+    billing: "subscription" as const,
+    maxConcurrent: 1,
+  }));
+  const tracker = new ProviderTracker(
+    providers,
+    f.factory.store,
+    f.factory.cfg.reserves,
+    {},
+    {},
+    clock.now,
+    fetch,
+    clock.timer,
+  );
+  const model = f.factory.router.model("fake/chat");
+  if (!model) throw new Error("missing model");
+  const models = [model, { ...model, id: "next/chat", provider: "next" }];
+  f.factory.deps.tracker = tracker;
+  f.factory.deps.router = new Router(
+    tracker,
+    { ...DEFAULT_POLICY, chat: { default: models.map((m) => m.id) } },
+    models,
+  );
+  const release = await tracker.acquire("fake", new AbortController().signal);
+  try {
+    const pending = send("hi");
+    await clock.flush();
+    await clock.advance(20_000);
+    expect((await pending).messages.at(-1)?.content).toBe("Hello");
+    expect(f.specs.map((s) => s.target.provider)).toEqual(["next"]);
+    expect(f.factory.store.listEvents("chat:one")).toHaveLength(0);
+    expect(clock.pending).toBe(0);
+  } finally {
+    release();
+  }
+});
+
+test("chat with one eligible provider keeps waiting beyond its role budget", async () => {
+  const clock = waitClock();
+  const tracker = new ProviderTracker(
+    [{ id: "fake", label: "Fake", harness: "fake", billing: "subscription", maxConcurrent: 1 }],
+    f.factory.store,
+    f.factory.cfg.reserves,
+    {},
+    {},
+    clock.now,
+    fetch,
+    clock.timer,
+  );
+  f.factory.deps.tracker = tracker;
+  const release = await tracker.acquire("fake", new AbortController().signal);
+  try {
+    const pending = send("hi");
+    await clock.flush();
+    await clock.advance(40_000);
+    expect(f.specs).toHaveLength(0);
+    expect(clock.pending).toBe(0);
+    release();
+    expect((await pending).messages.at(-1)?.content).toBe("Hello");
+    expect(f.specs.map((s) => s.target.provider)).toEqual(["fake"]);
+    expect(f.factory.store.listEvents("chat:one")).toHaveLength(0);
+    expect(tracker.status("fake")?.inFlight).toBe(0);
+  } finally {
+    release();
+  }
 });
