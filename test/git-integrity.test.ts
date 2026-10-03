@@ -8,6 +8,7 @@ import { parseAllow } from "../src/core/allow.ts";
 import type { AuditAllowance, Repo } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { attributeRules, auditDiff } from "../src/gates/audit.ts";
+import { loadPrivateStrings } from "../src/gates/private.ts";
 import { collectGarbage } from "../src/gc.ts";
 import { worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
@@ -75,9 +76,14 @@ test("private strings in binary or -diff content block without bloating the revi
   writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\n");
   writeFileSync(join(work, ".gitattributes"), "*.dat -diff\n");
   writeFileSync(join(work, "hidden.dat"), "SECRET-HOST.EXAMPLE\n");
-  writeFileSync(join(work, "blob.bin"), Buffer.from("\0\nsecret-host.example\n"));
+  // The entry straddles a 64 KiB stream chunk boundary.
+  const blob = Buffer.alloc(200_000);
+  blob.write("secret-host.example", 65_530);
+  writeFileSync(join(work, "blob.bin"), blob);
   await commitAll(work, "hidden content");
-  const diff = await diffSince(work, base);
+  // Without a denylist no blob is read.
+  expect((await diffSince(work, base)).privateHits).toEqual([]);
+  const diff = await diffSince(work, base, undefined, false, loadPrivateStrings(configDir));
   expect(diff.patch).not.toContain("secret-host.example");
   const findings = auditDiff(diff, { configDir, taskClass: null, protectedPaths: [] }).filter(
     (f) => f.rule === "private-string",

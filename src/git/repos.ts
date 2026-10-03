@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,6 +7,7 @@ import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { attributeRules, BINARY_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
+import type { PrivateStrings } from "../gates/private.ts";
 import { CommandError, sh } from "../util/proc.ts";
 import { emptyHookFlags, NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
 
@@ -462,8 +464,8 @@ export interface DiffFile {
 
 export interface DiffInfo {
   patch: string;
-  /** The patch with binary and attribute-hidden content forced to text, for the private-string scan. */
-  textPatch?: string;
+  /** Private-string entries found in changed content the patch shows as binary. */
+  privateHits?: { path: string; entry: number }[];
   files: DiffFile[];
   stat: string;
   added: number;
@@ -489,18 +491,18 @@ export async function diffSince(
   baseSha: string,
   env?: Record<string, string>,
   threeDot = false,
+  privateStrings: PrivateStrings = [],
 ): Promise<DiffInfo> {
   const range = `${baseSha}${threeDot ? "..." : ".."}HEAD`;
   // Committed .gitmodules settings must not hide gitlinks from audit inputs.
   const diff = (...args: string[]) =>
     worktreeGit(["git", "diff", "--ignore-submodules=none", ...args], { cwd, env });
-  const [patch, textPatch, names, stat, numstat, raw] = await Promise.all([
+  const [patch, names, stat, numstat, raw] = await Promise.all([
     diff(range),
-    diff("--text", "--no-textconv", "--no-ext-diff", range),
     diff("--name-status", "-M", range),
     diff("--stat", range),
     diff("--numstat", range),
-    diff("--raw", "-z", "--no-renames", range),
+    diff("--raw", "-z", "--no-renames", "--no-abbrev", range),
   ]);
   let added = 0;
   let removed = 0;
@@ -511,6 +513,7 @@ export async function diffSince(
   }
   const files = parseNameStatus(names.stdout);
   const gitlinks: string[] = [];
+  const blobs = new Map<string, string>();
   const origins = new Map(files.map((file) => [file.path, file.from]));
   const changes: { path: string; from?: string }[] = [];
   const entries = raw.stdout.split("\0");
@@ -519,21 +522,60 @@ export async function diffSince(
     const status = entries[i]?.split(" ").at(-1) ?? "";
     const path = entries[i + 1] ?? "";
     if (status.startsWith("D")) continue;
+    blobs.set(path, entries[i]?.split(" ")[3] ?? "");
     const from = origins.get(path);
     changes.push({ path, ...(from ? { from } : status.startsWith("A") ? {} : { from: path }) });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
   const inspection = await attributeInfo(cwd, env, range, revision, changes);
+  const privateHits: { path: string; entry: number }[] = [];
+  if (privateStrings.length) {
+    // Binary content is absent from the patch; stream each blob rather than forcing a text diff.
+    const numstatZ = await diff("--numstat", "-z", "--no-renames", range);
+    for (const line of numstatZ.stdout.split("\0")) {
+      const path = line.match(/^-\t-\t([\s\S]+)$/)?.[1];
+      const blob = path === undefined ? undefined : blobs.get(path);
+      if (path !== undefined && blob && !/^0+$/.test(blob))
+        for (const entry of await blobPrivateEntries(cwd, env, blob, privateStrings))
+          privateHits.push({ path, entry });
+    }
+  }
   return {
     patch: patch.stdout,
-    textPatch: textPatch.stdout,
     files,
     stat: stat.stdout,
     added,
     removed,
     gitlinks,
+    privateHits,
     ...inspection,
   };
+}
+
+async function blobPrivateEntries(
+  cwd: string,
+  env: Record<string, string> | undefined,
+  blob: string,
+  privateStrings: PrivateStrings,
+): Promise<number[]> {
+  const child = spawn("git", ["cat-file", "blob", blob], { cwd, env: env ?? process.env, stdio: "pipe" });
+  child.stdin.end();
+  child.stderr.resume();
+  const exited = new Promise<number | null>((done, fail) => {
+    child.on("error", fail);
+    child.on("close", done);
+  });
+  const keep = Math.max(...privateStrings.map(({ value }) => value.length)) - 1;
+  const decoder = new TextDecoder();
+  const found = new Set<number>();
+  let tail = "";
+  for await (const chunk of child.stdout as AsyncIterable<Buffer>) {
+    const text = tail + decoder.decode(chunk, { stream: true }).toLowerCase();
+    for (const { value, entry } of privateStrings) if (text.includes(value)) found.add(entry);
+    tail = keep > 0 ? text.slice(-keep) : "";
+  }
+  if ((await exited) !== 0) throw new Error(`Could not read blob ${blob} for the private-string scan`);
+  return [...found];
 }
 
 const LFS_POINTER = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:[0-9a-f]{64}\nsize \d+\n$/;

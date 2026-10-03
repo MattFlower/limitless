@@ -222,10 +222,14 @@ export function auditDiff(
       });
   };
   for (const f of diff.files) if (/^[ARC]/.test(f.status)) privateLine(f.path, f.path);
-  for (const fp of diff.textPatch === undefined ? patches : splitPatch(diff.textPatch))
+  for (const fp of patches)
     fp.added.forEach((text, i) => {
       privateLine(text, fp.path, fp.addedLines[i]);
     });
+  for (const { path, entry } of diff.privateHits ?? []) {
+    const file = privateMatches(path, entries).length ? "[redacted filename]" : path;
+    findings.push({ rule: "private-string", severity: "block", file, detail: privateReason(file, entry) });
+  }
   for (const path of diff.gitlinks ?? patches.filter((p) => p.gitlink && p.added.length).map((p) => p.path)) {
     if (!ctx.allow?.includes("submodules"))
       findings.push({

@@ -946,7 +946,9 @@ async function oneRound(
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
-  const changeDiff = () => diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change");
+  const privateStrings = () => loadPrivateStrings(ctx.deps.cfg.paths.configDir);
+  const changeDiff = () =>
+    diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change", privateStrings());
   const system =
     ctx.deps.reviewSystem ?? configuredReviewSystem(ctx.deps.cfg, profile(ctx), ctx.state.reviewLenses);
   const resolution = ctx.state.conflictRound === round;
@@ -1051,7 +1053,13 @@ async function oneRound(
         },
       });
       if (ctx.state.verification) {
-        const repairs = await diffSince(cwd, ctx.state.verification.headSha);
+        const repairs = await diffSince(
+          cwd,
+          ctx.state.verification.headSha,
+          undefined,
+          false,
+          privateStrings(),
+        );
         if (repairs.files.length)
           findings.push(
             ...auditDiff(repairs, {
@@ -1097,7 +1105,7 @@ async function oneRound(
       ? `### Your previous session ended early\n${ctx.state.implementerIssue}\nKeep the next attempt focused and finish by running the checks.`
       : "";
     ctx.state.feedback = [issue, gateFeedback, auditFeedback].filter(Boolean).join("\n\n");
-    ctx.state.feedback = redactPrivate(ctx.state.feedback, loadPrivateStrings(ctx.deps.cfg.paths.configDir));
+    ctx.state.feedback = redactPrivate(ctx.state.feedback, privateStrings());
     await ctx.save();
     ctx.log("Deterministic checks failed; sending feedback to implementer", "warn");
     return false;
@@ -1509,7 +1517,7 @@ async function checkPublication(ctx: RunContext, body: string, pr?: { sha: strin
       cwd,
     });
     checkPrivateText(messages.stdout, "Commit message", entries);
-    const findings = auditDiff(await diffSince(cwd, ctx.run.baseSha as string), {
+    const findings = auditDiff(await diffSince(cwd, ctx.run.baseSha as string, undefined, false, entries), {
       configDir: ctx.deps.cfg.paths.configDir,
       taskClass: ctx.run.taskClass,
       protectedPaths: [],
