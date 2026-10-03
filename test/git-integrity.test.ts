@@ -895,7 +895,7 @@ function gitShim(stall: boolean | "fail" = false) {
     "#!/bin/sh",
     `printf '%s\\n' "$*" >> '${log}'`,
     stall
-      ? `case "$* " in *" --cached --numstat "*) ${stall === "fail" ? "echo classification-broke >&2; exit 1" : "sleep 30"};; esac`
+      ? `case "$* " in *" --cached --raw --numstat "*) ${stall === "fail" ? "echo classification-broke >&2; exit 1" : "sleep 30"};; esac`
       : "",
     `case "$* " in *" --pathspec-from-file=- "*) cat > '${inputLog}'.$$; cat '${inputLog}'.$$ >> '${inputLog}'; exec '${Bun.which("git")}' "$@" < '${inputLog}'.$$;; esac`,
     `exec '${Bun.which("git")}' "$@"`,
@@ -903,7 +903,7 @@ function gitShim(stall: boolean | "fail" = false) {
   writeFileSync(join(bin, "git"), script, { mode: 0o755 });
   const env = { ...(process.env as Record<string, string>), PATH: `${bin}:${process.env.PATH}` };
   const calls = () => readFileSync(log, "utf8").split("\n").filter(Boolean);
-  const classifications = () => calls().filter((call) => call.includes(" --cached --numstat "));
+  const classifications = () => calls().filter((call) => call.includes(" --cached --raw --numstat "));
   return { env, calls, classifications, pathspecs: () => readFileSync(inputLog, "utf8").split("\0") };
 }
 
@@ -1100,7 +1100,7 @@ test("local repositories classify content with an explicit empty attribute sourc
     const scratch = call.match(/^--git-dir=(\S+)/)?.[1];
     expect(scratch).toBeDefined();
     expect(scratch && existsSync(scratch)).toBe(false);
-    expect(call).toContain(" diff --cached --numstat");
+    expect(call).toContain(" diff --cached --raw --numstat");
   }
 });
 

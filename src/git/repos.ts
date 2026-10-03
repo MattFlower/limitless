@@ -573,17 +573,26 @@ async function attributeInfo(
   const textAt = async (tree: string, pathspecs: string[], seen = matches) => {
     const raw = new Set<string>();
     if (!pathspecs.length) return { raw, text: raw };
-    const EMPTY_TREE = await emptyTreeOf();
+    const empty = await emptyTreeOf();
     // A fresh index per query lets classifications run concurrently.
     const index = join(scratch, `index-${indexes++}`);
     const specs = `${pathspecs.join("\0")}\0`;
     await scratchGit(["reset", "-q", tree, "--pathspec-from-file=-", "--pathspec-file-nul"], specs, index);
-    const flags = ["--cached", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv"];
-    const args = [`--attr-source=${EMPTY_TREE}`, "-c", NO_BIG_FILES, "diff", ...flags, EMPTY_TREE];
+    const flags = ["--cached", "--raw", "--numstat", "-z", "--no-abbrev", "--no-renames", "--no-ext-diff"];
+    const args = [`--attr-source=${empty}`, "-c", NO_BIG_FILES, "diff", ...flags, "--no-textconv", empty];
     const out = await scratchGit(args, undefined, index);
     rmSync(index, { force: true });
-    for (const entry of out.stdout.split("\0")) {
-      const match = entry.match(/^(\d+|-)\t(?:\d+|-)\t([\s\S]+)$/);
+    // Raw entries (blob id, then path) precede the numstat entries. Looking blobs up by id
+    // avoids a tree walk per `tree:path`, which dominates audits of many thousand files.
+    const blobs = new Map<string, string>();
+    const entries = out.stdout.split("\0");
+    for (let i = 0; i < entries.length; i++) {
+      const blob = entries[i]?.match(/^:\d+ \d+ \S+ (\S+) /);
+      if (blob?.[1]) {
+        blobs.set(entries[++i] ?? "", blob[1]);
+        continue;
+      }
+      const match = entries[i]?.match(/^(\d+|-)\t(?:\d+|-)\t([\s\S]+)$/);
       if (match?.[2]) {
         seen.add(match[2]);
         if (match[1] !== "-") raw.add(match[2]);
@@ -593,9 +602,9 @@ async function attributeInfo(
     const text = new Set(raw);
     const candidates = [...raw];
     if (candidates.length) {
-      const input = candidates.map((path) => `${tree}:${path}\0`).join("");
+      const input = candidates.map((path) => `${blobs.get(path)}\n`).join("");
       const sizes = (
-        await git(["cat-file", "--batch-check=%(objectname) %(objectsize)", "-z"], input)
+        await git(["cat-file", "--batch-check=%(objectname) %(objectsize)"], input)
       ).stdout.split("\n");
       for (const [i, path] of candidates.entries()) {
         const [oid = "", bytes] = (sizes[i] ?? "").split(" ");
