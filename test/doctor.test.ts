@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { doctor, setupCommand } from "../src/cli/setup.ts";
+import { doctor, setupCommand, setupDeps } from "../src/cli/setup.ts";
 import { tomlValue } from "../src/router/config-catalog.ts";
 import { customProvider } from "./provider-config-support.ts";
 import { setupFixture } from "./setup-support.ts";
@@ -13,6 +13,36 @@ const keyProvider = {
   health_url: "http://provider.invalid/health",
 };
 type Fixture = ReturnType<typeof setupFixture>;
+test("real setup runner preserves the child environment and overrides only the configured port", async () => {
+  const f = setupFixture("[server]\nport = 7461\n");
+  const env = {
+    PATH: `${join(f.root, "bin")}:${process.env.PATH ?? ""}`,
+    HOME: join(f.root, "user"),
+    LIMITLESS_HOME: f.home,
+    LIMITLESS_CONFIG_DIR: f.configDir,
+    LIMITLESS_APP_DIR: join(f.root, "app"),
+    LIMITLESS_PORT: "9999",
+  };
+  const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  try {
+    const d = setupDeps({ configDir: f.configDir, home: f.home });
+    Object.assign(process.env, env);
+    const result = await d.run([
+      process.execPath,
+      "--eval",
+      `console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(Object.keys(env))}.map(key => [key, process.env[key]]))))`,
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({ ...env, LIMITLESS_PORT: "7461" });
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    f.close();
+  }
+});
 const cases: [string, string, string, (f: Fixture) => void][] = [
   [
     "git",

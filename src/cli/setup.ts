@@ -236,7 +236,7 @@ export function setupDeps(options: SetupPaths = {}) {
     appDir = options.appDir ?? process.env.LIMITLESS_APP_DIR ?? join(homedir(), ".limitless/app");
   const main = join(repositoryRoot, "src/cli/main.ts");
   const run = (args: string[], cwd = repositoryRoot, timeoutMs = 10000): Promise<CommandResult> =>
-    sh(args, { cwd, allowFail: true, timeoutMs, env: { LIMITLESS_PORT: String(config.port) } });
+    sh(args, { cwd, allowFail: true, timeoutMs, env: { ...process.env, LIMITLESS_PORT: `${config.port}` } });
   const d = {
     config,
     appDir,
