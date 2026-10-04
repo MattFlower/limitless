@@ -6,10 +6,10 @@ How the factory runs day to day, where to look when something breaks, and how ch
 
 | Component | Where | Managed by | Logs |
 |---|---|---|---|
-| Daemon (API, UI, scheduler, pipeline) | Mac, `~/.limitless/app` (release checkout of `main`) | launchd `cc.mattflower.limitless` | `~/.limitless/logs/cc.mattflower.limitless.log` |
+| Daemon (API, UI, scheduler, pipeline) | Mac, `~/.limitless/app` (release checkout of `main`) | launchd `dev.limitless.daemon` | `~/.limitless/logs/dev.limitless.daemon.log` |
 | Local model (Qwen3.8 Flash Next; Swift-1.5 27B opt-in) | Mac, `127.0.0.1:8989` | external: oMLX.app / `omlx start` | oMLX server logs |
 | GPU model (Qwen 3.8 27B, CUDA llama.cpp) | twilight, `:8080` (LAN, API key) | systemd user unit `limitless-llama` (linger on) | `journalctl --user -u limitless-llama` on twilight |
-| Public webhook tunnel | Cloudflare → `<public_url host>/webhooks/*` | launchd `cc.mattflower.limitless-tunnel` (opt-in) | `~/.limitless/logs/cc.mattflower.limitless-tunnel.log` |
+| Public webhook tunnel | Cloudflare → `<public_url host>/webhooks/*` | launchd `dev.limitless.tunnel` (opt-in) | `~/.limitless/logs/dev.limitless.tunnel.log` |
 | Data | `~/.limitless/` — `limitless.db`, `repos/` (bare caches), `work/` (worktrees), `runs/<id>/inv-*.log` (raw agent streams) | the daemon | — |
 | Config & secrets | `~/.config/limitless/config.toml`, `secrets.env` (chmod 600) | you | — |
 
@@ -30,6 +30,11 @@ limitless deploy --smoke            # also run live CLI contract checks before r
 ```
 
 (`limitless` is `bun src/cli/main.ts` from a checkout, or link it onto your PATH.)
+
+`limitless service install` migrates older installations to the neutral labels above. It drains
+the daemon with the same 45-minute wait as deploy, stops the old agent, then starts and checks
+the replacement. A failed replacement restores the previous plist and starts that agent fresh.
+Only requested tunnel and mtplx agents migrate; they restart with rollback without draining.
 
 ## Shipping a change
 
@@ -58,7 +63,7 @@ An interrupted deploy logs `interrupted, rolling back...` and attempts to restor
 checkout and resume the scheduler. If the process was killed during rollback, inspect
 `limitless service status` and the release checkout before retrying `limitless deploy`. If the
 daemon has no boot SHA while the checkout already matches the target, restart it with
-`launchctl kickstart -k gui/$UID/cc.mattflower.limitless` (or `limitless service install`),
+`launchctl kickstart -k gui/$UID/dev.limitless.daemon` (or `limitless service install`),
 then retry. A second interrupt exits immediately; recovery may then require those manual steps.
 
 ## Live CLI smoke checks
