@@ -89,7 +89,7 @@ async function migration(
   dir = mkdtempSync(join(tmpdir(), "limitless-service-migration-")),
 ) {
   migrationDirs.push(dir);
-  const child = Bun.spawn([process.execPath, "test/fixtures/service-migration.ts", scenario, kind], {
+  const child = Bun.spawn([process.execPath, "test/service-migration-support.ts", scenario, kind], {
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, SERVICE_TEST_HOME: dir },
@@ -353,7 +353,7 @@ for (const scenario of ["install-install", "install-deploy", "deploy-install"]) 
 async function interrupted(scenario: string, signal: "SIGINT" | "SIGTERM" | "SIGKILL", twice = false) {
   const dir = mkdtempSync(join(tmpdir(), "limitless-interrupted-migration-"));
   migrationDirs.push(dir);
-  const child = Bun.spawn([process.execPath, "test/fixtures/service-migration.ts", scenario], {
+  const child = Bun.spawn([process.execPath, "test/service-migration-support.ts", scenario], {
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, SERVICE_TEST_HOME: dir },
@@ -433,7 +433,7 @@ for (const operation of ["recover-install", "recover-deploy"]) {
 test("healthy replacement after process loss clears recovery data before deployment", async () => {
   const dir = mkdtempSync(join(tmpdir(), "limitless-healthy-migration-"));
   migrationDirs.push(dir);
-  const child = Bun.spawn([process.execPath, "test/fixtures/service-migration.ts", "crash-healthy"], {
+  const child = Bun.spawn([process.execPath, "test/service-migration-support.ts", "crash-healthy"], {
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, SERVICE_TEST_HOME: dir },
