@@ -1053,9 +1053,13 @@ export class Store {
     return row ? toRun(row) : null;
   }
 
-  listRuns(opts: { status?: RunStatus[]; limit?: number; repoId?: string } = {}): Run[] {
+  listRuns(opts: { status?: RunStatus[]; limit?: number; repoId?: string; ids?: string[] } = {}): Run[] {
     const where: string[] = [];
     const params: (string | number)[] = [];
+    if (opts.ids?.length) {
+      where.push(`runs.id IN (${opts.ids.map(() => "?").join(",")})`);
+      params.push(...opts.ids);
+    }
     if (opts.status?.length) {
       where.push(`runs.status IN (${opts.status.map(() => "?").join(",")})`);
       params.push(...opts.status);

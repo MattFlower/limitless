@@ -368,8 +368,11 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle((req) => {
         const url = new URL(req.url);
         const status = url.searchParams.get("status")?.split(",").filter(Boolean) as RunStatus[] | undefined;
+        const ids = url.searchParams.get("ids")?.split(",").filter(Boolean);
         const limit = Number(url.searchParams.get("limit") ?? 100);
-        return json(store.listRuns({ ...(status ? { status } : {}), limit }));
+        return json(
+          store.listRuns({ ...(status ? { status } : {}), ...(ids?.length ? { ids } : {}), limit }),
+        );
       }),
       POST: handle(async (req) => {
         const input = await body<CreateRunRequest>(req);

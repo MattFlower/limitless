@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { renderToString } from "solid-js/web";
-import type { Run, RunDetail, StreamMessage } from "../src/core/types.ts";
+import type { Question, Run, RunDetail, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { normalizePr } from "../src/integrations/github-poller.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -704,6 +704,72 @@ test("a resolution that arrives after its SSE update still refreshes the run's d
       } finally {
         globalThis.fetch = originalFetch;
       }
+    },
+  );
+});
+
+test("a pushed update beats an older read in flight, and the next read after a gap replaces it", async () => {
+  const asked: Question = {
+    id: 1,
+    runId: run.id,
+    question: "Which database should it use?",
+    answer: null,
+    askedAt: 1,
+    answeredAt: null,
+    answeredBy: null,
+  };
+  const stage = detail.stages[0];
+  if (!stage) throw new Error("missing fixture stage");
+  const stale = deferred<Response>();
+  await withStream(
+    (request) => (request === 2 ? stale.promise : Promise.resolve(Response.json(detail))),
+    async ({ stream, clock, requests }) => {
+      stream.onopen?.();
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(requests()).toBe(2);
+      stream.emit({ kind: "question", question: { ...asked, answer: "Postgres", answeredAt: 2 } });
+      stale.resolve(Response.json({ ...detail, questions: [asked] }));
+      await clock.flush();
+      expect(render()).not.toContain(asked.question);
+
+      stream.emit({ kind: "stage", stage: { ...stage, status: "running" } });
+      expect(render()).toContain("timeline-bar running");
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+      expect(render()).toContain(`timeline-bar ${stage.status}`);
+      expect(render()).not.toContain("timeline-bar running");
+    },
+  );
+});
+
+test("an older reconnect read cannot erase a newer artifact refresh", async () => {
+  const reconnectRead = deferred<Response>();
+  const finished = detail.stages[0];
+  if (!finished) throw new Error("missing fixture stage");
+  await withStream(
+    async (request) =>
+      request === 1
+        ? Response.json(detail)
+        : request === 2
+          ? reconnectRead.promise
+          : Response.json(newerDetail),
+    async ({ stream, clock, requests }) => {
+      stream.onopen?.();
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      stream.emit({ kind: "stage", stage: finished });
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+      expect(render()).toContain("current.json");
+      reconnectRead.resolve(Response.json(detail));
+      await clock.flush();
+      expect(render()).toContain("current.json");
+      expect(render()).not.toContain("review-1.json");
     },
   );
 });

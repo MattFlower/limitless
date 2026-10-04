@@ -30,6 +30,8 @@ export async function buildNeedsYouUi(dir: string): Promise<NeedsYouUi> {
             let source = await Bun.file(args.path).text();
             if (args.path.endsWith("/RunDetail.tsx")) {
               source = source.replace("onCleanup, onMount, ", "");
+              // Server-rendered memos compute once; re-evaluate on each read so later renders see updates.
+              source = source.replace("import { createMemo, ", "import { ");
               source = source.replace(
                 'import { useNavigate, useParams } from "@solidjs/router";',
                 "const useNavigate = () => (path: string) => navigated.push(path); const useParams = <T,>(): T => ({ id: fixture.run.id }) as T;",
@@ -69,6 +71,7 @@ export async function buildNeedsYouUi(dir: string): Promise<NeedsYouUi> {
                 );
               }
               source += `
+              const createMemo = <T,>(fn: () => T) => fn;
               let fixture: Detail;
               let empty = false;
               let mounts: (() => void)[] = [], cleanups: (() => void)[] = [];

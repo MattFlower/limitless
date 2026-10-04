@@ -63,9 +63,12 @@ export function getHealth(): Promise<HealthResponse> {
   return request<HealthResponse>("/api/health", { signal: AbortSignal.timeout(5000) });
 }
 
-export function listRuns(opts: { status?: RunStatus[]; limit?: number } = {}): Promise<Run[]> {
+export function listRuns(
+  opts: { status?: RunStatus[]; limit?: number; ids?: string[] } = {},
+): Promise<Run[]> {
   const qs = new URLSearchParams();
   if (opts.status?.length) qs.set("status", opts.status.join(","));
+  if (opts.ids?.length) qs.set("ids", opts.ids.join(","));
   if (opts.limit) qs.set("limit", String(opts.limit));
   const q = qs.toString();
   return request<Run[]>(`/api/runs${q ? `?${q}` : ""}`);
@@ -159,6 +162,8 @@ export function getRepos(): Promise<Repo[]> {
   return request<Repo[]>("/api/repos");
 }
 
+const CLOSED = 2; // EventSource.CLOSED
+
 /**
  * The browser's EventSource retries a dropped connection itself, but gives up for good on an HTTP
  * error, such as a reverse proxy's 502 while the daemon restarts; reopen it after a pause then.
@@ -175,7 +180,7 @@ function openEventStream(
     source.onopen = () => onConnected(true);
     source.onerror = () => {
       onConnected(false);
-      if (source.readyState === EventSource.CLOSED) retry = setTimeout(open, 3000);
+      if (source.readyState === CLOSED) retry = setTimeout(open, 3000);
     };
     source.onmessage = (ev) => onData(ev.data);
   };

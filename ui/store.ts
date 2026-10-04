@@ -7,7 +7,7 @@ import { createSignal } from "solid-js";
 import { createStore, produce, reconcile } from "solid-js/store";
 import type { ProviderStatus, QuotaAlert, Run } from "../src/core/types.ts";
 import { getAlerts, getHealth, getProviders, listRuns, openGlobalStream } from "./api.ts";
-import { createCatchUp } from "./lib/catch-up.ts";
+import { createCatchUp, type Timers } from "./lib/catch-up.ts";
 
 const [runsById, setRunsById] = createStore<Record<string, Run>>({});
 const [providersById, setProvidersById] = createStore<Record<string, ProviderStatus>>(Object.create(null));
@@ -46,6 +46,7 @@ export function ensureLiveStore(
       setInterval(fn, ms);
     },
   },
+  timers?: Timers,
 ): void {
   if (started) return;
   started = true;
@@ -67,10 +68,23 @@ export function ensureLiveStore(
   const pendingAlerts = new Map<string, QuotaAlert | null>();
 
   const sync = createCatchUp(
-    () => {
+    async () => {
       alertsHydrated = false;
       pendingAlerts.clear();
-      return Promise.all([deps.listRuns({ limit: 200 }), deps.getProviders(), deps.getAlerts()]);
+      const [runs, providers, alerts] = await Promise.all([
+        deps.listRuns({ limit: 200 }),
+        deps.getProviders(),
+        deps.getAlerts(),
+      ]);
+      // Cached runs outside that window, such as an old run resolved during a gap, are re-read by id.
+      const listed = new Set(runs.map((r) => r.id));
+      const omitted = Object.values(runsById)
+        .filter((r) => !listed.has(r.id))
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .slice(0, 200)
+        .map((r) => r.id);
+      const refreshed = omitted.length ? await deps.listRuns({ ids: omitted, limit: omitted.length }) : [];
+      return [[...runs, ...refreshed], providers, alerts] as const;
     },
     ([runs, providers, alerts], pushed) => {
       setRunsById(
@@ -97,6 +111,7 @@ export function ensureLiveStore(
       alertsHydrated = true;
       setHydrated(true);
     },
+    timers,
   );
   sync.load();
 
