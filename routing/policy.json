@@ -9,21 +9,17 @@
       "openrouter/gpt-6-luna@none",
       "twilight/qwen-27b@none",
       "mtplx/qwen-27b@high",
-      "claude/sonnet@low"
+      "claude/sonnet-5.5@low"
     ]
   },
   "implement": {
-    "trivial": ["codex/sol-6.1@high", "codex/astra@high", "claude/opus"],
-    "small": ["codex/sol-6.1@high", "codex/astra@high", "claude/opus"],
-    "medium": ["codex/sol-6.1@high", "codex/astra@high", "claude/opus"],
-    "large": ["codex/astra@high", "codex/sol-6.1@high", "claude/opus"]
+    "trivial": ["codex/sol-6.1@high", "claude/opus"],
+    "small": ["codex/sol-6.1@high", "claude/opus"],
+    "medium": ["codex/sol-6.1@high", "claude/opus"],
+    "large": ["codex/sol-6.1@high", "claude/opus"]
   },
   "review": {
-    "default": [
-      "codex/sol-6.1|codex/sol|codex/sol-5.6|claude/opus",
-      "openrouter/glm-5.3",
-      "codex/astra|claude/opus"
-    ],
-    "large": ["codex/astra|claude/opus", "codex/sol-6.1|codex/sol|codex/sol-5.6|claude/sonnet"]
+    "default": ["codex/sol-6.1|codex/sol|codex/sol-5.6|claude/opus", "openrouter/glm-5.3", "claude/opus"],
+    "large": ["claude/opus", "codex/sol-6.1|codex/sol|codex/sol-5.6|claude/sonnet-5.5"]
   }
 }
