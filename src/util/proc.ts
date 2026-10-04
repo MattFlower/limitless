@@ -238,7 +238,6 @@ export async function sh(
     timeoutMs?: number;
     allowFail?: boolean;
     stdin?: string;
-    encoding?: BufferEncoding;
     signal?: AbortSignal;
   },
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
@@ -247,7 +246,6 @@ export async function sh(
     cmd,
     cwd: opts.cwd,
     signal: opts.signal,
-    encoding: opts.encoding,
     env: opts.env ?? (process.env as Record<string, string>),
     timeoutMs: opts.timeoutMs ?? 120_000,
     // Callers parse this output (diffs, JSON); never silently hand them a truncated tail.
@@ -259,7 +257,7 @@ export async function sh(
   if (res.truncated) {
     throw new Error(`Output of \`${cmd.join(" ")}\` exceeded ${SH_OUTPUT_LIMIT} characters`);
   }
-  if (res.cancelled || res.timedOut || (res.exitCode !== 0 && !opts.allowFail)) {
+  if (res.exitCode !== 0 && !opts.allowFail) {
     throw new CommandError(
       `Command failed (${res.exitCode ?? res.signal}): ${cmd.join(" ")}\n${res.stderr.trim() || res.stdout.trim()}`.slice(
         0,

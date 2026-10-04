@@ -99,6 +99,7 @@ export async function prepareCase(
     const gates = await gatesAt(cwd, item.base, signal);
     const names = gateScriptNames(gates);
     const audit = auditDiff(diff, {
+      roots: [cwd],
       allow: parseAllow(item.input.prompt),
       taskClass: null,
       protectedPaths: gates.protectedPaths,

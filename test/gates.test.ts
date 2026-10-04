@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
 import { attributeRules, auditDiff, newlyHidden, unquote } from "../src/gates/audit.ts";
 import {
@@ -782,6 +782,9 @@ test("private policy rejects broken lists and repository aliases; normalizes bot
       expect(privateMatches(redactPrivate(text, entries), entries)).toEqual([]);
     }
     expect(privateMatches("secret-\nhost.example", entries)).toEqual([]);
+    // Compatibility letters must be normalized before context-sensitive lowercasing.
+    writeFileSync(file, "AΣᴬ");
+    expect(privateMatches("aσa", loadPrivateStrings(config))).toHaveLength(1);
     writeFileSync(file, "＃secret-host.example");
     expect(privateMatches("#secret-host.example", loadPrivateStrings(config))).toHaveLength(1);
     const alias = join(root, "alias");
@@ -796,6 +799,41 @@ test("private policy rejects broken lists and repository aliases; normalizes bot
     writeFileSync(join(repo, "list"), "secret-host.example");
     symlinkSync(join(repo, "list"), file);
     expect(() => loadPrivateStrings(config, [repo])).toThrow("inside repository");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("daemon invocation directory is not an implicit repository root", async () => {
+  const root = mkdtempSync(join(tmpdir(), "private-daemon-cwd-"));
+  const config = join(root, "config");
+  const repo = join(root, "repo");
+  mkdirSync(config);
+  mkdirSync(repo);
+  writeFileSync(join(config, "private-strings.txt"), "secret-host.example");
+  const program = `
+    import { loadPrivateStrings } from ${JSON.stringify(resolve("src/gates/private.ts"))};
+    import { auditDiff } from ${JSON.stringify(resolve("src/gates/audit.ts"))};
+    const diff = { patch: "", files: [], stat: "", added: 0, removed: 0 };
+    if (loadPrivateStrings()[0]?.value !== "secret-host.example") throw new Error("missing list");
+    auditDiff(diff, { taskClass: "question", protectedPaths: [], roots: [${JSON.stringify(repo)}] });
+    for (const roots of [[${JSON.stringify(config)}], [${JSON.stringify(root)}]]) {
+      let blocked = false;
+      try { auditDiff(diff, { taskClass: "question", protectedPaths: [], roots }); }
+      catch (error) { blocked = error.message.includes("inside repository"); }
+      if (!blocked) throw new Error("repository config accepted");
+    }
+  `;
+  try {
+    const child = Bun.spawn([process.execPath, "-e", program], {
+      cwd: root,
+      env: { ...process.env, LIMITLESS_CONFIG_DIR: "config" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = await new Response(child.stderr).text();
+    expect(stderr).toBe("");
+    expect(await child.exited).toBe(0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

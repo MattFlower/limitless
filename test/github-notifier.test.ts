@@ -587,53 +587,63 @@ test("a stale snapshot never hides an untracked PR from the fallback; a merged o
 });
 
 for (const kind of ["issue", "pull_request"] as const) {
-  test.each(["matching", "encoded", "malformed", "unreadable", "absent", "clean"])(
-    `private factory ${kind} comment: %s`,
-    async (scenario) => {
-      const calls: string[][] = [];
-      const file = join(dir, "private-strings.txt");
-      if (scenario === "unreadable") mkdirSync(file);
-      else if (scenario !== "absent")
-        writeFileSync(file, scenario === "malformed" ? Buffer.from([0xff]) : "secret-host.example");
-      const stop = startGitHubNotifier(
-        store,
-        async (args) => {
-          calls.push(args);
-        },
-        () => {},
-        async () => null,
-        dir,
-      );
-      try {
-        const repo = store.upsertRepo({
-          slug: "fake/repo",
-          kind: "github",
-          url: "unused",
-          localPath: null,
-          defaultBranch: "main",
-          mergePolicy: "pr",
-        });
-        const run = store.createRun(repo, {
-          repo: repo.slug,
-          prompt: "fix",
-          source: "github",
-          sourceRef: { kind, repo: repo.slug, number: 1 },
-        });
-        calls.length = 0;
-        store.updateRun(run.id, {
-          status: "succeeded",
-          prUrl:
-            scenario === "encoded"
-              ? "https://%73ecret-host.example/pr/1"
-              : scenario === "matching"
-                ? "https://secret-host.example/pr/1"
-                : undefined,
-        });
-        await Bun.sleep(0);
-        expect(calls).toHaveLength(["clean", "absent"].includes(scenario) ? 1 : 0);
-      } finally {
-        stop();
-      }
-    },
-  );
+  test.each([
+    "matching",
+    "encoded",
+    "malformed",
+    "unreadable",
+    "absent",
+    "clean",
+    "repository-config",
+    "worktree-config",
+  ])(`private factory ${kind} comment: %s`, async (scenario) => {
+    const calls: string[][] = [];
+    const file = join(dir, "private-strings.txt");
+    if (scenario === "unreadable") mkdirSync(file);
+    else if (scenario !== "absent")
+      writeFileSync(file, scenario === "malformed" ? Buffer.from([0xff]) : "secret-host.example");
+    const invocationDir = process.cwd();
+    process.chdir(dir);
+    const stop = startGitHubNotifier(
+      store,
+      async (args) => {
+        calls.push(args);
+      },
+      () => {},
+      async () => null,
+      dir,
+    );
+    try {
+      const repo = store.upsertRepo({
+        slug: "fake/repo",
+        kind: "github",
+        url: "unused",
+        localPath: scenario === "repository-config" ? dir : null,
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const run = store.createRun(repo, {
+        repo: repo.slug,
+        prompt: "fix",
+        source: "github",
+        sourceRef: { kind, repo: repo.slug, number: 1 },
+      });
+      if (scenario === "worktree-config") store.setRunState(run.id, { worktreePath: dir });
+      calls.length = 0;
+      store.updateRun(run.id, {
+        status: "succeeded",
+        prUrl:
+          scenario === "encoded"
+            ? "https://%73ecret-host.example/pr/1"
+            : scenario === "matching"
+              ? "https://secret-host.example/pr/1"
+              : undefined,
+      });
+      await Bun.sleep(0);
+      expect(calls).toHaveLength(["clean", "absent"].includes(scenario) ? 1 : 0);
+    } finally {
+      stop();
+      process.chdir(invocationDir);
+    }
+  });
 }

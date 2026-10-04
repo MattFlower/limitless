@@ -190,6 +190,7 @@ export function auditDiff(
   diff: DiffInfo,
   ctx: {
     configDir?: string;
+    roots?: string[];
     taskClass: TaskClass | null;
     protectedPaths: string[];
     toolCommands?: string[];
@@ -198,7 +199,7 @@ export function auditDiff(
     allow?: readonly AuditAllowance[];
   },
 ): AuditFinding[] {
-  const entries = loadPrivateStrings(ctx.configDir);
+  const entries = loadPrivateStrings(ctx.configDir, ctx.roots);
   const findings: AuditFinding[] = [];
   if (diff.files.length === 0 && ctx.taskClass !== "question") {
     findings.push({

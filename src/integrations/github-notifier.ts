@@ -57,7 +57,6 @@ export function startGitHubNotifier(
   log: (message: string) => void = console.warn,
   client: GitHubPrClient = getGitHubPr,
   configDir?: string,
-  roots: string[] = [],
 ): () => void {
   const seen = new Set<string>();
   let stopped = false;
@@ -111,12 +110,8 @@ export function startGitHubNotifier(
       ? `Limitless run ${run.id} finished: **${run.status}**.\nPR: ${run.prUrl ?? "none"}\nCost: $${run.costUsd.toFixed(2)} (${run.costEquivUsd.toFixed(2)} subscription equivalent).`
       : `Limitless run created: ${run.id}`;
     try {
-      const entries = loadPrivateStrings(configDir, [
-        process.cwd(),
-        ...roots,
-        store.getRunState<{ worktreePath?: string }>(run.id)?.worktreePath ?? process.cwd(),
-        store.getRepo(run.repoId)?.localPath ?? process.cwd(),
-      ]);
+      const cwd = store.getRunState<{ worktreePath?: string }>(run.id)?.worktreePath;
+      const entries = loadPrivateStrings(configDir, [cwd, store.getRepo(run.repoId)?.localPath]);
       checkPrivateText(body, "Factory comment", entries);
     } catch {
       log("Factory comment blocked by private-string policy");
