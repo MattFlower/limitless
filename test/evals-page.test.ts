@@ -161,7 +161,9 @@ test("Evals SSR renders navigation, loading/errors/empty states, matrix, run cos
     expect(legacyHtml).toContain("codex/luna → unknown model (legacy) · low");
     expect(legacyHtml).not.toContain("→ null");
     expect(invocationHtml).toContain('<th class="num">Cache hit</th>');
-    expect(invocationHtml).toContain('title="3.0k cached, 500 written, 1.0k uncached of 4.5k prompt tokens"');
+    expect(invocationHtml).toContain(
+      'title="3.0k cached, 500 written, 1.0k not cached of 4.5k prompt tokens"',
+    );
     expect(invocationHtml).toContain("66.7%");
     expect(invocationHtml.match(/<th[ >]/g)).toHaveLength(11);
     expect(

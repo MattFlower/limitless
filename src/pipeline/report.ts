@@ -254,7 +254,7 @@ export function renderReport(input: ReportInput): string {
         ]),
       ),
       `**Total:** ${money(input.totals.costUsd)} spent, ${money(input.totals.costEquivUsd)} API-equivalent on subscriptions.`,
-      `**Cache:** ${cacheHitRate(cached, promptTokens(work))} of prompt tokens read from cache (${cached.toLocaleString("en-US")} cached, ${written.toLocaleString("en-US")} written, ${uncached.toLocaleString("en-US")} uncached).`,
+      `**Cache:** ${cacheHitRate(cached, promptTokens(work))} of prompt tokens read from cache (${cached.toLocaleString("en-US")} cached, ${written.toLocaleString("en-US")} written, ${uncached.toLocaleString("en-US")} not cached; cache writes older rows never recorded count here).`,
       ...(shadow.length ? [shadowSpend] : []),
     );
   }
