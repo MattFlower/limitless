@@ -20,6 +20,7 @@ export function providersExport(write: boolean, yes = false): void {
     .join("");
   const replacement = `${settings}\n${output}`;
   resolveCatalog((Bun.TOML.parse(replacement) as Record<string, unknown>).providers);
+  fs.mkdirSync(cfg.paths.configDir, { recursive: true });
   const backup = `${file}.${crypto.randomUUID()}.bak`;
   const warning = `One-way migration: the previous release cannot load [[providers]]. Rollback requires ${original ? `restoring the original backup: ${backup}` : "removing the new config; no previous config backup exists"}.`;
   console.error(warning);
@@ -29,7 +30,6 @@ export function providersExport(write: boolean, yes = false): void {
     (!process.stdin.isTTY || !/^y(es)?$/i.test(prompt(`${warning} Replace config? [y/N]`)?.trim() ?? ""))
   )
     throw new Error("Config replacement refused; confirm interactively or use --yes");
-  fs.mkdirSync(cfg.paths.configDir, { recursive: true });
   const temp = `${file}.${crypto.randomUUID()}.tmp`;
   try {
     fs.writeFileSync(temp, replacement, { flag: "wx", mode: 0o600 });

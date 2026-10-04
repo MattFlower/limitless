@@ -443,7 +443,8 @@ test("native fast flags cover edit, structured and isolated readers without leak
   });
 });
 
-test("configured backend auth survives inherited credential filtering and stays redacted", async () => {
+test("configured backend auth reaches the CLI only through a key helper, never the agent environment", async () => {
+  const { existsSync, statSync } = await import("node:fs");
   const { customModel, customProvider, providerFixture } = await import("./provider-config-support.ts");
   const { agentEnv, runProcess } = await import("../src/util/proc.ts");
   const { Factory } = await import("../src/app.ts");
@@ -468,10 +469,15 @@ test("configured backend auth survives inherited credential filtering and stays 
     process.env[key] = "FAKE_INHERITED_BACKEND_TOKEN_735";
     const factory = new Factory(fixture.load(), { store });
     expect(factory.tracker.authToken("mac-mlx")).toBe(token);
-    expect(agentEnv()[key]).toBeUndefined();
+    // Explicit overrides cannot reintroduce a configured credential under any name.
+    expect(agentEnv({ [key]: token, OTHER_NAME: token, KEPT: "ordinary" })).toMatchObject({
+      KEPT: "ordinary",
+    });
+    expect(Object.values(agentEnv({ [key]: token, OTHER_NAME: token }))).not.toContain(token);
     const resolved = factory.router.resolveFor("triage", "mac-mlx/flash");
     const events: AgentEvent[] = [];
     const logPath = join(fixture.root, "backend.log");
+    let keyFile = "";
     const result = await runClaude(
       {
         cwd: fixture.root,
@@ -486,20 +492,32 @@ test("configured backend auth survives inherited credential filtering and stays 
         onEvent: (event) => events.push(event),
       },
       async (options) => {
-        const child = await runProcess({
+        const settings: { apiKeyHelper: string } = JSON.parse(
+          options.cmd[options.cmd.indexOf("--settings") + 1] ?? "{}",
+        );
+        keyFile = JSON.parse(settings.apiKeyHelper.replace(/^cat /, ""));
+        expect(readFileSync(keyFile, "utf8")).toBe(token);
+        expect(statSync(keyFile).mode & 0o077).toBe(0);
+        expect(options.env?.ANTHROPIC_BASE_URL).toBe("https://example.invalid");
+        const helper = await runProcess({
+          cmd: ["sh", "-c", settings.apiKeyHelper],
+          cwd: fixture.root,
+          env: {},
+        });
+        expect(helper.stdout).toBe(token);
+        return runProcess({
           ...options,
           cmd: [
             process.execPath,
             "-e",
-            `const token = process.env.ANTHROPIC_AUTH_TOKEN; console.log(JSON.stringify({type:"result",result:"authenticated " + token})); process.exit(token === ${JSON.stringify(token)} ? 0 : 1);`,
+            `const leaked = Object.values(process.env).includes(${JSON.stringify(token)}); console.log(JSON.stringify({type:"result",result:"auth " + (process.env.ANTHROPIC_AUTH_TOKEN ?? "absent") + " leaked=" + leaked}));`,
           ],
         });
-        expect(child.exitCode).toBe(0);
-        return child;
       },
     );
     expect(result.status).toBe("ok");
-    expect(result.finalText).toBe("authenticated [credential]");
+    expect(result.finalText).toBe("auth absent leaked=false");
+    expect(existsSync(keyFile)).toBe(false);
     for (const recorded of [JSON.stringify(events), JSON.stringify(result), readFileSync(logPath, "utf8")]) {
       expect(recorded).not.toContain(token);
       expect(recorded).not.toContain(process.env[key] ?? "missing");

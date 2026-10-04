@@ -314,3 +314,31 @@ test("a decline keeps the mapped output and the cost, with the reason as the err
   expect(result.structured).toMatchObject({ mapped: { kind: { choice: "bug" } } });
   expect(JSON.parse(result.finalText)).toMatchObject({ urgent: { noul: 0.2 } });
 });
+
+test("the factory's decisions harness never writes a configured credential to its log", async () => {
+  const { Factory } = await import("../src/app.ts");
+  const { customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const secret = "FAKE_DECISIONS_CREDENTIAL_919";
+  const fixture = providerFixture(
+    [{ ...customProvider, api_key_env: "MAC_MLX_KEY" }],
+    `MAC_MLX_KEY=${secret}\n`,
+  );
+  const store = new Store(":memory:");
+  const factory = new Factory(fixture.load(), { store });
+  try {
+    reply = () => Response.json({ model: secret, answers, usage: { input_tokens: 1, output_tokens: 1 } });
+    const harness = factory.deps.harnesses.decisions;
+    if (!harness) throw new Error("decisions harness missing");
+    const events: AgentEvent[] = [];
+    const result = await harness(spec({ onEvent: (e) => events.push(e) }));
+    expect(result.status).toBe("ok");
+    const log = readFileSync(join(dir, "log"), "utf8");
+    expect(log).toContain('"model":"[credential]"');
+    for (const recorded of [log, JSON.stringify(events), JSON.stringify(result)])
+      expect(recorded).not.toContain(secret);
+  } finally {
+    await factory.stop();
+    store.close();
+    fixture.close();
+  }
+});

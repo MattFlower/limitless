@@ -117,17 +117,15 @@ export function redactJsonLine(line: string, redact?: (text: string) => string):
       typeof value === "string" ? redact(value) : value,
     );
   } catch {
-    return redactCredentials(redact(line));
+    return redact(line);
   }
 }
 
-export function protectCredentials(spec: AgentSpec): AgentSpec {
-  return {
-    ...spec,
-    onEvent: (event) => spec.onEvent(redactCredentialData(event)),
-    redactOutput: (text) => redactCredentials(spec.redactOutput?.(text) ?? text),
-  };
-}
+export const protectCredentials = (spec: AgentSpec): AgentSpec => ({
+  ...spec,
+  onEvent: (event) => spec.onEvent(redactCredentialData(event)),
+  redactOutput: (text) => redactCredentials(spec.redactOutput?.(text) ?? text),
+});
 
 export const emptyUsage = (): Usage => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 

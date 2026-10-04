@@ -215,8 +215,9 @@ runAgent(spec: AgentSpec): AsyncIterable<AgentEvent> & { result: Promise<AgentRe
 
 - **claude-cli** spawns the official `claude -p --output-format stream-json`. Using the official
   binary with your own login is the supported way to automate a Claude subscription (research/03 §1).
-  The *same adapter* drives OpenRouter, oMLX and llama.cpp by setting `ANTHROPIC_BASE_URL` /
-  `ANTHROPIC_AUTH_TOKEN` — all of them speak the Anthropic Messages API. Factory runs use
+  The *same adapter* drives OpenRouter, oMLX and llama.cpp by setting `ANTHROPIC_BASE_URL` and an
+  `apiKeyHelper` that reads a per-invocation 0600 key file, so the backend key never enters the
+  agent's or its tools' environment — all of them speak the Anthropic Messages API. Factory runs use
   `--setting-sources project` + an explicit `--settings` so your personal hooks/plugins don't
   fire inside factory runs.
 - **codex-cli** spawns `codex exec --json` (sandbox `workspace-write`), then reads the session

@@ -372,12 +372,13 @@ export class ProviderTracker {
   private reserveFor(id: string, window: string): number {
     const configured = this.reserves.windows?.[id]?.[window];
     if (configured !== undefined) return configured;
+    // Native defaults follow the preset's kind (claude-cli, codex-cli), not the literal provider id.
     const def = this.providers.get(id)?.def;
-    const kind = def && providerKind(def);
-    if (kind === "claude-cli" && window === "five_hour") return this.reserves.claudeFiveHour;
-    if (kind === "claude-cli" && window === "seven_day") return this.reserves.claudeSevenDay;
-    if (kind === "codex-cli" && window === "five_hour") return this.reserves.codexFiveHour;
-    if (kind === "codex-cli" && window === "seven_day") return this.reserves.codexWeekly;
+    if (def) id = providerKind(def).replace(/-cli$/, "");
+    if (id === "claude" && window === "five_hour") return this.reserves.claudeFiveHour;
+    if (id === "claude" && window === "seven_day") return this.reserves.claudeSevenDay;
+    if (id === "codex" && window === "five_hour") return this.reserves.codexFiveHour;
+    if (id === "codex" && window === "seven_day") return this.reserves.codexWeekly;
     return 1;
   }
 

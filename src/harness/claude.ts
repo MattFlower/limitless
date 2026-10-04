@@ -1,4 +1,5 @@
-import { appendFileSync, realpathSync } from "node:fs";
+import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
 import { readConfinement, scratchEnv, scratchParent, validateDenyRead, validateScratch } from "./scratch.ts";
@@ -147,7 +148,7 @@ export class ClaudeStreamParser {
   }
 }
 
-export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
+export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: string): string[] {
   const t = spec.target;
   if (spec.mode === "readonly" && spec.addDirs?.length)
     throw new Error("Reading invocations cannot grant additional directories");
@@ -165,7 +166,11 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
     "--permission-mode",
     "dontAsk",
   ];
-  const fastSettings = spec.fast && t.provider === "claude" ? { fastMode: true } : {};
+  // The CLI reads backend credentials itself, so they never enter the agent's or its tools' environment.
+  const fastSettings = {
+    ...(spec.fast && t.provider === "claude" ? { fastMode: true } : {}),
+    ...(keyFile ? { apiKeyHelper: `cat ${JSON.stringify(keyFile)}` } : {}),
+  };
   const denied = ["Bash(git push:*)", "Bash(gh pr merge:*)", "Bash(gh repo delete:*)", "Bash(rm -rf /*)"];
   let readTools = ["Read", "Grep", "Glob"];
   if (spec.mode === "readonly" && !spec.noTools) {
@@ -207,7 +212,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
       }),
     );
   }
-  if (spec.fast && t.provider === "claude" && (spec.mode !== "readonly" || spec.noTools))
+  if (Object.keys(fastSettings).length && (spec.mode !== "readonly" || spec.noTools))
     args.push("--settings", JSON.stringify(fastSettings));
   if (spec.privateSession) args.push("--no-session-persistence");
   if (spec.noTools) {
@@ -254,12 +259,13 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   spec = protectCredentials(spec);
   const sessionId = crypto.randomUUID();
   const t = spec.target;
-  const args = buildClaudeArgs(spec, sessionId);
+  const keyFile = t.backend && `${tmpdir()}/limitless-${sessionId}.key`;
+  const args = buildClaudeArgs(spec, sessionId, keyFile);
   appendFileSync(spec.logPath, `# claude ${t.model} ${new Date().toISOString()}\n`);
   const envExtra: Record<string, string> = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
+  if (keyFile) writeFileSync(keyFile, t.backend?.authToken ?? "", { flag: "wx", mode: 0o600 });
   if (t.backend) {
     envExtra.ANTHROPIC_BASE_URL = t.backend.baseUrl;
-    envExtra.ANTHROPIC_AUTH_TOKEN = t.backend.authToken;
     envExtra.ANTHROPIC_API_KEY = "";
     // Background/fast tasks inside Claude Code must hit the same backend model.
     envExtra.ANTHROPIC_SMALL_FAST_MODEL = t.model;
@@ -322,7 +328,10 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
       appendFileSync(spec.logPath, `[stderr] ${spec.redactOutput?.(line) ?? line}\n`);
       spec.onEvent({ type: "stderr", text: line });
     },
-  }).finally(() => clearInterval(progressWatch));
+  }).finally(() => {
+    clearInterval(progressWatch);
+    if (keyFile) rmSync(keyFile, { force: true });
+  });
 
   const cost = priceOf(parser.usage, t.price);
   const metered = t.billing === "metered";

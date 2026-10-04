@@ -33,7 +33,7 @@ import type { GhRunner } from "../integrations/github.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
-import { redactCredentialData, redactCredentials } from "../util/proc.ts";
+import { redactCredentialData } from "../util/proc.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
@@ -591,9 +591,8 @@ export class RunContext {
       const publicSources = opts.redactHoldout && this.state.holdout ? await this.publicHoldoutSources() : "";
       const redact =
         opts.redactHoldout && this.state.holdout
-          ? (value: string) =>
-              redactCredentials(redactHoldoutText(value, this.state.holdout as Holdout, publicSources))
-          : redactCredentials;
+          ? (value: string) => redactHoldoutText(value, this.state.holdout as Holdout, publicSources)
+          : undefined;
       try {
         const spec: AgentSpec = {
           fast: invocation.fast,
@@ -801,7 +800,6 @@ export class RunContext {
     role: Role,
     redact?: (value: string) => string,
   ): void {
-    ev = redactCredentialData(ev);
     const runId = this.run.id;
     const add = (
       type: RunEvent["type"],

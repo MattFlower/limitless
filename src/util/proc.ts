@@ -274,7 +274,7 @@ export async function sh(
 // Retain registrations across config reloads while older invocations may still be running.
 const credentialNames = new Set<string>();
 const credentialValues = new Set<string>();
-export function registerCredential(name: string, value: string): void {
+export function registerCredential(name: string, value?: string): void {
   credentialNames.add(name);
   for (const secret of [value, process.env[name]])
     if (typeof secret === "string" && secret) credentialValues.add(secret);
@@ -284,23 +284,21 @@ export function redactCredentials(text: string): string {
     text = text.split(secret).join("[credential]");
   return text;
 }
-export function redactCredentialData<T>(value: T): T {
-  return JSON.parse(
-    JSON.stringify(value, (_key, v: unknown) => {
-      if (typeof v === "string") return redactCredentials(v);
-      return v && typeof v === "object" && !Array.isArray(v)
-        ? Object.fromEntries(Object.entries(v).map(([k, value]) => [redactCredentials(k), value]))
-        : v;
-    }),
+export const redactCredentialData = <T>(value: T): T =>
+  JSON.parse(
+    JSON.stringify(value, (_key, v: unknown) => (typeof v === "string" ? redactCredentials(v) : v)),
+    (_key, v: unknown) =>
+      v && typeof v === "object" && !Array.isArray(v)
+        ? Object.fromEntries(Object.entries(v).map(([k, x]) => [redactCredentials(k), x]))
+        : v,
   );
-}
+const isCredential = ([k, v]: [string, string]) => credentialNames.has(k) || (!!v && credentialValues.has(v));
 
 /** Environment for agent child processes: inherit PATH etc. but never leak factory secrets. */
 export function agentEnv(extra: Record<string, string> = {}): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (v === undefined) continue;
-    if (credentialNames.has(k)) continue;
+    if (v === undefined || isCredential([k, v])) continue;
     if (/^(OPENROUTER_|DISCORD_|GITHUB_WEBHOOK_|LIMITLESS_)/.test(k)) continue;
     // Don't let a parent Claude Code session's markers change the child's behavior.
     if (k === "CLAUDECODE" || k.startsWith("CLAUDE_CODE_") || k === "CLAUDE_PLUGIN_DATA") continue;
@@ -320,6 +318,7 @@ export function agentEnv(extra: Record<string, string> = {}): Record<string, str
     GIT_CONFIG_COUNT: "1",
     GIT_CONFIG_KEY_0: "credential.helper",
     GIT_CONFIG_VALUE_0: "",
-    ...extra,
+    // Overrides cannot reintroduce a configured credential under its own or any other name.
+    ...Object.fromEntries(Object.entries(extra).filter((entry) => !isCredential(entry))),
   };
 }

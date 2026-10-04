@@ -396,10 +396,7 @@ async function main(): Promise<void> {
     case "providers": {
       if (rest[0] === "export") {
         if (rest.length !== 1) throw new Error("usage: limitless providers export [--write] [--yes]");
-        return (await import("./providers-export.ts")).providersExport(
-          values.write === true,
-          values.yes === true,
-        );
+        return (await import("./providers-export.ts")).providersExport(!!values.write, !!values.yes);
       }
       if (rest[0] === "fast") {
         const [, value, id] = rest;
