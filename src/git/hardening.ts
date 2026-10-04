@@ -19,13 +19,15 @@ const EMPTY_TREES: Record<string, string> = {
   sha256: "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",
 };
 /** Per directory, git prefix and environment; valid only while every config source is unchanged. */
-const entries = new Map<string, Hardening & { sources: Map<string, string | null> }>();
+const entries = new Map<string, Hardening & { where: string; sources: Map<string, string | null> }>();
 const listings = new Map<string, Promise<unknown>>();
 /** System and global config files (`git var`) per environment; null where git can't name them. */
 const configFiles = new Map<string, Promise<string[] | null>>();
 
 /** A regular file's bytes and identity; "dir", null when missing, undefined when unsafe to read. */
 function read(path: string): { data: Buffer; id: string } | "dir" | null | undefined {
+  // Git reads /dev/null (GIT_CONFIG_GLOBAL=/dev/null) as an empty file, as if it were missing.
+  if (path === "/dev/null") return null;
   let fd: number;
   try {
     // Non-blocking: a FIFO planted where config is read must not stall the daemon.
@@ -66,6 +68,35 @@ function configEnv(env: Record<string, string>): string {
     .join("\0");
 }
 
+/**
+ * The real git and common directories git will use for `cwd`, resolved in-process the way git does
+ * (explicit `--git-dir`/GIT_DIR, else `cwd/.git` as a directory or gitfile, else `cwd` itself), so a
+ * symlink retargeted under an unchanged pointer is noticed. Undefined when unsure.
+ */
+function locate(cwd: string, git: string[], env: Record<string, string>): string | undefined {
+  try {
+    const explicit = git.findLast((arg) => arg.startsWith("--git-dir="))?.slice(10) ?? env.GIT_DIR;
+    const dotGit = explicit === undefined ? read(join(cwd, ".git")) : null;
+    const pointer =
+      dotGit && dotGit !== "dir" ? /^gitdir: (.+)$/.exec(dotGit.data.toString().trimEnd()) : null;
+    if (dotGit === undefined || (dotGit && dotGit !== "dir" && !pointer)) return undefined;
+    const gitDir = realpathSync(
+      explicit !== undefined
+        ? resolve(cwd, explicit)
+        : dotGit === "dir"
+          ? join(cwd, ".git")
+          : pointer?.[1]
+            ? resolve(cwd, pointer[1])
+            : cwd,
+    );
+    const common = read(join(gitDir, "commondir"));
+    if (common === undefined || common === "dir") return undefined;
+    return `${gitDir}\0${common ? realpathSync(resolve(gitDir, common.data.toString().trim())) : gitDir}`;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Files git will probably read, guessed before asking it so that a first listing can be cached. */
 function likelySources(cwd: string, git: string[]): string[] {
   const explicit = git
@@ -98,7 +129,10 @@ export async function harden(
   const vars = configEnv(env);
   const key = [opts.cwd, ...git, vars].join("\0");
   const cached = entries.get(key);
-  if (cached && [...cached.sources].every(([path, seen]) => snapshot(path) === seen)) return cached;
+  const fresh = (entry: NonNullable<typeof cached>) =>
+    locate(opts.cwd, git, env) === entry.where &&
+    [...entry.sources].every(([path, seen]) => snapshot(path) === seen);
+  if (cached && fresh(cached)) return cached;
   // A caller arriving during another's listing waits for it, then checks the cache like any caller.
   const listing = listings.get(key);
   const retry = () => harden(git, opts, lookup);
@@ -118,7 +152,10 @@ async function refresh(
   key: string,
   previous: Iterable<string>,
 ): Promise<Hardening> {
-  const files = await (configFiles.get(vars) ?? gitConfigFiles(vars, opts));
+  // Relative GIT_CONFIG_GLOBAL/SYSTEM paths are resolved by git against the command's directory.
+  const files = (await (configFiles.get(vars) ?? gitConfigFiles(vars, opts, env)))?.map((f) =>
+    resolve(opts.cwd, f),
+  );
   if (!files) return { hooks: await lookup(), emptyTree: null };
   let known = [...files, ...likelySources(opts.cwd, git), ...previous];
   for (let attempt = 0; ; attempt++) {
@@ -126,11 +163,15 @@ async function refresh(
     const before = new Map(known.map((path) => [path, snapshot(path)]));
     const listed = await list(git, opts, env, files);
     if (!listed.parsed) return { hooks: await lookup(), emptyTree: listed.emptyTree };
-    const { sources, hooks, emptyTree } = listed;
-    if (sources?.every((path) => before.get(path) !== undefined && snapshot(path) === before.get(path))) {
+    const { sources, hooks, emptyTree, where } = listed;
+    if (
+      where &&
+      sources?.every((path) => before.get(path) !== undefined && snapshot(path) === before.get(path))
+    ) {
       const entry = {
         hooks,
         emptyTree,
+        where,
         sources: new Map(sources.map((path) => [path, before.get(path) ?? null])),
       };
       entries.set(key, entry);
@@ -143,13 +184,25 @@ async function refresh(
   }
 }
 
-function gitConfigFiles(vars: string, opts: Options): Promise<string[] | null> {
-  const query = (name: string) => sh(["git", "var", name], { ...opts, signal: undefined, allowFail: false });
+function gitConfigFiles(vars: string, opts: Options, env: Record<string, string>): Promise<string[] | null> {
+  const query = (name: string) => sh(["git", "var", name], { ...opts, signal: undefined, allowFail: true });
   const files = Promise.all([query("GIT_CONFIG_SYSTEM"), query("GIT_CONFIG_GLOBAL")]).then(
-    (outs) => outs.flatMap(({ stdout }) => stdout.split("\n").filter(Boolean)),
-    () => null,
+    ([system, global]) => {
+      // A killed query says nothing about git: forget it. Git before 2.42 lacks these variables,
+      // and with GIT_CONFIG_NOSYSTEM there is no system file to name.
+      if (system.exitCode === null || global.exitCode === null) configFiles.delete(vars);
+      if (global.exitCode !== 0 || (system.exitCode !== 0 && !("GIT_CONFIG_NOSYSTEM" in env))) return null;
+      return [system, global].flatMap((out) =>
+        out.exitCode === 0 ? out.stdout.split("\n").filter(Boolean) : [],
+      );
+    },
+    () => {
+      configFiles.delete(vars);
+      return null;
+    },
   );
   configFiles.set(vars, files);
+  if (configFiles.size > 64) configFiles.delete(configFiles.keys().next().value ?? "");
   return files;
 }
 
@@ -175,20 +228,17 @@ async function list(git: string[], opts: Options, env: Record<string, string>, f
   const hooks = new Set<string>();
   const sources = new Set([...files, join(opts.cwd, ".git"), join(commonDir, "config")]);
   for (const file of ["commondir", "HEAD", "config.worktree"]) sources.add(join(gitDir, file));
-  // Pinned only when git stopped at `cwd` (its `.git`, a gitfile there, or `cwd` itself) or was told
-  // where to look: a repository found further up could be replaced by one created at `cwd`.
-  const same = (path: string) => {
+  // Pinned only when the repository is where `locate` finds it again on every hit: a repository
+  // found further up, or behind a pointer that resolves elsewhere, could change without notice.
+  const real = (path: string) => {
     try {
-      return realpathSync(path) === realpathSync(gitDir);
+      return realpathSync(path);
     } catch {
-      return false;
+      return undefined;
     }
   };
-  const gitFile = read(join(opts.cwd, ".git"));
-  const explicit = git.some((arg) => arg.startsWith("--git-dir=")) || "GIT_DIR" in env;
-  let pinned =
-    located &&
-    (explicit || same(join(opts.cwd, ".git")) || same(opts.cwd) || (!!gitFile && gitFile !== "dir"));
+  const where = located ? locate(opts.cwd, git, env) : undefined;
+  let pinned = !!where && where === `${real(gitDir)}\0${real(commonDir)}`;
   for (let i = 0; parsed && i + 2 < fields.length; i += 3) {
     const [origin = "", entry = ""] = [fields[i + 1], fields[i + 2]];
     const name = entry.split("\n", 1)[0] ?? "";
@@ -197,6 +247,8 @@ async function list(git: string[], opts: Options, env: Record<string, string>, f
     const file = origin.startsWith("file:") ? resolve(opts.cwd, origin.slice(5)) : undefined;
     if (file) sources.add(file);
     else if (origin !== "command line:") pinned = false;
+    // With reftable, HEAD lives in reftable/, so an `onbranch:` include could start to apply unseen.
+    if (name === "extensions.refstorage" && value !== "files") pinned = false;
     if (!/^include(if\..+)?\.path$/.test(name)) continue;
     // Include targets count even while missing: creating one later must invalidate the cache.
     if (value?.startsWith("~/") && env.HOME) sources.add(join(env.HOME, value.slice(2)));
@@ -205,5 +257,5 @@ async function list(git: string[], opts: Options, env: Record<string, string>, f
     else pinned = false;
   }
   const emptyTree = (located && EMPTY_TREES[format]) || null;
-  return { parsed, hooks: [...hooks], emptyTree, sources: parsed && pinned ? [...sources] : null };
+  return { parsed, hooks: [...hooks], emptyTree, where, sources: parsed && pinned ? [...sources] : null };
 }
