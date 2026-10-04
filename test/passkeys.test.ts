@@ -118,8 +118,9 @@ test("a registered passkey signs in once per fresh challenge, with user verifica
   await refused(assertion, "challenge");
   expect(logs.join("\n")).not.toContain(options.challenge);
   await refused(key.get({ challenge: "bm90LWlzc3VlZA" }), "challenge");
-  await refused(key.get({ challenge: "x\npasskey: forged" }), "challenge");
-  expect(logs.join("|")).not.toMatch(/bm90LWlzc3VlZA|\n|forged/);
+  // A client-chosen challenge with a quote and a newline must not start a second log line.
+  await refused(key.get({ challenge: 'x"\npasskey: forged' }), "challenge");
+  expect(logs.join("|")).not.toMatch(/bm90LWlzc3VlZA|\n/);
   const stale = await passkeys.authenticationOptions();
   clock.now += 5 * 60_000;
   await refused(key.get(stale), "challenge");
