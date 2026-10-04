@@ -14,6 +14,7 @@ import { runClaude } from "./harness/claude.ts";
 import { runCodex } from "./harness/codex.ts";
 import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
+import { seatbeltBackend } from "./harness/sandbox.ts";
 import { type Harness, protectCredentials } from "./harness/types.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
@@ -27,6 +28,7 @@ import { redactCredentialData } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
+  confinement?: EngineDeps["confinement"];
   faults?: EngineDeps["faults"];
   bootSha?: string;
   evalCasePath?: string;
@@ -109,6 +111,7 @@ export class Factory {
       this.router.describeFallback(provider, exhausted),
     );
     this.deps = {
+      confinement: opts.confinement ?? seatbeltBackend,
       cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },
       faults: opts.faults,
       store: this.store,

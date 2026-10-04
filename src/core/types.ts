@@ -200,7 +200,7 @@ export interface Invocation {
   provider: string;
   model: string;
   effort: RecordedEffort | null;
-  modelId: string; // catalog id, e.g. "claude/sonnet"
+  modelId: string; // catalog id, e.g. "claude/opus"
   status: InvocationStatus;
   costUsd: number;
   costEquivUsd: number;
@@ -298,6 +298,7 @@ export interface ProviderStatus {
 /** Fixed probe diagnostics: the CLI's own output can echo config, including tokens. */
 export type ConfinementFailure =
   | "reader profile not enforced"
+  | "write profile not enforced"
   | "probe inconclusive"
   | "probe timed out"
   | "codex sandbox failed to start";

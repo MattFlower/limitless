@@ -1,6 +1,6 @@
 import type { Effort, ModelSelection, RecordedEffort, Role } from "../core/types.ts";
 import { DECISION_ROLES, TOOL_LESS_ROLES } from "../harness/select.ts";
-import type { ModelDef, ProviderDef } from "./catalog.ts";
+import { type ModelDef, type ProviderDef, REMOVED_MODELS } from "./catalog.ts";
 
 export const EFFORT_LEVELS: Effort[] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -28,7 +28,10 @@ export function resolveTarget(
   if (typeof reference !== "string" && parsed.effort !== undefined)
     throw new Error("saved modelId must be a base catalog ID");
   const model = lookup(parsed.modelId);
-  if (!model) throw new Error(`unknown model ID "${parsed.modelId}"`);
+  if (!model) {
+    const removed = REMOVED_MODELS.get(parsed.modelId);
+    throw new Error(`unknown model ID "${parsed.modelId}"${removed ? `: ${removed}` : ""}`);
+  }
   if (model.effort !== undefined && !model.supportedEfforts.includes(model.effort))
     throw new Error(`Invalid default effort for ${model.id}: ${model.effort}`);
   const effort =

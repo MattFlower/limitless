@@ -6,6 +6,7 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
+import { seatbeltBackend } from "../src/harness/sandbox.ts";
 import { DEFAULT_ROSTERS } from "../src/pipeline/review-system.ts";
 import { DEFAULT_POLICY, PROVIDERS } from "../src/router/catalog.ts";
 import { resolveCatalog, tomlValue } from "../src/router/config-catalog.ts";
@@ -93,6 +94,7 @@ test("provider concurrency overrides reach the tracker without changing catalog 
     writeFileSync(join(configDir, "secrets.env"), "OMLX_API_KEY=file-key\n");
     expect(loadConfig({ home: join(root, "data"), configDir }).secrets.OMLX_API_KEY).toBe("file-key");
     const defaults = new Factory(loadConfig({ home: join(root, "defaults"), configDir }));
+    expect(defaults.deps.confinement).toBe(seatbeltBackend);
     expect(defaults.tracker.status("omlx")?.maxConcurrent).toBe(4);
     defaults.store.close();
     writeFileSync(
@@ -243,6 +245,9 @@ test("roster targets are checked against the catalog at startup; single mode onl
     );
     expect(() => start('{ prompt = "adversarial", target = "claude/opsu" }')).toThrow(
       'review.rosters.standard[0].target claude/opsu: unknown model ID "claude/opsu"',
+    );
+    expect(() => start('{ prompt = "adversarial", target = "claude/fable" }')).toThrow(
+      'claude/fable: unknown model ID "claude/fable": Claude Fable 5.1 was removed from routing on 2026-10-04',
     );
     expect(() =>
       start('{ prompt = "careful" }, { prompt = "standard", local = true, target = "claude/opus" }'),

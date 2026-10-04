@@ -5,7 +5,7 @@ import type { DecisionDecline, DecisionTask } from "./decisions.ts";
 
 /** A concrete model on a concrete provider, as chosen by the router. */
 export interface ModelTarget {
-  modelId: string; // catalog id, e.g. "claude/sonnet"
+  modelId: string; // catalog id, e.g. "claude/opus"
   provider: string; // "claude" | "codex" | "openrouter" | "mtplx" | "twilight" | "typesafe"
   harness: "claude" | "codex" | "decisions" | "fake";
   model: string; // backend model name passed to the CLI / API

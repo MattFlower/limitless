@@ -17,6 +17,7 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Repo, Role, RunStatus, StageName } from "../src/core/types.ts";
 import { gateSlots } from "../src/gates/slots.ts";
+import { recordWorktree } from "../src/git/command.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
 import {
   cachePath,
@@ -28,10 +29,10 @@ import {
   worktreeOwner,
 } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
+import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook, mapGitHubEvent } from "../src/integrations/github.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
-
 import {
   CancelledError,
   invokeGuard,
@@ -39,7 +40,6 @@ import {
   RunContext,
   type RunState,
 } from "../src/pipeline/context.ts";
-
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
@@ -55,6 +55,7 @@ import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
+import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { reviewOutput } from "./evals-reading-support.ts";
 import { deferred } from "./evals-support.ts";
 import { attributionEvidence, findingEvidence } from "./review-support.ts";
@@ -208,6 +209,7 @@ function start(handler: Handler, effortRouting = false, freeProviders = false): 
   if (!alpha || !beta) throw new Error("missing fixture models");
   const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
   factory = new Factory(cfg, {
+    confinement: fakeConfinement,
     harnesses: { fake: fakeHarness(handler) },
     providers: freeProviders
       ? [
@@ -264,6 +266,8 @@ async function waitFor(
 
 beforeEach(async () => {
   home = mkdtempSync(join(tmpdir(), "limitless-e2e-"));
+  // Gate commands here count their runs in files under home; confinement itself is tested elsewhere.
+  observerRoots.add(realpathSync(home));
   repoDir = await makeRepo();
 });
 
@@ -273,6 +277,7 @@ afterEach(async () => {
   factory?.store.close();
   factory = null;
   rmSync(home, { recursive: true, force: true });
+  observerRoots.clear();
 });
 
 describe("local factory clones", () => {
@@ -542,6 +547,7 @@ describe("local factory clones", () => {
     const branch = `limitless/${run.id}-${slugify(run.title, 30)}`;
     const baseSha = await git(repoDir, "rev-parse", "HEAD");
     await git(repoDir, "worktree", "add", "-b", branch, work, baseSha);
+    await recordWorktree(work);
     f.store.updateRun(run.id, { status: "running", baseSha, branch }, {
       phase: "prepare",
       worktreePath: work,
@@ -829,6 +835,7 @@ describe("local factory clones", () => {
   test("delivery from a legacy worktree pushes nothing: the branch already lives in the source", async () => {
     const legacy = join(home, "legacy-work");
     await git(repoDir, "worktree", "add", "-q", "-b", "legacy-branch", legacy);
+    await recordWorktree(legacy);
     await pushBranch(localRepo(), legacy, "would-be-created");
     const refs = await git(repoDir, "for-each-ref", "--format=%(refname)", "refs/heads");
     expect(refs).toContain("refs/heads/legacy-branch");
@@ -1398,6 +1405,75 @@ esac
     const artifact = JSON.parse(resumed.store.getArtifact(run.id, "review-0.json") ?? "{}");
     expect(artifact).toMatchObject({ verdict: "request_changes", modelVerdict: "approve" });
   });
+  test.each([
+    ["sticks with it", 1, "alpha/m"],
+    ["escalates beyond it", 2, "beta/m"],
+  ])(
+    "a run restarted on an implementer since removed from the catalog routes to an available model when it %s",
+    async (_, roundsOnImplementer, next) => {
+      let reviews = 0;
+      const blocker = {
+        severity: "major" as const,
+        security: false,
+        ...findingEvidence,
+        file: "farewell.txt",
+        line: 1,
+        title: "First blocker",
+        detail: "First blocker",
+        suggestion: "Fix",
+      };
+      const handler: Handler = (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review")
+          return { structured: { ...approve, findings: ++reviews === 1 ? [blocker] : [] } };
+        return { files: { "farewell.txt": `goodbye ${reviews}\n` } };
+      };
+      const f = start(handler);
+      // Round 1 starts after a restart from state saved when the run was on GPT-6 Astra.
+      f.deps.faults = {
+        "stage:implement:before": {
+          action: "kill",
+          occurrence: 2,
+          onHit: ({ runId }) => {
+            const state = f.store.getRunState<RunState>(runId);
+            if (!state) throw new Error("missing run state");
+            const astra = { modelId: "codex/astra", effort: "high" as const };
+            state.implementer = { ...astra, targetId: "codex/astra@high", tier: 5, vendor: "openai" };
+            state.triedImplementers.push(astra);
+            state.roundsOnImplementer = roundsOnImplementer;
+            f.store.setRunState(runId, state);
+          },
+        },
+      };
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      const deadline = Date.now() + 10_000;
+      while (
+        f.store
+          .listStages(run.id)
+          .filter((s) => s.name === "implement")
+          .at(-1)?.status !== "cancelled"
+      ) {
+        if (Date.now() > deadline) throw new Error("implement interruption timed out");
+        await Bun.sleep(10);
+      }
+      await f.stop();
+      f.store.close();
+      const resumed = start(handler);
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const implemented = resumed.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.modelId);
+      expect(implemented).toEqual(["alpha/m", next]);
+      expect(resumed.store.getRunState<RunState>(run.id)?.implementer?.modelId).toBe(next);
+      const escalated = resumed.store
+        .listEvents(run.id)
+        .some((e) => e.message === "Escalating implementer beyond codex/astra");
+      expect(escalated).toBe(roundsOnImplementer === 2);
+    },
+  );
+
   test("Dependabot uses free models across quick stages and keeps them on feedback rounds", async () => {
     const seen: { role: string; provider: string }[] = [];
     let implementations = 0;
@@ -1745,8 +1821,11 @@ esac
       if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
       opts.signal?.throwIfAborted();
       const attempt = calls++;
-      commands.push(opts.cmd[2] ?? "");
-      const isLint = opts.cmd[2] === "fake-lint";
+      // Confined gate commands arrive as `/bin/sh -c <start check> sh <token> /bin/sh -c <command>`.
+      const command = opts.cmd.at(-1) ?? "";
+      opts.onStdoutLine?.(opts.cmd[4] ?? "");
+      commands.push(command);
+      const isLint = command === "fake-lint";
       const timeout =
         scenario === "base"
           ? attempt < 2
@@ -3361,6 +3440,7 @@ esac
   test("merge helpers isolate configured code in a linked worktree and reject non-conflict errors", async () => {
     const cwd = join(home, "linked");
     await sh(["git", "worktree", "add", "-b", "feature", cwd], { cwd: repoDir });
+    await recordWorktree(cwd);
     writeFileSync(join(cwd, "greeting.txt"), "feature\n");
     await mergeGit(cwd, ["add", "-A"]);
     await mergeGit(cwd, ["commit", "-qm", "feature"]);
@@ -6535,7 +6615,8 @@ for (const scenario of [
       if (role === "triage") return { structured: triage() };
       if (role === "spec") return { structured: spec };
       if (role === "holdout") return { structured: holdout };
-      if (role === "review" || role === "verify") {
+      // Readers and edit-mode implementers alike get a scratch owned and removed by their call.
+      if (role === "review" || role === "verify" || role === "implement") {
         expect(s.scratchDir).toBeDefined();
         const scratch = s.scratchDir as string;
         expect(existsSync(scratch)).toBe(true);
@@ -6707,6 +6788,7 @@ test("environment retry prefers another cross-vendor model over same-vendor fall
   const beta = models.find((m) => m.id === "beta/m");
   if (!beta) throw new Error("missing fixture model");
   factory = new Factory(cfg, {
+    confinement: fakeConfinement,
     providers,
     models: [...models, { ...beta, id: "beta/other", model: "beta-2" }],
     policy: { ...policy, verify: { default: ["alpha/m", "beta/m", "beta/other"] } },
@@ -7203,6 +7285,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
         factory = null;
         rmSync(home, { recursive: true, force: true });
         home = mkdtempSync(join(tmpdir(), "limitless-e2e-"));
+        observerRoots.add(realpathSync(home));
         repoDir = await makeRepo();
       }
       const calls = newCalls();
@@ -7475,6 +7558,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       factory = null;
       rmSync(home, { recursive: true, force: true });
       home = mkdtempSync(join(tmpdir(), "limitless-e2e-"));
+      observerRoots.add(realpathSync(home));
       repoDir = await makeRepo();
       return result;
     };
@@ -7548,6 +7632,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     factory = null;
     rmSync(home, { recursive: true, force: true });
     home = mkdtempSync(join(tmpdir(), "limitless-e2e-"));
+    observerRoots.add(realpathSync(home));
     repoDir = await makeRepo();
   };
   const isShadowCall = (s: AgentSpec) =>
@@ -7642,6 +7727,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
       const alpha = models[0] as ModelDef;
       factory = new Factory(cfg, {
+        confinement: fakeConfinement,
         harnesses: { fake: fakeHarness(scenario(calls)) },
         providers: [...providers, omega],
         models: [...models, { ...alpha, id: "omega/m", provider: "omega", vendor: "google" }],
@@ -8367,6 +8453,7 @@ describe("routing bounded slot waits", () => {
     const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
     const calls: AgentSpec[] = [];
     factory = new Factory(cfg, {
+      confinement: fakeConfinement,
       providers,
       models: catalog,
       policy: routing,
@@ -8837,4 +8924,36 @@ describe("audit allowances (fake agents, real git)", () => {
       expect(messages.some((m) => m.startsWith("[gitlink] vendor: Repair: vendor"))).toBe(!allowed);
       expect(messages.some((m) => m.startsWith("[gitlink] vendor: vendor"))).toBe(!allowed);
     });
+});
+
+test("factory gates use injected confinement with the platform forced off macOS", async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  if (!platform) throw new Error("missing platform descriptor");
+  const recording = recordingConfinement();
+  Object.defineProperty(process, "platform", { value: "linux" });
+  try {
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: pass };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    f.deps.confinement = recording.backend;
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(recording.calls.length).toBeGreaterThan(0);
+    for (const { roots, opts } of recording.calls) {
+      expect(roots.write).toContain(opts.cwd);
+      expect(roots.write).toContain(opts.env.TMPDIR ?? "missing");
+      expect(roots.protect).toContain(join(opts.cwd, ".git"));
+      expect(roots.protect.some((p) => p.includes("/worktrees/"))).toBe(true);
+      expect(opts.env.LIMITLESS_CONFINED).toBe("1");
+      expect(opts.env.GIT_OPTIONAL_LOCKS).toBe("0");
+    }
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+  }
 });

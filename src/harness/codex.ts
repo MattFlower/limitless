@@ -4,6 +4,7 @@ import {
   appendFileSync,
   constants,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -23,6 +24,7 @@ import {
   spellings,
   validateDenyRead,
   validateScratch,
+  writeRoots,
 } from "./scratch.ts";
 import {
   type AgentEvent,
@@ -264,11 +266,25 @@ function readerProfile(spec: AgentSpec, scratch: string): string[] {
   ];
 }
 
+/** Everything readable; only the write roots writable, `.git` read-only inside them; network as before. */
+function editorProfile(spec: AgentSpec): string[] {
+  const { write, protect } = writeRoots(spec.cwd, validateScratch(spec));
+  const entries = [["/", "read"], ...write.map((p) => [p, "write"]), ...protect.map((p) => [p, "read"])];
+  const filesystem = entries.map(([path, access]) => `${JSON.stringify(path)}="${access}"`).join(",");
+  return [
+    "-c",
+    'default_permissions="limitless-editor"',
+    "-c",
+    `permissions={limitless-editor={filesystem={${filesystem}},network={enabled=true}}}`,
+  ];
+}
+
 /** ENOENT is never a denial: every canary exists. */
 const MISSING = /no such file|\bENOENT\b/i;
 /** `codex --version` prints one line such as `codex-cli 0.157.1`. */
 const CODEX_VERSION = /^codex(?:-cli)?\s+v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/;
 const NOT_ENFORCED: ConfinementFailure = "reader profile not enforced";
+const WRITE_NOT_ENFORCED: ConfinementFailure = "write profile not enforced";
 const INCONCLUSIVE: ConfinementFailure = "probe inconclusive";
 const TIMED_OUT: ConfinementFailure = "probe timed out";
 const START_FAILED: ConfinementFailure = "codex sandbox failed to start";
@@ -431,7 +447,7 @@ export class CodexReaderProbe {
     if (spec.signal.aborted) return unverified;
     if (!lookup.version) return { ...unverified, reason: lookup.reason, exitCode: lookup.exitCode };
     // The list is encoded separately so a denied path can never stand in for the CLI path or version.
-    const key = `${path}\0${lookup.version}\0${JSON.stringify([...deny].sort())}`;
+    const key = `${spec.mode}\0${path}\0${lookup.version}\0${JSON.stringify([...deny].sort())}`;
     for (;;) {
       const verdict = this.verdicts.get(key);
       if (verdict) return verdict;
@@ -471,7 +487,8 @@ export class CodexReaderProbe {
         if (this.flights.get(key) === flight) this.flights.delete(key);
         if (!settled) return null;
         const probe = cleaned ? settled : { ...settled, ok: false, reason: INCONCLUSIVE, exitCode: null };
-        if (probe.ok || probe.reason === NOT_ENFORCED) this.verdicts.set(key, probe);
+        if (probe.ok || probe.reason === NOT_ENFORCED || probe.reason === WRITE_NOT_ENFORCED)
+          this.verdicts.set(key, probe);
         else this.retryAt.set(key, this.now() + this.backoffMs);
         return probe;
       });
@@ -543,10 +560,12 @@ async function sandboxProbe(
     writeFileSync(file.path, file.token);
     return file;
   };
+  // An editor must write its cwd and scratch, and be denied every private root and its own `.git`.
+  const editing = template.mode === "edit";
   let spec: AgentSpec;
-  let scratch: string;
+  let profile: string[];
   let codexHome: string;
-  let positive: { path: string; token: string };
+  let positives: { path: string; token: string }[];
   let negatives: { path: string; token: string }[];
   try {
     const tmp = realpathSync(tmpdir());
@@ -555,30 +574,57 @@ async function sandboxProbe(
     const probeCwd = temp(tmp, "limitless-probe-");
     const scratchDir = createScratch(probeCwd);
     owned.push(scratchParent(scratchDir));
-    spec = { ...template, cwd: probeCwd, scratchDir, confineReads: true };
-    scratch = validateScratch(spec);
+    spec = editing
+      ? { ...template, cwd: probeCwd, scratchDir, denyRead: [], confineReads: false }
+      : { ...template, cwd: probeCwd, scratchDir, confineReads: true };
+    const scratch = validateScratch(spec);
     // An empty CODEX_HOME: `codex sandbox` has no --ignore-user-config, and exec ignores it.
     codexHome = temp(tmp, "limitless-probe-home-");
-    positive = canary(spec.cwd);
     const { cwd, scratch: writable, deny } = readConfinement(spec, scratch);
     negatives = roots(deny).map((root) => canary(temp(root, "limitless-canary-")));
     const granted = (file: string) => [...cwd, ...writable].some((root) => file.startsWith(`${root}/`));
     if (!negatives.length || negatives.some((file) => granted(file.path))) return result(INCONCLUSIVE, null);
+    if (editing) {
+      const common = temp(tmp, "limitless-probe-common-");
+      const admin = join(common, "worktrees", "probe");
+      mkdirSync(admin, { recursive: true });
+      writeFileSync(join(admin, "commondir"), "../..");
+      writeFileSync(join(admin, "gitdir"), join(probeCwd, ".git"));
+      const pointer = `gitdir: ${admin}\n`;
+      writeFileSync(join(probeCwd, ".git"), pointer);
+      negatives.push(canary(common), canary(admin), { path: join(probeCwd, ".git"), token: pointer });
+      positives = [probeCwd, scratch].map((dir) => ({
+        path: join(dir, `written-${randomUUID()}`),
+        token: "",
+      }));
+      profile = editorProfile(spec);
+    } else {
+      positives = [canary(spec.cwd)];
+      profile = readerProfile(spec, scratch);
+    }
   } catch {
     return result(INCONCLUSIVE, null);
   }
-  const read = async (file: string) =>
+  const attempt = async (file: string, token: string) =>
     run({
-      cmd: [path, "sandbox", ...readerProfile(spec, scratch), "--", "/bin/cat", file],
+      cmd: [
+        path,
+        "sandbox",
+        ...profile,
+        "--",
+        ...(editing ? ["/bin/sh", "-c", 'printf %s "$1" > "$2"', "sh", token, file] : ["/bin/cat", file]),
+      ],
       cwd: spec.cwd,
       env: agentEnv({ ...scratchEnv(spec), CODEX_HOME: codexHome }),
       timeoutMs: 60_000,
       signal,
     });
-  for (const file of [...negatives, positive]) {
+  let last: number | null = null;
+  for (const file of [...negatives, ...positives]) {
     let proc: ProcResult;
+    const token = `written-${randomUUID()}`;
     try {
-      proc = await read(file.path);
+      proc = await attempt(file.path, token);
     } catch {
       return result(START_FAILED, null);
     }
@@ -586,7 +632,17 @@ async function sandboxProbe(
     // Only a completed exit is an answer, and only an answer may be cached.
     if (proc.timedOut || proc.idleTimedOut) return result(TIMED_OUT, proc.exitCode);
     if (proc.signal || proc.exitCode === null) return result(INCONCLUSIVE, proc.exitCode);
-    if (file === positive) {
+    last = proc.exitCode;
+    if (editing) {
+      // The file itself is the evidence, never the CLI's report: any change to a canary is a write.
+      const content = existsSync(file.path) ? readFileSync(file.path, "utf8") : null;
+      if (positives.includes(file)) {
+        if (proc.exitCode !== 0 || content !== token) return result(INCONCLUSIVE, proc.exitCode);
+      } else if (content !== file.token) return result(WRITE_NOT_ENFORCED, proc.exitCode);
+      else if (proc.exitCode === 0) return result(INCONCLUSIVE, proc.exitCode);
+      continue;
+    }
+    if (positives.includes(file)) {
       const ok = proc.exitCode === 0 && proc.stdout.trim() === file.token;
       return result(ok ? null : INCONCLUSIVE, proc.exitCode);
     }
@@ -594,7 +650,7 @@ async function sandboxProbe(
     if (proc.exitCode === 0 || !deniedRead(proc.stderr, file.path))
       return result(INCONCLUSIVE, proc.exitCode);
   }
-  return result(INCONCLUSIVE, null);
+  return editing ? result(null, last) : result(INCONCLUSIVE, null);
 }
 
 export function buildCodexArgs(spec: AgentSpec): string[] {
@@ -616,7 +672,8 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
   if (spec.fast && t.provider === "codex") args.push("-c", 'service_tier="fast"');
   if (t.effort) args.push("-c", `model_reasoning_effort="${t.effort}"`);
   if (spec.privateSession) args.push("--ephemeral");
-  if (spec.privateSession || spec.noTools || spec.mode === "readonly") args.push("--ignore-user-config");
+  // User config could add MCP servers, rules or permission profiles that widen what tools may write.
+  args.push("--ignore-user-config");
   if (spec.noTools) {
     // A read-only sandbox still permits reads, including through MCP tools such as node_repl.
     // Disable MCP discovery as well as built-in file access; retain rollouts unless privateSession
@@ -641,13 +698,13 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
       'web_search="disabled"',
     );
   }
-  if (spec.mode === "readonly" && !spec.noTools) {
-    // Named filesystem profiles (verified live on codex-cli 0.157.1). Legacy read-only mode
-    // ignores sandbox_workspace_write roots, and workspace-write grants cwd implicitly.
+  if (!spec.noTools) {
+    // Named filesystem profiles (verified live on codex-cli 0.157.1 and 0.160.0). Legacy read-only
+    // mode ignores sandbox_workspace_write roots, and workspace-write grants cwd and TMPDIR implicitly.
     args.push(
       "--strict-config",
       "--ignore-rules",
-      ...readerProfile(spec, validateScratch(spec)),
+      ...(spec.mode === "readonly" ? readerProfile(spec, validateScratch(spec)) : editorProfile(spec)),
       "-c",
       "orchestrator.mcp.enabled=false",
       "--disable",
@@ -658,14 +715,9 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
       "multi_agent",
       "--disable",
       "code_mode",
-      "-c",
-      'web_search="disabled"',
     );
-  } else if (spec.mode === "readonly") {
-    args.push("-s", "read-only");
-  } else {
-    args.push("-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true");
-  }
+    if (spec.mode === "readonly") args.push("-c", 'web_search="disabled"');
+  } else args.push("-s", "read-only");
   for (const dir of spec.addDirs ?? []) args.push("--add-dir", dir);
   if (spec.jsonSchema) {
     const schemaPath = `${spec.logPath}.schema.json`;
@@ -685,10 +737,11 @@ export async function runCodex(
 ): Promise<AgentResult> {
   spec = protectCredentials(spec);
   const t = spec.target;
-  const confined = spec.confineReads && spec.mode === "readonly" && !spec.noTools;
+  const editing = spec.mode === "edit" && !spec.noTools;
+  const confined = editing || (spec.confineReads && spec.mode === "readonly" && !spec.noTools);
   // One snapshot of the denied paths keys the verdict, drives the probe and builds the exec
   // profile; resolving it again is a no-op unless a symlink was retargeted meanwhile.
-  const deny = confined ? spellings(spec.denyRead ?? []) : [];
+  const deny = confined && !editing ? spellings(spec.denyRead ?? []) : [];
   const args = buildCodexArgs(confined ? { ...spec, denyRead: deny } : spec);
   let confinement: ConfinementProbe | undefined;
   if (confined) {
@@ -714,7 +767,7 @@ export async function runCodex(
       const cli = `${confinement.path ?? "codex"}${confinement.version ? ` (${confinement.version})` : ""}`;
       const detail = moved
         ? "denied paths changed during the probe"
-        : `${confinement.reason}${exit}; confined readers will not run on this CLI`;
+        : `${confinement.reason}${exit}; confined ${editing ? "editors" : "readers"} will not run on this CLI`;
       return {
         status: "unavailable",
         finalText: "",
@@ -724,7 +777,7 @@ export async function runCodex(
         numTurns: 0,
         costUsd: 0,
         costEquivUsd: 0,
-        error: `Codex read confinement not verified for ${cli}: ${detail}`,
+        error: `Codex ${editing ? "write" : "read"} confinement not verified for ${cli}: ${detail}`,
         quota: null,
         confinement,
       };

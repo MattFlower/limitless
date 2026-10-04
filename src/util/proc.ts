@@ -319,10 +319,13 @@ export function agentEnv(extra: Record<string, string> = {}): Record<string, str
     GH_TOKEN: "limitless-agents-have-no-github-access",
     GIT_SSH_COMMAND: "sh -c 'echo \"limitless: agents cannot use git over ssh\" >&2; exit 1'",
     GIT_TERMINAL_PROMPT: "0",
-    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_COUNT: "2",
     GIT_CONFIG_KEY_0: "credential.helper",
     GIT_CONFIG_VALUE_0: "",
+    GIT_CONFIG_KEY_1: "diff.autoRefreshIndex",
+    GIT_CONFIG_VALUE_1: "false",
     // Overrides cannot reintroduce a configured credential under its own or any other name.
     ...Object.fromEntries(Object.entries(extra).filter((entry) => !isCredential(entry))),
+    GIT_OPTIONAL_LOCKS: "0",
   };
 }

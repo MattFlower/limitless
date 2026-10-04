@@ -1,5 +1,5 @@
 The frozen baseline was generated from locally available `origin/main` ancestor
-`fff1b031d795f17c15a6e57d152cebbca63f9d7a` (before PR #318; that revision has no
+`03544903a25312a47c40c6cd7c38c533ff71ea12` (main after #342, before PR #318; that revision has no
 `src/router/config-catalog.ts`). It contains all 3,360 scenarios from the previous
 identity comparison, including complete candidate and skipped decisions,
 provider/model/checkpoint identities and experimentally observed quota-window/reserve-key
@@ -9,7 +9,7 @@ Reproduce from this checkout, with dependencies installed and `.routing-baseline
 
 ```sh
 mkdir .routing-baseline
-git archive fff1b031d795f17c15a6e57d152cebbca63f9d7a | tar -x -C .routing-baseline
+git archive 03544903a25312a47c40c6cd7c38c533ff71ea12 | tar -x -C .routing-baseline
 cp test/routing-identity-support.ts .routing-baseline/test/
 bun -e '
 import { identitySnapshot } from "./.routing-baseline/test/routing-identity-support.ts";
@@ -27,7 +27,7 @@ for (const row of snapshot.decisions) {
   row.decision = intern(decisionTable, row.decision);
 }
 await Bun.write("test/fixtures/routing-identity.json", JSON.stringify({
-  baselineCommit: "fff1b031d795f17c15a6e57d152cebbca63f9d7a",
+  baselineCommit: "03544903a25312a47c40c6cd7c38c533ff71ea12",
   snapshot, candidateTable, skippedTable, decisionTable
 }, null, 2) + "\n");
 '

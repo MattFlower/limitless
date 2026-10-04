@@ -238,7 +238,10 @@ test("reserved environment is enforced after expansion for build, seed and serve
       for (const key of ["HOME", "TMPDIR", "TMP", "TEMP"]) expect(env[key]).toBe(server.scratch);
       expect(env.GH_TOKEN).toBe("limitless-agents-have-no-github-access");
       expect(env.GIT_SSH_COMMAND).toContain("agents cannot use git over ssh");
-      expect(env.GIT_CONFIG_COUNT).toBe("1");
+      expect(env.GIT_CONFIG_COUNT).toBe("2");
+      expect(env.GIT_CONFIG_KEY_1).toBe("diff.autoRefreshIndex");
+      expect(env.GIT_CONFIG_VALUE_1).toBe("false");
+      expect(env.GIT_OPTIONAL_LOCKS).toBe("0");
       expect(env.GIT_CONFIG_KEY_0).toBe("credential.helper");
       expect(env.GIT_CONFIG_VALUE_0).toBe("");
       expect(env.GIT_CONFIG_KEY_99).toBeUndefined();

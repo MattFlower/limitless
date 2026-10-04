@@ -2,7 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
-import { buildCodexArgs, CodexStreamParser, parseRateLimits, runCodex } from "../src/harness/codex.ts";
+import {
+  buildCodexArgs,
+  type CodexReaderProbe,
+  CodexStreamParser,
+  parseRateLimits,
+  runCodex,
+} from "../src/harness/codex.ts";
+import { confinementScope } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import {
   type AgentEvent,
@@ -13,6 +20,7 @@ import {
   redactJsonLine,
 } from "../src/harness/types.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
+import { fakeConfinement } from "./confinement.ts";
 
 const fixture = (name: string) =>
   readFileSync(join(import.meta.dir, "fixtures", name), "utf8")
@@ -115,10 +123,21 @@ describe("CodexStreamParser", () => {
     for (const feature of ["apps", "plugins", "code_mode", "view_image"]) {
       expect(smokeArgs.join(" ")).toContain(`--disable ${feature}`);
     }
-    const editArgs = buildCodexArgs({ ...spec, privateSession: false, noTools: false, mode: "edit" });
-    expect(editArgs).not.toContain("--ignore-user-config");
-    expect(editArgs).not.toContain("orchestrator.mcp.enabled=false");
-    expect(editArgs).toContain("workspace-write");
+    const edit = { ...spec, privateSession: false, noTools: false, mode: "edit" as const };
+    expect(() => buildCodexArgs(edit)).toThrow("requires a scratch directory");
+    await withScratch(import.meta.dir, async (scratchDir) => {
+      // Editors are confined too: no user config, rules, MCP servers or implicit workspace-write roots.
+      const editArgs = buildCodexArgs({ ...edit, cwd: import.meta.dir, scratchDir });
+      for (const flag of [
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
+        "orchestrator.mcp.enabled=false",
+      ])
+        expect(editArgs).toContain(flag);
+      expect(editArgs).not.toContain("workspace-write");
+      expect(editArgs).not.toContain('web_search="disabled"');
+    });
   });
 
   test("parses a real codex exec --json run", () => {
@@ -165,6 +184,18 @@ describe("CodexStreamParser", () => {
     expect(w?.five_hour?.utilization).toBeCloseTo(0.425);
   });
 });
+
+// Tool-enabled editors run confined (#323): they need scratch, and a fake runner that swaps the
+// command keeps the sandbox's startup wrapper (the identity backend adds no profile).
+const confinedEdit = <T>(cwd: string, run: (scratchDir: string) => Promise<T>) =>
+  confinementScope.run(fakeConfinement, () => withScratch(cwd, run));
+const swapCommand = (cmd: string[], replacement: string[]) =>
+  cmd[4]?.startsWith("limitless-started-") ? [...cmd.slice(0, 5), ...replacement] : replacement;
+// A confined Codex editor runs only on a CLI whose sandbox was verified; this stub stands in for that probe.
+const verifiedCodex: typeof runClaude = (spec, runner) =>
+  runCodex(spec, runner, {
+    verify: async () => ({ ok: true, path: "codex", version: "test", reason: null, exitCode: null }),
+  } as unknown as CodexReaderProbe);
 
 test("CLI transcript redaction handles escaped multi-line scenario text", () => {
   const holdout = {
@@ -495,42 +526,45 @@ test("configured backend auth reaches the CLI only through a key helper, never t
     const events: AgentEvent[] = [];
     const logPath = join(fixture.root, "backend.log");
     let keyFile = "";
-    const result = await runClaude(
-      {
-        cwd: fixture.root,
-        prompt: "test",
-        mode: "edit",
-        logPath,
-        target: factory.router.toTarget(resolved.model),
-        timeoutMs: 5000,
-        idleTimeoutMs: 5000,
-        maxToolCalls: 1,
-        signal: new AbortController().signal,
-        onEvent: (event) => events.push(event),
-      },
-      async (options) => {
-        const settings: { apiKeyHelper: string } = JSON.parse(
-          options.cmd[options.cmd.indexOf("--settings") + 1] ?? "{}",
-        );
-        keyFile = JSON.parse(settings.apiKeyHelper.replace(/^cat /, ""));
-        expect(readFileSync(keyFile, "utf8")).toBe(token);
-        expect(statSync(keyFile).mode & 0o077).toBe(0);
-        expect(options.env?.ANTHROPIC_BASE_URL).toBe("https://example.invalid");
-        const helper = await runProcess({
-          cmd: ["sh", "-c", settings.apiKeyHelper],
+    const result = await confinedEdit(fixture.root, (scratchDir) =>
+      runClaude(
+        {
           cwd: fixture.root,
-          env: {},
-        });
-        expect(helper.stdout).toBe(token);
-        return runProcess({
-          ...options,
-          cmd: [
-            process.execPath,
-            "-e",
-            `const leaked = Object.values(process.env).includes(${JSON.stringify(token)}); console.log(JSON.stringify({type:"result",result:"auth " + (process.env.ANTHROPIC_AUTH_TOKEN ?? "absent") + " leaked=" + leaked}));`,
-          ],
-        });
-      },
+          scratchDir,
+          prompt: "test",
+          mode: "edit",
+          logPath,
+          target: factory.router.toTarget(resolved.model),
+          timeoutMs: 5000,
+          idleTimeoutMs: 5000,
+          maxToolCalls: 1,
+          signal: new AbortController().signal,
+          onEvent: (event) => events.push(event),
+        },
+        async (options) => {
+          const settings: { apiKeyHelper: string } = JSON.parse(
+            options.cmd[options.cmd.indexOf("--settings") + 1] ?? "{}",
+          );
+          keyFile = JSON.parse(settings.apiKeyHelper.replace(/^cat /, ""));
+          expect(readFileSync(keyFile, "utf8")).toBe(token);
+          expect(statSync(keyFile).mode & 0o077).toBe(0);
+          expect(options.env?.ANTHROPIC_BASE_URL).toBe("https://example.invalid");
+          const helper = await runProcess({
+            cmd: ["sh", "-c", settings.apiKeyHelper],
+            cwd: fixture.root,
+            env: {},
+          });
+          expect(helper.stdout).toBe(token);
+          return runProcess({
+            ...options,
+            cmd: swapCommand(options.cmd, [
+              process.execPath,
+              "-e",
+              `const leaked = Object.values(process.env).includes(${JSON.stringify(token)}); console.log(JSON.stringify({type:"result",result:"auth " + (process.env.ANTHROPIC_AUTH_TOKEN ?? "absent") + " leaked=" + leaked}));`,
+            ]),
+          });
+        },
+      ),
     );
     expect(result.status).toBe("ok");
     expect(result.finalText).toBe("auth absent leaked=false");
@@ -597,28 +631,31 @@ test("configured credentials never reach native children or their events, logs a
         child,
         `console.log("child credential=" + (process.env.MAC_MLX_KEY ?? "absent")); console.log(${JSON.stringify(JSON.stringify(event))}); console.log(${JSON.stringify(JSON.stringify(textEvent))}); console.error(${JSON.stringify(`ordinary diagnostic ${fileSecret} ${envSecret}`)}); console.error(${JSON.stringify(`token=${fileSecret}; token=${fileSecret};`)}); process.exit(1);`,
       );
-      const result = await (harness === "claude" ? runClaude : runCodex)(
-        {
-          cwd: fixture.root,
-          prompt: "test",
-          mode: "edit",
-          logPath,
-          target: {
-            modelId: `${harness}/test`,
-            provider: harness,
-            harness,
-            model: "test",
-            vendor: "other",
-            tier: 4,
-            billing: "subscription",
+      const result = await confinedEdit(fixture.root, (scratchDir) =>
+        (harness === "claude" ? runClaude : verifiedCodex)(
+          {
+            cwd: fixture.root,
+            scratchDir,
+            prompt: "test",
+            mode: "edit",
+            logPath,
+            target: {
+              modelId: `${harness}/test`,
+              provider: harness,
+              harness,
+              model: "test",
+              vendor: "other",
+              tier: 4,
+              billing: "subscription",
+            },
+            timeoutMs: 5000,
+            idleTimeoutMs: 5000,
+            maxToolCalls: 10,
+            signal: new AbortController().signal,
+            onEvent: (ev) => events.push(ev),
           },
-          timeoutMs: 5000,
-          idleTimeoutMs: 5000,
-          maxToolCalls: 10,
-          signal: new AbortController().signal,
-          onEvent: (ev) => events.push(ev),
-        },
-        (options) => runProcess({ ...options, cmd: [process.execPath, child] }),
+          (options) => runProcess({ ...options, cmd: swapCommand(options.cmd, [process.execPath, child]) }),
+        ),
       );
       expect(result.status).toBe("error");
       expect(readFileSync(logPath, "utf8")).toContain("token=[redacted]; token=[redacted];");
@@ -692,28 +729,31 @@ test("a credential inside the model name never reaches the log header", async ()
     writeFileSync(child, "process.exit(1);");
     for (const harness of ["claude", "codex"] as const) {
       const logPath = join(fixture.root, `${harness}.log`);
-      await (harness === "claude" ? runClaude : runCodex)(
-        {
-          cwd: fixture.root,
-          prompt: "test",
-          mode: "edit",
-          logPath,
-          target: {
-            modelId: `${harness}/test`,
-            provider: harness,
-            harness,
-            model: key,
-            vendor: "other",
-            tier: 4,
-            billing: "subscription",
+      await confinedEdit(fixture.root, (scratchDir) =>
+        (harness === "claude" ? runClaude : verifiedCodex)(
+          {
+            cwd: fixture.root,
+            scratchDir,
+            prompt: "test",
+            mode: "edit",
+            logPath,
+            target: {
+              modelId: `${harness}/test`,
+              provider: harness,
+              harness,
+              model: key,
+              vendor: "other",
+              tier: 4,
+              billing: "subscription",
+            },
+            timeoutMs: 5000,
+            idleTimeoutMs: 5000,
+            maxToolCalls: 10,
+            signal: new AbortController().signal,
+            onEvent: () => {},
           },
-          timeoutMs: 5000,
-          idleTimeoutMs: 5000,
-          maxToolCalls: 10,
-          signal: new AbortController().signal,
-          onEvent: () => {},
-        },
-        (options) => runProcess({ ...options, cmd: [process.execPath, child] }),
+          (options) => runProcess({ ...options, cmd: swapCommand(options.cmd, [process.execPath, child]) }),
+        ),
       );
       const header = readFileSync(logPath, "utf8").split("\n")[0] ?? "";
       expect(header).toStartWith(`# ${harness} [redacted] `);
