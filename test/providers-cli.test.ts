@@ -128,3 +128,37 @@ test("fast CLI sends boolean on/off and reports invalid arguments and provider e
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("providers CLI reports missing named credentials when listing and enabling", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "limitless-missing-cli-"));
+  try {
+    const preload = join(dir, "missing.ts");
+    writeFileSync(
+      preload,
+      `globalThis.fetch = async (input, init) => {
+      const provider = { id: "custom", state: "disabled", reason: "missing key EXAMPLE_KEY", maxConcurrent: 4, windows: {} };
+      return Response.json(init?.method === "POST" ? provider : [provider]);
+    };`,
+    );
+    for (const args of [[], ["enable", "custom"]]) {
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          "--preload",
+          preload,
+          join(import.meta.dir, "../src/cli/main.ts"),
+          "providers",
+          ...args,
+        ],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const output = await new Response(child.stdout).text();
+      expect(await child.exited).toBe(0);
+      expect(output).toContain("missing key EXAMPLE_KEY");
+      expect(output).toContain("disabled");
+      expect(output).not.toContain("never-publish-sentinel");
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

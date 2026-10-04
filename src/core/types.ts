@@ -204,9 +204,11 @@ export interface Invocation {
   status: InvocationStatus;
   costUsd: number;
   costEquivUsd: number;
+  /** Uncached input; `cacheReadTokens` and `cacheWriteTokens` carry the rest of the prompt. */
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
+  cacheWriteTokens: number;
   numTurns: number;
   sessionId: string | null;
   error: string | null;
@@ -269,6 +271,7 @@ export interface QuotaWindow {
 }
 
 export interface ProviderStatus {
+  kind?: string;
   fast?: boolean;
   supportsFast?: boolean;
   fastModeUnavailableReason?: string | null;
@@ -614,6 +617,9 @@ export interface EvalTrial {
     invocationStatus?: InvocationStatus;
     /** `[triage] decision_confidence` a decision-model trial ran with. */
     decisionConfidence?: number;
+    /** Prompt tokens read from and written to the provider's cache; absent on legacy trials. */
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
     preparationFailed?: boolean;
     interrupted?: boolean;
     /** Eval the trial ran in before a resume copied it; its spend was already charged to the provider there. */

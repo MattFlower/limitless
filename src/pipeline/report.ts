@@ -1,3 +1,4 @@
+import { cacheHitRate } from "../core/cache-format.ts";
 import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation } from "../core/types.ts";
 import type { RunContext, RunState } from "./context.ts";
@@ -230,22 +231,30 @@ export function renderReport(input: ReportInput): string {
   const spent = (key: "costUsd" | "costEquivUsd") =>
     money(shadow.reduce((total, inv) => total + inv[key], 0));
   const shadowSpend = `**Shadow review (included in total):** ${spent("costUsd")} spent, ${spent("costEquivUsd")} API-equivalent on subscriptions.`;
+  const promptTokens = (list: Invocation[]) =>
+    list.reduce((n, inv) => n + inv.inputTokens + inv.cacheReadTokens + inv.cacheWriteTokens, 0);
   if (work.length) {
+    const uncached = work.reduce((n, inv) => n + inv.inputTokens, 0);
+    const cached = work.reduce((n, inv) => n + inv.cacheReadTokens, 0);
+    const written = work.reduce((n, inv) => n + inv.cacheWriteTokens, 0);
     blocks.push(
       "## Work log",
       table(
-        ["Role", "Model", "Effort", "Status", "Tokens in / out", "Cost", "Duration"],
+        ["Role", "Model", "Effort", "Status", "Tokens in / out", "Cached", "Cache write", "Cost", "Duration"],
         work.map((inv) => [
           inv.role,
           `\`${inv.modelId}\``,
           effortLabel(inv.effort),
           inv.status,
-          `${(inv.inputTokens + inv.cacheReadTokens).toLocaleString("en-US")} / ${inv.outputTokens.toLocaleString("en-US")}`,
+          `${(inv.inputTokens + inv.cacheReadTokens + inv.cacheWriteTokens).toLocaleString("en-US")} / ${inv.outputTokens.toLocaleString("en-US")}`,
+          inv.cacheReadTokens.toLocaleString("en-US"),
+          inv.cacheWriteTokens.toLocaleString("en-US"),
           inv.costUsd > 0 ? money(inv.costUsd) : `${money(inv.costEquivUsd)} equiv.`,
           inv.finishedAt ? `${Math.round((inv.finishedAt - inv.startedAt) / 1000)}s` : "–",
         ]),
       ),
       `**Total:** ${money(input.totals.costUsd)} spent, ${money(input.totals.costEquivUsd)} API-equivalent on subscriptions.`,
+      `**Cache:** ${cacheHitRate(cached, promptTokens(work))} of prompt tokens read from cache (${cached.toLocaleString("en-US")} cached, ${written.toLocaleString("en-US")} written, ${uncached.toLocaleString("en-US")} not cached; cache writes older rows never recorded count here).`,
       ...(shadow.length ? [shadowSpend] : []),
     );
   }

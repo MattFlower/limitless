@@ -1218,6 +1218,7 @@ test("stored panel finder replay pairs candidates, bills only verifiers and surv
     expect([trial?.costUsd, trial?.costEquivUsd, trial?.tokensIn, trial?.tokensOut]).toEqual([
       0.02, 0.04, 10, 3,
     ]);
+    expect([trial?.details.cacheReadTokens, trial?.details.cacheWriteTokens]).toEqual([2, 1]);
     const stored = StoredReviewSchema.parse(trial?.output);
     expect(stored.panel?.candidates).toEqual(StoredReviewSchema.parse(original.output).panel?.candidates);
     expect(stored.panel?.candidates[0]?.duplicates).toHaveLength(1);

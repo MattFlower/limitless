@@ -114,6 +114,60 @@ test("a previous release can still open the database (deploy rollback)", () => {
       reopened_at: null,
     });
     db.close();
+    // Every shipped file migration, including the additive cache-write column, applies in turn.
+    const shipped = new Store(path);
+    shipped.close();
+    const after = new Database(path);
+    after.exec(
+      "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+    );
+    const stillApplied = new Set(
+      (after.query("SELECT version FROM schema_migrations").all() as { version: number }[]).map(
+        (r) => r.version,
+      ),
+    );
+    expect(MIGRATIONS.filter((m) => !stillApplied.has(m.version))).toEqual([]);
+    expect(after.query("SELECT input_tokens, cache_read_tokens FROM invocations LIMIT 0").all()).toEqual([]);
+    after.close();
+  });
+});
+
+test("invocations recorded before cache writes were stored read as zero writes", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-invocation-cache-write-tokens.sql"),
+    });
+    const old = new Store(path, before);
+    const repo = old.upsertRepo({
+      slug: "local/legacy",
+      kind: "local",
+      localPath: directory,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = old.createRun(repo, { repo: repo.slug, prompt: "legacy" });
+    const invocation = old.createInvocation({
+      runId: run.id,
+      stageId: null,
+      role: "implement",
+      harness: "claude",
+      provider: "claude",
+      model: "m",
+      modelId: "claude/m",
+    });
+    old.updateInvocation(invocation.id, { status: "ok", inputTokens: 10, cacheReadTokens: 20 });
+    old.close();
+
+    const store = new Store(path);
+    expect(store.listInvocations(run.id)[0]).toMatchObject({
+      inputTokens: 10,
+      cacheReadTokens: 20,
+      cacheWriteTokens: 0,
+    });
+    store.close();
   });
 });
 
