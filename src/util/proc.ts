@@ -300,6 +300,7 @@ export function agentEnv(extra: Record<string, string> = {}): Record<string, str
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
+    if (credentialNames.has(k)) continue;
     if (/^(OPENROUTER_|DISCORD_|GITHUB_WEBHOOK_|LIMITLESS_)/.test(k)) continue;
     // Don't let a parent Claude Code session's markers change the child's behavior.
     if (k === "CLAUDECODE" || k.startsWith("CLAUDE_CODE_") || k === "CLAUDE_PLUGIN_DATA") continue;
@@ -308,7 +309,7 @@ export function agentEnv(extra: Record<string, string> = {}): Record<string, str
     env[k] = v;
   }
   delete env.SSH_AUTH_SOCK;
-  const child: Record<string, string> = {
+  return {
     ...env,
     // Agents (and the repo code they write, which gates execute) must not act on GitHub or push:
     // the factory does delivery. An invalid token makes `gh` fail fast instead of using the
@@ -321,6 +322,4 @@ export function agentEnv(extra: Record<string, string> = {}): Record<string, str
     GIT_CONFIG_VALUE_0: "",
     ...extra,
   };
-  for (const name of credentialNames) delete child[name];
-  return child;
 }

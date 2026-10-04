@@ -443,6 +443,75 @@ test("native fast flags cover edit, structured and isolated readers without leak
   });
 });
 
+test("configured backend auth survives inherited credential filtering and stays redacted", async () => {
+  const { customModel, customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const { agentEnv, runProcess } = await import("../src/util/proc.ts");
+  const { Factory } = await import("../src/app.ts");
+  const { Store } = await import("../src/db/store.ts");
+  const key = "ANTHROPIC_AUTH_TOKEN";
+  const saved = process.env[key];
+  const token = "FAKE_EXPLICIT_BACKEND_TOKEN_734";
+  const fixture = providerFixture(
+    [
+      {
+        ...customProvider,
+        kind: "anthropic-compatible",
+        base_url: "https://example.invalid",
+        api_key_env: key,
+        models: [{ ...customModel, efforts: [], effort: undefined }],
+      },
+    ],
+    `${key}=${token}\n`,
+  );
+  const store = new Store(":memory:");
+  try {
+    process.env[key] = "FAKE_INHERITED_BACKEND_TOKEN_735";
+    const factory = new Factory(fixture.load(), { store });
+    expect(factory.tracker.authToken("mac-mlx")).toBe(token);
+    expect(agentEnv()[key]).toBeUndefined();
+    const resolved = factory.router.resolveFor("triage", "mac-mlx/flash");
+    const events: AgentEvent[] = [];
+    const logPath = join(fixture.root, "backend.log");
+    const result = await runClaude(
+      {
+        cwd: fixture.root,
+        prompt: "test",
+        mode: "edit",
+        logPath,
+        target: factory.router.toTarget(resolved.model),
+        timeoutMs: 5000,
+        idleTimeoutMs: 5000,
+        maxToolCalls: 1,
+        signal: new AbortController().signal,
+        onEvent: (event) => events.push(event),
+      },
+      async (options) => {
+        const child = await runProcess({
+          ...options,
+          cmd: [
+            process.execPath,
+            "-e",
+            `const token = process.env.ANTHROPIC_AUTH_TOKEN; console.log(JSON.stringify({type:"result",result:"authenticated " + token})); process.exit(token === ${JSON.stringify(token)} ? 0 : 1);`,
+          ],
+        });
+        expect(child.exitCode).toBe(0);
+        return child;
+      },
+    );
+    expect(result.status).toBe("ok");
+    expect(result.finalText).toBe("authenticated [credential]");
+    for (const recorded of [JSON.stringify(events), JSON.stringify(result), readFileSync(logPath, "utf8")]) {
+      expect(recorded).not.toContain(token);
+      expect(recorded).not.toContain(process.env[key] ?? "missing");
+    }
+  } finally {
+    if (saved === undefined) delete process.env[key];
+    else process.env[key] = saved;
+    store.close();
+    fixture.close();
+  }
+});
+
 test("configured credentials never reach native children or their events, logs and errors", async () => {
   const { writeFileSync } = await import("node:fs");
   const { customProvider, providerFixture } = await import("./provider-config-support.ts");
