@@ -170,9 +170,15 @@ test("add-passkey's one-time link registers a passkey through the proxy, which t
   const token = new URL(url).hash.slice(1);
   expect(url).toBe(`${origin}/enroll#${token}`);
   expect((await call("/enroll")).status).toBe(200);
+  const options = () => post("/api/auth/passkey/register/options", { token }).then((res) => res.json());
+  const wrongSite = fakeAuthenticator("https://evil.example").create(await options());
+  const refused = await post("/api/auth/passkey/register", { token, response: wrongSite });
+  expect([refused.status, await refused.json()]).toEqual([400, { error: "passkey registration failed" }]);
   const key = fakeAuthenticator(origin);
-  const options = await (await post("/api/auth/passkey/register/options", { token })).json();
-  const registered = await post("/api/auth/passkey/register", { token, response: key.create(options) });
+  const registered = await post("/api/auth/passkey/register", {
+    token,
+    response: key.create(await options()),
+  });
   const cookie = registered.headers.get("set-cookie")?.split(";")[0] ?? "";
   expect(await (await call("/api/auth/session", { headers: { cookie } })).json()).toMatchObject({
     session: { method: "passkey", device: "Phone/1" },
@@ -184,7 +190,10 @@ test("add-passkey's one-time link registers a passkey through the proxy, which t
   const challenge = await (await post("/api/auth/passkey/login/options", {})).json();
   const signedIn = await post("/api/auth/passkey/login", key.get(challenge));
   expect(signedIn.headers.get("set-cookie")).toStartWith("__Host-limitless-session=");
-  expect((await post("/api/auth/passkey/login", key.get(challenge))).status).toBe(400);
+  const replay = await post("/api/auth/passkey/login", key.get(challenge));
+  const replayed = await replay.text();
+  expect([replay.status, JSON.parse(replayed)]).toEqual([401, { error: "passkey sign-in failed" }]);
+  expect(replayed).not.toContain(challenge.challenge);
   const listed = await call("/api/admin/auth/passkeys", { address: "127.0.0.1" });
   expect(await listed.json()).toMatchObject([{ id: key.id, device: "Phone/1" }]);
   expect(await (await admin("/api/admin/auth/passkeys/remove", { id: key.id })).json()).toEqual({

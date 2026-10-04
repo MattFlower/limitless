@@ -18,6 +18,9 @@ const MAX_CHALLENGES = 1000;
 const USER = { userName: "limitless", userID: new TextEncoder().encode("limitless") };
 
 const sha256 = (token: string) => createHash("sha256").update(token).digest("hex");
+/** Failure detail for the log, with long tokens (challenges, credential ids, keys) cut out. */
+const redact = (error: unknown) =>
+  (error instanceof Error ? error.message : String(error)).replace(/[\w-]{16,}/g, "[redacted]");
 
 /**
  * WebAuthn passkeys for the first public origin (its host is the relying party). Registration needs a
@@ -30,6 +33,7 @@ export class Passkeys {
     private store: Store,
     private cfg: Pick<Config, "publicOrigins">,
     private now = Date.now,
+    private log = (reason: string) => console.warn(`passkey: ${reason}`),
   ) {}
 
   private get origins(): string[] {
@@ -88,35 +92,59 @@ export class Passkeys {
     return this.issue(await generateRegistrationOptions(options));
   }
 
+  /**
+   * Verifies and saves a new passkey. Callers see one fixed error; the reason goes to the log. After the
+   * await everything runs synchronously, so re-checking the link, saving and then consuming it can't
+   * interleave with a concurrent registration, and a failed save leaves the link usable.
+   */
   async register(token: unknown, response: RegistrationResponseJSON, device: string): Promise<void> {
     const key = this.enrollment(token);
-    const { verified, registrationInfo } = await verifyRegistrationResponse({
-      response,
-      expectedChallenge: this.answer,
-      expectedOrigin: this.origins,
-      expectedRPID: this.rpID,
-    });
-    // Checked again after the await: two registrations racing on one link must not both land.
-    if (!verified || !this.enrollments.delete(key)) throw new Error("passkey registration failed");
-    this.store.addPasskey(registrationInfo.credential, device.slice(0, 256), this.now());
+    try {
+      const { verified, registrationInfo } = await verifyRegistrationResponse({
+        response,
+        expectedChallenge: this.answer,
+        expectedOrigin: this.origins,
+        expectedRPID: this.rpID,
+        requireUserVerification: true,
+      });
+      if (!verified) throw new Error("registration not verified");
+      if (response.clientExtensionResults?.credProps?.rk === false)
+        throw new Error("credential not discoverable");
+      if ((this.enrollments.get(key) ?? 0) <= this.now()) throw new Error("enrollment link used or expired");
+      this.store.addPasskey(registrationInfo.credential, device.slice(0, 256), this.now());
+    } catch (error) {
+      this.log(`registration failed: ${redact(error)}`);
+      throw new Error("passkey registration failed");
+    }
+    this.enrollments.delete(key);
   }
 
   async authenticationOptions() {
     return this.issue(await generateAuthenticationOptions({ rpID: this.rpID, userVerification: "required" }));
   }
 
-  /** Whether the assertion is a fresh signature by a registered passkey. */
+  /** Whether the assertion is a fresh signature by a registered passkey; the reason for a no goes to the log. */
   async authenticate(response: AuthenticationResponseJSON): Promise<boolean> {
     const credential = typeof response?.id === "string" ? this.store.passkey(response.id) : null;
-    if (!credential) return false;
-    const { verified, authenticationInfo } = await verifyAuthenticationResponse({
-      response,
-      expectedChallenge: this.answer,
-      expectedOrigin: this.origins,
-      expectedRPID: this.rpID,
-      credential,
-    });
-    if (verified) this.store.usePasskey(credential.id, authenticationInfo.newCounter, this.now());
-    return verified;
+    try {
+      if (!credential) throw new Error("unknown credential");
+      const { verified, authenticationInfo } = await verifyAuthenticationResponse({
+        response,
+        expectedChallenge: this.answer,
+        expectedOrigin: this.origins,
+        expectedRPID: this.rpID,
+        credential,
+        requireUserVerification: true,
+      });
+      if (!verified) throw new Error("signature not verified");
+      // The credential was read before the await: it may since have been removed, or another sign-in may
+      // have stored a higher counter. The conditional update refuses both.
+      if (!this.store.usePasskey(credential.id, authenticationInfo.newCounter, this.now()))
+        throw new Error("passkey removed or counter not increasing");
+      return true;
+    } catch (error) {
+      this.log(`sign-in failed: ${redact(error)}`);
+      return false;
+    }
   }
 }

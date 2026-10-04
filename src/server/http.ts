@@ -259,7 +259,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       POST: handle(async (req) =>
         (await passkeys.authenticate(await body<AuthenticationResponseJSON>(req)))
           ? passkeySession(req)
-          : error("passkey not recognised", 401),
+          : error("passkey sign-in failed", 401),
       ),
     },
     "/api/auth/session": handle((req) => json({ session: auth.session(req.headers) })),

@@ -356,7 +356,8 @@ registering also signs that browser in. Afterwards **Sign in with a passkey** on
 needs no typing. The passkey belongs to the host of the first `public_origins` entry and works
 only there; user verification (biometrics or a PIN) is required. WebAuthn verification uses
 [`@simplewebauthn/server`](https://simplewebauthn.dev). Removing a passkey does not end the
-sessions it signed in; revoke those separately.
+sessions it signed in; revoke those separately. A failed passkey registration or sign-in shows only
+"passkey registration failed" or "passkey sign-in failed"; the reason is in the daemon log.
 
 The password is the fallback. It is stored in the database as an argon2id hash. The login page is a plain form
 (username `limitless`, `autocomplete="username"` / `"current-password"`), so password managers

@@ -1809,10 +1809,14 @@ export class Store {
     return { id, publicKey, counter: row.counter as number, transports: parse(row.transports, []) };
   }
 
-  usePasskey(id: string, counter: number, now: number): void {
-    this.db
-      .query("UPDATE auth_passkeys SET counter = ?, last_used_at = ? WHERE id = ?")
-      .run(counter, now, id);
+  /**
+   * Records a sign-in only if the passkey still exists and its counter moves forward, so a concurrent
+   * sign-in can't rewind it; authenticators that always report 0 (most synced passkeys) stay at 0.
+   */
+  usePasskey(id: string, counter: number, now: number): boolean {
+    const sql = `UPDATE auth_passkeys SET counter = ?1, last_used_at = ?2
+      WHERE id = ?3 AND (counter < ?1 OR (counter = 0 AND ?1 = 0))`;
+    return this.db.query(sql).run(counter, now, id).changes === 1;
   }
 
   listPasskeys(): AuthPasskey[] {
