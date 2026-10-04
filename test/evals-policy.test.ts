@@ -547,17 +547,17 @@ test("policy selects latest evidence per effort, costs them independently and re
 
 test("fresh bare evals of models without a default effort qualify; legacy unknown effort does not", () => {
   const fresh = evidence("triage", ["claude/opus", "codex/luna@medium"], { id: "fresh", finishedAt: 3000 });
-  const legacy = evidence("triage", ["claude/sonnet"], { id: "legacy" });
+  const legacy = evidence("triage", ["claude/sonnet-5.5"], { id: "legacy" });
   for (const t of legacy.trials) t.effort = null;
   const result = generatePolicy(input([fresh, legacy]));
   const candidates = result.roles[0]?.candidates ?? [];
   expect(fresh.trials.find((t) => t.modelId === "claude/opus")?.effort).toBe("default");
   expect(candidates.find((c) => c.modelId === "claude/opus")?.eligible).toBe(true);
-  expect(candidates.find((c) => c.modelId === "claude/sonnet (unknown effort)")?.reasons).toContain(
+  expect(candidates.find((c) => c.modelId === "claude/sonnet-5.5 (unknown effort)")?.reasons).toContain(
     "legacy evidence with unknown effort",
   );
   expect(result.generated.triage?.default).toContain("claude/opus");
-  expect(result.generated.triage?.default).not.toContain("claude/sonnet");
+  expect(result.generated.triage?.default).not.toContain("claude/sonnet-5.5");
   // A saved "default" is not reinterpreted once the catalog gains a default effort.
   const models = MODELS.map((m) => (m.id === "claude/opus" ? { ...m, effort: "high" as const } : m));
   const changed = generatePolicy({ ...input([fresh]), models });

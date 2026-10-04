@@ -1,6 +1,6 @@
 {
   "triage.default": {
-    "reason": "Luna at medium effort first, through the Codex subscription (codex/luna, the same gpt-6-luna model as openrouter/gpt-6-luna), then low and none; OpenRouter Luna follows as the metered fallback. Held-out evidence for Luna@medium: eval-mump7s7re29l (78.9%, no risk under-calls); the owner judged the transport difference to be within standard error. The remaining entries are availability fallbacks that the held-out set has not ranked.",
+    "reason": "Luna at medium effort first, through the Codex subscription (codex/luna, the same gpt-6-luna model as openrouter/gpt-6-luna), then low and none; OpenRouter Luna follows as the metered fallback. Held-out evidence for Luna@medium: eval-mump7s7re29l (78.9%, no risk under-calls); the owner judged the transport difference to be within standard error. The remaining entries are availability fallbacks that the held-out set has not ranked. Sonnet 5.5 replaced Sonnet 5 as the last fallback on 2026-10-04 (owner decision).",
     "decided": "2026-10-01"
   },
   "implement.trivial": {
@@ -24,7 +24,7 @@
     "decided": "2026-10-01"
   },
   "review.large": {
-    "reason": "Sol 6.1 first: on review eval v2 (eval-muo4xsbk3p8f, Codex, medium effort, k=3) it matched Sol 6.0 on blocking recall (27.6% vs 28.6%), caught more high-severity defects (50.0% vs 37.5%) and falsely blocked clean changes half as often (18.2% vs 36.4%), at the same cost and latency. The rest of each chain is the previous default. Neither model clears the review floors yet; this pins the better of the two. Astra was dropped from both review chains on 2026-10-04 (owner decision), leaving Opus in its place.",
+    "reason": "Sol 6.1 first: on review eval v2 (eval-muo4xsbk3p8f, Codex, medium effort, k=3) it matched Sol 6.0 on blocking recall (27.6% vs 28.6%), caught more high-severity defects (50.0% vs 37.5%) and falsely blocked clean changes half as often (18.2% vs 36.4%), at the same cost and latency. The rest of each chain is the previous default. Neither model clears the review floors yet; this pins the better of the two. Astra was dropped from both review chains on 2026-10-04 (owner decision), leaving Opus in its place. Sonnet 5.5 replaced Sonnet 5 in the second group the same day (owner decision).",
     "decided": "2026-09-30"
   }
 }

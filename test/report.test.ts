@@ -50,7 +50,7 @@ test("markdown tables are contiguous blocks", () => {
         blocking_questions: [],
       },
       lastVerify: {
-        modelId: "claude/sonnet",
+        modelId: "claude/sonnet-5.5",
         overall: "pass",
         notes: "",
         criteria: [
@@ -343,7 +343,7 @@ test("holdout counts separate blocking results from not-required follow-up notes
         ],
       },
       lastVerify: {
-        modelId: "claude/sonnet",
+        modelId: "claude/sonnet-5.5",
         overall: "fail",
         notes: "",
         criteria: [

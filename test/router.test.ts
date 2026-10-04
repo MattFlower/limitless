@@ -1039,12 +1039,12 @@ test("with the default policy, a verifier never reuses a raising model and prefe
     router.route("review", "small", verifierConstraints(vendors, raisedBy, implementer)).candidates[0]
       ?.modelId;
   // Raised by an OpenAI finder only: the implementer's vendor, but not its model.
-  expect(verifier(["openai"], ["codex/sol"])).toBe("claude/sonnet");
+  expect(verifier(["openai"], ["codex/sol"])).toBe("claude/sonnet-5.5");
   // Raised by both vendors (adversarial and careful): no clean vendor, so another model, never a raiser.
   tracker.observeWindows("codex", { seven_day: { utilization: 0.8, resetsAt: Date.now() + 86_400_000 } });
-  const both = verifier(["anthropic", "openai"], ["codex/sol", "claude/sonnet"]);
+  const both = verifier(["anthropic", "openai"], ["codex/sol", "claude/sonnet-5.5"]);
   expect(both).toBeDefined();
-  expect(["codex/sol", "claude/sonnet", "claude/opus"]).not.toContain(both);
+  expect(["codex/sol", "claude/sonnet-5.5", "claude/opus"]).not.toContain(both);
   // Deep profile: adversarial on codex/sol-6.1, careful on the implementer's claude/opus. Both vendors
   // raised it, so the one that did not implement verifies, even with more Claude headroom.
   const deep = router.route(

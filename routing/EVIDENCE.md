@@ -120,7 +120,7 @@ Why: same model, different transport, and the subscription has unused quota. The
 
 Paired difference -0.056, one-sided 95% lower bound -0.167. The same OpenRouter setting scored 78.9% on these cases two days earlier (eval-mump7s7re29l), so run-to-run variation is of the same order. Through Codex, Luna was less stable: its verdict flipped between trials on 7 of 30 cases (23%) against 3 of 30 (10%), and it used about 2.6 times the tokens ($0.0498 API-equivalent against $0.0189). Revisit if the field risk under-call rate rises.
 
-## Owner decision: remove `codex/astra` and `claude/fable` from routing (2026-10-04)
+## Owner decision: remove `codex/astra` and `claude/fable`; Sonnet 5.5 replaces Sonnet 5 (2026-10-04)
 
 GPT-6 Astra (`codex/astra`, backend model `gpt-6-astra`) and Claude Fable 5.1 (`claude/fable`, backend model `claude-fable-5-1`) are no longer in the model catalog, so nothing routes to them. No model replaces them:
 - every implement cell (`trivial`, `small`, `medium` and `large`) is `codex/sol-6.1@high`, then `claude/opus`. Codex stays first, Astra drops out, and Sol 6.1 now leads `large` as well;
@@ -128,7 +128,9 @@ GPT-6 Astra (`codex/astra`, backend model `gpt-6-astra`) and Claude Fable 5.1 (`
 
 Escalation still raises the minimum tier, capped at 5. Opus is now the only tier-5 model, so a run escalating from Sol 6.1 goes straight to Opus in every role.
 
-The evaluation results in this file that mention either model are kept as history. `limitless eval policy` lists such evidence as ineligible ("not in the model catalog"), so a regenerated policy cannot bring them back. Stored runs, invocations and evals that used them still show their recorded IDs. A routing policy or `--models` value that names one fails with an error saying it was removed; so does a review roster pin in panel mode (single mode, which uses no roster, warns).
+Claude Sonnet 5.5 (`claude/sonnet-5.5`, backend model `claude-sonnet-5-5`) replaces Claude Sonnet 5 (`claude/sonnet`, backend model `claude-sonnet-5`) in every chain, and Sonnet 5 leaves the catalog. It has the same tier and price, and the owner's field use puts it close to Opus 5.5. In effect, this changes the spec writer, holdout author and verifier groups (a Sol-implemented run is now verified by Sonnet 5.5), the last triage fallback (`claude/sonnet-5.5@low`) and the second `review.large` group. No routing eval covers Sonnet 5.5 yet. The Sonnet 5 results in this file, such as 10.5% blocking recall on review eval v2, don't carry over; #133 tracks the comparison.
+
+The evaluation results in this file that mention a removed model are kept as history. `limitless eval policy` lists such evidence as ineligible ("not in the model catalog"), so a regenerated policy cannot bring them back. Stored runs, invocations and evals that used them still show their recorded IDs. A routing policy or `--models` value that names one fails with an error saying it was removed; so does a review roster pin in panel mode (single mode, which uses no roster, warns).
 
 ## Owner decision: implement = Codex first in every cell while banked Codex resets last (2026-10-03)
 

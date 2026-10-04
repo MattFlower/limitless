@@ -127,15 +127,17 @@ export const MODELS: ModelDef[] = [
     price: { input: 4, output: 20, cacheRead: 0.2 },
   },
   {
-    id: "claude/sonnet",
+    id: "claude/sonnet-5.5",
     provider: "claude",
-    model: "claude-sonnet-5",
+    model: "claude-sonnet-5-5",
     vendor: "anthropic",
     origin: "US",
     baseOrigin: "US",
     supportedEfforts: ["low", "medium", "high"],
     tier: 4,
     price: { input: 2, output: 10, cacheRead: 0.2 },
+    notes:
+      "Released 2026-09-28; replaced Sonnet 5 in every chain on 2026-10-04 (owner decision; evals in #133)",
   },
   {
     id: "claude/haiku",
@@ -147,18 +149,6 @@ export const MODELS: ModelDef[] = [
     supportedEfforts: [],
     tier: 3,
     price: { input: 1, output: 5, cacheRead: 0.1 },
-  },
-  {
-    id: "claude/sonnet-5.5",
-    provider: "claude",
-    model: "claude-sonnet-5-5",
-    vendor: "anthropic",
-    origin: "US",
-    baseOrigin: "US",
-    supportedEfforts: ["low", "medium", "high"],
-    tier: 4,
-    price: { input: 2, output: 10, cacheRead: 0.2 },
-    notes: "Released 2026-09-28; under evaluation (#133), not in the routing policy",
   },
   // OpenAI via the ChatGPT subscription (Codex CLI >= 0.157 serves the gpt-6 family on this plan).
   {
@@ -465,6 +455,7 @@ export const MODELS: ModelDef[] = [
  */
 export const REMOVED_MODELS: ReadonlyMap<string, string> = new Map([
   ["claude/fable", "Claude Fable 5.1 was removed from routing on 2026-10-04 (owner decision)"],
+  ["claude/sonnet", "Claude Sonnet 5 was replaced by claude/sonnet-5.5 on 2026-10-04 (owner decision)"],
   ["codex/astra", "GPT-6 Astra was removed from routing on 2026-10-04 (owner decision)"],
 ]);
 
@@ -480,24 +471,24 @@ export const DEFAULT_POLICY: Policy = {
   summarize: { default: ["omlx/qwen-flash", "claude/haiku|codex/luna", "openrouter/glm-5.3-flash"] },
   chat: { default: ["omlx/qwen-flash", "claude/haiku|codex/luna"] },
   spec: {
-    default: ["claude/sonnet|codex/sol|codex/sol-5.6", "claude/opus"],
-    large: ["claude/opus", "claude/sonnet|codex/sol|codex/sol-5.6"],
+    default: ["claude/sonnet-5.5|codex/sol|codex/sol-5.6", "claude/opus"],
+    large: ["claude/opus", "claude/sonnet-5.5|codex/sol|codex/sol-5.6"],
   },
   plan: { default: ["claude/opus"] },
   plan_review: { default: ["claude/opus"] },
-  holdout: { default: ["claude/sonnet|codex/sol|codex/sol-5.6", "claude/opus"] },
+  holdout: { default: ["claude/sonnet-5.5|codex/sol|codex/sol-5.6", "claude/opus"] },
   implement: {
-    trivial: ["claude/haiku|codex/luna", "claude/sonnet|codex/sol|codex/sol-5.6", "claude/opus"],
-    small: ["claude/sonnet|codex/sol|codex/sol-5.6", "openrouter/glm-5.3", "claude/opus"],
-    medium: ["claude/sonnet|codex/sol|codex/sol-5.6", "claude/opus", "openrouter/kimi-code"],
+    trivial: ["claude/haiku|codex/luna", "claude/sonnet-5.5|codex/sol|codex/sol-5.6", "claude/opus"],
+    small: ["claude/sonnet-5.5|codex/sol|codex/sol-5.6", "openrouter/glm-5.3", "claude/opus"],
+    medium: ["claude/sonnet-5.5|codex/sol|codex/sol-5.6", "claude/opus", "openrouter/kimi-code"],
     large: ["claude/opus"],
   },
   review: {
-    default: ["codex/sol|codex/sol-5.6|claude/sonnet", "openrouter/glm-5.3", "claude/opus"],
-    large: ["claude/opus", "codex/sol|codex/sol-5.6|claude/sonnet"],
+    default: ["codex/sol|codex/sol-5.6|claude/sonnet-5.5", "openrouter/glm-5.3", "claude/opus"],
+    large: ["claude/opus", "codex/sol|codex/sol-5.6|claude/sonnet-5.5"],
   },
   verify: {
-    default: ["claude/sonnet|codex/sol|codex/sol-5.6", "claude/opus"],
-    large: ["claude/opus", "claude/sonnet|codex/sol|codex/sol-5.6"],
+    default: ["claude/sonnet-5.5|codex/sol|codex/sol-5.6", "claude/opus"],
+    large: ["claude/opus", "claude/sonnet-5.5|codex/sol|codex/sol-5.6"],
   },
 };

@@ -9,7 +9,7 @@
       "openrouter/gpt-6-luna@none",
       "twilight/qwen-27b@none",
       "mtplx/qwen-27b@high",
-      "claude/sonnet@low"
+      "claude/sonnet-5.5@low"
     ]
   },
   "implement": {
@@ -20,6 +20,6 @@
   },
   "review": {
     "default": ["codex/sol-6.1|codex/sol|codex/sol-5.6|claude/opus", "openrouter/glm-5.3", "claude/opus"],
-    "large": ["claude/opus", "codex/sol-6.1|codex/sol|codex/sol-5.6|claude/sonnet"]
+    "large": ["claude/opus", "codex/sol-6.1|codex/sol|codex/sol-5.6|claude/sonnet-5.5"]
   }
 }

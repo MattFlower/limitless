@@ -491,13 +491,13 @@ seedProvider(
     status: "succeeded",
     startedAt: t,
     finishedAt: t + 52 * SEC,
-    summary: "4 acceptance criteria (claude/sonnet)",
+    summary: "4 acceptance criteria (claude/sonnet-5.5)",
   });
   const specInv = addInvocation({
     runId: id,
     stageId: specStage,
     role: "spec",
-    modelId: "claude/sonnet",
+    modelId: "claude/sonnet-5.5",
     status: "ok",
     inputTokens: 5400,
     outputTokens: 980,
@@ -791,7 +791,7 @@ seedProvider(
 
   for (let round = 0; round < 3; round++) {
     // Two failed rounds on one implementer escalate it a tier.
-    const implementer = round < 2 ? "claude/sonnet" : "claude/opus";
+    const implementer = round < 2 ? "claude/sonnet-5.5" : "claude/opus";
     const implStage = addStage({
       runId: id,
       name: "implement",
@@ -1205,7 +1205,7 @@ seedProvider(
     runId: id,
     stageId: implStage,
     role: "implement",
-    modelId: "claude/sonnet",
+    modelId: "claude/sonnet-5.5",
     status: "cancelled",
     inputTokens: 3900,
     outputTokens: 780,
@@ -1287,7 +1287,7 @@ const succeededSpecs: SucceededSpec[] = [
     resolvedProfile: "standard",
     taskClass: "bugfix",
     complexity: "small",
-    implementModel: "claude/sonnet",
+    implementModel: "claude/sonnet-5.5",
     reviewModel: "codex/sol",
     daysAgo: 3,
     hour: 11,
@@ -1333,7 +1333,7 @@ const succeededSpecs: SucceededSpec[] = [
     resolvedProfile: "standard",
     taskClass: "refactor",
     complexity: "medium",
-    implementModel: "claude/sonnet",
+    implementModel: "claude/sonnet-5.5",
     reviewModel: "codex/sol",
     daysAgo: 1,
     hour: 14,
@@ -1348,7 +1348,7 @@ const succeededSpecs: SucceededSpec[] = [
     resolvedProfile: "standard",
     taskClass: "feature",
     complexity: "small",
-    implementModel: "claude/sonnet",
+    implementModel: "claude/sonnet-5.5",
     reviewModel: "codex/sol",
     daysAgo: 0,
     hour: -3, // 3 hours ago
@@ -1522,13 +1522,13 @@ for (const spec of succeededSpecs) {
       status: "succeeded",
       startedAt: specStart,
       finishedAt: specStart + specDur,
-      summary: "3 acceptance criteria (claude/sonnet)",
+      summary: "3 acceptance criteria (claude/sonnet-5.5)",
     });
     const specInv = addInvocation({
       runId: id,
       stageId: specStage,
       role: "spec",
-      modelId: "claude/sonnet",
+      modelId: "claude/sonnet-5.5",
       status: "ok",
       inputTokens: rand(5000, 3000),
       outputTokens: rand(900, 500),
@@ -1783,7 +1783,7 @@ for (const spec of succeededSpecs) {
         runId: id,
         stageId: verifyStage,
         role: "verify",
-        modelId: "claude/sonnet",
+        modelId: "claude/sonnet-5.5",
         status: "ok",
         inputTokens: 4500,
         outputTokens: 700,
@@ -1809,7 +1809,7 @@ for (const spec of succeededSpecs) {
         ],
         overall: "pass" as const,
         notes: "No regressions observed.",
-        model: "claude/sonnet",
+        model: "claude/sonnet-5.5",
       };
       addArtifact(id, `verify-${rt.round}.json`, "verify", JSON.stringify(verify, null, 2), rt.verifyStart);
     }

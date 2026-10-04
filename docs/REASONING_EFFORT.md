@@ -19,7 +19,7 @@ Use bare IDs or `model@effort` in every routing policy cell and in eval `--model
 limitless eval run triage --models codex/luna@low,codex/luna@high --k 2 --follow
 limitless eval policy
 limitless eval policy --write
-bun run smoke --models claude/sonnet@high,codex/luna@low
+bun run smoke --models claude/sonnet-5.5@high,codex/luna@low
 ```
 
 `POST /api/evals` accepts the same references in `models`. The shared resolver rejects
