@@ -21,6 +21,8 @@ All six runs pass 1,746 tests, skip 1 (no Codex CLI here) and fail the same 22. 
   - the baseline-cache case for `NODE_TLS_REJECT_UNAUTHORIZED`, which Bun 1.3.14 leaves out of `{...process.env}`;
   - the tab-in-URL readiness case.
 
+CI (GitHub's `ubuntu-latest`, Bun 1.4.0, git 2.55, identity-only git config, not root) passes all 1,768 runnable tests on this branch. Its `bun test` took 315.7s on the PR's first run. The four `main` runs just before it took 307.4s, 341.5s, 359.5s and 341.6s (mean 337.5s). CI's run-to-run spread is wider than the ~5% expected there, so one run neither confirms nor rules it out.
+
 In round 1, `main` also failed `verify-change: restart-initial` once. That test checks that the worktree is gone as soon as `waitFor` sees `succeeded`, but the engine removes the worktree only after writing that status. It passed in every other run, and this change does not address it.
 
 ### What dominates
