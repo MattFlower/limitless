@@ -241,6 +241,9 @@ test("roster targets are checked against the catalog at startup; single mode onl
     expect(() => start('{ prompt = "adversarial", target = "claude/opsu" }')).toThrow(
       'review.rosters.standard[0].target claude/opsu: unknown model ID "claude/opsu"',
     );
+    expect(() => start('{ prompt = "adversarial", target = "claude/fable" }')).toThrow(
+      'claude/fable: unknown model ID "claude/fable": Claude Fable 5.1 was removed from routing on 2026-10-04',
+    );
     expect(() =>
       start('{ prompt = "careful" }, { prompt = "standard", local = true, target = "claude/opus" }'),
     ).toThrow("review.rosters.standard[1].target claude/opus: a local finder needs a free model");

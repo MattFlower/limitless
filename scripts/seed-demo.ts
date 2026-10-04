@@ -491,13 +491,13 @@ seedProvider(
     status: "succeeded",
     startedAt: t,
     finishedAt: t + 52 * SEC,
-    summary: "4 acceptance criteria (claude/sonnet)",
+    summary: "4 acceptance criteria (claude/sonnet-5.5)",
   });
   const specInv = addInvocation({
     runId: id,
     stageId: specStage,
     role: "spec",
-    modelId: "claude/sonnet",
+    modelId: "claude/sonnet-5.5",
     status: "ok",
     inputTokens: 5400,
     outputTokens: 980,
@@ -790,6 +790,8 @@ seedProvider(
   t += 63 * SEC;
 
   for (let round = 0; round < 3; round++) {
+    // Two failed rounds on one implementer escalate it a tier.
+    const implementer = round < 2 ? "claude/sonnet-5.5" : "claude/opus";
     const implStage = addStage({
       runId: id,
       name: "implement",
@@ -797,13 +799,13 @@ seedProvider(
       status: "succeeded",
       startedAt: t,
       finishedAt: t + 210 * SEC,
-      summary: `claude/opus: ok, committed ${newId().slice(0, 8)}`,
+      summary: `${implementer}: ok, committed ${newId().slice(0, 8)}`,
     });
     const implInv = addInvocation({
       runId: id,
       stageId: implStage,
       role: "implement",
-      modelId: round < 2 ? "claude/opus" : "claude/fable",
+      modelId: implementer,
       status: "ok",
       inputTokens: 14000 + round * 2000,
       outputTokens: 4200 + round * 600,
@@ -1203,7 +1205,7 @@ seedProvider(
     runId: id,
     stageId: implStage,
     role: "implement",
-    modelId: "claude/sonnet",
+    modelId: "claude/sonnet-5.5",
     status: "cancelled",
     inputTokens: 3900,
     outputTokens: 780,
@@ -1285,7 +1287,7 @@ const succeededSpecs: SucceededSpec[] = [
     resolvedProfile: "standard",
     taskClass: "bugfix",
     complexity: "small",
-    implementModel: "claude/sonnet",
+    implementModel: "claude/sonnet-5.5",
     reviewModel: "codex/sol",
     daysAgo: 3,
     hour: 11,
@@ -1301,7 +1303,7 @@ const succeededSpecs: SucceededSpec[] = [
     taskClass: "feature",
     complexity: "large",
     implementModel: "claude/opus",
-    reviewModel: "codex/astra",
+    reviewModel: "codex/sol-6.1",
     daysAgo: 3,
     hour: 20,
     merged: true,
@@ -1331,7 +1333,7 @@ const succeededSpecs: SucceededSpec[] = [
     resolvedProfile: "standard",
     taskClass: "refactor",
     complexity: "medium",
-    implementModel: "claude/sonnet",
+    implementModel: "claude/sonnet-5.5",
     reviewModel: "codex/sol",
     daysAgo: 1,
     hour: 14,
@@ -1346,7 +1348,7 @@ const succeededSpecs: SucceededSpec[] = [
     resolvedProfile: "standard",
     taskClass: "feature",
     complexity: "small",
-    implementModel: "claude/sonnet",
+    implementModel: "claude/sonnet-5.5",
     reviewModel: "codex/sol",
     daysAgo: 0,
     hour: -3, // 3 hours ago
@@ -1520,13 +1522,13 @@ for (const spec of succeededSpecs) {
       status: "succeeded",
       startedAt: specStart,
       finishedAt: specStart + specDur,
-      summary: "3 acceptance criteria (claude/sonnet)",
+      summary: "3 acceptance criteria (claude/sonnet-5.5)",
     });
     const specInv = addInvocation({
       runId: id,
       stageId: specStage,
       role: "spec",
-      modelId: "claude/sonnet",
+      modelId: "claude/sonnet-5.5",
       status: "ok",
       inputTokens: rand(5000, 3000),
       outputTokens: rand(900, 500),
@@ -1591,7 +1593,7 @@ for (const spec of succeededSpecs) {
         runId: id,
         stageId: holdoutStage,
         role: "holdout",
-        modelId: "codex/astra",
+        modelId: "codex/sol",
         status: "ok",
         inputTokens: 6500,
         outputTokens: 2100,
@@ -1781,7 +1783,7 @@ for (const spec of succeededSpecs) {
         runId: id,
         stageId: verifyStage,
         role: "verify",
-        modelId: "claude/sonnet",
+        modelId: "claude/sonnet-5.5",
         status: "ok",
         inputTokens: 4500,
         outputTokens: 700,
@@ -1807,7 +1809,7 @@ for (const spec of succeededSpecs) {
         ],
         overall: "pass" as const,
         notes: "No regressions observed.",
-        model: "claude/sonnet",
+        model: "claude/sonnet-5.5",
       };
       addArtifact(id, `verify-${rt.round}.json`, "verify", JSON.stringify(verify, null, 2), rt.verifyStart);
     }
