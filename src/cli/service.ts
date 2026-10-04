@@ -309,6 +309,7 @@ export async function install(
   };
   if (control.recover) {
     const recovered: string[] = [];
+    const failures: string[] = [];
     for (const file of existsSync(directory)
       ? readdirSync(directory).filter((f) => f.endsWith(".json"))
       : []) {
@@ -320,14 +321,16 @@ export async function install(
           throw new Error("pending migration");
         if (state.label === LABEL) await race(waitForHealthy(client, clock, state.target));
       } catch (error) {
-        await restore(state).catch((restore) => recovered.push(`Restoration failed: ${String(restore)}`));
-        recovered.push(`${state.old.label}: ${String(error)}`);
+        await restore(state)
+          .then(() => recovered.push(`${state.old.label}: ${String(error)}`))
+          .catch((e) => failures.push(`Restoration failed for ${state.old.label}: ${e}`));
         continue;
       }
       clear(state);
     }
     if (recovered.length)
-      throw new Error(`Recovered previous agent ${recovered.join("; ")}; retry installation.`);
+      failures.push(`Recovered previous agent ${recovered.join("; ")}; retry installation.`);
+    if (failures.length) throw new Error(failures.join("\n"));
     return;
   }
   mkdirSync(logDir, { recursive: true });

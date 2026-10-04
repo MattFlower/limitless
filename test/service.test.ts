@@ -719,6 +719,10 @@ for (const phase of ["prepared", "restored", "stopping", "unhealthy", "restore-f
     if (phase === "restore-failure") {
       expect(r.error).toContain("Restoration failed");
       expect(r.error).toContain("old bootstrap failed");
+      expect(r.error).toStartWith("Error: Restoration failed for arbitrary.installed.daemon:");
+      const recovered = r.error.split("Recovered previous agent ").slice(1).join("");
+      expect(recovered).toContain("arbitrary.installed.tunnel");
+      expect(recovered).not.toContain("arbitrary.installed.daemon");
     } else expect(r.error).not.toContain("Restoration failed");
     expect(r.loaded).toContain("dev.limitless.mtplx");
     expect(existsSync(join(backupDir, "dev.limitless.mtplx.json"))).toBe(false);
