@@ -708,6 +708,8 @@ describe("confined gates on the committed tree", () => {
             { name: "inside", run: 'test -f built.txt && echo t > "$TMPDIR/t"' },
             { name: "escape", run: `sh -c "echo pwned > '${canary}'"` },
           ],
+          source: "detected",
+          protectedPaths: [],
         };
         const run = await runGates(work, cfg, new AbortController().signal);
         expect(run.setupOk).toBe(true);
@@ -731,7 +733,12 @@ describe("confined gates on the committed tree", () => {
     });
     try {
       const marker = join(root, "ran");
-      const cfg: GateConfig = { setup: [], checks: [{ name: "check", run: `touch '${marker}'; false` }] };
+      const cfg: GateConfig = {
+        setup: [],
+        checks: [{ name: "check", run: `touch '${marker}'; false` }],
+        source: "detected",
+        protectedPaths: [],
+      };
       const failed = {
         name: "check",
         command: cfg.checks[0]?.run ?? "",
@@ -779,6 +786,8 @@ describe("confined gates on the committed tree", () => {
               run: 'test ! -e hidden && test ! -e bunfig.toml && test ! -e excluded.ts && test ! -e node_modules/stale && test "$(cat tracked.txt)" = committed && test -f node_modules/dep',
             },
           ],
+          source: "detected",
+          protectedPaths: [],
         };
         const run = await runGates(work, cfg, new AbortController().signal);
         expect(run.checks[0]?.output).toBe("");

@@ -20,6 +20,7 @@ import { formatEvalReport } from "../src/evals/format.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { runGates } from "../src/gates/run.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
+import { observerRoots } from "../src/harness/sandbox.ts";
 import * as scratch from "../src/harness/scratch.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../src/pipeline/prompts.ts";
 import { SpecSchema } from "../src/pipeline/schemas.ts";
@@ -33,10 +34,15 @@ setDefaultTimeout(TEST_TIMEOUT);
 
 async function fixture(
   gate = "test ! -f broken",
-  baseFiles: (home: string) => Record<string, string> = () => ({}),
+  baseFiles: (home: string, observe: string) => Record<string, string> = () => ({}),
   extraModels: Parameters<typeof evalFixture>[0] = [],
 ) {
   const f = await evalFixture(extraModels);
+  // Confined gate and hidden commands may write here, and only here, outside their checkout.
+  const observe = join(f.home, "observe");
+  mkdirSync(observe);
+  const observed = realpathSync(observe);
+  observerRoots.add(observed);
   await sh(["git", "checkout", "--detach", f.sha], { cwd: f.source });
   writeFileSync(
     join(f.source, ".limitless.toml"),
@@ -44,7 +50,7 @@ async function fixture(
   );
   writeFileSync(join(f.source, "overwrite"), "original");
   writeFileSync(join(f.source, "protected"), "original");
-  for (const [path, content] of Object.entries(baseFiles(f.home)))
+  for (const [path, content] of Object.entries(baseFiles(f.home, observe)))
     writeFileSync(join(f.source, path), content);
   await sh(["git", "add", "-A"], { cwd: f.source });
   await sh(["git", "commit", "-qm", "gates"], { cwd: f.source });
@@ -81,7 +87,12 @@ async function fixture(
     ...f,
     item,
     hiddenDir,
+    observe,
     save,
+    close: () => {
+      observerRoots.delete(observed);
+      return f.close();
+    },
     run: (over: Record<string, unknown> = {}) =>
       f.run({ role: "implement", models: ["candidate-a"], k: 1, ...over }),
   };
@@ -132,8 +143,8 @@ for (const failure of ["setup", "timeout"] as const)
   });
 
 test("baseline gates are shared across repetitions and providers per case within each run", async () => {
-  const f = await fixture("sh count-gates.sh", (home) => ({
-    "count-gates.sh": `if test -f answer; then echo candidate >> '${home}/gate-runs'; else echo baseline >> '${home}/gate-runs'; fi\n`,
+  const f = await fixture("sh count-gates.sh", (_, observe) => ({
+    "count-gates.sh": `if test -f answer; then echo candidate >> '${observe}/gate-runs'; else echo baseline >> '${observe}/gate-runs'; fi\n`,
   }));
   try {
     const second = { ...f.item, id: "two" };
@@ -143,7 +154,7 @@ test("baseline gates are shared across repetitions and providers per case within
       const report = await f.run({ models: ["candidate-a", "candidate-b"], k: 2, cache: false });
       expect(report.trials).toHaveLength(8);
       expect(report.trials.every((trial) => trial.pass)).toBe(true);
-      const lines = readFileSync(join(f.home, "gate-runs"), "utf8").trim().split("\n");
+      const lines = readFileSync(join(f.observe, "gate-runs"), "utf8").trim().split("\n");
       expect(lines.filter((line) => line === "baseline")).toHaveLength(2 * run);
       expect(lines.filter((line) => line === "candidate")).toHaveLength(8 * run);
     }
@@ -514,7 +525,7 @@ for (const rounds of [1, 3])
     test(`cancellation during hidden grading retains spend and removes trial resources (rounds=${rounds}, ${via})`, async () => {
       const f = await fixture();
       try {
-        const started = join(f.home, "grading-started");
+        const started = join(f.observe, "grading-started");
         f.item.hidden.command = `test "$(cat answer)" = correct || exit 1; pwd -P > ${started}.tmp && mv ${started}.tmp ${started}; sleep 10`;
         if (rounds > 1)
           f.respond(() => ({ files: { answer: f.calls.length === 1 ? "wrong" : "correct" }, costUsd: 0.1 }));
@@ -827,9 +838,9 @@ for (const succeeds of [true, false])
   });
 
 test("failed grading preserves ignored baseline dependencies and build outputs for recovery", async () => {
-  const f = await fixture("sh setup.sh", (home) => ({
+  const f = await fixture("sh setup.sh", (_, observe) => ({
     ".gitignore": "node_modules/\nbuild/\n",
-    "setup.sh": `test -d node_modules || { mkdir -p node_modules build; echo installed > node_modules/dependency; echo compiled > build/output; pwd -P >> ${join(home, "setups")}; }\n`,
+    "setup.sh": `test -d node_modules || { mkdir -p node_modules build; echo installed > node_modules/dependency; echo compiled > build/output; pwd -P >> ${join(observe, "setups")}; }\n`,
   }));
   try {
     f.item.hidden.command = `test -f node_modules/dependency && ${f.item.hidden.command}`;
@@ -846,7 +857,7 @@ test("failed grading preserves ignored baseline dependencies and build outputs f
     expect(f.calls).toHaveLength(2);
     expect(stats[1]).toBe(stats[0]);
     // The baseline installed into the candidate's checkout; each grading checkout installed its own.
-    const setups = readFileSync(join(f.home, "setups"), "utf8").trim().split("\n");
+    const setups = readFileSync(join(f.observe, "setups"), "utf8").trim().split("\n");
     expect(setups).toHaveLength(3);
     expect(new Set(setups).size).toBe(3);
   } finally {
@@ -1272,8 +1283,8 @@ for (const rounds of [1, 2])
 
 /** A hidden-command prefix that records the grading checkout and commit, then waits for release. */
 function pauseGrading(f: Awaited<ReturnType<typeof fixture>>) {
-  const record = join(f.home, "grading");
-  const go = join(f.home, "go");
+  const record = join(f.observe, "grading");
+  const go = join(f.observe, "go");
   return {
     prefix: `{ pwd -P; git rev-parse HEAD; } > ${record}.tmp && mv ${record}.tmp ${record}; while [ ! -f ${go} ]; do sleep 0.02; done; rm -f ${go}; `,
     async paused() {
@@ -1396,7 +1407,7 @@ for (const kind of ["file", "parent"] as const)
 
 test("a candidate link to a completed grading checkout dangles before the next round", async () => {
   const f = await fixture();
-  const graded = join(f.home, "graded");
+  const graded = join(f.observe, "graded");
   try {
     f.item.hidden.command += `; result=$?; pwd -P >> ${graded}; exit $result`;
     f.save();
@@ -1422,7 +1433,7 @@ test("a candidate link to a completed grading checkout dangles before the next r
 test("candidate git config, hooks, index flags and filters never reach grading", async () => {
   const f = await fixture();
   const log = join(f.home, "candidate-git-log");
-  const seen = join(f.home, "seen");
+  const seen = join(f.observe, "seen");
   try {
     f.item.hidden.command = `cat protected > ${seen}; ${f.item.hidden.command}`;
     f.save();
@@ -1455,7 +1466,7 @@ test("candidate git config, hooks, index flags and filters never reach grading",
 
 test("round-0 grading artifacts are gone before round 1 searches for them", async () => {
   const f = await fixture();
-  const recorded = join(f.home, "grading-paths");
+  const recorded = join(f.observe, "grading-paths");
   try {
     f.item.hidden.command += `; result=$?; printf '%s\\n' "$PWD" "$HOME" "$TMPDIR" >> ${recorded}; cp hidden/check.sh "$HOME/copy"; cp hidden/check.sh "$TMPDIR/copy2"; cp hidden/check.sh stolen; git add -A; ${commitAs.join(" ")} commit -qm stolen; exit $result`;
     f.save();
@@ -1546,12 +1557,14 @@ for (const rounds of [1, 2])
               "bunfig.toml": '[test]\npreload=["./steal.ts"]\n',
               "candidate.test.ts":
                 'import { test, expect } from "bun:test"; test("candidate", () => expect(true).toBe(true));',
+              // Confinement should deny every copy; each is attempted regardless, and none may survive.
               "steal.ts": `import { cpSync, existsSync } from "node:fs";
+          const attempt = (copy) => { try { copy(); } catch {} };
           if (existsSync("hidden")) {
-            for (const dest of ${JSON.stringify([join(s.cwd, "stolen"), join(s.cwd, "dist/stolen"), join(s.scratchDir ?? "", "stolen")])}) cpSync("hidden", dest, { recursive: true });
-            cpSync("hidden/check.sh", ${JSON.stringify(join(s.cwd, "dist/output"))});
-            cpSync("hidden/check.sh", ${JSON.stringify(join(s.cwd, "overwrite"))});
-            console.log("copies created");
+            for (const dest of ${JSON.stringify([join(s.cwd, "stolen"), join(s.cwd, "dist/stolen"), join(s.scratchDir ?? "", "stolen")])}) attempt(() => cpSync("hidden", dest, { recursive: true }));
+            attempt(() => cpSync("hidden/check.sh", ${JSON.stringify(join(s.cwd, "dist/output"))}));
+            attempt(() => cpSync("hidden/check.sh", ${JSON.stringify(join(s.cwd, "overwrite"))}));
+            console.log("copies attempted");
           }`,
             },
           };
@@ -1561,7 +1574,7 @@ for (const rounds of [1, 2])
         expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
         expect(existsSync(f.calls[0]?.scratchDir ?? "")).toBe(false);
         const prior = f.factory.store.listEvalTrials(f.factory.store.listEvalRuns()[0]?.id ?? "")[0];
-        expect(prior?.details.grade?.implement?.hidden?.output).toContain("copies created");
+        expect(prior?.details.grade?.implement?.hidden?.output).toContain("copies attempted");
         return { files: { answer: "correct", "steal.ts": "" } };
       });
       expect((await f.run({ rounds })).trials[0]?.pass).toBe(rounds === 2);

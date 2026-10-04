@@ -120,7 +120,12 @@ describe("CodexStreamParser", () => {
     await withScratch(import.meta.dir, async (scratchDir) => {
       // Editors are confined too: no user config, rules, MCP servers or implicit workspace-write roots.
       const editArgs = buildCodexArgs({ ...edit, cwd: import.meta.dir, scratchDir });
-      for (const flag of ["--ignore-user-config", "--ignore-rules", "--strict-config", "orchestrator.mcp.enabled=false"])
+      for (const flag of [
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
+        "orchestrator.mcp.enabled=false",
+      ])
         expect(editArgs).toContain(flag);
       expect(editArgs).not.toContain("workspace-write");
       expect(editArgs).not.toContain('web_search="disabled"');
