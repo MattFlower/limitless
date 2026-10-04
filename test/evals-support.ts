@@ -9,6 +9,7 @@ import type { AgentSpec } from "../src/harness/types.ts";
 import type { Triage } from "../src/pipeline/schemas.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
+import { seeded } from "./seeded.ts";
 
 export const answer: Triage = {
   title: "Example",
@@ -48,15 +49,8 @@ export const verifierModel: ModelDef = {
   supportedEfforts: [],
   price: { input: 1, output: 1 },
 };
-export async function evalFixture(
-  extraModels: ModelDef[] = [],
-  extraProviders: ProviderDef[] = [],
-  policy?: Policy,
-) {
-  const home = mkdtempSync(join(tmpdir(), "limitless-eval-"));
-  const cfg = loadConfig({ home, configDir: join(home, "config") });
-  cfg.secrets = {};
-  cfg.openrouterBudgetUsd = 100;
+/** A source repository whose pinned commit precedes its current one, and the factory's bare clone of it. */
+const seedRepos = seeded(async (home) => {
   const source = join(home, "source");
   mkdirSync(source);
   const git = (args: string[]) => sh(["git", ...args], { cwd: source });
@@ -71,9 +65,24 @@ export async function evalFixture(
   writeFileSync(join(source, "CURRENT.txt"), "new");
   await git(["add", "-A"]);
   await git(["commit", "-qm", "current"]);
+  await git(["clone", "-q", "--bare", source, join(home, "repos", "fixture__repo.git")]);
+  return sha;
+});
+
+export async function evalFixture(
+  extraModels: ModelDef[] = [],
+  extraProviders: ProviderDef[] = [],
+  policy?: Policy,
+) {
+  const home = mkdtempSync(join(tmpdir(), "limitless-eval-"));
+  const cfg = loadConfig({ home, configDir: join(home, "config") });
+  cfg.secrets = {};
+  cfg.openrouterBudgetUsd = 100;
+  const source = join(home, "source");
   const cache = join(cfg.paths.repos, "fixture__repo.git");
-  mkdirSync(cfg.paths.repos, { recursive: true });
-  await git(["clone", "--bare", source, cache]);
+  const seed = await seedRepos(home);
+  seed.relocate("repos/fixture__repo.git/config");
+  const sha = seed.value;
   const dataset: CaseFile = {
     role: "triage",
     version: 1,
@@ -115,7 +124,8 @@ export async function evalFixture(
       ...extraProviders,
     ],
     models: [
-      ...extraModels,
+      // Tests edit models through the router; copies keep shared ones like verifierModel intact for later files.
+      ...extraModels.map((model) => structuredClone(model)),
       {
         id: "candidate-a",
         provider: "openrouter",

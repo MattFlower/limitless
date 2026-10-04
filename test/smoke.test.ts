@@ -975,10 +975,12 @@ for (const outcome of [
   });
 }
 
-const processModes = ["SIGINT", "SIGTERM", "stubborn", "probe", "timeout", "budget", "completed"] as const;
+const processModes = ["SIGINT", "SIGTERM", "stubborn", "probe", "completed"] as const;
 const interruptModes = ["escaped-SIGINT", "escaped-SIGTERM", "second-SIGINT", "second-SIGTERM"] as const;
-for (const mode of [...processModes, ...interruptModes, "escaped-timeout", "cli-timeout", "idle-timeout"]) {
-  test(`smoke cleans CLI groups: ${mode}`, async () => {
+// These wait out real timeouts and kill grace periods, each in its own directory and processes, so they overlap.
+const timeoutModes: string[] = ["timeout", "budget", "escaped-timeout", "cli-timeout", "idle-timeout"];
+for (const mode of [...processModes, ...interruptModes, ...timeoutModes]) {
+  const cleansGroups = async () => {
     const dir = mkdtempSync(join(tmpdir(), "smoke-processes-"));
     const escaped = mode.startsWith("escaped-") || mode.startsWith("second-");
     const ownTimeout = mode === "cli-timeout" || mode === "idle-timeout";
@@ -1114,7 +1116,8 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
       }
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 12000);
+  };
+  test.concurrentIf(timeoutModes.includes(mode))(`smoke cleans CLI groups: ${mode}`, cleansGroups, 12000);
 }
 
 test("fast smoke sends the option, validates Codex output, and reports Claude off without failure", async () => {
