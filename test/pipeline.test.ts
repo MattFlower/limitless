@@ -3592,6 +3592,10 @@ protected_paths = ["protected.txt"]
         expect(implementations).toBe(0);
         expect(f.store.listStages(runId).some((stage) => stage.name === "implement")).toBe(false);
         expect(f.store.getRun(runId)?.headSha).toBe(head);
+        // Success is recorded before the worktree is removed; "Run succeeded" is logged once it is gone.
+        const cleaned = Date.now() + 5000;
+        while (!f.store.listEvents(runId).some((e) => e.message === "Run succeeded") && Date.now() < cleaned)
+          await Bun.sleep(10);
         expect(existsSync(state?.worktreePath ?? "missing")).toBe(false);
         const comments = calls.filter((call) => call[1] === "comment");
         expect(comments).toHaveLength(1);
