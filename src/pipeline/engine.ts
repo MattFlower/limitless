@@ -1012,8 +1012,7 @@ async function oneRound(
           ...c,
           firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
         }));
-        if (!timeoutOnly && !baseTimeout)
-          cmp = await retryRegressions(cmp, cwd, gates, changed, ctx.signal, events.onWait);
+        if (!baseTimeout) cmp = await retryRegressions(cmp, cwd, gates, changed, ctx.signal, events.onWait);
         ctx.checkCancelled();
         baseTimeout ||= after.checks.some(
           (r) => r.timedOut && ctx.state.baseline?.checks.some((b) => b.name === r.name && b.timedOut),

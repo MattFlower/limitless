@@ -174,10 +174,19 @@ export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): str
         const output = stripVTControlCharacters(c.result.output);
         const last = [
           ...output.matchAll(
-            /^(?:\s*(?:RUN|# Subtest:)\s+(.+)|([^\n]+(?:\.test|\.spec)\.[cm]?[jt]sx?):\s*)$/gm,
+            /^([ \t]*)(?:(RUN|# Subtest:)[ \t]+([^\r\n]+)|([^\r\n]+(?:\.test|\.spec)\.[cm]?[jt]sx?):[ \t]*)\r?$/gm,
           ),
         ].at(-1);
-        return `### Check \`${c.name}\` timed out after ${limit} s${c.firstAttempt?.timedOut ? " twice" : ""}${last ? `; the last test running was ${last[1] ?? last[2]}` : ""}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`;
+        const completed =
+          last?.[2] === "# Subtest:" &&
+          [
+            ...output
+              .slice(last.index + last[0].length)
+              .matchAll(
+                /^([ \t]*)(?:not )?ok[ \t]+\d+(?:[ \t]+(?:-[ \t]+)?([^\r\n]*?))?(?:[ \t]+# (?:SKIP|TODO)\b[^\r\n]*)?[ \t]*\r?$/gim,
+              ),
+          ].some((result) => result[1] === last[1] && (!result[2] || result[2].trim() === last[3]?.trim()));
+        return `### Check \`${c.name}\` timed out after ${limit} s${c.firstAttempt?.timedOut ? " twice" : ""}${last && !completed ? `; the last test running was ${last[3] ?? last[4]}` : ""}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`;
       }
       return `### Check \`${c.name}\` ${c.verdict === "regressed" ? "now FAILS (it passed before your change)" : "FAILS"}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`;
     })

@@ -1609,11 +1609,12 @@ esac
     "unflagged",
     "setup",
     "retry setup failure",
+    "retry-lint",
   ])("gate timeout: %s", async (scenario) => {
     const limit = scenario === "twice" ? 37 : 900;
     writeFileSync(
       join(repoDir, ".limitless.toml"),
-      `[gates]\n${scenario.includes("setup") ? 'setup = ["fake-setup"]\n' : ""}checks = [{ name = "test", run = "fake-test", timeoutSec = ${limit} }${scenario === "mixed" ? ', { name = "lint", run = "fake-lint" }' : ""}]\n`,
+      `[gates]\n${scenario.includes("setup") ? 'setup = ["fake-setup"]\n' : ""}checks = [{ name = "test", run = "fake-test", timeoutSec = ${limit} }${["mixed", "retry-lint"].includes(scenario) ? ', { name = "lint", run = "fake-lint" }' : ""}]\n`,
     );
     await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "timeout fixture"], {
       cwd: repoDir,
@@ -1635,23 +1636,27 @@ esac
     let release: (() => void) | undefined;
     let calls = 0;
     let waits = 0;
+    const commands: string[] = [];
     const realProcess = proc.runProcess;
     const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
       if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
       opts.signal?.throwIfAborted();
       const attempt = calls++;
+      commands.push(opts.cmd[2] ?? "");
       const isLint = opts.cmd[2] === "fake-lint";
       const timeout =
         scenario === "base"
           ? attempt < 2
           : attempt ===
-              (scenario === "mixed" || scenario === "setup"
+              (["mixed", "setup", "retry-lint"].includes(scenario)
                 ? 2
                 : scenario === "retry setup failure"
                   ? 3
                   : 1) ||
             (["twice", "cancel retry"].includes(scenario) && attempt === 2);
-      const fail = (isLint && attempt === 3) || (scenario === "retry setup failure" && attempt === 4);
+      const fail =
+        (isLint && attempt === (scenario === "retry-lint" ? 5 : 3)) ||
+        (scenario === "retry setup failure" && attempt === 4);
       if (timeout && scenario !== "unflagged") {
         if (scenario === "slot" || scenario === "cancel slot")
           held = gateSlots.acquire(new AbortController().signal);
@@ -1679,7 +1684,9 @@ esac
         stdout: timeout
           ? `${scenario === "unflagged" ? "[timed out] from nested tool\n" : ""}RUN slow acceptance test\nfarewell.txt:12\n`
           : fail
-            ? "farewell.txt:12: lint error"
+            ? scenario === "retry-lint"
+              ? "transient lint error"
+              : "farewell.txt:12: lint error"
             : "passed",
         stderr: "",
         durationMs: timeout ? (opts.timeoutMs ?? 900_000) : 1,
@@ -1735,6 +1742,25 @@ esac
         if (scenario === "passes" || scenario === "slot") {
           expect(state?.round).toBe(0);
           expect(state?.feedback).toBeNull();
+        }
+        if (scenario === "retry-lint") {
+          expect(commands).toEqual([
+            "fake-test",
+            "fake-lint",
+            "fake-test",
+            "fake-lint",
+            "fake-test",
+            "fake-lint",
+            "fake-lint",
+          ]);
+          expect(state?.round).toBe(0);
+          expect(state?.feedback).toBeNull();
+          expect(state?.lastGates?.find((c) => c.name === "lint")).toMatchObject({
+            verdict: "flaky",
+            blocking: false,
+            firstAttempt: { ok: false, output: "transient lint error" },
+            result: { ok: true },
+          });
         }
         if (scenario === "twice") {
           expect(prompts[1]).toContain("Check `test` timed out after 37 s twice");
