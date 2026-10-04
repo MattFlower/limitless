@@ -15,7 +15,7 @@ test("upgrading the existing feed preserves items and cursors and allows a later
     const before = join(f.dir, "migrations-before-ordering");
     cpSync(MIGRATION_DIR, before, {
       recursive: true,
-      filter: (src) => !src.endsWith("-ordered-feed.sql"),
+      filter: (src) => !src.endsWith("-ordered-feed.sql") && !src.endsWith("-run-resolution.sql"),
     });
     f.store = new Store(f.path, before);
     const run = f.run();
@@ -45,7 +45,7 @@ test("the additive migration keeps inbox rows; items and cursors survive reopeni
     mkdirSync(before);
     cpSync(MIGRATION_DIR, before, {
       recursive: true,
-      filter: (src) => !src.endsWith("-feed.sql"),
+      filter: (src) => !src.endsWith("-feed.sql") && !src.endsWith("-run-resolution.sql"),
     });
     const old = new Store(f.path, before);
     old.db.query("INSERT INTO inbox VALUES ('d1', 'github', 'push', 1, '{}', 'done', NULL, 'kept')").run();

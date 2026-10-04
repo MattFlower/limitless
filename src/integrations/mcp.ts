@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { Factory } from "../app.ts";
-import type { CreateRunRequest, FeedAck, RunStatus } from "../core/types.ts";
+import type { CreateRunRequest, FeedAck, ResolutionKind, RunStatus } from "../core/types.ts";
 import { FeedAckSchema, FeedQuerySchema, waitForFeed } from "../feed.ts";
 
 const nonblank = z.string().trim().min(1);
@@ -18,6 +18,14 @@ const status = z.enum([
   "needs_human",
   "resolved",
 ]);
+/** A manual resolution; `merged` is recorded only when GitHub confirms a merge. */
+export const ResolveRunSchema = z
+  .object({
+    kind: z.enum(["done_elsewhere", "superseded", "wont_do", "pr_closed"] satisfies ResolutionKind[]),
+    ref: nonblank.optional(),
+    note: nonblank.optional(),
+  })
+  .strict();
 const profile = z.enum(["auto", "quick", "standard", "deep"]);
 const runSchema = z
   .object({
@@ -94,6 +102,7 @@ export interface McpBackend {
   list(status: RunStatus | undefined, limit: number): Promise<unknown>;
   cancel(id: string): Promise<unknown>;
   answer(id: string, answer: string): Promise<unknown>;
+  resolve(id: string, input: z.output<typeof ResolveRunSchema>): Promise<unknown>;
   providers(): Promise<unknown>;
   feed(query: z.output<typeof feedArgsSchema>, signal: AbortSignal): Promise<unknown>;
   feedAck(ack: FeedAck): Promise<unknown>;
@@ -118,11 +127,20 @@ export function factoryBackend(factory: Factory): McpBackend {
       requireRun(id);
       return factory.answer(id, answer, "mcp");
     },
+    resolve: async (id, input) => {
+      const run = requireRun(id).run;
+      const resolved = factory.store.resolveRun(id, { ...input, by: "human" });
+      if (!resolved) throw new Error(resolveConflict(factory.store.getRun(id)?.status ?? run.status));
+      return resolved;
+    },
     providers: async () => factory.tracker.all(),
     feed: (query, signal) => waitForFeed(factory.store, { ...query, limit: 100 }, signal),
     feedAck: async ({ consumer, id }) => factory.store.ackFeed(consumer, id),
   };
 }
+
+export const resolveConflict = (status: RunStatus) =>
+  `run is ${status}; only needs_human and failed runs can be resolved`;
 
 export type Fetch = (url: string, init?: RequestInit) => Promise<Response>;
 
@@ -170,6 +188,7 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
       detailSchema.parse(await api(path(id)));
       return api(`${path(id)}/answer`, { answer, by: "mcp" });
     },
+    resolve: (id, input) => api(`${path(id)}/resolve`, input),
     providers: () => api("/api/providers"),
     feed: (query, signal) => {
       const params = Object.entries(query).flatMap(([k, v]) => (v === undefined ? [] : [[k, String(v)]]));
@@ -265,6 +284,12 @@ export function createMcpServer(backend: McpBackend): Server {
           .array(questionSchema)
           .min(1)
           .parse(await backend.answer(id, answer)),
+    ),
+    tool(
+      "limitless_resolve_run",
+      "Record that a needs_human or failed run was dealt with outside the factory, so it leaves the human queue. Supply id and kind: done_elsewhere (landed by hand or another way), superseded (replaced by later work), wont_do, or pr_closed; optional ref (a run id or PR URL) and note. Starts no new run. Returns the resolved run; other statuses and unknown ids are errors.",
+      z.object({ id: nonblank }).merge(ResolveRunSchema).strict(),
+      async ({ id, ...input }) => runSchema.parse(await backend.resolve(id, input)),
     ),
     tool(
       "limitless_providers",

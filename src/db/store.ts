@@ -23,9 +23,11 @@ import type {
   Question,
   QuotaAlert,
   Repo,
+  ResolutionKind,
   Run,
   RunDetail,
   RunEvent,
+  RunResolution,
   RunStatus,
   Stage,
   StageName,
@@ -146,6 +148,7 @@ const toRun = (r: Row): Run => ({
   status: r.status as RunStatus,
   dependsOn: parse(r.depends_on, []),
   prClosedUnmerged: Boolean(r.pr_closed_unmerged),
+  resolution: parse(r.resolution, null),
   stage: (r.stage as StageName) ?? null,
   baseBranch: (r.base_branch as string) ?? null,
   deliveryBranch: (r.delivery_branch as string) ?? null,
@@ -235,6 +238,10 @@ export interface BaselineCacheKey {
   /** Lockfiles, Bun version, platform/arch, Limitless build and gate environment digest. */
   envHash: string;
 }
+
+/** Issue numbers named by standalone `Closes #N` directives. */
+export const closedIssues = (prompt: string) =>
+  new Set([...prompt.matchAll(/\bcloses\s+#([1-9][0-9]*)(?![\w#])/gi)].map((m) => Number(m[1])));
 
 const RUN_SELECT = "SELECT runs.*, repos.slug AS repo_slug FROM runs JOIN repos ON repos.id = runs.repo_id";
 
@@ -993,9 +1000,11 @@ export class Store {
           ? "PR was closed unmerged"
           : run.status === "failed" || run.status === "cancelled"
             ? `run ${run.status}`
-            : run.status === "needs_human" && !run.prUrl
-              ? `run needs_human without PR${run.error ? `: ${run.error}` : ""}`
-              : null;
+            : run.status === "resolved" // terminal: an unmerged resolved run never merges
+              ? `run resolved as ${run.resolution?.kind ?? "unknown"} without merging`
+              : run.status === "needs_human" && !run.prUrl
+                ? `run needs_human without PR${run.error ? `: ${run.error}` : ""}`
+                : null;
       if (cause)
         return { status: "needs_human", finishedAt: Date.now(), error: `Dependency ${id}: ${cause}` };
       waiting = true;
@@ -1099,28 +1108,65 @@ export class Store {
       this.db.query(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });
+    if (patch.merged) this.supersedeByIssue(run);
     return run;
+  }
+
+  /**
+   * Resolve once while the run is still in one of `from`; null when it isn't (another caller won).
+   * Keeps the original terminal evidence (finishedAt, error, stages, artifacts, costs).
+   */
+  resolveRun(
+    id: string,
+    input: { kind: ResolutionKind; by: string; ref?: string | null; note?: string | null; at?: number },
+    opts: { from?: RunStatus[]; patch?: RunPatch; why?: string; data?: Record<string, unknown> } = {},
+  ): Run | null {
+    const { kind, by, ref = null, note = null, at = Date.now() } = input;
+    const resolution: RunResolution = { kind, ref, note, by, at };
+    return this.chatTransaction(() => {
+      const from = this.getRun(id)?.status;
+      if (!from || !(opts.from ?? ["needs_human", "failed"]).includes(from)) return null;
+      const { sets, values } = buildUpdate({ ...opts.patch, status: "resolved" }, RUN_PATCH_COLUMNS);
+      const sql = `UPDATE runs SET ${sets.join(", ")}, resolution = ? WHERE id = ? AND status = ?`;
+      if (!this.db.query(sql).run(...(values as never[]), json(resolution), id, from).changes) return null;
+      this.addEvent({
+        runId: id,
+        type: "status",
+        message: `Run moved from ${from} to resolved ${opts.why ?? `as ${kind}`}`,
+        data: { from, to: "resolved", ...(opts.data ?? { resolution }) },
+      });
+      const run = this.getRun(id) as Run;
+      this.publish({ kind: "run", run });
+      return run;
+    });
   }
 
   /** Resolve once after GitHub confirms a merge; keep the original terminal evidence. */
   resolveMergedRun(id: string, mergedBy: string | null, mergedAt: number): boolean {
-    return this.chatTransaction(() => {
-      const changed = this.db
-        .query(
-          "UPDATE runs SET status = 'resolved', merged = 1, merged_by = ?, merged_at = ? WHERE id = ? AND status = 'needs_human' AND pr_url IS NOT NULL",
-        )
-        .run(mergedBy, mergedAt, id).changes;
-      if (!changed) return false;
-      this.addEvent({
-        runId: id,
-        type: "status",
-        message: `Run moved from needs_human to resolved after PR merged by ${mergedBy ?? "unknown"}`,
-        data: { from: "needs_human", to: "resolved", mergedBy, mergedAt },
-      });
-      const run = this.getRun(id);
-      if (run) this.publish({ kind: "run", run });
-      return true;
-    });
+    const prUrl = this.getRun(id)?.prUrl;
+    if (!prUrl) return false;
+    const run = this.resolveRun(
+      id,
+      { kind: "merged", ref: prUrl, by: "github", at: mergedAt },
+      {
+        from: ["needs_human"],
+        patch: { merged: true, mergedBy, mergedAt },
+        why: `after PR merged by ${mergedBy ?? "unknown"}`,
+        data: { mergedBy, mergedAt },
+      },
+    );
+    if (run) this.supersedeByIssue(run);
+    return run !== null;
+  }
+
+  /** A merged run supersedes needs_human runs in its repository that close one of the same issues. */
+  supersedeByIssue(merged: Run): Run[] {
+    const issues = closedIssues(merged.prompt);
+    if (!issues.size) return [];
+    const input = { kind: "superseded", ref: merged.prUrl ?? merged.id, by: "system" } as const;
+    return this.listRuns({ status: ["needs_human"], repoId: merged.repoId, limit: Number.MAX_SAFE_INTEGER })
+      .filter((r) => r.id !== merged.id && [...closedIssues(r.prompt)].some((n) => issues.has(n)))
+      .flatMap((r) => this.resolveRun(r.id, input, { from: ["needs_human"] }) ?? []);
   }
 
   /** Recompute run totals from its invocations. */

@@ -6,6 +6,7 @@ import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from 
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { runGh } from "../integrations/github.ts";
+import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
 import { Auth, CLEAR_SESSION, enrollPage, localPath, loginPage } from "./auth.ts";
@@ -391,6 +392,16 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     },
     "/api/runs/:id/retry": {
       POST: handle(async (req) => json(await factory.retryRun(req.params.id as string), 201)),
+    },
+    "/api/runs/:id/resolve": {
+      POST: handle(async (req) => {
+        const input = ResolveRunSchema.safeParse(await body<unknown>(req));
+        if (!input.success) return error(`invalid resolution: ${input.error.issues[0]?.message ?? ""}`);
+        const id = req.params.id as string;
+        if (!store.getRun(id)) return error("run not found", 404);
+        const run = store.resolveRun(id, { ...input.data, by: "human" });
+        return run ? json(run) : error(resolveConflict(store.getRun(id)?.status ?? "resolved"), 409);
+      }),
     },
     "/api/runs/:id/answer": {
       POST: handle(async (req) => {
