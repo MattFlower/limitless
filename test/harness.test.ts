@@ -51,6 +51,18 @@ describe("ClaudeStreamParser", () => {
     expect(p.quotaRejectedUntil).toBeNull();
   });
 
+  test("records cache writes with their duration, priced at the 1-hour rate", () => {
+    const p = new ClaudeStreamParser(() => {});
+    for (const line of fixture("claude-basic.jsonl")) p.feed(line);
+    // The CLI wrote the whole 35,377-token prompt to the 1-hour cache.
+    expect([p.usage.input, p.usage.output, p.usage.cacheRead, p.usage.cacheWrite]).toEqual([
+      18, 224, 33_921, 35_377,
+    ]);
+    expect(p.usage.cacheWrite1h).toBe(35_377);
+    // 18 uncached and 35,377 written at 2x input, 33,921 read at the discount, 224 output.
+    expect(priceOf(p.usage, { input: 3, output: 15, cacheRead: 0.3 })).toBeCloseTo(0.2258523, 10);
+  });
+
   test("detects a rejected rate limit as quota exhaustion", () => {
     const p = new ClaudeStreamParser(() => {});
     p.feed(
@@ -141,6 +153,9 @@ describe("CodexStreamParser", () => {
     expect(p.completed).toBe(true);
     expect(p.usage.cacheRead).toBe(29056);
     expect(p.usage.input).toBe(43706 - 29056);
+    // Codex never writes to a cache: only reads are split off the prompt.
+    expect(p.usage.cacheWrite).toBe(0);
+    expect(priceOf(p.usage, { input: 2, output: 10 })).toBeCloseTo((14650 * 2 + 29056 * 0.2 + 40 * 10) / 1e6);
     const call = events.find((e) => e.type === "tool_call") as { input: { command: string } };
     expect(call.input.command).toContain("cat a.txt");
     const result = events.find((e) => e.type === "tool_result") as { output: string; isError: boolean };
@@ -222,6 +237,16 @@ test("priceOf charges cache reads at a discount", () => {
   const usage = { input: 1_000_000, output: 1_000_000, cacheRead: 1_000_000, cacheWrite: 0 };
   expect(priceOf(usage, { input: 2, output: 10 })).toBeCloseTo(2 + 10 + 0.2);
   expect(priceOf(usage, undefined)).toBe(0);
+});
+
+test("priceOf charges 1-hour cache writes at twice the input rate and the rest at 1.25x", () => {
+  const price = { input: 2, output: 10 };
+  const write = { input: 0, output: 0, cacheRead: 0, cacheWrite: 1_000_000 };
+  // Without a duration breakdown every write is a 5-minute one.
+  expect(priceOf(write, price)).toBeCloseTo(2.5);
+  expect(priceOf({ ...write, cacheWrite1h: 400_000 }, price)).toBeCloseTo(3.1);
+  // A breakdown larger than the writes themselves cannot price more than the writes.
+  expect(priceOf({ ...write, cacheWrite: 100, cacheWrite1h: 1_000_000 }, price)).toBeCloseTo(0.0004);
 });
 
 describe("extractJson", () => {

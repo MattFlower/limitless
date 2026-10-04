@@ -694,9 +694,10 @@ export class RunContext {
         fastModeDisabledReason: result.fastModeDisabledReason ?? null,
         costUsd: result.costUsd,
         costEquivUsd: result.costEquivUsd,
-        inputTokens: result.usage.input + result.usage.cacheWrite,
+        inputTokens: result.usage.input,
         outputTokens: result.usage.output,
         cacheReadTokens: result.usage.cacheRead,
+        cacheWriteTokens: result.usage.cacheWrite,
         numTurns: result.numTurns,
         sessionId: result.sessionId,
         // A failed confinement probe ran before the agent, so its error holds no private output.

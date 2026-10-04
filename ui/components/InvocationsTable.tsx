@@ -1,5 +1,6 @@
 import type { Component } from "solid-js";
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { cacheHitRate } from "../../src/core/cache-format.ts";
 import { roleDescription, roleLabel } from "../../src/core/role-descriptions.ts";
 import type { Invocation } from "../../src/core/types.ts";
 import { compactNumber, duration, truncate } from "../lib/format.ts";
@@ -82,6 +83,11 @@ const RoleHelp: Component<{ role: Invocation["role"]; id: number }> = (props) =>
   );
 };
 
+const promptTokens = (inv: Invocation) => inv.inputTokens + inv.cacheReadTokens + inv.cacheWriteTokens;
+const cacheTitle = (inv: Invocation) =>
+  `${compactNumber(inv.cacheReadTokens)} cached, ${compactNumber(inv.cacheWriteTokens)} written, ` +
+  `${compactNumber(inv.inputTokens)} uncached of ${compactNumber(promptTokens(inv))} prompt tokens`;
+
 export const InvocationsTable: Component<{
   invocations: Invocation[];
   selectedId: number | null;
@@ -95,6 +101,7 @@ export const InvocationsTable: Component<{
         <th>Provider</th>
         <th>Status</th>
         <th class="num">In</th>
+        <th class="num">Cache hit</th>
         <th class="num">Out</th>
         <th class="num">Cost</th>
         <th class="num">Turns</th>
@@ -107,7 +114,7 @@ export const InvocationsTable: Component<{
         when={props.invocations.length > 0}
         fallback={
           <tr class="empty-row">
-            <td colspan={10}>No invocations yet.</td>
+            <td colspan={11}>No invocations yet.</td>
           </tr>
         }
       >
@@ -129,7 +136,10 @@ export const InvocationsTable: Component<{
               <td>
                 <span class={`badge badge-${STATUS_BADGE[inv.status] ?? "info"}`}>{inv.status}</span>
               </td>
-              <td class="num mono">{compactNumber(inv.inputTokens)}</td>
+              <td class="num mono">{compactNumber(promptTokens(inv))}</td>
+              <td class="num mono text-faint" title={cacheTitle(inv)}>
+                {cacheHitRate(inv.cacheReadTokens, promptTokens(inv))}
+              </td>
               <td class="num mono">{compactNumber(inv.outputTokens)}</td>
               <CostCell costUsd={inv.costUsd} costEquivUsd={inv.costEquivUsd} />
               <td class="num mono">{inv.numTurns}</td>

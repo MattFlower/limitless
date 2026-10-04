@@ -1028,6 +1028,8 @@ export class EvalRunner {
           trial.costEquivUsd += result.costEquivUsd;
           trial.tokensIn += result.usage.input + result.usage.cacheRead + result.usage.cacheWrite;
           trial.tokensOut += result.usage.output;
+          trial.details.cacheReadTokens = (trial.details.cacheReadTokens ?? 0) + result.usage.cacheRead;
+          trial.details.cacheWriteTokens = (trial.details.cacheWriteTokens ?? 0) + result.usage.cacheWrite;
           if (sessionId && attempt === 0 && result.status === "error" && !signal.aborted) {
             resumeFailed = true;
             sessionId = undefined;

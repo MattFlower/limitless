@@ -137,11 +137,15 @@ export class ClaudeStreamParser {
         this.numTurns = Number(e.num_turns ?? 0);
         this.reportedCostUsd = Number(e.total_cost_usd ?? 0);
         const u = (e.usage ?? {}) as Json;
+        const creation = (u.cache_creation ?? {}) as Json;
         this.usage = {
           input: Number(u.input_tokens ?? 0),
           output: Number(u.output_tokens ?? 0),
           cacheRead: Number(u.cache_read_input_tokens ?? 0),
           cacheWrite: Number(u.cache_creation_input_tokens ?? 0),
+          ...(creation.ephemeral_1h_input_tokens === undefined
+            ? {}
+            : { cacheWrite1h: Number(creation.ephemeral_1h_input_tokens) }),
         };
         this.structured = e.structured_output ?? null;
         this.finalText = typeof e.result === "string" ? e.result : this.lastAssistantText;

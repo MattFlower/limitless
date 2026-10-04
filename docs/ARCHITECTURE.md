@@ -20,7 +20,9 @@ and delivers a pull request — while spending as little of your paid AI capacit
    the implementer's family, possibly its own model in a fresh session (recorded in the panel
    record); nothing it reports blocks until a verifier that did not raise it confirms it.
 3. **Spend is a first-class dimension.** Every invocation records tokens, $ (metered) and
-   $-equivalent (subscription). Routing picks the cheapest model that is *capable enough* for the
+   $-equivalent (subscription); cached and cache-written prompt tokens are kept apart from uncached
+   input, and writes are priced by their cache duration (1.25× input for 5 minutes, 2× for an hour).
+   Routing picks the cheapest model that is *capable enough* for the
    role, and quota headroom on subscriptions is tracked from live rate-limit telemetry.
 4. **Fresh context per stage, state on disk.** Each stage starts a fresh agent session that reads
    artifacts (spec, plan, feedback) from files; nothing important lives only in a context window
