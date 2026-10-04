@@ -511,3 +511,66 @@ test("multi-round reports count independent trials, recovery costs, cache eviden
     costPerRecoveryUsd: null,
   });
 });
+
+test("review reports current and original label views from stored output without rewriting trial grades", async () => {
+  const { gradeReview } = await import("../src/evals/graders/review.ts");
+  const { reviewCase, reviewOutput } = await import("./evals-reading-support.ts");
+  const cases: import("../src/evals/cases.ts").ReviewCase[] = [
+    "review-033",
+    "review-036",
+    "review-037",
+    "review-039",
+  ].map((id) => ({
+    ...reviewCase,
+    id,
+    labelHistory: [
+      {
+        from: "clean" as const,
+        to: "real" as const,
+        on: "2026-10-03",
+        rule: "evals/review/LABELS.md",
+        by: "adjudicator",
+        evidence: "confirmed",
+      },
+    ],
+  }));
+  cases.push({ ...reviewCase, id: "unaffected-clean", kind: "clean", defects: [] });
+  cases.push({ ...reviewCase, id: "real" });
+  const rows = cases.map((item, i) => {
+    const output = i === 4 ? { ...reviewOutput(), findings: [] } : reviewOutput(i === 2 ? 100 : 10);
+    const grade = gradeReview(item.labelHistory ? { ...item, kind: "clean", defects: [] } : item, output);
+    return { ...trial("a", item.id, 0, grade.pass === true), output, details: { grade } };
+  });
+  const stored = structuredClone(rows);
+  const reviewRun = { ...run, role: "review" as const, k: 1 };
+  const summaries = summarize(reviewRun, rows, { reviewCases: cases, reviewGrader: gradeReview });
+  expect(summaries[0]?.review).toMatchObject({
+    defectRecall: { numerator: 4, denominator: 5 },
+    falseBlock: { numerator: 0, denominator: 1 },
+    originalLabels: {
+      defectRecall: { numerator: 1, denominator: 1 },
+      falseBlock: { numerator: 4, denominator: 5 },
+    },
+  });
+  const text = formatEvalReport({ run: reviewRun, trials: rows, summaries });
+  expect(text).toContain("current labels: blocking recall 80.0% (4/5)");
+  expect(text).toContain("current labels: clean false-block 0.0% (0/1)");
+  expect(text).toContain("original labels: blocking recall 100.0% (1/1)");
+  expect(text).toContain("original labels: clean false-block 80.0% (4/5)");
+  expect(JSON.parse(JSON.stringify(summaries))[0].review.originalLabels.falseBlock).toMatchObject({
+    numerator: 4,
+    denominator: 5,
+  });
+  expect(rows).toEqual(stored);
+  expect(
+    summarize(reviewRun, rows, { reviewCases: [reviewCase], reviewGrader: gradeReview })[0]?.review
+      ?.originalLabels,
+  ).toBeUndefined();
+  const invalid = rows.map((t, i) => (i === 0 ? { ...t, output: {} } : t));
+  expect(
+    summarize(reviewRun, invalid, { reviewCases: cases, reviewGrader: gradeReview })[0]?.review,
+  ).toMatchObject({
+    defectRecall: { numerator: 3, denominator: 4 },
+    originalLabels: { falseBlock: { numerator: 3, denominator: 4 } },
+  });
+});
