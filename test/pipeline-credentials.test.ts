@@ -52,14 +52,14 @@ test("shared invocation recording redacts configured credentials including throw
       complexity: "small",
       constraints: { only: "claude/haiku" },
     });
-    expect(outcome.result.error).toBe("ordinary diagnostic [credential]");
+    expect(outcome.result.error).toBe("ordinary diagnostic [redacted]");
     const invocations = store.listInvocations(run.id);
     expect(invocations).toHaveLength(1);
-    expect(invocations[0]?.error).toBe("ordinary diagnostic [credential]");
+    expect(invocations[0]?.error).toBe("ordinary diagnostic [redacted]");
     expect(JSON.stringify(store.listEvents(run.id))).not.toContain(secret);
     expect(JSON.stringify(store.listEvents(run.id))).toContain("ordinary diagnostic");
     expect(readFileSync(join(cfg.paths.runs, run.id, `inv-${invocations[0]?.id}.log`), "utf8")).toBe(
-      "ordinary diagnostic [credential]",
+      "ordinary diagnostic [redacted]",
     );
   } finally {
     await factory.stop();

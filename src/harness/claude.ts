@@ -263,6 +263,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const args = buildClaudeArgs(spec, sessionId, keyFile);
   appendFileSync(spec.logPath, `# claude ${t.model} ${new Date().toISOString()}\n`);
   const envExtra: Record<string, string> = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
+  // Agent tool read isolation for this key file is tracked in #335.
   if (keyFile) writeFileSync(keyFile, t.backend?.authToken ?? "", { flag: "wx", mode: 0o600 });
   if (t.backend) {
     envExtra.ANTHROPIC_BASE_URL = t.backend.baseUrl;

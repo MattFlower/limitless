@@ -452,6 +452,7 @@ test("configured backend auth reaches the CLI only through a key helper, never t
   const key = "ANTHROPIC_AUTH_TOKEN";
   const saved = process.env[key];
   const token = "FAKE_EXPLICIT_BACKEND_TOKEN_734";
+  const savedAuth = process.env.AUTH;
   const fixture = providerFixture(
     [
       {
@@ -467,6 +468,7 @@ test("configured backend auth reaches the CLI only through a key helper, never t
   const store = new Store(":memory:");
   try {
     process.env[key] = "FAKE_INHERITED_BACKEND_TOKEN_735";
+    process.env.AUTH = `Bearer ${token}`;
     const factory = new Factory(fixture.load(), { store });
     expect(factory.tracker.authToken("mac-mlx")).toBe(token);
     // Explicit overrides cannot reintroduce a configured credential under any name.
@@ -474,6 +476,21 @@ test("configured backend auth reaches the CLI only through a key helper, never t
       KEPT: "ordinary",
     });
     expect(Object.values(agentEnv({ [key]: token, OTHER_NAME: token }))).not.toContain(token);
+    const childEnvs: unknown[] = [];
+    const extras: Record<string, string>[] = [{}, { AUTH: `Bearer ${token}` }];
+    for (const extra of extras) {
+      const child = await runProcess({
+        cmd: [
+          process.execPath,
+          "-e",
+          'console.log(JSON.stringify({auth: process.env.AUTH ?? "absent", kept: process.env.KEPT}))',
+        ],
+        cwd: fixture.root,
+        env: agentEnv({ KEPT: "ordinary", ...extra }),
+      });
+      childEnvs.push(JSON.parse(child.stdout));
+    }
+    expect(childEnvs).toEqual(Array(2).fill({ auth: "absent", kept: "ordinary" }));
     const resolved = factory.router.resolveFor("triage", "mac-mlx/flash");
     const events: AgentEvent[] = [];
     const logPath = join(fixture.root, "backend.log");
@@ -525,6 +542,8 @@ test("configured backend auth reaches the CLI only through a key helper, never t
   } finally {
     if (saved === undefined) delete process.env[key];
     else process.env[key] = saved;
+    if (savedAuth === undefined) delete process.env.AUTH;
+    else process.env.AUTH = savedAuth;
     store.close();
     fixture.close();
   }
@@ -576,7 +595,7 @@ test("configured credentials never reach native children or their events, logs a
             };
       writeFileSync(
         child,
-        `console.log("child credential=" + (process.env.MAC_MLX_KEY ?? "absent")); console.log(${JSON.stringify(JSON.stringify(event))}); console.log(${JSON.stringify(JSON.stringify(textEvent))}); console.error(${JSON.stringify(`ordinary diagnostic ${fileSecret} ${envSecret}`)}); process.exit(1);`,
+        `console.log("child credential=" + (process.env.MAC_MLX_KEY ?? "absent")); console.log(${JSON.stringify(JSON.stringify(event))}); console.log(${JSON.stringify(JSON.stringify(textEvent))}); console.error(${JSON.stringify(`ordinary diagnostic ${fileSecret} ${envSecret}`)}); console.error(${JSON.stringify(`token=${fileSecret}; token=${fileSecret};`)}); process.exit(1);`,
       );
       const result = await (harness === "claude" ? runClaude : runCodex)(
         {
@@ -602,6 +621,7 @@ test("configured credentials never reach native children or their events, logs a
         (options) => runProcess({ ...options, cmd: [process.execPath, child] }),
       );
       expect(result.status).toBe("error");
+      expect(readFileSync(logPath, "utf8")).toContain("token=[redacted]; token=[redacted];");
       expect(events).toContainEqual({ type: "status", text: "child credential=absent" });
       expect(
         events.some((e) => e.type === "tool_call" && JSON.stringify(e.input).includes("ordinary diagnostic")),
@@ -624,6 +644,35 @@ test("configured credentials never reach native children or their events, logs a
     if (saved === undefined) delete process.env[key];
     else process.env[key] = saved;
     store.close();
+    fixture.close();
+  }
+});
+
+test("short credentials only match whole values while eight-character keys match substrings", async () => {
+  const { customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const { agentEnv, redactCredentials } = await import("../src/util/proc.ts");
+  const fixture = providerFixture(
+    [
+      { ...customProvider, api_key_env: "LIMITLESS_TEST_SHORT_KEY" },
+      { ...customProvider, id: "boundary", api_key_env: "LIMITLESS_TEST_EIGHT_KEY" },
+    ],
+    "LIMITLESS_TEST_SHORT_KEY=shrt735\nLIMITLESS_TEST_EIGHT_KEY=eight735\n",
+  );
+  try {
+    fixture.load();
+    expect(redactCredentials("token=shrt735; token=shrt735;")).toBe("token=shrt735; token=shrt735;");
+    expect(redactCredentials("token=eight735; token=eight735;")).toBe("token=[redacted]; token=[redacted];");
+    const env = agentEnv({
+      EXACT_SHORT: "shrt735",
+      SHORT_ALIAS: "Bearer shrt735",
+      EIGHT_ALIAS: "Bearer eight735",
+      KEPT: "ordinary",
+    });
+    expect(env.EXACT_SHORT).toBeUndefined();
+    expect(env.EIGHT_ALIAS).toBeUndefined();
+    expect(env.SHORT_ALIAS).toBe("Bearer shrt735");
+    expect(env.KEPT).toBe("ordinary");
+  } finally {
     fixture.close();
   }
 });

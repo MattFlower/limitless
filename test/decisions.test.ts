@@ -333,7 +333,7 @@ test("the factory's decisions harness never writes a configured credential to it
     const result = await harness(spec({ onEvent: (e) => events.push(e) }));
     expect(result.status).toBe("ok");
     const log = readFileSync(join(dir, "log"), "utf8");
-    expect(log).toContain('"model":"[credential]"');
+    expect(log).toContain('"model":"[redacted]"');
     for (const recorded of [log, JSON.stringify(events), JSON.stringify(result)])
       expect(recorded).not.toContain(secret);
   } finally {

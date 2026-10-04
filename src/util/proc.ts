@@ -280,8 +280,9 @@ export function registerCredential(name: string, value?: string): void {
     if (typeof secret === "string" && secret) credentialValues.add(secret);
 }
 export function redactCredentials(text: string): string {
+  // Substring matches require at least 8 characters to avoid redacting common short strings.
   for (const secret of [...credentialValues].sort((a, b) => b.length - a.length))
-    text = text.split(secret).join("[credential]");
+    if (secret.length >= 8 || text === secret) text = text.split(secret).join("[redacted]");
   return text;
 }
 export const redactCredentialData = <T>(value: T): T =>
@@ -292,7 +293,10 @@ export const redactCredentialData = <T>(value: T): T =>
         ? Object.fromEntries(Object.entries(v).map(([k, x]) => [redactCredentials(k), x]))
         : v,
   );
-const isCredential = ([k, v]: [string, string]) => credentialNames.has(k) || (!!v && credentialValues.has(v));
+const isCredential = ([k, v]: [string, string]) =>
+  credentialNames.has(k) ||
+  credentialValues.has(v) ||
+  [...credentialValues].some((secret) => secret.length >= 8 && v.includes(secret));
 
 /** Environment for agent child processes: inherit PATH etc. but never leak factory secrets. */
 export function agentEnv(extra: Record<string, string> = {}): Record<string, string> {
