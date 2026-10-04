@@ -19,7 +19,7 @@ export const ghClient: GitHubClient = async (path, body, signal) => {
 };
 
 export const OBSERVE_QUERY = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on PullRequest {
-  id url headRefOid state mergeable mergeStateStatus reviewDecision updatedAt mergedAt mergedBy { login }
+  id url headRefOid state isDraft mergeable mergeStateStatus reviewDecision updatedAt mergedAt mergedBy { login }
   commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
     ... on CheckRun { name conclusion url: detailsUrl }
     ... on StatusContext { name: context state url: targetUrl } } } } } } }
@@ -34,6 +34,7 @@ type Context = { name?: string; conclusion?: string | null; state?: string; url?
 const REQUIRED = ["id", "url", "headRefOid", "state", "mergeable", "mergeStateStatus", "updatedAt"] as const;
 type Base = Record<(typeof REQUIRED)[number], string> & GitHubPrState & { reviewDecision: string | null };
 type GqlPr = Base & {
+  isDraft?: boolean;
   commits?: Conn<{ commit?: { statusCheckRollup?: { state: string; contexts?: Conn<Context> } | null } }>;
   reviews?: Conn<Activity & { comments?: Conn<Activity> }>;
   comments?: Conn<Activity>;
@@ -43,6 +44,7 @@ type GqlPr = Base & {
 const MERGE = ["mergeable", "mergeStateStatus"] as const; // null until GitHub reports other than UNKNOWN
 type Known = Omit<Base, (typeof MERGE)[number]> & Record<(typeof MERGE)[number], string | null>;
 export type PrSnapshot = Known & {
+  isDraft?: boolean;
   ci: string | null;
   failing: { name: string; url: string | null }[];
   truncated?: boolean; // all 100 fetched check contexts were used, so there may be more
@@ -216,9 +218,11 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   };
 
   /** Saves the observation; returns the mergeability nudge's response (null: not sent) or undefined. */
-  const record = async (pr: TrackedPr, snap: PrSnapshot) => {
+  /** `since`: the PR's head version before the request, so an overtaken observation is dropped. */
+  const record = async (pr: TrackedPr, snap: PrSnapshot, since: number) => {
     const prev = saved(pr.data);
     const head = snap.headRefOid;
+    store.observePrHead(pr.url, head, since);
     const same = prev?.headRefOid === head;
     const unknown = snap.mergeable !== "UNKNOWN" ? 0 : same ? (prev?.unknown ?? 0) + 1 : 1;
     // Mergeability is per head; UNKNOWN is no observation, so this head's last known value stands.
@@ -260,6 +264,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     const resolved = prs.filter((p) => p.nodeId);
     for (let known = resolved.splice(0, 100); known.length; known = resolved.splice(0, 100)) {
       const ids = known.map((p) => p.nodeId);
+      const since = known.map((p) => store.prHead(p.url)?.version ?? 0);
       const res = await call(repo, "graphql", { query: OBSERVE_QUERY, variables: { ids } });
       if (!res) return;
       // An access failure of the whole query (SSO, IP allow list, HTTP 404) says nothing about any PR.
@@ -272,7 +277,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         return log(`GitHub observation of ${repo} failed with HTTP ${res.status}`);
       for (const [i, pr] of known.entries()) {
         const snap = normalizePr(found[i], pr.nodeId);
-        const nudged = snap ? await record(pr, snap) : null;
+        const nudged = snap ? await record(pr, snap, since[i] ?? 0) : null;
         // A nudge that failed (perhaps an access problem) must not let this cycle clear an episode.
         if (nudged === null) complete = false;
         if (found[i] === null || nudged?.status === 404) missing ??= pr;

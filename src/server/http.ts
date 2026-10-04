@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
@@ -7,6 +9,7 @@ import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
+import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
 import { Auth, CLEAR_SESSION, enrollPage, localPath, loginPage } from "./auth.ts";
@@ -385,7 +388,9 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     },
     "/api/runs/:id": handle((req) => {
       const detail = store.getRunDetail(req.params.id as string);
-      return detail ? json(detail) : error("not found", 404);
+      if (!detail) return error("not found", 404);
+      const path = join(factory.cfg.paths.work, detail.run.id);
+      return json({ ...detail, worktreePath: detail.run.branch && existsSync(path) ? path : null });
     }),
     "/api/runs/:id/cancel": {
       POST: handle((req) => json({ cancelled: factory.cancelRun(req.params.id as string, "ui") })),
@@ -401,6 +406,17 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         if (!store.getRun(id)) return error("run not found", 404);
         const run = store.resolveRun(id, { ...input.data, by: "human" });
         return run ? json(run) : error(resolveConflict(store.getRun(id)?.status ?? "resolved"), 409);
+      }, true),
+    },
+    "/api/runs/:id/review": {
+      POST: handle(async (req) => {
+        try {
+          const result = await submitReview(factory, req.params.id as string, await body<unknown>(req));
+          return json(result, "round" in result ? 201 : 200);
+        } catch (e) {
+          if (e instanceof ReviewRefused) return error(e.message, e.status);
+          throw e;
+        }
       }, true),
     },
     "/api/runs/:id/answer": {
@@ -458,7 +474,9 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
                       ? msg.event.runId
                       : msg.kind === "question"
                         ? msg.question.runId
-                        : null;
+                        : msg.kind === "feed"
+                          ? msg.item.runId
+                          : null;
             if (id === runId) send(msg);
           }),
         { backlog, alive: live(req) },

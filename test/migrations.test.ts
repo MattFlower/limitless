@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AuditAllowance, CreateRunRequest } from "../src/core/types.ts";
+import type { AuditAllowance, CreateRunRequest, Run } from "../src/core/types.ts";
 import { MIGRATION_DIR, migrationNames, runMigrations } from "../src/db/migration-runner.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
 import { Store } from "../src/db/store.ts";
@@ -375,5 +375,59 @@ test("audit allowances persist from requester text and options; legacy runs allo
     store = new Store(path);
     expect(store.getRun(legacy)?.allow).toEqual([]);
     store.close();
+  });
+});
+
+test("after the review-round migration the previous release still opens the database and writes runs", () => {
+  temporary((directory, path) => {
+    const current = new Store(path);
+    const repo = current.upsertRepo({
+      slug: "o/r",
+      kind: "github",
+      url: "unused",
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const prUrl = "https://github.com/o/r/pull/1";
+    const sha = "a".repeat(40);
+    const owner = current.createRun(repo, { repo: repo.slug, prompt: "feature" });
+    current.updateRun(owner.id, { status: "succeeded", branch: "limitless/feature", prUrl });
+    current.createReviewRound(
+      repo,
+      current.getRun(owner.id) as Run,
+      { prUrl, reviewedSha: sha, findings: [], cap: 3 },
+      (round) => ({
+        repo: repo.slug,
+        prompt: "apply findings",
+        baseBranch: "limitless/feature",
+        deliveryBranch: "limitless/feature",
+        sourceRef: { kind: "review-round", runId: owner.id, round, prUrl, reviewedSha: sha },
+      }),
+    );
+    current.recordApproval(owner.id, prUrl, sha, "reviewer");
+    current.close();
+    // The previous release ships every migration file except this one.
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, { recursive: true, filter: (src) => !src.endsWith("-review-rounds.sql") });
+    const previous = new Store(path, before);
+    const run = previous.createRun(repo, { repo: repo.slug, prompt: "after a rollback" });
+    previous.createInvocation({
+      runId: run.id,
+      stageId: previous.startStage(run.id, "implement").id,
+      role: "implement",
+      harness: "fake",
+      provider: "a",
+      model: "a",
+      modelId: "a",
+    });
+    previous.updateRun(run.id, { status: "succeeded", prUrl: "https://github.com/o/r/pull/2" });
+    previous.close();
+    const reopened = new Store(path);
+    expect(reopened.getRun(run.id)).toMatchObject({ status: "succeeded" });
+    expect(reopened.listInvocations(run.id)).toHaveLength(1);
+    expect(reopened.reviewRounds(prUrl)).toMatchObject([{ round: 1, reviewedSha: sha }]);
+    expect(reopened.approvalFor(prUrl)).toEqual({ sha, stale: false });
+    reopened.close();
   });
 });
