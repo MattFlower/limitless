@@ -26,18 +26,16 @@ export async function reconcileMergedRuns(
   log: (message: string) => void = console.warn,
 ): Promise<void> {
   for (const run of store.listRuns({
-    status: ["needs_human", "succeeded"],
+    status: ["needs_human", "succeeded", "resolved"],
     limit: Number.MAX_SAFE_INTEGER,
   })) {
-    if (!run.prUrl || (run.merged && run.status === "succeeded")) continue;
+    if (!run.prUrl || (run.merged && run.status !== "needs_human")) continue;
     try {
       const pr = await client(run.prUrl);
       if (!pr || pr.url !== run.prUrl || store.getRun(run.id)?.prUrl !== pr.url) continue;
       const mergedAt = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
       if (pr.state === "MERGED" && Number.isFinite(mergedAt)) {
-        if (run.status === "needs_human")
-          store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
-        else store.updateRun(run.id, { merged: true, mergedBy: pr.mergedBy?.login ?? null, mergedAt });
+        store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
       } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
         const closed = pr.state === "CLOSED";
         if (closed && !pr.mergedAt && run.status === "needs_human") {
@@ -85,7 +83,10 @@ export function startGitHubNotifier(
   const unsubscribe = store.subscribe((msg) => {
     if (msg.kind !== "run") return;
     const run = msg.run;
-    if (run.prUrl && (run.status === "needs_human" || (run.status === "succeeded" && !run.merged)))
+    if (
+      run.prUrl &&
+      (run.status === "needs_human" || (["succeeded", "resolved"].includes(run.status) && !run.merged))
+    )
       void check();
     const ref = run.sourceRef;
     if (

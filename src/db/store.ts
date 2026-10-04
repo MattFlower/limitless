@@ -1099,6 +1099,8 @@ export class Store {
 
   /** Optional state is checkpointed atomically with the run's SHAs and other fields. */
   updateRun(id: string, patch: RunPatch, state?: unknown): Run {
+    if (patch.merged && !this.pendingPublications)
+      return this.chatTransaction(() => this.updateRun(id, patch, state));
     const { sets, values } = buildUpdate(patch, RUN_PATCH_COLUMNS);
     if (state !== undefined) {
       sets.push("state_json = ?");
@@ -1137,14 +1139,20 @@ export class Store {
       });
       const run = this.getRun(id) as Run;
       this.publish({ kind: "run", run });
+      if (opts.patch?.merged) this.supersedeByIssue(run);
       return run;
     });
   }
 
-  /** Resolve once after GitHub confirms a merge; keep the original terminal evidence. */
+  /** Record a confirmed merge, preserving any existing manual resolution and terminal evidence. */
   resolveMergedRun(id: string, mergedBy: string | null, mergedAt: number): boolean {
-    const prUrl = this.getRun(id)?.prUrl;
-    if (!prUrl) return false;
+    const current = this.getRun(id);
+    const prUrl = current?.prUrl;
+    if (!current || !prUrl || (current.merged && current.status !== "needs_human")) return false;
+    if (current.status === "resolved" || current.status === "succeeded") {
+      this.updateRun(id, { merged: true, mergedBy, mergedAt });
+      return true;
+    }
     const run = this.resolveRun(
       id,
       { kind: "merged", ref: prUrl, by: "github", at: mergedAt },
@@ -1155,7 +1163,6 @@ export class Store {
         data: { mergedBy, mergedAt },
       },
     );
-    if (run) this.supersedeByIssue(run);
     return run !== null;
   }
 

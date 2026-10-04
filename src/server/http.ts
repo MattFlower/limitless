@@ -401,7 +401,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         if (!store.getRun(id)) return error("run not found", 404);
         const run = store.resolveRun(id, { ...input.data, by: "human" });
         return run ? json(run) : error(resolveConflict(store.getRun(id)?.status ?? "resolved"), 409);
-      }),
+      }, true),
     },
     "/api/runs/:id/answer": {
       POST: handle(async (req) => {
