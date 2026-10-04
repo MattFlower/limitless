@@ -66,6 +66,26 @@ ${quotedJson(findings)}
 </review-findings-json>`;
 }
 
+/**
+ * The PR body section a delivered round appends. The marker, keyed on the round's run, keeps a retried
+ * delivery from adding it twice; finding text is escaped so it can neither forge one nor add markup.
+ */
+export function roundSection(runId: string, round: number, findings: ReviewFinding[]) {
+  const line = (text: string) =>
+    text
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/[<>&`]/g, (c) => `&#${c.charCodeAt(0)};`);
+  const where = (f: ReviewFinding) =>
+    f.file ? ` (${line(f.file)}${f.line === undefined ? "" : `:${f.line}`})` : "";
+  const marker = `<!-- limitless-review-round:${runId} -->`;
+  const items = findings.map((f) => `- **${f.severity}**: ${line(f.title)}${where(f)}`);
+  return {
+    marker,
+    text: `\n\n${marker}\n## Round ${round}\nAddressed review findings (run ${runId}):\n${items.join("\n")}\n`,
+  };
+}
+
 type ReviewFactory = { store: Store; cfg: Pick<Config, "paths">; deps: { gh?: GhRunner } };
 
 /**
