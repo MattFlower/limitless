@@ -876,6 +876,76 @@ test("hook discovery fails closed on invalid config and honors cancellation even
   expect(readFileSync(global, "utf8")).toBe("[invalid\n");
 });
 
+test("hooks that arrive between cached factory commands are still blanked", async () => {
+  const marker = join(dir, "hook-ran");
+  const hook = (name: string) =>
+    `[hook "${name}"]\n\tcommand = echo ${name} >> '${marker}'\n\tevent = pre-commit\n\tevent = reference-transaction\n`;
+  let round = 0;
+  const commit = async () => {
+    writeFileSync(join(work, "sample.test.ts"), `round ${++round}\n`);
+    expect(await commitAll(work, `round ${round}`)).not.toBeNull();
+    expect(existsSync(marker)).toBe(false);
+  };
+  await commit();
+  // An include added to the shared config, then a hook added to the included file alone.
+  writeFileSync(join(dir, "added.inc"), "[x]\n\ty = 1\n");
+  await git(work, "config", "--add", "include.path", join(dir, "added.inc"));
+  await commit();
+  writeFileSync(join(dir, "added.inc"), hook("added"));
+  await commit();
+  // An include whose target only appears later.
+  await git(work, "config", "--add", "include.path", join(dir, "later.inc"));
+  await commit();
+  writeFileSync(join(dir, "later.inc"), hook("later"));
+  await commit();
+  // Conditional includes that start to apply without their file changing.
+  writeFileSync(join(dir, "branch.inc"), hook("branch"));
+  await git(work, "config", "includeIf.onbranch:hooked/**.path", join(dir, "branch.inc"));
+  await commit();
+  // Switched through the wrapper: a plain `git checkout` would itself run the planted hooks.
+  await factory("checkout", "-q", "-b", "hooked/x");
+  await commit();
+  writeFileSync(join(dir, "remote.inc"), hook("remote"));
+  await git(
+    work,
+    "config",
+    "includeIf.hasconfig:remote.*.url:https://hooked.invalid/**.path",
+    join(dir, "remote.inc"),
+  );
+  await commit();
+  await git(work, "remote", "add", "hooked", "https://hooked.invalid/repo.git");
+  await commit();
+  // Each planted hook is live: git runs it when not blanked (config hooks need Git 2.54).
+  const version = (await git(work, "--version")).stdout.match(/(\d+)\.(\d+)/);
+  if (version && (Number(version[1]) > 2 || Number(version[2]) >= 54)) {
+    await git(work, "hook", "run", "pre-commit");
+    expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual([
+      "added",
+      "branch",
+      "later",
+      "remote",
+    ]);
+  }
+});
+
+test("an unchanged worktree lists its config once and never hashes the empty tree", async () => {
+  const shim = gitShim();
+  const run = (...args: string[]) => worktreeGit(["git", ...args], { cwd: work, env: shim.env });
+  for (let i = 0; i < 3; i++) {
+    await run("status", "--porcelain");
+    await run("diff", base);
+    await run("log", "-1");
+  }
+  const calls = shim.calls();
+  expect(calls.filter((call) => call.includes(" config --list "))).toHaveLength(1);
+  expect(calls.filter((call) => call.includes(" --get-regexp ^hook"))).toEqual([]);
+  expect(calls.filter((call) => call.includes(" hash-object "))).toEqual([]);
+  // Any edit to a config source lists again.
+  await git(work, "config", "user.name", "Edited");
+  await run("status", "--porcelain");
+  expect(shim.calls().filter((call) => call.includes(" config --list "))).toHaveLength(2);
+});
+
 test("local pipeline scope retains original git settings and index behavior", async () => {
   await git(work, "config", "hook.agent.command", "original-command");
   await git(work, "update-index", "--skip-worktree", "sample.test.ts");

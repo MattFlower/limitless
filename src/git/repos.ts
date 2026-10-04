@@ -7,7 +7,7 @@ import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { attributeRules, BINARY_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
 import { CommandError, sh } from "../util/proc.ts";
-import { emptyHookFlags, NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
+import { emptyHookFlags, emptyTreeId, NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -561,7 +561,7 @@ async function attributeInfo(
   // The empty tree's id depends on the repository's object format (SHA-1 or SHA-256).
   let emptyTree: Promise<string> | undefined;
   const emptyTreeOf = () =>
-    (emptyTree ??= git(["hash-object", "-t", "tree", "--stdin"], "").then(({ stdout }) => stdout.trim()));
+    (emptyTree ??= emptyTreeId({ cwd, env, timeoutMs: Math.max(1, deadline - Date.now()) }));
   const matches = new Set<string>();
   const basePointers = new Set<string>();
   const pointers = new Map<string, boolean>();
