@@ -561,15 +561,10 @@ export async function blobPrivateEntries(
   privateStrings: PrivateStrings,
 ): Promise<[string, number][]> {
   const ids = [...new Set(blobs.filter((id) => !/^0*$/.test(id)))];
-  if (!ids.length) return [];
-  // Inspect published objects, not replacements; latin1 keeps byte offsets and sh fails closed.
-  const { stdout } = await sh(["git", "--no-replace-objects", "cat-file", "--batch"], {
-    cwd,
-    env,
-    stdin: `${ids.join("\n")}\n`,
-    encoding: "latin1",
-    timeoutMs: attributeLimits.timeoutMs,
-  });
+  // Inspect the object that will be published, never a local replacement.
+  const batch = ["git", "--no-replace-objects", "cat-file", "--batch"];
+  const opts = { cwd, env, stdin: ids.map((id) => `${id}\n`).join(""), timeoutMs: attributeLimits.timeoutMs };
+  const { stdout } = await sh(batch, { ...opts, encoding: "latin1" });
   const decoder = new TextDecoder();
   const found: [string, number][] = [];
   let at = 0;
@@ -585,8 +580,6 @@ export async function blobPrivateEntries(
     const content = lfs ? text + (await lfsPayload(cwd, env, text)) : text.includes("\0") ? text : "";
     for (const { entry } of privacy.privateMatches(content, privateStrings)) found.push([id, entry]);
   }
-  if (at !== stdout.length)
-    throw new privacy.PrivateError("Incomplete binary inspection; publication blocked");
   return [...found];
 }
 
@@ -595,25 +588,20 @@ async function lfsPayload(cwd: string, env: Record<string, string> | undefined, 
   const oid = pointer.match(/^oid sha256:([a-f0-9]{64})$/m)?.[1] ?? "";
   const common = await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd, env });
   const path = resolve(cwd, common.stdout.trim(), "lfs/objects", oid.slice(0, 2), oid.slice(2, 4), oid);
-  try {
-    const bytes = fs.statSync(path).isFile() ? fs.readFileSync(path) : undefined;
-    if (bytes && pointer.endsWith(`oid sha256:${Bun.SHA256.hash(bytes, "hex")}\nsize ${bytes.length}\n`))
-      return bytes.toString("utf8");
-  } catch {
-    // Missing or unreadable payloads block below.
-  }
+  const bytes = await fs.promises.readFile(path).catch(() => undefined);
+  if (bytes && pointer.endsWith(`oid sha256:${Bun.SHA256.hash(bytes, "hex")}\nsize ${bytes.length}\n`))
+    return bytes.toString("utf8");
   throw new privacy.PrivateError("Cannot inspect local LFS payload; publication blocked");
 }
 
 /** Checks each published commit's message and patch (and optionally the index), not the net diff. */
 export async function checkPrivateRange(cwd: string, range: string, entries: PrivateStrings, staged = false) {
-  const flags = ["--raw", "-z", "--no-abbrev", "-p", "--text", "--no-renames", "--unified=0"];
+  const flags = "--raw -z --no-abbrev -p --text --no-renames -U0 --ignore-submodules=none".split(" ");
   const blobs: string[] = [];
   for (const args of [["log", "-m", "--format=%B", range], ...(staged ? [["diff", "--cached"]] : [])]) {
     const { stdout } = await worktreeGit(["git", ...args, ...flags], { cwd });
     privacy.checkPrivateText(stdout, "Published content", entries);
-    for (const match of stdout.matchAll(/:\d+ (\d+) \w+ (\w+) [A-Z]\0/g))
-      if (match[1] !== "160000") blobs.push(match[2] ?? "");
+    for (const match of stdout.matchAll(/:\d+ (?!160000)\d+ \w+ (\w+) [A-Z]\0/g)) blobs.push(match[1] ?? "");
   }
   const hit = (await blobPrivateEntries(cwd, undefined, blobs, entries))[0];
   if (hit) throw new privacy.PrivateError(privacy.privateReason("Published blob", hit[1]));

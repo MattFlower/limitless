@@ -1749,6 +1749,17 @@ test.each(["patch", "message", "merge", "excluded"])("publication range checks %
   else await expect(scan).rejects.toThrow("entry 1");
 });
 
+test("publication range checks gitlink paths even when config ignores submodules", async () => {
+  await git(work, "config", "diff.ignoreSubmodules", "all");
+  await git(work, "update-index", "--add", "--cacheinfo", `160000,${base},secret-host.example`);
+  await git(work, "commit", "--no-verify", "-qm", "safe");
+  await git(work, "rm", "-q", "--cached", "secret-host.example");
+  await git(work, "commit", "--no-verify", "-qm", "remove gitlink");
+  await expect(
+    checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]),
+  ).rejects.toThrow("entry 1");
+});
+
 test.each([
   "matching",
   "clean",
@@ -1790,7 +1801,7 @@ test.each([
     );
 });
 
-test.each(["complete", "truncated", "failed", "timeout", "cancelled"])(
+test.each(["complete", "truncated", "failed", "timeout", "timeout-exit-0", "cancelled"])(
   "one byte-framed batch, %s",
   async (scenario) => {
     const bin = join(dir, "bin");
@@ -1809,7 +1820,7 @@ test.each(["complete", "truncated", "failed", "timeout", "cancelled"])(
     const calls = join(dir, "calls");
     writeFileSync(
       join(bin, "git"),
-      `#!/bin/sh\necho "$*" >> '${calls}'\ncat >/dev/null\n${["timeout", "cancelled"].includes(scenario) ? "sleep 10" : `cat '${output}'`}\nexit ${scenario === "failed" ? 1 : 0}\n`,
+      `#!/bin/sh\necho "$*" >> '${calls}'\ncat >/dev/null\n${["timeout", "cancelled"].includes(scenario) ? "sleep 10" : `cat '${output}'`}\n${scenario === "timeout-exit-0" ? "trap 'exit 0' TERM\nsleep 10 &\nwait\n" : ""}exit ${scenario === "failed" ? 1 : 0}\n`,
       { mode: 0o755 },
     );
     const limit = attributeLimits.timeoutMs;
@@ -1821,7 +1832,7 @@ test.each(["complete", "truncated", "failed", "timeout", "cancelled"])(
       scratchDirs: new Set<string>(),
     };
     try {
-      if (scenario === "timeout") attributeLimits.timeoutMs = 250;
+      if (scenario.startsWith("timeout")) attributeLimits.timeoutMs = 250;
       const scan = processScope.run(scope, () =>
         worktreeGitScope.run(false, () =>
           blobPrivateEntries(work, { ...process.env, PATH: `${bin}:${process.env.PATH}` }, ids, [
