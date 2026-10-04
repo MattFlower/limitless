@@ -199,6 +199,32 @@ describe("land-pr private strings", () => {
   });
 });
 
+test("land records the worktree's Git paths before any PR code runs", async () => {
+  const root = mkdtempSync(join(tmpdir(), "land-record-"));
+  try {
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const calls = join(root, "calls");
+    writeFileSync(
+      join(bin, "bun"),
+      `#!/bin/sh\necho "$*" >> '${calls}'\n[ "$1" = run ] && exit 1\nexit 0\n`,
+      {
+        mode: 0o755,
+      },
+    );
+    await sh(["bash", script, "123", "safe", root], {
+      cwd: root,
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: root },
+      allowFail: true,
+    });
+    const lines = readFileSync(calls, "utf8").trim().split("\n");
+    expect(lines[0]).toEndWith("check-private-strings.ts --record");
+    expect(lines.indexOf("run check")).toBeGreaterThan(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("land logs honor TMPDIR and overrides and are unique for concurrent failures", async () => {
   const root = mkdtempSync(join(tmpdir(), "land-logs-"));
   try {
@@ -207,7 +233,7 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
     const marker = join(root, "published");
     writeFileSync(
       join(bin, "bun"),
-      '#!/bin/sh\n[ "$1" = install ] && exit 0\necho "failed-check-$$"\nexit 1\n',
+      '#!/bin/sh\n[ "$1" = install ] || [ "$2" = --record ] && exit 0\necho "failed-check-$$"\nexit 1\n',
       { mode: 0o755 },
     );
     for (const name of ["git", "gh"])

@@ -1,8 +1,9 @@
-import { resolve } from "node:path";
+import { lstatSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { z } from "zod";
 import { splitPatch } from "../src/gates/audit.ts";
 import * as privacy from "../src/gates/private.ts";
-import { worktreeGit } from "../src/git/command.ts";
+import { recordWorktree, worktreeGit } from "../src/git/command.ts";
 import { checkPrivateRange } from "../src/git/repos.ts";
 import { processScope, sh } from "../src/util/proc.ts";
 
@@ -11,6 +12,12 @@ for (const event of ["SIGTERM", "SIGINT"] as const) process.on(event, () => cont
 const signal = controller.signal;
 processScope.enterWith({ signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set() });
 try {
+  if (process.argv[2] === "--record") {
+    // Land runs this before any PR code: the hardened git calls below trust only these paths.
+    if (lstatSync(join(process.cwd(), ".git"), { throwIfNoEntry: false })?.isFile())
+      await recordWorktree(process.cwd());
+    process.exit(0);
+  }
   const common = await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd: process.cwd() });
   const entries = privacy.loadPrivateStrings(undefined, [process.cwd(), resolve(common.stdout.trim(), "..")]);
   if (process.argv[4] === "--merge") {

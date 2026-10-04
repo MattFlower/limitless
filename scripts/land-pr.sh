@@ -15,6 +15,7 @@ checker=""
 trap '[ -z "$checker" ] || { kill -TERM "$checker" 2>/dev/null || :; wait "$checker" || :; }; exit 1' TERM INT
 check_private() { bun "$private_check" "$@" & checker=$!; wait "$checker"; checker=""; }
 
+check_private --record
 bun install --frozen-lockfile >/dev/null
 log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
 if ! bun run check >"$log" 2>&1; then
