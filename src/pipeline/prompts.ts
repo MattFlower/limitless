@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import type { Complexity, FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
@@ -165,14 +166,32 @@ ${checksSection(input.gates, input.baseline)}
 Reply with a concise report: files changed, how you verified (commands and results), assumptions, and anything left undone.`;
 }
 
-export function formatGateFeedback(cmp: GateComparison[]): string {
+export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): string {
   const bad = cmp.filter((c) => c.blocking);
   if (!bad.length) return "";
   return bad
-    .map(
-      (c) =>
-        `### Check \`${c.name}\` ${c.verdict === "regressed" ? "now FAILS (it passed before your change)" : "FAILS"}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`,
-    )
+    .map((c) => {
+      if (c.result.timedOut) {
+        const limit = cfg?.checks.find((k) => k.name === c.name)?.timeoutSec ?? 900;
+        const output = stripVTControlCharacters(c.result.output);
+        const last = [
+          ...output.matchAll(
+            /^([ \t]*)(?:(RUN|# Subtest:)[ \t]+([^\r\n]+)|([^\r\n]+(?:\.test|\.spec)\.[cm]?[jt]sx?):[ \t]*)\r?$/gm,
+          ),
+        ].at(-1);
+        const completed =
+          last?.[2] === "# Subtest:" &&
+          [
+            ...output
+              .slice(last.index + last[0].length)
+              .matchAll(
+                /^([ \t]*)(?:not )?ok[ \t]+\d+(?:[ \t]+(?:-[ \t]+)?([^\r\n]*?))?(?:[ \t]+# (?:SKIP|TODO)\b[^\r\n]*)?[ \t]*\r?$/gim,
+              ),
+          ].some((result) => result[1] === last[1] && (!result[2] || result[2].trim() === last[3]?.trim()));
+        return `### Check \`${c.name}\` timed out after ${limit} s${c.firstAttempt?.timedOut ? " twice" : ""}${last && !completed ? `; the last test running was ${last[3] ?? last[4]}` : ""}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`;
+      }
+      return `### Check \`${c.name}\` ${c.verdict === "regressed" ? "now FAILS (it passed before your change)" : "FAILS"}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`;
+    })
     .join("\n\n");
 }
 
