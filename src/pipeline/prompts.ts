@@ -10,6 +10,7 @@ import {
   renderSpec,
   requirementEntries,
   requirementSource,
+  rowKind,
   type Spec,
   type Verify,
 } from "./schemas.ts";
@@ -255,8 +256,10 @@ export function formatVerifyFeedback(
   const text = (id: string) => spec?.acceptance_criteria.find((a) => a.id === id)?.criterion ?? "";
   let unvalidated = false;
   const items = unmet
-    .map((c) => {
-      const privateScenario = /^H-\d+$/i.test(c.id);
+    .map((c, index) => {
+      const kind = rowKind(c.id, spec, holdout);
+      if (kind === "unknown") return `- **unknown-${index + 1}** (${c.status}): Unknown criterion.`;
+      const privateScenario = kind !== "public";
       const summary =
         privateScenario && holdout ? redactHoldoutText(c.publicSummary.trim(), holdout, publicSources) : "";
       const behavior = summary.replace(/\[private detail\]|\[\d+ private details withheld\]/g, "");

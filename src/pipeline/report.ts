@@ -1,7 +1,7 @@
 import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation } from "../core/types.ts";
 import type { RunContext, RunState } from "./context.ts";
-import type { Review } from "./schemas.ts";
+import { type Review, rowKind } from "./schemas.ts";
 import { notRequired } from "./verification.ts";
 
 function money(n: number): string {
@@ -88,7 +88,9 @@ export function renderReport(input: ReportInput): string {
       table(
         ["", "Criterion", "Evidence"],
         state.spec.acceptance_criteria.map((ac) => {
-          const v = verify?.criteria.find((c) => c.id === ac.id);
+          const v = verify?.criteria.find(
+            (c) => c.id === ac.id && rowKind(c.id, state.spec ?? null, state.holdout) === "public",
+          );
           const icon = !v
             ? "·"
             : v.status === "met"
