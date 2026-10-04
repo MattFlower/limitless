@@ -1092,6 +1092,43 @@ describe("pipeline (fake agents, real git + gates)", () => {
     } else expect(f.store.getArtifact(run.id, "spec.md")).toContain("AC-1");
   });
 
+  test.each([false, true])(
+    "spec criterion id retry preserves unrelated schema fallback (idRetry=%s)",
+    async (idRetry) => {
+      const prompts: string[] = [];
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") {
+          prompts.push(s.prompt);
+          if (s.target.provider === "alpha")
+            return {
+              structured:
+                idRetry && prompts.length === 1
+                  ? { ...spec, acceptance_criteria: [{ ...spec.acceptance_criteria[0], id: "H-1" }] }
+                  : { ...spec, summary: 42 },
+            };
+          return { structured: spec };
+        }
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") return { structured: pass };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const invocations = f.store.listInvocations(run.id).filter((i) => i.role === "spec");
+      expect(invocations.map((i) => [i.provider, i.status])).toEqual([
+        ["alpha", "error"],
+        ...(idRetry ? [["alpha", "error"]] : []),
+        ["beta", "ok"],
+      ]);
+      if (idRetry) expect(prompts[1]).toContain("Invalid id H-1");
+      else expect(prompts[1]).not.toContain("Invalid spec");
+      expect(f.store.getArtifact(run.id, "spec.md")).toContain("AC-1");
+    },
+  );
+
   test("prepare restart retains the reused worktree base after upstream advances", async () => {
     writeFileSync(
       join(repoDir, ".limitless.toml"),

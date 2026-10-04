@@ -437,7 +437,7 @@ export class RunContext {
     const busy = new Set<string>();
     let waitMs = 0;
     let lastFailure: string | null = null;
-    let specSchemaRetried = false;
+    let specIdRetried = false;
     // An unsure (not question-needing) decline beats failing the stage when nothing else answers.
     let lastResort: InvokeOutcome | null = null;
     const useLastResort = (outcome: InvokeOutcome, why: string) => {
@@ -771,9 +771,9 @@ export class RunContext {
         this.log(`${target.targetId ?? target.modelId} ${result.status}; falling back`, "warn");
         continue;
       }
-      if (opts.role === "spec" && result.error?.startsWith("structured output failed validation:")) {
-        if (specSchemaRetried) throw new Error(result.error);
-        specSchemaRetried = true;
+      if (opts.role === "spec" && result.error?.includes('"message": "Invalid id ')) {
+        if (specIdRetried) throw new Error(result.error);
+        specIdRetried = true;
         opts = { ...opts, prompt: `${opts.prompt}\n\nInvalid spec: ${result.error}` };
         tried.pop();
         continue;
