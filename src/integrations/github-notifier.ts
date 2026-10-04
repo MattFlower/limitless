@@ -41,12 +41,8 @@ export async function reconcileMergedRuns(
       } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
         const closed = pr.state === "CLOSED";
         if (closed && !pr.mergedAt && run.status === "needs_human") {
-          const patch = { prClosedUnmerged: true };
-          store.resolveRun(
-            run.id,
-            { kind: "pr_closed", ref: pr.url, by: "github" },
-            { from: ["needs_human"], patch },
-          );
+          const resolution = { kind: "pr_closed", ref: pr.url, by: "github" } as const;
+          store.resolveRun(run.id, resolution, { from: ["needs_human"], patch: { prClosedUnmerged: true } });
         } else if (run.prClosedUnmerged !== closed) store.updateRun(run.id, { prClosedUnmerged: closed });
       }
     } catch (error) {

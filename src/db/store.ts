@@ -1158,14 +1158,10 @@ export class Store {
   supersedeByIssue(merged: Run): Run[] {
     const issues = closedIssues(merged.prompt);
     if (!issues.size) return [];
+    const input = { kind: "superseded", ref: merged.prUrl ?? merged.id, by: "system" } as const;
     return this.listRuns({ status: ["needs_human"], repoId: merged.repoId, limit: Number.MAX_SAFE_INTEGER })
       .filter((r) => r.id !== merged.id && [...closedIssues(r.prompt)].some((n) => issues.has(n)))
-      .flatMap((r) => {
-        const ref = merged.prUrl ?? merged.id;
-        return (
-          this.resolveRun(r.id, { kind: "superseded", ref, by: "system" }, { from: ["needs_human"] }) ?? []
-        );
-      });
+      .flatMap((r) => this.resolveRun(r.id, input, { from: ["needs_human"] }) ?? []);
   }
 
   /** Recompute run totals from its invocations. */
