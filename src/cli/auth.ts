@@ -1,9 +1,10 @@
-import type { AuthSession } from "../core/types.ts";
+import type { AuthPasskey, AuthSession } from "../core/types.ts";
 
 type Api = <T>(path: string, init?: RequestInit) => Promise<T>;
 type Terminal = Pick<NodeJS.ReadStream, "isTTY" | "setRawMode" | "resume" | "pause" | "on" | "off">;
 
-const USAGE = "usage: limitless auth set-password | limitless auth sessions [revoke <id> | revoke --all]";
+const USAGE =
+  "usage: limitless auth add-passkey | passkeys [remove <id>] | set-password | sessions [revoke <id> | revoke --all]";
 const stamp = (ms: number) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
 
 /** Reads a line from the terminal without echoing it; piped input is read as its first line. */
@@ -45,6 +46,30 @@ export async function authCommand(
 ): Promise<void> {
   const { api, print, secret = readSecret, interactive = process.stdin.isTTY === true } = deps;
   const [action, sub, id] = args;
+  if (action === "add-passkey" && args.length === 1) {
+    const { url } = await api<{ url: string }>("/api/admin/auth/enroll", { method: "POST", body: "{}" });
+    print(`Open this link in the browser that should keep the passkey (once, within 10 minutes):\n${url}`);
+    return;
+  }
+  if (action === "passkeys" && args.length === 1) {
+    const passkeys = await api<AuthPasskey[]>("/api/admin/auth/passkeys");
+    if (!passkeys.length) print("No passkeys");
+    for (const p of passkeys)
+      print(
+        `${p.id}  added ${stamp(p.createdAt)}  used ${p.lastUsedAt ? stamp(p.lastUsedAt) : "never"}  ${p.device}`,
+      );
+    return;
+  }
+  if (action === "passkeys" && sub === "remove" && id && args.length === 3) {
+    const body = JSON.stringify({ id });
+    const { removed } = await api<{ removed: number }>("/api/admin/auth/passkeys/remove", {
+      method: "POST",
+      body,
+    });
+    if (!removed) throw new Error(`no passkey ${id}`);
+    print("Removed; sessions it signed in stay until revoked (limitless auth sessions)");
+    return;
+  }
   if (action === "set-password" && args.length === 1) {
     const password = await secret("New UI password: ");
     if (interactive && (await secret("Repeat it: ")) !== password) throw new Error("the passwords differ");
