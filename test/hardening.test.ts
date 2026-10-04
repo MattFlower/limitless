@@ -40,12 +40,19 @@ describe("process handling", () => {
 
   test("background processes left by the child are reaped", async () => {
     const marker = join(dir, "alive");
+    // The leftover keeps touching the marker; the child exits only once it is running.
     await runProcess({
-      cmd: ["/bin/sh", "-c", `(sleep 2; touch ${marker}) >/dev/null 2>&1 & exit 0`],
+      cmd: [
+        "/bin/sh",
+        "-c",
+        `(while :; do touch ${marker}; sleep 0.05; done) >/dev/null 2>&1 & while [ ! -e ${marker} ]; do sleep 0.01; done`,
+      ],
       cwd: dir,
       env: process.env as Record<string, string>,
     });
-    await Bun.sleep(2500);
+    await Bun.sleep(20);
+    rmSync(marker);
+    await Bun.sleep(300);
     expect(await Bun.file(marker).exists()).toBe(false);
   });
 
