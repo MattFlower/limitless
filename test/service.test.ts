@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { installationUnits } from "../src/cli/service.ts";
@@ -73,6 +73,11 @@ type MigrationResult = {
   lockHeld: boolean;
   recoveryCleaned: boolean;
   backup: string | null;
+  phase: string;
+  journals: string[];
+  firstError: string;
+  tunnelJournal: string;
+  daemonOld: string;
   state: boolean;
   lock: boolean;
   calls: string[];
@@ -117,7 +122,7 @@ test("migration drains current work, waits for unload, then replaces and checks 
   ]);
   expect(r.time).toBe(5500);
   expect(r.loaded).toEqual(["other.program", "dev.limitless.daemon"]);
-  expect(r.files["original.plist"]).toBeUndefined();
+  expect(r.files["daemon-original.plist"]).toBeUndefined();
   expect(r.files["dev.limitless.daemon.plist"]).toContain(
     "<key>LimitlessService</key><string>daemon</string>",
   );
@@ -134,7 +139,7 @@ for (const scenario of ["bootstrap", "partial", "health", "wrong-sha"]) {
         : `replacement ${scenario === "partial" ? "bootstrap" : scenario} failed`,
     );
     expect(r.calls.at(-1)).toBe("bootstrap arbitrary.installed.daemon");
-    expect(r.files["original.plist"]).toBe(r.old);
+    expect(r.files["daemon-original.plist"]).toBe(r.old);
     expect(r.files["dev.limitless.daemon.plist"]).toBeUndefined();
     expect(r.loaded).toEqual(["other.program", "arbitrary.installed.daemon"]);
     expect(r.calls).not.toContain("resume");
@@ -156,7 +161,7 @@ for (const scenario of [
   test(`${scenario} failure preserves the installed agent and avoids bootstrap`, async () => {
     const { result: r } = await migration(scenario);
     expect(r.error).not.toBe("");
-    expect(r.files["original.plist"]).toBe(r.old);
+    expect(r.files["daemon-original.plist"]).toBe(r.old);
     expect(r.loaded).toContain("arbitrary.installed.daemon");
     expect(r.calls.some((call) => call.startsWith("bootstrap"))).toBe(false);
     expect(r.files["dev.limitless.daemon.plist"]).toBeUndefined();
@@ -174,7 +179,7 @@ test("a failed resume reports both the original failure and the cleanup failure"
   expect(r.error).toContain("Resume scheduler failed: Error: resume failed");
   expect(r.calls).toEqual(["drain", "resume"]);
   expect(r.draining).toBe(true);
-  expect(r.files["original.plist"]).toBe(r.old);
+  expect(r.files["daemon-original.plist"]).toBe(r.old);
   expect(r.loaded).toContain("arbitrary.installed.daemon");
   expect(r.files["dev.limitless.daemon.plist"]).toBeUndefined();
 });
@@ -184,7 +189,7 @@ test("rollback reports both the replacement and restoration failures", async () 
   expect(r.error).toContain("replacement bootstrap failed");
   expect(r.error).toContain("Restoration failed:");
   expect(r.error).toContain("old bootstrap failed");
-  expect(r.files["original.plist"]).toBe(r.old);
+  expect(r.files["daemon-original.plist"]).toBe(r.old);
   expect(r.files["dev.limitless.daemon.plist"]).toBeUndefined();
 });
 
@@ -209,10 +214,10 @@ for (const kind of ["tunnel", "mtplx"])
       if (scenario === "migration") {
         expect(r.error).toBe("");
         expect(r.loaded).toContain(`dev.limitless.${kind}`);
-        expect(r.files["original.plist"]).toBeUndefined();
+        expect(r.files[`${kind}-original.plist`]).toBeUndefined();
       } else {
         expect(r.error).toContain("replacement bootstrap failed");
-        expect(r.files["original.plist"]).toBe(r.old);
+        expect(r.files[`${kind}-original.plist`]).toBe(r.old);
         expect(r.loaded).toContain(`arbitrary.installed.${kind}`);
         expect(r.files[`dev.limitless.${kind}.plist`]).toBeUndefined();
       }
@@ -233,7 +238,7 @@ test("status and uninstall recognize arbitrary installed labels", async () => {
   const { result: r } = await migration("uninstall");
   expect(r.error).toBe("");
   expect(r.calls).toEqual(["bootout arbitrary.installed.daemon"]);
-  expect(r.files["original.plist"]).toBeUndefined();
+  expect(r.files["daemon-original.plist"]).toBeUndefined();
   expect(r.files["unrelated.plist"]).toBe(r.unrelated);
 });
 
@@ -244,7 +249,7 @@ test("an already marked neutral unit is discovered and reinstalled with a draine
   expect(r.calls).toContain("bootout dev.limitless.daemon");
   expect(r.calls.at(-2)).toBe("bootstrap dev.limitless.daemon");
   expect(r.calls.at(-1)).toBe("health fresh");
-  expect(r.files["original.plist"]).toBeUndefined();
+  expect(r.files["daemon-original.plist"]).toBeUndefined();
 });
 
 test("migration uses deploy's 45-minute drain timeout and then restarts", async () => {
@@ -264,7 +269,7 @@ test("discovery rejects Bun's run command before the entry point", async () => {
   expect(r.error).toBe("");
   expect(r.calls).not.toContain("drain");
   expect(r.calls).not.toContain("bootout arbitrary.installed.daemon");
-  expect(r.files["original.plist"]).toBe(r.old);
+  expect(r.files["daemon-original.plist"]).toBe(r.old);
 });
 
 test("an unrelated plist at the neutral path is preserved without draining or stopping", async () => {
@@ -272,7 +277,7 @@ test("an unrelated plist at the neutral path is preserved without draining or st
   expect(r.error).toContain("unrelated agent:");
   expect(r.calls).toEqual([]);
   expect(r.files["dev.limitless.daemon.plist"]).toBe(r.unrelated);
-  expect(r.files["original.plist"]).toBe(r.old);
+  expect(r.files["daemon-original.plist"]).toBe(r.old);
 });
 
 for (const kind of ["tunnel", "mtplx"]) {
@@ -280,7 +285,7 @@ for (const kind of ["tunnel", "mtplx"]) {
     const { result: r } = await migration("unselected", kind);
     expect(r.error).toBe("");
     expect(r.calls).toEqual(["bootstrap dev.limitless.daemon", "health fresh"]);
-    expect(r.files["original.plist"]).toBe(r.old);
+    expect(r.files[`${kind}-original.plist`]).toBe(r.old);
     expect(r.files[`dev.limitless.${kind}.plist`]).toBeUndefined();
     expect(r.loaded).toContain(`arbitrary.installed.${kind}`);
   });
@@ -295,7 +300,7 @@ for (const kind of ["daemon", "tunnel", "mtplx"]) {
       expect(r.calls).not.toContain(`bootout arbitrary.installed.${kind}`);
       expect(r.calls).not.toContain(`bootstrap arbitrary.installed.${kind}`);
       expect(r.loaded).toContain(`arbitrary.installed.${kind}`);
-      expect(r.files["original.plist"]).toBe(r.old);
+      expect(r.files[`${kind}-original.plist`]).toBe(r.old);
     });
   }
   for (const scenario of [
@@ -309,7 +314,7 @@ for (const kind of ["daemon", "tunnel", "mtplx"]) {
       expect(r.error).toBe("");
       expect(r.calls).toContain(`bootout arbitrary.installed.${kind}`);
       expect(r.loaded).toContain(`dev.limitless.${kind}`);
-      expect(r.files["original.plist"]).toBeUndefined();
+      expect(r.files[`${kind}-original.plist`]).toBeUndefined();
       expect(r.backupBeforeStop).toBe(true);
       expect(r.backup).toBeNull();
       expect(r.state).toBe(false);
@@ -321,7 +326,7 @@ test("replacement bootout failure does not prevent restoration after failed heal
   const { result: r } = await migration("health-bootout");
   expect(r.error).toContain("replacement health failed");
   expect(r.error).toContain("bootout denied");
-  expect(r.files["original.plist"]).toBe(r.old);
+  expect(r.files["daemon-original.plist"]).toBe(r.old);
   expect(r.calls).toContain("bootstrap arbitrary.installed.daemon");
   expect(r.loaded).toContain("arbitrary.installed.daemon");
   expect(r.backup).toBe(r.old);
@@ -332,7 +337,7 @@ test("backup persistence failure aborts before draining or stopping", async () =
   const { result: r } = await migration("persist-failure");
   expect(r.error).not.toBe("");
   expect(r.calls).toEqual([]);
-  expect(r.files["original.plist"]).toBe(r.old);
+  expect(r.files["daemon-original.plist"]).toBe(r.old);
   expect(r.loaded).toContain("arbitrary.installed.daemon");
 });
 
@@ -355,10 +360,11 @@ async function interrupted(
   signal: "SIGINT" | "SIGTERM" | "SIGKILL",
   twice = false,
   phase = "replacing",
+  kind = "daemon",
 ) {
   const dir = mkdtempSync(join(tmpdir(), "limitless-interrupted-migration-"));
   migrationDirs.push(dir);
-  const child = Bun.spawn([process.execPath, "test/service-migration-support.ts", scenario], {
+  const child = Bun.spawn([process.execPath, "test/service-migration-support.ts", scenario, kind], {
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, SERVICE_TEST_HOME: dir },
@@ -375,8 +381,8 @@ async function interrupted(
   try {
     await until("READY");
     const backupDir = join(dir, ".limitless", "service-backup");
-    const original = readFileSync(join(backupDir, "original.plist"), "utf8");
-    const state = JSON.parse(readFileSync(join(backupDir, "migration.json"), "utf8"));
+    const state = JSON.parse(readFileSync(join(backupDir, "dev.limitless.daemon.json"), "utf8"));
+    const original = Buffer.from(state.backup, "base64").toString();
     expect(state.old.label).toBe(scenario.startsWith("marked") ? state.label : "arbitrary.installed.daemon");
     expect(state.label).toBe("dev.limitless.daemon");
     expect(state.phase).toBe(phase);
@@ -409,7 +415,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     const { dir, output, original } = await interrupted("signal", signal);
     const r = JSON.parse(output.trim().split("\n").at(-1) ?? "") as MigrationResult;
     expect(r.error).toContain(`interrupted by ${signal}`);
-    expect(r.files["original.plist"]).toBe(original);
+    expect(r.files["daemon-original.plist"]).toBe(original);
     expect(r.calls).toContain("bootstrap arbitrary.installed.daemon");
     expect(r.loaded).toContain("arbitrary.installed.daemon");
     expect(r.state).toBe(true);
@@ -429,7 +435,7 @@ for (const operation of ["recover-install", "recover-deploy"]) {
     const { dir, original } = await interrupted("signal-rollback", "SIGTERM", true);
     const { result: r } = await migration(operation, "daemon", dir);
     expect(r.error).toContain("Recovered previous agent arbitrary.installed.daemon");
-    expect(r.files["original.plist"]).toBe(original);
+    expect(r.files["daemon-original.plist"]).toBe(original);
     expect(r.calls).toContain("bootstrap arbitrary.installed.daemon");
     expect(r.loaded).toContain("arbitrary.installed.daemon");
     expect(r.loaded).not.toContain("dev.limitless.daemon");
@@ -452,7 +458,7 @@ test("a failed drain keeps its rollback data while deploy recovery leaves the ru
   const { result: r } = await migration("recover-deploy", "daemon", dir);
   expect(r.error).toBe("");
   expect(r.calls.filter((call) => call.startsWith("boot"))).toEqual([]);
-  expect(r.files["original.plist"]).toBe(failed.old);
+  expect(r.files["daemon-original.plist"]).toBe(failed.old);
   expect(r.loaded).toContain("arbitrary.installed.daemon");
   expect(r.state).toBe(true);
   expect(r.backup).toBe(failed.old);
@@ -468,7 +474,7 @@ for (const [scenario, signal] of [
     const { result: r } = await migration("recover-deploy", "daemon", dir);
     expect(r.error).toBe("");
     expect(r.calls.filter((call) => call.startsWith("boot"))).toEqual([]);
-    expect(r.files["original.plist"]).toBe(original);
+    expect(r.files["daemon-original.plist"]).toBe(original);
     expect(r.loaded).toContain(
       scenario.startsWith("marked") ? "dev.limitless.daemon" : "arbitrary.installed.daemon",
     );
@@ -524,7 +530,7 @@ test("rollback attempts old bootstrap even when the replacement uses the same la
   expect(r.error).toContain("replacement health failed");
   expect(r.error).toContain("bootout denied");
   expect(r.error).toContain("overlapping services");
-  expect(r.files["original.plist"]).toBe(r.old);
+  expect(r.files["daemon-original.plist"]).toBe(r.old);
   expect(r.calls.filter((call) => call === "bootstrap dev.limitless.daemon")).toHaveLength(2);
   expect(r.backup).toBe(r.old);
   expect(r.state).toBe(true);
@@ -534,8 +540,13 @@ test("a failed journal phase update retains its previous record and still restor
   const { result: r } = await migration("phase-update");
   expect(r.error).toContain("replacement health failed");
   expect(r.error).toContain("EISDIR");
+  expect(r.phase).toBe("replacing");
+  expect(r.journals).toEqual(["dev.limitless.daemon.json"]);
+  const backupDir = join(migrationDirs.at(-1) ?? "", ".limitless", "service-backup");
+  expect(existsSync(join(backupDir, "original.plist"))).toBe(false);
+  expect(existsSync(join(backupDir, "migration.json"))).toBe(false);
   expect(r.calls).toContain("bootstrap arbitrary.installed.daemon");
-  expect(r.files["original.plist"]).toBe(r.old);
+  expect(r.files["daemon-original.plist"]).toBe(r.old);
   expect(r.loaded).toContain("arbitrary.installed.daemon");
   expect(r.backup).toBe(r.old);
   expect(r.state).toBe(true);
@@ -543,12 +554,12 @@ test("a failed journal phase update retains its previous record and still restor
 
 test("SIGKILL after plist removal is recoverable without the old plist or an in-memory rollback", async () => {
   const { dir, original } = await interrupted("signal", "SIGKILL");
-  expect(existsSync(join(dir, "Library", "LaunchAgents", "original.plist"))).toBe(false);
+  expect(existsSync(join(dir, "Library", "LaunchAgents", "daemon-original.plist"))).toBe(false);
   const { result: r } = await migration("recover-install", "daemon", dir);
   expect(r.error).toContain("Recovered previous agent arbitrary.installed.daemon");
   expect(r.calls).toContain("bootstrap arbitrary.installed.daemon");
   expect(r.loaded).toContain("arbitrary.installed.daemon");
-  expect(r.files["original.plist"]).toBe(original);
+  expect(r.files["daemon-original.plist"]).toBe(original);
   expect(r.backup).toBe(original);
 });
 
@@ -558,7 +569,7 @@ for (const kind of ["tunnel", "mtplx"]) {
     expect(r.error).toBe("");
     expect(r.calls).toContain(`bootout dev.limitless.${kind}`);
     expect(r.loaded).toContain(`dev.limitless.${kind}`);
-    expect(r.files["original.plist"]).toBeUndefined();
+    expect(r.files[`${kind}-original.plist`]).toBeUndefined();
   });
 }
 
@@ -595,7 +606,136 @@ for (const [scenario, signal] of [
       expect(r.calls).toContain("bootstrap arbitrary.installed.daemon");
       expect(r.calls.includes("bootout arbitrary.installed.daemon")).toBe(!unloaded);
       expect(r.loaded).toContain("arbitrary.installed.daemon");
-      expect(r.files["original.plist"]).toBe(first.old);
+      expect(r.files["daemon-original.plist"]).toBe(first.old);
     });
   }
+}
+
+test("restored tunnel survives daemon install", async () => {
+  const { result: r } = await migration("sequence", "tunnel");
+  expect(r.firstError).toContain("replacement bootstrap failed");
+  expect(r.error).toBe("");
+  expect(r.files["tunnel-original.plist"]).toBe(r.old);
+  expect(r.files["daemon-original.plist"]).toBeUndefined();
+  expect(r.loaded).toContain("arbitrary.installed.tunnel");
+  expect(r.loaded).toContain("dev.limitless.daemon");
+  expect(r.journals).toEqual(["dev.limitless.tunnel.json"]);
+  const retained = readFileSync(
+    join(migrationDirs.at(-1) ?? "", ".limitless", "service-backup", "dev.limitless.tunnel.json"),
+    "utf8",
+  );
+  expect(retained).toBe(r.tunnelJournal);
+  expect(JSON.parse(retained).phase).toBe("restored");
+  expect(Buffer.from(JSON.parse(retained).backup, "base64").toString()).toBe(r.old);
+  expect(r.backup).toBe(r.old);
+});
+
+test("interrupted daemon preserves tunnel rollback", async () => {
+  const { dir, original } = await interrupted("sequence-signal", "SIGKILL", false, "prepared", "tunnel");
+  const backupDir = join(dir, ".limitless", "service-backup");
+  const tunnelJournal = readFileSync(join(backupDir, "dev.limitless.tunnel.json"), "utf8");
+  const tunnelOld = Buffer.from(JSON.parse(tunnelJournal).backup, "base64").toString();
+  expect(tunnelOld).toContain("arbitrary.installed.tunnel");
+  expect(tunnelOld).not.toBe(original);
+  const { result: r } = await migration("recover-deploy", "daemon", dir);
+  expect(r.error).toBe("");
+  expect(r.calls.filter((call) => call.startsWith("boot"))).toEqual([]);
+  expect(r.files["daemon-original.plist"]).toBe(original);
+  expect(r.files["tunnel-original.plist"]).toBe(tunnelOld);
+  expect(r.journals.sort()).toEqual(["dev.limitless.daemon.json", "dev.limitless.tunnel.json"]);
+  expect(r.backup).toBe(original);
+  expect(readFileSync(join(backupDir, "dev.limitless.tunnel.json"), "utf8")).toBe(tunnelJournal);
+  // If the old daemon subsequently unloads, only its own bytes are restored.
+  writeFileSync(
+    join(dir, "loaded.json"),
+    JSON.stringify(r.loaded.filter((l) => l !== "arbitrary.installed.daemon")),
+  );
+  const { result: restored } = await migration("recover-deploy", "daemon", dir);
+  expect(restored.error).toContain("Recovered previous agent arbitrary.installed.daemon");
+  expect(restored.files["daemon-original.plist"]).toBe(original);
+  expect(restored.files["tunnel-original.plist"]).toBe(tunnelOld);
+  expect(restored.backup).toBe(original);
+  expect(readFileSync(join(backupDir, "dev.limitless.tunnel.json"), "utf8")).toBe(tunnelJournal);
+});
+
+for (const phase of ["prepared", "restored", "stopping", "unhealthy", "restore-failure"]) {
+  test(`recovers every service record (${phase})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "limitless-multi-record-"));
+    migrationDirs.push(dir);
+    const backupDir = join(dir, ".limitless", "service-backup");
+    const agents = join(dir, "Library", "LaunchAgents");
+    mkdirSync(backupDir, { recursive: true });
+    mkdirSync(agents, { recursive: true });
+    const retain = ["prepared", "restored"].includes(phase);
+    const records = ["daemon", "tunnel", "mtplx"].map((kind) => {
+      const label = `dev.limitless.${kind}`;
+      const oldLabel = `arbitrary.installed.${kind}`;
+      const old = `<plist><dict><key>Label</key><string>${oldLabel}</string><key>Original</key><string>${kind}</string></dict></plist>`;
+      const state = {
+        label,
+        path: join(agents, `${label}.plist`),
+        old: { label: oldLabel, path: join(agents, `${kind}-original.plist`) },
+        phase:
+          kind === "mtplx"
+            ? "replacing"
+            : phase === "unhealthy" && kind === "daemon"
+              ? "replacing"
+              : phase === "unhealthy"
+                ? "stopping"
+                : phase === "restore-failure"
+                  ? "stopping"
+                  : phase,
+        target: "current",
+        backup: Buffer.from(old).toString("base64"),
+      };
+      const json = JSON.stringify(state);
+      writeFileSync(join(backupDir, `${label}.json`), json);
+      if (retain) writeFileSync(state.old.path, old);
+      else writeFileSync(state.path, `<plist><dict><key>Label</key><string>${label}</string></dict></plist>`);
+      return { state, old, json };
+    });
+    writeFileSync(join(backupDir, "incomplete.json.tmp"), "unfinished atomic write");
+    writeFileSync(
+      join(dir, "loaded.json"),
+      JSON.stringify([
+        "dev.limitless.mtplx",
+        ...(retain
+          ? ["arbitrary.installed.daemon", "arbitrary.installed.tunnel"]
+          : phase === "unhealthy"
+            ? ["dev.limitless.daemon"]
+            : []),
+      ]),
+    );
+    const { result: r } = await migration(
+      phase === "unhealthy"
+        ? "recover-unhealthy-deploy"
+        : phase === "restore-failure"
+          ? "recover-restore-failure-deploy"
+          : "recover-deploy",
+      "daemon",
+      dir,
+    );
+    expect(r.error === "").toBe(retain);
+    if (phase === "restore-failure") {
+      expect(r.error).toContain("Restoration failed");
+      expect(r.error).toContain("old bootstrap failed");
+    } else expect(r.error).not.toContain("Restoration failed");
+    expect(r.loaded).toContain("dev.limitless.mtplx");
+    expect(existsSync(join(backupDir, "dev.limitless.mtplx.json"))).toBe(false);
+    expect(readFileSync(join(backupDir, "incomplete.json.tmp"), "utf8")).toBe("unfinished atomic write");
+    for (const { state, old, json } of records.slice(0, 2)) {
+      const saved = readFileSync(join(backupDir, `${state.label}.json`), "utf8");
+      expect(Buffer.from(JSON.parse(saved).backup, "base64").toString()).toBe(old);
+      expect(readFileSync(state.old.path, "utf8")).toBe(old);
+      const failed = phase === "restore-failure" && state.label === "dev.limitless.daemon";
+      expect(r.loaded.includes(state.old.label)).toBe(!failed);
+      if (retain) expect(saved).toBe(json);
+      else {
+        expect(r.error).toContain(state.old.label);
+        expect(r.error).toContain("retry installation");
+        expect(JSON.parse(saved).phase).toBe(failed ? "rollback" : "restored");
+        expect(existsSync(state.path)).toBe(false);
+      }
+    }
+  });
 }

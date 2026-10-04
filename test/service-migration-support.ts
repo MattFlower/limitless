@@ -1,5 +1,14 @@
 import { mock, spyOn } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import * as os from "node:os";
 import { join } from "node:path";
 import type { DeployClient, DeployClock } from "../src/cli/deploy-wait.ts";
@@ -10,7 +19,9 @@ const home = process.env.SERVICE_TEST_HOME;
 if (!home) throw new Error("missing isolated test home");
 const nativeOs = { ...os };
 mock.module("node:os", () => ({ ...nativeOs, homedir: () => home }));
-const scenario = process.argv[2] ?? "migration";
+const requestedScenario = process.argv[2] ?? "migration";
+const sequential = requestedScenario.startsWith("sequence");
+let scenario = sequential ? "bootstrap" : requestedScenario;
 const kind = process.argv[3] ?? "daemon";
 const agents = join(home, "Library", "LaunchAgents");
 const realApp = join(home, "app & release");
@@ -35,7 +46,7 @@ writeFileSync(join(home, ".cloudflared", "12345678-1234-1234-1234-123456789abc.j
 const calls: string[] = [];
 const loaded = new Set<string>();
 const oldLabel = scenario.startsWith("marked") ? `dev.limitless.${kind}` : `arbitrary.installed.${kind}`;
-const oldPath = join(agents, "original.plist");
+const oldPath = join(agents, `${kind}-original.plist`);
 const neutral = `dev.limitless.${kind}`;
 const xmlEscape = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;");
 const decode = (value: string) => value.replaceAll("&lt;", "<").replaceAll("&amp;", "&");
@@ -112,6 +123,12 @@ const clock: DeployClock = {
 };
 const backupDir = join(home, ".limitless", "service-backup");
 const lock = join(home, ".limitless", "deploy.lock");
+const journal = join(backupDir, `${neutral}.json`);
+const journals = () =>
+  existsSync(backupDir) && statSync(backupDir).isDirectory()
+    ? readdirSync(backupDir).filter((name) => name.endsWith(".json"))
+    : [];
+const record = () => (existsSync(journal) ? JSON.parse(readFileSync(journal, "utf8")) : null);
 let backupBeforeStop = false;
 let recoveryCleaned = false;
 let contenderError = "";
@@ -137,8 +154,7 @@ const command: typeof sh = async (argv) => {
     return content.startsWith("<") ? ok(JSON.stringify(parse(content))) : ok("", 1, "invalid plist");
   }
   if (argv[0] !== "launchctl") {
-    if (argv[0] === "bun" && argv[1] === "install")
-      recoveryCleaned = !existsSync(join(backupDir, "migration.json"));
+    if (argv[0] === "bun" && argv[1] === "install") recoveryCleaned = !journals()?.length;
     return ok(argv[1] === "rev-parse" ? "current" : "");
   }
   const label = argv.at(-1)?.split("/").at(-1) ?? "";
@@ -151,10 +167,7 @@ const command: typeof sh = async (argv) => {
   }
   if (argv[1] === "bootout") {
     calls.push(`bootout ${label}`);
-    if (label === oldLabel)
-      backupBeforeStop =
-        existsSync(join(backupDir, "migration.json")) &&
-        readFileSync(join(backupDir, "original.plist"), "utf8") === old;
+    if (label === oldLabel) backupBeforeStop = record()?.backup === Buffer.from(old).toString("base64");
     if (label === oldLabel && scenario === "signal-stopping") {
       console.log("READY");
       await new Promise(() => {});
@@ -173,9 +186,12 @@ const command: typeof sh = async (argv) => {
   if (argv[1] === "bootstrap") {
     const path = argv.at(-1) ?? "";
     const data = parse(readFileSync(path, "utf8"));
+    const unitKind = data.Label?.split(".").at(-1) ?? "";
+    const unitNeutral = `dev.limitless.${unitKind}`;
+    const unitOld = unitKind === kind ? oldLabel : `arbitrary.installed.${unitKind}`;
+    const unitOldPath = join(agents, `${unitKind}-original.plist`);
     calls.push(`bootstrap ${data.Label}`);
-    if (data.Label === neutral && scenario === "phase-update")
-      mkdirSync(join(backupDir, "migration.json.tmp"));
+    if (data.Label === neutral && scenario === "phase-update") mkdirSync(`${journal}.tmp`);
     if (data.Label === neutral && scenario.startsWith("signal")) {
       if (existsSync(oldPath)) throw new Error("signal must follow old plist removal");
       signalTimer = setTimeout(() => {
@@ -198,17 +214,21 @@ const command: typeof sh = async (argv) => {
       if (scenario === "partial") loaded.add(neutral);
       return ok("", 1, "replacement bootstrap failed");
     }
-    if (data.Label === oldLabel && scenario === "restore") return ok("", 1, "old bootstrap failed");
+    if (
+      (data.Label === oldLabel && scenario === "restore") ||
+      (data.Label === "arbitrary.installed.daemon" && scenario === "recover-restore-failure-deploy")
+    )
+      return ok("", 1, "old bootstrap failed");
     if (
       loaded.has(data.Label ?? "") ||
-      (data.Label === neutral &&
-        loaded.has(oldLabel) &&
+      (data.Label === unitNeutral &&
+        loaded.has(unitOld) &&
         !["bun-run", "displaced", "contradictory", "other-install"].includes(scenario))
     )
       throw new Error("overlapping services");
     if (
-      data.Label === neutral &&
-      existsSync(oldPath) &&
+      data.Label === unitNeutral &&
+      existsSync(unitOldPath) &&
       !["bun-run", "displaced", "contradictory", "other-install"].includes(scenario)
     )
       throw new Error("old plist still present");
@@ -224,7 +244,7 @@ const client: DeployClient = {
     calls.push(action);
     if (action === "resume" && scenario === "resume-failure") throw new Error("resume failed");
     draining = action === "drain";
-    if (action === "drain" && scenario.endsWith("signal-drain")) {
+    if (action === "drain" && (scenario.endsWith("signal-drain") || scenario === "signal-journal")) {
       writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
       console.log("READY");
       await new Promise(() => {});
@@ -267,20 +287,44 @@ if (scenario.startsWith("recover") && existsSync(join(home, "loaded.json"))) {
 }
 const service = await import("../src/cli/service.ts");
 let error = "";
+let firstError = "";
+let tunnelJournal = "";
+let daemonOld = "";
 try {
   if (scenario === "deploy-install" || (scenario.startsWith("recover") && scenario.endsWith("deploy")))
     await service.deploy(0, undefined, false, { command, client, clock });
   else if (scenario === "status") await service.status(0);
   else if (scenario === "uninstall") await service.uninstall();
-  else
-    await service.install(0, {
-      command,
-      client,
-      clock,
-      mtplx: kind === "mtplx" && scenario !== "unselected",
-      tunnel: kind === "tunnel" && scenario !== "unselected",
-      publicUrl: "https://hooks.example.test",
-    });
+  else {
+    await service
+      .install(0, {
+        command,
+        client,
+        clock,
+        mtplx: kind === "mtplx" && scenario !== "unselected",
+        tunnel: kind === "tunnel" && scenario !== "unselected",
+        publicUrl: "https://hooks.example.test",
+      })
+      .catch((caught) => {
+        if (!sequential) throw caught;
+        firstError = String(caught);
+      });
+    if (sequential) {
+      tunnelJournal = existsSync(journal) ? readFileSync(journal, "utf8") : "";
+      const daemonPath = join(agents, "dev.limitless.daemon.plist");
+      daemonOld = readFileSync(daemonPath, "utf8").replaceAll(
+        "dev.limitless.daemon",
+        "arbitrary.installed.daemon",
+      );
+      // Give the second install a distinct, running legacy daemon to migrate.
+      unlinkSync(daemonPath);
+      writeFileSync(join(agents, "daemon-original.plist"), daemonOld);
+      loaded.delete("dev.limitless.daemon");
+      loaded.add("arbitrary.installed.daemon");
+      scenario = requestedScenario === "sequence-signal" ? "signal-journal" : "migration";
+      await service.install(0, { command, client, clock });
+    }
+  }
 } catch (caught) {
   error = String(caught);
 }
@@ -294,10 +338,13 @@ console.log(
     contenderCalls,
     lockHeld,
     recoveryCleaned,
-    backup: existsSync(join(backupDir, "original.plist"))
-      ? readFileSync(join(backupDir, "original.plist"), "utf8")
-      : null,
-    state: existsSync(join(backupDir, "migration.json")),
+    firstError,
+    tunnelJournal,
+    daemonOld,
+    backup: record() ? Buffer.from(record().backup, "base64").toString() : null,
+    phase: record()?.phase,
+    state: existsSync(journal),
+    journals: journals() || [],
     lock: existsSync(lock),
     calls,
     loaded: [...loaded],

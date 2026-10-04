@@ -147,7 +147,7 @@ function samePath(a: unknown, b: string): boolean {
     return false;
   }
 }
-type Migration = Record<"label" | "path" | "target" | "phase", string> & {
+type Migration = Record<"label" | "path" | "target" | "phase" | "backup", string> & {
   old: { label: string; path: string };
 };
 type ServiceOptions = NonNullable<Parameters<typeof deploy>[3]>;
@@ -286,13 +286,14 @@ export async function install(
     if (result.exitCode !== 0) throw new Error(`launchctl bootstrap failed for ${path}: ${result.stderr}`);
   };
   const directory = join(opts.lockPath ?? deployLock, "..", "service-backup");
-  const backup = join(directory, "original.plist"),
-    journal = join(directory, "migration.json");
+  const journal = (state: Migration) => join(directory, `${state.label}.json`);
   const save = (state: Migration) => {
-    writeFileSync(`${journal}.tmp`, JSON.stringify(state), { mode: 0o600, flush: true });
-    renameSync(`${journal}.tmp`, journal);
+    writeFileSync(`${journal(state)}.tmp`, JSON.stringify(state), { mode: 0o600, flush: true });
+    renameSync(`${journal(state)}.tmp`, journal(state));
   };
-  const clear = () => [journal, backup].filter(existsSync).forEach(unlinkSync);
+  const clear = (state: Migration) => {
+    if (existsSync(journal(state))) unlinkSync(journal(state));
+  };
   const restore = async (state: Migration) => {
     restoring = true;
     const errors: string[] = [];
@@ -300,27 +301,34 @@ export async function install(
     for (const l of [state.label, state.old.label]) await stop(l).catch((e) => errors.push(String(e)));
     await (async () => {
       if (existsSync(state.path)) unlinkSync(state.path);
-      writeFileSync(state.old.path, readFileSync(backup));
+      writeFileSync(state.old.path, Buffer.from(state.backup, "base64"));
       if (state.old.label === state.label || !(await isLoaded(state.old.label))) await start(state.old.path);
     })().catch((error) => errors.push(String(error)));
     if (errors.length) throw new Error(errors.join("; "));
     save({ ...state, phase: "restored" });
   };
   if (control.recover) {
-    if (!existsSync(journal)) return;
-    const state: Migration = JSON.parse(readFileSync(journal, "utf8"));
-    // Rollback data outlives a running old agent: only a healthy replacement retires it.
-    if (["prepared", "restored"].includes(state.phase) && (await isLoaded(state.old.label))) return;
-    try {
-      if (state.phase !== "replacing" || !(await isLoaded(state.label))) throw new Error("pending migration");
-      if (state.label === LABEL) await race(waitForHealthy(client, clock, state.target));
-    } catch (error) {
-      await restore(state).catch((restore) => {
-        throw new Error(`${String(error)}; Restoration failed: ${String(restore)}`);
-      });
-      throw new Error(`Recovered previous agent ${state.old.label}; retry installation. ${String(error)}`);
+    const recovered: string[] = [];
+    for (const file of existsSync(directory)
+      ? readdirSync(directory).filter((f) => f.endsWith(".json"))
+      : []) {
+      const state: Migration = JSON.parse(readFileSync(join(directory, file), "utf8"));
+      // Rollback data outlives a running old agent: only a healthy replacement retires it.
+      if (["prepared", "restored"].includes(state.phase) && (await isLoaded(state.old.label))) continue;
+      try {
+        if (state.phase !== "replacing" || !(await isLoaded(state.label)))
+          throw new Error("pending migration");
+        if (state.label === LABEL) await race(waitForHealthy(client, clock, state.target));
+      } catch (error) {
+        await restore(state).catch((restore) => recovered.push(`Restoration failed: ${String(restore)}`));
+        recovered.push(`${state.old.label}: ${String(error)}`);
+        continue;
+      }
+      clear(state);
     }
-    return clear();
+    if (recovered.length)
+      throw new Error(`Recovered previous agent ${recovered.join("; ")}; retry installation.`);
+    return;
   }
   mkdirSync(logDir, { recursive: true });
   mkdirSync(agentsDir, { recursive: true });
@@ -337,10 +345,11 @@ export async function install(
     const old = previous.find((unit) => `dev.limitless.${unit.kind}` === label);
     if (existsSync(path) && !samePath(old?.path, path)) throw new Error(`unrelated agent: ${path}`);
     if (old?.label !== label && (await isLoaded(label))) throw new Error(`unrecognized agent: ${label}`);
-    const state = old ? { old, label, path, target, phase: "prepared" } : null;
+    const state = old
+      ? { old, label, path, target, phase: "prepared", backup: readFileSync(old.path).toString("base64") }
+      : null;
     if (state) {
       mkdirSync(directory, { recursive: true, mode: 0o700 });
-      writeFileSync(backup, readFileSync(state.old.path), { mode: 0o600, flush: true });
       save(state);
     }
     let drainAttempted = false;
@@ -368,7 +377,7 @@ export async function install(
       writeFileSync(path, content);
       await race(start(path));
       if (label === LABEL) await race(waitForHealthy(client, clock, target));
-      clear();
+      if (state) clear(state);
     } catch (error) {
       try {
         restoring = true;
