@@ -31,10 +31,16 @@ and extend the closest case when it already exercises that behavior.
   server, or factory setup hooks. Keep expensive `beforeEach` hooks scoped to tests that use them.
 - Choose the smallest fixture that exercises the contract. Use an in-memory store for pure
   store behavior; use disk/reopening when persistence or migration is what the test proves.
+- Build a fixture repository once per process with `seeded` (`seeded.ts`) and copy it into each
+  test instead of repeating `git init`/`commit` in every `beforeEach`. Git runs with the
+  identity-only global config `setup.ts` installs, as in CI; set `GIT_CONFIG_GLOBAL` in a test
+  that needs more.
 - Use deferred promises, observable readiness signals, or an injected clock instead of fixed
-  sleeps to arrange ordering. Reuse `wait-clock.ts` for provider waits. Retain real subprocess
-  and timer coverage where OS cancellation, descendants, sockets, or actual timeout wiring is
-  the behavior under test.
+  sleeps to arrange ordering. Reuse `wait-clock.ts` for provider waits, and let promise chains
+  settle between fake-clock steps with `setImmediate` turns, not 1 ms timers. Retain real
+  subprocess and timer coverage where OS cancellation, descendants, sockets, or actual timeout
+  wiring is the behavior under test; when such tests only wait, each in its own directory and
+  processes, `test.concurrent` lets them overlap.
 - Parameterize distinct behavior classes and boundaries; avoid full Cartesian products whose
   combinations all exercise the same branch and outcome.
 - Do not delete security, isolation, cancellation, crash-resume, or delivery tests just because

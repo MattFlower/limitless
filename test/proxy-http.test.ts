@@ -48,7 +48,23 @@ test("config validates LAN settings; exact binds share routes, stop together and
       writeFileSync(join(configDir, "config.toml"), `[server]\n${toml}`);
       return loadConfig({ home: join(f.home, "data"), configDir });
     };
-    expect(config("")).toMatchObject({ listenLan: null, trustedProxies: [], publicOrigins: [] });
+    expect(config("")).toMatchObject({
+      listenLan: null,
+      trustedProxies: [],
+      publicOrigins: [],
+      auth: "required",
+      sessionIdleDays: 30,
+      sessionAbsoluteDays: 180,
+    });
+    expect(config('auth = "proxy"\npublic_origins = ["http://limitless.example.test"]')).toMatchObject({
+      auth: "proxy",
+    });
+    expect(config("[auth]\nidle_days = 7\nabsolute_days = 90.5")).toMatchObject({
+      sessionIdleDays: 7,
+      sessionAbsoluteDays: 90.5,
+    });
+    for (const toml of ["[auth]\nidle_days = 0", "[auth]\nabsolute_days = inf", '[auth]\nidle_days = "30"'])
+      expect(() => config(toml)).toThrow("auth.");
     for (const value of [
       "0.0.0.0",
       "::",
@@ -68,6 +84,8 @@ test("config validates LAN settings; exact binds share routes, stop together and
         (x) => `public_origins = ["${x}"]`,
       ),
       'listen_lan = "10.0.0.10"\nhost = "0.0.0.0"',
+      'auth = "basic"',
+      'public_origins = ["http://limitless.example.test"]',
     ])
       expect(() => config(toml)).toThrow("server.");
     for (const value of ["192.168.1.0/24", "2001:db8::/32", "host", 42])
@@ -147,6 +165,7 @@ test("guarded UI/assets, API, SSE, mutations and webhook transports", async () =
   const f = await fixture();
   try {
     const cfg = f.factory.cfg;
+    cfg.auth = "proxy";
     cfg.trustedProxies = [proxy];
     cfg.publicOrigins = [origin];
     cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";

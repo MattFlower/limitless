@@ -1,6 +1,6 @@
 import { createStore } from "solid-js/store";
 import { createRenderer } from "solid-js/universal";
-import type { ProviderStatus, QuotaAlert } from "../src/core/types.ts";
+import type { AuthSession, ProviderStatus, QuotaAlert } from "../src/core/types.ts";
 import type { ProviderWorkload } from "../src/db/stats.ts";
 
 // Solid's universal renderer exercises mounted reactive components without a browser or DOM dependency.
@@ -75,6 +75,12 @@ export async function getProviderWorkload() {
   return workload;
 }
 export const getStats = async () => null;
+let authSession: AuthSession | null = null;
+export function setAuthSession(session: AuthSession | null) {
+  authSession = session;
+}
+export const getSession = async () => ({ session: authSession });
+export const signOut = async () => ({ revoked: 1 });
 export const updates: { id: string; enabled?: boolean; fast?: boolean }[] = [];
 export async function setProviderEnabled(id: string, enabled: boolean) {
   updates.push({ id, enabled });

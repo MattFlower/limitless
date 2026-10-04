@@ -1,8 +1,11 @@
 import { Database } from "bun:sqlite";
+import type { WebAuthnCredential } from "@simplewebauthn/server";
 import { AUDIT_ALLOWANCES, parseAllow, validateAllow } from "../core/allow.ts";
 import { assertExistingBranchDelivery } from "../core/delivery.ts";
 import type {
   ArtifactMeta,
+  AuthPasskey,
+  AuthSession,
   ChatMessage,
   ChatOrigin,
   ChatProposal,
@@ -56,6 +59,8 @@ type GitHubFeedInput = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "d
 const toFeedItem = (r: Row) => ({ ...r, data: parse(r.data, {}) }) as FeedItem;
 /** The highest id retention has removed, so a cursor before it is told items were pruned. */
 const FEED_PRUNED = "feed_pruned_through";
+const AUTH_SESSION_SELECT =
+  "SELECT id, method, device, created_at AS createdAt, last_seen_at AS lastSeenAt FROM auth_sessions";
 
 function parse<T>(v: unknown, fallback: T): T {
   if (typeof v !== "string") return fallback;
@@ -1802,5 +1807,77 @@ export class Store {
 
   setProviderEnabledOverride(id: string, enabled: boolean): void {
     this.setSetting(`provider_enabled:${id}`, enabled);
+  }
+
+  // ---- UI sign-in sessions -------------------------------------------------
+
+  createAuthSession(tokenHash: string, method: AuthSession["method"], device: string, now: number) {
+    const session: AuthSession = { id: newId("ses-"), method, device, createdAt: now, lastSeenAt: now };
+    this.db
+      .query(
+        "INSERT INTO auth_sessions (id, token_hash, method, device, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(session.id, tokenHash, method, device, now, now);
+    return session;
+  }
+
+  authSession(tokenHash: string): AuthSession | null {
+    return this.db.query(`${AUTH_SESSION_SELECT} WHERE token_hash = ?`).get(tokenHash) as AuthSession | null;
+  }
+
+  touchAuthSession(id: string, now: number): void {
+    this.db.query("UPDATE auth_sessions SET last_seen_at = ? WHERE id = ?").run(now, id);
+  }
+
+  listAuthSessions(): AuthSession[] {
+    return this.db.query(`${AUTH_SESSION_SELECT} ORDER BY last_seen_at DESC`).all() as AuthSession[];
+  }
+
+  /** Revokes one session, or every session without an id; returns how many were removed. */
+  revokeAuthSessions(id?: string): number {
+    if (id === undefined) return this.db.query("DELETE FROM auth_sessions").run().changes;
+    return this.db.query("DELETE FROM auth_sessions WHERE id = ?").run(id).changes;
+  }
+
+  addPasskey(credential: WebAuthnCredential, device: string, now: number): void {
+    const { id, publicKey, counter, transports = [] } = credential;
+    this.db
+      .query(
+        "INSERT INTO auth_passkeys (id, public_key, counter, transports, device, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(id, publicKey, counter, JSON.stringify(transports), device, now);
+  }
+
+  passkey(id: string): WebAuthnCredential | null {
+    const row = this.db.query("SELECT * FROM auth_passkeys WHERE id = ?").get(id) as Row | null;
+    if (!row) return null;
+    const publicKey = new Uint8Array(row.public_key as Uint8Array);
+    return { id, publicKey, counter: row.counter as number, transports: parse(row.transports, []) };
+  }
+
+  /**
+   * Records a sign-in only if the passkey still exists and its counter moves forward, so a concurrent
+   * sign-in can't rewind it; authenticators that always report 0 (most synced passkeys) stay at 0.
+   */
+  usePasskey(id: string, counter: number, now: number): boolean {
+    const sql = `UPDATE auth_passkeys SET counter = ?1, last_used_at = ?2
+      WHERE id = ?3 AND (counter < ?1 OR (counter = 0 AND ?1 = 0))`;
+    return this.db.query(sql).run(counter, now, id).changes === 1;
+  }
+
+  listPasskeys(): AuthPasskey[] {
+    const sql = `SELECT id, device, created_at AS createdAt, last_used_at AS lastUsedAt
+      FROM auth_passkeys ORDER BY created_at`;
+    return this.db.query(sql).all() as AuthPasskey[];
+  }
+
+  removePasskey(id: string): number {
+    return this.db.query("DELETE FROM auth_passkeys WHERE id = ?").run(id).changes;
+  }
+
+  expireAuthSessions(createdBefore: number, seenBefore: number): number {
+    return this.db
+      .query("DELETE FROM auth_sessions WHERE created_at <= ? OR last_seen_at <= ?")
+      .run(createdBefore, seenBefore).changes;
   }
 }
