@@ -12,11 +12,12 @@ import {
   requirementEntries,
   requirementSource,
   type Spec,
+  SpecSchema,
   toStrictJsonSchema,
   type Verify,
   VerifySchema,
 } from "../src/pipeline/schemas.ts";
-import { blockedOnly, normalizeVerify } from "../src/pipeline/verification.ts";
+import { blockedOnly, normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
 
 const spec: Spec = {
   summary: "test",
@@ -657,7 +658,17 @@ test("feedback for several ungrounded holdouts states the fallback once and omit
     overall: "fail",
     notes: "",
   };
-  const feedback = formatVerifyFeedback(verify, spec, holdout, request, request);
+  const knownHoldouts = {
+    scenarios: verify.criteria.map((c) => ({
+      ...holdout.scenarios[0],
+      id: c.id,
+      description: "private",
+      steps: "secret input",
+      expected: "ok",
+      edge_case: true,
+    })),
+  };
+  const feedback = formatVerifyFeedback(verify, spec, knownHoldouts, request, request);
   expect(feedback.split("(the verifier's citation was not found in it)").length - 1).toBe(4);
   expect(feedback.split("REQUEST_BODY_MARKER").length - 1).toBeLessThanOrEqual(1);
   expect(feedback.split("check them against the original request and specification above").length - 1).toBe(
@@ -758,4 +769,86 @@ test("feedback names the violated public requirement and omits not_required hold
     expect(withheld).not.toContain("secret input");
   }
   expect(feedback({ requirement: "not_required" })).toBe("");
+});
+
+test("spec criterion ids are exactly AC-n", () => {
+  for (const id of ["AC-1", "AC-12", "H-1", "unknown", "AC-1 secret", "AC-1\n", "xAC-1", "AC-"]) {
+    const parsed = SpecSchema.safeParse({
+      ...spec,
+      acceptance_criteria: [{ ...spec.acceptance_criteria[0], id }],
+    });
+    expect(parsed.success).toBe(id === "AC-1" || id === "AC-12");
+  }
+});
+
+test("legacy collisions and unknown ids never expose private rows in artifacts or feedback", () => {
+  const legacy = {
+    ...spec,
+    acceptance_criteria: [
+      ...spec.acceptance_criteria,
+      { id: "H-1", criterion: "legacy", how_to_verify: "inspect" },
+    ],
+  };
+  const privateText = "secret input PrivateEvidence_931";
+  const verify: Verify = {
+    overall: "fail",
+    notes: "",
+    criteria: [
+      { id: "AC-1", status: "unmet", evidence: "public evidence at code.ts:12", publicSummary: "" },
+      {
+        id: "H-1",
+        status: "unmet",
+        evidence: privateText,
+        publicSummary: privateText,
+        requirementCitation: privateText,
+      },
+      {
+        id: "X-9",
+        status: "unclear",
+        evidence: "arbitrary private prose",
+        publicSummary: "arbitrary private prose",
+        requirementCitation: "arbitrary private prose",
+      },
+      {
+        id: "H-1 secret",
+        status: "unmet",
+        evidence: privateText,
+        publicSummary: privateText,
+        requirement: "spec",
+        requirementCitation: privateText,
+      },
+      {
+        id: "",
+        status: "unclear",
+        evidence: "arbitrary private prose",
+        publicSummary: "arbitrary private prose",
+      },
+    ],
+  };
+  const artifact = preDeliveryVerifyArtifact(
+    { ...verify, modelId: "fake", round: 0, attempt: 0 },
+    legacy,
+    holdout,
+    "",
+  );
+  const rows = JSON.parse(artifact) as Verify;
+  expect(rows.criteria.map((c) => c.id)).toEqual(["AC-1", "H-1", "unknown-3", "unknown-4", "unknown-5"]);
+  for (const row of rows.criteria.slice(2)) {
+    expect(row.evidence).toBe("");
+    expect(row.publicSummary).toBe("");
+    expect(row.requirementCitation).toBe("");
+  }
+  const feedback = formatVerifyFeedback(verify, legacy, holdout);
+  for (const output of [artifact, feedback]) {
+    expect(output).toContain("public evidence at code.ts:12");
+    for (const secret of [
+      "secret input",
+      "PrivateEvidence_931",
+      "H-1 secret",
+      "arbitrary private prose",
+      "X-9",
+    ])
+      expect(output).not.toContain(secret);
+    expect(output).toContain("unknown-");
+  }
 });

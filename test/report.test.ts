@@ -440,3 +440,45 @@ test("shadow review calls stay out of the work log and per-model review stats; t
     store.close();
   }
 });
+
+test("legacy holdout collisions never supply evidence to the public acceptance report", () => {
+  const privateEvidence = "PRIVATE_HOLDOUT_EVIDENCE";
+  const report = renderReport({
+    success: false,
+    runId: "legacy",
+    prompt: "test",
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "u",
+    state: {
+      spec: {
+        summary: "test",
+        assumptions: [],
+        requirements: [],
+        out_of_scope: [],
+        blocking_questions: [],
+        acceptance_criteria: ["AC-1", "H-1"].map((id) => ({ id, criterion: "works", how_to_verify: "test" })),
+      },
+      holdout: {
+        scenarios: [
+          { id: "H-1", description: "private scenario", steps: "test", expected: "pass", edge_case: false },
+        ],
+      },
+      lastVerify: {
+        modelId: "test/model",
+        overall: "fail",
+        notes: "",
+        criteria: [
+          { id: "AC-1", status: "met", evidence: "public evidence", publicSummary: "" },
+          { id: "H-1", status: "blocked", evidence: privateEvidence, publicSummary: privateEvidence },
+        ],
+      },
+    },
+  });
+  const publicSection = report.split("## Holdout scenarios")[0] ?? "";
+  expect(publicSection).toContain("public evidence");
+  expect(publicSection).not.toContain(privateEvidence);
+  expect(publicSection).toContain("not verified");
+  // The separate holdout section is the established delivery-time publication.
+  expect(report.split("## Holdout scenarios")[1]).toContain(privateEvidence);
+});
