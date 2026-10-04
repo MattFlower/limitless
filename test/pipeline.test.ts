@@ -1520,7 +1520,7 @@ esac
       console.log(
         "DEBUG-RUN",
         JSON.stringify(f.store.getRun(run.id)?.error),
-        JSON.stringify(f.store.listStages(run.id).map((st) => [st.name, st.status, st.error])),
+        JSON.stringify(f.store.listStages(run.id).map((st) => [st.name, st.status, st.summary])),
       );
     expect(dbgStatus).toBe("succeeded");
     expect(f.store.getArtifact(run.id, "diff.patch")).toContain("HEAD_FOCUS");
