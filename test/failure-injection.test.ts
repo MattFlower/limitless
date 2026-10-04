@@ -25,6 +25,7 @@ import {
 } from "../src/git/repos.ts";
 import { CodexReaderProbe, runCodex } from "../src/harness/codex.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
+import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { NoCapacityError, RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
@@ -124,6 +125,8 @@ let source: string;
 let factories: Factory[];
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), "limitless-fault-"));
+  // Confined gate commands may write their barrier and pid files here, and only here, outside their checkout.
+  observerRoots.add(realpathSync(root));
   source = join(root, "source");
   mkdirSync(source);
   writeFileSync(join(source, "README.md"), "fixture\n");
@@ -143,6 +146,7 @@ afterEach(async () => {
     await f.stop();
     f.store.close();
   }
+  observerRoots.clear();
   rmSync(root, { recursive: true, force: true });
 });
 function factory(
@@ -1287,6 +1291,8 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
     import { Factory } from ${JSON.stringify(join(import.meta.dir, "../src/app.ts"))};
     import { loadConfig } from ${JSON.stringify(join(import.meta.dir, "../src/config.ts"))};
     import { fakeHarness } from ${JSON.stringify(join(import.meta.dir, "../src/harness/fake.ts"))};
+    import { observerRoots } from ${JSON.stringify(join(import.meta.dir, "../src/harness/sandbox.ts"))};
+    observerRoots.add(${JSON.stringify(realpathSync(root))});
     const f = new Factory(loadConfig(${JSON.stringify({ home: join(root, "data"), configDir: join(root, "cfg") })}), {
       providers: ${JSON.stringify(providers)}, models: ${JSON.stringify(models)}, policy: ${JSON.stringify(policy)},
       healthFetch: async () => new Response('{}'), fetch: async () => new Response('{}'),
@@ -1330,7 +1336,8 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
     expect(readFileSync(observed, "utf8")).toBe("broken\nbroken\n");
     expect(next.store.getRunState<RunState>(r.id)?.lastGates?.[0]?.blocking).toBe(true);
     expect(existsSync(join(cwd, "debris"))).toBe(false);
-    expect(readFileSync(join(cwd, "cache/sentinel"), "utf8")).toBe("keep\n");
+    // Gates check exactly the committed tree: ignored residue from the interrupted run goes too.
+    expect(existsSync(join(cwd, "cache"))).toBe(false);
     expect(next.store.getRun(r.id)?.status).toBe("running");
     const repaired = await reopen(next, (s) =>
       s.mode === "edit"

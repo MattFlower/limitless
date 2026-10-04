@@ -230,7 +230,12 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
   }
   if (spec.fast && t.provider === "claude" && spec.noTools)
     args.push("--settings", JSON.stringify(fastSettings));
-  if (spec.privateSession) args.push("--no-session-persistence");
+  // The outer profile keeps CLAUDE_CONFIG_DIR read-only, so a confined editor cannot store a
+  // transcript: it runs ephemerally rather than failing on persistence, and cannot be resumed.
+  const ephemeral = spec.mode === "edit" && !spec.noTools;
+  if (ephemeral && spec.resumeSessionId)
+    throw new Error("Confined Claude editors do not persist sessions and cannot resume one");
+  if (spec.privateSession || ephemeral) args.push("--no-session-persistence");
   if (spec.noTools) {
     args.push("--tools", "");
   } else if (spec.mode === "readonly") {
@@ -331,7 +336,11 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
       ...envExtra,
       ...scratchEnv(spec),
       // Sandboxed Bash gets TMPDIR=$CLAUDE_CODE_TMPDIR/claude-<uid>, which is the scratch itself.
-      ...(spec.scratchDir ? { CLAUDE_CODE_TMPDIR: scratchParent(spec.scratchDir) } : {}),
+      // A confined editor runs without the CLI sandbox, so the CLI's own files there (the Bash
+      // cwd record) must land in the scratch directly: its parent is outside the boundary.
+      ...(spec.scratchDir
+        ? { CLAUDE_CODE_TMPDIR: editing ? spec.scratchDir : scratchParent(spec.scratchDir) }
+        : {}),
     }),
     stdin: spec.prompt,
     signal,

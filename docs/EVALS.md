@@ -296,6 +296,8 @@ policy entry at each successively higher tier, independent of health/headroom. I
 chain is part of the multi-round cache key. An unavailable next target stops recovery; it never
 skips a tier. Retry/effort resume the session when possible; a failed resume gets one fresh
 attempt with identical feedback, recorded as `resumeFailed: true`, with both calls charged.
+Confined Claude editors never persist a session, so their resume is refused before launch and
+only the fresh attempt is charged.
 Each round records its harness; the trial harness follows the last invocation.
 
 Reports show pass@1 (initial passes), and for multi-round trials pass@R (passes by the final

@@ -1436,11 +1436,14 @@ test("claude editors confine Bash and native edits to the same roots; project se
       hooks: { SessionStart: [{ hooks: [{ type: "command", command: "touch /tmp/pwned" }] }] },
     }),
   );
-  for (const variant of [{}, { fast: true }, { resumeSessionId: "s-1" }]) {
+  for (const variant of [{}, { fast: true }]) {
     const t = { ...spec.target, provider: "claude" };
     const args = buildClaudeArgs({ ...spec, ...variant, target: t }, "session");
     expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
     expect(args).toContain("--strict-mcp-config");
+    // The config directory is read-only inside the boundary: no transcript is written there.
+    expect(args).toContain("--no-session-persistence");
+    expect(args.slice(-2)).toEqual(["--session-id", "session"]);
     const settings = args.flatMap((a, i) => (args[i - 1] === "--settings" ? [JSON.parse(a)] : []));
     expect(settings).toHaveLength(1);
     const { sandbox, disableAllHooks, fastMode } = settings[0];
@@ -1459,11 +1462,12 @@ test("claude editors confine Bash and native edits to the same roots; project se
     expect(allowed).toContain(`Edit(/${cwd}/**)`);
     expect(allowed.filter((a) => a.startsWith("Edit("))).toHaveLength(3);
     expect(args).toContain(`Edit(/${join(cwd, ".git")}/**)`);
-    if ("resumeSessionId" in variant) expect(args.slice(-2)).toEqual(["--resume", "s-1"]);
   }
   expect(() => buildClaudeArgs({ ...spec, addDirs: ["/"] }, "s")).toThrow(
     "cannot grant additional directories",
   );
+  // An unpersisted session has no transcript to continue; refusing is cheaper than a failed launch.
+  expect(() => buildClaudeArgs({ ...spec, resumeSessionId: "s-1" }, "s")).toThrow("cannot resume");
 });
 
 /** A fake `codex sandbox` honouring (or, when leaky, ignoring) the editor profile's most specific entry. */
@@ -1584,7 +1588,7 @@ test.skipIf(codexSkip !== null)("the real Codex sandbox enforces the editor prof
 });
 
 test.skipIf(process.platform !== "darwin")(
-  "Claude edit launches put native tools inside the probed exact boundary, including resume",
+  "Claude edit launches put native tools inside the probed exact boundary, fast or not",
   async () => {
     const { spec, cwd, scratchDir, admin, common } = editFixture();
     mkdirSync(join(cwd, ".claude"));
@@ -1595,10 +1599,10 @@ test.skipIf(process.platform !== "darwin")(
         hooks: { SessionStart: [{ command: "touch escaped" }] },
       }),
     );
-    for (const resumeSessionId of [undefined, "existing-session"]) {
+    for (const fast of [false, true]) {
       let probes = 0;
       let payloads = 0;
-      const outcome = await runClaude({ ...spec, resumeSessionId, fast: true }, async (opts) => {
+      const outcome = await runClaude({ ...spec, fast }, async (opts) => {
         expect(opts.cmd[0]).toBe("/usr/bin/sandbox-exec");
         const profile = opts.cmd[2] ?? "";
         for (const path of [cwd, scratchDir, admin]) expect(profile).toContain(`(subpath "${path}")`);
@@ -1618,6 +1622,9 @@ test.skipIf(process.platform !== "darwin")(
         const settings = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}");
         expect(settings.sandbox.enabled).toBe(false);
         expect(settings.sandbox.allowUnsandboxedCommands).toBe(true);
+        expect(opts.cmd).toContain("--no-session-persistence");
+        // Without the CLI sandbox, the Bash cwd record goes to $CLAUDE_CODE_TMPDIR itself.
+        expect(opts.env.CLAUDE_CODE_TMPDIR).toBe(scratchDir);
         opts.onStdoutLine?.(opts.cmd[7] ?? "");
         opts.onStdoutLine?.('{"type":"result","subtype":"success","result":"ok"}');
         return procResult;

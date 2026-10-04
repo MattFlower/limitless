@@ -583,18 +583,27 @@ const CONFINE_MARKERS = [
   "cache-write-denied",
   "sibling-write-denied",
   "home-write-denied",
+  "config-write-denied",
 ];
+
+/** Where the CLI keeps its own state, which a confined editor must run without writing. */
+export const cliConfigDir = (target: ModelTarget, home = homedir()): string =>
+  target.harness === "codex"
+    ? (process.env.CODEX_HOME ?? join(home, ".codex"))
+    : (process.env.CLAUDE_CONFIG_DIR ?? join(home, ".claude"));
 
 /**
  * An edit-mode agent runs a probe that writes its worktree and scratch and is denied writes to the
- * repository's shared git directory, a sibling worktree and a home canary. The owned canaries are
- * inspected afterwards, independently of anything the agent reports.
+ * repository's shared git directory, a sibling worktree, a home canary and the CLI's own config
+ * directory. The owned canaries are inspected afterwards, independently of anything the agent
+ * reports; completing the run proves the CLI starts and finishes with its config directory read-only.
  */
 export async function confineLiveCheck(
   harness: Harness,
   target: ModelTarget,
   signal = new AbortController().signal,
   home = homedir(),
+  configDir = cliConfigDir(target, home),
 ): Promise<CheckResult> {
   const root = registerTemp(mkdtempSync(join(tmpdir(), "limitless-smoke-confine-")));
   // Like the reader probe's home canary: the factory's own directory when present.
@@ -603,6 +612,8 @@ export async function confineLiveCheck(
   const cache = join(root, "cache");
   const cwd = join(root, "worktree");
   const sibling = join(root, "sibling");
+  // Never pre-created: it only ever exists if a write escaped into the CLI's state directory.
+  const configCanary = join(configDir, `limitless-smoke-canary-${crypto.randomUUID()}`);
   try {
     const git = (dir: string, ...args: string[]) =>
       sh(["git", "-c", "user.name=smoke", "-c", "user.email=smoke@localhost", ...args], { cwd: dir });
@@ -626,7 +637,7 @@ for label, path in [("worktree", worktree / "confine-allowed"), ("scratch", path
     path.write_text("${token}")
     assert path.read_text() == "${token}"
     print("${token}:" + label + "-written", flush=True)
-for label, path in [${Object.entries(canaries)
+for label, path in [${Object.entries({ ...canaries, config: configCanary })
         .map(([label, file]) => `("${label}", ${JSON.stringify(file)})`)
         .join(", ")}]:
     try:
@@ -657,11 +668,11 @@ for label, path in [${Object.entries(canaries)
         onEvent: (event) => events.push(event),
       });
       // The owned canaries are the evidence that counts; inspect them before any cleanup.
-      const changed = Object.entries(canaries).filter(
-        ([, file]) => readFileSync(file, "utf8") !== `canary-${token}`,
-      );
-      if (changed.length)
-        return { status: "fail", reason: `write escaped to ${changed.map(([l]) => l).join(", ")}` };
+      const changed = Object.entries(canaries)
+        .filter(([, file]) => readFileSync(file, "utf8") !== `canary-${token}`)
+        .map(([label]) => label);
+      if (existsSync(configCanary)) changed.push("config");
+      if (changed.length) return { status: "fail", reason: `write escaped to ${changed.join(", ")}` };
       if (readFileSync(probe, "utf8") !== probeSource)
         return { status: "fail", reason: "probe was modified" };
       if (signal.aborted || result.status !== "ok")
@@ -675,10 +686,10 @@ for label, path in [${Object.entries(canaries)
       return verifyProbeEvidence(events, command, token, CONFINE_MARKERS)
         ? {
             status: "pass",
-            reason: `${target.model}: worktree and scratch writable; cache, sibling and home denied`,
+            reason: `${target.model}: worktree and scratch writable; cache, sibling, home and CLI config denied`,
           }
         : fail(
-            "missing successful probe command evidence (allowed writes and denied cache, sibling and home writes)",
+            "missing successful probe command evidence (allowed writes and denied cache, sibling, home and CLI config writes)",
             !events.some((e) => e.type === "tool_call" && ["shell", "Bash"].includes(e.name)) &&
               !`${JSON.stringify(events)}${result.finalText ?? ""}`.includes(token)
               ? "model"
@@ -688,6 +699,7 @@ for label, path in [${Object.entries(canaries)
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(homeDir, { recursive: true, force: true });
+    rmSync(configCanary, { force: true });
   }
 }
 

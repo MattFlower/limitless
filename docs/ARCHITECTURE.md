@@ -249,8 +249,12 @@ detection, per-invocation budget, process-group kill on cancel.
   identity, including the macOS Keychain service. Credentials are never copied to scratch.
   Those locations receive no filesystem write allowance: CLI versions requiring state or
   file-backed credential writes there are unsupported and must fail, without an unconfined retry.
-  Live edit-confinement smoke checks require a real Bash command through each CLI; authentication
-  and credential refresh compatibility still require validation on the deployment host.
+  Because no transcript can be written there, confined Claude editors run with session
+  persistence disabled and refuse a resume request before launching (the eval runner then
+  starts a fresh attempt, recorded as a failed resume). Live edit-confinement smoke checks
+  require a real Bash command through each CLI and prove the run starts and completes while a
+  write into the CLI's own config directory is denied; authentication and credential refresh
+  compatibility still require validation on the deployment host.
 - Gates and implement-eval hidden commands use the same Seatbelt boundary. Each launch probes
   its effective policy and requires a trusted shell startup marker; unavailable or inconclusive
   enforcement raises an operational error, even against a failing baseline. macOS is the only

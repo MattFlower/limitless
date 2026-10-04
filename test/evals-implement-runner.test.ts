@@ -942,15 +942,16 @@ for (const failure of ["harness-timeout", "hidden-timeout", "gate-timeout", "err
   test(`recovery preserves evidence and accounts for ${failure}`, async () => {
     const f = await fixture();
     try {
+      // The non-hanging branch must finish inside the limit, including the confined runner's startup.
       if (failure === "hidden-timeout") {
         f.item.hidden.command = 'test "$(cat answer)" != hangs || sleep 10; sh hidden/check.sh';
-        f.item.hidden.timeoutSec = 0.05;
+        f.item.hidden.timeoutSec = 1;
         f.save();
       }
       if (failure === "gate-timeout") {
         writeFileSync(
           join(f.source, ".limitless.toml"),
-          '[gates]\nchecks = [{ name = "test", run = "test ! -f hangs || sleep 10", timeoutSec = 0.05 }]\n',
+          '[gates]\nchecks = [{ name = "test", run = "test ! -f hangs || sleep 10", timeoutSec = 1 }]\n',
         );
         await pinBase(f);
       }
@@ -1531,9 +1532,8 @@ for (const [outcome, reason] of [
       expect(t?.details.grade?.implement?.reason).toBe(reason);
       const dirs = allocated.mock.results.map((r) => String(r.value));
       // The harness scratch, the grading checkout and, once injection succeeded, the hidden scratch,
-      // plus one confined scratch per gate command run: baseline and grading (setup stops at setup).
-      const gateCommands = outcome === "setup" ? 3 : 2;
-      expect(dirs).toHaveLength((outcome === "injection" ? 2 : 3) + gateCommands);
+      // plus one confined scratch per gate run (baseline and grading), shared by its setup and checks.
+      expect(dirs).toHaveLength((outcome === "injection" ? 2 : 3) + 2);
       expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
     } finally {
       allocated.mockRestore();
@@ -1570,7 +1570,8 @@ for (const rounds of [1, 2])
           };
         expect(existsSync(join(s.cwd, "stolen"))).toBe(false);
         expect(existsSync(join(s.cwd, "dist/stolen"))).toBe(false);
-        expect(existsSync(join(s.cwd, "dist/output"))).toBe(false);
+        // The candidate's own ignored build output survives for recovery, holding its bytes, not hidden ones.
+        expect(readFileSync(join(s.cwd, "dist/output"), "utf8")).toBe("built");
         expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
         expect(existsSync(f.calls[0]?.scratchDir ?? "")).toBe(false);
         const prior = f.factory.store.listEvalTrials(f.factory.store.listEvalRuns()[0]?.id ?? "")[0];
