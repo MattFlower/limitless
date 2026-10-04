@@ -1650,9 +1650,11 @@ async function deliverVerifiedDraft(
 }
 
 /**
- * Pushes a round onto its PR under the PR's lock, after a fresh lookup: the round's record, its run
- * as stored now and the PR as seen now must all agree. A remote already at `head` is this
- * delivery's own earlier push. The round is recorded before its section is added to the PR body.
+ * Pushes a round onto its PR under the PR's lock. On every attempt, after every await, the round's
+ * record and owner as stored now must still be the grant this delivery started with, and agree with
+ * the run as stored now; the PR as seen now must be open, here, on the owner's branch, at the
+ * reviewed head (or at `head`, when this delivery already pushed it). The round is recorded as
+ * delivered before its section is added to the PR body.
  */
 async function deliverReviewRound(
   ctx: RunContext,
@@ -1662,16 +1664,40 @@ async function deliverReviewRound(
   gh: GhRunner,
   budget: GitHubBudget,
 ): Promise<void> {
-  const { grant, prUrl } = review;
-  const branch = grant.owner.branch as string;
+  const { prUrl, reviewedSha } = review;
+  const branch = review.grant.owner.branch as string;
+  const stored = () => {
+    const fresh = reviewRound(ctx);
+    if (
+      fresh?.prUrl !== prUrl ||
+      fresh.reviewedSha !== reviewedSha ||
+      fresh.owner.id !== review.owner.id ||
+      fresh.owner.branch !== branch
+    )
+      throw new Error("existing-branch delivery refused: the round's record changed during delivery");
+    const run = ctx.store.getRun(ctx.run.id) ?? {};
+    assertExistingBranchDelivery(ctx.repo, run, fresh.grant);
+    return { grant: fresh.grant, run };
+  };
   await withPrLock(prUrl, async () => {
     const pr = await readPrHead(gh, prUrl, ctx.signal);
-    const remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
-    if (remote !== head) {
-      assertFactoryBranchPush(ctx.repo, ctx.store.getRun(ctx.run.id) ?? {}, grant, pr, remote);
-      await pushExistingBranch(ctx.repo, cwd, branch, grant.head, ctx.signal, budget);
-    }
+    let remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
+    const pushed = remote === head;
+    const { grant, run } = stored();
+    assertFactoryBranchPush(ctx.repo, run, grant, pr, remote, pushed ? head : reviewedSha);
+    // Recorded before pushing: a lookup that started earlier is overtaken and an approval of the old
+    // head is stale, even if the push lands but its acknowledgement is lost.
     ctx.store.observePrHead(prUrl, head);
+    if (!pushed)
+      try {
+        await pushExistingBranch(ctx.repo, cwd, branch, reviewedSha, ctx.signal, budget);
+      } catch (error) {
+        // An uncertain outcome: what the remote holds decides, and is recorded either way.
+        remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget).catch(() => null);
+        if (remote) ctx.store.observePrHead(prUrl, remote);
+        if (remote !== head) throw error;
+      }
+    stored();
     ctx.store.markRoundDelivered(ctx.run.id, head);
     const { marker, text } = roundSection(ctx.run.id, review.round, review.findings);
     if (!pr.body.includes(marker))

@@ -105,6 +105,7 @@ let pr: {
   view: Record<string, unknown>;
   fail: boolean;
   hold: { reached: () => void; wait: Promise<void> } | null;
+  onView: (() => void) | null;
 };
 
 const BASE_CONFIG =
@@ -170,6 +171,7 @@ function makeFactory(faults?: FaultPlan): Factory {
     if (args[0] === "pr" && args[1] === "view" && args[2] === PR_URL) {
       if (pr.fail) throw new Error("GraphQL: Could not resolve to a PullRequest");
       const headRefOid = await remoteHead();
+      pr.onView?.();
       const hold = pr.hold;
       pr.hold = null;
       hold?.reached();
@@ -222,6 +224,7 @@ beforeEach(async () => {
     view: {},
     fail: false,
     hold: null,
+    onView: null,
   };
   factory = makeFactory();
 });
@@ -293,6 +296,52 @@ async function push(branch: string, file: string, content: string) {
   await git("commit", "-qm", `edit ${file}`);
   await git("push", "-q", remote, `${branch}:${branch}`);
   return git("rev-parse", "HEAD");
+}
+
+/** Holds the next PR lookup after it read the head, until released. */
+function holdLookup() {
+  let release = () => {};
+  const reached = new Promise<void>((resolve) => {
+    const wait = new Promise<void>((done) => {
+      release = done;
+    });
+    pr.hold = { reached: resolve, wait };
+  });
+  return { reached, release: () => release() };
+}
+
+async function waitFor(check: () => boolean) {
+  const end = Date.now() + 20_000;
+  while (!check()) {
+    if (Date.now() > end) throw new Error("condition not reached");
+    await Bun.sleep(10);
+  }
+}
+
+/** A `git` first on PATH whose pushes land on the remote, then fail (`lost`) or never return (`hang`). */
+function stubPush(mode: "lost" | "hang") {
+  const real = Bun.which("git") as string;
+  const bin = join(root, "git-bin");
+  const landed = join(root, "push-landed");
+  mkdirSync(bin, { recursive: true });
+  const after = mode === "hang" ? "exec sleep 30" : 'echo "error: failed to push some refs" >&2; exit 1';
+  writeFileSync(
+    join(bin, "git"),
+    `#!/bin/sh
+command=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")
+if [ "$command" = push ]; then '${real}' "$@" || exit $?; touch '${landed}'; ${after}; fi
+exec '${real}' "$@"
+`,
+    { mode: 0o755 },
+  );
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path}`;
+  return {
+    landed,
+    restore: () => {
+      process.env.PATH = path;
+    },
+  };
 }
 
 test("a changes verdict runs one round that pushes onto the PR branch with the findings quoted", async () => {
@@ -470,17 +519,11 @@ test("an approval whose lookup a round's push overtook is refused, and stays so 
   const original = await delivered();
   const reviewed = await remoteHead();
   const roundId = (await changes(original.id)).body.round?.id as string;
-  let release = () => {};
-  const reached = new Promise<void>((resolve) => {
-    const wait = new Promise<void>((done) => {
-      release = done;
-    });
-    pr.hold = { reached: resolve, wait };
-  });
+  const held = holdLookup();
   const approving = review(original.id, { verdict: "approve", reviewedSha: reviewed });
-  await reached;
+  await held.reached;
   expect(await settle(roundId)).toMatchObject({ status: "succeeded" });
-  release();
+  held.release();
   expect(await approving).toMatchObject({
     status: 409,
     body: { error: expect.stringContaining("head moved") },
@@ -590,7 +633,13 @@ test.each([
   },
 );
 
-test("a resumed round refuses a merge at its HEAD other than the one it chose", async () => {
+test.each([
+  ["an unrelated merge", (reviewed: string, other: string, _: string) => [reviewed, other]],
+  [
+    "an extra parent beside the chosen base",
+    (reviewed: string, other: string, tip: string) => [reviewed, other, tip],
+  ],
+])("a resumed round refuses %s at its HEAD", async (_, parents) => {
   // Stop the daemon at prepare's first save after the round merged its base.
   await restart({
     "store:save": { action: "kill", when: (c) => c.stage === "prepare" && c.checkpoint === undefined },
@@ -598,13 +647,17 @@ test("a resumed round refuses a merge at its HEAD other than the one it chose", 
   const original = await delivered();
   const reviewed = await remoteHead();
   const oldBase = await remoteHead("main");
-  await push("main", "notes.txt", "base moved on\n");
+  const tip = await push("main", "notes.txt", "base moved on\n");
   const roundId = (await changes(original.id)).body.round?.id as string;
   expect(await settle(roundId, (run) => run.status === "running")).toMatchObject({ status: "running" });
   const cwd = factory.store.getRunState<RunState>(roundId)?.worktreePath as string;
-  // While it is down, an unrelated merge on the reviewed head replaces the factory's.
-  const merge = ["commit-tree", `${reviewed}^{tree}`, "-p", reviewed, "-p", oldBase, "-m", "unrelated"];
-  const unrelated = (await sh(["git", ...merge], { cwd })).stdout.trim();
+  // While it is down, another merge on the reviewed head replaces the factory's.
+  const merge = [
+    "commit-tree",
+    `${reviewed}^{tree}`,
+    ...parents(reviewed, oldBase, tip).flatMap((p) => ["-p", p]),
+  ];
+  const unrelated = (await sh(["git", ...merge, "-m", "unrelated"], { cwd })).stdout.trim();
   await sh(["git", "reset", "-q", "--hard", unrelated], { cwd });
   await restart();
   const round = await settle(roundId);
@@ -613,3 +666,79 @@ test("a resumed round refuses a merge at its HEAD other than the one it chose", 
   expect(factory.store.listInvocations(roundId)).toHaveLength(0);
   expect(await remoteHead()).toBe(reviewed);
 });
+
+test("a push that lands but loses its acknowledgement still overtakes an older approve lookup", async () => {
+  const original = await delivered();
+  const reviewed = await remoteHead();
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  const held = holdLookup();
+  const approving = review(original.id, { verdict: "approve", reviewedSha: reviewed });
+  await held.reached;
+  const stub = stubPush("lost");
+  let round: Run;
+  try {
+    round = await settle(roundId);
+  } finally {
+    stub.restore();
+  }
+  expect(existsSync(stub.landed)).toBe(true);
+  // The remote holds the push, so the round reconciles and counts as delivered.
+  const head = await remoteHead();
+  expect(round).toMatchObject({ status: "succeeded", headSha: head });
+  held.release();
+  expect(await approving).toMatchObject({
+    status: 409,
+    body: { error: expect.stringContaining("head moved") },
+  });
+  await restart();
+  expect(factory.store.approvalFor(PR_URL)).toBeNull();
+});
+
+test("a round whose PR URL is edited during its delivery lookup pushes and edits nothing", async () => {
+  const original = await delivered();
+  const reviewed = await remoteHead();
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  const other = "https://github.com/test/repo/pull/6";
+  pr.onView = () => {
+    factory.store.db.query("UPDATE review_rounds SET pr_url = ? WHERE run_id = ?").run(other, roundId);
+  };
+  const round = await settle(roundId);
+  expect(round.status).toBe("failed");
+  expect(round.error).toContain("existing-branch delivery refused");
+  expect(await remoteHead()).toBe(reviewed);
+  expect(pr.calls.some((args) => args[1] === "edit")).toBe(false);
+  expect(factory.store.reviewRounds(other)).toMatchObject([{ deliveredSha: null }]);
+});
+
+test.each([
+  ["closed", { state: "CLOSED" }, "the PR is closed, not open"],
+  [
+    "moved to a fork",
+    { isCrossRepository: true, headRepositoryOwner: { login: "fork" } },
+    "the PR head is in another repository",
+  ],
+  ["renamed", { headRefName: "renamed" }, `the PR head branch is renamed, not ${BRANCH}`],
+] as const)(
+  "a delivery retry after its push landed refuses a PR now %s and leaves the round undelivered",
+  async (_, seen, error) => {
+    const original = await delivered();
+    const reviewed = await remoteHead();
+    const roundId = (await changes(original.id)).body.round?.id as string;
+    // The push lands, then the daemon stops before hearing back; the round resumes at delivery.
+    const stub = stubPush("hang");
+    try {
+      factory.scheduler.start();
+      await waitFor(() => existsSync(stub.landed));
+      await restart();
+    } finally {
+      stub.restore();
+    }
+    expect(await remoteHead()).not.toBe(reviewed);
+    pr.view = { ...seen };
+    const round = await settle(roundId);
+    expect(round.status).toBe("failed");
+    expect(round.error).toContain(error);
+    expect(factory.store.reviewRounds(PR_URL)).toMatchObject([{ deliveredSha: null }]);
+    expect(pr.calls.some((args) => args[1] === "edit")).toBe(false);
+  },
+);

@@ -58,25 +58,26 @@ export function assertExistingBranchDelivery(
     throw new Error("existing-branch delivery requires a verified GitHub Dependabot webhook");
 }
 
-/** Just before pushing onto a factory branch: the stored grant holds, and so does the PR as seen now. */
+/**
+ * On every delivery attempt onto a factory branch: the stored grant holds, and so does the PR as
+ * seen now, at `at`: the reviewed head before a push, or this delivery's own earlier push.
+ */
 export function assertFactoryBranchPush(
   repo: Repo,
   run: DeliveryRun,
   grant: FactoryBranchGrant,
   pr: PrHead,
   remoteHead: string | null,
+  at = grant.head,
 ): void {
   assertFactoryBranch(repo, run, grant);
   const problem = prHeadProblem(repo, grant.owner.branch as string, pr);
   if (problem) refuse(problem);
-  if (remoteHead !== grant.head)
-    throw new Error(
-      `head moved: the PR branch is at ${remoteHead ?? "nothing"}, not the reviewed ${grant.head}`,
-    );
-  if (pr.headSha !== grant.head)
-    throw new Error(
-      `head moved: GitHub reports the PR head at ${pr.headSha}, not the reviewed ${grant.head}`,
-    );
+  const expected = at === grant.head ? `the reviewed ${at}` : `this round's pushed ${at}`;
+  if (remoteHead !== at)
+    throw new Error(`head moved: the PR branch is at ${remoteHead ?? "nothing"}, not ${expected}`);
+  if (pr.headSha !== at)
+    throw new Error(`head moved: GitHub reports the PR head at ${pr.headSha}, not ${expected}`);
 }
 
 /** Why the PR is not open with its head on `branch` in this repository (not a fork), or null. */
