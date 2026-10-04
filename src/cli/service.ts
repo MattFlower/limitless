@@ -5,6 +5,8 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -138,6 +140,16 @@ async function loaded(label: string): Promise<boolean> {
   return (await launchctl(["print", `gui/${uid}/${label}`])).exitCode === 0;
 }
 
+function samePath(a: unknown, b: string): boolean {
+  try {
+    return typeof a === "string" && realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+type Migration = Record<"label" | "path" | "target" | "phase", string> & {
+  old: { label: string; path: string };
+};
 type ServiceOptions = NonNullable<Parameters<typeof deploy>[3]>;
 export async function installedUnits(opts: ServiceOptions = {}) {
   const dir = opts.agentsDir ?? agentsDir;
@@ -155,10 +167,11 @@ export async function installedUnits(opts: ServiceOptions = {}) {
     if (!data || !Array.isArray(data.ProgramArguments) || typeof data.Label !== "string") continue;
     const args = data.ProgramArguments;
     const executable = basename(String(args[0]));
-    const is = (at: number, ...parts: string[]) => parts.every((part, i) => args[at + i] === part);
+    const is = (at: number, ...parts: string[]) =>
+      parts.every((part, i) => (part.startsWith("/") ? samePath(args[at + i], part) : args[at + i] === part));
     let kind = "";
-    if (executable === "bun" && is(args.indexOf(entry), entry, "serve")) kind = "daemon";
-    else if (data.WorkingDirectory === release) {
+    if (executable === "bun" && is(1, entry, "serve")) kind = "daemon";
+    else if (samePath(data.WorkingDirectory, release)) {
       if (is(0, join(home, ".mtplx", "bin", "mtplx"), "serve")) kind = "mtplx";
       if (executable === "cloudflared" && is(1, "tunnel", "--config", config, "run")) kind = "tunnel";
     }
@@ -245,11 +258,21 @@ export function installationUnits(
 export async function install(
   port: number,
   opts: { tunnel?: boolean; mtplx?: boolean; publicUrl?: string | null } & ServiceOptions = {},
+  control?: { run: typeof sh; race: <T>(work: Promise<T>) => Promise<T>; recover?: boolean },
 ): Promise<void> {
-  const command = opts.command ?? sh,
+  // Reuse deploy's lock and signal scope for installation and journal recovery.
+  if (!control)
+    return deploy(port, undefined, false, {
+      ...opts,
+      lifecycle: (run, race) => install(port, opts, { run, race }),
+    });
+  const { run: command, race } = control;
+  let restoring = false;
+  const raw = opts.command ?? sh,
     clock = opts.clock ?? deployClock;
   const client = opts.client ?? localDeployClient(port);
-  const ctl = async (args: string[]) => command(["launchctl", ...args], { cwd: home, allowFail: true });
+  const ctl = async (args: string[]) =>
+    (restoring ? raw : command)(["launchctl", ...args], { cwd: home, allowFail: true });
   const isLoaded = async (label: string) => (await ctl(["print", `gui/${uid}/${label}`])).exitCode === 0;
   const stop = async (label: string) => {
     if (!(await isLoaded(label))) return;
@@ -262,6 +285,44 @@ export async function install(
     const result = await ctl(["bootstrap", `gui/${uid}`, path]);
     if (result.exitCode !== 0) throw new Error(`launchctl bootstrap failed for ${path}: ${result.stderr}`);
   };
+  const directory = join(opts.lockPath ?? deployLock, "..", "service-backup");
+  const backup = join(directory, "original.plist"),
+    journal = join(directory, "migration.json");
+  const save = (state: Migration) => {
+    writeFileSync(`${journal}.tmp`, JSON.stringify(state), { mode: 0o600, flush: true });
+    renameSync(`${journal}.tmp`, journal);
+  };
+  const clear = () => [journal, backup].filter(existsSync).forEach(unlinkSync);
+  const restore = async (state: Migration) => {
+    restoring = true;
+    const errors: string[] = [];
+    await (async () => save({ ...state, phase: "rollback" }))().catch((e) => errors.push(String(e)));
+    await stop(state.label).catch((error) => errors.push(String(error)));
+    await (async () => {
+      if (existsSync(state.path)) unlinkSync(state.path);
+      writeFileSync(state.old.path, readFileSync(backup));
+      if (state.old.label === state.label || !(await isLoaded(state.old.label))) await start(state.old.path);
+      else if (state.label === LABEL) await requestAdmin(client, clock, "resume");
+    })().catch((error) => errors.push(String(error)));
+    if (errors.length) throw new Error(errors.join("; "));
+    save({ ...state, phase: "restored" });
+  };
+  if (control.recover) {
+    if (!existsSync(journal)) return;
+    const state: Migration = JSON.parse(readFileSync(journal, "utf8"));
+    if (state.phase === "restored") return;
+    try {
+      if (state.phase !== "replacing" || !(await isLoaded(state.label))) throw new Error("pending migration");
+      if (state.label === LABEL) await race(waitForHealthy(client, clock, state.target));
+    } catch (error) {
+      await restore(state).catch((restore) => {
+        throw new Error(`${String(error)}; Restoration failed: ${String(restore)}`);
+      });
+      throw new Error(`Recovered previous agent ${state.old.label}; retry installation. ${String(error)}`);
+    }
+    clear();
+    return;
+  }
   mkdirSync(logDir, { recursive: true });
   mkdirSync(agentsDir, { recursive: true });
   await ensureRelease(appDir, command);
@@ -275,19 +336,26 @@ export async function install(
   for (const [label, content] of units) {
     const path = join(agentsDir, `${label}.plist`);
     const old = previous.find((unit) => `dev.limitless.${unit.kind}` === label);
-    if (existsSync(path) && old?.path !== path) throw new Error(`unrelated agent: ${path}`);
+    if (existsSync(path) && !samePath(old?.path, path)) throw new Error(`unrelated agent: ${path}`);
     if (old?.label !== label && (await isLoaded(label))) throw new Error(`unrecognized agent: ${label}`);
-    const saved = old ? readFileSync(old.path) : null;
+    const state = old ? { old, label, path, target, phase: "prepared" } : null;
+    if (state) {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      writeFileSync(backup, readFileSync(state.old.path), { mode: 0o600, flush: true });
+      save(state);
+    }
     let drainAttempted = false;
     try {
       if (old && label === LABEL && (await isLoaded(old.label))) {
         drainAttempted = true;
-        await requestAdmin(client, clock, "drain");
-        await waitForDrain(client, clock, DEFAULT_MAX_WAIT_MS, false, console.log);
+        await race(requestAdmin(client, clock, "drain"));
+        await race(waitForDrain(client, clock, DEFAULT_MAX_WAIT_MS, false, console.log));
       }
-      if (old) await stop(old.label);
+      if (old) await race(stop(old.label));
     } catch (error) {
+      restoring = true;
       try {
+        if (state && !(await isLoaded(state.old.label))) await restore(state);
         if (drainAttempted && old && (await isLoaded(old.label))) await requestAdmin(client, clock, "resume");
       } catch (resume) {
         throw new Error(`${String(error)}\nResume scheduler failed: ${String(resume)}`, { cause: error });
@@ -295,17 +363,19 @@ export async function install(
       throw error;
     }
     try {
+      if (state) save({ ...state, phase: "replacing" });
       if (old) unlinkSync(old.path);
       writeFileSync(path, content);
-      await start(path);
-      if (label === LABEL) await waitForHealthy(client, clock, target);
+      await race(start(path));
+      if (label === LABEL) await race(waitForHealthy(client, clock, target));
+      clear();
     } catch (error) {
       try {
-        await stop(label);
-        if (existsSync(path)) unlinkSync(path);
-        if (old && saved) {
-          writeFileSync(old.path, saved);
-          await start(old.path);
+        restoring = true;
+        if (state) await restore(state);
+        else {
+          await stop(label);
+          if (existsSync(path)) unlinkSync(path);
         }
       } catch (restore) {
         throw new Error(`${String(error)}\nRestoration failed: ${String(restore)}`, { cause: error });
@@ -407,6 +477,7 @@ export async function deploy(
   ref = "origin/main",
   smoke = false,
   opts: {
+    lifecycle?: (run: typeof sh, race: <T>(work: Promise<T>) => Promise<T>) => Promise<void>;
     agentsDir?: string;
     releaseDir?: string;
     command?: typeof sh;
@@ -468,6 +539,8 @@ export async function deploy(
   let restartAttempted = false;
   let gatesPassed = false;
   try {
+    await install(port, opts, { run, race, recover: true });
+    if (opts.lifecycle) return await opts.lifecycle(run, race);
     await ensureRelease(dir, run);
     const running = validateHealth(await race(bounded(clock, (signal) => client.health(signal))));
     drainAttempted = running.draining;
@@ -477,8 +550,9 @@ export async function deploy(
     await run(["git", "fetch", "origin", "--prune"], { cwd: dir, timeoutMs: 300_000 });
     const target = (await run(["git", "rev-parse", `${ref}^{commit}`], { cwd: dir })).stdout.trim();
     if (running.sha === "unknown" && checkout === target) {
+      const label = (await installedUnits(opts)).find((unit) => unit.kind === "daemon")?.label ?? LABEL;
       throw new Error(
-        `daemon boot SHA is unknown and checkout already matches target; recover with launchctl kickstart -k gui/${uid}/${LABEL} or limitless service install`,
+        `daemon boot SHA is unknown and checkout already matches target; recover with launchctl kickstart -k gui/${uid}/${label} or limitless service install`,
       );
     }
     // Legacy upgrades can use the checkout for rollback, but never as proof of completion.
