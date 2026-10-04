@@ -4,9 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import type { Role } from "../src/core/types.ts";
+import { Store } from "../src/db/store.ts";
 import { evalSettings } from "../src/evals/settings.ts";
-import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
+import { DEFAULT_POLICY, MODELS, PROVIDERS } from "../src/router/catalog.ts";
+import { exportProviders, resolveCatalog } from "../src/router/config-catalog.ts";
 import { loadPolicy, validatePolicy } from "../src/router/policy.ts";
+import { ProviderTracker } from "../src/router/providers.ts";
+import { type RouteConstraints, Router } from "../src/router/router.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { evidence, local, subscription } from "./evals-policy-support.ts";
 import { evalFixture } from "./evals-support.ts";
@@ -230,4 +235,88 @@ test("the default local model comes first among free oMLX models", () => {
     "omlx/qwen-flash",
     "omlx/qwen-27b",
   ]);
+});
+
+test("export preserves complete routing decisions for all roles, complexities and constraint dimensions", () => {
+  const exported = resolveCatalog(
+    (Bun.TOML.parse(exportProviders(resolveCatalog())) as Record<string, unknown>).providers,
+  );
+  const stores = [new Store(":memory:"), new Store(":memory:")];
+  const reserves = { claudeFiveHour: 0.8, claudeSevenDay: 0.85, codexWeekly: 0.9, codexFiveHour: 0.9 };
+  const secrets = {
+    OPENROUTER_API_KEY: "router-key",
+    OMLX_API_KEY: "omlx-key",
+    TWILIGHT_API_KEY: "twilight-key",
+    TYPESAFE_API_KEY: "typesafe-key",
+  };
+  const catalogs = [{ providers: PROVIDERS, models: MODELS }, exported];
+  const constraints: RouteConstraints[] = [
+    {},
+    { billing: "free_only" },
+    { billing: "free_first" },
+    { minTier: 1 },
+    { minTier: 4 },
+    { minTier: 5 },
+    { avoidVendor: "anthropic" },
+    { avoidVendor: ["anthropic", "openai"] },
+    { excludeModels: ["mtplx/qwen-27b@none"], excludedBecause: "already reviewed checkpoint" },
+    { exclude: ["codex/sol@medium", { modelId: "omlx/qwen-flash", effort: "none" }] },
+    { prefer: "codex/sol@low" },
+    { prefer: { modelId: "claude/opus", effort: null } },
+    { only: "omlx/qwen-flash@none" },
+    { only: { modelId: "codex/sol", effort: "high" } },
+    { preferVendor: "qwen" },
+    { preferNotVendor: ["anthropic"] },
+    { preferNotModels: ["codex/sol", "claude/opus"] },
+    { billing: "free_first", independenceFirst: true, avoidVendor: "qwen", minTier: 2 },
+    { billing: "free_first", independenceFirst: false, avoidVendor: ["qwen", "openai"], minTier: 3 },
+    { prefer: "codex/sol", exclude: ["codex/sol"], excludeModels: ["claude/opus"], minTier: 4 },
+    {
+      preferVendor: "openai",
+      preferNotVendor: ["anthropic"],
+      preferNotModels: ["codex/sol"],
+      avoidVendor: "openai",
+    },
+  ];
+  try {
+    const trackers = catalogs.map((catalog, i) => {
+      const store = stores[i];
+      if (!store) throw new Error("missing store");
+      const tracker = new ProviderTracker(
+        catalog.providers,
+        store,
+        reserves,
+        secrets,
+        { openrouter: 50 },
+        () => 1000,
+      );
+      for (const provider of catalog.providers) tracker.setHealthy(provider.id, true);
+      tracker.observeWindows("claude", { five_hour: { utilization: 0.2, resetsAt: 100_000 } });
+      tracker.observeWindows("codex", { seven_day: { utilization: 0.5, resetsAt: 100_000 } });
+      return tracker;
+    });
+    const routers = trackers.map(
+      (tracker, i) => new Router(tracker, DEFAULT_POLICY, catalogs[i]?.models, ["codex"]),
+    );
+    for (const state of ["healthy", "disabled", "exhausted", "unavailable"]) {
+      for (const tracker of trackers) {
+        if (state === "disabled") tracker.setEnabled("claude", false);
+        if (state === "exhausted") tracker.record("codex", "quota", { exhaustedUntil: 100_000 });
+        if (state === "unavailable") {
+          tracker.setHealthy("omlx", false);
+          tracker.blockModel("openrouter/glm-5.3", "unavailable");
+        }
+      }
+      for (const role of Object.keys(DEFAULT_POLICY) as Role[])
+        for (const complexity of ["trivial", "small", "medium", "large"] as const)
+          for (const constraint of constraints)
+            expect(routers[1]?.route(role, complexity, constraint, false)).toEqual(
+              routers[0]?.route(role, complexity, constraint, false),
+            );
+    }
+    for (const model of MODELS)
+      expect(routers[1]?.checkpointIdentity(model.id)).toEqual(routers[0]?.checkpointIdentity(model.id));
+  } finally {
+    for (const store of stores) store.close();
+  }
 });

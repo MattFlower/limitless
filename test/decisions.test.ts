@@ -242,7 +242,7 @@ test("a decision model is routable only for roles with a decisions mapping", () 
     const offline = new Router(new ProviderTracker(PROVIDERS, store, reserves, {}), policy, MODELS);
     expect(offline.route("triage", "small").skipped).toContainEqual({
       modelId: jev,
-      reason: "typesafe: missing TYPESAFE_API_KEY",
+      reason: "typesafe: missing key TYPESAFE_API_KEY",
     });
 
     const tracker = new ProviderTracker(PROVIDERS, store, reserves, { TYPESAFE_API_KEY: "k" });

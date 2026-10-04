@@ -116,7 +116,8 @@ export class Router {
     const entry = this.policy[role];
     return (entry?.[complexity] ?? entry?.default ?? []).flatMap((group) =>
       group.split("|").flatMap((id) => {
-        if (!this.model(parseTarget(id).modelId)) return [];
+        const catalogModel = this.model(parseTarget(id).modelId);
+        if (!catalogModel || !this.tracker.def(catalogModel.provider)) return [];
         const { model, effort } = this.resolveFor(role, id);
         return [{ modelId: model.id, effort: effort ?? null, tier: model.tier }];
       }),

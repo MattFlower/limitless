@@ -17,15 +17,9 @@ import { runLlm } from "./harness/llm.ts";
 import type { Harness } from "./harness/types.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
-import {
-  DEFAULT_POLICY,
-  MODELS,
-  type ModelDef,
-  type Policy,
-  PROVIDERS,
-  type ProviderDef,
-} from "./router/catalog.ts";
-import { loadPolicy } from "./router/policy.ts";
+import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
+import { resolveCatalog } from "./router/config-catalog.ts";
+import { loadPolicy, validatePolicy } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
 import { Router } from "./router/router.ts";
 import { Scheduler } from "./scheduler.ts";
@@ -81,9 +75,10 @@ export class Factory {
   ) {
     this.bootSha = opts.bootSha ?? "unknown";
     gateSlots.setLimit(cfg.maxConcurrentGates);
-    this.models = opts.models ?? MODELS;
+    const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
+    this.models = opts.models ?? catalog.models;
     this.evalSettings = evalSettings(cfg.raw);
-    this.providerDefs = (opts.providers ?? PROVIDERS).map((provider) => ({
+    this.providerDefs = (opts.providers ?? catalog.providers).map((provider) => ({
       ...provider,
       maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
     }));
@@ -93,6 +88,7 @@ export class Factory {
       (opts.policyPath === undefined
         ? DEFAULT_POLICY
         : loadPolicy(opts.policyPath, this.models, this.providerDefs));
+    if (!opts.models && !opts.providers) validatePolicy(this.policy, this.models, this.providerDefs);
     this.store = opts.store ?? new Store(cfg.paths.db);
     this.cleanup = opts.cleanup ?? ((dryRun) => collectGarbage(this.store, cfg, { dryRun }));
     this.gcTimer = opts.gcTimer ?? { set: setInterval, clear: clearInterval };
@@ -164,7 +160,7 @@ export class Factory {
         ),
       policy: this.policy,
       models: this.models,
-      providers: this.providerDefs,
+      providers: this.providerDefs.map(({ apiKey: _key, ...p }) => p),
       runs: evidence.map(({ run, trials }) => ({
         ...run,
         costUsd: trials.reduce((n, t) => n + t.costUsd, 0),
@@ -175,6 +171,9 @@ export class Factory {
 
   start(): void {
     if (this.gcInterval) return;
+    for (const note of this.cfg.catalog?.notes ?? []) console.error(`[providers] ${note}`);
+    for (const p of this.tracker.all())
+      if (p.reason?.startsWith("missing key ")) console.error(`[providers] ${p.id}: ${p.reason}`);
     this.store.daemonStarted(this.bootId, version, this.bootSha);
     // UI development against seeded data must never launch real (paid) runs.
     if (process.env.LIMITLESS_NO_SCHEDULER === "1") return;

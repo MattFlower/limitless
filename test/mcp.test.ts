@@ -274,7 +274,7 @@ test("provider health and budget states pass through without secrets", async () 
       budgetUsd: 10,
       maxConcurrent: 3,
     });
-    expect(providers[1]).toMatchObject({ enabled: false, state: "disabled", reason: "missing MISSING" });
+    expect(providers[1]).toMatchObject({ enabled: false, state: "disabled", reason: "missing key MISSING" });
     expect(JSON.stringify(result)).not.toContain("do-not-expose");
   } finally {
     await conn.close();
