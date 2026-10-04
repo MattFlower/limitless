@@ -1,11 +1,10 @@
 import type { Component } from "solid-js";
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import type { RunStatus } from "../../src/core/types.ts";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import type { Stats } from "../../src/db/stats.ts";
 import { getStats } from "../api.ts";
 import { CostCell } from "../components/CostCell.tsx";
 import { CostChart } from "../components/CostChart.tsx";
-import { FilterChips } from "../components/FilterChips.tsx";
+import { FilterChips, matchesRunFilter, type RunFilter } from "../components/FilterChips.tsx";
 import { KpiStrip } from "../components/KpiStrip.tsx";
 import { RunsTable } from "../components/RunsTable.tsx";
 import { ensureLiveStore, live } from "../store.ts";
@@ -16,7 +15,7 @@ export const Dashboard: Component = () => {
   ensureLiveStore();
   const [stats, setStats] = createSignal<Stats | null>(null);
   const [now, setNow] = createSignal(Date.now());
-  const [statusFilter, setStatusFilter] = createSignal<RunStatus | null>(null);
+  const [statusFilter, setStatusFilter] = createSignal<RunFilter | null>(null);
 
   const refreshStats = () => {
     getStats(14)
@@ -34,9 +33,13 @@ export const Dashboard: Component = () => {
   });
 
   const runs = createMemo(() => Object.values(live.runs).sort((a, b) => b.createdAt - a.createdAt));
+  createEffect(() => {
+    runs();
+    refreshStats();
+  });
   const filteredRuns = createMemo(() => {
     const f = statusFilter();
-    return f ? runs().filter((r) => r.status === f) : runs();
+    return f ? runs().filter((r) => matchesRunFilter(r.status, f)) : runs();
   });
   const alerts = createMemo(() =>
     Object.values(live.alerts).filter((a) => a.resetsAt === null || a.resetsAt > now()),

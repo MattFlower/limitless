@@ -256,6 +256,14 @@ export interface ArtifactMeta {
 }
 
 export interface RunDetail {
+  blockingFindings?: string[];
+  prSnapshot?: {
+    state?: string;
+    isDraft?: boolean;
+    mergeable?: string | null;
+    ci?: string | null;
+  } | null;
+  worktreePath?: string | null;
   run: Run;
   stages: Stage[];
   invocations: Invocation[];

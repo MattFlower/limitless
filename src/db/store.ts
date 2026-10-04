@@ -1205,7 +1205,13 @@ export class Store {
   getRunDetail(id: string): RunDetail | null {
     const run = this.getRun(id);
     if (!run) return null;
+    const latest = this.listArtifacts(id).findLast((a) => a.kind === "review");
+    const review = parse<{ blocking?: { title?: string }[] }>(this.getArtifact(id, latest?.name ?? ""), {});
     return {
+      blockingFindings: Array.isArray(review?.blocking)
+        ? review.blocking.flatMap((f) => (typeof f?.title === "string" ? [f.title] : []))
+        : [],
+      prSnapshot: parse<RunDetail["prSnapshot"]>(run.prUrl && this.githubPrData(run.prUrl), null),
       run,
       stages: this.listStages(id),
       invocations: this.listInvocations(id),

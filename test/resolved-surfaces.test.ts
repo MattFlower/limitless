@@ -38,6 +38,8 @@ function storedRuns(): { store: Store; resolved: Run } {
   });
   const second = store.createRun(repo, { repo: repo.slug, prompt: "Still open" });
   store.updateRun(second.id, { status: "needs_human" });
+  const failed = store.createRun(repo, { repo: repo.slug, prompt: "Failed work" });
+  store.updateRun(failed.id, { status: "failed" });
   const resolved = store.getRun(first.id);
   if (!resolved) throw new Error("missing resolved run");
   return { store, resolved };
@@ -48,8 +50,8 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
   const { store, resolved } = storedRuns();
   try {
     const stats = computeStats(store);
-    expect(stats.totals.openNeedsHuman).toBe(1);
-    expect(stats.totals.openNeedsHumanRate).toBe(0.5);
+    expect(stats.totals.openNeedsHuman).toBe(2);
+    expect(stats.totals.openNeedsHumanRate).toBeCloseTo(2 / 3);
     const build = await Bun.build({
       entrypoints: [
         join(import.meta.dir, "../ui/components/StatusPill.tsx"),
@@ -57,6 +59,7 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
         join(import.meta.dir, "../ui/components/KpiStrip.tsx"),
         join(import.meta.dir, "../ui/components/RunsTable.tsx"),
         join(import.meta.dir, "../ui/pages/RunDetail.tsx"),
+        join(import.meta.dir, "../ui/pages/Dashboard.tsx"),
       ],
       outdir: join(dir, "ssr"),
       target: "bun",
@@ -95,6 +98,28 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
                   }
                 `;
               }
+              if (args.path.endsWith("/Dashboard.tsx")) {
+                source = source.replace(
+                  'import { ensureLiveStore, live } from "../store.ts";',
+                  "const ensureLiveStore = () => {}; const live = { get runs() { return Object.fromEntries(fixtureRuns.map(r => [r.id, r])); }, alerts: {} };",
+                );
+                source = source.replace(
+                  "createSignal<Stats | null>(null)",
+                  "createSignal<Stats | null>(fixtureStats)",
+                );
+                source = source.replace(
+                  "createSignal<RunFilter | null>(null)",
+                  "createSignal<RunFilter | null>(fixtureFilter)",
+                );
+                source += `
+                  let fixtureRuns: import("../../src/core/types.ts").Run[] = [];
+                  let fixtureStats: Stats;
+                  let fixtureFilter: RunFilter | null;
+                  export const withFixture = (runs: import("../../src/core/types.ts").Run[], stats: Stats, filter: RunFilter | null) => {
+                    fixtureRuns = runs; fixtureStats = stats; fixtureFilter = filter; return Dashboard({});
+                  };
+                `;
+              }
               const transformed = await transformAsync(source, {
                 filename: args.path,
                 parserOpts: { plugins: ["jsx", "typescript"] },
@@ -125,6 +150,13 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
     const { RunsTable } = (await import(
       output("RunsTable")
     )) as typeof import("../ui/components/RunsTable.tsx");
+    const dashboard = (await import(output("Dashboard"))) as {
+      withFixture: (
+        runs: Run[],
+        stats: ReturnType<typeof computeStats>,
+        filter: "needs_you" | null,
+      ) => ReturnType<typeof RunDetail>;
+    };
     const { RunDetail, withFixture } = (await import(
       output("RunDetail")
     )) as typeof import("../ui/pages/RunDetail.tsx") & {
@@ -140,8 +172,8 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
     expect(list).toContain('class="pill pill-resolved">resolved');
     expect(list).toContain('class="pill pill-needs_human">needs human');
     const kpis = renderToString(() => KpiStrip({ totals: stats.totals }));
-    expect(kpis).toMatch(/Open needs human \(14d\)<\/span>\s*<span class="kpi-value">1<\/span>/);
-    expect(kpis).toContain("50% of runs");
+    expect(kpis).toMatch(/Needs you \(14d\)<\/span>\s*<span class="kpi-value">2<\/span>/);
+    expect(kpis).toContain("67% of runs");
     const detail = renderToString(() => RunDetail({}));
     expect(detail).toContain('class="pill pill-resolved">resolved');
     expect(detail).toContain("Merged by reviewer on ");
@@ -155,7 +187,7 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
         kind: "done_elsewhere",
         by: "human",
         at: 42,
-        ref: null,
+        ref: "https://github.com/MattFlower/limitless/pull/40",
         note: "Handled in another change",
       },
     };
@@ -163,6 +195,32 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
     expect(manualDetail).toContain("done_elsewhere");
     expect(manualDetail).toContain("Handled in another change");
     expect(manualDetail).not.toContain("Merged by");
+    expect(manualDetail).toContain("https://github.com/MattFlower/limitless/pull/40");
+    for (const action of ["Resolve</button>", "Retry", "Take over"])
+      expect(manualDetail).not.toContain(action);
+    const attention = () =>
+      renderToString(() => dashboard.withFixture(store.listRuns(), computeStats(store), "needs_you"));
+    expect(renderToString(() => FilterChips({ active: "needs_you", onChange: () => {} }))).toContain(
+      'class="chip active">Needs you</button>',
+    );
+    const initialAttention = attention();
+    expect(initialAttention).toContain("Still open");
+    expect(initialAttention).toContain("Failed work");
+    expect(initialAttention).not.toContain("Resolved work");
+    const open = store.listRuns().find((r) => r.status === "needs_human");
+    if (!open) throw new Error("missing needs-human run");
+    store.resolveRun(open.id, { kind: "done_elsewhere", by: "human" });
+    const afterResolution = attention();
+    expect(afterResolution).not.toContain("Still open");
+    expect(afterResolution).toContain("Failed work");
+    expect(afterResolution).toMatch(/Needs you \(14d\)<\/span>\s*<span class="kpi-value">1<\/span>/);
+    expect(computeStats(store).totals.openNeedsHuman).toBe(1);
+    const failed = store.listRuns().find((r) => r.status === "failed");
+    if (!failed) throw new Error("missing failed run");
+    store.resolveRun(failed.id, { kind: "wont_do", by: "human" });
+    expect(attention()).not.toContain("Failed work");
+    expect(attention()).toMatch(/Needs you \(14d\)<\/span>\s*<span class="kpi-value">0<\/span>/);
+    expect(computeStats(store).totals.openNeedsHuman).toBe(0);
     expect(
       renderToString(() =>
         withFixture({ ...manual, merged: true, mergedBy: "owner", mergedAt: resolved.mergedAt }),
