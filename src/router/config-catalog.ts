@@ -158,6 +158,8 @@ export function resolveCatalog(raw: unknown = undefined) {
       },
       path,
     );
+    if (old && providerKind(old) !== p.kind)
+      throw new Error(`${path}.${name}: expected kind ${providerKind(old)}, received ${p.kind}`);
     if (p.kind === "openai-compatible" && c.base_url && !c.openai_base_url) p.openai_base_url = c.base_url;
     if (p.kind === "decisions" && c.base_url && !c.decisions_base_url) p.decisions_base_url = c.base_url;
     const endpoint =

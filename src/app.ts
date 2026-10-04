@@ -14,7 +14,7 @@ import { runClaude } from "./harness/claude.ts";
 import { runCodex } from "./harness/codex.ts";
 import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
-import type { Harness } from "./harness/types.ts";
+import { type Harness, protectCredentials } from "./harness/types.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
@@ -23,6 +23,7 @@ import { loadPolicy, validatePolicy } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
 import { Router } from "./router/router.ts";
 import { Scheduler } from "./scheduler.ts";
+import { redactCredentialData } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 
 export interface FactoryOptions {
@@ -126,7 +127,7 @@ export class Factory {
           name,
           (async (spec) => {
             const fast = spec.fast ?? this.tracker.isFast(spec.target.provider);
-            const result = await harness({ ...spec, fast });
+            const result = redactCredentialData(await harness(protectCredentials({ ...spec, fast })));
             this.tracker.observeFast(spec.target.provider, fast, result);
             return result;
           }) satisfies Harness,

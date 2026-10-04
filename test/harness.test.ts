@@ -442,3 +442,101 @@ test("native fast flags cover edit, structured and isolated readers without leak
     expect(parser.fastModeDisabledReason).toBeNull();
   });
 });
+
+test("configured credentials never reach native children or their events, logs and errors", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const { customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const { runProcess } = await import("../src/util/proc.ts");
+  const { Factory } = await import("../src/app.ts");
+  const { Store } = await import("../src/db/store.ts");
+  const key = "MAC_MLX_KEY";
+  const saved = process.env[key];
+  const fileSecret = 'FAKE_FILE_CREDENTIAL_"731';
+  const envSecret = "FAKE_ENV_CREDENTIAL_732";
+  const fixture = providerFixture([{ ...customProvider, api_key_env: key }], `${key}='${fileSecret}'\n`);
+  const store = new Store(":memory:");
+  try {
+    process.env[key] = envSecret;
+    const cfg = fixture.load();
+    const factory = new Factory(cfg, { store });
+    expect(factory.tracker.authToken("mac-mlx")).toBe(fileSecret);
+    for (const harness of ["claude", "codex"] as const) {
+      const events: AgentEvent[] = [];
+      const logPath = join(fixture.root, `${harness}.log`);
+      const child = join(fixture.root, `${harness}.ts`);
+      const nested = { secret: fileSecret, other: [envSecret], readable: "ordinary diagnostic" };
+      const event =
+        harness === "claude"
+          ? {
+              type: "assistant",
+              message: { content: [{ type: "tool_use", id: "call", name: "inspect", input: nested }] },
+            }
+          : {
+              type: "item.started",
+              item: { type: "mcp_tool_call", id: "call", server: "test", tool: "inspect", arguments: nested },
+            };
+      const textEvent =
+        harness === "claude"
+          ? {
+              type: "assistant",
+              message: {
+                content: [{ type: "text", text: `ordinary diagnostic ${fileSecret} ${envSecret}` }],
+              },
+            }
+          : {
+              type: "item.completed",
+              item: { type: "agent_message", text: `ordinary diagnostic ${fileSecret} ${envSecret}` },
+            };
+      writeFileSync(
+        child,
+        `console.log("child credential=" + (process.env.MAC_MLX_KEY ?? "absent")); console.log(${JSON.stringify(JSON.stringify(event))}); console.log(${JSON.stringify(JSON.stringify(textEvent))}); console.error(${JSON.stringify(`ordinary diagnostic ${fileSecret} ${envSecret}`)}); process.exit(1);`,
+      );
+      const result = await (harness === "claude" ? runClaude : runCodex)(
+        {
+          cwd: fixture.root,
+          prompt: "test",
+          mode: "edit",
+          logPath,
+          target: {
+            modelId: `${harness}/test`,
+            provider: harness,
+            harness,
+            model: "test",
+            vendor: "other",
+            tier: 4,
+            billing: "subscription",
+          },
+          timeoutMs: 5000,
+          idleTimeoutMs: 5000,
+          maxToolCalls: 10,
+          signal: new AbortController().signal,
+          onEvent: (ev) => events.push(ev),
+        },
+        (options) => runProcess({ ...options, cmd: [process.execPath, child] }),
+      );
+      expect(result.status).toBe("error");
+      expect(events).toContainEqual({ type: "status", text: "child credential=absent" });
+      expect(
+        events.some((e) => e.type === "tool_call" && JSON.stringify(e.input).includes("ordinary diagnostic")),
+      ).toBe(true);
+      for (const recorded of [
+        JSON.stringify(events),
+        readFileSync(logPath, "utf8"),
+        JSON.stringify(result),
+      ]) {
+        expect(recorded).not.toContain(envSecret);
+        expect(recorded).not.toContain("FAKE_FILE_CREDENTIAL_");
+        expect(recorded).toContain("ordinary diagnostic");
+      }
+    }
+    process.env[key] = "";
+    writeFileSync(join(fixture.configDir, "secrets.env"), `${key}=\n`);
+    fixture.load();
+    expect(redactJsonLine("ordinary empty credential")).toBe("ordinary empty credential");
+  } finally {
+    if (saved === undefined) delete process.env[key];
+    else process.env[key] = saved;
+    store.close();
+    fixture.close();
+  }
+});

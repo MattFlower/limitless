@@ -10,6 +10,7 @@ import { DEFAULT_ROSTERS } from "../src/pipeline/review-system.ts";
 import { DEFAULT_POLICY, PROVIDERS } from "../src/router/catalog.ts";
 import { resolveCatalog, tomlValue } from "../src/router/config-catalog.ts";
 import { validatePolicy } from "../src/router/policy.ts";
+import { ProviderTracker } from "../src/router/providers.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 import { customModel, customProvider, providerFixture } from "./provider-config-support.ts";
 
@@ -701,6 +702,71 @@ test("explicit native Claude transport can use a separate tool-free endpoint", (
     const target = factory.router.toTarget(factory.router.resolve("claude/opus").model);
     expect(target.openai?.baseUrl).toBe("https://example.com/v1");
     expect(target.backend).toBeUndefined();
+  } finally {
+    store.close();
+    fixture.close();
+  }
+});
+
+test("built-in kinds reject explicit and preset conflicts while same-kind overrides load", () => {
+  for (const change of [
+    { id: "claude", kind: "codex-cli" },
+    { id: "claude", preset: "codex" },
+  ]) {
+    const fixture = providerFixture([change]);
+    try {
+      expect(fixture.load).toThrow("claude: expected kind claude-cli, received codex-cli");
+    } finally {
+      fixture.close();
+    }
+  }
+  const fixture = providerFixture([{ id: "claude", kind: "claude-cli", label: "Work", max_concurrent: 7 }]);
+  try {
+    expect(fixture.load().catalog?.providers[0]).toMatchObject({
+      id: "claude",
+      label: "Work",
+      maxConcurrent: 7,
+    });
+  } finally {
+    fixture.close();
+  }
+});
+
+test("native aliases inherit both reserve windows, retain identity and honor explicit overrides", () => {
+  const fixture = providerFixture([
+    { preset: "codex", id: "work" },
+    { preset: "claude", id: "writing" },
+  ]);
+  const store = new Store(":memory:");
+  try {
+    const cfg = fixture.load();
+    let now = 1000;
+    const reserves = {
+      claudeFiveHour: 0.8,
+      claudeSevenDay: 0.85,
+      codexWeekly: 0.9,
+      codexFiveHour: 0.9,
+      windows: {} as Record<string, Record<string, number>>,
+    };
+    const tracker = new ProviderTracker(cfg.catalog?.providers ?? [], store, reserves, {}, {}, () => now);
+    for (const [id, window, limit] of [
+      ["work", "seven_day", 0.9],
+      ["work", "five_hour", 0.9],
+      ["writing", "five_hour", 0.8],
+      ["writing", "seven_day", 0.85],
+    ] as const) {
+      tracker.observeWindows(id, { [window]: { utilization: 0.95, resetsAt: now + 100 } });
+      expect(tracker.unavailableReason(id)).toBe("at reserve limit");
+      expect(tracker.unavailableReason(id === "work" ? "codex" : "claude")).toBeNull();
+      reserves.windows[id] = { [window]: 0.99 };
+      expect(tracker.unavailableReason(id)).toBeNull();
+      delete reserves.windows[id];
+      tracker.observeWindows(id, { [window]: { utilization: limit - 0.01, resetsAt: now + 100 } });
+      expect(tracker.unavailableReason(id)).toBeNull();
+      tracker.observeWindows(id, { [window]: { utilization: 0.95, resetsAt: now + 100 } });
+      now += 101;
+      expect(tracker.unavailableReason(id)).toBeNull();
+    }
   } finally {
     store.close();
     fixture.close();

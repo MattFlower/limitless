@@ -1015,6 +1015,12 @@ TOML. Diagnostics go to stderr and credentials are never exported. Use
 `limitless providers export --write` to replace the provider configuration, preserving
 unrelated settings semantically and creating a uniquely named `config.toml.<id>.bak` with
 the original bytes. Comments/formatting are regenerated; previous backups and `secrets.env`
-remain untouched. Validation or backup failures leave the original config intact. Restart
+remain untouched. Replacing an existing config requires affirmative interactive confirmation;
+use `--write --yes` for automation. Empty, negative, EOF, or non-interactive input refuses
+replacement without `--yes`. The warning and prompt show the planned backup path before writing.
+This is a one-way migration for the previous release: it cannot load `[[providers]]`.
+Before rolling back, restore the named original backup over `config.toml`, then start the older
+release. Creating a new config has no previous backup; remove it before rollback.
+Startup never migrates configuration automatically. Validation or backup failures leave the original config intact. Restart
 the daemon after editing configuration. Export includes disabled providers, without transient
 health, quota, or enablement state.

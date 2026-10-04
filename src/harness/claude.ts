@@ -1,6 +1,6 @@
 import { appendFileSync, realpathSync } from "node:fs";
 import type { QuotaWindow } from "../core/types.ts";
-import { agentEnv, runProcess } from "../util/proc.ts";
+import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
 import { readConfinement, scratchEnv, scratchParent, validateDenyRead, validateScratch } from "./scratch.ts";
 import {
   type AgentEvent,
@@ -10,6 +10,7 @@ import {
   extractJson,
   LoopDetector,
   priceOf,
+  protectCredentials,
   redactJsonLine,
   type Usage,
 } from "./types.ts";
@@ -250,6 +251,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
 }
 
 export async function runClaude(spec: AgentSpec, processRunner = runProcess): Promise<AgentResult> {
+  spec = protectCredentials(spec);
   const sessionId = crypto.randomUUID();
   const t = spec.target;
   const args = buildClaudeArgs(spec, sessionId);
@@ -314,7 +316,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     idleTimeoutMs: spec.idleTimeoutMs,
     onStdoutLine: (line) => {
       appendFileSync(spec.logPath, `${redactJsonLine(line, spec.redactOutput)}\n`);
-      parser.feed(line);
+      parser.feed(redactJsonLine(line, redactCredentials));
     },
     onStderrLine: (line) => {
       appendFileSync(spec.logPath, `[stderr] ${spec.redactOutput?.(line) ?? line}\n`);
@@ -357,7 +359,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     };
   }
   if (!parser.gotResult) {
-    const stderr = proc.stderr.trim().slice(-2000);
+    const stderr = redactCredentials(proc.stderr).trim().slice(-2000);
     const unavailable = /ECONNREFUSED|ENOTFOUND|fetch failed|overloaded|529|502|503|Could not connect/i.test(
       stderr,
     );

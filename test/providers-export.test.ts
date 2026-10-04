@@ -61,10 +61,12 @@ async function cli(root: string, args: string[], preloadExtra = "") {
     ],
     {
       env: { ...process.env, LIMITLESS_CONFIG_DIR: join(root, "config"), LIMITLESS_HOME: join(root, "data") },
+      stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
     },
   );
+  child.stdin.end();
   const [stdout, stderr, exit] = await Promise.all([
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
@@ -97,8 +99,12 @@ test("offline export stdout and repeated writes preserve unrelated settings, ori
       expect(resolveCatalog(parse(result.stdout).providers).models).toEqual(expected?.models);
       if (before) expect(readFileSync(fixture.file)).toEqual(before);
       expect(readdirSync(fixture.configDir).filter((p) => p.endsWith(".bak"))).toEqual([]);
-      const written = await cli(fixture.root, ["--write"]);
+      const written = await cli(fixture.root, ["--write", "--yes"]);
       expect(written.exit).toBe(0);
+      expect(written.stderr).toContain("previous release cannot load [[providers]]");
+      expect(written.stderr).toContain(
+        before ? "Rollback requires restoring the original backup:" : "no previous config backup exists",
+      );
       expect(written.stdout).toBe("");
       const firstBackup = readdirSync(fixture.configDir).filter((p) => p.endsWith(".bak"));
       expect(firstBackup).toHaveLength(before ? 1 : 0);
@@ -110,7 +116,7 @@ test("offline export stdout and repeated writes preserve unrelated settings, ori
         expect(unrelated).toEqual(parse(settings));
       }
       const firstWrite = readFileSync(fixture.file);
-      expect((await cli(fixture.root, ["--write"])).exit).toBe(0);
+      expect((await cli(fixture.root, ["--write", "--yes"])).exit).toBe(0);
       const secondBackup = readdirSync(fixture.configDir).filter(
         (p) => p.endsWith(".bak") && !firstBackup.includes(p),
       );
@@ -130,7 +136,7 @@ test("failed export validation and backup creation leave original config intact"
     const before = readFileSync(fixture.file);
     const result = await cli(
       fixture.root,
-      ["--write"],
+      ["--write", "--yes"],
       `import { mock } from "bun:test"; import * as fs from "node:fs"; const originalWrite = fs.writeFileSync;
       mock.module("node:fs", () => ({ ...fs, writeFileSync: (path, ...args) => { if (String(path).endsWith(".bak")) throw new Error("backup denied"); return originalWrite(path, ...args); } }));`,
     );
@@ -140,12 +146,82 @@ test("failed export validation and backup creation leave original config intact"
     expect(readdirSync(fixture.configDir).filter((p) => /\.(bak|tmp)$/.test(p))).toEqual([]);
     writeFileSync(fixture.file, '[[providers]]\nid="invalid"\napiKey="sentinel-key"\n');
     const invalid = readFileSync(fixture.file);
-    const failure = await cli(fixture.root, ["--write"]);
+    const failure = await cli(fixture.root, ["--write", "--yes"]);
     expect(failure.exit).toBe(1);
     expect(failure.stdout + failure.stderr).not.toContain("sentinel-key");
     expect(readFileSync(fixture.file)).toEqual(invalid);
     expect(readdirSync(fixture.configDir).filter((p) => p.endsWith(".bak"))).toEqual([]);
   } finally {
     fixture.close();
+  }
+});
+
+test("replacement refuses piped input and defaults interactive answers to refusal without touching backups", async () => {
+  for (const answer of [undefined, "no", "", null, "yes", "Y"]) {
+    const fixture = providerFixture();
+    try {
+      const before = readFileSync(fixture.file);
+      writeFileSync(join(fixture.configDir, "prior.bak"), "older backup");
+      const secrets = readFileSync(join(fixture.configDir, "secrets.env"));
+      const preload =
+        answer === undefined
+          ? ""
+          : `
+        Object.defineProperty(process.stdin, "isTTY", { value: true });
+        globalThis.prompt = (question) => {
+          if (Bun.file(${JSON.stringify(fixture.file)}).size !== ${before.length}) throw new Error("mutated before prompt");
+          console.error("PROMPT " + question);
+          return ${JSON.stringify(answer)};
+        };`;
+      const result = await cli(fixture.root, ["--write"], preload);
+      expect(result.stderr).toContain("previous release cannot load [[providers]]");
+      expect(result.stderr).toContain("Rollback requires restoring the original backup:");
+      if (answer !== undefined) expect(result.stderr).toContain("PROMPT One-way migration:");
+      const allowed = answer === "yes" || answer === "Y";
+      expect(result.exit).toBe(allowed ? 0 : 1);
+      const backups = readdirSync(fixture.configDir).filter((p) => p.endsWith(".bak") && p !== "prior.bak");
+      expect(backups).toHaveLength(allowed ? 1 : 0);
+      if (allowed) {
+        const path = join(fixture.configDir, backups[0] ?? "missing");
+        expect(result.stderr).toContain(path);
+        expect(readFileSync(path)).toEqual(before);
+      } else expect(readFileSync(fixture.file)).toEqual(before);
+      expect(readFileSync(join(fixture.configDir, "prior.bak"), "utf8")).toBe("older backup");
+      expect(readFileSync(join(fixture.configDir, "secrets.env"))).toEqual(secrets);
+    } finally {
+      fixture.close();
+    }
+  }
+});
+
+test("--yes warns with the planned rollback path before the first config write, including creation", async () => {
+  for (const exists of [true, false]) {
+    const fixture = providerFixture();
+    try {
+      if (!exists) rmSync(fixture.file);
+      const result = await cli(
+        fixture.root,
+        ["--write", "--yes"],
+        `
+        import { mock } from "bun:test";
+        import * as fs from "node:fs";
+        const write = fs.writeFileSync;
+        const error = console.error;
+        let warning = "";
+        console.error = (...args) => { warning += args.join(" "); error(...args); };
+        mock.module("node:fs", () => ({ ...fs, writeFileSync: (path, ...args) => {
+          if (String(path).endsWith(".tmp")) {
+            if (!warning.includes("previous release cannot load [[providers]]")) throw new Error("missing pre-write warning");
+            if (!warning.includes(${JSON.stringify(exists ? "restoring the original backup:" : "no previous config backup exists")})) throw new Error("missing rollback instructions");
+          }
+          if (String(path).endsWith(".bak") && !warning.includes(String(path))) throw new Error("wrong planned backup");
+          return write(path, ...args);
+        }}));`,
+      );
+      expect(result.exit).toBe(0);
+      expect(result.stderr).toContain(exists ? "restoring the original backup:" : "removing the new config");
+    } finally {
+      fixture.close();
+    }
   }
 });

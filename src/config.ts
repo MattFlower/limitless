@@ -2,13 +2,13 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
-
 import type { ResolvedProfile, ReviewFinder, Role } from "./core/types.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { defaultGateSlots } from "./gates/slots.ts";
 import { parseReviewRosters } from "./pipeline/review-system.ts";
 import { type EffectiveCatalog, resolveCatalog } from "./router/config-catalog.ts";
 import { isLanAddress, isLoopback, publicOrigin } from "./server/access.ts";
+import { registerCredential } from "./util/proc.ts";
 
 export interface Paths {
   home: string; // ~/.limitless
@@ -166,7 +166,10 @@ export function loadConfig(
 
   for (const p of catalog.providers) {
     const key = p.apiKeySecret;
-    if (key) secrets[key] = fileSecrets[key] || (Object.hasOwn(process.env, key) && process.env[key]) || "";
+    if (key) {
+      secrets[key] = fileSecrets[key] || (Object.hasOwn(process.env, key) && process.env[key]) || "";
+      registerCredential(key, secrets[key]);
+    }
   }
 
   const server = (raw.server ?? {}) as Record<string, unknown>;

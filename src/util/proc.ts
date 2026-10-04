@@ -271,6 +271,30 @@ export async function sh(
   return { stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode };
 }
 
+// Retain registrations across config reloads while older invocations may still be running.
+const credentialNames = new Set<string>();
+const credentialValues = new Set<string>();
+export function registerCredential(name: string, value: string): void {
+  credentialNames.add(name);
+  for (const secret of [value, process.env[name]])
+    if (typeof secret === "string" && secret) credentialValues.add(secret);
+}
+export function redactCredentials(text: string): string {
+  for (const secret of [...credentialValues].sort((a, b) => b.length - a.length))
+    text = text.split(secret).join("[credential]");
+  return text;
+}
+export function redactCredentialData<T>(value: T): T {
+  return JSON.parse(
+    JSON.stringify(value, (_key, v: unknown) => {
+      if (typeof v === "string") return redactCredentials(v);
+      return v && typeof v === "object" && !Array.isArray(v)
+        ? Object.fromEntries(Object.entries(v).map(([k, value]) => [redactCredentials(k), value]))
+        : v;
+    }),
+  );
+}
+
 /** Environment for agent child processes: inherit PATH etc. but never leak factory secrets. */
 export function agentEnv(extra: Record<string, string> = {}): Record<string, string> {
   const env: Record<string, string> = {};
@@ -284,7 +308,7 @@ export function agentEnv(extra: Record<string, string> = {}): Record<string, str
     env[k] = v;
   }
   delete env.SSH_AUTH_SOCK;
-  return {
+  const child: Record<string, string> = {
     ...env,
     // Agents (and the repo code they write, which gates execute) must not act on GitHub or push:
     // the factory does delivery. An invalid token makes `gh` fail fast instead of using the
@@ -297,4 +321,6 @@ export function agentEnv(extra: Record<string, string> = {}): Record<string, str
     GIT_CONFIG_VALUE_0: "",
     ...extra,
   };
+  for (const name of credentialNames) delete child[name];
+  return child;
 }
