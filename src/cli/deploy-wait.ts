@@ -2,6 +2,18 @@ import type { DrainState, HealthResponse, Run, RunDetail } from "../core/types.t
 
 export const DEFAULT_MAX_WAIT_MS = 45 * 60_000;
 const REQUEST_TIMEOUT_MS = 5000;
+/** A loaded machine can stall one daemon response for seconds; only repeated silence fails a drain. */
+const MAX_POLL_ATTEMPTS = 3;
+/** Resume is cleanup after a failed deploy, so a stalled daemon gets longer and repeated chances. */
+const RESUME_TIMEOUT_MS = 15_000;
+const RESUME_ATTEMPTS = 3;
+
+/** The daemon didn't answer within the request budget. */
+export class DaemonTimeoutError extends Error {
+  constructor() {
+    super("daemon request timed out");
+  }
+}
 
 export function parseMaxWait(value: string | undefined): number {
   if (value === undefined) return DEFAULT_MAX_WAIT_MS;
@@ -102,7 +114,7 @@ export async function bounded<T>(
   let cancel = () => {};
   const timeout = new Promise<never>((_, reject) => {
     cancel = clock.timeout(() => {
-      reject(new Error("daemon request timed out"));
+      reject(new DaemonTimeoutError());
       controller.abort();
     }, ms);
   });
@@ -119,9 +131,18 @@ export async function requestAdmin(
   clock: DeployClock,
   action: "drain" | "resume",
 ): Promise<void> {
-  const state = await bounded(clock, (signal) => client.admin(action, signal));
-  if (!validDrain(state) || state.draining !== (action === "drain")) {
-    throw new Error(`daemon did not acknowledge ${action}`);
+  const resume = action === "resume";
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const ms = resume ? RESUME_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+      const state = await bounded(clock, (signal) => client.admin(action, signal), ms);
+      if (!validDrain(state) || state.draining !== (action === "drain")) {
+        throw new Error(`daemon did not acknowledge ${action}`);
+      }
+      return;
+    } catch (error) {
+      if (!resume || !(error instanceof DaemonTimeoutError) || attempt >= RESUME_ATTEMPTS) throw error;
+    }
   }
 }
 
@@ -137,7 +158,21 @@ export async function waitForDrain(
   // Even immediate deployments verify that the daemon supports the drain protocol.
   const budget = () =>
     now || maxWaitMs === 0 ? REQUEST_TIMEOUT_MS : Math.min(REQUEST_TIMEOUT_MS, remaining());
-  let health = validateHealth(await bounded(clock, (signal) => client.health(signal), budget()));
+  const poll = async () => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return validateHealth(await bounded(clock, (signal) => client.health(signal), budget()));
+      } catch (error) {
+        // --now and zero-wait deploys keep their single, short attempt.
+        const retries = now || maxWaitMs === 0 ? 1 : MAX_POLL_ATTEMPTS;
+        if (!(error instanceof DaemonTimeoutError) || attempt >= retries) throw error;
+        await clock.sleep(Math.min(2000, remaining()));
+        if (remaining() === 0) throw error;
+        log(`Health poll timed out (attempt ${attempt} of ${MAX_POLL_ATTEMPTS}); retrying`);
+      }
+    }
+  };
+  let health = await poll();
   let lastProgress: string | undefined;
   let lastProgressAt = 0;
   for (;;) {
@@ -183,7 +218,7 @@ export async function waitForDrain(
       );
       return;
     }
-    health = validateHealth(await bounded(clock, (signal) => client.health(signal), budget()));
+    health = await poll();
   }
 }
 
