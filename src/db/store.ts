@@ -3,6 +3,7 @@ import { AUDIT_ALLOWANCES, parseAllow, validateAllow } from "../core/allow.ts";
 import { assertExistingBranchDelivery } from "../core/delivery.ts";
 import type {
   ArtifactMeta,
+  AuthSession,
   ChatMessage,
   ChatOrigin,
   ChatProposal,
@@ -54,6 +55,8 @@ type GitHubFeedInput = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "d
 const toFeedItem = (r: Row) => ({ ...r, data: parse(r.data, {}) }) as FeedItem;
 /** The highest id retention has removed, so a cursor before it is told items were pruned. */
 const FEED_PRUNED = "feed_pruned_through";
+const AUTH_SESSION_SELECT =
+  "SELECT id, method, device, created_at AS createdAt, last_seen_at AS lastSeenAt FROM auth_sessions";
 
 function parse<T>(v: unknown, fallback: T): T {
   if (typeof v !== "string") return fallback;
@@ -1756,5 +1759,41 @@ export class Store {
 
   setProviderEnabledOverride(id: string, enabled: boolean): void {
     this.setSetting(`provider_enabled:${id}`, enabled);
+  }
+
+  // ---- UI sign-in sessions -------------------------------------------------
+
+  createAuthSession(tokenHash: string, method: AuthSession["method"], device: string, now: number) {
+    const session: AuthSession = { id: newId("ses-"), method, device, createdAt: now, lastSeenAt: now };
+    this.db
+      .query(
+        "INSERT INTO auth_sessions (id, token_hash, method, device, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(session.id, tokenHash, method, device, now, now);
+    return session;
+  }
+
+  authSession(tokenHash: string): AuthSession | null {
+    return this.db.query(`${AUTH_SESSION_SELECT} WHERE token_hash = ?`).get(tokenHash) as AuthSession | null;
+  }
+
+  touchAuthSession(id: string, now: number): void {
+    this.db.query("UPDATE auth_sessions SET last_seen_at = ? WHERE id = ?").run(now, id);
+  }
+
+  listAuthSessions(): AuthSession[] {
+    return this.db.query(`${AUTH_SESSION_SELECT} ORDER BY last_seen_at DESC`).all() as AuthSession[];
+  }
+
+  /** Revokes one session, or every session without an id; returns how many were removed. */
+  revokeAuthSessions(id?: string): number {
+    if (id === undefined) return this.db.query("DELETE FROM auth_sessions").run().changes;
+    return this.db.query("DELETE FROM auth_sessions WHERE id = ?").run(id).changes;
+  }
+
+  expireAuthSessions(createdBefore: number, seenBefore: number): number {
+    return this.db
+      .query("DELETE FROM auth_sessions WHERE created_at <= ? OR last_seen_at <= ?")
+      .run(createdBefore, seenBefore).changes;
   }
 }
