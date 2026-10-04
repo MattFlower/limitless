@@ -93,10 +93,24 @@ export const GateComparisonSchema = z.strictObject({
 });
 /** `snapshot: true` gives the candidate neutral commits of the pinned trees without `evals/`. */
 const repositoryCase = { id: nonempty, repo: repoId, base: pin, head: pin, snapshot: z.boolean().optional() };
+const reviewKind = z.enum(["real", "clean", "seeded"]);
 export const ReviewCaseSchema = z
   .strictObject({
     ...repositoryCase,
-    kind: z.enum(["real", "clean", "seeded"]),
+    kind: reviewKind,
+    labelHistory: z
+      .array(
+        z.strictObject({
+          from: reviewKind,
+          to: reviewKind,
+          on: z.iso.date(),
+          rule: nonempty,
+          by: nonempty,
+          evidence: nonempty,
+        }),
+      )
+      .min(1)
+      .optional(),
     source: z.string(),
     input: z.strictObject({
       prompt: nonempty,
@@ -129,6 +143,20 @@ export const ReviewCaseSchema = z
       .optional(),
   })
   .superRefine((item, ctx) => {
+    for (const [index, entry] of (item.labelHistory ?? []).entries()) {
+      if (index > 0 && entry.from !== item.labelHistory?.[index - 1]?.to)
+        ctx.addIssue({
+          code: "custom",
+          path: ["labelHistory", index, "from"],
+          message: "broken label history chain",
+        });
+      if (index === (item.labelHistory?.length ?? 0) - 1 && entry.to !== item.kind)
+        ctx.addIssue({
+          code: "custom",
+          path: ["labelHistory", index, "to"],
+          message: "label history must end at current kind",
+        });
+    }
     // Snapshot mode strips the top-level evals/ directory, so the candidate could never see these.
     for (const [index, defect] of item.defects.entries())
       if (item.snapshot && /^(\.\/)*evals(\/|$)/.test(defect.file))

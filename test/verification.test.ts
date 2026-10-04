@@ -11,12 +11,14 @@ import {
   requirementCitationIssue,
   requirementEntries,
   requirementSource,
+  rowKind,
   type Spec,
+  SpecSchema,
   toStrictJsonSchema,
   type Verify,
   VerifySchema,
 } from "../src/pipeline/schemas.ts";
-import { blockedOnly, normalizeVerify } from "../src/pipeline/verification.ts";
+import { blockedOnly, normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
 
 const spec: Spec = {
   summary: "test",
@@ -147,10 +149,17 @@ test("verifier asks for a public behavior summary and accepts an empty one", () 
 });
 
 test("private feedback uses only sanitized summaries while public evidence stays actionable", () => {
+  const publicDiagnostic =
+    'assertion failed at src/code.ts:12: parseInput returned 42 instead of 500 with --verbose "enabled"';
   const feedback = formatVerifyFeedback(
     {
       criteria: [
-        { id: "AC-1", status: "unmet", evidence: "assertion failed at code.ts:12", publicSummary: "" },
+        {
+          id: "AC-1",
+          status: "unmet",
+          evidence: `${publicDiagnostic}; secret input privateCanary_731`,
+          publicSummary: "secret input privateCanary_731",
+        },
         {
           id: "H-1",
           status: "unmet",
@@ -162,11 +171,14 @@ test("private feedback uses only sanitized summaries while public evidence stays
       notes: "",
     },
     spec,
-    holdout,
+    {
+      scenarios: holdout.scenarios.map((s) => ({ ...s, description: "Private scenario privateCanary_731" })),
+    },
   );
   expect(feedback).toContain("works");
-  expect(feedback).toContain("assertion failed at code.ts:12");
+  expect(feedback).toContain(publicDiagnostic);
   expect(feedback).toContain("H-1** private scenario (unmet): rejects valid input when the list is empty");
+  expect(feedback).not.toContain("privateCanary_731");
   expect(feedback).not.toContain("secret input");
   expect(feedback).not.toContain("returned wrong result");
   const unclear = formatVerifyFeedback(
@@ -657,7 +669,17 @@ test("feedback for several ungrounded holdouts states the fallback once and omit
     overall: "fail",
     notes: "",
   };
-  const feedback = formatVerifyFeedback(verify, spec, holdout, request, request);
+  const knownHoldouts = {
+    scenarios: verify.criteria.map((c) => ({
+      ...holdout.scenarios[0],
+      id: c.id,
+      description: "private",
+      steps: "secret input",
+      expected: "ok",
+      edge_case: true,
+    })),
+  };
+  const feedback = formatVerifyFeedback(verify, spec, knownHoldouts, request, request);
   expect(feedback.split("(the verifier's citation was not found in it)").length - 1).toBe(4);
   expect(feedback.split("REQUEST_BODY_MARKER").length - 1).toBeLessThanOrEqual(1);
   expect(feedback.split("check them against the original request and specification above").length - 1).toBe(
@@ -759,3 +781,109 @@ test("feedback names the violated public requirement and omits not_required hold
   }
   expect(feedback({ requirement: "not_required" })).toBe("");
 });
+
+test("spec criterion ids are exactly AC-n", () => {
+  for (const id of ["AC-1", "AC-12", "H-1", "unknown", "AC-1 secret", "AC-1\n", "xAC-1", "AC-"]) {
+    const parsed = SpecSchema.safeParse({
+      ...spec,
+      acceptance_criteria: [{ ...spec.acceptance_criteria[0], id }],
+    });
+    expect(parsed.success).toBe(id === "AC-1" || id === "AC-12");
+  }
+});
+
+test.each(["H-1", "h-1", " H-1 "])(
+  "legacy collision %s and unknown ids never expose private rows in artifacts or feedback",
+  (legacyId) => {
+    const legacy = {
+      ...spec,
+      acceptance_criteria: [
+        ...spec.acceptance_criteria,
+        { id: legacyId, criterion: "legacy", how_to_verify: "inspect" },
+      ],
+    };
+    expect(rowKind(legacyId, legacy, holdout)).toBe("holdout");
+    expect(rowKind("H-1", legacy, holdout)).toBe("holdout");
+    expect(rowKind("ac-1", legacy, holdout)).toBe("public");
+    expect(rowKind(" AC-1 ", legacy, holdout)).toBe("public");
+    expect(
+      rowKind(
+        "AC-1",
+        { ...spec, acceptance_criteria: spec.acceptance_criteria.map((c) => ({ ...c, id: " ac-1 " })) },
+        holdout,
+      ),
+    ).toBe("public");
+    expect(rowKind("AC-1", spec, { scenarios: holdout.scenarios.map((c) => ({ ...c, id: " ac-1 " })) })).toBe(
+      "holdout",
+    );
+    expect(
+      rowKind(
+        "X-9",
+        { ...legacy, acceptance_criteria: [{ id: "X-9", criterion: "legacy", how_to_verify: "inspect" }] },
+        holdout,
+      ),
+    ).toBe("unknown");
+    const privateText = "secret input PrivateEvidence_931";
+    const verify: Verify = {
+      overall: "fail",
+      notes: "",
+      criteria: [
+        { id: "AC-1", status: "unmet", evidence: "public evidence at code.ts:12", publicSummary: "" },
+        {
+          id: legacyId,
+          status: "unmet",
+          evidence: privateText,
+          publicSummary: privateText,
+          requirementCitation: privateText,
+        },
+        {
+          id: "X-9",
+          status: "unclear",
+          evidence: "arbitrary private prose",
+          publicSummary: "arbitrary private prose",
+          requirementCitation: "arbitrary private prose",
+        },
+        {
+          id: "H-1 secret",
+          status: "unmet",
+          evidence: privateText,
+          publicSummary: privateText,
+          requirement: "spec",
+          requirementCitation: privateText,
+        },
+        {
+          id: "",
+          status: "unclear",
+          evidence: "arbitrary private prose",
+          publicSummary: "arbitrary private prose",
+        },
+      ],
+    };
+    const artifact = preDeliveryVerifyArtifact(
+      { ...verify, modelId: "fake", round: 0, attempt: 0 },
+      legacy,
+      holdout,
+      "",
+    );
+    const rows = JSON.parse(artifact) as Verify;
+    expect(rows.criteria.map((c) => c.id)).toEqual(["AC-1", legacyId, "unknown-3", "unknown-4", "unknown-5"]);
+    for (const row of rows.criteria.slice(2)) {
+      expect(row.evidence).toBe("");
+      expect(row.publicSummary).toBe("");
+      expect(row.requirementCitation).toBe("");
+    }
+    const feedback = formatVerifyFeedback(verify, legacy, holdout);
+    for (const output of [artifact, feedback]) {
+      expect(output).toContain("public evidence at code.ts:12");
+      for (const secret of [
+        "secret input",
+        "PrivateEvidence_931",
+        "H-1 secret",
+        "arbitrary private prose",
+        "X-9",
+      ])
+        expect(output).not.toContain(secret);
+      expect(output).toContain("unknown-");
+    }
+  },
+);
