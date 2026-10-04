@@ -558,7 +558,12 @@ async function blobPrivateEntries(
   blob: string,
   privateStrings: PrivateStrings,
 ): Promise<number[]> {
-  const child = spawn("git", ["cat-file", "blob", blob], { cwd, env: env ?? process.env, stdio: "pipe" });
+  // Inspect the object that will be published, never a local replacement.
+  const child = spawn("git", ["--no-replace-objects", "cat-file", "blob", blob], {
+    cwd,
+    env: env ?? process.env,
+    stdio: "pipe",
+  });
   child.stdin.end();
   child.stderr.resume();
   const exited = new Promise<number | null>((done, fail) => {
