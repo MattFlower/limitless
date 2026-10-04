@@ -69,7 +69,7 @@ function spec(cwd: string, scratchDir: string, mode: AgentSpec["mode"]): AgentSp
 function substitute(env: Record<string, string>, calls: string[][] = []): typeof runProcess {
   return (opts: ProcOptions) => {
     calls.push(opts.cmd);
-    const cli = opts.cmd.findIndex((arg) => arg === "claude" || arg === "codex-substitute");
+    const cli = opts.cmd.findIndex((arg) => ["claude", "codex", "codex-substitute"].includes(arg));
     return runProcess({
       ...opts,
       env: { ...opts.env, ...env },
@@ -88,6 +88,32 @@ function codexProbe() {
   });
   return probe;
 }
+
+test("offline substitutes cover default readers without starting installed CLIs", async () => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "signal-substitute-")));
+  try {
+    await withScratch(cwd, async (scratch) => {
+      const started = join(scratch, "started");
+      for (const launch of [
+        runClaude,
+        (s: AgentSpec, r: typeof runProcess) => runCodex(s, r, codexProbe()),
+      ]) {
+        const { backend } = recordingConfinement();
+        rmSync(started, { force: true });
+        const result = await confinementScope.run(backend, () =>
+          launch(
+            spec(cwd, scratch, "readonly"),
+            substitute({ SIGNAL_STARTED: started, SIGNAL_HANDSHAKE_ONLY: "1" }),
+          ),
+        );
+        expect(existsSync(started)).toBe(true);
+        expect(result.status).toBe("ok");
+      }
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test("offline adapters and gates protect outside/sibling markers or explicitly refuse before payload", async () => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "signal-smoke-")));
@@ -111,42 +137,47 @@ test("offline adapters and gates protect outside/sibling markers or explicitly r
         SIGNAL_OUTSIDE: String(outside.pid),
         SIGNAL_SIBLING: String(sibling?.pid ?? outside.pid),
       };
-      const paths: [string, () => Promise<unknown>][] = [];
+      const paths: [string, string, () => Promise<unknown>][] = [];
       for (const mode of ["edit", "readonly"] as const) {
         for (const confineReads of mode === "readonly" ? [false, true] : [false]) {
           const invocation = { ...spec(cwd, scratch, mode), confineReads };
           paths.push([
             `claude ${mode} confineReads=${confineReads}`,
+            started,
             () => runClaude(invocation, substitute(env)),
           ]);
           paths.push([
             `codex ${mode} confineReads=${confineReads}`,
+            started,
             () => runCodex(invocation, substitute(env), codexProbe()),
           ]);
         }
       }
+      // Gates own a different scratch; their handshake belongs in their writable checkout.
+      const gateStarted = join(cwd, "gate-started");
       paths.push([
         "gate",
+        gateStarted,
         () =>
           runConfined({
             cwd,
-            env: agentEnv(env),
+            env: agentEnv({ ...env, SIGNAL_STARTED: gateStarted }),
             command: `"${process.execPath}" "${payload}"`,
             timeoutMs: 5000,
           }),
       ]);
-      for (const [name, launch] of paths) {
-        rmSync(started, { force: true });
+      for (const [name, handshake, launch] of paths) {
+        rmSync(handshake, { force: true });
         try {
           const result = await launch();
           expect(refusal).toBeUndefined();
-          expect(existsSync(started)).toBe(true);
+          expect(existsSync(handshake)).toBe(true);
           expect(JSON.stringify(result)).toMatch(/owned-terminated|"status":"ok"/);
           console.log(`${name}: OS signal enforcement exercised`);
         } catch (error) {
           expect(error).toBeInstanceOf(ConfinementError);
           expect(String(error)).toMatch(/signal confinement/i);
-          expect(existsSync(started)).toBe(false);
+          expect(existsSync(handshake)).toBe(false);
           console.log(`${name}: confinement refused; OS enforcement not exercised`);
         }
         expect(alive(outside)).toBe(true);

@@ -110,7 +110,20 @@ and repair already share `implementPrompt`; both retain the shared-machine rule.
 
 The production delta stays below 250 added plus deleted lines, including the new detector
 and additive SQL migration, excluding this document, tests, fixtures and probes.
-Count tracked changes with `git diff --numstat HEAD -- src ui`; before staging,
-also count lines in new files from `git ls-files --others --exclude-standard src ui`.
+Count tracked changes against the implementation base instead of HEAD:
+`git diff --numstat 50e74bfd1831592896d03da21b2c49fe1cfcc4e5 -- src ui`.
+The current total is 240 added plus deleted production lines, including SQL.
 No authenticated live-model smoke was run. Effective OS enforcement and CLI
 compatibility still need the optional unrestricted-host validation described above.
+
+The follow-up worker repeated the offline target probe: all eight launches still
+refuse with exit 71 before their payload starts. The smoke now gives gates their
+own startup marker in the test checkout: an invocation's earlier scratch is outside
+the gate's write allowance. The substitute also recognizes the plain `codex`
+executable used by default readers, with a harmless launch regression test, so
+offline acceptance never falls through to an installed CLI. Both reported smoke
+regressions pass in focused testing and in `LIMITLESS_CONFINED=1 bun run check`:
+1,995 passed, 12 existing environment-dependent skips, zero failures. Frozen
+installation, lint and typecheck also pass. The marker uses the repository's
+existing confined-gate test behavior; no skip condition was added or weakened.
+Effective OS enforcement remains unexercised.

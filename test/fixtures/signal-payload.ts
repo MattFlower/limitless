@@ -6,6 +6,12 @@ import { writeFileSync } from "node:fs";
 if (process.argv[2] === "marker") {
   console.log("ready");
   setTimeout(() => process.exit(0), 20_000);
+} else if (process.env.SIGNAL_HANDSHAKE_ONLY === "1") {
+  const started = process.env.SIGNAL_STARTED;
+  if (!started) throw new Error("missing handshake path");
+  writeFileSync(started, "started");
+  console.log('{"type":"result","subtype":"success","result":"handshake"}');
+  console.log('{"type":"turn.completed","usage":{}}');
 } else {
   const marker = process.env.SIGNAL_MARKER;
   const started = process.env.SIGNAL_STARTED;
