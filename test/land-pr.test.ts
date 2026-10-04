@@ -27,6 +27,7 @@ describe("land-pr private strings", () => {
     "clean",
     "history",
     "message",
+    "author-email",
     "head-ref",
     "encoded",
     "malformed",
@@ -87,6 +88,22 @@ describe("land-pr private strings", () => {
         await git("-C", work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message);
         expectedHead = (await git("-C", work, "rev-parse", "HEAD")).stdout.trim();
       };
+      if (scenario === "author-email") {
+        await git("-C", work, "add", ".");
+        await git(
+          "-C",
+          work,
+          "-c",
+          "user.name=t",
+          "-c",
+          "user.email=t@t",
+          "commit",
+          "--author=Fake <fake@secret-host.example>",
+          "-qm",
+          "safe",
+        );
+        expectedHead = (await git("-C", work, "rev-parse", "HEAD")).stdout.trim();
+      }
       if (["history", "message"].includes(scenario)) {
         writeFileSync(join(work, "transient.txt"), scenario === "history" ? entry : "safe");
         await commit(scenario === "message" ? `Safe subject\n\n${entry}` : "safe");
@@ -157,6 +174,7 @@ describe("land-pr private strings", () => {
       });
       expect(result.exitCode).not.toBe(0);
       expect(`${result.stdout}${result.stderr}`.toLowerCase()).not.toContain(entry);
+      if (scenario === "author-email") expect(result.stderr).toContain("author email");
       if (!["post-commit", "destination"].includes(scenario))
         expect((await git("-C", work, "rev-parse", "HEAD")).stdout.trim()).toBe(expectedHead);
       if (["absent", "clean", "excluded"].includes(scenario)) {

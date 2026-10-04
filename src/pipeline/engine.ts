@@ -1890,7 +1890,14 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     let summary = `PR ${url}`;
     if (policy === "auto") {
       ctx.checkCancelled();
-      const outcome = await mergePullRequest(url, cwd, ctx.run.title, ctx.signal, budget);
+      const outcome = await mergePullRequest(
+        url,
+        cwd,
+        ctx.run.headSha as string,
+        ctx.signal,
+        budget,
+        privateEntries(ctx, cwd),
+      );
       if (outcome === "merged") ctx.run = ctx.store.updateRun(ctx.run.id, { merged: true });
       summary += ` — ${outcome === "merged" ? "merged" : outcome === "auto" ? "auto-merge enabled" : `merge failed (left open)${outcome === "unavailable" ? ": GitHub unavailable" : ""}`}`;
       ctx.log(summary, outcome === "failed" || outcome === "unavailable" ? "warn" : "info");

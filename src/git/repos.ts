@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { z } from "zod";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
@@ -595,8 +596,15 @@ async function lfsPayload(cwd: string, env: Record<string, string> | undefined, 
   throw new privacy.PrivateError("Cannot inspect local LFS payload; publication blocked");
 }
 
-/** Checks each published commit's message and patch (and optionally the index), not the net diff. */
+/** Checks published identities, messages and patches (and optionally the index), not the net diff. */
 export async function checkPrivateRange(cwd: string, range: string, entries: PrivateStrings, staged = false) {
+  const identities = await worktreeGit(["git", "log", "-z", "--format=%an%x00%ae%x00%cn%x00%ce", range], {
+    cwd,
+  });
+  const fields = ["author name", "author email", "committer name", "committer email"];
+  identities.stdout.split("\0").forEach((value, i) => {
+    privacy.checkPrivateText(value, `Published commit ${fields[i % 4]}`, entries);
+  });
   const flags = "--raw -z --no-abbrev -p --text --no-renames -U0 --ignore-submodules=none".split(" ");
   const blobs: string[] = [];
   for (const args of [["log", "-m", "--format=%B", range], ...(staged ? [["diff", "--cached"]] : [])]) {
@@ -1063,16 +1071,17 @@ export async function findPullRequest(
 export async function mergePullRequest(
   prUrl: string,
   cwd: string,
-  title?: string,
+  sha: string,
   signal?: AbortSignal,
   budget?: GitHubBudget,
+  entries: PrivateStrings = privacy.loadPrivateStrings(undefined, [cwd]),
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
   // Squash with the PR title as the subject, not the first round's commit message.
   const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
-  const subject = title ? ["--subject", number ? `${title} (#${number})` : title] : [];
   // After a transient failure or timeout the merge may still have landed. Until a state lookup
   // settles that, every attempt reconciles first; a failed lookup retries like any other call.
   let unsure = false;
+  let blocked = false;
   const landed = async () => {
     const view = ["gh", "pr", "view", prUrl, "--json", "state", "--jq", ".state"];
     const merged = (await sh(view, { cwd, signal })).stdout.trim() === "MERGED";
@@ -1083,6 +1092,15 @@ export async function mergePullRequest(
     withGitHubRetry(
       async () => {
         if (unsure && (await landed())) return "merged" as const;
+        blocked = true;
+        const view = ["gh", "pr", "view", prUrl, "--json", "title,body,headRefOid"];
+        const schema = z.object({ title: z.string().min(1), body: z.string(), headRefOid: z.string() });
+        const data = schema.parse(JSON.parse((await sh(view, { cwd, signal })).stdout));
+        if (!/^[a-f0-9]{40,64}$/.test(sha) || data.headRefOid !== sha) throw new Error("PR head moved");
+        privacy.checkPrivateText(`${data.title}\n${data.body}`, "PR text", entries);
+        blocked = false;
+        const title = number ? `${data.title} (#${number})` : data.title;
+        const subject = ["--subject", title, "--body", data.body, "--match-head-commit", sha];
         const cmd = ["gh", "pr", "merge", prUrl, "--squash", ...extra, "--delete-branch", ...subject];
         return sh(cmd, { cwd, signal }).then(
           () => "ok" as const,
@@ -1101,6 +1119,7 @@ export async function mergePullRequest(
     });
   const now = await merge([]);
   if (now === "ok" || now === "merged") return "merged";
+  if (blocked) return "failed";
   // As on main, fall back to auto-merge; it shares the budget and reconciles an unsure merge first.
   const auto = await merge(["--auto"]);
   if (auto === "merged") return "merged";

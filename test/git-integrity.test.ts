@@ -1752,6 +1752,31 @@ test("UTF-16 source content remains blocked", async () => {
   );
 });
 
+test.each([
+  ["GIT_AUTHOR_NAME", "author name"],
+  ["GIT_AUTHOR_EMAIL", "author email"],
+  ["GIT_COMMITTER_NAME", "committer name"],
+  ["GIT_COMMITTER_EMAIL", "committer email"],
+])("publication checks %s even after its changes are removed", async (variable, field) => {
+  const config = join(dir, "config");
+  mkdirSync(config);
+  writeFileSync(join(config, "private-strings.txt"), "secret-host.example");
+  writeFileSync(join(work, "transient.txt"), "safe");
+  await git(work, "add", ".");
+  await sh(["git", "commit", "-qm", "safe"], {
+    cwd: work,
+    env: { ...(process.env as Record<string, string>), [variable]: "secret-host.example" },
+  });
+  rmSync(join(work, "transient.txt"));
+  await commitAll(work, "remove transient");
+  const error = await checkPrivateRange(work, `${base}..HEAD`, loadPrivateStrings(config)).catch(
+    (error: unknown) => error,
+  );
+  expect(error).toBeInstanceOf(Error);
+  expect(String(error)).toContain(field);
+  expect(String(error)).not.toContain("secret-host.example");
+});
+
 test.each(["patch", "message", "merge", "excluded"])("publication range checks %s", async (scenario) => {
   const entries = [{ value: "secret-host.example", entry: 1 }];
   writeFileSync(

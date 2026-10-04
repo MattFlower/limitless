@@ -1218,7 +1218,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       `#!/bin/sh
 echo "$*" >> '${calls}'
 case "$1 $2" in
-  'pr view') echo '{"state":"'"$(cat '${stateFile}')"'","url":"${url}"}' ;;
+  'pr view') echo '{"state":"'"$(cat '${stateFile}')"'","url":"${url}","title":"Add farewell","body":"Safe body","headRefOid":"'"$(git rev-parse HEAD)"'"}' ;;
   'pr list') if [ -f '${stateFile}' ]; then
     if [ "$*" = "pr list --repo test/repo --head $6 --state all --json state,url" ]; then
       echo '[{"state":"'"$(cat '${stateFile}')"'","url":"${url}"}]'
@@ -2437,6 +2437,7 @@ esac
     "draft-history",
     "lfs-history",
     "cache-config",
+    "author-email",
   ])("private strings stop %s delivery before any push", async (scenario) => {
     const bare = await githubFixture();
     const entry = scenario === "branch" ? "secret-host-example" : "secret-host.example";
@@ -2509,12 +2510,30 @@ esac
           cwd: s.cwd,
         });
       }
-      if (scenario === "commit") {
+      if (["commit", "author-email"].includes(scenario)) {
         writeFileSync(join(s.cwd, "farewell.txt"), "goodbye\n");
         await sh(["git", "add", "."], { cwd: s.cwd });
-        await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", entry.toUpperCase()], {
-          cwd: s.cwd,
-        });
+        await sh(
+          [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            scenario === "commit" ? entry.toUpperCase() : "safe",
+          ],
+          {
+            cwd: s.cwd,
+            env: {
+              ...process.env,
+              ...(scenario === "author-email"
+                ? { GIT_AUTHOR_NAME: "Fake", GIT_AUTHOR_EMAIL: `fake@${entry}` }
+                : {}),
+            },
+          },
+        );
       }
       return {
         files: { "farewell.txt": "goodbye\n" },
@@ -2546,6 +2565,7 @@ esac
     expect(f.store.getRun(run.id)?.prUrl).toBeNull();
     const error = f.store.getRun(run.id)?.error ?? "";
     expect(error.toLowerCase()).not.toContain(entry);
+    if (scenario === "author-email") expect(error).toContain("author email");
     if (scenario === "cache-config") expect(error).toContain("inside repository");
     else if (scenario !== "unreadable") expect(error).toContain("entry 1 in private-strings.txt");
     calls.push(
