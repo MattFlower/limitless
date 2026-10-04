@@ -17,7 +17,6 @@ import { now } from "../lib/ticker.ts";
 
 type Detail = Awaited<ReturnType<typeof getRunDetail>>;
 type Kind = "done_elsewhere" | "superseded" | "wont_do";
-
 const QuestionCard: Component<{ runId: string; question: Question }> = (props) => {
   const [text, setText] = createSignal("");
   const [busy, setBusy] = createSignal(false);
@@ -206,13 +205,11 @@ export const RunDetail: Component = () => {
       else if (action === "copy")
         await navigator.clipboard.writeText(`${details()?.worktreePath}\n${run()?.branch ?? ""}`);
       else
-        setRun(
-          await resolveRun(params.id, {
-            kind: kind(),
-            ref: ref().trim() || undefined,
-            note: note().trim() || undefined,
-          }),
-        );
+        await resolveRun(params.id, {
+          kind: kind(),
+          ref: ref().trim() || undefined,
+          note: note().trim() || undefined,
+        }).then(setRun);
     } catch (e) {
       setActionError((e as Error).message);
     } finally {
@@ -409,7 +406,6 @@ export const RunDetail: Component = () => {
                 </Show>
               </section>
             </Show>
-
             <For each={openQuestions()}>{(q) => <QuestionCard runId={params.id} question={q} />}</For>
 
             <OriginalPrompt prompt={r().prompt} />

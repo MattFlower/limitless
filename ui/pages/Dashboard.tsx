@@ -1,5 +1,5 @@
 import type { Component } from "solid-js";
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import type { Stats } from "../../src/db/stats.ts";
 import { getStats } from "../api.ts";
 import { CostCell } from "../components/CostCell.tsx";
@@ -17,9 +17,11 @@ export const Dashboard: Component = () => {
   const [now, setNow] = createSignal(Date.now());
   const [statusFilter, setStatusFilter] = createSignal<RunFilter | null>(null);
 
+  let statsRequest = 0;
   const refreshStats = () => {
+    const request = ++statsRequest;
     getStats(14)
-      .then(setStats)
+      .then((next) => request === statsRequest && setStats(next))
       .catch(() => {});
   };
   onMount(() => {
@@ -33,10 +35,10 @@ export const Dashboard: Component = () => {
   });
 
   const runs = createMemo(() => Object.values(live.runs).sort((a, b) => b.createdAt - a.createdAt));
-  createEffect(() => {
-    runs();
-    refreshStats();
-  });
+  const needsYouCount = createMemo(
+    () => runs().filter((r) => matchesRunFilter(r.status, "needs_you")).length,
+  );
+  createEffect(on(needsYouCount, refreshStats, { defer: true }));
   const filteredRuns = createMemo(() => {
     const f = statusFilter();
     return f ? runs().filter((r) => matchesRunFilter(r.status, f)) : runs();
