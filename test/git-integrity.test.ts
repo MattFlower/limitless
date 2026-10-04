@@ -1,6 +1,15 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadConfig } from "../src/config.ts";
@@ -26,6 +35,7 @@ import {
   sweepClassificationScratch,
 } from "../src/git/repos.ts";
 import { sh } from "../src/util/proc.ts";
+import { gitSeed } from "./git-seed.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
@@ -39,19 +49,25 @@ const edited = 'test.skip("ok", () => {});\n';
 const git = (cwd: string, ...args: string[]) => sh(["git", ...args], { cwd });
 const factory = (...args: string[]) => worktreeGit(["git", ...args], { cwd: work });
 
+const seeded = gitSeed(async (repo) => {
+  await git(repo, "init", "-q", "-b", "main");
+  await git(repo, "config", "user.name", "Test");
+  await git(repo, "config", "user.email", "test@example.com");
+  for (const file of ["sample.test.ts", "flag.test.ts", "assume.test.ts"])
+    writeFileSync(join(repo, file), original);
+  await git(repo, "add", "-A");
+  await git(repo, "commit", "-qm", "base");
+  return (await git(repo, "rev-parse", "HEAD")).stdout.trim();
+});
+
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "git-integrity-"));
   seed = join(dir, "seed");
   work = join(dir, "work");
-  mkdirSync(seed);
-  await git(seed, "init", "-q", "-b", "main");
-  await git(seed, "config", "user.name", "Test");
-  await git(seed, "config", "user.email", "test@example.com");
-  for (const file of ["sample.test.ts", "flag.test.ts", "assume.test.ts"])
-    writeFileSync(join(seed, file), original);
-  await git(seed, "add", "-A");
-  await git(seed, "commit", "-qm", "base");
-  base = (await git(seed, "rev-parse", "HEAD")).stdout.trim();
+  const template = await seeded();
+  cpSync(template.dir, seed, { recursive: true });
+  base = template.value;
+  // Linked worktrees record absolute paths, so each copy adds its own.
   await git(seed, "worktree", "add", "-qb", "worker", work, base);
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -9,6 +9,7 @@ import type { AgentSpec } from "../src/harness/types.ts";
 import type { Triage } from "../src/pipeline/schemas.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
+import { gitSeed } from "./git-seed.ts";
 
 export const answer: Triage = {
   title: "Example",
@@ -48,16 +49,9 @@ export const verifierModel: ModelDef = {
   supportedEfforts: [],
   price: { input: 1, output: 1 },
 };
-export async function evalFixture(
-  extraModels: ModelDef[] = [],
-  extraProviders: ProviderDef[] = [],
-  policy?: Policy,
-) {
-  const home = mkdtempSync(join(tmpdir(), "limitless-eval-"));
-  const cfg = loadConfig({ home, configDir: join(home, "config") });
-  cfg.secrets = {};
-  cfg.openrouterBudgetUsd = 100;
-  const source = join(home, "source");
+/** The pinned commit, a later one, and a bare clone standing in for the factory's repo cache. */
+const repoSeed = gitSeed(async (dir) => {
+  const source = join(dir, "source");
   mkdirSync(source);
   const git = (args: string[]) => sh(["git", ...args], { cwd: source });
   await git(["init", "-q"]);
@@ -71,9 +65,32 @@ export async function evalFixture(
   writeFileSync(join(source, "CURRENT.txt"), "new");
   await git(["add", "-A"]);
   await git(["commit", "-qm", "current"]);
+  await git(["clone", "-q", "--bare", source, join(dir, "cache")]);
+  return sha;
+});
+export async function evalFixture(
+  extraModels: ModelDef[] = [],
+  extraProviders: ProviderDef[] = [],
+  policy?: Policy,
+) {
+  const home = mkdtempSync(join(tmpdir(), "limitless-eval-"));
+  const cfg = loadConfig({ home, configDir: join(home, "config") });
+  cfg.secrets = {};
+  cfg.openrouterBudgetUsd = 100;
+  const source = join(home, "source");
   const cache = join(cfg.paths.repos, "fixture__repo.git");
-  mkdirSync(cfg.paths.repos, { recursive: true });
-  await git(["clone", "--bare", source, cache]);
+  const seed = await repoSeed();
+  cpSync(join(seed.dir, "source"), source, { recursive: true });
+  cpSync(join(seed.dir, "cache"), cache, { recursive: true });
+  // The bare clone's origin is the seed; fetches of later pins must reach this fixture's source.
+  const config = readFileSync(join(cache, "config"), "utf8");
+  const origin = /^(\s*url = ).*$/m;
+  if (!origin.test(config)) throw new Error("seeded cache has no origin url");
+  writeFileSync(
+    join(cache, "config"),
+    config.replace(origin, (_, key: string) => key + source),
+  );
+  const sha = seed.value;
   const dataset: CaseFile = {
     role: "triage",
     version: 1,

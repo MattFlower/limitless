@@ -237,12 +237,13 @@ test("the CLI binary waits through empty pages and prints parseable JSON", async
   }
 });
 
-test("the CLI binary retries two 5xx responses and then prints items", async () => {
+// The backoff sequence is covered with an injected clock above; one real 1 s retry proves the wiring.
+test("the CLI binary retries a 5xx response and then prints items", async () => {
   let calls = 0;
   const server = Bun.serve({
     port: 0,
     fetch: () =>
-      ++calls <= 2
+      ++calls === 1
         ? Response.json({ error: "restarting" }, { status: 503 })
         : Response.json({ items: [feedItem(1)], nextAfter: 1, pruned: false }),
   });
@@ -260,7 +261,7 @@ test("the CLI binary retries two 5xx responses and then prints items", async () 
     ]);
     expect({ exit, stderr }).toEqual({ exit: 0, stderr: "" });
     expect(JSON.parse(stdout)).toEqual({ items: [feedItem(1)], nextAfter: 1, pruned: false });
-    expect(calls).toBe(3);
+    expect(calls).toBe(2);
   } finally {
     server.stop();
   }
