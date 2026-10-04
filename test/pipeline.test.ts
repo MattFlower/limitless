@@ -1517,7 +1517,11 @@ esac
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "deep" });
     const dbgStatus = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
     if (dbgStatus !== "succeeded")
-      console.log("DEBUG-RUN", JSON.stringify(f.store.getRun(run.id)?.error), JSON.stringify(f.store.listStages(run.id).map((st) => [st.name, st.status, st.error])));
+      console.log(
+        "DEBUG-RUN",
+        JSON.stringify(f.store.getRun(run.id)?.error),
+        JSON.stringify(f.store.listStages(run.id).map((st) => [st.name, st.status, st.error])),
+      );
     expect(dbgStatus).toBe("succeeded");
     expect(f.store.getArtifact(run.id, "diff.patch")).toContain("HEAD_FOCUS");
     const prompts = reviews.map((s) => s.prompt);
