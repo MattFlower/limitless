@@ -214,6 +214,23 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
     expect(providersLink?.props.href).toBe("/providers");
     expect(providersLink?.props.classList).toEqual({ active: true });
     expect(links[modelsIndex]?.props.classList).toEqual({ active: false });
+    await flush();
+    expect(nodes(nav).filter((n) => n.tag === "button")).toEqual([]);
+    dispose();
+    fixture.setAuthSession({
+      id: "ses-1",
+      method: "password",
+      device: "Browser",
+      createdAt: 0,
+      lastSeenAt: 0,
+    });
+    dispose = fixture.render(() => fixture.NavBar(), nav);
+    await flush();
+    expect(
+      nodes(nav)
+        .filter((n) => n.tag === "button")
+        .map(text),
+    ).toEqual(["Sign out", "Sign out everywhere"]);
   } finally {
     dispose();
     rmSync(dir, { recursive: true, force: true });

@@ -7,6 +7,7 @@ import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { runGh } from "../integrations/github.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
+import { Auth, CLEAR_SESSION, localPath, loginPage } from "./auth.ts";
 
 export interface HttpExtras {
   /** Extra routes contributed by integrations (webhooks, MCP). */
@@ -24,8 +25,11 @@ function sse(
   req: Request,
   server: Server<undefined>,
   subscribe: (send: (msg: unknown) => void) => () => void,
-  backlog?: unknown[],
-  eventId?: (msg: unknown) => number,
+  {
+    backlog = [],
+    eventId,
+    alive = () => true,
+  }: { backlog?: unknown[]; eventId?: (msg: unknown) => number; alive?: () => boolean } = {},
 ): Response {
   server.timeout(req, 0);
   let cleanup: (() => void) | null = null;
@@ -43,9 +47,11 @@ function sse(
       };
       // Flush headers right away so EventSource fires `open` before the first real message.
       controller.enqueue(encoder.encode(": connected\n\n"));
-      for (const m of backlog ?? []) send(m);
-      const unsubscribe = subscribe(send);
+      for (const m of backlog) send(m);
+      // A stream outlives the request that opened it, so it ends when its sign-in does.
+      const unsubscribe = subscribe((msg) => (alive() ? send(msg) : abort()));
       const keepAlive = setInterval(() => {
+        if (!alive()) return abort();
         try {
           controller.enqueue(encoder.encode(": ping\n\n"));
         } catch {
@@ -92,6 +98,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     `http://localhost:${port}`,
     new URL(factory.cfg.uiUrl).origin,
   ]);
+  const auth = new Auth(store, factory.cfg);
+  /** Requests admitted by a session cookie; their streams end with the session. */
+  const signedIn = new WeakSet<Request>();
+  const live = (req: Request) => () => !signedIn.has(req) || auth.session(req.headers) !== null;
   const handle =
     (
       fn: (
@@ -101,7 +111,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       localOnly = false,
     ) =>
     async (req: Request & { params: Record<string, string> }, server: Server<undefined>) => {
-      const path = new URL(req.url).pathname;
+      const url = new URL(req.url);
+      const path = url.pathname;
       const access = classifyRequest(
         server.requestIP(req)?.address ?? null,
         req.headers,
@@ -116,6 +127,19 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         (access === "proxy" && !publicHost(req.headers.get("host"), factory.cfg.publicOrigins))
       )
         return error("forbidden", 403);
+      if (
+        access === "proxy" &&
+        factory.cfg.auth === "required" &&
+        path !== "/login" &&
+        !path.startsWith("/webhooks/")
+      ) {
+        if (auth.session(req.headers)) signedIn.add(req);
+        else if (path.startsWith("/api/")) return error("sign-in required", 401);
+        else {
+          const next = encodeURIComponent(path + url.search);
+          return new Response(null, { status: 303, headers: { location: `/login?next=${next}` } });
+        }
+      }
       // Runs execute code, so a web page in the operator's browser must not be able to create or
       // control them (CSRF against localhost): mutations need a local Origin (or none, as from the
       // CLI) and a JSON body type, which cross-origin pages can't send without a CORS preflight.
@@ -134,7 +158,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         )
           return error("cross-origin request refused", 403);
         const type = req.headers.get("content-type") ?? "";
-        if (type.split(";")[0]?.trim().toLowerCase() !== "application/json") {
+        // The sign-in form is a plain HTML form so password managers can fill it; Origin still applies.
+        if (path !== "/login" && type.split(";")[0]?.trim().toLowerCase() !== "application/json") {
           return error("mutations require content-type: application/json", 415);
         }
       }
@@ -157,6 +182,13 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     }, true),
   });
 
+  const signOut = (req: Request, everywhere: boolean) => {
+    const id = auth.session(req.headers)?.id;
+    const revoked = everywhere ? store.revokeAuthSessions() : id ? store.revokeAuthSessions(id) : 0;
+    const headers = { "content-type": "application/json", "set-cookie": CLEAR_SESSION };
+    return new Response(JSON.stringify({ revoked }), { headers });
+  };
+
   const conversation = (req: Request & { params: Record<string, string> }) => {
     const id = req.params.conversationId ?? "";
     // Discord conversations are a separate transport namespace.
@@ -166,6 +198,28 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
   const routes: Record<string, unknown> = {
     "/api/admin/drain": admin("drain"),
     "/api/admin/resume": admin("resume"),
+    "/api/admin/auth/password": {
+      POST: handle(async (req) => {
+        await auth.setPassword((await body<{ password?: unknown }>(req)).password);
+        return json({ ok: true });
+      }, true),
+    },
+    "/api/admin/auth/sessions": { GET: handle(() => json(auth.sessions()), true) },
+    "/api/admin/auth/sessions/revoke": {
+      POST: handle(async (req) => {
+        const { id, all } = await body<{ id?: unknown; all?: unknown }>(req);
+        if (all === true) return json({ revoked: store.revokeAuthSessions() });
+        if (typeof id !== "string") throw new Error("pass a session id or all: true");
+        return json({ revoked: store.revokeAuthSessions(id) });
+      }, true),
+    },
+    "/login": {
+      GET: handle((req) => loginPage(localPath(new URL(req.url).searchParams.get("next")))),
+      POST: handle((req, server) => auth.passwordSignIn(req, server.requestIP(req)?.address ?? "")),
+    },
+    "/api/auth/session": handle((req) => json({ session: auth.session(req.headers) })),
+    "/api/auth/logout": { POST: handle((req) => signOut(req, false)) },
+    "/api/auth/logout-all": { POST: handle((req) => signOut(req, true)) },
     "/api/chat/:conversationId": {
       GET: handle((req) => json(factory.concierge.history(conversation(req)))),
     },
@@ -191,8 +245,11 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
           store.subscribe((msg) => {
             if (msg.kind === "chat" && msg.message.conversationId === id && msg.message.id > after) send(msg);
           }),
-        store.listChatMessages(id, after).map((message) => ({ kind: "chat", message })),
-        (msg) => (msg as import("../core/types.ts").ChatStreamMessage).message.id,
+        {
+          backlog: store.listChatMessages(id, after).map((message) => ({ kind: "chat", message })),
+          eventId: (msg) => (msg as import("../core/types.ts").ChatStreamMessage).message.id,
+          alive: live(req),
+        },
       );
     }),
     "/api/health": handle(() =>
@@ -348,14 +405,18 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
                         : null;
             if (id === runId) send(msg);
           }),
-        backlog,
+        { backlog, alive: live(req) },
       );
     }),
     "/api/stream": handle((req, server) =>
-      sse(req, server, (send) =>
-        store.subscribe((msg) => {
-          if (msg.kind !== "event" && msg.kind !== "chat") send(msg);
-        }),
+      sse(
+        req,
+        server,
+        (send) =>
+          store.subscribe((msg) => {
+            if (msg.kind !== "event" && msg.kind !== "chat") send(msg);
+          }),
+        { alive: live(req) },
       ),
     ),
     "/api/github/access": handle(() => json(store.githubAccessProblems())),

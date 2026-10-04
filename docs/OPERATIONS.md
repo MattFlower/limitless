@@ -298,6 +298,11 @@ fixed wired LAN IP and NPM's socket source IP):
 listen_lan = "10.0.0.10"
 trusted_proxies = ["10.0.0.20"]
 public_origins = ["https://limitless.example.test"]
+# auth = "required"    # default: proxied browsers sign in to Limitless; "proxy" leaves it to NPM
+
+[auth]
+# idle_days = 30       # a session unused this long ends
+# absolute_days = 180  # every session ends this long after sign-in
 ```
 
 Restart the daemon; allow incoming connections for Bun/Limitless if macOS displays its
@@ -308,12 +313,11 @@ operation. Do not use a wildcard address or change `server.host` to a LAN addres
 Create an NPM Proxy Host for your UI hostname (for example `limitless.example.test`), terminating TLS with the wildcard
 certificate and forwarding to `http://<mac>:7400`. Preserve the public `Host` header
 (`proxy_set_header Host $http_host;`), including any configured non-default port. Attach an
-Access List allowing only your LAN and WireGuard source ranges **and** requiring basic
-authentication. Disable NPM's “Satisfy Any” option so both checks are required; deny all
-other sources. This is essential if NPM also faces the internet: an internet client can
-send the expected Host, so hostname routing and the daemon's Host check alone do not
-restrict access. Test that a permitted source without credentials and a forbidden source
-with valid credentials are both rejected.
+Access List allowing only your LAN and WireGuard source ranges and denying all other sources.
+This is essential if NPM also faces the internet: an internet client can send the expected
+Host, so hostname routing and the daemon's Host check alone do not restrict access. With
+built-in sign-in (the default) the Access List needs no basic authentication; remove it if an
+older setup added it. Test that a forbidden source is rejected by NPM.
 
 In the proxy host's custom nginx configuration, disable buffering/caching for SSE and
 allow long-lived streams:
@@ -327,7 +331,36 @@ proxy_read_timeout 1h;
 The daemon trusts the proxy's socket IP for UI/API access (including SSE), never forwarded
 client-address headers. Proxy mutations require the configured public Origin and JSON.
 Administration (`/api/admin/*`, including drain/resume) and `/mcp` remain loopback-only;
-deploy remains a local CLI operation. Keep browser credentials and access controls at NPM.
-The backend hop is unencrypted HTTP: confine it to the small wired segment, whose hosts
-and the proxy must be trusted. Other LAN peers are refused by the daemon. Tunnel traffic
-remains webhook-only, and all webhook signature/source checks still apply.
+deploy remains a local CLI operation. The backend hop is unencrypted HTTP: confine it to the
+small wired segment, whose hosts and the proxy must be trusted. Other LAN peers are refused by
+the daemon. Tunnel traffic remains webhook-only, and all webhook signature/source checks still apply.
+
+### Signing in
+
+Requests through the proxy need a Limitless session; loopback requests (CLI, MCP, deploy,
+administration) never do. Without one, pages redirect to `/login` and API calls (SSE streams
+included) get 401. Set the password on the Mac:
+
+```bash
+limitless auth set-password                # prompts twice; never echoed or taken as an argument
+limitless auth sessions                    # id, method, last seen, signed in, browser
+limitless auth sessions revoke <id>        # or: revoke --all
+```
+
+The password is stored in the database as an argon2id hash. The login page is a plain form
+(username `limitless`, `autocomplete="username"` / `"current-password"`), so password managers
+fill it. Signing in sets `__Host-limitless-session`, an opaque random cookie with
+`HttpOnly; Secure; SameSite=Strict`; the database keeps only its SHA-256. A session ends after
+`idle_days` unused or `absolute_days` after sign-in, whichever comes first; open SSE streams
+end with it. Because the cookie
+is `Secure`, `public_origins` must be HTTPS unless `auth = "proxy"`. The UI's navigation bar
+offers **Sign out** and **Sign out everywhere**.
+
+Failed password attempts are limited to 5 per 15 minutes per source address (429 with
+`Retry-After` after that). The daemon sees only the proxy's address, so all proxied clients
+share that budget; the Access List keeps everyone else out. Setting a new password does not
+end existing sessions; revoke them if the old one may have leaked.
+
+`auth = "proxy"` keeps the earlier behaviour for setups that authenticate at the proxy: no
+built-in sign-in, so keep basic authentication on the Access List, with NPM's “Satisfy Any”
+disabled so both the source and the credentials are required.
