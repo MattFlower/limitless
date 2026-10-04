@@ -8,6 +8,7 @@ pr="$1"
 subject="$2"
 dir="${3:-.}"
 repo="MattFlower/limitless"
+private_check="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-private-strings.ts"
 cd "$dir"
 
 bun install --frozen-lockfile >/dev/null
@@ -17,6 +18,7 @@ if ! bun run check >/tmp/land-pr-check.log 2>&1; then
 fi
 
 git add -A
+bun "$private_check" "$pr" "$repo" "$subject"
 if ! git diff --cached --quiet || [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
   git commit -q -m "Merge main into PR $pr
 

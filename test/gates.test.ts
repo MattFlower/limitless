@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
@@ -13,6 +13,7 @@ import {
   singleFlight,
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
+import { loadPrivateStrings } from "../src/gates/private.ts";
 import {
   compareGates,
   type GateRun,
@@ -22,6 +23,7 @@ import {
 } from "../src/gates/run.ts";
 import { defaultGateSlots, gateSlots, Semaphore } from "../src/gates/slots.ts";
 import type { DiffInfo } from "../src/git/repos.ts";
+import { formatAuditFeedback } from "../src/pipeline/prompts.ts";
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -350,6 +352,84 @@ describe("audit allowances and attribute rules", () => {
       "linguist-generated",
     ]);
     expect(newlyHidden({ diff: "unset" }, { diff: "unset" })).toEqual([]);
+  });
+});
+
+describe("private strings", () => {
+  test.each(["A", "R100"])("quoted %s filename and unrelated diagnostics cannot reveal entries", (status) => {
+    const configDir = mkdtempSync(join(tmpdir(), "private-strings-"));
+    try {
+      writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\ni\u0307-host.example");
+      const patch =
+        'diff --git "a/secret-host.example\\t.txt" "b/secret-host.example\\t.txt"\n+++ "b/secret-host.example\\t.txt"\n@@ -0,0 +1 @@\n+SECRET-HOST.EXAMPLE\n';
+      const findings = auditDiff(diff(patch, [{ status, path: "secret-host.example\t.txt" }]), {
+        configDir,
+        taskClass: null,
+        protectedPaths: [],
+        toolCommands: ["git commit --no-verify İ-host.example"],
+      });
+      expect(findings.filter((f) => f.rule === "private-string")).toHaveLength(2);
+      expect(
+        findings.filter((f) => f.rule === "private-string").every((f) => f.file === "[redacted filename]"),
+      ).toBe(true);
+      const output = JSON.stringify(findings);
+      expect(output).not.toContain("secret-host.example");
+      expect(output).not.toContain("İ-host.example");
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("local loader, absent file, physical entry numbers, and unreadable file", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "private-strings-"));
+    try {
+      const changes = diff("diff --git a/a.txt b/a.txt\n@@ -0,0 +1 @@\n+SECRET-HOST.EXAMPLE", [
+        { status: "A", path: "a.txt" },
+      ]);
+      expect(loadPrivateStrings(configDir)).toEqual([]);
+      expect(auditDiff(changes, { configDir, taskClass: null, protectedPaths: [] })).toEqual([]);
+      writeFileSync(join(configDir, "private-strings.txt"), "  # ignored\n\n  secret-host.example  \n");
+      const findings = auditDiff(changes, { configDir, taskClass: null, protectedPaths: [] });
+      expect(findings).toEqual([
+        {
+          rule: "private-string",
+          severity: "block",
+          file: "a.txt",
+          detail: "a.txt:1 contains a private string (entry 3 in private-strings.txt)",
+        },
+      ]);
+      rmSync(join(configDir, "private-strings.txt"));
+      mkdirSync(join(configDir, "private-strings.txt"));
+      expect(() => loadPrivateStrings(configDir)).toThrow(
+        "Cannot read private-strings.txt; publication blocked",
+      );
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("multiple hunks, header-like content, added and renamed filenames redact every finding and feedback", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "private-strings-"));
+    try {
+      writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\nsecond-entry");
+      const patch =
+        "diff --git a/safe.txt b/safe.txt\n--- a/safe.txt\n+++ b/safe.txt\n@@ -1,2 +1,3 @@\n context\n+SECRET-HOST.EXAMPLE second-entry\n kept\n@@ -20 +21,2 @@\n keep\n+++ b/secret-host.example\n";
+      const changes = diff(patch, [
+        { status: "M", path: "safe.txt" },
+        { status: "A", path: "SECRET-HOST.EXAMPLE.txt" },
+        { status: "R100", path: "secret-host.example.test.ts" },
+      ]);
+      const findings = auditDiff(changes, { configDir, taskClass: null, protectedPaths: ["*.ts"] });
+      expect(findings.filter((f) => f.rule === "private-string")).toHaveLength(5);
+      expect(findings.some((f) => f.detail.startsWith("safe.txt:22 "))).toBe(true);
+      expect(findings.filter((f) => f.file === "[redacted filename]")).toHaveLength(3);
+      expect(JSON.stringify(findings).toLowerCase()).not.toContain("secret-host.example");
+      expect(JSON.stringify(findings)).not.toContain("second-entry");
+      expect(formatAuditFeedback(findings).toLowerCase()).not.toContain("secret-host.example");
+      expect(formatAuditFeedback(findings)).toContain("entry 2 in private-strings.txt");
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
   });
 });
 

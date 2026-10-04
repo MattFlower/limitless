@@ -8,6 +8,7 @@ import { parseAllow } from "../src/core/allow.ts";
 import type { AuditAllowance, Repo } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { attributeRules, auditDiff } from "../src/gates/audit.ts";
+import { loadPrivateStrings } from "../src/gates/private.ts";
 import { collectGarbage } from "../src/gc.ts";
 import { worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
@@ -68,6 +69,41 @@ async function audited(files = ["sample.test.ts"]) {
     expect(await readFileAt(work, "HEAD", file)).toBe(edited);
   }
 }
+
+test.each([false, true])(
+  "private strings in binary or -diff content block (replacement: %s)",
+  async (replace) => {
+    const configDir = join(dir, "config");
+    mkdirSync(configDir);
+    writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\n");
+    writeFileSync(join(work, ".gitattributes"), "*.dat -diff\n");
+    writeFileSync(join(work, "hidden.dat"), "SECRET-HOST.EXAMPLE\n");
+    // The entry straddles a 64 KiB stream chunk boundary.
+    const blob = Buffer.alloc(200_000);
+    blob.write("secret-host.example", 65_530);
+    writeFileSync(join(work, "blob.bin"), blob);
+    await commitAll(work, "hidden content");
+    if (replace) {
+      const original = (await git(work, "rev-parse", "HEAD:blob.bin")).stdout.trim();
+      const clean = (
+        await sh(["git", "hash-object", "-w", "--stdin"], { cwd: work, stdin: "clean\0" })
+      ).stdout.trim();
+      await git(work, "replace", original, clean);
+      expect((await git(work, "cat-file", "blob", original)).stdout).toBe("clean\0");
+    }
+    // Without a denylist no blob is read.
+    expect((await diffSince(work, base)).privateHits).toEqual([]);
+    const diff = await diffSince(work, base, undefined, false, loadPrivateStrings(configDir));
+    expect(diff.privateHits).toContainEqual({ path: "blob.bin", entry: 1 });
+    expect(diff.patch).not.toContain("secret-host.example");
+    const findings = auditDiff(diff, { configDir, taskClass: null, protectedPaths: [] }).filter(
+      (f) => f.rule === "private-string",
+    );
+    expect(findings.map((f) => f.file).sort()).toEqual(["blob.bin", "hidden.dat"]);
+    expect(findings.every((f) => f.severity === "block")).toBe(true);
+    expect(JSON.stringify(findings).toLowerCase()).not.toContain("secret-host.example");
+  },
+);
 
 test("committed -diff attributes cannot hide skipped tests, while 500 KB binaries stay compact", async () => {
   writeFileSync(join(work, ".gitattributes"), "*.ts -diff\n*.png diff\n");
