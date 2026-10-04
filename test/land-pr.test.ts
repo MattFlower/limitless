@@ -260,11 +260,28 @@ test.each(["redirect", "redirect-and-move-head"])(
       writeFileSync(
         join(bin, "bun"),
         `#!${process.execPath}
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 const paths = [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR];
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "bun", args, paths }) + "\\n");
+if (args[0] === "install" || args[0] === "run") {
+  const trustedEnv = { ...process.env, GIT_WORK_TREE: ${JSON.stringify(paths[0])}, GIT_DIR: ${JSON.stringify(paths[1])}, GIT_COMMON_DIR: ${JSON.stringify(paths[2])} };
+  const snapshot = () => ["rev-parse HEAD", "diff --cached --raw"].map(command => {
+    const result = spawnSync(${JSON.stringify(gitBin)}, command.split(" "), { env: trustedEnv, encoding: "utf8" });
+    if (result.status !== 0) process.exit(1);
+    return result.stdout.trim();
+  });
+  const before = snapshot();
+  const cwd = ${JSON.stringify(root)} + "/fixture-" + args[0];
+  mkdirSync(cwd);
+  writeFileSync(cwd + "/file", "test fixture\\n");
+  for (const command of [["init", "-qb", "main"], ["add", "."], ["commit", "-qm", "test fixture " + args[0]]]) {
+    const result = spawnSync(${JSON.stringify(gitBin)}, command, { cwd, stdio: "inherit" });
+    if (result.status !== 0) process.exit(result.status ?? 1);
+  }
+  writeFileSync(cwd + "-state", JSON.stringify([before, snapshot()]));
+}
 if (args[0] === "run") writeFileSync(${JSON.stringify(join(work, ".git"))}, "gitdir: " + ${JSON.stringify(join(alternate, ".git"))} + "\\n");
 if (args[0].endsWith(".ts")) {
   if (args.length === 6) {
@@ -328,7 +345,19 @@ else if (args[1] === "view") {
       expect(sha).toMatch(/^[a-f0-9]{40}$/);
       expect(sha).not.toBe(value.base);
       expect(sha).not.toBe(value.denied);
-      const logged: { tool: string; args: string[]; paths?: string[] }[] = readFileSync(calls, "utf8")
+      for (const command of ["install", "run"]) {
+        expect(JSON.parse(readFileSync(join(root, `fixture-${command}-state`), "utf8"))).toEqual([
+          [value.base, ""],
+          [value.base, ""],
+        ]);
+        expect(
+          (await git("-C", join(root, `fixture-${command}`), "log", "-1", "--format=%s")).stdout.trim(),
+        ).toBe(`test fixture ${command}`);
+      }
+      const logged: { tool: string; args: string[]; paths?: (string | null)[] }[] = readFileSync(
+        calls,
+        "utf8",
+      )
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line));
@@ -336,8 +365,10 @@ else if (args[1] === "view") {
       const recordedAt = logged.findIndex((call) => call.tool === "recorded");
       expect(recordedAt).toBeGreaterThan(0);
       expect(installed).toBeGreaterThan(recordedAt);
-      for (const call of logged.slice(recordedAt + 1).filter((call) => call.tool !== "gh"))
-        expect(call.paths).toEqual(paths);
+      for (const call of logged.slice(recordedAt + 1).filter((call) => call.tool !== "gh")) {
+        const check = call.tool === "bun" && ["install", "run"].includes(call.args[0] ?? "");
+        expect(call.paths).toEqual(check ? [null, null, null] : paths);
+      }
       const commands = (tool: string, command: string) =>
         logged.filter((call) => call.tool === tool && call.args.includes(command)).map((call) => call.args);
       expect(commands("bun", sha)).toEqual([
