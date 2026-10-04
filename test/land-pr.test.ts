@@ -15,7 +15,7 @@ test("landing check uses a named gate slot and stops before delivery on failure"
       chmodSync(path, 0o755);
     }
     const child = Bun.spawn(["bash", "scripts/land-pr.sh", "289", "subject", dir], {
-      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CALLS: log },
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CALLS: log, TMPDIR: dir },
       stdout: "pipe",
       stderr: "pipe",
     });
