@@ -163,7 +163,8 @@ export function pollerHarness(repos = ["o/r"]) {
     },
     async advance(ms: number) {
       await clock.advance(ms);
-      for (let i = 0; i < 5; i++) await Bun.sleep(1);
+      // Macrotask turns let the poller's chained awaits settle without a timer's millisecond floor.
+      for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
     },
     /** Feed items written since the previous call. */
     fresh(): FeedItem[] {

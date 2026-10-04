@@ -2,6 +2,7 @@ import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import type { Server } from "bun";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { fixture, type Route, requestWithParams } from "./mcp-support.ts";
+import { fakeAuthenticator } from "./webauthn-fake.ts";
 
 const proxy = "10.0.0.20",
   origin = "https://limitless.example.test",
@@ -157,6 +158,49 @@ test("concurrent wrong passwords from one address get exactly five tries, then e
   expect(limited.status).toBe(429);
   expect(Number(limited.headers.get("retry-after"))).toBeGreaterThan(800);
   expect(limited.headers.get("set-cookie")).toBeNull();
+});
+
+test("add-passkey's one-time link registers a passkey through the proxy, which then signs in", async () => {
+  const { call, admin } = routes();
+  const headers = { origin, "content-type": "application/json", "user-agent": "Phone/1" };
+  const post = (path: string, data: unknown) =>
+    call(path, { method: "POST", headers, body: JSON.stringify(data) });
+  expect((await post("/api/admin/auth/enroll", {})).status).toBe(403);
+  const { url } = await (await admin("/api/admin/auth/enroll", {})).json();
+  const token = new URL(url).hash.slice(1);
+  expect(url).toBe(`${origin}/enroll#${token}`);
+  expect((await call("/enroll")).status).toBe(200);
+  const options = () => post("/api/auth/passkey/register/options", { token }).then((res) => res.json());
+  const wrongSite = fakeAuthenticator("https://evil.example").create(await options());
+  const refused = await post("/api/auth/passkey/register", { token, response: wrongSite });
+  expect([refused.status, await refused.json()]).toEqual([400, { error: "passkey registration failed" }]);
+  const key = fakeAuthenticator(origin);
+  const registered = await post("/api/auth/passkey/register", {
+    token,
+    response: key.create(await options()),
+  });
+  const cookie = registered.headers.get("set-cookie")?.split(";")[0] ?? "";
+  expect(await (await call("/api/auth/session", { headers: { cookie } })).json()).toMatchObject({
+    session: { method: "passkey", device: "Phone/1" },
+  });
+  expect(await (await post("/api/auth/passkey/register/options", { token })).json()).toEqual({
+    error: "enrollment link invalid or expired",
+  });
+
+  const challenge = await (await post("/api/auth/passkey/login/options", {})).json();
+  const signedIn = await post("/api/auth/passkey/login", key.get(challenge));
+  expect(signedIn.headers.get("set-cookie")).toStartWith("__Host-limitless-session=");
+  const replay = await post("/api/auth/passkey/login", key.get(challenge));
+  const replayed = await replay.text();
+  expect([replay.status, JSON.parse(replayed)]).toEqual([401, { error: "passkey sign-in failed" }]);
+  expect(replayed).not.toContain(challenge.challenge);
+  const listed = await call("/api/admin/auth/passkeys", { address: "127.0.0.1" });
+  expect(await listed.json()).toMatchObject([{ id: key.id, device: "Phone/1" }]);
+  expect(await (await admin("/api/admin/auth/passkeys/remove", { id: key.id })).json()).toEqual({
+    removed: 1,
+  });
+  const fresh = await (await post("/api/auth/passkey/login/options", {})).json();
+  expect((await post("/api/auth/passkey/login", key.get(fresh))).status).toBe(401);
 });
 
 test("with no password set, sign-in checks a hash, answers like a wrong password, and counts toward the limit", async () => {

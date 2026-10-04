@@ -162,10 +162,43 @@ test("merged PR resolves once, preserves evidence, and survives reopening", asyn
   });
   expect(messages).toEqual(["resolved"]);
   expect(store.getArtifact(id, "report")).toBe("Human review required");
+  expect(run?.resolution).toEqual({
+    kind: "merged",
+    ref: prUrl,
+    note: null,
+    by: "github",
+    at: Date.parse("2026-09-27T20:00:00Z"),
+  });
+  const kinds = () => store.readFeed({ after: 0, limit: 100 }).items.map((i) => i.kind);
+  expect(kinds().filter((k) => k === "run.merged" || k === "run.resolved")).toEqual([
+    "run.merged",
+    "run.resolved",
+  ]);
   store.close();
   store = new Store(join(dir, "store.db"));
+  expect(store.getRun(id)?.resolution?.kind).toBe("merged");
+  expect(kinds().filter((k) => k === "run.resolved")).toHaveLength(1);
   expect(store.getRun(id)?.mergedBy).toBe("MattFlower");
   expect(store.listEvents(id).filter((event) => event.type === "status")).toHaveLength(2);
+});
+
+test("a needs_human run with a pre-recorded merge still gets its resolution and metadata", async () => {
+  const id = needsHuman();
+  store.updateRun(id, { merged: true });
+  await reconcileMergedRuns(store, async (url) => ({
+    url,
+    state: "MERGED",
+    mergedAt: "2026-09-27T20:00:00Z",
+    mergedBy: { login: "owner" },
+  }));
+  expect(store.getRun(id)).toMatchObject({
+    status: "resolved",
+    merged: true,
+    mergedBy: "owner",
+    mergedAt: Date.parse("2026-09-27T20:00:00Z"),
+    resolution: { kind: "merged" },
+  });
+  expect(store.readFeed().items.filter((item) => item.kind === "run.merged")).toHaveLength(1);
 });
 
 test("only an exact merged PR resolves; failures remain retryable", async () => {
@@ -174,7 +207,12 @@ test("only an exact merged PR resolves; failures remain retryable", async () => 
   let calls = 0;
   for (const state of [
     { url: prUrl, state: "OPEN", mergedAt: null, mergedBy: null },
-    { url: prUrl, state: "CLOSED", mergedAt: null, mergedBy: null },
+    {
+      url: "https://github.com/MattFlower/limitless/pull/40",
+      state: "CLOSED",
+      mergedAt: null,
+      mergedBy: null,
+    },
     {
       url: "https://github.com/MattFlower/limitless/pull/40",
       state: "MERGED",
@@ -209,6 +247,163 @@ test("only an exact merged PR resolves; failures remain retryable", async () => 
   expect(store.getRun(id)?.status).toBe("resolved");
   expect(store.getRun(id)?.mergedBy).toBeNull();
 });
+
+test("a needs_human PR closed unmerged resolves once as pr_closed; a manual resolution that wins is kept", async () => {
+  const id = needsHuman();
+  const closed = async () => ({ url: prUrl, state: "CLOSED", mergedAt: null, mergedBy: null });
+  await reconcileMergedRuns(store, closed);
+  await reconcileMergedRuns(store, closed);
+  const run = store.getRun(id);
+  expect(run).toMatchObject({
+    status: "resolved",
+    merged: false,
+    prClosedUnmerged: true,
+    finishedAt: 123456,
+  });
+  expect(run?.resolution).toMatchObject({ kind: "pr_closed", ref: prUrl, by: "github", note: null });
+  expect(
+    store.readFeed({ after: 0, limit: 100 }).items.filter((i) => i.kind === "run.resolved"),
+  ).toHaveLength(1);
+
+  const pendingUrl = `${prUrl}0`;
+  const pending = needsHuman(pendingUrl);
+  let answer: (pr: Awaited<ReturnType<GitHubPrClient>>) => void = () => {};
+  let started = () => {};
+  const checking = new Promise<void>((done) => {
+    started = done;
+  });
+  const observed = reconcileMergedRuns(store, async (url) =>
+    url === pendingUrl
+      ? new Promise((done) => {
+          answer = done;
+          started();
+        })
+      : closed(),
+  );
+  await checking;
+  store.resolveRun(pending, { kind: "done_elsewhere", by: "human" });
+  answer({ url: pendingUrl, state: "CLOSED", mergedAt: null, mergedBy: null });
+  await observed;
+  expect(store.getRun(pending)?.resolution?.kind).toBe("done_elsewhere");
+});
+
+test("a merge observed by GitHub supersedes needs_human runs closing the same issue", async () => {
+  const id = needsHuman();
+  store.db.query("UPDATE runs SET prompt = 'Fix\n\nCloses #12' WHERE id = ?").run(id);
+  const run = store.getRun(id);
+  const repo = run && store.getRepo(run.repoId);
+  if (!repo) throw new Error("missing repo");
+  const older = store.createRun(repo, { repo: repo.slug, prompt: "First try. Closes #12" });
+  store.updateRun(older.id, { status: "needs_human", finishedAt: 1 });
+  await reconcileMergedRuns(store, async (url) =>
+    url === prUrl ? { url, state: "MERGED", mergedAt: "2026-09-27T20:00:00Z", mergedBy: null } : null,
+  );
+  expect(store.getRun(id)?.resolution?.kind).toBe("merged");
+  expect(store.getRun(older.id)?.resolution).toMatchObject({ kind: "superseded", ref: prUrl, by: "system" });
+});
+
+for (const status of ["needs_human", "succeeded"] as const) {
+  test(`${status} merge and every supersession roll back on feed failure and retry`, async () => {
+    const id = needsHuman();
+    store.db.query("UPDATE runs SET prompt = 'Closes #12' WHERE id = ?").run(id);
+    const merging = store.updateRun(id, { status });
+    const targets = [needsHuman(null), needsHuman(null)];
+    for (const target of targets)
+      store.db.query("UPDATE runs SET prompt = 'Retry. Closes #12' WHERE id = ?").run(target);
+    const before = targets.map((target) => store.getRun(target));
+    const feed = store.readFeed().items;
+    const events = [id, ...targets].map((target) => store.listEvents(target));
+    const published: unknown[] = [];
+    const unsubscribe = store.subscribe((message) => published.push(message));
+    const errors: string[] = [];
+    const client: GitHubPrClient = async (url) => ({
+      url,
+      state: "MERGED",
+      mergedAt: "2026-09-27T20:00:00Z",
+      mergedBy: { login: "owner" },
+    });
+    store.db.exec(`CREATE TEMP TRIGGER reject_supersession BEFORE INSERT ON feed
+      WHEN NEW.kind = 'run.resolved' AND NEW.run_id = '${targets[0]}'
+      BEGIN SELECT RAISE(ABORT, 'injected supersession failure'); END`);
+    try {
+      await reconcileMergedRuns(store, client, (message) => errors.push(message));
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain("injected supersession failure");
+      expect(store.getRun(id)).toEqual(merging);
+      expect(targets.map((target) => store.getRun(target))).toEqual(before);
+      expect(store.readFeed().items).toEqual(feed);
+      expect([id, ...targets].map((target) => store.listEvents(target))).toEqual(events);
+      expect(published).toEqual([]);
+    } finally {
+      store.db.exec("DROP TRIGGER reject_supersession");
+      unsubscribe();
+    }
+    await reconcileMergedRuns(store, client);
+    await reconcileMergedRuns(store, client);
+    expect(store.getRun(id)).toMatchObject({
+      status: status === "needs_human" ? "resolved" : status,
+      merged: true,
+      mergedBy: "owner",
+      mergedAt: Date.parse("2026-09-27T20:00:00Z"),
+    });
+    const items = store.readFeed().items;
+    expect(items.filter((item) => item.kind === "run.merged" && item.runId === id)).toHaveLength(1);
+    for (const target of targets) {
+      expect(store.getRun(target)?.resolution).toMatchObject({ kind: "superseded", ref: prUrl });
+      expect(items.filter((item) => item.kind === "run.resolved" && item.runId === target)).toHaveLength(1);
+    }
+  });
+}
+
+for (const timing of ["already resolved", "lookup in flight"] as const) {
+  test(`a later PR merge keeps the manual resolution: ${timing}`, async () => {
+    const id = needsHuman();
+    store.db.query("UPDATE runs SET prompt = 'Closes #12' WHERE id = ?").run(id);
+    const target = needsHuman(null);
+    store.db.query("UPDATE runs SET prompt = 'Old attempt. Closes #12' WHERE id = ?").run(target);
+    const resolve = () =>
+      store.resolveRun(id, {
+        kind: "done_elsewhere",
+        by: "human",
+        note: "handled separately",
+        ref: "other work",
+        at: 42,
+      });
+    if (timing === "already resolved") resolve();
+    let release: (pr: Awaited<ReturnType<GitHubPrClient>>) => void = () => {};
+    const pending = reconcileMergedRuns(
+      store,
+      () =>
+        new Promise((done) => {
+          release = done;
+        }),
+    );
+    if (timing === "lookup in flight") resolve();
+    const resolution = store.getRun(id)?.resolution;
+    release({ url: prUrl, state: "MERGED", mergedAt: "2026-09-27T20:00:00Z", mergedBy: { login: "owner" } });
+    await pending;
+    await reconcileMergedRuns(
+      store,
+      async () => {
+        throw new Error("must not repoll merged PR");
+      },
+      () => {
+        throw new Error("unexpected lookup");
+      },
+    );
+    expect(store.getRun(id)).toMatchObject({
+      status: "resolved",
+      merged: true,
+      mergedBy: "owner",
+      mergedAt: Date.parse("2026-09-27T20:00:00Z"),
+      resolution,
+    });
+    expect(store.getRun(target)?.resolution).toMatchObject({ kind: "superseded", ref: prUrl });
+    const items = store.readFeed().items.filter((item) => item.runId === id);
+    expect(items.filter((item) => item.kind === "run.merged")).toHaveLength(1);
+    expect(items.filter((item) => item.kind === "run.resolved")).toHaveLength(1);
+  });
+}
 
 test("startup pass publishes a resolved run and stats count only open needs human", async () => {
   const id = needsHuman();

@@ -359,6 +359,26 @@ test("a closed PR is rechecked every 10 minutes; a reopen is observed and a late
   expect(h.store.githubTracked().map((p) => p.url)).toEqual([url("o/r", 3)]);
 });
 
+test("a needs_human run's PR closed unmerged is resolved as pr_closed once, across later polls", async () => {
+  h = pollerHarness();
+  const run = h.factoryPr("o/r", 2, "needs_human");
+  const open = h.factoryPr("o/r", 3, "needs_human");
+  h.start();
+  await h.advance(0);
+  h.node("o/r", 2).state = "CLOSED";
+  await h.advance(15 * S);
+  await h.advance(15 * S);
+  expect(h.store.getRun(run.id)).toMatchObject({ status: "resolved", merged: false, prClosedUnmerged: true });
+  expect(h.store.getRun(run.id)?.resolution).toMatchObject({
+    kind: "pr_closed",
+    ref: url("o/r", 2),
+    by: "github",
+  });
+  expect(h.store.getRun(open.id)).toMatchObject({ status: "needs_human", resolution: null });
+  const items = h.store.readFeed({ limit: 1000 }).items.filter((i) => i.kind === "run.resolved");
+  expect(items.map((i) => i.runId)).toEqual([run.id]);
+});
+
 test("tracking ends with the run; open PRs of runs failed or cancelled over 7 days ago expire", async () => {
   h = pollerHarness();
   const now = Date.now();

@@ -66,12 +66,17 @@ export function formatEvalReport(report: EvalReport): string {
       );
     }
     if (m.review) {
-      const { defectRecall, underRated, falseBlock, verdictAccuracy, legacyGrades } = m.review;
+      const { defectRecall, underRated, falseBlock, verdictAccuracy, legacyGrades, originalLabels } =
+        m.review;
       // A daemon older than blocking recall sends none of the breakdown, and its recall counted minor findings.
       const bySeverity = m.review.bySeverity ?? [];
       roleLines.push(
         metric(
-          underRated ? "blocking recall" : "defect recall (older daemon, not blocking recall)",
+          originalLabels
+            ? "current labels: blocking recall"
+            : underRated
+              ? "blocking recall"
+              : "defect recall (older daemon, not blocking recall)",
           defectRecall,
         ),
         ...bySeverity.map((group) => metric(`${group.severity}-severity blocking recall`, group)),
@@ -80,7 +85,13 @@ export function formatEvalReport(report: EvalReport): string {
               `  under-rated (detected, not blocking; diagnostic): ${underRated.numerator}/${underRated.denominator} required defects`,
             ]
           : []),
-        metric("clean false-block", falseBlock),
+        metric(originalLabels ? "current labels: clean false-block" : "clean false-block", falseBlock),
+        ...(originalLabels
+          ? [
+              metric("original labels: blocking recall", originalLabels.defectRecall),
+              metric("original labels: clean false-block", originalLabels.falseBlock),
+            ]
+          : []),
         ...(m.review.cleanBlocking ?? []).map(
           (c) => `  clean ${c.caseId}: blocking findings per trial ${c.blockingFindings.join(", ")}`,
         ),

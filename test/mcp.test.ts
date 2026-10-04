@@ -29,7 +29,7 @@ test("model-written MCP prompts cannot opt in through Allow lines", async () => 
   expect((await call("create_run", { repo: f.repo, prompt, allow: ["anything"] })).isError).toBe(true);
 });
 
-test("eight discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
+test("nine discoverable tools, create defaults and overrides, get and queued cancellation", async () => {
   const { tools } = await connection.client.listTools();
   expect(tools.map((t) => t.name).sort()).toEqual(
     [
@@ -41,6 +41,7 @@ test("eight discoverable tools, create defaults and overrides, get and queued ca
       "get_run",
       "list_runs",
       "providers",
+      "resolve_run",
     ].map((s) => `limitless_${s}`),
   );
   for (const tool of tools) {

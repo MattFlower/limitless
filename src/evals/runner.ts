@@ -38,6 +38,7 @@ import {
   type TriageCase,
   validateRequest,
 } from "./cases.ts";
+import { gradeReview } from "./graders/review.ts";
 import {
   failedImplement,
   gradeImplement,
@@ -269,7 +270,12 @@ export class EvalRunner {
     if (!run) return null;
     const trials = this.deps.store.listEvalTrials(id);
     const cascadeFallback = run.role === "triage" ? this.deps.router.decisionFallback("triage") : undefined;
-    return { run, summaries: summarize(run, trials, { cascadeFallback, ...options }), trials };
+    const reviewCases =
+      run.role === "review"
+        ? loadRoleCases("review", this.casePath).cases.flatMap((item) => ("defects" in item ? [item] : []))
+        : [];
+    const labels = { reviewCases, reviewGrader: gradeReview };
+    return { run, summaries: summarize(run, trials, { cascadeFallback, ...labels, ...options }), trials };
   }
 
   /**

@@ -1,3 +1,4 @@
+import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
@@ -5,9 +6,11 @@ import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from 
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { runGh } from "../integrations/github.ts";
+import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
-import { Auth, CLEAR_SESSION, localPath, loginPage } from "./auth.ts";
+import { Auth, CLEAR_SESSION, enrollPage, localPath, loginPage } from "./auth.ts";
+import { Passkeys } from "./passkeys.ts";
 
 export interface HttpExtras {
   /** Extra routes contributed by integrations (webhooks, MCP). */
@@ -102,6 +105,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
   /** Requests admitted by a session cookie; their streams end with the session. */
   const signedIn = new WeakSet<Request>();
   const live = (req: Request) => () => !signedIn.has(req) || auth.session(req.headers) !== null;
+  const passkeys = new Passkeys(store, factory.cfg);
+  /** Reachable without a session: signing in, and enrolling with a one-time link. */
+  const signInPath = (path: string) =>
+    path === "/login" || path === "/enroll" || path.startsWith("/api/auth/passkey/");
   const handle =
     (
       fn: (
@@ -130,7 +137,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       if (
         access === "proxy" &&
         factory.cfg.auth === "required" &&
-        path !== "/login" &&
+        !signInPath(path) &&
         !path.startsWith("/webhooks/")
       ) {
         if (auth.session(req.headers)) signedIn.add(req);
@@ -189,6 +196,13 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     return new Response(JSON.stringify({ revoked }), { headers });
   };
 
+  const passkeySession = (req: Request) => {
+    const cookie = auth.signIn("passkey", req.headers.get("user-agent") ?? "");
+    return new Response(JSON.stringify({ ok: true }), {
+      headers: { "content-type": "application/json", "set-cookie": cookie },
+    });
+  };
+
   const conversation = (req: Request & { params: Record<string, string> }) => {
     const id = req.params.conversationId ?? "";
     // Discord conversations are a separate transport namespace.
@@ -216,6 +230,38 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/login": {
       GET: handle((req) => loginPage(localPath(new URL(req.url).searchParams.get("next")))),
       POST: handle((req, server) => auth.passwordSignIn(req, server.requestIP(req)?.address ?? "")),
+    },
+    "/api/admin/auth/enroll": { POST: handle(() => json({ url: passkeys.enrollLink() }), true) },
+    "/api/admin/auth/passkeys": { GET: handle(() => json(store.listPasskeys()), true) },
+    "/api/admin/auth/passkeys/remove": {
+      POST: handle(async (req) => {
+        const { id } = await body<{ id?: unknown }>(req);
+        if (typeof id !== "string") throw new Error("pass a passkey id");
+        return json({ removed: store.removePasskey(id) });
+      }, true),
+    },
+    "/enroll": handle(() => enrollPage()),
+    "/api/auth/passkey/register/options": {
+      POST: handle(async (req) =>
+        json(await passkeys.registrationOptions((await body<{ token?: unknown }>(req)).token)),
+      ),
+    },
+    "/api/auth/passkey/register": {
+      POST: handle(async (req) => {
+        const { token, response } = await body<{ token?: unknown; response: RegistrationResponseJSON }>(req);
+        await passkeys.register(token, response, req.headers.get("user-agent") ?? "");
+        return passkeySession(req);
+      }),
+    },
+    "/api/auth/passkey/login/options": {
+      POST: handle(async () => json(await passkeys.authenticationOptions())),
+    },
+    "/api/auth/passkey/login": {
+      POST: handle(async (req) =>
+        (await passkeys.authenticate(await body<AuthenticationResponseJSON>(req)))
+          ? passkeySession(req)
+          : error("passkey sign-in failed", 401),
+      ),
     },
     "/api/auth/session": handle((req) => json({ session: auth.session(req.headers) })),
     "/api/auth/logout": { POST: handle((req) => signOut(req, false)) },
@@ -346,6 +392,16 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     },
     "/api/runs/:id/retry": {
       POST: handle(async (req) => json(await factory.retryRun(req.params.id as string), 201)),
+    },
+    "/api/runs/:id/resolve": {
+      POST: handle(async (req) => {
+        const input = ResolveRunSchema.safeParse(await body<unknown>(req));
+        if (!input.success) return error(`invalid resolution: ${input.error.issues[0]?.message ?? ""}`);
+        const id = req.params.id as string;
+        if (!store.getRun(id)) return error("run not found", 404);
+        const run = store.resolveRun(id, { ...input.data, by: "human" });
+        return run ? json(run) : error(resolveConflict(store.getRun(id)?.status ?? "resolved"), 409);
+      }, true),
     },
     "/api/runs/:id/answer": {
       POST: handle(async (req) => {
