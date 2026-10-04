@@ -802,6 +802,10 @@ export class EvalRunner {
             details: {
               ...("hidden" in item ? source.details : {}),
               ...trial.details,
+              // A reused trial spends no tokens of its own, so its cache split follows the tokensIn
+              // it records (zero here); inheriting the source's would report more cache than prompt.
+              cacheReadTokens: trial.details.cacheReadTokens ?? 0,
+              cacheWriteTokens: trial.details.cacheWriteTokens ?? 0,
               ...(source.details.fast === undefined ? {} : { fast: source.details.fast }),
               ...(source.details.verifiers ? { verifiers: source.details.verifiers } : {}),
               grade,

@@ -106,7 +106,7 @@ test("each model reports its cache reads and writes against its prompt tokens", 
       tokensIn: 1000,
       details: { cacheReadTokens: 700, cacheWriteTokens: 200 },
     },
-    // A trial recorded before the split carries none, and counts as uncached.
+    // A trial recorded before the split carries none, and counts as not cached.
     { ...trial("a", "one", 1, true), tokensIn: 500 },
     { ...trial("b", "one", 0, true), tokensIn: 100 },
   ];
@@ -114,8 +114,8 @@ test("each model reports its cache reads and writes against its prompt tokens", 
   expect(a).toMatchObject({ tokensIn: 1500, cacheReadTokens: 700, cacheWriteTokens: 200 });
   expect(b).toMatchObject({ tokensIn: 100, cacheReadTokens: 0, cacheWriteTokens: 0 });
   const text = formatEvalReport({ run, trials: rows, summaries: summarize(run, rows) });
-  expect(text).toContain("  cache 46.7% of 1,500 prompt tokens (700 cached, 200 written, 600 uncached)");
-  expect(text).toContain("  cache 0.0% of 100 prompt tokens (0 cached, 0 written, 100 uncached)");
+  expect(text).toContain("  cache 46.7% of 1,500 prompt tokens (700 cached, 200 written, 600 not cached)");
+  expect(text).toContain("  cache 0.0% of 100 prompt tokens (0 cached, 0 written, 100 not cached)");
 });
 
 test("review pools defects across repetitions, preserves empty denominators and excludes errors from prediction metrics", async () => {

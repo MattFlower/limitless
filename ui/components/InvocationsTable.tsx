@@ -86,7 +86,7 @@ const RoleHelp: Component<{ role: Invocation["role"]; id: number }> = (props) =>
 const promptTokens = (inv: Invocation) => inv.inputTokens + inv.cacheReadTokens + inv.cacheWriteTokens;
 const cacheTitle = (inv: Invocation) =>
   `${compactNumber(inv.cacheReadTokens)} cached, ${compactNumber(inv.cacheWriteTokens)} written, ` +
-  `${compactNumber(inv.inputTokens)} uncached of ${compactNumber(promptTokens(inv))} prompt tokens`;
+  `${compactNumber(inv.inputTokens)} not cached of ${compactNumber(promptTokens(inv))} prompt tokens`;
 
 export const InvocationsTable: Component<{
   invocations: Invocation[];

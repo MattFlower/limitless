@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { loadConfig } from "../src/config.ts";
 import type { Invocation } from "../src/core/types.ts";
+import { computeStats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import type { Harness } from "../src/harness/types.ts";
 import { RunContext } from "../src/pipeline/context.ts";
@@ -132,7 +133,7 @@ test("the work log shows the cache split and a per-run hit rate", () => {
   expect(md).toContain("| Cached | Cache write |");
   expect(md).toContain("| 4,500 / 200 | 3,000 | 500 |");
   expect(md).toContain(
-    "**Cache:** 63.6% of prompt tokens read from cache (3,500 cached, 500 written, 1,500 uncached).",
+    "**Cache:** 63.6% of prompt tokens read from cache (3,500 cached, 500 written, 1,500 not cached; cache writes older rows never recorded count here).",
   );
 });
 
@@ -140,6 +141,57 @@ test("an invocation recorded before cache writes were stored renders with none",
   const md = report([invocation({ inputTokens: 1000, cacheReadTokens: 3000, outputTokens: 200 })]);
   expect(md).toContain("| 4,000 / 200 | 3,000 | 0 |");
   expect(md).toContain(
-    "**Cache:** 75.0% of prompt tokens read from cache (3,000 cached, 0 written, 1,000 uncached).",
+    "**Cache:** 75.0% of prompt tokens read from cache (3,000 cached, 0 written, 1,000 not cached; cache writes older rows never recorded count here).",
   );
+});
+
+test("per-model stats count every row's prompt, legacy writes-in-input and new writes alike", () => {
+  const store = new Store(":memory:");
+  try {
+    const repo = store.upsertRepo({
+      slug: "local/stats",
+      kind: "local",
+      localPath: "/tmp",
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "stats" });
+    // A row from before cache writes were stored: its writes sit inside input_tokens, as they were then.
+    const legacy = store.createInvocation({
+      runId: run.id,
+      stageId: null,
+      role: "implement",
+      harness: "claude",
+      provider: "claude",
+      model: "m",
+      modelId: "claude/m",
+    });
+    store.updateInvocation(legacy.id, {
+      status: "ok",
+      inputTokens: 10_000,
+      cacheReadTokens: 90_000,
+      outputTokens: 500,
+    });
+    const current = store.createInvocation({
+      runId: run.id,
+      stageId: null,
+      role: "implement",
+      harness: "claude",
+      provider: "claude",
+      model: "m",
+      modelId: "claude/m",
+    });
+    store.updateInvocation(current.id, {
+      status: "ok",
+      inputTokens: 120,
+      cacheReadTokens: 800,
+      cacheWriteTokens: 450,
+      outputTokens: 30,
+    });
+    const [model] = computeStats(store).models;
+    expect(model).toMatchObject({ modelId: "claude/m", tokensIn: 100_000 + 1370, tokensOut: 530 });
+  } finally {
+    store.close();
+  }
 });
