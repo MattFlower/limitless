@@ -147,7 +147,9 @@ export function generatePolicy(input: PolicyInput) {
             settings.excludeOrigins.includes(model.baseOrigin) ||
             model.baseOrigin === "unknown");
         const reasons: string[] = [];
-        if (!model || !provider) reasons.push("catalog/provider metadata unavailable");
+        // Evidence for a model since removed from the catalog stays in the report but never routes.
+        if (!model) reasons.push(`${baseId} is not in the model catalog`);
+        else if (!provider) reasons.push("catalog/provider metadata unavailable");
         const mismatchedProviders = [
           ...new Set(
             rows

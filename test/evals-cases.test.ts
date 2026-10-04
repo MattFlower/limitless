@@ -218,12 +218,15 @@ test("eval validation resolves defaults, explicit none and rejects malformed or 
     // Every problem is reported in one pass, not just the first one encountered.
     expect(() =>
       validateRequest(
-        { role: "triage", models: ["unknown@low", "candidate-a@max", "candidate-a", "candidate-a@low"] },
+        {
+          role: "triage",
+          models: ["unknown@low", "codex/astra@high", "candidate-a@max", "candidate-a", "candidate-a@low"],
+        },
         f.dataset,
         f.factory.router,
       ),
     ).toThrow(
-      /Invalid eval models: "unknown@low": unknown model ID "unknown"; "candidate-a@max": Unsupported effort "max" for candidate-a.*; duplicate resolved model target candidate-a@low/,
+      /Invalid eval models: "unknown@low": unknown model ID "unknown"; "codex\/astra@high": unknown model ID "codex\/astra": GPT-6 Astra was removed from routing on 2026-10-04 \(owner decision\); "candidate-a@max": Unsupported effort "max" for candidate-a.*; duplicate resolved model target candidate-a@low/,
     );
     const { request } = validateRequest(
       { role: "triage", models: ["candidate-a", "candidate-a@high", "candidate-a@none"] },

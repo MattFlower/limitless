@@ -14,7 +14,7 @@ import type { EvalPolicyResponse } from "../evals/policy.ts";
 import type { EvalRegradeResult } from "../evals/runner.ts";
 import type { EvalReport } from "../evals/stats.ts";
 import { type EvalReviewSystem, parseEvalReviewSystems } from "../pipeline/review-system.ts";
-import { DEFAULT_POLICY } from "../router/catalog.ts";
+import { DEFAULT_POLICY, REMOVED_MODELS } from "../router/catalog.ts";
 import { overlayPolicy, parsePolicy, validatePolicy } from "../router/policy.ts";
 
 export { formatEvalReport } from "../evals/format.ts";
@@ -59,10 +59,12 @@ export async function evalCommand(
     };
     const path = "routing/policy.json";
     const old = await files.read(path);
-    const existing = old === null ? {} : parsePolicy(old, data.models, path, data.providers);
+    // A daemon older than this CLI may still list removed models; the written policy never names one.
+    const models = data.models.filter((m) => !REMOVED_MODELS.has(m.id));
+    const existing = old === null ? {} : parsePolicy(old, models, path, data.providers);
     const pins = parseOverrides(await files.read(OVERRIDES_PATH), existing);
     const evaluation = pinEvaluation(data.evaluation, pins);
-    const proposed = validatePolicy(proposedOverlay(existing, evaluation), data.models, data.providers);
+    const proposed = validatePolicy(proposedOverlay(existing, evaluation), models, data.providers);
     const document = `${JSON.stringify(proposed, null, 2)}\n`;
     const unevaluated = unevaluatedPins(evaluation, pins);
     const evidence = `${renderEvidence(evaluation)}${unevaluated.map(([key, pin]) => `## ${key.replace(/\.default$/, "")}\n\n${pinMessage(pin)}\n\n`).join("")}`;

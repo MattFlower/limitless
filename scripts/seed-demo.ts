@@ -790,6 +790,8 @@ seedProvider(
   t += 63 * SEC;
 
   for (let round = 0; round < 3; round++) {
+    // Two failed rounds on one implementer escalate it a tier.
+    const implementer = round < 2 ? "claude/sonnet" : "claude/opus";
     const implStage = addStage({
       runId: id,
       name: "implement",
@@ -797,13 +799,13 @@ seedProvider(
       status: "succeeded",
       startedAt: t,
       finishedAt: t + 210 * SEC,
-      summary: `claude/opus: ok, committed ${newId().slice(0, 8)}`,
+      summary: `${implementer}: ok, committed ${newId().slice(0, 8)}`,
     });
     const implInv = addInvocation({
       runId: id,
       stageId: implStage,
       role: "implement",
-      modelId: round < 2 ? "claude/opus" : "claude/fable",
+      modelId: implementer,
       status: "ok",
       inputTokens: 14000 + round * 2000,
       outputTokens: 4200 + round * 600,
@@ -1301,7 +1303,7 @@ const succeededSpecs: SucceededSpec[] = [
     taskClass: "feature",
     complexity: "large",
     implementModel: "claude/opus",
-    reviewModel: "codex/astra",
+    reviewModel: "codex/sol-6.1",
     daysAgo: 3,
     hour: 20,
     merged: true,
@@ -1591,7 +1593,7 @@ for (const spec of succeededSpecs) {
         runId: id,
         stageId: holdoutStage,
         role: "holdout",
-        modelId: "codex/astra",
+        modelId: "codex/sol",
         status: "ok",
         inputTokens: 6500,
         outputTokens: 2100,

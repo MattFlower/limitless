@@ -120,6 +120,16 @@ Why: same model, different transport, and the subscription has unused quota. The
 
 Paired difference -0.056, one-sided 95% lower bound -0.167. The same OpenRouter setting scored 78.9% on these cases two days earlier (eval-mump7s7re29l), so run-to-run variation is of the same order. Through Codex, Luna was less stable: its verdict flipped between trials on 7 of 30 cases (23%) against 3 of 30 (10%), and it used about 2.6 times the tokens ($0.0498 API-equivalent against $0.0189). Revisit if the field risk under-call rate rises.
 
+## Owner decision: remove `codex/astra` and `claude/fable` from routing (2026-10-04)
+
+GPT-6 Astra (`codex/astra`, backend model `gpt-6-astra`) and Claude Fable 5.1 (`claude/fable`, backend model `claude-fable-5-1`) are no longer in the model catalog, so nothing routes to them. No model replaces them:
+- every implement cell (`trivial`, `small`, `medium` and `large`) is `codex/sol-6.1@high`, then `claude/opus`. Codex stays first, Astra drops out, and Sol 6.1 now leads `large` as well;
+- every group that paired Opus with Astra (`claude/opus|codex/astra`, `codex/astra|claude/opus`) is now `claude/opus`, and `claude/fable` is gone from the built-in `plan` and `implement.large` chains.
+
+Escalation still raises the minimum tier, capped at 5. Opus is now the only tier-5 model, so a run escalating from Sol 6.1 goes straight to Opus in every role.
+
+The evaluation results in this file that mention either model are kept as history. `limitless eval policy` lists such evidence as ineligible ("not in the model catalog"), so a regenerated policy cannot bring them back. Stored runs, invocations and evals that used them still show their recorded IDs. A routing policy or `--models` value that names one fails with an error saying it was removed; so does a review roster pin in panel mode (single mode, which uses no roster, warns).
+
 ## Owner decision: implement = Codex first in every cell while banked Codex resets last (2026-10-03)
 
 Every implement cell now starts on Codex:
@@ -131,6 +141,8 @@ Escalation happens after two rounds on one implementer and raises the minimum ti
 `[routing] prefer = ["codex"]` could not do this, because it only reorders interchangeable `a|b` groups and the implement cells are explicit orders. Review still avoids the implementer's vendor, so Codex-implemented runs keep a Claude reviewer (`claude/opus`). The avoidance is soft: with no other vendor available, a Codex-implemented run can get an OpenAI reviewer. Dependabot runs in the default free-first mode can still put free local models ahead of Codex.
 
 Revisit when the banked resets are gone, or if the Sol trial summary (below) or review findings show worse outcomes for Codex-implemented large runs. The trial comparison uses runs started before this change.
+
+Partly superseded on 2026-10-04: Astra was removed from routing (see the section above), so every implement cell is now `codex/sol-6.1@high`, then `claude/opus`.
 
 ## Owner decision: implement trial = `codex/sol-6.1@high` first below large (2026-10-01)
 

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Role } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { type AgentResult, emptyUsage } from "../src/harness/types.ts";
 import {
@@ -12,6 +13,7 @@ import {
   PROVIDERS,
   type ProviderDef,
 } from "../src/router/catalog.ts";
+import { loadPolicy } from "../src/router/policy.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 import { waitClock } from "./wait-clock.ts";
@@ -1043,12 +1045,12 @@ test("with the default policy, a verifier never reuses a raising model and prefe
   const both = verifier(["anthropic", "openai"], ["codex/sol", "claude/sonnet"]);
   expect(both).toBeDefined();
   expect(["codex/sol", "claude/sonnet", "claude/opus"]).not.toContain(both);
-  // Deep profile: adversarial on codex/astra, careful on the implementer's claude/opus. Both vendors
+  // Deep profile: adversarial on codex/sol-6.1, careful on the implementer's claude/opus. Both vendors
   // raised it, so the one that did not implement verifies, even with more Claude headroom.
   const deep = router.route(
     "review",
     "large",
-    verifierConstraints(["anthropic", "openai"], ["codex/astra", "claude/opus"], {
+    verifierConstraints(["anthropic", "openai"], ["codex/sol-6.1", "claude/opus"], {
       vendor: "anthropic",
       modelId: "claude/opus",
     }),
@@ -1058,6 +1060,26 @@ test("with the default policy, a verifier never reuses a raising model and prefe
     modelId: "claude/opus",
     reason: "raised a candidate it would verify",
   });
+});
+
+test("escalating to tier 5 reaches Opus in every role and cell of the committed policy", () => {
+  const tracker = new ProviderTracker(PROVIDERS, store, reserves, {});
+  const policy = loadPolicy(join(import.meta.dir, "../routing/policy.json"), MODELS);
+  const router = new Router(tracker, policy, MODELS);
+  for (const role of Object.keys(policy) as Role[])
+    for (const complexity of ["trivial", "small", "medium", "large"] as const) {
+      const candidates = router.route(role, complexity, { minTier: 5 }).candidates;
+      expect(candidates.map((c) => c.modelId)).toContain("claude/opus");
+      expect(candidates.every((c) => c.tier >= 5)).toBe(true);
+    }
+  // The engine escalates a Sol 6.1 implementer (tier 4) with it excluded: Opus is next in every cell.
+  for (const complexity of ["trivial", "small", "medium", "large"] as const)
+    expect(
+      router.route("implement", complexity, {
+        minTier: 5,
+        exclude: [{ modelId: "codex/sol-6.1", effort: "high" }],
+      }).candidates[0]?.modelId,
+    ).toBe("claude/opus");
 });
 
 describe("bounded provider waits", () => {

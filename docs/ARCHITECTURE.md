@@ -159,7 +159,7 @@ lockfile edits outside dependency tasks, and files touched outside the planned s
 
 | Tier | Subscription (sunk cost) | Metered / free |
 |---|---|---|
-| 5 | Claude Fable 5.1, Claude Opus 5.5, GPT-6 Astra | (OpenRouter frontier — last resort) |
+| 5 | Claude Opus 5.5 | (OpenRouter frontier — last resort) |
 | 4 | Claude Sonnet 5, GPT-6 Sol | Kimi / MiniMax / DeepSeek-class via OpenRouter |
 | 3 | GPT-6 Luna, Claude Haiku 4.5 | GLM Flash / DeepSeek Flash via OpenRouter |
 | 2 | — | Qwen3.8 Flash Next (`omlx/qwen-flash`, Mac, default) and Swift-1.5 Qwen3.8 27B MTP (`omlx/qwen-27b`, opt-in), twilight llama.cpp models |
