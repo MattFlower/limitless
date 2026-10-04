@@ -10,7 +10,7 @@ for (const round of [0, 1]) {
         gates: { setup: [], checks: [], source: "none", protectedPaths: [] },
         baseline: null,
         baseSha: "base123",
-        feedback: null,
+        feedback: round ? "Repair the failed gate in this fresh invocation." : null,
         round,
         hasHoldout,
       });
@@ -27,6 +27,7 @@ for (const round of [0, 1]) {
       expect(prompt).toContain(
         "Never stop or signal processes you did not start: no `pkill`, `killall` or `kill` by name or pattern.",
       );
+      expect(prompt).toContain("Other runs, deploys and the user share this machine.");
       if (round === 0 && hasHoldout) {
         expect(prompt).toContain(
           "A separate verifier will check private scenarios derived from the request, including edge and failure cases: handle the edge and failure cases the request implies, within its scope.",

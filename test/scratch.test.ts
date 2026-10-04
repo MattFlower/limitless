@@ -13,15 +13,16 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
+import { buildClaudeArgs, runClaude as productionClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
   type CanaryClasses,
   CodexReaderProbe,
   canaryRoots,
+  runCodex as productionCodex,
   type ReaderProbeOptions,
-  runCodex,
 } from "../src/harness/codex.ts";
+import { confinementScope } from "../src/harness/sandbox.ts";
 import {
   createScratch,
   privateReadRoots,
@@ -34,7 +35,27 @@ import {
 import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
 import type { ProcOptions, ProcResult, runProcess } from "../src/util/proc.ts";
-import { seatbeltSkip } from "./confinement.ts";
+import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
+
+const simulatedOuter =
+  (runner: typeof runProcess): typeof runProcess =>
+  async (opts) => {
+    if (opts.cmd[0] === "/bin/sh" && opts.cmd[4]?.startsWith("limitless-started-")) {
+      opts.onStdoutLine?.(opts.cmd[4]);
+      return runner({ ...opts, cmd: opts.cmd.slice(5) });
+    }
+    return runner(opts);
+  };
+const runCodex: typeof productionCodex = (spec, runner, probe) => {
+  if (!runner) throw new Error("These tests require an injected CLI");
+  return confinementScope.run(fakeConfinement, () => productionCodex(spec, simulatedOuter(runner), probe));
+};
+const runClaude: typeof productionClaude = (spec, runner) => {
+  if (!runner) throw new Error("These tests require an injected CLI");
+  return spec.mode === "edit"
+    ? productionClaude(spec, runner)
+    : confinementScope.run(fakeConfinement, () => productionClaude(spec, simulatedOuter(runner)));
+};
 
 const specFor = (cwd: string, scratchDir: string): AgentSpec => ({
   cwd,
@@ -1635,6 +1656,10 @@ test.skipIf(process.platform !== "darwin")(
       let probes = 0;
       let payloads = 0;
       const outcome = await runClaude({ ...spec, fast }, async (opts) => {
+        if (opts.cmd[0] === "/bin/sh") {
+          probes++;
+          return { ...procResult, stdout: "signals-verified" };
+        }
         expect(opts.cmd[0]).toBe("/usr/bin/sandbox-exec");
         const profile = opts.cmd[2] ?? "";
         for (const path of [cwd, scratchDir, admin]) expect(profile).toContain(`(subpath "${path}")`);
@@ -1646,7 +1671,7 @@ test.skipIf(process.platform !== "darwin")(
           return { ...procResult, stdout: "verified" };
         }
         payloads++;
-        expect(probes).toBe(1);
+        expect(probes).toBe(2);
         expect(opts.cmd[opts.cmd.indexOf("--setting-sources") + 1]).toBe("");
         expect(opts.cmd).toContain("--strict-mcp-config");
         expect(opts.env.CLAUDE_CONFIG_DIR).toBe(process.env.CLAUDE_CONFIG_DIR);
@@ -1680,6 +1705,7 @@ test.skipIf(process.platform !== "darwin")(
     try {
       for (const exitCode of [0, 1]) {
         const result = await runClaude(spec, async (opts) => {
+          if (opts.cmd[0] === "/bin/sh") return { ...procResult, stdout: "signals-verified" };
           if (!opts.cmd.includes("claude")) {
             writeFileSync(opts.cmd.at(-2) ?? "", "ok");
             return { ...procResult, stdout: "verified" };

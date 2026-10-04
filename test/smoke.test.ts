@@ -1041,13 +1041,24 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
 ], console.log, {retryDelayMs: 0, stopGraceMs: 2000, budgetMs: ${mode === "budget" ? 2250 : 60000}});
 `,
     );
+    // These lifecycle fixtures use substitute CLIs; the real boundary/refusal is tested separately.
+    const confinedEntry = join(dir, "confined-runner.ts");
+    writeFileSync(
+      confinedEntry,
+      `
+import { main } from ${JSON.stringify(join(process.cwd(), "scripts/smoke.ts"))};
+import { confinementScope } from ${JSON.stringify(join(process.cwd(), "src/harness/sandbox.ts"))};
+import { fakeConfinement } from ${JSON.stringify(join(import.meta.dir, "confinement.ts"))};
+process.exitCode = await confinementScope.run(fakeConfinement, main);
+`,
+    );
     writeFileSync(join(dir, "pids"), "");
     const child = Bun.spawn(
       [
         process.execPath,
         ...(timed || ownTimeout || mode === "completed" || mode === "probe"
           ? [entry]
-          : ["scripts/smoke.ts", "--models", mode === "SIGTERM" ? "codex/luna@low" : "claude/sonnet@low"]),
+          : [confinedEntry, "--models", mode === "SIGTERM" ? "codex/luna@low" : "claude/sonnet@low"]),
       ],
       {
         env: {

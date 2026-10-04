@@ -16,6 +16,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
 import { agentEnv, type ProcResult, runProcess } from "../util/proc.ts";
+import { runSandboxed } from "./sandbox.ts";
 import {
   createScratch,
   readConfinement,
@@ -26,6 +27,7 @@ import {
   validateScratch,
   writeRoots,
 } from "./scratch.ts";
+import { signalWarnings } from "./signals.ts";
 import {
   type AgentEvent,
   type AgentResult,
@@ -50,8 +52,12 @@ export class CodexStreamParser {
   turns = 0;
   failed: string | null = null;
   completed = false;
+  private readonly commands = new Set<string>();
 
-  constructor(private readonly emit: (e: AgentEvent) => void) {}
+  private readonly emit: (e: AgentEvent) => void;
+  constructor(emit: (e: AgentEvent) => void) {
+    this.emit = signalWarnings(emit);
+  }
 
   feed(line: string): void {
     let e: Json;
@@ -111,9 +117,11 @@ export class CodexStreamParser {
         if (phase === "item.completed" && item.text) this.emit({ type: "thinking", text: String(item.text) });
         break;
       case "command_execution":
-        if (phase === "item.started") {
+        if (!this.commands.has(id)) {
+          this.commands.add(id);
           this.emit({ type: "tool_call", id, name: "shell", input: { command: item.command } });
-        } else {
+        }
+        if (phase !== "item.started") {
           const output = String(item.aggregated_output ?? "");
           this.emit({
             type: "tool_result",
@@ -801,7 +809,20 @@ export async function runCodex(
   });
 
   appendFileSync(spec.logPath, `# codex ${t.model} ${new Date().toISOString()}\n`);
-  const proc = await processRunner({
+  const runner: typeof runProcess = (opts) =>
+    spec.noTools
+      ? processRunner(opts)
+      : runSandboxed(
+          opts,
+          editing
+            ? writeRoots(spec.cwd, validateScratch(spec))
+            : { write: [validateScratch(spec)], protect: [spec.cwd] },
+          processRunner,
+          undefined,
+          undefined,
+          true,
+        );
+  const proc = await runner({
     cmd: args,
     cwd: spec.cwd,
     env: agentEnv(scratchEnv(spec)),

@@ -156,6 +156,7 @@ function backend(behaviour: "enforced" | "leaky" | "timeout" | "throws" | "incom
     calls.push(opts.cmd);
     if (behaviour === "throws") throw new Error("spawn failed");
     if (behaviour === "timeout") return proc({ exitCode: null, timedOut: true });
+    if (opts.cmd[1] === "-c") return proc({ stdout: "signals-verified" });
     const [inside, outside] = opts.cmd.slice(-2) as [string, string];
     writeFileSync(inside, "ok");
     if (behaviour === "leaky") writeFileSync(outside, "no");
@@ -182,7 +183,7 @@ test("unavailable, ineffective or inconclusive Seatbelt fails closed and is neve
   const good = backend("enforced");
   await verifySeatbelt(good.run, executable, "darwin");
   await verifySeatbelt(good.run, executable, "darwin");
-  expect(good.calls).toHaveLength(2);
+  expect(good.calls).toHaveLength(4);
 });
 
 test("the payload never runs after a failed verification or once cancelled", async () => {
@@ -402,4 +403,49 @@ test("concurrent backend scopes stay isolated across asynchronous launches", asy
     expect(recording.calls[0]?.opts.cmd).toEqual(["/bin/sh", "-c", `echo scope-${i}`]);
   }
   expect(confinementScope.getStore()).toBeUndefined();
+});
+
+test("a write-enforcing backend must also prove signals; signal-only leaks and inconclusive probes never launch payloads", async () => {
+  for (const failure of [
+    proc({ exitCode: 1 }),
+    proc(),
+    proc({ stdout: "signals-verified", timedOut: true }),
+    proc({ stdout: "signals-verified", signal: "SIGTERM" }),
+    proc({ stdout: "signals-verified", idleTimedOut: true }),
+  ]) {
+    const calls: string[][] = [];
+    const runner = async (opts: ProcOptions) => {
+      calls.push(opts.cmd);
+      if (opts.cmd[1] === "-c") return failure;
+      writeFileSync(opts.cmd.at(-2) ?? "", "ok");
+      return proc({ stdout: "verified" });
+    };
+    await expect(
+      runSandboxed(
+        { cmd: ["untrusted-payload"], cwd: work, env: agentEnv() },
+        { write: [work], protect: [] },
+        runner,
+        () => verifySeatbelt(runner, "/bin/sh", "darwin", { write: [work], protect: [] }),
+      ),
+    ).rejects.toThrow("Signal confinement");
+    expect(calls).toHaveLength(2);
+    expect(calls.flat()).not.toContain("untrusted-payload");
+  }
+});
+
+test("nested compatibility requires effective signal canaries after the inner profile, not successful startup alone", async () => {
+  const calls: ProcOptions[] = [];
+  const runner = async (opts: ProcOptions) => {
+    calls.push(opts);
+    if (opts.cmd[1] === "-p") {
+      writeFileSync(opts.cmd.at(-2) ?? "", "ok");
+      return proc({ stdout: "verified" });
+    }
+    return proc({ stdout: "nested" });
+  };
+  await expect(
+    verifySeatbelt(runner, "/bin/sh", "darwin", { write: [work], protect: [] }, undefined, true),
+  ).rejects.toThrow("Signal confinement");
+  expect(calls).toHaveLength(2);
+  expect(calls[1]?.cmd[2]).toContain('"$1" -p "$2" "$1" -p "(version 1)(allow default)" /bin/sh -c');
 });

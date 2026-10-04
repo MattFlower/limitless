@@ -10,6 +10,7 @@ import {
   validateScratch,
   writeRoots,
 } from "./scratch.ts";
+import { signalWarnings } from "./signals.ts";
 import {
   type AgentEvent,
   type AgentResult,
@@ -62,7 +63,10 @@ export class ClaudeStreamParser {
   quotaRejectedUntil: number | null = null;
   quotaText = false;
 
-  constructor(private readonly emit: (e: AgentEvent) => void) {}
+  private readonly emit: (e: AgentEvent) => void;
+  constructor(emit: (e: AgentEvent) => void) {
+    this.emit = signalWarnings(emit);
+  }
 
   feed(line: string): void {
     let e: Json;
@@ -175,6 +179,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
   ];
   const fastSettings = spec.fast && t.provider === "claude" ? { fastMode: true } : {};
   const denied = ["Bash(git push:*)", "Bash(gh pr merge:*)", "Bash(gh repo delete:*)", "Bash(rm -rf /*)"];
+  denied.push("Bash(pkill:*)", "Bash(killall:*)", "Bash(kill -9 -1:*)");
   let readTools = ["Read", "Grep", "Glob"];
   let editTools: string[] = [];
   if (!spec.noTools) {
@@ -278,11 +283,15 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const t = spec.target;
   const args = buildClaudeArgs(spec, sessionId);
   const editing = spec.mode === "edit" && !spec.noTools;
-  const roots = editing ? writeRoots(spec.cwd, validateScratch(spec)) : null;
+  const roots = spec.noTools
+    ? null
+    : editing
+      ? writeRoots(spec.cwd, validateScratch(spec))
+      : { write: [validateScratch(spec)], protect: [realpathSync(spec.cwd)] };
   // Preserve HOME and CLAUDE_CONFIG_DIR: they identify the persistent login/Keychain service.
   // Copying OAuth state to scratch loses refreshed tokens when scratch is removed.
   const runner: typeof runProcess = (opts) =>
-    roots ? runSandboxed(opts, roots, processRunner) : processRunner(opts);
+    roots ? runSandboxed(opts, roots, processRunner, undefined, undefined, !editing) : processRunner(opts);
   appendFileSync(spec.logPath, `# claude ${t.model} ${new Date().toISOString()}\n`);
   const envExtra: Record<string, string> = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
   if (t.backend) {

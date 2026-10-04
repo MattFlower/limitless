@@ -31,6 +31,8 @@ export function seatbeltProfile(roots: WriteRoots): string {
   return [
     "(version 1)",
     "(allow default)",
+    "(deny signal)",
+    "(allow signal (target self) (target same-sandbox))",
     "(deny file-write*)",
     `(allow file-write* ${paths(roots.write)} (literal "/dev/null") (literal "/dev/zero") (regex #"^/dev/(fd/|tty|ptmx$)"))`,
     ...(roots.protect.length ? [`(deny file-write* ${paths(roots.protect)})`] : []),
@@ -41,11 +43,13 @@ const observed = (roots: WriteRoots): WriteRoots => ({ ...roots, write: [...root
 
 export interface ConfinementBackend {
   verify(roots: WriteRoots, opts: ProcOptions, run: typeof runProcess): Promise<void>;
+  nested?: (roots: WriteRoots, opts: ProcOptions, run: typeof runProcess) => Promise<void>;
   wrap(cmd: string[], roots: WriteRoots): string[];
 }
 export const confinementScope = new AsyncLocalStorage<ConfinementBackend>();
 export const seatbeltBackend: ConfinementBackend = {
   verify: (roots, opts, run) => verifySeatbelt(run, SANDBOX_EXEC, process.platform, roots, opts.signal),
+  nested: (roots, opts, run) => verifySeatbelt(run, SANDBOX_EXEC, process.platform, roots, opts.signal, true),
   wrap: (cmd, roots) => [SANDBOX_EXEC, "-p", seatbeltProfile(roots), ...cmd],
 };
 
@@ -56,10 +60,30 @@ export async function verifySeatbelt(
   platform: string = process.platform,
   roots?: WriteRoots,
   signal?: AbortSignal,
+  nested = false,
 ): Promise<void> {
   signal?.throwIfAborted();
-  await probeSeatbelt(run, executable, platform, roots, signal);
+  try {
+    await probeSeatbelt(run, executable, platform, roots, signal, nested);
+  } catch (error) {
+    throw new ConfinementError(`Signal confinement preflight failed: ${String(error)}`);
+  }
 }
+
+// All targets are created by this trusted supervisor; no PID/name from the host is accepted.
+const SIGNAL_PROBE = (nested: boolean) => `
+sleep 30 & outside=$!
+sibling=""
+trap 'kill "$outside" $sibling 2>/dev/null; wait 2>/dev/null' EXIT
+"$1" -p "$2" /bin/sh -c 'echo ready > "$1"; exec sleep 30' sh "$3" & sibling=$!
+i=0; while [ ! -f "$3" ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .01; done
+"$1" -p "$2" ${nested ? '"$1" -p "(version 1)(allow default)" ' : ""}/bin/sh -c '
+  kill -TERM "$1" 2>/dev/null && exit 1
+  kill -TERM "$2" 2>/dev/null && exit 1
+  /bin/sh -c "$3" || exit 1
+' sh "$outside" "$sibling" 'sleep 30 & child=$!; kill -TERM "$child"; wait "$child"; [ "$?" -gt 128 ]' || exit 1
+kill -0 "$outside" && kill -0 "$sibling" && printf signals-verified
+`;
 
 const WRITE_BOTH = 'printf ok > "$1" && ! printf no > "$2" && printf verified';
 
@@ -69,9 +93,12 @@ async function probeSeatbelt(
   platform: string,
   roots?: WriteRoots,
   signal?: AbortSignal,
+  nested = false,
 ) {
   if (platform !== "darwin" || !existsSync(executable))
-    throw new ConfinementError(`Write confinement unavailable: ${platform} has no Seatbelt (${executable})`);
+    throw new ConfinementError(
+      `Write confinement unavailable (signal confinement also required): ${platform} has no Seatbelt (${executable})`,
+    );
   const root = realpathSync(mkdtempSync(join(tmpdir(), "limitless-seatbelt-")));
   const allowed = mkdtempSync(join(roots?.write[0] ?? root, "seatbelt-allowed-"));
   try {
@@ -102,8 +129,32 @@ async function probeSeatbelt(
       existsSync(outside)
     )
       throw new ConfinementError(
-        `Write confinement not verified: Seatbelt did not enforce its profile; ${proc.stderr.trim()}`,
+        `Write confinement not verified (signal confinement also required): Seatbelt did not enforce its profile; ${proc.stderr.trim()}`,
       );
+    const signals = await run({
+      cmd: [
+        "/bin/sh",
+        "-c",
+        SIGNAL_PROBE(nested),
+        "sh",
+        executable,
+        seatbeltProfile(roots ?? { write: [allowed], protect: [] }),
+        join(allowed, "ready"),
+      ],
+      cwd: root,
+      env: agentEnv(),
+      timeoutMs: 5000,
+      signal,
+    });
+    if (
+      signals.exitCode !== 0 ||
+      signals.stdout !== "signals-verified" ||
+      signals.cancelled ||
+      signals.timedOut ||
+      signals.idleTimedOut ||
+      signals.signal
+    )
+      throw new ConfinementError(`Signal confinement not verified: ${signals.stderr}`);
   } finally {
     rmSync(allowed, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
@@ -132,11 +183,18 @@ export async function runSandboxed(
   run = runProcess,
   verify?: () => Promise<void>,
   backend: ConfinementBackend = confinementScope.getStore() ?? seatbeltBackend,
+  nested = false,
 ): Promise<ProcResult> {
   await (verify ? verify() : backend.verify(roots, opts, run));
+  if (nested) {
+    if (!backend.nested) throw new ConfinementError("Signal confinement: nested CLI sandbox not verified");
+    await backend.nested(roots, opts, run);
+  }
   opts.signal?.throwIfAborted();
   const token = `limitless-started-${crypto.randomUUID()}`;
   let started = false;
+  let broken = false;
+  const unavailable = /sandbox[_ -](?:apply|init|initialization).*?(?:not permitted|failed)/i;
   const payload: ProcOptions = {
     ...opts,
     cmd: [
@@ -149,14 +207,19 @@ export async function runSandboxed(
       ...opts.cmd,
     ],
     onStdoutLine: (line) => {
+      broken ||= nested && unavailable.test(line);
       if (line === token) started = true;
       else opts.onStdoutLine?.(line);
     },
+    onStderrLine: (line) => {
+      broken ||= nested && unavailable.test(line);
+      opts.onStderrLine?.(line);
+    },
   };
   const result = await run({ ...payload, cmd: backend.wrap(payload.cmd, roots) });
-  if (!started)
+  if (!started || broken)
     throw new ConfinementError(
-      `Write confinement payload did not start: ${result.stderr || result.exitCode}`,
+      `Write confinement payload did not start (signal confinement also required): ${result.stderr || result.exitCode}`,
     );
   return { ...result, stdout: result.stdout.replace(`${token}\n`, "") };
 }

@@ -453,3 +453,100 @@ test("native fast flags cover edit, structured and isolated readers without leak
     expect(parser.fastModeDisabledReason).toBeNull();
   });
 });
+
+for (const [name, Parser] of [
+  ["claude", ClaudeStreamParser],
+  ["codex", CodexStreamParser],
+] as const) {
+  test(`${name} warns once for executable signals including denied attempts, not prose or literal data`, () => {
+    const events: AgentEvent[] = [];
+    const parser = new Parser((event) => events.push(event));
+    for (const line of fixture(`${name}-signals.jsonl`)) parser.feed(line);
+    const warnings = events.filter((event) => event.type === "warning");
+    expect(warnings.map((event) => event.id)).toEqual(Array.from({ length: 11 }, (_, i) => `signal-${i}`));
+    expect(JSON.stringify(warnings)).not.toContain("marker");
+    expect(events.filter((event) => event.type === "tool_result").length).toBeGreaterThan(10);
+  });
+}
+
+test("Claude edit denies named process signals and broadcast kill as backstops", async () => {
+  await withScratch(process.cwd(), async (scratchDir) => {
+    const args = buildClaudeArgs(
+      {
+        cwd: process.cwd(),
+        scratchDir,
+        prompt: "edit",
+        mode: "edit",
+        target: {
+          modelId: "claude/test",
+          model: "test",
+          provider: "claude",
+          harness: "claude",
+          vendor: "anthropic",
+          tier: 4,
+          billing: "subscription",
+        },
+        signal: new AbortController().signal,
+        timeoutMs: 1000,
+        idleTimeoutMs: 1000,
+        maxToolCalls: 5,
+        logPath: join(scratchDir, "log"),
+        onEvent: () => {},
+      },
+      "session",
+    );
+    for (const pattern of ["Bash(pkill:*)", "Bash(killall:*)", "Bash(kill -9 -1:*)"])
+      expect(args.slice(args.indexOf("--disallowedTools") + 1)).toContain(pattern);
+  });
+});
+
+test("Codex completion-only denied command warns once without treating tool output as commands", () => {
+  const events: AgentEvent[] = [];
+  const parser = new CodexStreamParser((event) => events.push(event));
+  const call = JSON.stringify({
+    type: "item.completed",
+    item: {
+      id: "denied",
+      type: "command_execution",
+      command: "kill -TERM 123",
+      status: "failed",
+      exit_code: 1,
+      aggregated_output: "Denied: killall marker",
+    },
+  });
+  parser.feed(call);
+  parser.feed(call);
+  expect(events.filter((event) => event.type === "warning")).toHaveLength(1);
+  expect(events.filter((event) => event.type === "tool_call")).toHaveLength(1);
+});
+
+test("executed JavaScript tools warn for process.kill while comments and printed strings stay literal", () => {
+  for (const kind of ["claude", "codex"]) {
+    const events: AgentEvent[] = [];
+    const parser =
+      kind === "claude"
+        ? new ClaudeStreamParser((e) => events.push(e))
+        : new CodexStreamParser((e) => events.push(e));
+    for (const [id, code] of [
+      ["signal-js", "process.kill(123, 'SIGTERM')"],
+      ["text-js", "console.log('process.kill(123)'); // process.kill(456)"],
+    ]) {
+      parser.feed(
+        JSON.stringify(
+          kind === "claude"
+            ? {
+                type: "assistant",
+                message: { content: [{ type: "tool_use", id, name: "node_repl", input: { code } }] },
+              }
+            : {
+                type: "item.started",
+                item: { type: "mcp_tool_call", id, server: "node_repl", tool: "js", arguments: { code } },
+              },
+        ),
+      );
+    }
+    expect(events.filter((event) => event.type === "warning").map((event) => event.id)).toEqual([
+      "signal-js",
+    ]);
+  }
+});

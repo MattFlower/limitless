@@ -515,3 +515,21 @@ test("legacy holdout collisions never supply evidence to the public acceptance r
   // The separate holdout section is the established delivery-time publication.
   expect(report.split("## Holdout scenarios")[1]).toContain(privateEvidence);
 });
+
+test("signal warnings are advisory and describe attempts without publishing command contents", () => {
+  for (const success of [true, false]) {
+    const md = renderReport({
+      success,
+      signalWarnings: 2,
+      runId: "r1",
+      prompt: "test",
+      state: {},
+      invocations: [],
+      totals: { costUsd: 0, costEquivUsd: 0 },
+      runUrl: "/runs/r1",
+    });
+    expect(md).toContain("2 process signal attempt(s) detected");
+    expect(md).toContain("does not establish that a signal succeeded");
+    expect(md).toContain(success ? "every gate below passed" : "needs a human");
+  }
+});

@@ -36,7 +36,8 @@ export type AgentEvent =
     }
   | { type: "rate_limit"; status: string; windows: Record<string, QuotaWindow>; resetsAt: number | null }
   | { type: "stderr"; text: string }
-  | { type: "status"; text: string };
+  | { type: "status"; text: string }
+  | { type: "warning"; id: string; text: string };
 
 export interface AgentSpec {
   fast?: boolean;
