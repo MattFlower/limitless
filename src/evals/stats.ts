@@ -378,6 +378,9 @@ export function summarize(
       flipDenominator: run.k > 1 ? complete.size : 0,
       costUsd: rows.reduce((n, t) => n + t.costUsd, 0),
       costEquivUsd: rows.reduce((n, t) => n + t.costEquivUsd, 0),
+      cacheReadTokens: rows.reduce((n, t) => n + (t.details.cacheReadTokens ?? 0), 0),
+      cacheWriteTokens: rows.reduce((n, t) => n + (t.details.cacheWriteTokens ?? 0), 0),
+      tokensIn: rows.reduce((n, t) => n + t.tokensIn, 0),
       p50LatencyMs: !latency.length
         ? null
         : latency.length % 2

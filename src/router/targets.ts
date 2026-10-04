@@ -62,6 +62,15 @@ export function transportError(
   target: Pick<ResolvedTarget, "model" | "effort" | "targetId">,
   provider: ProviderDef | undefined,
 ): string | null {
+  if (!provider) return `${target.model.id}: unknown provider`;
+  if (
+    provider.harness === "claude" &&
+    provider.kind !== "claude-cli" &&
+    provider.openaiBaseUrl &&
+    !provider.baseUrl &&
+    !TOOL_LESS_ROLES.includes(role)
+  )
+    return `${target.model.id}: openai-compatible transport cannot serve the ${role} role`;
   if (provider?.harness === "decisions" && !DECISION_ROLES.includes(role))
     return `${target.model.id} is a decision model; the ${role} role has no decisions mapping`;
   return effortTransportError(role, target, provider);

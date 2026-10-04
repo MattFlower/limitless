@@ -87,6 +87,13 @@ export function retryRun(id: string): Promise<Run> {
   return request<Run>(`/api/runs/${id}/retry`, { method: "POST" });
 }
 
+export function resolveRun(
+  id: string,
+  input: { kind: "done_elsewhere" | "superseded" | "wont_do"; ref?: string; note?: string },
+): Promise<Run> {
+  return request<Run>(`/api/runs/${id}/resolve`, { method: "POST", body: JSON.stringify(input) });
+}
+
 export function answerRun(id: string, answer: string, questionId?: number): Promise<Question[]> {
   return request(`/api/runs/${id}/answer`, {
     method: "POST",

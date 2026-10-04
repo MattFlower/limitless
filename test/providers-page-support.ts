@@ -1,7 +1,7 @@
 import { createStore } from "solid-js/store";
 import { createRenderer } from "solid-js/universal";
-import type { AuthSession, ProviderStatus, QuotaAlert } from "../src/core/types.ts";
-import type { ProviderWorkload } from "../src/db/stats.ts";
+import type { AuthSession, ProviderStatus, QuotaAlert, Run } from "../src/core/types.ts";
+import type { ProviderWorkload, Stats } from "../src/db/stats.ts";
 
 // Solid's universal renderer exercises mounted reactive components without a browser or DOM dependency.
 export interface TestNode {
@@ -53,10 +53,11 @@ export const {
   getNextSibling: (node) => node.parent?.children[(node.parent?.children.indexOf(node) ?? -1) + 1],
 });
 
-const [providers, setProviders] = createStore<Record<string, ProviderStatus>>({});
+const [providers, setProviders] = createStore<Record<string, ProviderStatus>>(Object.create(null));
 const [alerts, setAlerts] = createStore<Record<string, QuotaAlert>>({});
-export const live = { providers, alerts, runs: {}, connected: () => true };
-export { setAlerts, setProviders };
+const [runs, setRuns] = createStore<Record<string, Run>>({});
+export const live = { providers, alerts, runs, connected: () => true };
+export { setAlerts, setProviders, setRuns };
 export let liveStarts = 0;
 export function ensureLiveStore() {
   liveStarts++;
@@ -74,7 +75,11 @@ export async function getProviderWorkload() {
   if (failure) throw new Error("Workload unavailable");
   return workload;
 }
-export const getStats = async () => null;
+export const statsRequests: { days: number; resolve: (stats: Stats) => void }[] = [];
+export const getStats = (days: number) =>
+  new Promise<Stats>((resolve) => {
+    statsRequests.push({ days, resolve });
+  });
 let authSession: AuthSession | null = null;
 export function setAuthSession(session: AuthSession | null) {
   authSession = session;

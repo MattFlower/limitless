@@ -2,6 +2,7 @@ import type { Billing, Complexity, Effort, Role, Vendor } from "../core/types.ts
 
 export interface ProviderDef {
   id: string;
+  kind?: "claude-cli" | "codex-cli" | "openai-compatible" | "anthropic-compatible" | "decisions";
   label: string;
   harness: "claude" | "codex" | "decisions" | "fake";
   billing: Billing;
@@ -40,6 +41,7 @@ export interface ModelDef {
   notes?: string;
 }
 
+/** omlx, mtplx and twilight are deprecated implicit defaults pending config migration. */
 export const PROVIDERS: ProviderDef[] = [
   {
     id: "claude",

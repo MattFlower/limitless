@@ -8,7 +8,7 @@ import type { HealthResponse, ProviderStatus, QuotaAlert, Run } from "../src/cor
 import { getAlerts, getHealth, getProviders, listRuns, openGlobalStream } from "./api.ts";
 
 const [runsById, setRunsById] = createStore<Record<string, Run>>({});
-const [providersById, setProvidersById] = createStore<Record<string, ProviderStatus>>({});
+const [providersById, setProvidersById] = createStore<Record<string, ProviderStatus>>(Object.create(null));
 const [alertsByKey, setAlertsByKey] = createStore<Record<string, QuotaAlert>>({});
 const [connected, setConnected] = createSignal(false);
 const [gateSlots, setGateSlots] = createSignal<HealthResponse["gateSlots"]>();

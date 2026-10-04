@@ -4,7 +4,7 @@ import { parseArgs } from "node:util";
 import { validateAllow } from "../core/allow.ts";
 import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
-import type { Profile, Run, RunDetail, RunEvent } from "../core/types.ts";
+import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
 import { ApiError } from "./feed.ts";
 
@@ -25,6 +25,9 @@ Usage:
   limitless eval regrade <eval-id>        Recompute a review eval's grades from stored outputs (no model calls)
   limitless eval policy [--evals id,id] [--write]
   limitless review shadow-report [--since <ISO-8601>]  Single vs shadow panel reviews, with later outcomes
+  limitless review <run> --changes <findings.json> | --approve [--sha <sha>]
+        Apply findings as a new round on the run's PR, or approve it; --sha: the reviewed PR head
+        (default: the head the factory last delivered)
   limitless ls [--status s1,s2] [-n 20]   List runs
   limitless show <run>                    Run details
   limitless logs <run> [-f]               Print (and follow) the run's event log
@@ -36,6 +39,7 @@ Usage:
         Items to act on after the consumer's cursor; --wait long-polls until one arrives
   limitless feed ack <id> --consumer <name>  Acknowledge items through id once handled
   limitless providers                     Provider health and quota
+  limitless providers export [--write] [--yes]     Export effective provider config (offline)
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
   limitless doctor                        Report GitHub access problems the PR poller recorded
@@ -227,6 +231,7 @@ async function main(): Promise<void> {
       help: { type: "boolean", short: "h" },
       tunnel: { type: "boolean" },
       write: { type: "boolean" },
+      yes: { type: "boolean" },
       "dry-run": { type: "boolean" },
       mtplx: { type: "boolean" },
       smoke: { type: "boolean" },
@@ -237,6 +242,9 @@ async function main(): Promise<void> {
       ref: { type: "string" },
       note: { type: "string" },
       all: { type: "boolean" },
+      changes: { type: "string" },
+      approve: { type: "boolean" },
+      sha: { type: "string" },
     },
   });
   const [cmd, ...rest] = positionals;
@@ -414,6 +422,10 @@ async function main(): Promise<void> {
       });
     }
     case "providers": {
+      if (rest[0] === "export") {
+        if (rest.length !== 1) throw new Error("usage: limitless providers export [--write] [--yes]");
+        return (await import("./providers-export.ts")).providersExport(!!values.write, !!values.yes);
+      }
       if (rest[0] === "fast") {
         const [, value, id] = rest;
         if (rest.length !== 3 || (value !== "on" && value !== "off") || !id)
@@ -480,8 +492,35 @@ async function main(): Promise<void> {
       return;
     }
     case "review": {
+      const verdictUsage = "limitless review <run> --changes <findings.json> | --approve [--sha <sha>]";
+      if (values.changes !== undefined || values.approve) {
+        if (rest.length !== 1 || (values.changes !== undefined && values.approve))
+          throw new Error(`usage: ${verdictUsage}`);
+        const id = encodeURIComponent(rest[0] as string);
+        const detail = values.sha ? null : await api<RunDetail>(`/api/runs/${id}`);
+        const delivered = detail?.review?.rounds.findLast((r) => r.deliveredSha)?.deliveredSha;
+        const reviewedSha = values.sha ?? delivered ?? detail?.run.headSha;
+        const file = values.changes === undefined ? null : JSON.parse(await Bun.file(values.changes).text());
+        const result = await api<{ round?: Run; approval?: ReviewApproval }>(`/api/runs/${id}/review`, {
+          method: "POST",
+          body: JSON.stringify({
+            verdict: file ? "changes" : "approve",
+            reviewedSha,
+            ...(file ? { findings: Array.isArray(file) ? file : file.findings } : {}),
+            reviewer: process.env.USER ?? "cli",
+          }),
+        });
+        console.log(
+          result.round
+            ? `Review round queued: ${result.round.id} (${result.round.title})`
+            : `Approved ${result.approval?.sha}`,
+        );
+        return;
+      }
       if (rest.join(" ") !== "shadow-report")
-        throw new Error("usage: limitless review shadow-report [--since <ISO-8601 timestamp>]");
+        throw new Error(
+          `usage: limitless review shadow-report [--since <ISO-8601 timestamp>]\n       ${verdictUsage}`,
+        );
       const since = values.since === undefined ? undefined : parseSince(values.since);
       const { formatShadowReport } = await import("../pipeline/shadow-report.ts");
       console.log(

@@ -20,7 +20,9 @@ and delivers a pull request — while spending as little of your paid AI capacit
    the implementer's family, possibly its own model in a fresh session (recorded in the panel
    record); nothing it reports blocks until a verifier that did not raise it confirms it.
 3. **Spend is a first-class dimension.** Every invocation records tokens, $ (metered) and
-   $-equivalent (subscription). Routing picks the cheapest model that is *capable enough* for the
+   $-equivalent (subscription); cached and cache-written prompt tokens are kept apart from uncached
+   input, and writes are priced by their cache duration (1.25× input for 5 minutes, 2× for an hour).
+   Routing picks the cheapest model that is *capable enough* for the
    role, and quota headroom on subscriptions is tracked from live rate-limit telemetry.
 4. **Fresh context per stage, state on disk.** Each stage starts a fresh agent session that reads
    artifacts (spec, plan, feedback) from files; nothing important lives only in a context window
@@ -215,8 +217,9 @@ runAgent(spec: AgentSpec): AsyncIterable<AgentEvent> & { result: Promise<AgentRe
 
 - **claude-cli** spawns the official `claude -p --output-format stream-json`. Using the official
   binary with your own login is the supported way to automate a Claude subscription (research/03 §1).
-  The *same adapter* drives OpenRouter, oMLX and llama.cpp by setting `ANTHROPIC_BASE_URL` /
-  `ANTHROPIC_AUTH_TOKEN` — all of them speak the Anthropic Messages API. Factory runs use
+  The *same adapter* drives OpenRouter, oMLX and llama.cpp by setting `ANTHROPIC_BASE_URL` and an
+  `apiKeyHelper` that reads a per-invocation 0600 key file, so the backend key never enters the
+  agent's or its tools' environment — all of them speak the Anthropic Messages API. Factory runs use
   `--setting-sources project` + an explicit `--settings` so your personal hooks/plugins don't
   fire inside factory runs.
 - **codex-cli** spawns `codex exec --json` (sandbox `workspace-write`), then reads the session
