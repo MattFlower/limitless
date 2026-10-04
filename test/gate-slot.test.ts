@@ -299,6 +299,98 @@ test("restart re-registers running work immediately, even above the cap, before 
   }
 });
 
+test("late recovery replies keep running work leased until exit, including after a recovery retry", async () => {
+  for (const [retryDelay, delayExpired] of [
+    [0, false],
+    [1000, false],
+    [41_000, false],
+    [1000, true],
+  ] as const) {
+    const f = rig();
+    const clock = {
+      ...f.clock,
+      sleep: (ms: number) => new Promise<void>((resolve) => f.clock.timeout(resolve, ms)),
+    };
+    const done = Promise.withResolvers<void>(),
+      started = Promise.withResolvers<void>();
+    const reply = Promise.withResolvers<Awaited<ReturnType<LeaseClient>>>(),
+      heartbeatReply = Promise.withResolvers<Awaited<ReturnType<LeaseClient>>>();
+    const warnings: string[] = [],
+      order: string[] = [];
+    let recovered: Awaited<ReturnType<LeaseClient>> | undefined,
+      expired: Awaited<ReturnType<LeaseClient>> | undefined,
+      secondStarted = false;
+    const first = withGateLease(
+      "survivor",
+      () => {
+        started.resolve();
+        return done.promise.then(() => {
+          order.push("first exited");
+        });
+      },
+      {
+        ...f,
+        clock,
+        warn: (s) => warnings.push(s),
+        client: async (body, signal) => {
+          const result = await f.client(body, signal);
+          if (delayExpired && recovered && body.id && !body.release && result.expired) {
+            expired = result;
+            return heartbeatReply.promise;
+          }
+          if (body.running && !recovered) {
+            recovered = result;
+            return reply.promise;
+          }
+          return result;
+        },
+      },
+    );
+    await started.promise;
+    const oldSlots = f.slots;
+    f.slots = new Semaphore(1);
+    await f.time.advance(10_000);
+    const heartbeat = f.calls.find((body) => typeof body.id === "string" && !body.release);
+    if (typeof heartbeat?.id === "string") oldSlots.heartbeat(heartbeat.id, true);
+    await f.time.advance(2000);
+    expect(warnings.join()).toContain("timed out");
+    const second = withGateLease(
+      "second",
+      async () => {
+        secondStarted = true;
+        order.push("second started");
+      },
+      { ...f, clock },
+    );
+    try {
+      await f.time.flush();
+      for (let elapsed = 0; elapsed < retryDelay; elapsed += 1000) await f.time.advance(1000);
+      if (!recovered) throw new Error("missing recovery response");
+      reply.resolve(recovered);
+      await f.time.flush();
+      if (expired) {
+        heartbeatReply.resolve(expired);
+        await f.time.flush();
+      }
+      expect(f.slots.snapshot()).toEqual({ occupied: 1, limit: 1, holders: ["survivor"] });
+      expect(secondStarted).toBe(false);
+      for (let i = 0; i < 4; i++) {
+        await f.time.advance(10_000);
+        expect(f.slots.snapshot()).toEqual({ occupied: 1, limit: 1, holders: ["survivor"] });
+        expect(secondStarted).toBe(false);
+      }
+    } finally {
+      done.resolve();
+      await first;
+      await f.time.advance(250);
+      await second;
+    }
+    expect(order).toEqual(["first exited", "second started"]);
+    expect(f.slots.snapshot().occupied).toBe(0);
+    expect(f.time.pending).toBe(0);
+  }
+});
+
 test("recovery responses arriving after work exits or times out retire the new lease", async () => {
   for (const timeout of [false, true]) {
     const f = rig();

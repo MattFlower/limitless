@@ -58,9 +58,12 @@ export async function withGateLease<T>(
     bounded(
       clock,
       async (signal) => {
-        const result = await client(body, signal);
-        // A transport may finish after its deadline; retire even a late reservation.
-        if (signal.aborted && body.name) void request({ id: result.id, release: true }).catch(warn);
+        const previous = id,
+          result = await client(body, signal);
+        // A late recovery still belongs to running work unless another reply recovered it first.
+        if (body.running && !stopped && id === previous) id = result.id;
+        else if (body.name && (signal.aborted || body.running) && (stopped || result.id !== id))
+          void request({ id: result.id, release: true }).catch(warn);
         return result;
       },
       ms,
@@ -84,12 +87,11 @@ export async function withGateLease<T>(
       if (maxWait && clock.now() >= deadline) throw new Error("gate-slot acquisition deadline exceeded");
       const beat = (ms = 10_000) => {
         cancel = clock.timeout(() => {
-          void request({ id })
+          const leaseId = id;
+          void request({ id: leaseId })
             .then(async (r) => {
-              if (r.expired && !stopped) {
-                const renewed = await request({ name, running: true });
-                if (stopped) await request({ id: renewed.id, release: true });
-                else id = renewed.id;
+              if (r.expired && !stopped && id === leaseId) {
+                await request({ name, running: true });
               }
               if (!stopped) beat();
             })
