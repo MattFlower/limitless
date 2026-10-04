@@ -7,6 +7,34 @@ import { allItems, feedStore } from "./feed-support.ts";
 
 const DAY = 86_400_000;
 
+test("gate timeout re-run counts survive reopening and publish each cumulative increase once", () => {
+  const f = feedStore();
+  try {
+    const run = f.run();
+    f.store.setRunState(run.id, { gateTimeoutReruns: 1 });
+    f.reopen();
+    const saved = f.store.getRunState<{ gateTimeoutReruns: number }>(run.id);
+    expect(saved?.gateTimeoutReruns).toBe(1);
+    const state = { gateTimeoutReruns: (saved?.gateTimeoutReruns ?? 0) + 1 };
+    f.store.setRunState(run.id, state);
+    f.store.setRunState(run.id, state);
+    expect(allItems(f.store)).toMatchObject([
+      {
+        kind: "run.gate_timeout_retry",
+        summary: "Timeout-caused gate re-runs: 1",
+        data: { gateTimeoutReruns: 1 },
+      },
+      {
+        kind: "run.gate_timeout_retry",
+        summary: "Timeout-caused gate re-runs: 2",
+        data: { gateTimeoutReruns: 2 },
+      },
+    ]);
+  } finally {
+    f.close();
+  }
+});
+
 test("upgrading the existing feed preserves items and cursors and allows a later real cancellation", () => {
   const f = feedStore();
   try {
@@ -15,7 +43,7 @@ test("upgrading the existing feed preserves items and cursors and allows a later
     const before = join(f.dir, "migrations-before-ordering");
     cpSync(MIGRATION_DIR, before, {
       recursive: true,
-      filter: (src) => !src.endsWith("-ordered-feed.sql"),
+      filter: (src) => !src.endsWith("-ordered-feed.sql") && !src.endsWith("-run-resolution.sql"),
     });
     f.store = new Store(f.path, before);
     const run = f.run();
@@ -45,7 +73,7 @@ test("the additive migration keeps inbox rows; items and cursors survive reopeni
     mkdirSync(before);
     cpSync(MIGRATION_DIR, before, {
       recursive: true,
-      filter: (src) => !src.endsWith("-feed.sql"),
+      filter: (src) => !src.endsWith("-feed.sql") && !src.endsWith("-run-resolution.sql"),
     });
     const old = new Store(f.path, before);
     old.db.query("INSERT INTO inbox VALUES ('d1', 'github', 'push', 1, '{}', 'done', NULL, 'kept')").run();

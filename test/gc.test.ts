@@ -52,7 +52,10 @@ afterEach(() => {
 
 function run(status: RunStatus, ageDays: number, withFinish = true) {
   const record = store.createRun(repo, { prompt: status, repo: repo.slug });
-  store.updateRun(record.id, { status, finishedAt: withFinish ? now - ageDays * DAY : null });
+  // A resolved run here was resolved by hand from failed, keeping its original finishedAt.
+  const actual = status === "resolved" ? "failed" : status;
+  store.updateRun(record.id, { status: actual, finishedAt: withFinish ? now - ageDays * DAY : null });
+  if (status === "resolved") store.resolveRun(record.id, { kind: "wont_do", by: "human" });
   return record;
 }
 
@@ -70,8 +73,11 @@ test("terminal worktrees use exact 3/7 day boundaries and preserve nonterminal w
     ["cancelled", 3, true],
     ["failed", 7, true],
     ["needs_human", 7, true],
+    ["resolved", 3, true],
     ["succeeded", 3 - 1 / DAY, false],
+    ["resolved", 3 - 1 / DAY, false],
     ["failed", 7 - 1 / DAY, false],
+    ["needs_human", 7 - 1 / DAY, false],
     ["queued", 99, false],
     ["running", 99, false],
     ["waiting_input", 99, false],
@@ -80,6 +86,8 @@ test("terminal worktrees use exact 3/7 day boundaries and preserve nonterminal w
   const absent = run("failed", 8);
   const missing = await worktree(absent.id);
   rmSync(missing, { recursive: true, force: true });
+  const dry = await collectGarbage(store, cfg, { now, dryRun: true });
+  expect(dry.worktrees.toSorted()).toEqual(paths.filter((_, i) => cases[i]?.[2]).toSorted());
   const result = await collectGarbage(store, cfg, { now });
   expect(result.errors).toEqual([]);
   const gitList = await listed();
@@ -90,7 +98,7 @@ test("terminal worktrees use exact 3/7 day boundaries and preserve nonterminal w
   }
   expect(gitList).not.toContain(missing);
   expect(existsSync(`${missing}.git-paths`)).toBe(false);
-  expect(result.worktrees).toHaveLength(4);
+  expect(result.worktrees).toHaveLength(5);
 });
 
 test("cleanup removes legacy and cloned worktrees through their owners and prunes both", async () => {

@@ -26,21 +26,22 @@ export async function reconcileMergedRuns(
   log: (message: string) => void = console.warn,
 ): Promise<void> {
   for (const run of store.listRuns({
-    status: ["needs_human", "succeeded"],
+    status: ["needs_human", "succeeded", "resolved"],
     limit: Number.MAX_SAFE_INTEGER,
   })) {
-    if (!run.prUrl || (run.merged && run.status === "succeeded")) continue;
+    if (!run.prUrl || (run.merged && run.status !== "needs_human")) continue;
     try {
       const pr = await client(run.prUrl);
       if (!pr || pr.url !== run.prUrl || store.getRun(run.id)?.prUrl !== pr.url) continue;
       const mergedAt = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
       if (pr.state === "MERGED" && Number.isFinite(mergedAt)) {
-        if (run.status === "needs_human")
-          store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
-        else store.updateRun(run.id, { merged: true, mergedBy: pr.mergedBy?.login ?? null, mergedAt });
+        store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
       } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
         const closed = pr.state === "CLOSED";
-        if (run.prClosedUnmerged !== closed) store.updateRun(run.id, { prClosedUnmerged: closed });
+        if (closed && !pr.mergedAt && run.status === "needs_human") {
+          const resolution = { kind: "pr_closed", ref: pr.url, by: "github" } as const;
+          store.resolveRun(run.id, resolution, { from: ["needs_human"], patch: { prClosedUnmerged: true } });
+        } else if (run.prClosedUnmerged !== closed) store.updateRun(run.id, { prClosedUnmerged: closed });
       }
     } catch (error) {
       log(`GitHub PR check failed for ${run.id}: ${String(error)}`);
@@ -82,7 +83,10 @@ export function startGitHubNotifier(
   const unsubscribe = store.subscribe((msg) => {
     if (msg.kind !== "run") return;
     const run = msg.run;
-    if (run.prUrl && (run.status === "needs_human" || (run.status === "succeeded" && !run.merged)))
+    if (
+      run.prUrl &&
+      (run.status === "needs_human" || (["succeeded", "resolved"].includes(run.status) && !run.merged))
+    )
       void check();
     const ref = run.sourceRef;
     if (
@@ -93,6 +97,8 @@ export function startGitHubNotifier(
       typeof ref.number !== "number"
     )
       return;
+    // A resolution follows the terminal comment already posted for needs_human or failed.
+    if (run.status === "resolved") return;
     if (ref.kind === "pull_request" && run.status === "cancelled" && run.error?.startsWith("superseded:"))
       return;
     const terminal = TERMINAL_STATUSES.includes(run.status);

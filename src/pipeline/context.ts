@@ -120,6 +120,7 @@ export interface RunState {
   baselineScripts?: Record<string, string>;
   feedback: string | null;
   lastGates?: GateComparison[];
+  gateTimeoutReruns?: number;
   lastAudit?: AuditFinding[];
   lastReview?: Review & { modelId: string };
   reviewedSha?: string;
@@ -438,6 +439,7 @@ export class RunContext {
     const busy = new Set<string>();
     let waitMs = 0;
     let lastFailure: string | null = null;
+    let specIdRetried = false;
     // An unsure (not question-needing) decline beats failing the stage when nothing else answers.
     let lastResort: InvokeOutcome | null = null;
     const useLastResort = (outcome: InvokeOutcome, why: string) => {
@@ -667,12 +669,15 @@ export class RunContext {
         result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };
       if (opts.requireStructured && result.status === "ok" && result.structured === null)
         result = { ...result, status: "error", error: "missing structured output" };
+      let invalidSpecId = "";
       if (
         opts.schema &&
         (result.status === "ok" || result.status === "declined") &&
         result.structured !== null
       ) {
         const parsed = opts.schema.safeParse(result.structured);
+        if (!parsed.success)
+          invalidSpecId = parsed.error.issues.find((i) => i.message.startsWith("Invalid id "))?.message ?? "";
         result = parsed.success
           ? { ...result, structured: parsed.data }
           : {
@@ -770,6 +775,13 @@ export class RunContext {
             300,
           );
         this.log(`${target.targetId ?? target.modelId} ${result.status}; falling back`, "warn");
+        continue;
+      }
+      if (opts.role === "spec" && invalidSpecId) {
+        if (specIdRetried) throw new Error(result.error ?? invalidSpecId);
+        specIdRetried = true;
+        opts = { ...opts, prompt: `${opts.prompt}\n\nInvalid spec: ${invalidSpecId}\n${result.error}` };
+        tried.pop();
         continue;
       }
       if (opts.requireStructured && (result.status !== "ok" || result.structured === null)) {

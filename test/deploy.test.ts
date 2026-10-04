@@ -1,15 +1,25 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveBootSha } from "../src/cli/boot-sha.ts";
 import {
   bounded,
+  DaemonTimeoutError,
   DEFAULT_MAX_WAIT_MS,
   type DeployClient,
   type DeployClock,
   DrainUnsupportedError,
   parseMaxWait,
+  requestAdmin,
   waitForDrain,
 } from "../src/cli/deploy-wait.ts";
 import { deploy } from "../src/cli/service.ts";
@@ -103,6 +113,7 @@ function setup() {
       draining = value;
     },
     opts: {
+      agentsDir: join(dir, "LaunchAgents"),
       releaseDir: dir,
       lockPath: join(dir, "deploy.lock"),
       command,
@@ -411,6 +422,64 @@ test("malformed health fails closed and never restarts", async () => {
   expect(f.calls).not.toContain("resume");
 });
 
+test("--now and zero-wait drains don't retry a stalled health poll", async () => {
+  for (const [maxWaitMs, now] of [
+    [60_000, true],
+    [0, false],
+  ] as const) {
+    const f = setup();
+    let reads = 0;
+    f.client.health = async () => {
+      reads++;
+      throw new DaemonTimeoutError();
+    };
+    await expect(waitForDrain(f.client, f.clock, maxWaitMs, now, () => {})).rejects.toThrow(
+      "daemon request timed out",
+    );
+    expect(reads).toBe(1);
+  }
+});
+
+test("a drain tolerates two stalled health polls in a row but not three", async () => {
+  for (const stalls of [2, 3]) {
+    const f = setup();
+    let reads = 0;
+    f.client.health = async () => {
+      reads++;
+      if (reads >= 2 && reads < 2 + stalls) throw new DaemonTimeoutError();
+      return { ok: true, uptimeMs: 1, sha: "previous", draining: true, active: reads === 1 ? ["run-a"] : [] };
+    };
+    const result = waitForDrain(f.client, f.clock, 60_000, false, (line) => f.logs.push(line));
+    if (stalls === 3) {
+      await expect(result).rejects.toThrow("daemon request timed out");
+      continue;
+    }
+    await result;
+    expect(f.logs.filter((line) => line.startsWith("Health poll timed out"))).toHaveLength(2);
+    expect(f.logs.at(-1)).toStartWith("Drain complete");
+  }
+});
+
+test("resume retries a stalled daemon with a longer limit, up to three attempts", async () => {
+  const f = setup();
+  let calls = 0;
+  f.client.admin = async (action) => {
+    if (++calls < 3) throw new DaemonTimeoutError();
+    return { draining: action === "drain", active: [] };
+  };
+  await requestAdmin(f.client, f.clock, "resume");
+  expect(calls).toBe(3);
+  expect(f.timeouts).toEqual([15_000, 15_000, 15_000]);
+  calls = -10;
+  await expect(requestAdmin(f.client, f.clock, "resume")).rejects.toThrow("daemon request timed out");
+  expect(calls).toBe(-7);
+  f.client.admin = async () => {
+    throw new DaemonTimeoutError();
+  };
+  await expect(requestAdmin(f.client, f.clock, "drain")).rejects.toThrow("daemon request timed out");
+  expect(f.timeouts.at(-1)).toBe(5000);
+});
+
 test("requests are bounded even if a client ignores abort", async () => {
   const f = setup();
   let signal: AbortSignal | undefined;
@@ -688,9 +757,22 @@ test("an unknown daemon SHA cannot use the target checkout as proof of deploymen
       f.setDraining(draining);
       const health = f.client.health;
       f.client.health = async (signal) => ({ ...(await health(signal)), sha }) as unknown as HealthResponse;
+      mkdirSync(join(f.opts.releaseDir, "src", "cli"), { recursive: true });
+      writeFileSync(join(f.opts.releaseDir, "src", "cli", "main.ts"), "");
+      mkdirSync(f.opts.agentsDir);
+      const installed = {
+        Label: "arbitrary.installed.daemon",
+        ProgramArguments: ["bun", join(f.opts.releaseDir, "src", "cli", "main.ts"), "serve"],
+      };
+      writeFileSync(join(f.opts.agentsDir, "installed.plist"), JSON.stringify(installed));
+      const command = f.opts.command;
+      f.opts.command = async (args, opts) =>
+        args[0] === "plutil"
+          ? { stdout: readFileSync(args.at(-1) ?? "", "utf8"), stderr: "", exitCode: 0 }
+          : command(args, opts);
       const listeners = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
       await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow(
-        /daemon boot SHA is unknown.*launchctl kickstart -k gui\/\d+\/cc\.mattflower\.limitless or limitless service install/,
+        /daemon boot SHA is unknown.*launchctl kickstart -k gui\/\d+\/arbitrary\.installed\.daemon or limitless service install/,
       );
       expect(f.calls).toEqual([
         "health",
@@ -887,3 +969,52 @@ test("the tunnel config names the configured public host and exposes only webhoo
   expect(yaml).toContain("  - service: http_status:404\n");
   expect(yaml).not.toMatch(/mattflower/i);
 });
+
+for (const spelling of ["canonical", "symlink", "reverse"]) {
+  test(`deploy restarts the discovered ${spelling} daemon label and ignores unrelated marked agents`, async () => {
+    const f = setup();
+    const agentsDir = join(f.opts.releaseDir, "LaunchAgents");
+    mkdirSync(agentsDir);
+    mkdirSync(join(f.opts.releaseDir, "src", "cli"), { recursive: true });
+    writeFileSync(join(f.opts.releaseDir, "src", "cli", "main.ts"), "");
+    const alias = join(f.opts.releaseDir, "alias");
+    symlinkSync(f.opts.releaseDir, alias);
+    const installed = {
+      Label: "arbitrary.pre.migration.daemon",
+      ProgramArguments: [
+        "/custom/bin/bun",
+        join(spelling === "reverse" ? alias : f.opts.releaseDir, "src", "cli", "main.ts"),
+        "serve",
+      ],
+    };
+    if (spelling === "symlink") f.opts.releaseDir = alias;
+    const unrelated = {
+      Label: "unrelated.daemon",
+      LimitlessService: "daemon",
+      ProgramArguments: ["bun", "/different/install/src/cli/main.ts", "serve"],
+    };
+    writeFileSync(join(agentsDir, "installed.plist"), JSON.stringify(installed));
+    const unrelatedPath = join(agentsDir, "unrelated.plist");
+    writeFileSync(unrelatedPath, JSON.stringify(unrelated));
+    const command: typeof sh = async (args, opts) => {
+      if (args[0] === "plutil")
+        return {
+          stdout: readFileSync(args.at(-1) ?? "", "utf8"),
+          stderr: "",
+          exitCode: 0,
+        };
+      if (args[0] === "launchctl") {
+        f.calls.push(args.join(" "));
+        await f.opts.restart();
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      return f.opts.command(args, opts);
+    };
+    await deploy(7400, "feature", false, { ...f.opts, agentsDir, command, restart: undefined });
+    const launches = f.calls.filter((call) => call.startsWith("launchctl"));
+    expect(launches).toHaveLength(1);
+    expect(launches[0]).toMatch(/^launchctl kickstart -k gui\/\d+\/arbitrary\.pre\.migration\.daemon$/);
+    expect(readFileSync(unrelatedPath, "utf8")).toBe(JSON.stringify(unrelated));
+    expect(f.calls.indexOf("drain")).toBeLessThan(f.calls.indexOf(launches[0] ?? ""));
+  });
+}
