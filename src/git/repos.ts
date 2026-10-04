@@ -115,8 +115,9 @@ export function slugify(text: string, max = 40): string {
   );
 }
 
+type MergePolicy = Repo["mergePolicy"];
 /** Resolve "owner/name", a GitHub URL, or a local path into a registered repo. */
-export async function resolveRepo(store: Store, input: string): Promise<Repo> {
+export async function resolveRepo(store: Store, input: string, merge: MergePolicy = "auto"): Promise<Repo> {
   const trimmed = input.trim();
   const existing = store.getRepoBySlug(trimmed);
   if (existing) return existing;
@@ -157,7 +158,7 @@ export async function resolveRepo(store: Store, input: string): Promise<Repo> {
     url: info.sshUrl,
     localPath: null,
     defaultBranch: info.defaultBranchRef?.name ?? "main",
-    mergePolicy: "auto",
+    mergePolicy: merge,
   });
 }
 

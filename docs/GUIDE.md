@@ -107,15 +107,35 @@ warning. Optional extras: an OpenRouter API key, a local model server (see
 ### Get the code
 
 ```bash
-git clone git@github.com:MattFlower/limitless.git ~/code/limitless   # or your fork
+git clone git@github.com:<owner>/<repo>.git ~/code/limitless
 cd ~/code/limitless
 bun install --frozen-lockfile
 alias limitless="bun $PWD/src/cli/main.ts"   # or link the package bin onto your PATH
 limitless --help
 ```
 
-Most commands talk to the daemon over HTTP, so start it first. Only `serve`, `service` and
-`integrations install` work without it.
+### Getting started
+
+```bash
+limitless init
+# Accept defaults without prompts; --repo can be repeated:
+limitless init --yes --repo <owner>/<repo> --json
+```
+
+`init` checks prerequisites before writing config, detects logged-in Claude/Codex CLIs and local
+model servers, fills missing providers and repository settings, starts the service, and saves live
+smoke results. It asks before registering MCP with Claude Code or Codex; `--yes` grants consent.
+Without a terminal, questions use defaults and MCP changes are declined unless `--yes` is set.
+Re-running keeps existing settings and fills gaps. Discreet mode is not available yet (#37).
+
+For diagnosis, run `limitless doctor` (or `limitless doctor --json`). It reports exact fixes and
+never writes files or changes services. For a missing configured API key, add
+`<API_KEY_NAME>=<API_KEY>` to `~/.config/limitless/secrets.env`; setup never asks for secrets.
+The last smoke rows live in `~/.limitless/smoke-last.json` (`LIMITLESS_HOME` overrides the directory).
+For organization SSO failures, sign in to your identity provider, then `gh auth refresh`.
+
+Most other commands talk to the daemon over HTTP. `init`, `doctor`, `serve`, `service` and
+`integrations install` can run before it is started.
 
 ### Configure
 
@@ -160,6 +180,8 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
 | `[github] poll` | `true` | Observe the factory's own PRs (CI, conflicts, reviews, comments, merges) with one GraphQL query per repository and write changes to the feed. `false` restores per-run `gh pr view` merge checks. Access problems show in `limitless doctor`. |
 | `[github] poll_seconds` | `45` | Polling interval (minimum 15); repositories with a delivered, unmerged PR poll every 15 s |
+| `[github] repos` | `[]` | Setup repositories, e.g. `["<owner>/<repo>"]`; doctor reads the first to check access and SSO. This is not a run allowlist. |
+| `[github] merge` | `"auto"` when absent; init chooses `"pr"` | Default for newly registered GitHub repos: `"auto"`, `"pr"`, or `"none"`. Existing repo rows stay unchanged; repository `.limitless.toml` policy still wins. |
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[routing] wait_budget_s` | `{ triage = 20, summarize = 20, chat = 20 }` | Per-role provider slot wait budgets in whole seconds. `0` falls through immediately; `"unbounded"` removes the limit. Omitted roles `review`, `verify`, `spec`, `holdout`, `implement`, `plan` and `plan_review` wait without limit. |

@@ -52,12 +52,15 @@ test("doctor formats the problems with their fix", () => {
 
 /** Runs `limitless doctor` against `url` with an empty data directory it must never open. */
 async function doctor(url: string) {
-  const child = Bun.spawn(["bun", "src/cli/main.ts", "doctor"], {
-    cwd: join(import.meta.dir, ".."),
-    env: { ...process.env, LIMITLESS_URL: url, LIMITLESS_HOME: dir, LIMITLESS_CONFIG_DIR: dir },
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const child = Bun.spawn(
+    ["bun", "--preload", "./test/fixtures/setup-cli-preload.ts", "src/cli/main.ts", "doctor"],
+    {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, LIMITLESS_URL: url, LIMITLESS_HOME: dir, LIMITLESS_CONFIG_DIR: dir },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
   const [stdout, stderr, exit] = await Promise.all([
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
@@ -79,19 +82,22 @@ test("limitless doctor reads access problems through the daemon API, never the d
   });
   try {
     const url = `http://127.0.0.1:${server.port}`;
-    expect(await doctor(url)).toMatchObject({ stdout: "GitHub access: ok\n", exit: 0 });
+    const healthy = await doctor(url);
+    expect(healthy.exit).toBe(0);
+    expect(healthy.stdout).toContain("ok feed-access: GitHub access: ok");
     problems = [{ repo: "acme/app", reason: "sso", detail: "SSO authorization required", since: 0 }];
     const failing = await doctor(url);
     expect(failing.exit).toBe(1);
     expect(failing.stdout).toContain("GitHub access problem in acme/app");
     expect(failing.stdout).toContain("gh auth refresh");
-    expect(paths).toEqual(["/api/github/access", "/api/github/access"]);
+    expect(paths).toEqual(["/api/health", "/api/github/access", "/api/health", "/api/github/access"]);
   } finally {
     server.stop(true);
   }
   // The daemon is down: report that, with no database fallback.
   const down = await doctor(`http://127.0.0.1:${server.port}`);
-  expect(down.exit).toBe(1);
-  expect(down.stderr).toContain("Cannot reach the Limitless daemon");
+  expect(down.exit).toBe(0);
+  expect(down.stdout).toContain("warn daemon: unreachable");
+  expect(down.stdout).toContain("Fix: limitless service install");
   expect(existsSync(join(dir, "limitless.db"))).toBe(false);
 });

@@ -233,7 +233,7 @@ export class Factory {
   ): Promise<Run> {
     if (!req.prompt?.trim()) throw new Error("prompt is required");
     if (!req.repo?.trim()) throw new Error("repo is required");
-    const repo = await resolveRepo(this.store, req.repo);
+    const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
     const run = chat
       ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
       : this.store.createRun(repo, req, verifiedGitHubWebhook);
