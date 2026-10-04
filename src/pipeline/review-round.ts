@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { Config } from "../config.ts";
+import { type PrHead, prHeadProblem } from "../core/delivery.ts";
 import type { ReviewApproval, ReviewFinding, Run } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { cachePath, ensureCache, readFileAt } from "../git/repos.ts";
@@ -86,6 +87,58 @@ export function roundSection(runId: string, round: number, findings: ReviewFindi
   };
 }
 
+const PR_FIELDS =
+  "state,headRefOid,headRefName,isCrossRepository,headRepository,headRepositoryOwner,body,autoMergeRequest";
+
+/** The PR's state and head identity; a failed lookup or a missing field refuses, never skips a check. */
+export async function readPrHead(
+  gh: GhRunner,
+  prUrl: string,
+  signal?: AbortSignal,
+): Promise<PrHead & { body: string; autoMerge: boolean }> {
+  let pr: Record<string, unknown> | null;
+  try {
+    pr = JSON.parse((await gh(["pr", "view", prUrl, "--json", PR_FIELDS], signal)) || "null");
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    throw new ReviewRefused(`cannot verify PR head: ${(error as Error).message}`, 409);
+  }
+  const owner = (pr?.headRepositoryOwner as { login?: unknown } | null)?.login;
+  const name = (pr?.headRepository as { name?: unknown } | null)?.name;
+  const { state, headRefOid: headSha, headRefName: headBranch, isCrossRepository, body } = pr ?? {};
+  if (
+    typeof state !== "string" ||
+    typeof headSha !== "string" ||
+    typeof headBranch !== "string" ||
+    typeof isCrossRepository !== "boolean" ||
+    typeof owner !== "string" ||
+    typeof name !== "string"
+  )
+    throw new ReviewRefused("cannot verify PR head: the lookup is missing its state or head", 409);
+  return {
+    state,
+    crossRepository: isCrossRepository,
+    headRepo: `${owner}/${name}`,
+    headBranch,
+    headSha,
+    body: typeof body === "string" ? body : "",
+    autoMerge: !!pr?.autoMergeRequest,
+  };
+}
+
+const prLocks = new Map<string, Promise<unknown>>();
+
+/** Verdicts and round deliveries on one PR run one at a time, so neither acts on a head the other moved. */
+export async function withPrLock<T>(prUrl: string, fn: () => Promise<T>): Promise<T> {
+  const next = (prLocks.get(prUrl) ?? Promise.resolve()).catch(() => undefined).then(fn);
+  prLocks.set(prUrl, next);
+  try {
+    return await next;
+  } finally {
+    if (prLocks.get(prUrl) === next) prLocks.delete(prUrl);
+  }
+}
+
 type ReviewFactory = { store: Store; cfg: Pick<Config, "paths">; deps: { gh?: GhRunner } };
 
 /**
@@ -120,54 +173,47 @@ export async function submitReview(
       "only a finished run that opened its own PR on a GitHub repository can be reviewed",
       409,
     );
-  const gh = factory.deps.gh ?? runGh;
-  const pr = JSON.parse(
-    (await gh(["pr", "view", prUrl, "--json", "state,headRefOid,headRefName,autoMergeRequest"])) || "null",
-  ) as {
-    state?: unknown;
-    headRefOid?: unknown;
-    headRefName?: unknown;
-    autoMergeRequest?: unknown;
-  } | null;
-  if (typeof pr?.headRefOid !== "string" || typeof pr.state !== "string")
-    throw new Error("PR lookup did not return its state and head");
-  if (pr.state !== "OPEN") throw new ReviewRefused(`the PR is ${pr.state.toLowerCase()}, not open`, 409);
-  if (pr.headRefName !== branch)
-    throw new ReviewRefused(`the PR head branch is not the run's branch ${branch}`, 409);
-  store.observePrHead(prUrl, pr.headRefOid);
-  if (pr.headRefOid !== reviewedSha)
-    throw new ReviewRefused(
-      `head moved: the PR is at ${pr.headRefOid}, not the reviewed ${reviewedSha}`,
-      409,
-    );
-  const reviewer = parsed.data.reviewer ?? "human";
-  if (verdict === "approve")
-    return { approval: store.recordApproval(owner.id, prUrl, reviewedSha, reviewer) };
   // The cap comes from the run's base commit, never from the PR under review.
-  await ensureCache(factory.cfg.paths, repo);
-  const cap = readReviewRounds(
-    await readFileAt(cachePath(factory.cfg.paths, repo), baseSha, ".limitless.toml"),
-  );
-  // Changes requested: the PR must not land on its old head, nor on the round's before a new verdict.
-  if (pr.autoMergeRequest) await gh(["pr", "merge", prUrl, "--disable-auto"]);
-  const result = store.createReviewRound(repo, owner, { prUrl, reviewedSha, findings, cap }, (round) => ({
-    repo: repo.slug,
-    title: `Review round ${round}: ${owner.title}`,
-    prompt: reviewRoundPrompt(owner.prompt, prUrl, round, findings),
-    profile: owner.profile,
-    // Created through the local API; the owner's requester keeps its routing, never the reviewer's text.
-    source: "ui",
-    ...(owner.requestedBy ? { requestedBy: owner.requestedBy } : {}),
-    baseBranch: branch,
-    deliveryBranch: branch,
-    sourceRef: { kind: "review-round", runId: owner.id, round, prUrl, reviewedSha },
-    ...(owner.allow?.length ? { allow: owner.allow } : {}),
-  }));
-  if ("active" in result)
-    throw new ReviewRefused(
-      `review round ${result.active.round} (${result.active.runId}) is still in flight`,
-      409,
-    );
-  if ("limited" in result) throw new ReviewRefused("review round limit reached", 409);
-  return { round: result.run };
+  let cap = 0;
+  if (verdict === "changes") {
+    await ensureCache(factory.cfg.paths, repo);
+    cap = readReviewRounds(await readFileAt(cachePath(factory.cfg.paths, repo), baseSha, ".limitless.toml"));
+  }
+  const gh = factory.deps.gh ?? runGh;
+  const since = store.prHead(prUrl)?.version ?? 0;
+  const pr = await readPrHead(gh, prUrl);
+  const problem = prHeadProblem(repo, branch, pr);
+  if (problem) throw new ReviewRefused(problem, 409);
+  return withPrLock(prUrl, async () => {
+    // Compare-and-set: a lookup that a newer observation (a round's push) overtook says nothing.
+    if (!store.observePrHead(prUrl, pr.headSha, since))
+      throw new ReviewRefused(`head moved: the PR moved while ${reviewedSha} was being checked`, 409);
+    if (pr.headSha !== reviewedSha)
+      throw new ReviewRefused(`head moved: the PR is at ${pr.headSha}, not the reviewed ${reviewedSha}`, 409);
+    const reviewer = parsed.data.reviewer ?? "human";
+    if (verdict === "approve")
+      return { approval: store.recordApproval(owner.id, prUrl, reviewedSha, reviewer) };
+    // Changes requested: the PR must not land on its old head, nor on the round's before a new verdict.
+    if (pr.autoMerge) await gh(["pr", "merge", prUrl, "--disable-auto"]);
+    const result = store.createReviewRound(repo, owner, { prUrl, reviewedSha, findings, cap }, (round) => ({
+      repo: repo.slug,
+      title: `Review round ${round}: ${owner.title}`,
+      prompt: reviewRoundPrompt(owner.prompt, prUrl, round, findings),
+      profile: owner.profile,
+      // Created through the local API; the owner's requester keeps its routing, never the reviewer's text.
+      source: "ui",
+      ...(owner.requestedBy ? { requestedBy: owner.requestedBy } : {}),
+      baseBranch: branch,
+      deliveryBranch: branch,
+      sourceRef: { kind: "review-round", runId: owner.id, round, prUrl, reviewedSha },
+      ...(owner.allow?.length ? { allow: owner.allow } : {}),
+    }));
+    if ("active" in result)
+      throw new ReviewRefused(
+        `review round ${result.active.round} (${result.active.runId}) is still in flight`,
+        409,
+      );
+    if ("limited" in result) throw new ReviewRefused("review round limit reached", 409);
+    return { round: result.run };
+  });
 }

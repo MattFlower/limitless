@@ -283,7 +283,7 @@ export interface ReviewVerdict {
   reviewer?: string;
 }
 
-/** The latest approval of a PR; `stale` once its head moved other than by a factory base merge. */
+/** The latest approval of a PR; `stale` once its head is seen anywhere else or changes are requested. */
 export interface ReviewApproval {
   sha: string;
   stale: boolean;

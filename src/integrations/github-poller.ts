@@ -216,10 +216,11 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   };
 
   /** Saves the observation; returns the mergeability nudge's response (null: not sent) or undefined. */
-  const record = async (pr: TrackedPr, snap: PrSnapshot) => {
+  /** `since`: the PR's head version before the request, so an overtaken observation is dropped. */
+  const record = async (pr: TrackedPr, snap: PrSnapshot, since: number) => {
     const prev = saved(pr.data);
     const head = snap.headRefOid;
-    store.observePrHead(pr.url, head);
+    store.observePrHead(pr.url, head, since);
     const same = prev?.headRefOid === head;
     const unknown = snap.mergeable !== "UNKNOWN" ? 0 : same ? (prev?.unknown ?? 0) + 1 : 1;
     // Mergeability is per head; UNKNOWN is no observation, so this head's last known value stands.
@@ -261,6 +262,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     const resolved = prs.filter((p) => p.nodeId);
     for (let known = resolved.splice(0, 100); known.length; known = resolved.splice(0, 100)) {
       const ids = known.map((p) => p.nodeId);
+      const since = known.map((p) => store.prHead(p.url)?.version ?? 0);
       const res = await call(repo, "graphql", { query: OBSERVE_QUERY, variables: { ids } });
       if (!res) return;
       // An access failure of the whole query (SSO, IP allow list, HTTP 404) says nothing about any PR.
@@ -273,7 +275,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         return log(`GitHub observation of ${repo} failed with HTTP ${res.status}`);
       for (const [i, pr] of known.entries()) {
         const snap = normalizePr(found[i], pr.nodeId);
-        const nudged = snap ? await record(pr, snap) : null;
+        const nudged = snap ? await record(pr, snap, since[i] ?? 0) : null;
         // A nudge that failed (perhaps an access problem) must not let this cycle clear an episode.
         if (nudged === null) complete = false;
         if (found[i] === null || nudged?.status === 404) missing ??= pr;

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -8,6 +8,8 @@ import type { ReviewFinding, Run, RunDetail } from "../src/core/types.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
+import type { RunState } from "../src/pipeline/context.ts";
+import type { FaultPlan } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
@@ -94,14 +96,26 @@ let work: string;
 let factory: Factory;
 let implementPrompts: string[];
 let onImplement: () => Promise<Record<string, string>>;
-let pr: { state: string; body: string; autoMerge: boolean; calls: string[][] };
+/** The fake PR: `view` overrides fields of `gh pr view`; `fail` breaks it; `hold` delays one lookup. */
+let pr: {
+  state: string;
+  body: string;
+  autoMerge: boolean;
+  calls: string[][];
+  view: Record<string, unknown>;
+  fail: boolean;
+  hold: { reached: () => void; wait: Promise<void> } | null;
+};
 
+const BASE_CONFIG =
+  '[gates]\nchecks = [{name="check",run="test -f README.md"}]\n[policy]\nprotected_paths = ["protected.txt"]\n';
 /** A base commit on main and a factory PR branch with one commit, in a bare "GitHub" remote. */
 const seed = seeded(async (dir) => {
   const repo = join(dir, "work");
   mkdirSync(repo);
   writeFileSync(join(repo, "README.md"), "fixture\n");
-  writeFileSync(join(repo, ".limitless.toml"), '[gates]\nchecks = [{name="check",run="true"}]\n');
+  writeFileSync(join(repo, "protected.txt"), "keep\n");
+  writeFileSync(join(repo, ".limitless.toml"), BASE_CONFIG);
   const git = (...args: string[]) => sh(["git", ...args], { cwd: repo });
   await git("init", "-qb", "main");
   await git("add", ".");
@@ -109,10 +123,7 @@ const seed = seeded(async (dir) => {
   await git("checkout", "-qb", BRANCH);
   writeFileSync(join(repo, "feature.txt"), "feature\n");
   // The PR may not raise its own round cap: the cap is read from the base commit.
-  writeFileSync(
-    join(repo, ".limitless.toml"),
-    '[gates]\nchecks = [{name="check",run="true"}]\n[policy]\nreview_rounds = 10\n',
-  );
+  writeFileSync(join(repo, ".limitless.toml"), `${BASE_CONFIG}review_rounds = 10\n`);
   await git("add", ".");
   await git("commit", "-qm", "pr work");
   await git("checkout", "-q", "main");
@@ -140,18 +151,10 @@ const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: work
 const remoteHead = async (ref = BRANCH) =>
   (await sh(["git", "rev-parse", ref], { cwd: remote })).stdout.trim();
 
-beforeEach(async () => {
-  root = mkdtempSync(join(tmpdir(), "review-rounds-"));
-  observerRoots.add(realpathSync(root));
-  await seed(root);
-  remote = join(root, "remote.git");
-  work = join(root, "work");
-  implementPrompts = [];
-  onImplement = async () => ({ "fix.txt": "fixed\n" });
-  pr = { state: "OPEN", body: "Factory report", autoMerge: false, calls: [] };
+function makeFactory(faults?: FaultPlan): Factory {
   const cfg = loadConfig({ home: join(root, "data"), configDir: join(root, "cfg") });
   cfg.maxConcurrentGates = 1;
-  factory = new Factory(cfg, {
+  const f = new Factory(cfg, {
     confinement: fakeConfinement,
     healthFetch: Object.assign(async () => new Response("{}"), { preconnect() {} }),
     fetch: Object.assign(async () => new Response("{}"), { preconnect() {} }),
@@ -159,18 +162,30 @@ beforeEach(async () => {
     models,
     policy,
     harnesses: { fake: fakeHarness(answer) },
+    faults,
   });
   // Fake `gh`: the PR's head is whatever the bare remote's branch holds.
-  factory.deps.gh = async (args, _signal, stdin) => {
+  f.deps.gh = async (args, _signal, stdin) => {
     pr.calls.push(args);
-    if (args[0] === "pr" && args[1] === "view" && args[2] === PR_URL)
+    if (args[0] === "pr" && args[1] === "view" && args[2] === PR_URL) {
+      if (pr.fail) throw new Error("GraphQL: Could not resolve to a PullRequest");
+      const headRefOid = await remoteHead();
+      const hold = pr.hold;
+      pr.hold = null;
+      hold?.reached();
+      await hold?.wait;
       return JSON.stringify({
         state: pr.state,
-        headRefOid: await remoteHead(),
+        headRefOid,
         headRefName: BRANCH,
+        isCrossRepository: false,
+        headRepository: { name: "repo" },
+        headRepositoryOwner: { login: "test" },
         body: pr.body,
         autoMergeRequest: pr.autoMerge ? { enabledAt: "2026-10-04T00:00:00Z" } : null,
+        ...pr.view,
       });
+    }
     if (args.join(" ") === `pr merge ${PR_URL} --disable-auto`) {
       pr.autoMerge = false;
       return "";
@@ -181,6 +196,34 @@ beforeEach(async () => {
     }
     throw new Error(`unexpected gh ${args.join(" ")}`);
   };
+  return f;
+}
+
+/** Stops the daemon and starts another on the same data, as a restart does. */
+async function restart(faults?: FaultPlan) {
+  await factory.stop();
+  factory.store.close();
+  factory = makeFactory(faults);
+}
+
+beforeEach(async () => {
+  root = mkdtempSync(join(tmpdir(), "review-rounds-"));
+  observerRoots.add(realpathSync(root));
+  await seed(root);
+  remote = join(root, "remote.git");
+  work = join(root, "work");
+  implementPrompts = [];
+  onImplement = async () => ({ "fix.txt": "fixed\n" });
+  pr = {
+    state: "OPEN",
+    body: "Factory report",
+    autoMerge: false,
+    calls: [],
+    view: {},
+    fail: false,
+    hold: null,
+  };
+  factory = makeFactory();
 });
 afterEach(async () => {
   await factory.stop();
@@ -229,17 +272,16 @@ async function review(id: string, body: unknown) {
 const changes = async (id: string) =>
   review(id, { verdict: "changes", reviewedSha: await remoteHead(), findings });
 
-async function settle(id: string) {
+/** Runs the scheduler until `id` is finished (or, with `until`, until that holds while it is idle). */
+async function settle(id: string, until = (run: Run) => !["queued", "running"].includes(run.status)) {
   factory.scheduler.start();
   const end = Date.now() + 25_000;
-  while (
-    factory.scheduler.activeRunIds.includes(id) ||
-    ["queued", "running"].includes(factory.store.getRun(id)?.status ?? "")
-  ) {
-    if (Date.now() > end) throw new Error(`run ${id} did not finish`);
+  for (;;) {
+    const run = factory.store.getRun(id) as Run;
+    if (!factory.scheduler.activeRunIds.includes(id) && run.status !== "queued" && until(run)) return run;
+    if (Date.now() > end) throw new Error(`run ${id} did not settle`);
     await Bun.sleep(20);
   }
-  return factory.store.getRun(id) as Run;
 }
 const kinds = () => factory.store.readFeed({ after: 0, limit: 1000 }).items.map((i) => i.kind);
 
@@ -422,4 +464,152 @@ test("approve records the reviewed head; a later push makes it stale", async () 
   expect(await review(original.id, { verdict: "approve", reviewedSha: moved })).toMatchObject({
     status: 409,
   });
+});
+
+test("an approval whose lookup a round's push overtook is refused, and stays so after a restart", async () => {
+  const original = await delivered();
+  const reviewed = await remoteHead();
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  let release = () => {};
+  const reached = new Promise<void>((resolve) => {
+    const wait = new Promise<void>((done) => {
+      release = done;
+    });
+    pr.hold = { reached: resolve, wait };
+  });
+  const approving = review(original.id, { verdict: "approve", reviewedSha: reviewed });
+  await reached;
+  expect(await settle(roundId)).toMatchObject({ status: "succeeded" });
+  release();
+  expect(await approving).toMatchObject({
+    status: 409,
+    body: { error: expect.stringContaining("head moved") },
+  });
+  await restart();
+  expect(factory.store.approvalFor(PR_URL)).toBeNull();
+});
+
+test("each round takes gate and audit settings from the original base, not an earlier round's edits", async () => {
+  const original = await delivered();
+  // Round 1 strips the checks and the protected paths from the PR's configuration.
+  onImplement = async () => ({ ".limitless.toml": "[gates]\nchecks = []\n", "fix.txt": "fixed\n" });
+  expect(await settle((await changes(original.id)).body.round?.id as string)).toMatchObject({
+    status: "succeeded",
+  });
+  const weakened = await remoteHead();
+  // Round 2 rewrites the file the base protects.
+  onImplement = async () => ({ "protected.txt": "rewritten\n" });
+  const second = await settle((await changes(original.id)).body.round?.id as string);
+  expect(second.status).toBe("needs_human");
+  expect(second.error).toContain("Edited a protected path");
+  const gates = JSON.parse(factory.store.getArtifact(second.id, "gates-0.json") ?? "[]") as {
+    name: string;
+  }[];
+  expect(gates.map((g) => g.name)).toEqual(["check"]);
+  expect(await remoteHead()).toBe(weakened);
+});
+
+test.each([
+  [
+    "a fork head",
+    { isCrossRepository: true, headRepositoryOwner: { login: "fork" } },
+    "the PR head is in another repository",
+  ],
+  ["a renamed head branch", { headRefName: "renamed" }, `the PR head branch is renamed, not ${BRANCH}`],
+  ["a failed lookup", "fail", "cannot verify PR head"],
+  ["a closed PR", { state: "CLOSED" }, "the PR is closed, not open"],
+] as const)("a verdict and a round's push both refuse %s, and nothing is pushed", async (_, seen, error) => {
+  const original = await delivered();
+  const reviewed = await remoteHead();
+  const show = () => {
+    if (seen === "fail") pr.fail = true;
+    else pr.view = { ...seen };
+  };
+  show();
+  expect(await changes(original.id)).toMatchObject({
+    status: 409,
+    body: { error: expect.stringContaining(error) },
+  });
+  expect(factory.store.reviewRounds(PR_URL)).toEqual([]);
+  pr.fail = false;
+  pr.view = {};
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  // Seen this way only after the verdict: the push must look again.
+  onImplement = async () => {
+    show();
+    return { "fix.txt": "fixed\n" };
+  };
+  const round = await settle(roundId);
+  expect(round.status).toBe("failed");
+  expect(round.error).toContain(error);
+  expect(await remoteHead()).toBe(reviewed);
+  expect(pr.calls.some((args) => args[1] === "edit")).toBe(false);
+});
+
+test.each([
+  [
+    "a cleared delivery branch and a new stored branch",
+    "UPDATE runs SET delivery_branch = NULL, branch = 'limitless/elsewhere' WHERE id = ?1",
+    "no branch is not the factory run's own branch",
+  ],
+  [
+    "another PR on its round record",
+    "UPDATE review_rounds SET pr_url = 'https://github.com/test/repo/pull/6' WHERE run_id = ?1",
+    "the round's PR is not the factory run's PR",
+  ],
+])(
+  "a round whose stored rows were edited to %s is refused before any push or PR edit",
+  async (_, sql, error) => {
+    // Generic delivery would run the `gh` on PATH: put a stub first that records and fails.
+    const bin = join(root, "bin");
+    const ghCalls = join(root, "gh-calls");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "gh"), `#!/bin/sh\necho "$@" >> '${ghCalls}'\nexit 1\n`, { mode: 0o755 });
+    const path = process.env.PATH;
+    process.env.PATH = `${bin}:${path}`;
+    try {
+      const original = await delivered();
+      const reviewed = await remoteHead();
+      const roundId = (await changes(original.id)).body.round?.id as string;
+      // Edited while the round is suspended mid-run, after its start-of-run checks.
+      onImplement = async () => {
+        factory.store.db.query(sql).run(roundId);
+        return { "fix.txt": "fixed\n" };
+      };
+      const round = await settle(roundId);
+      expect(round.status).toBe("failed");
+      expect(round.error).toContain(error);
+      expect(await remoteHead()).toBe(reviewed);
+      const refs = await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads"], { cwd: remote });
+      expect(refs.stdout.trim().split("\n").sort()).toEqual([`refs/heads/${BRANCH}`, "refs/heads/main"]);
+      expect(existsSync(ghCalls)).toBe(false);
+      expect(pr.calls.every((args) => args[1] === "view" && args[2] === PR_URL)).toBe(true);
+    } finally {
+      process.env.PATH = path;
+    }
+  },
+);
+
+test("a resumed round refuses a merge at its HEAD other than the one it chose", async () => {
+  // Stop the daemon at prepare's first save after the round merged its base.
+  await restart({
+    "store:save": { action: "kill", when: (c) => c.stage === "prepare" && c.checkpoint === undefined },
+  });
+  const original = await delivered();
+  const reviewed = await remoteHead();
+  const oldBase = await remoteHead("main");
+  await push("main", "notes.txt", "base moved on\n");
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  expect(await settle(roundId, (run) => run.status === "running")).toMatchObject({ status: "running" });
+  const cwd = factory.store.getRunState<RunState>(roundId)?.worktreePath as string;
+  // While it is down, an unrelated merge on the reviewed head replaces the factory's.
+  const merge = ["commit-tree", `${reviewed}^{tree}`, "-p", reviewed, "-p", oldBase, "-m", "unrelated"];
+  const unrelated = (await sh(["git", ...merge], { cwd })).stdout.trim();
+  await sh(["git", "reset", "-q", "--hard", unrelated], { cwd });
+  await restart();
+  const round = await settle(roundId);
+  expect(round.status).toBe("failed");
+  expect(round.error).toContain("Invalid merge ancestry");
+  expect(factory.store.listInvocations(roundId)).toHaveLength(0);
+  expect(await remoteHead()).toBe(reviewed);
 });

@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { assertExistingBranchDelivery, type FactoryBranchGrant, isBranchName } from "../core/delivery.ts";
+import { assertExistingBranchDelivery, assertFactoryBranchPush, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, Run, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import {
@@ -93,7 +93,7 @@ import {
   runReview,
   type VerifierRequest,
 } from "./review.ts";
-import { roundSection } from "./review-round.ts";
+import { readPrHead, roundSection, withPrLock } from "./review-round.ts";
 import { type ShadowDeps, shadowReview } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import {
@@ -163,7 +163,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
 
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
-    assertExistingBranchDelivery(ctx.repo, ctx.run, reviewGrant(ctx));
+    assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
     if (ctx.state.needsHumanReason) throw new NeedsHumanError(ctx.state.needsHumanReason);
     ctx.state.flow ??= "build";
     await ctx.save();
@@ -334,14 +334,17 @@ function gateEvents(ctx: RunContext): Required<GateHooks> {
   };
 }
 
-/** A review round's authority to push onto its original run's PR branch; null for every other run. */
-function reviewGrant(ctx: RunContext, live: Pick<FactoryBranchGrant, "prOpen" | "remoteHead"> = {}) {
+/** A review round's record and the grant it alone gives to push onto its original run's PR branch. */
+function reviewRound(ctx: RunContext) {
   const review = ctx.store.reviewRound(ctx.run.id);
-  return review && { owner: review.owner, head: review.reviewedSha, ...live };
+  return (
+    review && { ...review, grant: { owner: review.owner, prUrl: review.prUrl, head: review.reviewedSha } }
+  );
 }
+type ReviewRoundRecord = NonNullable<ReturnType<typeof reviewRound>>;
 
 async function prepare(ctx: RunContext): Promise<void> {
-  assertExistingBranchDelivery(ctx.repo, ctx.run, reviewGrant(ctx));
+  assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
   await ctx.stage("prepare", async () => {
     const { cfg, store } = ctx.deps;
     if (ctx.state.flow === "verify-change") {
@@ -366,9 +369,13 @@ async function prepare(ctx: RunContext): Promise<void> {
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
     const reusingWorktree = existsSync(join(cfg.paths.work, ctx.run.id));
     const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base);
-    const review = ctx.store.reviewRound(ctx.run.id);
-    if (review) assertExistingBranchDelivery(ctx.repo, ctx.run, reviewGrant(ctx, { remoteHead: wt.baseSha }));
-    else if (ctx.run.deliveryBranch && ctx.run.sourceRef?.headSha !== wt.baseSha)
+    const review = reviewRound(ctx);
+    // Refused before any model call; delivery checks the PR again just before pushing.
+    if (review && wt.baseSha !== review.reviewedSha)
+      throw new Error(
+        `head moved: the PR branch is at ${wt.baseSha}, not the reviewed ${review.reviewedSha}`,
+      );
+    if (!review && ctx.run.deliveryBranch && ctx.run.sourceRef?.headSha !== wt.baseSha)
       throw new Error("PR head moved before preparation");
     ctx.state.worktreePath = wt.path;
     // A round's change is measured from the PR merged with its current base, not from the PR head.
@@ -385,9 +392,23 @@ async function prepare(ctx: RunContext): Promise<void> {
       await resetTo(wt.path, verification.baseSha);
     }
     await discardChanges(wt.path);
+    // A round's gate, audit and review settings come from its original run's base commit: an
+    // earlier round's edits to the PR must never weaken the next round's checks.
+    const trustedSha = review ? review.owner.baseSha : (verification?.baseSha ?? baseSha);
+    if (!trustedSha) throw new Error("Review round's original run has no recorded base commit");
+    const trusted =
+      review &&
+      (await withBaseSnapshot(
+        ctx,
+        async (dir) => {
+          const detected = detectGates(dir);
+          return { gates: detected, scripts: pickScripts(readPackageJson(dir), gateScriptNames(detected)) };
+        },
+        trustedSha,
+      ));
     let gates: GateConfig;
     try {
-      const repoConfig = await readFileAt(wt.path, verification?.baseSha ?? baseSha, ".limitless.toml");
+      const repoConfig = await readFileAt(wt.path, trustedSha, ".limitless.toml");
       ctx.state.previewConfig = readPreviewConfig(repoConfig);
       // Review lenses come from the base commit, never from the change under review.
       if (ctx.deps.cfg.reviewMode === "panel")
@@ -399,9 +420,11 @@ async function prepare(ctx: RunContext): Promise<void> {
         } catch (error) {
           ctx.state.shadowLenses = { error: String((error as Error).message).slice(0, 500) };
         }
-      gates = detectGates(wt.path);
+      gates = trusted ? trusted.gates : detectGates(wt.path);
       ctx.state.gatesConfig = gates;
-      ctx.state.baselineScripts = pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
+      ctx.state.baselineScripts = trusted
+        ? trusted.scripts
+        : pickScripts(readPackageJson(wt.path), gateScriptNames(gates));
       ctx.log(
         `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
       );
@@ -496,19 +519,26 @@ async function prepare(ctx: RunContext): Promise<void> {
 
 /**
  * Merges the original run's base into the PR branch when the PR doesn't contain it, with the
- * factory's merge helpers; returns the merge commit, or null when none was needed.
+ * factory's merge helpers; returns the merge commit, or null when none was needed. The base is
+ * saved before merging, so a resume completes or accepts exactly that merge and nothing else.
  */
 async function mergeReviewBase(
   ctx: RunContext,
   cwd: string,
-  review: { owner: Run; prUrl: string; reviewedSha: string },
+  review: { owner: Run; reviewedSha: string },
 ): Promise<string | null> {
   const head = review.reviewedSha;
-  let merge = await headSha(cwd);
-  if (merge === head) {
-    const base = review.owner.baseBranch ?? ctx.repo.defaultBranch;
-    const tip = await fetchBase(ctx.deps.cfg.paths, ctx.repo, base, ctx.signal);
+  const at = await headSha(cwd);
+  let tip = ctx.state.reviewBaseSha;
+  const base = review.owner.baseBranch ?? ctx.repo.defaultBranch;
+  if (!tip) {
+    if (at !== head) throw new Error("The round's worktree does not start from the reviewed PR head");
+    tip = await fetchBase(ctx.deps.cfg.paths, ctx.repo, base, ctx.signal);
     if (await isAncestor(cwd, tip, head)) return null;
+    ctx.state.reviewBaseSha = tip;
+    await ctx.save("review-base-chosen");
+  }
+  if (at === head) {
     const conflicts = await prepareMerge(cwd, head, tip);
     if (conflicts.length) {
       await mergeGit(cwd, ["merge", "--abort"]);
@@ -516,18 +546,10 @@ async function mergeReviewBase(
         `The PR branch conflicts with ${base} in ${conflicts.join(", ")}; review rounds do not resolve conflicts yet`,
       );
     }
-    merge = await completeMerge(cwd, head, tip);
+    await completeMerge(cwd, head, tip);
     ctx.log(`Merged ${base} (${tip.slice(0, 8)}) into the PR branch before the round`);
-  } else {
-    // Resumed after the merge: HEAD must be that merge, its first parent the reviewed head.
-    const [, first, ...others] = (await mergeGit(cwd, ["rev-list", "--parents", "-n", "1", "HEAD"])).stdout
-      .trim()
-      .split(/\s+/);
-    if (first !== head || !others.length)
-      throw new Error("The round's worktree does not start from the reviewed PR head");
   }
-  ctx.store.recordBaseMerge(review.prUrl, merge, head, ctx.run.id);
-  return merge;
+  return validateMerge(cwd, head, tip);
 }
 
 // ---------------------------------------------------------------------------
@@ -787,10 +809,13 @@ const HOLDOUT_TOOL_CALLS = 40;
  * Run `fn` in a private export of the recorded base commit, removed afterwards whatever the outcome.
  * Holdout runs alongside implement, so it must never see the worktree the implementer is editing.
  */
-async function withBaseSnapshot<T>(ctx: RunContext, fn: (dir: string) => Promise<T>): Promise<T> {
+async function withBaseSnapshot<T>(
+  ctx: RunContext,
+  fn: (dir: string) => Promise<T>,
+  baseSha = ctx.run.baseSha,
+): Promise<T> {
   const worktree = ctx.state.worktreePath;
-  const baseSha = ctx.run.baseSha;
-  if (!worktree || !baseSha) throw new Error("Holdout needs the run worktree and recorded base commit");
+  if (!worktree || !baseSha) throw new Error("A base snapshot needs the run worktree and a base commit");
   const snapshot = createSnapshotParent();
   try {
     const base = join(snapshot, "base");
@@ -1588,6 +1613,7 @@ async function deliverVerifiedDraft(
 ): Promise<void> {
   ctx.checkCancelled();
   if (ctx.state.deliveryComplete) return;
+  assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
   const cwd = ctx.state.worktreePath;
   const branch = ctx.run.branch;
   const base = ctx.run.baseBranch;
@@ -1623,21 +1649,42 @@ async function deliverVerifiedDraft(
   ctx.log(`Verified-work draft PR: ${url}`);
 }
 
-/** The PR a review round delivers to: its state, and the body the round's section is appended to. */
-async function reviewedPr(gh: GhRunner, url: string, signal: AbortSignal) {
-  const pr = JSON.parse((await gh(["pr", "view", url, "--json", "state,body"], signal)) || "null") as {
-    state?: unknown;
-    body?: unknown;
-  } | null;
-  if (typeof pr?.state !== "string") throw new Error("PR lookup did not return its state");
-  return { state: pr.state, body: typeof pr.body === "string" ? pr.body : "" };
+/**
+ * Pushes a round onto its PR under the PR's lock, after a fresh lookup: the round's record, its run
+ * as stored now and the PR as seen now must all agree. A remote already at `head` is this
+ * delivery's own earlier push. The round is recorded before its section is added to the PR body.
+ */
+async function deliverReviewRound(
+  ctx: RunContext,
+  review: ReviewRoundRecord,
+  cwd: string,
+  head: string,
+  gh: GhRunner,
+  budget: GitHubBudget,
+): Promise<void> {
+  const { grant, prUrl } = review;
+  const branch = grant.owner.branch as string;
+  await withPrLock(prUrl, async () => {
+    const pr = await readPrHead(gh, prUrl, ctx.signal);
+    const remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
+    if (remote !== head) {
+      assertFactoryBranchPush(ctx.repo, ctx.store.getRun(ctx.run.id) ?? {}, grant, pr, remote);
+      await pushExistingBranch(ctx.repo, cwd, branch, grant.head, ctx.signal, budget);
+    }
+    ctx.store.observePrHead(prUrl, head);
+    ctx.store.markRoundDelivered(ctx.run.id, head);
+    const { marker, text } = roundSection(ctx.run.id, review.round, review.findings);
+    if (!pr.body.includes(marker))
+      await gh(["pr", "edit", prUrl, "--body-file", "-"], ctx.signal, pr.body + text);
+  });
 }
 
 async function deliver(ctx: RunContext, success: boolean): Promise<void> {
   ctx.checkCancelled();
   if (ctx.state.deliveryComplete) return;
-  const review = ctx.store.reviewRound(ctx.run.id);
-  assertExistingBranchDelivery(ctx.repo, ctx.run, reviewGrant(ctx));
+  // Before any delivery path is chosen: a review round only ever takes its own.
+  const review = reviewRound(ctx);
+  assertExistingBranchDelivery(ctx.repo, ctx.run, review?.grant);
   if (ctx.run.deliveryBranch && !review && ctx.run.baseSha !== ctx.run.sourceRef?.headSha)
     throw new Error("PR delivery base does not match the verified webhook head");
   const deliverStage = async () => {
@@ -1650,6 +1697,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       success &&
       ctx.repo.kind === "github" &&
       !ctx.run.deliveryBranch &&
+      !review &&
       (ctx.run.prUrl || ctx.store.listStages(ctx.run.id).filter((s) => s.name === "deliver").length > 1)
     ) {
       const raw = await gh(
@@ -1795,7 +1843,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         : await commitAll(cwd, `limitless: ${ctx.run.title}\n\nRun: ${ctx.run.id}`);
     const head = sha ?? (await headSha(cwd));
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
-    if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch) {
+    if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch && !review) {
       const baseBranch = ctx.run.baseBranch as string;
       const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch, ctx.signal, budget);
       const recorded = ctx.run.baseSha as string;
@@ -1850,44 +1898,31 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       ctx.log(`Local repo: work is on branch ${ctx.run.branch}`);
       return { summary: `branch ${ctx.run.branch} ready in ${ctx.repo.localPath}`, value: undefined };
     }
-    if (ctx.run.deliveryBranch) {
+    if (review || ctx.run.deliveryBranch) {
       publish();
       if (!success) return { summary: "PR update needs human review; no push", value: undefined };
       ctx.checkCancelled();
-      const pr = review && (await reviewedPr(gh, review.prUrl, ctx.signal));
-      const remote = await remoteBranchSha(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.signal, budget);
-      // A remote already at `head` is this delivery's own earlier push.
-      if (remote !== head) {
-        if (review)
-          assertExistingBranchDelivery(
+      if (review) await deliverReviewRound(ctx, review, cwd, head, gh, budget);
+      else if (ctx.run.deliveryBranch) {
+        // A remote already at `head` is this delivery's own earlier push.
+        if ((await remoteBranchSha(ctx.repo, cwd, ctx.run.deliveryBranch, ctx.signal, budget)) !== head)
+          await pushExistingBranch(
             ctx.repo,
-            ctx.run,
-            reviewGrant(ctx, { prOpen: pr?.state === "OPEN", remoteHead: remote }),
+            cwd,
+            ctx.run.deliveryBranch,
+            ctx.run.baseSha as string,
+            ctx.signal,
+            budget,
           );
-        await pushExistingBranch(
-          ctx.repo,
-          cwd,
-          ctx.run.deliveryBranch,
-          review?.reviewedSha ?? (ctx.run.baseSha as string),
-          ctx.signal,
-          budget,
-        );
-      }
-      if (review && pr) {
-        // Recorded before the body edit: the push is what approvals and the next verdict depend on.
-        ctx.store.observePrHead(review.prUrl, head);
-        ctx.store.markRoundDelivered(ctx.run.id, head);
-        const { marker, text } = roundSection(ctx.run.id, review.round, review.findings);
-        if (!pr.body.includes(marker))
-          await gh(["pr", "edit", review.prUrl, "--body-file", "-"], ctx.signal, pr.body + text);
-      } else if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number") {
-        ctx.run = ctx.store.updateRun(ctx.run.id, {
-          prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef.number}`,
-        });
+        if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number")
+          ctx.run = ctx.store.updateRun(ctx.run.id, {
+            prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef.number}`,
+          });
       }
       ctx.state.deliveryComplete = true;
       await ctx.save("delivery-complete");
-      return { summary: `updated existing PR branch ${ctx.run.deliveryBranch}`, value: undefined };
+      const branch = review?.grant.owner.branch ?? ctx.run.deliveryBranch;
+      return { summary: `updated existing PR branch ${branch}`, value: undefined };
     }
     ctx.checkCancelled();
     await pushBranch(ctx.repo, cwd, ctx.run.branch as string, "HEAD", ctx.signal, budget);

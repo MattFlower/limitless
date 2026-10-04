@@ -1001,7 +1001,7 @@ export class Store {
           limited: this.updateRun(owner.id, { status: "needs_human", error: "review round limit reached" }),
         };
       const round = rounds.length + 1;
-      const grant = { owner, head: review.reviewedSha };
+      const grant = { owner, prUrl: review.prUrl, head: review.reviewedSha };
       const run = this.insertRun(repo, request(round), false, { prUrl: review.prUrl, grant });
       this.db
         .query(
@@ -1056,15 +1056,6 @@ export class Store {
     this.publishFeed();
   }
 
-  /** A base merge the factory pushed to a PR: an approval of its first parent stays current through it. */
-  recordBaseMerge(prUrl: string, sha: string, parentSha: string, runId: string): void {
-    this.db
-      .query(
-        "INSERT OR IGNORE INTO pr_base_merges (pr_url, sha, parent_sha, run_id, created_at) VALUES (?, ?, ?, ?, ?)",
-      )
-      .run(prUrl, sha, parentSha, runId, Date.now());
-  }
-
   /** `findings_resolved` counts the findings of the PR's delivered rounds. */
   recordApproval(runId: string, prUrl: string, sha: string, reviewer: string): ReviewApproval {
     this.db
@@ -1085,14 +1076,37 @@ export class Store {
     return row ? { sha: row.sha as string, stale: row.stale_reason !== null } : null;
   }
 
-  /** A head the PR was seen at: other approvals go stale unless factory base merges lead back to them. */
-  observePrHead(prUrl: string, head: string): void {
-    const sql = `UPDATE review_approvals SET stale_reason = 'head moved to ' || ?2
-      WHERE pr_url = ?1 AND stale_reason IS NULL AND sha NOT IN (
-        WITH RECURSIVE kept(sha) AS (SELECT ?2 UNION
-          SELECT m.parent_sha FROM pr_base_merges m JOIN kept ON m.sha = kept.sha WHERE m.pr_url = ?1)
-        SELECT sha FROM kept)`;
-    this.db.query(sql).run(prUrl, head);
+  /** The last head seen on a PR, and its version (0 before any). */
+  prHead(prUrl: string): { sha: string; version: number } | null {
+    return this.db.query("SELECT sha, version FROM pr_heads WHERE pr_url = ?").get(prUrl) as {
+      sha: string;
+      version: number;
+    } | null;
+  }
+
+  /**
+   * Records a head seen on a PR; an approval of any other commit goes stale. With `since`, the
+   * version read before looking, a lookup overtaken by a newer, different observation is refused
+   * (false) rather than rewinding the PR's last known head.
+   */
+  observePrHead(prUrl: string, head: string, since?: number): boolean {
+    return this.db.transaction(() => {
+      const last = this.prHead(prUrl);
+      if (since !== undefined && last && last.version !== since && last.sha !== head) return false;
+      if (last?.sha !== head)
+        this.db
+          .query(
+            `INSERT INTO pr_heads (pr_url, sha, version, observed_at) VALUES (?1, ?2, 1, ?3)
+            ON CONFLICT (pr_url) DO UPDATE SET sha = ?2, version = version + 1, observed_at = ?3`,
+          )
+          .run(prUrl, head, Date.now());
+      this.db
+        .query(
+          "UPDATE review_approvals SET stale_reason = 'head moved to ' || ?2 WHERE pr_url = ?1 AND stale_reason IS NULL AND sha <> ?2",
+        )
+        .run(prUrl, head);
+      return true;
+    })();
   }
 
   private validateDependencies(input: unknown, candidateId: string): string[] {

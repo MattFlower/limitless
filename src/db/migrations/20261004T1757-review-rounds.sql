@@ -12,16 +12,15 @@ CREATE TABLE review_rounds (
   UNIQUE (pr_url, round)
 );
 CREATE INDEX review_rounds_source ON review_rounds (source_run_id);
--- A base merge the factory itself pushed to a PR branch: it keeps an approval of `parent_sha` current.
-CREATE TABLE pr_base_merges (
-  pr_url TEXT NOT NULL,
+-- The last head seen on a PR. `version` grows with each new head, so a lookup that started
+-- before a newer observation can be refused (compare-and-set) instead of rewinding it.
+CREATE TABLE pr_heads (
+  pr_url TEXT PRIMARY KEY,
   sha TEXT NOT NULL,
-  parent_sha TEXT NOT NULL,
-  run_id TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  PRIMARY KEY (pr_url, sha)
+  version INTEGER NOT NULL,
+  observed_at INTEGER NOT NULL
 );
--- `stale_reason` is set once a later push (or a "changes" verdict) supersedes the approved SHA.
+-- `stale_reason` is set once the PR head moves (or a "changes" verdict arrives) after the approval.
 CREATE TABLE review_approvals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL REFERENCES runs(id),

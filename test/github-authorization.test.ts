@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
-import { assertExistingBranchDelivery, type FactoryBranchGrant } from "../src/core/delivery.ts";
+import {
+  assertExistingBranchDelivery,
+  assertFactoryBranchPush,
+  type FactoryBranchGrant,
+  type PrHead,
+} from "../src/core/delivery.ts";
 import type { CreateRunRequest, Repo, Run } from "../src/core/types.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -173,37 +178,66 @@ test("a persisted round without the verdict handler's record fails before prepar
     .query("UPDATE runs SET source_ref = ?, base_branch = ?, delivery_branch = ? WHERE id = ?")
     .run(JSON.stringify(roundRequest(o).sourceRef), BRANCH, BRANCH, run.id);
   expect(await executeRun(factory.deps, run.id, new AbortController().signal)).toBe("failed");
-  expect(factory.store.getRun(run.id)?.error).toContain("verified GitHub Dependabot webhook");
+  expect(factory.store.getRun(run.id)?.error).toContain("a review round without its verdict record");
   expect(factory.store.listStages(run.id)).toHaveLength(0);
 });
 
-test("a factory-branch grant covers only the owner's own branch, an open PR and the reviewed head", () => {
+test("a factory-branch grant covers only the owner's own branch and PR, with record and run agreeing", () => {
   const o = owner();
-  const run = { baseBranch: BRANCH, deliveryBranch: BRANCH };
-  const grant: FactoryBranchGrant = { owner: o, head: HEAD };
+  const run = roundRequest(o);
+  const grant: FactoryBranchGrant = { owner: o, prUrl: PR, head: HEAD };
   const check =
-    (patch: Partial<typeof run> = {}, g: Partial<FactoryBranchGrant> = {}, r: Repo = repo) =>
+    (patch: Partial<CreateRunRequest> = {}, g: Partial<FactoryBranchGrant> = {}, r: Repo = repo) =>
     () =>
       assertExistingBranchDelivery(r, { ...run, ...patch }, { ...grant, ...g });
   expect(check()).not.toThrow();
-  expect(check({}, { prOpen: true, remoteHead: HEAD })).not.toThrow();
-  expect(check({ deliveryBranch: "main", baseBranch: "main" })).toThrow(
-    "main is not the factory run's own branch",
-  );
-  expect(check({ baseBranch: "main" })).toThrow("is not the factory run's own branch");
-  expect(check({}, { owner: { ...o, branch: null } })).toThrow("is not the factory run's own branch");
-  expect(check({}, { owner: { ...o, deliveryBranch: "dependabot/x" } })).toThrow(
-    "is not the factory run's own branch",
-  );
+  const notOwn = "is not the factory run's own branch";
+  expect(check({ deliveryBranch: "main", baseBranch: "main" })).toThrow(`main ${notOwn}`);
+  expect(check({ baseBranch: "main" })).toThrow(notOwn);
+  // A round with no delivery branch never falls through to generic delivery.
+  expect(check({ deliveryBranch: undefined })).toThrow(`no branch ${notOwn}`);
+  expect(check({}, { owner: { ...o, branch: null } })).toThrow(notOwn);
+  expect(check({}, { owner: { ...o, deliveryBranch: "dependabot/x" } })).toThrow(notOwn);
   expect(check({}, { owner: { ...o, repoId: "other" } })).toThrow(
     "not a factory run of this GitHub repository",
   );
   expect(check({}, {}, { ...repo, kind: "local" })).toThrow("not a factory run of this GitHub repository");
-  expect(check({}, { owner: { ...o, prUrl: "https://github.com/other/repo/pull/7" } })).toThrow("has no PR");
-  expect(check({}, { owner: { ...o, prUrl: null } })).toThrow("has no PR");
-  expect(check({}, { prOpen: false })).toThrow("the PR is no longer open");
-  expect(check({}, { remoteHead: "e".repeat(40) })).toThrow(
-    `head moved: the PR branch is at ${"e".repeat(40)}`,
+  const notPr = "the round's PR is not the factory run's PR";
+  expect(check({}, { owner: { ...o, prUrl: "https://github.com/other/repo/pull/7" } })).toThrow(notPr);
+  expect(check({}, { owner: { ...o, prUrl: null } })).toThrow(notPr);
+  expect(check({}, { prUrl: `${PR.slice(0, -1)}8` })).toThrow(notPr);
+  const source = "the run's source does not match its review round record";
+  expect(check({ sourceRef: { ...run.sourceRef, runId: "other" } })).toThrow(source);
+  expect(check({ sourceRef: { ...run.sourceRef, reviewedSha: "e".repeat(40) } })).toThrow(source);
+  // Without the record, a review-round source is refused even with no delivery branch.
+  expect(() => assertExistingBranchDelivery(repo, { ...run, deliveryBranch: undefined })).toThrow(
+    "a review round without its verdict record",
   );
-  expect(check({}, { remoteHead: null })).toThrow("head moved");
+});
+
+test("pushing onto a factory branch needs the PR open, its head here on the owner's branch, at the reviewed SHA", () => {
+  const o = owner();
+  const grant: FactoryBranchGrant = { owner: o, prUrl: PR, head: HEAD };
+  const seen: PrHead = {
+    state: "OPEN",
+    crossRepository: false,
+    headRepo: repo.slug,
+    headBranch: BRANCH,
+    headSha: HEAD,
+  };
+  const push =
+    (pr: Partial<PrHead> = {}, remote: string | null = HEAD) =>
+    () =>
+      assertFactoryBranchPush(repo, roundRequest(o), grant, { ...seen, ...pr }, remote);
+  expect(push()).not.toThrow();
+  expect(push({ state: "CLOSED" })).toThrow("the PR is closed, not open");
+  expect(push({ crossRepository: true })).toThrow("the PR head is in another repository");
+  expect(push({ headRepo: "fork/limitless" })).toThrow("the PR head is in another repository");
+  expect(push({ headBranch: "renamed" })).toThrow(`the PR head branch is renamed, not ${BRANCH}`);
+  expect(push({}, "e".repeat(40))).toThrow(`head moved: the PR branch is at ${"e".repeat(40)}`);
+  expect(push({}, null)).toThrow("head moved: the PR branch is at nothing");
+  expect(push({ headSha: "e".repeat(40) })).toThrow("head moved: GitHub reports the PR head at");
+  expect(() =>
+    assertFactoryBranchPush(repo, { ...roundRequest(o), deliveryBranch: "main" }, grant, seen, HEAD),
+  ).toThrow("is not the factory run's own branch");
 });

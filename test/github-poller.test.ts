@@ -1318,7 +1318,7 @@ test("config: a poll_seconds that is not a finite number is an error", () => {
   h = pollerHarness();
 });
 
-test("an approval goes stale when the poller sees the PR head move, except through the factory's base merges", async () => {
+test("an approval goes stale on any head the poller sees, and an overtaken poll never rewinds the head", async () => {
   h = pollerHarness();
   const run = h.factoryPr("o/r", 1);
   const pr = h.node("o/r", 1);
@@ -1327,18 +1327,26 @@ test("an approval goes stale when the poller sees the PR head move, except throu
   h.start(15);
   await h.advance(0);
   expect(h.store.approvalFor(prUrl)).toEqual({ sha: SHA, stale: false });
-  // Two base merges the factory made on top of the approved head keep it current.
-  const [merge, again] = ["b".repeat(40), "c".repeat(40)];
-  h.store.recordBaseMerge(prUrl, merge, SHA, run.id);
-  h.store.recordBaseMerge(prUrl, again, merge, run.id);
-  pr.headRefOid = again;
-  await h.advance(15 * S);
-  expect(h.store.approvalFor(prUrl)).toEqual({ sha: SHA, stale: false });
-  pr.headRefOid = "d".repeat(40);
+  pr.headRefOid = "b".repeat(40);
   await h.advance(15 * S);
   expect(h.store.approvalFor(prUrl)).toEqual({ sha: SHA, stale: true });
   // Staleness sticks: moving the head back does not restore the approval.
   pr.headRefOid = SHA;
   await h.advance(15 * S);
   expect(h.store.approvalFor(prUrl)).toEqual({ sha: SHA, stale: true });
+  expect(h.store.prHead(prUrl)?.sha).toBe(SHA);
+
+  // A round pushes while a poll is in flight; the poll's older answer must not rewind the head.
+  let release = () => {};
+  h.gh.hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const pushed = "c".repeat(40);
+  await h.advance(15 * S);
+  h.store.observePrHead(prUrl, pushed);
+  h.gh.hold = null;
+  release();
+  await h.advance(0);
+  expect(h.gh.graphql().length).toBeGreaterThanOrEqual(4);
+  expect(h.store.prHead(prUrl)?.sha).toBe(pushed);
 });
