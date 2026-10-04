@@ -10,7 +10,19 @@ export interface GitHubPrState {
   mergedBy: { login: string } | null;
 }
 
-export type GitHubPrClient = (url: string) => Promise<GitHubPrState | null>;
+export type GitHubPrClient = ((url: string) => Promise<GitHubPrState | null>) & {
+  beginPass?: () => void;
+  observed?: (url: string) => boolean;
+};
+
+export const RECONCILE_REQUEST_CAP = 25;
+const passes = new WeakMap<
+  Store,
+  {
+    cursor: string;
+    retries: Map<string, { failures: number; at: number }>;
+  }
+>();
 
 export const getGitHubPr: GitHubPrClient = async (url) => {
   const { stdout } = await sh(["gh", "pr", "view", url, "--json", "url,state,mergedAt,mergedBy"], {
@@ -24,26 +36,61 @@ export async function reconcileMergedRuns(
   store: Store,
   client: GitHubPrClient,
   log: (message: string) => void = console.warn,
+  now: () => number = Date.now,
 ): Promise<void> {
-  for (const run of store.listRuns({
-    status: ["needs_human", "succeeded", "resolved"],
-    limit: Number.MAX_SAFE_INTEGER,
-  })) {
+  let pass = passes.get(store);
+  if (!pass) {
+    pass = { cursor: "", retries: new Map() };
+    passes.set(store, pass);
+  }
+  client.beginPass?.();
+  const runs = store
+    .listRuns({
+      status: ["needs_human", "succeeded", "resolved"],
+      limit: Number.MAX_SAFE_INTEGER,
+    })
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const start = runs.findIndex((run) => run.id > pass.cursor);
+  const ordered = start < 0 ? runs : [...runs.slice(start), ...runs.slice(0, start)];
+  let calls = 0;
+  const results = new Map<string, GitHubPrState | null>();
+  const failed = new Set<string>();
+  for (const run of ordered) {
     if (!run.prUrl || (run.merged && run.status !== "needs_human")) continue;
+    if (failed.has(run.prUrl) || store.githubPrExpired(run.prUrl, now())) continue;
+    if ((pass.retries.get(run.prUrl)?.at ?? 0) > now()) continue;
+    if (!results.has(run.prUrl) && calls >= RECONCILE_REQUEST_CAP) break;
+    pass.cursor = run.id;
     try {
-      const pr = await client(run.prUrl);
-      if (!pr || pr.url !== run.prUrl || store.getRun(run.id)?.prUrl !== pr.url) continue;
+      if (!results.has(run.prUrl)) {
+        calls++;
+        results.set(run.prUrl, await client(run.prUrl));
+      }
+      const pr = results.get(run.prUrl);
+      if (!pr || pr.url !== run.prUrl) {
+        if (!client.observed?.(run.prUrl)) throw new Error("No matching PR observation");
+        continue;
+      }
+      pass.retries.delete(run.prUrl);
+      if (store.getRun(run.id)?.prUrl !== pr.url) continue;
       const mergedAt = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
       if (pr.state === "MERGED" && Number.isFinite(mergedAt)) {
         store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
       } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
         const closed = pr.state === "CLOSED";
+        store.observeGithubPrState(pr.url, pr.state, now());
         if (closed && !pr.mergedAt && run.status === "needs_human") {
           const resolution = { kind: "pr_closed", ref: pr.url, by: "github" } as const;
           store.resolveRun(run.id, resolution, { from: ["needs_human"], patch: { prClosedUnmerged: true } });
         } else if (run.prClosedUnmerged !== closed) store.updateRun(run.id, { prClosedUnmerged: closed });
       }
     } catch (error) {
+      failed.add(run.prUrl);
+      const failures = (pass.retries.get(run.prUrl)?.failures ?? 0) + 1;
+      pass.retries.set(run.prUrl, {
+        failures,
+        at: failures < 2 ? 0 : now() + Math.min(60_000 * 2 ** (failures - 2), 900_000),
+      });
       log(`GitHub PR check failed for ${run.id}: ${String(error)}`);
     }
   }

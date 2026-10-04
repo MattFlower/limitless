@@ -6,6 +6,7 @@ import { computeStats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import {
   type GitHubPrClient,
+  RECONCILE_REQUEST_CAP,
   reconcileMergedRuns,
   startGitHubNotifier,
 } from "../src/integrations/github-notifier.ts";
@@ -202,6 +203,11 @@ test("a needs_human run with a pre-recorded merge still gets its resolution and 
 });
 
 test("only an exact merged PR resolves; failures remain retryable", async () => {
+  let now = Date.now();
+  const reconcile = (client: GitHubPrClient, log = () => {}) => {
+    now += 900_001;
+    return reconcileMergedRuns(store, client, log, () => now);
+  };
   const id = needsHuman();
   const noPr = needsHuman(null);
   let calls = 0;
@@ -221,14 +227,13 @@ test("only an exact merged PR resolves; failures remain retryable", async () => 
     },
     null,
   ]) {
-    await reconcileMergedRuns(store, async () => {
+    await reconcile(async () => {
       calls++;
       return state;
     });
     expect(store.getRun(id)?.status).toBe("needs_human");
   }
-  await reconcileMergedRuns(
-    store,
+  await reconcile(
     async () => {
       calls++;
       throw new Error("offline");
@@ -238,7 +243,7 @@ test("only an exact merged PR resolves; failures remain retryable", async () => 
   expect(store.getRun(id)?.status).toBe("needs_human");
   expect(store.getRun(noPr)?.status).toBe("needs_human");
   expect(calls).toBe(5);
-  await reconcileMergedRuns(store, async () => ({
+  await reconcile(async () => ({
     url: prUrl,
     state: "MERGED",
     mergedAt: "2026-09-27T20:00:00Z",
@@ -430,6 +435,11 @@ test("startup pass publishes a resolved run and stats count only open needs huma
 
 for (const status of ["succeeded", "needs_human"] as const) {
   test(`${status} PR merge releases dependents with metadata and preserved evidence`, async () => {
+    let now = Date.now();
+    const reconcile = (client: GitHubPrClient, log = () => {}) => {
+      now += 900_001;
+      return reconcileMergedRuns(store, client, log, () => now);
+    };
     const id = needsHuman();
     store.updateRun(id, { status });
     const run = store.getRun(id);
@@ -448,15 +458,14 @@ for (const status of ["succeeded", "needs_human"] as const) {
       );
       expect(store.getRun(dependent.id)?.status).toBe("waiting");
     }
-    await reconcileMergedRuns(
-      store,
+    await reconcile(
       async () => {
         throw new Error("offline");
       },
       () => {},
     );
     expect(store.getRun(dependent.id)?.status).toBe("waiting");
-    await reconcileMergedRuns(store, async () => ({
+    await reconcile(async () => ({
       url: prUrl,
       state: "MERGED",
       mergedAt: "2026-09-27T20:00:00Z",
@@ -471,8 +480,7 @@ for (const status of ["succeeded", "needs_human"] as const) {
       finishedAt: 123456,
     });
     expect(store.getRun(dependent.id)?.status).toBe("queued");
-    await reconcileMergedRuns(
-      store,
+    await reconcile(
       async () => {
         throw new Error("must not repoll merged run");
       },
@@ -779,4 +787,119 @@ test("a stale snapshot never hides an untracked PR from the fallback; a merged o
   } finally {
     h.close();
   }
+});
+
+test("each reconciliation pass looks up tracking once, caps calls, and progresses fairly", async () => {
+  const h = pollerHarness();
+  try {
+    const count = RECONCILE_REQUEST_CAP + 7;
+    for (let i = 1; i <= count; i++) h.factoryPr("o/r", i, "needs_human");
+    let lookups = 0;
+    const tracked = h.store.githubTracked.bind(h.store);
+    h.store.githubTracked = () => {
+      lookups++;
+      return tracked();
+    };
+    const observed = observedPrs(h.store, async () => {
+      throw new Error("tracked PR fallback");
+    });
+    const checked: string[] = [];
+    const client: GitHubPrClient = async (url) => {
+      checked.push(url);
+      return observed(url);
+    };
+    client.beginPass = observed.beginPass;
+    client.observed = observed.observed;
+    await reconcileMergedRuns(h.store, client);
+    expect(lookups).toBe(1);
+    expect(checked).toHaveLength(RECONCILE_REQUEST_CAP);
+    const first = checked.slice();
+    checked.length = 0;
+    await reconcileMergedRuns(h.store, client);
+    expect(lookups).toBe(2);
+    expect(checked).toHaveLength(RECONCILE_REQUEST_CAP);
+    expect(new Set([...first, ...checked]).size).toBe(count);
+  } finally {
+    h.close();
+  }
+});
+
+test.each(["throw", "null"])("repeated %s lookups back off while later runs progress", async (failure) => {
+  const h = pollerHarness();
+  try {
+    const bad = h.factoryPr("o/r", 1, "needs_human");
+    h.factoryPr("o/r", 1, "needs_human"); // a shared PR is still attempted only once per pass
+    const good = h.factoryPr("o/r", 2, "needs_human");
+    let now = Date.now();
+    const calls: string[] = [];
+    const client: GitHubPrClient = async (url) => {
+      calls.push(url);
+      if (url === bad.prUrl || url.endsWith("/1")) {
+        if (failure === "throw") throw new Error("inaccessible");
+        return null;
+      }
+      return { url, state: "OPEN", mergedAt: null, mergedBy: null };
+    };
+    const reconcile = () =>
+      reconcileMergedRuns(
+        h.store,
+        client,
+        () => {},
+        () => now,
+      );
+    await reconcile();
+    expect(calls.filter((u) => u.endsWith("/1"))).toHaveLength(1);
+    await reconcile();
+    expect(calls.filter((u) => u.endsWith("/1"))).toHaveLength(2);
+    calls.length = 0;
+    await reconcile();
+    expect(calls).toEqual([url("o/r", 2)]);
+    now += 60_000;
+    await reconcile();
+    expect(calls.filter((u) => u.endsWith("/1"))).toHaveLength(1);
+    calls.length = 0;
+    now += 60_000;
+    await reconcile();
+    expect(calls).toEqual([url("o/r", 2)]);
+    expect(h.store.getRun(good.id)?.status).toBe("needs_human");
+  } finally {
+    h.close();
+  }
+});
+
+test("fallback observations expire closed PRs without poller snapshots and a reopen clears expiry", async () => {
+  const id = needsHuman();
+  const now = Date.now();
+  const closed = mock(async (url: string) => ({ url, state: "CLOSED", mergedAt: null, mergedBy: null }));
+  await reconcileMergedRuns(
+    store,
+    closed,
+    () => {},
+    () => now,
+  );
+  expect(store.getRun(id)?.prClosedUnmerged).toBe(true);
+  await reconcileMergedRuns(
+    store,
+    closed,
+    () => {},
+    () => now + 604800000,
+  );
+  expect(closed).toHaveBeenCalledTimes(2);
+  await reconcileMergedRuns(
+    store,
+    closed,
+    () => {},
+    () => now + 604800001,
+  );
+  expect(closed).toHaveBeenCalledTimes(2);
+  store.updateRun(id, { prClosedUnmerged: false });
+  expect(store.githubPrExpired(prUrl, now + 604800001)).toBe(false);
+  const reopened = mock(async (url: string) => ({ url, state: "OPEN", mergedAt: null, mergedBy: null }));
+  await reconcileMergedRuns(
+    store,
+    reopened,
+    () => {},
+    () => now + 604800001,
+  );
+  expect(reopened).toHaveBeenCalledTimes(1);
 });
