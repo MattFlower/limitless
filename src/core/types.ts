@@ -391,6 +391,15 @@ export interface AuthSession {
   lastSeenAt: number;
 }
 
+/** A WebAuthn passkey registered for UI sign-in. */
+export interface AuthPasskey {
+  id: string;
+  /** The browser's User-Agent at registration. */
+  device: string;
+  createdAt: number;
+  lastUsedAt: number | null;
+}
+
 export interface ChatProposalFields {
   repo: string;
   prompt: string;

@@ -37,6 +37,8 @@ Usage:
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
   limitless doctor                        Report GitHub access problems the PR poller recorded
+  limitless auth add-passkey              Print a one-time link (10 minutes) that registers a UI passkey
+  limitless auth passkeys [remove <id>]   List or remove UI passkeys
   limitless auth set-password             Set the UI sign-in password (prompted, never echoed)
   limitless auth sessions [revoke <id>|revoke --all]  List or revoke UI sign-in sessions
   limitless gc [--dry-run]                Clean up expired worktrees, logs, debug events and baseline cache

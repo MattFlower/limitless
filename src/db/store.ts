@@ -1,8 +1,10 @@
 import { Database } from "bun:sqlite";
+import type { WebAuthnCredential } from "@simplewebauthn/server";
 import { AUDIT_ALLOWANCES, parseAllow, validateAllow } from "../core/allow.ts";
 import { assertExistingBranchDelivery } from "../core/delivery.ts";
 import type {
   ArtifactMeta,
+  AuthPasskey,
   AuthSession,
   ChatMessage,
   ChatOrigin,
@@ -1789,6 +1791,42 @@ export class Store {
   revokeAuthSessions(id?: string): number {
     if (id === undefined) return this.db.query("DELETE FROM auth_sessions").run().changes;
     return this.db.query("DELETE FROM auth_sessions WHERE id = ?").run(id).changes;
+  }
+
+  addPasskey(credential: WebAuthnCredential, device: string, now: number): void {
+    const { id, publicKey, counter, transports = [] } = credential;
+    this.db
+      .query(
+        "INSERT INTO auth_passkeys (id, public_key, counter, transports, device, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(id, publicKey, counter, JSON.stringify(transports), device, now);
+  }
+
+  passkey(id: string): WebAuthnCredential | null {
+    const row = this.db.query("SELECT * FROM auth_passkeys WHERE id = ?").get(id) as Row | null;
+    if (!row) return null;
+    const publicKey = new Uint8Array(row.public_key as Uint8Array);
+    return { id, publicKey, counter: row.counter as number, transports: parse(row.transports, []) };
+  }
+
+  /**
+   * Records a sign-in only if the passkey still exists and its counter moves forward, so a concurrent
+   * sign-in can't rewind it; authenticators that always report 0 (most synced passkeys) stay at 0.
+   */
+  usePasskey(id: string, counter: number, now: number): boolean {
+    const sql = `UPDATE auth_passkeys SET counter = ?1, last_used_at = ?2
+      WHERE id = ?3 AND (counter < ?1 OR (counter = 0 AND ?1 = 0))`;
+    return this.db.query(sql).run(counter, now, id).changes === 1;
+  }
+
+  listPasskeys(): AuthPasskey[] {
+    const sql = `SELECT id, device, created_at AS createdAt, last_used_at AS lastUsedAt
+      FROM auth_passkeys ORDER BY created_at`;
+    return this.db.query(sql).all() as AuthPasskey[];
+  }
+
+  removePasskey(id: string): number {
+    return this.db.query("DELETE FROM auth_passkeys WHERE id = ?").run(id).changes;
   }
 
   expireAuthSessions(createdBefore: number, seenBefore: number): number {

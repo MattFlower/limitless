@@ -342,12 +342,24 @@ administration) never do. Without one, pages redirect to `/login` and API calls 
 included) get 401. Set the password on the Mac:
 
 ```bash
+limitless auth add-passkey                 # prints a one-time link to register a passkey
+limitless auth passkeys                    # id, added, last used, browser; `passkeys remove <id>`
 limitless auth set-password                # prompts twice; never echoed or taken as an argument
 limitless auth sessions                    # id, method, last seen, signed in, browser
 limitless auth sessions revoke <id>        # or: revoke --all
 ```
 
-The password is stored in the database as an argon2id hash. The login page is a plain form
+Passkeys are the primary sign-in. `add-passkey` prints a link such as
+`https://limitless.example.test/enroll#<token>`; open it within 10 minutes in the browser (or
+password manager, such as 1Password) that should keep the passkey. The link works once, and
+registering also signs that browser in. Afterwards **Sign in with a passkey** on the login page
+needs no typing. The passkey belongs to the host of the first `public_origins` entry and works
+only there; user verification (biometrics or a PIN) is required. WebAuthn verification uses
+[`@simplewebauthn/server`](https://simplewebauthn.dev). Removing a passkey does not end the
+sessions it signed in; revoke those separately. A failed passkey registration or sign-in shows only
+"passkey registration failed" or "passkey sign-in failed"; the reason is in the daemon log.
+
+The password is the fallback. It is stored in the database as an argon2id hash. The login page is a plain form
 (username `limitless`, `autocomplete="username"` / `"current-password"`), so password managers
 fill it. Signing in sets `__Host-limitless-session`, an opaque random cookie with
 `HttpOnly; Secure; SameSite=Strict`; the database keeps only its SHA-256. A session ends after
@@ -358,7 +370,8 @@ offers **Sign out** and **Sign out everywhere**.
 
 Failed password attempts are limited to 5 per 15 minutes per source address (429 with
 `Retry-After` after that). The daemon sees only the proxy's address, so all proxied clients
-share that budget; the Access List keeps everyone else out. Setting a new password does not
+share that budget; the Access List keeps everyone else out. Passkey sign-ins are not counted:
+a signature cannot be guessed, so a burst of wrong passwords never locks out passkey sign-in. Setting a new password does not
 end existing sessions; revoke them if the old one may have leaked.
 
 `auth = "proxy"` keeps the earlier behaviour for setups that authenticate at the proxy: no
