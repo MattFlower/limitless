@@ -175,14 +175,20 @@ async function list(git: string[], opts: Options, env: Record<string, string>, f
   const hooks = new Set<string>();
   const sources = new Set([...files, join(opts.cwd, ".git"), join(commonDir, "config")]);
   for (const file of ["commondir", "HEAD", "config.worktree"]) sources.add(join(gitDir, file));
-  // Only a repository found at `cwd`, or named explicitly, is pinned by these sources.
-  let pinned = located && (git.some((arg) => arg.startsWith("--git-dir=")) || "GIT_DIR" in env);
-  try {
-    pinned ||=
-      located && (read(join(opts.cwd, ".git")) !== null || realpathSync(gitDir) === realpathSync(opts.cwd));
-  } catch {
-    pinned = false;
-  }
+  // Pinned only when git stopped at `cwd` (its `.git`, a gitfile there, or `cwd` itself) or was told
+  // where to look: a repository found further up could be replaced by one created at `cwd`.
+  const same = (path: string) => {
+    try {
+      return realpathSync(path) === realpathSync(gitDir);
+    } catch {
+      return false;
+    }
+  };
+  const gitFile = read(join(opts.cwd, ".git"));
+  const explicit = git.some((arg) => arg.startsWith("--git-dir=")) || "GIT_DIR" in env;
+  let pinned =
+    located &&
+    (explicit || same(join(opts.cwd, ".git")) || same(opts.cwd) || (!!gitFile && gitFile !== "dir"));
   for (let i = 0; parsed && i + 2 < fields.length; i += 3) {
     const [origin = "", entry = ""] = [fields[i + 1], fields[i + 2]];
     const name = entry.split("\n", 1)[0] ?? "";

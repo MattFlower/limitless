@@ -946,6 +946,16 @@ test("an unchanged worktree lists its config once and never hashes the empty tre
   expect(shim.calls().filter((call) => call.includes(" config --list "))).toHaveLength(2);
 });
 
+test("a repository found above the working directory is listed again for every command", async () => {
+  // An invalid `.git` directory doesn't stop discovery, and becoming valid later would switch repositories.
+  const sub = join(work, "sub");
+  mkdirSync(join(sub, ".git"), { recursive: true });
+  const shim = gitShim();
+  for (let i = 0; i < 3; i++)
+    await worktreeGit(["git", "status", "--porcelain"], { cwd: sub, env: shim.env });
+  expect(shim.calls().filter((call) => call.includes(" config --list "))).toHaveLength(3);
+});
+
 test("local pipeline scope retains original git settings and index behavior", async () => {
   await git(work, "config", "hook.agent.command", "original-command");
   await git(work, "update-index", "--skip-worktree", "sample.test.ts");
