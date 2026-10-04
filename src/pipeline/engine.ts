@@ -317,6 +317,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
 
 function gateEvents(ctx: RunContext): Required<GateHooks> {
   return {
+    holder: ctx.run.id,
     onResult: (r) =>
       ctx.store.addEvent({
         runId: ctx.run.id,

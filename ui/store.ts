@@ -5,7 +5,13 @@
 // the one shared EventSource regardless of which route is mounted.
 import { createSignal } from "solid-js";
 import { createStore, produce, reconcile } from "solid-js/store";
-import { MAX_RUN_IDS, type ProviderStatus, type QuotaAlert, type Run } from "../src/core/types.ts";
+import {
+  type HealthResponse,
+  MAX_RUN_IDS,
+  type ProviderStatus,
+  type QuotaAlert,
+  type Run,
+} from "../src/core/types.ts";
 import { getAlerts, getHealth, getProviders, listRuns, openGlobalStream } from "./api.ts";
 import { createCatchUp, type Timers } from "./lib/catch-up.ts";
 
@@ -13,6 +19,7 @@ const [runsById, setRunsById] = createStore<Record<string, Run>>({});
 const [providersById, setProvidersById] = createStore<Record<string, ProviderStatus>>(Object.create(null));
 const [alertsByKey, setAlertsByKey] = createStore<Record<string, QuotaAlert>>({});
 const [connected, setConnected] = createSignal(false);
+const [gateSlots, setGateSlots] = createSignal<HealthResponse["gateSlots"]>();
 const [draining, setDraining] = createSignal(false);
 const [hydrated, setHydrated] = createSignal(false);
 
@@ -55,7 +62,9 @@ export function ensureLiveStore(
     if (healthPending) return;
     healthPending = true;
     try {
-      setDraining((await deps.getHealth()).draining);
+      const health = await deps.getHealth();
+      setDraining(health.draining);
+      setGateSlots(health.gateSlots);
     } catch {
       // Keep the last known state while the daemon is unavailable during restart.
     } finally {
@@ -152,4 +161,5 @@ export const live = {
   connected,
   hydrated,
   draining,
+  gateSlots,
 };

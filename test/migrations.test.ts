@@ -81,8 +81,18 @@ test("upgrading an existing database applies only new files and leaves legacy tr
 
 test("a previous release can still open the database (deploy rollback)", () => {
   temporary((directory, path) => {
-    writeFileSync(join(directory, "20260927T1500-added.sql"), "CREATE TABLE added (id INTEGER);");
-    new Store(path, directory).close();
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-github-closed-expiry.sql"),
+    });
+    const old = new Store(path, before);
+    const url = "https://github.com/o/r/pull/1";
+    old.db
+      .query("INSERT OR REPLACE INTO github_prs VALUES (?, ?, ?, ?)")
+      .run(url, "node", JSON.stringify({ state: "CLOSED" }), 1);
+    old.close();
+    new Store(path).close();
     // The pre-file-migration Store.migrate(): version-keyed table, legacy array only.
     const db = new Database(path);
     db.exec(
@@ -94,6 +104,15 @@ test("a previous release can still open the database (deploy rollback)", () => {
       ),
     );
     expect(MIGRATIONS.filter((m) => !applied.has(m.version))).toEqual([]);
+    expect(() =>
+      db
+        .query("INSERT OR REPLACE INTO github_prs VALUES (?, ?, ?, ?)")
+        .run(url, "node", JSON.stringify({ state: "OPEN" }), 0),
+    ).not.toThrow();
+    expect(db.query("SELECT closed_at, reopened_at FROM github_pr_expiry WHERE url = ?").get(url)).toEqual({
+      closed_at: expect.any(Number),
+      reopened_at: null,
+    });
     db.close();
     // Every shipped file migration, including the additive cache-write column, applies in turn.
     const shipped = new Store(path);
