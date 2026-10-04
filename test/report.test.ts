@@ -17,9 +17,9 @@ const inv: Invocation = {
   role: "implement",
   harness: "codex",
   provider: "codex",
-  model: "gpt-6-astra",
+  model: "gpt-6.1-sol",
   effort: null,
-  modelId: "codex/astra",
+  modelId: "codex/sol-6.1",
   status: "ok",
   costUsd: 0,
   costEquivUsd: 1.5,
@@ -52,7 +52,7 @@ test("markdown tables are contiguous blocks", () => {
         blocking_questions: [],
       },
       lastVerify: {
-        modelId: "claude/sonnet",
+        modelId: "claude/sonnet-5.5",
         overall: "pass",
         notes: "",
         criteria: [
@@ -71,7 +71,7 @@ test("markdown tables are contiguous blocks", () => {
     "|  | Criterion | Evidence |\n|---|---|---|\n| ✅ AC-1 | works \\| fully | ok |\n| ✅ AC-2 | edge | ok |",
   );
   expect(md).toContain(
-    "| implement | `codex/astra` | unknown (legacy) | ok | 4,500 / 200 | 3,000 | 500 | $1.50 equiv. | 42s |",
+    "| implement | `codex/sol-6.1` | unknown (legacy) | ok | 4,500 / 200 | 3,000 | 500 | $1.50 equiv. | 42s |",
   );
   expect(md).toContain("No automated checks were detected");
   expect(md.startsWith("Built by **Limitless**")).toBe(true);
@@ -250,7 +250,7 @@ test("report rows show low, high, none and unknown effort independently", () => 
     runUrl: "u",
   });
   for (const effort of ["low", "high", "none", "backend default", "unknown (legacy)"])
-    expect(md).toContain(`| \`codex/astra\` | ${effort} | ok |`);
+    expect(md).toContain(`| \`codex/sol-6.1\` | ${effort} | ok |`);
 });
 
 test("blocked acceptance and holdout checks have a distinct marker, label, evidence and terminal reason", () => {
@@ -345,7 +345,7 @@ test("holdout counts separate blocking results from not-required follow-up notes
         ],
       },
       lastVerify: {
-        modelId: "claude/sonnet",
+        modelId: "claude/sonnet-5.5",
         overall: "fail",
         notes: "",
         criteria: [
@@ -398,7 +398,7 @@ test("shadow review calls stay out of the work log and per-model review stats; t
     totals: { costUsd: 0.02, costEquivUsd: 2.85 },
     runUrl: "u",
   });
-  expect(md).toContain("| implement | `codex/astra` |");
+  expect(md).toContain("| implement | `codex/sol-6.1` |");
   expect(md).toContain("| review | `claude/opus` |");
   expect(md).not.toContain("review_shadow");
   expect(md).not.toContain("shadow-a");

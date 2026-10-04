@@ -48,6 +48,8 @@ test("policy files: absent, empty, partial, pipe groups, complexity preservation
     }
     writeFileSync(path, '{"triage":{"default":["codex/luna|no/model"]}}');
     expect(() => loadPolicy(path, MODELS)).toThrow('unknown model ID \\"no/model\\"');
+    writeFileSync(path, '{"implement":{"large":["codex/astra@high","claude/opus"]}}');
+    expect(() => loadPolicy(path, MODELS)).toThrow("GPT-6 Astra was removed from routing on 2026-10-04");
     writeFileSync(path, '{"triage":{"default":["codex/luna||mtplx/qwen-27b"]}}');
     expect(() => loadPolicy(path, MODELS)).toThrow("empty model ID");
   } finally {
