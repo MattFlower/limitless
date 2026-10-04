@@ -117,7 +117,8 @@ export const RunDetail: Component = () => {
 
   let generation = 0;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
-  let reads = 0;
+  // The newest read still in flight; superseded reads do not hold back a reconnect refresh.
+  let currentRead = 0;
   let loaded = false;
   let refreshAfterRead = false;
   // Stage, invocation and question updates pushed while a read is in flight are newer than it.
@@ -131,7 +132,7 @@ export const RunDetail: Component = () => {
   const refetchArtifacts = () => {
     const request = ++generation;
     pushed.clear();
-    reads++;
+    currentRead = request;
     getRunDetail(params.id)
       .then((detail) => {
         if (request !== generation) return;
@@ -158,7 +159,9 @@ export const RunDetail: Component = () => {
       })
       .catch((e) => request === generation && setLoadError((e as Error).message))
       .finally(() => {
-        if (--reads === 0 && refreshAfterRead) {
+        if (request !== currentRead) return;
+        currentRead = 0;
+        if (refreshAfterRead) {
           refreshAfterRead = false;
           scheduleRefresh();
         }
@@ -220,8 +223,9 @@ export const RunDetail: Component = () => {
         if (!value) missedUpdates ||= wasOpen;
         else {
           wasOpen = true;
-          if (missedUpdates && reads) refreshAfterRead = true;
-          else if (missedUpdates || (!loaded && !reads)) scheduleRefresh();
+          const reading = currentRead !== 0 && currentRead === generation;
+          if (missedUpdates && reading) refreshAfterRead = true;
+          else if (missedUpdates || (!loaded && !reading)) scheduleRefresh();
           missedUpdates = false;
         }
       },

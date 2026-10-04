@@ -824,3 +824,81 @@ test("reconnect reads are single-flight: flapping adds one read and one follow-u
     },
   );
 });
+
+test("a stalled, superseded read does not hold back the reconnect refresh", async () => {
+  const stalled = deferred<Response>();
+  await withStream(
+    (request) => (request === 1 ? stalled.promise : Promise.resolve(Response.json(newerDetail))),
+    async ({ stream, clock, requests }) => {
+      stream.onopen?.();
+      stream.emit(observation());
+      await clock.advance(100);
+      expect(requests()).toBe(2);
+      expect(render()).toContain("Current finding");
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+      await clock.advance(1000);
+      expect(requests()).toBe(3);
+      stalled.resolve(Response.json(detail));
+      await clock.flush();
+      await clock.advance(1000);
+      expect(requests()).toBe(3);
+      expect(render()).toContain("Current finding");
+    },
+    true,
+  );
+});
+
+test("only the current read holds back a reconnect refresh: older reads settling or a newer generation release nothing extra", async () => {
+  const stalled = deferred<Response>();
+  const current = deferred<Response>();
+  await withStream(
+    (request) =>
+      request === 1
+        ? stalled.promise
+        : request === 2
+          ? current.promise
+          : Promise.resolve(Response.json(newerDetail)),
+    async ({ stream, clock, requests }) => {
+      stream.onopen?.();
+      stream.emit(observation());
+      await clock.advance(100);
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(requests()).toBe(2);
+      // The superseded read settling first must not start the follow-up early.
+      stalled.resolve(Response.json(detail));
+      await clock.flush();
+      await clock.advance(100);
+      expect(requests()).toBe(2);
+      current.resolve(Response.json(newerDetail));
+      await clock.flush();
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+    },
+    true,
+  );
+  const superseded = deferred<Response>();
+  await withStream(
+    (request) => (request === 1 ? superseded.promise : Promise.resolve(Response.json(newerDetail))),
+    async ({ stream, clock, requests }) => {
+      stream.onopen?.();
+      // A run update supersedes the stalled read; a reconnect right after needs only the one read.
+      stream.emit({ kind: "run", run: detail.run });
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(requests()).toBe(2);
+      await clock.advance(1000);
+      expect(requests()).toBe(2);
+      superseded.resolve(Response.json(detail));
+      await clock.flush();
+      await clock.advance(1000);
+      expect(requests()).toBe(2);
+    },
+    true,
+  );
+});
