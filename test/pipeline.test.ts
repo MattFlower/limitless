@@ -43,7 +43,13 @@ import {
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
-import { LaterReviewSchema, ReviewSchema, renderSpec, toStrictJsonSchema } from "../src/pipeline/schemas.ts";
+import {
+  LaterReviewSchema,
+  ReviewSchema,
+  renderSpec,
+  SpecSchema,
+  toStrictJsonSchema,
+} from "../src/pipeline/schemas.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
@@ -1062,7 +1068,16 @@ describe("pipeline (fake agents, real git + gates)", () => {
   );
 
   test.each([false, true])("spec criterion id feedback retry (exhausted=%s)", async (exhausted) => {
-    const invalid = { ...spec, acceptance_criteria: [{ ...spec.acceptance_criteria[0], id: "H-1" }] };
+    const invalid = {
+      ...spec,
+      summary: 42,
+      assumptions: [42, 42, 42],
+      requirements: [42, 42, 42],
+      acceptance_criteria: [{ ...spec.acceptance_criteria[0], id: "H-1" }],
+    };
+    const parsed = SpecSchema.safeParse(invalid);
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) expect(parsed.error.message.indexOf("Invalid id H-1")).toBeGreaterThan(500);
     const prompts: string[] = [];
     let implementations = 0;
     const f = start((s) => {
@@ -1084,7 +1099,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     );
     expect(prompts).toHaveLength(2);
     expect(prompts[1]).toContain("Invalid spec");
-    expect(prompts[1]).toContain("H-1");
+    expect(prompts[1]).toContain("Invalid id H-1: use AC-n");
     expect(implementations).toBe(exhausted ? 0 : 1);
     if (exhausted) {
       expect(f.store.getArtifact(run.id, "spec.md")).toBeNull();
@@ -4425,6 +4440,7 @@ protected_paths = ["protected.txt"]
       "privateNotesToken_736",
       "unknownRowToken_737",
       "retryPrivateEvidenceToken_739",
+      "privateCanary_731",
     ];
     const [description, steps, expected, evidence, summary, notes, unknown, retryEvidence] = privateLiterals;
     if (!description || !steps || !expected || !evidence || !summary || !notes || !unknown || !retryEvidence)
@@ -4432,7 +4448,7 @@ protected_paths = ["protected.txt"]
     const privateHoldout = {
       scenarios: holdout.scenarios.map((scenario, index) => ({
         ...scenario,
-        description: `Scenario ${description} ${index}`,
+        description: `Scenario ${description} privateCanary_731 ${index}`,
         steps: `Run ${steps} ${index}`,
         expected: `Returns ${expected} ${index}`,
       })),
@@ -4455,7 +4471,10 @@ protected_paths = ["protected.txt"]
       const artifact = JSON.parse(raw as string) as typeof pass;
       const publicRow = artifact.criteria.find((criterion) => criterion.id === "AC-1");
       expect(publicRow?.status).toBe(expectedPublicStatus);
-      expect(publicRow?.evidence).toBe(expectedPublicEvidence);
+      expect(publicRow?.evidence).toBe(
+        `${expectedPublicEvidence}; [private detail] [1 private details withheld]`,
+      );
+      expect(publicRow?.publicSummary).toBe("[private detail] [1 private details withheld]");
       for (const id of ["H-1", "H-2", "H-3"]) {
         const row = artifact.criteria.find((criterion) => criterion.id === id);
         expect(row?.id).toBe(id);
@@ -4499,6 +4518,10 @@ protected_paths = ["protected.txt"]
       if (role === "holdout") return { structured: privateHoldout };
       if (role === "review") return { structured: approve };
       if (role === "verify") {
+        if (verifies === 2) {
+          verifies++;
+          return { structured: pass };
+        }
         // Simulate a resumed persisted spec that predates ID validation.
         verifies++;
         if (verifies === 2) checkArtifact("verify-0.json", "blocked", "met", publicEvidence);
@@ -4509,9 +4532,9 @@ protected_paths = ["protected.txt"]
             criteria: [
               {
                 id: "AC-1",
-                status: verifies === 1 ? "blocked" : "met",
-                evidence: verifies === 1 ? publicEvidence : retryPublicEvidence,
-                publicSummary: "",
+                status: verifies === 1 ? "blocked" : "unmet",
+                evidence: `${verifies === 1 ? publicEvidence : retryPublicEvidence}; ${privateHoldout.scenarios[0]?.description}`,
+                publicSummary: `${privateHoldout.scenarios[0]?.description}`,
               },
               {
                 id: "H-1",
@@ -4537,11 +4560,21 @@ protected_paths = ["protected.txt"]
         };
       }
       implementations++;
-      if (implementations === 2) checkArtifact("verify-0-retry.json", "met", "unmet", retryPublicEvidence);
+      if (implementations === 2) {
+        checkArtifact("verify-0-retry.json", "unmet", "unmet", retryPublicEvidence);
+        expect(s.prompt).toContain(retryPublicEvidence);
+        expect(s.prompt).toContain("H-1** private scenario (unmet): Observed behavior");
+        expect(s.prompt).toContain("[private detail]");
+        for (const literal of privateLiterals) expect(s.prompt).not.toContain(literal);
+        expect(s.prompt).not.toContain(privateHoldout.scenarios[0]?.description ?? "missing scenario");
+      }
       return { files: { "farewell.txt": "goodbye\n" } };
     });
     try {
-      const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
+      const run = await f.createRun({
+        repo: repoDir,
+        prompt: `Add a farewell file. Public diagnostics: ${publicEvidence}; ${retryPublicEvidence}`,
+      });
       runId = run.id;
       expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       expect(verifies).toBe(3);

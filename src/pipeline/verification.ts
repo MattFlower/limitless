@@ -15,7 +15,11 @@ export function preDeliveryVerifyArtifact(
       notes: redactHoldoutText(verify.notes, holdout, publicSources),
       criteria: verify.criteria.map((criterion, index) =>
         rowKind(criterion.id, spec, holdout) === "public"
-          ? criterion
+          ? {
+              ...criterion,
+              evidence: redact(criterion.evidence, criterion.id),
+              publicSummary: redact(criterion.publicSummary, criterion.id),
+            }
           : {
               id: rowKind(criterion.id, spec, holdout) === "unknown" ? `unknown-${index + 1}` : criterion.id,
               status: criterion.status,

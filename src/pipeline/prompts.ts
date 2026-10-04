@@ -260,13 +260,13 @@ export function formatVerifyFeedback(
       const kind = rowKind(c.id, spec, holdout);
       if (kind === "unknown") return `- **unknown-${index + 1}** (${c.status}): Unknown criterion.`;
       const privateScenario = kind !== "public";
-      const summary =
-        privateScenario && holdout ? redactHoldoutText(c.publicSummary.trim(), holdout, publicSources) : "";
+      const summary = holdout ? redactHoldoutText(c.publicSummary.trim(), holdout, publicSources) : "";
       const behavior = summary.replace(/\[private detail\]|\[\d+ private details withheld\]/g, "");
       const safeSummary = /[\p{L}\p{N}]/u.test(behavior)
         ? summary
         : `The verifier could not confirm this private scenario.${summary.match(/ \[\d+ private details withheld\]$/)?.[0] ?? ""}`;
-      if (!privateScenario) return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
+      if (!privateScenario)
+        return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${holdout ? redactHoldoutText(c.evidence, holdout, publicSources) : c.evidence}`;
       if (c.status !== "unmet" || (c.requirement !== "request" && c.requirement !== "spec"))
         return `- **${c.id}** private scenario (${c.status}): ${safeSummary}`;
       const citation = c.requirementCitation ?? "";

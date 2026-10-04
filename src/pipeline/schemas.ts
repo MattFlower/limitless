@@ -458,7 +458,10 @@ export function renderSpec(spec: Spec): string {
 }
 
 export function rowKind(id: string, spec: Spec | null, holdout?: Holdout) {
-  const publicId = spec?.acceptance_criteria.some((c) => c.id === id);
-  if (holdout?.scenarios.some((s) => s.id === id) || (publicId && /^H-\d+$/.test(id))) return "holdout";
-  return publicId ? "public" : "unknown";
+  const canonical = (value: string) => value.trim().toUpperCase();
+  id = canonical(id);
+  if (holdout?.scenarios.some((s) => canonical(s.id) === id)) return "holdout";
+  return /^AC-\d+$/.test(id) && spec?.acceptance_criteria.some((c) => canonical(c.id) === id)
+    ? "public"
+    : "unknown";
 }

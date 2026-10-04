@@ -666,12 +666,15 @@ export class RunContext {
         result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };
       if (opts.requireStructured && result.status === "ok" && result.structured === null)
         result = { ...result, status: "error", error: "missing structured output" };
+      let invalidSpecId = "";
       if (
         opts.schema &&
         (result.status === "ok" || result.status === "declined") &&
         result.structured !== null
       ) {
         const parsed = opts.schema.safeParse(result.structured);
+        if (!parsed.success)
+          invalidSpecId = parsed.error.issues.find((i) => i.message.startsWith("Invalid id "))?.message ?? "";
         result = parsed.success
           ? { ...result, structured: parsed.data }
           : {
@@ -771,10 +774,10 @@ export class RunContext {
         this.log(`${target.targetId ?? target.modelId} ${result.status}; falling back`, "warn");
         continue;
       }
-      if (opts.role === "spec" && result.error?.includes('"message": "Invalid id ')) {
-        if (specIdRetried) throw new Error(result.error);
+      if (opts.role === "spec" && invalidSpecId) {
+        if (specIdRetried) throw new Error(result.error ?? invalidSpecId);
         specIdRetried = true;
-        opts = { ...opts, prompt: `${opts.prompt}\n\nInvalid spec: ${result.error}` };
+        opts = { ...opts, prompt: `${opts.prompt}\n\nInvalid spec: ${invalidSpecId}\n${result.error}` };
         tried.pop();
         continue;
       }
