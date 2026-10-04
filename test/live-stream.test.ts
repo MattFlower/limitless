@@ -1,5 +1,5 @@
 import { expect, jest, test } from "bun:test";
-import type { QuotaAlert, Run, StreamMessage } from "../src/core/types.ts";
+import { MAX_RUN_IDS, type QuotaAlert, type Run, type StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { openGlobalStream } from "../ui/api.ts";
@@ -76,6 +76,7 @@ test("the first open fetches once, and a burst of reconnects catches up with one
   for (let flap = 0; flap < 100; flap++) {
     stream.connected(false);
     stream.connected(true);
+    await clock.advance(100);
   }
   await clock.advance(1000);
   expect(fetches).toBe(2);
@@ -123,6 +124,37 @@ test("after a gap, runs (including cached ones outside the window) and alerts ca
   expect(live.runs[recent.failed.id]?.status).toBe("resolved");
   expect(live.runs[old.failed.id]?.status).toBe("resolved");
   expect(Object.keys(live.alerts)).toEqual([]);
+});
+
+test("every cached run outside the window is re-read, in sequential batches of at most 200", async () => {
+  const { failed } = runStates("Old work");
+  const old = Array.from({ length: MAX_RUN_IDS + 1 }, (_, i) => ({ ...failed, id: `old${i}`, createdAt: i }));
+  const clock = waitClock();
+  const batches: number[] = [];
+  let reading = 0;
+  let status: Run["status"] = "failed";
+  const { stream, deps } = liveDeps(async (opts) => {
+    if (!opts?.ids) return [];
+    expect(reading).toBe(0);
+    reading++;
+    batches.push(opts.ids.length);
+    await Promise.resolve();
+    reading--;
+    return old.filter((run) => opts.ids?.includes(run.id)).map((run) => ({ ...run, status }));
+  });
+  const { ensureLiveStore, live } = await freshStore("batches");
+  ensureLiveStore(deps, timers(clock));
+  stream.connected(true);
+  await clock.flush();
+  for (const run of old) stream.push({ kind: "run", run });
+
+  stream.connected(false);
+  status = "resolved";
+  stream.connected(true);
+  await clock.advance(250);
+  await clock.flush();
+  expect(batches).toEqual([MAX_RUN_IDS, 1]);
+  expect(old.filter((run) => live.runs[run.id]?.status !== "resolved")).toEqual([]);
 });
 
 test("a catch-up never replaces a newer pushed run, and reconnects while it runs wait for it", async () => {
@@ -186,6 +218,16 @@ test("the runs API re-reads specific runs by id", async () => {
     );
     const ids = ((await response.json()) as Run[]).map((run) => run.id).sort();
     expect(ids).toEqual([first.id, third.id].sort());
+    const tooMany = Array.from({ length: MAX_RUN_IDS + 1 }, (_, i) => `r${i}`);
+    for (const bad of [tooMany, [first.id, "not-a-run-id"]]) {
+      const refused = await list(
+        requestWithParams(`http://localhost:7400/api/runs?ids=${bad.join(",")}`),
+        localServer,
+      );
+      expect(refused.status).toBe(400);
+      expect(() => store.listRuns({ ids: bad })).toThrow("valid run ids");
+    }
+    expect(store.listRuns({ ids: tooMany.slice(0, MAX_RUN_IDS) })).toEqual([]);
   } finally {
     await f.close();
   }

@@ -106,6 +106,7 @@ export const RunDetail: Component = () => {
     if (feedbackTimer) clearTimeout(feedbackTimer);
     clearTimeout(refreshTimer);
     generation++;
+    refreshAfterRead = false;
   });
 
   const stages = createMemo(() => Object.values(stagesById).sort((a, b) => a.id - b.id));
@@ -116,6 +117,9 @@ export const RunDetail: Component = () => {
 
   let generation = 0;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let reads = 0;
+  let loaded = false;
+  let refreshAfterRead = false;
   // Stage, invocation and question updates pushed while a read is in flight are newer than it.
   const pushed = new Set<string>();
   const fresh = <T extends { id: number }>(kind: string, items: T[]) =>
@@ -127,9 +131,11 @@ export const RunDetail: Component = () => {
   const refetchArtifacts = () => {
     const request = ++generation;
     pushed.clear();
+    reads++;
     getRunDetail(params.id)
       .then((detail) => {
         if (request !== generation) return;
+        loaded = true;
         setLoadError(null);
         setRun(detail.run);
         setDetails(detail);
@@ -150,12 +156,19 @@ export const RunDetail: Component = () => {
         );
         setArtifacts(detail.artifacts);
       })
-      .catch((e) => request === generation && setLoadError((e as Error).message));
+      .catch((e) => request === generation && setLoadError((e as Error).message))
+      .finally(() => {
+        if (--reads === 0 && refreshAfterRead) {
+          refreshAfterRead = false;
+          scheduleRefresh();
+        }
+      });
   };
 
   onMount(() => {
     refetchArtifacts();
-    let reconnect = false;
+    let wasOpen = false;
+    let missedUpdates = false;
 
     const close = openRunStream(
       params.id,
@@ -202,8 +215,15 @@ export const RunDetail: Component = () => {
       },
       (value) => {
         setConnected(value);
-        if (value && reconnect) scheduleRefresh();
-        reconnect = true;
+        // Only a drop after the stream was open is a gap. A read already in flight may predate it,
+        // so reconnects during one wait for it and refresh once afterwards.
+        if (!value) missedUpdates ||= wasOpen;
+        else {
+          wasOpen = true;
+          if (missedUpdates && reads) refreshAfterRead = true;
+          else if (missedUpdates || (!loaded && !reads)) scheduleRefresh();
+          missedUpdates = false;
+        }
       },
     );
     onCleanup(close);

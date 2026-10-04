@@ -720,19 +720,45 @@ test("a pushed update beats an older read in flight, and the next read after a g
   };
   const stage = detail.stages[0];
   if (!stage) throw new Error("missing fixture stage");
+  const other = store.createRun(repo, { repo: repo.slug, prompt: "Invocation source" });
+  const running = {
+    ...store.createInvocation({
+      runId: other.id,
+      stageId: null,
+      role: "implement",
+      harness: "fake",
+      provider: "fake",
+      model: "test",
+      modelId: "fake/test",
+    }),
+    runId: run.id,
+  };
   const stale = deferred<Response>();
   await withStream(
-    (request) => (request === 2 ? stale.promise : Promise.resolve(Response.json(detail))),
+    (request) =>
+      request === 2
+        ? stale.promise
+        : Promise.resolve(
+            Response.json(request === 1 ? { ...detail, questions: [asked], invocations: [running] } : detail),
+          ),
     async ({ stream, clock, requests }) => {
+      expect(render()).toContain(asked.question);
+      expect(render()).toContain(">running</span>");
       stream.onopen?.();
       stream.onerror?.();
       stream.onopen?.();
       await clock.advance(100);
       expect(requests()).toBe(2);
       stream.emit({ kind: "question", question: { ...asked, answer: "Postgres", answeredAt: 2 } });
-      stale.resolve(Response.json({ ...detail, questions: [asked] }));
+      stream.emit({ kind: "invocation", invocation: { ...running, status: "ok" } });
+      stream.emit({ kind: "stage", stage: { ...stage, status: "succeeded" } });
+      expect(render()).not.toContain(asked.question);
+      expect(render()).toContain(">ok</span>");
+      stale.resolve(Response.json({ ...detail, questions: [asked], invocations: [running] }));
       await clock.flush();
       expect(render()).not.toContain(asked.question);
+      expect(render()).not.toContain(">running</span>");
+      expect(render()).toContain("timeline-bar succeeded");
 
       stream.emit({ kind: "stage", stage: { ...stage, status: "running" } });
       expect(render()).toContain("timeline-bar running");
@@ -770,6 +796,31 @@ test("an older reconnect read cannot erase a newer artifact refresh", async () =
       await clock.flush();
       expect(render()).toContain("current.json");
       expect(render()).not.toContain("review-1.json");
+    },
+  );
+});
+
+test("reconnect reads are single-flight: flapping adds one read and one follow-up; an early error adds none", async () => {
+  const inFlight = deferred<Response>();
+  await withStream(
+    (request) => (request === 2 ? inFlight.promise : Promise.resolve(Response.json(detail))),
+    async ({ stream, clock, requests }) => {
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(1000);
+      expect(requests()).toBe(1);
+      for (let flap = 0; flap < 100; flap++) {
+        stream.onerror?.();
+        stream.onopen?.();
+        await clock.advance(100);
+      }
+      expect(requests()).toBe(2);
+      inFlight.resolve(Response.json(detail));
+      await clock.flush();
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+      await clock.advance(1000);
+      expect(requests()).toBe(3);
     },
   );
 });
