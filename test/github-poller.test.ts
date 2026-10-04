@@ -430,8 +430,8 @@ test("a missed poll is caught later; restarts, retries and same-head recurrences
   pr.headRefOid = "c".repeat(40);
   await h.advance(15 * S);
   const items = h.fresh();
-  expect(items.map((i) => i.kind)).toEqual(["pr.ci_passed", "pr.ci_failed"]);
-  expect(items.map((i) => i.data.head)).toEqual([SHA, "c".repeat(40)]);
+  expect(items.map((i) => i.kind)).toEqual(["pr.ci_passed", "pr.ci_failed", "pr.ci_failed"]);
+  expect(items.map((i) => i.data.head)).toEqual([SHA, SHA, "c".repeat(40)]);
 });
 
 test("a failed feed write rolls the snapshot back with it", async () => {
@@ -1371,7 +1371,7 @@ test.each(["succeeded", "failed", "cancelled"] as const)(
     await h.advance(600000);
     expect(h.store.githubTracked(h.clock.now())).toEqual([]);
     expect(h.gh.calls).toHaveLength(calls);
-    expect(h.store.db.query("SELECT closed_at FROM github_prs WHERE url = ?").get(pr.url)).toEqual({
+    expect(h.store.db.query("SELECT closed_at FROM github_pr_expiry WHERE url = ?").get(pr.url)).toEqual({
       closed_at: closedAt,
     });
     expect(h.store.githubPrData(pr.url)).not.toBeNull();
@@ -1439,7 +1439,7 @@ test.each(["CLOSED", "MERGED", "OPEN"])(
   },
 );
 
-test("unrelated changes and same-head status recurrences do not repeat CI or review statuses", async () => {
+test("unrelated changes retain status episodes; same-head recurrences start new ones", async () => {
   h = pollerHarness();
   h.factoryPr("o/r", 1);
   const pr = h.node("o/r", 1);
@@ -1460,7 +1460,26 @@ test("unrelated changes and same-head status recurrences do not repeat CI or rev
   ci(pr, rollup("SUCCESS"));
   pr.latestReviews.nodes = [{ state: "APPROVED", author: { login: "alice" } }];
   await h.advance(15 * S);
-  expect(kinds()).toEqual([]);
+  expect(kinds()).toEqual(["pr.ci_passed", "pr.review"]);
+});
+
+test("a renewed changes request on the same head is reported after approval", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  const pr = h.node("o/r", 1);
+  pr.latestReviews.nodes = [{ state: "CHANGES_REQUESTED", author: { login: "alice" } }];
+  h.start();
+  await h.advance(0);
+  expect(kinds()).toEqual(["pr.review"]);
+  for (const state of ["APPROVED", "CHANGES_REQUESTED"]) {
+    pr.latestReviews.nodes = [{ state, author: { login: "alice" } }];
+    await h.advance(15 * S);
+    const items = h.fresh();
+    expect(items.map((i) => i.kind)).toEqual(["pr.review"]);
+    expect(items[0]?.data.review).toBe(`alice:${state}`);
+    await h.advance(15 * S);
+    expect(kinds()).toEqual([]);
+  }
 });
 
 test("a last-window partial NOT_FOUND response retains the accessible PR's data", async () => {

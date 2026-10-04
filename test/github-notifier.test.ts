@@ -789,11 +789,16 @@ test("a stale snapshot never hides an untracked PR from the fallback; a merged o
   }
 });
 
-test("each reconciliation pass looks up tracking once, caps calls, and progresses fairly", async () => {
+test("each reconciliation pass looks up tracking once, caps calls, and progresses fairly with shared PRs", async () => {
   const h = pollerHarness();
   try {
-    const count = RECONCILE_REQUEST_CAP + 7;
+    const count = RECONCILE_REQUEST_CAP + 8;
     for (let i = 1; i <= count; i++) h.factoryPr("o/r", i, "needs_human");
+    const runs = h.store.listRuns().sort((a, b) => a.id.localeCompare(b.id));
+    const firstRun = runs[0];
+    const lastRun = runs.at(-1);
+    if (!firstRun?.prUrl || !lastRun) throw new Error("missing factory PR");
+    h.store.updateRun(lastRun.id, { prUrl: firstRun.prUrl });
     let lookups = 0;
     const tracked = h.store.githubTracked.bind(h.store);
     h.store.githubTracked = () => {
@@ -818,7 +823,7 @@ test("each reconciliation pass looks up tracking once, caps calls, and progresse
     await reconcileMergedRuns(h.store, client);
     expect(lookups).toBe(2);
     expect(checked).toHaveLength(RECONCILE_REQUEST_CAP);
-    expect(new Set([...first, ...checked]).size).toBe(count);
+    expect(new Set([...first, ...checked]).size).toBe(count - 1);
   } finally {
     h.close();
   }
@@ -892,8 +897,6 @@ test("fallback observations expire closed PRs without poller snapshots and a reo
     () => now + 604800001,
   );
   expect(closed).toHaveBeenCalledTimes(2);
-  store.updateRun(id, { prClosedUnmerged: false });
-  expect(store.githubPrExpired(prUrl, now + 604800001)).toBe(false);
   const reopened = mock(async (url: string) => ({ url, state: "OPEN", mergedAt: null, mergedBy: null }));
   await reconcileMergedRuns(
     store,
@@ -901,5 +904,100 @@ test("fallback observations expire closed PRs without poller snapshots and a reo
     () => {},
     () => now + 604800001,
   );
+  expect(reopened).toHaveBeenCalledTimes(0);
+  await reconcileMergedRuns(
+    store,
+    reopened,
+    () => {},
+    () => now + 604800000 + 86_400_000,
+  );
   expect(reopened).toHaveBeenCalledTimes(1);
+  expect(store.githubPrExpired(prUrl, now + 604800000 + 86_400_000)).toBe(false);
+  expect(store.getRun(id)?.prClosedUnmerged).toBe(false);
+  expect(store.githubTracked(now + 604800000 + 86_400_000).map((pr) => pr.url)).toContain(prUrl);
+});
+
+test.each(["CLOSED", "OPEN", "throw"])(
+  "expired probes returning %s wait a day, follow healthy PRs, and share the cap",
+  async (answer) => {
+    const h = pollerHarness();
+    try {
+      const day = 86_400_000;
+      let now = Date.now();
+      const expired = Array.from({ length: RECONCILE_REQUEST_CAP + 2 }, (_, i) => {
+        h.factoryPr("o/r", i + 1, "succeeded");
+        const prUrl = url("o/r", i + 1);
+        h.store.observeGithubPrState(prUrl, "CLOSED", now - 8 * day);
+        return prUrl;
+      });
+      const shared = h.factoryPr("o/r", 1, "needs_human");
+      h.factoryPr("o/r", 100, "succeeded");
+      const healthy = url("o/r", 100);
+      const calls: string[] = [];
+      const client: GitHubPrClient = async (url) => {
+        calls.push(url);
+        if (url !== healthy && answer === "throw") throw new Error("offline");
+        return { url, state: url === healthy ? "OPEN" : answer, mergedAt: null, mergedBy: null };
+      };
+      const reconcile = () =>
+        reconcileMergedRuns(
+          h.store,
+          client,
+          () => {},
+          () => now,
+        );
+      await reconcile();
+      expect(calls).toEqual([healthy]);
+      calls.length = 0;
+      now += day - 1;
+      await reconcile();
+      expect(calls).toEqual([healthy]);
+      calls.length = 0;
+      now++;
+      await reconcile();
+      expect(calls[0]).toBe(healthy);
+      expect(calls).toHaveLength(RECONCILE_REQUEST_CAP);
+      const probed = calls.slice(1);
+      calls.length = 0;
+      await reconcile();
+      const slowCalls = calls.filter((url) => url !== healthy);
+      if (answer === "OPEN") {
+        expect(h.store.githubTracked(now).map((pr) => pr.url)).toEqual(expect.arrayContaining(probed));
+      } else {
+        expect(slowCalls).toHaveLength(expired.length - probed.length);
+        expect(slowCalls.every((url) => !probed.includes(url))).toBe(true);
+        calls.length = 0;
+        await reconcile();
+        expect(calls).toEqual([healthy]);
+        if (answer === "CLOSED")
+          expect(h.store.getRun(shared.id)).toMatchObject({ status: "resolved", prClosedUnmerged: true });
+      }
+    } finally {
+      h.close();
+    }
+  },
+);
+
+test("expiry timestamps retain the first close, clear on open, and restart on a later close", () => {
+  const clock = (url: string) =>
+    store.db.query("SELECT closed_at, reopened_at FROM github_pr_expiry WHERE url = ?").get(url);
+  store.observeGithubPrState(prUrl, "CLOSED", 10);
+  expect(clock(prUrl)).toEqual({ closed_at: 10, reopened_at: null });
+  store.observeGithubPrState(prUrl, "CLOSED", 20);
+  expect(clock(prUrl)).toEqual({ closed_at: 10, reopened_at: null });
+  store.db
+    .query("INSERT INTO github_prs (url, data) VALUES (?, ?)")
+    .run(prUrl, JSON.stringify({ state: "CLOSED" }));
+  store.db.exec(
+    "CREATE TEMP TRIGGER boom BEFORE UPDATE ON github_prs BEGIN SELECT RAISE(ABORT, 'boom'); END",
+  );
+  expect(() => store.observeGithubPrState(prUrl, "OPEN", 30)).toThrow("boom");
+  expect(clock(prUrl)).toEqual({ closed_at: 10, reopened_at: null });
+  store.db.exec("DROP TRIGGER boom");
+  store.observeGithubPrState(prUrl, "OPEN", 30);
+  expect(clock(prUrl)).toEqual({ closed_at: null, reopened_at: 30 });
+  store.observeGithubPrState(prUrl, "OPEN", 40);
+  expect(clock(prUrl)).toEqual({ closed_at: null, reopened_at: 30 });
+  store.observeGithubPrState(prUrl, "CLOSED", 50);
+  expect(clock(prUrl)).toEqual({ closed_at: 50, reopened_at: 30 });
 });

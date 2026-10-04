@@ -1754,12 +1754,13 @@ export class Store {
     const sql = `SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId, g.node_id AS nodeId, g.data,
         max(r.status IN ('succeeded', 'needs_human')) AS delivered
       FROM runs r JOIN repos ON repos.id = r.repo_id LEFT JOIN github_prs g ON g.url = r.pr_url
+      LEFT JOIN github_pr_expiry e ON e.url = r.pr_url
       WHERE repos.kind = 'github' AND r.pr_url IS NOT NULL
         AND NOT r.merged AND r.delivery_branch IS NULL AND coalesce(g.data ->> 'state', '') <> 'MERGED'
-        AND (g.closed_at IS NULL OR g.closed_at >= ?1 - 604800000)
+        AND (e.closed_at IS NULL OR e.closed_at >= ?1 - 604800000)
         AND coalesce(json_extract(r.source_ref, '$.kind'), '') <> 'pull_request'
         AND (r.status NOT IN ('failed', 'cancelled') OR coalesce(r.finished_at, ?1) >= ?1 - 604800000
-          OR r.pr_closed_unmerged OR g.data ->> 'state' = 'CLOSED' OR g.reopened_at >= ?1 - 604800000)
+          OR r.pr_closed_unmerged OR g.data ->> 'state' = 'CLOSED' OR e.reopened_at >= ?1 - 604800000)
       GROUP BY r.pr_url ORDER BY repos.slug, r.pr_url`;
     return (this.db.query(sql).all(now) as TrackedPr[]).filter((pr) => {
       const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/.exec(pr.url);
@@ -1774,7 +1775,7 @@ export class Store {
 
   githubPrExpired(url: string, now = Date.now()): boolean {
     const row = this.db
-      .query<{ closed_at: number | null }, [string]>("SELECT closed_at FROM github_prs WHERE url = ?")
+      .query<{ closed_at: number | null }, [string]>("SELECT closed_at FROM github_pr_expiry WHERE url = ?")
       .get(url);
     return row?.closed_at != null && row.closed_at < now - 604800000;
   }
@@ -1789,13 +1790,17 @@ export class Store {
 
   /** Reconciliation/reopen observations retain the poller's other saved fields. */
   observeGithubPrState(url: string, state: string, now = Date.now()): void {
-    this.db
-      .query(`INSERT INTO github_prs (url, closed_at) VALUES (?, ?)
-      ON CONFLICT(url) DO UPDATE SET reopened_at = CASE WHEN ? = 'OPEN' AND github_prs.closed_at IS NOT NULL
-        THEN ? ELSE github_prs.reopened_at END, closed_at = CASE WHEN ? = 'CLOSED'
-        THEN coalesce(github_prs.closed_at, excluded.closed_at) ELSE NULL END,
-        data = CASE WHEN data IS NULL THEN NULL ELSE json_set(data, '$.state', ?) END`)
-      .run(url, state === "CLOSED" ? now : null, state, now, state, state);
+    this.db.transaction(() => {
+      this.db
+        .query(`INSERT INTO github_pr_expiry (url, closed_at) VALUES (?, ?)
+      ON CONFLICT(url) DO UPDATE SET reopened_at = CASE WHEN ? = 'OPEN' AND github_pr_expiry.closed_at IS NOT NULL
+        THEN ? ELSE github_pr_expiry.reopened_at END, closed_at = CASE WHEN ? = 'CLOSED'
+        THEN coalesce(github_pr_expiry.closed_at, excluded.closed_at) ELSE NULL END`)
+        .run(url, state === "CLOSED" ? now : null, state, now, state);
+      this.db
+        .query("UPDATE github_prs SET data = json_set(data, '$.state', ?) WHERE url = ?")
+        .run(state, url);
+    })();
   }
 
   /** Advance a PR's saved state (when given) and write feed items in one transaction. */

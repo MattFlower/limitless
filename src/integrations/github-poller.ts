@@ -248,7 +248,8 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     const changes = diffPr(prev, snap);
     const revision = (prev?.revision ?? 0) + (changes.length ? 1 : 0);
     const items = changes.map((c) => {
-      const key = `${pr.url}:${head}:${/conflicting|behind|ci_passed|ci_failed|review/.test(c.kind) ? "" : revision}:${c.key}`;
+      // Status items are emitted only on entry; the revision distinguishes a returning episode.
+      const key = `${pr.url}:${head}:${/conflicting|behind/.test(c.kind) ? "" : revision}:${c.key}`;
       return { ...c, runId: pr.runId, repo: pr.repo, data: { ...c.data, url: pr.url, head }, key };
     });
     const save = (nudged: string | null, feed = items) => {

@@ -20,6 +20,7 @@ const passes = new WeakMap<
   Store,
   {
     cursor: string;
+    checked: Map<string, number>;
     retries: Map<string, { failures: number; at: number }>;
   }
 >();
@@ -40,7 +41,7 @@ export async function reconcileMergedRuns(
 ): Promise<void> {
   let pass = passes.get(store);
   if (!pass) {
-    pass = { cursor: "", retries: new Map() };
+    pass = { cursor: "", checked: new Map(), retries: new Map() };
     passes.set(store, pass);
   }
   client.beginPass?.();
@@ -52,18 +53,27 @@ export async function reconcileMergedRuns(
     .sort((a, b) => a.id.localeCompare(b.id));
   const start = runs.findIndex((run) => run.id > pass.cursor);
   const ordered = start < 0 ? runs : [...runs.slice(start), ...runs.slice(0, start)];
+  const expired = new Set(
+    ordered.flatMap((r) => (r.prUrl && store.githubPrExpired(r.prUrl, now()) ? [r.prUrl] : [])),
+  );
+  ordered.sort((a, b) => Number(expired.has(a.prUrl ?? "")) - Number(expired.has(b.prUrl ?? "")));
   let calls = 0;
   const results = new Map<string, GitHubPrState | null>();
   const failed = new Set<string>();
   for (const run of ordered) {
     if (!run.prUrl || (run.merged && run.status !== "needs_human")) continue;
-    if (failed.has(run.prUrl) || store.githubPrExpired(run.prUrl, now())) continue;
+    if (failed.has(run.prUrl)) continue;
+    if (expired.has(run.prUrl) && !results.has(run.prUrl)) {
+      if (!pass.checked.has(run.prUrl)) pass.checked.set(run.prUrl, now());
+      if (now() < (pass.checked.get(run.prUrl) ?? 0) + 86_400_000) continue;
+    }
     if ((pass.retries.get(run.prUrl)?.at ?? 0) > now()) continue;
-    if (!results.has(run.prUrl) && calls >= RECONCILE_REQUEST_CAP) break;
-    pass.cursor = run.id;
+    if (!results.has(run.prUrl) && calls >= RECONCILE_REQUEST_CAP) continue;
     try {
       if (!results.has(run.prUrl)) {
         calls++;
+        pass.cursor = run.id;
+        pass.checked.set(run.prUrl, now());
         results.set(run.prUrl, await client(run.prUrl));
       }
       const pr = results.get(run.prUrl);
