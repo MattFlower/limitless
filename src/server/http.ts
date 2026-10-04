@@ -7,6 +7,7 @@ import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
+import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { classifyRequest, publicHost } from "./access.ts";
 import { Auth, CLEAR_SESSION, enrollPage, localPath, loginPage } from "./auth.ts";
@@ -401,6 +402,17 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         if (!store.getRun(id)) return error("run not found", 404);
         const run = store.resolveRun(id, { ...input.data, by: "human" });
         return run ? json(run) : error(resolveConflict(store.getRun(id)?.status ?? "resolved"), 409);
+      }, true),
+    },
+    "/api/runs/:id/review": {
+      POST: handle(async (req) => {
+        try {
+          const result = await submitReview(factory, req.params.id as string, await body<unknown>(req));
+          return json(result, "round" in result ? 201 : 200);
+        } catch (e) {
+          if (e instanceof ReviewRefused) return error(e.message, e.status);
+          throw e;
+        }
       }, true),
     },
     "/api/runs/:id/answer": {

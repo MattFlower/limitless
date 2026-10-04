@@ -219,6 +219,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   const record = async (pr: TrackedPr, snap: PrSnapshot) => {
     const prev = saved(pr.data);
     const head = snap.headRefOid;
+    store.observePrHead(pr.url, head);
     const same = prev?.headRefOid === head;
     const unknown = snap.mergeable !== "UNKNOWN" ? 0 : same ? (prev?.unknown ?? 0) + 1 : 1;
     // Mergeability is per head; UNKNOWN is no observation, so this head's last known value stands.

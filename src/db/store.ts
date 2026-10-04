@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { WebAuthnCredential } from "@simplewebauthn/server";
 import { AUDIT_ALLOWANCES, parseAllow, validateAllow } from "../core/allow.ts";
-import { assertExistingBranchDelivery } from "../core/delivery.ts";
+import { assertExistingBranchDelivery, type FactoryBranchGrant } from "../core/delivery.ts";
 import type {
   ArtifactMeta,
   AuthPasskey,
@@ -24,6 +24,9 @@ import type {
   QuotaAlert,
   Repo,
   ResolutionKind,
+  ReviewApproval,
+  ReviewFinding,
+  ReviewRound,
   Run,
   RunDetail,
   RunEvent,
@@ -35,7 +38,7 @@ import type {
   StreamMessage,
   TrackedPr,
 } from "../core/types.ts";
-import { DEFAULT_EVAL_CONCURRENCY } from "../core/types.ts";
+import { DEFAULT_EVAL_CONCURRENCY, TERMINAL_STATUSES } from "../core/types.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
 type Row = Record<string, unknown>;
@@ -913,19 +916,38 @@ export class Store {
 
   // Provenance is an internal argument, never taken from the public request object.
   createRun(repo: Repo, req: CreateRunRequest, verifiedGitHubWebhook = false): Run {
-    assertExistingBranchDelivery(repo, { ...req, githubWebhookVerified: verifiedGitHubWebhook });
+    if (req.sourceRef?.kind === "review-round")
+      throw new Error("review rounds are created only by a review verdict");
+    return this.insertRun(repo, req, verifiedGitHubWebhook);
+  }
+
+  /** `round`: the review handler's grant; such a run's prompt quotes findings, so it allows nothing itself. */
+  private insertRun(
+    repo: Repo,
+    req: CreateRunRequest,
+    verifiedGitHubWebhook: boolean,
+    round?: { prUrl: string; grant: FactoryBranchGrant },
+  ): Run {
+    assertExistingBranchDelivery(
+      repo,
+      { ...req, githubWebhookVerified: verifiedGitHubWebhook },
+      round?.grant,
+    );
     const id = newId();
     const dependsOn = this.validateDependencies(req.dependsOn, id);
     const dependency = this.dependencyStatus(dependsOn);
     const title = req.title ?? req.prompt.split("\n")[0]?.slice(0, 80) ?? "Untitled";
     // Composed/model prompts cannot grant allowances; these sources use explicit options only.
     const composed =
-      verifiedGitHubWebhook || ["github", "mcp"].includes(req.source ?? "") || !!req.sourceRef?.proposalId;
+      verifiedGitHubWebhook ||
+      !!round ||
+      ["github", "mcp"].includes(req.source ?? "") ||
+      !!req.sourceRef?.proposalId;
     const allow = validateAllow([...validateAllow(req.allow), ...(composed ? [] : parseAllow(req.prompt))]);
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -947,10 +969,130 @@ export class Store {
         dependency.finishedAt ?? null,
         req.noBaselineCache === true ? 1 : 0,
         json(allow),
+        round?.prUrl ?? null,
       );
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });
     return run;
+  }
+
+  // ---- review rounds and approvals -------------------------------------------
+
+  /**
+   * Creates a round run with the record that authorizes it, at most one in flight and `cap` in all
+   * per PR. Over the cap it creates nothing and leaves `owner` needs_human instead.
+   */
+  createReviewRound(
+    repo: Repo,
+    owner: Run,
+    review: { prUrl: string; reviewedSha: string; findings: ReviewFinding[]; cap: number },
+    request: (round: number) => CreateRunRequest,
+  ): { run: Run } | { active: ReviewRound } | { limited: Run } {
+    return this.chatTransaction(() => {
+      const rounds = this.reviewRounds(review.prUrl);
+      const active = rounds.find((r) => !TERMINAL_STATUSES.includes(r.status));
+      if (active) return { active };
+      // The newest verdict wins: changes requested now outrank an earlier approval, even over the cap.
+      this.db
+        .query("UPDATE review_approvals SET stale_reason = ? WHERE pr_url = ? AND stale_reason IS NULL")
+        .run(`changes requested at ${review.reviewedSha}`, review.prUrl);
+      if (rounds.length >= review.cap)
+        return {
+          limited: this.updateRun(owner.id, { status: "needs_human", error: "review round limit reached" }),
+        };
+      const round = rounds.length + 1;
+      const grant = { owner, head: review.reviewedSha };
+      const run = this.insertRun(repo, request(round), false, { prUrl: review.prUrl, grant });
+      this.db
+        .query(
+          "INSERT INTO review_rounds (run_id, source_run_id, pr_url, round, reviewed_sha, findings, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          run.id,
+          owner.id,
+          review.prUrl,
+          round,
+          review.reviewedSha,
+          JSON.stringify(review.findings),
+          Date.now(),
+        );
+      return { run };
+    });
+  }
+
+  /** The review handler's record for `runId`, which alone authorizes it to push onto `owner`'s PR branch. */
+  reviewRound(
+    runId: string,
+  ): { owner: Run; prUrl: string; round: number; reviewedSha: string; findings: ReviewFinding[] } | null {
+    const sql = `SELECT source_run_id AS sourceRunId, pr_url AS prUrl, round, reviewed_sha AS reviewedSha, findings
+      FROM review_rounds WHERE run_id = ?`;
+    const row = this.db.query(sql).get(runId) as {
+      sourceRunId: string;
+      prUrl: string;
+      round: number;
+      reviewedSha: string;
+      findings: string;
+    } | null;
+    const owner = row && this.getRun(row.sourceRunId);
+    if (!row || !owner) return null;
+    const { prUrl, round, reviewedSha } = row;
+    return { owner, prUrl, round, reviewedSha, findings: parse(row.findings, []) };
+  }
+
+  reviewRounds(prUrl: string): ReviewRound[] {
+    const sql = `SELECT rr.run_id AS runId, rr.round, runs.status, rr.reviewed_sha AS reviewedSha,
+        rr.delivered_sha AS deliveredSha, rr.findings
+      FROM review_rounds rr JOIN runs ON runs.id = rr.run_id WHERE rr.pr_url = ? ORDER BY rr.round`;
+    return (this.db.query(sql).all(prUrl) as Row[]).map((r) => ({
+      ...(r as unknown as ReviewRound),
+      findings: parse(r.findings, []),
+    }));
+  }
+
+  markRoundDelivered(runId: string, sha: string): void {
+    this.db
+      .query("UPDATE review_rounds SET delivered_sha = ? WHERE run_id = ? AND delivered_sha IS NULL")
+      .run(sha, runId);
+    this.publishFeed();
+  }
+
+  /** A base merge the factory pushed to a PR: an approval of its first parent stays current through it. */
+  recordBaseMerge(prUrl: string, sha: string, parentSha: string, runId: string): void {
+    this.db
+      .query(
+        "INSERT OR IGNORE INTO pr_base_merges (pr_url, sha, parent_sha, run_id, created_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(prUrl, sha, parentSha, runId, Date.now());
+  }
+
+  /** `findings_resolved` counts the findings of the PR's delivered rounds. */
+  recordApproval(runId: string, prUrl: string, sha: string, reviewer: string): ReviewApproval {
+    this.db
+      .query(
+        `INSERT INTO review_approvals (run_id, pr_url, sha, reviewer, findings_resolved, created_at)
+        SELECT ?1, ?2, ?3, ?4, coalesce(sum(json_array_length(findings)), 0), ?5
+        FROM review_rounds WHERE pr_url = ?2 AND delivered_sha IS NOT NULL`,
+      )
+      .run(runId, prUrl, sha, reviewer, Date.now());
+    this.publishFeed();
+    return this.approvalFor(prUrl) as ReviewApproval;
+  }
+
+  approvalFor(prUrl: string): ReviewApproval | null {
+    const row = this.db
+      .query("SELECT sha, stale_reason FROM review_approvals WHERE pr_url = ? ORDER BY id DESC LIMIT 1")
+      .get(prUrl) as Row | null;
+    return row ? { sha: row.sha as string, stale: row.stale_reason !== null } : null;
+  }
+
+  /** A head the PR was seen at: other approvals go stale unless factory base merges lead back to them. */
+  observePrHead(prUrl: string, head: string): void {
+    const sql = `UPDATE review_approvals SET stale_reason = 'head moved to ' || ?2
+      WHERE pr_url = ?1 AND stale_reason IS NULL AND sha NOT IN (
+        WITH RECURSIVE kept(sha) AS (SELECT ?2 UNION
+          SELECT m.parent_sha FROM pr_base_merges m JOIN kept ON m.sha = kept.sha WHERE m.pr_url = ?1)
+        SELECT sha FROM kept)`;
+    this.db.query(sql).run(prUrl, head);
   }
 
   private validateDependencies(input: unknown, candidateId: string): string[] {
@@ -1214,6 +1356,9 @@ export class Store {
       invocations: this.listInvocations(id),
       questions: this.listQuestions(id),
       artifacts: this.listArtifacts(id),
+      ...(run.prUrl
+        ? { review: { approval: this.approvalFor(run.prUrl), rounds: this.reviewRounds(run.prUrl) } }
+        : {}),
     };
   }
 

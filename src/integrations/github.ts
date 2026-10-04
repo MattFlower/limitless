@@ -41,9 +41,13 @@ export const GITHUB_PREFACES = {
 } as const;
 export type GitHubPromptKind = keyof typeof GITHUB_PREFACES;
 
+/** Untrusted data as JSON with angle brackets escaped, so no string in it can close the tag around it. */
+export function quotedJson(data: unknown): string {
+  return JSON.stringify(data, null, 2).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+}
+
 function quoted(data: unknown): string {
-  const json = JSON.stringify(data, null, 2).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
-  return `${QUOTE_OPEN}${json}${QUOTE_CLOSE}`;
+  return `${QUOTE_OPEN}${quotedJson(data)}${QUOTE_CLOSE}`;
 }
 
 /** The inverse of a mapGitHubEvent prompt (its kind and quoted object); null for any other text. */
