@@ -53,7 +53,7 @@ export const {
   getNextSibling: (node) => node.parent?.children[(node.parent?.children.indexOf(node) ?? -1) + 1],
 });
 
-const [providers, setProviders] = createStore<Record<string, ProviderStatus>>({});
+const [providers, setProviders] = createStore<Record<string, ProviderStatus>>(Object.create(null));
 const [alerts, setAlerts] = createStore<Record<string, QuotaAlert>>({});
 const [runs, setRuns] = createStore<Record<string, Run>>({});
 export const live = { providers, alerts, runs, connected: () => true };

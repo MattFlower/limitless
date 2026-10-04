@@ -36,6 +36,7 @@ Usage:
         Items to act on after the consumer's cursor; --wait long-polls until one arrives
   limitless feed ack <id> --consumer <name>  Acknowledge items through id once handled
   limitless providers                     Provider health and quota
+  limitless providers export [--write] [--yes]     Export effective provider config (offline)
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
   limitless doctor                        Report GitHub access problems the PR poller recorded
@@ -222,6 +223,7 @@ async function main(): Promise<void> {
       help: { type: "boolean", short: "h" },
       tunnel: { type: "boolean" },
       write: { type: "boolean" },
+      yes: { type: "boolean" },
       "dry-run": { type: "boolean" },
       mtplx: { type: "boolean" },
       smoke: { type: "boolean" },
@@ -409,6 +411,10 @@ async function main(): Promise<void> {
       });
     }
     case "providers": {
+      if (rest[0] === "export") {
+        if (rest.length !== 1) throw new Error("usage: limitless providers export [--write] [--yes]");
+        return (await import("./providers-export.ts")).providersExport(!!values.write, !!values.yes);
+      }
       if (rest[0] === "fast") {
         const [, value, id] = rest;
         if (rest.length !== 3 || (value !== "on" && value !== "off") || !id)

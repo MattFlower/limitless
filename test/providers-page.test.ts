@@ -157,6 +157,30 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
     await flush();
     expect(fixture.workloadReads).toBe(3);
     expect(text(codex)).toContain("Invocations2317");
+    fixture.setProviders("custom", {
+      ...provider,
+      id: "custom",
+      label: "Configured MLX",
+      ...{ apiKey: "never-publish-sentinel" },
+      inFlight: 1,
+      kind: "openai-compatible",
+      billing: "free",
+      supportsFast: false,
+      maxConcurrent: 4,
+      enabled: false,
+      state: "disabled",
+      reason: "missing key EXAMPLE_KEY",
+    });
+    const custom = cards(root).find((card) => text(card).startsWith("Configured MLX"));
+    if (!custom) throw new Error("missing configured provider card");
+    expect(text(custom)).toContain("openai-compatible");
+    expect(text(custom)).toContain("missing key EXAMPLE_KEY");
+    expect(text(custom)).toContain("in-flight 1/4");
+    fixture.setProviders("custom", { enabled: true, state: "ok", reason: null, inFlight: 2 });
+    expect(text(custom)).not.toContain("missing key EXAMPLE_KEY");
+    expect(text(custom)).toContain("in-flight 2/4");
+    expect(text(custom)).toContain("Disable");
+    expect(text(root)).not.toContain("never-publish-sentinel");
     dispose();
     expect(fixture.timerCount()).toBe(0);
     fixture.advanceTimers(30_000);

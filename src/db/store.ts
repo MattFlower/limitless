@@ -204,6 +204,7 @@ const toInvocation = (r: Row): Invocation => ({
   inputTokens: r.input_tokens as number,
   outputTokens: r.output_tokens as number,
   cacheReadTokens: r.cache_read_tokens as number,
+  cacheWriteTokens: r.cache_write_tokens as number,
   numTurns: r.num_turns as number,
   sessionId: (r.session_id as string) ?? null,
   error: (r.error as string) ?? null,
@@ -297,6 +298,7 @@ export interface InvocationPatch {
   inputTokens?: number;
   outputTokens?: number;
   cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   numTurns?: number;
   sessionId?: string | null;
   error?: string | null;
@@ -312,6 +314,7 @@ const INVOCATION_PATCH_COLUMNS: Record<keyof InvocationPatch, string> = {
   inputTokens: "input_tokens",
   outputTokens: "output_tokens",
   cacheReadTokens: "cache_read_tokens",
+  cacheWriteTokens: "cache_write_tokens",
   numTurns: "num_turns",
   sessionId: "session_id",
   error: "error",
@@ -1184,7 +1187,7 @@ export class Store {
         `UPDATE runs SET
            cost_usd = (SELECT COALESCE(SUM(cost_usd),0) FROM invocations WHERE run_id = ?1),
            cost_equiv_usd = (SELECT COALESCE(SUM(cost_equiv_usd),0) FROM invocations WHERE run_id = ?1),
-           tokens_in = (SELECT COALESCE(SUM(input_tokens + cache_read_tokens),0) FROM invocations WHERE run_id = ?1),
+           tokens_in = (SELECT COALESCE(SUM(input_tokens + cache_read_tokens + cache_write_tokens),0) FROM invocations WHERE run_id = ?1),
            tokens_out = (SELECT COALESCE(SUM(output_tokens),0) FROM invocations WHERE run_id = ?1)
          WHERE id = ?1`,
       )

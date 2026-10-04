@@ -8,7 +8,7 @@ import type { ProviderStatus, QuotaAlert, Run } from "../src/core/types.ts";
 import { getAlerts, getHealth, getProviders, listRuns, openGlobalStream } from "./api.ts";
 
 const [runsById, setRunsById] = createStore<Record<string, Run>>({});
-const [providersById, setProvidersById] = createStore<Record<string, ProviderStatus>>({});
+const [providersById, setProvidersById] = createStore<Record<string, ProviderStatus>>(Object.create(null));
 const [alertsByKey, setAlertsByKey] = createStore<Record<string, QuotaAlert>>({});
 const [connected, setConnected] = createSignal(false);
 const [draining, setDraining] = createSignal(false);
