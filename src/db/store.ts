@@ -1210,19 +1210,25 @@ export class Store {
     const review = parse<{ blocking?: { title?: string }[] }>(this.getArtifact(id, latest?.name ?? ""), {});
     const state = this.getRunState<RunState>(id);
     const stages = this.listStages(id);
+    // Draft delivery failures are secondary; the run retains the original stopping error.
+    const evidence = stages.filter(
+      (s) =>
+        s.name !== "deliver" ||
+        s.status !== "failed" ||
+        (!!run.error && s.summary === run.error.slice(0, 500)),
+    );
+    const latestStages = new Map(evidence.map((s) => [s.name, s]));
     const blocked = [
       ["verify", state?.lastVerify?.overall === "fail"],
       ["review", state?.lastReview?.verdict === "request_changes"],
       ["audit", state?.lastAudit?.some((f) => f.severity === "block")],
       ["gates", state?.lastGates?.some((g) => g.blocking)],
     ] as const;
-    const stopping =
-      // Draft delivery failures are secondary; the run retains the original stopping error.
-      stages.findLast(
-        (s) =>
-          s.status === "failed" &&
-          (s.name !== "deliver" || (!!run.error && s.summary === run.error.slice(0, 500))),
-      ) ?? stages.findLast((s) => blocked.some(([name, blocks]) => blocks && name === s.name));
+    const stopping = evidence.findLast(
+      (s) =>
+        latestStages.get(s.name) === s &&
+        (s.status === "failed" || blocked.some(([name, blocks]) => blocks && name === s.name)),
+    );
     return {
       stoppingStage: stopping?.name ?? blocked.find(([, blocks]) => blocks)?.[0] ?? null,
       blockingFindings: Array.isArray(review?.blocking)

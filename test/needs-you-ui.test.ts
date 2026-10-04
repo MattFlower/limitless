@@ -260,13 +260,18 @@ async function withStream(
     requests: () => number;
   }) => Promise<void>,
   initiallyEmpty = false,
+  resolved?: Run,
 ) {
   const oldFetch = globalThis.fetch;
   const oldSource = globalThis.EventSource;
   const clock = waitClock();
   let stream = new TestEventSource();
   let requests = 0;
-  globalThis.fetch = (async (path) => {
+  globalThis.fetch = (async (path, init) => {
+    if (resolved && String(path).endsWith("/resolve")) {
+      expect(init?.method).toBe("POST");
+      return Response.json(resolved);
+    }
     expect(String(path)).toBe(`/api/runs/${run.id}`);
     return read(++requests);
   }) as typeof fetch;
@@ -312,6 +317,57 @@ const newerDetail: RunDetail = {
   prSnapshot: { ...detail.prSnapshot, ci: "SUCCESS" },
   artifacts: [{ name: "current.json", kind: "review", size: 1, createdAt: 1 }],
 };
+
+test.each(["resolution", "SSE", "resolution and SSE"])(
+  "%s invalidates a pending detail read before the debounced refresh starts",
+  async (update) => {
+    const obsolete = deferred<Response>();
+    const resolved: Run = {
+      ...detail.run,
+      status: "resolved",
+      resolution: { kind: "done_elsewhere", by: "human", at: 42, ref: null, note: "Handled" },
+    };
+    await withStream(
+      async (request) =>
+        request === 1
+          ? Response.json(detail)
+          : request === 2
+            ? obsolete.promise
+            : Response.json({ ...newerDetail, run: { ...resolved, title: "Current resolved run" } }),
+      async ({ stream, clock, requests }) => {
+        stream.emit(observation());
+        await clock.advance(100);
+        expect(requests()).toBe(2);
+        render();
+        if (update.includes("resolution")) await invoke("resolve");
+        if (update.includes("SSE")) stream.emit({ kind: "run", run: resolved });
+        expect(render()).toContain("Handled");
+        obsolete.resolve(Response.json(detail));
+        await clock.flush();
+        expect(requests()).toBe(2);
+        const html = render();
+        expect(html).toContain("Handled");
+        for (const action of ['aria-label="Needs you"', "Resolve</button>", "Retry"])
+          expect(html).not.toContain(action);
+        expect(ui.handlers.has("resolve")).toBe(false);
+        expect(ui.handlers.has("retry")).toBe(false);
+        expect(html).not.toContain("current.json");
+        if (update.includes("SSE")) {
+          await clock.advance(99);
+          expect(requests()).toBe(2);
+          await clock.advance(1);
+          expect(requests()).toBe(3);
+          expect(render()).toContain("Current resolved run");
+          expect(render()).toContain("current.json");
+          expect(render()).toContain("Handled");
+          expect(render()).not.toContain('aria-label="Needs you"');
+        }
+      },
+      false,
+      resolved,
+    );
+  },
+);
 
 test("newest-first detail responses guard initial hydration, observations and artifacts", async () => {
   const initial = deferred<Response>();
@@ -520,6 +576,37 @@ test("failed draft delivery falls back to retained blockers; original delivery f
   store.setRunState(stopped.id, { lastReview: { verdict: "request_changes" } });
   store.finishStage(store.startStage(stopped.id, "deliver", 1).id, "failed", error.slice(0, 500));
   expect(read()).toContain("deliver · Delivery rejected:");
+  store.finishStage(store.startStage(stopped.id, "deliver", 2).id, "failed", "Draft PR rejected");
+  expect(read()).toContain("deliver · Delivery rejected:");
+  store.finishStage(store.startStage(stopped.id, "deliver", 3).id, "succeeded");
+  expect(read()).toContain("review · Delivery rejected:");
+});
+
+test.each([
+  { reviewFirst: false, recovered: false, expected: "review" },
+  { reviewFirst: true, recovered: false, expected: "implement" },
+  { reviewFirst: true, recovered: true, expected: "review" },
+  { reviewFirst: false, recovered: true, expected: null },
+])("stopping evidence uses applicable attempt order: %j", ({ reviewFirst, recovered, expected }) => {
+  const stopped = store.createRun(repo, { repo: repo.slug, prompt: "Recovered failure" });
+  store.updateRun(stopped.id, { status: "needs_human", stage: "deliver", error: "Needs work" });
+  const blockReview = () => {
+    store.finishStage(store.startStage(stopped.id, "review").id, "succeeded");
+    store.setRunState(stopped.id, { lastReview: { verdict: "request_changes" } });
+  };
+  if (reviewFirst) blockReview();
+  store.finishStage(store.startStage(stopped.id, "implement").id, "failed", "Implement interrupted");
+  if (recovered) store.finishStage(store.startStage(stopped.id, "implement", 1).id, "succeeded");
+  else if (!reviewFirst) blockReview();
+  store.finishStage(store.startStage(stopped.id, "deliver").id, "failed", "Draft PR rejected");
+  const saved = store.getRunDetail(stopped.id);
+  if (!saved) throw new Error("missing stopping evidence");
+  expect(saved.stoppingStage).toBe(expected);
+  ui.mount(saved);
+  const html = render();
+  if (expected) expect(html).toContain(`${expected} · Needs work`);
+  else expect(html).not.toContain("implement · Needs work");
+  expect(html).not.toContain("deliver · Needs work");
 });
 
 test("per-run SSE forwards committed GitHub observations only for the displayed run", async () => {

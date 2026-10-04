@@ -157,6 +157,7 @@ export const RunDetail: Component = () => {
       0,
       (msg) => {
         if (msg.kind === "run" && msg.run.id === params.id) {
+          generation++;
           setRun(msg.run);
           scheduleRefresh();
         } else if (msg.kind === "feed" && msg.item.runId === params.id) scheduleRefresh();
@@ -223,7 +224,10 @@ export const RunDetail: Component = () => {
           kind: kind(),
           ref: ref().trim() || undefined,
           note: note().trim() || undefined,
-        }).then(setRun);
+        }).then((resolved) => {
+          generation++;
+          setRun(resolved);
+        });
     } catch (e) {
       setActionError((e as Error).message);
     } finally {

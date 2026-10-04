@@ -6775,6 +6775,59 @@ for (const failure of ["throw", "timeout", "quota", "cancelled"] as const) {
   });
 }
 
+test("a recovered implement failure followed by a review block names review in Needs you", async () => {
+  const f = start((s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review")
+      return {
+        structured: {
+          ...approve,
+          verdict: "request_changes",
+          findings: [
+            {
+              label: "unaddressed",
+              prior: "P1",
+              severity: "major",
+              security: false,
+              ...findingEvidence,
+              file: "farewell.txt",
+              line: 1,
+              title: "Incorrect output",
+              detail: "Needs work",
+              suggestion: "Fix it",
+            },
+          ],
+        },
+      };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  f.deps.cfg.maxRounds = 1;
+  f.deps.faults = { "stage:implement:before": { action: "throw" } };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+  expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+  const detail = f.store.getRunDetail(run.id);
+  if (!detail) throw new Error("missing recovered run detail");
+  expect(detail.stages.filter((stage) => stage.name === "implement").map((stage) => stage.status)).toEqual([
+    "failed",
+    "succeeded",
+    "succeeded",
+    "succeeded",
+  ]);
+  expect(f.store.getRunState<RunState>(run.id)?.lastReview?.verdict).toBe("request_changes");
+  expect(detail.stoppingStage).toBe("review");
+  const ui = await buildNeedsYouUi(join(home, "needs-you-ui"));
+  try {
+    ui.mount(detail);
+    const html = renderToString(() => ui.render());
+    expect(html).toContain('aria-label="Needs you"');
+    expect(html).toContain("review · Still failing after");
+    expect(html).not.toContain("implement · Still failing after");
+  } finally {
+    ui.dispose();
+  }
+});
+
 test("completed environment retry stays consumed after persisted-state restart", async () => {
   let implementations = 0;
   let verifies = 0;
