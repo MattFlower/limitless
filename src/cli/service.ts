@@ -302,7 +302,6 @@ export async function install(
       if (existsSync(state.path)) unlinkSync(state.path);
       writeFileSync(state.old.path, readFileSync(backup));
       if (state.old.label === state.label || !(await isLoaded(state.old.label))) await start(state.old.path);
-      else if (state.label === LABEL) await requestAdmin(client, clock, "resume");
     })().catch((error) => errors.push(String(error)));
     if (errors.length) throw new Error(errors.join("; "));
     save({ ...state, phase: "restored" });
@@ -311,6 +310,7 @@ export async function install(
     if (!existsSync(journal)) return;
     const state: Migration = JSON.parse(readFileSync(journal, "utf8"));
     if (state.phase === "restored") return;
+    if (state.phase === "prepared" && (await isLoaded(state.old.label))) return clear();
     try {
       if (state.phase !== "replacing" || !(await isLoaded(state.label))) throw new Error("pending migration");
       if (state.label === LABEL) await race(waitForHealthy(client, clock, state.target));
@@ -320,8 +320,7 @@ export async function install(
       });
       throw new Error(`Recovered previous agent ${state.old.label}; retry installation. ${String(error)}`);
     }
-    clear();
-    return;
+    return clear();
   }
   mkdirSync(logDir, { recursive: true });
   mkdirSync(agentsDir, { recursive: true });
@@ -356,6 +355,7 @@ export async function install(
       restoring = true;
       try {
         if (state && !(await isLoaded(state.old.label))) await restore(state);
+        else clear();
         if (drainAttempted && old && (await isLoaded(old.label))) await requestAdmin(client, clock, "resume");
       } catch (resume) {
         throw new Error(`${String(error)}\nResume scheduler failed: ${String(resume)}`, { cause: error });

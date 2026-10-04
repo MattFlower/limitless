@@ -220,6 +220,11 @@ const client: DeployClient = {
     calls.push(action);
     if (action === "resume" && scenario === "resume-failure") throw new Error("resume failed");
     draining = action === "drain";
+    if (action === "drain" && scenario.endsWith("signal-drain")) {
+      writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
+      console.log("READY");
+      await new Promise(() => {});
+    }
     if (action === "drain" && ["drain", "resume-failure"].includes(scenario)) throw new Error("drain failed");
     if (action === "drain" && scenario === "unsupported")
       throw new DrainUnsupportedError("no drain endpoint");
