@@ -1,8 +1,10 @@
 import { expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { evalCommand } from "../src/cli/eval.ts";
 import { loadRoleCases, type ReviewCase, VerifyCaseFileSchema, validateRequest } from "../src/evals/cases.ts";
 import { formatEvalReport } from "../src/evals/format.ts";
+import { gradeReview } from "../src/evals/graders/review.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { auditDiff } from "../src/gates/audit.ts";
 import { gateScriptNames, pickScripts } from "../src/gates/detect.ts";
@@ -1219,6 +1221,119 @@ test("an eval panel picks each batch's verifier from an ordered list, as product
       "not any finder's",
     );
     expect(f.calls).toHaveLength(calls);
+    await f.clean();
+  } finally {
+    await f.close();
+  }
+});
+
+test("eval regrade of locally seeded eval-musve313u2w9 preserves original 17/30 and corrects current labels with zero model calls", async () => {
+  const f = await fixture();
+  try {
+    const id = "eval-musve313u2w9";
+    const dataset = loadRoleCases("review");
+    const corrections = dataset.cases.filter(
+      (c): c is ReviewCase =>
+        "defects" in c && ["review-033", "review-036", "review-037", "review-039"].includes(c.id),
+    );
+    expect(corrections).toHaveLength(4);
+    const clean: ReviewCase[] = Array.from({ length: 26 }, (_, i) => ({
+      ...f.item,
+      id: `clean-${i}`,
+      kind: "clean",
+      defects: [],
+    }));
+    const cases = [...corrections, ...clean, { ...f.item, id: "unaffected-real" }];
+    writeFileSync(f.casePath, JSON.stringify({ role: "review", version: 1, cases }));
+    f.factory.store.db
+      .query("INSERT INTO eval_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(id, "review", JSON.stringify(["candidate-a"]), 1, 1, "completed", 1, 2, null);
+    for (const [i, item] of cases.entries()) {
+      const output = {
+        ...reviewOutput(),
+        summary: "Checked the pinned changes, their callers and regression coverage.",
+        findings:
+          i < 4
+            ? item.defects
+                .slice(0, item.id === "review-039" ? 2 : undefined)
+                .flatMap((d) => reviewOutput(d.lines[0], "major", d.file).findings)
+            : i < 17 || i === 30
+              ? reviewOutput().findings
+              : [],
+      };
+      const original = item.labelHistory ? { ...item, kind: "clean" as const, defects: [] } : item;
+      const grade = gradeReview(original, output);
+      f.factory.store.recordEvalTrial({
+        evalRunId: id,
+        modelId: "candidate-a",
+        effort: "default",
+        caseId: item.id,
+        trial: 0,
+        status: "ok",
+        output,
+        pass: grade.pass,
+        score: grade.score,
+        details: { grade },
+        cacheKey: "stored-before-adjudication",
+        harness: "fake",
+        costUsd: 0,
+        costEquivUsd: 0,
+        tokensIn: 0,
+        tokensOut: 0,
+        durationMs: 0,
+        createdAt: 1,
+      });
+    }
+    const before = f.factory.store.listEvalTrials(id);
+    expect(before.filter((t) => t.details.grade?.review?.falseBlock)).toHaveLength(17);
+    // Report is a regrade view, but does not rewrite the stored trials.
+    expect(f.factory.evals.report(id)?.summaries[0]?.review?.falseBlock).toMatchObject({
+      numerator: 13,
+      denominator: 26,
+    });
+    expect(f.factory.store.listEvalTrials(id)).toEqual(before);
+    const routes = createHttpRoutes(f.factory);
+    const printed: string[] = [];
+    await evalCommand(
+      ["regrade", id],
+      {},
+      {
+        async api<T>(path: string, init?: RequestInit): Promise<T> {
+          const route = path.endsWith("/regrade")
+            ? (routes["/api/evals/:id/regrade"] as { POST: Route }).POST
+            : (routes["/api/evals/:id"] as Route);
+          const response = await route(
+            requestWithParams(
+              `http://localhost:7400${path}`,
+              { ...init, headers: { "content-type": "application/json" } },
+              { id },
+            ),
+            localServer,
+          );
+          expect(response.status).toBe(200);
+          return (await response.json()) as T;
+        },
+        print: (text) => printed.push(text),
+        wait: async () => {},
+      },
+    );
+    expect(printed[0]).toContain("31 stored review trials from their outputs (4 changed); no model calls");
+    const after = f.factory.evals.report(id);
+    expect(after?.summaries[0]?.review).toMatchObject({
+      falseBlock: { numerator: 13, denominator: 26 },
+      defectRecall: { numerator: 6, denominator: 7 },
+      originalLabels: {
+        falseBlock: { numerator: 17, denominator: 30 },
+        defectRecall: { numerator: 1, denominator: 1 },
+      },
+    });
+    expect(printed[1]).toContain("original labels: clean false-block 56.7% (17/30)");
+    expect(
+      f.factory.store.listEvalTrials(id).filter((t) => t.details.grade?.review?.falseBlock),
+    ).toHaveLength(13);
+    expect(after?.trials.map((t) => t.output)).toEqual(before.map((t) => t.output));
+    expect(f.factory.evals.regrade(id)).toMatchObject({ regraded: 31, changed: 0, skipped: [] });
+    expect(f.calls).toHaveLength(0);
     await f.clean();
   } finally {
     await f.close();
