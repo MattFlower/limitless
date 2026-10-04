@@ -7,6 +7,25 @@ import { fakeAuthenticator } from "./webauthn-fake.ts";
 const origin = "https://limitless.example.test";
 const FAILED = "passkey registration failed";
 const tokenOf = (link: string) => new URL(link).hash.slice(1);
+/** Everything a failure may log: our own refusals and the fixed reasons for library errors. */
+const LOGGED = new RegExp(
+  `^(registration|sign-in) failed: (${[
+    "registration not verified",
+    "credential not discoverable",
+    "enrollment link used or expired",
+    "unknown credential",
+    "signature not verified",
+    "passkey removed or counter not increasing",
+    "challenge not issued or expired",
+    "origin not allowed",
+    "RP ID mismatch",
+    "user not verified",
+    "user not present",
+    "counter not increasing",
+    "passkey already registered \\(UNIQUE\\)",
+    "verification error",
+  ].join("|")})$`,
+);
 
 function setup() {
   const clock = { now: 1_700_000_000_000 };
@@ -84,7 +103,8 @@ test("registration needs user verification and a discoverable credential; only a
   const hostile = fakeAuthenticator(origin).create({ challenge: 'x"\u2028\nsecret' });
   await expect(passkeys.register(tokenOf(passkeys.enrollLink()), hostile, "Phone/1")).rejects.toThrow(FAILED);
   // Library messages quote client-chosen values, so only fixed reasons are logged.
-  for (const line of logs) expect(line).toMatch(/^registration failed: [\w ()]+$/);
+  for (const line of logs) expect(line).toMatch(LOGGED);
+  expect(logs.join("|")).not.toContain("secret");
 });
 
 test("the link is checked again after verification: racing registrations save one, an expired link none", async () => {
@@ -131,11 +151,15 @@ test("a registered passkey signs in once per fresh challenge, with user verifica
   await refused(stranger.get(await passkeys.authenticationOptions()), "unknown credential");
   const forged = { ...stranger.get(await passkeys.authenticationOptions()), id: key.id, rawId: key.id };
   await refused(forged, "not verified");
+  // An error no reason names (the library quotes the bad type) still logs a fixed reason.
+  const typed = { ...key.get(await passkeys.authenticationOptions()), type: "bm90LWlzc3VlZA" };
+  await refused(typed as AuthenticationResponseJSON, "verification error");
   store.removePasskey(key.id);
   await refused(key.get(await passkeys.authenticationOptions()), "unknown credential");
   // Library messages quote client-chosen values, so only fixed reasons are logged.
-  for (const line of logs.filter((l) => l.startsWith("sign-in")))
-    expect(line).toMatch(/^sign-in failed: [\w ()]+$/);
+  for (const line of logs) expect(line).toMatch(LOGGED);
+  expect(logs.join("|")).not.toMatch(/bm90LWlzc3VlZA|forged/);
+  expect(logs.join("|")).not.toContain(key.id);
 });
 
 test("a sign-in fails if its passkey is removed or overtaken while it verifies; zero counters keep working", async () => {
