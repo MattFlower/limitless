@@ -81,7 +81,13 @@ function sse(
     },
   });
   return new Response(stream, {
-    headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" },
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      // A buffering reverse proxy would otherwise hold frames until its buffer fills.
+      "x-accel-buffering": "no",
+    },
   });
 }
 

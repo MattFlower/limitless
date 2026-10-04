@@ -12,6 +12,7 @@ import { InvocationsTable } from "../components/InvocationsTable.tsx";
 import { OriginalPrompt } from "../components/OriginalPrompt.tsx";
 import { StageTimeline } from "../components/StageTimeline.tsx";
 import { RunStatusPill } from "../components/StatusPill.tsx";
+import { createCatchUp } from "../lib/catch-up.ts";
 import { compactNumber, duration, relativeTime } from "../lib/format.ts";
 import { now } from "../lib/ticker.ts";
 
@@ -113,35 +114,45 @@ export const RunDetail: Component = () => {
   };
 
   onMount(() => {
-    getRunDetail(params.id)
-      .then((detail) => {
-        setRun(detail.run);
+    // The run stream replays events after a gap, but not the run, stages, invocations or questions.
+    const sync = createCatchUp(
+      () => getRunDetail(params.id),
+      (detail, pushed) => {
+        const fresh = <T extends { id: number }>(kind: string, items: T[]) =>
+          items.filter((item) => !pushed.has(`${kind}:${item.id}`));
+        if (!pushed.has("run")) setRun(detail.run);
         setStagesById(
           produce((d) => {
-            for (const s of detail.stages) d[s.id] = s;
+            for (const s of fresh("stage", detail.stages)) d[s.id] = s;
           }),
         );
         setInvocationsById(
           produce((d) => {
-            for (const i of detail.invocations) d[i.id] = i;
+            for (const i of fresh("invocation", detail.invocations)) d[i.id] = i;
           }),
         );
         setQuestionsById(
           produce((d) => {
-            for (const q of detail.questions) d[q.id] = q;
+            for (const q of fresh("question", detail.questions)) d[q.id] = q;
           }),
         );
         setArtifacts(detail.artifacts);
-      })
-      .catch((e) => setLoadError((e as Error).message));
+        setLoadError(null);
+      },
+      (e) => setLoadError((e as Error).message),
+    );
+    sync.load();
 
     const close = openRunStream(
       params.id,
       0,
       (msg) => {
-        if (msg.kind === "run") setRun(msg.run);
-        else if (msg.kind === "stage") {
+        if (msg.kind === "run") {
+          sync.pushed("run");
+          setRun(msg.run);
+        } else if (msg.kind === "stage") {
           const stage = msg.stage;
+          sync.pushed(`stage:${stage.id}`);
           setStagesById(
             produce((d) => {
               d[stage.id] = stage;
@@ -150,6 +161,7 @@ export const RunDetail: Component = () => {
           if (stage.status !== "running") refetchArtifacts();
         } else if (msg.kind === "invocation") {
           const invocation = msg.invocation;
+          sync.pushed(`invocation:${invocation.id}`);
           setInvocationsById(
             produce((d) => {
               d[invocation.id] = invocation;
@@ -157,6 +169,7 @@ export const RunDetail: Component = () => {
           );
         } else if (msg.kind === "question") {
           const question = msg.question;
+          sync.pushed(`question:${question.id}`);
           setQuestionsById(
             produce((d) => {
               d[question.id] = question;
@@ -171,7 +184,10 @@ export const RunDetail: Component = () => {
           );
         }
       },
-      setConnected,
+      (isConnected) => {
+        setConnected(isConnected);
+        sync.connected(isConnected);
+      },
     );
     onCleanup(close);
   });
