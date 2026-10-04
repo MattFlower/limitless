@@ -2,12 +2,14 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { PROVIDERS } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { customProvider, providerFixture } from "./provider-config-support.ts";
 
 test("provider mutations persist, publish, and use existing request guards", async () => {
   const f = await fixture();
@@ -157,5 +159,84 @@ test("fast API toggles native providers, publishes status, and rejects invalid r
     expect(tracker.status("claude")?.fastModeUnavailableReason).toBeNull();
   } finally {
     await f.close();
+  }
+});
+
+test("configured provider status and model APIs include metadata but never credential values", async () => {
+  const fixture = providerFixture(
+    [
+      customProvider,
+      { ...customProvider, id: "missing", label: "Needs a key", api_key_env: "LIMITLESS_TEST_MISSING_KEY" },
+    ],
+    "LIMITLESS_TEST_MLX_KEY=never-publish-sentinel\n",
+  );
+  const store = new Store(":memory:");
+  try {
+    const factory = new Factory(fixture.load(), { store });
+    const routes = createHttpRoutes(factory);
+    const response = await (routes["/api/providers"] as Route)(
+      requestWithParams("http://localhost/api/providers", {}, {}),
+      localServer,
+    );
+    const body = await response.text();
+    expect(body).not.toContain("never-publish-sentinel");
+    expect(JSON.parse(body)).toContainEqual(
+      expect.objectContaining({
+        id: "mac-mlx",
+        label: "My MLX",
+        kind: "openai-compatible",
+        enabled: true,
+        maxConcurrent: 4,
+      }),
+    );
+    expect(JSON.parse(body)).toContainEqual(
+      expect.objectContaining({
+        id: "missing",
+        reason: "missing key LIMITLESS_TEST_MISSING_KEY",
+        enabled: false,
+      }),
+    );
+    const events: unknown[] = [];
+    const unsubscribe = store.subscribe((e) => events.push(e));
+    const enable = (routes["/api/providers/:id/enable"] as { POST: Route }).POST;
+    const enabled = await enable(
+      requestWithParams(
+        "http://localhost/api/providers/missing/enable",
+        { method: "POST", headers: { "content-type": "application/json" } },
+        { id: "missing" },
+      ),
+      localServer,
+    );
+    expect(await enabled.json()).toMatchObject({
+      kind: "openai-compatible",
+      label: "Needs a key",
+      enabled: false,
+      reason: "missing key LIMITLESS_TEST_MISSING_KEY",
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "provider",
+        provider: expect.objectContaining({ kind: "openai-compatible", enabled: false }),
+      }),
+    );
+    expect(JSON.stringify(events)).not.toContain("never-publish-sentinel");
+    unsubscribe();
+    const modelResponse = await (routes["/api/models"] as Route)(
+      requestWithParams("http://localhost/api/models", {}, {}),
+      localServer,
+    );
+    expect((await modelResponse.json()).models).toContainEqual(
+      expect.objectContaining({ id: "mac-mlx/flash", model: "org/backend" }),
+    );
+    const evalResponse = await (routes["/api/evals/policy"] as Route)(
+      requestWithParams("http://localhost/api/evals/policy", {}, {}),
+      localServer,
+    );
+    const evalBody = await evalResponse.text();
+    expect(evalBody).not.toContain("never-publish-sentinel");
+    expect(evalBody).not.toContain("mtplx-local");
+  } finally {
+    store.close();
+    fixture.close();
   }
 });

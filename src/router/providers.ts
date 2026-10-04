@@ -8,6 +8,7 @@ import type {
 } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import type { ProviderDef } from "./catalog.ts";
+import { providerKind } from "./config-catalog.ts";
 
 /** How far apart sources report one window's reset (seen: 5 s; allows minute rounding). Windows are hours apart. */
 const RESET_JITTER_MS = 60_000;
@@ -96,14 +97,15 @@ export class ProviderTracker {
     },
     private readonly fetchHealth: typeof fetch = fetch,
   ) {
+    this.budgets = Object.assign(Object.create(null), budgets);
     for (const def of defs) {
       const override = store.getProviderEnabledOverride(def.id);
       let enabled = override ?? true;
       let disabledReason: string | null = null;
       if (!enabled) disabledReason = "disabled";
-      if (def.apiKeySecret && !secrets[def.apiKeySecret]) {
+      if (enabled && def.apiKeySecret && !secrets[def.apiKeySecret]) {
         enabled = false;
-        disabledReason = `missing ${def.apiKeySecret}`;
+        disabledReason = `missing key ${def.apiKeySecret}`;
       }
       const row = store.getProviderRow(def.id);
       const lastFast = def.id === "claude" ? store.latestFastInvocation(def.id) : null;
@@ -314,7 +316,7 @@ export class ProviderTracker {
     this.store.setProviderEnabledOverride(id, enabled);
     p.enabled = enabled && (!p.def.apiKeySecret || !!this.secrets[p.def.apiKeySecret]);
     if (p.enabled && !wasEnabled && p.def.healthUrl) p.healthy = false;
-    p.disabledReason = !enabled ? "disabled" : p.enabled ? null : `missing ${p.def.apiKeySecret}`;
+    p.disabledReason = !enabled ? "disabled" : p.enabled ? null : `missing key ${p.def.apiKeySecret}`;
     if (id === "openrouter") {
       if (!p.enabled && this.pollTimer) {
         this.timer.clear(this.pollTimer);
@@ -720,6 +722,7 @@ export class ProviderTracker {
     return {
       id,
       label: p.def.label,
+      kind: providerKind(p.def),
       billing: p.def.billing,
       enabled: p.enabled,
       fast: p.fast,
