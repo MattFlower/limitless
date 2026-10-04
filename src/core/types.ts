@@ -381,6 +381,16 @@ export interface HealthResponse extends DrainState {
   sha: string;
 }
 
+/** A browser sign-in to the UI from a non-loopback address. */
+export interface AuthSession {
+  id: string;
+  method: "password" | "passkey";
+  /** The browser's User-Agent at sign-in. */
+  device: string;
+  createdAt: number;
+  lastSeenAt: number;
+}
+
 export interface ChatProposalFields {
   repo: string;
   prompt: string;

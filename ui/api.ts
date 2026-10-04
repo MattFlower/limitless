@@ -1,6 +1,7 @@
 // Typed client for the Limitless HTTP + SSE API. Domain types are imported from the backend so
 // the UI can never drift from the wire shape.
 import type {
+  AuthSession,
   CreateRunRequest,
   HealthResponse,
   ProviderStatus,
@@ -33,6 +34,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
   });
   const text = await res.text();
+  // A missing or expired sign-in on a proxied UI: send the browser to the login form, then back here.
+  if (res.status === 401 && path !== "/api/auth/session")
+    globalThis.location?.assign(`/login?next=${encodeURIComponent(location.pathname + location.search)}`);
   if (!res.ok) {
     let message = text || res.statusText;
     try {
@@ -44,6 +48,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(message, res.status);
   }
   return text ? (JSON.parse(text) as T) : (undefined as T);
+}
+
+/** The browser's sign-in session; null where none is needed (loopback, or proxy authentication). */
+export function getSession(): Promise<{ session: AuthSession | null }> {
+  return request("/api/auth/session");
+}
+
+export function signOut(everywhere: boolean): Promise<{ revoked: number }> {
+  return request(everywhere ? "/api/auth/logout-all" : "/api/auth/logout", { method: "POST" });
 }
 
 export function getHealth(): Promise<HealthResponse> {

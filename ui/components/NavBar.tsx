@@ -1,5 +1,7 @@
 import { A, useLocation } from "@solidjs/router";
-import type { Component } from "solid-js";
+import { type Component, createSignal, onMount, Show } from "solid-js";
+import type { AuthSession } from "../../src/core/types.ts";
+import { getSession, signOut } from "../api.ts";
 import { ensureLiveStore, live } from "../store.ts";
 
 function isActive(pathname: string, href: string): boolean {
@@ -13,6 +15,18 @@ export const NavBar: Component = () => {
   // user lands on first.
   ensureLiveStore();
   const location = useLocation();
+  const [session, setSession] = createSignal<AuthSession | null>(null);
+  onMount(() =>
+    getSession().then(
+      (r) => setSession(r.session),
+      () => {},
+    ),
+  );
+  const leave = (everywhere: boolean) => {
+    if (everywhere && !confirm("Sign out every browser, including this one?")) return;
+    const toLogin = () => window.location.assign("/login");
+    void signOut(everywhere).then(toLogin, toLogin);
+  };
   return (
     <nav class="nav">
       <A href="/" class="nav-brand">
@@ -55,6 +69,14 @@ export const NavBar: Component = () => {
         <span class="live-dot" classList={{ on: live.connected() }} />
         {live.connected() ? "live" : "offline"}
       </div>
+      <Show when={session()}>
+        <button type="button" class="btn btn-sm" onClick={() => leave(false)}>
+          Sign out
+        </button>
+        <button type="button" class="btn btn-sm" onClick={() => leave(true)}>
+          Sign out everywhere
+        </button>
+      </Show>
     </nav>
   );
 };
