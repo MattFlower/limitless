@@ -186,6 +186,7 @@ export function observedPrs(store: Store, fallback?: GitHubPrClient): GitHubPrCl
     tracked = undefined;
   };
   client.observed = (url) => !fallback || !!tracked?.has(url);
+  client.fresh = fallback ?? null;
   return client;
 }
 

@@ -11,6 +11,7 @@ export interface GitHubPrState {
 }
 
 export type GitHubPrClient = ((url: string) => Promise<GitHubPrState | null>) & {
+  fresh?: GitHubPrClient | null; // null for cache-only clients
   beginPass?: () => void;
   observed?: (url: string) => boolean;
 };
@@ -74,6 +75,7 @@ export async function reconcileMergedRuns(
   const overdue = new Set(
     ordered.flatMap((run) =>
       run.prUrl &&
+      client.fresh !== null &&
       expired.has(run.prUrl) &&
       (!run.merged || run.status === "needs_human") &&
       pass.checked.has(run.prUrl) &&
@@ -92,6 +94,7 @@ export async function reconcileMergedRuns(
     if (expired.has(run.prUrl) && !results.has(run.prUrl)) {
       if (!pass.checked.has(run.prUrl)) pass.checked.set(run.prUrl, now());
       if (now() < (pass.checked.get(run.prUrl) ?? 0) + 86_400_000) continue;
+      if (client.fresh === null) continue;
     }
     if ((pass.retries.get(run.prUrl)?.at ?? 0) > now()) continue;
     // Keep the final slot available for an overdue probe even under a full healthy backlog.
@@ -102,14 +105,16 @@ export async function reconcileMergedRuns(
         calls++;
         overdue.delete(run.prUrl);
         if (!expired.has(run.prUrl)) pass.cursor = run.id;
-        pass.checked.set(run.prUrl, now());
-        results.set(run.prUrl, await client(run.prUrl));
+        if (!expired.has(run.prUrl)) pass.checked.set(run.prUrl, now());
+        results.set(run.prUrl, await (expired.has(run.prUrl) ? (client.fresh ?? client) : client)(run.prUrl));
       }
       const pr = results.get(run.prUrl);
       if (!pr || pr.url !== run.prUrl) {
-        if (!client.observed?.(run.prUrl)) throw new Error("No matching PR observation");
+        if (expired.has(run.prUrl) || !client.observed?.(run.prUrl))
+          throw new Error("No matching PR observation");
         continue;
       }
+      if (expired.has(run.prUrl)) pass.checked.set(run.prUrl, now());
       pass.retries.delete(run.prUrl);
       if (store.getRun(run.id)?.prUrl !== pr.url) continue;
       const mergedAt = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
