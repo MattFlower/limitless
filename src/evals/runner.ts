@@ -27,6 +27,7 @@ import {
 } from "../pipeline/review.ts";
 import { StoredReviewSchema, toStrictJsonSchema } from "../pipeline/schemas.ts";
 import { effortTransportError, parseTarget, recordEffort, recordedTarget } from "../router/targets.ts";
+import { redactCredentials } from "../util/proc.ts";
 import { cacheKey, reviewSystemHash } from "./cache.ts";
 import {
   type AnyCaseFile,
@@ -1023,7 +1024,7 @@ export class EvalRunner {
               numTurns: 0,
               costUsd: 0,
               costEquivUsd: 0,
-              error: (error as Error).message,
+              error: redactCredentials((error as Error).message),
               quota: null,
             };
             result = spent.length ? combined(spent, failure, null) : failure;

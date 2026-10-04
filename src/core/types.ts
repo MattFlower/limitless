@@ -271,6 +271,7 @@ export interface QuotaWindow {
 }
 
 export interface ProviderStatus {
+  kind?: string;
   fast?: boolean;
   supportsFast?: boolean;
   fastModeUnavailableReason?: string | null;

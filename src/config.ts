@@ -7,8 +7,9 @@ import type { ResolvedProfile, ReviewFinder, Role } from "./core/types.ts";
 import { evalSettings } from "./evals/settings.ts";
 import { defaultGateSlots } from "./gates/slots.ts";
 import { parseReviewRosters } from "./pipeline/review-system.ts";
-import { PROVIDERS } from "./router/catalog.ts";
+import { type EffectiveCatalog, resolveCatalog } from "./router/config-catalog.ts";
 import { isLanAddress, isLoopback, publicOrigin } from "./server/access.ts";
+import { registerCredential } from "./util/proc.ts";
 
 export interface Paths {
   home: string; // ~/.limitless
@@ -47,6 +48,7 @@ export interface Config {
   uiUrl: string; // where the UI is reachable locally, used in PR bodies
   maxConcurrentRuns: number;
   providerMaxConcurrent: Record<string, number>;
+  catalog?: EffectiveCatalog;
   /** Gate suites (setup + checks) allowed to run at once across the whole process. */
   maxConcurrentGates: number;
   /** `[gates] baseline_cache`: reuse passing baselines per base commit. Off, every baseline runs (and refreshes). */
@@ -86,8 +88,8 @@ export interface Config {
 }
 
 function parseEnvFile(path: string): Record<string, string> {
-  if (!existsSync(path)) return {};
-  const out: Record<string, string> = {};
+  if (!existsSync(path)) return Object.create(null);
+  const out: Record<string, string> = Object.create(null);
   for (const line of readFileSync(path, "utf8").split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
@@ -153,38 +155,20 @@ export function loadConfig(
     ? (Bun.TOML.parse(readFileSync(tomlPath, "utf8")) as Record<string, unknown>)
     : {};
   evalSettings(raw);
-  const providerMaxConcurrent: Record<string, number> = {};
-  const configuredProviders = raw.providers === undefined ? {} : raw.providers;
-  if (
-    typeof configuredProviders !== "object" ||
-    configuredProviders === null ||
-    Array.isArray(configuredProviders)
-  )
-    throw new Error("providers must be a table");
-  for (const [id, value] of Object.entries(configuredProviders)) {
-    if (!PROVIDERS.some((provider) => provider.id === id))
-      throw new Error(`providers.${id}: unknown provider`);
-    if (typeof value !== "object" || value === null || Array.isArray(value))
-      throw new Error(`providers.${id} must be a table`);
-    const limit = (value as Record<string, unknown>).max_concurrent;
-    if (limit !== undefined) {
-      if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit <= 0)
-        throw new Error(`providers.${id}.max_concurrent must be a positive safe integer`);
-      providerMaxConcurrent[id] = limit;
-    }
-  }
-  const secrets = { ...parseEnvFile(join(configDir, "secrets.env")) };
+  const catalog = resolveCatalog(raw.providers);
+  const { providerMaxConcurrent } = catalog;
+  const fileSecrets = parseEnvFile(join(configDir, "secrets.env"));
+  const secrets: Record<string, string> = Object.assign(Object.create(null), fileSecrets);
   // Environment variables win over the secrets file (useful for tests and CI).
-  for (const key of [
-    "OPENROUTER_API_KEY",
-    "OMLX_API_KEY",
-    "DISCORD_BOT_TOKEN",
-    "DISCORD_APP_ID",
-    "DISCORD_GUILD_ID",
-    "GITHUB_WEBHOOK_SECRET",
-  ]) {
+  for (const key of ["DISCORD_BOT_TOKEN", "DISCORD_APP_ID", "DISCORD_GUILD_ID", "GITHUB_WEBHOOK_SECRET"]) {
     const v = process.env[key];
     if (v) secrets[key] = v;
+  }
+
+  for (const p of catalog.providers) {
+    const key = p.apiKeySecret;
+    if (key) secrets[key] = fileSecrets[key] || (Object.hasOwn(process.env, key) && process.env[key]) || "";
+    if (key) registerCredential(key, secrets[key]);
   }
 
   const server = (raw.server ?? {}) as Record<string, unknown>;
@@ -324,6 +308,7 @@ export function loadConfig(
     uiUrl: str(server.ui_url, `http://localhost:${port}`) as string,
     maxConcurrentRuns: num(limits.max_concurrent_runs, 3),
     providerMaxConcurrent,
+    catalog,
     maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
     baselineCache: gates.baseline_cache !== false,
     baselineEnv,

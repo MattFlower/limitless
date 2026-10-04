@@ -6,6 +6,7 @@ import {
   type Harness,
   type ModelTarget,
   priceOf,
+  redactJsonLine,
   type Usage,
 } from "./types.ts";
 
@@ -58,7 +59,7 @@ export const runLlm: Harness = async (spec) => {
   const endpoint = spec.target.openai;
   const usage = emptyUsage();
   const log = (entry: Record<string, string | number>) =>
-    appendFileSync(spec.logPath, `${JSON.stringify(entry)}\n`);
+    appendFileSync(spec.logPath, `${redactJsonLine(JSON.stringify(entry))}\n`);
   const finish = (result: AgentResult): AgentResult => {
     log({
       event: "complete",
