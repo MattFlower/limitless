@@ -225,11 +225,14 @@ limitless service status
   directory has no `.git`, it clones the upstream repository over SSH. To run a fork, clone your
   fork there first.
 - It runs `bun install --frozen-lockfile` in the release checkout.
-- It writes and loads these launchd agents: `cc.mattflower.limitless` (the daemon, run with
-  `~/.bun/bin/bun`). Only `--mtplx` adds the rollback agent `cc.mattflower.limitless-mtplx`
+- It writes and loads these launchd agents: `dev.limitless.daemon` (the daemon, run with
+  `~/.bun/bin/bun`). Only `--mtplx` adds the rollback agent `dev.limitless.mtplx`
   (server at `~/.mtplx/bin/mtplx`). Existing mtplx installations are not automatically removed.
   The primary Mac server is externally managed by oMLX.app / `omlx start`.
-- It waits for `/api/health`.
+- It migrates older installations discovered by their commands. The daemon drains active runs
+  for up to 45 minutes, then restarts under the new label and waits for `/api/health`. If startup
+  fails, it restores the previous agent and reports an error. Selected tunnel and mtplx agents
+  also migrate with rollback, without draining.
 
 The daemon's PATH is fixed in the plist: `~/.local/bin`, `/opt/homebrew/bin`, `~/.bun/bin`,
 `~/.mtplx/bin`, `/usr/local/bin` and the system directories. Install the CLIs somewhere on it.
@@ -791,7 +794,7 @@ with `Content-Type: application/json`. `/api/health` reports `draining` and `act
 
 ### Logs
 
-- Daemon: `~/.limitless/logs/cc.mattflower.limitless.log`, or stdout for `limitless serve`.
+- Daemon: `~/.limitless/logs/dev.limitless.daemon.log`, or stdout for `limitless serve`.
 - A run: `limitless logs <run> -f`, the UI event log, or `~/.limitless/runs/<run>/inv-<n>.log`.
 
 ### Garbage collection
@@ -824,7 +827,7 @@ This is not on `main` yet.
 ### Webhook tunnel
 
 GitHub webhooks need a public HTTPS endpoint. `limitless service install --tunnel` adds a
-`cc.mattflower.limitless-tunnel` launchd agent that runs `/opt/homebrew/bin/cloudflared` with a
+`dev.limitless.tunnel` launchd agent that runs `/opt/homebrew/bin/cloudflared` with a
 generated `~/.cloudflared/limitless.yml`. That requires tunnel credentials
 (`~/.cloudflared/<uuid>.json`); without them, the tunnel is skipped with a warning. The generated
 ingress forwards only paths matching `^/webhooks/` to the daemon and returns 404 for everything
@@ -884,7 +887,7 @@ version starting and exits. A second interrupt exits immediately, and recovery m
 manual. Afterwards, check `limitless service status` (loaded agents, release commit, health) and
 `/api/health`. If it still shows `draining`, resume as above. If deploy refuses with
 `daemon boot SHA is unknown and checkout already matches target`, restart the daemon with
-`launchctl kickstart -k gui/$UID/cc.mattflower.limitless` (or `limitless service install`) and
+`launchctl kickstart -k gui/$UID/dev.limitless.daemon` (or `limitless service install`) and
 rerun `limitless deploy`. `deploy already running (pid N)` means another deploy holds
 `~/.limitless/deploy.lock`; a stale lock from a dead process is cleared automatically.
 

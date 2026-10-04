@@ -1,5 +1,14 @@
 import { expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -7,6 +16,7 @@ import {
   type CheckResult,
   type Clock,
   checkCodexModels,
+  confineLiveCheck,
   decisionsCheck,
   exitCode,
   formatReport,
@@ -1230,3 +1240,93 @@ test("verify smoke passes when Codex reports a Homebrew bash wrapper", async () 
   }, target);
   expect(check.status).toBe("pass");
 });
+
+for (const outcome of [
+  "pass",
+  "fabricated-scratch",
+  "modified-probe",
+  "changed-canary",
+  "config-written",
+  "no-command",
+  "unavailable",
+  "cancelled",
+] as const) {
+  test(`edit smoke independently inspects owned evidence: ${outcome}`, async () => {
+    const home = mkdtempSync(join(tmpdir(), "smoke-edit-home-"));
+    const configDir = join(home, ".claude");
+    mkdirSync(configDir);
+    const abort = new AbortController();
+    let scratch = "";
+    try {
+      const target: ModelTarget = {
+        modelId: "fake/m",
+        provider: "fake",
+        model: "m",
+        vendor: "fake",
+        tier: 4,
+        harness: "fake",
+        billing: "subscription",
+      };
+      const check = await confineLiveCheck(
+        async (spec) => {
+          scratch = spec.scratchDir ?? "";
+          const command = spec.prompt.split("\n")[1] ?? "";
+          const path = command.slice("python3 '".length, -1);
+          const probe = readFileSync(path, "utf8");
+          const token = probe.match(/path.write_text\("([^"]+)"\)/)?.[1] ?? "";
+          expect(token).not.toBe("");
+          // The factory keeps the executable probe outside both writable roots.
+          expect(path.startsWith(`${spec.cwd}/`)).toBe(false);
+          expect(path.startsWith(`${scratch}/`)).toBe(false);
+          writeFileSync(join(spec.cwd, "confine-allowed"), token);
+          if (outcome !== "fabricated-scratch") writeFileSync(join(scratch, "confine-allowed"), token);
+          if (outcome === "modified-probe") writeFileSync(path, "print('fabricated')");
+          if (outcome === "changed-canary" || outcome === "config-written") {
+            const label = outcome === "changed-canary" ? "home" : "config";
+            const canary = probe.match(new RegExp(`\\("${label}", ("[^"]+")\\)`))?.[1];
+            if (!canary) throw new Error(`missing ${label} canary`);
+            const file: string = JSON.parse(canary);
+            // The CLI config canary is never pre-created: it exists only when a write escaped.
+            if (label === "config") expect(file.startsWith(`${configDir}/`)).toBe(true);
+            writeFileSync(file, "escaped");
+          }
+          if (outcome !== "no-command")
+            spec.onEvent({ type: "tool_call", id: "probe", name: "Bash", input: { command } });
+          spec.onEvent({
+            type: "tool_result",
+            id: "probe",
+            isError: false,
+            output: [
+              "worktree-written",
+              "scratch-written",
+              "cache-write-denied",
+              "sibling-write-denied",
+              "home-write-denied",
+              "config-write-denied",
+            ]
+              .map((s) => `${token}:${s}`)
+              .join("\n"),
+          });
+          if (outcome === "cancelled") abort.abort();
+          return outcome === "unavailable"
+            ? { ...result, status: "unavailable", error: "confinement unavailable" }
+            : result;
+        },
+        target,
+        abort.signal,
+        home,
+        configDir,
+      );
+      expect(check.status).toBe(outcome === "pass" ? "pass" : "fail");
+      if (outcome === "fabricated-scratch") expect(check.reason).toContain("scratch write did not land");
+      if (outcome === "modified-probe") expect(check.reason).toContain("probe was modified");
+      if (outcome === "changed-canary") expect(check.reason).toBe("write escaped to home");
+      if (outcome === "config-written") expect(check.reason).toBe("write escaped to config");
+      expect(existsSync(scratch)).toBe(false);
+      // Only the escaped canary is ever cleaned up there; nothing else is touched.
+      expect(readdirSync(configDir)).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
