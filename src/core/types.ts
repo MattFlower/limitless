@@ -352,6 +352,7 @@ export type StreamMessage =
   | { kind: "feed"; item: FeedItem };
 
 export type FeedKind =
+  | "run.gate_timeout_retry"
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged" | "resolved"}`
   | "eval.finished"
   | "daemon.started"

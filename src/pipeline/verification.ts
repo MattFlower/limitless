@@ -1,5 +1,5 @@
 import { redactHoldoutText } from "./prompts.ts";
-import { type Holdout, requirementCitationIssue, type Spec, type Verify } from "./schemas.ts";
+import { type Holdout, requirementCitationIssue, rowKind, type Spec, type Verify } from "./schemas.ts";
 
 export function preDeliveryVerifyArtifact(
   verify: Verify & { modelId: string; round: number; attempt: number },
@@ -7,22 +7,26 @@ export function preDeliveryVerifyArtifact(
   holdout: Holdout,
   publicSources: string,
 ): string {
-  const publicIds = new Set(spec.acceptance_criteria.map((criterion) => criterion.id));
-  const redact = (value: string) => redactHoldoutText(value, holdout, publicSources);
+  const redact = (value: string, id: string) =>
+    rowKind(id, spec, holdout) === "unknown" ? "" : redactHoldoutText(value, holdout, publicSources);
   return JSON.stringify(
     {
       ...verify,
-      notes: redact(verify.notes),
-      criteria: verify.criteria.map((criterion) =>
-        publicIds.has(criterion.id)
-          ? criterion
+      notes: redactHoldoutText(verify.notes, holdout, publicSources),
+      criteria: verify.criteria.map((criterion, index) =>
+        rowKind(criterion.id, spec, holdout) === "public"
+          ? {
+              ...criterion,
+              evidence: redactHoldoutText(criterion.evidence, holdout, publicSources, false),
+              publicSummary: redactHoldoutText(criterion.publicSummary, holdout, publicSources, false),
+            }
           : {
-              id: criterion.id,
+              id: rowKind(criterion.id, spec, holdout) === "unknown" ? `unknown-${index + 1}` : criterion.id,
               status: criterion.status,
-              evidence: redact(criterion.evidence),
-              publicSummary: redact(criterion.publicSummary.trim()),
+              evidence: redact(criterion.evidence, criterion.id),
+              publicSummary: redact(criterion.publicSummary.trim(), criterion.id),
               requirement: criterion.requirement ?? null,
-              requirementCitation: redact(criterion.requirementCitation ?? ""),
+              requirementCitation: redact(criterion.requirementCitation ?? "", criterion.id),
             },
       ),
     },
