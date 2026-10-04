@@ -297,7 +297,7 @@ export async function install(
     restoring = true;
     const errors: string[] = [];
     await (async () => save({ ...state, phase: "rollback" }))().catch((e) => errors.push(String(e)));
-    await stop(state.label).catch((error) => errors.push(String(error)));
+    for (const l of [state.label, state.old.label]) await stop(l).catch((e) => errors.push(String(e)));
     await (async () => {
       if (existsSync(state.path)) unlinkSync(state.path);
       writeFileSync(state.old.path, readFileSync(backup));
@@ -309,8 +309,7 @@ export async function install(
   if (control.recover) {
     if (!existsSync(journal)) return;
     const state: Migration = JSON.parse(readFileSync(journal, "utf8"));
-    if (state.phase === "restored") return;
-    if (state.phase === "prepared" && (await isLoaded(state.old.label))) return clear();
+    if (["prepared", "restored"].includes(state.phase) && (await isLoaded(state.old.label))) return clear();
     try {
       if (state.phase !== "replacing" || !(await isLoaded(state.label))) throw new Error("pending migration");
       if (state.label === LABEL) await race(waitForHealthy(client, clock, state.target));
@@ -350,12 +349,13 @@ export async function install(
         await race(requestAdmin(client, clock, "drain"));
         await race(waitForDrain(client, clock, DEFAULT_MAX_WAIT_MS, false, console.log));
       }
+      if (state) save(Object.assign(state, { phase: "stopping" }));
       if (old) await race(stop(old.label));
     } catch (error) {
       restoring = true;
       try {
         if (state && !(await isLoaded(state.old.label))) await restore(state);
-        else clear();
+        else if (state?.phase !== "stopping") clear();
         if (drainAttempted && old && (await isLoaded(old.label))) await requestAdmin(client, clock, "resume");
       } catch (resume) {
         throw new Error(`${String(error)}\nResume scheduler failed: ${String(resume)}`, { cause: error });

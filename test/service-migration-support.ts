@@ -155,6 +155,10 @@ const command: typeof sh = async (argv) => {
       backupBeforeStop =
         existsSync(join(backupDir, "migration.json")) &&
         readFileSync(join(backupDir, "original.plist"), "utf8") === old;
+    if (label === oldLabel && scenario === "signal-stopping") {
+      console.log("READY");
+      await new Promise(() => {});
+    }
     if (
       scenario === "bootout" ||
       (["health-bootout", "marked-health-bootout"].includes(scenario) &&

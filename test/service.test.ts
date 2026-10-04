@@ -551,3 +551,41 @@ for (const kind of ["tunnel", "mtplx"]) {
     expect(r.files["original.plist"]).toBeUndefined();
   });
 }
+
+// Bootout was accepted but the old agent unloads only after the installer gave up (timeout) or was
+// interrupted: the journal must survive so a later deploy can bootstrap the old agent again.
+for (const [scenario, signal] of [
+  ["stuck", null],
+  ["signal-stopping", "SIGTERM"],
+] as const) {
+  for (const unloaded of [true, false]) {
+    test(`${scenario} keeps rollback data until deploy restores the old agent (late unload: ${unloaded})`, async () => {
+      const run = signal
+        ? await interrupted(scenario, signal, false, "stopping")
+        : await migration(scenario).then((m) => ({ ...m, dir: migrationDirs.at(-1) ?? "" }));
+      const first = JSON.parse(
+        ("output" in run ? run.output : run.stdout).trim().split("\n").at(-1) ?? "",
+      ) as MigrationResult;
+      expect(first.error).not.toBe("");
+      expect(first.state).toBe(true);
+      expect(first.backup).toBe(first.old);
+      expect(first.calls.some((call: string) => call.startsWith("bootstrap"))).toBe(false);
+      const loadedFile = join(run.dir, "loaded.json");
+      if (unloaded)
+        writeFileSync(
+          loadedFile,
+          JSON.stringify(
+            JSON.parse(readFileSync(loadedFile, "utf8")).filter(
+              (l: string) => l !== "arbitrary.installed.daemon",
+            ),
+          ),
+        );
+      const { result: r } = await migration("recover-deploy", "daemon", run.dir);
+      expect(r.error).toContain("Recovered previous agent arbitrary.installed.daemon");
+      expect(r.calls).toContain("bootstrap arbitrary.installed.daemon");
+      expect(r.calls.includes("bootout arbitrary.installed.daemon")).toBe(!unloaded);
+      expect(r.loaded).toContain("arbitrary.installed.daemon");
+      expect(r.files["original.plist"]).toBe(first.old);
+    });
+  }
+}
