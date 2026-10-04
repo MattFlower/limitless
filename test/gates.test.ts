@@ -31,6 +31,8 @@ import {
 import { defaultGateSlots, gateSlots, Semaphore } from "../src/gates/slots.ts";
 import { checkoutCommitted, type DiffInfo } from "../src/git/repos.ts";
 import * as sandbox from "../src/harness/sandbox.ts";
+import { ConfinementError } from "../src/harness/sandbox.ts";
+import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 
 function tempDir(files: Record<string, string>): string {
@@ -798,3 +800,102 @@ describe("confined gates on the committed tree", () => {
     },
   );
 });
+
+test.skipIf(process.platform !== "darwin")(
+  "backend launch failure after preflight cannot become still_failing against a failing baseline",
+  async () => {
+    const cwd = tempDir({});
+    let probes = 0;
+    let launches = 0;
+    const runner = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      const probing = opts.cmd.at(-1)?.endsWith("/denied");
+      if (probing) {
+        probes++;
+        writeFileSync(opts.cmd.at(-2) ?? "", "ok");
+      } else launches++;
+      return {
+        exitCode: probing ? 0 : 71,
+        stdout: probing ? "verified" : "",
+        stderr: "sandbox initialization failed",
+        signal: null,
+        cancelled: false,
+        timedOut: false,
+        idleTimedOut: false,
+        truncated: false,
+        durationMs: 1,
+      };
+    });
+    try {
+      const config: GateConfig = {
+        source: "detected",
+        setup: [],
+        checks: [{ name: "test", run: "exit 1" }],
+        protectedPaths: [],
+      };
+      const baseline = {
+        setupOk: true,
+        setup: [],
+        checks: [{ name: "test", command: "exit 1", ok: false, exitCode: 1, output: "", durationMs: 1 }],
+      };
+      await expect(
+        (async () => compareGates(baseline, await runGates(cwd, config, new AbortController().signal)))(),
+      ).rejects.toThrow(ConfinementError);
+      expect(probes).toBe(1);
+      expect(launches).toBe(1);
+    } finally {
+      runner.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(process.platform !== "darwin")(
+  "gate setup and dependent checks share scratch and clean it after completion",
+  async () => {
+    const cwd = tempDir({});
+    let scratch = "";
+    const runner = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (opts.cmd.at(-1)?.endsWith("/denied")) {
+        writeFileSync(opts.cmd.at(-2) ?? "", "ok");
+      } else {
+        const current = opts.env.TMPDIR ?? "";
+        if (opts.cmd.at(-1) === "setup") {
+          scratch = current;
+          writeFileSync(join(scratch, "setup-output"), "ready");
+        } else {
+          expect(current).toBe(scratch);
+          expect(readFileSync(join(current, "setup-output"), "utf8")).toBe("ready");
+        }
+        opts.onStdoutLine?.(opts.cmd[7] ?? "");
+      }
+      return {
+        exitCode: 0,
+        stdout: opts.cmd.at(-1)?.endsWith("/denied") ? "verified" : "",
+        stderr: "",
+        signal: null,
+        cancelled: false,
+        timedOut: false,
+        idleTimedOut: false,
+        truncated: false,
+        durationMs: 1,
+      };
+    });
+    try {
+      const result = await runGates(
+        cwd,
+        {
+          source: "detected",
+          setup: ["setup"],
+          checks: [{ name: "test", run: "check" }],
+          protectedPaths: [],
+        },
+        new AbortController().signal,
+      );
+      expect(result.checks[0]?.ok).toBe(true);
+      expect(existsSync(scratch)).toBe(false);
+    } finally {
+      runner.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);

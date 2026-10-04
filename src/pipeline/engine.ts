@@ -50,6 +50,7 @@ import {
   resetTo,
   withGitHubRetry,
 } from "../git/repos.ts";
+import { commandScope } from "../harness/sandbox.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
@@ -392,14 +393,14 @@ async function prepare(ctx: RunContext): Promise<void> {
       await ctx.save();
       const { onWait } = gateEvents(ctx);
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
-      const runBaseline = async (): Promise<GateRun> => {
+      const runBaseline = commandScope(wt.path, async (): Promise<GateRun> => {
         const run = await runGates(wt.path, gates, ctx.signal, { onWait });
         ctx.checkCancelled();
         // Retry before resetting, so a check sees the same build output as its first attempt.
         const retried = await retryBaselineFailures(run, wt.path, gates, ctx.signal, onWait);
         ctx.checkCancelled();
         return retried;
-      };
+      });
       ctx.state.baselineCached = false;
       const buildSha = ctx.deps.buildSha;
       if (!hasGates) ctx.state.baseline = null;
@@ -978,7 +979,7 @@ async function oneRound(
   // --- gates
   const comparison = await ctx.stage(
     "gates",
-    async () => {
+    commandScope(cwd, async () => {
       const events = gateEvents(ctx);
       let cmp: GateComparison[];
       try {
@@ -1019,7 +1020,7 @@ async function oneRound(
           : `${cmp.length} checks ok${flaky.length ? `, flaky: ${flaky.join(", ")}` : ""}`,
         value: cmp,
       };
-    },
+    }),
     round,
   );
 

@@ -1,5 +1,5 @@
 import { basename } from "node:path";
-import { runConfined } from "../harness/sandbox.ts";
+import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { agentEnv } from "../util/proc.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { gateSlots } from "./slots.ts";
@@ -83,7 +83,7 @@ export async function runGates(
 ): Promise<GateRun> {
   const release = await gateSlots.acquire(signal, hooks.onWait);
   try {
-    return await runAll(cwd, cfg, signal, hooks.onResult);
+    return await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult));
   } finally {
     release();
   }

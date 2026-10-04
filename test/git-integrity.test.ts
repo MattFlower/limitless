@@ -12,6 +12,7 @@ import { collectGarbage } from "../src/gc.ts";
 import { worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
 import {
+  addDetachedWorktree,
   attributeLimits,
   checkoutCommitted,
   commitAll,
@@ -1722,6 +1723,11 @@ test("a global LFS-like driver never filters factory commits or checkouts, and b
     await resetTo(work, base);
     await resetTo(work, head as string);
     expect(readFileSync(join(work, "lib", "more.inc"), "utf8")).toBe(code);
+    expect(existsSync(marker)).toBe(false);
+    const review = join(dir, "detached-review");
+    await addDetachedWorktree(work, head as string, review);
+    expect(readFileSync(join(review, "lib", "helper.dat"), "utf8")).toBe(code);
+    expect(readFileSync(join(review, "lib", "more.inc"), "utf8")).toBe(code);
     expect(existsSync(marker)).toBe(false);
     // The audit sees the real bytes, not a pointer.
     const diff = await diffSince(work, base);

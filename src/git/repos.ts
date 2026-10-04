@@ -379,7 +379,7 @@ export async function exportCommit(
 
 /** A detached checkout of `sha` at `dest` sharing `cwd`'s repository, for readers kept off the worktree. */
 export async function addDetachedWorktree(cwd: string, sha: string, dest: string, signal?: AbortSignal) {
-  await sh(["git", "worktree", "add", "--detach", dest, sha], { cwd, signal, timeoutMs: 300_000 });
+  await worktreeGit(["git", "worktree", "add", "--detach", dest, sha], { cwd, signal, timeoutMs: 300_000 });
 }
 
 export async function mergeBase(cwd: string, base: string, head: string): Promise<string> {

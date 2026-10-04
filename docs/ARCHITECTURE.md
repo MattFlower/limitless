@@ -238,8 +238,23 @@ detection, per-invocation budget, process-group kill on cancel.
 - Local-only (non-GitHub) repos use a factory-owned bare clone with independent objects, created
   via a shared clone and fetched from the source before each new run. Delivery pushes only the
   run branch back to the source. Legacy worktrees attached to the source remain there until they finish.
-- Agents run with the CLIs' own sandboxes (Seatbelt on macOS) where they're compatible with the
-  repo's toolchain; secrets for Discord/GitHub/OpenRouter are scrubbed from agent environments.
+- Tool-enabled editors receive owned scratch and exact write roots: their checkout, linked
+  worktree administrative directory, and scratch. The shared repository is never a write root.
+  Codex uses a probed filesystem profile; Claude additionally runs entirely inside a factory
+  Seatbelt profile, covering native edits and overriding implicit CLI grants. CLI state stays in
+  scratch, with project/local settings, hooks and external MCP servers disabled.
+- Gates and implement-eval hidden commands use the same Seatbelt boundary. Each launch probes
+  its effective policy and requires a trusted shell startup marker; unavailable or inconclusive
+  enforcement raises an operational error, even against a failing baseline. macOS is the only
+  implemented backend for these commands and Claude editors; other platforms fail closed.
+  A restricted host that forbids nested Seatbelt also fails closed.
+- Gate setup, checks and pipeline retries share private scratch until completion or cancellation.
+  HOME and writable Cargo, npm, Go and XDG caches point into scratch. Explicit RUSTUP_HOME
+  and a private copy of Cargo configuration preserve installed toolchain discovery and read
+  access; writes to real HOME remain denied.
+  Candidate gates rebuild from committed bytes; factory Git suppresses configured filters on
+  commits, resets and detached review checkouts. Secrets for Discord/GitHub/OpenRouter are
+  scrubbed from agent environments.
 - Triggers are **allowlisted** (your GitHub login, `dependabot[bot]`, your Discord user id).
   Untrusted issue/PR text is treated as data and quoted, never as instructions.
 

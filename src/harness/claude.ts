@@ -1,6 +1,9 @@
-import { appendFileSync, realpathSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
+import { runSandboxed } from "./sandbox.ts";
 import {
   readConfinement,
   scratchEnv,
@@ -270,6 +273,24 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const sessionId = crypto.randomUUID();
   const t = spec.target;
   const args = buildClaudeArgs(spec, sessionId);
+  const editing = spec.mode === "edit" && !spec.noTools;
+  const roots = editing ? writeRoots(spec.cwd, validateScratch(spec)) : null;
+  const configDir = editing ? join(validateScratch(spec), ".claude") : null;
+  if (configDir) {
+    mkdirSync(configDir, { recursive: true });
+    const source = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
+    for (const [from, name] of [
+      [join(source, ".credentials.json"), ".credentials.json"],
+      [
+        process.env.CLAUDE_CONFIG_DIR ? join(source, ".claude.json") : join(homedir(), ".claude.json"),
+        ".claude.json",
+      ],
+    ]) {
+      if (from && name && existsSync(from)) copyFileSync(from, join(configDir, name));
+    }
+  }
+  const runner: typeof runProcess = (opts) =>
+    roots ? runSandboxed(opts, roots, processRunner) : processRunner(opts);
   appendFileSync(spec.logPath, `# claude ${t.model} ${new Date().toISOString()}\n`);
   const envExtra: Record<string, string> = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
   if (t.backend) {
@@ -316,11 +337,12 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     spec.onEvent(ev);
   });
 
-  const proc = await processRunner({
+  const proc = await runner({
     cmd: args,
     cwd: spec.cwd,
     env: agentEnv({
       ...envExtra,
+      ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}),
       ...scratchEnv(spec),
       // Sandboxed Bash gets TMPDIR=$CLAUDE_CODE_TMPDIR/claude-<uid>, which is the scratch itself.
       ...(spec.scratchDir ? { CLAUDE_CODE_TMPDIR: scratchParent(spec.scratchDir) } : {}),

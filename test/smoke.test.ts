@@ -7,6 +7,7 @@ import {
   type CheckResult,
   type Clock,
   checkCodexModels,
+  confineLiveCheck,
   decisionsCheck,
   exitCode,
   formatReport,
@@ -1227,3 +1228,80 @@ test("verify smoke passes when Codex reports a Homebrew bash wrapper", async () 
   }, target);
   expect(check.status).toBe("pass");
 });
+
+for (const outcome of [
+  "pass",
+  "fabricated-scratch",
+  "modified-probe",
+  "changed-canary",
+  "no-command",
+  "unavailable",
+  "cancelled",
+] as const) {
+  test(`edit smoke independently inspects owned evidence: ${outcome}`, async () => {
+    const home = mkdtempSync(join(tmpdir(), "smoke-edit-home-"));
+    const abort = new AbortController();
+    let scratch = "";
+    try {
+      const target: ModelTarget = {
+        modelId: "fake/m",
+        provider: "fake",
+        model: "m",
+        vendor: "fake",
+        tier: 4,
+        harness: "fake",
+        billing: "subscription",
+      };
+      const check = await confineLiveCheck(
+        async (spec) => {
+          scratch = spec.scratchDir ?? "";
+          const command = spec.prompt.split("\n")[1] ?? "";
+          const path = command.slice("python3 '".length, -1);
+          const probe = readFileSync(path, "utf8");
+          const token = probe.match(/path.write_text\("([^"]+)"\)/)?.[1] ?? "";
+          expect(token).not.toBe("");
+          // The factory keeps the executable probe outside both writable roots.
+          expect(path.startsWith(`${spec.cwd}/`)).toBe(false);
+          expect(path.startsWith(`${scratch}/`)).toBe(false);
+          writeFileSync(join(spec.cwd, "confine-allowed"), token);
+          if (outcome !== "fabricated-scratch") writeFileSync(join(scratch, "confine-allowed"), token);
+          if (outcome === "modified-probe") writeFileSync(path, "print('fabricated')");
+          if (outcome === "changed-canary") {
+            const canary = probe.match(/\("home", ("[^"]+")\)/)?.[1];
+            if (!canary) throw new Error("missing home canary");
+            writeFileSync(JSON.parse(canary), "escaped");
+          }
+          if (outcome !== "no-command")
+            spec.onEvent({ type: "tool_call", id: "probe", name: "Bash", input: { command } });
+          spec.onEvent({
+            type: "tool_result",
+            id: "probe",
+            isError: false,
+            output: [
+              "worktree-written",
+              "scratch-written",
+              "cache-write-denied",
+              "sibling-write-denied",
+              "home-write-denied",
+            ]
+              .map((s) => `${token}:${s}`)
+              .join("\n"),
+          });
+          if (outcome === "cancelled") abort.abort();
+          return outcome === "unavailable"
+            ? { ...result, status: "unavailable", error: "confinement unavailable" }
+            : result;
+        },
+        target,
+        abort.signal,
+        home,
+      );
+      expect(check.status).toBe(outcome === "pass" ? "pass" : "fail");
+      if (outcome === "fabricated-scratch") expect(check.reason).toContain("scratch write did not land");
+      if (outcome === "modified-probe") expect(check.reason).toContain("probe was modified");
+      expect(existsSync(scratch)).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+}

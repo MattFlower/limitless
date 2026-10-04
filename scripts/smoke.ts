@@ -617,11 +617,11 @@ export async function confineLiveCheck(
       home: join(homeDir, "canary"),
     };
     for (const file of Object.values(canaries)) writeFileSync(file, `canary-${token}`);
-    const probe = join(cwd, "confine-probe.py");
+    const probe = join(root, "confine-probe.py");
     writeFileSync(
       probe,
       `import os, errno, pathlib
-worktree = pathlib.Path(__file__).resolve().parent
+worktree = pathlib.Path(${JSON.stringify(cwd)})
 for label, path in [("worktree", worktree / "confine-allowed"), ("scratch", pathlib.Path(os.environ["TMPDIR"]) / "confine-allowed")]:
     path.write_text("${token}")
     assert path.read_text() == "${token}"
@@ -639,6 +639,7 @@ for label, path in [${Object.entries(canaries)
         raise RuntimeError(label + " write succeeded")
 `,
     );
+    const probeSource = readFileSync(probe, "utf8");
     const command = `python3 '${probe.replaceAll("'", "'\\''")}'`;
     const events: AgentEvent[] = [];
     return await withScratch(cwd, async (scratchDir) => {
@@ -661,7 +662,13 @@ for label, path in [${Object.entries(canaries)
       );
       if (changed.length)
         return { status: "fail", reason: `write escaped to ${changed.map(([l]) => l).join(", ")}` };
-      if (result.status !== "ok") return status(result);
+      if (readFileSync(probe, "utf8") !== probeSource)
+        return { status: "fail", reason: "probe was modified" };
+      if (signal.aborted || result.status !== "ok")
+        return { status: "fail", reason: result.error ?? "edit confinement check did not complete" };
+      const scratchFile = join(scratchDir, "confine-allowed");
+      if (!existsSync(scratchFile) || readFileSync(scratchFile, "utf8") !== token)
+        return { status: "fail", reason: "scratch write did not land" };
       const allowed = join(cwd, "confine-allowed");
       if (!existsSync(allowed) || readFileSync(allowed, "utf8") !== token)
         return { status: "fail", reason: "worktree write did not land" };
