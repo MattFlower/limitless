@@ -476,6 +476,21 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       ),
     ),
     "/api/github/access": handle(() => json(store.githubAccessProblems())),
+    "/api/land": {
+      GET: handle(() => json(factory.land.list())),
+      POST: handle(async (req) => {
+        const input = await body<{ runId?: unknown; sha?: unknown }>(req);
+        if (typeof input.runId !== "string" || !input.runId.trim()) return error("runId is required");
+        if (input.sha !== undefined && typeof input.sha !== "string") return error("sha must be a string");
+        return json(factory.land.request({ runId: input.runId, sha: input.sha as string | undefined }), 201);
+      }, true),
+    },
+    "/api/land/:id/cancel": {
+      POST: handle((req) => {
+        const cancelled = factory.land.cancel(Number(req.params.id as string));
+        return cancelled ? json({ cancelled: true }) : error("land entry not found", 404);
+      }, true),
+    },
     "/api/repos": {
       GET: handle(() => json(store.listRepos())),
     },

@@ -18,8 +18,11 @@ import type {
   FeedItem,
   FeedPage,
   GitHubAccessProblem,
+  GitHubFeedKind,
   Invocation,
   InvocationStatus,
+  LandEntry,
+  LandFeedKind,
   Question,
   QuotaAlert,
   Repo,
@@ -35,7 +38,7 @@ import type {
   StreamMessage,
   TrackedPr,
 } from "../core/types.ts";
-import { DEFAULT_EVAL_CONCURRENCY } from "../core/types.ts";
+import { ACTIVE_LAND_STATES, DEFAULT_EVAL_CONCURRENCY } from "../core/types.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
 type Row = Record<string, unknown>;
@@ -55,7 +58,17 @@ function json(v: unknown): string | null {
 
 const FEED_SELECT =
   "SELECT id, ts, kind, run_id AS runId, eval_id AS evalId, repo, title, summary, data FROM feed";
-type GitHubFeedInput = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
+type FeedInsert = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
+type GitHubFeedInput = FeedInsert & { kind: GitHubFeedKind };
+const LAND_SELECT = `SELECT id, run_id AS runId, repo, pr_url AS prUrl, base_branch AS baseBranch,
+  head_branch AS headBranch, approved_sha AS approvedSha, state, pushed_sha AS pushedSha,
+  attempts, reason, created_at AS createdAt, updated_at AS updatedAt, finished_at AS finishedAt FROM land_entries`;
+const LAND_PATCH_COLUMNS: Record<string, string> = {
+  state: "state",
+  pushedSha: "pushed_sha",
+  reason: "reason",
+  attempts: "attempts",
+};
 const toFeedItem = (r: Row) => ({ ...r, data: parse(r.data, {}) }) as FeedItem;
 /** The highest id retention has removed, so a cursor before it is told items were pruned. */
 const FEED_PRUNED = "feed_pruned_through";
@@ -1774,14 +1787,106 @@ export class Store {
     this.db.transaction(() => {
       const save = this.db.query("INSERT OR REPLACE INTO github_prs VALUES (?, ?, ?, ?)");
       if (pr) save.run(pr.url, pr.nodeId, pr.data, terminal);
-      const insert =
-        this.db.query(`INSERT INTO feed (ts, kind, run_id, repo, title, summary, data, dedupe_key)
-        VALUES (?, ?, ?, ?, substr(?, 1, 200), substr(?, 1, 500), ?, ?) ON CONFLICT (dedupe_key) DO NOTHING`);
-      for (const { kind, runId, repo, summary, data, key } of items) {
-        const title = `${kind}: ${String(data.url ?? repo)}`;
-        insert.run(Date.now(), kind, runId, repo, title, summary, JSON.stringify(data), `${kind}:${key}`);
-      }
+      this.addFeedItems(items);
     })();
+    this.publishFeed();
+  }
+
+  private addFeedItems(items: FeedInsert[]): void {
+    const insert = this.db.query(`INSERT INTO feed (ts, kind, run_id, repo, title, summary, data, dedupe_key)
+      VALUES (?, ?, ?, ?, substr(?, 1, 200), substr(?, 1, 500), ?, ?) ON CONFLICT (dedupe_key) DO NOTHING`);
+    for (const { kind, runId, repo, summary, data, key } of items) {
+      const title = `${kind}: ${String(data.url ?? repo)}`;
+      insert.run(Date.now(), kind, runId, repo, title, summary, JSON.stringify(data), `${kind}:${key}`);
+    }
+  }
+
+  // ---- land queue ----------------------------------------------------------
+
+  createLandEntry(entry: {
+    runId: string;
+    repo: string;
+    prUrl: string;
+    baseBranch: string;
+    headBranch: string;
+    approvedSha: string;
+  }): LandEntry {
+    const now = Date.now();
+    let id: number;
+    try {
+      const res = this.db
+        .query(
+          `INSERT INTO land_entries (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, attempts, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
+        )
+        .run(
+          entry.runId,
+          entry.repo,
+          entry.prUrl,
+          entry.baseBranch,
+          entry.headBranch,
+          entry.approvedSha,
+          now,
+          now,
+        );
+      id = Number(res.lastInsertRowid);
+    } catch (error) {
+      // The partial unique index holds at most one in-flight entry per PR.
+      if (String(error).includes("land_entries.pr_url")) throw new Error("PR is already in the land queue");
+      throw error;
+    }
+    return this.getLandEntry(id) as LandEntry;
+  }
+
+  getLandEntry(id: number): LandEntry | null {
+    return (this.db.query(`${LAND_SELECT} WHERE id = ?`).get(id) as LandEntry | null) ?? null;
+  }
+
+  listLandEntries(opts: { repo?: string; active?: boolean; limit?: number } = {}): LandEntry[] {
+    const where: string[] = [];
+    const params: string[] = [];
+    if (opts.repo) {
+      where.push("repo = ?");
+      params.push(opts.repo);
+    }
+    if (opts.active) {
+      where.push(`state IN (${ACTIVE_LAND_STATES.map(() => "?").join(", ")})`);
+      params.push(...ACTIVE_LAND_STATES);
+    }
+    params.push(String(opts.limit ?? 100));
+    const sql = `${LAND_SELECT}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY id LIMIT ?`;
+    return this.db.query(sql).all(...params) as LandEntry[];
+  }
+
+  updateLandEntry(
+    id: number,
+    patch: Partial<Pick<LandEntry, "state" | "pushedSha" | "reason" | "attempts">>,
+  ): LandEntry {
+    const { sets, values } = buildUpdate(patch, LAND_PATCH_COLUMNS);
+    sets.push("updated_at = ?");
+    values.push(Date.now());
+    if (patch.state && !ACTIVE_LAND_STATES.includes(patch.state)) {
+      sets.push("finished_at = ?");
+      values.push(Date.now());
+    }
+    this.db.query(`UPDATE land_entries SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
+    return this.getLandEntry(id) as LandEntry;
+  }
+
+  /** Feed items for the queue: the PR URL, the SHA and, when it failed, the reason. */
+  landFeed(kind: LandFeedKind, entry: LandEntry, summary: string, data: Record<string, unknown> = {}): void {
+    this.db.transaction(() =>
+      this.addFeedItems([
+        {
+          kind,
+          runId: entry.runId,
+          repo: entry.repo,
+          summary,
+          data: { url: entry.prUrl, sha: entry.approvedSha, ...data },
+          key: String(entry.id),
+        },
+      ]),
+    )();
     this.publishFeed();
   }
 

@@ -32,6 +32,9 @@ Usage:
   limitless answer <run> "<text>"         Answer a run's open question(s)
   limitless resolve <run> --as done_elsewhere|superseded|wont_do|pr_closed [--ref <run|url>] [--note "..."]
         Record that a needs_human or failed run was dealt with outside the factory
+  limitless land <run> [--sha <sha>]    Queue the run's open PR for landing (approved head, defaults to the last observed one)
+  limitless land list                    Show the land queue
+  limitless land cancel <id>             Drop a queued or in-flight land
   limitless feed [--consumer <name>] [--after <id>] [--wait <seconds>] [--json]
         Items to act on after the consumer's cursor; --wait long-polls until one arrives
   limitless feed ack <id> --consumer <name>  Acknowledge items through id once handled
@@ -92,7 +95,7 @@ const color = {
 
 function statusColor(s: string): string {
   const status = s.trim();
-  if (status === "succeeded") return color.green(s);
+  if (status === "succeeded" || status === "landed") return color.green(s);
   if (status === "resolved") return color.cyan(s);
   if (status === "failed" || status === "needs_human") return color.red(s);
   if (status === "running") return color.cyan(s);
@@ -231,6 +234,7 @@ async function main(): Promise<void> {
       as: { type: "string" },
       ref: { type: "string" },
       note: { type: "string" },
+      sha: { type: "string" },
       all: { type: "boolean" },
     },
   });
@@ -384,6 +388,31 @@ async function main(): Promise<void> {
         body: JSON.stringify({ kind: values.as, ref: values.ref, note: values.note }),
       });
       console.log(`Resolved ${run.id} as ${run.resolution?.kind ?? values.as}`);
+      return;
+    }
+    case "land": {
+      const [sub, ...args] = rest;
+      if (sub === "list") {
+        const entries = await api<import("../core/types.ts").LandEntry[]>("/api/land");
+        for (const entry of entries)
+          console.log(
+            `${entry.id}  ${statusColor(entry.state.padEnd(11))} ${entry.repo.padEnd(28)} ${entry.approvedSha.slice(0, 12)}  ${entry.prUrl}${entry.reason ? color.dim(`  ${entry.reason}`) : ""}`,
+          );
+        return;
+      }
+      if (sub === "cancel" && args.length === 1) {
+        await api(`/api/land/${encodeURIComponent(args[0] as string)}/cancel`, { method: "POST" });
+        console.log("Cancelled");
+        return;
+      }
+      if (!sub) throw new Error("usage: limitless land <run> [--sha <sha>] | land list | land cancel <id>");
+      const entry = await api<import("../core/types.ts").LandEntry>("/api/land", {
+        method: "POST",
+        body: JSON.stringify({ runId: sub, ...(values.sha ? { sha: values.sha } : {}) }),
+      });
+      console.log(
+        `Land ${color.bold(String(entry.id))} queued for ${entry.prUrl} at ${entry.approvedSha.slice(0, 12)}`,
+      );
       return;
     }
     case "service": {

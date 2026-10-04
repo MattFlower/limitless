@@ -976,13 +976,15 @@ export async function findPullRequest(
   return url.startsWith("http") ? url : null;
 }
 
-/** Merge now if possible; if branch protection requires checks, enable auto-merge instead. */
+/** Merge now if possible; if branch protection requires checks, enable auto-merge instead.
+ * `expectedHead` pins the merge to the commit the factory checked (`--match-head-commit`). */
 export async function mergePullRequest(
   prUrl: string,
   cwd: string,
   title?: string,
   signal?: AbortSignal,
   budget?: GitHubBudget,
+  expectedHead?: string,
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
   // Squash with the PR title as the subject, not the first round's commit message.
   const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
@@ -1000,7 +1002,17 @@ export async function mergePullRequest(
     withGitHubRetry(
       async () => {
         if (unsure && (await landed())) return "merged" as const;
-        const cmd = ["gh", "pr", "merge", prUrl, "--squash", ...extra, "--delete-branch", ...subject];
+        const cmd = [
+          "gh",
+          "pr",
+          "merge",
+          prUrl,
+          "--squash",
+          ...extra,
+          "--delete-branch",
+          ...(expectedHead ? ["--match-head-commit", expectedHead] : []),
+          ...subject,
+        ];
         return sh(cmd, { cwd, signal }).then(
           () => "ok" as const,
           async (e) => {

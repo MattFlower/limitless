@@ -8,16 +8,51 @@ export interface GitHubPrState {
   state: string;
   mergedAt: string | null;
   mergedBy: { login: string } | null;
+  /** The head the client saw; a client that reports only state leaves it undefined. */
+  headRefOid?: string;
+}
+
+/** `gh pr view`'s full report: the head and the CI rollup the land queue waits on. */
+export interface GitHubPrView extends GitHubPrState {
+  ci: string | null;
+  failing: string[];
 }
 
 export type GitHubPrClient = (url: string) => Promise<GitHubPrState | null>;
 
-export const getGitHubPr: GitHubPrClient = async (url) => {
-  const { stdout } = await sh(["gh", "pr", "view", url, "--json", "url,state,mergedAt,mergedBy"], {
-    cwd: process.cwd(),
-    timeoutMs: 30_000,
-  });
-  return JSON.parse(stdout) as GitHubPrState;
+// The poller keeps its own copy for GraphQL contexts; `gh pr view` reports the rollup the same way.
+const CI_FAILURES = new Set([
+  "FAILURE",
+  "ERROR",
+  "TIMED_OUT",
+  "CANCELLED",
+  "ACTION_REQUIRED",
+  "STARTUP_FAILURE",
+]);
+
+type GhPrView = GitHubPrView & {
+  statusCheckRollup?: {
+    state?: string;
+    contexts?: { name?: string; conclusion?: string; state?: string }[];
+  } | null;
+};
+
+export const getGitHubPr = async (url: string): Promise<GitHubPrView> => {
+  const { stdout } = await sh(
+    ["gh", "pr", "view", url, "--json", "url,state,mergedAt,mergedBy,headRefOid,statusCheckRollup"],
+    { cwd: process.cwd(), timeoutMs: 30_000 },
+  );
+  const view = JSON.parse(stdout) as GhPrView;
+  const contexts = view.statusCheckRollup?.contexts ?? [];
+  return {
+    url: view.url,
+    state: view.state,
+    mergedAt: view.mergedAt,
+    mergedBy: view.mergedBy,
+    headRefOid: view.headRefOid,
+    ci: view.statusCheckRollup?.state ?? null,
+    failing: contexts.filter((c) => CI_FAILURES.has(c.conclusion ?? c.state ?? "")).map((c) => c.name ?? ""),
+  };
 };
 
 export async function reconcileMergedRuns(

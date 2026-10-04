@@ -16,6 +16,8 @@ import { runDecisions } from "./harness/decisions.ts";
 import { runLlm } from "./harness/llm.ts";
 import { seatbeltBackend } from "./harness/sandbox.ts";
 import type { Harness } from "./harness/types.ts";
+import { getGitHubPr } from "./integrations/github-notifier.ts";
+import { type LandDeps, LandQueue } from "./land/queue.ts";
 import type { EngineDeps } from "./pipeline/context.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import {
@@ -53,6 +55,8 @@ export interface FactoryOptions {
   fetch?: typeof fetch;
   providerTimer?: { set: typeof setInterval; clear: typeof clearInterval };
   healthFetch?: typeof fetch;
+  /** Overrides for the land queue's GitHub reader, clock and CI limits (tests inject fakes). */
+  land?: Omit<LandDeps, "store" | "paths">;
 }
 
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
@@ -66,6 +70,7 @@ export class Factory {
   readonly tracker: ProviderTracker;
   readonly router: Router;
   readonly scheduler: Scheduler;
+  readonly land: LandQueue;
   readonly deps: EngineDeps;
   readonly startedAt = Date.now();
   readonly bootId = crypto.randomUUID();
@@ -142,6 +147,14 @@ export class Factory {
     };
     this.evals = new EvalRunner(this.deps, opts.evalCasePath);
     this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns);
+    this.land = new LandQueue({
+      store: this.store,
+      paths: cfg.paths,
+      polling: cfg.githubPoll,
+      client: getGitHubPr,
+      confinement: this.deps.confinement,
+      ...opts.land,
+    });
     this.concierge = new Concierge(this);
   }
 
@@ -206,7 +219,7 @@ export class Factory {
     this.gcInterval = null;
     await this.gcInFlight;
     this.tunnels.stop();
-    await Promise.all([this.scheduler.stop(), this.evals.stop()]);
+    await Promise.all([this.scheduler.stop(), this.evals.stop(), this.land.stop()]);
   }
 
   gc(dryRun = false): Promise<GcResult> {

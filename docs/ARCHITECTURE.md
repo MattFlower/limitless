@@ -293,17 +293,32 @@ detection, per-invocation budget, process-group kill on cancel.
 SQLite (`bun:sqlite`, WAL) at `~/.limitless/limitless.db`; large artifacts (event logs, diffs,
 prompts) as files under `~/.limitless/runs/<run-id>/`. Tables: `repos`, `runs`, `stages`,
 `invocations`, `events`, `artifacts`, `questions`, `provider_state`, `inbox` (webhook dedupe +
-audit), `chat_messages`, `settings`. The frozen legacy migrations and timestamped SQL files are applied at startup.
+audit), `chat_messages`, `settings`, `land_entries` (the approved-PR queue). The frozen legacy
+migrations and timestamped SQL files are applied at startup.
 
 On startup, runs left `running` by a crash/restart are re-queued and resume at the start of their
-current stage (the worktree is preserved; Claude sessions can be resumed).
+current stage (the worktree is preserved; Claude sessions can be resumed). Land entries left in
+flight are resumed too: `checking` re-runs the checks, `waiting_ci` keeps waiting on the recorded
+commit, and `merging` first asks GitHub whether the PR already merged.
+
+### Landing (the land queue)
+
+`limitless land <run>` (or `POST /api/land`) approves a run's open pull request: the SHA is the
+approval, and only it — plus a base merge the factory itself made — may land. One entry lands at a
+time per repository, oldest first. Each entry checks out the approved head from the bare cache,
+merges the base in when it has moved, runs the repository's checks (from the base commit's
+`.limitless.toml`) under a gate slot, pushes any merge commit with a lease on the approved head,
+waits for CI on exactly that commit (the poller's observation, or `gh pr view` when polling is off)
+and squash-merges with `--match-head-commit`. A conflict, a failing check, a moved head, red CI or
+CI that never finishes blocks the entry with a reason and merges nothing; a later restart or a
+cancel aborts in-flight git, gates and `gh` calls.
 
 ## 8. Interfaces
 
 | Surface | What it does |
 |---|---|
 | **Web UI** (SolidJS) | Mission control: live runs, queue, quota gauges, spend; run detail with stage timeline, invocations (model/cost/tokens/duration), live event log, spec/diff/review/verdict artifacts, questions, cancel/retry; chat to start runs. Loopback needs no sign-in; through the LAN proxy it takes a passkey (or password) and a long-lived session cookie ([OPERATIONS](OPERATIONS.md#signing-in)). |
-| **CLI** `limitless` | `run`, `ls`, `show`, `logs -f`, `cancel`, `answer`, `serve`, `mcp`, `deploy`, `auth` (UI passkeys, password and sessions). |
+| **CLI** `limitless` | `run`, `ls`, `show`, `logs -f`, `cancel`, `answer`, `land` (queue, list, cancel), `serve`, `mcp`, `deploy`, `auth` (UI passkeys, password and sessions). |
 | **Chat concierge** | Shared by UI chat and Discord: turns free text into a confirmed run, answers status questions. Runs on a local model when available. |
 | **GitHub** | `POST /webhooks/github` (HMAC-verified): Dependabot PRs → `quick` verify-and-merge; issue labeled `limitless` or `/limitless …` comment by the owner → run; CI failure on a factory PR → fix run. |
 | **Discord** | `/build`, `/runs`, `/show`, `/cancel`; one thread per run with progress, questions and the final report. |
