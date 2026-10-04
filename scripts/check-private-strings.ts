@@ -1,4 +1,4 @@
-import { lstatSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { z } from "zod";
 import { splitPatch } from "../src/gates/audit.ts";
@@ -16,8 +16,19 @@ try {
     // Land runs this before any PR code: the hardened git calls below trust only these paths.
     if (lstatSync(join(process.cwd(), ".git"), { throwIfNoEntry: false })?.isFile())
       await recordWorktree(process.cwd());
+    const paths = await worktreeGit(
+      ["git", "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"],
+      { cwd: process.cwd() },
+    );
+    const dirs = paths.stdout
+      .trim()
+      .split("\n")
+      .map((p) => realpathSync(p));
+    console.log(dirs.join("\n"));
     process.exit(0);
   }
+  const head = z.optional(z.string().regex(/^[a-f0-9]{40,64}$/i)).parse(process.argv[6]);
+  if (head) await worktreeGit(["git", "cat-file", "-e", `${head}^{commit}`], { cwd: process.cwd() });
   const common = await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd: process.cwd() });
   const entries = privacy.loadPrivateStrings(undefined, [process.cwd(), resolve(common.stdout.trim(), "..")]);
   if (process.argv[4] === "--merge") {
@@ -42,7 +53,7 @@ try {
     if (!/^[a-f0-9]{40,64}$/i.test(data.baseRefOid)) throw new Error("Cannot inspect PR base");
     privacy.checkPrivateText(data.body, "PR body", entries);
     privacy.checkPrivateText(z.string().parse(JSON.parse(stdout).headRefName), "Branch name", entries);
-    await checkPrivateRange(opts.cwd, `${data.baseRefOid}..HEAD`, entries, true);
+    await checkPrivateRange(opts.cwd, `${data.baseRefOid}..${head ?? "HEAD"}`, entries, true);
     const git = (...args: string[]) =>
       worktreeGit(["git", "diff", "--cached", ...args, data.baseRefOid], opts);
     const patch = await git("--text");

@@ -15,7 +15,12 @@ checker=""
 trap '[ -z "$checker" ] || { kill -TERM "$checker" 2>/dev/null || :; wait "$checker" || :; }; exit 1' TERM INT
 check_private() { bun "$private_check" "$@" & checker=$!; wait "$checker"; checker=""; }
 
-check_private --record
+admin="$(cd "$(git rev-parse --absolute-git-dir)" && pwd -P)"
+common="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)" && pwd -P)"
+paths="$(check_private --record)"
+{ IFS= read -r GIT_WORK_TREE; IFS= read -r GIT_DIR; IFS= read -r GIT_COMMON_DIR; ! IFS= read -r extra; } <<< "$paths" || exit 1
+[[ "$GIT_WORK_TREE" = "$(pwd -P)" && "$GIT_DIR" = "$admin" && "$GIT_COMMON_DIR" = "$common" ]] || exit 1
+export GIT_WORK_TREE GIT_DIR GIT_COMMON_DIR
 bun install --frozen-lockfile >/dev/null
 log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
 if ! bun run check >"$log" 2>&1; then
@@ -35,10 +40,10 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
-head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
-check_private "$pr" "$repo" "$subject" "$head_ref"
-git push -q --no-follow-tags origin "HEAD:refs/heads/$head_ref"
 sha="$(git rev-parse HEAD)"
+head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
+check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
+git push -q --no-follow-tags origin "$sha:refs/heads/$head_ref"
 
 # Wait for the CI run on exactly this commit, then require success.
 run=""

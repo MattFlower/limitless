@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -12,9 +13,26 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { sh } from "../src/util/proc.ts";
+import { seeded } from "./seeded.ts";
 
 const script = resolve("scripts/land-pr.sh");
 const entry = "secret-host.example";
+const repositories = seeded(async (root) => {
+  const source = join(root, "source");
+  const alternate = join(root, "alternate");
+  mkdirSync(source);
+  const git = (...args: string[]) => sh(["git", ...args], { cwd: source });
+  await git("init", "-qb", "main");
+  writeFileSync(join(source, "file"), "base\n");
+  await git("add", ".");
+  await git("commit", "-qm", "base");
+  const base = (await git("rev-parse", "HEAD")).stdout.trim();
+  await git("clone", "-q", source, alternate);
+  await git("-C", alternate, "commit", "--allow-empty", "-qm", entry);
+  const denied = (await git("-C", alternate, "rev-parse", "HEAD")).stdout.trim();
+  await git("init", "--bare", "-q", join(root, "remote"));
+  return { base, denied };
+});
 
 describe("land-pr private strings", () => {
   test.each([
@@ -202,6 +220,239 @@ describe("land-pr private strings", () => {
   });
 });
 
+test.each(["redirect", "redirect-and-move-head"])(
+  "land publishes only its trusted SHA: %s",
+  async (scenario) => {
+    const root = mkdtempSync(join(tmpdir(), "land-trusted-"));
+    try {
+      const { value } = await repositories(root);
+      const source = join(root, "source");
+      const alternate = join(root, "alternate");
+      const remote = join(root, "remote");
+      const work = join(root, "work");
+      const bin = join(root, "bin");
+      const config = join(root, "config");
+      for (const path of [bin, config]) mkdirSync(path);
+      const gitBin = Bun.which("git");
+      if (!gitBin) throw new Error("missing git");
+      const git = (...args: string[]) => sh([gitBin, ...args], { cwd: source });
+      await git("worktree", "add", "-qb", "pr", work);
+      await git("remote", "add", "origin", remote);
+      await git("-C", alternate, "remote", "set-url", "origin", remote);
+      await git("config", "push.followTags", "true");
+      await git("tag", "-am", "safe tag", "local-tag");
+      // Make the alternate commit available to HEAD-movement attacks without publishing it.
+      await git("fetch", "-q", alternate, "main");
+      writeFileSync(join(work, "file"), "safe change\n");
+      writeFileSync(join(config, "private-strings.txt"), entry);
+      const paths = [
+        realpathSync(work),
+        realpathSync(join(source, ".git/worktrees/work")),
+        realpathSync(join(source, ".git")),
+      ];
+      const recorded = await sh([process.execPath, resolve("scripts/check-private-strings.ts"), "--record"], {
+        cwd: work,
+      });
+      expect(recorded.stdout.trim().split("\n")).toEqual(paths);
+      expect(JSON.parse(readFileSync(`${work}.git-paths`, "utf8"))).toEqual(paths);
+      const calls = join(root, "calls");
+      const pinned = join(root, "pinned");
+      writeFileSync(
+        join(bin, "bun"),
+        `#!${process.execPath}
+import { appendFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+const paths = [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR];
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "bun", args, paths }) + "\\n");
+if (args[0] === "run") writeFileSync(${JSON.stringify(join(work, ".git"))}, "gitdir: " + ${JSON.stringify(join(alternate, ".git"))} + "\\n");
+if (args[0].endsWith(".ts")) {
+  if (args.length === 6) {
+    writeFileSync(${JSON.stringify(pinned)}, args[5]);
+    if (${JSON.stringify(scenario)} === "redirect-and-move-head") {
+      const moved = spawnSync(${JSON.stringify(gitBin)}, ["update-ref", "refs/heads/pr", ${JSON.stringify(value.denied)}], { stdio: "inherit" });
+      if (moved.status !== 0) process.exit(1);
+    }
+  }
+  const result = spawnSync(${JSON.stringify(process.execPath)}, args, { stdio: "inherit" });
+  if (args[1] === "--record") appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "recorded", args: [] }) + "\\n");
+  process.exit(result.status ?? 1);
+}
+`,
+        { mode: 0o755 },
+      );
+      writeFileSync(
+        join(bin, "git"),
+        `#!${process.execPath}
+import { appendFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "git", args, paths: [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR] }) + "\\n");
+const result = spawnSync(${JSON.stringify(gitBin)}, args, { stdio: "inherit" });
+process.exit(result.status ?? 1);
+`,
+        { mode: 0o755 },
+      );
+      writeFileSync(
+        join(bin, "gh"),
+        `#!${process.execPath}
+import { appendFileSync, readFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "gh", args }) + "\\n");
+if (args[0] === "run" && args[1] === "list") console.log("123");
+else if (args[1] === "view") {
+  if (args.includes("--jq")) console.log("pr");
+  else if (args.includes("title,body,headRefOid")) console.log(JSON.stringify({ title: "safe", body: "safe", headRefOid: readFileSync(${JSON.stringify(pinned)}, "utf8") }));
+  else console.log(${JSON.stringify(JSON.stringify({ baseRefOid: value.base, body: "safe", headRefName: "pr" }))});
+}
+`,
+        { mode: 0o755 },
+      );
+      const result = await sh(["bash", script, "123", "safe", work], {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          LIMITLESS_CONFIG_DIR: config,
+          TMPDIR: root,
+        },
+        allowFail: true,
+      });
+      expect(result.stderr).not.toContain(entry);
+      expect((await git("--git-dir", remote, "rev-list", "--all")).stdout.trim().split("\n")).not.toContain(
+        value.denied,
+      );
+      expect((await git("--git-dir", remote, "log", "--all", "--format=%B")).stdout).not.toContain(entry);
+      expect(result.exitCode).toBe(0);
+      const sha = readFileSync(pinned, "utf8");
+      expect(sha).toMatch(/^[a-f0-9]{40}$/);
+      expect(sha).not.toBe(value.base);
+      expect(sha).not.toBe(value.denied);
+      const logged: { tool: string; args: string[]; paths?: string[] }[] = readFileSync(calls, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      const installed = logged.findIndex((call) => call.tool === "bun" && call.args[0] === "install");
+      const recordedAt = logged.findIndex((call) => call.tool === "recorded");
+      expect(recordedAt).toBeGreaterThan(0);
+      expect(installed).toBeGreaterThan(recordedAt);
+      for (const call of logged.slice(recordedAt + 1).filter((call) => call.tool !== "gh"))
+        expect(call.paths).toEqual(paths);
+      const commands = (tool: string, command: string) =>
+        logged.filter((call) => call.tool === tool && call.args.includes(command)).map((call) => call.args);
+      expect(commands("bun", sha)).toEqual([
+        [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "safe", "pr", sha],
+        [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "--merge", sha],
+      ]);
+      expect(commands("git", "push")).toEqual([
+        ["push", "-q", "--no-follow-tags", "origin", `${sha}:refs/heads/pr`],
+      ]);
+      expect(commands("git", "HEAD")).toEqual([["rev-parse", "HEAD"]]);
+      expect(commands("git", "rev-list").some((args) => args.includes(`${value.base}..${sha}`))).toBe(true);
+      expect(commands("gh", "list")).toEqual([
+        [
+          "run",
+          "list",
+          "-R",
+          "MattFlower/limitless",
+          "--commit",
+          sha,
+          "--limit",
+          "1",
+          "--json",
+          "databaseId",
+          "--jq",
+          ".[0].databaseId // empty",
+        ],
+      ]);
+      expect(commands("gh", "merge")[0]).toContain("--match-head-commit");
+      expect(commands("gh", "merge")[0]?.at(-1)).toBe(sha);
+      expect((await git("--git-dir", remote, "rev-parse", "refs/heads/pr")).stdout.trim()).toBe(sha);
+      expect((await git("--git-dir", remote, "tag", "--list")).stdout).toBe("");
+      expect(readFileSync(join(work, ".git"), "utf8")).toContain(join(alternate, ".git"));
+      if (scenario === "redirect-and-move-head")
+        expect((await git("rev-parse", "pr")).stdout.trim()).toBe(value.denied);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each([
+  "missing",
+  "short",
+  "extra",
+  "relative",
+  "work-mismatch",
+  "git-mismatch",
+  "common-mismatch",
+  "not-directory",
+])("land refuses invalid recorded paths: %s", async (scenario) => {
+  const root = mkdtempSync(join(tmpdir(), "land-bad-paths-"));
+  try {
+    await repositories(root);
+    const work = join(root, "work");
+    const source = join(root, "source");
+    await sh(["git", "worktree", "add", "-qb", "pr", work], { cwd: source });
+    const paths = [
+      realpathSync(work),
+      realpathSync(join(source, ".git/worktrees/work")),
+      realpathSync(join(source, ".git")),
+    ];
+    if (scenario === "missing") paths.length = 0;
+    if (scenario === "short") paths.pop();
+    if (scenario === "extra") paths.push(root);
+    if (scenario === "relative") paths[1] = "../source/.git/worktrees/work";
+    if (scenario === "work-mismatch") paths[0] = realpathSync(source);
+    if (scenario === "git-mismatch") paths[1] = realpathSync(join(root, "alternate/.git"));
+    if (scenario === "common-mismatch") paths[2] = realpathSync(join(root, "alternate/.git"));
+    if (scenario === "not-directory") paths[1] = join(source, "file");
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const marker = join(root, "untrusted-code-or-publication");
+    writeFileSync(
+      join(bin, "bun"),
+      `#!${process.execPath}\nimport { writeFileSync } from "node:fs";\nif (process.argv[3] === "--record") console.log(${JSON.stringify(paths.join("\n"))});\nelse writeFileSync(${JSON.stringify(marker)}, "ran");\n`,
+      { mode: 0o755 },
+    );
+    writeFileSync(join(bin, "gh"), `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+    const result = await sh(["bash", script, "123", "safe", work], {
+      cwd: root,
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      allowFail: true,
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(existsSync(marker)).toBe(false);
+    expect((await sh(["git", "--git-dir", join(root, "remote"), "for-each-ref"], { cwd: root })).stdout).toBe(
+      "",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(["HEAD", "f".repeat(40)])(
+  "private check rejects an invalid or unavailable pinned SHA: %s",
+  async (head) => {
+    const root = mkdtempSync(join(tmpdir(), "land-bad-sha-"));
+    try {
+      await repositories(root);
+      const result = await sh(
+        [process.execPath, resolve("scripts/check-private-strings.ts"), "123", "local", "safe", "pr", head],
+        {
+          cwd: join(root, "source"),
+          env: { ...process.env, LIMITLESS_CONFIG_DIR: join(root, "absent") },
+          allowFail: true,
+        },
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr.trim()).toBe("Private check blocked");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
 test("land records the worktree's Git paths before any PR code runs", async () => {
   const root = mkdtempSync(join(tmpdir(), "land-record-"));
   try {
@@ -210,11 +461,18 @@ test("land records the worktree's Git paths before any PR code runs", async () =
     const calls = join(root, "calls");
     writeFileSync(
       join(bin, "bun"),
-      `#!/bin/sh\necho "$*" >> '${calls}'\n[ "$1" = run ] && exit 1\nexit 0\n`,
+      `#!/bin/sh\necho "$*" >> '${calls}'\n[ "$2" = --record ] && printf '%s\\n' "$PWD" "$PWD/admin" "$PWD/common"\n[ "$1" = run ] && exit 1\nexit 0\n`,
       {
         mode: 0o755,
       },
     );
+    writeFileSync(
+      join(bin, "git"),
+      '#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; esac\n',
+      { mode: 0o755 },
+    );
+    mkdirSync(join(root, "admin"));
+    mkdirSync(join(root, "common"));
     await sh(["bash", script, "123", "safe", root], {
       cwd: root,
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: root },
@@ -236,11 +494,17 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
     const marker = join(root, "published");
     writeFileSync(
       join(bin, "bun"),
-      '#!/bin/sh\n[ "$1" = install ] || [ "$2" = --record ] && exit 0\necho "failed-check-$$"\nexit 1\n',
+      '#!/bin/sh\n[ "$2" = --record ] && { printf "%s\\n" "$PWD" "$PWD/admin" "$PWD/common"; exit 0; }\n[ "$1" = install ] && exit 0\necho "failed-check-$$"\nexit 1\n',
       { mode: 0o755 },
     );
-    for (const name of ["git", "gh"])
-      writeFileSync(join(bin, name), `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\ncase "$*" in *--absolute-git-dir) echo "$PWD/admin" ;; *--git-common-dir) echo "$PWD/common" ;; *) touch '${marker}'; exit 1 ;; esac\n`,
+      { mode: 0o755 },
+    );
+    writeFileSync(join(bin, "gh"), `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+    mkdirSync(join(root, "admin"));
+    mkdirSync(join(root, "common"));
     const run = (log = "") =>
       sh(["bash", script, "123", "safe", root], {
         cwd: root,
@@ -396,7 +660,7 @@ exec '${gitBin}' "$@"
           "-q",
           "--no-follow-tags",
           "origin",
-          "HEAD:refs/heads/safe-branch",
+          `${sha}:refs/heads/safe-branch`,
         ]);
       }
     } finally {
