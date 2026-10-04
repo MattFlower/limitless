@@ -1,10 +1,12 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
-import { diffPr, githubDoctor, normalizePr } from "../src/integrations/github-poller.ts";
+import { githubWebhook } from "../src/integrations/github.ts";
+import { diffPr, githubDoctor, normalizePr, OBSERVE_QUERY } from "../src/integrations/github-poller.ts";
 import { type PrNode, pollerHarness, prNode, respond, SHA, url } from "./github-poller-support.ts";
 
 let h: ReturnType<typeof pollerHarness>;
@@ -187,7 +189,6 @@ test("each change produces exactly one feed item; repeats and non-changes produc
       },
       ["pr.behind"],
     ],
-    // reviewDecision stays null, as in repositories without required reviews.
     [
       "approved",
       (n) => {
@@ -742,30 +743,30 @@ test("SSO, 404, IP restrictions and missing nodes are access problems, once per 
   expect(h.store.readFeed({ limit: 1000 }).items.some((i) => i.kind === "pr.closed")).toBe(false);
 });
 
-test("diff reports a completed CI result on first sight, baselines activity, ignores marker deletion", () => {
+test("diff reports actionable states on first sight, baselines activity, ignores marker deletion", () => {
   const node = prNode("o/r", 1);
   ci(node, rollup("FAILURE", [{ name: "x", conclusion: "FAILURE", url: "https://ci/x" }]));
-  node.reviewDecision = "APPROVED";
   node.comments.nodes = [{ id: "C", updatedAt: "t" }];
   const snap = normalizePr(node);
   if (!snap) throw new Error("bad node");
   expect(diffPr(null, snap).map((c) => [c.kind, c.data])).toEqual([
     ["pr.ci_failed", { failing: [{ name: "x", url: "https://ci/x" }] }],
   ]);
-  expect(diffPr(null, { ...snap, ci: "SUCCESS", failing: [] }).map((c) => c.kind)).toEqual(["pr.ci_passed"]);
+  expect(diffPr(null, { ...snap, ci: "SUCCESS", failing: [] }).map((c) => c.kind)).toEqual([]);
   expect(diffPr(null, { ...snap, ci: null, failing: [] })).toEqual([]);
   expect(diffPr(snap, { ...snap, activity: { ...snap.activity, comment: [] } })).toEqual([]);
   expect(normalizePr(null)).toBeNull();
   h = pollerHarness();
 });
 
-test("a PR first seen with CI already finished reports that result", async () => {
+test("a PR first seen with passing CI records a silent baseline", async () => {
   h = pollerHarness();
   h.factoryPr("o/r", 1);
   ci(h.node("o/r", 1), rollup("SUCCESS", [{ name: "t", conclusion: "SUCCESS" }]));
   h.start();
   await h.advance(0);
-  expect(h.fresh().map((i) => [i.kind, i.data.head])).toEqual([["pr.ci_passed", SHA]]);
+  expect(h.fresh()).toEqual([]);
+  expect(JSON.parse(snapshotOf(url("o/r", 1))).ci).toBe("SUCCESS");
   await h.advance(15 * S);
   expect(kinds()).toEqual([]);
 });
@@ -803,11 +804,10 @@ test("GraphQL partial errors never overwrite the last successful snapshot", asyn
   h = pollerHarness();
   h.factoryPr("o/r", 1);
   const pr = h.node("o/r", 1);
-  pr.reviewDecision = "APPROVED";
   h.start();
   await h.advance(0);
   const before = snapshotOf(url("o/r", 1));
-  const partial = { ...pr, reviewDecision: null, mergeable: null };
+  const partial = { ...pr, mergeable: null };
   h.gh.next.push(
     respond(200, { data: { nodes: [partial] }, errors: [{ type: "FORBIDDEN", path: ["nodes", 0, "x"] }] }),
     respond(200, { data: { nodes: [{ ...pr, headRefOid: null }] } }),
@@ -1316,6 +1316,198 @@ test("config: a poll_seconds that is not a finite number is an error", () => {
     rmSync(dir, { recursive: true, force: true });
   }
   h = pollerHarness();
+});
+
+test.each([false, true])("the last rate-window response saves usable data only (error=%s)", async (error) => {
+  h = pollerHarness(["o/r", "o/s"]);
+  h.factoryPr("o/r", 1);
+  h.factoryPr("o/s", 1);
+  h.start();
+  await h.advance(0);
+  const pr = h.node("o/s", 1); // second pass starts here
+  pr.mergeable = "CONFLICTING";
+  const before = snapshotOf(pr.url);
+  const reset = Math.ceil((h.clock.now() + 90 * S) / S) * S;
+  h.gh.next.push(
+    respond(
+      200,
+      {
+        data: { nodes: [pr] },
+        ...(error ? { errors: [{ type: "RATE_LIMITED" }] } : {}),
+      },
+      { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset / S) },
+    ),
+  );
+  await h.advance(15 * S);
+  expect(kinds()).toEqual(error ? [] : ["pr.conflicting"]);
+  if (error) expect(snapshotOf(pr.url)).toBe(before);
+  else expect(JSON.parse(snapshotOf(pr.url)).mergeable).toBe("CONFLICTING");
+  const calls = h.gh.calls.length;
+  await h.advance(reset - h.clock.now() - 1);
+  expect(h.gh.calls).toHaveLength(calls);
+  await h.advance(1);
+  expect(h.gh.calls.length).toBeGreaterThan(calls);
+});
+
+test.each(["succeeded", "failed", "cancelled"] as const)(
+  "closed %s PR expires after seven days and a reopen restores tracking",
+  async (status) => {
+    h = pollerHarness();
+    const run = h.factoryPr("o/r", 1, status);
+    const pr = h.node("o/r", 1);
+    pr.state = "CLOSED";
+    h.start();
+    await h.advance(0);
+    const closedAt = h.clock.now();
+    expect(h.fresh()).toEqual([]);
+    h.store.updateRun(run.id, { finishedAt: closedAt - 8 * 86_400_000 });
+    h.reopen();
+    h.start();
+    await h.advance(0);
+    await h.advance(604800000);
+    expect(h.store.githubTracked(h.clock.now()).map((p) => p.url)).toEqual([pr.url]);
+    expect(h.store.githubPrExpired(pr.url, h.clock.now())).toBe(false);
+    const calls = h.gh.calls.length;
+    await h.advance(600000);
+    expect(h.store.githubTracked(h.clock.now())).toEqual([]);
+    expect(h.gh.calls).toHaveLength(calls);
+    expect(h.store.db.query("SELECT closed_at FROM github_pr_expiry WHERE url = ?").get(pr.url)).toEqual({
+      closed_at: closedAt,
+    });
+    expect(h.store.githubPrData(pr.url)).not.toBeNull();
+    // A real reopened delivery clears expiry and wakes an otherwise unscheduled poller.
+    pr.state = "OPEN";
+    const cfg = loadConfig({ home: h.dir, configDir: h.dir });
+    cfg.githubOwner = "o";
+    cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
+    const webhook = githubWebhook({
+      cfg,
+      store: h.store,
+      createRun: async () => {
+        throw new Error("reopen must not create a run");
+      },
+    });
+    const body = JSON.stringify({
+      action: "reopened",
+      repository: { full_name: "o/r" },
+      sender: { login: "o" },
+      pull_request: { number: 1, state: "open", base: { repo: { full_name: "o/r" } } },
+    });
+    setSystemTime(h.clock.now());
+    try {
+      const response = await webhook(
+        new Request("http://localhost/webhooks/github", {
+          method: "POST",
+          body,
+          headers: {
+            "x-github-event": "pull_request",
+            "x-github-delivery": "reopen",
+            "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+          },
+        }),
+      );
+      expect(response.status).toBe(200);
+    } finally {
+      setSystemTime();
+    }
+    expect(h.store.getRun(run.id)?.prClosedUnmerged).toBe(false);
+    expect(h.store.githubTracked(h.clock.now()).map((p) => p.url)).toEqual([pr.url]);
+    await h.advance(0);
+    expect(h.gh.calls.length).toBeGreaterThan(calls);
+    expect(JSON.parse(snapshotOf(pr.url)).state).toBe("OPEN");
+  },
+);
+
+test.each(["CLOSED", "MERGED", "OPEN"])(
+  "first %s observation baselines history and emits only actionable open states",
+  async (state) => {
+    h = pollerHarness();
+    h.factoryPr("o/r", 1);
+    const pr = h.node("o/r", 1);
+    Object.assign(pr, { state, mergeable: "CONFLICTING", mergeStateStatus: "BEHIND" });
+    ci(pr, rollup("FAILURE", [{ name: "test", conclusion: "FAILURE" }]));
+    pr.latestReviews.nodes = [
+      { state: "APPROVED", author: { login: "alice" } },
+      { state: "CHANGES_REQUESTED", author: { login: "bob" } },
+    ];
+    pr.comments.nodes = [{ id: "old", updatedAt: "t1" }];
+    h.start();
+    await h.advance(0);
+    expect(kinds()).toEqual(state === "OPEN" ? ["pr.ci_failed", "pr.conflicting", "pr.review"] : []);
+    expect(JSON.parse(snapshotOf(pr.url)).state).toBe(state);
+    expect(OBSERVE_QUERY).not.toContain("reviewDecision");
+  },
+);
+
+test("unrelated changes retain status episodes; same-head recurrences start new ones", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  const pr = h.node("o/r", 1);
+  h.start();
+  await h.advance(0);
+  ci(pr, rollup("SUCCESS"));
+  pr.latestReviews.nodes = [{ state: "APPROVED", author: { login: "alice" } }];
+  await h.advance(15 * S);
+  expect(kinds()).toEqual(["pr.ci_passed", "pr.review"]);
+  pr.mergeable = "CONFLICTING";
+  pr.latestReviews.nodes.push({ state: "COMMENTED", author: { login: "bob" } });
+  await h.advance(15 * S);
+  expect(kinds()).toEqual(["pr.conflicting"]);
+  ci(pr, rollup("PENDING"));
+  pr.latestReviews.nodes = [];
+  await h.advance(15 * S);
+  expect(kinds()).toEqual([]);
+  ci(pr, rollup("SUCCESS"));
+  pr.latestReviews.nodes = [{ state: "APPROVED", author: { login: "alice" } }];
+  await h.advance(15 * S);
+  expect(kinds()).toEqual(["pr.ci_passed", "pr.review"]);
+});
+
+test("a renewed changes request on the same head is reported after approval", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  const pr = h.node("o/r", 1);
+  pr.latestReviews.nodes = [{ state: "CHANGES_REQUESTED", author: { login: "alice" } }];
+  h.start();
+  await h.advance(0);
+  expect(kinds()).toEqual(["pr.review"]);
+  for (const state of ["APPROVED", "CHANGES_REQUESTED"]) {
+    pr.latestReviews.nodes = [{ state, author: { login: "alice" } }];
+    await h.advance(15 * S);
+    const items = h.fresh();
+    expect(items.map((i) => i.kind)).toEqual(["pr.review"]);
+    expect(items[0]?.data.review).toBe(`alice:${state}`);
+    await h.advance(15 * S);
+    expect(kinds()).toEqual([]);
+  }
+});
+
+test("a last-window partial NOT_FOUND response retains the accessible PR's data", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  h.factoryPr("o/r", 2);
+  h.start();
+  await h.advance(0);
+  const pr = h.node("o/r", 1);
+  pr.mergeable = "CONFLICTING";
+  const missingBefore = snapshotOf(url("o/r", 2));
+  h.gh.next.push(
+    respond(
+      200,
+      {
+        data: { nodes: [pr, null] },
+        errors: [{ type: "NOT_FOUND", path: ["nodes", 1] }],
+      },
+      { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(Math.ceil(h.clock.now() / S) + 90) },
+    ),
+  );
+  await h.advance(15 * S);
+  expect(h.fresh().map((i) => i.kind)).toEqual(["pr.conflicting", "github.access_problem"]);
+  expect(JSON.parse(snapshotOf(pr.url)).mergeable).toBe("CONFLICTING");
+  expect(snapshotOf(url("o/r", 2))).toBe(missingBefore);
+  const calls = h.gh.calls.length;
+  await h.advance(60 * S);
+  expect(h.gh.calls).toHaveLength(calls);
 });
 
 test("an approval goes stale on any head the poller sees, and an overtaken poll never rewinds the head", async () => {
