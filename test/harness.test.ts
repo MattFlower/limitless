@@ -676,3 +676,50 @@ test("short credentials only match whole values while eight-character keys match
     fixture.close();
   }
 });
+
+test("a credential inside the model name never reaches the log header", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const { customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const { runProcess } = await import("../src/util/proc.ts");
+  const key = "org/backend-secret";
+  const fixture = providerFixture(
+    [{ ...customProvider, api_key_env: "HEADER_TEST_KEY" }],
+    `HEADER_TEST_KEY=${key}\n`,
+  );
+  try {
+    fixture.load();
+    const child = join(fixture.root, "child.ts");
+    writeFileSync(child, "process.exit(1);");
+    for (const harness of ["claude", "codex"] as const) {
+      const logPath = join(fixture.root, `${harness}.log`);
+      await (harness === "claude" ? runClaude : runCodex)(
+        {
+          cwd: fixture.root,
+          prompt: "test",
+          mode: "edit",
+          logPath,
+          target: {
+            modelId: `${harness}/test`,
+            provider: harness,
+            harness,
+            model: key,
+            vendor: "other",
+            tier: 4,
+            billing: "subscription",
+          },
+          timeoutMs: 5000,
+          idleTimeoutMs: 5000,
+          maxToolCalls: 10,
+          signal: new AbortController().signal,
+          onEvent: () => {},
+        },
+        (options) => runProcess({ ...options, cmd: [process.execPath, child] }),
+      );
+      const header = readFileSync(logPath, "utf8").split("\n")[0] ?? "";
+      expect(header).toStartWith(`# ${harness} [redacted] `);
+      expect(header).not.toContain(key);
+    }
+  } finally {
+    fixture.close();
+  }
+});

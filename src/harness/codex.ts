@@ -749,7 +749,7 @@ export async function runCodex(
     spec.onEvent(ev);
   });
 
-  appendFileSync(spec.logPath, `# codex ${t.model} ${new Date().toISOString()}\n`);
+  appendFileSync(spec.logPath, redactCredentials(`# codex ${t.model} ${new Date().toISOString()}\n`));
   const proc = await processRunner({
     cmd: args,
     cwd: spec.cwd,
