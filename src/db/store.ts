@@ -36,6 +36,7 @@ import type {
   TrackedPr,
 } from "../core/types.ts";
 import { DEFAULT_EVAL_CONCURRENCY } from "../core/types.ts";
+import type { RunState } from "../pipeline/context.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
 type Row = Record<string, unknown>;
@@ -1208,7 +1209,35 @@ export class Store {
   getRunDetail(id: string): RunDetail | null {
     const run = this.getRun(id);
     if (!run) return null;
+    const latest = this.listArtifacts(id).findLast((a) => a.kind === "review");
+    const review = parse<{ blocking?: { title?: string }[] }>(this.getArtifact(id, latest?.name ?? ""), {});
+    const state = this.getRunState<RunState>(id);
+    const stages = this.listStages(id);
+    // Draft delivery failures are secondary; the run retains the original stopping error.
+    const evidence = stages.filter(
+      (s) =>
+        s.name !== "deliver" ||
+        s.status !== "failed" ||
+        (!!run.error && s.summary === run.error.slice(0, 500)),
+    );
+    const latestStages = new Map(evidence.map((s) => [s.name, s]));
+    const blocked = [
+      ["verify", state?.lastVerify?.overall === "fail"],
+      ["review", state?.lastReview?.verdict === "request_changes"],
+      ["audit", state?.lastAudit?.some((f) => f.severity === "block")],
+      ["gates", state?.lastGates?.some((g) => g.blocking)],
+    ] as const;
+    const stopping = evidence.findLast(
+      (s) =>
+        latestStages.get(s.name) === s &&
+        (s.status === "failed" || blocked.some(([name, blocks]) => blocks && name === s.name)),
+    );
     return {
+      stoppingStage: stopping?.name ?? blocked.find(([, blocks]) => blocks)?.[0] ?? null,
+      blockingFindings: Array.isArray(review?.blocking)
+        ? review.blocking.flatMap((f) => (typeof f?.title === "string" ? [f.title] : []))
+        : [],
+      prSnapshot: parse<RunDetail["prSnapshot"]>(run.prUrl && this.githubPrData(run.prUrl), null),
       run,
       stages: this.listStages(id),
       invocations: this.listInvocations(id),

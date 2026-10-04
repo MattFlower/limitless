@@ -5,17 +5,18 @@ import { createStore, produce } from "solid-js/store";
 import { formatCost } from "../../src/core/cost-format.ts";
 import type { ArtifactMeta, Invocation, Question, Run, RunEvent, Stage } from "../../src/core/types.ts";
 import { TERMINAL_STATUSES } from "../../src/core/types.ts";
-import { answerRun, cancelRun, getRunDetail, openRunStream, retryRun } from "../api.ts";
+import { answerRun, cancelRun, getRunDetail, openRunStream, resolveRun, retryRun } from "../api.ts";
 import { ArtifactsPanel } from "../components/ArtifactsPanel.tsx";
 import { EventLog } from "../components/EventLog.tsx";
 import { InvocationsTable } from "../components/InvocationsTable.tsx";
 import { OriginalPrompt } from "../components/OriginalPrompt.tsx";
 import { StageTimeline } from "../components/StageTimeline.tsx";
 import { RunStatusPill } from "../components/StatusPill.tsx";
-import { createCatchUp } from "../lib/catch-up.ts";
 import { compactNumber, duration, relativeTime } from "../lib/format.ts";
 import { now } from "../lib/ticker.ts";
 
+type Detail = Awaited<ReturnType<typeof getRunDetail>>;
+type Kind = "done_elsewhere" | "superseded" | "wont_do";
 const QuestionCard: Component<{ runId: string; question: Question }> = (props) => {
   const [text, setText] = createSignal("");
   const [busy, setBusy] = createSignal(false);
@@ -66,10 +67,14 @@ export const RunDetail: Component = () => {
   const [questionsById, setQuestionsById] = createStore<Record<number, Question>>({});
   const [eventsById, setEventsById] = createStore<Record<number, RunEvent>>({});
   const [artifacts, setArtifacts] = createSignal<ArtifactMeta[]>([]);
+  const [details, setDetails] = createSignal<Detail | null>(null);
+  const [kind, setKind] = createSignal<Kind>("done_elsewhere");
+  const [ref, setRef] = createSignal("");
+  const [note, setNote] = createSignal("");
   const [loadError, setLoadError] = createSignal<string | null>(null);
   const [connected, setConnected] = createSignal(false);
   const [selectedInvocation, setSelectedInvocation] = createSignal<number | null>(null);
-  const [busyAction, setBusyAction] = createSignal<"cancel" | "retry" | null>(null);
+  const [busyAction, setBusyAction] = createSignal<"cancel" | "retry" | "resolve" | "copy" | null>(null);
   const [actionError, setActionError] = createSignal<string | null>(null);
   const [copyFeedback, setCopyFeedback] = createSignal<"Copied" | "Selected — press ⌘C or Ctrl+C" | null>(
     null,
@@ -99,6 +104,8 @@ export const RunDetail: Component = () => {
   };
   onCleanup(() => {
     if (feedbackTimer) clearTimeout(feedbackTimer);
+    clearTimeout(refreshTimer);
+    generation++;
   });
 
   const stages = createMemo(() => Object.values(stagesById).sort((a, b) => a.id - b.id));
@@ -107,20 +114,25 @@ export const RunDetail: Component = () => {
   const events = createMemo(() => Object.values(eventsById).sort((a, b) => a.id - b.id));
   const openQuestions = createMemo(() => questions().filter((q) => q.answer === null));
 
-  const refetchArtifacts = () => {
-    getRunDetail(params.id)
-      .then((d) => setArtifacts(d.artifacts))
-      .catch(() => {});
+  let generation = 0;
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  // Stage, invocation and question updates pushed while a read is in flight are newer than it.
+  const pushed = new Set<string>();
+  const fresh = <T extends { id: number }>(kind: string, items: T[]) =>
+    items.filter((item) => !pushed.has(`${kind}:${item.id}`));
+  const scheduleRefresh = () => {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refetchArtifacts, 100);
   };
-
-  onMount(() => {
-    // The run stream replays events after a gap, but not the run, stages, invocations or questions.
-    const sync = createCatchUp(
-      () => getRunDetail(params.id),
-      (detail, pushed) => {
-        const fresh = <T extends { id: number }>(kind: string, items: T[]) =>
-          items.filter((item) => !pushed.has(`${kind}:${item.id}`));
-        if (!pushed.has("run")) setRun(detail.run);
+  const refetchArtifacts = () => {
+    const request = ++generation;
+    pushed.clear();
+    getRunDetail(params.id)
+      .then((detail) => {
+        if (request !== generation) return;
+        setLoadError(null);
+        setRun(detail.run);
+        setDetails(detail);
         setStagesById(
           produce((d) => {
             for (const s of fresh("stage", detail.stages)) d[s.id] = s;
@@ -137,31 +149,35 @@ export const RunDetail: Component = () => {
           }),
         );
         setArtifacts(detail.artifacts);
-        setLoadError(null);
-      },
-      (e) => setLoadError((e as Error).message),
-    );
-    sync.load();
+      })
+      .catch((e) => request === generation && setLoadError((e as Error).message));
+  };
+
+  onMount(() => {
+    refetchArtifacts();
+    let reconnect = false;
 
     const close = openRunStream(
       params.id,
       0,
       (msg) => {
-        if (msg.kind === "run") {
-          sync.pushed("run");
+        if (msg.kind === "run" && msg.run.id === params.id) {
+          generation++;
           setRun(msg.run);
-        } else if (msg.kind === "stage") {
+          scheduleRefresh();
+        } else if (msg.kind === "feed" && msg.item.runId === params.id) scheduleRefresh();
+        else if (msg.kind === "stage") {
           const stage = msg.stage;
-          sync.pushed(`stage:${stage.id}`);
+          pushed.add(`stage:${stage.id}`);
           setStagesById(
             produce((d) => {
               d[stage.id] = stage;
             }),
           );
-          if (stage.status !== "running") refetchArtifacts();
+          if (stage.status !== "running") scheduleRefresh();
         } else if (msg.kind === "invocation") {
           const invocation = msg.invocation;
-          sync.pushed(`invocation:${invocation.id}`);
+          pushed.add(`invocation:${invocation.id}`);
           setInvocationsById(
             produce((d) => {
               d[invocation.id] = invocation;
@@ -169,7 +185,7 @@ export const RunDetail: Component = () => {
           );
         } else if (msg.kind === "question") {
           const question = msg.question;
-          sync.pushed(`question:${question.id}`);
+          pushed.add(`question:${question.id}`);
           setQuestionsById(
             produce((d) => {
               d[question.id] = question;
@@ -184,9 +200,10 @@ export const RunDetail: Component = () => {
           );
         }
       },
-      (isConnected) => {
-        setConnected(isConnected);
-        sync.connected(isConnected);
+      (value) => {
+        setConnected(value);
+        if (value && reconnect) scheduleRefresh();
+        reconnect = true;
       },
     );
     onCleanup(close);
@@ -203,12 +220,24 @@ export const RunDetail: Component = () => {
       setBusyAction(null);
     }
   };
-  const doRetry = async () => {
-    setBusyAction("retry");
+  const doAction = async (action: "retry" | "resolve" | "copy") => {
+    setBusyAction(action);
     setActionError(null);
     try {
-      const created = await retryRun(params.id);
-      navigate(`/runs/${created.id}`);
+      if (action === "retry") navigate(`/runs/${(await retryRun(params.id)).id}`);
+      else if (action === "copy")
+        await navigator.clipboard.writeText(`${details()?.worktreePath}\n${run()?.branch ?? ""}`);
+      else
+        await resolveRun(params.id, {
+          kind: kind(),
+          ref: ref().trim() || undefined,
+          note: note().trim() || undefined,
+        }).then((resolved) => {
+          generation++;
+          setRun(resolved);
+          // The bump drops reads started before it, so fetch the resolved run's details afresh.
+          scheduleRefresh();
+        });
     } catch (e) {
       setActionError((e as Error).message);
     } finally {
@@ -279,10 +308,11 @@ export const RunDetail: Component = () => {
                         {r().mergedAt ? ` on ${new Date(r().mergedAt as number).toLocaleString()}` : ""}
                       </span>
                     </Show>
-                    <Show when={r().status === "resolved" && !r().merged && r().resolution}>
+                    <Show when={r().status === "resolved" && r().resolution}>
                       <span>·</span>
                       <span>
                         Resolved as {r().resolution?.kind}
+                        {r().resolution?.ref ? ` · ${r().resolution?.ref}` : ""}
                         {r().resolution?.note ? `: ${r().resolution?.note}` : ""}
                       </span>
                     </Show>
@@ -310,14 +340,14 @@ export const RunDetail: Component = () => {
                       {busyAction() === "cancel" ? "Cancelling…" : "Cancel"}
                     </button>
                   </Show>
-                  <Show when={TERMINAL_STATUSES.includes(r().status)}>
+                  <Show when={TERMINAL_STATUSES.includes(r().status) && r().status !== "resolved"}>
                     <button
                       type="button"
                       class="btn btn-primary"
                       disabled={busyAction() !== null}
-                      onClick={doRetry}
+                      onClick={() => doAction("retry")}
                     >
-                      {busyAction() === "retry" ? "Retrying…" : "Retry"}
+                      {busyAction() === "retry" ? "Retrying…" : "Retry — start a new run"}
                     </button>
                   </Show>
                 </div>
@@ -355,11 +385,55 @@ export const RunDetail: Component = () => {
                 </div>
               </div>
 
-              <Show when={r().error}>
+              <Show when={r().error && r().status !== "needs_human" && r().status !== "failed"}>
                 <div class="error-box">{r().error}</div>
               </Show>
             </div>
 
+            <Show when={r().status === "needs_human" || r().status === "failed"}>
+              <section class="card card-pad stack" aria-label="Needs you">
+                <h2>Needs you</h2>
+                <p>{[details()?.stoppingStage, r().error?.split(/\r?\n/)[0]].filter(Boolean).join(" · ")}</p>
+                <ul>
+                  <For each={details()?.blockingFindings}>{(finding) => <li>{finding}</li>}</For>
+                </ul>
+                <Show when={details()?.prSnapshot}>
+                  {(pr) => (
+                    <p>
+                      <a href={r().prUrl ?? undefined}>Pull request</a> · Observed:{" "}
+                      {[pr().state, pr().isDraft && "draft", pr().mergeable].filter(Boolean).join(" · ")}
+                      {pr().ci ? ` · CI: ${pr().ci}` : ""}
+                    </p>
+                  )}
+                </Show>
+                <label>
+                  Resolution kind{" "}
+                  <select value={kind()} onChange={(e) => setKind(e.currentTarget.value as Kind)}>
+                    <option value="done_elsewhere">Done elsewhere</option>
+                    <option value="superseded">Superseded</option>
+                    <option value="wont_do">Won't do</option>
+                  </select>
+                </label>
+                <label>
+                  Ref (optional) <input value={ref()} onInput={(e) => setRef(e.currentTarget.value)} />
+                </label>
+                <label>
+                  Note (optional) <textarea value={note()} onInput={(e) => setNote(e.currentTarget.value)} />
+                </label>
+                <button type="button" disabled={busyAction() !== null} onClick={() => doAction("resolve")}>
+                  Resolve
+                </button>
+                <Show when={details()?.worktreePath}>
+                  <details>
+                    <summary>Take over</summary>
+                    <pre>{`${details()?.worktreePath}\n${r().branch ?? ""}`}</pre>
+                    <button type="button" disabled={busyAction() !== null} onClick={() => doAction("copy")}>
+                      Copy path and branch
+                    </button>
+                  </details>
+                </Show>
+              </section>
+            </Show>
             <For each={openQuestions()}>{(q) => <QuestionCard runId={params.id} question={q} />}</For>
 
             <OriginalPrompt prompt={r().prompt} />
