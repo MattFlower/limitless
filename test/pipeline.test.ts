@@ -2436,61 +2436,78 @@ esac
     expect(readFileSync(join(home, "gh-calls"), "utf8").match(/^pr create/gm)).toHaveLength(1);
   });
 
-  test("needs-human draft delivery continues during drain", async () => {
-    const bare = await githubFixture();
-    const f = start((s) => {
-      const role = roleOf(s);
-      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
-      if (role === "review")
-        return {
-          structured: {
-            verdict: "request_changes",
-            summary: "Needs work",
-            findings: [
-              {
-                label: "unaddressed",
-                prior: "P1",
-                severity: "blocker",
-                security: false,
-                ...findingEvidence,
-                file: "farewell.txt",
-                line: 1,
-                title: "Incorrect output",
-                detail: "Needs work",
-                suggestion: "Fix it",
-              },
-            ],
-          },
-        };
-      return { files: { "farewell.txt": "goodbye\n" } };
-    });
-    f.cfg.maxRounds = 1;
-    registerGithub(f, bare);
-    const addEvent = f.store.addEvent.bind(f.store);
-    f.store.addEvent = (event) => {
-      if (event.message?.startsWith("Run needs a human")) f.scheduler.drain();
-      return addEvent(event);
-    };
-    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
-    expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
-    expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
-    expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
-    const detail = f.store.getRunDetail(run.id);
-    if (!detail) throw new Error("missing draft detail");
-    expect(detail.run.stage).toBe("deliver");
-    expect(detail.stoppingStage).toBe("review");
-    const ui = await buildNeedsYouUi(join(home, "needs-you-ui"));
-    try {
-      ui.mount(detail);
-      const html = renderToString(() => ui.render());
-      expect(html).toContain('aria-label="Needs you"');
-      expect(html).toContain("review · Still failing after");
-      expect(html).not.toContain("deliver · Still failing after");
-    } finally {
-      ui.dispose();
-    }
-  });
+  test.each(["succeeded", "failed"] as const)(
+    "review remains the stopping stage when needs-human draft delivery %s during drain",
+    async (deliveryStatus) => {
+      const bare = await githubFixture();
+      if (deliveryStatus === "failed") {
+        writeFileSync(
+          join(home, "bin", "gh"),
+          `#!/bin/sh\nif [ "$2" = create ]; then echo 'Draft PR rejected' >&2; exit 1; fi\n`,
+        );
+      }
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review")
+          return {
+            structured: {
+              verdict: "request_changes",
+              summary: "Needs work",
+              findings: [
+                {
+                  label: "unaddressed",
+                  prior: "P1",
+                  severity: "blocker",
+                  security: false,
+                  ...findingEvidence,
+                  file: "farewell.txt",
+                  line: 1,
+                  title: "Incorrect output",
+                  detail: "Needs work",
+                  suggestion: "Fix it",
+                },
+              ],
+            },
+          };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      f.cfg.maxRounds = 1;
+      registerGithub(f, bare);
+      const addEvent = f.store.addEvent.bind(f.store);
+      f.store.addEvent = (event) => {
+        if (event.message?.startsWith("Run needs a human")) f.scheduler.drain();
+        return addEvent(event);
+      };
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+      if (deliveryStatus === "succeeded") expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
+      else {
+        expect(f.store.getRun(run.id)?.prUrl).toBeNull();
+        expect(f.store.listEvents(run.id).some((e) => e.message?.startsWith("Could not open draft PR"))).toBe(
+          true,
+        );
+      }
+      expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe(
+        deliveryStatus,
+      );
+      expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+      const detail = f.store.getRunDetail(run.id);
+      if (!detail) throw new Error("missing draft detail");
+      expect(detail.run.stage).toBe("deliver");
+      expect(detail.stoppingStage).toBe("review");
+      const ui = await buildNeedsYouUi(join(home, "needs-you-ui"));
+      try {
+        ui.mount(detail);
+        const html = renderToString(() => ui.render());
+        expect(html).toContain('aria-label="Needs you"');
+        expect(html).toContain("review · Still failing after");
+        expect(html).not.toContain("deliver · Still failing after");
+      } finally {
+        ui.dispose();
+      }
+    },
+  );
 
   test("panel reviews R1-R3: fix-diff scope, tightening blocks, restart, then needs_human with a draft", async () => {
     const bare = await githubFixture();

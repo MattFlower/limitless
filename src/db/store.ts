@@ -1217,8 +1217,12 @@ export class Store {
       ["gates", state?.lastGates?.some((g) => g.blocking)],
     ] as const;
     const stopping =
-      stages.findLast((s) => s.status === "failed") ??
-      stages.findLast((s) => blocked.some(([name, blocks]) => blocks && name === s.name));
+      // Draft delivery failures are secondary; the run retains the original stopping error.
+      stages.findLast(
+        (s) =>
+          s.status === "failed" &&
+          (s.name !== "deliver" || (!!run.error && s.summary === run.error.slice(0, 500))),
+      ) ?? stages.findLast((s) => blocked.some(([name, blocks]) => blocks && name === s.name));
     return {
       stoppingStage: stopping?.name ?? blocked.find(([, blocks]) => blocks)?.[0] ?? null,
       blockingFindings: Array.isArray(review?.blocking)

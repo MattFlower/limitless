@@ -494,6 +494,32 @@ test("stopping evidence prefers the latest failed stage, falls back to retained 
   store.finishStage(store.startStage(stopped.id, "review").id, "failed");
   store.finishStage(store.startStage(stopped.id, "deliver").id, "succeeded");
   expect(read()).toContain("review · Needs work");
+  store.finishStage(store.startStage(stopped.id, "deliver").id, "failed", "Draft PR rejected");
+  expect(read()).toContain("review · Needs work");
+  expect(read()).not.toContain("deliver · Needs work");
+});
+
+test("failed draft delivery falls back to retained blockers; original delivery failures remain evidence", () => {
+  const stopped = store.createRun(repo, { repo: repo.slug, prompt: "Draft failed" });
+  store.updateRun(stopped.id, { status: "needs_human", stage: "deliver", error: "Needs work" });
+  store.finishStage(store.startStage(stopped.id, "review").id, "succeeded");
+  store.finishStage(store.startStage(stopped.id, "deliver").id, "failed", "Draft PR rejected");
+  store.setRunState(stopped.id, { lastReview: { verdict: "request_changes" } });
+  const read = () => {
+    const saved = store.getRunDetail(stopped.id);
+    if (!saved) throw new Error("missing stopped run");
+    ui.mount(saved);
+    return render();
+  };
+  expect(read()).toContain("review · Needs work");
+  store.setRunState(stopped.id, {});
+  expect(read()).not.toContain("deliver · Needs work");
+  // Delivery can itself be the original failure, even with old review blockers retained.
+  const error = `Delivery rejected: ${"x".repeat(600)}`;
+  store.updateRun(stopped.id, { error });
+  store.setRunState(stopped.id, { lastReview: { verdict: "request_changes" } });
+  store.finishStage(store.startStage(stopped.id, "deliver", 1).id, "failed", error.slice(0, 500));
+  expect(read()).toContain("deliver · Delivery rejected:");
 });
 
 test("per-run SSE forwards committed GitHub observations only for the displayed run", async () => {
