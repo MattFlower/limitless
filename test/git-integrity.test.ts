@@ -14,6 +14,8 @@ import { worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
 import {
   attributeLimits,
+  blobPrivateEntries,
+  checkPrivateRange,
   commitAll,
   createWorktree,
   diffSince,
@@ -26,7 +28,7 @@ import {
   resetTo,
   sweepClassificationScratch,
 } from "../src/git/repos.ts";
-import { sh } from "../src/util/proc.ts";
+import { processScope, sh } from "../src/util/proc.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
@@ -1720,3 +1722,124 @@ test("UTF-16 source content remains blocked", async () => {
     expect.objectContaining({ rule: "binary-content", file: "unicode.ts", severity: "block" }),
   );
 });
+
+test.each(["patch", "message", "merge", "excluded"])("publication range checks %s", async (scenario) => {
+  const entries = [{ value: "secret-host.example", entry: 1 }];
+  writeFileSync(
+    join(work, "transient.txt"),
+    ["message", "merge"].includes(scenario) ? "safe" : "secret-host.example",
+  );
+  await commitAll(work, scenario === "message" ? "safe subject\n\nsecret-host.example" : "safe");
+  if (scenario === "merge") {
+    const side = await headSha(work);
+    await git(work, "reset", "--hard", base);
+    writeFileSync(join(work, "other.txt"), "safe");
+    await commitAll(work, "other");
+    await git(work, "merge", "--no-ff", "--no-commit", side);
+    writeFileSync(join(work, "transient.txt"), "secret-host.example");
+    await commitAll(work, "safe merge");
+  }
+  rmSync(join(work, "transient.txt"));
+  await commitAll(work, "remove transient");
+  const start = scenario === "excluded" ? await headSha(work) : base;
+  writeFileSync(join(work, "safe.txt"), "safe");
+  await commitAll(work, "safe");
+  const scan = checkPrivateRange(work, `${start}..HEAD`, entries);
+  if (scenario === "excluded") await scan;
+  else await expect(scan).rejects.toThrow("entry 1");
+});
+
+test.each([
+  "matching",
+  "clean",
+  "missing",
+  "unreadable",
+  "removed",
+  "staged",
+  "extended",
+  "extended-clean",
+  "corrupt",
+])("LFS payload inspection: %s", async (scenario) => {
+  const payload = Buffer.from(scenario.includes("clean") ? "safe\0" : "%73ecret-host.example\0");
+  const oid = createHash("sha256").update(payload).digest("hex");
+  const object = join(seed, ".git", "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+  mkdirSync(join(object, ".."), { recursive: true });
+  if (scenario === "unreadable") mkdirSync(object);
+  else if (scenario !== "missing")
+    writeFileSync(object, scenario === "corrupt" ? Buffer.alloc(payload.length, 97) : payload);
+  writeFileSync(
+    join(work, "asset.dat"),
+    `version https://git-lfs.github.com/spec/v1\n${scenario.startsWith("extended") ? `ext-0-test sha256:${"a".repeat(64)}\n` : ""}oid sha256:${oid}\nsize ${payload.length}\n`,
+  );
+  if (scenario === "staged") await git(work, "add", ".");
+  else await commitAll(work, "asset");
+  if (scenario === "removed") {
+    rmSync(join(work, "asset.dat"));
+    await commitAll(work, "remove asset");
+  }
+  const entries = [{ value: "secret-host.example", entry: 1 }];
+  const scan = checkPrivateRange(work, `${base}..HEAD`, entries, scenario === "staged");
+  if (scenario.includes("clean")) {
+    await scan;
+    expect((await diffSince(work, base, undefined, false, entries)).privateHits).toEqual([]);
+  } else
+    await expect(scan).rejects.toThrow(
+      ["missing", "unreadable", "corrupt"].includes(scenario)
+        ? "Cannot inspect local LFS payload"
+        : "entry 1",
+    );
+});
+
+test.each(["complete", "truncated", "failed", "timeout", "cancelled"])(
+  "one byte-framed batch, %s",
+  async (scenario) => {
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const ids = ["a".repeat(40), "b".repeat(40), "c".repeat(40)];
+    const bytes = Buffer.concat([
+      Buffer.from("\0é"),
+      Buffer.alloc(65_530, 97),
+      Buffer.from("%73ecret-host.example"),
+    ]);
+    const response = Buffer.concat(
+      ids.map((id) => Buffer.concat([Buffer.from(`${id} blob ${bytes.length}\n`), bytes, Buffer.from("\n")])),
+    );
+    const output = join(dir, "batch");
+    writeFileSync(output, scenario === "truncated" ? response.subarray(0, -1) : response);
+    const calls = join(dir, "calls");
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\necho "$*" >> '${calls}'\ncat >/dev/null\n${["timeout", "cancelled"].includes(scenario) ? "sleep 10" : `cat '${output}'`}\nexit ${scenario === "failed" ? 1 : 0}\n`,
+      { mode: 0o755 },
+    );
+    const limit = attributeLimits.timeoutMs;
+    const controller = new AbortController();
+    const scope = {
+      signal: controller.signal,
+      killGraceMs: 10,
+      children: new Map(),
+      scratchDirs: new Set<string>(),
+    };
+    try {
+      if (scenario === "timeout") attributeLimits.timeoutMs = 250;
+      const scan = processScope.run(scope, () =>
+        worktreeGitScope.run(false, () =>
+          blobPrivateEntries(work, { ...process.env, PATH: `${bin}:${process.env.PATH}` }, ids, [
+            { value: "secret-host.example", entry: 1 },
+          ]),
+        ),
+      );
+      if (scenario === "cancelled") {
+        while (!existsSync(calls)) await Bun.sleep(1);
+        controller.abort();
+      }
+      if (scenario === "complete") expect(await scan).toEqual(ids.map((id) => [id, 1]));
+      else await expect(scan).rejects.toThrow();
+      expect(readFileSync(calls, "utf8").trim().split("\n")).toEqual([
+        "--no-replace-objects cat-file --batch",
+      ]);
+    } finally {
+      attributeLimits.timeoutMs = limit;
+    }
+  },
+);

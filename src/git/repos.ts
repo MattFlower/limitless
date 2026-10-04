@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +8,7 @@ import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { attributeRules, BINARY_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
 import type { PrivateStrings } from "../gates/private.ts";
+import * as privacy from "../gates/private.ts";
 import { CommandError, sh } from "../util/proc.ts";
 import { emptyHookFlags, NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
 
@@ -530,15 +531,9 @@ export async function diffSince(
   const inspection = await attributeInfo(cwd, env, range, revision, changes);
   const privateHits: { path: string; entry: number }[] = [];
   if (privateStrings.length) {
-    // Binary content is absent from the patch; stream each blob rather than forcing a text diff.
-    const numstatZ = await diff("--numstat", "-z", "--no-renames", range);
-    for (const line of numstatZ.stdout.split("\0")) {
-      const path = line.match(/^-\t-\t([\s\S]+)$/)?.[1];
-      const blob = path === undefined ? undefined : blobs.get(path);
-      if (path !== undefined && blob && !/^0+$/.test(blob))
-        for (const entry of await blobPrivateEntries(cwd, env, blob, privateStrings))
-          privateHits.push({ path, entry });
-    }
+    const ids = [...blobs].filter(([path]) => !gitlinks.includes(path)).map(([, oid]) => oid);
+    for (const [path, entry] of await blobPrivateEntries(cwd, env, ids, privateStrings))
+      privateHits.push({ path: [...blobs].find(([, oid]) => oid === path)?.[0] ?? path, entry });
   }
   return {
     patch: patch.stdout,
@@ -552,35 +547,76 @@ export async function diffSince(
   };
 }
 
-async function blobPrivateEntries(
+export async function blobPrivateEntries(
   cwd: string,
   env: Record<string, string> | undefined,
-  blob: string,
+  blobs: string[],
   privateStrings: PrivateStrings,
-): Promise<number[]> {
-  // Inspect the object that will be published, never a local replacement.
-  const child = spawn("git", ["--no-replace-objects", "cat-file", "blob", blob], {
+): Promise<[string, number][]> {
+  const ids = [...new Set(blobs.filter((id) => !/^0*$/.test(id)))];
+  if (!ids.length) return [];
+  const { stdout } = await worktreeGit(["git", "--no-replace-objects", "cat-file", "--batch"], {
     cwd,
-    env: env ?? process.env,
-    stdio: "pipe",
+    env,
+    stdin: `${ids.join("\n")}\n`,
+    encoding: "latin1",
+    timeoutMs: attributeLimits.timeoutMs,
   });
-  child.stdin.end();
-  child.stderr.resume();
-  const exited = new Promise<number | null>((done, fail) => {
-    child.on("error", fail);
-    child.on("close", done);
-  });
-  const keep = Math.max(...privateStrings.map(({ value }) => value.length)) - 1;
-  const decoder = new TextDecoder();
-  const found = new Set<number>();
-  let tail = "";
-  for await (const chunk of child.stdout as AsyncIterable<Buffer>) {
-    const text = tail + decoder.decode(chunk, { stream: true }).toLowerCase();
-    for (const { value, entry } of privateStrings) if (text.includes(value)) found.add(entry);
-    tail = keep > 0 ? text.slice(-keep) : "";
+  let offset = 0;
+  const found: [string, number][] = [];
+  for (const id of ids) {
+    const end = stdout.indexOf("\n", offset);
+    const header = stdout.slice(offset, end);
+    const size = Number(header.split(" ")[2]);
+    if (header !== `${id} blob ${size}` || size < 0 || stdout[end + size + 1] !== "\n")
+      throw new privacy.PrivateError("Cannot inspect binary blob; publication blocked");
+    const text = Buffer.from(stdout.slice(end + 1, end + 1 + size), "latin1").toString("utf8");
+    offset = end + size + 2;
+    let content = text.includes("\0") ? text : "";
+    if (text.startsWith("version https://git-lfs.github.com/spec/v1\n")) {
+      const oid = text.match(/^oid sha256:([a-f0-9]{64})$/m)?.[1] ?? "";
+      const { stdout: common } = await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd, env });
+      try {
+        const file = resolve(cwd, common.trim(), "lfs/objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+        if (!fs.statSync(file).isFile()) throw new Error("not a regular file");
+        const bytes = fs.readFileSync(file);
+        if (bytes.length !== Number(text.match(/^size (\d+)$/m)?.[1])) throw new Error("size");
+        if (createHash("sha256").update(bytes).digest("hex") !== oid) throw new Error("hash");
+        content = text + bytes.toString("utf8");
+      } catch {
+        throw new privacy.PrivateError("Cannot inspect local LFS payload; publication blocked");
+      }
+    }
+    for (const { entry } of privacy.privateMatches(content, privateStrings)) found.push([id, entry]);
   }
-  if ((await exited) !== 0) throw new Error(`Could not read blob ${blob} for the private-string scan`);
-  return [...found];
+  if (offset !== stdout.length)
+    throw new privacy.PrivateError("Incomplete binary inspection; publication blocked");
+  return found;
+}
+
+export async function checkPrivateRange(cwd: string, range: string, entries: PrivateStrings, staged = false) {
+  if (!entries.length) return;
+  const git = (...args: string[]) => worktreeGit(["git", ...args], { cwd });
+  const check = (text: string) => privacy.checkPrivateText(text, "Published content", entries);
+  check((await git("log", "--format=%B", range)).stdout);
+  const blobs: string[] = [];
+  for (const args of [["log", "-m", "--format=", range], ...(staged ? [["diff", "--cached"]] : [])]) {
+    const patch = (await git(...args, "-p", "--text", "--no-renames", "--unified=0")).stdout;
+    let hunk = false;
+    for (const line of patch.split("\n")) {
+      if (line.startsWith("diff --git")) hunk = false;
+      if (line.startsWith("@@")) hunk = true;
+      if (hunk && line.startsWith("+")) check(line.slice(1));
+    }
+    const raw = (await git(...args, "--raw", "-z", "--no-abbrev", "--no-renames")).stdout.split("\0");
+    for (let i = 0; i + 1 < raw.length; i += 2) {
+      check(raw[i + 1] ?? "");
+      const fields = raw[i]?.trim().split(" ");
+      if (fields?.[1] !== "160000") blobs.push(fields?.[3] ?? "");
+    }
+  }
+  const hit = (await blobPrivateEntries(cwd, undefined, blobs, entries))[0];
+  if (hit) throw new privacy.PrivateError(privacy.privateReason("Published blob", hit[1]));
 }
 
 const LFS_POINTER = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:[0-9a-f]{64}\nsize \d+\n$/;

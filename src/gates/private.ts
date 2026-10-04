@@ -1,26 +1,49 @@
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
+const invocationDir = process.cwd();
+const canonical = (path: string): string =>
+  lstatSync(path, { throwIfNoEntry: false })
+    ? realpathSync(path)
+    : join(canonical(dirname(path)), basename(path));
 export class PrivateError extends Error {}
 export function loadPrivateStrings(
   configDir = process.env.LIMITLESS_CONFIG_DIR ?? join(homedir(), ".config", "limitless"),
+  roots: string[] = [process.cwd()],
 ): { value: string; entry: number }[] {
   let text: string;
   try {
-    text = readFileSync(join(configDir, "private-strings.txt"), "utf8");
+    configDir = resolve(invocationDir, configDir);
+    const file = canonical(join(configDir, "private-strings.txt"));
+    const locations = [configDir, canonical(configDir), file];
+    const boundaries = roots.flatMap((root) => [resolve(root), canonical(resolve(root))]);
+    if (boundaries.some((root) => locations.some((path) => `${path}/`.startsWith(`${root}/`))))
+      throw new PrivateError("Private config is inside repository; publication blocked");
+    if (!lstatSync(file, { throwIfNoEntry: false })) return [];
+    if (!statSync(file).isFile()) throw new Error("not a regular file");
+    text = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(file));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    if (error instanceof PrivateError) throw error;
     throw new PrivateError("Cannot read private-strings.txt; publication blocked");
   }
   return text.split(/\r?\n/).flatMap((line, i) => {
-    const value = line.trim().toLowerCase();
-    return value && !value.startsWith("#") ? [{ value, entry: i + 1 }] : [];
+    const value = line.trim().normalize("NFKC").toLowerCase();
+    return value && !line.trim().startsWith("#") ? [{ value, entry: i + 1 }] : [];
   });
 }
 export type PrivateStrings = ReturnType<typeof loadPrivateStrings>;
 export const privateMatches = (text: string, entries: PrivateStrings) =>
-  entries.filter(({ value }) => text.toLowerCase().includes(value));
+  entries.filter(({ value }) =>
+    text.split(/\r?\n/).some((line) => {
+      try {
+        line += `\n${decodeURIComponent(line)}`;
+      } catch {
+        /* Check the original line on decode failure. */
+      }
+      return line.normalize("NFKC").toLowerCase().includes(value.normalize("NFKC").toLowerCase());
+    }),
+  );
 export const privateReason = (location: string, entry: number) =>
   `${location} contains a private string (entry ${entry} in private-strings.txt)`;
 export function redactPrivate(text: string, entries: PrivateStrings): string {

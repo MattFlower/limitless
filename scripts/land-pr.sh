@@ -9,11 +9,14 @@ subject="$2"
 dir="${3:-.}"
 repo="MattFlower/limitless"
 private_check="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-private-strings.ts"
+export LIMITLESS_CONFIG_DIR="${LIMITLESS_CONFIG_DIR-$HOME/.config/limitless}"
+[[ "$LIMITLESS_CONFIG_DIR" = /* ]] || export LIMITLESS_CONFIG_DIR="$PWD/$LIMITLESS_CONFIG_DIR"
 cd "$dir"
 
 bun install --frozen-lockfile >/dev/null
-if ! bun run check >/tmp/land-pr-check.log 2>&1; then
-  echo "bun run check failed; see /tmp/land-pr-check.log" >&2
+log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
+if ! bun run check >"$log" 2>&1; then
+  echo "bun run check failed; see $log" >&2
   exit 1
 fi
 
@@ -30,6 +33,7 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
+bun "$private_check" "$pr" "$repo" "$subject" "$head_ref"
 git push -q origin "HEAD:refs/heads/$head_ref"
 sha="$(git rev-parse HEAD)"
 

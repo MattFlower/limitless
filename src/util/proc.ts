@@ -13,6 +13,7 @@ export interface ProcOptions {
   cwd: string;
   env: Record<string, string>;
   stdin?: string;
+  encoding?: BufferEncoding;
   signal?: AbortSignal;
   /** Hard wall-clock limit. */
   timeoutMs?: number;
@@ -163,7 +164,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       );
     }
 
-    child.stdout.setEncoding("utf8");
+    child.stdout.setEncoding(opts.encoding ?? "utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       lastActivity = Date.now();
@@ -237,6 +238,7 @@ export async function sh(
     timeoutMs?: number;
     allowFail?: boolean;
     stdin?: string;
+    encoding?: BufferEncoding;
     signal?: AbortSignal;
   },
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
@@ -245,6 +247,7 @@ export async function sh(
     cmd,
     cwd: opts.cwd,
     signal: opts.signal,
+    encoding: opts.encoding,
     env: opts.env ?? (process.env as Record<string, string>),
     timeoutMs: opts.timeoutMs ?? 120_000,
     // Callers parse this output (diffs, JSON); never silently hand them a truncated tail.
@@ -256,7 +259,7 @@ export async function sh(
   if (res.truncated) {
     throw new Error(`Output of \`${cmd.join(" ")}\` exceeded ${SH_OUTPUT_LIMIT} characters`);
   }
-  if (res.exitCode !== 0 && !opts.allowFail) {
+  if (res.cancelled || res.timedOut || (res.exitCode !== 0 && !opts.allowFail)) {
     throw new CommandError(
       `Command failed (${res.exitCode ?? res.signal}): ${cmd.join(" ")}\n${res.stderr.trim() || res.stdout.trim()}`.slice(
         0,

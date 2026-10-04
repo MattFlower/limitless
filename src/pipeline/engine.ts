@@ -26,6 +26,7 @@ import {
 import { worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
+  checkPrivateRange,
   commitAll,
   createPullRequest,
   createWorktree,
@@ -946,7 +947,12 @@ async function oneRound(
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
-  const privateStrings = () => loadPrivateStrings(ctx.deps.cfg.paths.configDir);
+  const privateStrings = () =>
+    loadPrivateStrings(ctx.deps.cfg.paths.configDir, [
+      cwd,
+      ctx.repo.localPath ?? cwd,
+      ctx.deps.cfg.paths.repos,
+    ]);
   const changeDiff = () =>
     diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change", privateStrings());
   const system =
@@ -1508,11 +1514,17 @@ function deliveryBudget(ctx: RunContext): GitHubBudget {
 async function checkPublication(ctx: RunContext, body: string, pr?: { sha: string; title: string }) {
   const cwd = ctx.state.worktreePath as string;
   try {
-    const entries = loadPrivateStrings(ctx.deps.cfg.paths.configDir);
+    const entries = loadPrivateStrings(ctx.deps.cfg.paths.configDir, [
+      cwd,
+      ctx.repo.localPath ?? cwd,
+      ctx.deps.cfg.paths.repos,
+    ]);
     if (!entries.length) return;
     checkPrivateText(body, pr ? "PR body" : "PR comment", entries);
     if (!pr) return;
     checkPrivateText(pr.title, "PR title", entries);
+    checkPrivateText(ctx.run.deliveryBranch ?? ctx.run.branch ?? "", "Branch name", entries);
+    await checkPrivateRange(cwd, `${ctx.run.baseSha}..${pr.sha}`, entries);
     const messages = await worktreeGit(["git", "log", "--format=%B", `${ctx.run.baseSha}..${pr.sha}`], {
       cwd,
     });

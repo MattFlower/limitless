@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
@@ -13,7 +21,7 @@ import {
   singleFlight,
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
-import { loadPrivateStrings } from "../src/gates/private.ts";
+import { loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
 import {
   compareGates,
   type GateRun,
@@ -747,4 +755,48 @@ describe("baseline cache", () => {
       gatesHash({ ...cfg, checks: [{ name: "lint", run: "bun run lint" }] }),
     );
   });
+});
+
+test("private policy rejects broken lists and repository aliases; normalizes both sides", () => {
+  const root = mkdtempSync(join(tmpdir(), "private-policy-"));
+  const config = join(root, "config");
+  const file = join(config, "private-strings.txt");
+  mkdirSync(config);
+  try {
+    expect(loadPrivateStrings(config)).toEqual([]);
+    symlinkSync(join(root, "missing"), file);
+    expect(() => loadPrivateStrings(config)).toThrow("Cannot read");
+    rmSync(file);
+    writeFileSync(file, Buffer.from([0xff]));
+    expect(() => loadPrivateStrings(config)).toThrow("Cannot read");
+    writeFileSync(file, "# ignored\n\nＳＥＣＲＥＴ－ＨＯＳＴ．ＥＸＡＭＰＬＥ\n");
+    const entries = loadPrivateStrings(config);
+    expect(entries[0]?.entry).toBe(3);
+    for (const text of [
+      "secret-host.example",
+      "ＳＥＣＲＥＴ－ＨＯＳＴ．ＥＸＡＭＰＬＥ",
+      "%73ecret-host%2Eexample",
+      "%bad% secret-host.example",
+    ]) {
+      expect(privateMatches(text, entries)).toHaveLength(1);
+      expect(privateMatches(redactPrivate(text, entries), entries)).toEqual([]);
+    }
+    expect(privateMatches("secret-\nhost.example", entries)).toEqual([]);
+    writeFileSync(file, "＃secret-host.example");
+    expect(privateMatches("#secret-host.example", loadPrivateStrings(config))).toHaveLength(1);
+    const alias = join(root, "alias");
+    symlinkSync(config, alias);
+    expect(() => loadPrivateStrings(alias, [config])).toThrow("inside repository");
+    expect(() => loadPrivateStrings(join(config, "absent"), [config])).toThrow("inside repository");
+    const repo = join(root, "repo");
+    mkdirSync(repo);
+    symlinkSync(config, join(repo, "outward"));
+    expect(() => loadPrivateStrings(join(repo, "outward"), [repo])).toThrow("inside repository");
+    rmSync(file);
+    writeFileSync(join(repo, "list"), "secret-host.example");
+    symlinkSync(join(repo, "list"), file);
+    expect(() => loadPrivateStrings(config, [repo])).toThrow("inside repository");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

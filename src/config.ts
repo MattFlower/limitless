@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import type { ResolvedProfile, ReviewFinder, Role } from "./core/types.ts";
 import { evalSettings } from "./evals/settings.ts";
@@ -139,7 +139,7 @@ export function loadConfig(
     repos: join(home, "repos"),
     work: join(home, "work"),
     runs: join(home, "runs"),
-    configDir,
+    configDir: resolve(configDir),
   };
   for (const dir of [paths.home, paths.repos, paths.work, paths.runs]) mkdirSync(dir, { recursive: true });
 

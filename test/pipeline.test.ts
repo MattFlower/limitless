@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -2124,92 +2124,162 @@ esac
     expect(readFileSync(join(home, "gh-calls"), "utf8").match(/^pr create/gm)).toHaveLength(1);
   });
 
-  test.each(["commit", "title", "body", "draft-body", "unreadable"])(
-    "private strings stop %s delivery before any push",
-    async (scenario) => {
-      const bare = await githubFixture();
-      const entry = "secret-host.example";
-      const f = start(async (s) => {
-        const role = roleOf(s);
-        if (role === "triage")
-          return {
-            structured: triage({
-              title: scenario === "title" ? entry : "Add farewell",
-              suggested_profile: "quick",
-            }),
-          };
-        if (role === "review") {
-          if (scenario === "unreadable") {
-            rmSync(join(home, "cfg", "private-strings.txt"));
-            mkdirSync(join(home, "cfg", "private-strings.txt"));
-          }
-          return {
-            structured:
-              scenario === "draft-body"
-                ? {
-                    ...approve,
-                    verdict: "request_changes",
-                    summary: entry,
-                    findings: [
-                      {
-                        label: "new",
-                        prior: "",
-                        severity: "blocker",
-                        security: false,
-                        ...findingEvidence,
-                        file: "farewell.txt",
-                        line: 1,
-                        title: "Fix",
-                        detail: "Fix",
-                        suggestion: "Fix",
-                      },
-                    ],
-                  }
-                : approve,
-          };
+  test.each([
+    "commit",
+    "title",
+    "body",
+    "draft-body",
+    "unreadable",
+    "branch",
+    "history",
+    "message-body",
+    "encoded-body",
+    "draft-history",
+    "lfs-history",
+  ])("private strings stop %s delivery before any push", async (scenario) => {
+    const bare = await githubFixture();
+    const entry = scenario === "branch" ? "secret-host-example" : "secret-host.example";
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage")
+        return {
+          structured: triage({
+            title: scenario === "title" ? entry : "Add farewell",
+            suggested_profile: "quick",
+          }),
+        };
+      if (role === "review") {
+        if (scenario === "unreadable") {
+          rmSync(join(home, "cfg", "private-strings.txt"));
+          mkdirSync(join(home, "cfg", "private-strings.txt"));
         }
-        if (scenario === "commit") {
-          writeFileSync(join(s.cwd, "farewell.txt"), "goodbye\n");
-          await sh(["git", "add", "."], { cwd: s.cwd });
-          await sh(
-            ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", entry.toUpperCase()],
-            { cwd: s.cwd },
-          );
+        return {
+          structured: ["draft-body", "draft-history"].includes(scenario)
+            ? {
+                ...approve,
+                verdict: "request_changes",
+                summary: scenario === "draft-body" ? entry : "Repair required",
+                findings: [
+                  {
+                    label: "new",
+                    prior: "",
+                    severity: "blocker",
+                    security: false,
+                    ...findingEvidence,
+                    file: "farewell.txt",
+                    line: 1,
+                    title: "Fix",
+                    detail: "Fix",
+                    suggestion: "Fix",
+                  },
+                ],
+              }
+            : approve,
+        };
+      }
+      if (["history", "message-body", "draft-history", "lfs-history"].includes(scenario)) {
+        let content = scenario === "message-body" ? "safe" : entry;
+        if (scenario === "lfs-history") {
+          const oid = createHash("sha256").update(entry).digest("hex");
+          const common = (await sh(["git", "rev-parse", "--git-common-dir"], { cwd: s.cwd })).stdout.trim();
+          const object = resolve(s.cwd, common, "lfs/objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+          mkdirSync(dirname(object), { recursive: true });
+          writeFileSync(object, entry);
+          content = `version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize ${entry.length}\n`;
         }
-        return { files: { "farewell.txt": "goodbye\n" }, text: scenario === "body" ? entry : "Done" };
-      });
-      f.cfg.maxRounds = 1;
-      mkdirSync(f.cfg.paths.configDir, { recursive: true });
-      writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), entry);
-      registerGithub(f, bare);
-      const calls: string[] = [];
-      const originalGit = Bun.which("git");
-      if (!originalGit) throw new Error("git unavailable");
-      writeFileSync(
-        join(home, "bin", "git"),
-        `#!/bin/sh\nfor arg in "$@"; do [ "$arg" = push ] && echo push >> '${join(home, "push-calls")}'; done\nexec '${originalGit}' "$@"\n`,
-        { mode: 0o755 },
-      );
-      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-      expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
-      expect(existsSync(join(home, "push-calls"))).toBe(false);
-      expect(f.store.getRun(run.id)?.prUrl).toBeNull();
-      const error = f.store.getRun(run.id)?.error ?? "";
-      expect(error.toLowerCase()).not.toContain(entry);
-      if (scenario !== "unreadable") expect(error).toContain("entry 1 in private-strings.txt");
-      calls.push(
-        ...f.store
-          .listEvents(run.id)
-          .filter((e) => e.type === "status" || e.type === "error")
-          .map((e) => e.message),
-      );
-      expect(calls.join("\n").toLowerCase()).not.toContain(entry);
-      expect(
-        (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
-          .stdout,
-      ).toBe("");
-    },
-  );
+        writeFileSync(join(s.cwd, "transient.txt"), content);
+        await sh(["git", "add", "."], { cwd: s.cwd });
+        await sh(
+          [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            scenario === "message-body" ? `Safe subject\n\n${entry}` : "safe",
+          ],
+          { cwd: s.cwd },
+        );
+        rmSync(join(s.cwd, "transient.txt"));
+        await sh(["git", "add", "."], { cwd: s.cwd });
+        await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "remove transient"], {
+          cwd: s.cwd,
+        });
+      }
+      if (scenario === "commit") {
+        writeFileSync(join(s.cwd, "farewell.txt"), "goodbye\n");
+        await sh(["git", "add", "."], { cwd: s.cwd });
+        await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", entry.toUpperCase()], {
+          cwd: s.cwd,
+        });
+      }
+      return {
+        files: { "farewell.txt": "goodbye\n" },
+        text: scenario === "body" ? entry : scenario === "encoded-body" ? "%73ecret-host.example" : "Done",
+      };
+    });
+    f.cfg.maxRounds = 1;
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), entry);
+    registerGithub(f, bare);
+    const calls: string[] = [];
+    const originalGit = Bun.which("git");
+    if (!originalGit) throw new Error("git unavailable");
+    writeFileSync(
+      join(home, "bin", "git"),
+      `#!/bin/sh\nfor arg in "$@"; do [ "$arg" = push ] && echo push >> '${join(home, "push-calls")}'; done\nexec '${originalGit}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    const run = await f.createRun({
+      repo: "test/repo",
+      prompt: scenario === "branch" ? "Secret Host Example" : "Add farewell",
+      profile: "quick",
+    });
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+    expect(existsSync(join(home, "push-calls"))).toBe(false);
+    expect(f.store.getRun(run.id)?.prUrl).toBeNull();
+    const error = f.store.getRun(run.id)?.error ?? "";
+    expect(error.toLowerCase()).not.toContain(entry);
+    if (scenario !== "unreadable") expect(error).toContain("entry 1 in private-strings.txt");
+    calls.push(
+      ...f.store
+        .listEvents(run.id)
+        .filter((e) => e.type === "status" || e.type === "error")
+        .map((e) => e.message),
+    );
+    expect(calls.join("\n").toLowerCase()).not.toContain(entry);
+    expect(
+      (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+        .stdout,
+    ).toBe("");
+  });
+
+  test("private strings outside the published range permit clean delivery", async () => {
+    writeFileSync(join(repoDir, "old.txt"), "secret-host.example");
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "secret-host.example"], {
+      cwd: repoDir,
+    });
+    rmSync(join(repoDir, "old.txt"));
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "removed"], {
+      cwd: repoDir,
+    });
+    const bare = await githubFixture();
+    const f = start((s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(f.store.getRun(run.id)?.prUrl).toBe("https://github.com/test/repo/pull/1");
+  });
 
   test("private strings stop existing-branch delivery before pushing repairs", async () => {
     const bare = await githubFixture();
