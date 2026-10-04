@@ -1,6 +1,8 @@
+import { strict as assert } from "node:assert";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { z } from "zod";
 import { CommandError, sh } from "../util/proc.ts";
 
 /** Each pipeline run has its own scope; `false` opts out of the hardened git wrapper. */
@@ -12,19 +14,10 @@ const SEPARATE_VALUE_OPTIONS = new Set(["-C", "--git-dir", "--work-tree", "--nam
 
 /** Recorded before candidate execution; the sidecar is outside the writable checkout. */
 export async function recordWorktree(cwd: string): Promise<void> {
-  const paths = await sh(["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], {
-    cwd,
-  });
-  writeFileSync(
-    `${resolve(cwd)}.git-paths`,
-    JSON.stringify([
-      realpathSync(cwd),
-      ...paths.stdout
-        .trim()
-        .split("\n")
-        .map((p) => realpathSync(p)),
-    ]),
-  );
+  const cmd = ["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"];
+  const r = await sh(cmd, { cwd });
+  const dirs = [cwd, ...r.stdout.trim().split("\n")].map((p) => realpathSync(p));
+  writeFileSync(`${resolve(cwd)}.git-paths`, JSON.stringify(dirs));
 }
 
 function trustedEnv(cwd: string, env: Record<string, string>) {
@@ -34,34 +27,19 @@ function trustedEnv(cwd: string, env: Record<string, string>) {
       throw new Error("Missing trusted Git paths");
     return env;
   }
-  const paths: unknown = JSON.parse(readFileSync(record, "utf8"));
-  if (
-    !Array.isArray(paths) ||
-    paths.length !== 3 ||
-    paths.some((p) => typeof p !== "string" || !p.startsWith("/"))
-  )
-    throw new Error("Invalid trusted Git paths");
-  const [work, admin, common] = paths as [string, string, string];
-  const refuse = () => {
-    throw new Error("Unsafe worktree Git administration");
-  };
+  const path = z.string().startsWith("/");
+  const [work, admin, common] = z.tuple([path, path, path]).parse(JSON.parse(readFileSync(record, "utf8")));
+  const unsafe = "Unsafe worktree Git administration";
   const inspect = (path: string) => {
     const stat = lstatSync(path);
-    if (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1)) refuse();
-    if (stat.isDirectory())
-      for (const name of readdirSync(path)) {
-        if (name === "config" || name === "config.worktree") refuse();
-        inspect(join(path, name));
-      }
+    assert(path === admin || !/\/config(?:\.worktree)?$/.test(path), unsafe);
+    assert(stat.isDirectory() || (stat.isFile() && stat.nlink === 1), unsafe);
+    if (stat.isDirectory()) for (const name of readdirSync(path)) inspect(join(path, name));
   };
   inspect(admin);
-  if (
-    realpathSync(cwd) !== work ||
-    !lstatSync(admin).isDirectory() ||
-    resolve(admin, readFileSync(join(admin, "commondir"), "utf8").trim()) !== common ||
-    resolve(admin, readFileSync(join(admin, "gitdir"), "utf8").trim()) !== join(work, ".git")
-  )
-    refuse();
+  assert(realpathSync(cwd) === work && lstatSync(admin).isDirectory(), unsafe);
+  for (const [name, target] of Object.entries({ commondir: common, gitdir: join(work, ".git") }))
+    assert(resolve(admin, readFileSync(join(admin, name), "utf8").trim()) === target, unsafe);
   return { ...env, GIT_DIR: admin, GIT_COMMON_DIR: common, GIT_WORK_TREE: work };
 }
 

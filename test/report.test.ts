@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import type { Invocation } from "../src/core/types.ts";
 import { computeStats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
+import { compareGates, type GateRun } from "../src/gates/run.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { renderReport, verifiedFailureState } from "../src/pipeline/report.ts";
 
@@ -441,33 +442,34 @@ test("shadow review calls stay out of the work log and per-model review stats; t
   }
 });
 
-test("confinement failures are reported as blocking infrastructure errors", () => {
-  const md = renderReport({
-    success: false,
-    runId: "confined",
-    prompt: "check",
-    state: {
-      lastGates: [
+for (const flagged of [true, false])
+  test(`confinement failures are reported as blocking infrastructure errors (flagged=${flagged})`, () => {
+    const run: GateRun = {
+      setupOk: true,
+      setup: [],
+      checks: [
         {
           name: "test",
-          verdict: "confinement_error",
-          blocking: true,
-          result: {
-            name: "test",
-            command: "test",
-            ok: false,
-            exitCode: 1,
-            durationMs: 1,
-            output: "",
-            confinementError: true,
-          },
+          command: "test",
+          ok: false,
+          exitCode: 1,
+          durationMs: 1,
+          output: flagged ? "" : "sandbox_apply: Operation not permitted",
+          ...(flagged ? { confinementError: true } : {}),
         },
       ],
-    },
-    invocations: [],
-    totals: { costUsd: 0, costEquivUsd: 0 },
-    runUrl: "http://localhost/runs/confined",
+    };
+    const md = renderReport({
+      success: false,
+      runId: "confined",
+      prompt: "check",
+      state: {
+        lastGates: compareGates(run, run),
+      },
+      invocations: [],
+      totals: { costUsd: 0, costEquivUsd: 0 },
+      runUrl: "http://localhost/runs/confined",
+    });
+    expect(md).toContain("❌ confinement error");
+    expect(md).not.toContain("still failing");
   });
-  expect(md).toContain("❌ confinement error");
-  expect(md).not.toContain("still failing");
-});

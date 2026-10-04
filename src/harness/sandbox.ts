@@ -43,6 +43,7 @@ export interface ConfinementBackend {
   verify(roots: WriteRoots, opts: ProcOptions, run: typeof runProcess): Promise<void>;
   wrap(cmd: string[], roots: WriteRoots): string[];
 }
+export const confinementScope = new AsyncLocalStorage<ConfinementBackend>();
 export const seatbeltBackend: ConfinementBackend = {
   verify: (roots, opts, run) => verifySeatbelt(run, SANDBOX_EXEC, process.platform, roots, opts.signal),
   wrap: (cmd, roots) => [SANDBOX_EXEC, "-p", seatbeltProfile(roots), ...cmd],
@@ -130,23 +131,29 @@ export async function runSandboxed(
   roots: WriteRoots,
   run = runProcess,
   verify?: () => Promise<void>,
-  backend: ConfinementBackend = seatbeltBackend,
+  backend: ConfinementBackend = confinementScope.getStore() ?? seatbeltBackend,
 ): Promise<ProcResult> {
   await (verify ? verify() : backend.verify(roots, opts, run));
   opts.signal?.throwIfAborted();
   const token = `limitless-started-${crypto.randomUUID()}`;
   let started = false;
-  const result = await run({
+  const payload: ProcOptions = {
     ...opts,
-    cmd: backend.wrap(
-      ["/bin/sh", "-c", 'printf "%s\\n" "$1"; shift; exec "$@"', "sh", token, ...opts.cmd],
-      roots,
-    ),
+    cmd: [
+      // Confirm sandbox startup separately from the candidate's exit status.
+      "/bin/sh",
+      "-c",
+      'printf "%s\\n" "$1"; shift; exec "$@"',
+      "sh",
+      token,
+      ...opts.cmd,
+    ],
     onStdoutLine: (line) => {
       if (line === token) started = true;
       else opts.onStdoutLine?.(line);
     },
-  });
+  };
+  const result = await run({ ...payload, cmd: backend.wrap(payload.cmd, roots) });
   if (!started)
     throw new ConfinementError(
       `Write confinement payload did not start: ${result.stderr || result.exitCode}`,
@@ -159,7 +166,6 @@ export async function runConfined(
   opts: Omit<ProcOptions, "cmd"> & { command: string },
   verify?: () => Promise<void>,
   run = runProcess,
-  backend: ConfinementBackend = seatbeltBackend,
 ): Promise<ProcResult> {
   return withCommandScratch(opts.cwd, async () => {
     const scope = commandScratch.getStore();
@@ -198,7 +204,6 @@ export async function runConfined(
       observed(writeRoots(opts.cwd, scratch)),
       run,
       verify,
-      backend,
     );
   });
 }

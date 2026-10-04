@@ -18,7 +18,7 @@ import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.t
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
 import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
-import { type ConfinementBackend, runConfined } from "../harness/sandbox.ts";
+import { runConfined } from "../harness/sandbox.ts";
 import { createScratch, removeScratch } from "../harness/scratch.ts";
 import type { ModelTarget } from "../harness/types.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../pipeline/prompts.ts";
@@ -28,14 +28,9 @@ import { agentEnv, sh } from "../util/proc.ts";
 import type { hiddenContents, ImplementCase } from "./cases.ts";
 import { gatesAt } from "./prepare.ts";
 
-export async function prepareImplement(
-  item: ImplementCase,
-  cwd: string,
-  signal: AbortSignal,
-  backend?: ConfinementBackend,
-) {
+export async function prepareImplement(item: ImplementCase, cwd: string, signal: AbortSignal) {
   const gates = await gatesAt(cwd, item.base, signal);
-  const baseline = await runGates(cwd, gates, signal, {}, backend);
+  const baseline = await runGates(cwd, gates, signal);
   signal.throwIfAborted();
   if (!baseline.setupOk) throw new Error("baseline gate setup failed");
   if (baseline.checks.some((check) => check.output.startsWith("[timed out]")))
@@ -185,7 +180,6 @@ export async function gradeImplement(
   prepared: { gates: GateConfig; baseline: GateRun },
   toolCommands: string[],
   signal: AbortSignal,
-  backend?: ConfinementBackend,
 ): Promise<EvalGrade> {
   // The candidate controls .git/config and .gitattributes, so filters and diff drivers are its code.
   const env = agentEnv();
@@ -248,7 +242,7 @@ export async function gradeImplement(
     });
     evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");
     evidence.auditWarnings = findings.filter((finding) => finding.severity === "warn");
-    const after = await runGates(checkout, prepared.gates, signal, {}, backend);
+    const after = await runGates(checkout, prepared.gates, signal);
     signal.throwIfAborted();
     await worktreeGit(["git", "reset", "--hard", "-q", commit], opts);
     await worktreeGit(["git", "clean", "-fdq"], opts);
@@ -263,19 +257,14 @@ export async function gradeImplement(
     inject(checkout, files);
     const grading = checkout;
     // Confined to the grading checkout and its own scratch HOME/TMPDIR; never the candidate's.
-    const hidden = await runConfined(
-      {
-        command: item.hidden.command,
-        cwd: grading,
-        env: agentEnv(),
-        signal,
-        timeoutMs: item.hidden.timeoutSec * 1000,
-        tailLimit: 6000,
-      },
-      undefined,
-      undefined,
-      backend,
-    );
+    const hidden = await runConfined({
+      command: item.hidden.command,
+      cwd: grading,
+      env: agentEnv(),
+      signal,
+      timeoutMs: item.hidden.timeoutSec * 1000,
+      tailLimit: 6000,
+    });
     signal.throwIfAborted();
     evidence.hidden = {
       exitCode: hidden.exitCode,

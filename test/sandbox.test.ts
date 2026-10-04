@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ConfinementError,
+  confinementScope,
   runConfined,
   runSandboxed,
   verifySeatbelt,
@@ -366,7 +367,7 @@ test("portable backend exercises startup and roots off macOS; production remains
     utimesSync(join(work, "a.ts"), newer, newer);
     const before = readFileSync(join(privateDir(), "index"));
     for (const command of ["git status --porcelain", "git diff", "git log -1 --format=%s"]) {
-      const result = await runConfined({ ...opts, command }, undefined, undefined, fake);
+      const result = await confinementScope.run(fake, () => runConfined({ ...opts, command }));
       expect(result.exitCode).toBe(0);
       expect(readFileSync(join(privateDir(), "index")), command).toEqual(before);
     }
@@ -381,4 +382,22 @@ test("portable backend exercises startup and roots off macOS; production remains
   } finally {
     Object.defineProperty(process, "platform", platform);
   }
+});
+
+test("concurrent backend scopes stay isolated across asynchronous launches", async () => {
+  const recordings = [recordingConfinement(), recordingConfinement()];
+  const results = await Promise.all(
+    recordings.map(({ backend }, i) =>
+      confinementScope.run(backend, async () => {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        return runConfined({ command: `echo scope-${i}`, cwd: work, env: agentEnv() });
+      }),
+    ),
+  );
+  for (const [i, recording] of recordings.entries()) {
+    expect(results[i]?.stdout.trim()).toBe(`scope-${i}`);
+    expect(recording.calls).toHaveLength(1);
+    expect(recording.calls[0]?.opts.cmd).toEqual(["/bin/sh", "-c", `echo scope-${i}`]);
+  }
+  expect(confinementScope.getStore()).toBeUndefined();
 });

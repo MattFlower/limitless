@@ -267,12 +267,15 @@ detection, per-invocation budget, process-group kill on cancel.
   enforcement raises an operational error, even against a failing baseline. macOS is the only
   implemented backend for these commands and Claude editors; other platforms fail closed.
   A restricted host that forbids nested Seatbelt also fails closed. Tests inject a recording
-  backend through factory dependencies; no environment or configuration selects it in production.
+  backend through factory dependencies, scoped per run with `AsyncLocalStorage` across gates,
+  retries and eval preparation/grading; concurrent runs keep separate backends. No environment or
+  configuration selects it in production.
   Gates set `LIMITLESS_CONFINED=1`: only real-Seatbelt tests skip under this marker, with a nested
   Seatbelt explanation. Real-Seatbelt tests run in development and at landing, not inside factory
   gates; portable tests still run there. A child diagnostic `sandbox_apply: Operation not permitted`
   produces a blocking `confinement_error`, captured before output truncation and never downgraded
-  to `still_failing` or `flaky`, even when baseline and candidate fail identically.
+  to `still_failing` or `flaky`, even when baseline and candidate fail identically. Comparison also
+  inspects output and retained first attempts, so restored results without a diagnostic flag still block.
 - Gate setup, checks and pipeline retries share private scratch until completion or cancellation.
   HOME and writable Cargo, npm, Go and XDG caches point into scratch. Explicit RUSTUP_HOME
   and a private copy of Cargo configuration preserve installed toolchain discovery and read

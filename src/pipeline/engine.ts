@@ -50,7 +50,7 @@ import {
   resetTo,
   withGitHubRetry,
 } from "../git/repos.ts";
-import { commandScope } from "../harness/sandbox.ts";
+import { commandScope, confinementScope, seatbeltBackend } from "../harness/sandbox.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
@@ -137,8 +137,10 @@ export async function executeRun(
     return "failed";
   }
   // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
-  return worktreeGitScope.run(true, () =>
-    executeScopedRun(new RunContext(deps, run, repo, signal, isDraining, drainEvents), signal),
+  return confinementScope.run(deps.confinement ?? seatbeltBackend, () =>
+    worktreeGitScope.run(true, () =>
+      executeScopedRun(new RunContext(deps, run, repo, signal, isDraining, drainEvents), signal),
+    ),
   );
 }
 
@@ -394,17 +396,10 @@ async function prepare(ctx: RunContext): Promise<void> {
       const { onWait } = gateEvents(ctx);
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
       const runBaseline = commandScope(wt.path, async (): Promise<GateRun> => {
-        const run = await runGates(wt.path, gates, ctx.signal, { onWait }, ctx.deps.confinement);
+        const run = await runGates(wt.path, gates, ctx.signal, { onWait });
         ctx.checkCancelled();
         // Retry before resetting, so a check sees the same build output as its first attempt.
-        const retried = await retryBaselineFailures(
-          run,
-          wt.path,
-          gates,
-          ctx.signal,
-          onWait,
-          ctx.deps.confinement,
-        );
+        const retried = await retryBaselineFailures(run, wt.path, gates, ctx.signal, onWait);
         ctx.checkCancelled();
         return retried;
       });
@@ -991,7 +986,7 @@ async function oneRound(
       let cmp: GateComparison[];
       try {
         await checkoutCommitted(cwd);
-        const after = await runGates(cwd, gates, ctx.signal, events, ctx.deps.confinement);
+        const after = await runGates(cwd, gates, ctx.signal, events);
         ctx.checkCancelled();
         const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
         // Retry before discarding, so a check sees the same build output as its first attempt.
@@ -1002,7 +997,6 @@ async function oneRound(
           changed,
           ctx.signal,
           events.onWait,
-          ctx.deps.confinement,
         );
         ctx.checkCancelled();
         // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
@@ -1879,13 +1873,7 @@ async function mergeForDelivery(
     await ctx.stage(
       "gates",
       async () => {
-        const after = await runGates(
-          cwd,
-          ctx.state.gatesConfig as GateConfig,
-          ctx.signal,
-          gateEvents(ctx),
-          ctx.deps.confinement,
-        );
+        const after = await runGates(cwd, ctx.state.gatesConfig as GateConfig, ctx.signal, gateEvents(ctx));
         ctx.checkCancelled();
         await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
         await mergeGit(cwd, ["clean", "-fdq"]);

@@ -95,7 +95,7 @@ export function validateScratch(spec: AgentSpec): string {
 export interface WriteRoots {
   /** Writable, as given and canonical: the worktree, scratch. */
   write: string[];
-  /** Read-only Git metadata: the worktree's `.git` entry and its private admin directory. */
+  /** Read-only inside them: the worktree's `.git`, so it can't be pointed at another git directory. */
   protect: string[];
 }
 

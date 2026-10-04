@@ -580,7 +580,10 @@ export function verifyProbeEvidence(
 const CONFINE_MARKERS = [
   "worktree-written",
   "scratch-written",
-  ...["cache", "sibling", "home", "config"].map((label) => `${label}-write-denied`),
+  "cache-write-denied",
+  "sibling-write-denied",
+  "home-write-denied",
+  "config-write-denied",
 ];
 
 /** Where the CLI keeps its own state, which a confined editor must run without writing. */
@@ -589,7 +592,12 @@ export const cliConfigDir = (target: ModelTarget, home = homedir()): string =>
     ? (process.env.CODEX_HOME ?? join(home, ".codex"))
     : (process.env.CLAUDE_CONFIG_DIR ?? join(home, ".claude"));
 
-/** Check real edits and denied writes independently of the agent's reported command evidence. */
+/**
+ * An edit-mode agent runs a probe that writes its worktree and scratch and is denied writes to the
+ * repository's shared git directory, a sibling worktree, a home canary and the CLI's own config
+ * directory. The owned canaries are inspected afterwards, independently of anything the agent
+ * reports; completing the run proves the CLI starts and finishes with its config directory read-only.
+ */
 export async function confineLiveCheck(
   harness: Harness,
   target: ModelTarget,
@@ -669,14 +677,12 @@ for label, path in [${Object.entries({ ...canaries, config: configCanary })
         return { status: "fail", reason: "probe was modified" };
       if (signal.aborted || result.status !== "ok")
         return { status: "fail", reason: result.error ?? "edit confinement check did not complete" };
-      for (const [label, dir] of [
-        ["scratch", scratchDir],
-        ["worktree", cwd],
-      ] as const) {
-        const file = join(dir, "confine-allowed");
-        if (!existsSync(file) || readFileSync(file, "utf8") !== token)
-          return { status: "fail", reason: `${label} write did not land` };
-      }
+      const scratchFile = join(scratchDir, "confine-allowed");
+      if (!existsSync(scratchFile) || readFileSync(scratchFile, "utf8") !== token)
+        return { status: "fail", reason: "scratch write did not land" };
+      const allowed = join(cwd, "confine-allowed");
+      if (!existsSync(allowed) || readFileSync(allowed, "utf8") !== token)
+        return { status: "fail", reason: "worktree write did not land" };
       return verifyProbeEvidence(events, command, token, CONFINE_MARKERS)
         ? {
             status: "pass",

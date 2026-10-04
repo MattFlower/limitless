@@ -685,11 +685,13 @@ describe("baseline cache", () => {
 });
 
 const runGates: typeof productionGates = (cwd, cfg, signal, hooks) =>
-  productionGates(cwd, cfg, signal, hooks, fakeConfinement);
+  sandbox.confinementScope.run(fakeConfinement, () => productionGates(cwd, cfg, signal, hooks));
 const retryBaselineFailures: typeof productionBaselineRetry = (run, cwd, cfg, signal, onWait) =>
-  productionBaselineRetry(run, cwd, cfg, signal, onWait, fakeConfinement);
+  sandbox.confinementScope.run(fakeConfinement, () => productionBaselineRetry(run, cwd, cfg, signal, onWait));
 const retryRegressions: typeof productionRetry = (cmp, cwd, cfg, changed, signal, onWait) =>
-  productionRetry(cmp, cwd, cfg, changed, signal, onWait, fakeConfinement);
+  sandbox.confinementScope.run(fakeConfinement, () =>
+    productionRetry(cmp, cwd, cfg, changed, signal, onWait),
+  );
 describe("confined gates on the committed tree", () => {
   const git = (cwd: string, ...args: string[]) =>
     sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd });
@@ -934,6 +936,49 @@ for (const padding of [0, 70_000])
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
+  });
+
+for (const padding of [0, 70_000])
+  test(`output-only confinement results stay blocking through comparison and retries (${padding} bytes)`, async () => {
+    const result = {
+      name: "check",
+      command: "exit 0",
+      ok: false,
+      exitCode: 1,
+      durationMs: 0,
+      output: `sandbox_apply: Operation not permitted\n${"x".repeat(padding)}`,
+    };
+    const passed = { ...result, ok: true, exitCode: 0, output: "passed" };
+    const run = (check: GateRun["checks"][number]): GateRun => ({
+      setupOk: true,
+      setup: [],
+      checks: [check],
+    });
+    const failed = run(result);
+    const recovered: GateRun = run({ ...passed, firstAttempt: result });
+    const cfg: GateConfig = {
+      setup: [],
+      checks: [{ name: result.name, run: result.command }],
+      source: "detected",
+      protectedPaths: [],
+    };
+    const signal = new AbortController().signal;
+    // No subprocess may retry away this operational failure, including restored results without flags.
+    expect(await retryBaselineFailures(failed, "/nonexistent", cfg, signal)).toBe(failed);
+    for (const [baseline, after] of [
+      [failed, failed],
+      [run(passed), failed],
+      [failed, run(passed)],
+      [run(passed), recovered],
+      [recovered, run(passed)],
+    ] as const) {
+      const cmp = compareGates(baseline, after);
+      expect(cmp[0]).toMatchObject({ verdict: "confinement_error", blocking: true });
+      expect(await retryRegressions(cmp, "/nonexistent", cfg, [], signal)).toBe(cmp);
+      expect(formatGateFeedback(cmp)).toContain("CONFINEMENT ERROR (sandbox launch failed)");
+    }
+    const setup: GateRun = { setupOk: false, setup: [result], checks: [] };
+    expect(compareGates(setup, setup)[0]).toMatchObject({ verdict: "confinement_error", blocking: true });
   });
 
 test("a confinement failure on regression retry cannot become flaky", async () => {

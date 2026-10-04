@@ -26,7 +26,7 @@ import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../src
 import { SpecSchema } from "../src/pipeline/schemas.ts";
 import { sh } from "../src/util/proc.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
-import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
+import { recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { enableEfforts, evalFixture } from "./evals-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -206,7 +206,7 @@ test("implement invokes once in edit mode with shared prompt, isolates head/hidd
           prompt: f.item.prompt,
           spec: f.item.spec,
           gates,
-          baseline: await runGates(s.cwd, gates, s.signal, {}, fakeConfinement),
+          baseline: await runGates(s.cwd, gates, s.signal),
           baseSha: f.item.base,
           round: 0,
           feedback: null,
