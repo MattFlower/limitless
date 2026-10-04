@@ -38,7 +38,18 @@ export function localPath(value: unknown): string {
   )
     return "/";
   const url = new URL(value, LOCAL);
-  return url.origin === LOCAL && !/^\/login(\/|$)/.test(url.pathname) ? url.pathname + url.search : "/";
+  const path = url.pathname;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(path);
+  } catch {
+    return "/";
+  }
+  // Resolving dot segments can yield `//host` (`/x/..//host`), which a browser follows off-origin.
+  const unsafe = [...decoded].some((c) => c === "\\" || c < " " || c === "\x7f");
+  return url.origin === LOCAL && !path.startsWith("//") && !unsafe && !/^\/login(\/|$)/.test(decoded)
+    ? path + url.search
+    : "/";
 }
 
 /** Browser half of passkeys: base64url to bytes and back around navigator.credentials. */
