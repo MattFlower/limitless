@@ -114,8 +114,7 @@ export function startGitHubNotifier(
       const entries = loadPrivateStrings(configDir, [cwd, store.getRepo(run.repoId)?.localPath]);
       checkPrivateText(body, "Factory comment", entries);
     } catch {
-      log("Factory comment blocked by private-string policy");
-      return;
+      return log("Factory comment blocked by private-string policy");
     }
     void gh([
       ref.kind === "issue" ? "issue" : "pr",

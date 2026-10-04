@@ -813,13 +813,11 @@ test("daemon invocation directory is not an implicit repository root", async () 
   writeFileSync(join(config, "private-strings.txt"), "secret-host.example");
   const program = `
     import { loadPrivateStrings } from ${JSON.stringify(resolve("src/gates/private.ts"))};
-    import { auditDiff } from ${JSON.stringify(resolve("src/gates/audit.ts"))};
-    const diff = { patch: "", files: [], stat: "", added: 0, removed: 0 };
     if (loadPrivateStrings()[0]?.value !== "secret-host.example") throw new Error("missing list");
-    auditDiff(diff, { taskClass: "question", protectedPaths: [], roots: [${JSON.stringify(repo)}] });
+    loadPrivateStrings(undefined, [${JSON.stringify(repo)}]);
     for (const roots of [[${JSON.stringify(config)}], [${JSON.stringify(root)}]]) {
       let blocked = false;
-      try { auditDiff(diff, { taskClass: "question", protectedPaths: [], roots }); }
+      try { loadPrivateStrings(undefined, roots); }
       catch (error) { blocked = error.message.includes("inside repository"); }
       if (!blocked) throw new Error("repository config accepted");
     }

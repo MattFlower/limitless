@@ -227,7 +227,6 @@ export async function gradeImplement(
     // Audit before gates run: their commands could move HEAD or rewrite the grading repository.
     const names = gateScriptNames(prepared.gates);
     const findings = auditDiff(await diffSince(checkout, item.base, env), {
-      roots: [cwd, checkout],
       allow: parseAllow(item.prompt),
       taskClass: null,
       protectedPaths: prepared.gates.protectedPaths,

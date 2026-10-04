@@ -947,8 +947,7 @@ async function oneRound(
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
-  const privateStrings = () =>
-    loadPrivateStrings(ctx.deps.cfg.paths.configDir, [cwd, ctx.repo.localPath ?? cwd]);
+  const privateStrings = () => loadPrivateStrings(ctx.deps.cfg.paths.configDir, [cwd, ctx.repo.localPath]);
   const changeDiff = () =>
     diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change", privateStrings());
   const system =
@@ -1036,7 +1035,6 @@ async function oneRound(
     async () => {
       const findings = auditDiff(diff, {
         configDir: ctx.deps.cfg.paths.configDir,
-        roots: [cwd, ctx.repo.localPath ?? cwd],
         allow: ctx.run.allow ?? [],
         taskClass: ctx.state.verification && ctx.run.taskClass === "question" ? null : ctx.run.taskClass,
         protectedPaths: gates.protectedPaths,
@@ -1067,7 +1065,6 @@ async function oneRound(
           findings.push(
             ...auditDiff(repairs, {
               configDir: ctx.deps.cfg.paths.configDir,
-              roots: [cwd, ctx.repo.localPath ?? cwd],
               allow: ctx.run.allow ?? [],
               taskClass: ctx.run.taskClass,
               protectedPaths: gates.protectedPaths,
@@ -1512,7 +1509,7 @@ function deliveryBudget(ctx: RunContext): GitHubBudget {
 async function checkPublication(ctx: RunContext, body: string, pr?: { sha: string; title: string }) {
   const cwd = ctx.state.worktreePath as string;
   try {
-    const entries = loadPrivateStrings(ctx.deps.cfg.paths.configDir, [cwd, ctx.repo.localPath ?? cwd]);
+    const entries = loadPrivateStrings(ctx.deps.cfg.paths.configDir, [cwd, ctx.repo.localPath]);
     if (!entries.length) return;
     checkPrivateText(body, pr ? "PR body" : "PR comment", entries);
     if (!pr) return;
@@ -1525,7 +1522,6 @@ async function checkPublication(ctx: RunContext, body: string, pr?: { sha: strin
     checkPrivateText(messages.stdout, "Commit message", entries);
     const findings = auditDiff(await diffSince(cwd, ctx.run.baseSha as string, undefined, false, entries), {
       configDir: ctx.deps.cfg.paths.configDir,
-      roots: [cwd, ctx.repo.localPath ?? cwd],
       taskClass: ctx.run.taskClass,
       protectedPaths: [],
     });

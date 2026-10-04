@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -19,7 +19,6 @@ export function loadPrivateStrings(
     if (boundaries.some((root) => locations.some((path) => `${path}/`.startsWith(`${root}/`))))
       throw new PrivateError("Private config is inside repository; publication blocked");
     if (!lstatSync(file, { throwIfNoEntry: false })) return [];
-    if (!statSync(file).isFile()) throw new Error("not a regular file");
     text = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(file));
   } catch (error) {
     if (error instanceof PrivateError) throw error;
@@ -31,11 +30,13 @@ export function loadPrivateStrings(
   });
 }
 export type PrivateStrings = ReturnType<typeof loadPrivateStrings>;
-// biome-ignore format: Keep normalization and decoding within the task's source-line budget.
-export const privateMatches = (text: string, entries: PrivateStrings) =>
-  entries.filter(({ value }) => text.split(/\r?\n/).some((line) => {
-    try { line += `\n${decodeURIComponent(line)}`; } catch { /* Check the original line on decode failure. */ }
-    return line.normalize("NFKC").toLowerCase().includes(value.normalize("NFKC").toLowerCase()); }));
+const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
+const urlDecoded = (line: string) =>
+  line.replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString());
+export function privateMatches(text: string, entries: PrivateStrings) {
+  const lines = text.split(/\r?\n/).map((line) => normalize(`${line}\n${urlDecoded(line)}`));
+  return entries.filter(({ value }) => lines.some((line) => line.includes(normalize(value))));
+}
 export const privateReason = (location: string, entry: number) =>
   `${location} contains a private string (entry ${entry} in private-strings.txt)`;
 export function redactPrivate(text: string, entries: PrivateStrings): string {

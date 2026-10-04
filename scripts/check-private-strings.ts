@@ -7,10 +7,8 @@ import { checkPrivateRange } from "../src/git/repos.ts";
 import { sh } from "../src/util/proc.ts";
 
 try {
-  const cwd = process.cwd();
-  const common = await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd });
-  const root = resolve(cwd, common.stdout.trim().replace(/\/\.git$/, ""));
-  const entries = privacy.loadPrivateStrings(undefined, [cwd, root]);
+  const common = await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd: process.cwd() });
+  const entries = privacy.loadPrivateStrings(undefined, [process.cwd(), resolve(common.stdout.trim(), "..")]);
   if (entries.length) {
     const [pr = "", repo = "", subject = ""] = process.argv.slice(2);
     const opts = { cwd: process.cwd() };

@@ -9,8 +9,7 @@ subject="$2"
 dir="${3:-.}"
 repo="MattFlower/limitless"
 private_check="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-private-strings.ts"
-export LIMITLESS_CONFIG_DIR="${LIMITLESS_CONFIG_DIR-$HOME/.config/limitless}"
-[[ "$LIMITLESS_CONFIG_DIR" = /* ]] || export LIMITLESS_CONFIG_DIR="$PWD/$LIMITLESS_CONFIG_DIR"
+[[ "${LIMITLESS_CONFIG_DIR-/}" = /* ]] || export LIMITLESS_CONFIG_DIR="$PWD/$LIMITLESS_CONFIG_DIR"
 cd "$dir"
 
 bun install --frozen-lockfile >/dev/null
