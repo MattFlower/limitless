@@ -7177,6 +7177,10 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     cooldown: { status: "quota", error: "slow down" },
   };
 
+  // With the shadow off nothing fails, so every failure kind shares one control run.
+  let shadowOff:
+    | Promise<{ targets: string[]; health: ReturnType<typeof health>; failed: number }>
+    | undefined;
   test.each(Object.keys(failures))(
     "shadow %s failures leave provider health and later production review targets as with the shadow off",
     async (kind) => {
@@ -7210,7 +7214,8 @@ describe("review shadow panel: single reviews decide, the panel only records", (
           failed: failed.length,
         };
       };
-      const off = await runOnce("none");
+      shadowOff ??= runOnce("none");
+      const off = await shadowOff;
       const on = await runOnce("shadow");
       expect(on.failed).toBeGreaterThanOrEqual(3);
       expect(on.targets).toEqual(off.targets);
