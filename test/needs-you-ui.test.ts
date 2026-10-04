@@ -665,3 +665,45 @@ test("per-run SSE forwards committed GitHub observations only for the displayed 
     await f.close();
   }
 });
+
+test("a resolution that arrives after its SSE update still refreshes the run's details", async () => {
+  const refresh = deferred<Response>();
+  const post = deferred<Response>();
+  const resolved: Run = {
+    ...detail.run,
+    status: "resolved",
+    resolution: { kind: "done_elsewhere", by: "human", at: 42, ref: null, note: "Handled" },
+  };
+  await withStream(
+    async (request) =>
+      request === 1
+        ? Response.json(detail)
+        : request === 2
+          ? refresh.promise
+          : Response.json({ ...newerDetail, run: resolved }),
+    async ({ stream, clock, requests }) => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = (async (path, init) =>
+        String(path).endsWith("/resolve") ? post.promise : originalFetch(path, init)) as typeof fetch;
+      try {
+        render();
+        const resolving = invoke("resolve");
+        stream.emit({ kind: "run", run: resolved });
+        await clock.advance(100);
+        expect(requests()).toBe(2);
+        // The POST settles after the SSE-triggered read started; that read is now stale.
+        post.resolve(Response.json(resolved));
+        await resolving;
+        refresh.resolve(Response.json({ ...newerDetail, run: resolved }));
+        await clock.flush();
+        await clock.advance(1000);
+        const html = render();
+        expect(html).toContain("Handled");
+        expect(html).not.toContain('aria-label="Needs you"');
+        expect(html).toContain("current.json");
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    },
+  );
+});

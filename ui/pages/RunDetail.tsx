@@ -227,6 +227,8 @@ export const RunDetail: Component = () => {
         }).then((resolved) => {
           generation++;
           setRun(resolved);
+          // The bump drops reads started before it, so fetch the resolved run's details afresh.
+          scheduleRefresh();
         });
     } catch (e) {
       setActionError((e as Error).message);
