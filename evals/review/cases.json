@@ -1,7 +1,7 @@
 {
   "role": "review",
   "version": 1,
-  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 are merged PRs with no known defect. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 stay clean, because their blocking findings are real but minor. v3 (2026-10-01): review-h01..h19 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days before 2026-10-01, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike; false blocks are reported per case (blocked in a majority of trials) as well as per trial. v3.1 (2026-10-02): the pre-registered audit of the held-out validation run (eval-mur0xwft29pa) reproduced real defects of at least medium consequence in review-h04, h05, h07, h08, h09 and h10, so they are relabelled real; 13 held-out cases stay clean. Defects that only affect runs saved by the previous release (upgrade window) count, because they fail any such run after the deploy that ships the change.",
+  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 were initially labelled clean from merged PRs with no known defect; see the 2026-10-03 corrections and labelHistory. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 were retained as clean on that audit, superseded by the independent 2026-10-03 adjudication below. v3 (2026-10-01): review-h01..h19 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days before 2026-10-01, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike; false blocks are reported per case (blocked in a majority of trials) as well as per trial. v3.1 (2026-10-02): the pre-registered audit of the held-out validation run (eval-mur0xwft29pa) reproduced real defects of at least medium consequence in review-h04, h05, h07, h08, h09 and h10, so they are relabelled real; 13 held-out cases stay clean. Defects that only affect runs saved by the previous release (upgrade window) count, because they fail any such run after the deploy that ships the change. 2026-10-03: under evals/review/LABELS.md, independent medium-or-higher adjudication and orchestrator verification corrected review-033, review-036, review-037 and review-039 to real. Each preserves its original clean label in labelHistory. review-010 and review-034 remain clean (low severity only); review-038 remains clean (finding not a defect). Reports show current and original labels from stored outputs without model calls.",
   "cases": [
     {
       "id": "review-001",
@@ -3762,8 +3762,8 @@
       "repo": "MattFlower/limitless",
       "base": "a7a086ca450227d6bc799bd8040963d5250b4489",
       "head": "1acbc5e9132fe19ebbfd4d68165c5e51c782fc60",
-      "kind": "clean",
-      "source": "mujzrf35u6qk round 1 (PR #22; approved and merged; no later fix known)",
+      "kind": "real",
+      "source": "mujzrf35u6qk round 1 (PR #22; approved and merged; medium defects confirmed by adjudication 2026-10-03)",
       "input": {
         "prompt": "Run detail: copyable run id, role help, exact model versions\n\nOwner feedback on the run detail page (ui/pages/RunDetail.tsx, ui/components/InvocationsTable.tsx):\n1. Make the run id easy to copy: clicking it copies it to the clipboard (navigator.clipboard.writeText inside the click handler, falling back to selecting the text when the clipboard API is refused) and shows a brief \"Copied\" confirmation; keyboard accessible.\n2. In the invocations table, add a small circled question-mark icon next to each role name that explains what the role does and why it exists (triage, spec, holdout, implement, review, verify, chat, summarize, plan, plan_review), as a tooltip/popover that works on hover, focus and tap. Keep the role descriptions in one shared module so the UI and docs can reuse them.\n3. Show the exact model each invocation used, not just our catalog id: the backend model string recorded on the invocation (e.g. claude-opus-5-5, gpt-6-luna, qwen3.8-27b) plus its reasoning effort when recorded, e.g. \"claude/opus → claude-opus-5-5 · high\". Tests for the role description coverage (every Role has one) and the model label formatting.\n\nContext: this is the Limitless repository itself (see AGENTS.md and docs/ARCHITECTURE.md). Keep changes consistent with the existing architecture and code style (SolidJS UI in ui/, theme tokens in ui/styles.css), and make `bun run check` and `bun run build:ui` pass. Keep the change focused (aim for under ~500 changed lines).",
         "spec": {
@@ -3863,8 +3863,28 @@
           }
         ]
       },
-      "defects": [],
-      "snapshot": true
+      "defects": [
+        {
+          "file": "ui/components/InvocationsTable.tsx",
+          "lines": [51, 52],
+          "severity": "major",
+          "category": "accessibility",
+          "summary": "Role help disappears when the pointer moves onto its explanation, violating WCAG 1.4.13 hoverable content.",
+          "required": true,
+          "foundBy": "adjudication 2026-10-03 (codex/sol-6.1 high), reproduction confirmed by the orchestrator"
+        }
+      ],
+      "snapshot": true,
+      "labelHistory": [
+        {
+          "to": "real",
+          "on": "2026-10-03",
+          "rule": "evals/review/LABELS.md",
+          "by": "adjudication 2026-10-03 (codex/sol-6.1 high), reproduction confirmed by the orchestrator",
+          "evidence": "Head ui/components/InvocationsTable.tsx:51-52: onPointerLeave closes with \"if (document.activeElement !== button) setOpen(false)\"; ui/styles.css:849 sets \"pointer-events: none\". Hover without focus, then move onto the explanation: it disappears. Base has no RoleHelp or hover explanation; the head adds both this content and its non-hoverable behavior.",
+          "from": "clean"
+        }
+      ]
     },
     {
       "id": "review-034",
@@ -4087,8 +4107,8 @@
       "repo": "MattFlower/limitless",
       "base": "dfb147e1fcf008fbd6d072d21bff58797f1bbdc3",
       "head": "0ecf59f677df41b8e21e6ae711eec9308616b1a1",
-      "kind": "clean",
-      "source": "mukb090xnhk1 round 1 (PR #80; approved and merged; no later fix known)",
+      "kind": "real",
+      "source": "mukb090xnhk1 round 1 (PR #80; approved and merged; medium defects confirmed by adjudication 2026-10-03)",
       "input": {
         "prompt": "# Verify artifacts: redact only private scenarios\n\nAfter #23, implementer feedback is right (public criteria unredacted, private scenarios as\n`publicSummary`), but the stored `verify-N.json` artifact (what the UI shows) still runs every string\nthrough `redactHoldoutText`, whose literal backstop masks line numbers and identifiers in public\ncriteria's evidence (\"engine.ts:[private detail]\"). Apply the same split as the feedback: public\ncriteria stored as-is, private scenarios stored with their publicSummary and redacted evidence.\nTest: a public criterion's `file:line` evidence survives in the artifact; private scenario text never\nappears.\n\n---\nTracked from `docs/BACKLOG.md` (item 31). Planned work: the orchestrator starts a run for it deliberately. It is not picked up automatically (don't add the `limitless` label).\n\nCloses #31",
         "spec": {
@@ -4181,16 +4201,36 @@
           }
         ]
       },
-      "defects": [],
-      "snapshot": true
+      "defects": [
+        {
+          "file": "src/pipeline/verification.ts",
+          "lines": [17, 18],
+          "severity": "major",
+          "category": "privacy",
+          "summary": "Public criterion ID collisions bypass holdout redaction, and unexpected IDs copy private text verbatim into the pre-delivery artifact.",
+          "required": true,
+          "foundBy": "adjudication 2026-10-03 (codex/sol-6.1 high), reproduction confirmed by the orchestrator"
+        }
+      ],
+      "snapshot": true,
+      "labelHistory": [
+        {
+          "to": "real",
+          "on": "2026-10-03",
+          "rule": "evals/review/LABELS.md",
+          "by": "adjudication 2026-10-03 (codex/sol-6.1 high), reproduction confirmed by the orchestrator",
+          "evidence": "Head src/pipeline/verification.ts:17-18 returns the entire criterion when \"publicIds.has(criterion.id)\"; line 20 copies \"id: criterion.id\" without redaction. A public spec ID H-1 colliding with a holdout ID leaves its private evidence/publicSummary intact; an unexpected ID containing private holdout text also leaks. Base src/pipeline/engine.ts:779-791 JSON.stringify replacer applied redactHoldoutText to every string, including IDs and evidence; the head replaces it with preDeliveryVerifyArtifact.",
+          "from": "clean"
+        }
+      ]
     },
     {
       "id": "review-037",
       "repo": "MattFlower/limitless",
       "base": "6046b0a56c17f296635147a1a2675969aea1155f",
       "head": "43dc3882d13f878994b73b19885d8926e55794d8",
-      "kind": "clean",
-      "source": "mukb09g8axtd round 1 (PR #87; approved and merged; no later fix known)",
+      "kind": "real",
+      "source": "mukb09g8axtd round 1 (PR #87; approved and merged; medium defects confirmed by adjudication 2026-10-03)",
       "input": {
         "prompt": "# A merged needs-human PR marks its run resolved in the UI\n\nWhen a run ends needs-human, the orchestrator often finishes it and merges its draft PR, but the run keeps showing \"needs human\" in the UI and in `limitless ls`.\n\n- When the run's PR is merged (GitHub state, checked by the notifier or on demand), mark the run `resolved` (keep `needs_human` visible in its history), with who merged it.\n- Show resolved runs distinctly on the dashboard and exclude them from the needs-human rate's \"open\" count.\n- Tests with a fake GitHub client.\n\n---\nTracked from `docs/BACKLOG.md` (item 22). Planned work: the orchestrator starts a run for it deliberately. It is not picked up automatically (don't add the `limitless` label).\n\nCloses #39",
         "spec": {
@@ -4292,8 +4332,28 @@
           }
         ]
       },
-      "defects": [],
-      "snapshot": true
+      "defects": [
+        {
+          "file": "src/integrations/github-notifier.ts",
+          "lines": [28, 37],
+          "severity": "major",
+          "category": "performance",
+          "summary": "Merge reconciliation repeatedly scans every needs_human PR sequentially with no backoff, causing hundreds of gh calls per pass.",
+          "required": true,
+          "foundBy": "adjudication 2026-10-03 (codex/sol-6.1 high), reproduction confirmed by the orchestrator"
+        }
+      ],
+      "snapshot": true,
+      "labelHistory": [
+        {
+          "to": "real",
+          "on": "2026-10-03",
+          "rule": "evals/review/LABELS.md",
+          "by": "adjudication 2026-10-03 (codex/sol-6.1 high), reproduction confirmed by the orchestrator",
+          "evidence": "Head src/integrations/github-notifier.ts:28 uses \"limit: Number.MAX_SAFE_INTEGER\" and line 31 awaits one client call per PR. Lines 70-75 invoke reconciliation every five minutes and on needs_human run updates; CLOSED PRs stay in needs_human and are checked again. With 300 closed PRs each pass makes 300 sequential gh pr view calls (lines 15-19). Base has only the comment subscription and no reconciliation scan, timer, or PR-state client.",
+          "from": "clean"
+        }
+      ]
     },
     {
       "id": "review-038",
@@ -4403,8 +4463,8 @@
       "repo": "MattFlower/limitless",
       "base": "67f37b616f01b7b169ffdb79b9b4e831ff00df02",
       "head": "9c647fd337620b5106ff55d1e10a7d3185cc5641",
-      "kind": "clean",
-      "source": "mukj3n9ptegp round 0 (PR #99; approved and merged; no later fix known)",
+      "kind": "real",
+      "source": "mukj3n9ptegp round 0 (PR #99; approved and merged; medium defects confirmed by adjudication 2026-10-03)",
       "input": {
         "prompt": "# Never strand verified work: deliver a draft PR when post-verify steps fail\n\n## Why\nRun mukehly9lr4a (#86) passed verify 16/16 in round 3. Its delivery merge then conflicted, the resolution round failed, and the run ended needs-human **without pushing or opening a PR**. The verified work existed only in the run's worktree, and the orchestrator had to recover it by hand (PR #96).\n\n## Design\n- When a run has a passing verify (or, for `quick`, an approving review) at some commit, and any later step fails (delivery merge, conflict-resolution round, post-merge gates), deliver a **draft PR** from the last verified commit:\n  - title prefixed `[needs human]`, report attached;\n  - a clear section: \"Verified at `<sha>`; failed after verification at `<stage>`: `<reason>`. The PR may conflict with `<base>`.\"\n- Record `lastVerifiedSha` in run state whenever verify passes; delivery uses it on the failure path.\n- For existing-branch (Dependabot) runs, never push on the failure path, as today.\n- #46's refresh runs can then pick up a conflicting draft.\n\n## Acceptance\n- Fake-harness tests:\n  - verify passes, then a conflict round fails: a draft PR is created from `lastVerifiedSha` with the failure explained, and the run is needs_human with `prUrl` set;\n  - a failure before any passing verify behaves as today;\n  - a Dependabot existing-branch run never pushes on this path.\n- `bun run check` passes; under ~250 lines.\n\nCloses #98",
         "spec": {
@@ -4512,8 +4572,46 @@
           }
         ]
       },
-      "defects": [],
-      "snapshot": true
+      "defects": [
+        {
+          "file": "src/pipeline/engine.ts",
+          "lines": [999, 999],
+          "severity": "major",
+          "category": "delivery",
+          "summary": "Fallback cannot rewind a branch already pushed by normal delivery: force-with-lease rejects stale info and no PR is opened.",
+          "required": true,
+          "foundBy": "adjudication 2026-10-03 (codex/sol-6.1 high), reproduction confirmed by the orchestrator"
+        },
+        {
+          "file": "src/git/repos.ts",
+          "lines": [332, 338],
+          "severity": "major",
+          "category": "delivery",
+          "summary": "Fallback reusing an existing ready PR only edits its body, leaving it ready and without the needs human title.",
+          "required": true,
+          "foundBy": "adjudication 2026-10-03 (codex/sol-6.1 high), reproduction confirmed by the orchestrator"
+        },
+        {
+          "file": "src/pipeline/engine.ts",
+          "lines": [964, 968],
+          "severity": "major",
+          "category": "delivery",
+          "summary": "Restart between recording verification and advancing phase can bypass verified fallback and publish unverified retry edits.",
+          "required": true,
+          "foundBy": "adjudication 2026-10-03 (codex/sol-6.1 high), reproduction confirmed by the orchestrator"
+        }
+      ],
+      "snapshot": true,
+      "labelHistory": [
+        {
+          "to": "real",
+          "on": "2026-10-03",
+          "rule": "evals/review/LABELS.md",
+          "by": "adjudication 2026-10-03 (codex/sol-6.1 high), reproduction confirmed by the orchestrator",
+          "evidence": "Head delivery (a): src/pipeline/engine.ts:1132 pushes the current branch before PR creation; fallback at 999 pushes lastVerifiedSha. src/git/repos.ts:292-297 uses \"git push --force-with-lease\" against repo.url, without updating the tracking expectation; after the first push, the rewind is rejected as stale info, before createPullRequest at 1001. (b): src/git/repos.ts:332-338 calls only gh pr edit --body-file for an existing URL; it never changes title or draft status despite fallback passing title \"[needs human]\" and draft:true at engine.ts:1004-1007. (c): engine.ts:964 records verified state, then awaits stopPreview at 968 before buildLoop sets phase deliver at 456. A restart in that window leaves phase loop; a failing resumed round is outside the fallback condition at 147 unless conflictRound is set, and the ordinary NeedsHuman path can deliver retry edits instead of lastVerifiedSha. Base has no lastVerifiedSha, recordVerified, deliverVerifiedDraft, or verifiedFailure branch: all three defects are newly exposed by the added verified-work fallback guarantee.",
+          "from": "clean"
+        }
+      ]
     },
     {
       "id": "review-h01",

@@ -1,5 +1,8 @@
 import type { EvalRun, EvalTrial } from "../core/types.ts";
+import { StoredReviewSchema } from "../pipeline/schemas.ts";
 import { evidenceTarget, recordedTarget } from "../router/targets.ts";
+import type { ReviewCase } from "./cases.ts";
+import type { gradeReview } from "./graders/review.ts";
 
 export interface StatsOptions {
   delta?: number;
@@ -87,8 +90,37 @@ export function completeCases(trials: EvalTrial[], k: number) {
     [...groups].filter(([, group]) => group.length === k && new Set(group.map((t) => t.trial)).size === k),
   );
 }
-/** Prediction metrics pool labeled observations, excluding failed/invalid invocations. */
-function roleMetrics(run: EvalRun, rows: EvalTrial[]) {
+// The runner supplies the server-side grader; the UI also imports these statistics.
+function labelTrials(
+  run: EvalRun,
+  rows: EvalTrial[],
+  cases: ReviewCase[],
+  grader: typeof gradeReview,
+  original = false,
+) {
+  return rows.map((trial) => {
+    const item = cases.find((c) => c.id === trial.caseId);
+    if (!item?.labelHistory || trial.status !== "ok") return trial;
+    const output = StoredReviewSchema.safeParse(trial.output);
+    const kind = original ? (item.labelHistory[0]?.from ?? item.kind) : item.kind;
+    const grade = output.success
+      ? grader(
+          { ...item, kind, defects: kind === "clean" ? [] : item.defects },
+          output.data,
+          run.systems?.find((s) => s.name === trial.details.system)?.causalAttribution,
+        )
+      : undefined;
+    return { ...trial, details: { ...trial.details, grade } };
+  });
+}
+function roleMetrics(run: EvalRun, rows: EvalTrial[], cases: ReviewCase[] = [], grader?: typeof gradeReview) {
+  const original =
+    grader && cases.some((c) => c.labelHistory)
+      ? labelTrials(run, rows, cases, grader, true)
+          .filter((t) => t.status === "ok" && !legacyReviewGrade(t))
+          .flatMap((t) => t.details.grade?.review ?? [])
+      : null;
+  if (original && grader) rows = labelTrials(run, rows, cases, grader);
   const graded = rows.filter((t) => t.status === "ok" && t.details.grade);
   const valid = graded.filter((t) => !legacyReviewGrade(t));
   const review = valid.flatMap((t) =>
@@ -100,6 +132,9 @@ function roleMetrics(run: EvalRun, rows: EvalTrial[]) {
     denominator,
     rate: denominator ? numerator / denominator : null,
   });
+  const originalMatched = original?.reduce((n, r) => n + r.requiredMatched, 0) ?? 0;
+  const originalTotal = original?.reduce((n, r) => n + r.requiredTotal, 0) ?? 0;
+  const originalClean = original?.filter((r) => r.falseBlock !== null) ?? [];
   const matched = review.reduce((n, r) => n + r.requiredMatched, 0);
   const total = review.reduce((n, r) => n + r.requiredTotal, 0);
   const clean = review.filter((r) => r.falseBlock !== null);
@@ -112,6 +147,17 @@ function roleMetrics(run: EvalRun, rows: EvalTrial[]) {
         ? {
             defectRecall: { ...rate(matched, total), ci: wilson(matched, total) },
             falseBlock: rate(clean.filter((r) => r.falseBlock).length, clean.length),
+            ...(original
+              ? {
+                  originalLabels: {
+                    defectRecall: {
+                      ...rate(originalMatched, originalTotal),
+                      ci: wilson(originalMatched, originalTotal),
+                    },
+                    falseBlock: rate(originalClean.filter((r) => r.falseBlock).length, originalClean.length),
+                  },
+                }
+              : {}),
             verdictAccuracy: rate(review.filter((r) => r.verdictMatch).length, review.length),
             underRated: rate(
               review.reduce((n, r) => n + (r.underRated ?? 0), 0),
@@ -258,9 +304,19 @@ function escalation(trials: EvalTrial[], modelId: string, fallbackModel: string 
 export function summarize(
   run: EvalRun,
   trials: EvalTrial[],
-  { cascadeFallback, ...options }: StatsOptions & { cascadeFallback?: string } = {},
+  {
+    cascadeFallback,
+    reviewCases = [],
+    reviewGrader,
+    ...options
+  }: StatsOptions & {
+    cascadeFallback?: string;
+    reviewCases?: ReviewCase[];
+    reviewGrader?: typeof gradeReview;
+  } = {},
 ) {
   const settings = statsOptions(options);
+  const labeledCases = reviewCases.filter((c) => trials.some((t) => t.caseId === c.id));
   const declared = run.systems?.map((system) => system.name) ?? run.models;
   const candidates = [
     ...new Set([
@@ -295,7 +351,7 @@ export function summarize(
       modelId: first ? evidenceTarget(first) : (system?.finders[0]?.target ?? candidate),
       system,
       effort: rows[0]?.effort ?? null,
-      ...roleMetrics(run, rows),
+      ...roleMetrics(run, rows, labeledCases, reviewGrader),
       ...(run.role === "implement"
         ? {
             implement: {
