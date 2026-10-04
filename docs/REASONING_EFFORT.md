@@ -11,7 +11,7 @@ Use bare IDs or `model@effort` in every routing policy cell and in eval `--model
 ```json
 {
   "triage": { "default": ["codex/luna@low|claude/opus@high", "mtplx/qwen-27b@none"] },
-  "review": { "large": ["codex/astra@high", "claude/opus@high"] }
+  "review": { "large": ["codex/sol-6.1@high", "claude/opus@high"] }
 }
 ```
 
@@ -19,7 +19,7 @@ Use bare IDs or `model@effort` in every routing policy cell and in eval `--model
 limitless eval run triage --models codex/luna@low,codex/luna@high --k 2 --follow
 limitless eval policy
 limitless eval policy --write
-bun run smoke --models claude/sonnet@high,codex/luna@low
+bun run smoke --models claude/sonnet-5.5@high,codex/luna@low
 ```
 
 `POST /api/evals` accepts the same references in `models`. The shared resolver rejects
@@ -29,9 +29,9 @@ provider preference and quota headroom. Overlay merging and cell order are uncha
 
 The Models page lists `supportedEfforts` and the optional `effort` default. An empty set
 means explicit control is unavailable; it does not mean the backend performs no reasoning.
-Catalog defaults must belong to the supported set. The existing four Codex defaults
-remain Astra high, Sol medium, Luna medium and Sol 5.6 medium. Models without a configured
-default leave the backend setting unset.
+Catalog defaults must belong to the supported set. The Codex defaults are Sol 6.1, Sol,
+Luna and Sol 5.6, all at medium. Models without a configured default leave the backend
+setting unset.
 
 A bare ID and its explicit catalog default are the same target. Routing deduplicates
 them; eval submissions reject duplicate resolved targets before scheduling, and report
