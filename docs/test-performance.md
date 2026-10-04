@@ -1,5 +1,40 @@
 # Test runtime and coverage review
 
+## Git wrapper caching (#319)
+
+The second pass found that half of all git processes came from `worktreeGit` in `src/git/command.ts`: a hook-config lookup before every command, and an empty-tree `hash-object` before every diff or log. #319 caches both without trusting a stale result.
+
+Measured 2026-10-04 on the same machine as the second pass:
+- Bun 1.4.0, with `codex` off `PATH` as on CI.
+- *Before* is `main` at `8a73535`; *after* adds this change.
+- Two whole-suite runs before and three after, the first four alternating; git starts counted per file as in the second pass.
+
+| Bun 1.4.0 | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Whole-suite wall time | 215.9 s | 183.6 s | −15.0% |
+| Whole-suite CPU time (user + system, with children) | 261.3 s | 203.2 s | −22.2% |
+| Git processes started | 128,054 | 80,582 | −37.1% |
+| Hook lookups (`config --get-regexp ^hook\.`) | 51,903 | 363 | |
+| Fingerprinted listings (`config --list`, each with one `rev-parse`) | 0 | 10,001 | |
+| Empty-tree `hash-object` | 16,239 | 39 | |
+| `git var` (config file locations, once per environment) | 0 | 248 | |
+| Tests | 1,921 | 1,924 | three new |
+
+Lookups and listings together fall from 51,903 to 10,364 (−80.0%). The remaining `--get-regexp` lookups are delivery's check of the source repository's receive hooks, plus fallbacks. The remaining `hash-object` calls are tests that run it themselves, and the deliberately unhardened scope.
+
+Each *before* run had one failure, "tracked text and triage recovery examples use neutral service labels". It reads tracked files, and the *before* copy was an archive with no `.git`. The *after* runs, in the git worktree, had none.
+
+**Per command on this machine:**
+
+| | Wall time |
+| --- | ---: |
+| Today: hook lookup process | 0.92 ms |
+| Today: `hash-object` process, per diff or log | 1.05 ms |
+| Cache hit: fingerprint check, no process | 0.04 ms |
+| Cache miss: `rev-parse` and `config --list` in parallel | about 1.8 ms |
+
+How the cache stays safe is described in `src/git/hardening.ts` and in the pull request.
+
 ## Second pass (#282)
 
 Measured 2026-10-03 on Linux x86_64 (kernel 7.2) with an AMD Ryzen 9 5950X (16 cores, 32 threads), 125 GiB of memory, `/tmp` on tmpfs, and git 2.55.0. The machine was otherwise idle. Before and after use the same base commit (`019c3a0`), without and with this change. The headline numbers use Bun 1.4.0, the version CI pins. On Bun 1.4.2 the suite is about 3% faster in absolute terms, with the same relative change.

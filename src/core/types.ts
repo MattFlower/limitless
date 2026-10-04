@@ -200,7 +200,7 @@ export interface Invocation {
   provider: string;
   model: string;
   effort: RecordedEffort | null;
-  modelId: string; // catalog id, e.g. "claude/sonnet"
+  modelId: string; // catalog id, e.g. "claude/opus"
   status: InvocationStatus;
   costUsd: number;
   costEquivUsd: number;
