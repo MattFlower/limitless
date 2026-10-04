@@ -309,7 +309,8 @@ export async function install(
   if (control.recover) {
     if (!existsSync(journal)) return;
     const state: Migration = JSON.parse(readFileSync(journal, "utf8"));
-    if (["prepared", "restored"].includes(state.phase) && (await isLoaded(state.old.label))) return clear();
+    // Rollback data outlives a running old agent: only a healthy replacement retires it.
+    if (["prepared", "restored"].includes(state.phase) && (await isLoaded(state.old.label))) return;
     try {
       if (state.phase !== "replacing" || !(await isLoaded(state.label))) throw new Error("pending migration");
       if (state.label === LABEL) await race(waitForHealthy(client, clock, state.target));
@@ -355,7 +356,6 @@ export async function install(
       restoring = true;
       try {
         if (state && !(await isLoaded(state.old.label))) await restore(state);
-        else if (state?.phase !== "stopping") clear();
         if (drainAttempted && old && (await isLoaded(old.label))) await requestAdmin(client, clock, "resume");
       } catch (resume) {
         throw new Error(`${String(error)}\nResume scheduler failed: ${String(resume)}`, { cause: error });

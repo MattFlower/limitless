@@ -406,7 +406,7 @@ async function interrupted(
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   test(`${signal} restores and bootstraps the old unit and releases lifecycle resources`, async () => {
-    const { output, original } = await interrupted("signal", signal);
+    const { dir, output, original } = await interrupted("signal", signal);
     const r = JSON.parse(output.trim().split("\n").at(-1) ?? "") as MigrationResult;
     expect(r.error).toContain(`interrupted by ${signal}`);
     expect(r.files["original.plist"]).toBe(original);
@@ -414,6 +414,14 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     expect(r.loaded).toContain("arbitrary.installed.daemon");
     expect(r.state).toBe(true);
     expect(r.lock).toBe(false);
+    // The restored old agent is not the replacement: a later deploy that never proves the
+    // replacement healthy must leave the rollback data on disk.
+    const { result: later } = await migration("recover-unhealthy-deploy", "daemon", dir);
+    expect(later.error).toContain("daemon health failed");
+    expect(later.calls.filter((call) => call.startsWith("boot"))).toEqual([]);
+    expect(later.loaded).toContain("arbitrary.installed.daemon");
+    expect(later.state).toBe(true);
+    expect(later.backup).toBe(original);
   });
 }
 for (const operation of ["recover-install", "recover-deploy"]) {
@@ -435,17 +443,19 @@ for (const operation of ["recover-install", "recover-deploy"]) {
   });
 }
 
-test("a failed drain clears its journal so deploy recovery leaves the running agent alone", async () => {
+test("a failed drain keeps its rollback data while deploy recovery leaves the running agent alone", async () => {
   const dir = mkdtempSync(join(tmpdir(), "limitless-drain-failure-"));
   const { result: failed } = await migration("drain", "daemon", dir);
   expect(failed.error).toContain("drain failed");
-  expect(failed.state).toBe(false);
-  expect(failed.backup).toBeNull();
+  expect(failed.state).toBe(true);
+  expect(failed.backup).toBe(failed.old);
   const { result: r } = await migration("recover-deploy", "daemon", dir);
   expect(r.error).toBe("");
   expect(r.calls.filter((call) => call.startsWith("boot"))).toEqual([]);
   expect(r.files["original.plist"]).toBe(failed.old);
   expect(r.loaded).toContain("arbitrary.installed.daemon");
+  expect(r.state).toBe(true);
+  expect(r.backup).toBe(failed.old);
 });
 
 for (const [scenario, signal] of [
@@ -453,7 +463,7 @@ for (const [scenario, signal] of [
   ["signal-drain", "SIGTERM"],
   ["marked-signal-drain", "SIGKILL"],
 ] as const) {
-  test(`${signal} during ${scenario} leaves no rollback for deploy recovery`, async () => {
+  test(`${signal} during ${scenario} leaves the running agent alone and its rollback data intact`, async () => {
     const { dir, original } = await interrupted(scenario, signal, false, "prepared");
     const { result: r } = await migration("recover-deploy", "daemon", dir);
     expect(r.error).toBe("");
@@ -462,8 +472,8 @@ for (const [scenario, signal] of [
     expect(r.loaded).toContain(
       scenario.startsWith("marked") ? "dev.limitless.daemon" : "arbitrary.installed.daemon",
     );
-    expect(r.state).toBe(false);
-    expect(r.backup).toBeNull();
+    expect(r.state).toBe(true);
+    expect(r.backup).toBe(original);
   });
 }
 

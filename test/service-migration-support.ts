@@ -238,6 +238,7 @@ const client: DeployClient = {
     calls.push(`health ${draining ? "draining" : "fresh"}`);
     if (scenario === "deploy-install") await compete();
     if (draining && scenario === "drain-health") throw new Error("drain health failed");
+    if (scenario === "recover-unhealthy-deploy") throw new Error("daemon health failed");
     if (
       ["health", "wrong-sha", "health-bootout", "marked-health-bootout", "phase-update"].includes(scenario) &&
       loaded.has(neutral) &&
@@ -267,7 +268,7 @@ if (scenario.startsWith("recover") && existsSync(join(home, "loaded.json"))) {
 const service = await import("../src/cli/service.ts");
 let error = "";
 try {
-  if (["recover-deploy", "recover-healthy-deploy", "deploy-install"].includes(scenario))
+  if (scenario === "deploy-install" || (scenario.startsWith("recover") && scenario.endsWith("deploy")))
     await service.deploy(0, undefined, false, { command, client, clock });
   else if (scenario === "status") await service.status(0);
   else if (scenario === "uninstall") await service.uninstall();
