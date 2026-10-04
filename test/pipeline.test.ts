@@ -4453,8 +4453,10 @@ protected_paths = ["protected.txt"]
         expected: `Returns ${expected} ${index}`,
       })),
     };
-    const publicEvidence = "src/pipeline/engine.ts:742 publicIdentifier_738 is handled";
-    const retryPublicEvidence = "src/pipeline/verification.ts:42 retryIdentifier_740 is handled";
+    const publicEvidence =
+      'src/farewell.ts:742 publicIdentifier_738 returned 42 instead of 500 with --verbose "enabled"';
+    const retryPublicEvidence =
+      'src/farewell.ts:42 retryIdentifier_740 returned 500 instead of 42 with --verbose "enabled"';
     const privateEvidence = `Observed ${description} ${steps} ${expected} ${evidence}`;
     const retryPrivateEvidence = `Retry observed ${description} ${steps} ${expected} ${retryEvidence}`;
     let verifies = 0;
@@ -4474,7 +4476,9 @@ protected_paths = ["protected.txt"]
       expect(publicRow?.evidence).toBe(
         `${expectedPublicEvidence}; [private detail] [1 private details withheld]`,
       );
-      expect(publicRow?.publicSummary).toBe("[private detail] [1 private details withheld]");
+      expect(publicRow?.publicSummary).toBe(
+        `${expectedPublicEvidence}; [private detail] [1 private details withheld]`,
+      );
       for (const id of ["H-1", "H-2", "H-3"]) {
         const row = artifact.criteria.find((criterion) => criterion.id === id);
         expect(row?.id).toBe(id);
@@ -4534,7 +4538,7 @@ protected_paths = ["protected.txt"]
                 id: "AC-1",
                 status: verifies === 1 ? "blocked" : "unmet",
                 evidence: `${verifies === 1 ? publicEvidence : retryPublicEvidence}; ${privateHoldout.scenarios[0]?.description}`,
-                publicSummary: `${privateHoldout.scenarios[0]?.description}`,
+                publicSummary: `${verifies === 1 ? publicEvidence : retryPublicEvidence}; ${privateHoldout.scenarios[0]?.description}`,
               },
               {
                 id: "H-1",
@@ -4573,7 +4577,7 @@ protected_paths = ["protected.txt"]
     try {
       const run = await f.createRun({
         repo: repoDir,
-        prompt: `Add a farewell file. Public diagnostics: ${publicEvidence}; ${retryPublicEvidence}`,
+        prompt: "Add a farewell file",
       });
       runId = run.id;
       expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");

@@ -149,13 +149,15 @@ test("verifier asks for a public behavior summary and accepts an empty one", () 
 });
 
 test("private feedback uses only sanitized summaries while public evidence stays actionable", () => {
+  const publicDiagnostic =
+    'assertion failed at src/code.ts:12: parseInput returned 42 instead of 500 with --verbose "enabled"';
   const feedback = formatVerifyFeedback(
     {
       criteria: [
         {
           id: "AC-1",
           status: "unmet",
-          evidence: "assertion failed at code.ts:12; secret input privateCanary_731",
+          evidence: `${publicDiagnostic}; secret input privateCanary_731`,
           publicSummary: "secret input privateCanary_731",
         },
         {
@@ -169,11 +171,12 @@ test("private feedback uses only sanitized summaries while public evidence stays
       notes: "",
     },
     spec,
-    holdout,
-    "code.ts:12",
+    {
+      scenarios: holdout.scenarios.map((s) => ({ ...s, description: "Private scenario privateCanary_731" })),
+    },
   );
   expect(feedback).toContain("works");
-  expect(feedback).toContain("assertion failed at code.ts:12");
+  expect(feedback).toContain(publicDiagnostic);
   expect(feedback).toContain("H-1** private scenario (unmet): rejects valid input when the list is empty");
   expect(feedback).not.toContain("privateCanary_731");
   expect(feedback).not.toContain("secret input");
@@ -860,7 +863,7 @@ test.each(["H-1", "h-1", " H-1 "])(
       { ...verify, modelId: "fake", round: 0, attempt: 0 },
       legacy,
       holdout,
-      "code.ts:12",
+      "",
     );
     const rows = JSON.parse(artifact) as Verify;
     expect(rows.criteria.map((c) => c.id)).toEqual(["AC-1", legacyId, "unknown-3", "unknown-4", "unknown-5"]);
@@ -869,7 +872,7 @@ test.each(["H-1", "h-1", " H-1 "])(
       expect(row.publicSummary).toBe("");
       expect(row.requirementCitation).toBe("");
     }
-    const feedback = formatVerifyFeedback(verify, legacy, holdout, "code.ts:12");
+    const feedback = formatVerifyFeedback(verify, legacy, holdout);
     for (const output of [artifact, feedback]) {
       expect(output).toContain("public evidence at code.ts:12");
       for (const secret of [

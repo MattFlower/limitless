@@ -17,8 +17,8 @@ export function preDeliveryVerifyArtifact(
         rowKind(criterion.id, spec, holdout) === "public"
           ? {
               ...criterion,
-              evidence: redact(criterion.evidence, criterion.id),
-              publicSummary: redact(criterion.publicSummary, criterion.id),
+              evidence: redactHoldoutText(criterion.evidence, holdout, publicSources, false),
+              publicSummary: redactHoldoutText(criterion.publicSummary, holdout, publicSources, false),
             }
           : {
               id: rowKind(criterion.id, spec, holdout) === "unknown" ? `unknown-${index + 1}` : criterion.id,

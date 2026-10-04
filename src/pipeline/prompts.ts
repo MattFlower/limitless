@@ -193,7 +193,12 @@ export function formatReviewFeedback(findings: Review["findings"], panel = false
     .join("\n")}`;
 }
 
-export function redactHoldoutText(value: string, holdout: Holdout, publicSources = ""): string {
+export function redactHoldoutText(
+  value: string,
+  holdout: Holdout,
+  publicSources = "",
+  includeObservedLiterals = true,
+): string {
   if (!holdout.scenarios.length) return value;
   const details = new Set<string>();
   const boundaryPattern = (detail: string) => {
@@ -220,7 +225,7 @@ export function redactHoldoutText(value: string, holdout: Holdout, publicSources
     }
   }
   // Observed values and runtime error identifiers need not occur in the authored scenarios.
-  collectLiterals(value);
+  if (includeObservedLiterals) collectLiterals(value);
   if (!details.size) return value;
   const pattern = new RegExp(
     [...details]
@@ -260,13 +265,15 @@ export function formatVerifyFeedback(
       const kind = rowKind(c.id, spec, holdout);
       if (kind === "unknown") return `- **unknown-${index + 1}** (${c.status}): Unknown criterion.`;
       const privateScenario = kind !== "public";
-      const summary = holdout ? redactHoldoutText(c.publicSummary.trim(), holdout, publicSources) : "";
+      const summary = holdout
+        ? redactHoldoutText(c.publicSummary.trim(), holdout, publicSources, privateScenario)
+        : "";
       const behavior = summary.replace(/\[private detail\]|\[\d+ private details withheld\]/g, "");
       const safeSummary = /[\p{L}\p{N}]/u.test(behavior)
         ? summary
         : `The verifier could not confirm this private scenario.${summary.match(/ \[\d+ private details withheld\]$/)?.[0] ?? ""}`;
       if (!privateScenario)
-        return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${holdout ? redactHoldoutText(c.evidence, holdout, publicSources) : c.evidence}`;
+        return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${holdout ? redactHoldoutText(c.evidence, holdout, publicSources, false) : c.evidence}`;
       if (c.status !== "unmet" || (c.requirement !== "request" && c.requirement !== "spec"))
         return `- **${c.id}** private scenario (${c.status}): ${safeSummary}`;
       const citation = c.requirementCitation ?? "";
