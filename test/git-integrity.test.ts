@@ -26,6 +26,7 @@ import {
   sweepClassificationScratch,
 } from "../src/git/repos.ts";
 import { sh } from "../src/util/proc.ts";
+import { seeded } from "./seeded.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
@@ -39,19 +40,24 @@ const edited = 'test.skip("ok", () => {});\n';
 const git = (cwd: string, ...args: string[]) => sh(["git", ...args], { cwd });
 const factory = (...args: string[]) => worktreeGit(["git", ...args], { cwd: work });
 
+const seedRepo = seeded(async (root) => {
+  const repo = join(root, "seed");
+  mkdirSync(repo);
+  await git(repo, "init", "-q", "-b", "main");
+  await git(repo, "config", "user.name", "Test");
+  await git(repo, "config", "user.email", "test@example.com");
+  for (const file of ["sample.test.ts", "flag.test.ts", "assume.test.ts"])
+    writeFileSync(join(repo, file), original);
+  await git(repo, "add", "-A");
+  await git(repo, "commit", "-qm", "base");
+  return (await git(repo, "rev-parse", "HEAD")).stdout.trim();
+});
+
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "git-integrity-"));
   seed = join(dir, "seed");
   work = join(dir, "work");
-  mkdirSync(seed);
-  await git(seed, "init", "-q", "-b", "main");
-  await git(seed, "config", "user.name", "Test");
-  await git(seed, "config", "user.email", "test@example.com");
-  for (const file of ["sample.test.ts", "flag.test.ts", "assume.test.ts"])
-    writeFileSync(join(seed, file), original);
-  await git(seed, "add", "-A");
-  await git(seed, "commit", "-qm", "base");
-  base = (await git(seed, "rev-parse", "HEAD")).stdout.trim();
+  base = (await seedRepo(dir)).value;
   await git(seed, "worktree", "add", "-qb", "worker", work, base);
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
