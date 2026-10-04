@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, realpathSync, rmSync, unlinkSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { Config } from "./config.ts";
 import type { Repo, Run } from "./core/types.ts";
@@ -127,6 +127,7 @@ export async function collectGarbage(
           throw new Error(`worktree is not registered to ${repo.slug}: ${path}`);
         }
       });
+      if (!dryRun && !existsSync(path)) rmSync(`${path}.git-paths`, { force: true });
     } catch (error) {
       result.errors.push(`${run.id} worktree: ${(error as Error).message}`);
     }

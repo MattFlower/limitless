@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import { seatbeltBackend } from "../src/harness/sandbox.ts";
 import { DEFAULT_ROSTERS } from "../src/pipeline/review-system.ts";
 import { PROVIDERS } from "../src/router/catalog.ts";
 
@@ -88,6 +89,7 @@ test("provider concurrency overrides reach the tracker without changing catalog 
       process.env.OMLX_API_KEY || "file-key",
     );
     const defaults = new Factory(loadConfig({ home: join(root, "defaults"), configDir }));
+    expect(defaults.deps.confinement).toBe(seatbeltBackend);
     expect(defaults.tracker.status("omlx")?.maxConcurrent).toBe(4);
     defaults.store.close();
     writeFileSync(
