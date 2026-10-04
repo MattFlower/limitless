@@ -49,7 +49,7 @@ export const SpecSchema = z.object({
   requirements: z.array(z.string()),
   acceptance_criteria: z.array(
     z.object({
-      id: z.string().describe("AC-1, AC-2, ..."),
+      id: z.string().regex(/^AC-\d+$/, { error: (i) => `Invalid id ${i.input}: use AC-n` }),
       criterion: z.string().describe("Observable, testable statement of behavior"),
       how_to_verify: z.string().describe("Concrete command, test, or inspection that proves it"),
     }),
@@ -455,4 +455,13 @@ export function renderSpec(spec: Spec): string {
     `## Assumptions\n${list(spec.assumptions)}`,
     `## Out of scope\n${list(spec.out_of_scope)}`,
   ].join("\n\n");
+}
+
+export function rowKind(id: string, spec: Spec | null, holdout?: Holdout) {
+  const canonical = (value: string) => value.trim().toUpperCase();
+  id = canonical(id);
+  if (holdout?.scenarios.some((s) => canonical(s.id) === id)) return "holdout";
+  return /^AC-\d+$/.test(id) && spec?.acceptance_criteria.some((c) => canonical(c.id) === id)
+    ? "public"
+    : "unknown";
 }

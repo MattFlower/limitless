@@ -99,6 +99,7 @@ import {
   type Review,
   type ReviewScope,
   renderSpec,
+  rowKind,
   type Spec,
   SpecSchema,
   TriageSchema,
@@ -1412,7 +1413,11 @@ async function oneRound(
       const stop = async (routing = ""): Promise<never> => {
         const evidence = verify.criteria
           .filter((c) => c.status === "blocked")
-          .map((c) => `${c.id}: ${c.evidence}`)
+          .map((c, index) =>
+            rowKind(c.id, ctx.state.spec ?? null, ctx.state.holdout) === "unknown"
+              ? `unknown-${index + 1}: private evidence withheld`
+              : `${c.id}: ${c.evidence}`,
+          )
           .join("\n");
         const detail = redactHoldoutText(
           `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`,
