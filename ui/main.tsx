@@ -16,6 +16,13 @@ import { live } from "./store.ts";
 const Shell: Component<RouteSectionProps> = (props) => (
   <>
     <NavBar />
+    <Show when={live.gateSlots()}>
+      {(slots) => (
+        <div role="status">
+          Gate slots: {slots().occupied}/{slots().limit} {slots().holders.join(", ")}
+        </div>
+      )}
+    </Show>
     <Show when={live.draining()}>
       <div class="draining-banner" role="status">
         Draining for deployment: active runs continue; new runs are queued until scheduling resumes.
