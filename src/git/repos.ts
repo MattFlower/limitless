@@ -379,7 +379,7 @@ export async function exportCommit(
 
 /** A detached checkout of `sha` at `dest` sharing `cwd`'s repository, for readers kept off the worktree. */
 export async function addDetachedWorktree(cwd: string, sha: string, dest: string, signal?: AbortSignal) {
-  await sh(["git", "worktree", "add", "--detach", dest, sha], { cwd, signal, timeoutMs: 300_000 });
+  await worktreeGit(["git", "worktree", "add", "--detach", dest, sha], { cwd, signal, timeoutMs: 300_000 });
 }
 
 export async function mergeBase(cwd: string, base: string, head: string): Promise<string> {
@@ -442,6 +442,18 @@ export async function commitAll(cwd: string, message: string): Promise<string | 
 export async function resetTo(cwd: string, sha: string): Promise<void> {
   await worktreeGit(["git", "reset", "--hard", "-q", sha], { cwd });
   await worktreeGit(["git", "clean", "-fdq"], { cwd });
+}
+
+/**
+ * Exactly the committed tree for gates, even when status looks clean: a fresh index drops
+ * skip-worktree and assume-unchanged flags, and `-x` removes ignored payloads (including
+ * info/exclude ones) along with dependencies, which gate setup installs again.
+ */
+export async function checkoutCommitted(cwd: string, env?: Record<string, string>): Promise<void> {
+  const index = await worktreeGit(["git", "rev-parse", "--git-path", "index"], { cwd, env });
+  rmSync(resolve(cwd, index.stdout.trim()), { force: true });
+  await worktreeGit(["git", "reset", "--hard", "-q", "HEAD"], { cwd, env });
+  await worktreeGit(["git", "clean", "-ffdxq"], { cwd, env });
 }
 
 /** Throw away any uncommitted changes (used after read-only stages). */
@@ -1066,7 +1078,10 @@ export async function createEvalWorktree(
   try {
     const pins = await stageEvalRepo(paths, store, slug, base, head, path, signal, labels, snapshot);
     const opts = { cwd: path, signal };
-    await sh(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", pins[1]], opts);
+    await worktreeGit(
+      ["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", pins[1]],
+      opts,
+    );
     for (const ref of ["refs/eval/base", "refs/eval/head"]) await sh(["git", "update-ref", "-d", ref], opts);
     await sh(["git", "reflog", "expire", "--expire=now", "--all"], opts);
     return Object.assign(cleanup, { base: pins[0] });

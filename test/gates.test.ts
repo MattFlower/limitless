@@ -1,5 +1,13 @@
-import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { describe, expect, spyOn, test } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
@@ -21,7 +29,11 @@ import {
   runGates,
 } from "../src/gates/run.ts";
 import { defaultGateSlots, gateSlots, Semaphore } from "../src/gates/slots.ts";
-import type { DiffInfo } from "../src/git/repos.ts";
+import { checkoutCommitted, type DiffInfo } from "../src/git/repos.ts";
+import * as sandbox from "../src/harness/sandbox.ts";
+import { ConfinementError } from "../src/harness/sandbox.ts";
+import * as proc from "../src/util/proc.ts";
+import { sh } from "../src/util/proc.ts";
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -668,3 +680,222 @@ describe("baseline cache", () => {
     );
   });
 });
+
+describe("confined gates on the committed tree", () => {
+  const git = (cwd: string, ...args: string[]) =>
+    sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd });
+  async function linked() {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "limitless-gates-git-")));
+    const cache = join(root, "cache");
+    const work = join(root, "work");
+    await git(root, "init", "-q", cache);
+    writeFileSync(join(cache, "tracked.txt"), "committed");
+    writeFileSync(join(cache, ".gitignore"), "hidden/\nbunfig.toml\nnode_modules/\n");
+    await git(cache, "add", "-A");
+    await git(cache, "commit", "-qm", "base");
+    await git(cache, "worktree", "add", "-q", "--detach", work);
+    return { root, cache, work };
+  }
+
+  test.skipIf(process.platform !== "darwin")(
+    "setup, checks and retries write only the checkout and scratch, descendants included",
+    async () => {
+      const { root, work } = await linked();
+      try {
+        const canary = join(root, "canary");
+        writeFileSync(canary, "untouched");
+        const cfg: GateConfig = {
+          setup: ['echo built > built.txt && echo cached > "$HOME/cache"'],
+          checks: [
+            { name: "inside", run: 'test -f built.txt && echo t > "$TMPDIR/t"' },
+            { name: "escape", run: `sh -c "echo pwned > '${canary}'"` },
+          ],
+          source: "detected",
+          protectedPaths: [],
+        };
+        const run = await runGates(work, cfg, new AbortController().signal);
+        expect(run.setupOk).toBe(true);
+        expect(run.checks.map((c) => [c.name, c.ok])).toEqual([
+          ["inside", true],
+          ["escape", false],
+        ]);
+        const retried = await retryBaselineFailures(run, work, cfg, new AbortController().signal);
+        expect(retried.checks[1]?.ok).toBe(false);
+        expect(readFileSync(canary, "utf8")).toBe("untouched");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("unavailable confinement is an error, never a still_failing result", async () => {
+    const { root, work } = await linked();
+    const spy = spyOn(sandbox, "verifySeatbelt").mockImplementation(async () => {
+      throw new sandbox.ConfinementError("Write confinement unavailable");
+    });
+    try {
+      const marker = join(root, "ran");
+      const cfg: GateConfig = {
+        setup: [],
+        checks: [{ name: "check", run: `touch '${marker}'; false` }],
+        source: "detected",
+        protectedPaths: [],
+      };
+      const failed = {
+        name: "check",
+        command: cfg.checks[0]?.run ?? "",
+        ok: false,
+        exitCode: 1,
+        durationMs: 1,
+        output: "",
+      };
+      const failing: GateRun = { setupOk: true, setup: [], checks: [failed] };
+      await expect(runGates(work, cfg, new AbortController().signal)).rejects.toThrow(
+        sandbox.ConfinementError,
+      );
+      await expect(retryBaselineFailures(failing, work, cfg, new AbortController().signal)).rejects.toThrow(
+        sandbox.ConfinementError,
+      );
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      spy.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform !== "darwin")(
+    "gates see committed bytes plus fresh setup, even when status reports nothing",
+    async () => {
+      const { root, cache, work } = await linked();
+      try {
+        // Ignored payloads via .gitignore and info/exclude, plus a skip-worktree edit status hides.
+        mkdirSync(join(work, "hidden"));
+        writeFileSync(join(work, "hidden", "x.ts"), "payload");
+        writeFileSync(join(work, "bunfig.toml"), 'preload = ["./hidden/x.ts"]');
+        writeFileSync(join(cache, ".git", "info", "exclude"), "excluded.ts\n");
+        writeFileSync(join(work, "excluded.ts"), "payload");
+        mkdirSync(join(work, "node_modules"));
+        writeFileSync(join(work, "node_modules", "stale"), "agent-installed");
+        await git(work, "update-index", "--skip-worktree", "tracked.txt");
+        writeFileSync(join(work, "tracked.txt"), "forged");
+        expect((await git(work, "status", "--porcelain")).stdout).toBe("");
+        await checkoutCommitted(work);
+        const cfg: GateConfig = {
+          setup: ["mkdir -p node_modules && echo fresh > node_modules/dep"],
+          checks: [
+            {
+              name: "committed",
+              run: 'test ! -e hidden && test ! -e bunfig.toml && test ! -e excluded.ts && test ! -e node_modules/stale && test "$(cat tracked.txt)" = committed && test -f node_modules/dep',
+            },
+          ],
+          source: "detected",
+          protectedPaths: [],
+        };
+        const run = await runGates(work, cfg, new AbortController().signal);
+        expect(run.checks[0]?.output).toBe("");
+        expect(run.checks[0]?.ok).toBe(true);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test.skipIf(process.platform !== "darwin")(
+  "backend launch failure after preflight cannot become still_failing against a failing baseline",
+  async () => {
+    const cwd = tempDir({});
+    let probes = 0;
+    let launches = 0;
+    const runner = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      const probing = opts.cmd.at(-1)?.endsWith("/denied");
+      if (probing) {
+        probes++;
+        writeFileSync(opts.cmd.at(-2) ?? "", "ok");
+      } else launches++;
+      return {
+        exitCode: probing ? 0 : 71,
+        stdout: probing ? "verified" : "",
+        stderr: "sandbox initialization failed",
+        signal: null,
+        cancelled: false,
+        timedOut: false,
+        idleTimedOut: false,
+        truncated: false,
+        durationMs: 1,
+      };
+    });
+    try {
+      const config: GateConfig = {
+        source: "detected",
+        setup: [],
+        checks: [{ name: "test", run: "exit 1" }],
+        protectedPaths: [],
+      };
+      const baseline = {
+        setupOk: true,
+        setup: [],
+        checks: [{ name: "test", command: "exit 1", ok: false, exitCode: 1, output: "", durationMs: 1 }],
+      };
+      await expect(
+        (async () => compareGates(baseline, await runGates(cwd, config, new AbortController().signal)))(),
+      ).rejects.toThrow(ConfinementError);
+      expect(probes).toBe(1);
+      expect(launches).toBe(1);
+    } finally {
+      runner.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(process.platform !== "darwin")(
+  "gate setup and dependent checks share scratch and clean it after completion",
+  async () => {
+    const cwd = tempDir({});
+    let scratch = "";
+    const runner = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (opts.cmd.at(-1)?.endsWith("/denied")) {
+        writeFileSync(opts.cmd.at(-2) ?? "", "ok");
+      } else {
+        const current = opts.env.TMPDIR ?? "";
+        if (opts.cmd.at(-1) === "setup") {
+          scratch = current;
+          writeFileSync(join(scratch, "setup-output"), "ready");
+        } else {
+          expect(current).toBe(scratch);
+          expect(readFileSync(join(current, "setup-output"), "utf8")).toBe("ready");
+        }
+        opts.onStdoutLine?.(opts.cmd[7] ?? "");
+      }
+      return {
+        exitCode: 0,
+        stdout: opts.cmd.at(-1)?.endsWith("/denied") ? "verified" : "",
+        stderr: "",
+        signal: null,
+        cancelled: false,
+        timedOut: false,
+        idleTimedOut: false,
+        truncated: false,
+        durationMs: 1,
+      };
+    });
+    try {
+      const result = await runGates(
+        cwd,
+        {
+          source: "detected",
+          setup: ["setup"],
+          checks: [{ name: "test", run: "check" }],
+          protectedPaths: [],
+        },
+        new AbortController().signal,
+      );
+      expect(result.checks[0]?.ok).toBe(true);
+      expect(existsSync(scratch)).toBe(false);
+    } finally {
+      runner.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);

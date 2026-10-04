@@ -115,10 +115,21 @@ describe("CodexStreamParser", () => {
     for (const feature of ["apps", "plugins", "code_mode", "view_image"]) {
       expect(smokeArgs.join(" ")).toContain(`--disable ${feature}`);
     }
-    const editArgs = buildCodexArgs({ ...spec, privateSession: false, noTools: false, mode: "edit" });
-    expect(editArgs).not.toContain("--ignore-user-config");
-    expect(editArgs).not.toContain("orchestrator.mcp.enabled=false");
-    expect(editArgs).toContain("workspace-write");
+    const edit = { ...spec, privateSession: false, noTools: false, mode: "edit" as const };
+    expect(() => buildCodexArgs(edit)).toThrow("requires a scratch directory");
+    await withScratch(import.meta.dir, async (scratchDir) => {
+      // Editors are confined too: no user config, rules, MCP servers or implicit workspace-write roots.
+      const editArgs = buildCodexArgs({ ...edit, cwd: import.meta.dir, scratchDir });
+      for (const flag of [
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
+        "orchestrator.mcp.enabled=false",
+      ])
+        expect(editArgs).toContain(flag);
+      expect(editArgs).not.toContain("workspace-write");
+      expect(editArgs).not.toContain('web_search="disabled"');
+    });
   });
 
   test("parses a real codex exec --json run", () => {
