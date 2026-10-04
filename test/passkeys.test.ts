@@ -81,6 +81,10 @@ test("registration needs user verification and a discoverable credential; only a
   const other = fakeAuthenticator(origin);
   await passkeys.register(again, other.create(await retry()), "Laptop/1");
   expect(store.listPasskeys().map((p) => p.id)).toEqual([key.id, other.id]);
+  const hostile = fakeAuthenticator(origin).create({ challenge: 'x"\u2028\nsecret' });
+  await expect(passkeys.register(tokenOf(passkeys.enrollLink()), hostile, "Phone/1")).rejects.toThrow(FAILED);
+  // Library messages quote client-chosen values, so only fixed reasons are logged.
+  for (const line of logs) expect(line).toMatch(/^registration failed: [\w ()]+$/);
 });
 
 test("the link is checked again after verification: racing registrations save one, an expired link none", async () => {
@@ -118,9 +122,7 @@ test("a registered passkey signs in once per fresh challenge, with user verifica
   await refused(assertion, "challenge");
   expect(logs.join("\n")).not.toContain(options.challenge);
   await refused(key.get({ challenge: "bm90LWlzc3VlZA" }), "challenge");
-  // A client-chosen challenge with a quote and a newline must not start a second log line.
-  await refused(key.get({ challenge: 'x"\npasskey: forged' }), "challenge");
-  expect(logs.join("|")).not.toMatch(/bm90LWlzc3VlZA|\n/);
+  await refused(key.get({ challenge: 'x"\u2028\npasskey: forged' }), "challenge");
   const stale = await passkeys.authenticationOptions();
   clock.now += 5 * 60_000;
   await refused(key.get(stale), "challenge");
@@ -131,6 +133,9 @@ test("a registered passkey signs in once per fresh challenge, with user verifica
   await refused(forged, "not verified");
   store.removePasskey(key.id);
   await refused(key.get(await passkeys.authenticationOptions()), "unknown credential");
+  // Library messages quote client-chosen values, so only fixed reasons are logged.
+  for (const line of logs.filter((l) => l.startsWith("sign-in")))
+    expect(line).toMatch(/^sign-in failed: [\w ()]+$/);
 });
 
 test("a sign-in fails if its passkey is removed or overtaken while it verifies; zero counters keep working", async () => {

@@ -18,16 +18,28 @@ const MAX_CHALLENGES = 1000;
 const USER = { userName: "limitless", userID: new TextEncoder().encode("limitless") };
 
 const sha256 = (token: string) => createHash("sha256").update(token).digest("hex");
+/** A refusal whose message is ours, so it can be logged as it is. */
+class Refused extends Error {}
+
 /**
- * Failure detail for the log. The library quotes the values it compares (challenges, origins), and those
- * can come from the client, so quoted values, long tokens and control characters are cut out.
+ * Library failures are logged as a fixed reason, never their message: it quotes values the client
+ * chose (challenges, credential ids, origins). The first keyword found names the check that failed.
  */
-const redact = (error: unknown) =>
-  (error instanceof Error ? error.message : String(error))
-    .replace(/\p{Cc}/gu, " ")
-    .replace(/"[^"]*"/g, '"[redacted]"')
-    .replace(/[\w-]{16,}/g, "[redacted]")
-    .slice(0, 300);
+const LIBRARY_REASONS: [keyword: string, reason: string][] = [
+  ["challenge", "challenge not issued or expired"],
+  ["origin", "origin not allowed"],
+  ["rp id", "RP ID mismatch"],
+  ["user verification", "user not verified"],
+  ["user present", "user not present"],
+  ["signature", "signature not verified"],
+  ["counter", "counter not increasing"],
+  ["unique", "passkey already registered (UNIQUE)"],
+];
+const reason = (error: unknown) => {
+  if (error instanceof Refused) return error.message;
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return LIBRARY_REASONS.find(([keyword]) => message.includes(keyword))?.[1] ?? "verification error";
+};
 
 /**
  * WebAuthn passkeys for the first public origin (its host is the relying party). Registration needs a
@@ -114,13 +126,14 @@ export class Passkeys {
         expectedRPID: this.rpID,
         requireUserVerification: true,
       });
-      if (!verified) throw new Error("registration not verified");
+      if (!verified) throw new Refused("registration not verified");
       if (response.clientExtensionResults?.credProps?.rk === false)
-        throw new Error("credential not discoverable");
-      if ((this.enrollments.get(key) ?? 0) <= this.now()) throw new Error("enrollment link used or expired");
+        throw new Refused("credential not discoverable");
+      if ((this.enrollments.get(key) ?? 0) <= this.now())
+        throw new Refused("enrollment link used or expired");
       this.store.addPasskey(registrationInfo.credential, device.slice(0, 256), this.now());
     } catch (error) {
-      this.log(`registration failed: ${redact(error)}`);
+      this.log(`registration failed: ${reason(error)}`);
       throw new Error("passkey registration failed");
     }
     this.enrollments.delete(key);
@@ -134,7 +147,7 @@ export class Passkeys {
   async authenticate(response: AuthenticationResponseJSON): Promise<boolean> {
     const credential = typeof response?.id === "string" ? this.store.passkey(response.id) : null;
     try {
-      if (!credential) throw new Error("unknown credential");
+      if (!credential) throw new Refused("unknown credential");
       const { verified, authenticationInfo } = await verifyAuthenticationResponse({
         response,
         expectedChallenge: this.answer,
@@ -143,14 +156,14 @@ export class Passkeys {
         credential,
         requireUserVerification: true,
       });
-      if (!verified) throw new Error("signature not verified");
+      if (!verified) throw new Refused("signature not verified");
       // The credential was read before the await: it may since have been removed, or another sign-in may
       // have stored a higher counter. The conditional update refuses both.
       if (!this.store.usePasskey(credential.id, authenticationInfo.newCounter, this.now()))
-        throw new Error("passkey removed or counter not increasing");
+        throw new Refused("passkey removed or counter not increasing");
       return true;
     } catch (error) {
-      this.log(`sign-in failed: ${redact(error)}`);
+      this.log(`sign-in failed: ${reason(error)}`);
       return false;
     }
   }
