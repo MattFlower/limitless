@@ -11,6 +11,7 @@ import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { Harness } from "../src/harness/types.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
+import { fakeConfinement } from "./confinement.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
@@ -108,6 +109,7 @@ function start(): Factory {
   } as unknown as Policy;
   const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
   factory = new Factory(cfg, {
+    confinement: fakeConfinement,
     providers,
     models: [model("typesafe/jev", "typesafe"), model("alpha/m", "alpha")],
     policy,

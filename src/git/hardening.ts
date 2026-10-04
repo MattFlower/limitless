@@ -16,7 +16,7 @@ type Options = Parameters<typeof sh>[1];
 
 /** What `worktreeGit` adds to a command: hooks to blank and the empty tree for `--attr-source`. */
 export interface Hardening {
-  /** Every config-defined hook key git sees. */
+  /** Every config-defined hook and filter-driver key git sees, to blank. */
   hooks: string[];
   /** The empty tree's id in the repository's object format; null when it must be hashed. */
   emptyTree: string | null;
@@ -96,10 +96,17 @@ function locate(cwd: string, git: string[], env: Record<string, string>): string
     if (dotGit === undefined || (dotGit && dotGit !== "dir" && !pointer)) return undefined;
     const target = explicit ?? (dotGit === "dir" ? join(cwd, ".git") : (pointer ?? cwd));
     const gitDir = realpathSync(resolve(cwd, target));
-    const common = read(join(gitDir, "commondir"));
+    // GIT_COMMON_DIR overrides the commondir file, as it does for git.
+    const common = env.GIT_COMMON_DIR === undefined ? read(join(gitDir, "commondir")) : null;
     const commonPath = common ? pathIn(common) : null;
     if (commonPath === undefined || common === "dir") return undefined;
-    const commonDir = commonPath === null ? gitDir : realpathSync(resolve(gitDir, commonPath));
+    const commonDir = realpathSync(
+      env.GIT_COMMON_DIR !== undefined
+        ? resolve(cwd, env.GIT_COMMON_DIR)
+        : commonPath === null
+          ? gitDir
+          : resolve(gitDir, commonPath),
+    );
     // Git's is_git_directory: without these, discovery moves on to a repository further up.
     const head = read(join(gitDir, "HEAD"));
     if (!head || head === "dir" || !/^(ref: |[0-9a-f]{40})/.test(head.data.toString())) return undefined;
@@ -113,10 +120,11 @@ function locate(cwd: string, git: string[], env: Record<string, string>): string
 }
 
 /** Files git will probably read, guessed before asking it so that a first listing can be cached. */
-function likelySources(cwd: string, git: string[]): string[] {
-  const explicit = git
-    .filter((arg) => arg.startsWith("--git-dir="))
-    .map((arg) => resolve(cwd, arg.slice(10)));
+function likelySources(cwd: string, git: string[], env: Record<string, string>): string[] {
+  const named = [...git.filter((arg) => arg.startsWith("--git-dir=")).map((arg) => arg.slice(10))];
+  const explicit = [...named, env.GIT_DIR, env.GIT_COMMON_DIR].flatMap((dir) =>
+    dir ? [resolve(cwd, dir)] : [],
+  );
   const dotGit = read(join(cwd, ".git"));
   const pointer = dotGit && dotGit !== "dir" && /^gitdir: (.+)$/m.exec(dotGit.data.toString())?.[1];
   const dirs = [...explicit, join(cwd, ".git"), cwd, ...(pointer ? [resolve(cwd, pointer)] : [])];
@@ -172,7 +180,7 @@ async function refresh(
     resolve(opts.cwd, f),
   );
   if (!files) return { hooks: await lookup(), emptyTree: null };
-  let known = [...files, ...likelySources(opts.cwd, git), ...previous];
+  let known = [...files, ...likelySources(opts.cwd, git, env), ...previous];
   for (let attempt = 0; ; attempt++) {
     // Sources must read the same before and after the listing, or a concurrent edit could hide.
     const before = new Map(known.map((path) => [path, snapshot(path)]));
@@ -260,7 +268,7 @@ async function list(git: string[], opts: Options, env: Record<string, string>, f
     const [origin = "", entry = ""] = [fields[i + 1], fields[i + 2]];
     const name = entry.split("\n", 1)[0] ?? "";
     const value = entry.includes("\n") ? entry.slice(name.length + 1) : undefined;
-    if (name.startsWith("hook.")) hooks.add(name);
+    if (name.startsWith("hook.") || name.startsWith("filter.")) hooks.add(name);
     const file = origin.startsWith("file:") ? resolve(opts.cwd, origin.slice(5)) : undefined;
     if (file) sources.add(file);
     else if (origin !== "command line:") pinned = false;

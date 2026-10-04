@@ -25,6 +25,7 @@ import {
 } from "../src/git/repos.ts";
 import { CodexReaderProbe, runCodex } from "../src/harness/codex.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
+import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { NoCapacityError, RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
@@ -39,6 +40,7 @@ import {
 } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { CommandError, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
+import { fakeConfinement } from "./confinement.ts";
 import { findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
 
@@ -139,6 +141,8 @@ const seedSource = seeded(async (dir) => {
 });
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), "limitless-fault-"));
+  // Confined gate commands may write their barrier and pid files here, and only here, outside their checkout.
+  observerRoots.add(realpathSync(root));
   source = join(root, "source");
   await seedSource(root);
   factories = [];
@@ -148,6 +152,7 @@ afterEach(async () => {
     await f.stop();
     f.store.close();
   }
+  observerRoots.clear();
   rmSync(root, { recursive: true, force: true });
 });
 function factory(
@@ -158,6 +163,7 @@ function factory(
   const cfg = loadConfig({ home: join(root, "data"), configDir: join(root, "cfg") });
   cfg.maxConcurrentGates = 1;
   const f = new Factory(cfg, {
+    confinement: fakeConfinement,
     healthFetch: Object.assign(async () => new Response("{}"), { preconnect() {} }),
     fetch: Object.assign(async () => new Response("{}"), { preconnect() {} }),
     providers,
@@ -871,7 +877,7 @@ end();
   );
   writeFileSync(
     join(bin, "git"),
-    `#!/bin/sh\ncommand=$(while [ "$1" = -c ]; do shift 2; done; printf '%s' "$1")\nif [ "$command" = push ]; then printf '%s\\n' "$@" >> '${join(root, "pushes")}'; exit 0; fi\nexec /usr/bin/git "$@"\n`,
+    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\nif [ "$command" = push ]; then printf '%s\\n' "$@" >> '${join(root, "pushes")}'; exit 0; fi\nexec /usr/bin/git "$@"\n`,
     { mode: 0o755 },
   );
   const oldPath = process.env.PATH;
@@ -934,7 +940,7 @@ for (const operation of [
         writeFileSync(
           path,
           `#!/bin/sh
-args=$(while [ "$1" = -c ]; do shift 2; done; printf '%s' "$*")
+args=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$*")
 printf '%s\\n' "${bin} $args" >> '${calls}'
 case "${bin} $args" in
   ${pattern
@@ -1292,7 +1298,10 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
     import { Factory } from ${JSON.stringify(join(import.meta.dir, "../src/app.ts"))};
     import { loadConfig } from ${JSON.stringify(join(import.meta.dir, "../src/config.ts"))};
     import { fakeHarness } from ${JSON.stringify(join(import.meta.dir, "../src/harness/fake.ts"))};
-    const f = new Factory(loadConfig(${JSON.stringify({ home: join(root, "data"), configDir: join(root, "cfg") })}), {
+    import { observerRoots } from ${JSON.stringify(join(import.meta.dir, "../src/harness/sandbox.ts"))};
+    observerRoots.add(${JSON.stringify(realpathSync(root))});
+    const { fakeConfinement } = await import(${JSON.stringify(join(import.meta.dir, "confinement.ts"))});
+    const f = new Factory(loadConfig(${JSON.stringify({ home: join(root, "data"), configDir: join(root, "cfg") })}), { confinement: fakeConfinement,
       providers: ${JSON.stringify(providers)}, models: ${JSON.stringify(models)}, policy: ${JSON.stringify(policy)},
       healthFetch: async () => new Response('{}'), fetch: async () => new Response('{}'),
       harnesses: { fake: fakeHarness(s => s.prompt.startsWith('Classify')
@@ -1335,7 +1344,8 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
     expect(readFileSync(observed, "utf8")).toBe("broken\nbroken\n");
     expect(next.store.getRunState<RunState>(r.id)?.lastGates?.[0]?.blocking).toBe(true);
     expect(existsSync(join(cwd, "debris"))).toBe(false);
-    expect(readFileSync(join(cwd, "cache/sentinel"), "utf8")).toBe("keep\n");
+    // Gates check exactly the committed tree: ignored residue from the interrupted run goes too.
+    expect(existsSync(join(cwd, "cache"))).toBe(false);
     expect(next.store.getRun(r.id)?.status).toBe("running");
     const repaired = await reopen(next, (s) =>
       s.mode === "edit"
@@ -1820,7 +1830,7 @@ test("the budget bounds retries and waits, never a call's first attempt or a hea
   writeFileSync(
     join(root, "bin", "git"),
     // The wrapper's own lookups (version, config, repository) reach real git; anything else is the push.
-    `#!/bin/sh\ncommand=$(while [ "$1" = -c ]; do shift 2; done; printf '%s' "$1")\ncase "$command" in config|rev-parse|var|--version) exec /usr/bin/git "$@";; esac\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
+    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\ncase "$command" in config|rev-parse|var|--version) exec /usr/bin/git "$@";; esac\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
     {
       mode: 0o755,
     },

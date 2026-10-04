@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
 } from "node:fs";
@@ -80,12 +81,53 @@ export function scratchEnv(spec: AgentSpec): Record<string, string> {
 }
 
 export function validateScratch(spec: AgentSpec): string {
-  if (!spec.scratchDir) throw new Error("Tool-enabled reading invocation requires a scratch directory");
+  if (!spec.scratchDir) throw new Error("Tool-enabled invocation requires a scratch directory");
   const path = realpathSync(spec.scratchDir);
   const cwd = realpathSync(spec.cwd);
   if (within(cwd, path) || within(path, cwd)) throw new Error("Scratch must be separate from the worktree");
-  if (spec.addDirs?.length) throw new Error("Reading invocations cannot grant additional directories");
+  if (spec.addDirs?.length)
+    throw new Error(
+      `${spec.mode === "edit" ? "Edit" : "Reading"} invocations cannot grant additional directories`,
+    );
   return path;
+}
+
+export interface WriteRoots {
+  /** Writable, as given and canonical: the worktree, scratch. */
+  write: string[];
+  /** Read-only inside them: the worktree's `.git`, so it can't be pointed at another git directory. */
+  protect: string[];
+}
+
+/**
+ * Where an edit agent, gate or hidden command may write. The shared common directory (config,
+ * info/, hooks, objects, other worktrees) and the private admin directory stay read-only.
+ */
+export function writeRoots(cwd: string, scratchDir: string): WriteRoots {
+  const root = realpathSync(cwd);
+  const scratch = realpathSync(scratchDir);
+  if (within(root, scratch) || within(scratch, root))
+    throw new Error("Scratch must be separate from the worktree");
+  const dotGit = join(root, ".git");
+  const stat = lstatSync(dotGit, { throwIfNoEntry: false });
+  const granted = [cwd, scratchDir];
+  const protectedPaths = [join(cwd, ".git"), dotGit];
+  if (stat?.isFile()) {
+    const pointer = /^gitdir: (.+)$/m.exec(readFileSync(dotGit, "utf8"))?.[1]?.trim();
+    let gitDir: string | null = null;
+    try {
+      const dir = realpathSync(resolve(root, pointer ?? ""));
+      const back = readFileSync(join(dir, "gitdir"), "utf8").trim();
+      if (pointer && realpathSync(resolve(dir, back)) === dotGit) gitDir = dir;
+    } catch {
+      gitDir = null;
+    }
+    const overlaps = (dir: string) => [root, scratch].some((p) => within(p, dir) || within(dir, p));
+    if (!gitDir || basename(dirname(gitDir)) !== "worktrees" || overlaps(gitDir))
+      throw new Error("Worktree .git does not name its own linked worktree directory");
+    protectedPaths.push(gitDir);
+  } else if (stat && !stat.isDirectory()) throw new Error("Worktree .git must be a file or directory");
+  return { write: spellings(granted), protect: spellings(protectedPaths) };
 }
 
 /** Each path as given and, when it exists, canonical: what a confined profile actually denies. */

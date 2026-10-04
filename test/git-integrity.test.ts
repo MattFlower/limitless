@@ -2,8 +2,10 @@ import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test
 import { createHash } from "node:crypto";
 import {
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -19,10 +21,12 @@ import type { AuditAllowance, Repo } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { attributeRules, auditDiff } from "../src/gates/audit.ts";
 import { collectGarbage } from "../src/gc.ts";
-import { worktreeGit, worktreeGitScope } from "../src/git/command.ts";
+import { recordWorktree, worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
 import {
+  addDetachedWorktree,
   attributeLimits,
+  checkoutCommitted,
   commitAll,
   createWorktree,
   diffSince,
@@ -69,6 +73,7 @@ beforeEach(async () => {
   work = join(dir, "work");
   base = (await seedRepo(dir)).value;
   await git(seed, "worktree", "add", "-qb", "worker", work, base);
+  await recordWorktree(work);
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -411,7 +416,8 @@ test.each(["filter=unset", "linguist-generated=unset"])("literal %s is a hiding 
     expect.objectContaining({ file: ".gitattributes", severity: "block" }),
   );
   expect(existsSync(marker)).toBe(false);
-  expect(filteredOnAdd).toBe(attr === "filter=unset");
+  // The factory's add runs no filter driver, whatever attributes select.
+  expect(filteredOnAdd).toBe(false);
 });
 
 test.each([
@@ -858,7 +864,15 @@ test("effective hooks from system, global, includes and environment config are o
     GIT_CONFIG_VALUE_2: "true",
     LIMITLESS_GIT_EMPTY_HOOK: `touch '${marker}'`,
   };
-  const paths = [system, global, include, worktreeConfig];
+  const worktreeBytes = readFileSync(worktreeConfig);
+  await expect(
+    worktreeGit(["git", "commit", "--allow-empty", "-qm", "refuse"], { cwd: work, env }),
+  ).rejects.toThrow("Unsafe worktree Git administration");
+  expect(readFileSync(worktreeConfig)).toEqual(worktreeBytes);
+  expect(existsSync(marker)).toBe(false);
+  rmSync(worktreeConfig);
+  writeFileSync(include, content("included") + content("worktree"));
+  const paths = [system, global, include];
   const configs = paths.map((path) => readFileSync(path));
   for (const name of ["system", "global", "included", "environment", "worktree"]) {
     const result = await worktreeGit(["git", "config", "--get", `hook.${name}.command`], { cwd: work, env });
@@ -983,48 +997,51 @@ async function hookValues(cwd: string, env = process.env as Record<string, strin
 const hookConfig = (name: string) => `[hook "${name}"]\n\tcommand = true\n\tevent = pre-commit\n`;
 const blanked = (name: string) => ({ [`hook.${name}.command`]: "\n", [`hook.${name}.event`]: "\n" });
 
-test("a gitfile or commondir through a retargeted symlink is resolved again before reuse", async () => {
+test("a git directory or commondir through a retargeted symlink is resolved again before reuse", async () => {
+  // Recorded worktrees pin GIT_DIR and GIT_COMMON_DIR to real paths; these probes name them by hand.
   const other = join(dir, "other");
   await git(dir, "init", "-q", "-b", "main", other);
   writeFileSync(
     join(other, ".git", "config"),
     `${readFileSync(join(other, ".git", "config"))}${hookConfig("other")}`,
   );
-  // A gitfile whose path runs through `link`, first to the seed repository, then to `other`.
   const probe = join(dir, "probe");
   mkdirSync(probe);
+  const viaLink = { ...(process.env as Record<string, string>), GIT_DIR: join(dir, "link") };
   symlinkSync(join(seed, ".git"), join(dir, "link"));
-  writeFileSync(join(probe, ".git"), `gitdir: ${join(dir, "link")}\n`);
-  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe });
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe, env: viaLink });
   rmSync(join(dir, "link"));
   symlinkSync(join(other, ".git"), join(dir, "link"));
-  expect(await hookValues(probe)).toEqual(blanked("other"));
-  // The same through a linked worktree's commondir.
+  expect(await hookValues(probe, viaLink)).toEqual(blanked("other"));
+  // A worktree's administrative directory whose commondir runs through a symlink.
+  const admin = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
+  const viaAdmin = { ...(process.env as Record<string, string>), GIT_DIR: admin };
   symlinkSync(join(seed, ".git"), join(dir, "common"));
-  const worktreeDir = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
-  writeFileSync(join(worktreeDir, "commondir"), `${join(dir, "common")}\n`);
-  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: work });
+  writeFileSync(join(admin, "commondir"), `${join(dir, "common")}\n`);
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe, env: viaAdmin });
   rmSync(join(dir, "common"));
   symlinkSync(join(other, ".git"), join(dir, "common"));
-  expect(await hookValues(work)).toEqual(blanked("other"));
+  expect(await hookValues(probe, viaAdmin)).toEqual(blanked("other"));
 });
 
-test("a gitfile path with a trailing space is resolved as git reads it", async () => {
+test("a commondir path with a trailing space is resolved as git reads it", async () => {
   const other = join(dir, "other");
   await git(dir, "init", "-q", "-b", "main", other);
   writeFileSync(
     join(other, ".git", "config"),
     `${readFileSync(join(other, ".git", "config"))}${hookConfig("other")}`,
   );
-  // Git keeps the trailing space: `link ` is the pointer, `link` only a decoy with the same target.
-  for (const name of ["link", "link "]) symlinkSync(join(seed, ".git"), join(dir, name));
+  // Git keeps the trailing space: `common ` is the pointer, `common` only a decoy with the same target.
+  for (const name of ["common", "common "]) symlinkSync(join(seed, ".git"), join(dir, name));
+  const admin = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
+  writeFileSync(join(admin, "commondir"), `${join(dir, "common ")}\n`);
   const probe = join(dir, "probe");
   mkdirSync(probe);
-  writeFileSync(join(probe, ".git"), `gitdir: ${join(dir, "link ")}\n`);
-  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe });
-  rmSync(join(dir, "link "));
-  symlinkSync(join(other, ".git"), join(dir, "link "));
-  expect(await hookValues(probe)).toEqual(blanked("other"));
+  const env = { ...(process.env as Record<string, string>), GIT_DIR: admin };
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe, env });
+  rmSync(join(dir, "common "));
+  symlinkSync(join(other, ".git"), join(dir, "common "));
+  expect(await hookValues(probe, env)).toEqual(blanked("other"));
 });
 
 test("a nested .git that stops being a repository hands over to the one above, and is listed again", async () => {
@@ -1913,4 +1930,150 @@ test("UTF-16 source content remains blocked", async () => {
   expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toContainEqual(
     expect.objectContaining({ rule: "binary-content", file: "unicode.ts", severity: "block" }),
   );
+});
+
+test("a global LFS-like driver never filters factory commits or checkouts, and bad config fails closed", async () => {
+  const marker = join(dir, "filtered");
+  const driver = join(dir, "driver.sh");
+  writeFileSync(
+    driver,
+    `#!/bin/sh\necho "$0 $*" >> '${marker}'\necho 'version https://git-lfs.github.com/spec/v1'\n`,
+    {
+      mode: 0o755,
+    },
+  );
+  const included = join(dir, "included.gitconfig");
+  writeFileSync(included, `[filter "inc"]\n\tclean = ${driver}\n\tsmudge = ${driver}\n\trequired = true\n`);
+  const global = join(dir, "global.gitconfig");
+  writeFileSync(
+    global,
+    `[filter "lfs"]\n\tclean = ${driver}\n\tsmudge = ${driver}\n\tprocess = ${driver}\n\trequired = true\n[include]\n\tpath = ${included}\n`,
+  );
+  const previous = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = global;
+  try {
+    const code = "module.exports = () => { require('child_process').execSync('id'); };\n";
+    mkdirSync(join(work, "lib"));
+    writeFileSync(join(work, ".gitattributes"), "*.dat filter=lfs\n*.inc filter=inc\n");
+    writeFileSync(join(work, "lib", "helper.dat"), code);
+    writeFileSync(join(work, "lib", "more.inc"), code);
+    const head = await commitAll(work, "helper");
+    expect(head).not.toBeNull();
+    expect(await readFileAt(work, "HEAD", "lib/helper.dat")).toBe(code);
+    expect(await readFileAt(work, "HEAD", "lib/more.inc")).toBe(code);
+    rmSync(join(work, "lib"), { recursive: true });
+    await checkoutCommitted(work);
+    expect(readFileSync(join(work, "lib", "helper.dat"), "utf8")).toBe(code);
+    await resetTo(work, base);
+    await resetTo(work, head as string);
+    expect(readFileSync(join(work, "lib", "more.inc"), "utf8")).toBe(code);
+    expect(existsSync(marker)).toBe(false);
+    const review = join(dir, "detached-review");
+    await addDetachedWorktree(work, head as string, review);
+    expect(readFileSync(join(review, "lib", "helper.dat"), "utf8")).toBe(code);
+    expect(readFileSync(join(review, "lib", "more.inc"), "utf8")).toBe(code);
+    expect(existsSync(marker)).toBe(false);
+    // The audit sees the real bytes, not a pointer.
+    const diff = await diffSince(work, base);
+    expect(diff.patch).toContain("+module.exports");
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toContainEqual(
+      expect.objectContaining({ rule: "gitattributes", file: ".gitattributes" }),
+    );
+    // A config file discovery cannot parse stops the factory instead of running unfiltered-or-not.
+    writeFileSync(global, '[filter "lfs"\n\tclean = broken');
+    writeFileSync(join(work, "lib", "helper.dat"), "changed");
+    await expect(commitAll(work, "after bad config")).rejects.toThrow();
+    expect(existsSync(marker)).toBe(false);
+  } finally {
+    if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = previous;
+  }
+});
+
+test("a filter selected by in-tree attributes and repository config does not run on add", async () => {
+  const marker = join(dir, "filtered");
+  await git(work, "config", "filter.spy.clean", `touch '${marker}'; echo pointer`);
+  await git(work, "config", "filter.spy.required", "true");
+  writeFileSync(join(work, ".gitattributes"), "*.ts filter=spy\n");
+  writeFileSync(join(work, "sample.test.ts"), edited);
+  await commitAll(work, "filtered");
+  expect(existsSync(marker)).toBe(false);
+  await audited();
+});
+
+for (const attack of [
+  "config",
+  "config.worktree",
+  "redirect",
+  "reflog",
+  "dangling",
+  "hardlink",
+  "missing-common",
+  "wrong-common",
+  "wrong-backlink",
+])
+  test(`trusted git refuses private admin attack: ${attack}`, async () => {
+    const admin = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
+    const outside = join(dir, "outside");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "sample.test.ts"), "outside original");
+    writeFileSync(join(outside, "untracked"), "do not delete");
+    const sentinel = join(outside, "executed");
+    const payload = join(work, "payload");
+    writeFileSync(payload, `#!/bin/sh\ntouch '${sentinel}'\n`, { mode: 0o755 });
+    const snapshot = () =>
+      readdirSync(outside)
+        .sort()
+        .map((name) => [name, readFileSync(join(outside, name)).toString("hex")]);
+    const before = snapshot();
+    if (attack === "config" || attack === "config.worktree")
+      writeFileSync(
+        join(admin, attack),
+        `[core]\nworktree = ${outside}\n[commit]\ngpgsign = true\n[gpg]\nprogram = ${payload}\n`,
+      );
+    if (attack === "redirect") {
+      rmSync(join(admin, "commondir"));
+      symlinkSync(join(seed, ".git", "objects"), join(admin, "objects"));
+      writeFileSync(join(admin, "config"), `[core]\nworktree = ${outside}\n`);
+    }
+    if (attack === "reflog") {
+      rmSync(join(admin, "logs", "HEAD"));
+      symlinkSync(join(outside, "untracked"), join(admin, "logs", "HEAD"));
+    }
+    if (attack === "dangling") symlinkSync(join(outside, "absent"), join(admin, "dangling"));
+    if (attack === "hardlink") linkSync(join(outside, "untracked"), join(admin, "linked"));
+    if (attack === "missing-common") rmSync(join(admin, "commondir"));
+    if (attack === "wrong-common") writeFileSync(join(admin, "commondir"), outside);
+    if (attack === "wrong-backlink") writeFileSync(join(admin, "gitdir"), join(outside, ".git"));
+    const index = readFileSync(join(admin, "index"));
+    await expect(commitAll(work, "must refuse")).rejects.toThrow();
+    await expect(checkoutCommitted(work)).rejects.toThrow();
+    expect(readFileSync(join(admin, "index"))).toEqual(index);
+    expect(snapshot()).toEqual(before);
+    expect(existsSync(sentinel)).toBe(false);
+  });
+
+test("recorded directories override inherited Git authority; missing records fail closed", async () => {
+  writeFileSync(join(work, "sample.test.ts"), edited);
+  const inherited = Object.fromEntries(
+    ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"].map((key) => [key, process.env[key]]),
+  );
+  try {
+    process.env.GIT_DIR = join(dir, "absent");
+    process.env.GIT_COMMON_DIR = join(dir, "absent");
+    process.env.GIT_WORK_TREE = seed;
+    expect(await commitAll(work, "valid")).not.toBeNull();
+    writeFileSync(join(work, "sample.test.ts"), "dirty");
+    await checkoutCommitted(work);
+    expect(readFileSync(join(work, "sample.test.ts"), "utf8")).toBe(edited);
+    expect(readFileSync(join(seed, "sample.test.ts"), "utf8")).toBe(original);
+  } finally {
+    for (const [key, value] of Object.entries(inherited)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  rmSync(`${work}.git-paths`);
+  await expect(commitAll(work, "unrecorded")).rejects.toThrow("Missing trusted Git paths");
+  await expect(checkoutCommitted(work)).rejects.toThrow("Missing trusted Git paths");
 });

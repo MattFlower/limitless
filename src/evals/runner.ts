@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { DEFAULT_EVAL_CONCURRENCY, type EvalRun, type EvalTrial } from "../core/types.ts";
 import { Semaphore } from "../gates/slots.ts";
 import { createEvalWorktree, type EvalLabels, pinnedTree, snapshotTopLevel } from "../git/repos.ts";
+import { confinementScope, seatbeltBackend } from "../harness/sandbox.ts";
 import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
 import { selectHarness } from "../harness/select.ts";
 import {
@@ -356,7 +357,9 @@ export class EvalRunner {
     this.executing.set(run.id, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY);
     this.resizeEvalSlots();
     try {
-      await this.executeRun(run, file, cases, cache, signal, predecessors);
+      await confinementScope.run(this.deps.confinement ?? seatbeltBackend, () =>
+        this.executeRun(run, file, cases, cache, signal, predecessors),
+      );
     } finally {
       this.executing.delete(run.id);
       this.resizeEvalSlots();

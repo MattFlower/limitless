@@ -1,4 +1,8 @@
+import { strict as assert } from "node:assert";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { z } from "zod";
 import { CommandError, sh } from "../util/proc.ts";
 import { harden } from "./hardening.ts";
 
@@ -21,10 +25,42 @@ const HARDENING = [
   "core.useReplaceRefs=false",
 ];
 
+/** Recorded before candidate execution; the sidecar is outside the writable checkout. */
+export async function recordWorktree(cwd: string): Promise<void> {
+  const cmd = ["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"];
+  const r = await sh(cmd, { cwd });
+  const dirs = [cwd, ...r.stdout.trim().split("\n")].map((p) => realpathSync(p));
+  writeFileSync(`${resolve(cwd)}.git-paths`, JSON.stringify(dirs));
+}
+
+function trustedEnv(cwd: string, env: Record<string, string>) {
+  const record = `${resolve(cwd)}.git-paths`;
+  if (!existsSync(record)) {
+    if (lstatSync(join(cwd, ".git"), { throwIfNoEntry: false })?.isDirectory() === false)
+      throw new Error("Missing trusted Git paths");
+    return env;
+  }
+  const path = z.string().startsWith("/");
+  const [work, admin, common] = z.tuple([path, path, path]).parse(JSON.parse(readFileSync(record, "utf8")));
+  const unsafe = "Unsafe worktree Git administration";
+  const inspect = (path: string) => {
+    const stat = lstatSync(path);
+    assert(path === admin || !/\/config(?:\.worktree)?$/.test(path), unsafe);
+    assert(stat.isDirectory() || (stat.isFile() && stat.nlink === 1), unsafe);
+    if (stat.isDirectory()) for (const name of readdirSync(path)) inspect(join(path, name));
+  };
+  inspect(admin);
+  assert(realpathSync(cwd) === work && lstatSync(admin).isDirectory(), unsafe);
+  for (const [name, target] of Object.entries({ commondir: common, gitdir: join(work, ".git") }))
+    assert(resolve(admin, readFileSync(join(admin, name), "utf8").trim()) === target, unsafe);
+  return { ...env, GIT_DIR: admin, GIT_COMMON_DIR: common, GIT_WORK_TREE: work };
+}
+
 /** Factory commands in agent-controlled worktrees, without changing any config files. */
 export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1]) {
   if (worktreeGitScope.getStore() === false) return sh(cmd, opts);
   opts.signal?.throwIfAborted();
+  opts = { ...opts, env: trustedEnv(opts.cwd, opts.env ?? (process.env as Record<string, string>)) };
   // Not bound to the first caller's signal: an aborted first call must not fail every later one.
   gitVersion ??= sh(["git", "--version"], { ...opts, signal: undefined, allowFail: false }).then(
     ({ stdout }) => {
@@ -70,6 +106,7 @@ export async function worktreeGit(cmd: string[], opts: Parameters<typeof sh>[1])
 /** The empty tree's id in `opts.cwd`'s object format, as `worktreeGit` passes it to `--attr-source`. */
 export async function emptyTreeId(opts: Parameters<typeof sh>[1]): Promise<string> {
   if (worktreeGitScope.getStore() === false) return hashEmptyTree(["git"], opts);
+  opts = { ...opts, env: trustedEnv(opts.cwd, opts.env ?? (process.env as Record<string, string>)) };
   const prefix = ["git", ...HARDENING];
   const { emptyTree } = await harden(prefix, opts, () => hookKeys(prefix, opts));
   return emptyTree ?? hashEmptyTree(prefix, opts);
@@ -84,14 +121,18 @@ async function hashEmptyTree(git: string[], opts: Parameters<typeof sh>[1]): Pro
   return empty.stdout.trim();
 }
 
-/** Flags blanking every config-defined hook git sees as `git` in `opts.cwd`; needs LIMITLESS_GIT_EMPTY_HOOK="". */
+/**
+ * Flags blanking every config-defined hook and filter driver git sees as `git` in `opts.cwd`; needs
+ * LIMITLESS_GIT_EMPTY_HOOK="". An empty clean/smudge/process runs nothing and an empty `required`
+ * is false, so what is committed or checked out is exactly the bytes, whatever attributes select.
+ */
 export async function emptyHookFlags(git: string[], opts: Parameters<typeof sh>[1]): Promise<string[]> {
   return hookFlags(await hookKeys(git, opts));
 }
 
 async function hookKeys(git: string[], opts: Parameters<typeof sh>[1]): Promise<string[]> {
   // Config lookup cannot run hooks; errors other than "no matching keys" must fail closed.
-  const hooks = await sh([...git, "config", "--null", "--name-only", "--get-regexp", "^hook\\."], {
+  const hooks = await sh([...git, "config", "--null", "--name-only", "--get-regexp", "^(hook|filter)\\."], {
     ...opts,
     allowFail: false,
   }).catch((error: unknown) => {
