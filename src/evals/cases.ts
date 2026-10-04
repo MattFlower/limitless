@@ -74,6 +74,7 @@ const GateResultSchema = z.strictObject({
   durationMs: z.number().finite().nonnegative(),
   output: z.string(),
   timedOut: z.boolean().optional(),
+  confinementError: z.boolean().optional(),
 });
 export const GateComparisonSchema = z.strictObject({
   name: nonempty,
@@ -86,6 +87,7 @@ export const GateComparisonSchema = z.strictObject({
     "new_pass",
     "not_run",
     "flaky",
+    "confinement_error",
   ]),
   blocking: z.boolean(),
   result: GateResultSchema,

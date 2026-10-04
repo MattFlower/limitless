@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   CaseFileSchema,
   EvalRequestSchema,
+  GateComparisonSchema,
   ImplementCaseFileSchema,
   loadCases,
   loadRoleCases,
@@ -520,4 +521,16 @@ test("adjudicated review cases have required major defects at their pinned heads
     expect(file.cases.find((c) => c.id === id)?.labelHistory).toBeUndefined();
   }
   expect(file.cases.find((c) => c.id === "review-039")?.defects).toHaveLength(3);
+});
+
+test("recorded gate comparisons accept a confinement verdict and keep rejecting unknown fields", () => {
+  const result = { name: "test", command: "bun test", ok: false, exitCode: 1, durationMs: 5, output: "" };
+  const confined = {
+    name: "test",
+    verdict: "confinement_error" as const,
+    blocking: true,
+    result: { ...result, confinementError: true },
+  };
+  expect(GateComparisonSchema.parse(confined)).toEqual(confined);
+  expect(() => GateComparisonSchema.parse({ ...confined, result: { ...result, unknown: true } })).toThrow();
 });

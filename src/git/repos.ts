@@ -7,7 +7,7 @@ import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { attributeRules, BINARY_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
 import { CommandError, sh } from "../util/proc.ts";
-import { emptyHookFlags, NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
+import { emptyHookFlags, NO_BIG_FILES, recordWorktree, worktreeGit, worktreeGitScope } from "./command.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -302,6 +302,7 @@ export async function createWorktree(
     await worktreeGit(["git", "worktree", "add", "--no-checkout", "-b", branch, path, base.stdout.trim()], {
       cwd: cache,
     });
+    await recordWorktree(path);
     await worktreeGit(["git", "reset", "--hard", "-q"], { cwd: path });
     return { path, branch, baseSha: base.stdout.trim() };
   });
@@ -314,6 +315,7 @@ export async function removeWorktree(paths: Paths, repo: Repo, path: string): Pr
   await withRepoLock(cache, () =>
     git(["git", "worktree", "remove", "--force", path], { cwd: cache, allowFail: true }),
   );
+  rmSync(`${resolve(path)}.git-paths`, { force: true });
 }
 
 export async function headSha(cwd: string): Promise<string> {
@@ -379,7 +381,8 @@ export async function exportCommit(
 
 /** A detached checkout of `sha` at `dest` sharing `cwd`'s repository, for readers kept off the worktree. */
 export async function addDetachedWorktree(cwd: string, sha: string, dest: string, signal?: AbortSignal) {
-  await sh(["git", "worktree", "add", "--detach", dest, sha], { cwd, signal, timeoutMs: 300_000 });
+  await worktreeGit(["git", "worktree", "add", "--detach", dest, sha], { cwd, signal, timeoutMs: 300_000 });
+  await recordWorktree(dest);
 }
 
 export async function mergeBase(cwd: string, base: string, head: string): Promise<string> {
@@ -442,6 +445,18 @@ export async function commitAll(cwd: string, message: string): Promise<string | 
 export async function resetTo(cwd: string, sha: string): Promise<void> {
   await worktreeGit(["git", "reset", "--hard", "-q", sha], { cwd });
   await worktreeGit(["git", "clean", "-fdq"], { cwd });
+}
+
+/**
+ * Exactly the committed tree for gates, even when status looks clean: a fresh index drops
+ * skip-worktree and assume-unchanged flags, and `-x` removes ignored payloads (including
+ * info/exclude ones) along with dependencies, which gate setup installs again.
+ */
+export async function checkoutCommitted(cwd: string, env?: Record<string, string>): Promise<void> {
+  const index = await worktreeGit(["git", "rev-parse", "--git-path", "index"], { cwd, env });
+  rmSync(resolve(cwd, index.stdout.trim()), { force: true });
+  await worktreeGit(["git", "reset", "--hard", "-q", "HEAD"], { cwd, env });
+  await worktreeGit(["git", "clean", "-ffdxq"], { cwd, env });
 }
 
 /** Throw away any uncommitted changes (used after read-only stages). */
@@ -569,8 +584,8 @@ async function attributeInfo(
   let indexes = 0;
   const scratchGit = (args: string[], stdin?: string, index = join(scratch, "index")) =>
     worktreeGit(["git", `--git-dir=${scratch}`, ...args], {
-      cwd,
-      env: { ...(env ?? (process.env as Record<string, string>)), GIT_INDEX_FILE: index },
+      cwd: scratch,
+      env: { ...(env ?? (process.env as Record<string, string>)), GIT_INDEX_FILE: index, GIT_WORK_TREE: cwd },
       timeoutMs: Math.max(1, deadline - Date.now()),
       stdin,
     });
@@ -1066,7 +1081,10 @@ export async function createEvalWorktree(
   try {
     const pins = await stageEvalRepo(paths, store, slug, base, head, path, signal, labels, snapshot);
     const opts = { cwd: path, signal };
-    await sh(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", pins[1]], opts);
+    await worktreeGit(
+      ["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", pins[1]],
+      opts,
+    );
     for (const ref of ["refs/eval/base", "refs/eval/head"]) await sh(["git", "update-ref", "-d", ref], opts);
     await sh(["git", "reflog", "expire", "--expire=now", "--all"], opts);
     return Object.assign(cleanup, { base: pins[0] });
