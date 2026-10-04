@@ -158,6 +158,7 @@ ${checksSection(input.gates, input.baseline)}
 6. Follow repository conventions (CLAUDE.md, AGENTS.md, CONTRIBUTING, existing code style).
 7. ${input.resolution ? "Do not run Git. Edit files only; the factory stages and commits the merge." : "Committing is optional (the factory commits for you). Never push."}
 8. Stay within the request and specification: add nothing that neither asks for. If part of the specification looks unnecessary for the request, still meet its acceptance criteria and name that part in your final report.
+9. Never stop or signal processes you did not start: no \`pkill\`, \`killall\` or \`kill\` by name or pattern. Other runs, deploys and the user share this machine. Stop your own background command by the PID you started it with.
 
 # Final message
 Reply with a concise report: files changed, how you verified (commands and results), assumptions, and anything left undone.`;
