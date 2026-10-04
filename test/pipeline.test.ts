@@ -51,6 +51,7 @@ import { sh } from "../src/util/proc.ts";
 import { reviewOutput } from "./evals-reading-support.ts";
 import { deferred } from "./evals-support.ts";
 import { attributionEvidence, findingEvidence } from "./review-support.ts";
+import { seeded } from "./seeded.ts";
 import { waitClock } from "./wait-clock.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -99,8 +100,8 @@ let repoDir: string;
 let factory: Factory | null = null;
 const originalPath = process.env.PATH;
 
-async function makeRepo(): Promise<string> {
-  const dir = join(home, "target");
+const seedTarget = seeded(async (root) => {
+  const dir = join(root, "target");
   mkdirSync(dir);
   writeFileSync(join(dir, "greeting.txt"), "hello\n");
   writeFileSync(
@@ -110,7 +111,11 @@ async function makeRepo(): Promise<string> {
   await sh(["git", "init", "-q", "-b", "main"], { cwd: dir });
   await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "."], { cwd: dir });
   await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], { cwd: dir });
-  return dir;
+});
+
+async function makeRepo(): Promise<string> {
+  await seedTarget(home);
+  return join(home, "target");
 }
 
 type Handler = (spec: AgentSpec) => FakeReply | Promise<FakeReply>;
@@ -227,10 +232,25 @@ async function waitFor(
   timeoutMs = 20_000,
 ): Promise<RunStatus> {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = f.store.getRun(runId);
-    if (run && statuses.includes(run.status)) return run.status;
-    await Bun.sleep(25);
+  // A run update wakes the check a turn later, once the scheduler has settled; the poll covers the rest.
+  let wake = () => {};
+  const unsubscribe = f.store.subscribe((msg) => {
+    if (msg.kind === "run") wake();
+  });
+  try {
+    while (Date.now() < deadline) {
+      const run = f.store.getRun(runId);
+      if (run && statuses.includes(run.status)) return run.status;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 25);
+        wake = () => {
+          clearTimeout(timer);
+          setImmediate(resolve);
+        };
+      });
+    }
+  } finally {
+    unsubscribe();
   }
   throw new Error(`timed out waiting for ${statuses.join("|")}; status=${f.store.getRun(runId)?.status}`);
 }
@@ -7157,6 +7177,10 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     cooldown: { status: "quota", error: "slow down" },
   };
 
+  // With the shadow off nothing fails, so every failure kind shares one control run.
+  let shadowOff:
+    | Promise<{ targets: string[]; health: ReturnType<typeof health>; failed: number }>
+    | undefined;
   test.each(Object.keys(failures))(
     "shadow %s failures leave provider health and later production review targets as with the shadow off",
     async (kind) => {
@@ -7190,7 +7214,8 @@ describe("review shadow panel: single reviews decide, the panel only records", (
           failed: failed.length,
         };
       };
-      const off = await runOnce("none");
+      shadowOff ??= runOnce("none");
+      const off = await shadowOff;
       const on = await runOnce("shadow");
       expect(on.failed).toBeGreaterThanOrEqual(3);
       expect(on.targets).toEqual(off.targets);
