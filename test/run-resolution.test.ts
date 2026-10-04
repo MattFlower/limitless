@@ -158,3 +158,39 @@ test("a merge recorded by the pipeline supersedes matching needs_human runs in i
   expect(f.store.getRun(decided)?.resolution?.kind).toBe("wont_do");
   expect(resolvedItems()).toHaveLength(matching.length + 2);
 });
+
+test("the previous release's merge SQL still resolves a run and writes one merged-kind feed item", () => {
+  const id = finished("needs_human");
+  f.store.updateRun(id, { prUrl: "https://github.com/o/r/pull/7" });
+  f.store.db
+    .query(
+      "UPDATE runs SET status = 'resolved', merged = 1, merged_by = ?, merged_at = ? WHERE id = ? AND status = 'needs_human' AND pr_url IS NOT NULL",
+    )
+    .run("octocat", 99, id);
+  expect(f.store.getRun(id)).toMatchObject({ status: "resolved", merged: true, resolution: null });
+  expect(resolvedItems().map((item) => [item.title, item.data?.kind])).toEqual([
+    ["Resolved (merged): work", "merged"],
+  ]);
+});
+
+test("an unmerged resolved prerequisite blocks new dependants, retries and waiting runs", () => {
+  const ancestor = f.run("ancestor");
+  f.store.updateRun(ancestor.id, { status: "failed", error: "gates failed", finishedAt: 123 });
+  const pending = f.run("pending");
+  f.store.updateRun(pending.id, { status: "needs_human", prUrl: "https://github.com/o/r/pull/8" });
+  const waiting = f.run("waiting", [pending.id]);
+  expect(waiting.status).toBe("waiting");
+  f.store.resolveRun(ancestor.id, { kind: "wont_do", by: "human" });
+  f.store.resolveRun(pending.id, { kind: "done_elsewhere", by: "human" });
+  const created = f.run("after", [ancestor.id]);
+  expect(created).toMatchObject({
+    status: "needs_human",
+    error: `Dependency ${ancestor.id}: run resolved as wont_do without merging`,
+  });
+  expect(f.run("retry", created.dependsOn).status).toBe("needs_human");
+  f.store.reconcileWaitingRuns();
+  expect(f.store.getRun(waiting.id)).toMatchObject({
+    status: "needs_human",
+    error: `Dependency ${pending.id}: run resolved as done_elsewhere without merging`,
+  });
+});

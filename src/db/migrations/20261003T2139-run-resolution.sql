@@ -18,10 +18,11 @@ CREATE TRIGGER feed_run_update AFTER UPDATE OF status, pr_url, merged ON runs BE
     json_object('status', NEW.status, 'error', NEW.error, 'reason', NEW.error, 'prUrl', NEW.pr_url),
     NEW.id || ':' || (SELECT coalesce(max(seq), 0) + 1 FROM sqlite_sequence WHERE name = 'feed')
     WHERE NEW.status IN ('needs_human', 'failed', 'succeeded', 'cancelled') AND OLD.status IS NOT NEW.status;
-  INSERT INTO feed_add SELECT 'run.resolved', NEW.id, NULL, 'Resolved (' || (NEW.resolution ->> 'kind') || '): ' || NEW.title,
-    'Run resolved as ' || (NEW.resolution ->> 'kind') || coalesce(': ' || (NEW.resolution ->> 'ref'), '')
+  -- The previous release resolves merges without a resolution; that can only be a merge.
+  INSERT INTO feed_add SELECT 'run.resolved', NEW.id, NULL, 'Resolved (' || coalesce(NEW.resolution ->> 'kind', 'merged') || '): ' || NEW.title,
+    'Run resolved as ' || coalesce(NEW.resolution ->> 'kind', 'merged') || coalesce(': ' || (NEW.resolution ->> 'ref'), '')
       || coalesce(' — ' || (NEW.resolution ->> 'note'), ''),
-    json_object('kind', NEW.resolution ->> 'kind', 'ref', NEW.resolution ->> 'ref', 'note', NEW.resolution ->> 'note',
+    json_object('kind', coalesce(NEW.resolution ->> 'kind', 'merged'), 'ref', NEW.resolution ->> 'ref', 'note', NEW.resolution ->> 'note',
       'by', NEW.resolution ->> 'by', 'status', NEW.status, 'prUrl', NEW.pr_url), NEW.id
     WHERE NEW.status = 'resolved' AND OLD.status IS NOT NEW.status;
 END;

@@ -995,9 +995,11 @@ export class Store {
           ? "PR was closed unmerged"
           : run.status === "failed" || run.status === "cancelled"
             ? `run ${run.status}`
-            : run.status === "needs_human" && !run.prUrl
-              ? `run needs_human without PR${run.error ? `: ${run.error}` : ""}`
-              : null;
+            : run.status === "resolved" // terminal: an unmerged resolved run never merges
+              ? `run resolved as ${run.resolution?.kind ?? "unknown"} without merging`
+              : run.status === "needs_human" && !run.prUrl
+                ? `run needs_human without PR${run.error ? `: ${run.error}` : ""}`
+                : null;
       if (cause)
         return { status: "needs_human", finishedAt: Date.now(), error: `Dependency ${id}: ${cause}` };
       waiting = true;
