@@ -130,7 +130,7 @@ test("dependency release, immediate dependency blocking and the alternate merge 
   expect(store.getRun(child.id)?.status).toBe("waiting");
   store.updateRun(parent.id, { prUrl: "https://github.com/o/r/pull/3", status: "needs_human" });
   const merged = twice(() => store.resolveMergedRun(parent.id, "octo", 9));
-  expect(kinds(merged)).toEqual(["run.merged"]);
+  expect(kinds(merged)).toEqual(["run.merged", "run.resolved"]);
   expect(merged[0]?.data).toMatchObject({
     prUrl: "https://github.com/o/r/pull/3",
     mergedBy: "octo",

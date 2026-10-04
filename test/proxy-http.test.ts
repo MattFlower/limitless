@@ -129,6 +129,58 @@ test("config validates LAN settings; exact binds share routes, stop together and
   }
 });
 
+test("resolve is loopback-only even through a trusted proxy with valid Host and Origin", async () => {
+  const f = await fixture();
+  try {
+    Object.assign(f.factory.cfg, { auth: "proxy", trustedProxies: [proxy], publicOrigins: [origin] });
+    const store = f.factory.store;
+    const repo = store.upsertRepo({
+      slug: "o/r",
+      kind: "github",
+      url: "unused",
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "resolve" });
+    const before = store.updateRun(run.id, { status: "needs_human" });
+    const feed = store.readFeed().items;
+    const routes = createHttpRoutes(f.factory);
+    const route = (routes["/api/runs/:id/resolve"] as { POST: Route }).POST;
+    const request = (headers: Record<string, string>) =>
+      requestWithParams(
+        `http://localhost:7400/api/runs/${run.id}/resolve`,
+        { method: "POST", headers, body: JSON.stringify({ kind: "done_elsewhere", note: "handled" }) },
+        { id: run.id },
+      );
+    expect(
+      (
+        await route(
+          request({ host: "limitless.example.test", origin, "content-type": "application/json" }),
+          peer(proxy),
+        )
+      ).status,
+    ).toBe(403);
+    expect(store.getRun(run.id)).toEqual(before);
+    expect(store.readFeed().items).toEqual(feed);
+    expect(
+      (
+        await route(
+          request({
+            host: "localhost:7400",
+            origin: "http://localhost:7400",
+            "content-type": "application/json",
+          }),
+          peer("127.0.0.1"),
+        )
+      ).status,
+    ).toBe(200);
+    expect(store.getRun(run.id)?.resolution?.kind).toBe("done_elsewhere");
+  } finally {
+    await f.close();
+  }
+});
+
 test("direct navigation to every UI route serves the SPA shell; unknown API paths stay JSON 404s", async () => {
   const f = await fixture();
   const ui = await buildUi();
