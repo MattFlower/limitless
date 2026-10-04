@@ -1,7 +1,7 @@
 import { appendFileSync } from "node:fs";
 import { z } from "zod";
 import { untilAborted } from "../pipeline/faults.ts";
-import { type AgentResult, emptyUsage, type Harness, priceOf } from "./types.ts";
+import { type AgentResult, emptyUsage, type Harness, priceOf, redactJsonLine } from "./types.ts";
 
 /** A typed question. The model never sees its id, so `instructions` carries the whole question. */
 export type DecisionQuestion =
@@ -123,7 +123,8 @@ export const runDecisions: Harness = async (spec) => {
   const endpoint = spec.target.decisions;
   const task = spec.decisionTask;
   const usage = emptyUsage();
-  const log = (entry: Record<string, unknown>) => appendFileSync(spec.logPath, `${JSON.stringify(entry)}\n`);
+  const log = (entry: Record<string, unknown>) =>
+    appendFileSync(spec.logPath, `${redactJsonLine(JSON.stringify(entry))}\n`);
   const finish = (
     status: AgentResult["status"],
     error: string | null,

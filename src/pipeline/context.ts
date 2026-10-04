@@ -33,6 +33,7 @@ import type { GhRunner } from "../integrations/github.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
+import { redactCredentialData } from "../util/proc.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
@@ -688,6 +689,7 @@ export class RunContext {
             };
       }
 
+      result = redactCredentialData(result);
       const updated = store.updateInvocation(invocation.id, {
         status: result.status,
         fastModeState: result.fastModeState ?? null,

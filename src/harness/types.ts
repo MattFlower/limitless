@@ -1,5 +1,6 @@
 import type { ZodType } from "zod";
 import type { Billing, ConfinementProbe, Effort, InvocationStatus, QuotaWindow } from "../core/types.ts";
+import { redactCredentialData, redactCredentials } from "../util/proc.ts";
 import type { DecisionDecline, DecisionTask } from "./decisions.ts";
 
 /** A concrete model on a concrete provider, as chosen by the router. */
@@ -110,15 +111,21 @@ export type Harness = (spec: AgentSpec) => Promise<AgentResult>;
 
 /** Redact string values before persisting a structured CLI event. */
 export function redactJsonLine(line: string, redact?: (text: string) => string): string {
-  if (!redact) return line;
+  redact ??= redactCredentials;
   try {
-    return JSON.stringify(JSON.parse(line), (_key, value: unknown) =>
+    return JSON.stringify(redactCredentialData(JSON.parse(line)), (_key, value: unknown) =>
       typeof value === "string" ? redact(value) : value,
     );
   } catch {
     return redact(line);
   }
 }
+
+export const protectCredentials = (spec: AgentSpec): AgentSpec => ({
+  ...spec,
+  onEvent: (event) => spec.onEvent(redactCredentialData(event)),
+  redactOutput: (text) => redactCredentials(spec.redactOutput?.(text) ?? text),
+});
 
 export const emptyUsage = (): Usage => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
