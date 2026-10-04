@@ -788,3 +788,31 @@ test("an approve whose lookup starts while a round is pushing is refused, and st
   await restart();
   expect(factory.store.approvalFor(PR_URL)).toBeNull();
 });
+
+test("an approve that agrees only with a push's intended head is refused, and stays so after a restart", async () => {
+  const original = await delivered();
+  const a = await remoteHead();
+  // 1. A round delivers B.
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  expect(await settle(roundId)).toMatchObject({ status: "succeeded" });
+  const b = await remoteHead();
+  // 2. An approve reads B and pauses.
+  const held = holdLookup();
+  const approving = review(original.id, { verdict: "approve", reviewedSha: b });
+  await held.reached;
+  // 3. The branch is reset to A, and A is seen.
+  await sh(["git", "update-ref", `refs/heads/${BRANCH}`, a], { cwd: remote });
+  factory.store.observePrHead(PR_URL, a);
+  // 4. A retried push of B fails, and so does reading the remote: B is recorded only as intended.
+  factory.store.beginPrPush(PR_URL, b, roundId);
+  factory.store.endPrPush(PR_URL, null);
+  // 5. The paused approve agrees with that intended head, but the remote holds A.
+  held.release();
+  expect(await approving).toMatchObject({
+    status: 409,
+    body: { error: expect.stringContaining("head moved") },
+  });
+  expect(await remoteHead()).toBe(a);
+  await restart();
+  expect(factory.store.approvalFor(PR_URL)).toBeNull();
+});

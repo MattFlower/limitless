@@ -1087,16 +1087,13 @@ export class Store {
   /**
    * Records a head seen on a PR; an approval of any other commit goes stale. With `since`, the
    * version read before looking, the observation is refused (false) while a round is pushing to the
-   * PR, or when the epoch has moved on to a different head: it can never rewind the last known head.
+   * PR or once the epoch has moved on at all, even to the same head: a head recorded when a push
+   * began is only what the push intended, so agreeing with it proves nothing.
    */
   observePrHead(prUrl: string, head: string, since?: number): boolean {
     return this.db.transaction(() => {
       const last = this.prHead(prUrl);
-      if (
-        since !== undefined &&
-        (this.pushingTo(prUrl) || (last && last.version !== since && last.sha !== head))
-      )
-        return false;
+      if (since !== undefined && (this.pushingTo(prUrl) || (last ? last.version : 0) !== since)) return false;
       if (last?.sha !== head) this.writePrHead(prUrl, head, null);
       this.staleApprovals(prUrl, head);
       return true;
