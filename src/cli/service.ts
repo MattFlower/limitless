@@ -26,6 +26,7 @@ import {
   waitForDrain,
   waitForHealthy,
 } from "./deploy-wait.ts";
+import { type LeaseClient, type LeaseOptions, localLeaseClient, withGateLease } from "./gate-slot.ts";
 
 const LABEL = "dev.limitless.daemon";
 const TUNNEL_LABEL = "dev.limitless.tunnel";
@@ -440,7 +441,7 @@ function tailLines(lines: string[], maxLines: number, maxBytes: number): string[
   return kept;
 }
 
-async function gates(run: typeof sh, dir: string, smoke: boolean): Promise<void> {
+async function gates(run: typeof sh, dir: string, smoke: boolean, lease: LeaseOptions): Promise<void> {
   const gate = async (args: string[], timeoutMs: number) => {
     const res = await run(args, { cwd: dir, timeoutMs, allowFail: true });
     if (res.exitCode === 0) return;
@@ -476,7 +477,13 @@ async function gates(run: typeof sh, dir: string, smoke: boolean): Promise<void>
     );
   };
   // The full suite takes 8–11 minutes alone and longer while runs use the machine.
-  for (const args of GATES) await gate(args, args.includes("test") ? 1_200_000 : 600_000);
+  await withGateLease(
+    "deploy",
+    async () => {
+      for (const args of GATES) await gate(args, args.includes("test") ? 1_200_000 : 600_000);
+    },
+    lease,
+  );
   if (smoke) await gate(SMOKE, 900_000);
 }
 
@@ -489,6 +496,7 @@ export async function deploy(
   ref = "origin/main",
   smoke = false,
   opts: {
+    leaseClient?: LeaseClient;
     lifecycle?: (run: typeof sh, race: <T>(work: Promise<T>) => Promise<T>) => Promise<void>;
     agentsDir?: string;
     releaseDir?: string;
@@ -520,6 +528,7 @@ export async function deploy(
   const unlock = acquireDeployLock(opts.lockPath ?? deployLock);
   let interrupted: Error | null = null;
   const commandAbort = new AbortController();
+  const lease = { client: opts.leaseClient ?? localLeaseClient(port), signal: commandAbort.signal };
   let rejectSignal = (_error: Error) => {};
   const signal = new Promise<never>((_, reject) => {
     rejectSignal = reject;
@@ -579,7 +588,7 @@ export async function deploy(
         await race(requestAdmin(client, clock, "resume"));
         drainAttempted = false;
       }
-      if (smoke) await gates(run, dir, smoke);
+      if (smoke) await gates(run, dir, smoke, lease);
       log(`daemon after: ${running.sha}`);
       log(`already deployed ${target}`);
       return;
@@ -587,7 +596,7 @@ export async function deploy(
     if (checkout !== target) await run(["git", "checkout", "-q", "--detach", target], { cwd: dir });
     else log(`checkout already at ${target}; continuing deployment`);
     await run(["bun", "install", "--frozen-lockfile"], { cwd: dir, timeoutMs: 300_000 });
-    await gates(run, dir, smoke);
+    await gates(run, dir, smoke, lease);
     gatesPassed = true;
     // A lost response may still have enabled drain on the daemon.
     drainAttempted = true;

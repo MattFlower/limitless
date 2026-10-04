@@ -28,7 +28,7 @@ import { gatesAt } from "./prepare.ts";
 
 export async function prepareImplement(item: ImplementCase, cwd: string, signal: AbortSignal) {
   const gates = await gatesAt(cwd, item.base, signal);
-  const baseline = await runGates(cwd, gates, signal);
+  const baseline = await runGates(cwd, gates, signal, { holder: "eval baseline" });
   signal.throwIfAborted();
   if (!baseline.setupOk) throw new Error("baseline gate setup failed");
   if (baseline.checks.some((check) => check.output.startsWith("[timed out]")))
@@ -238,7 +238,7 @@ export async function gradeImplement(
     });
     evidence.auditBlocks = findings.filter((finding) => finding.severity === "block");
     evidence.auditWarnings = findings.filter((finding) => finding.severity === "warn");
-    const after = await runGates(checkout, prepared.gates, signal);
+    const after = await runGates(checkout, prepared.gates, signal, { holder: "eval trial" });
     signal.throwIfAborted();
     await sh(["git", "reset", "--hard", "-q", commit], opts);
     await sh(["git", "clean", "-fdq"], opts);

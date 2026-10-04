@@ -141,7 +141,13 @@ async function compete() {
   const before = calls.length;
   const contender =
     scenario === "install-deploy"
-      ? () => service.deploy(0, undefined, false, { command, client, clock })
+      ? () =>
+          service.deploy(0, undefined, false, {
+            command,
+            client,
+            clock,
+            leaseClient: async () => ({ id: "lease", acquired: true }),
+          })
       : () => service.install(0, { command, client, clock });
   contenderError = String(await contender().catch((error) => error));
   contenderCalls = calls.slice(before);
@@ -292,7 +298,12 @@ let tunnelJournal = "";
 let daemonOld = "";
 try {
   if (scenario === "deploy-install" || (scenario.startsWith("recover") && scenario.endsWith("deploy")))
-    await service.deploy(0, undefined, false, { command, client, clock });
+    await service.deploy(0, undefined, false, {
+      command,
+      client,
+      clock,
+      leaseClient: async () => ({ id: "lease", acquired: true }),
+    });
   else if (scenario === "status") await service.status(0);
   else if (scenario === "uninstall") await service.uninstall();
   else {

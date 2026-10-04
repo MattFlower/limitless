@@ -11,7 +11,7 @@ repo="MattFlower/limitless"
 cd "$dir"
 
 bun install --frozen-lockfile >/dev/null
-if ! bun run check >/tmp/land-pr-check.log 2>&1; then
+if ! limitless gate-slot --name "land-pr #$pr" -- bun run check >/tmp/land-pr-check.log 2>&1; then
   echo "bun run check failed; see /tmp/land-pr-check.log" >&2
   exit 1
 fi
