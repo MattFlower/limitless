@@ -54,6 +54,7 @@ import {
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
+import { processScope } from "../util/proc.ts";
 import {
   CancelledError,
   type EngineDeps,
@@ -138,8 +139,10 @@ export async function executeRun(
     return "failed";
   }
   // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
-  return worktreeGitScope.run(true, () =>
-    executeScopedRun(new RunContext(deps, run, repo, signal, isDraining, drainEvents), signal),
+  const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
+  return processScope.run(
+    { signal: ctx.signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set() },
+    () => worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
   );
 }
 
@@ -948,7 +951,7 @@ async function oneRound(
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
-  const privateStrings = () => loadPrivateStrings(ctx.deps.cfg.paths.configDir, [cwd, ctx.repo.localPath]);
+  const privateStrings = () => privateEntries(ctx, cwd);
   const changeDiff = () =>
     diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change", privateStrings());
   const system =
@@ -1541,11 +1544,16 @@ function deliveryBudget(ctx: RunContext): GitHubBudget {
   return budget;
 }
 
+function privateEntries(ctx: RunContext, cwd: string) {
+  const { configDir, repos, work } = ctx.deps.cfg.paths;
+  return loadPrivateStrings(configDir, [cwd, ctx.repo.localPath, repos, work]);
+}
+
 /** Without `pr`, `body` is a PR comment and only its text is checked. */
 async function checkPublication(ctx: RunContext, body: string, pr?: { sha: string; title: string }) {
   const cwd = ctx.state.worktreePath as string;
   try {
-    const entries = loadPrivateStrings(ctx.deps.cfg.paths.configDir, [cwd, ctx.repo.localPath]);
+    const entries = privateEntries(ctx, cwd);
     if (!entries.length) return;
     checkPrivateText(body, pr ? "PR body" : "PR comment", entries);
     if (!pr) return;
@@ -1680,7 +1688,6 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         });
         const report = buildReport(ctx, true);
         if (!ctx.state.verdictCommentPosted) {
-          await checkPublication(ctx, report);
           const marker = `<!-- limitless-verification:${ctx.run.id} -->`;
           ctx.checkCancelled();
           const comments = [
@@ -1743,7 +1750,9 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
               ctx.checkCancelled();
-              await runner([...comment, "--body", `${marker}\n${report}`], ctx.signal);
+              const body = `${marker}\n${report}`;
+              await checkPublication(ctx, body);
+              await runner([...comment, "--body", body], ctx.signal);
             },
             { budget, signal: ctx.signal },
           ).catch(async (error: unknown) => {

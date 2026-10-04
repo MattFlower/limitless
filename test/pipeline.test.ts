@@ -2436,6 +2436,7 @@ esac
     "encoded-body",
     "draft-history",
     "lfs-history",
+    "cache-config",
   ])("private strings stop %s delivery before any push", async (scenario) => {
     const bare = await githubFixture();
     const entry = scenario === "branch" ? "secret-host-example" : "secret-host.example";
@@ -2521,6 +2522,7 @@ esac
       };
     });
     f.cfg.maxRounds = 1;
+    if (scenario === "cache-config") f.cfg.paths.configDir = join(f.cfg.paths.repos, "config");
     mkdirSync(f.cfg.paths.configDir, { recursive: true });
     writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), entry);
     registerGithub(f, bare);
@@ -2537,12 +2539,15 @@ esac
       prompt: scenario === "branch" ? "Secret Host Example" : "Add farewell",
       profile: "quick",
     });
-    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe(
+      scenario === "cache-config" ? "failed" : "needs_human",
+    );
     expect(existsSync(join(home, "push-calls"))).toBe(false);
     expect(f.store.getRun(run.id)?.prUrl).toBeNull();
     const error = f.store.getRun(run.id)?.error ?? "";
     expect(error.toLowerCase()).not.toContain(entry);
-    if (scenario !== "unreadable") expect(error).toContain("entry 1 in private-strings.txt");
+    if (scenario === "cache-config") expect(error).toContain("inside repository");
+    else if (scenario !== "unreadable") expect(error).toContain("entry 1 in private-strings.txt");
     calls.push(
       ...f.store
         .listEvents(run.id)
@@ -2554,6 +2559,79 @@ esac
       (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
         .stdout,
     ).toBe("");
+  });
+
+  test.each(["diff", "publication"])("run cancellation stops the production %s blob scan", async (stage) => {
+    const bare = await githubFixture();
+    const armed = join(home, "scan-armed");
+    const started = join(home, "scan-started");
+    const pushed = join(home, "push-calls");
+    const gitBin = Bun.which("git");
+    if (!gitBin) throw new Error("missing git");
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        if (stage === "publication") writeFileSync(armed, "ready");
+        return { structured: approve };
+      }
+      if (stage === "diff") writeFileSync(armed, "ready");
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+    registerGithub(f, bare);
+    writeFileSync(
+      join(home, "bin", "git"),
+      `#!/bin/sh
+for arg in "$@"; do [ "$arg" = push ] && echo push >> '${pushed}'; done
+if [ -f '${armed}' ] && [ "$1" = --no-replace-objects ] && [ "$2" = cat-file ] && [ "$3" = --batch ]; then
+  sleep 60 & scan=$!
+  printf '%s %s' "$$" "$scan" > '${started}'
+  wait
+  exit 1
+fi
+exec '${gitBin}' "$@"
+`,
+      { mode: 0o755 },
+    );
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    const deadline = Date.now() + 10000;
+    while (!existsSync(started) && Date.now() < deadline) await Bun.sleep(10);
+    expect(existsSync(started)).toBe(true);
+    const pids = readFileSync(started, "utf8").split(" ").map(Number);
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      const at = Date.now();
+      expect(f.cancelRun(run.id)).toBe(true);
+      while (
+        (pids.some(alive) || f.store.listStages(run.id).at(-1)?.status !== "cancelled") &&
+        Date.now() - at < 4900
+      )
+        await Bun.sleep(10);
+      expect(Date.now() - at).toBeLessThan(5000);
+      expect(pids.some(alive)).toBe(false);
+      expect(f.store.listStages(run.id).at(-1)?.status).toBe("cancelled");
+      expect(f.store.getRun(run.id)?.status).toBe("cancelled");
+      expect(existsSync(pushed)).toBe(false);
+      expect(existsSync(join(home, "gh-calls"))).toBe(false);
+    } finally {
+      const group = pids[0];
+      if (group && pids.some(alive)) {
+        try {
+          process.kill(-group, "SIGKILL");
+        } catch {
+          /* already exited */
+        }
+      }
+    }
   });
 
   test("private strings outside the published range permit clean delivery", async () => {
@@ -3829,6 +3907,7 @@ esac
     "pr-script",
     "pr-script-removed",
     "private-comment",
+    "private-marker",
   ])(
     "verify-change: %s",
     async (scenario) => {
@@ -3967,9 +4046,12 @@ protected_paths = ["protected.txt"]
         };
       };
       let f = start(handler);
-      if (scenario === "private-comment") {
+      if (["private-comment", "private-marker"].includes(scenario)) {
         mkdirSync(f.cfg.paths.configDir, { recursive: true });
-        writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+        writeFileSync(
+          join(f.cfg.paths.configDir, "private-strings.txt"),
+          scenario === "private-marker" ? "<!-- limitless-verification:" : "secret-host.example",
+        );
       }
       const calls: string[][] = [];
       const gh = async (args: string[]) => {
@@ -4059,7 +4141,8 @@ protected_paths = ["protected.txt"]
         if (scenario === "restart-repair") expect(before?.implementedRound).toBe(0);
       }
       const blocked =
-        prScript || ["persistent", "repair-audit", "empty", "private-comment"].includes(scenario);
+        prScript ||
+        ["persistent", "repair-audit", "empty", "private-comment", "private-marker"].includes(scenario);
       expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human", "cancelled"])).toBe(
         scenario === "head-moved" ? "cancelled" : stale ? "failed" : blocked ? "needs_human" : "succeeded",
       );
@@ -4072,7 +4155,7 @@ protected_paths = ["protected.txt"]
       const baseRuns = scenario === "baseline" ? [baseTip, baseTip] : [baseTip];
       expect(revisions.slice(0, baseRuns.length + 1)).toEqual([...baseRuns, head]);
       const remote = (await git("ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).split("\t")[0];
-      if (scenario === "private-comment") {
+      if (["private-comment", "private-marker"].includes(scenario)) {
         expect(calls.some((call) => call.at(-1)?.includes("limitless-verification"))).toBe(false);
         expect(JSON.stringify(calls)).not.toContain("secret-host.example");
         expect(remote).toBe(head);

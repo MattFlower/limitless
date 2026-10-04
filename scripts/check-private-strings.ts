@@ -4,12 +4,27 @@ import { splitPatch } from "../src/gates/audit.ts";
 import * as privacy from "../src/gates/private.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { checkPrivateRange } from "../src/git/repos.ts";
-import { sh } from "../src/util/proc.ts";
+import { processScope, sh } from "../src/util/proc.ts";
 
+const controller = new AbortController();
+for (const event of ["SIGTERM", "SIGINT"] as const) process.on(event, () => controller.abort());
+const signal = controller.signal;
+processScope.enterWith({ signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set() });
 try {
   const common = await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd: process.cwd() });
   const entries = privacy.loadPrivateStrings(undefined, [process.cwd(), resolve(common.stdout.trim(), "..")]);
-  if (entries.length) {
+  if (process.argv[4] === "--merge") {
+    const [pr = "", repo = "", , sha = ""] = process.argv.slice(2);
+    const opts = { cwd: process.cwd() };
+    const cmd = ["gh", "pr", "view", pr, "-R", repo, "--json", "title,body,headRefOid"];
+    const { stdout } = await sh(cmd, opts);
+    const schema = z.object({ title: z.string().min(1), body: z.string(), headRefOid: z.string() });
+    const data = schema.parse(JSON.parse(stdout));
+    if (!/^[a-f0-9]{40,64}$/.test(sha) || data.headRefOid !== sha) throw new Error("PR head moved");
+    privacy.checkPrivateText(`${data.title}\n${data.body}`, "PR text", entries);
+    const merge = ["gh", "pr", "merge", pr, "-R", repo, "--squash", "--delete-branch"];
+    await sh([...merge, "--subject", data.title, "--body", data.body, "--match-head-commit", sha], opts);
+  } else if (entries.length) {
     const [pr = "", repo = "", subject = ""] = process.argv.slice(2);
     const opts = { cwd: process.cwd() };
     privacy.checkPrivateText(subject, "Squash subject", entries);

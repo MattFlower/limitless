@@ -1369,6 +1369,10 @@ test.each([
   ["onnx", "valid", false],
   ["\npointer.png", "valid", false],
   ["ts", "valid", true],
+  ["ts", "crlf", true],
+  ["ts", "legacy", true],
+  ["png", "crlf", false],
+  ["png", "legacy", false],
   ["png", "missing oid", true],
   ["psd", "missing oid", true],
   ["png", "missing size", true],
@@ -1376,6 +1380,8 @@ test.each([
   ["png", "invalid size", true],
 ])("LFS pointer %s (%s) receives only the non-source-path exemption", async (extension, kind, blocks) => {
   let pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 68\n`;
+  if (kind === "crlf") pointer = pointer.replaceAll("\n", "\r\n");
+  if (kind === "legacy") pointer = pointer.replace("git-lfs", "hawser");
   if (kind === "missing oid") pointer = pointer.replace(/oid.*\n/, "");
   if (kind === "missing size") pointer = pointer.replace(/size.*\n/, "");
   if (kind === "invalid hash") pointer = pointer.replace("a".repeat(64), "bad");
@@ -1405,7 +1411,15 @@ test.each([
   await factory("commit", "-qm", "LFS pointer fixture");
   const findings = auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] });
   expect(attributeBlocksOf(findings).length > 0).toBe(blocks);
-  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+  if (["valid", "crlf", "legacy"].includes(kind))
+    expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+  else
+    expect(findings.filter((f) => f.rule === "binary-content")).toEqual([
+      expect.objectContaining({
+        severity: "block",
+        detail: expect.stringContaining("Malformed LFS pointer"),
+      }),
+    ]);
 });
 
 test.each(["diff", "-diff"])(
@@ -1565,7 +1579,7 @@ test("16,000 added files use stdin pathspecs without uncertainty findings", asyn
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
 }, 120_000);
 
-test("LFS inspection skips short blobs and checks repeated candidate blobs once", async () => {
+test("LFS inspection batches short and repeated candidate blobs per tree", async () => {
   const pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 2\n`;
   for (let i = 0; i < 128; i++) {
     writeFileSync(join(work, `short-${i}.dat`), `small text ${i}\n`);
@@ -1584,9 +1598,9 @@ test("LFS inspection skips short blobs and checks repeated candidate blobs once"
   const diff = await diffSince(work, revision, shim.env);
   expect(diff.binaryErrors).toBeUndefined();
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
-  // The two distinct candidate blobs at base are read in one batch; head has no candidates.
+  // Short blobs also need classification: each tree still uses only one batch.
   expect(shim.calls().filter((call) => ` ${call} `.includes(" cat-file -p "))).toEqual([]);
-  expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(1);
+  expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(2);
 }, 30_000);
 
 test("failed binary classification blocks even with attribute and binary allowances", async () => {
@@ -1685,7 +1699,16 @@ test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size
     );
     await factory("commit", "-qm", "binary LFS edit");
     const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
-    expect(findings.filter((f) => f.rule === "binary-content").length).toBe(kind === "valid" ? 0 : 3);
+    expect(findings.filter((f) => f.rule === "binary-content")).toEqual(
+      kind === "valid"
+        ? []
+        : [
+            expect.objectContaining({
+              severity: "block",
+              detail: expect.stringContaining("Malformed LFS pointer"),
+            }),
+          ],
+    );
   },
 );
 
@@ -1776,6 +1799,13 @@ test.each([
   "extended",
   "extended-clean",
   "corrupt",
+  "crlf",
+  "legacy",
+  "legacy-crlf",
+  "crlf-clean",
+  "legacy-clean",
+  "malformed",
+  "bad-extension",
 ])("LFS payload inspection: %s", async (scenario) => {
   const payload = Buffer.from(scenario.includes("clean") ? "safe\0" : "%73ecret-host.example\0");
   const oid = createHash("sha256").update(payload).digest("hex");
@@ -1784,10 +1814,11 @@ test.each([
   if (scenario === "unreadable") mkdirSync(object);
   else if (scenario !== "missing")
     writeFileSync(object, scenario === "corrupt" ? Buffer.alloc(payload.length, 97) : payload);
-  writeFileSync(
-    join(work, "asset.dat"),
-    `version https://git-lfs.github.com/spec/v1\n${scenario.startsWith("extended") ? `ext-0-test sha256:${"a".repeat(64)}\n` : ""}oid sha256:${oid}\nsize ${payload.length}\n`,
-  );
+  let pointer = `version https://${scenario.startsWith("legacy") ? "hawser" : "git-lfs"}.github.com/spec/v1\n${scenario.startsWith("extended") ? `ext-0-test sha256:${"a".repeat(64)}\n` : ""}oid sha256:${oid}\nsize ${payload.length}\n`;
+  if (scenario.includes("crlf")) pointer = pointer.replaceAll("\n", "\r\n");
+  if (scenario === "malformed") pointer = pointer.replace("size ", "unknown ");
+  if (scenario === "bad-extension") pointer = pointer.replace("oid ", "ext-0-test broken\noid ");
+  writeFileSync(join(work, "asset.dat"), pointer);
   if (scenario === "staged") await git(work, "add", ".");
   else await commitAll(work, "asset");
   if (scenario === "removed") {
@@ -1801,10 +1832,25 @@ test.each([
     expect((await diffSince(work, base, undefined, false, entries)).privateHits).toEqual([]);
   } else
     await expect(scan).rejects.toThrow(
-      ["missing", "unreadable", "corrupt"].includes(scenario)
-        ? "Cannot inspect local LFS payload"
-        : "entry 1",
+      ["malformed", "bad-extension"].includes(scenario)
+        ? "Malformed LFS pointer"
+        : ["missing", "unreadable", "corrupt"].includes(scenario)
+          ? "Cannot inspect local LFS payload"
+          : "entry 1",
     );
+  if (!["removed", "staged"].includes(scenario)) {
+    const classified = await diffSince(work, base);
+    const findings = auditDiff(classified, { taskClass: "feature", protectedPaths: [] });
+    if (["malformed", "bad-extension"].includes(scenario))
+      expect(findings.some((f) => f.severity === "block" && f.detail.includes("Malformed LFS pointer"))).toBe(
+        true,
+      );
+    else expect(classified.attributeMatches).toBeDefined();
+    if (!["missing", "unreadable", "corrupt", "malformed", "bad-extension"].includes(scenario)) {
+      const inspected = await diffSince(work, base, undefined, false, entries);
+      expect(inspected.privateHits?.length).toBe(scenario.includes("clean") ? 0 : 1);
+    }
+  }
 });
 
 test.each(["complete", "truncated", "failed", "timeout", "timeout-exit-0", "cancelled"])(

@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -13,7 +13,22 @@ export function loadPrivateStrings(
   try {
     const file = canonical(join(configDir, "private-strings.txt"));
     const locations = [resolve(configDir), canonical(configDir), file];
-    const boundaries = roots.flatMap((root) => (root ? [resolve(root), canonical(resolve(root))] : []));
+    const read = (path: string) => readFileSync(path, "utf8").trim();
+    const repositoryRoots = roots.flatMap((root) => {
+      if (!root) return [];
+      let git = canonical(join(root, ".git"));
+      const stat = lstatSync(git, { throwIfNoEntry: false });
+      if (stat?.isFile()) git = resolve(root, read(git).replace(/^gitdir: /, ""));
+      else if (!stat) git = root;
+      if (lstatSync(join(git, "commondir"), { throwIfNoEntry: false }))
+        git = canonical(resolve(git, read(join(git, "commondir"))));
+      const worktrees = join(git, "worktrees");
+      const linked = lstatSync(worktrees, { throwIfNoEntry: false })
+        ? readdirSync(worktrees).map((name) => dirname(read(join(worktrees, name, "gitdir"))))
+        : [];
+      return [root, git, ...(basename(git) === ".git" ? [dirname(git)] : []), ...linked];
+    });
+    const boundaries = repositoryRoots.flatMap((root) => [resolve(root), canonical(resolve(root))]);
     if (boundaries.some((root) => locations.some((path) => `${path}/`.startsWith(`${root}/`))))
       throw new PrivateError("Private config is inside repository; publication blocked");
     if (!lstatSync(file, { throwIfNoEntry: false })) return [];

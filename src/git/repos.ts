@@ -11,6 +11,7 @@ import * as privacy from "../gates/private.ts";
 import { CommandError, sh } from "../util/proc.ts";
 import { emptyHookFlags, NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
 
+const BRANCH_PUSH = ["git", "push", "--no-follow-tags"];
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
 /** Retry policy for GitHub and remote git (tests shorten it). */
@@ -576,8 +577,8 @@ export async function blobPrivateEntries(
       throw new privacy.PrivateError("Cannot inspect binary blob; publication blocked");
     const text = decoder.decode(Buffer.from(stdout.slice(end + 1, end + 1 + size), "latin1"));
     at = end + size + 2;
-    const lfs = text.startsWith("version https://git-lfs.github.com/spec/v1\n");
-    const content = lfs ? text + (await lfsPayload(cwd, env, text)) : text.includes("\0") ? text : "";
+    const lfs = lfsPointer(text);
+    const content = lfs ? text + (await lfsPayload(cwd, env, lfs)) : text.includes("\0") ? text : "";
     for (const { entry } of privacy.privateMatches(content, privateStrings)) found.push([id, entry]);
   }
   return [...found];
@@ -607,7 +608,27 @@ export async function checkPrivateRange(cwd: string, range: string, entries: Pri
   if (hit) throw new privacy.PrivateError(privacy.privateReason("Published blob", hit[1]));
 }
 
-const LFS_POINTER = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:[0-9a-f]{64}\nsize \d+\n$/;
+function lfsPointer(text: string): string | null {
+  const normalized = text.trim().replaceAll("\r\n", "\n").replaceAll(/\n\n+/g, "\n");
+  if (!/^(?:version https?:|oid sha256:|ext-\d-)/.test(normalized)) return null;
+  const extensions = normalized.match(/^ext-.*$/gm) ?? [];
+  const priorities = extensions.map((line) => line.slice(4, 5));
+  const validExtensions = extensions.every((line) => /^ext-\d-\w[^ ]* sha256:[a-f0-9]{64}$/.test(line));
+  const core = normalized.replaceAll(/^ext-.*\n/gm, "");
+  const match =
+    /^version (?:https:\/\/(?:git-lfs|hawser)\.github\.com\/spec\/v1|http:\/\/git-media\.io\/v\/2)\noid sha256:([a-f0-9]{64})\nsize (\+?\d+)$/.exec(
+      core,
+    );
+  if (
+    !match?.[1] ||
+    !Number.isSafeInteger(Number(match[2])) ||
+    !validExtensions ||
+    new Set(priorities).size !== priorities.length ||
+    /\nsize [^\n]+\n/.test(normalized)
+  )
+    throw new privacy.PrivateError("Malformed LFS pointer; publication blocked");
+  return `oid sha256:${match[1]}\nsize ${Number(match[2])}\n`;
+}
 /** Deadline for attribute queries and content classification; missing it blocks the audit. */
 export const attributeLimits = { timeoutMs: 60_000 };
 
@@ -699,14 +720,13 @@ async function attributeInfo(
       const sizes = (
         await git(["cat-file", "--batch-check=%(objectname) %(objectsize)"], input)
       ).stdout.split("\n");
-      // The shortest strict pointer is 126 bytes; ordinary small text needs no blob read.
       const sized = candidates.flatMap((path, i) => {
         const [oid = "", bytes] = (sizes[i] ?? "").split(" ");
         const size = Number(bytes);
-        return size >= 126 && size <= 200 ? [{ path, oid }] : [];
+        return size < 1024 ? [{ path, oid }] : [];
       });
-      // One read for every blob not classified yet. These are text blobs of at most 200 bytes,
-      // so they hold no NUL and -Z output splits unambiguously; any misparse reads as no pointer.
+      // One read for every blob not classified yet. These are text blobs below 1024 bytes,
+      // so they hold no NUL and -Z output splits unambiguously; malformed pointers block classification.
       const unread = [...new Set(sized.map(({ oid }) => oid))].filter((oid) => !pointers.has(oid));
       if (unread.length) {
         const records = (
@@ -715,7 +735,8 @@ async function attributeInfo(
         for (const [i, oid] of unread.entries())
           pointers.set(
             oid,
-            (records[2 * i] ?? "").startsWith(`${oid} blob `) && LFS_POINTER.test(records[2 * i + 1] ?? ""),
+            (records[2 * i] ?? "").startsWith(`${oid} blob `) &&
+              lfsPointer(records[2 * i + 1] ?? "") !== null,
           );
       }
       for (const { path, oid } of sized)
@@ -893,6 +914,7 @@ export async function pushBranch(
         "--no-follow-tags",
         `--receive-pack=git -c core.hooksPath=/dev/null -c receive.denyCurrentBranch=refuse -c receive.autogc=false ${receiveHooks} receive-pack`,
         repo.localPath,
+        // Branch-only refspecs exclude git notes.
         `${sha}:refs/heads/${branch}`,
       ],
       {
@@ -905,7 +927,7 @@ export async function pushBranch(
     return;
   }
   if (!repo.url) return;
-  await remoteSh(["git", "push", "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
+  await remoteSh([...BRANCH_PUSH, "--force-with-lease", repo.url, `${sha}:refs/heads/${branch}`], {
     cwd,
     timeoutMs: 300_000,
     signal,
@@ -950,7 +972,7 @@ export async function pushExistingBranch(
     signal,
   });
   if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
-  await remoteSh(["git", "push", `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
+  await remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
     cwd,
     timeoutMs: 300_000,
     signal,
@@ -1248,7 +1270,7 @@ async function stageEvalRepo(
     mkdirSync(path, { recursive: true });
     await sh(["git", "init", "-q", path], opts);
     if (snapshot) pins = await pushSnapshot(cache, base, head, path, signal);
-    else await sh(["git", "push", "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
+    else await sh([...BRANCH_PUSH, "-q", path, `${base}:refs/eval/base`, `${head}:refs/eval/head`], opts);
   });
   await rejectContamination(path, labels, signal);
   return pins;
@@ -1301,7 +1323,7 @@ async function pushSnapshot(
     const snapshotBase = await commit(base, "Snapshot base");
     const snapshotHead = await commit(head, "Snapshot head", snapshotBase);
     await sh(
-      ["git", "push", "-q", path, `${snapshotBase}:refs/eval/base`, `${snapshotHead}:refs/eval/head`],
+      [...BRANCH_PUSH, "-q", path, `${snapshotBase}:refs/eval/base`, `${snapshotHead}:refs/eval/head`],
       opts,
     );
     return [snapshotBase, snapshotHead];

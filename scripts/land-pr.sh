@@ -11,6 +11,9 @@ repo="MattFlower/limitless"
 private_check="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-private-strings.ts"
 [[ "${LIMITLESS_CONFIG_DIR-/}" = /* ]] || export LIMITLESS_CONFIG_DIR="$PWD/$LIMITLESS_CONFIG_DIR"
 cd "$dir"
+checker=""
+trap '[ -z "$checker" ] || { kill -TERM "$checker" 2>/dev/null || :; wait "$checker" || :; }; exit 1' TERM INT
+check_private() { bun "$private_check" "$@" & checker=$!; wait "$checker"; checker=""; }
 
 bun install --frozen-lockfile >/dev/null
 log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
@@ -20,7 +23,7 @@ if ! bun run check >"$log" 2>&1; then
 fi
 
 git add -A
-bun "$private_check" "$pr" "$repo" "$subject"
+check_private "$pr" "$repo" "$subject"
 if ! git diff --cached --quiet || [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
   git commit -q -m "Merge main into PR $pr
 
@@ -32,8 +35,8 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
-bun "$private_check" "$pr" "$repo" "$subject" "$head_ref"
-git push -q origin "HEAD:refs/heads/$head_ref"
+check_private "$pr" "$repo" "$subject" "$head_ref"
+git push -q --no-follow-tags origin "HEAD:refs/heads/$head_ref"
 sha="$(git rev-parse HEAD)"
 
 # Wait for the CI run on exactly this commit, then require success.
@@ -52,5 +55,5 @@ if ! gh run watch "$run" -R "$repo" --exit-status >/dev/null; then
   exit 1
 fi
 
-gh pr merge "$pr" -R "$repo" --squash --delete-branch --subject "$subject" --match-head-commit "$sha"
+check_private "$pr" "$repo" --merge "$sha"
 echo "landed #$pr at $sha"

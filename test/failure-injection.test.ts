@@ -923,7 +923,7 @@ for (const operation of [
         merge: "gh pr merge *",
         "auto-merge": "gh pr merge *--auto*",
         "existing-head": "git ls-remote *",
-        "existing-push": "git push --force-with-lease=*",
+        "existing-push": "git push --no-follow-tags --force-with-lease=*",
         comment: "gh pr comment *",
         comments: "gh api *",
         draft: "gh pr create *--draft*",

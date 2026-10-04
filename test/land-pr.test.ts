@@ -36,6 +36,7 @@ describe("land-pr private strings", () => {
     "relative",
     "excluded",
     "lfs",
+    "lfs-crlf-legacy",
     "lfs-missing",
     "lfs-removed",
     "post-commit",
@@ -101,7 +102,9 @@ describe("land-pr private strings", () => {
         if (scenario !== "lfs-missing") writeFileSync(object, payload);
         writeFileSync(
           join(work, "asset.dat"),
-          `version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize ${payload.length}\n`,
+          scenario === "lfs-crlf-legacy"
+            ? `version https://hawser.github.com/spec/v1\r\noid sha256:${oid}\r\nsize ${payload.length}\r\n`
+            : `version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize ${payload.length}\n`,
         );
         if (scenario === "lfs-removed") {
           await commit("asset");
@@ -213,3 +216,154 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test.each(["title", "body", "moved", "lookup-failed", "malformed", "missing", "clean", "cancel"])(
+  "land validates the final PR after CI: %s",
+  async (scenario) => {
+    const root = mkdtempSync(join(tmpdir(), "land-final-"));
+    const work = join(root, "work");
+    const config = join(root, "config");
+    const bin = join(root, "bin");
+    const gitBin = Bun.which("git");
+    if (!gitBin) throw new Error("missing git");
+    let scanGroup: number | undefined;
+    let child: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      for (const path of [work, config, bin]) mkdirSync(path);
+      const git = (...args: string[]) => sh([gitBin, ...args], { cwd: work });
+      await git("init", "-qb", "main");
+      writeFileSync(join(work, "file"), "base");
+      await git("add", ".");
+      await git("commit", "-qm", "base");
+      const base = (await git("rev-parse", "HEAD")).stdout.trim();
+      writeFileSync(join(work, "file"), "safe change");
+      await git("commit", "-qam", "safe");
+      const sha = (await git("rev-parse", "HEAD")).stdout.trim();
+      writeFileSync(join(config, "private-strings.txt"), entry);
+      const final = { title: "Fresh safe title", body: "Fresh body\n\nSecond line\n", headRefOid: sha };
+      if (scenario === "title") final.title = entry;
+      if (scenario === "body") final.body = entry;
+      if (scenario === "moved") final.headRefOid = "a".repeat(40);
+      const calls = join(root, "gh-calls");
+      const watched = join(root, "watched");
+      const started = join(root, "scan-started");
+      const pushed = join(root, "push-args");
+      writeFileSync(
+        join(bin, "gh"),
+        `#!${process.execPath}\n
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");
+if (args[0] === "run" && args[1] === "list") console.log("123");
+else if (args[0] === "run" && args[1] === "watch") writeFileSync(${JSON.stringify(watched)}, "ready");
+else if (args[1] === "view") {
+  if (args.includes("--jq")) console.log("safe-branch");
+  else if (existsSync(${JSON.stringify(watched)})) {
+    if (${JSON.stringify(scenario)} === "lookup-failed") process.exit(1);
+    console.log(${JSON.stringify(scenario === "malformed" ? "not-json" : scenario === "missing" ? "{}" : JSON.stringify(final))});
+  } else console.log(${JSON.stringify(JSON.stringify({ baseRefOid: base, body: "Initial safe body", headRefName: "safe-branch" }))});
+}
+`,
+        { mode: 0o755 },
+      );
+      writeFileSync(
+        join(bin, "bun"),
+        `#!/bin/sh\ncase "$1" in *.ts) exec '${process.execPath}' "$@" ;; esac\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      writeFileSync(
+        join(bin, "git"),
+        `#!/bin/sh
+if [ "$1" = push ]; then printf '%s\\n' "$@" > '${pushed}'; exit 0; fi
+${scenario === "cancel" ? `case "$*" in *cat-file*--batch*) sleep 60 & scan=$!; printf '%s %s' "$$" "$scan" > '${started}'; wait; exit 1 ;; esac` : ""}
+exec '${gitBin}' "$@"
+`,
+        { mode: 0o755 },
+      );
+      child = Bun.spawn(["bash", script, "123", "Earlier subject", work], {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          LIMITLESS_CONFIG_DIR: config,
+          TMPDIR: root,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (scenario === "cancel") {
+        const deadline = Date.now() + 5000;
+        while (!existsSync(started) && Date.now() < deadline) await Bun.sleep(10);
+        expect(existsSync(started)).toBe(true);
+        const pids = readFileSync(started, "utf8").split(" ").map(Number);
+        scanGroup = pids[0];
+        const at = Date.now();
+        child.kill("SIGTERM");
+        await Promise.race([
+          child.exited,
+          Bun.sleep(4900).then(() => {
+            throw new Error("land cancellation timed out");
+          }),
+        ]);
+        expect(Date.now() - at).toBeLessThan(5000);
+        for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow();
+        expect(existsSync(pushed)).toBe(false);
+      }
+      const code = await child.exited;
+      if (typeof child.stderr === "number") throw new Error("expected piped stderr");
+      const stderr = await new Response(child.stderr).text();
+      expect(stderr).not.toContain(entry);
+      const recorded: string[][] = readFileSync(calls, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      const merges = recorded.filter((args) => args[1] === "merge");
+      if (scenario === "clean") {
+        expect(code).toBe(0);
+        expect(merges).toEqual([
+          [
+            "pr",
+            "merge",
+            "123",
+            "-R",
+            "MattFlower/limitless",
+            "--squash",
+            "--delete-branch",
+            "--subject",
+            final.title,
+            "--body",
+            final.body,
+            "--match-head-commit",
+            sha,
+          ],
+        ]);
+      } else {
+        expect(code).not.toBe(0);
+        expect(merges).toEqual([]);
+      }
+      if (scenario !== "cancel") {
+        expect(existsSync(watched)).toBe(true);
+        expect(readFileSync(pushed, "utf8").trim().split("\n")).toEqual([
+          "push",
+          "-q",
+          "--no-follow-tags",
+          "origin",
+          "HEAD:refs/heads/safe-branch",
+        ]);
+      }
+    } finally {
+      if (scanGroup) {
+        try {
+          process.kill(-scanGroup, "SIGKILL");
+        } catch {
+          /* already exited */
+        }
+      }
+      if (child && child.exitCode === null) {
+        child.kill("SIGTERM");
+        await child.exited;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);

@@ -596,6 +596,7 @@ for (const kind of ["issue", "pull_request"] as const) {
     "clean",
     "repository-config",
     "worktree-config",
+    "cache-config",
   ])(`private factory ${kind} comment: %s`, async (scenario) => {
     const calls: string[][] = [];
     const file = join(dir, "private-strings.txt");
@@ -612,6 +613,7 @@ for (const kind of ["issue", "pull_request"] as const) {
       () => {},
       async () => null,
       dir,
+      scenario === "cache-config" ? [dir] : [],
     );
     try {
       const repo = store.upsertRepo({

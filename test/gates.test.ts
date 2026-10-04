@@ -32,6 +32,7 @@ import {
 import { defaultGateSlots, gateSlots, Semaphore } from "../src/gates/slots.ts";
 import type { DiffInfo } from "../src/git/repos.ts";
 import { formatAuditFeedback } from "../src/pipeline/prompts.ts";
+import { sh } from "../src/util/proc.ts";
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -832,6 +833,42 @@ test("daemon invocation directory is not an implicit repository root", async () 
     const stderr = await new Response(child.stderr).text();
     expect(stderr).toBe("");
     expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("private config excludes common git directories and all linked worktrees canonically", async () => {
+  const root = mkdtempSync(join(tmpdir(), "private-boundaries-"));
+  try {
+    const repo = join(root, "repo");
+    const work = join(root, "work");
+    const other = join(root, "other");
+    await sh(["git", "init", "-q", repo], { cwd: root });
+    await sh(["git", "commit", "--allow-empty", "-qm", "base"], { cwd: repo });
+    await sh(["git", "worktree", "add", "-qb", "work", work], { cwd: repo });
+    await sh(["git", "worktree", "add", "-qb", "other", other], { cwd: repo });
+    for (const boundary of [repo, work, other, join(repo, ".git")]) {
+      const config = join(boundary, "config-private");
+      mkdirSync(config);
+      writeFileSync(join(config, "private-strings.txt"), "secret-host.example");
+      const alias = join(root, "alias");
+      symlinkSync(config, alias);
+      expect(() => loadPrivateStrings(config, [work])).toThrow("inside repository");
+      expect(() => loadPrivateStrings(alias, [work])).toThrow("inside repository");
+      rmSync(alias);
+    }
+    const aliasWork = join(root, "alias-work");
+    mkdirSync(aliasWork);
+    symlinkSync(join(repo, ".git"), join(aliasWork, ".git"));
+    expect(() => loadPrivateStrings(join(repo, "config-private"), [aliasWork])).toThrow("inside repository");
+    const external = join(root, "repo-sibling");
+    mkdirSync(external);
+    writeFileSync(join(external, "private-strings.txt"), "secret-host.example");
+    expect(loadPrivateStrings(external, [work])).toEqual([{ value: "secret-host.example", entry: 1 }]);
+    rmSync(join(external, "private-strings.txt"));
+    symlinkSync(join(other, "config-private", "private-strings.txt"), join(external, "private-strings.txt"));
+    expect(() => loadPrivateStrings(external, [work])).toThrow("inside repository");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
