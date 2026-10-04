@@ -379,7 +379,7 @@ export class EvalRunner {
       const key = JSON.stringify([item.id, item.base]);
       let prepared = implementations.get(key);
       if (!prepared) {
-        prepared = prepareImplement(item, cwd, signal);
+        prepared = prepareImplement(item, cwd, signal, this.deps.confinement);
         implementations.set(key, prepared);
       }
       return prepared;
@@ -1075,7 +1075,15 @@ export class EvalRunner {
         const grade =
           "hidden" in effective && implementation
             ? result.status === "ok"
-              ? await gradeImplement(effective, cwd, hidden, implementation, toolCommands, signal)
+              ? await gradeImplement(
+                  effective,
+                  cwd,
+                  hidden,
+                  implementation,
+                  toolCommands,
+                  signal,
+                  this.deps.confinement,
+                )
               : failedImplement(result.status === "timeout" ? "timeout" : "error", result.error ?? undefined)
             : ok && output?.success && !("hidden" in item)
               ? gradeCase(item, output.data, system?.causalAttribution)

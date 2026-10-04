@@ -24,16 +24,19 @@ import { detectGates, type GateConfig } from "../src/gates/detect.ts";
 import {
   compareGates,
   type GateRun,
-  retryBaselineFailures,
-  retryRegressions,
-  runGates,
+  retryBaselineFailures as productionBaselineRetry,
+  runGates as productionGates,
+  retryRegressions as productionRetry,
 } from "../src/gates/run.ts";
 import { defaultGateSlots, gateSlots, Semaphore } from "../src/gates/slots.ts";
+import { recordWorktree } from "../src/git/command.ts";
 import { checkoutCommitted, type DiffInfo } from "../src/git/repos.ts";
 import * as sandbox from "../src/harness/sandbox.ts";
 import { ConfinementError } from "../src/harness/sandbox.ts";
+import { formatGateFeedback } from "../src/pipeline/prompts.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
+import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -681,6 +684,12 @@ describe("baseline cache", () => {
   });
 });
 
+const runGates: typeof productionGates = (cwd, cfg, signal, hooks) =>
+  productionGates(cwd, cfg, signal, hooks, fakeConfinement);
+const retryBaselineFailures: typeof productionBaselineRetry = (run, cwd, cfg, signal, onWait) =>
+  productionBaselineRetry(run, cwd, cfg, signal, onWait, fakeConfinement);
+const retryRegressions: typeof productionRetry = (cmp, cwd, cfg, changed, signal, onWait) =>
+  productionRetry(cmp, cwd, cfg, changed, signal, onWait, fakeConfinement);
 describe("confined gates on the committed tree", () => {
   const git = (cwd: string, ...args: string[]) =>
     sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd });
@@ -694,11 +703,12 @@ describe("confined gates on the committed tree", () => {
     await git(cache, "add", "-A");
     await git(cache, "commit", "-qm", "base");
     await git(cache, "worktree", "add", "-q", "--detach", work);
+    await recordWorktree(work);
     return { root, cache, work };
   }
 
-  test.skipIf(process.platform !== "darwin")(
-    "setup, checks and retries write only the checkout and scratch, descendants included",
+  test.skipIf(seatbeltSkip !== null)(
+    `setup, checks and retries write only the checkout and scratch, descendants included ${seatbeltSkip ?? ""}`,
     async () => {
       const { root, work } = await linked();
       try {
@@ -713,13 +723,13 @@ describe("confined gates on the committed tree", () => {
           source: "detected",
           protectedPaths: [],
         };
-        const run = await runGates(work, cfg, new AbortController().signal);
+        const run = await productionGates(work, cfg, new AbortController().signal);
         expect(run.setupOk).toBe(true);
         expect(run.checks.map((c) => [c.name, c.ok])).toEqual([
           ["inside", true],
           ["escape", false],
         ]);
-        const retried = await retryBaselineFailures(run, work, cfg, new AbortController().signal);
+        const retried = await productionBaselineRetry(run, work, cfg, new AbortController().signal);
         expect(retried.checks[1]?.ok).toBe(false);
         expect(readFileSync(canary, "utf8")).toBe("untouched");
       } finally {
@@ -750,10 +760,10 @@ describe("confined gates on the committed tree", () => {
         output: "",
       };
       const failing: GateRun = { setupOk: true, setup: [], checks: [failed] };
-      await expect(runGates(work, cfg, new AbortController().signal)).rejects.toThrow(
+      await expect(productionGates(work, cfg, new AbortController().signal)).rejects.toThrow(
         sandbox.ConfinementError,
       );
-      await expect(retryBaselineFailures(failing, work, cfg, new AbortController().signal)).rejects.toThrow(
+      await expect(productionBaselineRetry(failing, work, cfg, new AbortController().signal)).rejects.toThrow(
         sandbox.ConfinementError,
       );
       expect(existsSync(marker)).toBe(false);
@@ -763,42 +773,39 @@ describe("confined gates on the committed tree", () => {
     }
   });
 
-  test.skipIf(process.platform !== "darwin")(
-    "gates see committed bytes plus fresh setup, even when status reports nothing",
-    async () => {
-      const { root, cache, work } = await linked();
-      try {
-        // Ignored payloads via .gitignore and info/exclude, plus a skip-worktree edit status hides.
-        mkdirSync(join(work, "hidden"));
-        writeFileSync(join(work, "hidden", "x.ts"), "payload");
-        writeFileSync(join(work, "bunfig.toml"), 'preload = ["./hidden/x.ts"]');
-        writeFileSync(join(cache, ".git", "info", "exclude"), "excluded.ts\n");
-        writeFileSync(join(work, "excluded.ts"), "payload");
-        mkdirSync(join(work, "node_modules"));
-        writeFileSync(join(work, "node_modules", "stale"), "agent-installed");
-        await git(work, "update-index", "--skip-worktree", "tracked.txt");
-        writeFileSync(join(work, "tracked.txt"), "forged");
-        expect((await git(work, "status", "--porcelain")).stdout).toBe("");
-        await checkoutCommitted(work);
-        const cfg: GateConfig = {
-          setup: ["mkdir -p node_modules && echo fresh > node_modules/dep"],
-          checks: [
-            {
-              name: "committed",
-              run: 'test ! -e hidden && test ! -e bunfig.toml && test ! -e excluded.ts && test ! -e node_modules/stale && test "$(cat tracked.txt)" = committed && test -f node_modules/dep',
-            },
-          ],
-          source: "detected",
-          protectedPaths: [],
-        };
-        const run = await runGates(work, cfg, new AbortController().signal);
-        expect(run.checks[0]?.output).toBe("");
-        expect(run.checks[0]?.ok).toBe(true);
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-  );
+  test("gates see committed bytes plus fresh setup, even when status reports nothing", async () => {
+    const { root, cache, work } = await linked();
+    try {
+      // Ignored payloads via .gitignore and info/exclude, plus a skip-worktree edit status hides.
+      mkdirSync(join(work, "hidden"));
+      writeFileSync(join(work, "hidden", "x.ts"), "payload");
+      writeFileSync(join(work, "bunfig.toml"), 'preload = ["./hidden/x.ts"]');
+      writeFileSync(join(cache, ".git", "info", "exclude"), "excluded.ts\n");
+      writeFileSync(join(work, "excluded.ts"), "payload");
+      mkdirSync(join(work, "node_modules"));
+      writeFileSync(join(work, "node_modules", "stale"), "agent-installed");
+      await git(work, "update-index", "--skip-worktree", "tracked.txt");
+      writeFileSync(join(work, "tracked.txt"), "forged");
+      expect((await git(work, "status", "--porcelain")).stdout).toBe("");
+      await checkoutCommitted(work);
+      const cfg: GateConfig = {
+        setup: ["mkdir -p node_modules && echo fresh > node_modules/dep"],
+        checks: [
+          {
+            name: "committed",
+            run: 'test ! -e hidden && test ! -e bunfig.toml && test ! -e excluded.ts && test ! -e node_modules/stale && test "$(cat tracked.txt)" = committed && test -f node_modules/dep',
+          },
+        ],
+        source: "detected",
+        protectedPaths: [],
+      };
+      const run = await runGates(work, cfg, new AbortController().signal);
+      expect(run.checks[0]?.output).toBe("");
+      expect(run.checks[0]?.ok).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 test.skipIf(process.platform !== "darwin")(
@@ -838,7 +845,8 @@ test.skipIf(process.platform !== "darwin")(
         checks: [{ name: "test", command: "exit 1", ok: false, exitCode: 1, output: "", durationMs: 1 }],
       };
       await expect(
-        (async () => compareGates(baseline, await runGates(cwd, config, new AbortController().signal)))(),
+        (async () =>
+          compareGates(baseline, await productionGates(cwd, config, new AbortController().signal)))(),
       ).rejects.toThrow(ConfinementError);
       expect(probes).toBe(1);
       expect(launches).toBe(1);
@@ -881,7 +889,7 @@ test.skipIf(process.platform !== "darwin")(
       };
     });
     try {
-      const result = await runGates(
+      const result = await productionGates(
         cwd,
         {
           source: "detected",
@@ -895,6 +903,80 @@ test.skipIf(process.platform !== "darwin")(
       expect(existsSync(scratch)).toBe(false);
     } finally {
       runner.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+for (const padding of [0, 70_000])
+  test(`nested sandbox diagnostic blocks despite identical baseline and ${padding} trailing bytes`, async () => {
+    const cwd = tempDir({});
+    try {
+      const cfg: GateConfig = {
+        setup: [],
+        source: "detected",
+        protectedPaths: [],
+        checks: [
+          {
+            name: "nested",
+            run: `printf 'sandbox_apply: Operation not permitted\n'; printf '%${padding}s' ''; exit 1`,
+          },
+        ],
+      };
+      const signal = new AbortController().signal;
+      const baseline = await runGates(cwd, cfg, signal);
+      const retried = await retryBaselineFailures(baseline, cwd, cfg, signal);
+      expect(retried).toBe(baseline);
+      const cmp = compareGates(baseline, await runGates(cwd, cfg, signal));
+      expect(cmp[0]).toMatchObject({ verdict: "confinement_error", blocking: true });
+      expect(await retryRegressions(cmp, cwd, cfg, [], signal)).toBe(cmp);
+      expect(formatGateFeedback(cmp)).toContain("CONFINEMENT ERROR (sandbox launch failed)");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+test("a confinement failure on regression retry cannot become flaky", async () => {
+  const cwd = tempDir({});
+  try {
+    const command = "echo 'sandbox_apply: Operation not permitted'; exit 0";
+    const result = {
+      name: "check",
+      command,
+      ok: false,
+      exitCode: 1,
+      output: "ordinary failure",
+      durationMs: 0,
+    };
+    const cmp = await retryRegressions(
+      [{ name: "check", verdict: "regressed", blocking: true, result }],
+      cwd,
+      { setup: [], source: "detected", protectedPaths: [], checks: [{ name: "check", run: command }] },
+      [],
+      new AbortController().signal,
+    );
+    expect(cmp[0]).toMatchObject({ verdict: "confinement_error", blocking: true });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(seatbeltSkip !== null)(
+  `real nested Seatbelt produces a blocking confinement verdict ${seatbeltSkip ?? ""}`,
+  async () => {
+    const cwd = tempDir({});
+    try {
+      const cfg: GateConfig = {
+        setup: [],
+        source: "detected",
+        protectedPaths: [],
+        checks: [
+          { name: "nested", run: '/usr/bin/sandbox-exec -p "(version 1)(allow default)" /usr/bin/true' },
+        ],
+      };
+      const run = await productionGates(cwd, cfg, new AbortController().signal);
+      expect(compareGates(run, run)[0]).toMatchObject({ verdict: "confinement_error", blocking: true });
+    } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
   },

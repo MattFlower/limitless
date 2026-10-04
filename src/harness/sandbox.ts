@@ -39,7 +39,16 @@ export function seatbeltProfile(roots: WriteRoots): string {
 
 const observed = (roots: WriteRoots): WriteRoots => ({ ...roots, write: [...roots.write, ...observerRoots] });
 
-/** Probe every launch: verdicts cannot outlive the executable or effective policy. */
+export interface ConfinementBackend {
+  verify(roots: WriteRoots, opts: ProcOptions, run: typeof runProcess): Promise<void>;
+  wrap(cmd: string[], roots: WriteRoots): string[];
+}
+export const seatbeltBackend: ConfinementBackend = {
+  verify: (roots, opts, run) => verifySeatbelt(run, SANDBOX_EXEC, process.platform, roots, opts.signal),
+  wrap: (cmd, roots) => [SANDBOX_EXEC, "-p", seatbeltProfile(roots), ...cmd],
+};
+
+/** Seatbelt verifies the effective profile every launch; Codex capability probes cache by CLI/version. */
 export async function verifySeatbelt(
   run: typeof runProcess = runProcess,
   executable = SANDBOX_EXEC,
@@ -120,25 +129,19 @@ export async function runSandboxed(
   opts: ProcOptions,
   roots: WriteRoots,
   run = runProcess,
-  verify: () => Promise<void> = () => verifySeatbelt(run, SANDBOX_EXEC, process.platform, roots, opts.signal),
+  verify?: () => Promise<void>,
+  backend: ConfinementBackend = seatbeltBackend,
 ): Promise<ProcResult> {
-  await verify();
+  await (verify ? verify() : backend.verify(roots, opts, run));
   opts.signal?.throwIfAborted();
   const token = `limitless-started-${crypto.randomUUID()}`;
   let started = false;
   const result = await run({
     ...opts,
-    cmd: [
-      SANDBOX_EXEC,
-      "-p",
-      seatbeltProfile(roots),
-      "/bin/sh",
-      "-c",
-      'printf "%s\\n" "$1"; shift; exec "$@"',
-      "sh",
-      token,
-      ...opts.cmd,
-    ],
+    cmd: backend.wrap(
+      ["/bin/sh", "-c", 'printf "%s\\n" "$1"; shift; exec "$@"', "sh", token, ...opts.cmd],
+      roots,
+    ),
     onStdoutLine: (line) => {
       if (line === token) started = true;
       else opts.onStdoutLine?.(line);
@@ -156,6 +159,7 @@ export async function runConfined(
   opts: Omit<ProcOptions, "cmd"> & { command: string },
   verify?: () => Promise<void>,
   run = runProcess,
+  backend: ConfinementBackend = seatbeltBackend,
 ): Promise<ProcResult> {
   return withCommandScratch(opts.cwd, async () => {
     const scope = commandScratch.getStore();
@@ -177,6 +181,8 @@ export async function runConfined(
         cmd: ["/bin/sh", "-c", opts.command],
         env: {
           ...opts.env,
+          GIT_OPTIONAL_LOCKS: "0",
+          LIMITLESS_CONFINED: "1",
           HOME: scratch,
           TMPDIR: scratch,
           TMP: scratch,
@@ -192,6 +198,7 @@ export async function runConfined(
       observed(writeRoots(opts.cwd, scratch)),
       run,
       verify,
+      backend,
     );
   });
 }

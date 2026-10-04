@@ -40,6 +40,7 @@ import {
 } from "../src/pipeline/faults.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { CommandError, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
+import { fakeConfinement } from "./confinement.ts";
 import { findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
 
@@ -162,6 +163,7 @@ function factory(
   const cfg = loadConfig({ home: join(root, "data"), configDir: join(root, "cfg") });
   cfg.maxConcurrentGates = 1;
   const f = new Factory(cfg, {
+    confinement: fakeConfinement,
     healthFetch: Object.assign(async () => new Response("{}"), { preconnect() {} }),
     fetch: Object.assign(async () => new Response("{}"), { preconnect() {} }),
     providers,
@@ -1298,7 +1300,8 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
     import { fakeHarness } from ${JSON.stringify(join(import.meta.dir, "../src/harness/fake.ts"))};
     import { observerRoots } from ${JSON.stringify(join(import.meta.dir, "../src/harness/sandbox.ts"))};
     observerRoots.add(${JSON.stringify(realpathSync(root))});
-    const f = new Factory(loadConfig(${JSON.stringify({ home: join(root, "data"), configDir: join(root, "cfg") })}), {
+    const { fakeConfinement } = await import(${JSON.stringify(join(import.meta.dir, "confinement.ts"))});
+    const f = new Factory(loadConfig(${JSON.stringify({ home: join(root, "data"), configDir: join(root, "cfg") })}), { confinement: fakeConfinement,
       providers: ${JSON.stringify(providers)}, models: ${JSON.stringify(models)}, policy: ${JSON.stringify(policy)},
       healthFetch: async () => new Response('{}'), fetch: async () => new Response('{}'),
       harnesses: { fake: fakeHarness(s => s.prompt.startsWith('Classify')

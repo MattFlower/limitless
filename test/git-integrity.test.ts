@@ -1,6 +1,17 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadConfig } from "../src/config.ts";
@@ -9,7 +20,7 @@ import type { AuditAllowance, Repo } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { attributeRules, auditDiff } from "../src/gates/audit.ts";
 import { collectGarbage } from "../src/gc.ts";
-import { worktreeGit, worktreeGitScope } from "../src/git/command.ts";
+import { recordWorktree, worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
 import {
   addDetachedWorktree,
@@ -61,6 +72,7 @@ beforeEach(async () => {
   work = join(dir, "work");
   base = (await seedRepo(dir)).value;
   await git(seed, "worktree", "add", "-qb", "worker", work, base);
+  await recordWorktree(work);
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -851,7 +863,15 @@ test("effective hooks from system, global, includes and environment config are o
     GIT_CONFIG_VALUE_2: "true",
     LIMITLESS_GIT_EMPTY_HOOK: `touch '${marker}'`,
   };
-  const paths = [system, global, include, worktreeConfig];
+  const worktreeBytes = readFileSync(worktreeConfig);
+  await expect(
+    worktreeGit(["git", "commit", "--allow-empty", "-qm", "refuse"], { cwd: work, env }),
+  ).rejects.toThrow("Unsafe worktree Git administration");
+  expect(readFileSync(worktreeConfig)).toEqual(worktreeBytes);
+  expect(existsSync(marker)).toBe(false);
+  rmSync(worktreeConfig);
+  writeFileSync(include, content("included") + content("worktree"));
+  const paths = [system, global, include];
   const configs = paths.map((path) => readFileSync(path));
   for (const name of ["system", "global", "included", "environment", "worktree"]) {
     const result = await worktreeGit(["git", "config", "--get", `hook.${name}.command`], { cwd: work, env });
@@ -1761,4 +1781,81 @@ test("a filter selected by in-tree attributes and repository config does not run
   await commitAll(work, "filtered");
   expect(existsSync(marker)).toBe(false);
   await audited();
+});
+
+for (const attack of [
+  "config",
+  "config.worktree",
+  "redirect",
+  "reflog",
+  "dangling",
+  "hardlink",
+  "missing-common",
+  "wrong-common",
+  "wrong-backlink",
+])
+  test(`trusted git refuses private admin attack: ${attack}`, async () => {
+    const admin = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
+    const outside = join(dir, "outside");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "sample.test.ts"), "outside original");
+    writeFileSync(join(outside, "untracked"), "do not delete");
+    const sentinel = join(outside, "executed");
+    const payload = join(work, "payload");
+    writeFileSync(payload, `#!/bin/sh\ntouch '${sentinel}'\n`, { mode: 0o755 });
+    const snapshot = () =>
+      readdirSync(outside)
+        .sort()
+        .map((name) => [name, readFileSync(join(outside, name)).toString("hex")]);
+    const before = snapshot();
+    if (attack === "config" || attack === "config.worktree")
+      writeFileSync(
+        join(admin, attack),
+        `[core]\nworktree = ${outside}\n[commit]\ngpgsign = true\n[gpg]\nprogram = ${payload}\n`,
+      );
+    if (attack === "redirect") {
+      rmSync(join(admin, "commondir"));
+      symlinkSync(join(seed, ".git", "objects"), join(admin, "objects"));
+      writeFileSync(join(admin, "config"), `[core]\nworktree = ${outside}\n`);
+    }
+    if (attack === "reflog") {
+      rmSync(join(admin, "logs", "HEAD"));
+      symlinkSync(join(outside, "untracked"), join(admin, "logs", "HEAD"));
+    }
+    if (attack === "dangling") symlinkSync(join(outside, "absent"), join(admin, "dangling"));
+    if (attack === "hardlink") linkSync(join(outside, "untracked"), join(admin, "linked"));
+    if (attack === "missing-common") rmSync(join(admin, "commondir"));
+    if (attack === "wrong-common") writeFileSync(join(admin, "commondir"), outside);
+    if (attack === "wrong-backlink") writeFileSync(join(admin, "gitdir"), join(outside, ".git"));
+    const index = readFileSync(join(admin, "index"));
+    await expect(commitAll(work, "must refuse")).rejects.toThrow();
+    await expect(checkoutCommitted(work)).rejects.toThrow();
+    expect(readFileSync(join(admin, "index"))).toEqual(index);
+    expect(snapshot()).toEqual(before);
+    expect(existsSync(sentinel)).toBe(false);
+  });
+
+test("recorded directories override inherited Git authority; missing records fail closed", async () => {
+  writeFileSync(join(work, "sample.test.ts"), edited);
+  const inherited = Object.fromEntries(
+    ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"].map((key) => [key, process.env[key]]),
+  );
+  try {
+    process.env.GIT_DIR = join(dir, "absent");
+    process.env.GIT_COMMON_DIR = join(dir, "absent");
+    process.env.GIT_WORK_TREE = seed;
+    expect(await commitAll(work, "valid")).not.toBeNull();
+    writeFileSync(join(work, "sample.test.ts"), "dirty");
+    await checkoutCommitted(work);
+    expect(readFileSync(join(work, "sample.test.ts"), "utf8")).toBe(edited);
+    expect(readFileSync(join(seed, "sample.test.ts"), "utf8")).toBe(original);
+  } finally {
+    for (const [key, value] of Object.entries(inherited)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  rmSync(`${work}.git-paths`);
+  await expect(commitAll(work, "unrecorded")).rejects.toThrow("Missing trusted Git paths");
+  await expect(checkoutCommitted(work)).rejects.toThrow("Missing trusted Git paths");
 });

@@ -440,3 +440,34 @@ test("shadow review calls stay out of the work log and per-model review stats; t
     store.close();
   }
 });
+
+test("confinement failures are reported as blocking infrastructure errors", () => {
+  const md = renderReport({
+    success: false,
+    runId: "confined",
+    prompt: "check",
+    state: {
+      lastGates: [
+        {
+          name: "test",
+          verdict: "confinement_error",
+          blocking: true,
+          result: {
+            name: "test",
+            command: "test",
+            ok: false,
+            exitCode: 1,
+            durationMs: 1,
+            output: "",
+            confinementError: true,
+          },
+        },
+      ],
+    },
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    runUrl: "http://localhost/runs/confined",
+  });
+  expect(md).toContain("❌ confinement error");
+  expect(md).not.toContain("still failing");
+});

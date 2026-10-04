@@ -20,12 +20,13 @@ import { formatEvalReport } from "../src/evals/format.ts";
 import { gatesAt } from "../src/evals/prepare.ts";
 import { runGates } from "../src/gates/run.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
-import { observerRoots } from "../src/harness/sandbox.ts";
+import { observerRoots, seatbeltBackend } from "../src/harness/sandbox.ts";
 import * as scratch from "../src/harness/scratch.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../src/pipeline/prompts.ts";
 import { SpecSchema } from "../src/pipeline/schemas.ts";
 import { sh } from "../src/util/proc.ts";
 import { evalMatrix } from "../ui/lib/evals.ts";
+import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { enableEfforts, evalFixture } from "./evals-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -205,7 +206,7 @@ test("implement invokes once in edit mode with shared prompt, isolates head/hidd
           prompt: f.item.prompt,
           spec: f.item.spec,
           gates,
-          baseline: await runGates(s.cwd, gates, s.signal),
+          baseline: await runGates(s.cwd, gates, s.signal, {}, fakeConfinement),
           baseSha: f.item.base,
           round: 0,
           feedback: null,
@@ -469,9 +470,9 @@ test("candidate-configured git filters never run in the factory's git", async ()
   }
 });
 
-test("baseline gates cannot install a git filter for the cleanup after them", async () => {
-  // The gate runs confined (the checkout's .git is read-only), and the Git cleanup after it would
-  // otherwise run a freshly installed clean filter on the dirtied tracked file while computing status.
+test("filters planted by baseline gates cannot run during trusted cleanup", async () => {
+  // The fake backend permits planting the filter, exercising trusted Git suppression even after
+  // an older escape. Real confinement independently protects the checkout's .git directory.
   const f = await fixture("sh baseline-gate.sh", (home) => ({
     "baseline-gate.sh": [
       `git config filter.leak.clean "sh -c 'printf %s \\"\\$LIMITLESS_EVAL_SECRET\\" >> ${join(home, "leak")}; cat'"`,
@@ -1542,23 +1543,26 @@ for (const [outcome, reason] of [
   });
 
 for (const rounds of [1, 2])
-  test(`a committed Bun preload leaves no hidden copies in the worktree or scratch (rounds=${rounds})`, async () => {
-    const f = await fixture();
-    try {
-      f.item.hidden.command = `bun test candidate.test.ts && ${f.item.hidden.command}`;
-      f.save();
-      f.respond((s): FakeReply => {
-        if (f.calls.length === 1)
-          return {
-            files: {
-              answer: "wrong",
-              ".gitignore": "dist/\n",
-              "dist/output": "built",
-              "bunfig.toml": '[test]\npreload=["./steal.ts"]\n',
-              "candidate.test.ts":
-                'import { test, expect } from "bun:test"; test("candidate", () => expect(true).toBe(true));',
-              // Confinement should deny every copy; each is attempted regardless, and none may survive.
-              "steal.ts": `import { cpSync, existsSync } from "node:fs";
+  test.skipIf(seatbeltSkip !== null)(
+    `a committed Bun preload leaves no hidden copies in the worktree or scratch (rounds=${rounds}) ${seatbeltSkip ?? ""}`,
+    async () => {
+      const f = await fixture();
+      f.factory.deps.confinement = seatbeltBackend;
+      try {
+        f.item.hidden.command = `bun test candidate.test.ts && ${f.item.hidden.command}`;
+        f.save();
+        f.respond((s): FakeReply => {
+          if (f.calls.length === 1)
+            return {
+              files: {
+                answer: "wrong",
+                ".gitignore": "dist/\n",
+                "dist/output": "built",
+                "bunfig.toml": '[test]\npreload=["./steal.ts"]\n',
+                "candidate.test.ts":
+                  'import { test, expect } from "bun:test"; test("candidate", () => expect(true).toBe(true));',
+                // Confinement should deny every copy; each is attempted regardless, and none may survive.
+                "steal.ts": `import { cpSync, existsSync } from "node:fs";
           const attempt = (copy) => { try { copy(); } catch {} };
           if (existsSync("hidden")) {
             for (const dest of ${JSON.stringify([join(s.cwd, "stolen"), join(s.cwd, "dist/stolen"), join(s.scratchDir ?? "", "stolen")])}) attempt(() => cpSync("hidden", dest, { recursive: true }));
@@ -1566,25 +1570,26 @@ for (const rounds of [1, 2])
             attempt(() => cpSync("hidden/check.sh", ${JSON.stringify(join(s.cwd, "overwrite"))}));
             console.log("copies attempted");
           }`,
-            },
-          };
-        expect(existsSync(join(s.cwd, "stolen"))).toBe(false);
-        expect(existsSync(join(s.cwd, "dist/stolen"))).toBe(false);
-        // The candidate's own ignored build output survives for recovery, holding its bytes, not hidden ones.
-        expect(readFileSync(join(s.cwd, "dist/output"), "utf8")).toBe("built");
-        expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
-        expect(existsSync(f.calls[0]?.scratchDir ?? "")).toBe(false);
-        const prior = f.factory.store.listEvalTrials(f.factory.store.listEvalRuns()[0]?.id ?? "")[0];
-        expect(prior?.details.grade?.implement?.hidden?.output).toContain("copies attempted");
-        return { files: { answer: "correct", "steal.ts": "" } };
-      });
-      expect((await f.run({ rounds })).trials[0]?.pass).toBe(rounds === 2);
-      expect(f.calls).toHaveLength(rounds);
-      expect(f.calls.every((call) => !existsSync(call.scratchDir ?? ""))).toBe(true);
-    } finally {
-      await f.close();
-    }
-  });
+              },
+            };
+          expect(existsSync(join(s.cwd, "stolen"))).toBe(false);
+          expect(existsSync(join(s.cwd, "dist/stolen"))).toBe(false);
+          // The candidate's own ignored build output survives for recovery, holding its bytes, not hidden ones.
+          expect(readFileSync(join(s.cwd, "dist/output"), "utf8")).toBe("built");
+          expect(readFileSync(join(s.cwd, "overwrite"), "utf8")).toBe("original");
+          expect(existsSync(f.calls[0]?.scratchDir ?? "")).toBe(false);
+          const prior = f.factory.store.listEvalTrials(f.factory.store.listEvalRuns()[0]?.id ?? "")[0];
+          expect(prior?.details.grade?.implement?.hidden?.output).toContain("copies attempted");
+          return { files: { answer: "correct", "steal.ts": "" } };
+        });
+        expect((await f.run({ rounds })).trials[0]?.pass).toBe(rounds === 2);
+        expect(f.calls).toHaveLength(rounds);
+        expect(f.calls.every((call) => !existsSync(call.scratchDir ?? ""))).toBe(true);
+      } finally {
+        await f.close();
+      }
+    },
+  );
 
 test("grading removes hidden tests even when candidate code makes checkout directories read-only", async () => {
   const f = await fixture();
@@ -1600,6 +1605,32 @@ test("grading removes hidden tests even when candidate code makes checkout direc
     expect(dirs.flatMap((d) => [d, dirname(d)]).filter((d) => existsSync(d))).toEqual([]);
   } finally {
     allocated.mockRestore();
+    await f.close();
+  }
+});
+
+test("injected confinement covers preparation, grading gates and the hidden grading checkout", async () => {
+  const f = await fixture();
+  const recording = recordingConfinement();
+  f.factory.deps.confinement = recording.backend;
+  try {
+    f.respond(() => ({ files: { answer: "correct" } }));
+    await f.run();
+    const hidden = recording.calls.find(({ opts }) => opts.cmd.at(-1) === f.item.hidden.command);
+    expect(hidden).toBeDefined();
+    const candidate = f.calls[0]?.cwd;
+    expect(hidden?.opts.cwd).not.toBe(candidate);
+    expect(hidden?.roots.write).toContain(hidden?.opts.cwd ?? "missing");
+    expect(hidden?.roots.protect).toContain(join(hidden?.opts.cwd ?? "missing", ".git"));
+    expect(
+      recording.calls.some(({ opts }) => opts.cwd === candidate && opts.env.LIMITLESS_CONFINED === "1"),
+    ).toBe(true);
+    expect(
+      recording.calls.some(
+        ({ opts }) => opts.cwd === hidden?.opts.cwd && opts.env.LIMITLESS_CONFINED === "1",
+      ),
+    ).toBe(true);
+  } finally {
     await f.close();
   }
 });

@@ -584,8 +584,14 @@ async function sandboxProbe(
     const granted = (file: string) => [...cwd, ...writable].some((root) => file.startsWith(`${root}/`));
     if (!negatives.length || negatives.some((file) => granted(file.path))) return result(INCONCLUSIVE, null);
     if (editing) {
-      mkdirSync(join(probeCwd, ".git"));
-      negatives.push(canary(join(probeCwd, ".git")));
+      const common = temp(tmp, "limitless-probe-common-");
+      const admin = join(common, "worktrees", "probe");
+      mkdirSync(admin, { recursive: true });
+      writeFileSync(join(admin, "commondir"), "../..");
+      writeFileSync(join(admin, "gitdir"), join(probeCwd, ".git"));
+      const pointer = `gitdir: ${admin}\n`;
+      writeFileSync(join(probeCwd, ".git"), pointer);
+      negatives.push(canary(common), canary(admin), { path: join(probeCwd, ".git"), token: pointer });
       positives = [probeCwd, scratch].map((dir) => ({
         path: join(dir, `written-${randomUUID()}`),
         token: "",

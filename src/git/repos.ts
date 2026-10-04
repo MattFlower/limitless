@@ -7,7 +7,7 @@ import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { attributeRules, BINARY_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
 import { CommandError, sh } from "../util/proc.ts";
-import { emptyHookFlags, NO_BIG_FILES, worktreeGit, worktreeGitScope } from "./command.ts";
+import { emptyHookFlags, NO_BIG_FILES, recordWorktree, worktreeGit, worktreeGitScope } from "./command.ts";
 
 const NO_PUSH = "no-push://limitless-agents-cannot-push";
 
@@ -302,6 +302,7 @@ export async function createWorktree(
     await worktreeGit(["git", "worktree", "add", "--no-checkout", "-b", branch, path, base.stdout.trim()], {
       cwd: cache,
     });
+    await recordWorktree(path);
     await worktreeGit(["git", "reset", "--hard", "-q"], { cwd: path });
     return { path, branch, baseSha: base.stdout.trim() };
   });
@@ -314,6 +315,7 @@ export async function removeWorktree(paths: Paths, repo: Repo, path: string): Pr
   await withRepoLock(cache, () =>
     git(["git", "worktree", "remove", "--force", path], { cwd: cache, allowFail: true }),
   );
+  rmSync(`${resolve(path)}.git-paths`, { force: true });
 }
 
 export async function headSha(cwd: string): Promise<string> {
@@ -380,6 +382,7 @@ export async function exportCommit(
 /** A detached checkout of `sha` at `dest` sharing `cwd`'s repository, for readers kept off the worktree. */
 export async function addDetachedWorktree(cwd: string, sha: string, dest: string, signal?: AbortSignal) {
   await worktreeGit(["git", "worktree", "add", "--detach", dest, sha], { cwd, signal, timeoutMs: 300_000 });
+  await recordWorktree(dest);
 }
 
 export async function mergeBase(cwd: string, base: string, head: string): Promise<string> {
@@ -581,8 +584,8 @@ async function attributeInfo(
   let indexes = 0;
   const scratchGit = (args: string[], stdin?: string, index = join(scratch, "index")) =>
     worktreeGit(["git", `--git-dir=${scratch}`, ...args], {
-      cwd,
-      env: { ...(env ?? (process.env as Record<string, string>)), GIT_INDEX_FILE: index },
+      cwd: scratch,
+      env: { ...(env ?? (process.env as Record<string, string>)), GIT_INDEX_FILE: index, GIT_WORK_TREE: cwd },
       timeoutMs: Math.max(1, deadline - Date.now()),
       stdin,
     });

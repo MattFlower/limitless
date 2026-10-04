@@ -238,8 +238,15 @@ detection, per-invocation budget, process-group kill on cancel.
 - Local-only (non-GitHub) repos use a factory-owned bare clone with independent objects, created
   via a shared clone and fetched from the source before each new run. Delivery pushes only the
   run branch back to the source. Legacy worktrees attached to the source remain there until they finish.
-- Tool-enabled editors receive owned scratch and exact write roots: their checkout, linked
-  worktree administrative directory, and scratch. The shared repository is never a write root.
+- Tool-enabled editors receive owned scratch and exact write roots: their checkout and
+  scratch. The private worktree admin directory, `.git` pointer and shared repository are read-only.
+  Agent and gate environments set `GIT_OPTIONAL_LOCKS=0` and disable `diff.autoRefreshIndex`
+  for read-only Git inspection. The factory
+  records absolute worktree/admin/common paths in a protected sibling `.git-paths` file at creation,
+  including detached worktrees, and reuses them after restart. Trusted Git explicitly receives
+  `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE`; before config discovery or index removal it
+  rejects missing records, admin config files, symlinks, hard links and mismatched backlinks.
+  Pre-existing linked worktrees without a trusted record fail closed and must be recreated.
   Codex uses a probed filesystem profile; Claude additionally runs entirely inside a factory
   Seatbelt profile, covering native edits and overriding implicit CLI grants. Claude's internal
   Bash sandbox is disabled for editors because macOS cannot nest Seatbelt; Bash remains inside
@@ -259,13 +266,21 @@ detection, per-invocation budget, process-group kill on cancel.
   its effective policy and requires a trusted shell startup marker; unavailable or inconclusive
   enforcement raises an operational error, even against a failing baseline. macOS is the only
   implemented backend for these commands and Claude editors; other platforms fail closed.
-  A restricted host that forbids nested Seatbelt also fails closed.
+  A restricted host that forbids nested Seatbelt also fails closed. Tests inject a recording
+  backend through factory dependencies; no environment or configuration selects it in production.
+  Gates set `LIMITLESS_CONFINED=1`: only real-Seatbelt tests skip under this marker, with a nested
+  Seatbelt explanation. Real-Seatbelt tests run in development and at landing, not inside factory
+  gates; portable tests still run there. A child diagnostic `sandbox_apply: Operation not permitted`
+  produces a blocking `confinement_error`, captured before output truncation and never downgraded
+  to `still_failing` or `flaky`, even when baseline and candidate fail identically.
 - Gate setup, checks and pipeline retries share private scratch until completion or cancellation.
   HOME and writable Cargo, npm, Go and XDG caches point into scratch. Explicit RUSTUP_HOME
   and a private copy of Cargo configuration preserve installed toolchain discovery and read
   access; writes to real HOME remain denied.
   Candidate gates rebuild from committed bytes; factory Git suppresses configured filters on
-  commits, resets and detached review checkouts. Secrets for Discord/GitHub/OpenRouter are
+  commits, resets and detached review checkouts. `clean -ffdx` removes `node_modules`; fresh scratch
+  caches therefore cause cold `bun install` runs from the network. A safe shared package cache is
+  separate work. Secrets for Discord/GitHub/OpenRouter are
   scrubbed from agent environments.
 - Triggers are **allowlisted** (your GitHub login, `dependabot[bot]`, your Discord user id).
   Untrusted issue/PR text is treated as data and quoted, never as instructions.

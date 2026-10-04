@@ -156,7 +156,7 @@ ${checksSection(input.gates, input.baseline)}
 4. Run the relevant checks yourself before finishing and fix what fails.
 5. Stay in scope: no unrelated refactors or reformatting.
 6. Follow repository conventions (CLAUDE.md, AGENTS.md, CONTRIBUTING, existing code style).
-7. ${input.resolution ? "Do not run Git. Edit files only; the factory stages and commits the merge." : "Committing is optional (the factory commits for you). Never push."}
+7. ${input.resolution ? "Do not run Git. Edit files only; the factory stages and commits the merge." : "The factory commits. Do not run Git commands that write: add, commit, stash, or checkout -- <file>. Read-only status, diff and log are fine. Never push."}
 8. Stay within the request and specification: add nothing that neither asks for. If part of the specification looks unnecessary for the request, still meet its acceptance criteria and name that part in your final report.
 9. Never stop or signal processes you did not start: no \`pkill\`, \`killall\` or \`kill\` by name or pattern. Other runs, deploys and the user share this machine. Stop your own background command by the PID you started it with.
 
@@ -170,7 +170,7 @@ export function formatGateFeedback(cmp: GateComparison[]): string {
   return bad
     .map(
       (c) =>
-        `### Check \`${c.name}\` ${c.verdict === "regressed" ? "now FAILS (it passed before your change)" : "FAILS"}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`,
+        `### Check \`${c.name}\` ${c.verdict === "confinement_error" ? "CONFINEMENT ERROR (sandbox launch failed)" : c.verdict === "regressed" ? "now FAILS (it passed before your change)" : "FAILS"}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`,
     )
     .join("\n\n");
 }

@@ -93,16 +93,15 @@ export function validateScratch(spec: AgentSpec): string {
 }
 
 export interface WriteRoots {
-  /** Writable, as given and canonical: the worktree, a linked worktree's own git directory, scratch. */
+  /** Writable, as given and canonical: the worktree, scratch. */
   write: string[];
-  /** Read-only inside them: the worktree's `.git`, so it can't be pointed at another git directory. */
+  /** Read-only Git metadata: the worktree's `.git` entry and its private admin directory. */
   protect: string[];
 }
 
 /**
  * Where an edit agent, gate or hidden command may write. The shared common directory (config,
- * info/, hooks, objects, other worktrees) is never granted: only the admin directory that the
- * shared repository itself records for this worktree, never one of its ancestors.
+ * info/, hooks, objects, other worktrees) and the private admin directory stay read-only.
  */
 export function writeRoots(cwd: string, scratchDir: string): WriteRoots {
   const root = realpathSync(cwd);
@@ -112,6 +111,7 @@ export function writeRoots(cwd: string, scratchDir: string): WriteRoots {
   const dotGit = join(root, ".git");
   const stat = lstatSync(dotGit, { throwIfNoEntry: false });
   const granted = [cwd, scratchDir];
+  const protectedPaths = [join(cwd, ".git"), dotGit];
   if (stat?.isFile()) {
     const pointer = /^gitdir: (.+)$/m.exec(readFileSync(dotGit, "utf8"))?.[1]?.trim();
     let gitDir: string | null = null;
@@ -125,9 +125,9 @@ export function writeRoots(cwd: string, scratchDir: string): WriteRoots {
     const overlaps = (dir: string) => [root, scratch].some((p) => within(p, dir) || within(dir, p));
     if (!gitDir || basename(dirname(gitDir)) !== "worktrees" || overlaps(gitDir))
       throw new Error("Worktree .git does not name its own linked worktree directory");
-    granted.push(gitDir);
+    protectedPaths.push(gitDir);
   } else if (stat && !stat.isDirectory()) throw new Error("Worktree .git must be a file or directory");
-  return { write: spellings(granted), protect: spellings([join(cwd, ".git"), dotGit]) };
+  return { write: spellings(granted), protect: spellings(protectedPaths) };
 }
 
 /** Each path as given and, when it exists, canonical: what a confined profile actually denies. */

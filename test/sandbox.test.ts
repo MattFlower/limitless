@@ -7,6 +7,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,6 +20,7 @@ import {
   withCommandScratch,
 } from "../src/harness/sandbox.ts";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
+import { recordingConfinement, seatbeltSkip } from "./confinement.ts";
 
 // Real git and sandboxed subprocesses.
 setDefaultTimeout(30_000);
@@ -66,6 +68,9 @@ async function attempt(target: string): Promise<boolean> {
 }
 
 const protectedTargets = () => [
+  join(privateDir(), "config"),
+  join(common(), "packed-refs"),
+  join(common(), "refs", "heads", "planted"),
   join(common(), "config"),
   join(common(), "info", "attributes"),
   join(common(), "info", "exclude"),
@@ -77,26 +82,31 @@ const protectedTargets = () => [
   join(home, "canary"),
 ];
 
-test.skipIf(!darwin)("confined commands write the worktree, its git directory and scratch only", async () => {
-  const before = new Map(protectedTargets().map((p) => [p, existsSync(p) ? readFileSync(p, "utf8") : null]));
-  expect(await attempt(join(work, "allowed"))).toBe(true);
-  expect(await attempt(join(privateDir(), "allowed"))).toBe(true);
-  const scratch = await runConfined({
-    command: 'printf ok > "$TMPDIR/f" && printf ok > "$HOME/g" && cat "$TMPDIR/f" "$HOME/g"',
-    cwd: work,
-    env: agentEnv(),
-  });
-  expect(scratch.stdout).toBe("okok");
-  for (const target of protectedTargets()) expect(await attempt(target)).toBe(false);
-  // A symlink inside the worktree does not carry a write outside it.
-  symlinkSync(home, join(work, "via-link"));
-  expect(await attempt(join(work, "via-link", "canary"))).toBe(false);
-  for (const [path, content] of before)
-    expect(existsSync(path) ? readFileSync(path, "utf8") : null).toBe(content);
-});
+test.skipIf(seatbeltSkip !== null)(
+  `confined commands write the worktree, scratch only ${seatbeltSkip ?? ""}`,
+  async () => {
+    const before = new Map(
+      protectedTargets().map((p) => [p, existsSync(p) ? readFileSync(p, "utf8") : null]),
+    );
+    expect(await attempt(join(work, "allowed"))).toBe(true);
+    expect(await attempt(join(privateDir(), "allowed"))).toBe(false);
+    const scratch = await runConfined({
+      command: 'printf ok > "$TMPDIR/f" && printf ok > "$HOME/g" && cat "$TMPDIR/f" "$HOME/g"',
+      cwd: work,
+      env: agentEnv(),
+    });
+    expect(scratch.stdout).toBe("okok");
+    for (const target of protectedTargets()) expect(await attempt(target)).toBe(false);
+    // A symlink inside the worktree does not carry a write outside it.
+    symlinkSync(home, join(work, "via-link"));
+    expect(await attempt(join(work, "via-link", "canary"))).toBe(false);
+    for (const [path, content] of before)
+      expect(existsSync(path) ? readFileSync(path, "utf8") : null).toBe(content);
+  },
+);
 
-test.skipIf(!darwin)(
-  "an agent cannot plant '*.ts -diff' or a clean filter in the shared repository",
+test.skipIf(seatbeltSkip !== null)(
+  `an agent cannot plant '*.ts -diff' or a clean filter in the shared repository ${seatbeltSkip ?? ""}`,
   async () => {
     const plant = await runConfined({
       command: [
@@ -116,7 +126,7 @@ test.skipIf(!darwin)(
   },
 );
 
-test.skipIf(!darwin)("a redirected .git is refused before anything runs", async () => {
+test("a redirected .git is refused before anything runs", async () => {
   writeFileSync(join(work, ".git"), `gitdir: ${join(common(), "worktrees", "sibling")}\n`);
   const marker = join(root, "ran");
   await expect(
@@ -269,14 +279,17 @@ test("command scratch persists across setup, checks and retry scopes, with reada
   expect(existsSync(scratch)).toBe(false);
 });
 
-test.skipIf(!darwin)("installed rustup discovery survives command confinement", async () => {
-  // No download or network: run the installed toolchain only when this host has one.
-  const normal = await runProcess({ cmd: ["cargo", "--version"], cwd: work, env: agentEnv() });
-  if (normal.exitCode !== 0) return;
-  const confined = await runConfined({ command: "cargo --version", cwd: work, env: agentEnv() });
-  expect(confined.exitCode).toBe(0);
-  expect(confined.stdout).toBe(normal.stdout);
-});
+test.skipIf(seatbeltSkip !== null)(
+  `installed rustup discovery survives command confinement ${seatbeltSkip ?? ""}`,
+  async () => {
+    // No download or network: run the installed toolchain only when this host has one.
+    const normal = await runProcess({ cmd: ["cargo", "--version"], cwd: work, env: agentEnv() });
+    if (normal.exitCode !== 0) return;
+    const confined = await runConfined({ command: "cargo --version", cwd: work, env: agentEnv() });
+    expect(confined.exitCode).toBe(0);
+    expect(confined.stdout).toBe(normal.stdout);
+  },
+);
 
 test("later commands never copy trusted config through setup-created scratch symlinks", async () => {
   mkdirSync(join(home, ".cargo"));
@@ -316,4 +329,56 @@ test("confined environment retains installed cargo discovery without a live sand
   );
   expect(result.exitCode).toBe(0);
   expect(result.stdout).toBe(normal.stdout);
+});
+
+test.skipIf(seatbeltSkip !== null)(
+  `private admin metadata cannot be removed or linked ${seatbeltSkip ?? ""}`,
+  async () => {
+    const admin = privateDir();
+    const before = readFileSync(join(admin, "commondir"));
+    for (const command of [
+      `rm '${admin}/commondir'`,
+      `rm '${work}/.git'`,
+      `mv '${work}/.git' '${work}/moved-git'`,
+      `ln '${home}/canary' '${work}/hardlink'`,
+      `echo bad > '${admin}/config'`,
+      `ln -sf '${home}/canary' '${admin}/logs/HEAD'`,
+    ]) {
+      expect((await runConfined({ command, cwd: work, env: agentEnv() })).exitCode).not.toBe(0);
+    }
+    expect(readFileSync(join(admin, "commondir"))).toEqual(before);
+    expect(existsSync(join(admin, "config"))).toBe(false);
+  },
+);
+
+test("portable backend exercises startup and roots off macOS; production remains Seatbelt", async () => {
+  const { backend: fake, calls } = recordingConfinement();
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  if (!platform) throw new Error("missing platform descriptor");
+  Object.defineProperty(process, "platform", { value: "linux" });
+  try {
+    const opts = {
+      cwd: work,
+      env: agentEnv({ GIT_OPTIONAL_LOCKS: "1" }),
+      command: "git status --porcelain && git diff && git log -1 --format=%s",
+    };
+    const newer = new Date(Date.now() + 5000);
+    utimesSync(join(work, "a.ts"), newer, newer);
+    const before = readFileSync(join(privateDir(), "index"));
+    for (const command of ["git status --porcelain", "git diff", "git log -1 --format=%s"]) {
+      const result = await runConfined({ ...opts, command }, undefined, undefined, fake);
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(join(privateDir(), "index")), command).toEqual(before);
+    }
+    expect(calls[0]?.roots.protect).toContain(privateDir());
+    expect(calls[0]?.roots.write).not.toContain(privateDir());
+    expect(calls[0]?.opts.env.GIT_OPTIONAL_LOCKS).toBe("0");
+    expect(calls[0]?.opts.env.LIMITLESS_CONFINED).toBe("1");
+    await expect(runConfined({ ...opts, command: "touch should-not-start" })).rejects.toThrow(
+      ConfinementError,
+    );
+    expect(existsSync(join(work, "should-not-start"))).toBe(false);
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+  }
 });

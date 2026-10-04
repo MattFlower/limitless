@@ -40,6 +40,7 @@ import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schem
 import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
+  confinement?: import("../harness/sandbox.ts").ConfinementBackend;
   faults?: FaultPlan;
   gh?: GhRunner;
   cfg: Config;

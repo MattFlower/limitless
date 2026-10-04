@@ -17,6 +17,7 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Repo, Role, RunStatus, StageName } from "../src/core/types.ts";
 import { gateSlots } from "../src/gates/slots.ts";
+import { recordWorktree } from "../src/git/command.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
 import {
   cachePath,
@@ -32,7 +33,6 @@ import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { githubWebhook, mapGitHubEvent } from "../src/integrations/github.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
-
 import {
   CancelledError,
   invokeGuard,
@@ -40,7 +40,6 @@ import {
   RunContext,
   type RunState,
 } from "../src/pipeline/context.ts";
-
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
@@ -49,6 +48,7 @@ import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 import { sh } from "../src/util/proc.ts";
+import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { reviewOutput } from "./evals-reading-support.ts";
 import { deferred } from "./evals-support.ts";
 import { attributionEvidence, findingEvidence } from "./review-support.ts";
@@ -202,6 +202,7 @@ function start(handler: Handler, effortRouting = false, freeProviders = false): 
   if (!alpha || !beta) throw new Error("missing fixture models");
   const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
   factory = new Factory(cfg, {
+    confinement: fakeConfinement,
     harnesses: { fake: fakeHarness(handler) },
     providers: freeProviders
       ? [
@@ -539,6 +540,7 @@ describe("local factory clones", () => {
     const branch = `limitless/${run.id}-${slugify(run.title, 30)}`;
     const baseSha = await git(repoDir, "rev-parse", "HEAD");
     await git(repoDir, "worktree", "add", "-b", branch, work, baseSha);
+    await recordWorktree(work);
     f.store.updateRun(run.id, { status: "running", baseSha, branch }, {
       phase: "prepare",
       worktreePath: work,
@@ -826,6 +828,7 @@ describe("local factory clones", () => {
   test("delivery from a legacy worktree pushes nothing: the branch already lives in the source", async () => {
     const legacy = join(home, "legacy-work");
     await git(repoDir, "worktree", "add", "-q", "-b", "legacy-branch", legacy);
+    await recordWorktree(legacy);
     await pushBranch(localRepo(), legacy, "would-be-created");
     const refs = await git(repoDir, "for-each-ref", "--format=%(refname)", "refs/heads");
     expect(refs).toContain("refs/heads/legacy-branch");
@@ -3085,6 +3088,7 @@ esac
   test("merge helpers isolate configured code in a linked worktree and reject non-conflict errors", async () => {
     const cwd = join(home, "linked");
     await sh(["git", "worktree", "add", "-b", "feature", cwd], { cwd: repoDir });
+    await recordWorktree(cwd);
     writeFileSync(join(cwd, "greeting.txt"), "feature\n");
     await mergeGit(cwd, ["add", "-A"]);
     await mergeGit(cwd, ["commit", "-qm", "feature"]);
@@ -6317,6 +6321,7 @@ test("environment retry prefers another cross-vendor model over same-vendor fall
   const beta = models.find((m) => m.id === "beta/m");
   if (!beta) throw new Error("missing fixture model");
   factory = new Factory(cfg, {
+    confinement: fakeConfinement,
     providers,
     models: [...models, { ...beta, id: "beta/other", model: "beta-2" }],
     policy: { ...policy, verify: { default: ["alpha/m", "beta/m", "beta/other"] } },
@@ -7255,6 +7260,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
       const alpha = models[0] as ModelDef;
       factory = new Factory(cfg, {
+        confinement: fakeConfinement,
         harnesses: { fake: fakeHarness(scenario(calls)) },
         providers: [...providers, omega],
         models: [...models, { ...alpha, id: "omega/m", provider: "omega", vendor: "google" }],
@@ -7980,6 +7986,7 @@ describe("routing bounded slot waits", () => {
     const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
     const calls: AgentSpec[] = [];
     factory = new Factory(cfg, {
+      confinement: fakeConfinement,
       providers,
       models: catalog,
       policy: routing,
@@ -8450,4 +8457,36 @@ describe("audit allowances (fake agents, real git)", () => {
       expect(messages.some((m) => m.startsWith("[gitlink] vendor: Repair: vendor"))).toBe(!allowed);
       expect(messages.some((m) => m.startsWith("[gitlink] vendor: vendor"))).toBe(!allowed);
     });
+});
+
+test("factory gates use injected confinement with the platform forced off macOS", async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  if (!platform) throw new Error("missing platform descriptor");
+  const recording = recordingConfinement();
+  Object.defineProperty(process, "platform", { value: "linux" });
+  try {
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: spec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: pass };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    f.deps.confinement = recording.backend;
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(recording.calls.length).toBeGreaterThan(0);
+    for (const { roots, opts } of recording.calls) {
+      expect(roots.write).toContain(opts.cwd);
+      expect(roots.write).toContain(opts.env.TMPDIR ?? "missing");
+      expect(roots.protect).toContain(join(opts.cwd, ".git"));
+      expect(roots.protect.some((p) => p.includes("/worktrees/"))).toBe(true);
+      expect(opts.env.LIMITLESS_CONFINED).toBe("1");
+      expect(opts.env.GIT_OPTIONAL_LOCKS).toBe("0");
+    }
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+  }
 });
