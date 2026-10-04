@@ -877,7 +877,7 @@ end();
   );
   writeFileSync(
     join(bin, "git"),
-    `#!/bin/sh\ncommand=$(while [ "$1" = -c ]; do shift 2; done; printf '%s' "$1")\nif [ "$command" = push ]; then printf '%s\\n' "$@" >> '${join(root, "pushes")}'; exit 0; fi\nexec /usr/bin/git "$@"\n`,
+    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\nif [ "$command" = push ]; then printf '%s\\n' "$@" >> '${join(root, "pushes")}'; exit 0; fi\nexec /usr/bin/git "$@"\n`,
     { mode: 0o755 },
   );
   const oldPath = process.env.PATH;
@@ -940,7 +940,7 @@ for (const operation of [
         writeFileSync(
           path,
           `#!/bin/sh
-args=$(while [ "$1" = -c ]; do shift 2; done; printf '%s' "$*")
+args=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$*")
 printf '%s\\n' "${bin} $args" >> '${calls}'
 case "${bin} $args" in
   ${pattern
@@ -1829,7 +1829,7 @@ test("the budget bounds retries and waits, never a call's first attempt or a hea
   // A healthy push that takes longer than the budget left still completes on its own timeout.
   writeFileSync(
     join(root, "bin", "git"),
-    `#!/bin/sh\ncommand=$(while [ "$1" = -c ]; do shift 2; done; printf '%s' "$1")\nif [ "$command" = config ]; then exec /usr/bin/git "$@"; fi\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
+    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\nif [ "$command" = config ]; then exec /usr/bin/git "$@"; fi\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
     {
       mode: 0o755,
     },

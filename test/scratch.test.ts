@@ -69,37 +69,42 @@ const procResult: ProcResult = {
   durationMs: 1,
 };
 
-test("scratch is outside inherited TMPDIR in checkout, unique concurrently, removed after throw", async () => {
-  const root = mkdtempSync(join(tmpdir(), "scratch-test-"));
-  const inherited = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
-  const paths: string[] = [];
-  try {
-    process.env.TMPDIR = root;
-    await Promise.all(
-      [0, 1, 2].map((n) =>
-        withScratch(root, async (path) => {
-          paths.push(path);
-          expect(path.startsWith(realpathSync(root))).toBe(false);
-          writeFileSync(join(path, "fixture"), "data");
-          await Bun.sleep(5);
-          expect(existsSync(path)).toBe(true);
-          expect(process.env.TMPDIR).toBe(root);
-          if (n === 2) throw new Error("failure");
-        }).catch((e: Error) => expect(e.message).toBe("failure")),
-      ),
-    );
-    expect(new Set(paths).size).toBe(3);
-    for (const path of paths) expect(existsSync(dirname(path))).toBe(false);
-    expect(process.env.TMP).toBe(inherited.TMP);
-    expect(process.env.TEMP).toBe(inherited.TEMP);
-  } finally {
-    for (const [key, value] of Object.entries(inherited)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
+// Inside a confined gate the only writable temp roots are the checkout and its scratch, so there is no
+// directory outside an inherited in-checkout TMPDIR to pick; the property is checked in development and at landing.
+test.skipIf(process.env.LIMITLESS_CONFINED === "1")(
+  "scratch is outside inherited TMPDIR in checkout, unique concurrently, removed after throw",
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "scratch-test-"));
+    const inherited = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+    const paths: string[] = [];
+    try {
+      process.env.TMPDIR = root;
+      await Promise.all(
+        [0, 1, 2].map((n) =>
+          withScratch(root, async (path) => {
+            paths.push(path);
+            expect(path.startsWith(realpathSync(root))).toBe(false);
+            writeFileSync(join(path, "fixture"), "data");
+            await Bun.sleep(5);
+            expect(existsSync(path)).toBe(true);
+            expect(process.env.TMPDIR).toBe(root);
+            if (n === 2) throw new Error("failure");
+          }).catch((e: Error) => expect(e.message).toBe("failure")),
+        ),
+      );
+      expect(new Set(paths).size).toBe(3);
+      for (const path of paths) expect(existsSync(dirname(path))).toBe(false);
+      expect(process.env.TMP).toBe(inherited.TMP);
+      expect(process.env.TEMP).toBe(inherited.TEMP);
+    } finally {
+      for (const [key, value] of Object.entries(inherited)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
     }
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+  },
+);
 
 test("native arguments restrict reading writes and preserve no-tools isolation", async () => {
   const root = mkdtempSync(join(tmpdir(), "args with spaces-"));

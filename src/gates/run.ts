@@ -75,12 +75,13 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   return {
     name: cmd.name,
     command: cmd.run,
-    confinementError,
     ok: !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled,
     exitCode: res.exitCode,
     durationMs: res.durationMs,
     output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
     ...(res.timedOut ? { timedOut: true } : {}),
+    // Present only when set, like timedOut, so results stay readable by strict schemas and older releases.
+    ...(confinementError ? { confinementError: true } : {}),
   };
 }
 

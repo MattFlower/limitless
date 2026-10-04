@@ -253,7 +253,9 @@ test("the effective profile is probed before the native-tool process and failed 
 
 test("command scratch persists across setup, checks and retry scopes, with readable toolchains", async () => {
   let scratch = "";
-  const opts = { command: "unused", cwd: work, env: agentEnv({ HOME: home }) };
+  // Toolchain homes come from the test's HOME, not from whatever the outer environment (a gate) set.
+  const { RUSTUP_HOME: _rustup, CARGO_HOME: _cargo, ...env } = agentEnv({ HOME: home });
+  const opts = { command: "unused", cwd: work, env };
   mkdirSync(join(home, ".cargo"));
   writeFileSync(join(home, ".cargo", "config.toml"), "[net]\nretry = 2\n");
   const run = async (opts: ProcOptions) => {
