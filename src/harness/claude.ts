@@ -235,11 +235,11 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
   }
   if (spec.fast && t.provider === "claude" && spec.noTools)
     args.push("--settings", JSON.stringify(fastSettings));
-  // The outer profile keeps CLAUDE_CONFIG_DIR read-only, so a confined editor cannot store a
-  // transcript: it runs ephemerally rather than failing on persistence, and cannot be resumed.
-  const ephemeral = spec.mode === "edit" && !spec.noTools;
+  // The outer profile keeps CLAUDE_CONFIG_DIR read-only, so a confined (tool-enabled) invocation
+  // cannot store a transcript: it runs ephemerally rather than failing on persistence, and cannot be resumed.
+  const ephemeral = !spec.noTools;
   if (ephemeral && spec.resumeSessionId)
-    throw new Error("Confined Claude editors do not persist sessions and cannot resume one");
+    throw new Error("Confined Claude invocations do not persist sessions and cannot resume one");
   if (spec.privateSession || ephemeral) args.push("--no-session-persistence");
   if (spec.noTools) {
     args.push("--tools", "");
@@ -372,7 +372,8 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     fastModeDisabledReason: parser.fastModeDisabledReason,
     finalText: parser.finalText || parser.lastAssistantText,
     structured: parser.structured,
-    sessionId: parser.sessionId ?? (spec.resumeSessionId || sessionId),
+    // An unpersisted session cannot be resumed, so it is not advertised as one.
+    sessionId: spec.noTools ? (parser.sessionId ?? (spec.resumeSessionId || sessionId)) : null,
     usage: parser.usage,
     numTurns: parser.numTurns,
     costUsd: metered ? cost : 0,

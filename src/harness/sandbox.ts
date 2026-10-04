@@ -131,30 +131,12 @@ async function probeSeatbelt(
       throw new ConfinementError(
         `Write confinement not verified (signal confinement also required): Seatbelt did not enforce its profile; ${proc.stderr.trim()}`,
       );
-    const signals = await run({
-      cmd: [
-        "/bin/sh",
-        "-c",
-        SIGNAL_PROBE(nested),
-        "sh",
-        executable,
-        seatbeltProfile(roots ?? { write: [allowed], protect: [] }),
-        join(allowed, "ready"),
-      ],
-      cwd: root,
-      env: agentEnv(),
-      timeoutMs: 5000,
-      signal,
-    });
-    if (
-      signals.exitCode !== 0 ||
-      signals.stdout !== "signals-verified" ||
-      signals.cancelled ||
-      signals.timedOut ||
-      signals.idleTimedOut ||
-      signals.signal
-    )
-      throw new ConfinementError(`Signal confinement not verified: ${signals.stderr}`);
+    const profile = seatbeltProfile(roots ?? { write: [allowed], protect: [] });
+    const cmd = ["/bin/sh", "-c", SIGNAL_PROBE(nested), "sh", executable, profile, join(allowed, "ready")];
+    const p = await run({ cmd, cwd: root, env: agentEnv(), timeoutMs: 5000, signal });
+    // An interrupted probe is inconclusive even when its marker was printed.
+    if (p.exitCode !== 0 || p.stdout !== "signals-verified" || p.timedOut || p.idleTimedOut || p.signal)
+      throw new ConfinementError(`Signal confinement not verified: ${p.stderr}`);
   } finally {
     rmSync(allowed, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });

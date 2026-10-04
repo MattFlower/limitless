@@ -52,6 +52,14 @@ with no unsandboxed retry. On this host both
 reader composition and Codex composition are refused before agent execution.
 No claim of effective CLI signal isolation is made from that refusal.
 
+The outer boundary keeps `HOME` and `CLAUDE_CONFIG_DIR` read-only (they hold the
+persistent login), so no confined Claude invocation can write a transcript. #233
+already ran editors with `--no-session-persistence`; every tool-enabled reader now
+does the same, refuses `resumeSessionId` before launch, and returns a null
+`sessionId` so callers do not try to resume a session that was never stored.
+No-tools calls run outside the boundary and keep resumable sessions. Granting
+writes to the shared configuration directory was rejected.
+
 Claude edit arguments add deny patterns for pkill, killall, and kill -9 -1.
 These are bypassable convenience rules; interpreters remain inside Seatbelt.
 [Codex rules](https://developers.openai.com/codex/rules) support forbidden prefixes
@@ -102,7 +110,12 @@ blocking, including diagnostics followed by enough output to truncate the tail.
 
 Warning fixtures cover executable shell and JavaScript inputs, denied and
 completion-only calls, duplicate records, comments, heredocs, assistant prose,
-file edits, tool output, and printed/searched literals. Private invocations retain
+file edits, tool output, and printed/searched literals. Interpreter options before
+the code argument are skipped (`node --input-type=module -e …`, `node -r m -e …`,
+`bash -e -o pipefail -c …`). A heredoc is scanned as code only when its command word
+is a shell (`bash <<EOF`) or a JavaScript runtime (`node <<'JS'`); other heredocs
+(`cat > file <<EOF`) are literal data, and text after the delimiter on the same line
+(`<<EOF && kill 123`) is still examined. Private invocations retain
 only an opaque tool-call identifier and a fixed warning message. Warnings are
 persisted with invocation linkage; the additive feed trigger deduplicates by
 invocation/tool id, and reports contain a command-free warning count. Implement

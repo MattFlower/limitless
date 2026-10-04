@@ -463,7 +463,7 @@ for (const [name, Parser] of [
     const parser = new Parser((event) => events.push(event));
     for (const line of fixture(`${name}-signals.jsonl`)) parser.feed(line);
     const warnings = events.filter((event) => event.type === "warning");
-    expect(warnings.map((event) => event.id)).toEqual(Array.from({ length: 11 }, (_, i) => `signal-${i}`));
+    expect(warnings.map((event) => event.id)).toEqual(Array.from({ length: 16 }, (_, i) => `signal-${i}`));
     expect(JSON.stringify(warnings)).not.toContain("marker");
     expect(events.filter((event) => event.type === "tool_result").length).toBeGreaterThan(10);
   });

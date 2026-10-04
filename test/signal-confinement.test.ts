@@ -108,6 +108,8 @@ test("offline substitutes cover default readers without starting installed CLIs"
         );
         expect(existsSync(started)).toBe(true);
         expect(result.status).toBe("ok");
+        // A confined Claude reader cannot persist a transcript, so it advertises no resumable session.
+        if (launch === runClaude) expect(result.sessionId).toBeNull();
       }
     });
   } finally {

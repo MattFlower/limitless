@@ -1504,6 +1504,20 @@ test("claude editors confine Bash and native edits to the same roots; project se
   expect(() => buildClaudeArgs({ ...spec, resumeSessionId: "s-1" }, "s")).toThrow("cannot resume");
 });
 
+test("claude tool-enabled readers run under the same read-only config boundary: no transcript, no resume", () => {
+  const { spec } = editFixture();
+  const target = { ...spec.target, provider: "claude" };
+  for (const confineReads of [false, true]) {
+    const reader = { ...spec, mode: "readonly" as const, confineReads, target };
+    expect(buildClaudeArgs(reader, "session")).toContain("--no-session-persistence");
+    expect(() => buildClaudeArgs({ ...reader, resumeSessionId: "s-1" }, "s")).toThrow("cannot resume");
+  }
+  // A no-tools call runs outside the outer profile, so it keeps a persistent, resumable session.
+  const plain = { ...spec, mode: "readonly" as const, noTools: true, target };
+  expect(buildClaudeArgs(plain, "session")).not.toContain("--no-session-persistence");
+  expect(buildClaudeArgs({ ...plain, resumeSessionId: "s-1" }, "s").slice(-2)).toEqual(["--resume", "s-1"]);
+});
+
 /** A fake `codex sandbox` honouring (or, when leaky, ignoring) the editor profile's most specific entry. */
 function editCodex(
   behaviour: "enforcing" | "leaky" | "timeout" | "admin-leak" | "common-leak" = "enforcing",

@@ -69,3 +69,17 @@
 {"type": "item.started", "item": {"id": "comment", "type": "command_execution", "command": "echo safe # pkill -f marker; kill 123"}}
 {"type": "item.started", "item": {"id": "signal-10", "type": "command_execution", "command": "bash -lc \"kill \\\"$PID\\\"\""}}
 {"type": "item.started", "item": {"id": "escaped-literal", "type": "command_execution", "command": "node -e \"console.log(\\\"process.kill(123)\\\")\""}}
+{"type":"item.started","item":{"id":"signal-11","type":"command_execution","command":"node --input-type=module -e 'process.kill(123)'"}}
+{"type":"item.completed","item":{"id":"signal-11","type":"command_execution","command":"node --input-type=module -e 'process.kill(123)'","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"signal-12","type":"command_execution","command":"node <<'JS'\nprocess.kill(123)\nJS\n"}}
+{"type":"item.completed","item":{"id":"signal-12","type":"command_execution","command":"node <<'JS'\nprocess.kill(123)\nJS\n","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"signal-13","type":"command_execution","command":"bash -e -o pipefail -c \"pkill -f marker\""}}
+{"type":"item.completed","item":{"id":"signal-13","type":"command_execution","command":"bash -e -o pipefail -c \"pkill -f marker\"","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"signal-14","type":"command_execution","command":"FOO=1 /bin/bash -s <<EOF\nkillall marker\nEOF\n"}}
+{"type":"item.completed","item":{"id":"signal-14","type":"command_execution","command":"FOO=1 /bin/bash -s <<EOF\nkillall marker\nEOF\n","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"signal-15","type":"command_execution","command":"cat <<EOF > notes.txt && kill 123\nhi\nEOF\n"}}
+{"type":"item.completed","item":{"id":"signal-15","type":"command_execution","command":"cat <<EOF > notes.txt && kill 123\nhi\nEOF\n","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"literal-22","type":"command_execution","command":"cat > a.js <<'JS'\nprocess.kill(123)\nJS\n"}}
+{"type":"item.completed","item":{"id":"literal-22","type":"command_execution","command":"cat > a.js <<'JS'\nprocess.kill(123)\nJS\n","aggregated_output":"kill 123","exit_code":0}}
+{"type":"item.started","item":{"id":"literal-23","type":"command_execution","command":"node --version && node -r ./x.js -e \"console.log(1)\""}}
+{"type":"item.completed","item":{"id":"literal-23","type":"command_execution","command":"node --version && node -r ./x.js -e \"console.log(1)\"","aggregated_output":"kill 123","exit_code":0}}
