@@ -40,13 +40,11 @@ describe("process handling", () => {
 
   test("background processes left by the child are reaped", async () => {
     const marker = join(dir, "alive");
-    // The leftover keeps touching the marker; the child exits only once it is running.
+    // The leftover keeps touching the marker; the child exits only once it is running. Should reaping
+    // fail, the leftover still stops once afterEach removes `dir`, or after about 5 s.
+    const leftover = `i=0; while [ $i -lt 100 ] && [ -d ${dir} ]; do touch ${marker}; i=$((i+1)); sleep 0.05; done`;
     await runProcess({
-      cmd: [
-        "/bin/sh",
-        "-c",
-        `(while :; do touch ${marker}; sleep 0.05; done) >/dev/null 2>&1 & while [ ! -e ${marker} ]; do sleep 0.01; done`,
-      ],
+      cmd: ["/bin/sh", "-c", `(${leftover}) >/dev/null 2>&1 & while [ ! -e ${marker} ]; do sleep 0.01; done`],
       cwd: dir,
       env: process.env as Record<string, string>,
     });
