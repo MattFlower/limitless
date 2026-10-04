@@ -410,6 +410,7 @@ test("a write-enforcing backend must also prove signals; signal-only leaks and i
     proc({ exitCode: 1 }),
     proc(),
     proc({ stdout: "signals-verified", timedOut: true }),
+    proc({ stdout: "signals-verified", cancelled: true }),
     proc({ stdout: "signals-verified", signal: "SIGTERM" }),
     proc({ stdout: "signals-verified", idleTimedOut: true }),
   ]) {

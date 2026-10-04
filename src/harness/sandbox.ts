@@ -135,7 +135,14 @@ async function probeSeatbelt(
     const cmd = ["/bin/sh", "-c", SIGNAL_PROBE(nested), "sh", executable, profile, join(allowed, "ready")];
     const p = await run({ cmd, cwd: root, env: agentEnv(), timeoutMs: 5000, signal });
     // An interrupted probe is inconclusive even when its marker was printed.
-    if (p.exitCode !== 0 || p.stdout !== "signals-verified" || p.timedOut || p.idleTimedOut || p.signal)
+    if (
+      p.exitCode !== 0 ||
+      p.stdout !== "signals-verified" ||
+      p.cancelled ||
+      p.timedOut ||
+      p.idleTimedOut ||
+      p.signal
+    )
       throw new ConfinementError(`Signal confinement not verified: ${p.stderr}`);
   } finally {
     rmSync(allowed, { recursive: true, force: true });

@@ -27,7 +27,8 @@ before sandbox_apply is observed; their runtime behavior here is **unverified**.
 The chosen outer policy denies `signal` except self and same-sandbox. Forked tools
 and interpreters must inherit it. Every launch must prove actual denial to an
 outside owned process and an independently confined sibling, and termination of
-an owned descendant. A missing, ineffective or inconclusive probe fails closed.
+an owned descendant. A missing, ineffective or inconclusive probe fails closed,
+including a cancelled probe that printed its success marker.
 This is an invocation boundary, which is stricter than a run boundary.
 
 `runProcess` already starts a detached process group and cleans that group on
@@ -125,18 +126,22 @@ The production delta stays below 250 added plus deleted lines, including the new
 and additive SQL migration, excluding this document, tests, fixtures and probes.
 Count tracked changes against the implementation base instead of HEAD:
 `git diff --numstat 50e74bfd1831592896d03da21b2c49fe1cfcc4e5 -- src ui`.
-The current total is 240 added plus deleted production lines, including SQL.
+The current total is 248 added plus deleted production lines, including SQL.
 No authenticated live-model smoke was run. Effective OS enforcement and CLI
 compatibility still need the optional unrestricted-host validation described above.
 
-The follow-up worker repeated the offline target probe: all eight launches still
+The worker repeated the offline target probe: all eight launches still
 refuse with exit 71 before their payload starts. The smoke now gives gates their
 own startup marker in the test checkout: an invocation's earlier scratch is outside
 the gate's write allowance. The substitute also recognizes the plain `codex`
 executable used by default readers, with a harmless launch regression test, so
-offline acceptance never falls through to an installed CLI. Both reported smoke
-regressions pass in focused testing and in `LIMITLESS_CONFINED=1 bun run check`:
-1,995 passed, 12 existing environment-dependent skips, zero failures. Frozen
-installation, lint and typecheck also pass. The marker uses the repository's
+offline acceptance never falls through to an installed CLI. The standalone smoke
+passes all seven cases, and all ten factory-reported delivery failures pass with
+their original assertions and deadlines. Frozen installation, lint and typecheck
+also pass. A cancelled signal probe is now rejected even if it printed the success
+marker; the injectable-backend regression verifies the payload never launches.
+Two committed startup-marker leftovers were removed. The tracked-text check
+excludes Git-recorded working-tree deletions until the factory commits them and
+continues inspecting every surviving tracked file. The marker uses the repository's
 existing confined-gate test behavior; no skip condition was added or weakened.
 Effective OS enforcement remains unexercised.

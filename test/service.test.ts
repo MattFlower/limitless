@@ -509,10 +509,15 @@ test("tracked text and triage recovery examples use neutral service labels", () 
     expect(forbidden.test(sample)).toBe(true);
   const tracked = Bun.spawnSync(["git", "ls-files", "-z"], { stdout: "pipe" });
   expect(tracked.exitCode).toBe(0);
+  // The index still lists working-tree removals until the factory commits them.
+  const removed = Bun.spawnSync(["git", "ls-files", "--deleted", "-z"], { stdout: "pipe" });
+  expect(removed.exitCode).toBe(0);
+  const deleted = new Set(removed.stdout.toString().split("\0"));
   const violations = tracked.stdout
     .toString()
     .split("\0")
     .filter(Boolean)
+    .filter((path) => !deleted.has(path))
     .filter((path) => {
       const content = readFileSync(path);
       return !content.includes(0) && forbidden.test(content.toString());
