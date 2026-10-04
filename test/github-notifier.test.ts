@@ -1317,3 +1317,49 @@ test("expiry timestamps retain the first close, clear on open, and restart on a 
   store.observeGithubPrState(prUrl, "CLOSED", 50);
   expect(clock(prUrl)).toEqual({ closed_at: 50, reopened_at: 30 });
 });
+
+test("inaccessible expired PRs rotate with the others instead of holding the reserved probe", async () => {
+  const h = pollerHarness();
+  const day = 86_400_000;
+  let now = Date.now();
+  try {
+    const expired = new Set<string>();
+    const inaccessible = new Set([1, 2, 3].map((n) => url("o/r", n)));
+    // 6 expired (3 always failing) behind 30 healthy PRs: only the reserved slot reaches them.
+    for (let i = 1; i <= 36; i++) {
+      const run = h.factoryPr("o/r", i, i <= 6 ? "cancelled" : "succeeded");
+      h.store.db.query("UPDATE runs SET id = ? WHERE id = ?").run(String(i).padStart(6, "0"), run.id);
+      if (i > 6) continue;
+      expired.add(url("o/r", i));
+      h.store.observeGithubPrState(url("o/r", i), "CLOSED", now - 8 * day);
+      h.store.db
+        .query("INSERT INTO github_prs (url, data) VALUES (?, ?)")
+        .run(url("o/r", i), JSON.stringify({ ...h.node("o/r", i), state: "CLOSED" }));
+    }
+    const probed = new Set<string>();
+    const fresh: GitHubPrClient = async (u: string) => {
+      if (expired.has(u)) probed.add(u);
+      if (inaccessible.has(u)) throw new Error("access denied");
+      return { url: u, state: "OPEN", mergedAt: null, mergedBy: null };
+    };
+    const client = observedPrs(h.store, fresh);
+    const pass = () =>
+      reconcileMergedRuns(
+        h.store,
+        client,
+        () => {},
+        () => now,
+      );
+    await pass();
+    now += day;
+    // Two hours of passes five minutes apart, past the failing PRs' 15-minute backoff ceiling.
+    for (let i = 0; i < 24; i++) {
+      await pass();
+      now += 300_000;
+    }
+    expect([...probed].sort()).toEqual([...expired].sort());
+    for (const u of expired) expect(h.store.githubPrExpired(u, now)).toBe(inaccessible.has(u));
+  } finally {
+    h.close();
+  }
+});

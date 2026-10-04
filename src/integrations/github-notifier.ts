@@ -22,6 +22,8 @@ const passes = new WeakMap<
   {
     cursor: string;
     checked: Map<string, number>;
+    /** Last probe attempt of an expired PR; PRs in backoff rotate by it. */
+    attempted: Map<string, number>;
     retries: Map<string, { failures: number; at: number }>;
   }
 >();
@@ -42,7 +44,7 @@ export async function reconcileMergedRuns(
 ): Promise<void> {
   let pass = passes.get(store);
   if (!pass) {
-    pass = { cursor: "", checked: new Map(), retries: new Map() };
+    pass = { cursor: "", checked: new Map(), attempted: new Map(), retries: new Map() };
     passes.set(store, pass);
   }
   client.beginPass?.();
@@ -65,12 +67,15 @@ export async function reconcileMergedRuns(
   const expired = new Set(
     ordered.flatMap((r) => (r.prUrl && store.githubPrExpired(r.prUrl, now()) ? [r.prUrl] : [])),
   );
+  // A PR in backoff rotates by its last attempt, so inaccessible PRs can't hold the reserved slot.
+  const lastTry = (url: string) =>
+    ((pass.retries.get(url)?.failures ?? 0) >= 2 ? pass.attempted.get(url) : undefined) ??
+    pass.checked.get(url) ??
+    Infinity;
   ordered.sort(
     (a, b) =>
       Number(expired.has(a.prUrl ?? "")) - Number(expired.has(b.prUrl ?? "")) ||
-      (expired.has(a.prUrl ?? "")
-        ? (pass.checked.get(a.prUrl ?? "") ?? Infinity) - (pass.checked.get(b.prUrl ?? "") ?? Infinity)
-        : 0),
+      (expired.has(a.prUrl ?? "") ? lastTry(a.prUrl ?? "") - lastTry(b.prUrl ?? "") : 0),
   );
   const overdue = new Set(
     ordered.flatMap((run) =>
@@ -104,6 +109,7 @@ export async function reconcileMergedRuns(
       if (!results.has(run.prUrl)) {
         calls++;
         overdue.delete(run.prUrl);
+        if (expired.has(run.prUrl)) pass.attempted.set(run.prUrl, now());
         if (!expired.has(run.prUrl)) pass.cursor = run.id;
         if (!expired.has(run.prUrl)) pass.checked.set(run.prUrl, now());
         results.set(run.prUrl, await (expired.has(run.prUrl) ? (client.fresh ?? client) : client)(run.prUrl));
