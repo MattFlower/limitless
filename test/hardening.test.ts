@@ -14,6 +14,7 @@ import { fakeHarness } from "../src/harness/fake.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { startHttp } from "../src/server/http.ts";
 import { runProcess, sh } from "../src/util/proc.ts";
+import { fakeConfinement } from "./confinement.ts";
 import { findingEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -242,7 +243,10 @@ describe("provider tracker hardening", () => {
 describe("HTTP API", () => {
   test("refuses cross-origin and non-JSON mutations", async () => {
     const cfg = loadConfig({ home: join(dir, "data"), configDir: join(dir, "cfg"), port: 0 });
-    const factory = new Factory(cfg, { harnesses: { fake: fakeHarness(() => ({})) } });
+    const factory = new Factory(cfg, {
+      confinement: fakeConfinement,
+      harnesses: { fake: fakeHarness(() => ({})) },
+    });
     const server = startHttp(factory);
     const base = `http://127.0.0.1:${server.port}`;
     try {
@@ -347,6 +351,7 @@ describe("pipeline hardening", () => {
     let reviews = 0;
     const cfg = loadConfig({ home: join(dir, "data"), configDir: join(dir, "cfg") });
     const f = new Factory(cfg, {
+      confinement: fakeConfinement,
       providers,
       models,
       policy,
@@ -477,6 +482,7 @@ describe("pipeline hardening", () => {
     let rounds = 0;
     const cfg = loadConfig({ home: join(dir, "data"), configDir: join(dir, "cfg") });
     const f = new Factory(cfg, {
+      confinement: fakeConfinement,
       providers,
       models,
       policy,
@@ -580,7 +586,13 @@ describe("resume after restart", () => {
     });
     const cfg = loadConfig({ home: join(dir, "data"), configDir: join(dir, "cfg") });
 
-    const first = new Factory(cfg, { providers, models, policy, harnesses: { fake: harness } });
+    const first = new Factory(cfg, {
+      confinement: fakeConfinement,
+      providers,
+      models,
+      policy,
+      harnesses: { fake: harness },
+    });
     first.start();
     const run = await first.createRun({ repo, prompt: "add b" });
     const deadline = Date.now() + 10_000;
@@ -592,7 +604,13 @@ describe("resume after restart", () => {
     first.store.close();
 
     reviewDelay = 0;
-    const second = new Factory(cfg, { providers, models, policy, harnesses: { fake: harness } });
+    const second = new Factory(cfg, {
+      confinement: fakeConfinement,
+      providers,
+      models,
+      policy,
+      harnesses: { fake: harness },
+    });
     expect(second.scheduler.draining).toBe(false);
     // Also cover an abrupt shutdown that left a persisted running status.
     second.store.updateRun(run.id, { status: "running" });

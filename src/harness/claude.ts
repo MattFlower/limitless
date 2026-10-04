@@ -1,7 +1,15 @@
 import { appendFileSync, realpathSync } from "node:fs";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
-import { readConfinement, scratchEnv, scratchParent, validateDenyRead, validateScratch } from "./scratch.ts";
+import { runSandboxed } from "./sandbox.ts";
+import {
+  readConfinement,
+  scratchEnv,
+  scratchParent,
+  validateDenyRead,
+  validateScratch,
+  writeRoots,
+} from "./scratch.ts";
 import {
   type AgentEvent,
   type AgentResult,
@@ -158,28 +166,48 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
     "--verbose",
     "--model",
     t.model,
-    // Readers must not inherit hooks, sandbox exclusions or permissions from project settings.
+    // Tools must not inherit hooks, sandbox exclusions, permissions or MCP servers from project
+    // settings: arrays such as excludedCommands and permission rules merge across sources.
     "--setting-sources",
-    spec.mode === "readonly" ? "" : "project,local",
+    spec.mode === "readonly" || !spec.noTools ? "" : "project,local",
     "--permission-mode",
     "dontAsk",
   ];
   const fastSettings = spec.fast && t.provider === "claude" ? { fastMode: true } : {};
   const denied = ["Bash(git push:*)", "Bash(gh pr merge:*)", "Bash(gh repo delete:*)", "Bash(rm -rf /*)"];
   let readTools = ["Read", "Grep", "Glob"];
-  if (spec.mode === "readonly" && !spec.noTools) {
+  let editTools: string[] = [];
+  if (!spec.noTools) {
     const scratch = validateScratch(spec);
     scratchParent(scratch);
-    const explicit = validateDenyRead(spec, scratch);
-    const confined = spec.confineReads ? readConfinement(spec, scratch) : null;
-    const denyRead = confined?.deny ?? explicit;
-    // The sandbox confines Bash; Read rules also cover Grep and Glob. "//" marks an absolute path.
-    denied.push(...explicit.map((p) => `Read(/${p}/**)`));
-    // Deny rules beat allow rules and the private roots contain cwd and scratch, so a confined
-    // reader is allowed Read (which also governs Grep and Glob) only there; a bare Grep or Glob
-    // allow would search anywhere. dontAsk refuses every other path.
-    const readable = confined ? [...confined.cwd, ...confined.scratch] : [];
-    if (confined) readTools = readable.map((p) => `Read(/${p}/**)`);
+    let filesystem: Record<string, unknown>;
+    if (spec.mode === "edit") {
+      // The outer Seatbelt profile covers Bash and native tools. These permission rules also
+      // refuse native edits outside the roots before they reach the filesystem.
+      const { write, protect } = writeRoots(spec.cwd, scratch);
+      editTools = write.map((p) => `Edit(/${p}/**)`);
+      denied.push(...protect.flatMap((p) => [`Edit(/${p})`, `Edit(/${p}/**)`]));
+      filesystem = { allowWrite: write, denyWrite: protect, disabled: false };
+    } else {
+      const explicit = validateDenyRead(spec, scratch);
+      const confined = spec.confineReads ? readConfinement(spec, scratch) : null;
+      const denyRead = confined?.deny ?? explicit;
+      // The sandbox confines Bash; Read rules also cover Grep and Glob. "//" marks an absolute path.
+      denied.push(...explicit.map((p) => `Read(/${p}/**)`));
+      // Deny rules beat allow rules and the private roots contain cwd and scratch, so a confined
+      // reader is allowed Read (which also governs Grep and Glob) only there; a bare Grep or Glob
+      // allow would search anywhere. dontAsk refuses every other path.
+      const readable = confined ? [...confined.cwd, ...confined.scratch] : [];
+      if (confined) readTools = readable.map((p) => `Read(/${p}/**)`);
+      filesystem = {
+        allowWrite: [scratch],
+        denyWrite: [realpathSync(spec.cwd)],
+        ...(denyRead.length ? { denyRead } : {}),
+        // Takes precedence over denyRead, so the private roots may contain cwd and scratch.
+        ...(confined ? { allowRead: readable } : {}),
+        disabled: false,
+      };
+    }
     args.push(
       "--strict-mcp-config",
       "--mcp-config",
@@ -188,27 +216,26 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
       JSON.stringify({
         ...fastSettings,
         sandbox: {
-          enabled: true,
+          // macOS cannot nest Seatbelt: editors already run entirely inside runSandboxed.
+          enabled: spec.mode !== "edit",
           failIfUnavailable: true,
           autoAllowBashIfSandboxed: true,
-          allowUnsandboxedCommands: false,
+          allowUnsandboxedCommands: spec.mode === "edit",
           excludedCommands: [],
-          filesystem: {
-            allowWrite: [scratch],
-            denyWrite: [realpathSync(spec.cwd)],
-            ...(denyRead.length ? { denyRead } : {}),
-            // Takes precedence over denyRead, so the private roots may contain cwd and scratch.
-            ...(confined ? { allowRead: readable } : {}),
-            disabled: false,
-          },
+          filesystem,
         },
         disableAllHooks: true,
       }),
     );
   }
-  if (spec.fast && t.provider === "claude" && (spec.mode !== "readonly" || spec.noTools))
+  if (spec.fast && t.provider === "claude" && spec.noTools)
     args.push("--settings", JSON.stringify(fastSettings));
-  if (spec.privateSession) args.push("--no-session-persistence");
+  // The outer profile keeps CLAUDE_CONFIG_DIR read-only, so a confined editor cannot store a
+  // transcript: it runs ephemerally rather than failing on persistence, and cannot be resumed.
+  const ephemeral = spec.mode === "edit" && !spec.noTools;
+  if (ephemeral && spec.resumeSessionId)
+    throw new Error("Confined Claude editors do not persist sessions and cannot resume one");
+  if (spec.privateSession || ephemeral) args.push("--no-session-persistence");
   if (spec.noTools) {
     args.push("--tools", "");
   } else if (spec.mode === "readonly") {
@@ -220,10 +247,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
       "--allowedTools",
       "Bash",
       "Read",
-      "Edit",
-      "Write",
-      "MultiEdit",
-      "NotebookEdit",
+      ...editTools,
       "Glob",
       "Grep",
       "TodoWrite",
@@ -253,6 +277,12 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const sessionId = crypto.randomUUID();
   const t = spec.target;
   const args = buildClaudeArgs(spec, sessionId);
+  const editing = spec.mode === "edit" && !spec.noTools;
+  const roots = editing ? writeRoots(spec.cwd, validateScratch(spec)) : null;
+  // Preserve HOME and CLAUDE_CONFIG_DIR: they identify the persistent login/Keychain service.
+  // Copying OAuth state to scratch loses refreshed tokens when scratch is removed.
+  const runner: typeof runProcess = (opts) =>
+    roots ? runSandboxed(opts, roots, processRunner) : processRunner(opts);
   appendFileSync(spec.logPath, `# claude ${t.model} ${new Date().toISOString()}\n`);
   const envExtra: Record<string, string> = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
   if (t.backend) {
@@ -299,14 +329,18 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     spec.onEvent(ev);
   });
 
-  const proc = await processRunner({
+  const proc = await runner({
     cmd: args,
     cwd: spec.cwd,
     env: agentEnv({
       ...envExtra,
       ...scratchEnv(spec),
       // Sandboxed Bash gets TMPDIR=$CLAUDE_CODE_TMPDIR/claude-<uid>, which is the scratch itself.
-      ...(spec.scratchDir ? { CLAUDE_CODE_TMPDIR: scratchParent(spec.scratchDir) } : {}),
+      // A confined editor runs without the CLI sandbox, so the CLI's own files there (the Bash
+      // cwd record) must land in the scratch directly: its parent is outside the boundary.
+      ...(spec.scratchDir
+        ? { CLAUDE_CODE_TMPDIR: editing ? spec.scratchDir : scratchParent(spec.scratchDir) }
+        : {}),
     }),
     stdin: spec.prompt,
     signal,
