@@ -1681,22 +1681,27 @@ async function deliverReviewRound(
   };
   await withPrLock(prUrl, async () => {
     const pr = await readPrHead(gh, prUrl, ctx.signal);
-    let remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
+    const remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
     const pushed = remote === head;
     const { grant, run } = stored();
     assertFactoryBranchPush(ctx.repo, run, grant, pr, remote, pushed ? head : reviewedSha);
-    // Recorded before pushing: a lookup that started earlier is overtaken and an approval of the old
-    // head is stale, even if the push lands but its acknowledgement is lost.
-    ctx.store.observePrHead(prUrl, head);
-    if (!pushed)
+    // An earlier attempt's push: record it, ending any push mark that attempt left behind.
+    if (pushed) ctx.store.endPrPush(prUrl, head);
+    else {
+      // A barrier around the push: lookups from before it, or made while it runs, cannot record a
+      // head or an approval afterwards, even if the push lands but its acknowledgement is lost.
+      ctx.store.beginPrPush(prUrl, head, ctx.run.id);
+      let landed: string | null = head;
       try {
         await pushExistingBranch(ctx.repo, cwd, branch, reviewedSha, ctx.signal, budget);
       } catch (error) {
-        // An uncertain outcome: what the remote holds decides, and is recorded either way.
-        remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget).catch(() => null);
-        if (remote) ctx.store.observePrHead(prUrl, remote);
-        if (remote !== head) throw error;
+        // An uncertain outcome: what the remote holds decides.
+        landed = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget).catch(() => null);
+        if (landed !== head) throw error;
+      } finally {
+        ctx.store.endPrPush(prUrl, landed);
       }
+    }
     stored();
     ctx.store.markRoundDelivered(ctx.run.id, head);
     const { marker, text } = roundSection(ctx.run.id, review.round, review.findings);

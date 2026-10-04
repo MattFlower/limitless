@@ -1336,17 +1336,29 @@ test("an approval goes stale on any head the poller sees, and an overtaken poll 
   expect(h.store.approvalFor(prUrl)).toEqual({ sha: SHA, stale: true });
   expect(h.store.prHead(prUrl)?.sha).toBe(SHA);
 
-  // A round pushes while a poll is in flight; the poll's older answer must not rewind the head.
-  let release = () => {};
-  h.gh.hold = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const pushed = "c".repeat(40);
-  await h.advance(15 * S);
-  h.store.observePrHead(prUrl, pushed);
-  h.gh.hold = null;
-  release();
-  await h.advance(0);
-  expect(h.gh.graphql().length).toBeGreaterThanOrEqual(4);
-  expect(h.store.prHead(prUrl)?.sha).toBe(pushed);
+  // A round pushes while a poll is in flight, the poll having started before the push or during it:
+  // its older answer must never rewind the head the push recorded.
+  const round = h.store.createRun(h.repo("o/r"), { repo: "o/r", prompt: "review round" });
+  for (const [i, during] of [false, true].entries()) {
+    const pushed = (i ? "d" : "c").repeat(40);
+    let release = () => {};
+    if (during) h.store.beginPrPush(prUrl, pushed, round.id);
+    h.gh.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await h.advance(15 * S);
+    if (!during) h.store.beginPrPush(prUrl, pushed, round.id);
+    h.store.endPrPush(prUrl, pushed);
+    h.gh.hold = null;
+    release();
+    await h.advance(0);
+    expect(h.store.prHead(prUrl)?.sha).toBe(pushed);
+  }
+  expect(h.gh.graphql().length).toBeGreaterThanOrEqual(5);
+  // While a round is pushing, no observation records a head at all.
+  const version = h.store.prHead(prUrl)?.version ?? 0;
+  h.store.beginPrPush(prUrl, "e".repeat(40), round.id);
+  expect(h.store.observePrHead(prUrl, "e".repeat(40), version + 1)).toBe(false);
+  h.store.endPrPush(prUrl, "e".repeat(40));
+  expect(h.store.observePrHead(prUrl, "f".repeat(40), version + 2)).toBe(true);
 });

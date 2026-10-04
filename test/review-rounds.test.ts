@@ -275,9 +275,17 @@ async function review(id: string, body: unknown) {
 const changes = async (id: string) =>
   review(id, { verdict: "changes", reviewedSha: await remoteHead(), findings });
 
+const started = new WeakSet<Factory>();
+/** Starts this factory's scheduler once: a second start would re-queue the runs it is executing. */
+function startScheduler() {
+  if (started.has(factory)) return;
+  started.add(factory);
+  factory.scheduler.start();
+}
+
 /** Runs the scheduler until `id` is finished (or, with `until`, until that holds while it is idle). */
 async function settle(id: string, until = (run: Run) => !["queued", "running"].includes(run.status)) {
-  factory.scheduler.start();
+  startScheduler();
   const end = Date.now() + 25_000;
   for (;;) {
     const run = factory.store.getRun(id) as Run;
@@ -318,18 +326,28 @@ async function waitFor(check: () => boolean) {
   }
 }
 
-/** A `git` first on PATH whose pushes land on the remote, then fail (`lost`) or never return (`hang`). */
-function stubPush(mode: "lost" | "hang") {
+/**
+ * A `git` first on PATH whose pushes land on the remote, then fail (`lost`) or never return
+ * (`hang`); a `gate` push waits for `release()` before it lands, then succeeds.
+ */
+function stubPush(mode: "lost" | "hang" | "gate") {
   const real = Bun.which("git") as string;
   const bin = join(root, "git-bin");
+  const started = join(root, "push-started");
   const landed = join(root, "push-landed");
+  const released = join(root, "push-released");
   mkdirSync(bin, { recursive: true });
-  const after = mode === "hang" ? "exec sleep 30" : 'echo "error: failed to push some refs" >&2; exit 1';
+  const wait = mode === "gate" ? `while [ ! -e '${released}' ]; do sleep 0.02; done` : ":";
+  const after = {
+    lost: 'echo "error: failed to push some refs" >&2; exit 1',
+    hang: "exec sleep 30",
+    gate: "exit 0",
+  }[mode];
   writeFileSync(
     join(bin, "git"),
     `#!/bin/sh
 command=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")
-if [ "$command" = push ]; then '${real}' "$@" || exit $?; touch '${landed}'; ${after}; fi
+if [ "$command" = push ]; then touch '${started}'; ${wait}; '${real}' "$@" || exit $?; touch '${landed}'; ${after}; fi
 exec '${real}' "$@"
 `,
     { mode: 0o755 },
@@ -337,7 +355,9 @@ exec '${real}' "$@"
   const path = process.env.PATH;
   process.env.PATH = `${bin}:${path}`;
   return {
+    started,
     landed,
+    release: () => writeFileSync(released, ""),
     restore: () => {
       process.env.PATH = path;
     },
@@ -727,7 +747,7 @@ test.each([
     // The push lands, then the daemon stops before hearing back; the round resumes at delivery.
     const stub = stubPush("hang");
     try {
-      factory.scheduler.start();
+      startScheduler();
       await waitFor(() => existsSync(stub.landed));
       await restart();
     } finally {
@@ -742,3 +762,29 @@ test.each([
     expect(pr.calls.some((args) => args[1] === "edit")).toBe(false);
   },
 );
+
+test("an approve whose lookup starts while a round is pushing is refused, and stays so after a restart", async () => {
+  const original = await delivered();
+  const reviewed = await remoteHead();
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  const stub = stubPush("gate");
+  try {
+    startScheduler();
+    // The round has recorded its push and is pushing; the remote still holds the reviewed head.
+    await waitFor(() => existsSync(stub.started));
+    const held = holdLookup();
+    const approving = review(original.id, { verdict: "approve", reviewedSha: reviewed });
+    await held.reached;
+    held.release();
+    stub.release();
+    expect(await settle(roundId)).toMatchObject({ status: "succeeded" });
+    expect(await approving).toMatchObject({
+      status: 409,
+      body: { error: expect.stringContaining("head moved") },
+    });
+  } finally {
+    stub.restore();
+  }
+  await restart();
+  expect(factory.store.approvalFor(PR_URL)).toBeNull();
+});

@@ -1086,27 +1086,69 @@ export class Store {
 
   /**
    * Records a head seen on a PR; an approval of any other commit goes stale. With `since`, the
-   * version read before looking, a lookup overtaken by a newer, different observation is refused
-   * (false) rather than rewinding the PR's last known head.
+   * version read before looking, the observation is refused (false) while a round is pushing to the
+   * PR, or when the epoch has moved on to a different head: it can never rewind the last known head.
    */
   observePrHead(prUrl: string, head: string, since?: number): boolean {
     return this.db.transaction(() => {
       const last = this.prHead(prUrl);
-      if (since !== undefined && last && last.version !== since && last.sha !== head) return false;
-      if (last?.sha !== head)
-        this.db
-          .query(
-            `INSERT INTO pr_heads (pr_url, sha, version, observed_at) VALUES (?1, ?2, 1, ?3)
-            ON CONFLICT (pr_url) DO UPDATE SET sha = ?2, version = version + 1, observed_at = ?3`,
-          )
-          .run(prUrl, head, Date.now());
-      this.db
-        .query(
-          "UPDATE review_approvals SET stale_reason = 'head moved to ' || ?2 WHERE pr_url = ?1 AND stale_reason IS NULL AND sha <> ?2",
-        )
-        .run(prUrl, head);
+      if (
+        since !== undefined &&
+        (this.pushingTo(prUrl) || (last && last.version !== since && last.sha !== head))
+      )
+        return false;
+      if (last?.sha !== head) this.writePrHead(prUrl, head, null);
+      this.staleApprovals(prUrl, head);
       return true;
     })();
+  }
+
+  /** A round's push begins: earlier lookups are overtaken and approvals of other heads go stale. */
+  beginPrPush(prUrl: string, head: string, runId: string): void {
+    this.db.transaction(() => {
+      this.writePrHead(prUrl, head, runId);
+      this.staleApprovals(prUrl, head);
+    })();
+  }
+
+  /** It ends with `head` on the remote (null: unknown): the epoch moves on again, past any lookup made meanwhile. */
+  endPrPush(prUrl: string, head: string | null): void {
+    this.db.transaction(() => {
+      if (head === null)
+        this.db
+          .query(
+            "UPDATE pr_heads SET version = version + 1, observed_at = ?, pushing = NULL WHERE pr_url = ?",
+          )
+          .run(Date.now(), prUrl);
+      else {
+        this.writePrHead(prUrl, head, null);
+        this.staleApprovals(prUrl, head);
+      }
+    })();
+  }
+
+  /** A round run, not yet finished, recorded as pushing to the PR (a crash can leave one behind). */
+  private pushingTo(prUrl: string): boolean {
+    const sql = `SELECT 1 FROM pr_heads h JOIN runs ON runs.id = h.pushing
+      WHERE h.pr_url = ? AND runs.status NOT IN (${TERMINAL_STATUSES.map(() => "?").join(", ")})`;
+    return this.db.query(sql).get(prUrl, ...TERMINAL_STATUSES) !== null;
+  }
+
+  private writePrHead(prUrl: string, head: string, pushing: string | null): void {
+    this.db
+      .query(
+        `INSERT INTO pr_heads (pr_url, sha, version, observed_at, pushing) VALUES (?1, ?2, 1, ?3, ?4)
+        ON CONFLICT (pr_url) DO UPDATE SET sha = ?2, version = version + 1, observed_at = ?3, pushing = ?4`,
+      )
+      .run(prUrl, head, Date.now(), pushing);
+  }
+
+  private staleApprovals(prUrl: string, head: string): void {
+    this.db
+      .query(
+        "UPDATE review_approvals SET stale_reason = 'head moved to ' || ?2 WHERE pr_url = ?1 AND stale_reason IS NULL AND sha <> ?2",
+      )
+      .run(prUrl, head);
   }
 
   private validateDependencies(input: unknown, candidateId: string): string[] {

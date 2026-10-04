@@ -12,13 +12,15 @@ CREATE TABLE review_rounds (
   UNIQUE (pr_url, round)
 );
 CREATE INDEX review_rounds_source ON review_rounds (source_run_id);
--- The last head seen on a PR. `version` grows with each new head, so a lookup that started
--- before a newer observation can be refused (compare-and-set) instead of rewinding it.
+-- The last head seen on a PR. `version` (the PR's observation epoch) grows with each new head and
+-- at both ends of a round's push, so a lookup that started before either can be refused
+-- (compare-and-set) instead of rewinding it. `pushing`: the round run whose push is under way.
 CREATE TABLE pr_heads (
   pr_url TEXT PRIMARY KEY,
   sha TEXT NOT NULL,
   version INTEGER NOT NULL,
-  observed_at INTEGER NOT NULL
+  observed_at INTEGER NOT NULL,
+  pushing TEXT
 );
 -- `stale_reason` is set once the PR head moves (or a "changes" verdict arrives) after the approval.
 CREATE TABLE review_approvals (
