@@ -1946,6 +1946,71 @@ test.each([
   expect(String(error)).not.toContain("secret-host.example");
 });
 
+test.each(["author-email", "message", "clean"])(
+  "publication ignores UTF-16 log config: %s",
+  async (scenario) => {
+    await git(work, "config", "i18n.logOutputEncoding", "UTF-16");
+    writeFileSync(join(work, "safe.txt"), "safe");
+    await git(work, "add", ".");
+    await git(
+      work,
+      "commit",
+      "--author=Safe <" +
+        (scenario === "author-email" ? "fake@secret-host.example" : "safe@example.com") +
+        ">",
+      "-qm",
+      scenario === "message" ? "Safe subject\n\nsecret-host.example" : "safe",
+    );
+    const scan = checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]);
+    if (scenario === "clean") await scan;
+    else {
+      const error = await scan.catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain("entry 1");
+      expect(String(error)).not.toContain("secret-host.example");
+      if (scenario === "author-email") expect(String(error)).toContain("author email");
+    }
+  },
+);
+
+test.each(["mergetag", "gpgsig", "encoding", "utf8", "invalid-utf8", "message-header", "replacement"])(
+  "publication inspects raw commit headers: %s",
+  async (scenario) => {
+    const tree = (await git(work, "rev-parse", `${base}^{tree}`)).stdout.trim();
+    const tag = `mergetag object ${base}\n type commit\n tag safe\n tagger Safe <fake@secret-host.example> 1 +0000\n \n safe tag\n`;
+    const extra =
+      scenario === "gpgsig"
+        ? "gpgsig safe\n secret-host.example\n"
+        : ["mergetag", "replacement"].includes(scenario)
+          ? tag
+          : scenario === "encoding"
+            ? "encoding ISO-8859-1\n"
+            : scenario === "utf8"
+              ? "encoding UTF-8\n"
+              : "";
+    const raw = `tree ${tree}\nparent ${base}\nauthor Safe <safe@example.com> 1 +0000\ncommitter Safe <safe@example.com> 1 +0000\n${extra}\nsafe${scenario === "message-header" ? "\nencoding ISO-8859-1" : ""}\n`;
+    const object = join(dir, "commit-object");
+    writeFileSync(
+      object,
+      scenario === "invalid-utf8" ? Buffer.concat([Buffer.from(raw), Buffer.from([0xff])]) : raw,
+    );
+    const sha = (await git(work, "hash-object", "-t", "commit", "-w", object)).stdout.trim();
+    await git(work, "reset", "--hard", sha);
+    if (scenario === "replacement") await git(work, "replace", sha, base);
+    expect((await git(work, "tag", "--list")).stdout).toBe("");
+    const scan = checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]);
+    if (["utf8", "message-header"].includes(scenario)) await scan;
+    else {
+      const error = await scan.catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain(["encoding", "invalid-utf8"].includes(scenario) ? "UTF-8" : "entry 1");
+      expect(String(error)).not.toContain("secret-host.example");
+      expect(String(error)).not.toContain("safe@example.com");
+      expect(String(error)).not.toContain("ISO-8859-1");
+    }
+  },
+);
+
 test.each(["patch", "message", "merge", "excluded"])("publication range checks %s", async (scenario) => {
   const entries = [{ value: "secret-host.example", entry: 1 }];
   writeFileSync(

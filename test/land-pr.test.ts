@@ -28,6 +28,8 @@ describe("land-pr private strings", () => {
     "history",
     "message",
     "author-email",
+    "utf16-author-email",
+    "utf16-message",
     "head-ref",
     "encoded",
     "malformed",
@@ -88,7 +90,8 @@ describe("land-pr private strings", () => {
         await git("-C", work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message);
         expectedHead = (await git("-C", work, "rev-parse", "HEAD")).stdout.trim();
       };
-      if (scenario === "author-email") {
+      if (scenario.startsWith("utf16-")) await git("config", "i18n.logOutputEncoding", "UTF-16");
+      if (scenario.endsWith("author-email")) {
         await git("-C", work, "add", ".");
         await git(
           "-C",
@@ -104,9 +107,9 @@ describe("land-pr private strings", () => {
         );
         expectedHead = (await git("-C", work, "rev-parse", "HEAD")).stdout.trim();
       }
-      if (["history", "message"].includes(scenario)) {
+      if (["history", "message", "utf16-message"].includes(scenario)) {
         writeFileSync(join(work, "transient.txt"), scenario === "history" ? entry : "safe");
-        await commit(scenario === "message" ? `Safe subject\n\n${entry}` : "safe");
+        await commit(scenario.endsWith("message") ? `Safe subject\n\n${entry}` : "safe");
         rmSync(join(work, "transient.txt"));
         await commit("remove transient");
         writeFileSync(join(work, "file.txt"), "final safe\n");
@@ -174,7 +177,7 @@ describe("land-pr private strings", () => {
       });
       expect(result.exitCode).not.toBe(0);
       expect(`${result.stdout}${result.stderr}`.toLowerCase()).not.toContain(entry);
-      if (scenario === "author-email") expect(result.stderr).toContain("author email");
+      if (scenario.endsWith("author-email")) expect(result.stderr).toContain("author email");
       if (!["post-commit", "destination"].includes(scenario))
         expect((await git("-C", work, "rev-parse", "HEAD")).stdout.trim()).toBe(expectedHead);
       if (["absent", "clean", "excluded"].includes(scenario)) {
@@ -261,7 +264,7 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
   }
 });
 
-test.each(["title", "body", "moved", "lookup-failed", "malformed", "missing", "clean", "cancel"])(
+test.each(["title", "subject", "body", "moved", "lookup-failed", "malformed", "missing", "clean", "cancel"])(
   "land validates the final PR after CI: %s",
   async (scenario) => {
     const root = mkdtempSync(join(tmpdir(), "land-final-"));
@@ -283,7 +286,8 @@ test.each(["title", "body", "moved", "lookup-failed", "malformed", "missing", "c
       writeFileSync(join(work, "file"), "safe change");
       await git("commit", "-qam", "safe");
       const sha = (await git("rev-parse", "HEAD")).stdout.trim();
-      writeFileSync(join(config, "private-strings.txt"), entry);
+      const denied = scenario === "subject" ? "Fresh safe title" : entry;
+      writeFileSync(join(config, "private-strings.txt"), denied);
       const final = { title: "Fresh safe title", body: "Fresh body\n\nSecond line\n", headRefOid: sha };
       if (scenario === "title") final.title = entry;
       if (scenario === "body") final.body = entry;
@@ -356,7 +360,7 @@ exec '${gitBin}' "$@"
       const code = await child.exited;
       if (typeof child.stderr === "number") throw new Error("expected piped stderr");
       const stderr = await new Response(child.stderr).text();
-      expect(stderr).not.toContain(entry);
+      expect(stderr).not.toContain(denied);
       const recorded: string[][] = readFileSync(calls, "utf8")
         .trim()
         .split("\n")

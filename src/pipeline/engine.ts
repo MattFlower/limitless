@@ -1567,9 +1567,18 @@ async function checkPublication(ctx: RunContext, body: string, pr?: { sha: strin
     checkPrivateText(pr.title, "PR title", entries);
     checkPrivateText(ctx.run.deliveryBranch ?? ctx.run.branch ?? "", "Branch name", entries);
     await checkPrivateRange(cwd, `${ctx.run.baseSha}..${pr.sha}`, entries);
-    const messages = await worktreeGit(["git", "log", "--format=%B", `${ctx.run.baseSha}..${pr.sha}`], {
-      cwd,
-    });
+    const messages = await worktreeGit(
+      [
+        "git",
+        "-c",
+        "i18n.logOutputEncoding=UTF-8",
+        "log",
+        "--encoding=UTF-8",
+        "--format=%B",
+        `${ctx.run.baseSha}..${pr.sha}`,
+      ],
+      { cwd },
+    );
     checkPrivateText(messages.stdout, "Commit message", entries);
     const findings = auditDiff(await diffSince(cwd, ctx.run.baseSha as string, undefined, false, entries), {
       configDir: ctx.deps.cfg.paths.configDir,

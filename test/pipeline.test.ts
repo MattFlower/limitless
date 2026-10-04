@@ -2448,6 +2448,8 @@ esac
     "lfs-history",
     "cache-config",
     "author-email",
+    "utf16-author-email",
+    "utf16-message-body",
   ])("private strings stop %s delivery before any push", async (scenario) => {
     const bare = await githubFixture();
     const entry = scenario === "branch" ? "secret-host-example" : "secret-host.example";
@@ -2489,8 +2491,12 @@ esac
             : approve,
         };
       }
-      if (["history", "message-body", "draft-history", "lfs-history"].includes(scenario)) {
-        let content = scenario === "message-body" ? "safe" : entry;
+      if (scenario.startsWith("utf16-"))
+        await sh(["git", "config", "i18n.logOutputEncoding", "UTF-16"], { cwd: s.cwd });
+      if (
+        ["history", "message-body", "utf16-message-body", "draft-history", "lfs-history"].includes(scenario)
+      ) {
+        let content = scenario.endsWith("message-body") ? "safe" : entry;
         if (scenario === "lfs-history") {
           const oid = createHash("sha256").update(entry).digest("hex");
           const common = (await sh(["git", "rev-parse", "--git-common-dir"], { cwd: s.cwd })).stdout.trim();
@@ -2510,7 +2516,7 @@ esac
             "user.name=t",
             "commit",
             "-qm",
-            scenario === "message-body" ? `Safe subject\n\n${entry}` : "safe",
+            scenario.endsWith("message-body") ? `Safe subject\n\n${entry}` : "safe",
           ],
           { cwd: s.cwd },
         );
@@ -2520,7 +2526,7 @@ esac
           cwd: s.cwd,
         });
       }
-      if (["commit", "author-email"].includes(scenario)) {
+      if (["commit", "author-email", "utf16-author-email"].includes(scenario)) {
         writeFileSync(join(s.cwd, "farewell.txt"), "goodbye\n");
         await sh(["git", "add", "."], { cwd: s.cwd });
         await sh(
@@ -2538,7 +2544,7 @@ esac
             cwd: s.cwd,
             env: {
               ...process.env,
-              ...(scenario === "author-email"
+              ...(scenario.endsWith("author-email")
                 ? { GIT_AUTHOR_NAME: "Fake", GIT_AUTHOR_EMAIL: `fake@${entry}` }
                 : {}),
             },
@@ -2575,7 +2581,7 @@ esac
     expect(f.store.getRun(run.id)?.prUrl).toBeNull();
     const error = f.store.getRun(run.id)?.error ?? "";
     expect(error.toLowerCase()).not.toContain(entry);
-    if (scenario === "author-email") expect(error).toContain("author email");
+    if (scenario.endsWith("author-email")) expect(error).toContain("author email");
     if (scenario === "cache-config") expect(error).toContain("inside repository");
     else if (scenario !== "unreadable") expect(error).toContain("entry 1 in private-strings.txt");
     calls.push(

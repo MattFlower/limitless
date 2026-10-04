@@ -611,19 +611,47 @@ async function lfsPayload(cwd: string, env: Record<string, string> | undefined, 
   throw new privacy.PrivateError("Cannot inspect local LFS payload; publication blocked");
 }
 
-/** Checks published identities, messages and patches (and optionally the index), not the net diff. */
+/** Checks raw commits and patches (and optionally the index), not the net diff. */
 export async function checkPrivateRange(cwd: string, range: string, entries: PrivateStrings, staged = false) {
-  const identities = await worktreeGit(["git", "log", "-z", "--format=%an%x00%ae%x00%cn%x00%ce", range], {
+  const log = [
+    "git",
+    "--no-replace-objects",
+    "-c",
+    "i18n.logOutputEncoding=UTF-8",
+    "log",
+    "--encoding=UTF-8",
+  ];
+  const identities = await worktreeGit([...log, "-z", "--format=%an%x00%ae%x00%cn%x00%ce", range], {
     cwd,
   });
   const fields = ["author name", "author email", "committer name", "committer email"];
   identities.stdout.split("\0").forEach((value, i) => {
     privacy.checkPrivateText(value, `Published commit ${fields[i % 4]}`, entries);
   });
+  const commits = await worktreeGit(["git", "--no-replace-objects", "rev-list", range], { cwd });
+  for (const sha of commits.stdout.trim().split("\n").filter(Boolean)) {
+    const raw = await worktreeGit(["git", "--no-replace-objects", "cat-file", "commit", sha], {
+      cwd,
+      encoding: "latin1",
+    });
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(raw.stdout, "latin1"));
+    } catch {
+      throw new privacy.PrivateError("Published commit is not valid UTF-8; publication blocked");
+    }
+    const headers = text.slice(0, text.indexOf("\n\n"));
+    if ([...headers.matchAll(/^encoding (.*)$/gm)].some((match) => !/^UTF-8$/i.test(match[1] ?? "")))
+      throw new privacy.PrivateError("Published commit encoding must be UTF-8; publication blocked");
+    privacy.checkPrivateText(text, "Published commit object", entries);
+  }
   const flags = "--raw -z --no-abbrev -p --text --no-renames -U0 --ignore-submodules=none".split(" ");
   const blobs: string[] = [];
-  for (const args of [["log", "-m", "--format=%B", range], ...(staged ? [["diff", "--cached"]] : [])]) {
-    const { stdout } = await worktreeGit(["git", ...args, ...flags], { cwd });
+  for (const args of [
+    [...log, "-m", "--format=%B", range],
+    ...(staged ? [["git", "diff", "--cached"]] : []),
+  ]) {
+    const { stdout } = await worktreeGit([...args, ...flags], { cwd });
     privacy.checkPrivateText(stdout, "Published content", entries);
     for (const match of stdout.matchAll(/:\d+ (?!160000)\d+ \w+ (\w+) [A-Z]\0/g)) blobs.push(match[1] ?? "");
   }
@@ -1112,9 +1140,9 @@ export async function mergePullRequest(
         const schema = z.object({ title: z.string().min(1), body: z.string(), headRefOid: z.string() });
         const data = schema.parse(JSON.parse((await sh(view, { cwd, signal })).stdout));
         if (!/^[a-f0-9]{40,64}$/.test(sha) || data.headRefOid !== sha) throw new Error("PR head moved");
-        privacy.checkPrivateText(`${data.title}\n${data.body}`, "PR text", entries);
-        blocked = false;
         const title = number ? `${data.title} (#${number})` : data.title;
+        privacy.checkPrivateText(`${title}\n${data.body}`, "PR text", entries);
+        blocked = false;
         const subject = ["--subject", title, "--body", data.body, "--match-head-commit", sha];
         const cmd = ["gh", "pr", "merge", prUrl, "--squash", ...extra, "--delete-branch", ...subject];
         return sh(cmd, { cwd, signal }).then(

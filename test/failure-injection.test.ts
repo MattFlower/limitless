@@ -1861,6 +1861,7 @@ test("the budget bounds retries and waits, never a call's first attempt or a hea
 test.each([
   "title",
   "body",
+  "subject",
   "moved",
   "invalid",
   "missing",
@@ -1869,6 +1870,7 @@ test.each([
   "clean",
   "auto",
   "auto-body",
+  "auto-subject",
   "auto-moved",
   "retry-body",
   "retry-moved",
@@ -1879,7 +1881,10 @@ test.each([
   const restore = fakeGh(pr);
   const config = join(root, "config");
   mkdirSync(config);
-  writeFileSync(join(config, "private-strings.txt"), "secret-host.example");
+  writeFileSync(
+    join(config, "private-strings.txt"),
+    scenario.endsWith("subject") ? "Checked subject (#1)" : "secret-host.example",
+  );
   const sha = "a".repeat(40);
   const safe = { title: "Checked subject", body: "Complete body\n\nLast paragraph\n", headRefOid: sha };
   const changed = { ...safe };
@@ -1889,12 +1894,13 @@ test.each([
   if (scenario === "invalid") changed.headRefOid = "invalid";
   const fallback = scenario.startsWith("auto");
   const retry = scenario.startsWith("retry");
+  const initial = scenario === "auto-subject" ? { ...safe, title: "Initially safe" } : safe;
   // Earlier PR text was safe; the final lookup can observe an edit or a moved head.
   writeFileSync(pr, url);
   writeFileSync(
     `${pr}.text`,
     JSON.stringify([
-      ...(fallback || retry ? [safe] : []),
+      ...(fallback || retry ? [initial] : []),
       scenario === "missing" ? {} : scenario === "malformed" ? "not an object" : changed,
     ]),
   );
@@ -1918,7 +1924,7 @@ test.each([
     for (const args of merges) {
       expect(args.slice(args.indexOf("--subject"))).toEqual([
         "--subject",
-        "Checked subject (#1)",
+        scenario === "auto-subject" ? "Initially safe (#1)" : "Checked subject (#1)",
         "--body",
         safe.body,
         "--match-head-commit",
