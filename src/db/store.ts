@@ -1779,6 +1779,14 @@ export class Store {
     return row?.closed_at != null && row.closed_at < now - 604800000;
   }
 
+  /** Wake polling for known PRs even after closed snapshots have expired. */
+  reopenGithubPr(url: string): void {
+    const runs = this.db
+      .query<{ id: string }, [string]>("SELECT id FROM runs WHERE pr_url = ? COLLATE NOCASE AND NOT merged")
+      .all(url);
+    for (const run of runs) this.updateRun(run.id, { prClosedUnmerged: false });
+  }
+
   /** Reconciliation/reopen observations retain the poller's other saved fields. */
   observeGithubPrState(url: string, state: string, now = Date.now()): void {
     this.db

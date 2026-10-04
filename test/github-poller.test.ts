@@ -1,9 +1,11 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
+import { githubWebhook } from "../src/integrations/github.ts";
 import { diffPr, githubDoctor, normalizePr, OBSERVE_QUERY } from "../src/integrations/github-poller.ts";
 import { type PrNode, pollerHarness, prNode, respond, SHA, url } from "./github-poller-support.ts";
 
@@ -1373,10 +1375,42 @@ test.each(["succeeded", "failed", "cancelled"] as const)(
       closed_at: closedAt,
     });
     expect(h.store.githubPrData(pr.url)).not.toBeNull();
-    // An existing reconciliation observation updates the run's closed flag and wakes the poller.
+    // A real reopened delivery clears expiry and wakes an otherwise unscheduled poller.
     pr.state = "OPEN";
-    h.store.observeGithubPrState(pr.url, "OPEN", h.clock.now());
-    h.store.updateRun(run.id, { prClosedUnmerged: false });
+    const cfg = loadConfig({ home: h.dir, configDir: h.dir });
+    cfg.githubOwner = "o";
+    cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
+    const webhook = githubWebhook({
+      cfg,
+      store: h.store,
+      createRun: async () => {
+        throw new Error("reopen must not create a run");
+      },
+    });
+    const body = JSON.stringify({
+      action: "reopened",
+      repository: { full_name: "o/r" },
+      sender: { login: "o" },
+      pull_request: { number: 1, state: "open", base: { repo: { full_name: "o/r" } } },
+    });
+    setSystemTime(h.clock.now());
+    try {
+      const response = await webhook(
+        new Request("http://localhost/webhooks/github", {
+          method: "POST",
+          body,
+          headers: {
+            "x-github-event": "pull_request",
+            "x-github-delivery": "reopen",
+            "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+          },
+        }),
+      );
+      expect(response.status).toBe(200);
+    } finally {
+      setSystemTime();
+    }
+    expect(h.store.getRun(run.id)?.prClosedUnmerged).toBe(false);
     expect(h.store.githubTracked(h.clock.now()).map((p) => p.url)).toEqual([pr.url]);
     await h.advance(0);
     expect(h.gh.calls.length).toBeGreaterThan(calls);
