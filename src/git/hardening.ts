@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto";
-import { closeSync, constants, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
+import {
+  accessSync,
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { sh } from "../util/proc.ts";
 
@@ -74,24 +83,30 @@ function configEnv(env: Record<string, string>): string {
  * symlink retargeted under an unchanged pointer is noticed. Undefined when unsure.
  */
 function locate(cwd: string, git: string[], env: Record<string, string>): string | undefined {
+  // Git strips only trailing CR/LF from a gitfile or commondir path; any other edge whitespace is unsure.
+  const pathIn = (file: ReturnType<typeof read>, prefix = "") => {
+    const text = file && file !== "dir" ? file.data.toString().replace(/[\r\n]+$/, "") : "";
+    const path = text.startsWith(prefix) ? text.slice(prefix.length) : "";
+    return path && path.trim() === path && !/[\r\n]/.test(path) ? path : undefined;
+  };
   try {
     const explicit = git.findLast((arg) => arg.startsWith("--git-dir="))?.slice(10) ?? env.GIT_DIR;
     const dotGit = explicit === undefined ? read(join(cwd, ".git")) : null;
-    const pointer =
-      dotGit && dotGit !== "dir" ? /^gitdir: (.+)$/.exec(dotGit.data.toString().trimEnd()) : null;
+    const pointer = dotGit && dotGit !== "dir" ? pathIn(dotGit, "gitdir: ") : undefined;
     if (dotGit === undefined || (dotGit && dotGit !== "dir" && !pointer)) return undefined;
-    const gitDir = realpathSync(
-      explicit !== undefined
-        ? resolve(cwd, explicit)
-        : dotGit === "dir"
-          ? join(cwd, ".git")
-          : pointer?.[1]
-            ? resolve(cwd, pointer[1])
-            : cwd,
-    );
+    const target = explicit ?? (dotGit === "dir" ? join(cwd, ".git") : (pointer ?? cwd));
+    const gitDir = realpathSync(resolve(cwd, target));
     const common = read(join(gitDir, "commondir"));
-    if (common === undefined || common === "dir") return undefined;
-    return `${gitDir}\0${common ? realpathSync(resolve(gitDir, common.data.toString().trim())) : gitDir}`;
+    const commonPath = common ? pathIn(common) : null;
+    if (commonPath === undefined || common === "dir") return undefined;
+    const commonDir = commonPath === null ? gitDir : realpathSync(resolve(gitDir, commonPath));
+    // Git's is_git_directory: without these, discovery moves on to a repository further up.
+    const head = read(join(gitDir, "HEAD"));
+    if (!head || head === "dir" || !/^(ref: |[0-9a-f]{40})/.test(head.data.toString())) return undefined;
+    if (!statSync(join(commonDir, "objects")).isDirectory()) return undefined;
+    if (!statSync(join(commonDir, "refs")).isDirectory()) return undefined;
+    accessSync(join(commonDir, "refs"), constants.X_OK);
+    return `${gitDir}\0${commonDir}`;
   } catch {
     return undefined;
   }
@@ -161,10 +176,12 @@ async function refresh(
   for (let attempt = 0; ; attempt++) {
     // Sources must read the same before and after the listing, or a concurrent edit could hide.
     const before = new Map(known.map((path) => [path, snapshot(path)]));
+    const located = locate(opts.cwd, git, env);
     const listed = await list(git, opts, env, files);
     if (!listed.parsed) return { hooks: await lookup(), emptyTree: listed.emptyTree };
     const { sources, hooks, emptyTree, where } = listed;
     if (
+      where === located &&
       where &&
       sources?.every((path) => before.get(path) !== undefined && snapshot(path) === before.get(path))
     ) {

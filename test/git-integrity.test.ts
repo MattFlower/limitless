@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -1006,6 +1007,39 @@ test("a gitfile or commondir through a retargeted symlink is resolved again befo
   rmSync(join(dir, "common"));
   symlinkSync(join(other, ".git"), join(dir, "common"));
   expect(await hookValues(work)).toEqual(blanked("other"));
+});
+
+test("a gitfile path with a trailing space is resolved as git reads it", async () => {
+  const other = join(dir, "other");
+  await git(dir, "init", "-q", "-b", "main", other);
+  writeFileSync(
+    join(other, ".git", "config"),
+    `${readFileSync(join(other, ".git", "config"))}${hookConfig("other")}`,
+  );
+  // Git keeps the trailing space: `link ` is the pointer, `link` only a decoy with the same target.
+  for (const name of ["link", "link "]) symlinkSync(join(seed, ".git"), join(dir, name));
+  const probe = join(dir, "probe");
+  mkdirSync(probe);
+  writeFileSync(join(probe, ".git"), `gitdir: ${join(dir, "link ")}\n`);
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe });
+  rmSync(join(dir, "link "));
+  symlinkSync(join(other, ".git"), join(dir, "link "));
+  expect(await hookValues(probe)).toEqual(blanked("other"));
+});
+
+test("a nested .git that stops being a repository hands over to the one above, and is listed again", async () => {
+  const outer = join(dir, "outer");
+  const inner = join(outer, "inner");
+  await git(dir, "init", "-q", "-b", "main", outer);
+  await git(dir, "init", "-q", "-b", "main", inner);
+  writeFileSync(
+    join(outer, ".git", "config"),
+    `${readFileSync(join(outer, ".git", "config"))}${hookConfig("outer")}`,
+  );
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: inner });
+  // Without refs/ (or objects/, or a valid HEAD) git skips inner/.git and finds outer's.
+  renameSync(join(inner, ".git", "refs"), join(inner, ".git", "refs.moved"));
+  expect(await hookValues(inner)).toEqual(blanked("outer"));
 });
 
 test("a branch switch in a reftable repository is listed again, since its HEAD is not a file", async () => {
