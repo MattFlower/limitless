@@ -1,6 +1,4 @@
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { appendFileSync, realpathSync } from "node:fs";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
 import { runSandboxed } from "./sandbox.ts";
@@ -184,8 +182,8 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
     scratchParent(scratch);
     let filesystem: Record<string, unknown>;
     if (spec.mode === "edit") {
-      // The sandbox confines Bash; dontAsk refuses native edits (Edit rules also govern Write,
-      // MultiEdit and NotebookEdit) outside the allowed roots, and the deny rules beat them.
+      // The outer Seatbelt profile covers Bash and native tools. These permission rules also
+      // refuse native edits outside the roots before they reach the filesystem.
       const { write, protect } = writeRoots(spec.cwd, scratch);
       editTools = write.map((p) => `Edit(/${p}/**)`);
       denied.push(...protect.flatMap((p) => [`Edit(/${p})`, `Edit(/${p}/**)`]));
@@ -218,10 +216,11 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string): string[] {
       JSON.stringify({
         ...fastSettings,
         sandbox: {
-          enabled: true,
+          // macOS cannot nest Seatbelt: editors already run entirely inside runSandboxed.
+          enabled: spec.mode !== "edit",
           failIfUnavailable: true,
           autoAllowBashIfSandboxed: true,
-          allowUnsandboxedCommands: false,
+          allowUnsandboxedCommands: spec.mode === "edit",
           excludedCommands: [],
           filesystem,
         },
@@ -275,20 +274,8 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
   const args = buildClaudeArgs(spec, sessionId);
   const editing = spec.mode === "edit" && !spec.noTools;
   const roots = editing ? writeRoots(spec.cwd, validateScratch(spec)) : null;
-  const configDir = editing ? join(validateScratch(spec), ".claude") : null;
-  if (configDir) {
-    mkdirSync(configDir, { recursive: true });
-    const source = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
-    for (const [from, name] of [
-      [join(source, ".credentials.json"), ".credentials.json"],
-      [
-        process.env.CLAUDE_CONFIG_DIR ? join(source, ".claude.json") : join(homedir(), ".claude.json"),
-        ".claude.json",
-      ],
-    ]) {
-      if (from && name && existsSync(from)) copyFileSync(from, join(configDir, name));
-    }
-  }
+  // Preserve HOME and CLAUDE_CONFIG_DIR: they identify the persistent login/Keychain service.
+  // Copying OAuth state to scratch loses refreshed tokens when scratch is removed.
   const runner: typeof runProcess = (opts) =>
     roots ? runSandboxed(opts, roots, processRunner) : processRunner(opts);
   appendFileSync(spec.logPath, `# claude ${t.model} ${new Date().toISOString()}\n`);
@@ -342,7 +329,6 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     cwd: spec.cwd,
     env: agentEnv({
       ...envExtra,
-      ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}),
       ...scratchEnv(spec),
       // Sandboxed Bash gets TMPDIR=$CLAUDE_CODE_TMPDIR/claude-<uid>, which is the scratch itself.
       ...(spec.scratchDir ? { CLAUDE_CODE_TMPDIR: scratchParent(spec.scratchDir) } : {}),

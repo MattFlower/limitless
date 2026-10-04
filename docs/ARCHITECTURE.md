@@ -241,8 +241,16 @@ detection, per-invocation budget, process-group kill on cancel.
 - Tool-enabled editors receive owned scratch and exact write roots: their checkout, linked
   worktree administrative directory, and scratch. The shared repository is never a write root.
   Codex uses a probed filesystem profile; Claude additionally runs entirely inside a factory
-  Seatbelt profile, covering native edits and overriding implicit CLI grants. CLI state stays in
-  scratch, with project/local settings, hooks and external MCP servers disabled.
+  Seatbelt profile, covering native edits and overriding implicit CLI grants. Claude's internal
+  Bash sandbox is disabled for editors because macOS cannot nest Seatbelt; Bash remains inside
+  the mandatory, probed outer boundary. Reader sandbox settings are unchanged. Project/local
+  settings, hooks and external MCP servers are disabled.
+  Claude retains the original HOME and CLAUDE_CONFIG_DIR for its persistent authentication
+  identity, including the macOS Keychain service. Credentials are never copied to scratch.
+  Those locations receive no filesystem write allowance: CLI versions requiring state or
+  file-backed credential writes there are unsupported and must fail, without an unconfined retry.
+  Live edit-confinement smoke checks require a real Bash command through each CLI; authentication
+  and credential refresh compatibility still require validation on the deployment host.
 - Gates and implement-eval hidden commands use the same Seatbelt boundary. Each launch probes
   its effective policy and requires a trusted shell startup marker; unavailable or inconclusive
   enforcement raises an operational error, even against a failing baseline. macOS is the only

@@ -1447,9 +1447,9 @@ test("claude editors confine Bash and native edits to the same roots; project se
     expect(fastMode).toBe("fast" in variant ? true : undefined);
     expect(disableAllHooks).toBe(true);
     expect(sandbox).toMatchObject({
-      enabled: true,
+      enabled: false,
       failIfUnavailable: true,
-      allowUnsandboxedCommands: false,
+      allowUnsandboxedCommands: true,
       excludedCommands: [],
       filesystem: { denyWrite: [join(cwd, ".git")], disabled: false },
     });
@@ -1613,13 +1613,53 @@ test.skipIf(process.platform !== "darwin")(
         expect(probes).toBe(1);
         expect(opts.cmd[opts.cmd.indexOf("--setting-sources") + 1]).toBe("");
         expect(opts.cmd).toContain("--strict-mcp-config");
-        expect(opts.env.CLAUDE_CONFIG_DIR).toBe(join(scratchDir, ".claude"));
+        expect(opts.env.CLAUDE_CONFIG_DIR).toBe(process.env.CLAUDE_CONFIG_DIR);
+        expect(opts.env.HOME).toBe(process.env.HOME);
+        const settings = JSON.parse(opts.cmd[opts.cmd.indexOf("--settings") + 1] ?? "{}");
+        expect(settings.sandbox.enabled).toBe(false);
+        expect(settings.sandbox.allowUnsandboxedCommands).toBe(true);
         opts.onStdoutLine?.(opts.cmd[7] ?? "");
         opts.onStdoutLine?.('{"type":"result","subtype":"success","result":"ok"}');
         return procResult;
       });
       expect(outcome.status).toBe("ok");
       expect(payloads).toBe(1);
+    }
+  },
+);
+
+test.skipIf(process.platform !== "darwin")(
+  "Claude preserves a custom authentication directory without copying or granting writes to it",
+  async () => {
+    const { root, spec, scratchDir } = editFixture();
+    const config = join(root, "persistent-auth");
+    mkdirSync(config);
+    for (const name of [".credentials.json", ".claude.json"])
+      writeFileSync(join(config, name), '{"ownedAuthCanary":true}');
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = config;
+    try {
+      for (const exitCode of [0, 1]) {
+        const result = await runClaude(spec, async (opts) => {
+          if (!opts.cmd.includes("claude")) {
+            writeFileSync(opts.cmd.at(-2) ?? "", "ok");
+            return { ...procResult, stdout: "verified" };
+          }
+          expect(opts.env.CLAUDE_CONFIG_DIR).toBe(config);
+          expect(opts.env.HOME).toBe(process.env.HOME);
+          expect(opts.cmd[2]).not.toContain(config);
+          expect(existsSync(join(scratchDir, ".claude"))).toBe(false);
+          opts.onStdoutLine?.(opts.cmd[7] ?? "");
+          if (!exitCode) opts.onStdoutLine?.('{"type":"result","result":"ok"}');
+          return { ...procResult, exitCode, stderr: exitCode ? "authentication failed" : "" };
+        });
+        expect(result.status).toBe(exitCode ? "error" : "ok");
+        for (const name of [".credentials.json", ".claude.json"])
+          expect(readFileSync(join(config, name), "utf8")).toBe('{"ownedAuthCanary":true}');
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previous;
     }
   },
 );
