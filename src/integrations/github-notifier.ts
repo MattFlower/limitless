@@ -47,16 +47,42 @@ export async function reconcileMergedRuns(
   client.beginPass?.();
   const runs = store
     .listRuns({
-      status: ["needs_human", "succeeded", "resolved"],
+      status: ["needs_human", "succeeded", "resolved", "failed", "cancelled"],
       limit: Number.MAX_SAFE_INTEGER,
     })
+    .filter(
+      (run) =>
+        !["failed", "cancelled"].includes(run.status) ||
+        (run.prUrl &&
+          !run.deliveryBranch &&
+          run.sourceRef?.kind !== "pull_request" &&
+          store.githubPrExpired(run.prUrl, now())),
+    )
     .sort((a, b) => a.id.localeCompare(b.id));
   const start = runs.findIndex((run) => run.id > pass.cursor);
   const ordered = start < 0 ? runs : [...runs.slice(start), ...runs.slice(0, start)];
   const expired = new Set(
     ordered.flatMap((r) => (r.prUrl && store.githubPrExpired(r.prUrl, now()) ? [r.prUrl] : [])),
   );
-  ordered.sort((a, b) => Number(expired.has(a.prUrl ?? "")) - Number(expired.has(b.prUrl ?? "")));
+  ordered.sort(
+    (a, b) =>
+      Number(expired.has(a.prUrl ?? "")) - Number(expired.has(b.prUrl ?? "")) ||
+      (expired.has(a.prUrl ?? "")
+        ? (pass.checked.get(a.prUrl ?? "") ?? Infinity) - (pass.checked.get(b.prUrl ?? "") ?? Infinity)
+        : 0),
+  );
+  const overdue = new Set(
+    ordered.flatMap((run) =>
+      run.prUrl &&
+      expired.has(run.prUrl) &&
+      (!run.merged || run.status === "needs_human") &&
+      pass.checked.has(run.prUrl) &&
+      now() >= (pass.checked.get(run.prUrl) ?? 0) + 86_400_000 &&
+      (pass.retries.get(run.prUrl)?.at ?? 0) <= now()
+        ? [run.prUrl]
+        : [],
+    ),
+  );
   let calls = 0;
   const results = new Map<string, GitHubPrState | null>();
   const failed = new Set<string>();
@@ -68,11 +94,14 @@ export async function reconcileMergedRuns(
       if (now() < (pass.checked.get(run.prUrl) ?? 0) + 86_400_000) continue;
     }
     if ((pass.retries.get(run.prUrl)?.at ?? 0) > now()) continue;
-    if (!results.has(run.prUrl) && calls >= RECONCILE_REQUEST_CAP) continue;
+    // Keep the final slot available for an overdue probe even under a full healthy backlog.
+    const cap = RECONCILE_REQUEST_CAP - Number(!expired.has(run.prUrl) && overdue.size > 0);
+    if (!results.has(run.prUrl) && calls >= cap) continue;
     try {
       if (!results.has(run.prUrl)) {
         calls++;
-        pass.cursor = run.id;
+        overdue.delete(run.prUrl);
+        if (!expired.has(run.prUrl)) pass.cursor = run.id;
         pass.checked.set(run.prUrl, now());
         results.set(run.prUrl, await client(run.prUrl));
       }

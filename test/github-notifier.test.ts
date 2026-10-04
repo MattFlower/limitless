@@ -917,6 +917,151 @@ test("fallback observations expire closed PRs without poller snapshots and a reo
   expect(store.githubTracked(now + 604800000 + 86_400_000).map((pr) => pr.url)).toContain(prUrl);
 });
 
+test.each(["cancelled", "failed"] as const)(
+  "an expired %s factory PR gets a daily probe and is tracked again on reopen",
+  async (status) => {
+    const h = pollerHarness();
+    try {
+      const day = 86_400_000;
+      let now = Date.now();
+      const run = h.factoryPr("o/r", 1, status);
+      const prUrl = url("o/r", 1);
+      h.store.observeGithubPrState(prUrl, "CLOSED", now - 8 * day);
+      h.store.updateRun(run.id, { finishedAt: now - 8 * day, prClosedUnmerged: true });
+      h.store.db
+        .query("INSERT INTO github_prs (url, data) VALUES (?, ?)")
+        .run(prUrl, JSON.stringify({ state: "CLOSED" }));
+      const client = mock(async (url: string) => ({
+        url,
+        state: "OPEN",
+        mergedAt: null,
+        mergedBy: null,
+      }));
+      const reconcile = () =>
+        reconcileMergedRuns(
+          h.store,
+          client,
+          () => {},
+          () => now,
+        );
+      expect(h.store.githubPrExpired(prUrl, now)).toBe(true);
+      expect(h.store.githubTracked(now).map((pr) => pr.url)).not.toContain(prUrl);
+      await reconcile();
+      expect(client).not.toHaveBeenCalled();
+      now += day - 1;
+      await reconcile();
+      expect(client).not.toHaveBeenCalled();
+      now++;
+      await reconcile();
+      expect(client.mock.calls).toEqual([[prUrl]]);
+      expect(JSON.parse(h.store.githubPrData(prUrl) ?? "null")?.state).toBe("OPEN");
+      expect(h.store.githubPrExpired(prUrl, now)).toBe(false);
+      expect(h.store.getRun(run.id)).toMatchObject({ status, prClosedUnmerged: false });
+      expect(h.store.githubTracked(now).map((pr) => pr.url)).toContain(prUrl);
+    } finally {
+      h.close();
+    }
+  },
+);
+
+test.each(["CLOSED", "throw"])(
+  "overdue probes returning %s get a slot under healthy load without early repeats",
+  async (answer) => {
+    const h = pollerHarness();
+    try {
+      const day = 86_400_000;
+      let now = Date.now();
+      h.factoryPr("o/r", 1);
+      const overdue = url("o/r", 1);
+      h.store.observeGithubPrState(overdue, "CLOSED", now - 8 * day);
+      for (let i = 2; i <= 31; i++) h.factoryPr("o/r", i);
+      let calls: string[] = [];
+      const client: GitHubPrClient = async (url) => {
+        calls.push(url);
+        if (url === overdue && answer === "throw") throw new Error("offline");
+        return { url, state: url === overdue ? "CLOSED" : "OPEN", mergedAt: null, mergedBy: null };
+      };
+      const reconcile = () =>
+        reconcileMergedRuns(
+          h.store,
+          client,
+          () => {},
+          () => now,
+        );
+      await reconcile(); // Start the existing daily clock for the expired PR.
+      expect(calls).not.toContain(overdue);
+      expect(calls.length).toBeLessThanOrEqual(RECONCILE_REQUEST_CAP);
+      now += day;
+      const passes: string[][] = [];
+      for (let i = 0; i < 2; i++) {
+        calls = [];
+        await reconcile();
+        passes.push(calls);
+        expect(calls.length).toBeLessThanOrEqual(RECONCILE_REQUEST_CAP);
+        expect(new Set(calls).size).toBe(calls.length);
+      }
+      expect(passes.flat().filter((url) => url === overdue)).toEqual([overdue]);
+      calls = [];
+      now += day - 1;
+      await reconcile();
+      expect(calls).not.toContain(overdue);
+      expect(calls.length).toBeLessThanOrEqual(RECONCILE_REQUEST_CAP);
+      calls = [];
+      now++;
+      await reconcile();
+      expect(calls.filter((url) => url === overdue)).toEqual([overdue]);
+      expect(calls.length).toBeLessThanOrEqual(RECONCILE_REQUEST_CAP);
+    } finally {
+      h.close();
+    }
+  },
+);
+
+test("overdue probes rotate through a backlog larger than the cap under healthy load", async () => {
+  const h = pollerHarness();
+  try {
+    const day = 86_400_000;
+    let now = Date.now();
+    const overdue = Array.from({ length: RECONCILE_REQUEST_CAP + 2 }, (_, i) => {
+      h.factoryPr("o/r", i + 1);
+      const prUrl = url("o/r", i + 1);
+      h.store.observeGithubPrState(prUrl, "CLOSED", now - 8 * day);
+      return prUrl;
+    });
+    for (let i = 100; i < 130; i++) h.factoryPr("o/r", i);
+    let calls: string[] = [];
+    const client: GitHubPrClient = async (url) => {
+      calls.push(url);
+      return { url, state: overdue.includes(url) ? "CLOSED" : "OPEN", mergedAt: null, mergedBy: null };
+    };
+    const reconcile = () =>
+      reconcileMergedRuns(
+        h.store,
+        client,
+        () => {},
+        () => now,
+      );
+    await reconcile();
+    now += day;
+    const probed: string[] = [];
+    const healthy = new Set<string>();
+    for (let i = 0; i < overdue.length; i++) {
+      calls = [];
+      await reconcile();
+      expect(calls.length).toBeLessThanOrEqual(RECONCILE_REQUEST_CAP);
+      expect(new Set(calls).size).toBe(calls.length);
+      const daily = calls.filter((url) => overdue.includes(url));
+      expect(daily).toHaveLength(1);
+      probed.push(...daily);
+      for (const url of calls.filter((url) => !overdue.includes(url))) healthy.add(url);
+    }
+    expect(probed.toSorted()).toEqual(overdue.toSorted());
+    expect(healthy.size).toBe(30);
+  } finally {
+    h.close();
+  }
+});
+
 test.each(["CLOSED", "OPEN", "throw"])(
   "expired probes returning %s wait a day, follow healthy PRs, and share the cap",
   async (answer) => {
