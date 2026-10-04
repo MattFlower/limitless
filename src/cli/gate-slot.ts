@@ -60,7 +60,7 @@ export async function withGateLease<T>(
       async (signal) => {
         const result = await client(body, signal);
         // A transport may finish after its deadline; retire even a late reservation.
-        if (signal.aborted && !body.release) void request({ id: result.id, release: true }).catch(warn);
+        if (signal.aborted && body.name) void request({ id: result.id, release: true }).catch(warn);
         return result;
       },
       ms,
@@ -82,15 +82,22 @@ export async function withGateLease<T>(
         if (state.expired) throw new Error("gate-slot lease expired");
       }
       if (maxWait && clock.now() >= deadline) throw new Error("gate-slot acquisition deadline exceeded");
-      const beat = () => {
+      const beat = (ms = 10_000) => {
         cancel = clock.timeout(() => {
           void request({ id })
-            .then((r) => {
-              if (r.expired) throw new Error("gate-slot lease expired");
+            .then(async (r) => {
+              if (r.expired && !stopped) {
+                const renewed = await request({ name, running: true });
+                if (stopped) await request({ id: renewed.id, release: true });
+                else id = renewed.id;
+              }
               if (!stopped) beat();
             })
-            .catch(warn);
-        }, 10_000);
+            .catch((e) => {
+              warn(e);
+              if (!stopped) beat(1000);
+            });
+        }, ms);
       };
       beat();
     } catch (e) {

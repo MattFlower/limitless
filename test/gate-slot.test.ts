@@ -8,8 +8,8 @@ import { Semaphore } from "../src/gates/slots.ts";
 import { waitClock } from "./wait-clock.ts";
 
 function rig(limit = 1) {
-  const time = waitClock(),
-    slots = new Semaphore(limit);
+  const time = waitClock();
+  let slots = new Semaphore(limit);
   const clock: DeployClock = {
     now: time.now,
     sleep: async (ms) => time.advance(ms),
@@ -24,11 +24,28 @@ function rig(limit = 1) {
     const id =
       typeof body.id === "string"
         ? body.id
-        : await slots.lease(String(body.name), body.immediate === true, time.timer.set, time.timer.clear);
+        : await slots.lease(
+            String(body.name),
+            body.immediate === true,
+            time.timer.set,
+            time.timer.clear,
+            body.running === true,
+          );
     const acquired = slots.heartbeat(id, body.release === true);
     return { id, acquired: acquired ?? false, expired: acquired === undefined };
   };
-  return { time, slots, clock, calls, client };
+  return {
+    time,
+    clock,
+    calls,
+    client,
+    get slots() {
+      return slots;
+    },
+    set slots(value: Semaphore) {
+      slots = value;
+    },
+  };
 }
 const signal = new AbortController().signal;
 
@@ -103,6 +120,247 @@ test("wrapper holds and heartbeats throughout work and releases on success and f
     expect(f.slots.snapshot().occupied).toBe(0);
     expect(f.time.pending).toBe(0);
   }
+});
+
+test("a failed heartbeat retries while a second client waits beyond the original expiry", async () => {
+  const f = rig();
+  const clock = {
+    ...f.clock,
+    sleep: (ms: number) => new Promise<void>((resolve) => f.clock.timeout(resolve, ms)),
+  };
+  const done = Promise.withResolvers<void>();
+  const started = Promise.withResolvers<void>();
+  const warnings: string[] = [];
+  let renewals = 0,
+    secondStarted = false;
+  const first = withGateLease(
+    "first",
+    () => {
+      started.resolve();
+      return done.promise;
+    },
+    {
+      ...f,
+      clock,
+      warn: (s) => warnings.push(s),
+      client: (body, signal) => {
+        if (body.id && !body.release && ++renewals === 1) throw new Error("one failed heartbeat");
+        return f.client(body, signal);
+      },
+    },
+  );
+  await started.promise;
+  const second = withGateLease(
+    "second",
+    async () => {
+      secondStarted = true;
+    },
+    { ...f, clock },
+  );
+  try {
+    await f.time.flush();
+    await f.time.advance(10_000);
+    expect(warnings.join()).toContain("one failed heartbeat");
+    expect(renewals).toBe(1);
+    await f.time.advance(1000);
+    expect(renewals).toBe(2);
+    for (let i = 0; i < 3; i++) {
+      await f.time.advance(10_000);
+      expect(f.slots.snapshot().holders).toEqual(["first"]);
+      expect(secondStarted).toBe(false);
+    }
+  } finally {
+    done.resolve();
+    await first;
+    await f.time.advance(250);
+    await second;
+  }
+  expect(secondStarted).toBe(true);
+  expect(f.slots.snapshot().occupied).toBe(0);
+  expect(f.time.pending).toBe(0);
+});
+
+test("a late response to a timed-out heartbeat does not release running work", async () => {
+  const f = rig(),
+    started = Promise.withResolvers<void>(),
+    done = Promise.withResolvers<void>();
+  const reply = Promise.withResolvers<Awaited<ReturnType<LeaseClient>>>();
+  let late: Awaited<ReturnType<LeaseClient>> | undefined,
+    renewals = 0,
+    nextStarted = false;
+  const warnings: string[] = [];
+  const work = withGateLease(
+    "first",
+    () => {
+      started.resolve();
+      return done.promise;
+    },
+    {
+      ...f,
+      warn: (s) => warnings.push(s),
+      client: async (body, signal) => {
+        const result = await f.client(body, signal);
+        if (body.id && !body.release && ++renewals === 1) {
+          late = result;
+          return reply.promise;
+        }
+        return result;
+      },
+    },
+  );
+  await started.promise;
+  const next = f.slots.acquire(signal, undefined, "next").then((release) => {
+    nextStarted = true;
+    return release;
+  });
+  try {
+    await f.time.advance(10_000);
+    await f.time.advance(2000);
+    expect(warnings.join()).toContain("timed out");
+    await f.time.advance(1000);
+    expect(renewals).toBe(2);
+    if (!late) throw new Error("missing heartbeat response");
+    reply.resolve(late);
+    await f.time.flush();
+    expect(f.slots.snapshot().holders).toEqual(["first"]);
+    expect(nextStarted).toBe(false);
+  } finally {
+    done.resolve();
+    await work;
+    (await next)();
+  }
+  expect(f.time.pending).toBe(0);
+});
+
+test("restart re-registers running work immediately, even above the cap, before admitting new work", async () => {
+  for (const occupied of [false, true]) {
+    const f = rig();
+    const clock = {
+      ...f.clock,
+      sleep: (ms: number) => new Promise<void>((resolve) => f.clock.timeout(resolve, ms)),
+    };
+    const done = Promise.withResolvers<void>(),
+      started = Promise.withResolvers<void>();
+    const first = withGateLease(
+      "survivor",
+      () => {
+        started.resolve();
+        return done.promise;
+      },
+      { ...f, clock },
+    );
+    await started.promise;
+    // Retire the old daemon's timers; the command itself remains running.
+    const oldSlots = f.slots;
+    f.slots = new Semaphore(1);
+    const release = occupied ? await f.slots.acquire(signal, undefined, "new-run") : () => {};
+    let secondStarted = false;
+    const queue = () =>
+      withGateLease(
+        "second",
+        async () => {
+          secondStarted = true;
+        },
+        { ...f, clock },
+      );
+    let second: Promise<void> | undefined;
+    try {
+      if (occupied) {
+        second = queue();
+        await f.time.flush();
+      }
+      await f.time.advance(10_000);
+      const holders = occupied ? ["new-run", "survivor"] : ["survivor"];
+      expect(f.slots.snapshot()).toEqual({ occupied: holders.length, limit: 1, holders });
+      expect(f.calls).toContainEqual({ name: "survivor", running: true });
+      const heartbeat = f.calls.find((body) => typeof body.id === "string" && !body.release);
+      if (typeof heartbeat?.id === "string") oldSlots.heartbeat(heartbeat.id, true);
+      second ??= queue();
+      await f.time.flush();
+      expect(secondStarted).toBe(false);
+      done.resolve();
+      await first;
+      await f.time.advance(250);
+      if (occupied) {
+        expect(f.slots.snapshot().holders).toEqual(["new-run"]);
+        expect(secondStarted).toBe(false);
+      }
+    } finally {
+      done.resolve();
+      await first;
+      release();
+      await f.time.flush();
+      await f.time.advance(250);
+      await second;
+    }
+    expect(secondStarted).toBe(true);
+    expect(f.slots.snapshot().occupied).toBe(0);
+    expect(f.time.pending).toBe(0);
+  }
+});
+
+test("recovery responses arriving after work exits or times out retire the new lease", async () => {
+  for (const timeout of [false, true]) {
+    const f = rig();
+    const done = Promise.withResolvers<void>(),
+      started = Promise.withResolvers<void>();
+    const reply = Promise.withResolvers<Awaited<ReturnType<LeaseClient>>>();
+    const warnings: string[] = [];
+    let recovered: Awaited<ReturnType<LeaseClient>> | undefined;
+    const work = withGateLease(
+      "survivor",
+      () => {
+        started.resolve();
+        return done.promise;
+      },
+      {
+        ...f,
+        warn: (s) => warnings.push(s),
+        client: async (body, signal) => {
+          const result = await f.client(body, signal);
+          if (body.running) {
+            recovered = result;
+            return reply.promise;
+          }
+          return result;
+        },
+      },
+    );
+    await started.promise;
+    const oldSlots = f.slots;
+    f.slots = new Semaphore(1);
+    await f.time.advance(10_000);
+    expect(f.slots.snapshot().holders).toEqual(["survivor"]);
+    const heartbeat = f.calls.find((body) => typeof body.id === "string" && !body.release);
+    if (typeof heartbeat?.id === "string") oldSlots.heartbeat(heartbeat.id, true);
+    if (timeout) {
+      await f.time.advance(2000);
+      expect(warnings.join()).toContain("timed out");
+    }
+    done.resolve();
+    await work;
+    if (!recovered) throw new Error("missing recovery response");
+    reply.resolve(recovered);
+    await f.time.flush();
+    expect(f.slots.snapshot().occupied).toBe(0);
+    expect(f.time.pending).toBe(0);
+  }
+});
+
+test("an abandoned queued lease admitted at 29 seconds still expires by 30 seconds", async () => {
+  const f = rig();
+  const release = await f.slots.acquire(signal, undefined, "first");
+  const id = await f.slots.lease("abandoned", false, f.time.timer.set, f.time.timer.clear);
+  const next = f.slots.acquire(signal, undefined, "next");
+  await f.time.advance(29_000);
+  release();
+  await f.time.flush();
+  expect(f.slots.snapshot().holders).toEqual(["abandoned"]);
+  await f.time.advance(2000);
+  expect(f.slots.snapshot().holders).toEqual(["next"]);
+  expect(f.slots.heartbeat(id)).toBeUndefined();
+  (await next)();
+  expect(f.time.pending).toBe(0);
 });
 
 test("deadline and zero budget cancel before executing once; default budget is 1800 seconds", async () => {

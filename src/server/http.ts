@@ -214,7 +214,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/api/admin/gate-slot": {
       POST: handle(async (req) => {
         if (req.headers.has("forwarded")) return error("forbidden", 403);
-        const { name, id, release, immediate } = await body<Record<string, unknown>>(req);
+        const { name, id, release, immediate, running } = await body<Record<string, unknown>>(req);
         if (id !== undefined) {
           if (typeof id !== "string" || (release !== undefined && typeof release !== "boolean"))
             return error("invalid lease");
@@ -222,8 +222,9 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
           return json({ id, acquired: acquired ?? false, expired: acquired === undefined });
         }
         if (typeof name !== "string" || !name.trim()) return error("invalid holder name");
+        if (running !== undefined && typeof running !== "boolean") return error("invalid running flag");
         req.signal.throwIfAborted();
-        const lease = await gateSlots.lease(name, immediate === true);
+        const lease = await gateSlots.lease(name, immediate === true, undefined, undefined, running === true);
         if (req.signal.aborted) gateSlots.heartbeat(lease, true);
         req.signal.throwIfAborted();
         return json({ id: lease, acquired: gateSlots.heartbeat(lease) ?? false });

@@ -1,7 +1,7 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import type { Server } from "bun";
 import type { HealthResponse } from "../src/core/types.ts";
-import { gateSlots } from "../src/gates/slots.ts";
+import { gateSlots, Semaphore } from "../src/gates/slots.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
@@ -104,4 +104,53 @@ test("gate leases share health occupancy and admin mutation protections", async 
     gateSlots.setLimit(limit);
     await f.close();
   }
+});
+
+test("the gate-slot route counts running registrations above the cap and rejects invalid flags", async () => {
+  const f = await fixture("lease-recovery-test"),
+    time = waitClock(),
+    slots = new Semaphore(1);
+  const lease = spyOn(gateSlots, "lease").mockImplementation((name, immediate, _timer, _clear, running) =>
+    slots.lease(name, immediate, time.timer.set, time.timer.clear, running),
+  );
+  const heartbeat = spyOn(gateSlots, "heartbeat").mockImplementation((id, release) =>
+    slots.heartbeat(id, release),
+  );
+  const release = await slots.acquire(new AbortController().signal, undefined, "new-run");
+  const ids: string[] = [];
+  try {
+    const route = (createHttpRoutes(f.factory)["/api/admin/gate-slot"] as { POST: Route }).POST;
+    const request = (body: unknown) =>
+      route(
+        requestWithParams("http://localhost:7400/api/admin/gate-slot", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+        localServer,
+      );
+    expect((await request({ name: "survivor", running: "true" })).status).toBe(400);
+    const survivor = (await (await request({ name: "survivor", running: true })).json()) as {
+      id: string;
+      acquired: boolean;
+    };
+    ids.push(survivor.id);
+    expect(survivor.acquired).toBe(true);
+    expect(slots.snapshot()).toEqual({ occupied: 2, limit: 1, holders: ["new-run", "survivor"] });
+    const waiter = (await (await request({ name: "waiting" })).json()) as typeof survivor;
+    ids.push(waiter.id);
+    expect(waiter.acquired).toBe(false);
+    await request({ id: survivor.id, release: true });
+    expect(await (await request({ id: waiter.id })).json()).toMatchObject({ acquired: false });
+    release();
+    await time.flush();
+    expect(await (await request({ id: waiter.id })).json()).toMatchObject({ acquired: true });
+  } finally {
+    release();
+    for (const id of ids) slots.heartbeat(id, true);
+    lease.mockRestore();
+    heartbeat.mockRestore();
+    await f.close();
+  }
+  expect(time.pending).toBe(0);
 });

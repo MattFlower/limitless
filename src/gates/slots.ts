@@ -31,9 +31,14 @@ export class Semaphore {
   }
 
   /** Resolves with a release function; `onWait` fires once when the caller has to queue. */
-  async acquire(signal: AbortSignal, onWait?: (limit: number) => void, holder = "gate"): Promise<() => void> {
+  async acquire(
+    signal: AbortSignal,
+    onWait?: (limit: number) => void,
+    holder = "gate",
+    running = false,
+  ): Promise<() => void> {
     signal.throwIfAborted();
-    if (this.active < this.max && !this.waiters.length) this.active++;
+    if (running || (this.active < this.max && !this.waiters.length)) this.active++;
     else {
       onWait?.(this.max);
       signal.throwIfAborted();
@@ -70,6 +75,7 @@ export class Semaphore {
     immediate = false,
     timer: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = setTimeout,
     clear = clearTimeout,
+    running = false,
   ): Promise<string> {
     const id = crypto.randomUUID(),
       controller = new AbortController();
@@ -85,10 +91,10 @@ export class Semaphore {
     };
     this.leases.set(id, touch);
     touch(false);
-    void this.acquire(controller.signal, undefined, name).then(
+    void this.acquire(controller.signal, undefined, name, running).then(
       (free) => {
         release = free;
-        touch(controller.signal.aborted);
+        if (controller.signal.aborted) touch(true);
       },
       () => touch(true),
     );
