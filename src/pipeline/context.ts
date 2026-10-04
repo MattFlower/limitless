@@ -62,6 +62,8 @@ export interface RunState {
   parked?: boolean;
   flow?: "build" | "verify-change";
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
+  /** A review round's chosen base tip, saved before it is merged into the PR branch. */
+  reviewBaseSha?: string;
   verdictCommentPosted?: boolean;
   verdictCommentPending?: boolean;
   phase: Phase;
