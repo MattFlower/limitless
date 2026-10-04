@@ -1,5 +1,6 @@
 import { basename } from "node:path";
-import { agentEnv, runProcess } from "../util/proc.ts";
+import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
+import { agentEnv } from "../util/proc.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { gateSlots } from "./slots.ts";
 
@@ -12,6 +13,7 @@ export interface GateResult {
   output: string; // tail
   /** Set only when the process was killed for exceeding its timeout. */
   timedOut?: boolean;
+  confinementError?: boolean;
   /** The first attempt of a check that was re-run; this result is the re-run. */
   firstAttempt?: GateResult;
 }
@@ -30,7 +32,8 @@ export type GateVerdict =
   | "new_failure"
   | "new_pass"
   | "not_run"
-  | "flaky";
+  | "flaky"
+  | "confinement_error";
 
 export interface GateComparison {
   name: string;
@@ -49,27 +52,37 @@ export interface GateHooks {
 }
 
 const OUTPUT_TAIL = 6_000;
+const launchFailure = (output: string) => output.includes("sandbox_apply: Operation not permitted");
+const confinementFailed = (r?: GateResult): boolean =>
+  !!r && (!!r.confinementError || launchFailure(r.output) || confinementFailed(r.firstAttempt));
 
 /** Gates execute code the agent wrote; give them the same scrubbed environment as agents. */
 export const gateEnv = (): Record<string, string> => agentEnv({ CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" });
 
+/** Gates run confined to the checkout; a ConfinementError propagates so it can never grade a check. */
 async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promise<GateResult> {
-  const res = await runProcess({
-    cmd: ["/bin/sh", "-c", cmd.run],
+  let confinementError = false;
+  const observe = (line: string) => (confinementError ||= launchFailure(line));
+  const res = await runConfined({
+    command: cmd.run,
     cwd,
     env: gateEnv(),
     signal,
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
+    onStdoutLine: observe,
+    onStderrLine: observe,
   });
   const combined = `${res.stdout}\n${res.stderr}`.trim();
   return {
     name: cmd.name,
     command: cmd.run,
-    ok: res.exitCode === 0 && !res.timedOut && !res.cancelled,
+    ok: !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled,
     exitCode: res.exitCode,
     durationMs: res.durationMs,
     output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
     ...(res.timedOut ? { timedOut: true } : {}),
+    // Present only when set, like timedOut, so results stay readable by strict schemas and older releases.
+    ...(confinementError ? { confinementError: true } : {}),
   };
 }
 
@@ -82,7 +95,7 @@ export async function runGates(
 ): Promise<GateRun> {
   const release = await gateSlots.acquire(signal, hooks.onWait, hooks.holder ?? basename(cwd));
   try {
-    return await runAll(cwd, cfg, signal, hooks.onResult);
+    return await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult));
   } finally {
     release();
   }
@@ -124,7 +137,9 @@ export async function retryBaselineFailures(
   onWait?: GateHooks["onWait"],
 ): Promise<GateRun> {
   const retryable = (r: GateResult) =>
-    !r.ok && !r.timedOut ? cfg.checks.find((k) => k.name === r.name && k.run === r.command) : undefined;
+    !r.ok && !r.timedOut && !confinementFailed(r)
+      ? cfg.checks.find((k) => k.name === r.name && k.run === r.command)
+      : undefined;
   if (!run.setupOk || signal.aborted || !run.checks.some(retryable)) return run;
   const release = await gateSlots.acquire(signal, onWait, basename(cwd));
   try {
@@ -151,7 +166,8 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     // Nothing downstream ran, so nothing was verified: always blocking, even if setup was
     // already broken on the base branch.
     const failed = after.setup.find((s) => !s.ok);
-    if (failed) out.push({ name: failed.name, verdict: "regressed", blocking: true, result: failed });
+    const verdict = confinementFailed(failed) ? "confinement_error" : "regressed";
+    if (failed) out.push({ name: failed.name, verdict, blocking: true, result: failed });
     const skipped = baseline?.checks ?? [];
     for (const c of skipped) {
       out.push({
@@ -173,7 +189,8 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
   for (const r of after.checks) {
     const before = baseline?.checks.find((b) => b.name === r.name);
     let verdict: GateVerdict;
-    if (!before) verdict = r.ok ? "new_pass" : "new_failure";
+    if (confinementFailed(r) || confinementFailed(before)) verdict = "confinement_error";
+    else if (!before) verdict = r.ok ? "new_pass" : "new_failure";
     else if (before.ok && r.ok) verdict = "pass";
     else if (before.ok && !r.ok) verdict = "regressed";
     else if (!before.ok && r.ok) verdict = "fixed";
@@ -181,7 +198,11 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     out.push({
       name: r.name,
       verdict,
-      blocking: !!r.timedOut || verdict === "regressed" || verdict === "new_failure",
+      blocking:
+        verdict === "confinement_error" ||
+        !!r.timedOut ||
+        verdict === "regressed" ||
+        verdict === "new_failure",
       result: r,
     });
   }
@@ -226,7 +247,7 @@ export async function retryRegressions(
       const retry = await runOne(check, cwd, signal);
       out.push({
         ...c,
-        verdict: retry.ok ? "flaky" : c.verdict,
+        verdict: confinementFailed(retry) ? "confinement_error" : retry.ok ? "flaky" : c.verdict,
         blocking: !retry.ok,
         result: retry,
         firstAttempt: c.result,

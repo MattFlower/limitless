@@ -297,6 +297,7 @@ export interface ProviderStatus {
 /** Fixed probe diagnostics: the CLI's own output can echo config, including tokens. */
 export type ConfinementFailure =
   | "reader profile not enforced"
+  | "write profile not enforced"
   | "probe inconclusive"
   | "probe timed out"
   | "codex sandbox failed to start";

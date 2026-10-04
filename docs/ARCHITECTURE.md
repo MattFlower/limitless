@@ -238,8 +238,53 @@ detection, per-invocation budget, process-group kill on cancel.
 - Local-only (non-GitHub) repos use a factory-owned bare clone with independent objects, created
   via a shared clone and fetched from the source before each new run. Delivery pushes only the
   run branch back to the source. Legacy worktrees attached to the source remain there until they finish.
-- Agents run with the CLIs' own sandboxes (Seatbelt on macOS) where they're compatible with the
-  repo's toolchain; secrets for Discord/GitHub/OpenRouter are scrubbed from agent environments.
+- Tool-enabled editors receive owned scratch and exact write roots: their checkout and
+  scratch. The private worktree admin directory, `.git` pointer and shared repository are read-only.
+  Agent and gate environments set `GIT_OPTIONAL_LOCKS=0` and disable `diff.autoRefreshIndex`
+  for read-only Git inspection. The factory
+  records absolute worktree/admin/common paths in a protected sibling `.git-paths` file at creation,
+  including detached worktrees, and reuses them after restart. Trusted Git explicitly receives
+  `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE`; before config discovery or index removal it
+  rejects missing records, admin config files, symlinks, hard links and mismatched backlinks.
+  Pre-existing linked worktrees without a trusted record fail closed and must be recreated.
+  Codex uses a probed filesystem profile; Claude additionally runs entirely inside a factory
+  Seatbelt profile, covering native edits and overriding implicit CLI grants. Claude's internal
+  Bash sandbox is disabled for editors because macOS cannot nest Seatbelt; Bash remains inside
+  the mandatory, probed outer boundary. Reader sandbox settings are unchanged. Project/local
+  settings, hooks and external MCP servers are disabled.
+  Claude retains the original HOME and CLAUDE_CONFIG_DIR for its persistent authentication
+  identity, including the macOS Keychain service. Credentials are never copied to scratch.
+  Those locations receive no filesystem write allowance: CLI versions requiring state or
+  file-backed credential writes there are unsupported and must fail, without an unconfined retry.
+  Because no transcript can be written there, confined Claude editors run with session
+  persistence disabled and refuse a resume request before launching (the eval runner then
+  starts a fresh attempt, recorded as a failed resume). Live edit-confinement smoke checks
+  require a real Bash command through each CLI and prove the run starts and completes while a
+  write into the CLI's own config directory is denied; authentication and credential refresh
+  compatibility still require validation on the deployment host.
+- Gates and implement-eval hidden commands use the same Seatbelt boundary. Each launch probes
+  its effective policy and requires a trusted shell startup marker; unavailable or inconclusive
+  enforcement raises an operational error, even against a failing baseline. macOS is the only
+  implemented backend for these commands and Claude editors; other platforms fail closed.
+  A restricted host that forbids nested Seatbelt also fails closed. Tests inject a recording
+  backend through factory dependencies, scoped per run with `AsyncLocalStorage` across gates,
+  retries and eval preparation/grading; concurrent runs keep separate backends. No environment or
+  configuration selects it in production.
+  Gates set `LIMITLESS_CONFINED=1`: only real-Seatbelt tests skip under this marker, with a nested
+  Seatbelt explanation. Real-Seatbelt tests run in development and at landing, not inside factory
+  gates; portable tests still run there. A child diagnostic `sandbox_apply: Operation not permitted`
+  produces a blocking `confinement_error`, captured before output truncation and never downgraded
+  to `still_failing` or `flaky`, even when baseline and candidate fail identically. Comparison also
+  inspects output and retained first attempts, so restored results without a diagnostic flag still block.
+- Gate setup, checks and pipeline retries share private scratch until completion or cancellation.
+  HOME and writable Cargo, npm, Go and XDG caches point into scratch. Explicit RUSTUP_HOME
+  and a private copy of Cargo configuration preserve installed toolchain discovery and read
+  access; writes to real HOME remain denied.
+  Candidate gates rebuild from committed bytes; factory Git suppresses configured filters on
+  commits, resets and detached review checkouts. `clean -ffdx` removes `node_modules`; fresh scratch
+  caches therefore cause cold `bun install` runs from the network. A safe shared package cache is
+  separate work. Secrets for Discord/GitHub/OpenRouter are
+  scrubbed from agent environments.
 - Triggers are **allowlisted** (your GitHub login, `dependabot[bot]`, your Discord user id).
   Untrusted issue/PR text is treated as data and quoted, never as instructions.
 

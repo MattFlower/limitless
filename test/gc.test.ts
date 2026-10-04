@@ -7,6 +7,7 @@ import { type Config, loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { collectGarbage, type GcResult } from "../src/gc.ts";
+import { recordWorktree } from "../src/git/command.ts";
 import { cachePath, createWorktree } from "../src/git/repos.ts";
 import { startHttp } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
@@ -92,9 +93,11 @@ test("terminal worktrees use exact 3/7 day boundaries and preserve nonterminal w
   const gitList = await listed();
   for (const [i, [, , removed]] of cases.entries()) {
     expect(existsSync(paths[i] as string)).toBe(!removed);
+    expect(existsSync(`${paths[i]}.git-paths`)).toBe(!removed);
     expect(gitList.includes(paths[i] as string)).toBe(!removed);
   }
   expect(gitList).not.toContain(missing);
+  expect(existsSync(`${missing}.git-paths`)).toBe(false);
   expect(result.worktrees).toHaveLength(5);
 });
 
@@ -102,6 +105,7 @@ test("cleanup removes legacy and cloned worktrees through their owners and prune
   const legacyRun = run("succeeded", 4);
   const legacy = join(cfg.paths.work, legacyRun.id);
   await sh(["git", "worktree", "add", "-b", "legacy", legacy], { cwd: repoDir });
+  await recordWorktree(legacy);
   const staleRun = run("succeeded", 4);
   const stale = join(cfg.paths.work, staleRun.id);
   await sh(["git", "worktree", "add", "-b", "legacy-stale", stale], { cwd: repoDir });
@@ -139,6 +143,7 @@ test("cleanup refuses a run path that is a worktree of an unrelated repository",
   });
   const stray = join(cfg.paths.work, run("succeeded", 4).id);
   await sh(["git", "worktree", "add", "--detach", stray], { cwd: unrelated });
+  await recordWorktree(stray);
   writeFileSync(join(stray, "uncommitted.txt"), "keep me");
   const result = await collectGarbage(store, cfg, { now });
   expect(result.errors.join("\n")).toContain("worktree is not registered to local/test");

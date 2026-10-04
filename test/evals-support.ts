@@ -9,6 +9,7 @@ import type { AgentSpec } from "../src/harness/types.ts";
 import type { Triage } from "../src/pipeline/schemas.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
+import { fakeConfinement } from "./confinement.ts";
 import { seeded } from "./seeded.ts";
 
 export const answer: Triage = {
@@ -109,6 +110,7 @@ export async function evalFixture(
       return handler(s);
     });
   const factory = new Factory(cfg, {
+    confinement: fakeConfinement,
     ...(policy ? { policy } : {}),
     evalCasePath: casePath,
     providers: [

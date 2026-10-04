@@ -16,13 +16,15 @@ import type { EvalGrade, EvalStrategy, EvalTrial } from "../core/types.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { compareGates, type GateRun, runGates } from "../gates/run.ts";
+import { worktreeGit } from "../git/command.ts";
 import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
-import { createScratch, removeScratch, withScratch } from "../harness/scratch.ts";
+import { runConfined } from "../harness/sandbox.ts";
+import { createScratch, removeScratch } from "../harness/scratch.ts";
 import type { ModelTarget } from "../harness/types.ts";
 import { formatAuditFeedback, formatGateFeedback, implementPrompt } from "../pipeline/prompts.ts";
 import type { Router } from "../router/router.ts";
 import { EFFORT_LEVELS } from "../router/targets.ts";
-import { agentEnv, runProcess, sh } from "../util/proc.ts";
+import { agentEnv, sh } from "../util/proc.ts";
 import type { hiddenContents, ImplementCase } from "./cases.ts";
 import { gatesAt } from "./prepare.ts";
 
@@ -129,8 +131,8 @@ async function restoreCandidate(
   before: Map<string, string>,
   since: bigint,
 ) {
-  await sh(["git", "-c", "core.hooksPath=/dev/null", "reset", "--hard", "-q", commit], { cwd, env });
-  await sh(["git", "clean", "-fdq"], { cwd, env });
+  await worktreeGit(["git", "reset", "--hard", "-q", commit], { cwd, env });
+  await worktreeGit(["git", "clean", "-fdq"], { cwd, env });
   const root = realpathSync(cwd);
   for (const [path, fingerprint] of await untrackedState(cwd, env, since))
     if (before.get(path) !== fingerprint) removeWithin(root, path);
@@ -194,16 +196,15 @@ export async function gradeImplement(
   const since = BigInt(Date.now() - 5_000) * 1_000_000n;
   try {
     signal.throwIfAborted();
-    await sh(["git", "add", "-A"], { cwd, env, signal });
-    await sh(
+    // The wrapper blanks hooks and every filter driver, so the commit holds the bytes on disk.
+    await worktreeGit(["git", "add", "-A"], { cwd, env, signal });
+    await worktreeGit(
       [
         "git",
         "-c",
         "user.name=Limitless",
         "-c",
         "user.email=limitless@localhost",
-        "-c",
-        "core.hooksPath=/dev/null",
         "-c",
         "commit.gpgsign=false",
         "commit",
@@ -221,9 +222,12 @@ export async function gradeImplement(
     // only reads the candidate's objects; nothing in the grading repository points back at it.
     checkout = createScratch(cwd);
     const opts = { cwd: checkout, env, signal };
-    await sh(["git", "init", "-q"], opts);
-    await sh(["git", "fetch", "-q", "--no-tags", "--no-write-fetch-head", cwd, commit, item.base], opts);
-    await sh(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", commit], opts);
+    await worktreeGit(["git", "init", "-q"], opts);
+    await worktreeGit(
+      ["git", "fetch", "-q", "--no-tags", "--no-write-fetch-head", cwd, commit, item.base],
+      opts,
+    );
+    await worktreeGit(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", commit], opts);
     // Audit before gates run: their commands could move HEAD or rewrite the grading repository.
     const names = gateScriptNames(prepared.gates);
     const findings = auditDiff(await diffSince(checkout, item.base, env), {
@@ -240,8 +244,8 @@ export async function gradeImplement(
     evidence.auditWarnings = findings.filter((finding) => finding.severity === "warn");
     const after = await runGates(checkout, prepared.gates, signal, { holder: "eval trial" });
     signal.throwIfAborted();
-    await sh(["git", "reset", "--hard", "-q", commit], opts);
-    await sh(["git", "clean", "-fdq"], opts);
+    await worktreeGit(["git", "reset", "--hard", "-q", commit], opts);
+    await worktreeGit(["git", "clean", "-fdq"], opts);
     evidence.gates = compareGates(prepared.baseline, after);
     const gateTimeout = [
       ...prepared.baseline.setup,
@@ -252,16 +256,15 @@ export async function gradeImplement(
     if (gateTimeout) evidence.reason = "timeout";
     inject(checkout, files);
     const grading = checkout;
-    const hidden = await withScratch(grading, (scratch) =>
-      runProcess({
-        cmd: ["/bin/sh", "-c", item.hidden.command],
-        cwd: grading,
-        env: agentEnv({ HOME: scratch, TMPDIR: scratch, TMP: scratch, TEMP: scratch }),
-        signal,
-        timeoutMs: item.hidden.timeoutSec * 1000,
-        tailLimit: 6000,
-      }),
-    );
+    // Confined to the grading checkout and its own scratch HOME/TMPDIR; never the candidate's.
+    const hidden = await runConfined({
+      command: item.hidden.command,
+      cwd: grading,
+      env: agentEnv(),
+      signal,
+      timeoutMs: item.hidden.timeoutSec * 1000,
+      tailLimit: 6000,
+    });
     signal.throwIfAborted();
     evidence.hidden = {
       exitCode: hidden.exitCode,

@@ -25,6 +25,7 @@ import {
 import { worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
+  checkoutCommitted,
   commitAll,
   createPullRequest,
   createWorktree,
@@ -49,6 +50,7 @@ import {
   resetTo,
   withGitHubRetry,
 } from "../git/repos.ts";
+import { commandScope, confinementScope, seatbeltBackend } from "../harness/sandbox.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
@@ -136,8 +138,10 @@ export async function executeRun(
     return "failed";
   }
   // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
-  return worktreeGitScope.run(true, () =>
-    executeScopedRun(new RunContext(deps, run, repo, signal, isDraining, drainEvents), signal),
+  return confinementScope.run(deps.confinement ?? seatbeltBackend, () =>
+    worktreeGitScope.run(true, () =>
+      executeScopedRun(new RunContext(deps, run, repo, signal, isDraining, drainEvents), signal),
+    ),
   );
 }
 
@@ -393,14 +397,14 @@ async function prepare(ctx: RunContext): Promise<void> {
       await ctx.save();
       const { onWait } = gateEvents(ctx);
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
-      const runBaseline = async (): Promise<GateRun> => {
+      const runBaseline = commandScope(wt.path, async (): Promise<GateRun> => {
         const run = await runGates(wt.path, gates, ctx.signal, { onWait });
         ctx.checkCancelled();
         // Retry before resetting, so a check sees the same build output as its first attempt.
         const retried = await retryBaselineFailures(run, wt.path, gates, ctx.signal, onWait);
         ctx.checkCancelled();
         return retried;
-      };
+      });
       ctx.state.baselineCached = false;
       const buildSha = ctx.deps.buildSha;
       if (!hasGates) ctx.state.baseline = null;
@@ -979,12 +983,12 @@ async function oneRound(
   // --- gates
   const comparison = await ctx.stage(
     "gates",
-    async () => {
+    commandScope(cwd, async () => {
       const events = gateEvents(ctx);
       let cmp: GateComparison[];
       let baseTimeout = false;
       try {
-        await discardChanges(cwd);
+        await checkoutCommitted(cwd);
         let after = await runGates(cwd, gates, ctx.signal, events);
         ctx.checkCancelled();
         baseTimeout = after.checks.some(
@@ -1001,6 +1005,8 @@ async function oneRound(
             `Gate checks timed out; re-running gates (timeout re-runs: ${ctx.state.gateTimeoutReruns})`,
             "warn",
           );
+          // The re-run starts from the committed tree too, not from what the first attempt left behind.
+          await checkoutCommitted(cwd);
           after = await runGates(cwd, gates, ctx.signal, events);
           ctx.checkCancelled();
           after.checks = after.checks.map((r) => ({
@@ -1046,7 +1052,7 @@ async function oneRound(
           : `${cmp.length} checks ok${flaky.length ? `, flaky: ${flaky.join(", ")}` : ""}`,
         value: cmp,
       };
-    },
+    }),
     round,
   );
 
@@ -1900,8 +1906,7 @@ async function mergeForDelivery(
   }
   if ((await headSha(cwd)) === before) await completeMerge(cwd, before, fetched);
   await validateMerge(cwd, before, fetched);
-  await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
-  await mergeGit(cwd, ["clean", "-fdq"]);
+  await checkoutCommitted(cwd);
   const previous = ctx.state.preRebaseGates ?? [];
   try {
     await ctx.stage(
