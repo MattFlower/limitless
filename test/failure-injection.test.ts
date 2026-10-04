@@ -41,6 +41,7 @@ import {
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { CommandError, type ProcOptions, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
 import { findingEvidence } from "./review-support.ts";
+import { seeded } from "./seeded.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
@@ -123,14 +124,11 @@ function answer(s: AgentSpec): FakeReply {
 let root: string;
 let source: string;
 let factories: Factory[];
-beforeEach(async () => {
-  root = mkdtempSync(join(tmpdir(), "limitless-fault-"));
-  // Confined gate commands may write their barrier and pid files here, and only here, outside their checkout.
-  observerRoots.add(realpathSync(root));
-  source = join(root, "source");
-  mkdirSync(source);
-  writeFileSync(join(source, "README.md"), "fixture\n");
-  writeFileSync(join(source, ".limitless.toml"), '[gates]\nchecks = [{name="check",run="true"}]\n');
+const seedSource = seeded(async (dir) => {
+  const repo = join(dir, "source");
+  mkdirSync(repo);
+  writeFileSync(join(repo, "README.md"), "fixture\n");
+  writeFileSync(join(repo, ".limitless.toml"), '[gates]\nchecks = [{name="check",run="true"}]\n');
   for (const cmd of [
     ["init", "-qb", "main"],
     ["config", "user.email", "test@example.test"],
@@ -138,7 +136,14 @@ beforeEach(async () => {
     ["add", "."],
     ["commit", "-qm", "base"],
   ])
-    await sh(["git", ...cmd], { cwd: source });
+    await sh(["git", ...cmd], { cwd: repo });
+});
+beforeEach(async () => {
+  root = mkdtempSync(join(tmpdir(), "limitless-fault-"));
+  // Confined gate commands may write their barrier and pid files here, and only here, outside their checkout.
+  observerRoots.add(realpathSync(root));
+  source = join(root, "source");
+  await seedSource(root);
   factories = [];
 });
 afterEach(async () => {
