@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import type { Complexity, FinderPrompt, ReviewLens } from "../core/types.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
@@ -10,6 +11,7 @@ import {
   renderSpec,
   requirementEntries,
   requirementSource,
+  rowKind,
   type Spec,
   type Verify,
 } from "./schemas.ts";
@@ -158,19 +160,38 @@ ${checksSection(input.gates, input.baseline)}
 6. Follow repository conventions (CLAUDE.md, AGENTS.md, CONTRIBUTING, existing code style).
 7. ${input.resolution ? "Do not run Git. Edit files only; the factory stages and commits the merge." : "Committing is optional (the factory commits for you). Never push."}
 8. Stay within the request and specification: add nothing that neither asks for. If part of the specification looks unnecessary for the request, still meet its acceptance criteria and name that part in your final report.
+9. Never stop or signal processes you did not start: no \`pkill\`, \`killall\` or \`kill\` by name or pattern. Other runs, deploys and the user share this machine. Stop your own background command by the PID you started it with.
 
 # Final message
 Reply with a concise report: files changed, how you verified (commands and results), assumptions, and anything left undone.`;
 }
 
-export function formatGateFeedback(cmp: GateComparison[]): string {
+export function formatGateFeedback(cmp: GateComparison[], cfg?: GateConfig): string {
   const bad = cmp.filter((c) => c.blocking);
   if (!bad.length) return "";
   return bad
-    .map(
-      (c) =>
-        `### Check \`${c.name}\` ${c.verdict === "regressed" ? "now FAILS (it passed before your change)" : "FAILS"}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`,
-    )
+    .map((c) => {
+      if (c.result.timedOut) {
+        const limit = cfg?.checks.find((k) => k.name === c.name)?.timeoutSec ?? 900;
+        const output = stripVTControlCharacters(c.result.output);
+        const last = [
+          ...output.matchAll(
+            /^([ \t]*)(?:(RUN|# Subtest:)[ \t]+([^\r\n]+)|([^\r\n]+(?:\.test|\.spec)\.[cm]?[jt]sx?):[ \t]*)\r?$/gm,
+          ),
+        ].at(-1);
+        const completed =
+          last?.[2] === "# Subtest:" &&
+          [
+            ...output
+              .slice(last.index + last[0].length)
+              .matchAll(
+                /^([ \t]*)(?:not )?ok[ \t]+\d+(?:[ \t]+(?:-[ \t]+)?([^\r\n]*?))?(?:[ \t]+# (?:SKIP|TODO)\b[^\r\n]*)?[ \t]*\r?$/gim,
+              ),
+          ].some((result) => result[1] === last[1] && (!result[2] || result[2].trim() === last[3]?.trim()));
+        return `### Check \`${c.name}\` timed out after ${limit} s${c.firstAttempt?.timedOut ? " twice" : ""}${last && !completed ? `; the last test running was ${last[3] ?? last[4]}` : ""}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`;
+      }
+      return `### Check \`${c.name}\` ${c.verdict === "regressed" ? "now FAILS (it passed before your change)" : "FAILS"}\nCommand: \`${c.result.command}\`\n${fence(c.result.output.slice(-3000))}`;
+    })
     .join("\n\n");
 }
 
@@ -191,7 +212,12 @@ export function formatReviewFeedback(findings: Review["findings"], panel = false
     .join("\n")}`;
 }
 
-export function redactHoldoutText(value: string, holdout: Holdout, publicSources = ""): string {
+export function redactHoldoutText(
+  value: string,
+  holdout: Holdout,
+  publicSources = "",
+  includeObservedLiterals = true,
+): string {
   if (!holdout.scenarios.length) return value;
   const details = new Set<string>();
   const boundaryPattern = (detail: string) => {
@@ -218,7 +244,7 @@ export function redactHoldoutText(value: string, holdout: Holdout, publicSources
     }
   }
   // Observed values and runtime error identifiers need not occur in the authored scenarios.
-  collectLiterals(value);
+  if (includeObservedLiterals) collectLiterals(value);
   if (!details.size) return value;
   const pattern = new RegExp(
     [...details]
@@ -254,15 +280,19 @@ export function formatVerifyFeedback(
   const text = (id: string) => spec?.acceptance_criteria.find((a) => a.id === id)?.criterion ?? "";
   let unvalidated = false;
   const items = unmet
-    .map((c) => {
-      const privateScenario = /^H-\d+$/i.test(c.id);
-      const summary =
-        privateScenario && holdout ? redactHoldoutText(c.publicSummary.trim(), holdout, publicSources) : "";
+    .map((c, index) => {
+      const kind = rowKind(c.id, spec, holdout);
+      if (kind === "unknown") return `- **unknown-${index + 1}** (${c.status}): Unknown criterion.`;
+      const privateScenario = kind !== "public";
+      const summary = holdout
+        ? redactHoldoutText(c.publicSummary.trim(), holdout, publicSources, privateScenario)
+        : "";
       const behavior = summary.replace(/\[private detail\]|\[\d+ private details withheld\]/g, "");
       const safeSummary = /[\p{L}\p{N}]/u.test(behavior)
         ? summary
         : `The verifier could not confirm this private scenario.${summary.match(/ \[\d+ private details withheld\]$/)?.[0] ?? ""}`;
-      if (!privateScenario) return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${c.evidence}`;
+      if (!privateScenario)
+        return `- **${c.id}** (${c.status}) ${text(c.id)}\n  Evidence: ${holdout ? redactHoldoutText(c.evidence, holdout, publicSources, false) : c.evidence}`;
       if (c.status !== "unmet" || (c.requirement !== "request" && c.requirement !== "spec"))
         return `- **${c.id}** private scenario (${c.status}): ${safeSummary}`;
       const citation = c.requirementCitation ?? "";

@@ -1,7 +1,7 @@
 import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation } from "../core/types.ts";
 import type { RunContext, RunState } from "./context.ts";
-import type { Review } from "./schemas.ts";
+import { type Review, rowKind } from "./schemas.ts";
 import { notRequired } from "./verification.ts";
 
 function money(n: number): string {
@@ -32,6 +32,7 @@ export interface ReportInput {
     | "holdout"
     | "lastVerify"
     | "lastGates"
+    | "gateTimeoutReruns"
     | "lastReview"
     | "reviewFollowUps"
     | "reviewHistory"
@@ -88,7 +89,9 @@ export function renderReport(input: ReportInput): string {
       table(
         ["", "Criterion", "Evidence"],
         state.spec.acceptance_criteria.map((ac) => {
-          const v = verify?.criteria.find((c) => c.id === ac.id);
+          const v = verify?.criteria.find(
+            (c) => c.id === ac.id && rowKind(c.id, state.spec ?? null, state.holdout) === "public",
+          );
           const icon = !v
             ? "·"
             : v.status === "met"
@@ -148,6 +151,7 @@ export function renderReport(input: ReportInput): string {
   }
 
   blocks.push("## Checks");
+  if (state.gateTimeoutReruns) blocks.push(`Timeout-caused gate re-runs: ${state.gateTimeoutReruns}.`);
   if (state.lastGates?.length) {
     // PR verdict comments omit commands: they can name local paths and generated outputs.
     const commands = state.flow !== "verify-change";
@@ -157,7 +161,7 @@ export function renderReport(input: ReportInput): string {
         state.lastGates.map((g) => {
           const warn = g.verdict === "still_failing" || g.verdict === "flaky";
           const icon = g.blocking ? "❌" : warn ? "⚠️" : "✅";
-          const row = [g.name, `${icon} ${g.verdict.replace("_", " ")}`];
+          const row = [g.name, `${icon} ${g.result.timedOut ? "timed out" : g.verdict.replace("_", " ")}`];
           return commands ? [...row, `\`${escapeCell(g.result.command)}\``] : row;
         }),
       ),

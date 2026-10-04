@@ -257,8 +257,8 @@ current stage (the worktree is preserved; Claude sessions can be resumed).
 
 | Surface | What it does |
 |---|---|
-| **Web UI** (SolidJS) | Mission control: live runs, queue, quota gauges, spend; run detail with stage timeline, invocations (model/cost/tokens/duration), live event log, spec/diff/review/verdict artifacts, questions, cancel/retry; chat to start runs. |
-| **CLI** `limitless` | `run`, `ls`, `show`, `logs -f`, `cancel`, `answer`, `serve`, `mcp`, `deploy`. |
+| **Web UI** (SolidJS) | Mission control: live runs, queue, quota gauges, spend; run detail with stage timeline, invocations (model/cost/tokens/duration), live event log, spec/diff/review/verdict artifacts, questions, cancel/retry; chat to start runs. Loopback needs no sign-in; through the LAN proxy it takes a passkey (or password) and a long-lived session cookie ([OPERATIONS](OPERATIONS.md#signing-in)). |
+| **CLI** `limitless` | `run`, `ls`, `show`, `logs -f`, `cancel`, `answer`, `serve`, `mcp`, `deploy`, `auth` (UI passkeys, password and sessions). |
 | **Chat concierge** | Shared by UI chat and Discord: turns free text into a confirmed run, answers status questions. Runs on a local model when available. |
 | **GitHub** | `POST /webhooks/github` (HMAC-verified): Dependabot PRs → `quick` verify-and-merge; issue labeled `limitless` or `/limitless …` comment by the owner → run; CI failure on a factory PR → fix run. |
 | **Discord** | `/build`, `/runs`, `/show`, `/cancel`; one thread per run with progress, questions and the final report. |
