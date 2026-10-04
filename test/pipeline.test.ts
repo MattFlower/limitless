@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { renderToString } from "solid-js/web";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Repo, Role, RunStatus, StageName } from "../src/core/types.ts";
@@ -58,6 +59,7 @@ import { sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { reviewOutput } from "./evals-reading-support.ts";
 import { deferred } from "./evals-support.ts";
+import { buildNeedsYouUi } from "./needs-you-ui-support.ts";
 import { attributionEvidence, findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
 import { waitClock } from "./wait-clock.ts";
@@ -2474,6 +2476,20 @@ esac
     expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
     expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
     expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+    const detail = f.store.getRunDetail(run.id);
+    if (!detail) throw new Error("missing draft detail");
+    expect(detail.run.stage).toBe("deliver");
+    expect(detail.stoppingStage).toBe("review");
+    const ui = await buildNeedsYouUi(join(home, "needs-you-ui"));
+    try {
+      ui.mount(detail);
+      const html = renderToString(() => ui.render());
+      expect(html).toContain('aria-label="Needs you"');
+      expect(html).toContain("review · Still failing after");
+      expect(html).not.toContain("deliver · Still failing after");
+    } finally {
+      ui.dispose();
+    }
   });
 
   test("panel reviews R1-R3: fix-diff scope, tightening blocks, restart, then needs_human with a draft", async () => {

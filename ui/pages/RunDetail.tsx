@@ -104,6 +104,8 @@ export const RunDetail: Component = () => {
   };
   onCleanup(() => {
     if (feedbackTimer) clearTimeout(feedbackTimer);
+    clearTimeout(refreshTimer);
+    generation++;
   });
 
   const stages = createMemo(() => Object.values(stagesById).sort((a, b) => a.id - b.id));
@@ -112,18 +114,18 @@ export const RunDetail: Component = () => {
   const events = createMemo(() => Object.values(eventsById).sort((a, b) => a.id - b.id));
   const openQuestions = createMemo(() => questions().filter((q) => q.answer === null));
 
-  const refetchArtifacts = () => {
-    getRunDetail(params.id)
-      .then((d) => {
-        setArtifacts(d.artifacts);
-        setDetails(d);
-      })
-      .catch(() => {});
+  let generation = 0;
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleRefresh = () => {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refetchArtifacts, 100);
   };
-
-  onMount(() => {
+  const refetchArtifacts = () => {
+    const request = ++generation;
     getRunDetail(params.id)
       .then((detail) => {
+        if (request !== generation) return;
+        setLoadError(null);
         setRun(detail.run);
         setDetails(detail);
         setStagesById(
@@ -143,13 +145,21 @@ export const RunDetail: Component = () => {
         );
         setArtifacts(detail.artifacts);
       })
-      .catch((e) => setLoadError((e as Error).message));
+      .catch((e) => request === generation && setLoadError((e as Error).message));
+  };
+
+  onMount(() => {
+    refetchArtifacts();
+    let reconnect = false;
 
     const close = openRunStream(
       params.id,
       0,
       (msg) => {
-        if (msg.kind === "run") setRun(msg.run);
+        if (msg.kind === "run" && msg.run.id === params.id) {
+          setRun(msg.run);
+          scheduleRefresh();
+        } else if (msg.kind === "feed" && msg.item.runId === params.id) scheduleRefresh();
         else if (msg.kind === "stage") {
           const stage = msg.stage;
           setStagesById(
@@ -157,7 +167,7 @@ export const RunDetail: Component = () => {
               d[stage.id] = stage;
             }),
           );
-          if (stage.status !== "running") refetchArtifacts();
+          if (stage.status !== "running") scheduleRefresh();
         } else if (msg.kind === "invocation") {
           const invocation = msg.invocation;
           setInvocationsById(
@@ -181,7 +191,11 @@ export const RunDetail: Component = () => {
           );
         }
       },
-      setConnected,
+      (value) => {
+        setConnected(value);
+        if (value && reconnect) scheduleRefresh();
+        reconnect = true;
+      },
     );
     onCleanup(close);
   });
@@ -365,7 +379,7 @@ export const RunDetail: Component = () => {
             <Show when={r().status === "needs_human" || r().status === "failed"}>
               <section class="card card-pad stack" aria-label="Needs you">
                 <h2>Needs you</h2>
-                <p>{[r().stage, r().error?.split(/\r?\n/)[0]].filter(Boolean).join(" · ")}</p>
+                <p>{[details()?.stoppingStage, r().error?.split(/\r?\n/)[0]].filter(Boolean).join(" · ")}</p>
                 <ul>
                   <For each={details()?.blockingFindings}>{(finding) => <li>{finding}</li>}</For>
                 </ul>

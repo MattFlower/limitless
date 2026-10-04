@@ -36,6 +36,7 @@ import type {
   TrackedPr,
 } from "../core/types.ts";
 import { DEFAULT_EVAL_CONCURRENCY } from "../core/types.ts";
+import type { RunState } from "../pipeline/context.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
 type Row = Record<string, unknown>;
@@ -1207,7 +1208,19 @@ export class Store {
     if (!run) return null;
     const latest = this.listArtifacts(id).findLast((a) => a.kind === "review");
     const review = parse<{ blocking?: { title?: string }[] }>(this.getArtifact(id, latest?.name ?? ""), {});
+    const state = this.getRunState<RunState>(id);
+    const stages = this.listStages(id);
+    const blocked = [
+      ["verify", state?.lastVerify?.overall === "fail"],
+      ["review", state?.lastReview?.verdict === "request_changes"],
+      ["audit", state?.lastAudit?.some((f) => f.severity === "block")],
+      ["gates", state?.lastGates?.some((g) => g.blocking)],
+    ] as const;
+    const stopping =
+      stages.findLast((s) => s.status === "failed") ??
+      stages.findLast((s) => blocked.some(([name, blocks]) => blocks && name === s.name));
     return {
+      stoppingStage: stopping?.name ?? blocked.find(([, blocks]) => blocks)?.[0] ?? null,
       blockingFindings: Array.isArray(review?.blocking)
         ? review.blocking.flatMap((f) => (typeof f?.title === "string" ? [f.title] : []))
         : [],

@@ -462,7 +462,9 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
                       ? msg.event.runId
                       : msg.kind === "question"
                         ? msg.question.runId
-                        : null;
+                        : msg.kind === "feed"
+                          ? msg.item.runId
+                          : null;
             if (id === runId) send(msg);
           }),
         { backlog, alive: live(req) },

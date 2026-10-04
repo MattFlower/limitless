@@ -256,6 +256,7 @@ export interface ArtifactMeta {
 }
 
 export interface RunDetail {
+  stoppingStage?: StageName | null;
   blockingFindings?: string[];
   prSnapshot?: {
     state?: string;

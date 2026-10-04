@@ -77,7 +77,7 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
               if (args.path.endsWith("/RunDetail.tsx")) {
                 source = source.replace(
                   'import { useNavigate, useParams } from "@solidjs/router";',
-                  'const useNavigate = () => (_path: string) => {}; const useParams = <T,>(): T => ({ id: "run" }) as T;',
+                  "const useNavigate = () => (_path: string) => {}; const useParams = <T,>(): T => ({ id: injectedRun.id }) as T;",
                 );
                 source = source.replace(
                   "createSignal<Run | null>(null)",

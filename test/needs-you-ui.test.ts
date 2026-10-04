@@ -1,19 +1,18 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type PresetTarget, transformAsync } from "@babel/core";
-import ts from "@babel/preset-typescript";
 import { renderToString } from "solid-js/web";
-import type { Run, RunDetail } from "../src/core/types.ts";
+import type { Run, RunDetail, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { normalizePr } from "../src/integrations/github-poller.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import { deferred } from "./evals-support.ts";
 import { prNode } from "./github-poller-support.ts";
 import { fixture as httpFixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { buildNeedsYouUi, type NeedsYouUi } from "./needs-you-ui-support.ts";
+import { waitClock } from "./wait-clock.ts";
 
-const solid = createRequire(import.meta.url)("babel-preset-solid") as PresetTarget<object>;
 const dir = mkdtempSync(join(tmpdir(), "limitless-needs-you-ui-"));
 const store = new Store(":memory:");
 const repo = store.upsertRepo({
@@ -32,6 +31,7 @@ store.updateRun(run.id, {
   branch: "limitless/stopped",
   prUrl: "https://github.com/owner/repo/pull/1",
 });
+store.finishStage(store.startStage(run.id, "review").id, "failed", "Still blocking after review");
 store.putArtifact(
   run.id,
   "review-1.json",
@@ -70,95 +70,19 @@ store.saveGithubPr({
     ci: "FAILURE",
   }),
 });
-const detail = store.getRunDetail(run.id);
-if (!detail) throw new Error("missing fixture");
+const detail =
+  store.getRunDetail(run.id) ??
+  (() => {
+    throw new Error("missing fixture");
+  })();
 detail.worktreePath = "/work/stopped";
 
-type Handler = (event?: { currentTarget: { value: string } }) => void | Promise<void>;
-let ui: {
-  mount: (detail: RunDetail) => void;
-  render: () => ReturnType<typeof renderToString>;
-  handlers: Map<string, Handler>;
-  navigated: string[];
-};
+let ui: NeedsYouUi;
 beforeAll(async () => {
-  const build = await Bun.build({
-    entrypoints: [join(import.meta.dir, "../ui/pages/RunDetail.tsx")],
-    outdir: dir,
-    target: "bun",
-    plugins: [
-      {
-        name: "needs-you-ssr-events",
-        setup(builder) {
-          builder.onLoad({ filter: /\.tsx$/ }, async (args) => {
-            let source = await Bun.file(args.path).text();
-            if (args.path.endsWith("/RunDetail.tsx")) {
-              source = source.replace(
-                'import { useNavigate, useParams } from "@solidjs/router";',
-                "const useNavigate = () => (path: string) => navigated.push(path); const useParams = <T,>(): T => ({ id: fixture.run.id }) as T;",
-              );
-              source = source.replace(
-                "createSignal<Run | null>(null)",
-                "createSignal<Run | null>(fixture.run)",
-              );
-              source = source.replace(
-                "createSignal<Detail | null>(null)",
-                "createSignal<Detail | null>(fixture)",
-              );
-              // Keep a render closure so interaction handlers and the next render share the same signals.
-              source = source.replace(
-                '  return (\n    <div class="page stack">',
-                '  const render = () => (\n    <div class="page stack">',
-              );
-              source = source.replace(
-                /\n {2}\);\n};\s*$/,
-                "\n  );\n  activeRender = render; return render();\n};",
-              );
-              for (const action of ["retry", "resolve", "copy"]) {
-                source = source.replace(
-                  `onClick={() => doAction("${action}")}`,
-                  `{...capture("${action}", () => doAction("${action}"))}`,
-                );
-              }
-              source = source.replace(
-                "onChange={(e) => setKind(e.currentTarget.value as Kind)}",
-                '{...capture("kind", (e: { currentTarget: { value: Kind } }) => setKind(e.currentTarget.value))}',
-              );
-              for (const field of ["ref", "note"]) {
-                const setter = field === "ref" ? "setRef" : "setNote";
-                source = source.replace(
-                  `onInput={(e) => ${setter}(e.currentTarget.value)}`,
-                  `{...capture("${field}", (e: { currentTarget: { value: string } }) => ${setter}(e.currentTarget.value))}`,
-                );
-              }
-              source += `
-              let fixture: Detail;
-              let activeRender: () => ReturnType<typeof RunDetail>;
-              export const handlers = new Map();
-              export const navigated: string[] = [];
-              const capture = (key: string, handler: unknown) => { handlers.set(key, handler); return {}; };
-              export const mount = (detail: Detail) => { fixture = detail; navigated.length = 0; RunDetail({}); };
-              export const render = () => { handlers.clear(); return activeRender(); };
-            `;
-            }
-            const transformed = await transformAsync(source, {
-              filename: args.path,
-              parserOpts: { plugins: ["jsx", "typescript"] },
-              presets: [
-                [solid, { generate: "ssr" }],
-                [ts, {}],
-              ],
-            });
-            return { contents: transformed?.code ?? "", loader: "js" };
-          });
-        },
-      },
-    ],
-  });
-  expect(build.success).toBe(true);
-  ui = await import(join(dir, "RunDetail.js"));
+  ui = await buildNeedsYouUi(dir);
 });
 afterAll(() => {
+  ui.dispose();
   store.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -312,6 +236,319 @@ test("run-detail HTTP returns only existing configured worktrees and retains sav
     f.factory.store.db.query("UPDATE runs SET branch = NULL WHERE id = ?").run(stopped.id);
     expect((await (await read(request(), localServer)).json()).worktreePath).toBeNull();
   } finally {
+    await f.close();
+  }
+});
+
+class TestEventSource {
+  onopen: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  closed = false;
+  close() {
+    this.closed = true;
+  }
+  emit(message: StreamMessage) {
+    this.onmessage?.({ data: JSON.stringify(message) });
+  }
+}
+async function withStream(
+  read: (request: number) => Promise<Response>,
+  check: (context: {
+    stream: TestEventSource;
+    clock: ReturnType<typeof waitClock>;
+    requests: () => number;
+  }) => Promise<void>,
+  initiallyEmpty = false,
+) {
+  const oldFetch = globalThis.fetch;
+  const oldSource = globalThis.EventSource;
+  const clock = waitClock();
+  let stream = new TestEventSource();
+  let requests = 0;
+  globalThis.fetch = (async (path) => {
+    expect(String(path)).toBe(`/api/runs/${run.id}`);
+    return read(++requests);
+  }) as typeof fetch;
+  globalThis.EventSource = class extends TestEventSource {
+    constructor(url: string) {
+      super();
+      expect(url).toBe(`/api/runs/${run.id}/stream?after=0`);
+      stream = this;
+    }
+  } as unknown as typeof EventSource;
+  ui.setTimers({ set: clock.timer.set as typeof setTimeout, clear: clock.timer.clear });
+  try {
+    ui.mount(detail, initiallyEmpty);
+    ui.start();
+    await clock.flush();
+    await check({ stream, clock, requests: () => requests });
+  } finally {
+    ui.dispose();
+    expect(stream.closed).toBe(true);
+    expect(clock.pending).toBe(0);
+    ui.setTimers({ set: globalThis.setTimeout, clear: globalThis.clearTimeout });
+    globalThis.fetch = oldFetch;
+    globalThis.EventSource = oldSource;
+  }
+}
+const observation = (runId = run.id): StreamMessage => ({
+  kind: "feed",
+  item: {
+    id: 1,
+    ts: 1,
+    kind: "pr.ci_passed",
+    runId,
+    evalId: null,
+    repo: repo.slug,
+    title: "CI passed",
+    summary: "Checks are green",
+    data: {},
+  },
+});
+const newerDetail: RunDetail = {
+  ...detail,
+  blockingFindings: ["Current finding"],
+  prSnapshot: { ...detail.prSnapshot, ci: "SUCCESS" },
+  artifacts: [{ name: "current.json", kind: "review", size: 1, createdAt: 1 }],
+};
+
+test("newest-first detail responses guard initial hydration, observations and artifacts", async () => {
+  const initial = deferred<Response>();
+  const refresh = deferred<Response>();
+  await withStream(
+    (request) => (request === 1 ? initial.promise : refresh.promise),
+    async ({ stream, clock, requests }) => {
+      expect(requests()).toBe(1);
+      stream.emit({ kind: "run", run: detail.run });
+      await clock.advance(100);
+      expect(requests()).toBe(2);
+      refresh.resolve(Response.json(newerDetail));
+      await clock.flush();
+      expect(render()).toContain("Current finding");
+      initial.resolve(Response.json(detail));
+      await clock.flush();
+      const html = render();
+      for (const current of ["Current finding", "CI: SUCCESS", "current.json"])
+        expect(html).toContain(current);
+      for (const obsolete of ["Missing cancellation", "Wrong result", "CI: FAILURE", "review-1.json"])
+        expect(html).not.toContain(obsolete);
+    },
+    true,
+  );
+});
+
+test("overlapping later refreshes cannot replace newer findings or CI", async () => {
+  const obsolete = deferred<Response>();
+  const latest = deferred<Response>();
+  await withStream(
+    (request) =>
+      request === 1
+        ? Promise.resolve(Response.json(detail))
+        : request === 2
+          ? obsolete.promise
+          : latest.promise,
+    async ({ stream, clock, requests }) => {
+      stream.emit(observation());
+      await clock.advance(100);
+      stream.emit(observation());
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+      latest.resolve(Response.json(newerDetail));
+      await clock.flush();
+      obsolete.resolve(Response.json(detail));
+      await clock.flush();
+      expect(render()).toContain("Current finding");
+      expect(render()).toContain("CI: SUCCESS");
+      expect(render()).not.toContain("CI: FAILURE");
+    },
+  );
+});
+
+test("newer requests suppress stale errors and recover from an initial detail failure", async () => {
+  const stale = deferred<Response>();
+  await withStream(
+    (request) => (request === 1 ? stale.promise : Promise.resolve(Response.json(newerDetail))),
+    async ({ stream, clock }) => {
+      stream.emit(observation());
+      await clock.advance(100);
+      stale.resolve(Response.json({ error: "Obsolete failure" }, { status: 500 }));
+      await clock.flush();
+      expect(render()).toContain("Current finding");
+      expect(render()).not.toContain("Obsolete failure");
+    },
+  );
+  await withStream(
+    async (request) =>
+      request === 1 ? Response.json({ error: "Disconnected" }, { status: 500 }) : Response.json(newerDetail),
+    async ({ stream, clock }) => {
+      expect(render()).toContain("Disconnected");
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(render()).toContain("CI: SUCCESS");
+      expect(render()).not.toContain("Disconnected");
+    },
+    true,
+  );
+});
+
+test("run and run-linked feed bursts refresh once; unrelated runs do not refresh", async () => {
+  await withStream(
+    async (request) => Response.json(request === 1 ? detail : newerDetail),
+    async ({ stream, clock, requests }) => {
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(requests()).toBe(1);
+      stream.emit({ kind: "run", run: { ...detail.run, id: "another-run" } });
+      stream.emit(observation("another-run"));
+      stream.emit(observation(""));
+      await clock.advance(100);
+      expect(requests()).toBe(1);
+      stream.emit({ kind: "run", run: detail.run });
+      await clock.advance(99);
+      expect(requests()).toBe(1);
+      await clock.advance(1);
+      expect(requests()).toBe(2);
+      expect(render()).toContain("Current finding");
+      stream.emit(observation());
+      await clock.advance(50);
+      stream.emit({ kind: "run", run: detail.run });
+      stream.emit(observation());
+      await clock.advance(99);
+      expect(requests()).toBe(2);
+      await clock.advance(1);
+      expect(requests()).toBe(3);
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+    },
+  );
+});
+
+test("reconnect refreshes saved observations once and coalesces simultaneous updates", async () => {
+  let saved = detail;
+  await withStream(
+    async () => Response.json(saved),
+    async ({ stream, clock, requests }) => {
+      stream.onopen?.();
+      stream.onerror?.();
+      saved = newerDetail;
+      await clock.advance(100);
+      expect(requests()).toBe(1);
+      expect(render()).toContain("CI: FAILURE");
+      stream.onopen?.();
+      await clock.advance(99);
+      expect(requests()).toBe(1);
+      await clock.advance(1);
+      expect(requests()).toBe(2);
+      expect(render()).toContain("CI: SUCCESS");
+      expect(render()).toContain("Current finding");
+      stream.onerror?.();
+      stream.onopen?.();
+      stream.emit(observation());
+      stream.emit({ kind: "run", run: detail.run });
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+      stream.emit(observation());
+      ui.dispose();
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+    },
+  );
+});
+
+test("stopping evidence prefers the latest failed stage, falls back to retained blockers and omits unknown", () => {
+  const stopped = store.createRun(repo, { repo: repo.slug, prompt: "Evidence" });
+  store.updateRun(stopped.id, { status: "needs_human", stage: "deliver", error: "Needs work" });
+  const read = () => {
+    const saved = store.getRunDetail(stopped.id);
+    if (!saved) throw new Error("missing stopped run");
+    ui.mount(saved);
+    return render();
+  };
+  expect(read()).not.toContain("deliver · Needs work");
+  for (const [state, expected] of [
+    [{ lastGates: [{ blocking: true }] }, "gates"],
+    [{ lastAudit: [{ severity: "block" }] }, "audit"],
+    [{ lastReview: { verdict: "request_changes" } }, "review"],
+    [{ lastVerify: { overall: "fail" } }, "verify"],
+  ] as const) {
+    store.setRunState(stopped.id, state);
+    expect(read()).toContain(`${expected} · Needs work`);
+  }
+  store.setRunState(stopped.id, {
+    lastVerify: { overall: "fail" },
+    lastReview: { verdict: "request_changes" },
+  });
+  store.finishStage(store.startStage(stopped.id, "verify").id, "succeeded");
+  store.finishStage(store.startStage(stopped.id, "review", 1).id, "succeeded");
+  store.finishStage(store.startStage(stopped.id, "deliver").id, "succeeded");
+  expect(read()).toContain("review · Needs work");
+  store.finishStage(store.startStage(stopped.id, "gates", 2).id, "succeeded");
+  store.setRunState(stopped.id, {
+    lastReview: { verdict: "request_changes" },
+    lastGates: [{ blocking: true }],
+  });
+  expect(read()).toContain("gates · Needs work");
+  store.finishStage(store.startStage(stopped.id, "implement").id, "failed");
+  store.finishStage(store.startStage(stopped.id, "review").id, "failed");
+  store.finishStage(store.startStage(stopped.id, "deliver").id, "succeeded");
+  expect(read()).toContain("review · Needs work");
+});
+
+test("per-run SSE forwards committed GitHub observations only for the displayed run", async () => {
+  const f = await httpFixture();
+  const controller = new AbortController();
+  try {
+    const store = f.factory.store;
+    const repo = store.upsertRepo({
+      slug: "owner/repo",
+      kind: "github",
+      url: "unused",
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const target = store.createRun(repo, { repo: repo.slug, prompt: "target" });
+    const other = store.createRun(repo, { repo: repo.slug, prompt: "other" });
+    const route = createHttpRoutes(f.factory)["/api/runs/:id/stream"] as Route;
+    const response = await route(
+      requestWithParams(
+        `http://localhost:7400/api/runs/${target.id}/stream`,
+        { signal: controller.signal },
+        { id: target.id },
+      ),
+      localServer,
+    );
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("missing SSE body");
+    const decoder = new TextDecoder();
+    expect(decoder.decode((await reader.read()).value)).toBe(": connected\n\n");
+    store.saveGithubPr(null, false, [
+      {
+        kind: "pr.comment",
+        runId: other.id,
+        repo: repo.slug,
+        summary: "Other run",
+        data: {},
+        key: "other",
+      },
+      {
+        kind: "pr.ci_passed",
+        runId: target.id,
+        repo: repo.slug,
+        summary: "CI recovered",
+        data: {},
+        key: "target",
+      },
+    ]);
+    const frame = decoder.decode((await reader.read()).value);
+    expect(JSON.parse(frame.slice(6))).toMatchObject({
+      kind: "feed",
+      item: { runId: target.id, kind: "pr.ci_passed", summary: "CI recovered" },
+    });
+  } finally {
+    controller.abort();
     await f.close();
   }
 });
