@@ -2,7 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildClaudeArgs, ClaudeStreamParser, runClaude } from "../src/harness/claude.ts";
-import { buildCodexArgs, CodexStreamParser, parseRateLimits, runCodex } from "../src/harness/codex.ts";
+import {
+  buildCodexArgs,
+  type CodexReaderProbe,
+  CodexStreamParser,
+  parseRateLimits,
+  runCodex,
+} from "../src/harness/codex.ts";
+import { confinementScope } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import {
   type AgentEvent,
@@ -13,6 +20,7 @@ import {
   redactJsonLine,
 } from "../src/harness/types.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
+import { fakeConfinement } from "./confinement.ts";
 
 const fixture = (name: string) =>
   readFileSync(join(import.meta.dir, "fixtures", name), "utf8")
@@ -49,6 +57,18 @@ describe("ClaudeStreamParser", () => {
     expect(p.windows.seven_day?.utilization).toBeCloseTo(0.01);
     expect(p.windows.five_hour?.resetsAt).toBeGreaterThan(1_700_000_000_000);
     expect(p.quotaRejectedUntil).toBeNull();
+  });
+
+  test("records cache writes with their duration, priced at the 1-hour rate", () => {
+    const p = new ClaudeStreamParser(() => {});
+    for (const line of fixture("claude-basic.jsonl")) p.feed(line);
+    // The CLI wrote the whole 35,377-token prompt to the 1-hour cache.
+    expect([p.usage.input, p.usage.output, p.usage.cacheRead, p.usage.cacheWrite]).toEqual([
+      18, 224, 33_921, 35_377,
+    ]);
+    expect(p.usage.cacheWrite1h).toBe(35_377);
+    // 18 uncached and 35,377 written at 2x input, 33,921 read at the discount, 224 output.
+    expect(priceOf(p.usage, { input: 3, output: 15, cacheRead: 0.3 })).toBeCloseTo(0.2258523, 10);
   });
 
   test("detects a rejected rate limit as quota exhaustion", () => {
@@ -141,6 +161,9 @@ describe("CodexStreamParser", () => {
     expect(p.completed).toBe(true);
     expect(p.usage.cacheRead).toBe(29056);
     expect(p.usage.input).toBe(43706 - 29056);
+    // Codex never writes to a cache: only reads are split off the prompt.
+    expect(p.usage.cacheWrite).toBe(0);
+    expect(priceOf(p.usage, { input: 2, output: 10 })).toBeCloseTo((14650 * 2 + 29056 * 0.2 + 40 * 10) / 1e6);
     const call = events.find((e) => e.type === "tool_call") as { input: { command: string } };
     expect(call.input.command).toContain("cat a.txt");
     const result = events.find((e) => e.type === "tool_result") as { output: string; isError: boolean };
@@ -176,6 +199,18 @@ describe("CodexStreamParser", () => {
     expect(w?.five_hour?.utilization).toBeCloseTo(0.425);
   });
 });
+
+// Tool-enabled editors run confined (#323): they need scratch, and a fake runner that swaps the
+// command keeps the sandbox's startup wrapper (the identity backend adds no profile).
+const confinedEdit = <T>(cwd: string, run: (scratchDir: string) => Promise<T>) =>
+  confinementScope.run(fakeConfinement, () => withScratch(cwd, run));
+const swapCommand = (cmd: string[], replacement: string[]) =>
+  cmd[4]?.startsWith("limitless-started-") ? [...cmd.slice(0, 5), ...replacement] : replacement;
+// A confined Codex editor runs only on a CLI whose sandbox was verified; this stub stands in for that probe.
+const verifiedCodex: typeof runClaude = (spec, runner) =>
+  runCodex(spec, runner, {
+    verify: async () => ({ ok: true, path: "codex", version: "test", reason: null, exitCode: null }),
+  } as unknown as CodexReaderProbe);
 
 test("CLI transcript redaction handles escaped multi-line scenario text", () => {
   const holdout = {
@@ -222,6 +257,16 @@ test("priceOf charges cache reads at a discount", () => {
   const usage = { input: 1_000_000, output: 1_000_000, cacheRead: 1_000_000, cacheWrite: 0 };
   expect(priceOf(usage, { input: 2, output: 10 })).toBeCloseTo(2 + 10 + 0.2);
   expect(priceOf(usage, undefined)).toBe(0);
+});
+
+test("priceOf charges 1-hour cache writes at twice the input rate and the rest at 1.25x", () => {
+  const price = { input: 2, output: 10 };
+  const write = { input: 0, output: 0, cacheRead: 0, cacheWrite: 1_000_000 };
+  // Without a duration breakdown every write is a 5-minute one.
+  expect(priceOf(write, price)).toBeCloseTo(2.5);
+  expect(priceOf({ ...write, cacheWrite1h: 400_000 }, price)).toBeCloseTo(3.1);
+  // A breakdown larger than the writes themselves cannot price more than the writes.
+  expect(priceOf({ ...write, cacheWrite: 100, cacheWrite1h: 1_000_000 }, price)).toBeCloseTo(0.0004);
 });
 
 describe("extractJson", () => {
@@ -452,4 +497,294 @@ test("native fast flags cover edit, structured and isolated readers without leak
     expect(parser.fastModeState).toBe("on");
     expect(parser.fastModeDisabledReason).toBeNull();
   });
+});
+
+test("configured backend auth reaches the CLI only through a key helper, never the agent environment", async () => {
+  const { existsSync, statSync } = await import("node:fs");
+  const { customModel, customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const { agentEnv, runProcess } = await import("../src/util/proc.ts");
+  const { Factory } = await import("../src/app.ts");
+  const { Store } = await import("../src/db/store.ts");
+  const key = "ANTHROPIC_AUTH_TOKEN";
+  const saved = process.env[key];
+  const token = "FAKE_EXPLICIT_BACKEND_TOKEN_734";
+  const savedAuth = process.env.AUTH;
+  const fixture = providerFixture(
+    [
+      {
+        ...customProvider,
+        kind: "anthropic-compatible",
+        base_url: "https://example.invalid",
+        api_key_env: key,
+        models: [{ ...customModel, efforts: [], effort: undefined }],
+      },
+    ],
+    `${key}=${token}\n`,
+  );
+  const store = new Store(":memory:");
+  try {
+    process.env[key] = "FAKE_INHERITED_BACKEND_TOKEN_735";
+    process.env.AUTH = `Bearer ${token}`;
+    const factory = new Factory(fixture.load(), { store });
+    expect(factory.tracker.authToken("mac-mlx")).toBe(token);
+    // Explicit overrides cannot reintroduce a configured credential under any name.
+    expect(agentEnv({ [key]: token, OTHER_NAME: token, KEPT: "ordinary" })).toMatchObject({
+      KEPT: "ordinary",
+    });
+    expect(Object.values(agentEnv({ [key]: token, OTHER_NAME: token }))).not.toContain(token);
+    const childEnvs: unknown[] = [];
+    const extras: Record<string, string>[] = [{}, { AUTH: `Bearer ${token}` }];
+    for (const extra of extras) {
+      const child = await runProcess({
+        cmd: [
+          process.execPath,
+          "-e",
+          'console.log(JSON.stringify({auth: process.env.AUTH ?? "absent", kept: process.env.KEPT}))',
+        ],
+        cwd: fixture.root,
+        env: agentEnv({ KEPT: "ordinary", ...extra }),
+      });
+      childEnvs.push(JSON.parse(child.stdout));
+    }
+    expect(childEnvs).toEqual(Array(2).fill({ auth: "absent", kept: "ordinary" }));
+    const resolved = factory.router.resolveFor("triage", "mac-mlx/flash");
+    const events: AgentEvent[] = [];
+    const logPath = join(fixture.root, "backend.log");
+    let keyFile = "";
+    const result = await confinedEdit(fixture.root, (scratchDir) =>
+      runClaude(
+        {
+          cwd: fixture.root,
+          scratchDir,
+          prompt: "test",
+          mode: "edit",
+          logPath,
+          target: factory.router.toTarget(resolved.model),
+          timeoutMs: 5000,
+          idleTimeoutMs: 5000,
+          maxToolCalls: 1,
+          signal: new AbortController().signal,
+          onEvent: (event) => events.push(event),
+        },
+        async (options) => {
+          const settings: { apiKeyHelper: string } = JSON.parse(
+            options.cmd[options.cmd.indexOf("--settings") + 1] ?? "{}",
+          );
+          keyFile = JSON.parse(settings.apiKeyHelper.replace(/^cat /, ""));
+          expect(readFileSync(keyFile, "utf8")).toBe(token);
+          expect(statSync(keyFile).mode & 0o077).toBe(0);
+          expect(options.env?.ANTHROPIC_BASE_URL).toBe("https://example.invalid");
+          const helper = await runProcess({
+            cmd: ["sh", "-c", settings.apiKeyHelper],
+            cwd: fixture.root,
+            env: {},
+          });
+          expect(helper.stdout).toBe(token);
+          return runProcess({
+            ...options,
+            cmd: swapCommand(options.cmd, [
+              process.execPath,
+              "-e",
+              `const leaked = Object.values(process.env).includes(${JSON.stringify(token)}); console.log(JSON.stringify({type:"result",result:"auth " + (process.env.ANTHROPIC_AUTH_TOKEN ?? "absent") + " leaked=" + leaked}));`,
+            ]),
+          });
+        },
+      ),
+    );
+    expect(result.status).toBe("ok");
+    expect(result.finalText).toBe("auth absent leaked=false");
+    expect(existsSync(keyFile)).toBe(false);
+    for (const recorded of [JSON.stringify(events), JSON.stringify(result), readFileSync(logPath, "utf8")]) {
+      expect(recorded).not.toContain(token);
+      expect(recorded).not.toContain(process.env[key] ?? "missing");
+    }
+  } finally {
+    if (saved === undefined) delete process.env[key];
+    else process.env[key] = saved;
+    if (savedAuth === undefined) delete process.env.AUTH;
+    else process.env.AUTH = savedAuth;
+    store.close();
+    fixture.close();
+  }
+});
+
+test("configured credentials never reach native children or their events, logs and errors", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const { customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const { runProcess } = await import("../src/util/proc.ts");
+  const { Factory } = await import("../src/app.ts");
+  const { Store } = await import("../src/db/store.ts");
+  const key = "MAC_MLX_KEY";
+  const saved = process.env[key];
+  const fileSecret = 'FAKE_FILE_CREDENTIAL_"731';
+  const envSecret = "FAKE_ENV_CREDENTIAL_732";
+  const fixture = providerFixture([{ ...customProvider, api_key_env: key }], `${key}='${fileSecret}'\n`);
+  const store = new Store(":memory:");
+  try {
+    process.env[key] = envSecret;
+    const cfg = fixture.load();
+    const factory = new Factory(cfg, { store });
+    expect(factory.tracker.authToken("mac-mlx")).toBe(fileSecret);
+    for (const harness of ["claude", "codex"] as const) {
+      const events: AgentEvent[] = [];
+      const logPath = join(fixture.root, `${harness}.log`);
+      const child = join(fixture.root, `${harness}.ts`);
+      const nested = { secret: fileSecret, other: [envSecret], readable: "ordinary diagnostic" };
+      const event =
+        harness === "claude"
+          ? {
+              type: "assistant",
+              message: { content: [{ type: "tool_use", id: "call", name: "inspect", input: nested }] },
+            }
+          : {
+              type: "item.started",
+              item: { type: "mcp_tool_call", id: "call", server: "test", tool: "inspect", arguments: nested },
+            };
+      const textEvent =
+        harness === "claude"
+          ? {
+              type: "assistant",
+              message: {
+                content: [{ type: "text", text: `ordinary diagnostic ${fileSecret} ${envSecret}` }],
+              },
+            }
+          : {
+              type: "item.completed",
+              item: { type: "agent_message", text: `ordinary diagnostic ${fileSecret} ${envSecret}` },
+            };
+      writeFileSync(
+        child,
+        `console.log("child credential=" + (process.env.MAC_MLX_KEY ?? "absent")); console.log(${JSON.stringify(JSON.stringify(event))}); console.log(${JSON.stringify(JSON.stringify(textEvent))}); console.error(${JSON.stringify(`ordinary diagnostic ${fileSecret} ${envSecret}`)}); console.error(${JSON.stringify(`token=${fileSecret}; token=${fileSecret};`)}); process.exit(1);`,
+      );
+      const result = await confinedEdit(fixture.root, (scratchDir) =>
+        (harness === "claude" ? runClaude : verifiedCodex)(
+          {
+            cwd: fixture.root,
+            scratchDir,
+            prompt: "test",
+            mode: "edit",
+            logPath,
+            target: {
+              modelId: `${harness}/test`,
+              provider: harness,
+              harness,
+              model: "test",
+              vendor: "other",
+              tier: 4,
+              billing: "subscription",
+            },
+            timeoutMs: 5000,
+            idleTimeoutMs: 5000,
+            maxToolCalls: 10,
+            signal: new AbortController().signal,
+            onEvent: (ev) => events.push(ev),
+          },
+          (options) => runProcess({ ...options, cmd: swapCommand(options.cmd, [process.execPath, child]) }),
+        ),
+      );
+      expect(result.status).toBe("error");
+      expect(readFileSync(logPath, "utf8")).toContain("token=[redacted]; token=[redacted];");
+      expect(events).toContainEqual({ type: "status", text: "child credential=absent" });
+      expect(
+        events.some((e) => e.type === "tool_call" && JSON.stringify(e.input).includes("ordinary diagnostic")),
+      ).toBe(true);
+      for (const recorded of [
+        JSON.stringify(events),
+        readFileSync(logPath, "utf8"),
+        JSON.stringify(result),
+      ]) {
+        expect(recorded).not.toContain(envSecret);
+        expect(recorded).not.toContain("FAKE_FILE_CREDENTIAL_");
+        expect(recorded).toContain("ordinary diagnostic");
+      }
+    }
+    process.env[key] = "";
+    writeFileSync(join(fixture.configDir, "secrets.env"), `${key}=\n`);
+    fixture.load();
+    expect(redactJsonLine("ordinary empty credential")).toBe("ordinary empty credential");
+  } finally {
+    if (saved === undefined) delete process.env[key];
+    else process.env[key] = saved;
+    store.close();
+    fixture.close();
+  }
+});
+
+test("short credentials only match whole values while eight-character keys match substrings", async () => {
+  const { customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const { agentEnv, redactCredentials } = await import("../src/util/proc.ts");
+  const fixture = providerFixture(
+    [
+      { ...customProvider, api_key_env: "LIMITLESS_TEST_SHORT_KEY" },
+      { ...customProvider, id: "boundary", api_key_env: "LIMITLESS_TEST_EIGHT_KEY" },
+    ],
+    "LIMITLESS_TEST_SHORT_KEY=shrt735\nLIMITLESS_TEST_EIGHT_KEY=eight735\n",
+  );
+  try {
+    fixture.load();
+    expect(redactCredentials("token=shrt735; token=shrt735;")).toBe("token=shrt735; token=shrt735;");
+    expect(redactCredentials("token=eight735; token=eight735;")).toBe("token=[redacted]; token=[redacted];");
+    const env = agentEnv({
+      EXACT_SHORT: "shrt735",
+      SHORT_ALIAS: "Bearer shrt735",
+      EIGHT_ALIAS: "Bearer eight735",
+      KEPT: "ordinary",
+    });
+    expect(env.EXACT_SHORT).toBeUndefined();
+    expect(env.EIGHT_ALIAS).toBeUndefined();
+    expect(env.SHORT_ALIAS).toBe("Bearer shrt735");
+    expect(env.KEPT).toBe("ordinary");
+  } finally {
+    fixture.close();
+  }
+});
+
+test("a credential inside the model name never reaches the log header", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const { customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const { runProcess } = await import("../src/util/proc.ts");
+  const key = "org/backend-secret";
+  const fixture = providerFixture(
+    [{ ...customProvider, api_key_env: "HEADER_TEST_KEY" }],
+    `HEADER_TEST_KEY=${key}\n`,
+  );
+  try {
+    fixture.load();
+    const child = join(fixture.root, "child.ts");
+    writeFileSync(child, "process.exit(1);");
+    for (const harness of ["claude", "codex"] as const) {
+      const logPath = join(fixture.root, `${harness}.log`);
+      await confinedEdit(fixture.root, (scratchDir) =>
+        (harness === "claude" ? runClaude : verifiedCodex)(
+          {
+            cwd: fixture.root,
+            scratchDir,
+            prompt: "test",
+            mode: "edit",
+            logPath,
+            target: {
+              modelId: `${harness}/test`,
+              provider: harness,
+              harness,
+              model: key,
+              vendor: "other",
+              tier: 4,
+              billing: "subscription",
+            },
+            timeoutMs: 5000,
+            idleTimeoutMs: 5000,
+            maxToolCalls: 10,
+            signal: new AbortController().signal,
+            onEvent: () => {},
+          },
+          (options) => runProcess({ ...options, cmd: swapCommand(options.cmd, [process.execPath, child]) }),
+        ),
+      );
+      const header = readFileSync(logPath, "utf8").split("\n")[0] ?? "";
+      expect(header).toStartWith(`# ${harness} [redacted] `);
+      expect(header).not.toContain(key);
+    }
+  } finally {
+    fixture.close();
+  }
 });

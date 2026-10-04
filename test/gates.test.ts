@@ -1222,3 +1222,29 @@ test("private config excludes common git directories and all linked worktrees ca
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("gate subprocess excludes an arbitrary unselected provider credential", async () => {
+  const { customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const fixture = providerFixture([{ ...customProvider, api_key_env: "MAC_MLX_KEY" }]);
+  const saved = process.env.MAC_MLX_KEY;
+  try {
+    process.env.MAC_MLX_KEY = "FAKE_GATE_CREDENTIAL_733";
+    fixture.load();
+    const gate = await runGates(
+      fixture.root,
+      {
+        setup: [],
+        checks: [{ name: "env", run: 'test -z "$MAC_MLX_KEY" && printf "credential=absent CI=%s" "$CI"' }],
+        source: "detected",
+        protectedPaths: [],
+        merge: "pr",
+      },
+      new AbortController().signal,
+    );
+    expect(gate.checks[0]).toMatchObject({ ok: true, output: "credential=absent CI=1" });
+  } finally {
+    if (saved === undefined) delete process.env.MAC_MLX_KEY;
+    else process.env.MAC_MLX_KEY = saved;
+    fixture.close();
+  }
+});

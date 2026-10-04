@@ -1,19 +1,21 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { parseAllow } from "../src/core/allow.ts";
 import type { AuditAllowance, Repo } from "../src/core/types.ts";
@@ -935,6 +937,243 @@ test("hook discovery fails closed on invalid config and honors cancellation even
   await expect(worktreeGit(cmd, { cwd: work, signal: controller.signal, allowFail: true })).rejects.toThrow();
   expect(await headSha(work)).toBe(base);
   expect(readFileSync(global, "utf8")).toBe("[invalid\n");
+});
+
+test("hooks that arrive between cached factory commands are still blanked", async () => {
+  const marker = join(dir, "hook-ran");
+  const hook = (name: string) =>
+    `[hook "${name}"]\n\tcommand = echo ${name} >> '${marker}'\n\tevent = pre-commit\n\tevent = reference-transaction\n`;
+  let round = 0;
+  const commit = async () => {
+    writeFileSync(join(work, "sample.test.ts"), `round ${++round}\n`);
+    expect(await commitAll(work, `round ${round}`)).not.toBeNull();
+    expect(existsSync(marker)).toBe(false);
+  };
+  await commit();
+  // An include added to the shared config, then a hook added to the included file alone.
+  writeFileSync(join(dir, "added.inc"), "[x]\n\ty = 1\n");
+  await git(work, "config", "--add", "include.path", join(dir, "added.inc"));
+  await commit();
+  writeFileSync(join(dir, "added.inc"), hook("added"));
+  await commit();
+  // An include whose target only appears later.
+  await git(work, "config", "--add", "include.path", join(dir, "later.inc"));
+  await commit();
+  writeFileSync(join(dir, "later.inc"), hook("later"));
+  await commit();
+  // Conditional includes that start to apply without their file changing.
+  writeFileSync(join(dir, "branch.inc"), hook("branch"));
+  await git(work, "config", "includeIf.onbranch:hooked/**.path", join(dir, "branch.inc"));
+  await commit();
+  // Switched through the wrapper: a plain `git checkout` would itself run the planted hooks.
+  await factory("checkout", "-q", "-b", "hooked/x");
+  await commit();
+  writeFileSync(join(dir, "remote.inc"), hook("remote"));
+  await git(
+    work,
+    "config",
+    "includeIf.hasconfig:remote.*.url:https://hooked.invalid/**.path",
+    join(dir, "remote.inc"),
+  );
+  await commit();
+  await git(work, "remote", "add", "hooked", "https://hooked.invalid/repo.git");
+  await commit();
+  // Each planted hook is live: git runs it when not blanked (config hooks need Git 2.54).
+  const version = (await git(work, "--version")).stdout.match(/(\d+)\.(\d+)/);
+  if (version && (Number(version[1]) > 2 || Number(version[2]) >= 54)) {
+    await git(work, "hook", "run", "pre-commit");
+    expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual([
+      "added",
+      "branch",
+      "later",
+      "remote",
+    ]);
+  }
+});
+
+test("an unchanged worktree lists its config once and never hashes the empty tree", async () => {
+  const shim = gitShim();
+  const run = (...args: string[]) => worktreeGit(["git", ...args], { cwd: work, env: shim.env });
+  for (let i = 0; i < 3; i++) {
+    await run("status", "--porcelain");
+    await run("diff", base);
+    await run("log", "-1");
+  }
+  const calls = shim.calls();
+  expect(calls.filter((call) => call.includes(" config --list "))).toHaveLength(1);
+  expect(calls.filter((call) => call.includes(" --get-regexp ^hook"))).toEqual([]);
+  expect(calls.filter((call) => call.includes(" hash-object "))).toEqual([]);
+  // Any edit to a config source lists again.
+  await git(work, "config", "user.name", "Edited");
+  await run("status", "--porcelain");
+  expect(shim.calls().filter((call) => call.includes(" config --list "))).toHaveLength(2);
+});
+
+test("a repository found above the working directory is listed again for every command", async () => {
+  // An invalid `.git` directory doesn't stop discovery, and becoming valid later would switch repositories.
+  const sub = join(work, "sub");
+  mkdirSync(join(sub, ".git"), { recursive: true });
+  const shim = gitShim();
+  for (let i = 0; i < 3; i++)
+    await worktreeGit(["git", "status", "--porcelain"], { cwd: sub, env: shim.env });
+  expect(shim.calls().filter((call) => call.includes(" config --list "))).toHaveLength(3);
+});
+
+/** Every hook key git sees in `cwd`, with the value a factory command sees there: "" once blanked. */
+async function hookValues(cwd: string, env = process.env as Record<string, string>) {
+  const listed = await sh(["git", "config", "--null", "--name-only", "--get-regexp", "^hook\\."], {
+    cwd,
+    env,
+    allowFail: true,
+  });
+  const keys = [...new Set(listed.stdout.split("\0").filter(Boolean))];
+  const seen = async (key: string) => [
+    key,
+    (await worktreeGit(["git", "config", "--get", key], { cwd, env })).stdout,
+  ];
+  return Object.fromEntries(await Promise.all(keys.map(seen)));
+}
+const hookConfig = (name: string) => `[hook "${name}"]\n\tcommand = true\n\tevent = pre-commit\n`;
+const blanked = (name: string) => ({ [`hook.${name}.command`]: "\n", [`hook.${name}.event`]: "\n" });
+
+test("a git directory or commondir through a retargeted symlink is resolved again before reuse", async () => {
+  // Recorded worktrees pin GIT_DIR and GIT_COMMON_DIR to real paths; these probes name them by hand.
+  const other = join(dir, "other");
+  await git(dir, "init", "-q", "-b", "main", other);
+  writeFileSync(
+    join(other, ".git", "config"),
+    `${readFileSync(join(other, ".git", "config"))}${hookConfig("other")}`,
+  );
+  const probe = join(dir, "probe");
+  mkdirSync(probe);
+  const viaLink = { ...(process.env as Record<string, string>), GIT_DIR: join(dir, "link") };
+  symlinkSync(join(seed, ".git"), join(dir, "link"));
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe, env: viaLink });
+  rmSync(join(dir, "link"));
+  symlinkSync(join(other, ".git"), join(dir, "link"));
+  expect(await hookValues(probe, viaLink)).toEqual(blanked("other"));
+  // A worktree's administrative directory whose commondir runs through a symlink.
+  const admin = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
+  const viaAdmin = { ...(process.env as Record<string, string>), GIT_DIR: admin };
+  symlinkSync(join(seed, ".git"), join(dir, "common"));
+  writeFileSync(join(admin, "commondir"), `${join(dir, "common")}\n`);
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe, env: viaAdmin });
+  rmSync(join(dir, "common"));
+  symlinkSync(join(other, ".git"), join(dir, "common"));
+  expect(await hookValues(probe, viaAdmin)).toEqual(blanked("other"));
+});
+
+test("a commondir path with a trailing space is resolved as git reads it", async () => {
+  const other = join(dir, "other");
+  await git(dir, "init", "-q", "-b", "main", other);
+  writeFileSync(
+    join(other, ".git", "config"),
+    `${readFileSync(join(other, ".git", "config"))}${hookConfig("other")}`,
+  );
+  // Git keeps the trailing space: `common ` is the pointer, `common` only a decoy with the same target.
+  for (const name of ["common", "common "]) symlinkSync(join(seed, ".git"), join(dir, name));
+  const admin = (await git(work, "rev-parse", "--absolute-git-dir")).stdout.trim();
+  writeFileSync(join(admin, "commondir"), `${join(dir, "common ")}\n`);
+  const probe = join(dir, "probe");
+  mkdirSync(probe);
+  const env = { ...(process.env as Record<string, string>), GIT_DIR: admin };
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: probe, env });
+  rmSync(join(dir, "common "));
+  symlinkSync(join(other, ".git"), join(dir, "common "));
+  expect(await hookValues(probe, env)).toEqual(blanked("other"));
+});
+
+test("a nested .git that stops being a repository hands over to the one above, and is listed again", async () => {
+  const outer = join(dir, "outer");
+  const inner = join(outer, "inner");
+  await git(dir, "init", "-q", "-b", "main", outer);
+  await git(dir, "init", "-q", "-b", "main", inner);
+  writeFileSync(
+    join(outer, ".git", "config"),
+    `${readFileSync(join(outer, ".git", "config"))}${hookConfig("outer")}`,
+  );
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: inner });
+  // Without refs/ (or objects/, or a valid HEAD) git skips inner/.git and finds outer's.
+  renameSync(join(inner, ".git", "refs"), join(inner, ".git", "refs.moved"));
+  expect(await hookValues(inner)).toEqual(blanked("outer"));
+});
+
+test("a nested .git whose objects/ can't be searched hands over to the one above", async () => {
+  const outer = join(dir, "outer-objects");
+  const inner = join(outer, "inner");
+  await git(dir, "init", "-q", "-b", "main", outer);
+  await git(dir, "init", "-q", "-b", "main", inner);
+  writeFileSync(
+    join(outer, ".git", "config"),
+    `${readFileSync(join(outer, ".git", "config"))}${hookConfig("outer2")}`,
+  );
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: inner });
+  // is_git_directory also needs objects/ to be searchable, not only a directory.
+  const objects = join(inner, ".git", "objects");
+  chmodSync(objects, 0o644);
+  try {
+    expect(await hookValues(inner)).toEqual(blanked("outer2"));
+  } finally {
+    chmodSync(objects, 0o755);
+  }
+});
+
+test("a branch switch in a reftable repository is listed again, since its HEAD is not a file", async () => {
+  const version = (await git(dir, "--version")).stdout.match(/(\d+)\.(\d+)/);
+  if (!version || (Number(version[1]) === 2 && Number(version[2]) < 45)) return; // reftable needs Git 2.45
+  const repo = join(dir, "reftable");
+  await git(dir, "init", "-q", "-b", "main", "--ref-format=reftable", repo);
+  writeFileSync(join(dir, "branch.inc"), hookConfig("branch"));
+  await git(repo, "config", "includeIf.onbranch:hooked/**.path", join(dir, "branch.inc"));
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: repo });
+  await git(repo, "symbolic-ref", "HEAD", "refs/heads/hooked/x");
+  expect(await hookValues(repo)).toEqual(blanked("branch"));
+});
+
+test("config edited while it is being listed is listed again before the command runs", async () => {
+  const bin = join(dir, "racy");
+  const edited = join(dir, "edited");
+  const real = Bun.which("git");
+  mkdirSync(bin);
+  // The first listing finishes, then the repository config gains a hook before git exits.
+  writeFileSync(
+    join(bin, "git"),
+    `#!/bin/sh\ncase "$* " in *" config --list "*) if [ ! -e '${edited}' ]; then out=$('${real}' "$@" | base64); touch '${edited}'; '${real}' -C '${seed}' config hook.racy.command true; '${real}' -C '${seed}' config hook.racy.event pre-commit; printf '%s' "$out" | base64 -d; exit 0; fi;; esac\nexec '${real}' "$@"\n`,
+    { mode: 0o755 },
+  );
+  const env = { ...(process.env as Record<string, string>), PATH: `${bin}:${process.env.PATH}` };
+  expect(
+    (await worktreeGit(["git", "config", "--get", "hook.racy.command"], { cwd: work, env })).stdout,
+  ).toBe("\n");
+  expect(existsSync(edited)).toBe(true);
+});
+
+test("hooks added through GIT_CONFIG_* variables are blanked in an already cached worktree", async () => {
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: work });
+  const env = {
+    ...(process.env as Record<string, string>),
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: "hook.envy.command",
+    GIT_CONFIG_VALUE_0: "true",
+    GIT_CONFIG_KEY_1: "hook.envy.event",
+    GIT_CONFIG_VALUE_1: "pre-commit",
+  };
+  expect(await hookValues(work, env)).toEqual(blanked("envy"));
+});
+
+test("a global or XDG config file created after caching is listed again", async () => {
+  const { GIT_CONFIG_GLOBAL: _global, ...base } = process.env as Record<string, string>;
+  const home = join(dir, "home");
+  const variants: [Record<string, string>, string][] = [
+    [{ ...base, GIT_CONFIG_GLOBAL: join(dir, "global.config") }, join(dir, "global.config")],
+    [{ ...base, HOME: home, XDG_CONFIG_HOME: join(home, "xdg") }, join(home, "xdg", "git", "config")],
+  ];
+  for (const [env, file] of variants) {
+    await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: work, env });
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, hookConfig("global"));
+    expect(await hookValues(work, env)).toEqual(blanked("global"));
+  }
 });
 
 test("local pipeline scope retains original git settings and index behavior", async () => {

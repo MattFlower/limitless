@@ -1047,7 +1047,11 @@ ${mode === "escaped-timeout" ? `{name: 'next', run: async () => ({status: 'pass'
         process.execPath,
         ...(timed || ownTimeout || mode === "completed" || mode === "probe"
           ? [entry]
-          : ["scripts/smoke.ts", "--models", mode === "SIGTERM" ? "codex/luna@low" : "claude/sonnet@low"]),
+          : [
+              "scripts/smoke.ts",
+              "--models",
+              mode === "SIGTERM" ? "codex/luna@low" : "claude/sonnet-5.5@low",
+            ]),
       ],
       {
         env: {
