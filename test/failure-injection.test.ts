@@ -1829,7 +1829,8 @@ test("the budget bounds retries and waits, never a call's first attempt or a hea
   // A healthy push that takes longer than the budget left still completes on its own timeout.
   writeFileSync(
     join(root, "bin", "git"),
-    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\nif [ "$command" = config ]; then exec /usr/bin/git "$@"; fi\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
+    // The wrapper's own lookups (version, config, repository) reach real git; anything else is the push.
+    `#!/bin/sh\ncommand=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) break;; esac; done; printf '%s' "$1")\ncase "$command" in config|rev-parse|var|--version) exec /usr/bin/git "$@";; esac\nsleep 0.3\necho "$@" >> '${join(root, "pushes")}'\n`,
     {
       mode: 0o755,
     },

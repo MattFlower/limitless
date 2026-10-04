@@ -7907,7 +7907,8 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     const f = start(handler);
     shadowOn(f);
     slowRoster(f);
-    f.deps.cfg.reviewShadowGraceSeconds = 0;
+    // Long enough for the fast finder to be recorded; at 0 that raced the single review's completion.
+    f.deps.cfg.reviewShadowGraceSeconds = 0.5;
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     const stage = f.store.listStages(run.id).find((st) => st.name === "review");
@@ -8153,7 +8154,8 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     });
     shadowOn(f);
     slowRoster(f);
-    f.deps.cfg.reviewShadowGraceSeconds = 0;
+    // Long enough for the fast finder to be recorded; at 0 that raced the single review's completion.
+    f.deps.cfg.reviewShadowGraceSeconds = 0.5;
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
     const deadline = Date.now() + 10_000;
     while (!(slow.length && f.tracker.status("beta")?.inFlight === 2) && Date.now() < deadline)
