@@ -163,7 +163,9 @@ export async function waitForDrain(
       try {
         return validateHealth(await bounded(clock, (signal) => client.health(signal), budget()));
       } catch (error) {
-        if (!(error instanceof DaemonTimeoutError) || attempt >= MAX_POLL_ATTEMPTS) throw error;
+        // --now and zero-wait deploys keep their single, short attempt.
+        const retries = now || maxWaitMs === 0 ? 1 : MAX_POLL_ATTEMPTS;
+        if (!(error instanceof DaemonTimeoutError) || attempt >= retries) throw error;
         await clock.sleep(Math.min(2000, remaining()));
         if (remaining() === 0) throw error;
         log(`Health poll timed out (attempt ${attempt} of ${MAX_POLL_ATTEMPTS}); retrying`);

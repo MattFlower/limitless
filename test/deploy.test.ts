@@ -422,6 +422,24 @@ test("malformed health fails closed and never restarts", async () => {
   expect(f.calls).not.toContain("resume");
 });
 
+test("--now and zero-wait drains don't retry a stalled health poll", async () => {
+  for (const [maxWaitMs, now] of [
+    [60_000, true],
+    [0, false],
+  ] as const) {
+    const f = setup();
+    let reads = 0;
+    f.client.health = async () => {
+      reads++;
+      throw new DaemonTimeoutError();
+    };
+    await expect(waitForDrain(f.client, f.clock, maxWaitMs, now, () => {})).rejects.toThrow(
+      "daemon request timed out",
+    );
+    expect(reads).toBe(1);
+  }
+});
+
 test("a drain tolerates two stalled health polls in a row but not three", async () => {
   for (const stalls of [2, 3]) {
     const f = setup();
@@ -442,16 +460,19 @@ test("a drain tolerates two stalled health polls in a row but not three", async 
   }
 });
 
-test("resume retries a stalled daemon with a longer limit", async () => {
+test("resume retries a stalled daemon with a longer limit, up to three attempts", async () => {
   const f = setup();
   let calls = 0;
   f.client.admin = async (action) => {
-    if (++calls === 1) throw new DaemonTimeoutError();
+    if (++calls < 3) throw new DaemonTimeoutError();
     return { draining: action === "drain", active: [] };
   };
   await requestAdmin(f.client, f.clock, "resume");
-  expect(calls).toBe(2);
-  expect(f.timeouts).toEqual([15_000, 15_000]);
+  expect(calls).toBe(3);
+  expect(f.timeouts).toEqual([15_000, 15_000, 15_000]);
+  calls = -10;
+  await expect(requestAdmin(f.client, f.clock, "resume")).rejects.toThrow("daemon request timed out");
+  expect(calls).toBe(-7);
   f.client.admin = async () => {
     throw new DaemonTimeoutError();
   };
