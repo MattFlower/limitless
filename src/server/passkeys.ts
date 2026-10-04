@@ -18,9 +18,16 @@ const MAX_CHALLENGES = 1000;
 const USER = { userName: "limitless", userID: new TextEncoder().encode("limitless") };
 
 const sha256 = (token: string) => createHash("sha256").update(token).digest("hex");
-/** Failure detail for the log, with long tokens (challenges, credential ids, keys) cut out. */
+/**
+ * Failure detail for the log. The library quotes the values it compares (challenges, origins), and those
+ * can come from the client, so quoted values, long tokens and control characters are cut out.
+ */
 const redact = (error: unknown) =>
-  (error instanceof Error ? error.message : String(error)).replace(/[\w-]{16,}/g, "[redacted]");
+  (error instanceof Error ? error.message : String(error))
+    .replace(/\p{Cc}/gu, " ")
+    .replace(/"[^"]*"/g, '"[redacted]"')
+    .replace(/[\w-]{16,}/g, "[redacted]")
+    .slice(0, 300);
 
 /**
  * WebAuthn passkeys for the first public origin (its host is the relying party). Registration needs a
