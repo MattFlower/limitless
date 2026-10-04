@@ -135,6 +135,8 @@ export interface Run {
   status: RunStatus;
   dependsOn: string[];
   prClosedUnmerged: boolean;
+  /** How a `resolved` run was dealt with; null for every other status. */
+  resolution: RunResolution | null;
   stage: StageName | null;
   baseBranch: string | null;
   deliveryBranch: string | null;
@@ -158,6 +160,16 @@ export interface Run {
   noBaselineCache?: boolean;
   /** Persisted at creation from requester-authored text or options only; legacy runs allow nothing. */
   allow?: AuditAllowance[];
+}
+
+export type ResolutionKind = "merged" | "done_elsewhere" | "superseded" | "wont_do" | "pr_closed";
+/** `ref`: a run id or PR URL; `by`: "human", "github" or "system"; `at`: epoch ms. */
+export interface RunResolution {
+  kind: ResolutionKind;
+  ref: string | null;
+  note: string | null;
+  by: string;
+  at: number;
 }
 
 /** Blocking audit rules a requester may explicitly allow. */
@@ -340,7 +352,8 @@ export type StreamMessage =
   | { kind: "feed"; item: FeedItem };
 
 export type FeedKind =
-  | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged"}`
+  | "run.gate_timeout_retry"
+  | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged" | "resolved"}`
   | "eval.finished"
   | "daemon.started"
   | GitHubFeedKind;

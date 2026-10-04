@@ -256,11 +256,18 @@ export const RunDetail: Component = () => {
                         pull request ↗
                       </a>
                     </Show>
-                    <Show when={r().status === "resolved"}>
+                    <Show when={r().merged}>
                       <span>·</span>
                       <span>
                         Merged by {r().mergedBy ?? "unknown"}
                         {r().mergedAt ? ` on ${new Date(r().mergedAt as number).toLocaleString()}` : ""}
+                      </span>
+                    </Show>
+                    <Show when={r().status === "resolved" && !r().merged && r().resolution}>
+                      <span>·</span>
+                      <span>
+                        Resolved as {r().resolution?.kind}
+                        {r().resolution?.note ? `: ${r().resolution?.note}` : ""}
                       </span>
                     </Show>
                   </div>

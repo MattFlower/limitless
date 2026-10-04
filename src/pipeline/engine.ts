@@ -317,7 +317,7 @@ function gateEvents(ctx: RunContext): Required<GateHooks> {
         runId: ctx.run.id,
         type: "gate",
         level: r.ok ? "info" : "warn",
-        message: `${r.name}: ${r.ok ? "pass" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
+        message: `${r.name}: ${r.ok ? "pass" : r.timedOut ? "timed out" : "FAIL"} (${Math.round(r.durationMs / 1000)}s)`,
         data: r,
       }),
     onWait: (slots) =>
@@ -981,23 +981,45 @@ async function oneRound(
     async () => {
       const events = gateEvents(ctx);
       let cmp: GateComparison[];
+      let baseTimeout = false;
       try {
         await discardChanges(cwd);
-        const after = await runGates(cwd, gates, ctx.signal, events);
+        let after = await runGates(cwd, gates, ctx.signal, events);
         ctx.checkCancelled();
+        baseTimeout = after.checks.some(
+          (r) => r.timedOut && ctx.state.baseline?.checks.some((b) => b.name === r.name && b.timedOut),
+        );
+        const failed = after.checks.filter((r) => !r.ok);
+        const timeoutOnly = after.setupOk && failed.length > 0 && failed.every((r) => r.timedOut);
+        if (timeoutOnly && !baseTimeout) {
+          const first = after;
+          ctx.store.putArtifact(ctx.run.id, `gates-timeout-${round}.json`, "gates", JSON.stringify(first));
+          ctx.state.gateTimeoutReruns = (ctx.state.gateTimeoutReruns ?? 0) + 1;
+          await ctx.save();
+          ctx.log(
+            `Gate checks timed out; re-running gates (timeout re-runs: ${ctx.state.gateTimeoutReruns})`,
+            "warn",
+          );
+          after = await runGates(cwd, gates, ctx.signal, events);
+          ctx.checkCancelled();
+          after.checks = after.checks.map((r) => ({
+            ...r,
+            firstAttempt: first.checks.find((c) => c.name === r.name),
+          }));
+        }
         const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
         // Retry before discarding, so a check sees the same build output as its first attempt.
-        cmp = await retryRegressions(
-          compareGates(ctx.state.baseline ?? null, after),
-          cwd,
-          gates,
-          changed,
-          ctx.signal,
-          events.onWait,
-        );
+        cmp = compareGates(ctx.state.baseline ?? null, after).map((c) => ({
+          ...c,
+          firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
+        }));
+        if (!baseTimeout) cmp = await retryRegressions(cmp, cwd, gates, changed, ctx.signal, events.onWait);
         ctx.checkCancelled();
-        // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
+        baseTimeout ||= after.checks.some(
+          (r) => r.timedOut && ctx.state.baseline?.checks.some((b) => b.name === r.name && b.timedOut),
+        );
       } finally {
+        // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
         await discardChanges(cwd);
       }
       for (const c of cmp.filter((c) => c.firstAttempt)) {
@@ -1005,12 +1027,16 @@ async function oneRound(
           runId: ctx.run.id,
           type: "gate",
           level: "warn",
-          message: `${c.name} retry: ${c.result.ok ? "pass (flaky, not blocking)" : "FAIL again"}`,
-          data: { flaky: c.result.ok, firstAttempt: c.firstAttempt, retry: c.result },
+          message: `${c.name} retry: ${c.result.timedOut ? "timed out again" : c.result.ok ? (c.firstAttempt?.timedOut ? "pass after timeout" : "pass (flaky, not blocking)") : "FAIL again"}`,
+          data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
         });
       }
       ctx.state.lastGates = cmp;
       ctx.store.putArtifact(ctx.run.id, `gates-${round}.json`, "gates", JSON.stringify(cmp, null, 2));
+      if (baseTimeout) {
+        await ctx.save();
+        throw new NeedsHumanError("gate timed out on the base revision too");
+      }
       const blocking = cmp.filter((c) => c.blocking).map((c) => c.name);
       const flaky = cmp.filter((c) => c.verdict === "flaky").map((c) => c.name);
       return {
@@ -1085,7 +1111,7 @@ async function oneRound(
     round,
   );
 
-  const gateFeedback = formatGateFeedback(comparison);
+  const gateFeedback = formatGateFeedback(comparison, gates);
   const auditFeedback = formatAuditFeedback(audit);
   if (gateFeedback || auditFeedback) {
     // Don't spend reviewer tokens on work that fails deterministic checks.
@@ -1094,7 +1120,12 @@ async function oneRound(
       : "";
     ctx.state.feedback = [issue, gateFeedback, auditFeedback].filter(Boolean).join("\n\n");
     await ctx.save();
-    ctx.log("Deterministic checks failed; sending feedback to implementer", "warn");
+    ctx.log(
+      comparison.some((c) => c.blocking && c.result.timedOut)
+        ? "Gate checks timed out; sending timeout feedback to implementer"
+        : "Deterministic checks failed; sending feedback to implementer",
+      "warn",
+    );
     return false;
   }
 

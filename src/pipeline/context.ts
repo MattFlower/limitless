@@ -119,6 +119,7 @@ export interface RunState {
   baselineScripts?: Record<string, string>;
   feedback: string | null;
   lastGates?: GateComparison[];
+  gateTimeoutReruns?: number;
   lastAudit?: AuditFinding[];
   lastReview?: Review & { modelId: string };
   reviewedSha?: string;

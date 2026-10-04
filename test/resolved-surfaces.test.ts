@@ -146,6 +146,28 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
     expect(detail).toContain('class="pill pill-resolved">resolved');
     expect(detail).toContain("Merged by reviewer on ");
     expect(detail).toContain("pull request ↗");
+    const manual: Run = {
+      ...resolved,
+      merged: false,
+      mergedBy: null,
+      mergedAt: null,
+      resolution: {
+        kind: "done_elsewhere",
+        by: "human",
+        at: 42,
+        ref: null,
+        note: "Handled in another change",
+      },
+    };
+    const manualDetail = renderToString(() => withFixture(manual));
+    expect(manualDetail).toContain("done_elsewhere");
+    expect(manualDetail).toContain("Handled in another change");
+    expect(manualDetail).not.toContain("Merged by");
+    expect(
+      renderToString(() =>
+        withFixture({ ...manual, merged: true, mergedBy: "owner", mergedAt: resolved.mergedAt }),
+      ),
+    ).toContain("Merged by owner on ");
     const waiting: Run = {
       ...resolved,
       status: "waiting",

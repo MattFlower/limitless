@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuditAllowance, CreateRunRequest } from "../src/core/types.ts";
@@ -184,6 +184,39 @@ test("dependency migration upgrades existing runs and round-trips waiting runs",
     store = new Store(path);
     expect(store.getRun(run.id)).toMatchObject({ dependsOn: ["old"], status: "waiting" });
     store.close();
+  });
+});
+
+test("the resolution migration backfills legacy resolved runs as merged without feed items", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, { recursive: true, filter: (src) => !src.endsWith("-run-resolution.sql") });
+    const old = new Store(path, before);
+    old.db.exec("INSERT INTO repos (id, slug, kind, created_at) VALUES ('repo', 'local', 'local', 1)");
+    for (const [id, status, pr, mergedAt, finishedAt] of [
+      ["merged", "resolved", "https://github.com/o/r/pull/1", 30, 20],
+      ["no-merged-at", "resolved", null, null, 20],
+      ["bare", "resolved", null, null, null],
+      ["open", "needs_human", "https://github.com/o/r/pull/2", null, 20],
+    ] as const)
+      old.db
+        .query(
+          "INSERT INTO runs (id, repo_id, title, prompt, source, status, pr_url, merged_at, finished_at, created_at) VALUES (?, 'repo', 't', 'p', 'cli', ?, ?, ?, ?, 10)",
+        )
+        .run(id, status, pr, mergedAt, finishedAt);
+    old.close();
+    for (let open = 0; open < 2; open++) {
+      const store = new Store(path);
+      const resolution = (id: string) => store.getRun(id)?.resolution;
+      const merged = { kind: "merged", note: null, by: "github" } as const;
+      expect(resolution("merged")).toEqual({ ...merged, ref: "https://github.com/o/r/pull/1", at: 30 });
+      expect(resolution("no-merged-at")).toEqual({ ...merged, ref: null, at: 20 });
+      expect(resolution("bare")).toEqual({ ...merged, ref: null, at: 10 });
+      expect(resolution("open")).toBeNull();
+      const kinds = store.readFeed({ after: 0, limit: 100 }).items.map((i) => i.kind);
+      expect(kinds).toEqual(["run.needs_human"]); // the insert-time item, never a run.resolved
+      store.close();
+    }
   });
 });
 
