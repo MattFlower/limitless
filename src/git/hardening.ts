@@ -111,6 +111,7 @@ function locate(cwd: string, git: string[], env: Record<string, string>): string
     const head = read(join(gitDir, "HEAD"));
     if (!head || head === "dir" || !/^(ref: |[0-9a-f]{40})/.test(head.data.toString())) return undefined;
     if (!statSync(join(commonDir, "objects")).isDirectory()) return undefined;
+    accessSync(join(commonDir, "objects"), constants.X_OK);
     if (!statSync(join(commonDir, "refs")).isDirectory()) return undefined;
     accessSync(join(commonDir, "refs"), constants.X_OK);
     return `${gitDir}\0${commonDir}`;

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   linkSync,
   mkdirSync,
@@ -1057,6 +1058,26 @@ test("a nested .git that stops being a repository hands over to the one above, a
   // Without refs/ (or objects/, or a valid HEAD) git skips inner/.git and finds outer's.
   renameSync(join(inner, ".git", "refs"), join(inner, ".git", "refs.moved"));
   expect(await hookValues(inner)).toEqual(blanked("outer"));
+});
+
+test("a nested .git whose objects/ can't be searched hands over to the one above", async () => {
+  const outer = join(dir, "outer-objects");
+  const inner = join(outer, "inner");
+  await git(dir, "init", "-q", "-b", "main", outer);
+  await git(dir, "init", "-q", "-b", "main", inner);
+  writeFileSync(
+    join(outer, ".git", "config"),
+    `${readFileSync(join(outer, ".git", "config"))}${hookConfig("outer2")}`,
+  );
+  await worktreeGit(["git", "rev-parse", "--git-dir"], { cwd: inner });
+  // is_git_directory also needs objects/ to be searchable, not only a directory.
+  const objects = join(inner, ".git", "objects");
+  chmodSync(objects, 0o644);
+  try {
+    expect(await hookValues(inner)).toEqual(blanked("outer2"));
+  } finally {
+    chmodSync(objects, 0o755);
+  }
 });
 
 test("a branch switch in a reftable repository is listed again, since its HEAD is not a file", async () => {
