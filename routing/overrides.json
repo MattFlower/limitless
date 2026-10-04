@@ -4,20 +4,20 @@
     "decided": "2026-10-01"
   },
   "implement.trivial": {
-    "reason": "Field trial (owner decision, 2026-10-01): Sol 6.1 at high effort first, through the Codex subscription, with Opus as the fallback. The implement eval cannot rank models (every model scores 100%), so evidence comes from factory runs: rounds to converge, verify first-pass rate and review findings, compared with recent Opus-first runs. Large work stays Opus-first.",
-    "decided": "2026-10-01"
+    "reason": "Codex first while banked Codex resets last (owner decision, 2026-10-03): Sol 6.1 at high effort, then Astra at high effort, then Opus. This continues the Sol 6.1 field trial of 2026-10-01 (the implement eval cannot rank models; every model scores 100%), and now also keeps escalation on Codex before any Claude model. See routing/EVIDENCE.md.",
+    "decided": "2026-10-03"
   },
   "implement.small": {
-    "reason": "Field trial (owner decision, 2026-10-01): Sol 6.1 at high effort first, through the Codex subscription, with Opus as the fallback. The implement eval cannot rank models (every model scores 100%), so evidence comes from factory runs: rounds to converge, verify first-pass rate and review findings, compared with recent Opus-first runs. Large work stays Opus-first.",
-    "decided": "2026-10-01"
+    "reason": "Codex first while banked Codex resets last (owner decision, 2026-10-03): Sol 6.1 at high effort, then Astra at high effort, then Opus. This continues the Sol 6.1 field trial of 2026-10-01 (the implement eval cannot rank models; every model scores 100%), and now also keeps escalation on Codex before any Claude model. See routing/EVIDENCE.md.",
+    "decided": "2026-10-03"
   },
   "implement.medium": {
-    "reason": "Field trial (owner decision, 2026-10-01): Sol 6.1 at high effort first, through the Codex subscription, with Opus as the fallback. The implement eval cannot rank models (every model scores 100%), so evidence comes from factory runs: rounds to converge, verify first-pass rate and review findings, compared with recent Opus-first runs. Large work stays Opus-first.",
-    "decided": "2026-10-01"
+    "reason": "Codex first while banked Codex resets last (owner decision, 2026-10-03): Sol 6.1 at high effort, then Astra at high effort, then Opus. This continues the Sol 6.1 field trial of 2026-10-01 (the implement eval cannot rank models; every model scores 100%), and now also keeps escalation on Codex before any Claude model. See routing/EVIDENCE.md.",
+    "decided": "2026-10-03"
   },
   "implement.large": {
-    "reason": "Opus first, Sol fallback: the implement eval has a ceiling (every model scored 100%), so Luna led on cost alone; field use shows Opus far stronger on hard, underspecified work. Revisit when the dataset is stratified by difficulty.",
-    "decided": "2026-09-28"
+    "reason": "Codex first while banked Codex resets last (owner decision, 2026-10-03): Astra at high effort, then Sol 6.1 at high effort, then Opus. Previously Opus first, because field use showed Opus stronger on hard, underspecified work. Revisit when the resets are gone, or if Codex-implemented large runs need more rounds or draw more review findings. See routing/EVIDENCE.md.",
+    "decided": "2026-10-03"
   },
   "review.default": {
     "reason": "Sol 6.1 first: on review eval v2 (eval-muo4xsbk3p8f, Codex, medium effort, k=3) it matched Sol 6.0 on blocking recall (27.6% vs 28.6%), caught more high-severity defects (50.0% vs 37.5%) and falsely blocked clean changes half as often (18.2% vs 36.4%), at the same cost and latency. The rest of each chain is the previous default. Neither model clears the review floors yet; this pins the better of the two. Opus, not Sonnet 5, is the Anthropic reviewer in the first group (2026-10-01): a reviewer avoids the implementer's vendor, so a Sol-implemented run is reviewed by the first non-OpenAI entry, and on review eval v2 Opus 5.5 caught 23.0% of blocking defects with 3.0% clean false-blocks against Sonnet 5's 10.5% and 9.1% (eval-munjly1s57xk).",

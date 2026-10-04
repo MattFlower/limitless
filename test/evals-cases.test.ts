@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,7 @@ import {
   loadCases,
   loadRoleCases,
   ReviewCaseFileSchema,
+  ReviewCaseSchema,
   VerifyCaseFileSchema,
   validateRequest,
 } from "../src/evals/cases.ts";
@@ -439,4 +441,80 @@ test("concurrency defaults to 2 and rejects non-positive, fractional and unsafe 
   } finally {
     await f.close();
   }
+});
+
+test("review label history preserves legacy cases and rejects empty, inconsistent and broken chains", async () => {
+  const { reviewCase } = await import("./evals-reading-support.ts");
+  const entry = {
+    from: "clean",
+    to: "real",
+    on: "2026-10-03",
+    rule: "evals/review/LABELS.md",
+    by: "independent adjudicator",
+    evidence: "reproduction confirmed",
+  };
+  expect(ReviewCaseSchema.safeParse(reviewCase).success).toBe(true);
+  expect(ReviewCaseSchema.safeParse({ ...reviewCase, labelHistory: [entry] }).success).toBe(true);
+  expect(
+    ReviewCaseSchema.safeParse({
+      ...reviewCase,
+      labelHistory: [entry, { ...entry, from: "real", to: "seeded" }],
+      kind: "seeded",
+    }).success,
+  ).toBe(true);
+  for (const over of [
+    { labelHistory: [] },
+    { kind: "clean", labelHistory: [entry] },
+    { labelHistory: [entry, entry] },
+    { labelHistory: [{ ...entry, from: "unknown" }] },
+    { labelHistory: [{ ...entry, on: "2026-02-30" }] },
+    { labelHistory: [{ ...entry, evidence: " " }] },
+  ])
+    expect(ReviewCaseSchema.safeParse({ ...reviewCase, ...over }).success).toBe(false);
+});
+
+test("adjudicated review cases have required major defects at their pinned heads; other audited labels stay clean", () => {
+  const file = ReviewCaseFileSchema.parse(loadRoleCases("review"));
+  const expected = [
+    ["review-033", "ui/components/InvocationsTable.tsx", [51, 52], "onPointerLeave", "accessibility"],
+    ["review-036", "src/pipeline/verification.ts", [17, 18], "publicIds.has", "privacy"],
+    [
+      "review-037",
+      "src/integrations/github-notifier.ts",
+      [28, 37],
+      "limit: Number.MAX_SAFE_INTEGER",
+      "performance",
+    ],
+    ["review-039", "src/pipeline/engine.ts", [999, 999], "pushBranch", "delivery"],
+    ["review-039", "src/git/repos.ts", [332, 338], '"--body-file"', "delivery"],
+    ["review-039", "src/pipeline/engine.ts", [964, 968], "recordVerified", "delivery"],
+  ] as const;
+  for (const [id, path, range, snippet, category] of expected) {
+    const item = file.cases.find((c) => c.id === id);
+    if (!item) throw new Error(`missing ${id}`);
+    expect(item.kind).toBe("real");
+    expect(item.labelHistory).toHaveLength(1);
+    expect(item.labelHistory?.[0]).toMatchObject({
+      from: "clean",
+      to: "real",
+      on: "2026-10-03",
+      rule: "evals/review/LABELS.md",
+      by: "adjudication 2026-10-03 (codex/sol-6.1 high), reproduction confirmed by the orchestrator",
+    });
+    expect(item.defects).toContainEqual(
+      expect.objectContaining({ file: path, lines: [...range], severity: "major", required: true, category }),
+    );
+    expect(item.labelHistory?.[0]?.evidence).toContain("Base");
+    // Pinned heads are PR commits that squash merges leave outside main, so CI's checkout lacks them.
+    if (spawnSync("git", ["cat-file", "-e", `${item.head}^{commit}`]).status !== 0) continue;
+    const source = execFileSync("git", ["show", `${item.head}:${path}`], { encoding: "utf8" }).split("\n");
+    expect(range[0]).toBeGreaterThan(0);
+    expect(range[1]).toBeLessThan(source.length);
+    expect(source.slice(range[0] - 1, range[1]).join("\n")).toContain(snippet);
+  }
+  for (const id of ["review-010", "review-034", "review-038"]) {
+    expect(file.cases.find((c) => c.id === id)).toMatchObject({ kind: "clean", defects: [] });
+    expect(file.cases.find((c) => c.id === id)?.labelHistory).toBeUndefined();
+  }
+  expect(file.cases.find((c) => c.id === "review-039")?.defects).toHaveLength(3);
 });

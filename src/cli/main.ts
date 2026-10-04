@@ -37,6 +37,10 @@ Usage:
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
   limitless doctor                        Report GitHub access problems the PR poller recorded
+  limitless auth add-passkey              Print a one-time link (10 minutes) that registers a UI passkey
+  limitless auth passkeys [remove <id>]   List or remove UI passkeys
+  limitless auth set-password             Set the UI sign-in password (prompted, never echoed)
+  limitless auth sessions [revoke <id>|revoke --all]  List or revoke UI sign-in sessions
   limitless gc [--dry-run]                Clean up expired worktrees, logs, debug events and baseline cache
   limitless gates clear-cache [--repo owner/name]  Drop cached passing baselines (all repos by default)
   limitless mcp                           MCP stdio proxy (daemon must be running)
@@ -222,6 +226,7 @@ async function main(): Promise<void> {
       "max-wait": { type: "string" },
       now: { type: "boolean" },
       since: { type: "string" },
+      all: { type: "boolean" },
     },
   });
   const [cmd, ...rest] = positionals;
@@ -237,6 +242,10 @@ async function main(): Promise<void> {
     case "feed": {
       const { feedCommand } = await import("./feed.ts");
       return feedCommand(rest, values, { api, print: console.log });
+    }
+    case "auth": {
+      const { authCommand } = await import("./auth.ts");
+      return authCommand(rest, values.all === true, { api, print: console.log });
     }
     case "serve":
       return serve();
