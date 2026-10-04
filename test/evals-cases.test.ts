@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -504,11 +504,13 @@ test("adjudicated review cases have required major defects at their pinned heads
     expect(item.defects).toContainEqual(
       expect.objectContaining({ file: path, lines: [...range], severity: "major", required: true, category }),
     );
+    expect(item.labelHistory?.[0]?.evidence).toContain("Base");
+    // Pinned heads are PR commits that squash merges leave outside main, so CI's checkout lacks them.
+    if (spawnSync("git", ["cat-file", "-e", `${item.head}^{commit}`]).status !== 0) continue;
     const source = execFileSync("git", ["show", `${item.head}:${path}`], { encoding: "utf8" }).split("\n");
     expect(range[0]).toBeGreaterThan(0);
     expect(range[1]).toBeLessThan(source.length);
     expect(source.slice(range[0] - 1, range[1]).join("\n")).toContain(snippet);
-    expect(item.labelHistory?.[0]?.evidence).toContain("Base");
   }
   for (const id of ["review-010", "review-034", "review-038"]) {
     expect(file.cases.find((c) => c.id === id)).toMatchObject({ kind: "clean", defects: [] });
