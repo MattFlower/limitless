@@ -1405,6 +1405,75 @@ esac
     const artifact = JSON.parse(resumed.store.getArtifact(run.id, "review-0.json") ?? "{}");
     expect(artifact).toMatchObject({ verdict: "request_changes", modelVerdict: "approve" });
   });
+  test.each([
+    ["sticks with it", 1, "alpha/m"],
+    ["escalates beyond it", 2, "beta/m"],
+  ])(
+    "a run restarted on an implementer since removed from the catalog routes to an available model when it %s",
+    async (_, roundsOnImplementer, next) => {
+      let reviews = 0;
+      const blocker = {
+        severity: "major" as const,
+        security: false,
+        ...findingEvidence,
+        file: "farewell.txt",
+        line: 1,
+        title: "First blocker",
+        detail: "First blocker",
+        suggestion: "Fix",
+      };
+      const handler: Handler = (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review")
+          return { structured: { ...approve, findings: ++reviews === 1 ? [blocker] : [] } };
+        return { files: { "farewell.txt": `goodbye ${reviews}\n` } };
+      };
+      const f = start(handler);
+      // Round 1 starts after a restart from state saved when the run was on GPT-6 Astra.
+      f.deps.faults = {
+        "stage:implement:before": {
+          action: "kill",
+          occurrence: 2,
+          onHit: ({ runId }) => {
+            const state = f.store.getRunState<RunState>(runId);
+            if (!state) throw new Error("missing run state");
+            const astra = { modelId: "codex/astra", effort: "high" as const };
+            state.implementer = { ...astra, targetId: "codex/astra@high", tier: 5, vendor: "openai" };
+            state.triedImplementers.push(astra);
+            state.roundsOnImplementer = roundsOnImplementer;
+            f.store.setRunState(runId, state);
+          },
+        },
+      };
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      const deadline = Date.now() + 10_000;
+      while (
+        f.store
+          .listStages(run.id)
+          .filter((s) => s.name === "implement")
+          .at(-1)?.status !== "cancelled"
+      ) {
+        if (Date.now() > deadline) throw new Error("implement interruption timed out");
+        await Bun.sleep(10);
+      }
+      await f.stop();
+      f.store.close();
+      const resumed = start(handler);
+      expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const implemented = resumed.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.modelId);
+      expect(implemented).toEqual(["alpha/m", next]);
+      expect(resumed.store.getRunState<RunState>(run.id)?.implementer?.modelId).toBe(next);
+      const escalated = resumed.store
+        .listEvents(run.id)
+        .some((e) => e.message === "Escalating implementer beyond codex/astra");
+      expect(escalated).toBe(roundsOnImplementer === 2);
+    },
+  );
+
   test("Dependabot uses free models across quick stages and keeps them on feedback rounds", async () => {
     const seen: { role: string; provider: string }[] = [];
     let implementations = 0;
