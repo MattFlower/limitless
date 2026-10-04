@@ -13,11 +13,13 @@ import { join } from "node:path";
 import { resolveBootSha } from "../src/cli/boot-sha.ts";
 import {
   bounded,
+  DaemonTimeoutError,
   DEFAULT_MAX_WAIT_MS,
   type DeployClient,
   type DeployClock,
   DrainUnsupportedError,
   parseMaxWait,
+  requestAdmin,
   waitForDrain,
 } from "../src/cli/deploy-wait.ts";
 import { deploy } from "../src/cli/service.ts";
@@ -418,6 +420,43 @@ test("malformed health fails closed and never restarts", async () => {
   await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("invalid or unhealthy");
   expect(f.calls).not.toContain("restart");
   expect(f.calls).not.toContain("resume");
+});
+
+test("a drain tolerates two stalled health polls in a row but not three", async () => {
+  for (const stalls of [2, 3]) {
+    const f = setup();
+    let reads = 0;
+    f.client.health = async () => {
+      reads++;
+      if (reads >= 2 && reads < 2 + stalls) throw new DaemonTimeoutError();
+      return { ok: true, uptimeMs: 1, sha: "previous", draining: true, active: reads === 1 ? ["run-a"] : [] };
+    };
+    const result = waitForDrain(f.client, f.clock, 60_000, false, (line) => f.logs.push(line));
+    if (stalls === 3) {
+      await expect(result).rejects.toThrow("daemon request timed out");
+      continue;
+    }
+    await result;
+    expect(f.logs.filter((line) => line.startsWith("Health poll timed out"))).toHaveLength(2);
+    expect(f.logs.at(-1)).toStartWith("Drain complete");
+  }
+});
+
+test("resume retries a stalled daemon with a longer limit", async () => {
+  const f = setup();
+  let calls = 0;
+  f.client.admin = async (action) => {
+    if (++calls === 1) throw new DaemonTimeoutError();
+    return { draining: action === "drain", active: [] };
+  };
+  await requestAdmin(f.client, f.clock, "resume");
+  expect(calls).toBe(2);
+  expect(f.timeouts).toEqual([15_000, 15_000]);
+  f.client.admin = async () => {
+    throw new DaemonTimeoutError();
+  };
+  await expect(requestAdmin(f.client, f.clock, "drain")).rejects.toThrow("daemon request timed out");
+  expect(f.timeouts.at(-1)).toBe(5000);
 });
 
 test("requests are bounded even if a client ignores abort", async () => {
