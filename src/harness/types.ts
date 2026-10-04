@@ -83,6 +83,8 @@ export interface Usage {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  /** The subset of `cacheWrite` priced at the 1-hour cache rate; absent when the stream has no breakdown. */
+  cacheWrite1h?: number;
 }
 
 export interface AgentResult {
@@ -132,11 +134,11 @@ export const emptyUsage = (): Usage => ({ input: 0, output: 0, cacheRead: 0, cac
 export function priceOf(usage: Usage, price: ModelTarget["price"]): number {
   if (!price) return 0;
   const cacheRead = price.cacheRead ?? price.input * 0.1;
+  // A 1-hour write costs twice the input rate; without the breakdown every write is a 5-minute one.
+  const write1h = Math.min(usage.cacheWrite1h ?? 0, usage.cacheWrite);
+  const cacheWrite = (usage.cacheWrite - write1h) * price.input * 1.25 + write1h * price.input * 2;
   return (
-    (usage.input * price.input +
-      usage.cacheWrite * price.input * 1.25 +
-      usage.cacheRead * cacheRead +
-      usage.output * price.output) /
+    (usage.input * price.input + cacheWrite + usage.cacheRead * cacheRead + usage.output * price.output) /
     1_000_000
   );
 }

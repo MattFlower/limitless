@@ -26,6 +26,7 @@ const inv: Invocation = {
   inputTokens: 1000,
   outputTokens: 200,
   cacheReadTokens: 3000,
+  cacheWriteTokens: 500,
   numTurns: 4,
   sessionId: null,
   error: null,
@@ -70,7 +71,7 @@ test("markdown tables are contiguous blocks", () => {
     "|  | Criterion | Evidence |\n|---|---|---|\n| ✅ AC-1 | works \\| fully | ok |\n| ✅ AC-2 | edge | ok |",
   );
   expect(md).toContain(
-    "| implement | `codex/sol-6.1` | unknown (legacy) | ok | 4,000 / 200 | $1.50 equiv. | 42s |",
+    "| implement | `codex/sol-6.1` | unknown (legacy) | ok | 4,500 / 200 | 3,000 | 500 | $1.50 equiv. | 42s |",
   );
   expect(md).toContain("No automated checks were detected");
   expect(md.startsWith("Built by **Limitless**")).toBe(true);

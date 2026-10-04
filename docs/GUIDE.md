@@ -428,8 +428,9 @@ The PR body is the evidence report, also saved as `report.md`. It contains:
 - **Code review:** the model, verdict and findings. **Review follow-ups** lists non-blocking
   findings from later rounds.
 - **Audit flags:** any audit findings. On a run that passed, these are warnings only.
-- **Work log:** each invocation's role, model, effort, status, tokens, cost and duration, then the
-  totals: dollars spent and the API-equivalent value on subscriptions.
+- **Work log:** each invocation's role, model, effort, status, tokens (in = uncached + cached +
+  cache-write, with the cached and cache-write columns and the run's cache hit rate), cost and
+  duration, then the totals: dollars spent and the API-equivalent value on subscriptions.
 - `Closes #n` for issue-triggered runs, and a link to the run in the UI (`ui_url`).
 
 ## 5. Models and routing
