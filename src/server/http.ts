@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
@@ -386,7 +388,9 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     },
     "/api/runs/:id": handle((req) => {
       const detail = store.getRunDetail(req.params.id as string);
-      return detail ? json(detail) : error("not found", 404);
+      if (!detail) return error("not found", 404);
+      const path = join(factory.cfg.paths.work, detail.run.id);
+      return json({ ...detail, worktreePath: detail.run.branch && existsSync(path) ? path : null });
     }),
     "/api/runs/:id/cancel": {
       POST: handle((req) => json({ cancelled: factory.cancelRun(req.params.id as string, "ui") })),
@@ -470,7 +474,9 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
                       ? msg.event.runId
                       : msg.kind === "question"
                         ? msg.question.runId
-                        : null;
+                        : msg.kind === "feed"
+                          ? msg.item.runId
+                          : null;
             if (id === runId) send(msg);
           }),
         { backlog, alive: live(req) },
