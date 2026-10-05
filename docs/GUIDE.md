@@ -113,15 +113,39 @@ warning. Optional extras: an OpenRouter API key, a local model server (see
 ### Get the code
 
 ```bash
-git clone git@github.com:MattFlower/limitless.git ~/code/limitless   # or your fork
+git clone git@github.com:<owner>/<repo>.git ~/code/limitless
 cd ~/code/limitless
 bun install --frozen-lockfile
 alias limitless="bun $PWD/src/cli/main.ts"   # or link the package bin onto your PATH
 limitless --help
 ```
 
-Most commands talk to the daemon over HTTP, so start it first. Only `serve`, `service` and
-`integrations install` work without it.
+### Getting started
+
+```bash
+limitless init
+# Accept defaults without prompts; --repo can be repeated:
+limitless init --yes --repo <owner>/<repo> --json
+```
+
+`init` checks prerequisites before writing config, detects logged-in Claude/Codex CLIs and local
+model servers, fills missing providers and repository settings, starts the service, and saves live
+smoke results. It asks before registering MCP with Claude Code or Codex; `--yes` grants consent.
+Without a terminal, questions use defaults and MCP changes are declined unless `--yes` is set.
+Re-running keeps existing settings and fills gaps. Existing TOML comments and unrelated settings
+are preserved, and changes create a timestamped backup. Converting to `[[providers]]` requires
+consent because the previous release cannot read it. If service startup, smoke checks, or MCP
+registration fails, init restores the original config. Discreet mode defaults to off; init records
+your choice in its summary, with behavior deferred to #37.
+
+For diagnosis, run `limitless doctor` (or `limitless doctor --json`). It reports exact fixes and
+never writes files or changes services. For a missing configured API key, add
+`<API_KEY_NAME>=<API_KEY>` to `~/.config/limitless/secrets.env`; setup never asks for secrets.
+The last smoke rows live in `~/.limitless/smoke-last.json` (`LIMITLESS_HOME` overrides the directory).
+For organization SSO failures, sign in to your identity provider, then `gh auth refresh`.
+
+Most other commands talk to the daemon over HTTP. `init`, `doctor`, `serve`, `service` and
+`integrations install` can run before it is started.
 
 ### Configure
 
@@ -166,6 +190,8 @@ and `#` comments are allowed. Environment variables of the same name override th
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
 | `[github] poll` | `true` | Observe the factory's own PRs (CI, conflicts, reviews, comments, merges) with one GraphQL query per repository and write changes to the feed. `false` restores per-run `gh pr view` merge checks. Access problems show in `limitless doctor`. |
 | `[github] poll_seconds` | `45` | Polling interval (minimum 15); repositories with a delivered, unmerged PR poll every 15 s |
+| `[github] repos` | `[]` | Setup repositories, e.g. `["<owner>/<repo>"]`; doctor reads the first to check access and SSO. This is not a run allowlist. |
+| `[github] merge` | `"auto"` when absent; init chooses `"pr"` | Default for newly registered GitHub repos: `"auto"`, `"pr"`, or `"none"`. Existing repo rows stay unchanged; repository `.limitless.toml` policy still wins. |
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
 | `[routing] dependabot` | `"free_first"` | `"free_first"` tries free local models first for Dependabot runs. `"policy"` routes them normally. |
 | `[routing] wait_budget_s` | `{ triage = 20, summarize = 20, chat = 20 }` | Per-role provider slot wait budgets in whole seconds. `0` falls through immediately; `"unbounded"` removes the limit. Omitted roles `review`, `verify`, `spec`, `holdout`, `implement`, `plan` and `plan_review` wait without limit. |
@@ -290,8 +316,8 @@ Coming soon (#49): run dependencies, meaning a run that starts only after anothe
 
 ### UI and chat
 
-The UI has these pages: **Dashboard** (runs, quota alerts, spend KPIs, provider cards, cost
-chart), **New run**, **Chat**, **Models** (providers, catalog, policy), **Evals** and run detail.
+The UI has these pages: **Dashboard** (runs, quota alerts, spend KPIs, cost
+chart), **New run**, **Chat**, **Providers** (provider cards), **Models** (catalog, policy), **Evals** and run detail.
 The chat concierge runs on the `chat` routing role. It can propose a run (repo, title, profile,
 prompt), report status, and answer a run's questions. Nothing starts until you press **Confirm** on
 a proposal.
@@ -459,7 +485,7 @@ servers are probed every minute and show `down` until they answer. That is harml
 skips them.
 
 **Enable or disable** a provider with `limitless providers enable|disable <id>` or the button on
-its provider card (Dashboard or **Models** page). The setting persists across restarts. A provider
+its provider card on the **Providers** page. The setting persists across restarts. A provider
 whose API key is missing stays disabled.
 
 For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
@@ -474,7 +500,8 @@ use the bare ID, preserving server-default thinking. Compare them with:
 limitless eval run triage --models omlx/qwen-flash@none,omlx/qwen-flash@high --follow
 ```
 
-The committed `routing/policy.json` overlay remains authoritative over built-in defaults.
+The committed `routing/policy.json` eval overlay replaces built-in defaults cell by cell.
+SQLite operator overrides take precedence over both layers.
 For rollback, install with `--mtplx`, enable the provider if disabled, and select `mtplx/qwen-27b`.
 
 ### How a model is chosen
@@ -494,6 +521,42 @@ candidates that are:
 Quota or availability failures fall through to the next candidate without counting against the
 task. Review, verify and holdout avoid the relevant vendor where possible. Escalation adds any
 remaining catalog model at the required tier.
+
+### Editing routing live
+
+Routing has three layers: code `DEFAULT_POLICY`, the reviewed eval overlay in
+`routing/policy.json`, then operator cells stored in SQLite. Each override replaces one
+`role.cell` chain; resetting it reveals the eval cell, or the code cell when no eval cell exists.
+Cells are `default`, `trivial`, `small`, `medium`, and `large`. A complexity cell takes precedence
+over its role's `default`. Changes take effect on the next model call, including ongoing runs.
+An implementer removed from its cell loses its sticky preference; escalation constraints still apply.
+
+For example, reroute around a depleted Claude subscription:
+
+```sh
+limitless routing show --role implement
+limitless routing set implement.small 'codex/sol@high,codex/luna' --note 'Claude depleted'
+limitless routing preview implement small
+limitless routing reset implement.small
+limitless routing reset --all
+```
+
+Commas separate fallback groups; `|` joins interchangeable targets and `@effort` selects an
+explicit supported effort. Preview lists eligible and skipped targets without reserving capacity.
+Operator edits and resets persist across restarts, retain old/new audit history, and publish SSE updates.
+A run's `models` chains override all three layers for their roles and never fall back outside the chain.
+Use `limitless routing show --run <id>` or `limitless routing preview implement small --run <id>`
+to inspect a run's chains; without `--run`, these commands show global policy.
+
+`GET /api/routing` shows all layers, effective cells with their source and shadowed eval cells,
+provider preference, and history. Both it and `GET /api/routing/preview?role=implement&complexity=small`
+accept a `run=<id>` query parameter to apply the run's chains. Snapshot cells then report source `run`.
+Preview applies current eligibility to the chain without changing global policy.
+Cell PUT/DELETE requests use `/api/routing/cells/:role/:cell`
+(PUT body: `{ "groups": ["codex/sol@high"], "note": "Claude depleted" }`).
+PUT `/api/routing/prefer` with `{ "prefer": ["codex"] }` replaces config `[routing] prefer`
+until DELETE clears it; use provider IDs. An empty list also overrides config. These mutations
+use the same authentication, Origin, and JSON checks as provider enablement.
 
 A slot wait budget is spent once per provider in an invocation, across all its models. An expired
 provider stays eligible if its slot opens later. If every provider is busy after the budgets expire,
@@ -703,8 +766,9 @@ limitless eval policy --write          # write routing/policy.json and routing/E
 - The **Evals** page lists eval runs, per-trial details and a roles-by-models eligibility matrix
   with reasons.
 
-Today `routing/policy.json` overrides only `triage.default`. Metric definitions and statistics are
-in [EVALS](EVALS.md).
+The eval overlay can replace any role cell. `eval policy --write` continues to write the reviewed
+files; it does not hot-reload the daemon or remove operator overrides. Live operator changes sit
+above those recommendations until reset. Metric definitions and statistics are in [EVALS](EVALS.md).
 
 ## 6. Costs and quotas
 

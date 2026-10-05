@@ -93,6 +93,20 @@ const invoke = async (key: string, value?: string) => {
   await handler(value === undefined ? undefined : { currentTarget: { value } });
 };
 
+test("run detail displays the persisted experiment chains", () => {
+  ui.mount({
+    ...detail,
+    run: {
+      ...detail.run,
+      models: { implement: ["codex/sol@high", "claude/opus"], review: ["claude/opus|codex/sol"] },
+    },
+  });
+  const html = render();
+  expect(html).toContain("Model experiment");
+  expect(html).toContain("codex/sol@high, claude/opus");
+  expect(html).toContain("claude/opus|codex/sol");
+});
+
 test("needs-you and failed panels render the latest recorded blockers and observed PR", () => {
   for (const status of ["needs_human", "failed"] as const) {
     ui.mount({ ...detail, run: { ...detail.run, status } });

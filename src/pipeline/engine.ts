@@ -927,6 +927,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
                 current.effort === undefined
                   ? (current.targetId ?? current.modelId)
                   : { modelId: current.modelId, effort: current.effort },
+              preferPolicyRevision: current.policyRevision,
             }
           : {};
         if (escalate) {
@@ -936,12 +937,13 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             { exclude: ctx.state.triedImplementers },
             {},
           ];
-          constraints =
-            options.find(
-              (c) =>
-                ctx.deps.router.route("implement", ctx.complexity, ctx.routingConstraints(c)).candidates
-                  .length,
-            ) ?? {};
+          constraints = ctx.run.models?.implement
+            ? { exclude: ctx.state.triedImplementers }
+            : (options.find(
+                (c) =>
+                  ctx.deps.router.route("implement", ctx.complexity, ctx.routingConstraints(c)).candidates
+                    .length,
+              ) ?? {});
           ctx.log(`Escalating implementer beyond ${current.modelId}`, "warn", { constraints });
           ctx.state.roundsOnImplementer = 0;
         }
@@ -964,13 +966,6 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             resolution: merge,
           }),
         });
-        ctx.state.implementer = {
-          modelId: target.modelId,
-          targetId: target.targetId,
-          effort: target.effort ?? null,
-          tier: target.tier,
-          vendor: target.vendor,
-        };
         if (
           !ctx.state.triedImplementers.some(
             (ref) =>
@@ -1333,7 +1328,7 @@ async function oneRound(
             try {
               return await call(request, constraints, finder?.target, deadline);
             } catch (error) {
-              if ((finder?.local || shadow) && error instanceof NoCapacityError)
+              if ((shadow || (finder?.local && !ctx.run.models?.review)) && error instanceof NoCapacityError)
                 throw new FinderSkipped(error.message);
               throw error;
             }
@@ -1344,7 +1339,7 @@ async function oneRound(
             const skip = (error: unknown): never => {
               throw error instanceof Preempted ? new FinderSkipped(error.message) : error;
             };
-            if (!system.verifier?.targets)
+            if (!system.verifier?.targets || (ctx.run.models?.review && !shadow))
               return call(request, constraints, system.verifier?.target).catch(skip);
             // Picked per batch, as evals do, and offered alone: a routed fallback could share its vendor.
             const listed = system.verifier.targets.map((target) => {
