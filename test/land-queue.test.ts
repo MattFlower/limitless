@@ -227,10 +227,9 @@ function queue(
 
 /** Answer CI for whatever each entry waits on, then let promise chains settle on the fake clock. */
 async function tick(answer: { ci: string; failing?: string[] }): Promise<void> {
+  // A claimed entry with a pushed commit is in its CI phase, whatever the claim left it as.
   for (const entry of store.listLandEntries({ active: true }))
-    // A claimed entry with a pushed commit is in its CI phase, whatever the claim left it as.
-    if (entry.pushedSha)
-      observers.get(entry.prUrl)?.(entry.pushedSha, answer.ci, answer.failing ?? []);
+    if (entry.pushedSha) observers.get(entry.prUrl)?.(entry.pushedSha, answer.ci, answer.failing ?? []);
   await clock.advance(100);
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 }
