@@ -1,6 +1,6 @@
 import { cacheHitRate } from "../core/cache-format.ts";
 import { effortLabel } from "../core/effort-format.ts";
-import type { Invocation } from "../core/types.ts";
+import type { Invocation, RunModels } from "../core/types.ts";
 import type { RunContext, RunState } from "./context.ts";
 import { type Review, rowKind } from "./schemas.ts";
 import { notRequired } from "./verification.ts";
@@ -22,6 +22,7 @@ function table(header: string[], rows: string[][]): string {
 }
 
 export interface ReportInput {
+  models?: RunModels;
   success: boolean;
   runId: string;
   prompt: string;
@@ -79,6 +80,12 @@ export function renderReport(input: ReportInput): string {
       .map((l) => `> ${l}`)
       .join("\n"),
   ];
+
+  if (Object.keys(input.models ?? {}).length)
+    blocks.push(
+      "## Routing — model experiment",
+      ...Object.entries(input.models ?? {}).map(([role, chain]) => `- ${role}: \`${chain.join(", ")}\``),
+    );
 
   if (state.implementerReport)
     blocks.push("## Implementer's summary", state.implementerReport.trim().slice(0, 5000));
@@ -289,6 +296,7 @@ export function buildReport(
     totals: { costUsd: latest.costUsd, costEquivUsd: latest.costEquivUsd },
     runUrl: `${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}`,
     freeFirstRouting: ctx.freeFirstRouting,
+    models: ctx.run.models,
     ...(issueClosedBy(ctx) ? { closesIssue: issueClosedBy(ctx) as number } : {}),
   });
 }

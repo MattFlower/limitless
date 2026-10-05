@@ -1,7 +1,7 @@
 import { version } from "../package.json";
 import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
-import type { CreateRunRequest, Question, Run } from "./core/types.ts";
+import type { CreateRunRequest, Question, Run, RunModels } from "./core/types.ts";
 import { Store } from "./db/store.ts";
 import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
@@ -20,9 +20,10 @@ import type { EngineDeps } from "./pipeline/context.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
-import { loadPolicy, validatePolicy } from "./router/policy.ts";
+import { readPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
 import { Router } from "./router/router.ts";
+import { RuntimePolicy } from "./router/runtime-policy.ts";
 import { Scheduler } from "./scheduler.ts";
 import { redactCredentialData } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
@@ -53,7 +54,10 @@ export interface FactoryOptions {
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
 export class Factory {
   readonly store: Store;
-  readonly policy: Policy;
+  readonly routing: RuntimePolicy;
+  get policy(): Policy {
+    return this.router.getPolicy();
+  }
   readonly models: ModelDef[];
   readonly evalSettings: ReturnType<typeof evalSettings>;
   readonly evals: EvalRunner;
@@ -86,12 +90,11 @@ export class Factory {
       maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
     }));
     const shadowOk = checkRosterTargets(cfg, this.models, this.providerDefs, console.warn);
-    this.policy =
-      opts.policy ??
-      (opts.policyPath === undefined
-        ? DEFAULT_POLICY
-        : loadPolicy(opts.policyPath, this.models, this.providerDefs));
-    if (!opts.models && !opts.providers) validatePolicy(this.policy, this.models, this.providerDefs);
+    const code = opts.policy ?? DEFAULT_POLICY;
+    const evals =
+      opts.policy || opts.policyPath === undefined
+        ? {}
+        : readPolicy(opts.policyPath, this.models, this.providerDefs);
     this.store = opts.store ?? new Store(cfg.paths.db);
     this.cleanup = opts.cleanup ?? ((dryRun) => collectGarbage(this.store, cfg, { dryRun }));
     this.gcTimer = opts.gcTimer ?? { set: setInterval, clear: clearInterval };
@@ -106,7 +109,18 @@ export class Factory {
       opts.providerTimer,
       opts.healthFetch,
     );
-    this.router = new Router(this.tracker, this.policy, this.models, cfg.preferProviders);
+    this.router = new Router(this.tracker, code, this.models, cfg.preferProviders);
+    this.routing = new RuntimePolicy(
+      this.store,
+      this.router,
+      this.models,
+      this.providerDefs,
+      cfg.preferProviders,
+      code,
+      evals,
+    );
+    if (!opts.models && !opts.providers)
+      validatePolicy(this.router.getPolicy(), this.models, this.providerDefs);
     this.tracker.setRoutingDescription((provider, exhausted) =>
       this.router.describeFallback(provider, exhausted),
     );
@@ -233,7 +247,9 @@ export class Factory {
   ): Promise<Run> {
     if (!req.prompt?.trim()) throw new Error("prompt is required");
     if (!req.repo?.trim()) throw new Error("repo is required");
-    const repo = await resolveRepo(this.store, req.repo);
+    if (req.models !== undefined)
+      req = { ...req, models: validateRunModels(req.models, this.models, this.providerDefs) };
+    const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
     const run = chat
       ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
       : this.store.createRun(repo, req, verifiedGitHubWebhook);
@@ -249,12 +265,13 @@ export class Factory {
     return this.scheduler.cancel(id, by);
   }
 
-  async retryRun(id: string): Promise<Run> {
+  async retryRun(id: string, models?: RunModels): Promise<Run> {
     const run = this.store.getRun(id);
     if (!run) throw new Error(`run ${id} not found`);
     return this.createRun(
       {
         repo: run.repoSlug,
+        models: models === undefined ? run.models : models,
         prompt: run.prompt,
         dependsOn: run.dependsOn,
         title: run.title,
