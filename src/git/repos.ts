@@ -978,8 +978,9 @@ export async function findPullRequest(
 
 /**
  * Merge now if possible; if branch protection requires checks, enable auto-merge instead.
- * `expectedHead` pins the merge to the commit the factory checked (`--match-head-commit`), and
- * `auto: false` never arms auto-merge, which would let a later push land unchecked.
+ * `expectedHead` pins the merge to the commit the factory checked (`--match-head-commit`), `body`
+ * is the squash message the factory reviewed, and `auto: false` never arms auto-merge, which would
+ * let a later push land unchecked.
  */
 export async function mergePullRequest(
   prUrl: string,
@@ -987,11 +988,12 @@ export async function mergePullRequest(
   title?: string,
   signal?: AbortSignal,
   budget?: GitHubBudget,
-  opts: { expectedHead?: string; auto?: boolean } = {},
+  opts: { expectedHead?: string; body?: string; auto?: boolean } = {},
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
   // Squash with the PR title as the subject, not the first round's commit message.
   const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
   const subject = title ? ["--subject", number ? `${title} (#${number})` : title] : [];
+  const body = opts.body ? ["--body-file", "-"] : [];
   // After a transient failure or timeout the merge may still have landed. Until a state lookup
   // settles that, every attempt reconciles first; a failed lookup retries like any other call.
   let unsure = false;
@@ -1015,8 +1017,9 @@ export async function mergePullRequest(
           "--delete-branch",
           ...(opts.expectedHead ? ["--match-head-commit", opts.expectedHead] : []),
           ...subject,
+          ...body,
         ];
-        return sh(cmd, { cwd, signal }).then(
+        return sh(cmd, { cwd, signal, stdin: opts.body }).then(
           () => "ok" as const,
           async (e) => {
             if (signal?.aborted || !isTransient(e)) throw e;

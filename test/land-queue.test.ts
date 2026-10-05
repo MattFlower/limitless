@@ -125,7 +125,7 @@ writeFileSync(file+".merged-"+pr,"");
 const landLog: string[] = [];
 const observers = new Map<string, (head: string, ci: string, failing?: string[]) => void>();
 /** Feed items dedupe per observation, so each published verdict is a new one. */
-let revision = 0;
+const revision = 0;
 /** What CI reports next for a waiting entry; `null` leaves it waiting for another signal. */
 let ci: () => { ci: string; failing?: string[] } | null = () => ({ ci: "SUCCESS" });
 const runs = new Map<number, Run>();
@@ -156,6 +156,7 @@ function delivered(n: number, branch: string): { run: Run; prUrl: string } {
     status: "succeeded",
     title: `PR ${n}`,
   });
+  store.putArtifact(run.id, "report.md", "report", `report for ${n}\n`);
   observers.set(url(n), (head, ci, failing = []) =>
     store.saveGithubPr({
       url: url(n),
@@ -340,7 +341,7 @@ test("a checking entry whose merge commit is already on the remote resumes and l
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: mergeSha, attempts: 2 });
   expect(await remoteHead("pr-1")).toBe(mergeSha); // nothing was pushed again
   expect(ghCalls("pr merge")).toEqual([
-    `pr merge ${url(1)} --squash --delete-branch --match-head-commit ${mergeSha}`,
+    `pr merge ${url(1)} --squash --delete-branch --match-head-commit ${mergeSha} --subject PR 1 (#1) --body-file -`,
   ]);
   expect(gateLog()).toEqual([]); // the checks had already run before the crash
 });
@@ -374,8 +375,8 @@ test("a base that moved is merged in and pushed with the lease; an up-to-date en
   const ahead = store.getLandEntry(2);
   expect(ahead).toMatchObject({ state: "landed", pushedSha: await remoteHead("pr-2") });
   expect(ghCalls("pr merge")).toEqual([
-    `pr merge ${url(1)} --squash --delete-branch --match-head-commit ${mergeSha}`,
-    `pr merge ${url(2)} --squash --delete-branch --match-head-commit ${ahead?.pushedSha}`,
+    `pr merge ${url(1)} --squash --delete-branch --match-head-commit ${mergeSha} --subject PR 1 (#1) --body-file -`,
+    `pr merge ${url(2)} --squash --delete-branch --match-head-commit ${ahead?.pushedSha} --subject PR 2 (#2) --body-file -`,
   ]);
 });
 
@@ -502,7 +503,9 @@ test("a failing land check blocks the entry with the check names and no output",
   const entry = q.request({ runId: pr.run.id });
   await settle();
   const blocked = store.getLandEntry(entry.id);
-  expect(blocked).toMatchObject({ state: "blocked", reason: "lint failed" });
+  expect(blocked).toMatchObject({ state: "blocked" });
+  // Check names only: the output is in the log, never in the reason.
+  expect(blocked?.reason).toMatch(/^lint failed \(/);
   expect(blocked?.reason).not.toContain("secret in output");
   expect(ghCalls("pr merge")).toEqual([]);
 });

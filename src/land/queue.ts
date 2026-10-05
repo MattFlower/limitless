@@ -1,5 +1,5 @@
-import { mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { Paths } from "../config.ts";
 import type { LandEntry, Repo, Run } from "../core/types.ts";
 import { ACTIVE_LAND_STATES } from "../core/types.ts";
@@ -234,7 +234,7 @@ export class LandQueue {
       if (!head) {
         const baseSha = await fetchBase(this.deps.paths, repo, entry.baseBranch, signal);
         head = await this.mergeBase(cwd, entry, baseSha);
-        await this.checks(cwd, baseSha, signal);
+        await this.checks(entry, cwd, baseSha, signal);
         if (head !== entry.approvedSha) await this.pushApproved(entry, cwd, repo, head, signal);
         // Recorded either way: with it, a resume waits for this commit instead of checking again.
         this.store.updateLandEntry(entry.id, { pushedSha: head, state: "waiting_ci" });
@@ -262,16 +262,23 @@ export class LandQueue {
   }
 
   /** The repository's checks, taken from the base commit so the PR cannot weaken them. */
-  private async checks(cwd: string, baseSha: string, signal: AbortSignal): Promise<void> {
+  private async checks(entry: LandEntry, cwd: string, baseSha: string, signal: AbortSignal): Promise<void> {
+    const log = join(this.deps.paths.runs, entry.runId, `land-${entry.id}.log`);
     const base = `${cwd}-base`;
     try {
       rmSync(base, { recursive: true, force: true });
       mkdirSync(base, { recursive: true });
+      mkdirSync(dirname(log), { recursive: true });
+      writeFileSync(log, `# land ${entry.id} ${entry.prUrl} at ${entry.approvedSha}\n`);
       await exportCommit(cwd, baseSha, base, signal);
-      const cfg = detectGates(base);
-      const run = await runGates(cwd, cfg, signal);
+      // The gate slot comes from runGates itself: one lease, never a second one on top.
+      const run = await runGates(cwd, detectGates(base), signal, {
+        holder: "land",
+        onResult: (r) => appendFileSync(log, `\n$ ${r.command}\n${r.output}\n`),
+      });
+      this.store.updateLandEntry(entry.id, { logPath: log });
       const failed = run.setupOk ? run.checks.filter((c) => !c.ok) : run.setup.filter((c) => !c.ok);
-      if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed`);
+      if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -352,9 +359,11 @@ export class LandQueue {
     signal: AbortSignal,
   ): Promise<void> {
     this.store.updateLandEntry(entry.id, { state: "merging", pushedSha: sha });
-    // A land never arms auto-merge: it would let a later push land without the factory checking it.
-    const outcome = await mergePullRequest(entry.prUrl, cwd, undefined, signal, undefined, {
+    // A land never arms auto-merge: it would let a later push land without the factory checking it,
+    // and the squash message is what was reviewed rather than whatever the PR says today.
+    const outcome = await mergePullRequest(entry.prUrl, cwd, run.title, signal, undefined, {
       expectedHead: sha,
+      body: this.store.getArtifact(run.id, "report.md") ?? undefined,
       auto: false,
     });
     if (outcome !== "merged") {

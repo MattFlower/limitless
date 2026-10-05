@@ -425,6 +425,8 @@ export interface LandEntry {
   state: LandState;
   /** The commit the queue pushed (the merge commit, or the approved one when it needed no merge). */
   pushedSha: string | null;
+  /** Where this land's check output was written. */
+  logPath: string | null;
   attempts: number;
   reason: string | null;
   createdAt: number;
