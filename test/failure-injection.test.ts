@@ -188,6 +188,36 @@ async function run(f: Factory) {
   f.scheduler.start(); // Fixture providers have no probe URLs, credentials or network operations.
   return r.id;
 }
+
+test.each(["disabled", "quota", "rejected"])(
+  "an unavailable pinned implementer stops with its chain and reason: %s",
+  async (reason) => {
+    const f = factory(undefined, (s) => {
+      if (s.mode !== "edit") return answer(s);
+      return reason === "quota"
+        ? { status: "quota", error: "quota exhausted" }
+        : { status: "error", error: "model not found" };
+    });
+    if (reason === "disabled") f.tracker.setEnabled("b", false);
+    const run = await f.createRun({
+      repo: source,
+      prompt: "Change",
+      profile: "standard",
+      models: { implement: ["b"] },
+    });
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.modelId),
+    ).toEqual(reason === "disabled" ? [] : ["b"]);
+    const question = f.store.listQuestions(run.id).at(-1)?.question ?? "";
+    expect(question).toContain("implement; pinned chain: b");
+    expect(question).toContain("b@high (");
+    expect(question).toContain(reason === "rejected" ? "model not found" : reason);
+  },
+);
 async function settled(f: Factory, id: string) {
   await wait(() => !f.scheduler.activeRunIds.includes(id) && f.store.getRun(id)?.status !== "queued");
 }

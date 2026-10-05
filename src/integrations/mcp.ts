@@ -3,7 +3,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { Factory } from "../app.ts";
-import type { CreateRunRequest, FeedAck, ResolutionKind, RunStatus } from "../core/types.ts";
+import {
+  type CreateRunRequest,
+  type FeedAck,
+  type ResolutionKind,
+  RUN_ROLES,
+  type RunStatus,
+} from "../core/types.ts";
 import { FeedAckSchema, FeedQuerySchema, waitForFeed } from "../feed.ts";
 
 const nonblank = z.string().trim().min(1);
@@ -234,6 +240,7 @@ export function createMcpServer(backend: McpBackend): Server {
           prompt: nonblank,
           title: nonblank.optional(),
           allow: z.array(z.enum(["submodules", "gitattributes", "binary"])).optional(),
+          models: z.partialRecord(z.enum(RUN_ROLES), z.array(z.string()).min(1)).optional(),
           dependsOn: z.array(nonblank).optional(),
           profile: profile.default("auto"),
         })

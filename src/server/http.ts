@@ -4,7 +4,7 @@ import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simp
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
-import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from "../core/types.ts";
+import type { CreateRunRequest, HealthResponse, RunModels, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { gateSlots } from "../gates/slots.ts";
@@ -426,7 +426,13 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       POST: handle((req) => json({ cancelled: factory.cancelRun(req.params.id as string, "ui") })),
     },
     "/api/runs/:id/retry": {
-      POST: handle(async (req) => json(await factory.retryRun(req.params.id as string), 201)),
+      POST: handle(async (req) => {
+        const text = await req.text();
+        const input = text ? (JSON.parse(text) as { models?: RunModels }) : {};
+        if (!input || typeof input !== "object" || Array.isArray(input))
+          throw new Error("invalid retry body");
+        return json(await factory.retryRun(req.params.id as string, input.models), 201);
+      }),
     },
     "/api/runs/:id/resolve": {
       POST: handle(async (req) => {

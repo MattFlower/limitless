@@ -100,6 +100,64 @@ function setup(secrets: Record<string, string> = {}) {
   return { tracker, router: new Router(tracker, policy, models) };
 }
 
+test("run chains replace every complexity, retain groups and never extend for escalation or billing", () => {
+  const { tracker, router } = setup({ OPENROUTER_API_KEY: "key" });
+  const chain = ["openrouter/ds", "codex/sol|claude/opus"];
+  expect(
+    router
+      .route("review", "small", { chain: ["claude/opus", "codex/sol"], prefer: "codex/sol" })
+      .candidates.map((m) => m.modelId),
+  ).toEqual(["claude/opus", "codex/sol"]);
+  tracker.observeWindows("claude", { five_hour: { utilization: 0.1, resetsAt: null } });
+  tracker.observeWindows("codex", { five_hour: { utilization: 0.5, resetsAt: null } });
+  for (const complexity of ["trivial", "small", "medium", "large"] as const)
+    expect(
+      router
+        .route("implement", complexity, { chain, minTier: 5, avoidVendor: "deepseek", billing: "free_first" })
+        .candidates.map((m) => m.modelId),
+    ).toEqual(["openrouter/ds", "claude/opus", "codex/sol"]);
+  expect(
+    router.route("implement", "small", {
+      chain,
+      exclude: ["openrouter/ds", "claude/opus", "codex/sol"],
+      minTier: 5,
+    }).candidates,
+  ).toEqual([]);
+  for (const id of ["codex", "openrouter", "claude"]) tracker.setEnabled(id, false);
+  expect(router.route("implement", "large", { chain }).skipped).toEqual([
+    { modelId: "openrouter/ds", reason: "disabled" },
+    { modelId: "codex/sol", reason: "disabled" },
+    { modelId: "claude/opus", reason: "disabled" },
+  ]);
+});
+
+test.each(["health", "quota", "reserve", "circuit", "rejection"])(
+  "pinned routing retains availability filtering: %s",
+  (reason) => {
+    const { tracker, router } = setup();
+    if (reason === "health") tracker.setHealthy("claude", false);
+    if (reason === "quota")
+      tracker.record("claude", "quota", { exhaustedUntil: Date.now() + 60000, error: "quota exhausted" });
+    if (reason === "reserve")
+      tracker.observeWindows("claude", { five_hour: { utilization: 0.9, resetsAt: Date.now() + 60000 } });
+    if (reason === "circuit")
+      for (let i = 0; i < 3; i++) tracker.record("claude", "unavailable", { error: "offline" });
+    if (reason === "rejection") tracker.blockModel("claude/opus", "plan does not support model");
+    const result = router.route("implement", "small", { chain: ["claude/opus"] });
+    expect(result.candidates).toEqual([]);
+    expect(result.skipped).toHaveLength(1);
+    expect(result.skipped[0]?.reason).toContain(
+      {
+        health: "server not reachable",
+        quota: "quota exhausted",
+        reserve: "at reserve limit",
+        circuit: "circuit open",
+        rejection: "plan does not support model",
+      }[reason],
+    );
+  },
+);
+
 test("verifier routing excludes checkpoints across backends, including pinned targets", () => {
   const tracker = new ProviderTracker(PROVIDERS, store, reserves, { OMLX_API_KEY: "key" });
   tracker.setHealthy("omlx", true);

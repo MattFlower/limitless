@@ -69,6 +69,10 @@ export type Role =
   | "summarize"
   | "chat";
 
+export const RUN_ROLES = ["triage", "spec", "holdout", "implement", "review", "verify"] as const;
+export type RunRole = (typeof RUN_ROLES)[number];
+export type RunModels = Partial<Record<RunRole, string[]>>;
+
 export type Vendor =
   | "anthropic"
   | "openai"
@@ -121,6 +125,7 @@ export interface Repo {
 }
 
 export interface Run {
+  models?: RunModels;
   flow?: "build" | "verify-change";
   id: string;
   repoId: string;
@@ -370,6 +375,7 @@ export interface QuotaAlert {
 }
 
 export interface CreateRunRequest {
+  models?: RunModels;
   dependsOn?: string[];
   repo: string;
   prompt: string;
