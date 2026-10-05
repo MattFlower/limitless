@@ -70,6 +70,64 @@ const fileNames = (db: Database) =>
     (r) => r.name,
   );
 
+test("worktree provenance upgrade requires pre-sidecar factory evidence and survives reopen", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-worktree-provenance.sql"),
+    });
+    const old = new Store(path, before);
+    const repo = old.upsertRepo({
+      slug: "local",
+      kind: "local",
+      localPath: directory,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const cases = ["completed", "interrupted", "creation only", "modern", "ambiguous", "no worktree"];
+    const ids = cases.map((evidence) => {
+      const run = old.createRun(repo, { repo: repo.slug, prompt: evidence });
+      old.db.query("UPDATE runs SET created_at = 1 WHERE id = ?").run(run.id);
+      if (evidence !== "creation only") {
+        const stage = old.startStage(run.id, "prepare");
+        old.db
+          .query("UPDATE stages SET started_at = ?, finished_at = ?, status = ? WHERE id = ?")
+          .run(
+            evidence === "modern" ? 1791100000000 : 1791000000000,
+            evidence === "modern" ? 1791100001000 : 1791000001000,
+            ["interrupted", "no worktree"].includes(evidence) ? "failed" : "succeeded",
+            stage.id,
+          );
+        if (evidence === "interrupted") {
+          old.addEvent({ runId: run.id, type: "gate", message: "baseline passed" });
+          old.db.query("UPDATE events SET ts = 1791000000500 WHERE run_id = ?").run(run.id);
+        }
+        if (evidence === "ambiguous") old.startStage(run.id, "prepare");
+      }
+      return run.id;
+    });
+    old.close();
+    const current = new Store(path);
+    expect(ids.map((id) => current.hasLegacyWorktree(id))).toEqual([true, true, false, false, false, false]);
+    const completed = ids[0];
+    if (!completed) throw new Error("missing completed run");
+    current.markModernWorktree(completed);
+    current.close();
+    const reopened = new Store(path);
+    expect(ids.map((id) => reopened.hasLegacyWorktree(id))).toEqual([
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+    ]);
+    reopened.close();
+  });
+});
+
 test("the legacy migration array is frozen", () => {
   expect(MIGRATIONS.map((m) => m.version)).toEqual(Array.from({ length: 12 }, (_, i) => i + 1));
 });

@@ -1412,6 +1412,14 @@ export class Store {
     return r ? parse<T | null>(r.state_json, null) : null;
   }
 
+  hasLegacyWorktree(runId: string): boolean {
+    return !!this.db.query("SELECT id FROM runs WHERE id = ? AND worktree_provenance = 'legacy'").get(runId);
+  }
+
+  markModernWorktree(runId: string): void {
+    this.db.query("UPDATE runs SET worktree_provenance = 'recorded' WHERE id = ?").run(runId);
+  }
+
   setRunState(runId: string, state: unknown): void {
     this.db.query("UPDATE runs SET state_json = ? WHERE id = ?").run(json(state), runId);
   }

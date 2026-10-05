@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -24,6 +24,7 @@ import { attributeRules, auditDiff } from "../src/gates/audit.ts";
 import { loadPrivateStrings } from "../src/gates/private.ts";
 import { collectGarbage } from "../src/gc.ts";
 import { recordWorktree, worktreeGit, worktreeGitScope } from "../src/git/command.ts";
+import { recordLegacyWorktree } from "../src/git/legacy.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
 import {
   addDetachedWorktree,
@@ -80,6 +81,78 @@ beforeEach(async () => {
   await recordWorktree(work);
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+test.each([
+  "untampered",
+  "rewritten pointer",
+  "symlinked pointer",
+  "symlinked admin",
+  "redirected commondir",
+  "outside admin",
+  "symlinked worktrees",
+  "symlinked admin file",
+  "cache in checkout",
+  "other owner",
+])("legacy worktree: legacy registration refuses unsafe administration (%s)", async (tampering) => {
+  let common = join(dir, "cache.git");
+  const legacy = join(dir, "legacy");
+  await git(dir, "clone", "-q", "--bare", seed, common);
+  await git(common, "worktree", "add", "-qb", "legacy", legacy, base);
+  const admin = join(common, "worktrees", "legacy");
+  const pointer = join(legacy, ".git");
+  const sidecar = `${legacy}.git-paths`;
+  if (tampering === "rewritten pointer") writeFileSync(pointer, `gitdir: ${join(seed, ".git")}\n`);
+  if (tampering === "symlinked pointer") {
+    renameSync(pointer, join(dir, "pointer"));
+    symlinkSync(join(dir, "pointer"), pointer);
+  }
+  if (tampering === "symlinked admin") {
+    renameSync(admin, `${admin}-moved`);
+    symlinkSync(`${admin}-moved`, admin);
+  }
+  if (tampering === "redirected commondir") writeFileSync(join(admin, "commondir"), `${seed}/.git\n`);
+  if (tampering === "outside admin") {
+    const outside = join(common, "outside");
+    renameSync(admin, outside);
+    writeFileSync(pointer, `gitdir: ${outside}\n`);
+  }
+  if (tampering === "symlinked worktrees") {
+    renameSync(join(common, "worktrees"), join(common, "moved"));
+    symlinkSync(join(common, "moved"), join(common, "worktrees"));
+  }
+  if (tampering === "symlinked admin file") {
+    renameSync(join(admin, "HEAD"), join(dir, "HEAD"));
+    symlinkSync(join(dir, "HEAD"), join(admin, "HEAD"));
+  }
+  if (tampering === "cache in checkout") {
+    const inside = join(legacy, "cache.git");
+    renameSync(common, inside);
+    common = inside;
+    writeFileSync(pointer, `gitdir: ${join(common, "worktrees", "legacy")}\n`);
+  }
+  const uid = process.getuid?.();
+  const owner =
+    tampering === "other owner" && uid !== undefined
+      ? spyOn(process, "getuid").mockReturnValue(uid + 1)
+      : undefined;
+  try {
+    if (tampering === "untampered") {
+      expect(await recordLegacyWorktree(legacy, common)).toBe(true);
+      const bytes = readFileSync(sidecar, "utf8");
+      expect(await recordLegacyWorktree(legacy, common)).toBe(false);
+      expect(readFileSync(sidecar, "utf8")).toBe(bytes);
+      expect(await headSha(legacy)).toBe(base);
+    } else {
+      await expect(recordLegacyWorktree(legacy, common)).rejects.toThrow(
+        "Unsafe worktree Git administration",
+      );
+      expect(existsSync(sidecar)).toBe(false);
+      await expect(headSha(legacy)).rejects.toThrow("Missing trusted Git paths");
+    }
+  } finally {
+    owner?.mockRestore();
+  }
+});
 
 async function audited(files = ["sample.test.ts"]) {
   const diff = await diffSince(work, base);

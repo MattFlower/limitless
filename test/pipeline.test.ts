@@ -453,7 +453,7 @@ describe("per-run model chains", () => {
   );
 });
 
-function start(handler: Handler, effortRouting = false, freeProviders = false): Factory {
+function start(handler: Handler, effortRouting = false, freeProviders = false, autoStart = true): Factory {
   const alpha = models[0];
   const beta = models[1];
   if (!alpha || !beta) throw new Error("missing fixture models");
@@ -480,7 +480,7 @@ function start(handler: Handler, effortRouting = false, freeProviders = false): 
     policy: effortRouting ? { ...policy, implement: { default: ["alpha/m@high", "alpha/m@low"] } } : policy,
     bootSha: "test-build",
   });
-  factory.start();
+  if (autoStart) factory.start();
   return factory;
 }
 
@@ -3169,6 +3169,37 @@ exec '${gitBin}' "$@"
     expect(await git("ls-remote", bare, "refs/heads/dependabot/pkg")).toContain(head);
     expect(f.store.getRun(run.id)?.error).toContain("PR body contains a private string (entry 1");
     expect(f.store.getRun(run.id)?.error).not.toContain("secret-host.example");
+  });
+
+  test("legacy draft delivery registers before needsHumanReason", async () => {
+    const bare = await githubFixture();
+    const handler: Handler = (s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      factory?.scheduler.drain();
+      return { files: { "farewell.txt": "goodbye\n" } };
+    };
+    const f = start(handler);
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["queued"])).toBe("queued");
+    await f.stop();
+    const state = f.store.getRunState<RunState>(run.id);
+    if (!state?.worktreePath) throw new Error("Missing parked worktree");
+    rmSync(`${resolve(state.worktreePath)}.git-paths`);
+    state.needsHumanReason = "Operator review required";
+    f.store.setRunState(run.id, state);
+    legacyWorktreeFixture(f, run.id);
+    f.store.close();
+    const resumed = start(handler, false, false, false);
+    expect(await executeRun(resumed.deps, run.id, new AbortController().signal)).toBe("needs_human");
+    expect(resumed.store.getRun(run.id)?.prUrl).toContain("/pull/1");
+    expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
+    expect(
+      resumed.store.listEvents(run.id).filter((e) => e.message.includes("recorded legacy worktree")),
+    ).toHaveLength(1);
+    expect(
+      resumed.store.listEvents(run.id).some((e) => e.message.includes("Missing trusted Git paths")),
+    ).toBe(false);
   });
 
   test("needs-human draft delivery continues during drain", async () => {
@@ -7025,51 +7056,119 @@ test("drain blocks queued starts and parks the active run at its next boundary",
   }
 });
 
-test.each(["missing", "mismatched"])("legacy worktree resumes with %s record", async (record) => {
-  let resumedRecord: string | undefined;
-  let resumedBytes: string | undefined;
+// Serialize the factory evidence and schema that a release without sidecars left behind.
+function legacyWorktreeFixture(f: Factory, runId: string, interrupted = false): void {
+  f.store.db
+    .query(
+      "UPDATE stages SET started_at = 1791000000000, finished_at = 1791000001000, status = ? WHERE run_id = ? AND name = 'prepare'",
+    )
+    .run(interrupted ? "failed" : "succeeded", runId);
+  f.store.db.query("UPDATE events SET ts = 1791000000500 WHERE run_id = ? AND type = 'gate'").run(runId);
+  f.store.db.exec("ALTER TABLE runs DROP COLUMN worktree_provenance");
+  f.store.db.exec("DELETE FROM applied_migrations WHERE name = '20261005T134145-worktree-provenance.sql'");
+}
+
+test.each(["legacy missing", "modern missing", "legacy mismatched"])(
+  "legacy worktree resumes with %s record",
+  async (record) => {
+    const handler: Handler = (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      factory?.scheduler.drain();
+      return { files: { "farewell.txt": "goodbye\n" } };
+    };
+    const f = start(handler);
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["queued"])).toBe("queued");
+    const state = f.store.getRunState<RunState>(run.id);
+    expect(state).toMatchObject({ phase: "loop", implementedRound: 0, parked: true });
+    if (!state?.worktreePath) throw new Error("Missing parked worktree");
+    const sidecar = `${resolve(state.worktreePath)}.git-paths`;
+    const original = readFileSync(sidecar, "utf8");
+    await f.stop();
+    delete state.previewConfig;
+    f.store.setRunState(run.id, state);
+    if (record.startsWith("legacy")) legacyWorktreeFixture(f, run.id);
+    f.store.close();
+    if (record.endsWith("missing")) rmSync(sidecar);
+    else {
+      const paths = JSON.parse(original) as string[];
+      paths[0] = repoDir;
+      writeFileSync(sidecar, JSON.stringify(paths));
+    }
+    const bytes = existsSync(sidecar) ? readFileSync(sidecar, "utf8") : undefined;
+    const resumed = start(handler, false, false, false);
+    const controller = new AbortController();
+    if (record === "legacy missing") {
+      // Re-park after registration, then reopen the persisted state once more.
+      expect(await executeRun(resumed.deps, run.id, controller.signal, () => true)).toBe("queued");
+      expect(readFileSync(sidecar, "utf8")).toBe(original);
+      resumed.store.close();
+      const again = start(handler, false, false, false);
+      expect(await executeRun(again.deps, run.id, controller.signal)).toBe("succeeded");
+      expect(
+        again.store.listEvents(run.id).filter((e) => e.message.includes("recorded legacy worktree")),
+      ).toHaveLength(1);
+      // Once adopted, this worktree requires its record just like a newly created one.
+      expect(again.store.hasLegacyWorktree(run.id)).toBe(false);
+      again.store.setRunState(run.id, state);
+      again.store.updateRun(run.id, { status: "queued" });
+      again.store.close();
+      rmSync(sidecar);
+      const stripped = start(handler, false, false, false);
+      expect(await executeRun(stripped.deps, run.id, controller.signal)).toBe("failed");
+      expect(stripped.store.getRun(run.id)?.error).toContain("Missing trusted Git paths");
+      expect(existsSync(sidecar)).toBe(false);
+      expect(
+        stripped.store.listEvents(run.id).filter((e) => e.message.includes("recorded legacy worktree")),
+      ).toHaveLength(1);
+    } else {
+      expect(await executeRun(resumed.deps, run.id, controller.signal)).toBe("failed");
+      expect(resumed.store.getRun(run.id)?.error).toContain(
+        record === "modern missing" ? "Missing trusted Git paths" : "Unsafe worktree Git administration",
+      );
+      expect(existsSync(sidecar)).toBe(bytes !== undefined);
+      if (bytes !== undefined) expect(readFileSync(sidecar, "utf8")).toBe(bytes);
+      expect(
+        resumed.store.listEvents(run.id).filter((e) => e.message.includes("recorded legacy worktree")),
+      ).toHaveLength(0);
+    }
+  },
+);
+
+test.each([true, false])("interrupted prepare worktree (legacy: %s)", async (legacy) => {
+  let parking = true;
   const handler: Handler = (s) => {
     const role = roleOf(s);
     if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
-    if (role === "review") {
-      if (!resumedRecord || resumedBytes === undefined) throw new Error("Missing resumed worktree record");
-      expect(readFileSync(resumedRecord, "utf8")).toBe(resumedBytes);
-      return { structured: approve };
-    }
-    factory?.scheduler.drain();
+    if (role === "review") return { structured: approve };
+    if (parking) factory?.scheduler.drain();
     return { files: { "farewell.txt": "goodbye\n" } };
   };
   const f = start(handler);
   const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
   expect(await waitFor(f, run.id, ["queued"])).toBe("queued");
+  await f.stop();
+  parking = false;
   const state = f.store.getRunState<RunState>(run.id);
-  expect(state).toMatchObject({ phase: "loop", implementedRound: 0, parked: true });
   if (!state?.worktreePath) throw new Error("Missing parked worktree");
   const sidecar = `${resolve(state.worktreePath)}.git-paths`;
-  const original = readFileSync(sidecar, "utf8");
-  await f.stop();
-  // Also exercise the Git call made while restoring pre-upgrade preview state.
-  delete state.previewConfig;
+  rmSync(sidecar);
+  delete state.worktreePath;
+  state.phase = "prepare";
   f.store.setRunState(run.id, state);
+  if (legacy) legacyWorktreeFixture(f, run.id, true);
   f.store.close();
-  if (record === "missing") rmSync(sidecar);
-  else {
-    const paths = JSON.parse(original) as string[];
-    paths[0] = repoDir;
-    writeFileSync(sidecar, JSON.stringify(paths));
-  }
-  resumedRecord = sidecar;
-  resumedBytes = record === "missing" ? original : readFileSync(sidecar, "utf8");
-  const resumed = start(handler);
-  expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe(
-    record === "missing" ? "succeeded" : "failed",
+  const resumed = start(handler, false, false, false);
+  expect(await executeRun(resumed.deps, run.id, new AbortController().signal)).toBe(
+    legacy ? "succeeded" : "failed",
   );
-  expect(readFileSync(sidecar, "utf8")).toBe(resumedBytes);
+  expect(existsSync(sidecar)).toBe(legacy);
   expect(
-    resumed.store.listEvents(run.id).filter((event) => event.message.includes("recorded legacy worktree")),
-  ).toHaveLength(record === "missing" ? 1 : 0);
-  if (record === "mismatched")
-    expect(resumed.store.getRun(run.id)?.error).toContain("Unsafe worktree Git administration");
+    resumed.store.listEvents(run.id).filter((e) => e.message.includes("recorded legacy worktree")),
+  ).toHaveLength(legacy ? 1 : 0);
+  if (!legacy) expect(resumed.store.getRun(run.id)?.error).toContain("Missing trusted Git paths");
 });
 
 for (const profile of ["quick", "standard"] as const) {

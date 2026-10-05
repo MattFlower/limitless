@@ -1,5 +1,5 @@
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { assertExistingBranchDelivery, assertFactoryBranchPush, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, Run, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
@@ -23,9 +23,11 @@ import {
   retryRegressions,
   runGates,
 } from "../gates/run.ts";
-import { recordWorktree, worktreeGit, worktreeGitScope } from "../git/command.ts";
+import { worktreeGit, worktreeGitScope } from "../git/command.ts";
+import { recordLegacyWorktree } from "../git/legacy.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
+  cachePath,
   checkoutCommitted,
   checkPrivateRange,
   commitAll,
@@ -170,20 +172,20 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   try {
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
+    const worktree = ctx.state.worktreePath ?? join(deps.cfg.paths.work, runId);
+    if (existsSync(worktree)) {
+      if (deps.store.hasLegacyWorktree(runId)) {
+        const recorded = await recordLegacyWorktree(worktree, cachePath(deps.cfg.paths, ctx.repo));
+        deps.store.markModernWorktree(runId);
+        if (recorded) ctx.log(`recorded legacy worktree: ${worktree}`);
+      }
+      await headSha(worktree);
+    }
     if (ctx.state.needsHumanReason) throw new NeedsHumanError(ctx.state.needsHumanReason);
     ctx.state.flow ??= "build";
     await ctx.save();
     if (ctx.state.flow === "verify-change" && ctx.state.phase !== "prepare" && !ctx.state.verification)
       throw new Error("Verification state is missing its recorded PR revisions");
-    const worktree = ctx.state.worktreePath;
-    if (
-      worktree &&
-      lstatSync(join(worktree, ".git"), { throwIfNoEntry: false })?.isFile() &&
-      !lstatSync(`${resolve(worktree)}.git-paths`, { throwIfNoEntry: false })
-    ) {
-      await recordWorktree(worktree);
-      ctx.log(`recorded legacy worktree: ${worktree}`);
-    }
     if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined) {
       if (!ctx.run.baseSha || !ctx.state.worktreePath)
         throw new Error("Cannot restore base preview configuration: missing base SHA or worktree");
@@ -386,6 +388,7 @@ async function prepare(ctx: RunContext): Promise<void> {
     if (ctx.repo.kind === "github") await ensureCache(cfg.paths, ctx.repo);
     const base = ctx.run.baseBranch ?? ctx.repo.defaultBranch;
     const reusingWorktree = existsSync(join(cfg.paths.work, ctx.run.id));
+    if (!reusingWorktree) store.markModernWorktree(ctx.run.id);
     const wt = await createWorktree(cfg.paths, ctx.repo, ctx.run.id, ctx.run.title, base);
     const review = reviewRound(ctx);
     // Refused before any model call; delivery checks the PR again just before pushing.
