@@ -534,10 +534,18 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle(() => json(store.listRepos())),
     },
     "/api/providers": handle(() => json(factory.tracker.all())),
-    "/api/routing": handle(() => json(factory.routing.snapshot())),
+    "/api/routing": handle((req) =>
+      json(factory.routing.snapshot(new URL(req.url).searchParams.get("run") ?? undefined)),
+    ),
     "/api/routing/preview": handle((req) => {
       const query = new URL(req.url).searchParams;
-      return json(factory.routing.preview(query.get("role") ?? "", query.get("complexity") ?? "medium"));
+      return json(
+        factory.routing.preview(
+          query.get("role") ?? "",
+          query.get("complexity") ?? "medium",
+          query.get("run") ?? undefined,
+        ),
+      );
     }),
     "/api/routing/cells/:role/:cell": {
       PUT: handle(async (req) => {

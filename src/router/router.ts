@@ -109,9 +109,9 @@ export class Router {
     this.invalidateRouting();
   }
 
-  preview(role: Role, complexity: Complexity): RoutePreview[] {
+  preview(role: Role, complexity: Complexity, constraints: RouteConstraints = {}): RoutePreview[] {
     const preview: RoutePreview[] = [];
-    this.decideRoute(role, complexity, {}, preview);
+    this.decideRoute(role, complexity, constraints, preview);
     return preview;
   }
 

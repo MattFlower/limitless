@@ -82,6 +82,43 @@ test("routing API reports provenance, applies cell/prefer edits and resets, and 
   expect(factory.store.routingHistory()).toHaveLength(4);
 });
 
+test("run-scoped routing previews and snapshots put chains above code, evals and live operator edits", async () => {
+  const call = client();
+  const repo = factory.store.upsertRepo({
+    slug: "routing/repo",
+    kind: "local",
+    localPath: dir,
+    url: null,
+    defaultBranch: "main",
+    mergePolicy: "none",
+  });
+  const chain = ["codex/luna@low", "claude/opus@high"];
+  const run = await factory.createRun({ repo: repo.slug, prompt: "Pinned", models: { triage: chain } });
+  const unpinned = await factory.createRun({ repo: repo.slug, prompt: "Unpinned" });
+  factory.routing.setCell("triage", "small", ["codex/sol@high"]);
+  factory.routing.setPrefer(["claude"]);
+  const before = factory.routing.snapshot();
+  const preview = await call(`/api/routing/preview?role=triage&complexity=small&run=${run.id}`);
+  expect(await preview.json()).toEqual(chain.map((modelId) => ({ modelId, eligible: true, reason: null })));
+  const scoped = await (await call(`/api/routing?run=${run.id}`)).json();
+  expect(scoped.runId).toBe(run.id);
+  for (const cell of ["default", "trivial", "small", "medium", "large"])
+    expect(scoped.effective.triage[cell]).toEqual({ groups: chain, layer: "run" });
+  expect(scoped.effective.review).toEqual(before.effective.review);
+  expect((await (await call(`/api/routing?run=${unpinned.id}`)).json()).effective.triage.small).toEqual({
+    groups: ["codex/sol@high"],
+    layer: "operator",
+  });
+  factory.tracker.setEnabled("codex", false);
+  expect(await (await call(`/api/routing/preview?role=triage&run=${run.id}`)).json()).toEqual([
+    { modelId: chain[0], eligible: false, reason: "disabled" },
+    { modelId: chain[1], eligible: true, reason: null },
+  ]);
+  expect(factory.routing.snapshot()).toEqual(before);
+  for (const path of ["/api/routing", "/api/routing/preview?role=triage"])
+    expect((await call(`${path}${path.includes("?") ? "&" : "?"}run=missing`)).status).toBe(400);
+});
+
 test("routing mutations reject invalid payloads and honor the provider endpoint guards", async () => {
   const call = client();
   for (const path of ["/api/routing/cells/triage/default", "/api/routing/prefer"]) {

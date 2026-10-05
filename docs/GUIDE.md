@@ -518,10 +518,15 @@ limitless routing reset --all
 Commas separate fallback groups; `|` joins interchangeable targets and `@effort` selects an
 explicit supported effort. Preview lists eligible and skipped targets without reserving capacity.
 Operator edits and resets persist across restarts, retain old/new audit history, and publish SSE updates.
-A run's own chains, when supported, retain precedence.
+A run's `models` chains override all three layers for their roles and never fall back outside the chain.
+Use `limitless routing show --run <id>` or `limitless routing preview implement small --run <id>`
+to inspect a run's chains; without `--run`, these commands show global policy.
 
 `GET /api/routing` shows all layers, effective cells with their source and shadowed eval cells,
-provider preference, and history. Cell PUT/DELETE requests use `/api/routing/cells/:role/:cell`
+provider preference, and history. Both it and `GET /api/routing/preview?role=implement&complexity=small`
+accept a `run=<id>` query parameter to apply the run's chains. Snapshot cells then report source `run`.
+Preview applies current eligibility to the chain without changing global policy.
+Cell PUT/DELETE requests use `/api/routing/cells/:role/:cell`
 (PUT body: `{ "groups": ["codex/sol@high"], "note": "Claude depleted" }`).
 PUT `/api/routing/prefer` with `{ "prefer": ["codex"] }` replaces config `[routing] prefer`
 until DELETE clears it; use provider IDs. An empty list also overrides config. These mutations

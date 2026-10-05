@@ -9330,6 +9330,90 @@ describe("routing bounded slot waits", () => {
   );
 
   test.each(["cell", "prefer"])(
+    "a queued pinned implementer survives live %s edits without being tried early",
+    async (edit) => {
+      const f = fixture(models, policy, undefined, { implement: ["alpha/m", "beta/m"] });
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], policy);
+      const slots = await Promise.all(
+        ["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      try {
+        const pending = f.invoke(undefined, "implement");
+        expect(f.events()[0]?.message).toContain("waiting for alpha slot");
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        await f.clock.flush();
+        expect(f.calls).toEqual([]);
+        expect(f.context.state.triedImplementers).toEqual([]);
+        slots[0]?.();
+        expect((await pending).target.modelId).toBe("alpha/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["alpha/m"]);
+        expect(f.context.state.triedImplementers).toEqual([{ modelId: "alpha/m", effort: null }]);
+      } finally {
+        for (const release of slots) release();
+      }
+    },
+  );
+
+  test.each(["cell", "prefer"])(
+    "a live %s edit cancelling a pinned call before dispatch leaves it eligible for escalation",
+    async (edit) => {
+      const chain = ["alpha/m", "beta/m"];
+      const f = fixture(models, policy, undefined, { implement: chain });
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], policy);
+      const slots = await Promise.all(
+        ["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      const reached = deferred<void>();
+      const resume = deferred<void>();
+      const save = f.context.save.bind(f.context);
+      const persist = spyOn(f.context, "save").mockImplementationOnce(async () => {
+        reached.resolve();
+        await resume.promise;
+        await save();
+      });
+      try {
+        const pending = f.invoke(undefined, "implement");
+        expect(f.events()[0]?.message).toContain("waiting for alpha slot");
+        // First edit lands while queued; a second races the saved candidate before dispatch.
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        await f.clock.flush();
+        slots[0]?.();
+        await reached.promise;
+        f.tracker.blockModel("alpha/m", "temporarily rejected", 1_000);
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m", "alpha/m"]);
+        else runtime.setPrefer([]);
+        resume.resolve();
+        expect((await pending).target.modelId).toBe("beta/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+        expect(f.context.store.listInvocations(f.run.id).map((i) => i.status)).toEqual(["cancelled", "ok"]);
+        expect(f.context.state.triedImplementers).toEqual([{ modelId: "beta/m", effort: null }]);
+        const loaded = new RunContext(
+          { ...f.context.deps, tracker: f.tracker, router: f.router },
+          f.run,
+          f.context.repo,
+          f.controller.signal,
+        );
+        expect(loaded.state.triedImplementers).toEqual(f.context.state.triedImplementers);
+        await f.clock.advance(1_000);
+        expect(
+          f.router
+            .route("implement", "small", {
+              chain,
+              exclude: loaded.state.triedImplementers,
+            })
+            .candidates.map((t) => t.modelId),
+        ).toEqual(["alpha/m"]);
+      } finally {
+        resume.resolve();
+        persist.mockRestore();
+        for (const release of slots) release();
+      }
+    },
+  );
+
+  test.each(["cell", "prefer"])(
     "live %s edits during preflight release the obsolete reservation",
     async (edit) => {
       const routing = { ...policy, implement: { default: ["alpha/m|beta/m"] } };

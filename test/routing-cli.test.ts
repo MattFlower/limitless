@@ -17,9 +17,10 @@ test("routing CLI uses guarded API requests and preserves groups, alternatives a
       { modelId: "claude/opus", eligible: false, reason: "disabled" }
     ]);
     return Response.json({
+      runId: url.searchParams.get("run"),
       layers: { operator: { implement: { small: ["codex/sol@high"] } } },
       effective: {
-        implement: { small: { groups: ["codex/sol@high"], layer: "operator" } },
+        implement: { small: { groups: url.searchParams.has("run") ? ["claude/opus", "codex/luna@low"] : ["codex/sol@high"], layer: url.searchParams.has("run") ? "run" : "operator" } },
         triage: { default: { groups: ["claude/opus"], layer: "evals" } }
       }, prefer: ["codex"], operatorPrefer: ["codex"]
     });
@@ -54,6 +55,13 @@ test("routing CLI uses guarded API requests and preserves groups, alternatives a
     expect(shown.output).toContain("implement.small [operator] codex/sol@high");
     expect(shown.output).not.toContain("triage.default");
     expect((await run("show")).output).toContain("triage.default [evals] claude/opus");
+    expect(shown.output).toContain("Global routing policy: per-run model chains take precedence");
+    const pinned = await run("show", "--role", "implement", "--run", "pinned");
+    expect(pinned.exit).toBe(0);
+    expect(pinned.output).toContain("REQUEST GET /api/routing?run=pinned");
+    expect(pinned.output).toContain("Routing for run pinned");
+    expect(pinned.output).toContain("implement.small [run] claude/opus,codex/luna@low");
+    expect(pinned.output).not.toContain("implement.small [operator]");
     const set = await run(
       "set",
       "implement.small",
@@ -79,10 +87,15 @@ test("routing CLI uses guarded API requests and preserves groups, alternatives a
     expect(preview.output).toContain("codex/sol@high: eligible");
     expect(preview.output).toContain("claude/opus: skipped (disabled)");
     expect((await run("preview", "triage")).output).toContain("complexity=medium");
+    expect((await run("preview", "triage", "small", "--run", "pinned")).output).toContain(
+      "REQUEST GET /api/routing/preview?role=triage&complexity=small&run=pinned",
+    );
     for (const args of [
       ["reset"],
       ["reset", "implement.small", "--all"],
       ["set", "bad", "codex/sol"],
+      ["set", "implement.small", "codex/sol", "--run", "pinned"],
+      ["reset", "--all", "--run", "pinned"],
       ["preview"],
     ]) {
       const invalid = await run(...args);

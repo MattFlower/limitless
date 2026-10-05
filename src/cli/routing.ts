@@ -7,17 +7,26 @@ type Api = <T>(path: string, init?: RequestInit) => Promise<T>;
 
 export async function routingCommand(
   args: string[],
-  options: { role?: string; note?: string; all?: boolean },
+  options: { role?: string; note?: string; all?: boolean; run?: string },
   api: Api,
 ): Promise<void> {
   const [action, entry, chain] = args;
+  if (options.run !== undefined && action !== "show" && action !== "preview")
+    throw new Error("--run applies only to routing show and preview");
   const cellPath = (key: string) => {
     const parts = key.split(".");
     if (parts.length !== 2 || parts.some((s) => !s)) throw new Error("expected <role>.<cell>");
     return `/api/routing/cells/${parts.map(encodeURIComponent).join("/")}`;
   };
   if (action === "show" && args.length === 1) {
-    const routing = await api<Snapshot>("/api/routing");
+    const routing = await api<Snapshot>(
+      options.run ? `/api/routing?${new URLSearchParams({ run: options.run })}` : "/api/routing",
+    );
+    console.log(
+      routing.runId
+        ? `Routing for run ${routing.runId}: model chains override every policy cell`
+        : "Global routing policy: per-run model chains take precedence",
+    );
     if (options.role && !Object.hasOwn(routing.effective, options.role))
       throw new Error(`unknown role ${options.role}`);
     for (const [role, cells] of Object.entries(routing.effective)) {
@@ -52,11 +61,12 @@ export async function routingCommand(
     console.log(`Routing reset: ${entry ?? "all operator overrides"}`);
   } else if (action === "preview" && entry && (args.length === 2 || args.length === 3)) {
     const query = new URLSearchParams({ role: entry, complexity: chain ?? "medium" });
+    if (options.run) query.set("run", options.run);
     const candidates = await api<RoutePreview[]>(`/api/routing/preview?${query}`);
     for (const c of candidates)
       console.log(`${c.modelId}: ${c.eligible ? "eligible" : `skipped (${c.reason})`}`);
   } else
     throw new Error(
-      "usage: limitless routing show [--role r] | set <role>.<cell> <chain> [--note …] | reset <role>.<cell> | reset --all | preview <role> [<complexity>]",
+      "usage: limitless routing show [--role r] [--run id] | set <role>.<cell> <chain> [--note …] | reset <role>.<cell> | reset --all | preview <role> [<complexity>] [--run id]",
     );
 }

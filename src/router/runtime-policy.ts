@@ -1,4 +1,4 @@
-import type { Complexity, Role, RoutingCell, RoutingChange } from "../core/types.ts";
+import type { Complexity, Role, RoutingCell, RoutingChange, RunModels, RunRole } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef, REMOVED_MODELS } from "./catalog.ts";
 import { overlayPolicy, type PolicyOverlay, validatePolicy } from "./policy.ts";
@@ -83,28 +83,42 @@ export class RuntimePolicy {
     return [...(this.operatorPrefer ?? this.configPrefer)];
   }
 
-  snapshot() {
+  private runModels(runId?: string): RunModels | undefined {
+    if (runId === undefined) return undefined;
+    const run = this.store.getRun(runId);
+    if (!run) throw new Error(`run ${runId} not found`);
+    return run.models ?? undefined;
+  }
+
+  snapshot(runId?: string) {
+    const models = this.runModels(runId);
     const effective = Object.fromEntries(
-      Object.entries(this.router.getPolicy()).map(([role, cells]) => [
-        role,
-        Object.fromEntries(
-          Object.entries(cells).map(([cell, groups]) => {
-            const r = role as Role;
-            const c = cell as RoutingCell;
-            const operator = this.operator[r]?.[c] !== undefined;
-            return [
-              cell,
-              {
-                groups,
-                layer: operator ? "operator" : this.evals[r]?.[c] ? "evals" : "code",
-                ...(operator && this.evals[r]?.[c] ? { evals: this.evals[r]?.[c] } : {}),
+      Object.entries(this.router.getPolicy()).map(([role, cells]) => {
+        const chain = models?.[role as RunRole];
+        return [
+          role,
+          Object.fromEntries(
+            (chain ? CELLS.map((cell) => [cell, chain] as const) : Object.entries(cells)).map(
+              ([cell, groups]) => {
+                const r = role as Role;
+                const c = cell as RoutingCell;
+                const operator = this.operator[r]?.[c] !== undefined;
+                return [
+                  cell,
+                  {
+                    groups,
+                    layer: chain ? "run" : operator ? "operator" : this.evals[r]?.[c] ? "evals" : "code",
+                    ...(!chain && operator && this.evals[r]?.[c] ? { evals: this.evals[r]?.[c] } : {}),
+                  },
+                ];
               },
-            ];
-          }),
-        ),
-      ]),
+            ),
+          ),
+        ];
+      }),
     );
     return {
+      runId: runId ?? null,
       layers: { code: this.code, evals: this.evals, operator: this.operator },
       effective,
       prefer: this.prefer,
@@ -139,9 +153,10 @@ export class RuntimePolicy {
     return this.snapshot();
   }
 
-  preview(role: string, complexity = "medium") {
+  preview(role: string, complexity = "medium", runId?: string) {
     this.entry(role, complexity);
     if (complexity === "default") throw new Error(`${role}.${complexity}: expected complexity`);
-    return this.router.preview(role as Role, complexity as Complexity);
+    const chain = this.runModels(runId)?.[role as RunRole];
+    return this.router.preview(role as Role, complexity as Complexity, { chain });
   }
 }

@@ -617,15 +617,8 @@ export class RunContext {
         throw new Error(`No harness registered for ${harnessName}`);
       }
       tried.push({ modelId: target.modelId, effort: target.effort ?? null });
+      const previousImplementer = this.state.implementer;
       if (opts.role === "implement") {
-        if (
-          chain &&
-          !this.state.triedImplementers.some(
-            (ref) =>
-              (typeof ref === "string" ? ref : formatTarget(ref.modelId, ref.effort)) === target.targetId,
-          )
-        )
-          this.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
         this.state.implementer = {
           policyRevision: cellRevision,
           modelId: target.modelId,
@@ -637,6 +630,7 @@ export class RunContext {
         try {
           await this.save();
         } catch (error) {
+          this.state.implementer = previousImplementer;
           release();
           throw error;
         }
@@ -672,6 +666,22 @@ export class RunContext {
             "warn",
           );
       }
+      let dispatched = false;
+      const dispatch = () => {
+        // Persist tried history without yielding between recording it and starting the harness.
+        if (
+          opts.role === "implement" &&
+          chain &&
+          !this.state.triedImplementers.some(
+            (ref) =>
+              (typeof ref === "string" ? ref : formatTarget(ref.modelId, ref.effort)) === target.targetId,
+          )
+        ) {
+          this.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
+          store.setRunState(this.run.id, this.state);
+        }
+        dispatched = true;
+      };
       let result: AgentResult;
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
       const publicSources = opts.redactHoldout && this.state.holdout ? await this.publicHoldoutSources() : "";
@@ -733,11 +743,19 @@ export class RunContext {
           attempt--;
           continue;
         }
-        if (stream) result = parseFakeStream(stream, spec.onEvent);
-        else if (!noTools) {
+        if (stream) {
+          dispatch();
+          result = parseFakeStream(stream, spec.onEvent);
+        } else if (!noTools) {
           // Every tool-enabled call is confined to its cwd plus a scratch this call owns.
-          result = await withScratch(spec.cwd, (scratchDir) => harness({ ...spec, scratchDir }));
-        } else result = await harness(spec);
+          result = await withScratch(spec.cwd, (scratchDir) => {
+            dispatch();
+            return harness({ ...spec, scratchDir });
+          });
+        } else {
+          dispatch();
+          result = await harness(spec);
+        }
       } catch (e) {
         if (e instanceof SimulatedTermination) {
           this.termination = e;
@@ -756,6 +774,10 @@ export class RunContext {
           quota: null,
         };
       } finally {
+        if (!dispatched && revision.aborted && opts.role === "implement") {
+          this.state.implementer = previousImplementer;
+          store.setRunState(this.run.id, this.state);
+        }
         release();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
         const checkout = shadow?.cwd ?? this.state.worktreePath;

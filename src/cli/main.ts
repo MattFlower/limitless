@@ -45,10 +45,10 @@ Usage:
   limitless providers export [--write] [--yes]     Export effective provider config (offline)
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
-  limitless routing show [--role r]
+  limitless routing show [--role r] [--run id]
   limitless routing set <role>.<cell> <chain> [--note …]
   limitless routing reset <role>.<cell> | --all
-  limitless routing preview <role> [<complexity>]
+  limitless routing preview <role> [<complexity>] [--run id]
   limitless doctor                        Report GitHub access problems the PR poller recorded
   limitless auth add-passkey              Print a one-time link (10 minutes) that registers a UI passkey
   limitless auth passkeys [remove <id>]   List or remove UI passkeys
@@ -232,6 +232,7 @@ async function main(): Promise<void> {
       wait: { type: "string" },
       repo: { type: "string", short: "r" },
       role: { type: "string" },
+      run: { type: "string" },
       profile: { type: "string", short: "p" },
       title: { type: "string", short: "t" },
       follow: { type: "boolean", short: "f" },
