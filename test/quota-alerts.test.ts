@@ -132,6 +132,14 @@ for (const knownReset of [false, true]) {
     }
     expect(alerts()).toHaveLength(6);
     expect(alerts().find((alert) => alert.window === "rejected")?.source).toBe("rejection");
+    // Fresh telemetry cannot establish whether an older exhausted alert was a rejection.
+    factory.tracker.observeWindows("claude", {
+      legacy_exhausted: { utilization: 0.9, resetsAt: reset },
+    });
+    expect(alerts().find((alert) => alert.window === "legacy_exhausted")).toMatchObject({
+      severity: "exhausted",
+      source: null,
+    });
     store.close();
     store = new Store(factory.cfg.paths.db);
     factory = new Factory(factory.cfg, {
