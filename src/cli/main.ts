@@ -473,7 +473,17 @@ async function main(): Promise<void> {
     case "init":
     case "doctor": {
       const { setupCommand, setupDeps } = await import("./setup.ts");
-      process.exitCode = await setupCommand(cmd, values, setupDeps());
+      let deps: ReturnType<typeof setupDeps>;
+      try {
+        deps = setupDeps();
+      } catch {
+        const error = "Invalid configuration; fix config.toml before running setup";
+        if (values.json) console.log(JSON.stringify({ ok: false, failedStep: "config", error }));
+        else console.error(error);
+        process.exitCode = 1;
+        return;
+      }
+      process.exitCode = await setupCommand(cmd, values, deps);
       return;
     }
     case "gc": {

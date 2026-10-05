@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { doctor, setupCommand, setupDeps } from "../src/cli/setup.ts";
 import { tomlValue } from "../src/router/config-catalog.ts";
 import { customProvider } from "./provider-config-support.ts";
-import { setupFixture } from "./setup-support.ts";
+import { assertReadOnlyCommand, setupFixture } from "./setup-support.ts";
 
 const keyProvider = {
   ...customProvider,
@@ -142,14 +142,22 @@ for (const [id, status, fix, arrange] of cases)
 test("all checks pass without external effects, and outputs stay read-only", async () => {
   const f = setupFixture("[server]\nport = 7400\n");
   try {
-    writeFileSync(join(f.configDir, "secrets.env"), "UNUSED_API_KEY=sk-SENTINEL-read-only\n");
+    writeFileSync(
+      join(f.configDir, "secrets.env"),
+      "UNUSED_API_KEY=sk-SENTINEL-read-only\nOPENROUTER_API_KEY=sk-SENTINEL-or\nOMLX_API_KEY=sk-SENTINEL-omlx\nTWILIGHT_API_KEY=sk-SENTINEL-twilight\nTYPESAFE_API_KEY=sk-SENTINEL-typesafe\n",
+    );
     f.reload();
+    const fetch = f.d.fetch;
+    f.d.fetch = (url, init) =>
+      url.includes("/api/") && !url.includes("openrouter.ai")
+        ? fetch(url, init)
+        : Promise.resolve(Response.json({ ok: true }));
     mkdirSync(f.home);
     writeFileSync(f.smokeFile, JSON.stringify([{ name: "live", status: "pass" }]));
     const before = f.snapshot();
     expect(await setupCommand("doctor", { json: true }, f.d)).toBe(0);
     const summary = JSON.parse(f.output[0] ?? "");
-    expect(summary.checks.map((c: { status: string }) => c.status)).toEqual(Array(8).fill("ok"));
+    expect(summary.checks.map((c: { status: string }) => c.status)).toEqual(Array(16).fill("ok"));
     expect(f.snapshot()).toEqual(before);
     expect(f.effects).toEqual([]);
     expect(f.requests.every((r) => r.method === "GET")).toBe(true);
@@ -290,7 +298,10 @@ test("escaped secrets are redacted before JSON encoding in feed, smoke storage a
     expect(
       JSON.parse(f.output[0] ?? "").checks.find((c: { id: string }) => c.id === "feed-access").message,
     ).toContain("[redacted]");
-    f.d.fetch = fetch;
+    f.d.fetch = (url, init) =>
+      url.startsWith("http://provider.invalid")
+        ? Promise.resolve(Response.json({ ok: true }))
+        : fetch(url, init);
     f.d.smoke = async () => [{ name: "live", status: "pass", reason: secret, durationMs: 1 }];
     expect(await setupCommand("init", { yes: true, json: true }, f.d)).toBe(0);
     expect(JSON.parse(f.output[1] ?? "").smoke[0].reason).toBe("[redacted]");
@@ -300,3 +311,117 @@ test("escaped secrets are redacted before JSON encoding in feed, smoke storage a
     f.close();
   }
 });
+
+test("doctor fakes reject service installation and MCP mutations", () => {
+  for (const args of [
+    ["bun", "main.ts", "service", "install"],
+    ["claude", "mcp", "add", "limitless"],
+    ["codex", "mcp", "add", "limitless"],
+  ])
+    expect(() => assertReadOnlyCommand(args)).toThrow("Unexpected command");
+});
+
+test("isolated CLI config errors never echo TOML or validation input", async () => {
+  const secret = "sk-SENTINEL-private-config";
+  const f = setupFixture();
+  try {
+    for (const text of [`credential = ${secret}\n`, `[providers.${secret}]\nmax_concurrent = 2\n`]) {
+      writeFileSync(f.file, text);
+      for (const command of ["doctor", "init"])
+        for (const json of [false, true]) {
+          const child = Bun.spawn(
+            [process.execPath, "src/cli/main.ts", command, ...(json ? ["--json"] : [])],
+            {
+              env: { ...process.env, LIMITLESS_HOME: f.home, LIMITLESS_CONFIG_DIR: f.configDir },
+              stdout: "pipe",
+              stderr: "pipe",
+            },
+          );
+          const [stdout, stderr, exit] = await Promise.all([
+            new Response(child.stdout).text(),
+            new Response(child.stderr).text(),
+            child.exited,
+          ]);
+          expect(exit).toBe(1);
+          expect(stdout + stderr).toContain("fix config.toml");
+          expect(stdout + stderr).not.toContain(secret);
+          expect(stdout + stderr).not.toContain(text.trim());
+          if (json) expect(JSON.parse(stdout)).toMatchObject({ ok: false, failedStep: "config" });
+        }
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test("feed credentials are redacted in plain, URL, form, and base64 encodings", async () => {
+  const f = setupFixture();
+  const secret = "sk-SENTINEL:/? +private";
+  const forms = [
+    secret,
+    encodeURIComponent(secret),
+    encodeURIComponent(secret).replace(/%[\dA-F]{2}/g, (s) => s.toLowerCase()),
+    new URLSearchParams({ key: secret }).toString().slice(4),
+    Buffer.from(secret).toString("base64"),
+    Buffer.from(secret).toString("base64url"),
+  ];
+  try {
+    writeFileSync(join(f.configDir, "secrets.env"), `FEED_TOKEN=${secret}\n`);
+    f.reload();
+    const fetch = f.d.fetch;
+    f.d.fetch = (url, init) =>
+      url.endsWith("/api/github/access")
+        ? Promise.resolve(
+            Response.json([{ repo: "acme/app", reason: "auth", since: 0, detail: forms.join(" | ") }]),
+          )
+        : fetch(url, init);
+    for (const json of [false, true]) {
+      f.output.length = 0;
+      expect(await setupCommand("doctor", { json }, f.d)).toBe(1);
+      const output = f.output.join("\n");
+      expect(output).toContain("[redacted]");
+      for (const form of forms) expect(output).not.toContain(form);
+    }
+  } finally {
+    f.close();
+  }
+});
+
+for (const explicit of [false, true])
+  for (const outcome of ["ok", "unauthorized", "unreachable", "missing"])
+    test(`effective OpenRouter provider explicit=${explicit}: ${outcome}`, async () => {
+      const f = setupFixture(explicit ? '[[providers]]\npreset = "openrouter"\n' : undefined);
+      try {
+        f.d.config.secrets.OPENROUTER_API_KEY = outcome === "missing" ? "" : "sk-SENTINEL-health";
+        const fetch = f.d.fetch;
+        const probes: RequestInit[] = [];
+        f.d.fetch = async (url, init) => {
+          if (url !== "https://openrouter.ai/api/v1/key") return fetch(url, init);
+          probes.push(init ?? {});
+          if (outcome === "unreachable") throw new Error("offline");
+          return new Response("", { status: outcome === "ok" ? 200 : 401 });
+        };
+        const before = f.snapshot(),
+          checks = await doctor(f.d);
+        expect(checks.find((c) => c.id === "provider:openrouter:key")).toMatchObject({
+          status: outcome === "missing" ? (explicit ? "fail" : "warn") : "ok",
+        });
+        const status = outcome === "ok" ? "ok" : explicit && outcome === "unauthorized" ? "fail" : "warn";
+        expect(checks.find((c) => c.id === "provider:openrouter:health")).toMatchObject({
+          status,
+          ...(status !== "ok"
+            ? { fix: "start or repair provider openrouter, then run limitless doctor" }
+            : {}),
+        });
+        expect(probes).toHaveLength(1);
+        expect(probes[0]?.method).toBe("GET");
+        expect(new Headers(probes[0]?.headers).get("authorization")).toBe(
+          outcome === "missing" ? null : "Bearer sk-SENTINEL-health",
+        );
+        expect(f.requests.some((r) => r.url === "http://127.0.0.1:8989/v1/models")).toBe(true);
+        expect(checks.find((c) => c.id === "provider:omlx:key")?.status).toBe("warn");
+        expect(f.snapshot()).toEqual(before);
+      } finally {
+        f.close();
+      }
+    });

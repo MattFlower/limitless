@@ -1,3 +1,4 @@
+import { expect } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -12,6 +13,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setupDeps } from "../src/cli/setup.ts";
 import { loadConfig } from "../src/config.ts";
+
+export function assertReadOnlyCommand(args: string[]): void {
+  const command = args.join(" ");
+  if (
+    ![
+      "git --version",
+      "git rev-parse HEAD",
+      "gh auth status",
+      "claude --version",
+      "claude auth status",
+      "codex --version",
+      "codex login status",
+      "python3 --version",
+    ].includes(command) &&
+    !/^gh api repos\/[\w.-]+\/[\w.-]+ -i$/.test(command)
+  )
+    throw new Error(`Unexpected command: ${command}`);
+}
 
 export function setupFixture(text?: string) {
   const root = mkdtempSync(join(tmpdir(), "limitless-setup-")),
@@ -32,6 +51,7 @@ export function setupFixture(text?: string) {
   d.print = (s) => output.push(s);
   d.run = async (args) => {
     commands.push(args.join(" "));
+    assertReadOnlyCommand(args);
     return {
       exitCode: args.join(" ") === "gh auth status" && !state.auth ? 1 : 0,
       stdout:
@@ -106,6 +126,10 @@ export function setupFixture(text?: string) {
     effects,
     reload,
     snapshot,
-    close: () => rmSync(root, { recursive: true, force: true }),
+    close: () => {
+      rmSync(root, { recursive: true, force: true });
+      // Doctor catches failed commands; assert here so forbidden calls cannot be swallowed.
+      for (const command of commands) expect(() => assertReadOnlyCommand(command.split(" "))).not.toThrow();
+    },
   };
 }

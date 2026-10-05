@@ -152,9 +152,17 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     for (const dir of [paths.home, paths.repos, paths.work, paths.runs]) mkdirSync(dir, { recursive: true });
 
   const tomlPath = join(configDir, "config.toml");
-  const raw: Record<string, unknown> =
-    overrides.raw ??
-    (existsSync(tomlPath) ? (Bun.TOML.parse(readFileSync(tomlPath, "utf8")) as Record<string, unknown>) : {});
+  let raw: Record<string, unknown>;
+  try {
+    raw =
+      overrides.raw ??
+      (existsSync(tomlPath)
+        ? (Bun.TOML.parse(readFileSync(tomlPath, "utf8")) as Record<string, unknown>)
+        : {});
+  } catch {
+    // Parser diagnostics can include the source line, including credentials.
+    throw new Error("Invalid config.toml; fix TOML syntax in the configuration file");
+  }
   evalSettings(raw);
   const catalog = resolveCatalog(raw.providers);
   const { providerMaxConcurrent } = catalog;

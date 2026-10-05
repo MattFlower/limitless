@@ -1,12 +1,13 @@
-import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { loadConfig, repoName } from "../config.ts";
 import type { GitHubAccessProblem } from "../core/types.ts";
 import { githubDoctor } from "../integrations/github-poller.ts";
 import { installIntegrations, repositoryRoot } from "../integrations/install.ts";
-import { resolveCatalog, tomlValue } from "../router/config-catalog.ts";
+import { resolveCatalog } from "../router/config-catalog.ts";
 import { sh } from "../util/proc.ts";
+import { patchSetupConfig } from "./setup-config.ts";
 export type Check = { id: string; status: "ok" | "warn" | "fail"; message: string; fix?: string };
 type CommandResult = { exitCode: number | null; stdout: string; stderr: string };
 type SmokeRow = { name: string; status: "pass" | "fail" | "skip"; reason?: string; durationMs: number };
@@ -22,7 +23,26 @@ async function get(d: SetupDeps, url: string, token?: string) {
   }
 }
 function safe(d: SetupDeps, text: string): string {
-  for (const value of Object.values(d.config.secrets)) if (value) text = text.replaceAll(value, "[redacted]");
+  const values = Object.values(d.config.secrets).concat(
+    resolveCatalog(d.config.raw.providers).providers.map((p) => p.apiKey ?? ""),
+  );
+  const forms = values.filter(Boolean).flatMap((v) => {
+    const url = encodeURIComponent(v),
+      base64 = Buffer.from(v).toString("base64");
+    return [
+      v,
+      url,
+      url.replace(/%[\dA-F]{2}/g, (s) => s.toLowerCase()),
+      url.replace(/%20/g, "+"),
+      new URLSearchParams({ key: v }).toString().slice(4),
+      encodeURI(v),
+      base64,
+      base64.replace(/=+$/, ""),
+      Buffer.from(v).toString("base64url"),
+    ];
+  });
+  for (const value of [...new Set(forms)].sort((a, b) => b.length - a.length))
+    text = text.replaceAll(value, "[redacted]");
   return text;
 }
 function encoded(d: SetupDeps, value: unknown): string {
@@ -80,19 +100,30 @@ export async function doctor(d: SetupDeps): Promise<Check[]> {
   const ids = Array.isArray(configured)
     ? configured.map((p) => p.id ?? p.preset)
     : Object.keys(configured ?? {});
-  for (const p of resolveCatalog(configured).providers.filter((p) => ids.includes(p.id))) {
+  for (const p of resolveCatalog(configured).providers) {
+    const explicit = ids.includes(p.id);
     const key = p.apiKeySecret,
       token = key ? d.config.secrets[key] : p.apiKey;
     if (key) {
       const id = `provider:${p.id}:key`;
       fixes[id] = `add ${key}=... to ${d.config.paths.configDir}/secrets.env`;
-      add(id, token ? "ok" : "fail", `${key} ${token ? "present" : "missing"}`);
+      add(id, token ? "ok" : explicit ? "fail" : "warn", `${key} ${token ? "present" : "missing"}`);
     }
-    if (p.healthUrl) {
+    const preset = Array.isArray(configured)
+      ? configured.find((c) => c.id === p.id || (!c.id && c.preset === p.id))?.preset
+      : p.id;
+    const healthUrl =
+      p.healthUrl ??
+      (preset === "openrouter" || p.id === "openrouter" ? "https://openrouter.ai/api/v1/key" : undefined);
+    if (healthUrl) {
       const id = `provider:${p.id}:health`,
-        healthy = (await get(d, p.healthUrl, token))?.ok;
+        response = await get(d, healthUrl, token);
       fixes[id] = `start or repair provider ${p.id}, then run limitless doctor`;
-      add(id, healthy ? "ok" : "warn", healthy ? "healthy" : "health check failed");
+      add(
+        id,
+        response?.ok ? "ok" : explicit && (!key || token) && response ? "fail" : "warn",
+        response?.ok ? "healthy" : "health check failed",
+      );
     }
   }
   const health = await get(d, `${d.url}/api/health`);
@@ -126,21 +157,57 @@ export async function doctor(d: SetupDeps): Promise<Check[]> {
 }
 type Flags = { yes?: boolean; json?: boolean; repo?: string[] };
 export async function setupCommand(command: "doctor" | "init", flags: Flags, d: SetupDeps): Promise<number> {
+  const file = join(d.config.paths.configDir, "config.toml");
+  const original = existsSync(file) ? readFileSync(file, "utf8") : null;
+  const originalRaw = d.config.raw;
+  const transaction = { failedStep: "preflight", replaced: false, warnings: [] as string[] };
+  try {
+    return await runSetup(command, flags, d, original, transaction);
+  } catch (error) {
+    if (transaction.replaced) {
+      if (original === null) rmSync(file, { force: true });
+      else d.write(file, original);
+      d.config.raw = originalRaw;
+    }
+    const message = safe(d, error instanceof Error ? error.message : "Setup failed; run limitless doctor");
+    if (!flags.json) throw new Error(message);
+    d.print(
+      encoded(d, {
+        ok: false,
+        failedStep: transaction.failedStep,
+        error: message,
+        warnings: transaction.warnings,
+      }),
+    );
+    return 1;
+  }
+}
+async function runSetup(
+  command: "doctor" | "init",
+  flags: Flags,
+  d: SetupDeps,
+  original: string | null,
+  transaction: { failedStep: string; replaced: boolean; warnings: string[] },
+): Promise<number> {
   const checks = await doctor(d),
     ok = checks.every((c) => c.status !== "fail");
   const printChecks = () => {
     for (const c of checks) d.print(`${c.status} ${c.id}: ${c.message}${c.fix ? `\n  Fix: ${c.fix}` : ""}`);
   };
   if (command === "doctor" || !ok) {
-    if (flags.json) d.print(JSON.stringify({ checks, ok }));
+    if (flags.json)
+      d.print(
+        JSON.stringify({ checks, ok, ...(!ok && command === "init" ? { failedStep: "preflight" } : {}) }),
+      );
     else printChecks();
     return ok ? 0 : 1;
   }
   if (!flags.json) printChecks();
+  transaction.failedStep = "config";
   const ask = (q: string, fallback: string) =>
     flags.yes || !d.tty ? Promise.resolve(fallback) : d.ask(q, fallback);
   const confirm = async (q: string, fallback: boolean) =>
-    flags.yes || (await ask(q, fallback ? "yes" : "no")).toLowerCase() === "yes";
+    flags.yes || /^y(es)?$/i.test(await ask(q, fallback ? "yes" : "no"));
   const raw = structuredClone(d.config.raw);
   const entries: Record<string, unknown>[] = Array.isArray(raw.providers)
     ? (raw.providers as Record<string, unknown>[])
@@ -190,23 +257,47 @@ export async function setupCommand(command: "doctor" | "init", flags: Flags, d: 
   if (requested.some((r) => !repoName.test(r))) throw new Error("--repo requires owner/name");
   const repos = { added: [...new Set(requested)].filter((r) => !existing.includes(r)), existing };
   const merge = github.merge ?? (await ask("Merge policy (auto/pr/none)", "pr"));
+  const discreet = `discreet mode: ${await ask("Discreet mode (on/off)", "off")} (deferred to #37; not available yet (#37))`;
   raw.github = { ...github, repos: [...existing, ...repos.added], merge };
   raw.providers = entries;
   d.validate(raw);
   const missing = providers.added.length || repos.added.length || !("repos" in github && "merge" in github);
   if (missing) {
-    const line = ([k, v]: [string, unknown]) => `${tomlValue(k)} = ${tomlValue(v)}\n`;
-    const assignments = (r: Record<string, unknown>) => Object.entries(r).map(line).join("");
-    const { providers: _providers, ...other } = raw;
-    const text = assignments(other) + entries.map((p) => `\n[[providers]]\n${assignments(p)}`).join("");
-    d.validate(Bun.TOML.parse(text) as Record<string, unknown>);
+    const convert = !Array.isArray(d.config.raw.providers) && entries.length > 0;
+    const backup =
+      original === null
+        ? null
+        : `${join(d.config.paths.configDir, "config.toml")}.${new Date().toISOString().replace(/[:.]/g, "-")}.${crypto.randomUUID()}.bak`;
+    if (convert) {
+      const warning = `One-way migration: the previous release cannot load [[providers]]. Rollback requires ${backup ? `restoring the original backup: ${backup}` : "removing the new config"}.`;
+      transaction.warnings.push(warning);
+      if (!flags.json) d.print(safe(d, warning));
+      if (!(await confirm(`Convert to [[providers]]? ${warning}`, false)))
+        throw new Error(`${warning} Config replacement refused; confirm interactively or use --yes`);
+    }
+    const text = patchSetupConfig(
+      original ?? "",
+      raw.github as Record<string, unknown>,
+      entries,
+      providers.added,
+      convert,
+    );
+    try {
+      d.validate(Bun.TOML.parse(text) as Record<string, unknown>);
+    } catch {
+      throw new Error("Cannot update config.toml; check providers and github settings");
+    }
+    if (backup && original !== null) d.write(backup, original);
     d.write(join(d.config.paths.configDir, "config.toml"), text);
+    transaction.replaced = true;
   }
   d.config.raw = raw;
   let service = "already set";
   if (checks.find((c) => c.id === "daemon")?.status !== "ok") {
+    transaction.failedStep = "service";
     await d.install();
     service = "started";
+    transaction.failedStep = "readiness";
     const sha = await d.run(["git", "rev-parse", "HEAD"], d.appDir);
     let ready = false;
     for (let i = 0; i < 30 && !ready; i++) {
@@ -217,18 +308,32 @@ export async function setupCommand(command: "doctor" | "init", flags: Flags, d: 
     }
     if (!ready) throw new Error("daemon did not become healthy; run limitless service install");
   }
+  transaction.failedStep = "smoke";
   const smoke = await d.smoke();
   d.write(join(d.config.paths.home, "smoke-last.json"), encoded(d, smoke));
+  if (smoke.some((r) => r.status === "fail"))
+    throw new Error("Live smoke checks failed; run limitless doctor");
+  transaction.failedStep = "mcp";
   const mcp = await d.mcp(await confirm("Register MCP with Claude Code and Codex?", false));
-  const discreet = "skipped: discreet mode: not available yet (#37)";
-  const summary = { checks, providers, repos, merge, service, smoke, mcp, discreet };
+  const summary = {
+    ok: true,
+    checks,
+    providers,
+    repos,
+    merge,
+    service,
+    smoke,
+    mcp,
+    discreet,
+    warnings: transaction.warnings,
+  };
   if (flags.json) d.print(encoded(d, summary));
   else {
-    for (const id of providers.existing.concat(repos.existing)) d.print(`${id}: already set`);
+    for (const id of providers.existing.concat(repos.existing)) d.print(safe(d, `${id}: already set`));
     for (const [key, value] of Object.entries(summary).filter(([k]) => k !== "checks"))
       d.print(safe(d, `${key}: ${typeof value === "string" ? value : encoded(d, value)}`));
   }
-  return smoke.some((r) => r.status === "fail") ? 1 : 0;
+  return 0;
 }
 type SetupPaths = Partial<{ configDir: string; home: string; appDir: string; userHome: string }>;
 export function setupDeps(options: SetupPaths = {}) {
@@ -256,7 +361,13 @@ export function setupDeps(options: SetupPaths = {}) {
         rmSync(temp, { force: true });
       }
     },
-    validate: (raw: Record<string, unknown>) => void loadConfig({ ...options, readOnly: true, raw }),
+    validate: (raw: Record<string, unknown>) => {
+      try {
+        loadConfig({ ...options, readOnly: true, raw });
+      } catch {
+        throw new Error("Invalid config.toml; check providers, github.repos and github.merge settings");
+      }
+    },
     ask: async (q: string, fallback: string) => prompt(`${q} [${fallback}]:`)?.trim() || fallback,
     install: async (): Promise<void> => {
       const result = await d.run(["bun", main, "service", "install"], repositoryRoot, 900000);

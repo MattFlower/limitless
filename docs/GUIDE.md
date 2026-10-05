@@ -126,7 +126,11 @@ limitless init --yes --repo <owner>/<repo> --json
 model servers, fills missing providers and repository settings, starts the service, and saves live
 smoke results. It asks before registering MCP with Claude Code or Codex; `--yes` grants consent.
 Without a terminal, questions use defaults and MCP changes are declined unless `--yes` is set.
-Re-running keeps existing settings and fills gaps. Discreet mode is not available yet (#37).
+Re-running keeps existing settings and fills gaps. Existing TOML comments and unrelated settings
+are preserved, and changes create a timestamped backup. Converting to `[[providers]]` requires
+consent because the previous release cannot read it. If service startup, smoke checks, or MCP
+registration fails, init restores the original config. Discreet mode defaults to off; init records
+your choice in its summary, with behavior deferred to #37.
 
 For diagnosis, run `limitless doctor` (or `limitless doctor --json`). It reports exact fixes and
 never writes files or changes services. For a missing configured API key, add
