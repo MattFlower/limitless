@@ -237,6 +237,7 @@ export async function classifyCi(
     ...failures.filter((c) => c.status === "completed" && bad.has(c.conclusion ?? "")).map((c) => c.name),
   ]);
   if (!names.size) throw new Error("Incomplete CI failure: no failing checks");
+  let pendingRerun = false;
   for (const name of names) {
     const matches = failures.filter(
       (c) => c.name === name && c.status === "completed" && bad.has(c.conclusion ?? ""),
@@ -309,7 +310,11 @@ export async function classifyCi(
               (job && p.rerunJob?.runId === job.run_id && p.rerunJob.name === job.name)),
         );
       if (job && resolved.has(job.id)) continue;
-      if (prior.some((p) => p.outcome === "rerunning")) continue;
+      if (prior.some((p) => p.outcome === "rerunning")) {
+        // A new failure can precede REST's attempt update; keep retrying until it is reconciled.
+        pendingRerun ||= prior.some((p) => p.outcome === "rerunning" && p.rerunMarker !== marker);
+        continue;
+      }
       if (!unsafe) store.recordCiFailure(f);
       const needsFix = () =>
         emit("ci.needs_fix", f, `${pr.url}:${snap.headRefOid}:${f.signature}`, false, log || f.line);
@@ -348,5 +353,5 @@ export async function classifyCi(
       needsFix();
     }
   }
-  return true;
+  return !pendingRerun;
 }

@@ -125,6 +125,49 @@ test("a failed rerun reports needs-fix and the cap survives reopening SQLite", a
   expect(items("ci.needs_fix")).toHaveLength(1);
 });
 
+test.each([
+  ["FAILURE", "attempt"],
+  ["ERROR", "attempt"],
+  ["FAILURE", "job"],
+  ["ERROR", "job"],
+  ["FAILURE", "checks"],
+  ["ERROR", "checks"],
+])("a %s rerun with lagging REST %s stays pending across restart", async (rollup, lag) => {
+  h = pollerHarness();
+  const f = failure();
+  h.start(15);
+  await h.advance(0);
+  if (lag !== "checks") {
+    f.rerun("timed_out", lag === "job" ? "in_progress" : "completed");
+    f.check.status = "completed";
+  }
+  f.observe(rollup, "rerun");
+  let attempt = lag === "job" ? 2 : 1;
+  h.gh.responses.set("repos/o/r/actions/runs/1", () => respond(200, { head_sha: SHA, run_attempt: attempt }));
+  await h.advance(15000);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  const pendingCalls = h.gh.rest().length;
+  await h.advance(15000);
+  expect(h.gh.rest().length).toBeGreaterThan(pendingCalls);
+  h.reopen();
+  h.start(15);
+  await h.advance(0);
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
+  attempt = 2;
+  if (lag === "checks") f.rerun("timed_out");
+  f.job.status = "completed";
+  await h.advance(15000);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_again");
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
+  expect(items("ci.needs_fix")).toHaveLength(1);
+  expect(reruns()).toHaveLength(1);
+  const completedCalls = h.gh.rest().length;
+  await h.advance(15000);
+  expect(h.gh.rest()).toHaveLength(completedCalls);
+});
+
 test.each([false, true])("same-name checks have independent reruns (same workflow=%s)", async (sameRun) => {
   h = pollerHarness();
   const f = failure();
