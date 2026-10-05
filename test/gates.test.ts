@@ -6,10 +6,11 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
 import { attributeRules, auditDiff, newlyHidden, unquote } from "../src/gates/audit.ts";
 import {
@@ -21,6 +22,7 @@ import {
   singleFlight,
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
+import { loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
 import {
   compareGates,
   type GateRun,
@@ -33,7 +35,7 @@ import { recordWorktree } from "../src/git/command.ts";
 import { checkoutCommitted, type DiffInfo } from "../src/git/repos.ts";
 import * as sandbox from "../src/harness/sandbox.ts";
 import { ConfinementError } from "../src/harness/sandbox.ts";
-import { formatGateFeedback } from "../src/pipeline/prompts.ts";
+import { formatAuditFeedback, formatGateFeedback } from "../src/pipeline/prompts.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
@@ -365,6 +367,84 @@ describe("audit allowances and attribute rules", () => {
       "linguist-generated",
     ]);
     expect(newlyHidden({ diff: "unset" }, { diff: "unset" })).toEqual([]);
+  });
+});
+
+describe("private strings", () => {
+  test.each(["A", "R100"])("quoted %s filename and unrelated diagnostics cannot reveal entries", (status) => {
+    const configDir = mkdtempSync(join(tmpdir(), "private-strings-"));
+    try {
+      writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\ni\u0307-host.example");
+      const patch =
+        'diff --git "a/secret-host.example\\t.txt" "b/secret-host.example\\t.txt"\n+++ "b/secret-host.example\\t.txt"\n@@ -0,0 +1 @@\n+SECRET-HOST.EXAMPLE\n';
+      const findings = auditDiff(diff(patch, [{ status, path: "secret-host.example\t.txt" }]), {
+        configDir,
+        taskClass: null,
+        protectedPaths: [],
+        toolCommands: ["git commit --no-verify İ-host.example"],
+      });
+      expect(findings.filter((f) => f.rule === "private-string")).toHaveLength(2);
+      expect(
+        findings.filter((f) => f.rule === "private-string").every((f) => f.file === "[redacted filename]"),
+      ).toBe(true);
+      const output = JSON.stringify(findings);
+      expect(output).not.toContain("secret-host.example");
+      expect(output).not.toContain("İ-host.example");
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("local loader, absent file, physical entry numbers, and unreadable file", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "private-strings-"));
+    try {
+      const changes = diff("diff --git a/a.txt b/a.txt\n@@ -0,0 +1 @@\n+SECRET-HOST.EXAMPLE", [
+        { status: "A", path: "a.txt" },
+      ]);
+      expect(loadPrivateStrings(configDir)).toEqual([]);
+      expect(auditDiff(changes, { configDir, taskClass: null, protectedPaths: [] })).toEqual([]);
+      writeFileSync(join(configDir, "private-strings.txt"), "  # ignored\n\n  secret-host.example  \n");
+      const findings = auditDiff(changes, { configDir, taskClass: null, protectedPaths: [] });
+      expect(findings).toEqual([
+        {
+          rule: "private-string",
+          severity: "block",
+          file: "a.txt",
+          detail: "a.txt:1 contains a private string (entry 3 in private-strings.txt)",
+        },
+      ]);
+      rmSync(join(configDir, "private-strings.txt"));
+      mkdirSync(join(configDir, "private-strings.txt"));
+      expect(() => loadPrivateStrings(configDir)).toThrow(
+        "Cannot read private-strings.txt; publication blocked",
+      );
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("multiple hunks, header-like content, added and renamed filenames redact every finding and feedback", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "private-strings-"));
+    try {
+      writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\nsecond-entry");
+      const patch =
+        "diff --git a/safe.txt b/safe.txt\n--- a/safe.txt\n+++ b/safe.txt\n@@ -1,2 +1,3 @@\n context\n+SECRET-HOST.EXAMPLE second-entry\n kept\n@@ -20 +21,2 @@\n keep\n+++ b/secret-host.example\n";
+      const changes = diff(patch, [
+        { status: "M", path: "safe.txt" },
+        { status: "A", path: "SECRET-HOST.EXAMPLE.txt" },
+        { status: "R100", path: "secret-host.example.test.ts" },
+      ]);
+      const findings = auditDiff(changes, { configDir, taskClass: null, protectedPaths: ["*.ts"] });
+      expect(findings.filter((f) => f.rule === "private-string")).toHaveLength(5);
+      expect(findings.some((f) => f.detail.startsWith("safe.txt:22 "))).toBe(true);
+      expect(findings.filter((f) => f.file === "[redacted filename]")).toHaveLength(3);
+      expect(JSON.stringify(findings).toLowerCase()).not.toContain("secret-host.example");
+      expect(JSON.stringify(findings)).not.toContain("second-entry");
+      expect(formatAuditFeedback(findings).toLowerCase()).not.toContain("secret-host.example");
+      expect(formatAuditFeedback(findings)).toContain("entry 2 in private-strings.txt");
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1026,6 +1106,122 @@ test.skipIf(seatbeltSkip !== null)(
     }
   },
 );
+
+test("private policy rejects broken lists and repository aliases; normalizes both sides", () => {
+  const root = mkdtempSync(join(tmpdir(), "private-policy-"));
+  const config = join(root, "config");
+  const file = join(config, "private-strings.txt");
+  mkdirSync(config);
+  try {
+    expect(loadPrivateStrings(config)).toEqual([]);
+    symlinkSync(join(root, "missing"), file);
+    expect(() => loadPrivateStrings(config)).toThrow("Cannot read");
+    rmSync(file);
+    writeFileSync(file, Buffer.from([0xff]));
+    expect(() => loadPrivateStrings(config)).toThrow("Cannot read");
+    writeFileSync(file, "# ignored\n\nＳＥＣＲＥＴ－ＨＯＳＴ．ＥＸＡＭＰＬＥ\n");
+    const entries = loadPrivateStrings(config);
+    expect(entries[0]?.entry).toBe(3);
+    for (const text of [
+      "secret-host.example",
+      "ＳＥＣＲＥＴ－ＨＯＳＴ．ＥＸＡＭＰＬＥ",
+      "%73ecret-host%2Eexample",
+      "%bad% secret-host.example",
+    ]) {
+      expect(privateMatches(text, entries)).toHaveLength(1);
+      expect(privateMatches(redactPrivate(text, entries), entries)).toEqual([]);
+    }
+    expect(privateMatches("secret-\nhost.example", entries)).toEqual([]);
+    // Compatibility letters must be normalized before context-sensitive lowercasing.
+    writeFileSync(file, "AΣᴬ");
+    expect(privateMatches("aσa", loadPrivateStrings(config))).toHaveLength(1);
+    writeFileSync(file, "＃secret-host.example");
+    expect(privateMatches("#secret-host.example", loadPrivateStrings(config))).toHaveLength(1);
+    const alias = join(root, "alias");
+    symlinkSync(config, alias);
+    expect(() => loadPrivateStrings(alias, [config])).toThrow("inside repository");
+    expect(() => loadPrivateStrings(join(config, "absent"), [config])).toThrow("inside repository");
+    const repo = join(root, "repo");
+    mkdirSync(repo);
+    symlinkSync(config, join(repo, "outward"));
+    expect(() => loadPrivateStrings(join(repo, "outward"), [repo])).toThrow("inside repository");
+    rmSync(file);
+    writeFileSync(join(repo, "list"), "secret-host.example");
+    symlinkSync(join(repo, "list"), file);
+    expect(() => loadPrivateStrings(config, [repo])).toThrow("inside repository");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("daemon invocation directory is not an implicit repository root", async () => {
+  const root = mkdtempSync(join(tmpdir(), "private-daemon-cwd-"));
+  const config = join(root, "config");
+  const repo = join(root, "repo");
+  mkdirSync(config);
+  mkdirSync(repo);
+  writeFileSync(join(config, "private-strings.txt"), "secret-host.example");
+  const program = `
+    import { loadPrivateStrings } from ${JSON.stringify(resolve("src/gates/private.ts"))};
+    if (loadPrivateStrings()[0]?.value !== "secret-host.example") throw new Error("missing list");
+    loadPrivateStrings(undefined, [${JSON.stringify(repo)}]);
+    for (const roots of [[${JSON.stringify(config)}], [${JSON.stringify(root)}]]) {
+      let blocked = false;
+      try { loadPrivateStrings(undefined, roots); }
+      catch (error) { blocked = error.message.includes("inside repository"); }
+      if (!blocked) throw new Error("repository config accepted");
+    }
+  `;
+  try {
+    const child = Bun.spawn([process.execPath, "-e", program], {
+      cwd: root,
+      env: { ...process.env, LIMITLESS_CONFIG_DIR: "config" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = await new Response(child.stderr).text();
+    expect(stderr).toBe("");
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("private config excludes common git directories and all linked worktrees canonically", async () => {
+  const root = mkdtempSync(join(tmpdir(), "private-boundaries-"));
+  try {
+    const repo = join(root, "repo");
+    const work = join(root, "work");
+    const other = join(root, "other");
+    await sh(["git", "init", "-q", repo], { cwd: root });
+    await sh(["git", "commit", "--allow-empty", "-qm", "base"], { cwd: repo });
+    await sh(["git", "worktree", "add", "-qb", "work", work], { cwd: repo });
+    await sh(["git", "worktree", "add", "-qb", "other", other], { cwd: repo });
+    for (const boundary of [repo, work, other, join(repo, ".git")]) {
+      const config = join(boundary, "config-private");
+      mkdirSync(config);
+      writeFileSync(join(config, "private-strings.txt"), "secret-host.example");
+      const alias = join(root, "alias");
+      symlinkSync(config, alias);
+      expect(() => loadPrivateStrings(config, [work])).toThrow("inside repository");
+      expect(() => loadPrivateStrings(alias, [work])).toThrow("inside repository");
+      rmSync(alias);
+    }
+    const aliasWork = join(root, "alias-work");
+    mkdirSync(aliasWork);
+    symlinkSync(join(repo, ".git"), join(aliasWork, ".git"));
+    expect(() => loadPrivateStrings(join(repo, "config-private"), [aliasWork])).toThrow("inside repository");
+    const external = join(root, "repo-sibling");
+    mkdirSync(external);
+    writeFileSync(join(external, "private-strings.txt"), "secret-host.example");
+    expect(loadPrivateStrings(external, [work])).toEqual([{ value: "secret-host.example", entry: 1 }]);
+    rmSync(join(external, "private-strings.txt"));
+    symlinkSync(join(other, "config-private", "private-strings.txt"), join(external, "private-strings.txt"));
+    expect(() => loadPrivateStrings(external, [work])).toThrow("inside repository");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("waiting behind a lease does not spend the internal gate's execution timeout", async () => {
   const previous = gateSlots.limit;
