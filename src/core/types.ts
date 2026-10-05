@@ -69,6 +69,10 @@ export type Role =
   | "summarize"
   | "chat";
 
+export const RUN_ROLES = ["triage", "spec", "holdout", "implement", "review", "verify"] as const;
+export type RunRole = (typeof RUN_ROLES)[number];
+export type RunModels = Partial<Record<RunRole, string[]>>;
+
 export type Vendor =
   | "anthropic"
   | "openai"
@@ -121,6 +125,7 @@ export interface Repo {
 }
 
 export interface Run {
+  models?: RunModels;
   flow?: "build" | "verify-change";
   id: string;
   repoId: string;
@@ -375,6 +380,7 @@ export interface QuotaAlert {
 }
 
 export interface CreateRunRequest {
+  models?: RunModels;
   dependsOn?: string[];
   repo: string;
   prompt: string;
@@ -396,6 +402,7 @@ export interface CreateRunRequest {
 /** Messages pushed on the global SSE stream. */
 export type StreamMessage =
   | ChatStreamMessage
+  | { kind: "routing"; change: RoutingChange }
   | { kind: "run"; run: Run }
   | { kind: "stage"; stage: Stage }
   | { kind: "invocation"; invocation: Invocation }
@@ -404,6 +411,25 @@ export type StreamMessage =
   | { kind: "alert"; alert: QuotaAlert | null; provider: string; window: string; created: boolean }
   | { kind: "question"; question: Question }
   | { kind: "feed"; item: FeedItem };
+
+export type RoutingCell = Complexity | "default";
+export interface OperatorRoutingCell {
+  role: Role;
+  cell: RoutingCell;
+  groups: string[];
+  note: string | null;
+  updatedAt: number;
+  updatedBy: string;
+}
+export interface RoutingChange {
+  id: number;
+  key: string;
+  oldValue: string[] | null;
+  newValue: string[] | null;
+  note: string | null;
+  at: number;
+  by: string;
+}
 
 export type FeedKind =
   | "run.gate_timeout_retry"

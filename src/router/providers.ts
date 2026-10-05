@@ -389,12 +389,16 @@ export class ProviderTracker {
     return 1;
   }
 
-  unavailableReason(id: string, now = this.clock()): string | null {
+  unavailableReason(id: string, now = this.clock(), detailed = false): string | null {
     const p = this.providers.get(id);
     if (!p) return "unknown provider";
     if (!p.enabled) return p.disabledReason ?? "disabled";
     if (!p.healthy) return "server not reachable";
-    if (p.exhaustedUntil && p.exhaustedUntil > now) return p.exhaustedReason ?? "quota exhausted";
+    if (p.exhaustedUntil && p.exhaustedUntil > now)
+      return (
+        (p.exhaustedReason ?? "quota exhausted") +
+        (detailed ? `; exhausted until ${new Date(p.exhaustedUntil).toISOString()}` : "")
+      );
     if (p.circuitOpenUntil && p.circuitOpenUntil > now)
       return `circuit open after ${p.consecutiveFailures} failures`;
     if (this.headroom(id, now) <= 0) return "at reserve limit";

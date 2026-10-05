@@ -77,6 +77,7 @@ export interface Config {
   /** Decision-model triage declines (falls through to the next model) below this answer confidence. */
   triageDecisionConfidence: number;
   githubOwner: string | null; // allowlisted GitHub login for triggers
+  githubMerge?: "auto" | "pr" | "none";
   githubPoll: boolean; // [github] poll: observe factory PRs; off restores the notifier's per-run PR checks
   githubPollSeconds: number; // [github] poll_seconds: the normal polling interval, at least 15
   discordOwnerId: string | null;
@@ -134,9 +135,8 @@ function str(v: unknown, fallback: string | null): string | null {
   return typeof v === "string" && v.length > 0 ? v : fallback;
 }
 
-export function loadConfig(
-  overrides: Partial<{ home: string; configDir: string; port: number }> = {},
-): Config {
+type LoadOptions = Partial<Paths> & { port?: number; readOnly?: boolean; raw?: Record<string, unknown> };
+export function loadConfig(overrides: LoadOptions = {}): Config {
   const home = overrides.home ?? process.env.LIMITLESS_HOME ?? join(homedir(), ".limitless");
   const configDir =
     overrides.configDir ?? process.env.LIMITLESS_CONFIG_DIR ?? join(homedir(), ".config", "limitless");
@@ -148,12 +148,21 @@ export function loadConfig(
     runs: join(home, "runs"),
     configDir,
   };
-  for (const dir of [paths.home, paths.repos, paths.work, paths.runs]) mkdirSync(dir, { recursive: true });
+  if (!overrides.readOnly)
+    for (const dir of [paths.home, paths.repos, paths.work, paths.runs]) mkdirSync(dir, { recursive: true });
 
   const tomlPath = join(configDir, "config.toml");
-  const raw: Record<string, unknown> = existsSync(tomlPath)
-    ? (Bun.TOML.parse(readFileSync(tomlPath, "utf8")) as Record<string, unknown>)
-    : {};
+  let raw: Record<string, unknown>;
+  try {
+    raw =
+      overrides.raw ??
+      (existsSync(tomlPath)
+        ? (Bun.TOML.parse(readFileSync(tomlPath, "utf8")) as Record<string, unknown>)
+        : {});
+  } catch {
+    // Parser diagnostics can include the source line, including credentials.
+    throw new Error("Invalid config.toml; fix TOML syntax in the configuration file");
+  }
   evalSettings(raw);
   const catalog = resolveCatalog(raw.providers);
   const { providerMaxConcurrent } = catalog;
@@ -248,6 +257,11 @@ export function loadConfig(
     throw new Error("triage.decision_confidence must be a number from 0 to 1");
   const retention = (raw.retention ?? {}) as Record<string, unknown>;
   const github = (raw.github ?? {}) as Record<string, unknown>;
+  const repos = github.repos;
+  const valid = Array.isArray(repos) && repos.every((r) => typeof r === "string" && repoName.test(r));
+  if (repos !== undefined && !valid) throw new Error("github.repos must be an array of owner/name strings");
+  if (github.merge !== undefined && !["auto", "pr", "none"].includes(github.merge as string))
+    throw new Error("github.merge must be auto, pr or none");
   if (github.poll !== undefined && typeof github.poll !== "boolean")
     throw new Error("github.poll must be true or false");
   if (github.poll_seconds !== undefined && !Number.isFinite(github.poll_seconds))
@@ -344,6 +358,7 @@ export function loadConfig(
     reviewRosters: parseReviewRosters(review.rosters),
     triageDecisionConfidence: confidence,
     githubOwner: str(owners.github, "MattFlower"),
+    githubMerge: github.merge as Config["githubMerge"],
     githubPoll: github.poll !== false,
     githubPollSeconds: Math.max(15, num(github.poll_seconds, 45)),
     discordOwnerId: str(owners.discord, null),
@@ -353,3 +368,4 @@ export function loadConfig(
     raw,
   };
 }
+export const repoName = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
