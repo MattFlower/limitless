@@ -284,8 +284,8 @@ Coming soon (#49): run dependencies, meaning a run that starts only after anothe
 
 ### UI and chat
 
-The UI has these pages: **Dashboard** (runs, quota alerts, spend KPIs, provider cards, cost
-chart), **New run**, **Chat**, **Models** (providers, catalog, policy), **Evals** and run detail.
+The UI has these pages: **Dashboard** (runs, quota alerts, spend KPIs, cost
+chart), **New run**, **Chat**, **Providers** (provider cards), **Models** (catalog, policy), **Evals** and run detail.
 The chat concierge runs on the `chat` routing role. It can propose a run (repo, title, profile,
 prompt), report status, and answer a run's questions. Nothing starts until you press **Confirm** on
 a proposal.
@@ -453,7 +453,7 @@ servers are probed every minute and show `down` until they answer. That is harml
 skips them.
 
 **Enable or disable** a provider with `limitless providers enable|disable <id>` or the button on
-its provider card (Dashboard or **Models** page). The setting persists across restarts. A provider
+its provider card on the **Providers** page. The setting persists across restarts. A provider
 whose API key is missing stays disabled.
 
 For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
@@ -468,7 +468,8 @@ use the bare ID, preserving server-default thinking. Compare them with:
 limitless eval run triage --models omlx/qwen-flash@none,omlx/qwen-flash@high --follow
 ```
 
-The committed `routing/policy.json` overlay remains authoritative over built-in defaults.
+The committed `routing/policy.json` eval overlay replaces built-in defaults cell by cell.
+SQLite operator overrides take precedence over both layers.
 For rollback, install with `--mtplx`, enable the provider if disabled, and select `mtplx/qwen-27b`.
 
 ### How a model is chosen
@@ -488,6 +489,37 @@ candidates that are:
 Quota or availability failures fall through to the next candidate without counting against the
 task. Review, verify and holdout avoid the relevant vendor where possible. Escalation adds any
 remaining catalog model at the required tier.
+
+### Editing routing live
+
+Routing has three layers: code `DEFAULT_POLICY`, the reviewed eval overlay in
+`routing/policy.json`, then operator cells stored in SQLite. Each override replaces one
+`role.cell` chain; resetting it reveals the eval cell, or the code cell when no eval cell exists.
+Cells are `default`, `trivial`, `small`, `medium`, and `large`. A complexity cell takes precedence
+over its role's `default`. Changes take effect on the next model call, including ongoing runs.
+An implementer removed from its cell loses its sticky preference; escalation constraints still apply.
+
+For example, reroute around a depleted Claude subscription:
+
+```sh
+limitless routing show --role implement
+limitless routing set implement.small 'codex/sol@high,codex/luna' --note 'Claude depleted'
+limitless routing preview implement small
+limitless routing reset implement.small
+limitless routing reset --all
+```
+
+Commas separate fallback groups; `|` joins interchangeable targets and `@effort` selects an
+explicit supported effort. Preview lists eligible and skipped targets without reserving capacity.
+Operator edits and resets persist across restarts, retain old/new audit history, and publish SSE updates.
+A run's own chains, when supported, retain precedence.
+
+`GET /api/routing` shows all layers, effective cells with their source and shadowed eval cells,
+provider preference, and history. Cell PUT/DELETE requests use `/api/routing/cells/:role/:cell`
+(PUT body: `{ "groups": ["codex/sol@high"], "note": "Claude depleted" }`).
+PUT `/api/routing/prefer` with `{ "prefer": ["codex"] }` replaces config `[routing] prefer`
+until DELETE clears it; use provider IDs. An empty list also overrides config. These mutations
+use the same authentication, Origin, and JSON checks as provider enablement.
 
 A slot wait budget is spent once per provider in an invocation, across all its models. An expired
 provider stays eligible if its slot opens later. If every provider is busy after the budgets expire,
@@ -697,8 +729,9 @@ limitless eval policy --write          # write routing/policy.json and routing/E
 - The **Evals** page lists eval runs, per-trial details and a roles-by-models eligibility matrix
   with reasons.
 
-Today `routing/policy.json` overrides only `triage.default`. Metric definitions and statistics are
-in [EVALS](EVALS.md).
+The eval overlay can replace any role cell. `eval policy --write` continues to write the reviewed
+files; it does not hot-reload the daemon or remove operator overrides. Live operator changes sit
+above those recommendations until reset. Metric definitions and statistics are in [EVALS](EVALS.md).
 
 ## 6. Costs and quotas
 

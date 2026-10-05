@@ -528,6 +528,32 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle(() => json(store.listRepos())),
     },
     "/api/providers": handle(() => json(factory.tracker.all())),
+    "/api/routing": handle(() => json(factory.routing.snapshot())),
+    "/api/routing/preview": handle((req) => {
+      const query = new URL(req.url).searchParams;
+      return json(factory.routing.preview(query.get("role") ?? "", query.get("complexity") ?? "medium"));
+    }),
+    "/api/routing/cells/:role/:cell": {
+      PUT: handle(async (req) => {
+        const data = await body<{ groups?: unknown; note?: unknown }>(req);
+        if (!data || !Array.isArray(data.groups))
+          throw new Error(`${req.params.role}.${req.params.cell}: groups must be a nonempty chain`);
+        return json(
+          factory.routing.setCell(req.params.role ?? "", req.params.cell ?? "", data.groups, data.note),
+        );
+      }),
+      DELETE: handle((req) =>
+        json(factory.routing.setCell(req.params.role ?? "", req.params.cell ?? "", null)),
+      ),
+    },
+    "/api/routing/prefer": {
+      PUT: handle(async (req) => {
+        const data = await body<{ prefer?: unknown; note?: unknown }>(req);
+        if (!data || !Array.isArray(data.prefer)) throw new Error("prefer: expected provider IDs");
+        return json(factory.routing.setPrefer(data.prefer, data.note));
+      }),
+      DELETE: handle(() => json(factory.routing.setPrefer(null))),
+    },
     "/api/stats/providers": handle(() => json(computeProviderWorkload(store))),
     "/api/providers/:id/fast": {
       POST: handle(async (req) => {
