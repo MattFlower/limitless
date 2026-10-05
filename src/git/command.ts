@@ -23,6 +23,11 @@ const HARDENING = [
   "core.attributesFile=/dev/null",
   "-c",
   "core.useReplaceRefs=false",
+  // A forged commit-graph or pack bitmap could change which parents a scan sees or what a push sends.
+  "-c",
+  "core.commitGraph=false",
+  "-c",
+  "pack.useBitmaps=false",
 ];
 
 /** Recorded before candidate execution; the sidecar is outside the writable checkout. */
@@ -33,13 +38,15 @@ export async function recordWorktree(cwd: string): Promise<void> {
   writeFileSync(`${resolve(cwd)}.git-paths`, JSON.stringify(dirs));
 }
 
-// Grafts are disabled too: a planted .git/info/grafts could hide ancestry from scans that get pushed.
+// Planted grafts or shallow files could hide ancestry from scans that get pushed. "/dev/null/none"
+// can't exist, so it disables grafts without git's deprecation hint for an existing graft file.
+const NO_PARENT_REWRITES = { GIT_GRAFT_FILE: "/dev/null/none", GIT_SHALLOW_FILE: "" };
 function trustedEnv(cwd: string, env: Record<string, string>) {
   const record = `${resolve(cwd)}.git-paths`;
   if (!existsSync(record)) {
     if (lstatSync(join(cwd, ".git"), { throwIfNoEntry: false })?.isDirectory() === false)
       throw new Error("Missing trusted Git paths");
-    return { ...env, GIT_GRAFT_FILE: "/dev/null" };
+    return { ...env, ...NO_PARENT_REWRITES };
   }
   const path = z.string().startsWith("/");
   const [work, admin, common] = z.tuple([path, path, path]).parse(JSON.parse(readFileSync(record, "utf8")));
@@ -54,7 +61,7 @@ function trustedEnv(cwd: string, env: Record<string, string>) {
   assert(realpathSync(cwd) === work && lstatSync(admin).isDirectory(), unsafe);
   for (const [name, target] of Object.entries({ commondir: common, gitdir: join(work, ".git") }))
     assert(resolve(admin, readFileSync(join(admin, name), "utf8").trim()) === target, unsafe);
-  return { ...env, GIT_DIR: admin, GIT_COMMON_DIR: common, GIT_WORK_TREE: work, GIT_GRAFT_FILE: "/dev/null" };
+  return { ...env, GIT_DIR: admin, GIT_COMMON_DIR: common, GIT_WORK_TREE: work, ...NO_PARENT_REWRITES };
 }
 
 /** Factory commands in agent-controlled worktrees, without changing any config files. */

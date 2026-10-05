@@ -15,39 +15,51 @@ cli="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/cli/main.ts"
 cd "$dir"
 checker=""
 trap '[ -z "$checker" ] || { kill -TERM "$checker" 2>/dev/null || :; wait "$checker" || :; }; exit 1' TERM INT
-check_private() { bun "$private_check" "$@" & checker=$!; wait "$checker"; checker=""; }
+# The worktree's bunfig.toml (preload) and .env must not reach the checker.
+check_private() { bun --config=/dev/null --no-env-file "$private_check" "$@" & checker=$!; wait "$checker"; checker=""; }
+# Factory git after PR code has run: no hooks (files or config), filters, fsmonitor, forged commit-graph or bitmaps.
+export LIMITLESS_GIT_EMPTY_HOOK=""
+safe_git() {
+  local keys flags=() key
+  keys="$(mktemp)"
+  git config --null --name-only --get-regexp '^(hook|filter)\.' >"$keys" || [ $? = 1 ] || { rm -f "$keys"; return 1; }
+  while IFS= read -r -d '' key; do flags+=("--config-env=$key=LIMITLESS_GIT_EMPTY_HOOK"); done <"$keys"
+  rm -f "$keys"
+  git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
+    ${flags[@]+"${flags[@]}"} "$@"
+}
 
 admin="$(cd "$(git rev-parse --absolute-git-dir)" && pwd -P)"
 common="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)" && pwd -P)"
 paths="$(check_private --record)"
 { IFS= read -r GIT_WORK_TREE; IFS= read -r GIT_DIR; IFS= read -r GIT_COMMON_DIR; ! IFS= read -r extra; } <<< "$paths" || exit 1
 [[ "$GIT_WORK_TREE" = "$(pwd -P)" && "$GIT_DIR" = "$admin" && "$GIT_COMMON_DIR" = "$common" ]] || exit 1
-# A planted graft could hide ancestry from the scan and still be pushed.
-export GIT_GRAFT_FILE=/dev/null
+# A planted graft or shallow file could hide ancestry from the scan and still be pushed.
+export GIT_GRAFT_FILE=/dev/null/none GIT_SHALLOW_FILE=""
 export GIT_WORK_TREE GIT_DIR GIT_COMMON_DIR
-env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE bun install --frozen-lockfile >/dev/null
+env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun install --frozen-lockfile >/dev/null
 log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
-if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE bun "$cli" gate-slot --name "land-pr #$pr" -- bun run check >"$log" 2>&1; then
+if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun "$cli" gate-slot --name "land-pr #$pr" -- bun run check >"$log" 2>&1; then
   echo "bun run check failed; see $log" >&2
   exit 1
 fi
 
-git add -A
+safe_git add -A
 check_private "$pr" "$repo" "$subject"
-if ! git diff --cached --quiet || [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
-  git commit -q -m "Merge main into PR $pr
+if ! safe_git diff --cached --quiet || [ -f "$(safe_git rev-parse --git-path MERGE_HEAD)" ]; then
+  safe_git commit --no-verify -q -m "Merge main into PR $pr
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 fi
-if [ -n "$(git status --porcelain)" ]; then
+if [ -n "$(safe_git status --porcelain)" ]; then
   echo "worktree still dirty after commit" >&2
   exit 1
 fi
 
-sha="$(git rev-parse HEAD)"
+sha="$(safe_git rev-parse HEAD)"
 head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
 check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
-git push -q --no-follow-tags origin "$sha:refs/heads/$head_ref"
+safe_git push --no-verify -q --no-follow-tags origin "$sha:refs/heads/$head_ref"
 
 # Wait for the CI run on exactly this commit, then require success.
 run=""

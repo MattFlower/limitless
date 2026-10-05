@@ -17,6 +17,16 @@ import { seeded } from "./seeded.ts";
 
 const script = resolve("scripts/land-pr.sh");
 const entry = "secret-host.example";
+// Fake git scripts dispatch on the subcommand, after the global options land prepends.
+const gitSubcommand =
+  'sub=""; skip=""; for a in "$@"; do if [ -n "$skip" ]; then skip=""; continue; fi; case "$a" in -c|-C) skip=1 ;; -*) ;; *) sub="$a"; break ;; esac; done';
+// The global options land's factory git calls carry once PR code has run.
+const hardened = [
+  "core.hooksPath=/dev/null",
+  "core.fsmonitor=false",
+  "core.commitGraph=false",
+  "pack.useBitmaps=false",
+].flatMap((flag) => ["-c", flag]);
 const repositories = seeded(async (root) => {
   const source = join(root, "source");
   const alternate = join(root, "alternate");
@@ -63,6 +73,7 @@ describe("land-pr private strings", () => {
     "post-commit",
     "destination",
     "source-inside",
+    "bunfig-preload",
   ])("checks %s before committing or pushing", async (scenario) => {
     const root = mkdtempSync(join(tmpdir(), "land-private-"));
     const source = join(root, "source");
@@ -100,7 +111,9 @@ describe("land-pr private strings", () => {
         writeFileSync(join(config, "private-strings.txt"), ` # comment\n\n ${entry} \n`);
       writeFileSync(
         join(work, "file.txt"),
-        ["diff", "absent", "relative"].includes(scenario) ? `${entry.toUpperCase()}\n` : "safe\n",
+        ["diff", "absent", "relative", "bunfig-preload"].includes(scenario)
+          ? `${entry.toUpperCase()}\n`
+          : "safe\n",
       );
       let expectedHead = sha;
       const commit = async (message: string) => {
@@ -167,15 +180,23 @@ describe("land-pr private strings", () => {
         mkdirSync(configDir);
       }
       if (scenario === "filename") writeFileSync(join(work, `${entry}.txt`), "safe\n");
+      if (scenario === "bunfig-preload") {
+        // PR files Bun would load from the worktree: a preload that turns every exit into success.
+        writeFileSync(join(work, "bunfig.toml"), 'preload = ["./pre.ts"]\n');
+        writeFileSync(
+          join(work, "pre.ts"),
+          'const exit = process.exit.bind(process);\nprocess.exit = ((_code?: number) => exit(0)) as typeof process.exit;\nprocess.on("exit", () => {\n  process.exitCode = 0;\n});\n',
+        );
+      }
       // Stop permitted deliveries at commit so the script never reaches external delivery commands.
       writeFileSync(
         join(bin, "git"),
-        `#!/bin/sh\ncase "$1" in\ncommit) echo commit >> '${join(root, "mutations")}'; ${["post-commit", "destination"].includes(scenario) ? `exec '${gitBin}' -c user.name=t -c user.email=t@t commit -qm '${scenario === "post-commit" ? entry : "safe"}'` : "exit 17"} ;;\npush) echo push >> '${join(root, "mutations")}'; exit 17 ;;\nesac\nexec '${gitBin}' "$@"\n`,
+        `#!/bin/sh\n${gitSubcommand}\ncase "$sub" in\ncommit) echo commit >> '${join(root, "mutations")}'; ${["post-commit", "destination"].includes(scenario) ? `exec '${gitBin}' -c user.name=t -c user.email=t@t commit -qm '${scenario === "post-commit" ? entry : "safe"}'` : "exit 17"} ;;\npush) echo push >> '${join(root, "mutations")}'; exit 17 ;;\nesac\nexec '${gitBin}' "$@"\n`,
         { mode: 0o755 },
       );
       writeFileSync(
         join(bin, "bun"),
-        `#!/bin/sh\ncase "$1" in\n*.ts) exec '${bunBin}' "$@" ;;\nesac\nexit 0\n`,
+        `#!/bin/sh\ncase "$*" in\n*check-private-strings.ts*) exec '${bunBin}' "$@" ;;\nesac\nexit 0\n`,
         { mode: 0o755 },
       );
       writeFileSync(
@@ -263,6 +284,8 @@ test.each(["redirect", "redirect-and-move-head"])(
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 let args = process.argv.slice(2);
+const bunFlags = [];
+while (args[0]?.startsWith("--")) bunFlags.push(args.shift());
 // The gate-slot wrapper is unwrapped here, so the test never reaches a daemon.
 if (args[1] === "gate-slot") {
   const command = args.slice(args.indexOf("--") + 1);
@@ -296,7 +319,7 @@ if (args[0].endsWith(".ts")) {
       if (moved.status !== 0) process.exit(1);
     }
   }
-  const result = spawnSync(${JSON.stringify(process.execPath)}, args, { stdio: "inherit" });
+  const result = spawnSync(${JSON.stringify(process.execPath)}, [...bunFlags, ...args], { stdio: "inherit" });
   if (args[1] === "--record") appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "recorded", args: [] }) + "\\n");
   process.exit(result.status ?? 1);
 }
@@ -381,9 +404,9 @@ else if (args[1] === "view") {
         [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "--merge", sha],
       ]);
       expect(commands("git", "push")).toEqual([
-        ["push", "-q", "--no-follow-tags", "origin", `${sha}:refs/heads/pr`],
+        [...hardened, "push", "--no-verify", "-q", "--no-follow-tags", "origin", `${sha}:refs/heads/pr`],
       ]);
-      expect(commands("git", "HEAD")).toEqual([["rev-parse", "HEAD"]]);
+      expect(commands("git", "HEAD")).toEqual([[...hardened, "rev-parse", "HEAD"]]);
       expect(commands("git", "rev-list").some((args) => args.includes(`${value.base}..${sha}`))).toBe(true);
       expect(commands("gh", "list")).toEqual([
         [
@@ -448,7 +471,7 @@ test.each([
     const marker = join(root, "untrusted-code-or-publication");
     writeFileSync(
       join(bin, "bun"),
-      `#!${process.execPath}\nimport { writeFileSync } from "node:fs";\nif (process.argv[3] === "--record") console.log(${JSON.stringify(paths.join("\n"))});\nelse writeFileSync(${JSON.stringify(marker)}, "ran");\n`,
+      `#!${process.execPath}\nimport { writeFileSync } from "node:fs";\nif (process.argv[5] === "--record") console.log(${JSON.stringify(paths.join("\n"))});\nelse writeFileSync(${JSON.stringify(marker)}, "ran");\n`,
       { mode: 0o755 },
     );
     writeFileSync(join(bin, "gh"), `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
@@ -497,7 +520,7 @@ test("land records the worktree's Git paths before any PR code runs", async () =
     const calls = join(root, "calls");
     writeFileSync(
       join(bin, "bun"),
-      `#!/bin/sh\necho "$*" >> '${calls}'\n[ "$2" = --record ] && printf '%s\\n' "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"\n[ "$2" = gate-slot ] && exit 1\nexit 0\n`,
+      `#!/bin/sh\necho "$*" >> '${calls}'\n[ "$4" = --record ] && printf '%s\\n' "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"\n[ "$2" = gate-slot ] && exit 1\nexit 0\n`,
       {
         mode: 0o755,
       },
@@ -515,6 +538,7 @@ test("land records the worktree's Git paths before any PR code runs", async () =
       allowFail: true,
     });
     const lines = readFileSync(calls, "utf8").trim().split("\n");
+    expect(lines[0]).toStartWith("--config=/dev/null --no-env-file ");
     expect(lines[0]).toEndWith("check-private-strings.ts --record");
     // The check runs through the checkout's own CLI in a named gate slot; `limitless` need not be on PATH.
     const check = lines.findIndex((line) =>
@@ -534,7 +558,7 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
     const marker = join(root, "published");
     writeFileSync(
       join(bin, "bun"),
-      '#!/bin/sh\n[ "$2" = --record ] && { printf "%s\\n" "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"; exit 0; }\n[ "$1" = install ] && exit 0\necho "failed-check-$$"\nexit 1\n',
+      '#!/bin/sh\n[ "$4" = --record ] && { printf "%s\\n" "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"; exit 0; }\n[ "$1" = install ] && exit 0\necho "failed-check-$$"\nexit 1\n',
       { mode: 0o755 },
     );
     writeFileSync(
@@ -620,13 +644,14 @@ else if (args[1] === "view") {
       );
       writeFileSync(
         join(bin, "bun"),
-        `#!/bin/sh\ncase "$1" in *.ts) exec '${process.execPath}' "$@" ;; esac\nexit 0\n`,
+        `#!/bin/sh\ncase "$*" in *check-private-strings.ts*) exec '${process.execPath}' "$@" ;; esac\nexit 0\n`,
         { mode: 0o755 },
       );
       writeFileSync(
         join(bin, "git"),
         `#!/bin/sh
-if [ "$1" = push ]; then printf '%s\\n' "$@" > '${pushed}'; exit 0; fi
+${gitSubcommand}
+if [ "$sub" = push ]; then printf '%s\\n' "$@" > '${pushed}'; exit 0; fi
 ${scenario === "cancel" ? `case "$*" in *cat-file*--batch*) sleep 60 & scan=$!; printf '%s %s' "$$" "$scan" > '${started}'; wait; exit 1 ;; esac` : ""}
 exec '${gitBin}' "$@"
 `,
@@ -696,7 +721,9 @@ exec '${gitBin}' "$@"
       if (scenario !== "cancel") {
         expect(existsSync(watched)).toBe(true);
         expect(readFileSync(pushed, "utf8").trim().split("\n")).toEqual([
+          ...hardened,
           "push",
+          "--no-verify",
           "-q",
           "--no-follow-tags",
           "origin",

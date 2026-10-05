@@ -2231,6 +2231,77 @@ test("a planted graft cannot hide a published ancestor from the range check", as
   ).rejects.toThrow("entry 1");
 });
 
+/** Points one parent slot of `target` in a commit-graph file's CDAT chunk at `parent`, as a forged graph would. */
+function forgeGraphParent(path: string, target: string, slot: number, parent: string) {
+  const data = readFileSync(path);
+  const hashLength = data[5] === 1 ? 20 : 32;
+  const chunks = new Map<string, number>();
+  for (let i = 0; i <= (data[6] ?? 0); i++) {
+    const at = 8 + i * 12;
+    chunks.set(data.subarray(at, at + 4).toString("latin1"), Number(data.readBigUInt64BE(at + 4)));
+  }
+  const [fanout, lookup, cdat] = ["OIDF", "OIDL", "CDAT"].map((id) => chunks.get(id));
+  if (fanout === undefined || lookup === undefined || cdat === undefined)
+    throw new Error("unexpected commit-graph");
+  const oids = Array.from({ length: data.readUInt32BE(fanout + 255 * 4) }, (_, i) =>
+    data.subarray(lookup + i * hashLength, lookup + (i + 1) * hashLength).toString("hex"),
+  );
+  data.writeUInt32BE(
+    oids.indexOf(parent),
+    cdat + oids.indexOf(target) * (hashLength + 16) + hashLength + 4 * slot,
+  );
+  writeFileSync(path, data);
+}
+
+test.each(["shallow", "commit-graph"])(
+  "a planted %s cannot hide a published ancestor from the range check",
+  async (kind) => {
+    writeFileSync(join(work, "transient.txt"), "safe");
+    await commitAll(work, "hidden subject\n\nsecret-host.example");
+    const hidden = await headSha(work);
+    writeFileSync(join(work, "mid.txt"), "safe");
+    await commitAll(work, "mid");
+    const mid = await headSha(work);
+    writeFileSync(join(work, "safe.txt"), "safe");
+    await commitAll(work, "safe");
+    const tip = await headSha(work);
+    const common = (
+      await sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: work })
+    ).stdout.trim();
+    // Either one makes `mid` look parentless or based directly on `base`, skipping the denylisted commit.
+    if (kind === "shallow") writeFileSync(join(common, "shallow"), `${mid}\n`);
+    else {
+      await sh(["git", "commit-graph", "write", "--reachable"], { cwd: work });
+      const graph = join(common, "objects", "info", "commit-graph");
+      chmodSync(graph, 0o644);
+      forgeGraphParent(graph, mid, 0, base);
+    }
+    expect((await sh(["git", "rev-list", `${base}..${tip}`], { cwd: work })).stdout).not.toContain(hidden);
+    await expect(
+      checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]),
+    ).rejects.toThrow("entry 1");
+  },
+);
+
+test("factory git ignores commit-graphs and pack bitmaps, which could change what a push sends", async () => {
+  const bin = join(dir, "logging-bin");
+  const calls = join(dir, "git-calls");
+  mkdirSync(bin);
+  const real = Bun.which("git");
+  if (!real) throw new Error("missing git");
+  writeFileSync(join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\nexec '${real}' "$@"\n`, {
+    mode: 0o755,
+  });
+  await worktreeGit(["git", "rev-parse", "HEAD"], {
+    cwd: work,
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } as Record<string, string>,
+  });
+  const call = readFileSync(calls, "utf8")
+    .split("\n")
+    .find((line) => line.endsWith("rev-parse HEAD"));
+  expect(call).toContain("-c core.commitGraph=false -c pack.useBitmaps=false");
+});
+
 test.each(["mergetag", "gpgsig", "encoding", "utf8", "invalid-utf8", "message-header", "replacement"])(
   "publication inspects raw commit headers: %s",
   async (scenario) => {
