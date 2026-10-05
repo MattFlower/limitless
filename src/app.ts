@@ -20,9 +20,10 @@ import type { EngineDeps } from "./pipeline/context.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
-import { loadPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
+import { readPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
 import { Router } from "./router/router.ts";
+import { RuntimePolicy } from "./router/runtime-policy.ts";
 import { Scheduler } from "./scheduler.ts";
 import { redactCredentialData } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
@@ -53,7 +54,10 @@ export interface FactoryOptions {
 /** The factory service: one instance per daemon, shared by the HTTP API, CLI, Discord and MCP. */
 export class Factory {
   readonly store: Store;
-  readonly policy: Policy;
+  readonly routing: RuntimePolicy;
+  get policy(): Policy {
+    return this.router.getPolicy();
+  }
   readonly models: ModelDef[];
   readonly evalSettings: ReturnType<typeof evalSettings>;
   readonly evals: EvalRunner;
@@ -86,12 +90,11 @@ export class Factory {
       maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
     }));
     const shadowOk = checkRosterTargets(cfg, this.models, this.providerDefs, console.warn);
-    this.policy =
-      opts.policy ??
-      (opts.policyPath === undefined
-        ? DEFAULT_POLICY
-        : loadPolicy(opts.policyPath, this.models, this.providerDefs));
-    if (!opts.models && !opts.providers) validatePolicy(this.policy, this.models, this.providerDefs);
+    const code = opts.policy ?? DEFAULT_POLICY;
+    const evals =
+      opts.policy || opts.policyPath === undefined
+        ? {}
+        : readPolicy(opts.policyPath, this.models, this.providerDefs);
     this.store = opts.store ?? new Store(cfg.paths.db);
     this.cleanup = opts.cleanup ?? ((dryRun) => collectGarbage(this.store, cfg, { dryRun }));
     this.gcTimer = opts.gcTimer ?? { set: setInterval, clear: clearInterval };
@@ -106,7 +109,18 @@ export class Factory {
       opts.providerTimer,
       opts.healthFetch,
     );
-    this.router = new Router(this.tracker, this.policy, this.models, cfg.preferProviders);
+    this.router = new Router(this.tracker, code, this.models, cfg.preferProviders);
+    this.routing = new RuntimePolicy(
+      this.store,
+      this.router,
+      this.models,
+      this.providerDefs,
+      cfg.preferProviders,
+      code,
+      evals,
+    );
+    if (!opts.models && !opts.providers)
+      validatePolicy(this.router.getPolicy(), this.models, this.providerDefs);
     this.tracker.setRoutingDescription((provider, exhausted) =>
       this.router.describeFallback(provider, exhausted),
     );

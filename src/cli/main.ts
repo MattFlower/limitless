@@ -45,6 +45,10 @@ Usage:
   limitless providers export [--write] [--yes]     Export effective provider config (offline)
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
+  limitless routing show [--role r] [--run id]
+  limitless routing set <role>.<cell> <chain> [--note …]
+  limitless routing reset <role>.<cell> | --all
+  limitless routing preview <role> [<complexity>] [--run id]
   limitless init [--yes] [--repo owner/name]... [--json]  Idempotent machine setup
   limitless doctor [--json]                Read-only machine and access diagnosis
   limitless auth add-passkey              Print a one-time link (10 minutes) that registers a UI passkey
@@ -228,6 +232,8 @@ async function main(): Promise<void> {
       consumer: { type: "string" },
       wait: { type: "string" },
       repo: { type: "string", short: "r", multiple: true },
+      role: { type: "string" },
+      run: { type: "string" },
       profile: { type: "string", short: "p" },
       title: { type: "string", short: "t" },
       follow: { type: "boolean", short: "f" },
@@ -440,6 +446,8 @@ async function main(): Promise<void> {
         now: values.now === true,
       });
     }
+    case "routing":
+      return (await import("./routing.ts")).routingCommand(rest, values, api);
     case "providers": {
       if (rest[0] === "export") {
         if (rest.length !== 1) throw new Error("usage: limitless providers export [--write] [--yes]");

@@ -17,6 +17,7 @@ import { renderToString } from "solid-js/web";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Repo, Role, RunStatus, StageName } from "../src/core/types.ts";
+import { Store } from "../src/db/store.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { recordWorktree } from "../src/git/command.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
@@ -42,6 +43,7 @@ import {
   type RunState,
 } from "../src/pipeline/context.ts";
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
+import { SimulatedTermination } from "../src/pipeline/faults.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
 import {
@@ -54,6 +56,7 @@ import {
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
+import { RuntimePolicy } from "../src/router/runtime-policy.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement } from "./confinement.ts";
@@ -285,6 +288,48 @@ describe("per-run model chains", () => {
         .map((i) => i.modelId),
     ).toEqual(["alpha/m", "beta/m", "beta/m"]);
     expect(f.store.listQuestions(run.id).at(-1)?.question).toContain("alpha/m (already tried)");
+  });
+  test("unpinned fallback history prevents escalation from returning to either dispatched model", async () => {
+    const alpha = models[0];
+    if (!alpha) throw new Error("missing fixture model");
+    let quota = true;
+    const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
+    factory = new Factory(cfg, {
+      confinement: fakeConfinement,
+      providers,
+      models: [...models, { ...alpha, id: "alpha/next", model: "alpha-next" }],
+      policy: { ...policy, implement: { default: ["alpha/m", "beta/m", "alpha/next"] } },
+      harnesses: {
+        fake: fakeHarness((s) => {
+          if (roleOf(s) !== "implement") return reply(s);
+          if (s.target.modelId === "alpha/m" && quota) {
+            quota = false;
+            return {
+              status: "quota",
+              error: "transient quota",
+              quota: { windows: {}, exhaustedUntil: Date.now() - 1 },
+            };
+          }
+          return { files: { "farewell.txt": s.target.modelId === "beta/m" ? "BAD\n" : "goodbye\n" } };
+        }),
+      },
+      bootSha: "test-build",
+    });
+    const f = factory;
+    f.start();
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.modelId),
+    ).toEqual(["alpha/m", "beta/m", "beta/m", "alpha/next"]);
+    expect(f.store.getRunState<RunState>(run.id)?.triedImplementers).toEqual([
+      { modelId: "alpha/m", effort: null },
+      { modelId: "beta/m", effort: null },
+      { modelId: "alpha/next", effort: null },
+    ]);
   });
   test.each(["trivial", "large"] as const)(
     "implement override wins at %s complexity; other roles use policy",
@@ -1714,6 +1759,61 @@ esac
       expect(escalated).toBe(roundsOnImplementer === 2);
     },
   );
+
+  test("an in-flight run picks up an operator cell and leaves its removed sticky implementer", async () => {
+    const reached = deferred<void>();
+    const resume = deferred<void>();
+    const invoked: string[] = [];
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      invoked.push(s.target.modelId);
+      if (invoked.length === 1) {
+        reached.resolve();
+        await resume.promise;
+      }
+      return { files: { "farewell.txt": invoked.length === 1 ? "BAD goodbye\n" : "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    await reached.promise;
+    f.routing.setCell("implement", "small", ["beta/m"], "subscription depleted");
+    resume.resolve();
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(invoked).toEqual(["alpha/m", "beta/m"]);
+    expect(f.store.getRunState<RunState>(run.id)?.implementer?.modelId).toBe("beta/m");
+  });
+
+  test("an escalation selected after a live edit stays sticky on the fourth round", async () => {
+    const reached = deferred<void>();
+    const resume = deferred<void>();
+    const invoked: string[] = [];
+    const f = start(
+      async (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        invoked.push(s.target.modelId);
+        if (invoked.length === 1) {
+          reached.resolve();
+          await resume.promise;
+        }
+        return { files: { "farewell.txt": invoked.length < 4 ? "BAD goodbye\n" : "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    await reached.promise;
+    f.routing.setCell("implement", "small", ["alpha/m"]);
+    resume.resolve();
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(invoked).toEqual(["alpha/m", "alpha/m", "delta/m", "delta/m"]);
+    expect(f.store.getRunState<RunState>(run.id)?.implementer).toMatchObject({
+      modelId: "delta/m",
+      policyRevision: f.router.cellRevision("implement", "small"),
+    });
+  });
 
   test("Dependabot uses free models across quick stages and keeps them on feedback rounds", async () => {
     const seen: { role: string; provider: string }[] = [];
@@ -9239,8 +9339,250 @@ describe("routing bounded slot waits", () => {
         deadline,
       });
     const events = () => context.store.listEvents(run.id).filter((e) => e.message.startsWith("waiting for"));
-    return { clock, cfg, tracker, calls, controller, context, run, invoke, events };
+    return { clock, cfg, tracker, router, calls, controller, context, run, invoke, events };
   }
+
+  test.each([false, true])(
+    "implement dispatch history survives a crash inside the harness and database reopen (pinned=%s)",
+    async (pinned) => {
+      const f = fixture(
+        models,
+        policy,
+        () => {
+          throw new SimulatedTermination("daemon terminated during implement harness");
+        },
+        pinned ? { implement: ["alpha/m", "beta/m"] } : undefined,
+      );
+      await expect(f.invoke(undefined, "implement")).rejects.toThrow(SimulatedTermination);
+      expect(f.calls.map((s) => s.target.modelId)).toEqual(["alpha/m"]);
+      f.context.store.close();
+      const reopened = new Store(f.cfg.paths.db);
+      try {
+        const tracker = new ProviderTracker(providers, reopened, f.cfg.reserves, {}, {});
+        const router = new Router(tracker, policy, models);
+        const loaded = new RunContext(
+          { ...f.context.deps, store: reopened, tracker, router },
+          f.run,
+          f.context.repo,
+          new AbortController().signal,
+        );
+        expect(loaded.state.triedImplementers).toEqual([{ modelId: "alpha/m", effort: null }]);
+        expect(
+          router
+            .route("implement", "small", { exclude: loaded.state.triedImplementers })
+            .candidates.map((t) => t.modelId),
+        ).toEqual(["beta/m"]);
+      } finally {
+        reopened.close();
+      }
+    },
+  );
+
+  test.each(["cell", "prefer"])(
+    "live %s edits cancel obsolete capacity waits before invoking",
+    async (edit) => {
+      const routing = { ...policy, implement: { default: ["alpha/m|beta/m"] } };
+      const f = fixture(models, routing);
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], routing);
+      const slots = await Promise.all(
+        ["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      try {
+        const pending = f.invoke(undefined, "implement");
+        expect(f.events()[0]?.message).toContain("waiting for alpha slot");
+        await f.clock.advance(2_500);
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        const outcome = await pending;
+        expect(outcome.target.modelId).toBe("beta/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+        expect(outcome.invocation.waitMs).toBe(2_500);
+        // The obsolete wait is gone even though the old provider has not freed any capacity.
+        expect(f.tracker.status("alpha")?.inFlight).toBe(2);
+        expect(f.tracker.status("beta")?.inFlight).toBe(0);
+        expect(f.clock.pending).toBe(0);
+      } finally {
+        for (const release of slots) release();
+      }
+      expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+    },
+  );
+
+  test.each(["cell", "prefer"])(
+    "a queued pinned implementer survives live %s edits without being tried early",
+    async (edit) => {
+      const f = fixture(models, policy, undefined, { implement: ["alpha/m", "beta/m"] });
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], policy);
+      const slots = await Promise.all(
+        ["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      try {
+        const pending = f.invoke(undefined, "implement");
+        expect(f.events()[0]?.message).toContain("waiting for alpha slot");
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        await f.clock.flush();
+        expect(f.calls).toEqual([]);
+        expect(f.context.state.triedImplementers).toEqual([]);
+        slots[0]?.();
+        expect((await pending).target.modelId).toBe("alpha/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["alpha/m"]);
+        expect(f.context.state.triedImplementers).toEqual([{ modelId: "alpha/m", effort: null }]);
+      } finally {
+        for (const release of slots) release();
+      }
+    },
+  );
+
+  test.each([
+    ["cell", false],
+    ["cell", true],
+    ["prefer", false],
+    ["prefer", true],
+  ] as const)(
+    "a live %s edit cancelling a call before dispatch leaves it eligible for escalation (pinned=%s)",
+    async (edit, pinned) => {
+      const chain = ["alpha/m", "beta/m"];
+      const f = fixture(models, policy, undefined, pinned ? { implement: chain } : undefined);
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], policy);
+      const slots = await Promise.all(
+        ["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      const reached = deferred<void>();
+      const resume = deferred<void>();
+      const save = f.context.save.bind(f.context);
+      const persist = spyOn(f.context, "save").mockImplementationOnce(async () => {
+        reached.resolve();
+        await resume.promise;
+        await save();
+      });
+      try {
+        const pending = f.invoke(undefined, "implement");
+        expect(f.events()[0]?.message).toContain("waiting for alpha slot");
+        // First edit lands while queued; a second races the saved candidate before dispatch.
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        await f.clock.flush();
+        slots[0]?.();
+        await reached.promise;
+        f.tracker.blockModel("alpha/m", "temporarily rejected", 1_000);
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m", "alpha/m"]);
+        else runtime.setPrefer([]);
+        resume.resolve();
+        expect((await pending).target.modelId).toBe("beta/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+        expect(f.context.store.listInvocations(f.run.id).map((i) => i.status)).toEqual(["cancelled", "ok"]);
+        expect(f.context.state.triedImplementers).toEqual([{ modelId: "beta/m", effort: null }]);
+        const loaded = new RunContext(
+          { ...f.context.deps, tracker: f.tracker, router: f.router },
+          f.run,
+          f.context.repo,
+          f.controller.signal,
+        );
+        expect(loaded.state.triedImplementers).toEqual(f.context.state.triedImplementers);
+        await f.clock.advance(1_000);
+        expect(
+          f.router
+            .route("implement", "small", {
+              ...(pinned ? { chain } : {}),
+              exclude: loaded.state.triedImplementers,
+            })
+            .candidates.map((t) => t.modelId),
+        ).toEqual(["alpha/m"]);
+      } finally {
+        resume.resolve();
+        persist.mockRestore();
+        for (const release of slots) release();
+      }
+    },
+  );
+
+  test.each(["cell", "prefer"])(
+    "live %s edits during preflight release the obsolete reservation",
+    async (edit) => {
+      const routing = { ...policy, implement: { default: ["alpha/m|beta/m"] } };
+      const f = fixture(models, routing);
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], routing);
+      const reached = deferred<void>();
+      const resume = deferred<boolean>();
+      const preflight = f.tracker.preflight.bind(f.tracker);
+      const probe = spyOn(f.tracker, "preflight").mockImplementation((provider) => {
+        if (provider !== "alpha") return preflight(provider);
+        reached.resolve();
+        return resume.promise;
+      });
+      try {
+        const pending = f.invoke(undefined, "implement");
+        await reached.promise;
+        expect(f.tracker.status("alpha")?.inFlight).toBe(1);
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        resume.resolve(true);
+        expect((await pending).target.modelId).toBe("beta/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+        expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+        expect(f.tracker.status("beta")?.inFlight).toBe(0);
+      } finally {
+        probe.mockRestore();
+      }
+    },
+  );
+
+  test("a reset reroutes all-provider waits without leaving losing reservations", async () => {
+    const routing = { ...policy, implement: { default: ["beta/m"] } };
+    const f = fixture(models, routing);
+    const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], routing);
+    runtime.setCell("implement", "small", ["alpha/m", "beta/m"]);
+    f.cfg.waitBudgetS.implement = 0;
+    const slots = await Promise.all(
+      ["alpha", "alpha", "beta", "beta"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+    );
+    try {
+      const pending = f.invoke(undefined, "implement");
+      await f.clock.flush();
+      expect(f.events().map((e) => e.message)).toContain("waiting for beta slot (0 ahead), up to unbounded");
+      runtime.setCell("implement", "small", null);
+      // Free the obsolete provider too, racing admission against the routing edit.
+      slots[0]?.();
+      slots[2]?.();
+      expect((await pending).target.modelId).toBe("beta/m");
+      expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+      expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+      expect(f.clock.pending).toBe(0);
+    } finally {
+      for (const release of slots) release();
+    }
+    expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+    expect(f.tracker.status("beta")?.inFlight).toBe(0);
+  });
+
+  test("a live edit during implementer persistence revalidates before the model call", async () => {
+    const f = fixture();
+    const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], policy);
+    const reached = deferred<void>();
+    const resume = deferred<void>();
+    const save = f.context.save.bind(f.context);
+    const persist = spyOn(f.context, "save").mockImplementationOnce(async () => {
+      reached.resolve();
+      await resume.promise;
+      await save();
+    });
+    try {
+      const pending = f.invoke(undefined, "implement");
+      await reached.promise;
+      runtime.setCell("implement", "small", ["beta/m"]);
+      resume.resolve();
+      expect((await pending).target.modelId).toBe("beta/m");
+      expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+      expect(f.context.state.implementer?.modelId).toBe("beta/m");
+      expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+      expect(f.tracker.status("beta")?.inFlight).toBe(0);
+    } finally {
+      persist.mockRestore();
+    }
+  });
 
   test("expiry falls through without an invocation; immediate admission records zero and no wait event", async () => {
     const f = fixture();

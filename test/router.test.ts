@@ -100,6 +100,132 @@ function setup(secrets: Record<string, string> = {}) {
   return { tracker, router: new Router(tracker, policy, models) };
 }
 
+test("live policy removes sticky targets, preserves exclusions and tiers, and explicit only targets win", () => {
+  const { router } = setup();
+  const selected = router.cellRevision("implement", "small");
+  expect(router.route("implement", "small").candidates[0]?.modelId).toBe("claude/sonnet");
+  router.setPolicy({ ...policy, implement: { default: ["codex/sol"] } });
+  expect(
+    router.route("implement", "small", { prefer: "claude/sonnet", preferPolicyRevision: selected })
+      .candidates[0]?.modelId,
+  ).toBe("codex/sol");
+  const escalated = router.cellRevision("implement", "small");
+  expect(
+    router.route("implement", "small", { prefer: "claude/opus", preferPolicyRevision: escalated })
+      .candidates[0]?.modelId,
+  ).toBe("claude/opus");
+  expect(
+    router
+      .route("implement", "small", {
+        prefer: "claude/sonnet",
+        preferPolicyRevision: selected,
+        minTier: 5,
+        exclude: ["claude/sonnet", "codex/sol"],
+      })
+      .candidates.map((m) => m.modelId),
+  ).toEqual(["claude/opus"]);
+  expect(
+    router.route("implement", "small", { only: "claude/sonnet" }).candidates.map((m) => m.modelId),
+  ).toEqual(["claude/sonnet"]);
+  router.setPreferProviders(["codex"]);
+  router.setPolicy(policy);
+  expect(router.route("implement", "small").candidates[0]?.modelId).toBe("codex/sol");
+  router.setPreferProviders([]);
+  expect(router.route("implement", "small").candidates[0]?.modelId).toBe("claude/sonnet");
+});
+
+test("preview includes every skip reason in order without observations, alerts or slot claims", () => {
+  const now = 1_000_000;
+  const defs: ProviderDef[] = Array.from({ length: 8 }, (_, i) => ({
+    id: `p${i}`,
+    label: `P${i}`,
+    harness: i === 5 ? "decisions" : "fake",
+    billing: "subscription",
+    maxConcurrent: 1,
+  }));
+  const model = models[0];
+  if (!model) throw new Error("missing fixture model");
+  const catalog = defs.map((p) => ({ ...model, id: `${p.id}/m`, provider: p.id }));
+  const tracker = new ProviderTracker(defs, store, reserves, {}, {}, () => now);
+  const router = new Router(
+    tracker,
+    {
+      ...policy,
+      implement: { default: catalog.map((m) => m.id) },
+      summarize: { default: ["p6/m"] },
+    },
+    catalog,
+  );
+  tracker.setEnabled("p0", false);
+  tracker.setHealthy("p1", false);
+  tracker.record("p2", "quota", { exhaustedUntil: now + 60_000 });
+  tracker.observeWindows("p3", { five_hour: { utilization: 1, resetsAt: now + 60_000 } });
+  for (let i = 0; i < 3; i++) tracker.record("p4", "unavailable", { error: "failed" });
+  router.route("summarize", "small");
+  const status = tracker.all();
+  const description = router.describeFallback("p6", false);
+  const alerts = store.listAlerts(now);
+  const messages: unknown[] = [];
+  store.subscribe((message) => messages.push(message));
+  const preview = router.preview("implement", "small");
+  expect(preview.map((c) => [c.modelId, c.eligible])).toEqual(catalog.map((m, i) => [m.id, i >= 6]));
+  expect(preview.map((c) => c.reason)).toEqual([
+    "disabled",
+    "p1: server not reachable",
+    `p2: quota exhausted; exhausted until ${new Date(now + 60_000).toISOString()}`,
+    "p3: at reserve limit",
+    "p4: circuit open after 3 failures",
+    "p5/m is a decision model; the implement role has no decisions mapping",
+    null,
+    null,
+  ]);
+  expect(router.preview("implement", "small")).toEqual(preview);
+  expect(tracker.all()).toEqual(status);
+  expect(router.describeFallback("p6", false)).toBe(description);
+  expect(store.listAlerts(now)).toEqual(alerts);
+  expect(messages).toEqual([]);
+});
+
+test("preview and route share alternative ordering under preference and headroom changes", () => {
+  const tracker = new ProviderTracker(
+    providers,
+    store,
+    reserves,
+    { OPENROUTER_API_KEY: "key" },
+    { openrouter: 50 },
+    () => 1_000_000,
+  );
+  const router = new Router(tracker, policy, models);
+  router.setPolicy({ ...policy, implement: { default: ["claude/sonnet|codex/sol|openrouter/ds"] } });
+  tracker.setEnabled("openrouter", false);
+  const check = (expected: string[]) => {
+    const status = tracker.all();
+    const alerts = store.listAlerts(tracker.now());
+    const fallback = router.describeFallback("claude", false);
+    const messages: unknown[] = [];
+    const unsubscribe = store.subscribe((message) => messages.push(message));
+    const preview = router.preview("implement", "small");
+    expect(preview.filter((p) => p.eligible).map((p) => p.modelId)).toEqual(expected);
+    expect(preview.find((p) => p.modelId === "openrouter/ds")).toEqual({
+      modelId: "openrouter/ds",
+      eligible: false,
+      reason: "disabled",
+    });
+    expect(tracker.all()).toEqual(status);
+    expect(store.listAlerts(tracker.now())).toEqual(alerts);
+    expect(router.describeFallback("claude", false)).toBe(fallback);
+    expect(messages).toEqual([]);
+    unsubscribe();
+    expect(router.route("implement", "small").candidates.map((c) => c.modelId)).toEqual(expected);
+  };
+  tracker.observeWindows("claude", { five_hour: { utilization: 0.6, resetsAt: 2_000_000 } });
+  check(["codex/sol", "claude/sonnet"]);
+  router.setPreferProviders(["claude"]);
+  check(["claude/sonnet", "codex/sol"]);
+  router.setPreferProviders([]);
+  tracker.observeWindows("codex", { five_hour: { utilization: 0.7, resetsAt: 2_000_000 } });
+  check(["claude/sonnet", "codex/sol"]);
+});
 test("run chains replace every complexity, retain groups and never extend for escalation or billing", () => {
   const { tracker, router } = setup({ OPENROUTER_API_KEY: "key" });
   const chain = ["openrouter/ds", "codex/sol|claude/opus"];

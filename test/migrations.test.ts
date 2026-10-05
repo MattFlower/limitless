@@ -78,6 +78,37 @@ test("repository migration files are validly named", () => {
   expect(() => migrationNames(MIGRATION_DIR)).not.toThrow();
 });
 
+test("operator routing migration upgrades an existing DB and permits previous-release reopen", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-operator-routing.sql"),
+    });
+    let previous = new Store(path, before);
+    previous.setSetting("sentinel", "unchanged");
+    const legacy = legacyRows(previous.db);
+    previous.close();
+    const current = new Store(path);
+    current.writeRouting("triage.default", ["codex/sol"], "live", "tester");
+    current.writeRouting("prefer", ["codex"], null, "tester");
+    expect(legacyRows(current.db)).toEqual(legacy);
+    current.close();
+    previous = new Store(path, before);
+    expect(previous.getSetting("sentinel", "")).toBe("unchanged");
+    previous.setSetting("rollback", "works");
+    previous.close();
+    const reopened = new Store(path);
+    expect(reopened.getSetting("rollback", "")).toBe("works");
+    expect(reopened.routingCells()).toMatchObject([
+      { role: "triage", cell: "default", groups: ["codex/sol"] },
+    ]);
+    expect(reopened.routingPrefer()).toEqual(["codex"]);
+    expect(reopened.routingHistory()).toHaveLength(2);
+    reopened.close();
+  });
+});
+
 test("fresh Store applies legacy and file migrations and reopens without new records", () => {
   temporary((directory, path) => {
     writeFileSync(join(directory, "20260927T1500-fresh.sql"), "CREATE TABLE from_file (id INTEGER);");

@@ -19,6 +19,8 @@ export interface RouteConstraints {
   exclude?: (string | ModelSelection)[];
   /** Put this target first when it is available (stick with the current implementer). */
   prefer?: string | ModelSelection;
+  /** Applicable policy revision when the preferred implementer was selected. */
+  preferPolicyRevision?: string;
   /** Offer this target and nothing else, policy included (a listed panel verifier never falls back). */
   only?: string | ModelSelection;
   /** Put this vendor's models first, as if every other vendor were avoided. */
@@ -39,8 +41,16 @@ export interface RouteDecision {
   skipped: { modelId: string; reason: string }[];
 }
 
+export interface RoutePreview {
+  modelId: string;
+  eligible: boolean;
+  reason: string | null;
+}
+
 export class Router {
   private readonly models: Map<string, ModelDef>;
+  private policyChange = new AbortController();
+  private cellRevisions = new Map<string, string>();
   private readonly lastRoute = new Map<
     string,
     { role: Role; complexity: Complexity; constraints: RouteConstraints }
@@ -48,13 +58,72 @@ export class Router {
 
   constructor(
     private readonly tracker: ProviderTracker,
-    private readonly policy: Policy = DEFAULT_POLICY,
+    private policy: Policy = DEFAULT_POLICY,
     models: ModelDef[] = MODELS,
-    private readonly preferProviders: string[] = [],
+    private preferProviders: string[] = [],
   ) {
     this.models = new Map(models.map((m) => [m.id, m]));
     for (const model of models) this.resolve(model.id);
   }
+
+  getPolicy(): Policy {
+    return this.policy;
+  }
+
+  /** Captures a routing revision; aborted by edits so queued calls can reroute. */
+  get policyRevision(): AbortSignal {
+    return this.policyChange.signal;
+  }
+
+  private invalidateRouting(): void {
+    const previous = this.policyChange;
+    this.policyChange = new AbortController();
+    previous.abort();
+  }
+
+  cellRevision(role: Role, complexity: Complexity): string {
+    const entry = this.policy[role];
+    return JSON.stringify([
+      entry?.[complexity] ?? entry?.default ?? [],
+      this.cellRevisions.get(`${role}.${complexity}`),
+      entry?.[complexity] === undefined ? this.cellRevisions.get(`${role}.default`) : null,
+    ]);
+  }
+
+  setPolicy(policy: Policy, revisions?: Map<string, string>): void {
+    for (const role of Object.keys(policy) as Role[]) {
+      const cells = new Set([...Object.keys(this.policy[role] ?? {}), ...Object.keys(policy[role])]);
+      for (const cell of cells) {
+        const key = cell as keyof Policy[Role];
+        if (!revisions && JSON.stringify(this.policy[role]?.[key]) !== JSON.stringify(policy[role][key]))
+          this.cellRevisions.set(`${role}.${cell}`, crypto.randomUUID());
+      }
+    }
+    this.policy = policy;
+    if (revisions) this.cellRevisions = new Map(revisions);
+    this.invalidateRouting();
+  }
+
+  setPreferProviders(prefer: string[]): void {
+    this.preferProviders = [...prefer];
+    this.invalidateRouting();
+  }
+
+  preview(role: Role, complexity: Complexity, constraints: RouteConstraints = {}): RoutePreview[] {
+    const preview: RoutePreview[] = [];
+    this.decideRoute(role, complexity, constraints, preview);
+    return preview;
+  }
+
+  /** Interchangeable candidates prefer configured providers, then more headroom. */
+  private compareCandidates = (a?: Pick<ModelDef, "provider">, b?: Pick<ModelDef, "provider">) => {
+    if (!a || !b) return 0;
+    const pref = (provider: string) => (this.preferProviders.includes(provider) ? 0 : 1);
+    return (
+      pref(a.provider) - pref(b.provider) ||
+      this.tracker.headroom(b.provider) - this.tracker.headroom(a.provider)
+    );
+  };
 
   model(id: string): ModelDef | undefined {
     return this.models.get(id);
@@ -185,7 +254,12 @@ export class Router {
     return decision;
   }
 
-  private decideRoute(role: Role, complexity: Complexity, c: RouteConstraints): RouteDecision {
+  private decideRoute(
+    role: Role,
+    complexity: Complexity,
+    c: RouteConstraints,
+    preview?: RoutePreview[],
+  ): RouteDecision {
     const entry = this.policy[role];
     const groups = c.chain ?? entry?.[complexity] ?? entry?.default ?? [];
     const skipped: RouteDecision["skipped"] = [];
@@ -203,7 +277,15 @@ export class Router {
     };
     const excluded = new Set(c.exclude?.map(identity));
     const excludedCheckpoints = new Set(c.excludeModels?.map(this.checkpointIdentity));
-    const preference = c.prefer ? identity(c.prefer) : undefined;
+    const edited =
+      c.preferPolicyRevision !== undefined
+        ? c.preferPolicyRevision !== this.cellRevision(role, complexity)
+        : this.cellRevisions.has(`${role}.${complexity}`) ||
+          (entry?.[complexity] === undefined && this.cellRevisions.has(`${role}.default`));
+    // A live edit can remove a saved target, including its explicit effort.
+    let preference = c.prefer ? identity(c.prefer) : undefined;
+    if (edited && !groups.some((g) => g.split("|").some((id) => identity(id) === preference)))
+      preference = undefined;
 
     const avoid = [c.avoidVendor ?? []].flat();
     // Additive, so an avoided vendor that is also the implementer's ranks below one that is not.
@@ -213,18 +295,22 @@ export class Router {
       (c.preferNotVendor?.includes(m.vendor) ? 1 : 0);
     const consider = (ids: (string | ModelSelection)[], fromPolicy = false) => {
       const group: ModelTarget[] = [];
+      const start = skipped.length;
+      const visited: string[] = [];
       for (const reference of ids) {
         let resolved: ReturnType<Router["resolve"]>;
         try {
           resolved = this.resolve(reference);
         } catch (error) {
           skipped.push({ modelId: identity(reference), reason: String(error) });
+          visited.push(identity(reference));
           continue;
         }
         const { model: m, effort, targetId: id } = resolved;
         if (fromPolicy && this.tracker.def(m.provider)?.billing === "free") policyFreeModels.add(m.id);
         if (seen.has(id)) continue;
         seen.add(id);
+        visited.push(id);
         if (excluded.has(id) || excludedCheckpoints.has(this.checkpointIdentity(m.id))) {
           skipped.push({
             modelId: id,
@@ -241,18 +327,25 @@ export class Router {
           skipped.push({ modelId: id, reason: `below tier ${c.minTier}` });
           continue;
         }
-        const why = this.tracker.unavailableReason(m.provider) ?? this.tracker.modelUnavailableReason(m.id);
+        const why =
+          this.tracker.unavailableReason(m.provider, undefined, preview !== undefined) ??
+          this.tracker.modelUnavailableReason(m.id);
         if (why) {
           skipped.push({ modelId: id, reason: why === "disabled" ? "disabled" : `${m.provider}: ${why}` });
           continue;
         }
         group.push(this.toTarget(m, effort ?? null));
       }
-      // Interchangeable models: preferred providers first, then most headroom (spreads load).
-      const pref = (m: ModelTarget) => (this.preferProviders.includes(m.provider) ? 0 : 1);
-      group.sort(
-        (a, b) => pref(a) - pref(b) || this.tracker.headroom(b.provider) - this.tracker.headroom(a.provider),
-      );
+      group.sort(this.compareCandidates);
+      if (preview) {
+        const orderedIds = visited.sort((a, b) =>
+          this.compareCandidates(this.model(parseTarget(a).modelId), this.model(parseTarget(b).modelId)),
+        );
+        for (const modelId of orderedIds) {
+          const reason = skipped.slice(start).find((s) => s.modelId === modelId)?.reason ?? null;
+          preview.push({ modelId, eligible: reason === null, reason });
+        }
+      }
       for (const m of group) {
         const paid = !c.chain && c.billing !== undefined && m.billing !== "free" ? 1 : 0;
         if (paid && c.billing === "free_only") continue;
@@ -273,7 +366,7 @@ export class Router {
       return { candidates, skipped };
     }
     // A persisted implementer can retain an explicit effort after the catalog default changes.
-    if (c.prefer) consider([c.prefer]);
+    if (c.prefer && preference) consider([c.prefer]);
     if (c.billing !== undefined) {
       for (const m of this.models.values())
         if (this.tracker.def(m.provider)?.billing === "free" && !policyFreeModels.has(m.id)) consider([m.id]);

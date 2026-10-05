@@ -918,6 +918,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
                 current.effort === undefined
                   ? (current.targetId ?? current.modelId)
                   : { modelId: current.modelId, effort: current.effort },
+              preferPolicyRevision: current.policyRevision,
             }
           : {};
         if (escalate) {
@@ -956,13 +957,6 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             resolution: merge,
           }),
         });
-        ctx.state.implementer = {
-          modelId: target.modelId,
-          targetId: target.targetId,
-          effort: target.effort ?? null,
-          tier: target.tier,
-          vendor: target.vendor,
-        };
         if (
           !ctx.state.triedImplementers.some(
             (ref) =>

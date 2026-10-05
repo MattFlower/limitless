@@ -88,6 +88,7 @@ export interface RunState {
   answers: string[];
   round: number;
   implementer?: {
+    policyRevision?: string;
     targetId?: string;
     effort?: ModelSelection["effort"];
     modelId: string;
@@ -488,6 +489,8 @@ export class RunContext {
         throw new NoCapacityError(
           `Timed out routing ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}`,
         );
+      const revision = router.policyRevision;
+      const cellRevision = router.cellRevision(opts.role, opts.complexity);
       const decision = router.route(
         opts.role,
         opts.complexity,
@@ -545,15 +548,17 @@ export class RunContext {
         admission = { provider: target.provider, release: free };
       } else {
         const provider = target.provider;
+        const admissionSignal = AbortSignal.any([this.signal, revision]);
         admission = await (allBusy
-          ? tracker.acquireFirst(providers, this.signal, limit, onWait)
+          ? tracker.acquireFirst(providers, admissionSignal, limit, onWait)
           : tracker
-              .acquire(provider, this.signal, busy.has(provider) ? 0 : limit, (ahead) =>
+              .acquire(provider, admissionSignal, busy.has(provider) ? 0 : limit, (ahead) =>
                 onWait(provider, ahead),
               )
               .then((release) => release && { provider, release })
         ).catch((error: unknown) => {
           this.checkCancelled();
+          if (revision.aborted) return null;
           throw error;
         });
       }
@@ -566,12 +571,24 @@ export class RunContext {
         if (chain) exhaustPinned(decision, true);
         throw new NoCapacityError(`${target.targetId ?? target.modelId}: busy until the deadline`);
       }
+      if (revision.aborted) {
+        release?.();
+        busy.clear();
+        attempt--;
+        continue;
+      }
       if (!release) {
         busy.add(target.provider);
         attempt--;
         continue;
       }
       const ready = shadow ? tracker.isAvailable(target.provider) : await tracker.preflight(target.provider);
+      if (revision.aborted) {
+        release();
+        busy.clear();
+        attempt--;
+        continue;
+      }
       if (!ready || tracker.modelUnavailableReason(target.modelId)) {
         release();
         tried.push({ modelId: target.modelId, effort: target.effort ?? null });
@@ -600,16 +617,10 @@ export class RunContext {
         throw new Error(`No harness registered for ${harnessName}`);
       }
       tried.push({ modelId: target.modelId, effort: target.effort ?? null });
+      const previousImplementer = this.state.implementer;
       if (opts.role === "implement") {
-        if (
-          chain &&
-          !this.state.triedImplementers.some(
-            (ref) =>
-              (typeof ref === "string" ? ref : formatTarget(ref.modelId, ref.effort)) === target.targetId,
-          )
-        )
-          this.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
         this.state.implementer = {
+          policyRevision: cellRevision,
           modelId: target.modelId,
           targetId: target.targetId,
           effort: target.effort ?? null,
@@ -619,6 +630,7 @@ export class RunContext {
         try {
           await this.save();
         } catch (error) {
+          this.state.implementer = previousImplementer;
           release();
           throw error;
         }
@@ -654,6 +666,21 @@ export class RunContext {
             "warn",
           );
       }
+      let dispatched = false;
+      const dispatch = () => {
+        // Persist tried history without yielding between recording it and starting the harness.
+        if (
+          opts.role === "implement" &&
+          !this.state.triedImplementers.some(
+            (ref) =>
+              (typeof ref === "string" ? ref : formatTarget(ref.modelId, ref.effort)) === target.targetId,
+          )
+        ) {
+          this.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
+          store.setRunState(this.run.id, this.state);
+        }
+        dispatched = true;
+      };
       let result: AgentResult;
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
       const publicSources = opts.redactHoldout && this.state.holdout ? await this.publicHoldoutSources() : "";
@@ -703,11 +730,31 @@ export class RunContext {
         this.checkCancelled();
         const stream = await this.faults.hit("harness:stream", faultContext, this.signal);
         this.checkCancelled();
-        if (stream) result = parseFakeStream(stream, spec.onEvent);
-        else if (!noTools) {
+        // Saving state, preparing redaction and fault hooks can also yield before the model call.
+        if (revision.aborted) {
+          store.updateInvocation(invocation.id, {
+            status: "cancelled",
+            error: "routing changed before model call",
+            finishedAt: Date.now(),
+          });
+          tried.pop();
+          busy.clear();
+          attempt--;
+          continue;
+        }
+        if (stream) {
+          dispatch();
+          result = parseFakeStream(stream, spec.onEvent);
+        } else if (!noTools) {
           // Every tool-enabled call is confined to its cwd plus a scratch this call owns.
-          result = await withScratch(spec.cwd, (scratchDir) => harness({ ...spec, scratchDir }));
-        } else result = await harness(spec);
+          result = await withScratch(spec.cwd, (scratchDir) => {
+            dispatch();
+            return harness({ ...spec, scratchDir });
+          });
+        } else {
+          dispatch();
+          result = await harness(spec);
+        }
       } catch (e) {
         if (e instanceof SimulatedTermination) {
           this.termination = e;
@@ -726,6 +773,10 @@ export class RunContext {
           quota: null,
         };
       } finally {
+        if (!dispatched && revision.aborted && opts.role === "implement") {
+          this.state.implementer = previousImplementer;
+          store.setRunState(this.run.id, this.state);
+        }
         release();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
         const checkout = shadow?.cwd ?? this.state.worktreePath;
