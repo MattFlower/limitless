@@ -19,6 +19,7 @@ const checkSchema = z.object({
       title: z.string().nullable(),
       summary: z.string().nullable(),
       text: z.string().nullable().optional(),
+      annotations_count: z.number().int().nonnegative().optional(),
     })
     .optional(),
 });
@@ -33,13 +34,20 @@ const jobSchema = z.object({
   name: z.string(),
   labels: z.array(z.string()).optional(),
   started_at: z.string().nullable().optional(),
+  steps: z.array(z.object({ name: z.string(), status: z.string(), conclusion: z.string().nullable() })),
 });
 type Check = z.infer<typeof checkSchema>;
 type Call = (repo: string, path: string, body?: unknown) => Promise<GitHubResponse | null>;
 const bounded = (text: string) => text.trim().slice(0, 500);
+const logLines = (log: string) =>
+  log.split(/\r?\n/).map((line) => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ""));
+// Bun, Playwright, and the Actions runner's timeout diagnostics, matched as whole lines.
+const timeoutDiagnostic =
+  /^(?:error: Test "[^"\r\n]+" timed out after \d+(?:\.\d+)?\s*ms\.?|(?:Error: )?Test timeout of \d+ms exceeded\.|##\[error\]The job running on runner .+ has exceeded the maximum execution time of \d+ minutes\.)$/;
+const pending = (f: CiFailure) => f.outcome === "rerunning" || f.outcome === "rerun_requested";
 /** Logs are data. Only these literal failure patterns participate in deterministic classification. */
 export function ciSignature(check: string, log: string, fallback: string, labels: string[] = []) {
-  const lines = log.split(/\r?\n/).map((line) => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ""));
+  const lines = logLines(log);
   const line = bounded(
     lines.find((l) => /timed out after|##\[error\]|\b(?:error|fail(?:ed|ure)?)\b/i.test(l)) ?? fallback,
   );
@@ -79,6 +87,34 @@ export async function classifyCi(
       all.push(...parsed.jobs);
       if (all.length === parsed.total_count) return all;
       if (!parsed.jobs.length || all.length > parsed.total_count) throw new Error("Incomplete CI job page");
+    }
+  };
+  const unsafeEvidence = async (
+    check: number,
+    job: z.infer<typeof jobSchema>,
+    evidence: string,
+    count?: number,
+  ) => {
+    let unsafe = security.test(job.name) || security.test(evidence);
+    for (const step of job.steps) if (bad.has(step.conclusion ?? "")) unsafe ||= security.test(step.name);
+    let seen = 0;
+    for (let page = 1; ; page++) {
+      const annotations = z
+        .array(
+          z.object({
+            annotation_level: z.string(),
+            title: z.string().nullable(),
+            message: z.string(),
+            raw_details: z.string().nullable().optional(),
+          }),
+        )
+        .parse(await read(`check-runs/${check}/annotations?per_page=100&page=${page}`));
+      seen += annotations.length;
+      for (const a of annotations) unsafe ||= security.test([a.title, a.message, a.raw_details].join("\n"));
+      if (annotations.length < 100) {
+        if (count !== undefined && seen !== count) throw new Error("Incomplete CI annotations");
+        return unsafe;
+      }
     }
   };
   const checks = async (ref: string): Promise<Check[]> => {
@@ -184,7 +220,7 @@ export async function classifyCi(
   // Only a later attempt of the originating workflow job can resolve a rerun.
   for (const f of store.ciFailures(pr.url, snap.headRefOid)) {
     const origin = f.rerunJob;
-    if (f.outcome !== "rerunning" || !origin) continue;
+    if (!pending(f) || !origin) continue;
     const run = z
       .object({ head_sha: z.string(), run_attempt: z.number().int().positive() })
       .parse(await read(`actions/runs/${origin.runId}`));
@@ -217,7 +253,14 @@ export async function classifyCi(
         rerunMarker: null,
         rerunJob: null,
       } as const;
-      if (!security.test(job.name) && !security.test(failure.line)) store.recordCiFailure(failure);
+      const checkPrefix = `https://api.github.com/${root}/check-runs/`;
+      const checkId =
+        job.check_run_url.startsWith(checkPrefix) &&
+        job.check_run_url.slice(checkPrefix.length).match(/^(\d+)$/);
+      if (!checkId) throw new Error("Incomplete CI rerun check");
+      const unsafe = await unsafeEvidence(Number(checkId[1]), job, `${f.check}\n${log}\n${failure.line}`);
+      if (!current()) return true;
+      if (!unsafe) store.recordCiFailure(failure);
       store.finishCiFailure(f, "failed_again");
       emit("ci.needs_fix", failure, `${pr.url}:${f.sha}:${failure.signature}`, false, log || failure.line);
     } else continue;
@@ -225,10 +268,7 @@ export async function classifyCi(
   }
   if (snap.ci !== "FAILURE" && snap.ci !== "ERROR") {
     // The rollup can finish before REST; retry unchanged success until every rerun is confirmed.
-    return (
-      snap.ci !== "SUCCESS" ||
-      !store.ciFailures(pr.url, snap.headRefOid).some((f) => f.outcome === "rerunning")
-    );
+    return snap.ci !== "SUCCESS" || !store.ciFailures(pr.url, snap.headRefOid).some(pending);
   }
   const failures = await checks(snap.headRefOid);
   if (failures.some((c) => c.head_sha !== snap.headRefOid)) throw new Error("Incomplete PR CI");
@@ -239,7 +279,8 @@ export async function classifyCi(
   if (!names.size) throw new Error("Incomplete CI failure: no failing checks");
   // Retain unresolved prior attempts even when their checks now pass or are absent below.
   // Reruns requested in this inspection wait for a new GraphQL observation first.
-  const pendingRerun = store.ciFailures(pr.url, snap.headRefOid).some((f) => f.outcome === "rerunning");
+  const pendingRerun = store.ciFailures(pr.url, snap.headRefOid).some(pending);
+  let paused = false;
   for (const name of names) {
     const matches = failures.filter(
       (c) => c.name === name && c.status === "completed" && bad.has(c.conclusion ?? ""),
@@ -253,23 +294,17 @@ export async function classifyCi(
         throw new Error("Outdated CI check completion");
       let log = c.output?.text ?? c.output?.summary ?? "";
       if (state.get(c.name)?.red) {
+        paused = true;
         emit(
           "ci.main_red",
           ciSignature(c.name, log, c.conclusion ?? "failure"),
           `${pr.repo}:${c.name}:${state.get(c.name)?.episode}`,
           true,
         );
-        const f = {
-          ...ciSignature(c.name, log, c.output?.title ?? c.conclusion ?? "failure"),
-          prUrl: pr.url,
-          sha: snap.headRefOid,
-          outcome: "failed",
-          rerunMarker: null,
-        } as const;
-        if (!security.test(c.name) && !security.test(f.line)) store.recordCiFailure(f);
         continue;
       }
       let job: z.infer<typeof jobSchema> | undefined;
+      let jobUnsafe = false;
       const prefix = `https://github.com/${pr.repo}/`;
       const ids =
         c.details_url?.toLowerCase().startsWith(prefix.toLowerCase()) &&
@@ -283,6 +318,12 @@ export async function classifyCi(
           !bad.has(job.conclusion ?? "")
         )
           throw new Error("Incomplete failing job");
+        jobUnsafe = await unsafeEvidence(
+          c.id,
+          job,
+          [c.name, c.output?.title, c.output?.summary, c.output?.text].join("\n"),
+          c.output?.annotations_count,
+        );
         // A job that never started has no downloadable logs.
         if (
           job.started_at !== null &&
@@ -301,7 +342,8 @@ export async function classifyCi(
         outcome: "failed",
         rerunMarker: null,
       };
-      const unsafe = security.test(c.name) || security.test(job?.name ?? "") || security.test(f.line);
+      const evidence = [c.name, c.output?.title, c.output?.summary, c.output?.text, log].join("\n");
+      const unsafe = jobUnsafe || security.test(evidence);
       const marker = JSON.stringify([c.id, c.completed_at ?? snap.ciKey]);
       const prior = store
         .ciFailures(pr.url, snap.headRefOid)
@@ -312,7 +354,7 @@ export async function classifyCi(
               (job && p.rerunJob?.runId === job.run_id && p.rerunJob.name === job.name)),
         );
       if (job && resolved.has(job.id)) continue;
-      if (prior.some((p) => p.outcome === "rerunning")) {
+      if (prior.some(pending)) {
         continue;
       }
       if (!unsafe) store.recordCiFailure(f);
@@ -323,7 +365,7 @@ export async function classifyCi(
           ["timed_out", "startup_failure", "cancelled"].includes(v ?? ""),
         ) ||
         job?.started_at === null ||
-        /timed out after/i.test(log);
+        logLines(log).some((line) => timeoutDiagnostic.test(line));
       if (!unsafe && !prior.length && job && transient && reruns) {
         const siblings = (await jobs(job.run_id, job.run_attempt)).filter((j) => j.name === job.name);
         if (siblings.length !== 1 || siblings[0]?.id !== job.id)
@@ -349,9 +391,9 @@ export async function classifyCi(
         }
       }
       if (!current()) return true;
-      for (const p of prior) if (p.outcome === "rerun_requested") store.finishCiFailure(p, "failed_again");
       needsFix();
     }
   }
-  return !pendingRerun;
+  // The existing persisted pending inspection also tracks main-red pauses across restarts.
+  return !pendingRerun && !paused;
 }

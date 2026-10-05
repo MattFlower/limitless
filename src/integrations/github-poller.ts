@@ -292,7 +292,9 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     const nudge = unknown >= 3 && prev?.nudged !== head;
     const changes = diffPr(prev, snap);
     const ciChanged = !same || prev?.ciKey !== snap.ciKey;
-    const outstanding = store.ciFailures(pr.url, head).some((f) => f.outcome === "rerunning");
+    const outstanding = store
+      .ciFailures(pr.url, head)
+      .some((f) => f.outcome === "rerunning" || f.outcome === "rerun_requested");
     let ciPending =
       (same && prev?.ciPending) ||
       (snap.state === "OPEN" && (snap.ci === "FAILURE" || snap.ci === "ERROR") && ciChanged) ||

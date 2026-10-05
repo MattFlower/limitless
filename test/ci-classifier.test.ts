@@ -34,8 +34,12 @@ function failure(n = 1, name = "test", conclusion = "timed_out") {
     head_sha: SHA,
     check_run_url: `https://api.github.com/repos/o/r/check-runs/${check.id}`,
     labels: ["ubuntu-latest"],
+    steps: [] as { name: string; status: string; conclusion: string | null }[],
   };
-  const state = { log: "Image: ubuntu-24.04\nerror: smoke timed out after 30000ms" };
+  const state = { log: 'Image: ubuntu-24.04\nerror: Test "smoke" timed out after 30000ms' };
+  h.gh.responses.set(`repos/o/r/check-runs/${check.id}/annotations?per_page=100&page=1`, () =>
+    respond(200, []),
+  );
   const observe = (rollup = "FAILURE", completedAt = "first") => {
     const head = node.commits.nodes[0];
     if (head)
@@ -78,6 +82,9 @@ function failure(n = 1, name = "test", conclusion = "timed_out") {
     check.status = status;
     check.details_url = `https://github.com/o/r/actions/runs/${n}/job/${job.id}`;
     job.check_run_url = `https://api.github.com/repos/o/r/check-runs/${check.id}`;
+    h.gh.responses.set(`repos/o/r/check-runs/${check.id}/annotations?per_page=100&page=1`, () =>
+      respond(200, []),
+    );
     h.gh.responses.set(`repos/o/r/actions/jobs/${job.id}`, () => respond(200, job));
     h.gh.responses.set(`repos/o/r/actions/jobs/${job.id}/logs`, () => respond(200, state.log));
   };
@@ -231,6 +238,7 @@ test.each([false, true])("same-name checks have independent reruns (same workflo
     check_run_url: "https://api.github.com/repos/o/r/check-runs/12",
   };
   const original = { ...f.job };
+  h.gh.responses.set("repos/o/r/check-runs/12/annotations?per_page=100&page=1", () => respond(200, []));
   h.gh.responses.set(checksPath(SHA), () => respond(200, { total_count: 2, check_runs: [f.check, other] }));
   h.gh.responses.set("repos/o/r/actions/jobs/22", () => respond(200, job));
   h.gh.responses.set("repos/o/r/actions/jobs/22/logs", () =>
@@ -266,6 +274,7 @@ test.each([false, true])("same-name checks have independent reruns (same workflo
   other.id = 112;
   other.details_url = `https://github.com/o/r/actions/runs/${job.run_id}/job/${job.id}`;
   job.check_run_url = "https://api.github.com/repos/o/r/check-runs/112";
+  h.gh.responses.set("repos/o/r/check-runs/112/annotations?per_page=100&page=1", () => respond(200, []));
   h.gh.responses.set("repos/o/r/actions/jobs/122", () => respond(200, job));
   h.gh.responses.set("repos/o/r/actions/jobs/122/logs", () =>
     respond(200, "error: different test timed out after 10000ms"),
@@ -387,13 +396,16 @@ test("main red suppresses multiple PRs, deduplicates across restart, and ends on
   expect(items("ci.needs_fix")).toHaveLength(0);
   expect(items("ci.main_red")).toHaveLength(1);
   expect(items("ci.main_red")[0]).toMatchObject({ repo: "o/r", runId: null });
+  expect(JSON.parse(h.store.githubPrData(a.node.url) ?? "{}").ciPending).toBe(true);
   h.reopen();
-  a.observe("FAILURE", "second");
-  b.observe("FAILURE", "second");
   h.start(15);
   await h.advance(0);
   expect(items("ci.main_red")).toHaveLength(1);
+  expect(reruns()).toHaveLength(0);
   main.conclusion = "success";
+  await h.advance(15000);
+  expect(reruns()).toHaveLength(2);
+  expect(items("ci.needs_fix")).toHaveLength(0);
   a.observe("SUCCESS", "green");
   b.observe("SUCCESS", "green");
   await h.advance(15000);
@@ -401,7 +413,7 @@ test("main red suppresses multiple PRs, deduplicates across restart, and ends on
   a.observe("FAILURE", "new-episode");
   await h.advance(15000);
   expect(items("ci.main_red")).toHaveLength(2);
-  expect(reruns()).toHaveLength(0);
+  expect(reruns()).toHaveLength(2);
 });
 
 test.each(["cancelled", "timed_out"])(
@@ -506,6 +518,78 @@ test.each(["timed_out", "startup_failure", "cancelled", "failure"])(
   },
 );
 
+test.each([
+  ['error: Test "smoke" timed out after 30000ms', true],
+  ["2026-10-05T00:00:00Z Test timeout of 30000ms exceeded.", true],
+  ['error: assertion failed: expected "timed out after 30000ms"', false],
+  ['Expected: "error: Test \\"smoke\\" timed out after 30000ms"', false],
+  ["error: smoke timed out after 30000ms", false],
+])("timeout classification uses recognized diagnostics: %s", async (log, retry) => {
+  h = pollerHarness();
+  const f = failure(1, "test", "failure");
+  f.state.log = log;
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(retry ? 1 : 0);
+  expect(items("ci.needs_fix")).toHaveLength(retry ? 0 : 1);
+});
+
+test.each(["step", "annotation", "later annotation", "log"])(
+  "security failure in a %s blocks a generic timeout job",
+  async (source) => {
+    h = pollerHarness();
+    const f = failure();
+    f.job.steps.push({ name: "smoke", status: "completed", conclusion: "failure" });
+    const annotation = { annotation_level: "failure", title: "test", message: "test failed" };
+    if (source === "step")
+      f.job.steps.push({ name: "security tests", status: "completed", conclusion: "failure" });
+    if (source === "log") f.state.log += "\nerror: security test failed";
+    const page = `repos/o/r/check-runs/${f.check.id}/annotations?per_page=100&page=`;
+    h.gh.responses.set(`${page}1`, () =>
+      respond(
+        200,
+        source === "later annotation"
+          ? Array.from({ length: 100 }, () => annotation)
+          : [{ ...annotation, message: source === "annotation" ? "security test failed" : "test failed" }],
+      ),
+    );
+    h.gh.responses.set(`${page}2`, () =>
+      respond(200, [{ ...annotation, raw_details: "security test failed" }]),
+    );
+    h.start(15);
+    await h.advance(0);
+    expect(reruns()).toHaveLength(0);
+    expect(items("ci.needs_fix")).toHaveLength(1);
+    expect(h.store.ciFailures(f.node.url, SHA)).toHaveLength(0);
+    if (source === "later annotation") expect(h.gh.rest().some((c) => c.path === `${page}2`)).toBe(true);
+  },
+);
+
+test("an unavailable annotation page keeps the failure pending until evidence is complete", async () => {
+  h = pollerHarness();
+  const f = failure();
+  const page = `repos/o/r/check-runs/${f.check.id}/annotations?per_page=100&page=`;
+  h.gh.responses.set(`${page}1`, () =>
+    respond(
+      200,
+      Array.from({ length: 100 }, () => ({
+        annotation_level: "failure",
+        title: "test",
+        message: "test failed",
+      })),
+    ),
+  );
+  h.gh.responses.set(`${page}2`, () => respond(500, {}));
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(0);
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
+  h.gh.responses.set(`${page}2`, () => respond(200, []));
+  await h.advance(15000);
+  expect(reruns()).toHaveLength(1);
+});
+
 test("a pass on a different SHA does not prove nondeterminism", async () => {
   h = pollerHarness();
   const f = failure();
@@ -517,7 +601,7 @@ test("a pass on a different SHA does not prove nondeterminism", async () => {
   expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
 });
 
-test.each(["checks", "job", "logs", "main", "attempt"])(
+test.each(["checks", "job", "logs", "main", "attempt", "steps", "annotations"])(
   "incomplete %s details remain retryable and cannot rerun",
   async (part) => {
     h = pollerHarness();
@@ -527,13 +611,17 @@ test.each(["checks", "job", "logs", "main", "attempt"])(
         ? checksPath(SHA)
         : part === "job"
           ? `repos/o/r/actions/jobs/${f.job.id}`
-          : part === "logs"
-            ? `repos/o/r/actions/jobs/${f.job.id}/logs`
-            : part === "attempt"
-              ? "repos/o/r/actions/runs/1/attempts/1/jobs?per_page=100&page=1"
-              : checksPath(mainSha);
+          : part === "steps"
+            ? `repos/o/r/actions/jobs/${f.job.id}`
+            : part === "annotations"
+              ? `repos/o/r/check-runs/${f.check.id}/annotations?per_page=100&page=1`
+              : part === "logs"
+                ? `repos/o/r/actions/jobs/${f.job.id}/logs`
+                : part === "attempt"
+                  ? "repos/o/r/actions/runs/1/attempts/1/jobs?per_page=100&page=1"
+                  : checksPath(mainSha);
     const original = h.gh.responses.get(path);
-    h.gh.responses.set(path, () => respond(200, null));
+    h.gh.responses.set(path, () => respond(200, part === "steps" ? { ...f.job, steps: undefined } : null));
     h.start(15);
     await h.advance(0);
     expect(reruns()).toHaveLength(0);
@@ -546,7 +634,7 @@ test.each(["checks", "job", "logs", "main", "attempt"])(
   },
 );
 
-test("an ambiguous rerun response consumes the cap but remains reportable after restart", async () => {
+test.each(["success", "failure"])("a lost rerun response reconciles %s after restart", async (result) => {
   h = pollerHarness();
   const f = failure();
   h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () => {
@@ -554,12 +642,25 @@ test("an ambiguous rerun response consumes the cap but remains reportable after 
   });
   h.start(15);
   await h.advance(0);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_requested");
   h.reopen();
   h.start(15);
   await h.advance(0);
   expect(reruns()).toHaveLength(1);
-  expect(items("ci.needs_fix")).toHaveLength(1);
-  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_again");
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_requested");
+  f.rerun(result);
+  // An unchanged GraphQL key must not prevent reconciliation of the ambiguous claim.
+  await h.advance(15000);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe(
+    result === "success" ? "failed_then_passed" : "failed_again",
+  );
+  expect(items("ci.needs_fix")).toHaveLength(result === "success" ? 0 : 1);
+  expect(reruns()).toHaveLength(1);
+  h.reopen();
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(1);
 });
 
 test("a last-window log response pauses before claiming the rerun, then retries", async () => {
