@@ -157,7 +157,7 @@ export class LandQueue {
     const given = sha?.trim();
     if (given) {
       if (!/^[a-fA-F0-9]{40}$/.test(given)) throw new Error("sha must be a full commit id");
-      if (head && head !== given) throw new Error("sha is not the pull request's current head");
+      if (!head || head !== given) throw new Error("sha is not the pull request's current head");
       return given;
     }
     const approval = this.store.approvalFor(prUrl);
@@ -456,7 +456,7 @@ export class LandQueue {
 
   /** The poller's saved observation, or null when it holds nothing usable. */
   private savedReport(url: string): LandObservation | null {
-    const snapshot = this.deps.polling === false ? null : savedSnapshot(this.store.githubPrData(url));
+    const snapshot = savedSnapshot(this.store.githubPrData(url));
     return snapshot
       ? {
           head: snapshot.headRefOid,
@@ -469,7 +469,7 @@ export class LandQueue {
 
   /** The saved observation when polling is on, `gh pr view` otherwise; cancellable either way. */
   private async observe(url: string, signal: AbortSignal): Promise<LandObservation | null> {
-    const saved = this.savedReport(url);
+    const saved = this.deps.polling === false ? null : this.savedReport(url);
     if (saved) return saved;
     const pr = await (this.deps.client ?? getGitHubPr)(url, signal);
     return pr ? { head: pr.headRefOid ?? "", state: pr.state, ci: pr.ci ?? null, failing: pr.failing } : null;

@@ -604,6 +604,7 @@ test("a restart during checking re-runs the checks from the start", async () => 
 test("a restart during waiting_ci resumes waiting on the pushed commit", async () => {
   const pr = delivered(1, "pr-1");
   const approved = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, approved);
   // Polling off: the queue reads `gh pr view` instead of the poller's saved observation.
   const view: GitHubPrView = {
     url: url(1),
@@ -744,6 +745,7 @@ test("a head that changes while waiting blocks at once", async () => {
 test("a cancel interrupts a CI read that never answers", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head);
   let calls = 0;
   const q = queue({
     polling: false,
@@ -782,6 +784,9 @@ test("a request needs a review approval, or an explicit head that is the PR's", 
   const q = queue({ start: false });
   expect(() => q.request({ target: "missing" })).toThrow("run not found");
   expect(() => q.request({ target: pr.run.id })).toThrow("no review approval");
+  expect(() => q.request({ target: pr.run.id, sha: "c".repeat(40) })).toThrow(
+    "not the pull request's current head",
+  );
   observe(1, "c".repeat(40));
   approve(1, "c".repeat(40));
   // A head that moved after the approval makes it stale.
@@ -840,6 +845,14 @@ test("the API queues, lists and cancels lands behind the loopback and content-ty
     });
     const run = f.factory.store.createRun(repo, { repo: SLUG, prompt: "api" });
     f.factory.store.updateRun(run.id, { prUrl: url(7), branch: "pr-7", baseBranch: "main" });
+    f.factory.store.saveGithubPr({
+      url: url(7),
+      repo: SLUG,
+      runId: run.id,
+      delivered: 1,
+      nodeId: "PR_7",
+      data: JSON.stringify({ headRefOid: "b".repeat(40), state: "OPEN", ci: "PENDING", failing: [] }),
+    });
     const routes = createHttpRoutes(f.factory);
     const land = routes["/api/land"] as { GET: Route; POST: Route };
     const cancel = routes["/api/land/:id/cancel"] as { POST: Route };
