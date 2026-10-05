@@ -1,15 +1,41 @@
 import { tomlValue } from "../router/config-catalog.ts";
 
+type Statement = { table: string[]; key?: string; path?: string[]; text: string };
+const segment = String.raw`(?:[\w-]+|"(?:\\[^\r\n]|[^"\\\r\n])*"|'[^'\r\n]*')`;
+const key = `${segment}(?:[ \\t]*\\.[ \\t]*${segment})*`;
+const tableHeader = new RegExp(
+  `^\\s*(?:\\[\\[[ \\t]*(${key})[ \\t]*\\]\\]|\\[[ \\t]*(${key})[ \\t]*\\])\\s*(?:#.*)?(?:\\r?\\n)?$`,
+);
+const keyAssignment = new RegExp(`^\\s*(${key})\\s*=`);
+
+function keyPath(key: string): string[] {
+  // Let TOML decode quoted segments and escapes without losing literal dots.
+  let value: unknown = Bun.TOML.parse(`${key} = 0`);
+  const path: string[] = [];
+  while (typeof value === "object" && value !== null) {
+    const entry = Object.entries(value)[0];
+    if (!entry) throw new Error("Cannot patch config.toml; fix TOML syntax");
+    path.push(entry[0]);
+    value = entry[1];
+  }
+  return path;
+}
+const inTable = (p: Statement, name: string) => p.table.length === 1 && p.table[0] === name;
+const hasKey = (p: Statement, ...keys: string[]) => {
+  const path = p.path ? p.table.concat(p.path) : [];
+  return path.length === keys.length && path.every((segment, i) => segment === keys[i]);
+};
+
 /** Keep original statements intact, including multiline values and comments. */
-function statements(text: string): { table: string; key?: string; text: string }[] {
+function statements(text: string): Statement[] {
   const lines = text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
-  const result: { table: string; key?: string; text: string }[] = [];
-  let table = "";
+  const result: Statement[] = [];
+  let table: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i] ?? "";
-    const header = /^\s*\[\[?(.+?)\]\]?\s*(?:#.*)?(?:\r?\n)?$/.exec(line);
-    if (header) table = header[1]?.replace(/["']/g, "").trim() ?? "";
-    const assignment = /^\s*((?:"[^"\n]+"|'[^'\n]+'|[\w.-]+))\s*=/.exec(line);
+    const header = tableHeader.exec(line);
+    if (header) table = keyPath(header[1] ?? header[2] ?? "");
+    const assignment = keyAssignment.exec(line);
     if (assignment) {
       while (true) {
         try {
@@ -21,7 +47,8 @@ function statements(text: string): { table: string; key?: string; text: string }
         }
       }
     }
-    result.push({ table, key: assignment?.[1]?.replace(/^["']|["']$/g, ""), text: line });
+    const key = assignment?.[1];
+    result.push({ table, key, path: key === undefined ? undefined : keyPath(key), text: line });
   }
   return result;
 }
@@ -38,40 +65,41 @@ export function patchSetupConfig(
   convert: boolean,
 ): string {
   const parts = statements(original);
-  const githubInline = parts.find((p) => p.table === "" && p.key === "github");
-  if (githubInline) githubInline.text = `github = ${tomlValue(github)}\n`;
+  const githubInline = parts.find((p) => hasKey(p, "github"));
+  if (githubInline) githubInline.text = `${githubInline.key} = ${tomlValue(github)}\n`;
   else {
     const missing: Record<string, unknown> = {};
     for (const key of ["repos", "merge"]) {
-      const part = parts.find(
-        (p) => (p.table === "github" && p.key === key) || (p.table === "" && p.key === `github.${key}`),
-      );
+      const part = parts.find((p) => hasKey(p, "github", key));
       if (!part) missing[key] = github[key];
       else {
         const value = Bun.TOML.parse(part.text) as Record<string, unknown>;
-        const current = part.table === "" ? (value.github as Record<string, unknown>)[key] : value[key];
+        const current = part.table.length === 0 ? (value.github as Record<string, unknown>)[key] : value[key];
         if (JSON.stringify(current) !== JSON.stringify(github[key])) {
           const comment = /\s+#.*(?:\r?\n)?$/.exec(part.text)?.[0] ?? "\n";
           part.text = `${part.key} = ${tomlValue(github[key])}${comment}`;
         }
       }
     }
-    const at = parts.findIndex((p) => p.table === "github");
+    const at = parts.findIndex((p) => inTable(p, "github"));
     if (Object.keys(missing).length) {
       if (at >= 0) {
-        const end = parts.findIndex((p, i) => i > at && p.table !== "github");
-        parts.splice(end < 0 ? parts.length : end, 0, { table: "github", text: `\n${assignments(missing)}` });
-      } else if (parts.some((p) => p.table === "" && p.key?.startsWith("github."))) {
+        const end = parts.findIndex((p, i) => i > at && !inTable(p, "github"));
+        parts.splice(end < 0 ? parts.length : end, 0, {
+          table: ["github"],
+          text: `\n${assignments(missing)}`,
+        });
+      } else if (parts.some((p) => p.table.length === 0 && p.path?.[0] === "github")) {
         parts.unshift({
-          table: "",
+          table: [],
           text: Object.entries(missing)
             .map(([k, v]) => `github.${k} = ${tomlValue(v)}\n`)
             .join(""),
         });
-      } else parts.push({ table: "github", text: `\n[github]\n${assignments(missing)}` });
+      } else parts.push({ table: ["github"], text: `\n[github]\n${assignments(missing)}` });
     }
   }
-  const providersInline = parts.find((p) => p.table === "" && p.key === "providers");
+  const providersInline = parts.find((p) => hasKey(p, "providers"));
   if (providersInline && !convert && added.length) {
     const additions = entries
       .filter((p) => added.includes(String(p.id ?? p.preset)))
@@ -96,10 +124,7 @@ export function patchSetupConfig(
     if (!patched) throw new Error("Cannot patch providers; check config.toml array formatting");
   }
   const kept = parts.map((p) => {
-    const owned =
-      p.table === "providers" ||
-      p.table.startsWith("providers.") ||
-      (p.table === "" && (p.key === "providers" || p.key?.startsWith("providers.")));
+    const owned = p.table[0] === "providers" || (p.table.length === 0 && p.path?.[0] === "providers");
     if (!convert || !owned || (!p.key && !p.text.trimStart().startsWith("["))) return p.text;
     const comment = /(?:^|\s)(#[^\n]*)(?:\r?\n)?$/.exec(p.text)?.[1];
     return comment ? `${comment}\n` : "";

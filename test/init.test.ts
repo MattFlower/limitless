@@ -413,6 +413,32 @@ for (const comma of ["", ","])
     }
   });
 
+test("init preserves literal dotted tables and updates quoted dotted keys through conversion and rerun", async () => {
+  const unrelated = '["providers.notes"] # unrelated table\ncustom = "keep me"\n';
+  const original = `'github'."repos" = [] # keep repo comment\n"github".'merge' = "none"\n${unrelated}`;
+  const f = setupFixture(original);
+  try {
+    const flags = { yes: true, json: true, repo: ["acme/app"] };
+    expect(await setupCommand("init", flags, f.d)).toBe(0);
+    const updated = readFileSync(f.file, "utf8");
+    expect(updated).toContain(unrelated);
+    expect(updated).toContain('\'github\'."repos" = ["acme/app"] # keep repo comment\n');
+    expect(updated).toContain('"github".\'merge\' = "none"\n');
+    f.reload();
+    expect(f.d.config.raw.github).toEqual({ repos: ["acme/app"], merge: "none" });
+    expect(f.d.config.raw["providers.notes"]).toEqual({ custom: "keep me" });
+    const backup = readdirSync(f.configDir).find((p) => p.endsWith(".bak"));
+    expect(backup).toBeDefined();
+    expect(readFileSync(join(f.configDir, backup ?? ""), "utf8")).toBe(original);
+    const mtime = statSync(f.file).mtimeMs;
+    expect(await setupCommand("init", flags, f.d)).toBe(0);
+    expect(readFileSync(f.file, "utf8")).toBe(updated);
+    expect(statSync(f.file).mtimeMs).toBe(mtime);
+  } finally {
+    f.close();
+  }
+});
+
 for (const consent of ["no", "yes", "noninteractive"])
   test(`implicit provider conversion requires consent: ${consent}`, async () => {
     const original = "# preserve me\n[providers.claude]\nmax_concurrent = 2\n[server]\nport = 7400\n";
