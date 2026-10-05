@@ -27,6 +27,13 @@ const hardened = [
   "core.commitGraph=false",
   "pack.useBitmaps=false",
 ].flatMap((flag) => ["-c", flag]);
+// Config-defined hooks and filters (e.g. a runner's global git-lfs filters) are blanked one flag each.
+const blanked = (args: string[]) => {
+  const blanks = args.filter((arg) => arg.startsWith("--config-env="));
+  for (const flag of blanks)
+    expect(flag).toMatch(/^--config-env=(hook|filter)\..+=LIMITLESS_GIT_EMPTY_HOOK$/);
+  return args.filter((arg) => !blanks.includes(arg));
+};
 const repositories = seeded(async (root) => {
   const source = join(root, "source");
   const alternate = join(root, "alternate");
@@ -403,10 +410,10 @@ else if (args[1] === "view") {
         [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "safe", "pr", sha],
         [resolve("scripts/check-private-strings.ts"), "123", "MattFlower/limitless", "--merge", sha],
       ]);
-      expect(commands("git", "push")).toEqual([
+      expect(commands("git", "push").map(blanked)).toEqual([
         [...hardened, "push", "--no-verify", "-q", "--no-follow-tags", "origin", `${sha}:refs/heads/pr`],
       ]);
-      expect(commands("git", "HEAD")).toEqual([[...hardened, "rev-parse", "HEAD"]]);
+      expect(commands("git", "HEAD").map(blanked)).toEqual([[...hardened, "rev-parse", "HEAD"]]);
       expect(commands("git", "rev-list").some((args) => args.includes(`${value.base}..${sha}`))).toBe(true);
       expect(commands("gh", "list")).toEqual([
         [
@@ -720,7 +727,7 @@ exec '${gitBin}' "$@"
       }
       if (scenario !== "cancel") {
         expect(existsSync(watched)).toBe(true);
-        expect(readFileSync(pushed, "utf8").trim().split("\n")).toEqual([
+        expect(blanked(readFileSync(pushed, "utf8").trim().split("\n"))).toEqual([
           ...hardened,
           "push",
           "--no-verify",
