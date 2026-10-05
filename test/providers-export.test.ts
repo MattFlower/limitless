@@ -32,7 +32,8 @@ test("export round-trips ordered catalog identities, metadata, nested fields and
     expect(output).not.toContain("apiKey");
     const after = resolveCatalog(parse(output).providers);
     expect(after.providers).toEqual(before.providers);
-    expect(after.models).toEqual(before.models);
+    expect(after.models).toEqual(before.models.map((m) => ({ ...m, source: "config" })));
+    expect(after.models.every((m) => m.source === "config")).toBe(true);
     expect(after.notes).toEqual([]);
   }
   expect(defaults.providers).toEqual(PROVIDERS);
@@ -96,7 +97,9 @@ test("offline export stdout and repeated writes preserve unrelated settings, ori
       expect(result.exit).toBe(0);
       expect(result.stdout).toStartWith("[[providers]]");
       expect(result.stdout + result.stderr).not.toContain("super-secret-sentinel");
-      expect(resolveCatalog(parse(result.stdout).providers).models).toEqual(expected?.models);
+      expect(resolveCatalog(parse(result.stdout).providers).models).toEqual(
+        expected.models.map((m) => ({ ...m, source: "config" })),
+      );
       if (before) expect(readFileSync(fixture.file)).toEqual(before);
       expect(readdirSync(fixture.configDir).filter((p) => p.endsWith(".bak"))).toEqual([]);
       const written = await cli(fixture.root, ["--write", "--yes"]);

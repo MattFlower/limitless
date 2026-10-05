@@ -5,19 +5,35 @@ import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
+import { fakeHarness } from "../src/harness/fake.ts";
+import { RunContext } from "../src/pipeline/context.ts";
 import { Auth } from "../src/server/auth.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { customModel } from "./provider-config-support.ts";
 
 let dir: string;
 let factory: Factory;
+let calls: string[];
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "limitless-routing-http-"));
   const overlay = join(dir, "policy.json");
   writeFileSync(overlay, JSON.stringify({ triage: { default: ["claude/opus"] } }));
   const cfg = loadConfig({ home: dir, configDir: dir, port: 7400 });
   cfg.preferProviders = ["claude"];
-  factory = new Factory(cfg, { store: new Store(":memory:"), policyPath: overlay });
+  cfg.secrets.OMLX_API_KEY = "fake-key";
+  calls = [];
+  const harness = fakeHarness((spec) => {
+    calls.push(spec.target.modelId);
+    return { text: "ok" };
+  });
+  factory = new Factory(cfg, {
+    store: new Store(":memory:"),
+    policyPath: overlay,
+    harnesses: { claude: harness, codex: harness, llm: harness },
+    healthFetch: (async (_url: Parameters<typeof fetch>[0]) =>
+      Response.json({ data: [{ id: "org/backend" }, { id: "uncataloged" }] })) as typeof fetch,
+  });
 });
 afterEach(() => {
   factory.store.close();
@@ -36,7 +52,9 @@ function client() {
     const parts = path.split("/");
     const key = path.startsWith("/api/routing/cells/")
       ? "/api/routing/cells/:role/:cell"
-      : (path.split("?")[0] ?? "");
+      : path.startsWith("/api/catalog/models/")
+        ? "/api/catalog/models/:id"
+        : (path.split("?")[0] ?? "");
     const entry = routes[key];
     const route = typeof entry === "function" ? entry : (entry as Record<string, Route>)[method];
     return (route as Route)(
@@ -47,12 +65,186 @@ function client() {
           headers,
           ...(input === undefined ? {} : { body: JSON.stringify(input) }),
         },
-        { role: parts[4] ?? "", cell: parts[5] ?? "" },
+        { role: parts[4] ?? "", cell: parts[5] ?? "", id: decodeURIComponent(parts[4] ?? "") },
       ),
       server,
     );
   };
 }
+
+test("catalog API adds, patches, validates live policy, blocks referenced deletion and streams changes", async () => {
+  const call = client();
+  const response = await call("/api/stream");
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("missing stream");
+  await reader.read();
+  const input = { ...customModel, provider: "codex", id: "experiment", model: "new-build" };
+  const path = "/api/catalog/models/codex%2Fexperiment";
+  try {
+    expect((await call("/api/catalog/models", "POST", input)).status).toBe(201);
+    let event = "";
+    for (let count = 0; count <= factory.tracker.all().length; count++) {
+      event = new TextDecoder().decode((await reader.read()).value);
+      if (event.includes('"kind":"catalog"')) break;
+    }
+    expect(event).toContain('"kind":"catalog"');
+    expect((await (await call("/api/catalog")).json()).models).toContainEqual(
+      expect.objectContaining({
+        id: "codex/experiment",
+        model: "new-build",
+        source: "runtime",
+      }),
+    );
+    expect(factory.router.resolveFor("triage", "codex/experiment@high").model.model).toBe("new-build");
+    const repo = factory.store.upsertRepo({
+      slug: "runtime/repo",
+      kind: "local",
+      localPath: dir,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = factory.store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "test",
+      models: { triage: ["codex/experiment@high"] },
+    });
+    const invoke = async (run: ReturnType<Store["createRun"]>) => {
+      const context = new RunContext(factory.deps, run, repo, new AbortController().signal);
+      return context.invoke({
+        role: "triage",
+        stage: factory.store.startStage(run.id, "triage", 0),
+        prompt: "test",
+        mode: "readonly",
+        complexity: "small",
+      });
+    };
+    expect((await invoke(run)).target.modelId).toBe("codex/experiment");
+    expect(
+      factory.router.route("triage", "small", { chain: ["codex/experiment@high"] }).candidates[0]?.modelId,
+    ).toBe("codex/experiment");
+    factory.routing.setCell("triage", "default", ["codex/experiment@high|claude/opus"]);
+    factory.routing.setCell("triage", "small", ["codex/experiment"]);
+    expect(factory.router.route("triage", "small").candidates[0]?.modelId).toBe("codex/experiment");
+    const live = factory.store.createRun(repo, { repo: repo.slug, prompt: "policy" });
+    expect((await invoke(live)).target.modelId).toBe("codex/experiment");
+    expect(calls).toEqual(["codex/experiment", "codex/experiment"]);
+    const blocked = await call(path, "DELETE");
+    expect(blocked.status).toBe(400);
+    const error = (await blocked.json()).error;
+    expect(error).toContain("triage.default");
+    expect(error).toContain("triage.small");
+    const before = factory.store.runtimeModels();
+    expect((await call(path, "PATCH", { efforts: ["none"] })).status).toBe(400);
+    expect(factory.store.runtimeModels()).toEqual(before);
+    expect((await call(path, "PATCH", { model: "updated-build", price: { input: 1 } })).status).toBe(200);
+    expect(factory.router.resolveFor("triage", "codex/experiment").model).toMatchObject({
+      model: "updated-build",
+      price: { input: 1, output: 0 },
+    });
+    factory.routing.setCell("triage", "default", null);
+    factory.routing.setCell("triage", "small", null);
+    expect((await call(path, "DELETE")).status).toBe(200);
+    expect(factory.store.runtimeModels()).toEqual([]);
+    const deleted = factory.router.route("triage", "small", { chain: ["codex/experiment"] });
+    expect(deleted.candidates).toEqual([]);
+    expect(deleted.skipped[0]?.reason).toContain('unknown model ID "codex/experiment"');
+    await expect(invoke(run)).rejects.toThrow('unknown model ID "codex/experiment"');
+    expect(factory.store.listInvocations(run.id)).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+  } finally {
+    await reader.cancel();
+  }
+});
+
+test("catalog discovery API differences and pinned stale targets make no invocation attempt", async () => {
+  const call = client();
+  expect(
+    (await call("/api/catalog/models", "POST", { ...customModel, provider: "omlx", id: "experiment" }))
+      .status,
+  ).toBe(201);
+  await factory.tracker.probe();
+  const catalog = await (await call("/api/catalog")).json();
+  const discovery = catalog.providers.find((p: { provider: string }) => p.provider === "omlx");
+  expect(discovery.servedNotInCatalog).toEqual(["uncataloged"]);
+  expect(discovery.catalogNotServed).toContain("omlx/qwen-flash");
+  expect(discovery.catalogNotServed).not.toContain("omlx/experiment");
+  const repo = factory.store.upsertRepo({
+    slug: "discovery/repo",
+    kind: "local",
+    localPath: dir,
+    url: null,
+    defaultBranch: "main",
+    mergePolicy: "none",
+  });
+  const run = factory.store.createRun(repo, {
+    repo: repo.slug,
+    prompt: "test",
+    models: { triage: ["omlx/qwen-flash", "omlx/experiment"] },
+  });
+  const context = new RunContext(factory.deps, run, repo, new AbortController().signal);
+  const result = await context.invoke({
+    role: "triage",
+    stage: factory.store.startStage(run.id, "triage", 0),
+    prompt: "test",
+    mode: "readonly",
+    complexity: "small",
+  });
+  expect(result.target.modelId).toBe("omlx/experiment");
+  expect(calls).toEqual(["omlx/experiment"]);
+  expect(factory.store.listInvocations(run.id)).toHaveLength(1);
+  expect(JSON.stringify(factory.store.listEvents(run.id))).toContain("not served by omlx");
+});
+
+test("catalog invalid mutations and code/config edits leave memory and storage unchanged", async () => {
+  const call = client();
+  const base = { ...customModel, provider: "codex", id: "experiment" };
+  const before = factory.models.slice();
+  for (const input of [
+    { ...base, origin: undefined },
+    { ...base, base_origin: undefined },
+    { ...base, price: undefined },
+    { ...base, id: "bad/id" },
+    { ...base, effort: "max" },
+    { ...base, provider: "unknown" },
+    { ...base, id: "sol" },
+    { ...base, source: "code" },
+  ]) {
+    expect((await call("/api/catalog/models", "POST", input)).status).toBe(400);
+    expect(factory.models).toEqual(before);
+    expect(factory.store.runtimeModels()).toEqual([]);
+  }
+  factory.models.push({
+    ...factory.models[0],
+    id: "codex/configured",
+    source: "config",
+  } as (typeof factory.models)[number]);
+  for (const id of ["codex/sol", "codex/configured"])
+    for (const method of ["PATCH", "DELETE"])
+      expect(
+        (await call(`/api/catalog/models/${encodeURIComponent(id)}`, method, { notes: "changed" })).status,
+      ).toBe(400);
+  expect((await call("/api/catalog/models", "POST", base)).status).toBe(201);
+  const stored = factory.store.runtimeModels();
+  for (const patch of [
+    { origin: null },
+    { id: "bad@id" },
+    { id: "sol" },
+    { effort: "max" },
+    { provider: "missing" },
+  ]) {
+    expect((await call("/api/catalog/models/codex%2Fexperiment", "PATCH", patch)).status).toBe(400);
+    expect(factory.store.runtimeModels()).toEqual(stored);
+  }
+  expect((await call("/api/catalog/models", "POST", base)).status).toBe(400);
+  factory.store.db.exec(
+    "CREATE TRIGGER reject_model BEFORE INSERT ON runtime_models BEGIN SELECT RAISE(ABORT, 'disk failure'); END",
+  );
+  const catalog = factory.models.slice();
+  expect((await call("/api/catalog/models", "POST", { ...base, id: "failed" })).status).toBe(400);
+  expect(factory.models).toEqual(catalog);
+  expect(factory.store.runtimeModels()).toEqual(stored);
+});
 
 test("routing API reports provenance, applies cell/prefer edits and resets, and streams each change", async () => {
   const call = client();

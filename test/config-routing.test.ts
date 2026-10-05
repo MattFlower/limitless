@@ -12,8 +12,81 @@ import { DEFAULT_POLICY, MODELS, PROVIDERS, REMOVED_MODELS } from "../src/router
 import { resolveCatalog, tomlValue } from "../src/router/config-catalog.ts";
 import { validatePolicy, validateRunModels } from "../src/router/policy.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
+import { Router } from "../src/router/router.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 import { customModel, customProvider, providerFixture } from "./provider-config-support.ts";
+
+test("authenticated discovery replaces the served set, preserves history, and skips absent targets in routes and previews", async () => {
+  const f = providerFixture(
+    [{ ...customProvider, health_url: "http://localhost/v1/models" }],
+    "LIMITLESS_TEST_MLX_KEY=discovery-key",
+  );
+  const store = new Store(":memory:");
+  let now = 100;
+  let payload: unknown = { data: [{ id: "org/backend" }, { id: "uncataloged" }, { id: "uncataloged" }] };
+  let status = 200;
+  const fetchHealth = (async (_url, init) => {
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer discovery-key");
+    return Response.json(payload, { status });
+  }) as typeof fetch;
+  try {
+    const cfg = f.load();
+    const catalog = cfg.catalog ?? resolveCatalog();
+    const defs = catalog.providers.filter((p) => p.id === "mac-mlx");
+    const tracker = new ProviderTracker(
+      defs,
+      store,
+      cfg.reserves,
+      cfg.secrets,
+      {},
+      () => now,
+      undefined,
+      undefined,
+      fetchHealth,
+    );
+    tracker.setModels(catalog.models);
+    const router = new Router(tracker, undefined, catalog.models);
+    await tracker.probe();
+    expect(tracker.status("mac-mlx")?.discovery).toMatchObject({
+      served: ["org/backend", "uncataloged"],
+      servedNotInCatalog: ["uncataloged"],
+      catalogNotServed: [],
+    });
+    now = 200;
+    payload = { data: [{ id: "uncataloged" }] };
+    const revision = router.policyRevision;
+    await tracker.probe();
+    expect(revision.aborted).toBe(true);
+    expect(tracker.status("mac-mlx")?.discovery?.catalogNotServed).toEqual(["mac-mlx/flash"]);
+    const route = router.route("triage", "small", { chain: ["mac-mlx/flash"] });
+    expect(route.candidates).toEqual([]);
+    expect(route.skipped).toEqual([{ modelId: "mac-mlx/flash@none", reason: "not served by mac-mlx" }]);
+    expect(router.preview("triage", "small", { chain: ["mac-mlx/flash"] })).toEqual([
+      { modelId: "mac-mlx/flash@none", eligible: false, reason: "not served by mac-mlx" },
+    ]);
+    expect(store.discovery("mac-mlx").observations).toEqual([
+      { model: "org/backend", firstSeen: 100, lastSeen: 100 },
+      { model: "uncataloged", firstSeen: 100, lastSeen: 200 },
+    ]);
+    for (const malformed of [{}, { data: [{ id: 1 }] }, { data: null }]) {
+      payload = malformed;
+      await tracker.probe();
+      expect(tracker.status("mac-mlx")?.discovery?.served).toBeNull();
+      expect(router.route("triage", "small", { chain: ["mac-mlx/flash"] }).candidates).toHaveLength(1);
+    }
+    payload = { data: [] };
+    await tracker.probe();
+    expect(router.route("triage", "small", { chain: ["mac-mlx/flash"] }).candidates).toEqual([]);
+    status = 503;
+    await tracker.probe();
+    expect(store.discovery("mac-mlx").served).toBeNull();
+    expect(tracker.status("mac-mlx")?.discovery?.catalogNotServed).toEqual([]);
+    expect(store.discovery("mac-mlx").observations).toHaveLength(2);
+  } finally {
+    store.close();
+    f.close();
+  }
+});
 
 test("run model chains share policy validation and only accept run roles", () => {
   const validate = (value: unknown) => validateRunModels(value, MODELS, PROVIDERS);

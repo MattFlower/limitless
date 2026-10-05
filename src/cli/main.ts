@@ -42,6 +42,9 @@ Usage:
         Items to act on after the consumer's cursor; --wait long-polls until one arrives
   limitless feed ack <id> --consumer <name>  Acknowledge items through id once handled
   limitless providers                     Provider health and quota
+  limitless catalog list                  Effective models and discovery
+  limitless catalog add <provider>/<id> --model <backend> --origin <country> --base-origin <country> --vendor <vendor> --tier N --price-input N --price-output N [--efforts none,high] [--effort high] [--notes …]
+  limitless catalog remove <id>            Remove a runtime model
   limitless providers export [--write] [--yes]     Export effective provider config (offline)
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
@@ -215,6 +218,16 @@ async function main(): Promise<void> {
     options: {
       evals: { type: "string" },
       models: { type: "string" },
+      origin: { type: "string" },
+      "base-origin": { type: "string" },
+      vendor: { type: "string" },
+      tier: { type: "string" },
+      efforts: { type: "string" },
+      effort: { type: "string" },
+      "price-input": { type: "string" },
+      "price-output": { type: "string" },
+      "price-cache-read": { type: "string" },
+      notes: { type: "string" },
       model: { type: "string", multiple: true },
       systems: { type: "string" },
       "replay-finders": { type: "string" },
@@ -446,6 +459,8 @@ async function main(): Promise<void> {
         now: values.now === true,
       });
     }
+    case "catalog":
+      return (await import("./catalog.ts")).catalogCommand(rest, values, api);
     case "routing":
       return (await import("./routing.ts")).routingCommand(rest, values, api);
     case "providers": {
@@ -483,6 +498,7 @@ async function main(): Promise<void> {
             reason: string | null;
             maxConcurrent: number;
             windows: Record<string, { utilization: number; observedAt?: number | null }>;
+            discovery?: import("../core/types.ts").ModelDiscovery;
           }[]
         >("/api/providers");
       for (const p of ps) {
@@ -492,6 +508,10 @@ async function main(): Promise<void> {
         console.log(
           `${p.id.padEnd(11)} ${p.state.padEnd(9)} maxConcurrent ${p.maxConcurrent} ${w} ${p.reason ? color.dim(p.reason) : ""}`,
         );
+        if (p.discovery) {
+          console.log(`  served-not-in-catalog: ${p.discovery.servedNotInCatalog.join(", ") || "none"}`);
+          console.log(`  catalog-not-served: ${p.discovery.catalogNotServed.join(", ") || "none"}`);
+        }
       }
       return;
     }

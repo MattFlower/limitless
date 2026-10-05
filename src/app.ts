@@ -23,6 +23,7 @@ import { resolveCatalog } from "./router/config-catalog.ts";
 import { readPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
 import { Router } from "./router/router.ts";
+import { RuntimeCatalog } from "./router/runtime-catalog.ts";
 import { RuntimePolicy } from "./router/runtime-policy.ts";
 import { Scheduler } from "./scheduler.ts";
 import { redactCredentialData } from "./util/proc.ts";
@@ -55,6 +56,7 @@ export interface FactoryOptions {
 export class Factory {
   readonly store: Store;
   readonly routing: RuntimePolicy;
+  readonly catalog: RuntimeCatalog;
   get policy(): Policy {
     return this.router.getPolicy();
   }
@@ -83,19 +85,25 @@ export class Factory {
     this.bootSha = opts.bootSha ?? "unknown";
     gateSlots.setLimit(cfg.maxConcurrentGates);
     const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
-    this.models = opts.models ?? catalog.models;
+    this.store = opts.store ?? new Store(cfg.paths.db);
+    this.models = [...(opts.models ?? catalog.models)];
     this.evalSettings = evalSettings(cfg.raw);
     this.providerDefs = (opts.providers ?? catalog.providers).map((provider) => ({
       ...provider,
       maxConcurrent: cfg.providerMaxConcurrent[provider.id] ?? provider.maxConcurrent,
     }));
+    for (const model of this.store.runtimeModels()) {
+      if (this.models.some((m) => m.id === model.id)) throw new Error(`catalog collision: ${model.id}`);
+      if (!this.providerDefs.some((p) => p.id === model.provider))
+        throw new Error(`unknown provider ${model.provider}`);
+      this.models.push(model);
+    }
     const shadowOk = checkRosterTargets(cfg, this.models, this.providerDefs, console.warn);
     const code = opts.policy ?? DEFAULT_POLICY;
     const evals =
       opts.policy || opts.policyPath === undefined
         ? {}
         : readPolicy(opts.policyPath, this.models, this.providerDefs);
-    this.store = opts.store ?? new Store(cfg.paths.db);
     this.cleanup = opts.cleanup ?? ((dryRun) => collectGarbage(this.store, cfg, { dryRun }));
     this.gcTimer = opts.gcTimer ?? { set: setInterval, clear: clearInterval };
     this.tracker = new ProviderTracker(
@@ -110,6 +118,8 @@ export class Factory {
       opts.healthFetch,
     );
     this.router = new Router(this.tracker, code, this.models, cfg.preferProviders);
+    this.tracker.setModels(this.models);
+    this.catalog = new RuntimeCatalog(this.store, this.models, this.providerDefs, this.router, this.tracker);
     this.routing = new RuntimePolicy(
       this.store,
       this.router,
