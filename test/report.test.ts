@@ -78,6 +78,23 @@ test("markdown tables are contiguous blocks", () => {
   expect(md).toContain("Flow: build");
 });
 
+test("routing identifies a model experiment and lists full chains alongside actual invocations", () => {
+  const md = renderReport({
+    success: true,
+    runId: "r1",
+    prompt: "Try models",
+    state: {},
+    invocations: [inv],
+    totals: { costUsd: 0, costEquivUsd: 1.5 },
+    runUrl: "u",
+    models: { implement: ["codex/sol-6.1@high", "claude/opus"], review: ["claude/opus|codex/sol"] },
+  });
+  expect(md).toContain("## Routing — model experiment");
+  expect(md).toContain("- implement: `codex/sol-6.1@high, claude/opus`");
+  expect(md).toContain("- review: `claude/opus|codex/sol`");
+  expect(md).toContain("| implement | `codex/sol-6.1`");
+});
+
 test("needs-human report says so", () => {
   const md = renderReport({
     success: false,

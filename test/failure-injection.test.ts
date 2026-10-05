@@ -189,6 +189,76 @@ async function run(f: Factory) {
   f.scheduler.start(); // Fixture providers have no probe URLs, credentials or network operations.
   return r.id;
 }
+
+test.each(["disabled", "quota", "rejected"])(
+  "an unavailable pinned implementer stops with its chain and reason: %s",
+  async (reason) => {
+    const f = factory(undefined, (s) => {
+      if (s.mode !== "edit") return answer(s);
+      return reason === "quota"
+        ? { status: "quota", error: "quota exhausted" }
+        : { status: "error", error: "model not found" };
+    });
+    if (reason === "disabled") f.tracker.setEnabled("b", false);
+    const run = await f.createRun({
+      repo: source,
+      prompt: "Change",
+      profile: "standard",
+      models: { implement: ["b"] },
+    });
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.modelId),
+    ).toEqual(reason === "disabled" ? [] : ["b"]);
+    const question = f.store.listQuestions(run.id).at(-1)?.question ?? "";
+    expect(question).toContain("implement; pinned chain: b");
+    expect(question).toContain("b@high (");
+    expect(question).toContain(reason === "rejected" ? "model not found" : reason);
+  },
+);
+test.each(["unavailable", "rejected"])(
+  "pinned verifier exhaustion redacts private holdout details: %s",
+  async (reason) => {
+    const secret = "PRIVATE_HOLDOUT_TOKEN_729";
+    const f = factory(undefined, (s) => {
+      if (s.prompt.startsWith("Write holdout checks"))
+        return {
+          structured: {
+            scenarios: [{ ...holdout.scenarios[0], steps: `send ${secret}` }],
+          },
+        };
+      if (s.prompt.startsWith("You are the acceptance"))
+        return reason === "unavailable"
+          ? { status: "unavailable", error: `failed on ${secret}` }
+          : { status: "error", error: `model not found while checking ${secret}` };
+      return answer(s);
+    });
+    const run = await f.createRun({
+      repo: source,
+      prompt: "Change",
+      profile: "standard",
+      models: { verify: ["b"] },
+    });
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
+    const invocations = f.store.listInvocations(run.id).filter((i) => i.role === "verify");
+    expect(invocations.map((i) => i.modelId)).toEqual(["b"]);
+    const question = f.store.listQuestions(run.id).at(-1)?.question ?? "";
+    expect(question).toContain("verify; pinned chain: b");
+    expect(question).toContain(reason === "unavailable" ? "unavailable" : "model not found");
+    expect(question).toContain("[private detail]");
+    for (const value of [
+      question,
+      f.store.getRun(run.id)?.error,
+      JSON.stringify(invocations),
+      JSON.stringify(f.store.listStages(run.id)),
+      JSON.stringify(f.store.listEvents(run.id)),
+    ])
+      expect(value).not.toContain(secret);
+  },
+);
 async function settled(f: Factory, id: string) {
   await wait(() => !f.scheduler.activeRunIds.includes(id) && f.store.getRun(id)?.status !== "queued");
 }

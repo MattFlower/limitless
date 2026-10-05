@@ -278,6 +278,18 @@ export const RunDetail: Component = () => {
 
   return (
     <div class="page stack">
+      <Show when={Object.keys(run()?.models ?? {}).length}>
+        <div class="card card-pad">
+          <strong>Model experiment</strong>
+          <For each={Object.entries(run()?.models ?? {})}>
+            {([role, chain]) => (
+              <div>
+                {role}: <code>{chain.join(", ")}</code>
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
       <Show when={loadError()}>
         <div class="error-box">{loadError()}</div>
       </Show>

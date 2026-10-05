@@ -8,12 +8,37 @@ import { Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { seatbeltBackend } from "../src/harness/sandbox.ts";
 import { DEFAULT_ROSTERS } from "../src/pipeline/review-system.ts";
-import { DEFAULT_POLICY, PROVIDERS } from "../src/router/catalog.ts";
+import { DEFAULT_POLICY, MODELS, PROVIDERS, REMOVED_MODELS } from "../src/router/catalog.ts";
 import { resolveCatalog, tomlValue } from "../src/router/config-catalog.ts";
-import { validatePolicy } from "../src/router/policy.ts";
+import { validatePolicy, validateRunModels } from "../src/router/policy.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 import { customModel, customProvider, providerFixture } from "./provider-config-support.ts";
+
+test("run model chains share policy validation and only accept run roles", () => {
+  const validate = (value: unknown) => validateRunModels(value, MODELS, PROVIDERS);
+  const good = { triage: ["omlx/qwen-flash@high|codex/sol"], implement: ["codex/sol", "claude/opus"] };
+  expect(validate(good)).toEqual(good);
+  expect(validate({})).toEqual({});
+  for (const [value, message] of [
+    [{ implement: ["missing/id"] }, 'unknown model ID "missing/id"'],
+    [{ implement: ["claude/fable"] }, REMOVED_MODELS.get("claude/fable")],
+    [{ implement: ["omlx/qwen-flash@high"] }, "cannot carry effort in the implement role"],
+    [{ review: ["codex/sol@max"] }, 'Unsupported effort "max"'],
+    [{ chat: ["codex/sol"] }, "unknown run role"],
+    [{ implement: [] }, "Too small"],
+    [{ implement: [""] }, "empty model ID"],
+    [{ implement: ["codex/sol|"] }, "empty model ID"],
+    [{ implement: ["codex/sol@@high"] }, "Invalid model reference"],
+    [{ implement: "codex/sol" }, "expected array"],
+    [null, "expected a role-to-chain map"],
+  ] as const)
+    expect(() => validate(value)).toThrow(message);
+  const configured = resolveCatalog([customProvider]);
+  expect(() =>
+    validateRunModels({ implement: ["mac-mlx/flash"] }, configured.models, configured.providers),
+  ).toThrow("openai-compatible transport cannot serve the implement role");
+});
 
 test("Dependabot routing defaults to free-first and accepts either configured mode", () => {
   const root = mkdtempSync(join(tmpdir(), "limitless-routing-config-"));

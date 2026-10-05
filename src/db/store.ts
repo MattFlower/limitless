@@ -176,6 +176,7 @@ const toRun = (r: Row): Run => ({
   finishedAt: (r.finished_at as number) ?? null,
   priority: r.priority as number,
   ...(r.no_baseline_cache === 1 ? { noBaselineCache: true } : {}),
+  models: parse(r.models_json, {}),
   allow: AUDIT_ALLOWANCES.filter((kind) => parse<unknown[]>(r.audit_allow, []).includes(kind)),
 });
 
@@ -950,8 +951,8 @@ export class Store {
     const allow = validateAllow([...validateAllow(req.allow), ...(composed ? [] : parseAllow(req.prompt))]);
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url, models_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -974,6 +975,7 @@ export class Store {
         req.noBaselineCache === true ? 1 : 0,
         json(allow),
         round?.prUrl ?? null,
+        json(req.models ?? {}),
       );
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });

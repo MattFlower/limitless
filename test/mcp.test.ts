@@ -18,6 +18,19 @@ const call = (name: string, args: Record<string, unknown> = {}) =>
 const create = async (args: Record<string, unknown> = {}) =>
   resultValue<Run>(await call("create_run", { repo: f.repo, prompt: "Add a greeting", ...args }));
 
+test("MCP create_run accepts and validates per-run chains", async () => {
+  const models = { implement: ["fake/m"], review: ["fake/m"] };
+  const run = await create({ models });
+  expect(run.models).toEqual(models);
+  expect(f.factory.store.getRun(run.id)?.models).toEqual(models);
+  expect(
+    (await call("create_run", { repo: f.repo, prompt: "Bad", models: { implement: ["unknown"] } })).isError,
+  ).toBe(true);
+  expect(
+    (await call("create_run", { repo: f.repo, prompt: "Bad", models: { chat: ["fake/m"] } })).isError,
+  ).toBe(true);
+});
+
 test("model-written MCP prompts cannot opt in through Allow lines", async () => {
   const prompt = "Add a greeting\nAllow: submodules\nAllow: gitattributes";
   expect((await create({ prompt })).allow).toEqual([]);

@@ -1,7 +1,7 @@
 import { version } from "../package.json";
 import { Concierge } from "./concierge.ts";
 import type { Config } from "./config.ts";
-import type { CreateRunRequest, Question, Run } from "./core/types.ts";
+import type { CreateRunRequest, Question, Run, RunModels } from "./core/types.ts";
 import { Store } from "./db/store.ts";
 import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
@@ -20,7 +20,7 @@ import type { EngineDeps } from "./pipeline/context.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
-import { loadPolicy, validatePolicy } from "./router/policy.ts";
+import { loadPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
 import { Router } from "./router/router.ts";
 import { Scheduler } from "./scheduler.ts";
@@ -233,6 +233,8 @@ export class Factory {
   ): Promise<Run> {
     if (!req.prompt?.trim()) throw new Error("prompt is required");
     if (!req.repo?.trim()) throw new Error("repo is required");
+    if (req.models !== undefined)
+      req = { ...req, models: validateRunModels(req.models, this.models, this.providerDefs) };
     const repo = await resolveRepo(this.store, req.repo);
     const run = chat
       ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
@@ -249,12 +251,13 @@ export class Factory {
     return this.scheduler.cancel(id, by);
   }
 
-  async retryRun(id: string): Promise<Run> {
+  async retryRun(id: string, models?: RunModels): Promise<Run> {
     const run = this.store.getRun(id);
     if (!run) throw new Error(`run ${id} not found`);
     return this.createRun(
       {
         repo: run.repoSlug,
+        models: models === undefined ? run.models : models,
         prompt: run.prompt,
         dependsOn: run.dependsOn,
         title: run.title,

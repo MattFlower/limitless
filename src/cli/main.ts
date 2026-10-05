@@ -4,6 +4,7 @@ import { parseArgs } from "node:util";
 import { validateAllow } from "../core/allow.ts";
 import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
+import { parseRunModels } from "../core/run-models.ts";
 import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
 import { ApiError } from "./feed.ts";
@@ -16,6 +17,8 @@ Usage:
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
         [--no-baseline-cache]  Always execute the baseline gates; a passing one refreshes the cache
         [--allow submodules|gitattributes|binary]  Allow that blocked audit change (repeatable)
+        [--model role=model[@effort][,fallback]]  Pin a role's chain (repeatable; | joins alternatives)
+  limitless retry <run> [--model role=chain]  Retry, inheriting or replacing model chains
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
         review only: --systems <file.json> [--replay-finders <evalId>] instead of --models
@@ -207,6 +210,7 @@ async function main(): Promise<void> {
     options: {
       evals: { type: "string" },
       models: { type: "string" },
+      model: { type: "string", multiple: true },
       systems: { type: "string" },
       "replay-finders": { type: "string" },
       k: { type: "string" },
@@ -315,6 +319,7 @@ async function main(): Promise<void> {
         body: JSON.stringify({
           repo: values.repo,
           prompt,
+          models: parseRunModels(values.model),
           ...(values.after !== undefined ? { dependsOn: values.after.split(",") } : {}),
           profile: (values.profile as Profile | undefined) ?? "auto",
           ...(values.title ? { title: values.title } : {}),
@@ -325,6 +330,16 @@ async function main(): Promise<void> {
         }),
       });
       console.log(`Created run ${color.bold(run.id)} on ${run.repoSlug}: ${run.status}`);
+      if (values.follow) await follow(run.id);
+      return;
+    }
+    case "retry": {
+      if (rest.length !== 1) throw new Error("usage: limitless retry <run> [--model role=chain]");
+      const run = await api<Run>(`/api/runs/${encodeURIComponent(rest[0] ?? "")}/retry`, {
+        method: "POST",
+        body: JSON.stringify({ models: parseRunModels(values.model) }),
+      });
+      console.log(`Created retry ${color.bold(run.id)} on ${run.repoSlug}: ${run.status}`);
       if (values.follow) await follow(run.id);
       return;
     }
@@ -349,6 +364,8 @@ async function main(): Promise<void> {
         `repo ${r.repoSlug}  status ${statusColor(r.status)}  profile ${r.resolvedProfile ?? r.profile}`,
       );
       if (r.prUrl) console.log(`PR ${r.prUrl}`);
+      for (const [role, chain] of Object.entries(r.models ?? {}))
+        console.log(`Model experiment: ${role} = ${chain.join(", ")}`);
       if (r.error) console.log(color.red(r.error));
       const cost = formatCost(r.costUsd, r.costEquivUsd);
       console.log(`cost ${cost.primary}${cost.paid ? ` ${cost.paid} paid` : ""} (${cost.title})`);
