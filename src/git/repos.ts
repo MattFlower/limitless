@@ -6,7 +6,7 @@ import { z } from "zod";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { attributeRules, BINARY_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
+import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
 import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
 import { CommandError, sh } from "../util/proc.ts";
@@ -881,7 +881,7 @@ async function attributeInfo(
           matches.has(path) &&
           !afterText.raw.has(path) &&
           !basePointers.has(from ?? "") &&
-          (beforeText.text.has(from ?? "") || !BINARY_PATH.test(path)),
+          (beforeText.text.has(from ?? "") || !INERT_MEDIA_PATH.test(path)),
       )
       .map((c) => c.path);
     const attributeMatches: Record<string, string[]> = {};
@@ -899,7 +899,7 @@ async function attributeInfo(
       attributePatch,
       attributes,
       textPaths,
-      headTextPaths: [...afterText.raw],
+      headTextPaths: [...afterText.text],
       existingRuleKeys,
       attributeMatches,
       binaryPaths,

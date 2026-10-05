@@ -1602,7 +1602,7 @@ test("a rename from text to a binary image keeps its text origin", async () => {
 test.each([
   ["src/**/*.impl.ts -diff", "block"],
   ["*.png -diff", "warn"],
-  ["*.zip binary", "warn"],
+  ["*.zip binary", "block"],
   ["*.woff2 -diff", "warn"],
   ["*.mp4 -diff", "warn"],
   ["*.unknown -diff", "block"],
@@ -1785,35 +1785,103 @@ test.each(["nul.test.mts", "nul.cts", "nul.jsx", "lib/helper.dat", "script", "st
   },
 );
 
+test("new and edited opaque binaries require the binary allowance", async () => {
+  const paths = [
+    "wasm",
+    "WASM",
+    "so",
+    "dll",
+    "dylib",
+    "exe",
+    "class",
+    "pyc",
+    "zip",
+    "jar",
+    "war",
+    "apk",
+    "whl",
+    "tar",
+    "gz",
+    "bz2",
+    "xz",
+    "7z",
+    "rar",
+    "zst",
+    "docx",
+    "xlsx",
+    "pptx",
+    "odt",
+    "docm",
+    "sqlite",
+    "db",
+    "ai",
+    "unknown",
+  ].map((ext, i) => `opaque-${i}.${ext}`);
+  paths.push("bun.lockb");
+  for (const path of paths) writeFileSync(join(work, path), Buffer.from([0, 1]));
+  await commitAll(work, "opaque binary additions");
+  const binaryBase = await headSha(work);
+  for (const path of paths) writeFileSync(join(work, path), Buffer.from([0, 2]));
+  await commitAll(work, "opaque binary edits");
+  for (const revision of [base, binaryBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] }).filter(
+      (f) => f.rule === "binary-content",
+    );
+    expect(findings).toHaveLength(paths.length);
+    for (const path of paths)
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file: path,
+          severity: "block",
+          detail: expect.stringContaining(`${path}:`),
+        }),
+      );
+    expect(findings.every((f) => f.detail.includes("Allow: binary"))).toBe(true);
+    expect(
+      auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] }).filter(
+        (f) => f.rule === "binary-content",
+      ),
+    ).toEqual([]);
+  }
+});
+
 const assetExtensions = [
   "png",
-  "pdf",
-  "woff2",
-  "jar",
-  "war",
-  "apk",
-  "whl",
-  "docx",
-  "xlsx",
-  "pptx",
-  "odt",
-  "psd",
-  "ai",
+  "PNG",
+  "jpg",
+  "jpeg",
+  "gif",
+  "bmp",
+  "ico",
+  "webp",
+  "avif",
+  "tif",
+  "tiff",
   "heic",
-  "wasm",
-  "so",
-  "dll",
-  "dylib",
-  "exe",
-  "class",
-  "pyc",
-  "sqlite",
-  "db",
+  "psd",
+  "mp3",
+  "mp4",
+  "m4a",
+  "mkv",
+  "mov",
+  "avi",
+  "webm",
+  "ogg",
+  "wav",
+  "flac",
+  "aac",
+  "woff",
+  "woff2",
+  "ttf",
+  "otf",
+  "eot",
+  "pdf",
   "glb",
   "fbx",
   "blend",
 ];
-test("known binary extensions exempt assets and unmatched attribute rules", async () => {
+test("inert media extensions exempt new and edited assets and unmatched attribute rules", async () => {
   writeFileSync(join(work, ".gitattributes"), assetExtensions.map((ext) => `*.${ext} binary\n`).join(""));
   await commitAll(work, "unmatched asset rules");
   let diff = await diffSince(work, base);
@@ -1821,12 +1889,19 @@ test("known binary extensions exempt assets and unmatched attribute rules", asyn
   expect(findings.filter((f) => f.severity === "block")).toEqual([]);
   expect(findings).toHaveLength(assetExtensions.length);
   const revision = await headSha(work);
-  for (const ext of assetExtensions) writeFileSync(join(work, `asset.${ext}`), Buffer.from([0, 1, 2]));
+  for (const [i, ext] of assetExtensions.entries())
+    writeFileSync(join(work, `asset-${i}.${ext}`), Buffer.from([0, 1, 2]));
   await commitAll(work, "ordinary assets");
-  diff = await diffSince(work, revision);
-  findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
-  expect(diff.attributeErrors).toBeUndefined();
-  expect(findings).toEqual([]);
+  const binaryBase = await headSha(work);
+  for (const [i, ext] of assetExtensions.entries())
+    writeFileSync(join(work, `asset-${i}.${ext}`), Buffer.from([0, 3, 4]));
+  await commitAll(work, "edited assets");
+  for (const start of [revision, binaryBase]) {
+    diff = await diffSince(work, start);
+    findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(diff.attributeErrors).toBeUndefined();
+    expect(findings).toEqual([]);
+  }
 }, 30_000);
 
 test("16,000 added files use stdin pathspecs without uncertainty findings", async () => {
@@ -1910,6 +1985,31 @@ test("existing hiding warnings group text paths per rule and omit binary PNGs", 
   );
   expect(findings.some((f) => f.file === "photo.png")).toBe(false);
 }, 30_000);
+
+test("a new strict LFS pointer under an existing rule is not warned about as text", async () => {
+  writeFileSync(join(work, ".gitattributes"), "*.dat filter=lfs diff=lfs merge=lfs -text\n");
+  await commitAll(work, "base LFS rule");
+  const revision = await headSha(work);
+  writeFileSync(
+    join(work, "asset.dat"),
+    `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 68\n`,
+  );
+  // Commit the pointer bytes without invoking an installed LFS clean filter.
+  await factory(
+    "-c",
+    "filter.lfs.process=",
+    "-c",
+    "filter.lfs.clean=cat",
+    "-c",
+    "filter.lfs.required=false",
+    "add",
+    "-A",
+  );
+  await factory("commit", "-qm", "new LFS pointer");
+  const diff = await diffSince(work, revision);
+  expect(diff.headTextPaths).toEqual([]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
+});
 
 test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size", "extra line"])(
   "binary edits of %s base LFS pointers require a strict pointer exemption",
