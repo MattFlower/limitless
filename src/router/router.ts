@@ -5,6 +5,8 @@ import type { ProviderTracker } from "./providers.ts";
 import { formatTarget, parseTarget, resolveTarget, transportError } from "./targets.ts";
 
 export interface RouteConstraints {
+  /** A run's policy cell: no outside candidates or soft preference reordering. */
+  chain?: string[];
   /** Skip models from these vendors (cross-vendor review). Falls back to them only if nothing else is available. */
   avoidVendor?: string | string[];
   /** Exclude checkpoints regardless of backend or reasoning effort. */
@@ -185,7 +187,7 @@ export class Router {
 
   private decideRoute(role: Role, complexity: Complexity, c: RouteConstraints): RouteDecision {
     const entry = this.policy[role];
-    const groups = entry?.[complexity] ?? entry?.default ?? [];
+    const groups = c.chain ?? entry?.[complexity] ?? entry?.default ?? [];
     const skipped: RouteDecision["skipped"] = [];
     // Lower ranks first; the sort is stable, so policy and headroom order hold within a rank.
     const ranked: { target: ModelTarget; rank: number }[] = [];
@@ -235,7 +237,7 @@ export class Router {
           skipped.push({ modelId: id, reason: transport });
           continue;
         }
-        if (c.minTier !== undefined && m.tier < c.minTier) {
+        if (!c.chain && c.minTier !== undefined && m.tier < c.minTier) {
           skipped.push({ modelId: id, reason: `below tier ${c.minTier}` });
           continue;
         }
@@ -252,18 +254,24 @@ export class Router {
         (a, b) => pref(a) - pref(b) || this.tracker.headroom(b.provider) - this.tracker.headroom(a.provider),
       );
       for (const m of group) {
-        const paid = c.billing !== undefined && m.billing !== "free" ? 1 : 0;
+        const paid = !c.chain && c.billing !== undefined && m.billing !== "free" ? 1 : 0;
         if (paid && c.billing === "free_only") continue;
-        const rank = independence(m);
+        const rank = c.chain ? 0 : independence(m);
         ranked.push({ target: m, rank: c.independenceFirst ? rank * 2 + paid : paid * 8 + rank });
       }
     };
 
-    if (c.only) {
+    if (c.only && !c.chain) {
       consider([c.only]);
       return { candidates: ranked.map((r) => r.target), skipped };
     }
     for (const g of groups) consider(g.split("|"), true);
+    if (c.chain) {
+      const candidates = ranked.map((r) => r.target);
+      const current = role === "implement" ? candidates.findIndex((m) => m.targetId === preference) : -1;
+      if (current > 0) candidates.unshift(...candidates.splice(current, 1));
+      return { candidates, skipped };
+    }
     // A persisted implementer can retain an explicit effort after the catalog default changes.
     if (c.prefer) consider([c.prefer]);
     if (c.billing !== undefined) {
