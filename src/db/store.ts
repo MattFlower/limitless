@@ -2140,6 +2140,17 @@ export class Store {
     this.publishFeed();
   }
 
+  /** The newest run that opened `pr`: a pull request URL, or its number (`7`). */
+  runForPr(pr: string): Run | null {
+    const number = /^\d+$/.test(pr);
+    const row = this.db
+      .query(
+        `${RUN_SELECT} WHERE runs.pr_url ${number ? "LIKE ?" : "= ?"} COLLATE NOCASE ORDER BY runs.created_at DESC LIMIT 1`,
+      )
+      .get(number ? `%/pull/${pr}` : pr) as Row | null;
+    return row ? toRun(row) : null;
+  }
+
   // ---- GitHub poller -------------------------------------------------------
 
   /** Unmerged PRs factory runs opened; PRs runs only verified, or abandoned over 7 days while open, are excluded. */

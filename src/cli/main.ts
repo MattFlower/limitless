@@ -35,7 +35,8 @@ Usage:
   limitless answer <run> "<text>"         Answer a run's open question(s)
   limitless resolve <run> --as done_elsewhere|superseded|wont_do|pr_closed [--ref <run|url>] [--note "..."]
         Record that a needs_human or failed run was dealt with outside the factory
-  limitless land <run> [--sha <sha>]    Queue the run's open PR for landing (approved head, defaults to the last observed one)
+  limitless land <run|pr|https://.../pull/7> [--sha <sha>]
+        Queue an open PR for landing; --sha approves a head explicitly (default: the recorded approval)
   limitless land list                    Show the land queue
   limitless land cancel <id>             Drop a queued or in-flight land
   limitless feed [--consumer <name>] [--after <id>] [--wait <seconds>] [--json]
@@ -421,7 +422,7 @@ async function main(): Promise<void> {
         throw new Error("usage: limitless land <run|pr> [--sha <sha>] | land list | land cancel <id>");
       const entry = await api<import("../core/types.ts").LandEntry>("/api/land", {
         method: "POST",
-        body: JSON.stringify({ runId: sub, ...(values.sha ? { sha: values.sha } : {}) }),
+        body: JSON.stringify({ target: sub, ...(values.sha ? { sha: values.sha } : {}) }),
       });
       console.log(
         `Land ${color.bold(String(entry.id))} queued for ${entry.prUrl} at ${entry.approvedSha.slice(0, 12)}`,

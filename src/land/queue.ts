@@ -121,11 +121,11 @@ export class LandQueue {
   }
 
   /**
-   * Queue a land for `runId`. The approval is the PR's recorded review approval; `sha` names one
-   * explicitly instead and must be the PR's current head.
+   * Queue a land for a run id, a pull request URL or a pull request number. The approval is the
+   * PR's recorded review approval; `sha` names one explicitly and must be the PR's current head.
    */
-  request(input: { runId: string; sha?: string }): LandEntry {
-    const run = this.store.getRun(input.runId);
+  request(input: { target: string; sha?: string }): LandEntry {
+    const run = this.store.getRun(input.target) ?? this.store.runForPr(this.prRef(input.target));
     if (!run) throw new Error("run not found");
     const repo = this.store.getRepoBySlug(run.repoSlug);
     if (repo?.kind !== "github") throw new Error("run is not on a GitHub repository");
@@ -162,6 +162,11 @@ export class LandQueue {
     if (!approval) throw new Error("no review approval for this pull request");
     if (approval.stale) throw new Error("review approval is stale: the head moved after it");
     return approval.sha;
+  }
+
+  /** A PR URL as given, or the bare number in `#12`/`12`; a run id is looked up first anyway. */
+  private prRef(target: string): string {
+    return target.match(/(?:^|#)\d+$/)?.[0].replace(/^#/, "") ?? target;
   }
 
   cancel(id: number): boolean {

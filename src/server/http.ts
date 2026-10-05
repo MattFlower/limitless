@@ -527,10 +527,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/api/land": {
       GET: handle(() => json(factory.land.list())),
       POST: handle(async (req) => {
-        const input = await body<{ runId?: unknown; sha?: unknown }>(req);
-        if (typeof input.runId !== "string" || !input.runId.trim()) return error("runId is required");
+        const input = await body<{ target?: unknown; runId?: unknown; sha?: unknown }>(req);
+        const target = typeof input.target === "string" ? input.target : input.runId;
+        if (typeof target !== "string" || !target.trim())
+          return error("target is required: a run id, a PR URL or a PR number");
         if (input.sha !== undefined && typeof input.sha !== "string") return error("sha must be a string");
-        return json(factory.land.request({ runId: input.runId, sha: input.sha as string | undefined }), 201);
+        return json(factory.land.request({ target, sha: input.sha as string | undefined }), 201);
       }, true),
     },
     "/api/land/:id/cancel": {
