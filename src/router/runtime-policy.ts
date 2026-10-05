@@ -41,12 +41,8 @@ export class RuntimePolicy {
   }
 
   private changesCell(change: RoutingChange): boolean {
-    const [role, cell] = change.key.split(".") as [Role, RoutingCell];
-    const base = this.evals[role]?.[cell] ?? this.code[role]?.[cell];
-    return (
-      change.key !== "prefer" &&
-      JSON.stringify(change.oldValue ?? base) !== JSON.stringify(change.newValue ?? base)
-    );
+    // Compare recorded operator values: today's lower layers cannot reclassify an old edit.
+    return change.key !== "prefer" && JSON.stringify(change.oldValue) !== JSON.stringify(change.newValue);
   }
 
   private entry(role: string, cell: string): { role: Role; cell: RoutingCell } {

@@ -177,3 +177,30 @@ test("saved implementer revisions survive restart and only later cell edits disl
   factory.routing.setCell("implement", "small", ["codex/sol"]);
   expect(selected()).toBe("codex/sol");
 });
+
+test("an eval update beneath an unchanged override preserves the saved implementer after reopen", () => {
+  const overlay = join(dir, "evals.json");
+  writeFileSync(overlay, JSON.stringify({ implement: { small: ["codex/sol"] } }));
+  const cfg = loadConfig({ home: dir, configDir: dir });
+  const reopen = () => new Factory(cfg, { store, policyPath: overlay });
+  let factory = reopen();
+  // Installing an override equal to the eval cell must have a stable revision too.
+  factory.routing.setCell("implement", "small", ["codex/sol"]);
+  const constraints = {
+    prefer: "claude/opus",
+    preferPolicyRevision: factory.router.cellRevision("implement", "small"),
+  };
+  const selected = () => factory.router.route("implement", "small", constraints).candidates[0]?.modelId;
+  expect(selected()).toBe("claude/opus");
+  factory.routing.setCell("implement", "small", ["codex/sol"], "note only");
+  store.close();
+  writeFileSync(overlay, JSON.stringify({ implement: { small: ["codex/luna"] } }));
+  store = new Store(join(dir, "db.sqlite"));
+  factory = reopen();
+  expect(factory.policy.implement.small).toEqual(["codex/sol"]);
+  expect(factory.router.cellRevision("implement", "small")).toBe(constraints.preferPolicyRevision);
+  expect(selected()).toBe("claude/opus");
+  factory.routing.setCell("implement", "small", null);
+  expect(factory.policy.implement.small).toEqual(["codex/luna"]);
+  expect(selected()).toBe("codex/luna");
+});
