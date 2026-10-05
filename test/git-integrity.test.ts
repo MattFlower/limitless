@@ -2212,6 +2212,25 @@ test.each(["author-email", "message", "clean"])(
   },
 );
 
+test("a planted graft cannot hide a published ancestor from the range check", async () => {
+  writeFileSync(join(work, "transient.txt"), "safe");
+  await commitAll(work, "hidden subject\n\nsecret-host.example");
+  const hidden = await headSha(work);
+  writeFileSync(join(work, "safe.txt"), "safe");
+  await commitAll(work, "safe");
+  const tip = await headSha(work);
+  // The graft makes the tip look parentless, hiding the denylisted commit from rev-list.
+  const common = (
+    await sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: work })
+  ).stdout.trim();
+  mkdirSync(join(common, "info"), { recursive: true });
+  writeFileSync(join(common, "info", "grafts"), `${tip}\n`);
+  expect(hidden).not.toBe(tip);
+  await expect(
+    checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]),
+  ).rejects.toThrow("entry 1");
+});
+
 test.each(["mergetag", "gpgsig", "encoding", "utf8", "invalid-utf8", "message-header", "replacement"])(
   "publication inspects raw commit headers: %s",
   async (scenario) => {

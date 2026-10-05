@@ -20,6 +20,8 @@ common="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)" && pwd -
 paths="$(check_private --record)"
 { IFS= read -r GIT_WORK_TREE; IFS= read -r GIT_DIR; IFS= read -r GIT_COMMON_DIR; ! IFS= read -r extra; } <<< "$paths" || exit 1
 [[ "$GIT_WORK_TREE" = "$(pwd -P)" && "$GIT_DIR" = "$admin" && "$GIT_COMMON_DIR" = "$common" ]] || exit 1
+# A planted graft could hide ancestry from the scan and still be pushed.
+export GIT_GRAFT_FILE=/dev/null
 export GIT_WORK_TREE GIT_DIR GIT_COMMON_DIR
 env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR bun install --frozen-lockfile >/dev/null
 log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"

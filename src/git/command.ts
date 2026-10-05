@@ -33,12 +33,13 @@ export async function recordWorktree(cwd: string): Promise<void> {
   writeFileSync(`${resolve(cwd)}.git-paths`, JSON.stringify(dirs));
 }
 
+// Grafts are disabled too: a planted .git/info/grafts could hide ancestry from scans that get pushed.
 function trustedEnv(cwd: string, env: Record<string, string>) {
   const record = `${resolve(cwd)}.git-paths`;
   if (!existsSync(record)) {
     if (lstatSync(join(cwd, ".git"), { throwIfNoEntry: false })?.isDirectory() === false)
       throw new Error("Missing trusted Git paths");
-    return env;
+    return { ...env, GIT_GRAFT_FILE: "/dev/null" };
   }
   const path = z.string().startsWith("/");
   const [work, admin, common] = z.tuple([path, path, path]).parse(JSON.parse(readFileSync(record, "utf8")));
@@ -53,7 +54,7 @@ function trustedEnv(cwd: string, env: Record<string, string>) {
   assert(realpathSync(cwd) === work && lstatSync(admin).isDirectory(), unsafe);
   for (const [name, target] of Object.entries({ commondir: common, gitdir: join(work, ".git") }))
     assert(resolve(admin, readFileSync(join(admin, name), "utf8").trim()) === target, unsafe);
-  return { ...env, GIT_DIR: admin, GIT_COMMON_DIR: common, GIT_WORK_TREE: work };
+  return { ...env, GIT_DIR: admin, GIT_COMMON_DIR: common, GIT_WORK_TREE: work, GIT_GRAFT_FILE: "/dev/null" };
 }
 
 /** Factory commands in agent-controlled worktrees, without changing any config files. */

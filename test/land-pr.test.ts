@@ -492,7 +492,7 @@ test("land records the worktree's Git paths before any PR code runs", async () =
     const calls = join(root, "calls");
     writeFileSync(
       join(bin, "bun"),
-      `#!/bin/sh\necho "$*" >> '${calls}'\n[ "$2" = --record ] && printf '%s\\n' "$PWD" "$PWD/admin" "$PWD/common"\n[ "$1" = run ] && exit 1\nexit 0\n`,
+      `#!/bin/sh\necho "$*" >> '${calls}'\n[ "$2" = --record ] && printf '%s\\n' "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"\n[ "$1" = run ] && exit 1\nexit 0\n`,
       {
         mode: 0o755,
       },
@@ -525,7 +525,7 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
     const marker = join(root, "published");
     writeFileSync(
       join(bin, "bun"),
-      '#!/bin/sh\n[ "$2" = --record ] && { printf "%s\\n" "$PWD" "$PWD/admin" "$PWD/common"; exit 0; }\n[ "$1" = install ] && exit 0\necho "failed-check-$$"\nexit 1\n',
+      '#!/bin/sh\n[ "$2" = --record ] && { printf "%s\\n" "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"; exit 0; }\n[ "$1" = install ] && exit 0\necho "failed-check-$$"\nexit 1\n',
       { mode: 0o755 },
     );
     writeFileSync(
