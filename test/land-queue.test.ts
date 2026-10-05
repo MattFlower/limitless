@@ -16,7 +16,7 @@ import { Store } from "../src/db/store.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { GitHubPrView } from "../src/integrations/github-notifier.ts";
-import { LandQueue } from "../src/land/queue.ts";
+import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
@@ -54,6 +54,8 @@ beforeEach(async () => {
   };
   for (const dir of [paths.home, paths.repos, paths.work, paths.runs]) mkdirSync(dir, { recursive: true });
   store = new Store(paths.db);
+  ci = () => ({ ci: "SUCCESS" });
+  landLog.length = 0;
   clock = waitClock();
   slots = gateSlots.limit;
   gateSlots.setLimit(1);
@@ -118,8 +120,16 @@ writeFileSync(file+".merged-"+pr,"");
   process.env.PATH = `${bin}:${originalPath}`;
 }
 
-/** The poller's saved observation of each PR: the head and its CI rollup. */
-const observers = new Map<string, (head: string, ci: string, failing?: string[]) => void>();
+/** The poller's saved observation of each PR: the head, its CI rollup and the item it writes. */
+/** What the queue reported, so a test can wait for a rerun it cannot otherwise observe. */
+const landLog: string[] = [];
+const observers = new Map<
+  string,
+  (head: string, ci: string, failing?: string[], opts?: { emit?: boolean }) => void
+>();
+const revision = 0;
+/** What CI reports next for a waiting entry; `null` leaves it waiting for another signal. */
+let ci: () => { ci: string; failing?: string[] } | null = () => ({ ci: "SUCCESS" });
 const runs = new Map<number, Run>();
 
 /** The review approval `limitless land` reads: this head, reviewed. */
@@ -202,7 +212,7 @@ const remoteHead = (branch: string) =>
 function queue(
   opts: {
     polling?: boolean;
-    client?: (url: string) => Promise<GitHubPrView | null>;
+    client?: LandPrClient;
     ciPollMs?: number;
     ciTimeoutMs?: number;
     start?: boolean;
@@ -217,7 +227,7 @@ function queue(
       set: (fn, ms) => clock.timer.set(fn, ms),
       clear: (id) => clock.timer.clear(id as unknown as number),
     },
-    log: () => {},
+    log: (message: string) => void landLog.push(message),
     ...opts,
   });
   queues.push(q);
@@ -226,16 +236,18 @@ function queue(
 }
 
 /** Answer CI for whatever each entry waits on, then let promise chains settle on the fake clock. */
-async function tick(answer: { ci: string; failing?: string[] }): Promise<void> {
+async function tick(answer?: { ci: string; failing?: string[] }): Promise<void> {
+  const plan = answer ?? ci();
+
   // A claimed entry with a pushed commit is in its CI phase, whatever the claim left it as.
   for (const entry of store.listLandEntries({ active: true }))
-    if (entry.pushedSha) observers.get(entry.prUrl)?.(entry.pushedSha, answer.ci, answer.failing ?? []);
+    if (entry.pushedSha && plan) observers.get(entry.prUrl)?.(entry.pushedSha, plan.ci, plan.failing ?? []);
   await clock.advance(100);
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
 /** Advance the injected clock until the queue is idle. */
-async function settle(answer: { ci: string; failing?: string[] } = { ci: "SUCCESS" }): Promise<void> {
+async function settle(answer?: { ci: string; failing?: string[] }): Promise<void> {
   const end = Date.now() + 20_000;
   while (store.listLandEntries({ active: true }).length) {
     if (Date.now() > end)
@@ -249,10 +261,7 @@ async function settleIdle(): Promise<void> {
   for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
-async function waitFor(
-  check: () => boolean,
-  answer: { ci: string; failing?: string[] } = { ci: "SUCCESS" },
-): Promise<void> {
+async function waitFor(check: () => boolean, answer?: { ci: string; failing?: string[] }): Promise<void> {
   const end = Date.now() + 15_000;
   while (!check()) {
     if (Date.now() > end) throw new Error("timed out waiting for the land queue");
@@ -646,6 +655,108 @@ test("CI that never finishes gives up with a reason", async () => {
   await settle({ ci: "PENDING" });
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason: "CI did not finish" });
   expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("a CI feed item lands the entry without the clock moving", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head);
+  approve(1, head);
+  ci = () => null; // only the test publishes an observation, and no clock ever advances
+  const q = queue();
+  const entry = q.request({ runId: pr.run.id });
+  await waitFor(() => !!store.getLandEntry(entry.id)?.pushedSha);
+  expect(clock.pending).toBeGreaterThan(0); // the fallback read is armed, and is not what wakes it
+  observers.get(url(1))?.(store.getLandEntry(entry.id)?.pushedSha ?? "", "SUCCESS");
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "landed");
+  expect(ghCalls("pr merge")).toHaveLength(1);
+});
+
+test("a transient CI failure is re-run once and lands", async () => {
+  const flaky = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head);
+  approve(1, head);
+  ci = () => null; // the test answers CI itself, one verdict at a time
+  const q = queue();
+  const entry = q.request({ runId: flaky.run.id });
+  const published = async () => store.getLandEntry(entry.id)?.pushedSha ?? "";
+  await waitFor(() => !!store.getLandEntry(entry.id)?.pushedSha);
+  observers.get(url(1))?.(await published(), "FAILURE", ["network"]);
+  await waitFor(() => landLog.some((l) => l.includes("transient CI failure")));
+  observers.get(url(1))?.(await published(), "SUCCESS");
+  await settle();
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+  expect(landLog.filter((l) => l.includes("transient CI failure"))).toHaveLength(1);
+});
+
+test("a transient CI failure twice blocks, and a real one is not re-run", async () => {
+  const broken = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head);
+  approve(1, head);
+  ci = () => null;
+  const q = queue();
+  const entry = q.request({ runId: broken.run.id });
+  await waitFor(() => !!store.getLandEntry(entry.id)?.pushedSha);
+  const pinned = store.getLandEntry(entry.id)?.pushedSha ?? "";
+  observers.get(url(1))?.(pinned, "FAILURE", ["network"]);
+  await waitFor(() => landLog.some((l) => l.includes("transient CI failure")));
+  observers.get(url(1))?.(pinned, "FAILURE", ["network"]);
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason: "CI failed: network" });
+
+  const real = delivered(2, "pr-2");
+  const head2 = await pushBranch("pr-2", "two.txt", "two\n", 2);
+  observe(2, head2);
+  approve(2, head2);
+  ci = () => null;
+  landLog.length = 0;
+  const second = q.request({ runId: real.run.id });
+  await waitFor(() => !!store.getLandEntry(second.id)?.pushedSha);
+  observers.get(url(2))?.(store.getLandEntry(second.id)?.pushedSha ?? "", "FAILURE", ["build"]);
+  await settle();
+  expect(store.getLandEntry(second.id)).toMatchObject({ state: "blocked", reason: "CI failed: build" });
+  expect(landLog.some((l) => l.includes("transient"))).toBe(false);
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("a head that changes while waiting blocks at once", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head);
+  approve(1, head);
+  ci = () => ({ ci: "PENDING" });
+  const q = queue();
+  const entry = q.request({ runId: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  const moved = await pushBranch("pr-1", "one.txt", "one\nagain\n", 1);
+  ci = () => null; // the moved head is the last thing this PR reports
+  observers.get(url(1))?.(moved, "SUCCESS");
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "blocked");
+  expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("a cancel interrupts a CI read that never answers", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  let calls = 0;
+  const q = queue({
+    polling: false,
+    ciPollMs: 10,
+    // A reader that hangs until it is told to stop: cancel must not wait for it.
+    client: (_url, signal) =>
+      new Promise<GitHubPrView | null>((resolve) => {
+        if (++calls > 1) return resolve(null);
+        signal?.addEventListener("abort", () => resolve(null), { once: true });
+      }),
+  });
+  const entry = q.request({ runId: pr.run.id, sha: head });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  q.cancel(entry.id);
+  await q.stop();
+  expect(store.getLandEntry(entry.id)?.state).toBe("cancelled");
 });
 
 test("a request needs a review approval, or an explicit head that is the PR's", () => {

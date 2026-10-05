@@ -22,6 +22,7 @@ import {
 } from "../git/repos.ts";
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
 import { type GitHubPrView, getGitHubPr } from "../integrations/github-notifier.ts";
+import { savedSnapshot } from "../integrations/github-poller.ts";
 
 /** A land the factory will not retry: the operator has to look at it. */
 export class LandBlocked extends Error {}
@@ -35,8 +36,8 @@ export interface LandObservation {
   failing: string[];
 }
 
-/** The poller's saved snapshot, the `gh` fallback, or whatever a test injects. */
-export type LandPrClient = (url: string) => Promise<GitHubPrView | null>;
+/** The `gh pr view` client a land reads its CI from when polling is off. */
+export type LandPrClient = (url: string, signal?: AbortSignal) => Promise<GitHubPrView | null>;
 
 /** An injected clock and timers, so CI waits and timeouts never need real sleeps. */
 export interface LandClock {
@@ -61,34 +62,17 @@ export interface LandDeps {
 }
 
 const DEFAULTS = { ciPollMs: 15_000, ciTimeoutMs: 60 * 60_000 };
+/** The poller's verdicts, as feed items; they are what moves a CI wait. */
+const CI_FEED = new Set(["pr.ci_passed", "pr.ci_failed"]);
+const UNSETTLED_CI = new Set(["PENDING", "EXPECTED"]);
+/**
+ * Checks whose failures are the infrastructure's rather than the change's: one rerun, then block.
+ * #353 replaces this with a policy over the whole run; it is deliberately a short explicit list.
+ */
+const TRANSIENT_CI =
+  /flaky|network|timed? ?out|timeout|cancel|beacon|startup|action required|infrastructure/i;
 /** A claim has to be this quiet before another queue may take the entry it holds. */
 const CLAIM_STALE_MS = 30_000;
-
-/** The saved poller observation, or null when it holds nothing usable. */
-function saved(url: string | null): LandObservation | null {
-  if (!url) return null;
-  let data: {
-    headRefOid?: unknown;
-    state?: unknown;
-    ci?: unknown;
-    failing?: unknown;
-  };
-  try {
-    data = JSON.parse(url) as typeof data;
-  } catch {
-    return null;
-  }
-  if (typeof data.headRefOid !== "string" || typeof data.state !== "string") return null;
-  const failing = Array.isArray(data.failing) ? data.failing : [];
-  return {
-    head: data.headRefOid,
-    state: data.state,
-    ci: typeof data.ci === "string" ? data.ci : null,
-    failing: failing.flatMap((f) =>
-      typeof (f as { name?: unknown })?.name === "string" ? [(f as { name: string }).name] : [],
-    ),
-  };
-}
 
 /**
  * Which queue is draining each repository in this process. The store's claim is the durable half of
@@ -146,7 +130,7 @@ export class LandQueue {
     const repo = this.store.getRepoBySlug(run.repoSlug);
     if (repo?.kind !== "github") throw new Error("run is not on a GitHub repository");
     if (!run.prUrl) throw new Error("run has no pull request");
-    const observed = this.deps.polling === false ? null : saved(this.store.githubPrData(run.prUrl));
+    const observed = this.savedReport(run.prUrl);
     if (observed && observed.state !== "OPEN") throw new Error(`pull request is ${observed.state}`);
     const approved = this.approval(run.prUrl, input.sha, observed?.head);
     const headBranch = run.deliveryBranch ?? run.branch;
@@ -308,22 +292,56 @@ export class LandQueue {
   }
 
   /** Wait for CI on exactly `sha`; nothing else counts as the green that lets the merge happen. */
+  /**
+   * Wait for CI on exactly `sha`. The poller's `pr.ci_passed` / `pr.ci_failed` items move the wait;
+   * the fallback read covers a restart and polling off. A head that moved after we saw ours blocks
+   * at once, and a transient failure is re-run once.
+   */
   private async awaitCi(entry: LandEntry, sha: string, signal: AbortSignal): Promise<"green" | "merged"> {
-    const pollMs = this.deps.ciPollMs ?? DEFAULTS.ciPollMs;
     const deadline = this.now() + (this.deps.ciTimeoutMs ?? DEFAULTS.ciTimeoutMs);
+    let observed = false,
+      reruns = 0;
     for (;;) {
       signal.throwIfAborted();
-      const seen = await this.observe(entry);
-      if (seen && seen.state === "MERGED") return "merged";
-      if (seen?.head === sha) {
-        // Only SUCCESS is green; a rollup that is not there yet means the push has no checks yet.
+      const seen = await this.observe(entry.prUrl, signal);
+      if (seen?.state === "MERGED") return "merged";
+      if (seen && seen.head === sha) observed = true;
+      // Only a head we have already seen at our own commit counts as moved: before that, the
+      // poller's saved observation may simply predate our push.
+      else if (observed && seen?.head) throw new LandBlocked("head moved after approval");
+      if (observed && seen?.ci && !UNSETTLED_CI.has(seen.ci)) {
         if (seen.ci === "SUCCESS") return "green";
-        if (seen.ci && seen.ci !== "PENDING" && seen.ci !== "EXPECTED")
-          throw new LandBlocked(`CI failed: ${seen.failing.join(", ") || "unknown check"}`);
+        if (reruns < 1 && seen.failing.length > 0 && seen.failing.every((n) => TRANSIENT_CI.test(n))) {
+          reruns++;
+          this.log(`[land] ${entry.id}: transient CI failure (${seen.failing.join(", ")}); re-running`);
+          await this.ciWake(entry, signal);
+          continue;
+        }
+        throw new LandBlocked(`CI failed: ${seen.failing.join(", ") || "unknown check"}`);
       }
       if (this.now() >= deadline) throw new LandBlocked("CI did not finish");
-      await this.sleep(pollMs, signal);
+      await this.ciWake(entry, signal);
     }
+  }
+
+  /** Resolves on the poller's next CI item for this PR, the fallback tick, or an abort. */
+  private ciWake(entry: LandEntry, signal: AbortSignal): Promise<void> {
+    const set = this.deps.clock?.set ?? ((fn, ms) => setTimeout(fn, ms));
+    const clear = this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
+    return new Promise((resolve) => {
+      const id = set(() => done(), this.deps.ciPollMs ?? DEFAULTS.ciPollMs);
+      const unsubscribe = this.store.subscribe((msg) => {
+        if (msg.kind === "feed" && CI_FEED.has(msg.item.kind) && msg.item.data.url === entry.prUrl) done();
+      });
+      function done() {
+        clear(id);
+        unsubscribe();
+        signal.removeEventListener("abort", done);
+        resolve();
+      }
+      if (signal.aborted) done();
+      else signal.addEventListener("abort", done, { once: true });
+    });
   }
 
   private async merge(
@@ -390,37 +408,25 @@ export class LandQueue {
     rmSync(cwd, { recursive: true, force: true });
   }
 
-  private async observe(entry: LandEntry): Promise<LandObservation | null> {
-    const fromPoller = this.deps.polling === false ? null : saved(this.store.githubPrData(entry.prUrl));
-    if (fromPoller) return fromPoller;
-    const pr = await (this.deps.client ?? getGitHubPr)(entry.prUrl);
-    if (!pr) return null;
-    return {
-      head: pr.headRefOid ?? "",
-      state: pr.state,
-      ci: pr.ci ?? null,
-      failing: pr.failing ?? [],
-    };
+  /** The poller's saved observation, or null when it holds nothing usable. */
+  private savedReport(url: string): LandObservation | null {
+    const snapshot = this.deps.polling === false ? null : savedSnapshot(this.store.githubPrData(url));
+    return snapshot
+      ? {
+          head: snapshot.headRefOid,
+          state: snapshot.state,
+          ci: snapshot.ci,
+          failing: snapshot.failing.map((f) => f.name),
+        }
+      : null;
   }
 
-  /** A cancellable wait on the injected clock, never a bare sleep. */
-  private sleep(ms: number, signal: AbortSignal): Promise<void> {
-    const set: LandClock["set"] = this.deps.clock?.set ?? ((fn, delay) => setTimeout(fn, delay));
-    const clear: LandClock["clear"] =
-      this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
-    return new Promise((resolve, reject) => {
-      const done = () => {
-        signal.removeEventListener("abort", aborted);
-        resolve();
-      };
-      const aborted = () => {
-        clear(id as never);
-        reject(signal.reason);
-      };
-      const id = set(done, ms);
-      if (signal.aborted) aborted();
-      else signal.addEventListener("abort", aborted, { once: true });
-    });
+  /** The saved observation when polling is on, `gh pr view` otherwise; cancellable either way. */
+  private async observe(url: string, signal: AbortSignal): Promise<LandObservation | null> {
+    const saved = this.savedReport(url);
+    if (saved) return saved;
+    const pr = await (this.deps.client ?? getGitHubPr)(url, signal);
+    return pr ? { head: pr.headRefOid ?? "", state: pr.state, ci: pr.ci ?? null, failing: pr.failing } : null;
   }
 
   private block(id: number, reason: string): void {
