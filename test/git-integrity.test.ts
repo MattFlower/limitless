@@ -43,6 +43,7 @@ import {
   removeWorktree,
   resetTo,
   sweepClassificationScratch,
+  withRepoLock,
 } from "../src/git/repos.ts";
 import { processScope, sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
@@ -84,6 +85,9 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 test.each([
   "untampered",
+  "empty sibling",
+  "non-file sibling backlink",
+  "duplicate backlink",
   "rewritten pointer",
   "symlinked pointer",
   "symlinked admin",
@@ -93,7 +97,7 @@ test.each([
   "symlinked admin file",
   "cache in checkout",
   "other owner",
-])("legacy worktree: legacy registration refuses unsafe administration (%s)", async (tampering) => {
+])("legacy worktree: legacy registration validates administration (%s)", async (tampering) => {
   let common = join(dir, "cache.git");
   const legacy = join(dir, "legacy");
   await git(dir, "clone", "-q", "--bare", seed, common);
@@ -101,6 +105,12 @@ test.each([
   const admin = join(common, "worktrees", "legacy");
   const pointer = join(legacy, ".git");
   const sidecar = `${legacy}.git-paths`;
+  if (["empty sibling", "non-file sibling backlink", "duplicate backlink"].includes(tampering)) {
+    const sibling = join(common, "worktrees", "sibling");
+    mkdirSync(sibling);
+    if (tampering === "non-file sibling backlink") mkdirSync(join(sibling, "gitdir"));
+    if (tampering === "duplicate backlink") writeFileSync(join(sibling, "gitdir"), `${pointer}\n`);
+  }
   if (tampering === "rewritten pointer") writeFileSync(pointer, `gitdir: ${join(seed, ".git")}\n`);
   if (tampering === "symlinked pointer") {
     renameSync(pointer, join(dir, "pointer"));
@@ -136,7 +146,7 @@ test.each([
       ? spyOn(process, "getuid").mockReturnValue(uid + 1)
       : undefined;
   try {
-    if (tampering === "untampered") {
+    if (["untampered", "empty sibling", "non-file sibling backlink"].includes(tampering)) {
       expect(await recordLegacyWorktree(legacy, common)).toBe(true);
       const bytes = readFileSync(sidecar, "utf8");
       expect(await recordLegacyWorktree(legacy, common)).toBe(false);
@@ -152,6 +162,33 @@ test.each([
   } finally {
     owner?.mockRestore();
   }
+});
+
+test("legacy registration checks the sidecar only after acquiring the repository lock", async () => {
+  const hold = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  const common = join(seed, ".git");
+  const bytes = readFileSync(`${work}.git-paths`, "utf8");
+  const lock = withRepoLock(common, async () => {
+    entered.resolve();
+    await hold.promise;
+  });
+  await entered.promise;
+  let completed = false;
+  const registration = recordLegacyWorktree(work, common).then((recorded) => {
+    completed = true;
+    return recorded;
+  });
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(completed).toBe(false);
+  } finally {
+    hold.resolve();
+    await lock;
+    await registration;
+  }
+  expect(await registration).toBe(false);
+  expect(readFileSync(`${work}.git-paths`, "utf8")).toBe(bytes);
 });
 
 async function audited(files = ["sample.test.ts"]) {

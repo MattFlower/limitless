@@ -2,9 +2,14 @@ import { strict as assert } from "node:assert";
 import { lstatSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { worktreeGit } from "./command.ts";
+import { withRepoLock } from "./repos.ts";
 
 /** Discover only through the protected cache, never through the candidate's Git pointer. */
 export async function recordLegacyWorktree(cwd: string, cache: string): Promise<boolean> {
+  return withRepoLock(cache, () => registerLegacyWorktree(cwd, cache));
+}
+
+async function registerLegacyWorktree(cwd: string, cache: string): Promise<boolean> {
   const record = `${resolve(cwd)}.git-paths`;
   if (lstatSync(record, { throwIfNoEntry: false })) return false;
   const unsafe = "Unsafe worktree Git administration";
@@ -43,8 +48,12 @@ export async function recordLegacyWorktree(cwd: string, cache: string): Promise<
     assert(fields.includes(`worktree ${work}`), unsafe);
     const matches = readdirSync(admins).filter((name) => {
       const admin = join(admins, name);
-      inspect(admin);
-      inspect(join(admin, "gitdir"));
+      // Interrupted sibling creation may leave no backlink; validate only the matched admin below.
+      if (
+        !lstatSync(admin).isDirectory() ||
+        !lstatSync(join(admin, "gitdir"), { throwIfNoEntry: false })?.isFile()
+      )
+        return false;
       return pointsTo(admin, readFileSync(join(admin, "gitdir"), "utf8").trim(), join(work, ".git"));
     });
     assert(matches.length === 1, unsafe);
