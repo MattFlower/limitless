@@ -71,72 +71,87 @@ test("partial config keeps values; a second run leaves bytes and mtime unchanged
   }
 });
 
-test("CLI init --yes --json fakes LAN health and loopback discovery without live provider fetches", async () => {
-  const provider = {
-    ...customProvider,
-    api_key_env: undefined,
-    id: "lan",
-    health_url: "http://192.0.2.10:8080/v1/models",
-  };
-  const f = setupFixture(`providers = ${tomlValue([provider])}\n`);
-  const paths: string[] = [];
-  const server = Bun.serve({
-    port: 0,
-    fetch: (req) => {
-      const path = new URL(req.url).pathname;
-      paths.push(path);
-      return Response.json(path === "/api/health" ? { ok: true, sha: "installed" } : []);
-    },
-  });
-  try {
-    const child = Bun.spawn(
-      [
-        process.execPath,
-        "--preload",
-        "./test/fixtures/setup-cli-preload.ts",
-        "src/cli/main.ts",
-        "init",
-        "--yes",
-        "--json",
-        "--repo",
-        "acme/app",
-      ],
-      {
-        env: {
-          ...process.env,
-          LIMITLESS_HOME: f.home,
-          LIMITLESS_CONFIG_DIR: f.configDir,
-          LIMITLESS_URL: `http://127.0.0.1:${server.port}`,
-          LIMITLESS_TEST_SETUP_TRACE: "1",
-        },
-        stdout: "pipe",
-        stderr: "pipe",
+for (const source of ["implicit", "lan", "unexpected"])
+  test(`CLI init --yes --json isolates ${source} provider health and loopback discovery`, async () => {
+    const provider = {
+      ...customProvider,
+      api_key_env: undefined,
+      id: "lan",
+      health_url:
+        source === "unexpected"
+          ? "https://unexpected-provider.invalid/health"
+          : "http://192.0.2.10:8080/v1/models",
+    };
+    const f = setupFixture(source === "implicit" ? undefined : `providers = ${tomlValue([provider])}\n`);
+    const paths: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch: (req) => {
+        const path = new URL(req.url).pathname;
+        paths.push(path);
+        return Response.json(path === "/api/health" ? { ok: true, sha: "installed" } : []);
       },
-    );
-    const [stdout, stderr, exit] = await Promise.all([
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-      child.exited,
-    ]);
-    expect(exit).toBe(0);
-    const trace = JSON.parse(stderr);
-    expect(trace.violations).toEqual([]);
-    expect(trace.requests).toContain(`GET ${provider.health_url}`);
-    for (const port of [1234, 8000, 8080, 11434, 10240])
-      expect(trace.requests).toContain(`GET http://127.0.0.1:${port}/v1/models`);
-    expect(paths).toEqual(["/api/health", "/api/github/access"]);
-    expect(JSON.parse(stdout)).toMatchObject({
-      ok: true,
-      providers: { added: ["claude", "codex", "local-1234"] },
     });
-    expect(Bun.TOML.parse(readFileSync(f.file, "utf8"))).toMatchObject({
-      github: { repos: ["acme/app"], merge: "pr" },
-    });
-  } finally {
-    server.stop(true);
-    f.close();
-  }
-});
+    try {
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          "--preload",
+          "./test/fixtures/setup-cli-preload.ts",
+          "src/cli/main.ts",
+          "init",
+          "--yes",
+          "--json",
+          "--repo",
+          "acme/app",
+        ],
+        {
+          env: {
+            ...process.env,
+            LIMITLESS_HOME: f.home,
+            LIMITLESS_CONFIG_DIR: f.configDir,
+            LIMITLESS_URL: `http://127.0.0.1:${server.port}`,
+            LIMITLESS_TEST_SETUP_TRACE: "1",
+            LIMITLESS_TEST_SETUP_MUTATION: "",
+          },
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+      const [stdout, stderr, exit] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      expect(exit).toBe(source === "unexpected" ? 1 : 0);
+      const trace = JSON.parse(source === "unexpected" ? (stderr.split("\n")[0] ?? "") : stderr);
+      expect(trace.violations).toEqual(
+        source === "unexpected" ? [`Unexpected fetch: GET ${provider.health_url}`] : [],
+      );
+      if (source === "implicit") {
+        for (const url of [
+          "https://openrouter.ai/api/v1/key",
+          "http://127.0.0.1:8989/v1/models",
+          "http://127.0.0.1:8000/v1/models",
+          "http://twilight:8080/v1/models",
+        ])
+          expect(trace.requests).toContain(`GET ${url}`);
+      } else expect(trace.requests).toContain(`GET ${provider.health_url}`);
+      for (const port of [1234, 8000, 8080, 11434, 10240])
+        expect(trace.requests).toContain(`GET http://127.0.0.1:${port}/v1/models`);
+      expect(paths).toEqual(["/api/health", "/api/github/access"]);
+      expect(JSON.parse(stdout)).toMatchObject({
+        ok: true,
+        providers: { added: ["claude", "codex", "local-1234"] },
+      });
+      expect(Bun.TOML.parse(readFileSync(f.file, "utf8"))).toMatchObject({
+        github: { repos: ["acme/app"], merge: "pr" },
+      });
+    } finally {
+      server.stop(true);
+      f.close();
+    }
+  });
 
 for (const merge of ["", ', merge  =  "none"'])
   test(`init preserves inline GitHub bytes while extending repos and filling missing merge (${merge || "missing"})`, async () => {
