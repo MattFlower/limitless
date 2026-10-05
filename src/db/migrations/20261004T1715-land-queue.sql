@@ -21,3 +21,6 @@ CREATE INDEX land_entries_queue ON land_entries (repo, state, id);
 -- At most one entry per PR may be in flight; a land that has landed, blocked or been cancelled frees it.
 CREATE UNIQUE INDEX land_entries_active ON land_entries (pr_url) WHERE state IN
   ('queued', 'checking', 'waiting_ci', 'merging');
+-- A repository is landed one at a time: claiming a second entry while one runs fails here.
+CREATE UNIQUE INDEX land_entries_one_running ON land_entries (repo) WHERE state IN
+  ('checking', 'waiting_ci', 'merging');

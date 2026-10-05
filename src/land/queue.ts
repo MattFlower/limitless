@@ -61,6 +61,8 @@ export interface LandDeps {
 }
 
 const DEFAULTS = { ciPollMs: 15_000, ciTimeoutMs: 60 * 60_000 };
+/** A claim has to be this quiet before another queue may take the entry it holds. */
+const CLAIM_STALE_MS = 30_000;
 
 /** The saved poller observation, or null when it holds nothing usable. */
 function saved(url: string | null): LandObservation | null {
@@ -89,12 +91,18 @@ function saved(url: string | null): LandObservation | null {
 }
 
 /**
+ * Which queue is draining each repository in this process. The store's claim is the durable half of
+ * ownership; this keeps two queue objects in one daemon off the same rows.
+ */
+const draining = new Map<string, LandQueue>();
+
+/**
  * The land queue: one approved pull request at a time per repository. Each entry merges the base in,
  * runs the repository's land checks on the result, pushes that commit with a lease on the approved
  * head, waits for CI on exactly that commit and squash-merges with the head pinned.
  */
 export class LandQueue {
-  private readonly workers = new Map<string, { pending: boolean; done: Promise<void> }>();
+  private readonly workers = new Map<string, Promise<void>>();
   private readonly inFlight = new Map<number, AbortController>();
   private stopped = false;
 
@@ -110,9 +118,10 @@ export class LandQueue {
     return this.deps.clock?.now ?? Date.now;
   }
 
-  /** Resume every entry a previous daemon left in flight, then wait for new requests. */
+  /** Take over whatever the previous daemon left in flight, then wait for new requests. */
   start(): void {
     this.stopped = false;
+    this.store.releaseLandClaims();
     for (const entry of this.store.listLandEntries({ active: true })) this.pump(entry.repo);
   }
 
@@ -120,7 +129,7 @@ export class LandQueue {
   async stop(): Promise<void> {
     this.stopped = true;
     for (const controller of this.inFlight.values()) controller.abort();
-    await Promise.all([...this.workers.values()].map((worker) => worker.done.catch(() => undefined)));
+    await Promise.all([...this.workers.values()].map((worker) => worker.catch(() => undefined)));
   }
 
   list(): LandEntry[] {
@@ -183,25 +192,26 @@ export class LandQueue {
     return ACTIVE_LAND_STATES.includes(entry.state);
   }
 
-  /** Run this repository's queue, one entry at a time, oldest first. */
+  /** Drain this repository's queue: claim the next entry and land it, until there is none. */
   private pump(repo: string): void {
-    if (this.stopped) return;
-    const running = this.workers.get(repo);
-    if (running) {
-      running.pending = true;
-      return;
-    }
-    const worker: { pending: boolean; done: Promise<void> } = { pending: true, done: Promise.resolve() };
-    worker.done = (async () => {
-      while (worker.pending) {
-        worker.pending = false;
-        const next = this.store.listLandEntries({ repo, active: true, limit: 1 })[0];
-        if (next) await this.process(next);
+    if (this.stopped || draining.has(repo)) return;
+    draining.set(repo, this);
+    const worker = (async () => {
+      for (;;) {
+        if (this.stopped) return;
+        // The claim is a store transaction, so this repository has exactly one land at a time.
+        const entry = this.store.claimLandEntry(repo, CLAIM_STALE_MS);
+        if (!entry) return;
+        await this.process(entry);
       }
-    })().finally(() => {
-      if (this.workers.get(repo) === worker) this.workers.delete(repo);
-    });
+    })();
     this.workers.set(repo, worker);
+    void worker
+      .catch((error: unknown) => this.log(`[land] ${repo}: ${String(error)}`))
+      .finally(() => {
+        this.workers.delete(repo);
+        if (draining.get(repo) === this) draining.delete(repo);
+      });
   }
 
   private async process(entry: LandEntry): Promise<void> {
@@ -228,7 +238,7 @@ export class LandQueue {
 
   private async land(entry: LandEntry, signal: AbortSignal): Promise<void> {
     const { repo, run } = this.context(entry);
-    this.store.updateLandEntry(entry.id, { state: "checking", attempts: entry.attempts + 1 });
+    // The claim already moved the entry into `checking` and counted this attempt.
     this.log(`[land] ${entry.id}: checking ${entry.prUrl} at ${entry.approvedSha.slice(0, 12)}`);
     const cache = await ensureCache(this.deps.paths, repo, signal);
     const cwd = await this.checkout(entry, repo, cache, entry.approvedSha, signal);

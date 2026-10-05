@@ -244,6 +244,11 @@ async function settle(answer: { ci: string; failing?: string[] } = { ci: "SUCCES
   }
 }
 
+/** Lets the queue's promise chains settle without answering CI or moving the clock. */
+async function settleIdle(): Promise<void> {
+  for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
 async function waitFor(
   check: () => boolean,
   answer: { ci: string; failing?: string[] } = { ci: "SUCCESS" },
@@ -448,6 +453,77 @@ test("a failing land check blocks the entry with the check names and no output",
   expect(blocked).toMatchObject({ state: "blocked", reason: "lint failed" });
   expect(blocked?.reason).not.toContain("secret in output");
   expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("stopping mid-check leaves a later entry unstarted", async () => {
+  const first = delivered(1, "pr-1");
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head1);
+  approve(1, head1);
+  const second = delivered(2, "pr-2");
+  const head2 = await pushBranch("pr-2", "two.txt", "two\n", 2);
+  observe(2, head2);
+  approve(2, head2);
+  const q = queue();
+  q.request({ runId: first.run.id });
+  q.request({ runId: second.run.id });
+  await waitFor(() => gateLog().length === 1);
+  await q.stop(); // the daemon stops with the second entry still queued
+  expect(store.getLandEntry(1)?.state).toBe("checking");
+  for (let i = 0; i < 20; i++) await settleIdle();
+  expect(store.getLandEntry(2)?.state).toBe("queued");
+  expect(gateLog()).toEqual(["start"]);
+});
+
+test("a repository claim is durable: a second claim finds nothing", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head);
+  approve(1, head);
+  const entry = store.createLandEntry({
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: url(1),
+    baseBranch: "main",
+    headBranch: "pr-1",
+    approvedSha: head,
+  });
+  store.createLandEntry({
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: url(2),
+    baseBranch: "main",
+    headBranch: "pr-2",
+    approvedSha: head,
+  });
+  // The first claim holds the repository; the next is refused by the store, not by memory.
+  expect(store.claimLandEntry(SLUG, 30_000)?.id).toBe(entry.id);
+  expect(store.claimLandEntry(SLUG, 30_000)).toBeNull();
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", attempts: 1 });
+  // Only a start releases it: one daemon owns this database, so a claim it finds is a dead one's.
+  expect(store.releaseLandClaims()).toBe(1);
+  expect(store.claimLandEntry(SLUG, 30_000)?.id).toBe(entry.id);
+});
+
+test("two queues on one database never run two checks for the same repository", async () => {
+  gateSlots.setLimit(2);
+  const first = delivered(1, "pr-1");
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head1);
+  approve(1, head1);
+  const second = delivered(2, "pr-2");
+  const head2 = await pushBranch("pr-2", "two.txt", "two\n", 2);
+  observe(2, head2);
+  approve(2, head2);
+  const a = queue({ start: false });
+  const b = queue({ start: false });
+  a.request({ runId: first.run.id });
+  a.request({ runId: second.run.id });
+  b.start();
+  a.start();
+  await settle();
+  expect(store.listLandEntries().map((e) => e.state)).toEqual(["landed", "landed"]);
+  expect(gateLog()).toEqual(["start", "end", "start", "end"]);
 });
 
 test("a restart during checking re-runs the checks from the start", async () => {
