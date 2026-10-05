@@ -2149,27 +2149,27 @@ export class Store {
   /**
    * The oldest entry this repository may start now, claimed by moving it into `checking`. A queued
    * entry is free; one already in flight is only taken when its claim has gone quiet for `staleMs`,
-   * so the queue that owns it keeps it and `releaseLandClaims` (at startup) frees a dead one's. The
+   * so a live heartbeat keeps its owner while a crashed process expires. The
    * claim is a compare-and-swap on `attempts`, so two queues racing for one row see one winner, and
    * `land_entries_one_running` refuses a second entry while one runs for the repository.
    */
-  claimLandEntry(repo: string, staleMs: number): LandEntry | null {
+  claimLandEntry(repo: string, staleMs: number, owner: string, now = Date.now()): LandEntry | null {
     try {
       return (
         this.db.transaction(() => {
           const row = this.db
             .query(
               `${LAND_SELECT} WHERE repo = ? AND state IN ('queued', 'checking', 'waiting_ci', 'merging')
-                 AND (state = 'queued' OR updated_at <= ?) ORDER BY id LIMIT 1`,
+                 AND (state = 'queued' OR claim_heartbeat_at IS NULL OR claim_heartbeat_at <= ?) ORDER BY id LIMIT 1`,
             )
-            .get(repo, Date.now() - staleMs) as Row | null;
+            .get(repo, now - staleMs) as Row | null;
           if (!row) return null;
           const claimed = this.db
             .query(
-              `UPDATE land_entries SET state = 'checking', attempts = attempts + 1, updated_at = ?
+              `UPDATE land_entries SET state = 'checking', attempts = attempts + 1, updated_at = ?, claim_owner = ?, claim_heartbeat_at = ?
                WHERE id = ? AND attempts = ? AND state IN ('queued', 'checking', 'waiting_ci', 'merging')`,
             )
-            .run(Date.now(), row.id as number, row.attempts as number).changes;
+            .run(now, owner, now, row.id as number, row.attempts as number).changes;
           return claimed ? this.getLandEntry(row.id as number) : null;
         })() ?? null
       );
@@ -2181,14 +2181,22 @@ export class Store {
     }
   }
 
-  /**
-   * Every claim in the table belongs to a daemon that is gone, so what it left in flight may be
-   * resumed now. One daemon owns this database, so this is its own right at startup.
-   */
-  releaseLandClaims(): number {
+  /** Renew only the claim this queue owns; loss of ownership aborts its worker. */
+  heartbeatLandClaim(id: number, owner: string, now = Date.now()): boolean {
+    return (
+      this.db
+        .query(`UPDATE land_entries SET claim_heartbeat_at = ? WHERE id = ? AND claim_owner = ?
+      AND state IN ('checking', 'waiting_ci', 'merging')`)
+        .run(now, id, owner).changes === 1
+    );
+  }
+
+  /** Only this queue's stopped workers may be freed, never another process's live claims. */
+  releaseLandClaims(owner: string): number {
     return this.db
-      .query(`UPDATE land_entries SET updated_at = 0 WHERE state IN ('checking', 'waiting_ci', 'merging')`)
-      .run().changes;
+      .query(`UPDATE land_entries SET claim_owner = NULL, claim_heartbeat_at = NULL
+        WHERE claim_owner = ? AND state IN ('checking', 'waiting_ci', 'merging')`)
+      .run(owner).changes;
   }
 
   updateLandEntry(

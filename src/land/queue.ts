@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Paths } from "../config.ts";
@@ -91,6 +92,7 @@ export class LandQueue {
   private readonly workers = new Map<string, Promise<void>>();
   private readonly inFlight = new Map<number, AbortController>();
   private stopped = false;
+  private readonly owner = randomUUID();
 
   constructor(private readonly deps: LandDeps) {}
 
@@ -107,7 +109,7 @@ export class LandQueue {
   /** Take over whatever the previous daemon left in flight, then wait for new requests. */
   start(): void {
     this.stopped = false;
-    this.store.releaseLandClaims();
+    if (!this.workers.size) this.store.releaseLandClaims(this.owner);
     for (const entry of this.store.listLandEntries({ active: true })) this.pump(entry.repo);
   }
 
@@ -116,6 +118,7 @@ export class LandQueue {
     this.stopped = true;
     for (const controller of this.inFlight.values()) controller.abort();
     await Promise.all([...this.workers.values()].map((worker) => worker.catch(() => undefined)));
+    this.store.releaseLandClaims(this.owner);
   }
 
   list(): LandEntry[] {
@@ -191,7 +194,7 @@ export class LandQueue {
       for (;;) {
         if (this.stopped) return;
         // The claim is a store transaction, so this repository has exactly one land at a time.
-        const entry = this.store.claimLandEntry(repo, CLAIM_STALE_MS);
+        const entry = this.store.claimLandEntry(repo, CLAIM_STALE_MS, this.owner, this.now());
         if (!entry) return;
         await this.process(entry);
       }
@@ -209,6 +212,13 @@ export class LandQueue {
     const controller = new AbortController();
     this.inFlight.set(entry.id, controller);
     const signal = controller.signal;
+    const set = this.deps.clock?.set ?? ((fn, ms) => setTimeout(fn, ms));
+    const clear = this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
+    const beat = (): void => {
+      if (!this.store.heartbeatLandClaim(entry.id, this.owner, this.now())) controller.abort();
+      else heartbeat = set(beat, CLAIM_STALE_MS / 3);
+    };
+    let heartbeat = set(beat, CLAIM_STALE_MS / 3);
     // `checking` re-runs the checks from the start, like a `queued` entry.
     const work = () => this.land(entry, signal);
     try {
@@ -218,6 +228,7 @@ export class LandQueue {
       if (controller.signal.aborted) return;
       this.block(entry.id, (error as Error).message);
     } finally {
+      clear(heartbeat);
       this.inFlight.delete(entry.id);
     }
   }

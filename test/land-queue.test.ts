@@ -554,12 +554,13 @@ test("a repository claim is durable: a second claim finds nothing", async () => 
     approvedSha: head,
   });
   // The first claim holds the repository; the next is refused by the store, not by memory.
-  expect(store.claimLandEntry(SLUG, 30_000)?.id).toBe(entry.id);
-  expect(store.claimLandEntry(SLUG, 30_000)).toBeNull();
+  expect(store.claimLandEntry(SLUG, 30_000, "test-owner")?.id).toBe(entry.id);
+  expect(store.claimLandEntry(SLUG, 30_000, "test-owner")).toBeNull();
   expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", attempts: 1 });
-  // Only a start releases it: one daemon owns this database, so a claim it finds is a dead one's.
-  expect(store.releaseLandClaims()).toBe(1);
-  expect(store.claimLandEntry(SLUG, 30_000)?.id).toBe(entry.id);
+  // Only the owner can release a claim.
+  expect(store.releaseLandClaims("other-owner")).toBe(0);
+  expect(store.releaseLandClaims("test-owner")).toBe(1);
+  expect(store.claimLandEntry(SLUG, 30_000, "test-owner")?.id).toBe(entry.id);
 });
 
 test("two queues on one database never run two checks for the same repository", async () => {
@@ -969,4 +970,33 @@ test("an empty report sends an explicit empty merge body", async () => {
   expect(store.getLandEntry(entry.id)?.state).toBe("landed");
   expect(ghCalls("pr merge")[0]).toContain("--body-file -");
   expect(readFileSync(join(root, "gh.body-1"), "utf8")).toBe("");
+});
+
+test("a second process cannot reclaim a heartbeating land, but can reclaim its expired heartbeat", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  ci = () => null;
+  const q = queue();
+  const entry = q.request({ target: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  const second = async (now: number) => {
+    const code = `import { Store } from ${JSON.stringify(join(process.cwd(), "src/db/store.ts"))};
+      const s = new Store(${JSON.stringify(paths.db)});
+      s.releaseLandClaims("second-process");
+      console.log(JSON.stringify(s.claimLandEntry(${JSON.stringify(SLUG)}, 30000, "second-process", ${now})));
+      s.close();`;
+    const child = Bun.spawn([process.execPath, "-e", code], { stdout: "pipe", stderr: "pipe" });
+    const output = await new Response(child.stdout).text();
+    expect(await child.exited).toBe(0);
+    return JSON.parse(output) as LandEntry | null;
+  };
+  await clock.advance(31_000);
+  expect(await second(clock.now())).toBeNull();
+  expect(store.getLandEntry(entry.id)?.attempts).toBe(1);
+  // No more owner timer ticks: another process observes expiry after a further 31 seconds.
+  expect(await second(clock.now() + 31_000)).toMatchObject({ id: entry.id, attempts: 2 });
+  await q.stop();
+  expect(store.releaseLandClaims("second-process")).toBe(1);
 });
