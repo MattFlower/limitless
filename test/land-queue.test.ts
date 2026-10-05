@@ -124,8 +124,6 @@ writeFileSync(file+".merged-"+pr,"");
 /** What the queue reported, so a test can wait for a rerun it cannot otherwise observe. */
 const landLog: string[] = [];
 const observers = new Map<string, (head: string, ci: string, failing?: string[]) => void>();
-/** Feed items dedupe per observation, so each published verdict is a new one. */
-const revision = 0;
 /** What CI reports next for a waiting entry; `null` leaves it waiting for another signal. */
 let ci: () => { ci: string; failing?: string[] } | null = () => ({ ci: "SUCCESS" });
 const runs = new Map<number, Run>();
