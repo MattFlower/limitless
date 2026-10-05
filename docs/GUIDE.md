@@ -277,7 +277,7 @@ Coming soon (#49): run dependencies, meaning a run that starts only after anothe
 | `limitless logs <run> [-f]` | Event log (non-debug), optionally followed |
 | `limitless answer <run> "<text>"` | Answer **all** open questions on a run |
 | `limitless cancel <run>` | Cancel a queued or active run |
-| `limitless land <run> [--sha <sha>]` | Queue a run's open PR for landing (the approved head; one land per repository at a time) |
+| `limitless land <run\|pr> [--sha <sha>]` | Queue an open PR for landing (its recorded approval, or an explicit head; one land per repository at a time) |
 | `limitless land list` / `limitless land cancel <id>` | Show the land queue, or drop a queued or in-flight land |
 | `limitless providers [enable\|disable <id>]` | Provider health and quota, or toggle a provider |
 

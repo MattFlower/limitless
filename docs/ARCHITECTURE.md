@@ -306,15 +306,22 @@ commit, and `merging` first asks GitHub whether the PR already merged.
 
 ### Landing (the land queue)
 
-`limitless land <run>` (or `POST /api/land`) approves a run's open pull request: the SHA is the
-approval, and only it — plus a base merge the factory itself made — may land. One entry lands at a
-time per repository, oldest first. Each entry checks out the approved head from the bare cache,
-merges the base in when it has moved, runs the repository's checks (from the base commit's
-`.limitless.toml`) under a gate slot, pushes any merge commit with a lease on the approved head,
-waits for CI on exactly that commit (the poller's observation, or `gh pr view` when polling is off)
-and squash-merges with `--match-head-commit`. A conflict, a failing check, a moved head, red CI or
-CI that never finishes blocks the entry with a reason and merges nothing; a later restart or a
-cancel aborts in-flight git, gates and `gh` calls.
+`limitless land <run|pr>` (or `POST /api/land`) approves a pull request for landing: the approval is
+the run's recorded review approval, or an explicit `--sha` that must be the PR's current head. Only
+the approved SHA — plus a base merge the factory itself made — may land. One entry lands at a time
+per repository, oldest first, and the claim that gives a repository to one queue is a store
+transaction (`claimLandEntry`, one running land per repository), so a restart resumes and two queues
+cannot check the same repository at once.
+
+Each entry checks out the approved head from the bare cache, merges the base in when it has moved,
+runs the repository's checks (from the base commit's `.limitless.toml`) in one gate slot with the
+output written to `<runs>/<run>/land-<entry>.log`, pushes any merge commit with a lease on the
+approved head, and waits for CI on exactly that commit — moved by the poller's `pr.ci_passed` /
+`pr.ci_failed` items, with a timed read for a restart and for polling being off. A transient CI
+failure is re-run once. The squash-merge is pinned with `--match-head-commit` and carries the
+reviewed title and body; it never arms auto-merge. A conflict, a failing check, a moved head, red CI
+or CI that never finishes blocks the entry with a reason and merges nothing; a cancel or a shutdown
+aborts in-flight git, gates and `gh` calls through one signal.
 
 ## 8. Interfaces
 
