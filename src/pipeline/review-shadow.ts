@@ -33,7 +33,8 @@ export async function shadowReview(
       : tracker.def(id)?.billing === "subscription" && tracker.headroom(id) <= SHADOW_MIN_HEADROOM
         ? `${id} quota headroom is at or below ${SHADOW_MIN_HEADROOM}`
         : undefined;
-  const unknown = (id: string) => !Object.keys(tracker.status(id)?.windows ?? {}).length;
+  const unknown = (id: string) =>
+    tracker.def(id)?.quota !== "unlimited" && !Object.keys(tracker.status(id)?.windows ?? {}).length;
   const abort = new AbortController();
   const guard = { signal: AbortSignal.any([ctx.signal, abort.signal]), stop, ids: [] as number[], cwd: "" };
   const finished: Record<string, unknown>[] = [];
