@@ -455,6 +455,7 @@ async function main(): Promise<void> {
             state: string;
             reason: string | null;
             maxConcurrent: number;
+            quota?: import("../core/types.ts").QuotaMode;
             windows: Record<string, { utilization: number; observedAt?: number | null }>;
           }[]
         >("/api/providers");
@@ -463,7 +464,7 @@ async function main(): Promise<void> {
           .map(([k, v]) => `${k} ${utilizationPercent(v.utilization)} (${observationAge(v.observedAt)})`)
           .join(", ");
         console.log(
-          `${p.id.padEnd(11)} ${p.state.padEnd(9)} maxConcurrent ${p.maxConcurrent} ${w} ${p.reason ? color.dim(p.reason) : ""}`,
+          `${p.id.padEnd(11)} ${p.state.padEnd(9)} maxConcurrent ${p.maxConcurrent} ${p.quota === "unlimited" ? "No limit (configured) " : ""}${w} ${p.reason ? color.dim(p.reason) : ""}`,
         );
       }
       return;

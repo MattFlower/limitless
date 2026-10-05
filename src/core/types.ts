@@ -315,7 +315,10 @@ export interface QuotaWindow {
   resetsAt: number | null; // epoch ms
 }
 
+export type QuotaMode = "windows" | "unlimited";
+
 export interface ProviderStatus {
+  quota?: QuotaMode;
   kind?: string;
   fast?: boolean;
   supportsFast?: boolean;

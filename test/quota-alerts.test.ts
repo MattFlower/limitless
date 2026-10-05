@@ -84,6 +84,29 @@ afterEach(() => {
 
 const alerts = (): QuotaAlert[] => store.listAlerts(now);
 
+test("unlimited windows are informational while CLI quota rejections still alert", () => {
+  factory = new Factory(factory.cfg, {
+    store,
+    providers: providers.map((p) => ({ ...p, quota: "unlimited" })),
+    models,
+    policy,
+    clock: () => now,
+  });
+  const reset = now + 500_000;
+  factory.tracker.observeWindows("claude", { five_hour: { utilization: 0.99, resetsAt: reset } });
+  expect(alerts()).toEqual([]);
+  const exhaustedUntil = now + 100_000;
+  factory.tracker.record("claude", "quota", { exhaustedUntil });
+  expect(alerts()).toMatchObject([
+    { provider: "claude", window: "hard_limit", severity: "exhausted", resetsAt: exhaustedUntil },
+  ]);
+  factory.tracker.observeWindows("claude", { five_hour: { utilization: 1, resetsAt: reset } });
+  expect(alerts()).toHaveLength(1);
+  now = exhaustedUntil;
+  factory.scheduler.tick();
+  expect(alerts()).toEqual([]);
+});
+
 test("threshold, exhaustion, and reset produce one alert per window with live updates", () => {
   const changes: StreamMessage[] = [];
   const unsubscribe = store.subscribe((msg) => changes.push(msg));

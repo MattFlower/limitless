@@ -345,7 +345,9 @@ export class ProviderTracker {
     const p = this.providers.get(id);
     if (!p) return 0;
     let min = 1;
-    for (const [name, w] of Object.entries(p.windows)) {
+    for (const [name, w] of Object.entries(
+      p.def.billing === "subscription" && p.def.quota === "unlimited" ? {} : p.windows,
+    )) {
       const cap = this.reserveFor(id, name);
       const util = w.resetsAt !== null && w.resetsAt <= now ? 0 : w.utilization;
       min = Math.min(min, (cap - util) / cap);
@@ -569,7 +571,7 @@ export class ProviderTracker {
     p.windows = { ...p.windows, ...current };
     for (const name of Object.keys(current)) p.windowObservedAt[name] = now;
     this.persist(id);
-    if (p.def.billing !== "subscription") return;
+    if (p.def.billing !== "subscription" || p.def.quota === "unlimited") return;
     for (const [name, window] of Object.entries(current)) {
       const cap = this.reserveFor(id, name);
       if (window.resetsAt !== null && window.resetsAt <= now) {
@@ -640,7 +642,9 @@ export class ProviderTracker {
         const known = Object.entries(p.windows)
           .filter(
             ([name, w]) =>
-              (w.resetsAt === null || w.resetsAt > now) && w.utilization >= this.reserveFor(id, name),
+              p.def.quota !== "unlimited" &&
+              (w.resetsAt === null || w.resetsAt > now) &&
+              w.utilization >= this.reserveFor(id, name),
           )
           .sort((a, b) => (a[1].resetsAt ?? Infinity) - (b[1].resetsAt ?? Infinity))[0];
         let resetsAt = known ? known[1].resetsAt : (detail?.exhaustedUntil ?? null);
@@ -727,6 +731,7 @@ export class ProviderTracker {
       label: p.def.label,
       kind: providerKind(p.def),
       billing: p.def.billing,
+      quota: p.def.quota ?? "windows",
       enabled: p.enabled,
       fast: p.fast,
       supportsFast: id === "codex" || id === "claude",

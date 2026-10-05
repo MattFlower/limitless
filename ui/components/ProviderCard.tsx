@@ -153,6 +153,9 @@ export const ProviderCard: Component<{ provider: ProviderStatus; workload?: Prov
         </div>
       </div>
       <div class="provider-gauges">
+        <Show when={props.provider.quota === "unlimited"}>
+          <div>No limit (configured)</div>
+        </Show>
         <For each={Object.entries(props.provider.windows)}>
           {([name, w]) => (
             <Gauge

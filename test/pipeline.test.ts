@@ -7809,13 +7809,15 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       billing: "subscription",
       maxConcurrent: 2,
     };
-    const startWithOmega = (calls: Calls) => {
+    const startWithOmega = (calls: Calls, unlimited: string[]) => {
       const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
       const alpha = models[0] as ModelDef;
       factory = new Factory(cfg, {
         confinement: fakeConfinement,
         harnesses: { fake: fakeHarness(scenario(calls)) },
-        providers: [...providers, omega],
+        providers: [...providers, omega].map((p) =>
+          unlimited.includes(p.id) ? { ...p, quota: "unlimited" } : p,
+        ),
         models: [...models, { ...alpha, id: "omega/m", provider: "omega", vendor: "google" }],
         policy,
         bootSha: "test-build",
@@ -7824,10 +7826,10 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       factory.deps.cfg.reviewShadow = "panel";
       return factory;
     };
-    const outcome = async (observed: string[], low?: string) => {
+    const outcome = async (observed: string[], low?: string, unlimited: string[] = []) => {
       await reset();
       const calls = newCalls();
-      const f = startWithOmega(calls);
+      const f = startWithOmega(calls, unlimited);
       for (const id of observed)
         f.tracker.observeWindows(id, { five_hour: { utilization: 0, resetsAt: null } });
       const headroom = f.tracker.headroom.bind(f.tracker);
@@ -7839,6 +7841,13 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     // Omega is enabled but no review route reaches it: unknown or low there never skips the shadow.
     expect((await outcome(["alpha", "beta"])).shadow.status).toBe("completed");
     expect((await outcome(["alpha", "beta"], "omega")).shadow.status).toBe("completed");
+    const noLimit = await outcome([], undefined, ["alpha", "beta"]);
+    expect(noLimit.shadow.status).toBe("completed");
+    expect(noLimit.calls.shadow.length).toBeGreaterThan(0);
+    expect((await outcome([], undefined, ["alpha"])).shadow).toMatchObject({
+      status: "skipped",
+      reason: "beta quota headroom is unknown",
+    });
     // Beta is the roster's route, alpha a fallback (and verifier) route: either unknown skips it.
     for (const [observed, reason] of [
       [["alpha"], "beta quota headroom is unknown"],
