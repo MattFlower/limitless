@@ -84,18 +84,33 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
-/** A `gh` on PATH that records every call; `gh.hang` makes a merge hang instead of landing. */
+/**
+ * A `gh` on PATH that records every call and reads each PR's head out of the bare remote, so a merge
+ * whose `--match-head-commit` names another commit is refused exactly as GitHub would. `gh.branch-n`
+ * names a PR's branch, `gh.auto` records armed auto-merge, `gh.hang` stalls a merge and `gh.reject`
+ * refuses every merge.
+ */
 function fakeGh(): void {
   const bin = join(root, "bin");
   mkdirSync(bin);
   writeFileSync(
     join(bin, "gh"),
     `#!${process.execPath}
-import {appendFileSync,existsSync,writeFileSync} from "node:fs";
+import {appendFileSync,existsSync,readFileSync,writeFileSync} from "node:fs";
 const file=${JSON.stringify(join(root, "gh"))}, args=process.argv.slice(2);
 appendFileSync(file+".calls",args.join(" ")+"\\n");
-if(args[0]==="pr"&&args[1]==="merge"){ if(existsSync(file+".hang")) await Bun.sleep(600000); writeFileSync(file+".merged",""); }
-if(args[0]==="pr"&&args[1]==="view") console.log(existsSync(file+".merged")?"MERGED":"OPEN");
+const pr=args[2].match(/pull\\/(\\d+)/)?.[1]??"0", merged=existsSync(file+".merged-"+pr);
+const branch=existsSync(file+".branch-"+pr)?readFileSync(file+".branch-"+pr,"utf8").trim():"";
+const head=()=>branch?new TextDecoder().decode(Bun.spawnSync(["/usr/bin/git","--git-dir",${JSON.stringify(bare)},"rev-parse","refs/heads/"+branch]).stdout).trim():"";
+const flag=(n)=>args.includes(n);
+if(args[0]!=="pr"||args[1]!=="merge"){ if(args[1]==="view") console.log(merged?"MERGED":"OPEN"); process.exit(0); }
+if(flag("--auto")) writeFileSync(file+".auto","");
+if(flag("--disable-auto")){ rmSync(file+".auto",{force:true}); process.exit(0); }
+if(existsSync(file+".hang")) await Bun.sleep(600000);
+const pin=args[args.indexOf("--match-head-commit")+1];
+if(pin&&pin!==head()){ console.error("head ref was modified; not merging"); process.exit(1); }
+if(existsSync(file+".reject")){ console.error("Pull request is not mergeable"); process.exit(1); }
+writeFileSync(file+".merged-"+pr,"");
 `,
     { mode: 0o755 },
   );
@@ -155,7 +170,7 @@ const observe = (n: number, head: string, ci = "PENDING", failing: string[] = []
   observers.get(url(n))?.(head, ci, failing);
 
 /** Push `text` to `name`, reusing the branch when a test already pushed one there. */
-async function pushBranch(name: string, file: string, text: string): Promise<string> {
+async function pushBranch(name: string, file: string, text: string, pr = 1): Promise<string> {
   const existing = await sh(["git", "rev-parse", "--verify", "-q", `refs/heads/${name}`], {
     cwd: seed,
     allowFail: true,
@@ -167,6 +182,8 @@ async function pushBranch(name: string, file: string, text: string): Promise<str
   await sh(["git", "add", "."], { cwd: seed });
   await sh(["git", "commit", "-qm", name], { cwd: seed });
   await sh(["git", "push", "-q", bare, `HEAD:refs/heads/${name}`], { cwd: seed });
+  // `gh pr view` only ever sees what has been pushed: it reads the branch out of the bare remote.
+  writeFileSync(join(root, `gh.branch-${pr}`), name);
   return remoteHead(name);
 }
 
@@ -238,6 +255,7 @@ async function waitFor(
   }
 }
 
+const autoArmed = () => existsSync(join(root, "gh.auto"));
 const ghCalls = (verb: string) =>
   (existsSync(join(root, "gh.calls")) ? readFileSync(join(root, "gh.calls"), "utf8") : "")
     .split("\n")
@@ -248,11 +266,11 @@ const gateLog = () =>
 
 test("two approved entries on one repository land in order, never checking at once", async () => {
   const first = delivered(1, "pr-1");
-  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head1);
   approve(1, head1);
   const second = delivered(2, "pr-2");
-  const head2 = await pushBranch("pr-2", "two.txt", "two\n");
+  const head2 = await pushBranch("pr-2", "two.txt", "two\n", 2);
   observe(2, head2);
   approve(2, head2);
   const q = queue();
@@ -272,12 +290,12 @@ test("two approved entries on one repository land in order, never checking at on
 
 test("a base that moved is merged in and pushed with the lease; an up-to-date entry pushes nothing", async () => {
   const behind = delivered(1, "pr-1");
-  const behindHead = await pushBranch("pr-1", "one.txt", "one\n");
+  const behindHead = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, behindHead);
   approve(1, behindHead);
   await advanceBase();
   const upToDate = delivered(2, "pr-2");
-  const head2 = await pushBranch("pr-2", "two.txt", "two\n");
+  const head2 = await pushBranch("pr-2", "two.txt", "two\n", 2);
   observe(2, head2);
   approve(2, head2);
   const q = queue();
@@ -304,16 +322,65 @@ test("a base that moved is merged in and pushed with the lease; an up-to-date en
   ]);
 });
 
+test("a rejected merge blocks, arms no auto-merge, and a later head never lands", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head);
+  approve(1, head);
+  writeFileSync(join(root, "gh.reject"), "");
+  const q = queue();
+  const entry = q.request({ runId: pr.run.id });
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason: "merge failed" });
+  expect(ghCalls("pr merge").some((c) => c.includes("--auto"))).toBe(false);
+  expect(autoArmed()).toBe(false);
+  expect(ghCalls("pr merge").at(-1)).toContain("--disable-auto");
+  // The head moves after the blocked merge; nothing may land on it.
+  const moved = await pushBranch("pr-1", "one.txt", "one\nagain\n", 1);
+  observe(1, moved);
+  approve(1, moved);
+  await settle();
+  expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
+  expect(store.getRun(pr.run.id)?.merged).toBe(false);
+  expect(existsSync(join(root, "gh.merged-1"))).toBe(false);
+});
+
+test("a pinned merge whose head moved is refused", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+  observe(1, head);
+  approve(1, head);
+  writeFileSync(join(root, "gh.hang"), ""); // hold the merge while the head moves underneath it
+  const q = queue();
+  const entry = q.request({ runId: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "merging");
+  const pinned = store.getLandEntry(entry.id)?.pushedSha ?? head;
+  await q.stop();
+  rmSync(join(root, "gh.hang"));
+  await pushBranch("pr-1", "one.txt", "one\nagain\n", 1);
+  queue();
+  await settle();
+  expect(
+    ghCalls("pr merge")
+      .filter((c) => c.includes("--match-head-commit"))
+      .at(-1),
+  ).toContain(`--match-head-commit ${pinned}`);
+  expect(ghCalls("pr merge").at(-1)).toContain("--disable-auto");
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked", reason: "merge failed" });
+  expect(store.getRun(pr.run.id)?.merged).toBe(false);
+  expect(existsSync(join(root, "gh.merged-1"))).toBe(false);
+});
+
 test("a push to the PR after approval blocks the entry and merges nothing", async () => {
   const pr = delivered(1, "pr-1");
-  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head1);
   approve(1, head1);
   await advanceBase(); // forces the factory merge commit, so the entry has to push
   const q = queue();
   const entry = q.request({ runId: pr.run.id });
   // Someone pushes to the branch after the operator approved the head.
-  const pushedByHand = await pushBranch("pr-1", "one.txt", "one\nedited\n");
+  const pushedByHand = await pushBranch("pr-1", "one.txt", "one\nedited\n", 1);
   observe(1, pushedByHand);
   approve(1, pushedByHand);
   await settle();
@@ -328,7 +395,7 @@ test("a push to the PR after approval blocks the entry and merges nothing", asyn
 
 test("a conflicting base blocks the entry without pushing", async () => {
   const pr = delivered(1, "pr-1");
-  const approved = await pushBranch("pr-1", "shared.txt", "from the pr\n");
+  const approved = await pushBranch("pr-1", "shared.txt", "from the pr\n", 1);
   observe(1, approved);
   approve(1, approved);
   await sh(["git", "checkout", "-q", "main"], { cwd: seed });
@@ -346,7 +413,7 @@ test("a conflicting base blocks the entry without pushing", async () => {
 
 test("red CI on the pushed commit blocks the entry with the failing check names", async () => {
   const pr = delivered(1, "pr-1");
-  const approved = await pushBranch("pr-1", "one.txt", "one\n");
+  const approved = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, approved);
   approve(1, approved);
   const q = queue();
@@ -371,7 +438,7 @@ test("a failing land check blocks the entry with the check names and no output",
   await sh(["git", "commit", "-qam", "failing check"], { cwd: seed });
   await sh(["git", "push", "-q", bare, "main"], { cwd: seed });
   const pr = delivered(1, "pr-1");
-  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head1);
   approve(1, head1);
   const q = queue();
@@ -385,7 +452,7 @@ test("a failing land check blocks the entry with the check names and no output",
 
 test("a restart during checking re-runs the checks from the start", async () => {
   const pr = delivered(1, "pr-1");
-  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head1);
   approve(1, head1);
   const first = queue();
@@ -403,7 +470,7 @@ test("a restart during checking re-runs the checks from the start", async () => 
 
 test("a restart during waiting_ci resumes waiting on the pushed commit", async () => {
   const pr = delivered(1, "pr-1");
-  const approved = await pushBranch("pr-1", "one.txt", "one\n");
+  const approved = await pushBranch("pr-1", "one.txt", "one\n", 1);
   // Polling off: the queue reads `gh pr view` instead of the poller's saved observation.
   const view: GitHubPrView = {
     url: url(1),
@@ -428,7 +495,7 @@ test("a restart during waiting_ci resumes waiting on the pushed commit", async (
 
 test("a restart during merging takes an already merged PR as landed without merging again", async () => {
   const pr = delivered(1, "pr-1");
-  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head1);
   approve(1, head1);
   writeFileSync(join(root, "gh.hang"), "");
@@ -439,7 +506,7 @@ test("a restart during merging takes an already merged PR as landed without merg
   expect(store.getLandEntry(entry.id)?.state).toBe("merging");
   rmSync(join(root, "gh.hang"));
   // The merge had in fact landed before the daemon stopped.
-  writeFileSync(join(root, "gh.merged"), "");
+  writeFileSync(join(root, "gh.merged-1"), "");
   queue();
   await settle();
   expect(store.getLandEntry(entry.id)).toBeTruthy();
@@ -450,7 +517,7 @@ test("a restart during merging takes an already merged PR as landed without merg
 
 test("CI that never finishes gives up with a reason", async () => {
   const pr = delivered(1, "pr-1");
-  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head1);
   approve(1, head1);
   const q = queue({ ciTimeoutMs: 5_000 });
@@ -490,7 +557,7 @@ test("a request needs a review approval, or an explicit head that is the PR's", 
 
 test("cancelling a queued land stops it before any git runs", async () => {
   const pr = delivered(1, "pr-1");
-  const approved = await pushBranch("pr-1", "one.txt", "one\n");
+  const approved = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, approved);
   approve(1, approved);
   store.createLandEntry({

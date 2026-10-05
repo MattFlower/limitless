@@ -10,6 +10,7 @@ import { worktreeGit } from "../git/command.ts";
 import { completeMerge, prepareMerge } from "../git/merge.ts";
 import {
   addDetachedWorktree,
+  disableAutoMerge,
   ensureCache,
   exportCommit,
   fetchBase,
@@ -309,13 +310,15 @@ export class LandQueue {
     signal: AbortSignal,
   ): Promise<void> {
     this.store.updateLandEntry(entry.id, { state: "merging", pushedSha: sha });
-    const outcome = await mergePullRequest(entry.prUrl, cwd, undefined, signal, undefined, sha);
-    const leftOpen = {
-      auto: "left to auto-merge, not merged",
-      failed: "merge failed",
-      unavailable: "GitHub unavailable",
-    } as const;
-    if (outcome !== "merged") throw new LandBlocked(leftOpen[outcome]);
+    // A land never arms auto-merge: it would let a later push land without the factory checking it.
+    const outcome = await mergePullRequest(entry.prUrl, cwd, undefined, signal, undefined, {
+      expectedHead: sha,
+      auto: false,
+    });
+    if (outcome !== "merged") {
+      await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
+      throw new LandBlocked(outcome === "unavailable" ? "GitHub unavailable" : "merge failed");
+    }
     this.store.updateRun(run.id, { merged: true });
     this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
     this.log(`[land] ${entry.id}: merged ${entry.prUrl}`);

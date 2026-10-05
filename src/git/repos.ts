@@ -976,15 +976,18 @@ export async function findPullRequest(
   return url.startsWith("http") ? url : null;
 }
 
-/** Merge now if possible; if branch protection requires checks, enable auto-merge instead.
- * `expectedHead` pins the merge to the commit the factory checked (`--match-head-commit`). */
+/**
+ * Merge now if possible; if branch protection requires checks, enable auto-merge instead.
+ * `expectedHead` pins the merge to the commit the factory checked (`--match-head-commit`), and
+ * `auto: false` never arms auto-merge, which would let a later push land unchecked.
+ */
 export async function mergePullRequest(
   prUrl: string,
   cwd: string,
   title?: string,
   signal?: AbortSignal,
   budget?: GitHubBudget,
-  expectedHead?: string,
+  opts: { expectedHead?: string; auto?: boolean } = {},
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
   // Squash with the PR title as the subject, not the first round's commit message.
   const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
@@ -1010,7 +1013,7 @@ export async function mergePullRequest(
           "--squash",
           ...extra,
           "--delete-branch",
-          ...(expectedHead ? ["--match-head-commit", expectedHead] : []),
+          ...(opts.expectedHead ? ["--match-head-commit", opts.expectedHead] : []),
           ...subject,
         ];
         return sh(cmd, { cwd, signal }).then(
@@ -1030,11 +1033,17 @@ export async function mergePullRequest(
     });
   const now = await merge([]);
   if (now === "ok" || now === "merged") return "merged";
+  if (opts.auto === false) return now;
   // As on main, fall back to auto-merge; it shares the budget and reconciles an unsure merge first.
   const auto = await merge(["--auto"]);
   if (auto === "merged") return "merged";
   if (auto === "ok") return "auto";
   return now === "unavailable" || auto === "unavailable" ? "unavailable" : "failed";
+}
+
+/** Turn off a PR's auto-merge, so no later push can land without the factory checking it. */
+export async function disableAutoMerge(prUrl: string, cwd: string, signal?: AbortSignal): Promise<void> {
+  await sh(["gh", "pr", "merge", prUrl, "--disable-auto"], { cwd, signal, allowFail: true });
 }
 
 /** Same stable top-level representation used in pipeline and eval prompts. */
