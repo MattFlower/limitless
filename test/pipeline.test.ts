@@ -255,7 +255,7 @@ describe("per-run model chains", () => {
       profile: "standard",
       models: { spec: ["beta/m"] },
     });
-    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("failed");
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
     expect(f.store.listStages(run.id).find((s) => s.name === "spec")?.summary).toContain(
       "pinned chain: beta/m",
     );
@@ -1328,15 +1328,51 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
-      exhausted ? "failed" : "succeeded",
+      exhausted ? "needs_human" : "succeeded",
     );
-    expect(prompts).toHaveLength(2);
+    expect(prompts).toHaveLength(exhausted ? 4 : 2);
     expect(prompts[1]).toContain("Invalid spec");
     expect(prompts[1]).toContain("Invalid id H-1: use AC-n");
     expect(implementations).toBe(exhausted ? 0 : 1);
     if (exhausted) {
       expect(f.store.getArtifact(run.id, "spec.md")).toBeNull();
       expect(f.store.getRunState<RunState>(run.id)?.spec).toBeUndefined();
+    } else expect(f.store.getArtifact(run.id, "spec.md")).toContain("AC-1");
+  });
+
+  test.each([false, true])("pinned spec criterion id fallback (exhausted=%s)", async (exhausted) => {
+    const calls: AgentSpec[] = [];
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") {
+        calls.push(s);
+        return {
+          structured:
+            s.target.modelId === "alpha/m"
+              ? { ...spec, acceptance_criteria: [{ ...spec.acceptance_criteria[0], id: "H-1" }] }
+              : spec,
+        };
+      }
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: pass };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const chain = exhausted ? ["alpha/m"] : ["alpha/m", "beta/m"];
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", models: { spec: chain } });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+      exhausted ? "needs_human" : "succeeded",
+    );
+    expect(calls.map((s) => s.target.modelId)).toEqual(
+      exhausted ? ["alpha/m", "alpha/m"] : ["alpha/m", "alpha/m", "beta/m"],
+    );
+    expect(calls[1]?.prompt).toContain("Invalid id H-1: use AC-n");
+    if (exhausted) {
+      const question = f.store.listQuestions(run.id).at(-1)?.question;
+      expect(question).toContain("spec; pinned chain: alpha/m");
+      expect(question).toContain("alpha/m (validation failed: Invalid id H-1: use AC-n");
+      expect(f.store.getArtifact(run.id, "spec.md")).toBeNull();
     } else expect(f.store.getArtifact(run.id, "spec.md")).toContain("AC-1");
   });
 
@@ -9148,6 +9184,7 @@ describe("routing bounded slot waits", () => {
     catalog = models,
     routing = policy,
     reply?: (s: AgentSpec) => FakeReply | Promise<FakeReply>,
+    runModels?: CreateRunRequest["models"],
   ) {
     const clock = waitClock();
     const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
@@ -9186,7 +9223,7 @@ describe("routing bounded slot waits", () => {
       defaultBranch: "main",
       mergePolicy: "none",
     });
-    const run = factory.store.createRun(repo, { repo: repo.slug, prompt: "wait" });
+    const run = factory.store.createRun(repo, { repo: repo.slug, prompt: "wait", models: runModels });
     const controller = new AbortController();
     const context = new RunContext({ ...factory.deps, tracker, router }, run, repo, controller.signal);
     const stage = factory.store.startStage(run.id, "triage", 0);
@@ -9488,6 +9525,91 @@ describe("routing bounded slot waits", () => {
       for (const release of slots) release();
     }
   });
+
+  test.each(["before routing", "waiting", "admitted", "cancel"])(
+    "a run's pinned chain records deadline exhaustion: %s",
+    async (expiry) => {
+      const f = fixture(models, policy, undefined, { triage: ["alpha/m", "beta/m"] });
+      const now = spyOn(Date, "now").mockImplementation(f.clock.now);
+      const slots = await Promise.all(
+        ["alpha", "alpha", "beta", "beta"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      const waiting = deferred<void>();
+      const unsubscribe = f.context.store.subscribe((message) => {
+        if (
+          message.kind === "event" &&
+          message.event.runId === f.run.id &&
+          message.event.message.startsWith("waiting for")
+        )
+          waiting.resolve();
+      });
+      const invoke = RunContext.prototype.invoke;
+      const invocation = spyOn(RunContext.prototype, "invoke").mockImplementation(async function (
+        this: RunContext,
+        opts,
+      ) {
+        const deadline = f.clock.now() + 60_000;
+        if (expiry === "before routing") await f.clock.advance(60_000);
+        return invoke.call(this, { ...opts, deadline });
+      });
+      const acquire = f.tracker.acquire;
+      function admit(id: string, signal: AbortSignal): Promise<() => void>;
+      function admit(
+        id: string,
+        signal: AbortSignal,
+        ms: number | undefined,
+        onWait?: (ahead: number) => void,
+      ): Promise<(() => void) | null>;
+      async function admit(id: string, signal: AbortSignal, ms?: number, onWait?: (ahead: number) => void) {
+        const release = await acquire.call(f.tracker, id, signal, ms, onWait);
+        if (release && expiry === "admitted") await f.clock.advance(60_000);
+        return release;
+      }
+      const admission = spyOn(f.tracker, "acquire").mockImplementation(admit);
+      try {
+        const pending = executeRun(f.context.deps, f.run.id, f.controller.signal);
+        if (expiry !== "before routing") {
+          await waiting.promise;
+          if (expiry === "cancel") f.controller.abort();
+          else if (expiry === "admitted") slots[0]?.();
+          else {
+            await f.clock.advance(20_000);
+            await f.clock.advance(20_000);
+            await f.clock.advance(20_000);
+          }
+        }
+        expect(await pending).toBe(expiry === "cancel" ? "cancelled" : "needs_human");
+        expect(f.context.store.getRun(f.run.id)?.status).toBe(
+          expiry === "cancel" ? "cancelled" : "needs_human",
+        );
+        const questions = f.context.store.listQuestions(f.run.id);
+        if (expiry === "cancel") expect(questions).toHaveLength(0);
+        else {
+          expect(questions).toHaveLength(1);
+          expect(questions[0]?.question).toContain("triage; pinned chain: alpha/m, beta/m");
+          for (const id of ["alpha/m", "beta/m"])
+            expect(questions[0]?.question).toMatch(new RegExp(`${id} \\([^)]*(busy|deadline)`));
+        }
+        expect(f.calls).toHaveLength(0);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(0);
+        expect(f.clock.pending).toBe(0);
+        for (const release of slots) release();
+        expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+        expect(f.tracker.status("beta")?.inFlight).toBe(0);
+        const release = await f.tracker.acquire(
+          "alpha",
+          f.controller.signal.aborted ? new AbortController().signal : f.controller.signal,
+        );
+        release();
+      } finally {
+        admission.mockRestore();
+        invocation.mockRestore();
+        now.mockRestore();
+        unsubscribe();
+        for (const release of slots) release();
+      }
+    },
+  );
 });
 
 describe("audit allowances (fake agents, real git)", () => {

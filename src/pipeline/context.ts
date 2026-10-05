@@ -32,7 +32,7 @@ import { parseFakeStream } from "../harness/stream-fault.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
 import type { GhRunner } from "../integrations/github.ts";
 import type { ProviderTracker } from "../router/providers.ts";
-import type { RouteConstraints, Router } from "../router/router.ts";
+import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
 import { formatTarget, recordEffort } from "../router/targets.ts";
 import { redactCredentialData } from "../util/proc.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
@@ -452,7 +452,24 @@ export class RunContext {
     const busy = new Set<string>();
     let waitMs = 0;
     let lastFailure: string | null = null;
-    let specIdRetried = false;
+    const specIdRetried = new Set<string>();
+    const exhaustPinned = (decision: RouteDecision, deadline = false): never => {
+      const skipped = [
+        ...decision.skipped,
+        ...decision.candidates.map((target) => ({
+          modelId: target.targetId ?? target.modelId,
+          reason:
+            busy.has(target.provider) ||
+            (tracker.status(target.provider)?.inFlight ?? 0) >=
+              (tracker.status(target.provider)?.maxConcurrent ?? Infinity)
+              ? "busy until the deadline"
+              : "invocation deadline expired",
+        })),
+      ];
+      const message = `No model available for ${opts.role}; pinned chain: ${chain?.join(", ")}. Skipped: ${skipped.map((s) => `${s.modelId} (${failures.get(s.modelId) ?? s.reason})`).join(", ")}.${deadline ? " Invocation deadline expired." : ""} Retry with another chain or resolve this run.`;
+      store.askQuestion(this.run.id, message);
+      throw new NoCapacityError(message);
+    };
     // An unsure (not question-needing) decline beats failing the stage when nothing else answers.
     let lastResort: InvokeOutcome | null = null;
     const useLastResort = (outcome: InvokeOutcome, why: string) => {
@@ -467,7 +484,7 @@ export class RunContext {
     for (let attempt = 0; attempt < (chain ? Infinity : 6); attempt++) {
       this.checkCancelled();
       if (signal.aborted) throw new CancelledError();
-      if (left() <= 0)
+      if (!chain && left() <= 0)
         throw new NoCapacityError(
           `Timed out routing ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}`,
         );
@@ -481,6 +498,7 @@ export class RunContext {
         }),
         !shadow,
       );
+      if (chain && left() <= 0) exhaustPinned(decision, true);
       const candidates = decision.candidates;
       let target =
         candidates.find((t) => {
@@ -490,11 +508,7 @@ export class RunContext {
       if (!target && lastResort && !chain)
         return useLastResort(lastResort, `No other model for ${opts.role}`);
       if (!target) {
-        if (chain) {
-          const message = `No model available for ${opts.role}; pinned chain: ${chain.join(", ")}. Skipped: ${decision.skipped.map((s) => `${s.modelId} (${failures.get(s.modelId) ?? s.reason})`).join(", ")}. Retry with another chain or resolve this run.`;
-          store.askQuestion(this.run.id, message);
-          throw new NoCapacityError(message);
-        }
+        if (chain) exhaustPinned(decision);
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
         if (opts.privateOutput) throw new NoCapacityError(`No model available for ${opts.role}`);
         throw new NoCapacityError(
@@ -549,6 +563,7 @@ export class RunContext {
       if (this.signal.aborted || left() <= 0) {
         release?.();
         this.checkCancelled();
+        if (chain) exhaustPinned(decision, true);
         throw new NoCapacityError(`${target.targetId ?? target.modelId}: busy until the deadline`);
       }
       if (!release) {
@@ -838,10 +853,16 @@ export class RunContext {
         continue;
       }
       if (opts.role === "spec" && invalidSpecId) {
-        if (specIdRetried) throw new Error(result.error ?? invalidSpecId);
-        specIdRetried = true;
-        opts = { ...opts, prompt: `${opts.prompt}\n\nInvalid spec: ${invalidSpecId}\n${result.error}` };
-        tried.pop();
+        const id = target.targetId ?? target.modelId;
+        if (!specIdRetried.has(id)) {
+          specIdRetried.add(id);
+          opts = { ...opts, prompt: `${opts.prompt}\n\nInvalid spec: ${invalidSpecId}\n${result.error}` };
+          tried.pop();
+          continue;
+        }
+        failures.set(id, `validation failed: ${invalidSpecId}`);
+        lastFailure = `${id}: validation failed: ${invalidSpecId}`;
+        this.log(`${id} returned invalid spec criterion IDs twice; trying next model`, "warn");
         continue;
       }
       if (opts.requireStructured && (result.status !== "ok" || result.structured === null)) {
