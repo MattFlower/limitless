@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { join } from "node:path";
 import { setupCommand, setupDeps } from "../src/cli/setup.ts";
 import { loadConfig } from "../src/config.ts";
+import { tomlValue } from "../src/router/config-catalog.ts";
+import { customProvider } from "./provider-config-support.ts";
 import { setupFixture } from "./setup-support.ts";
 
 test("empty --yes --json setup detects providers, writes validated config, starts service and saves smoke", async () => {
@@ -68,6 +70,106 @@ test("partial config keeps values; a second run leaves bytes and mtime unchanged
     f.close();
   }
 });
+
+test("CLI init --yes --json fakes LAN health and loopback discovery without live provider fetches", async () => {
+  const provider = {
+    ...customProvider,
+    api_key_env: undefined,
+    id: "lan",
+    health_url: "http://192.0.2.10:8080/v1/models",
+  };
+  const f = setupFixture(`providers = ${tomlValue([provider])}\n`);
+  const paths: string[] = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch: (req) => {
+      const path = new URL(req.url).pathname;
+      paths.push(path);
+      return Response.json(path === "/api/health" ? { ok: true, sha: "installed" } : []);
+    },
+  });
+  try {
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        "--preload",
+        "./test/fixtures/setup-cli-preload.ts",
+        "src/cli/main.ts",
+        "init",
+        "--yes",
+        "--json",
+        "--repo",
+        "acme/app",
+      ],
+      {
+        env: {
+          ...process.env,
+          LIMITLESS_HOME: f.home,
+          LIMITLESS_CONFIG_DIR: f.configDir,
+          LIMITLESS_URL: `http://127.0.0.1:${server.port}`,
+          LIMITLESS_TEST_SETUP_TRACE: "1",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const [stdout, stderr, exit] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    expect(exit).toBe(0);
+    const trace = JSON.parse(stderr);
+    expect(trace.violations).toEqual([]);
+    expect(trace.requests).toContain(`GET ${provider.health_url}`);
+    for (const port of [1234, 8000, 8080, 11434, 10240])
+      expect(trace.requests).toContain(`GET http://127.0.0.1:${port}/v1/models`);
+    expect(paths).toEqual(["/api/health", "/api/github/access"]);
+    expect(JSON.parse(stdout)).toMatchObject({
+      ok: true,
+      providers: { added: ["claude", "codex", "local-1234"] },
+    });
+    expect(Bun.TOML.parse(readFileSync(f.file, "utf8"))).toMatchObject({
+      github: { repos: ["acme/app"], merge: "pr" },
+    });
+  } finally {
+    server.stop(true);
+    f.close();
+  }
+});
+
+for (const merge of ["", ', merge  =  "none"'])
+  test(`init preserves inline GitHub bytes while extending repos and filling missing merge (${merge || "missing"})`, async () => {
+    const assignment = `github  =  { token_env = "X", poll = false, interval = 60, repos  =  [ "acme/app" ]${merge} } # note\n`;
+    const providers = '[[providers]]\npreset = "claude"\n[[providers]]\npreset = "codex"\n';
+    const f = setupFixture(assignment + providers);
+    try {
+      f.state.local = false;
+      const flags = { yes: true, json: true, repo: ["acme/lib"] };
+      expect(await setupCommand("init", flags, f.d)).toBe(0);
+      const updated = readFileSync(f.file, "utf8");
+      expect(updated).toBe(
+        assignment.replace('[ "acme/app" ]', `["acme/app", "acme/lib"]${merge ? "" : ', merge = "pr"'}`) +
+          providers,
+      );
+      expect(Bun.TOML.parse(updated)).toMatchObject({
+        github: {
+          token_env: "X",
+          poll: false,
+          interval: 60,
+          repos: ["acme/app", "acme/lib"],
+          merge: merge ? "none" : "pr",
+        },
+      });
+      const mtime = statSync(f.file).mtimeMs;
+      f.reload();
+      expect(await setupCommand("init", flags, f.d)).toBe(0);
+      expect(readFileSync(f.file, "utf8")).toBe(updated);
+      expect(statSync(f.file).mtimeMs).toBe(mtime);
+    } finally {
+      f.close();
+    }
+  });
 for (const text of [undefined, "[server]\nport = 7444\n"])
   test(`failed preflight leaves ${text === undefined ? "absent" : "existing"} config untouched`, async () => {
     const f = setupFixture(text);

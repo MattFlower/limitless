@@ -13,24 +13,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setupDeps } from "../src/cli/setup.ts";
 import { loadConfig } from "../src/config.ts";
+import { assertReadOnlyCommand } from "./fixtures/setup-commands.ts";
 
-export function assertReadOnlyCommand(args: string[]): void {
-  const command = args.join(" ");
-  if (
-    ![
-      "git --version",
-      "git rev-parse HEAD",
-      "gh auth status",
-      "claude --version",
-      "claude auth status",
-      "codex --version",
-      "codex login status",
-      "python3 --version",
-    ].includes(command) &&
-    !/^gh api repos\/[\w.-]+\/[\w.-]+ -i$/.test(command)
-  )
-    throw new Error(`Unexpected command: ${command}`);
-}
+export { assertReadOnlyCommand } from "./fixtures/setup-commands.ts";
 
 export function setupFixture(text?: string) {
   const root = mkdtempSync(join(tmpdir(), "limitless-setup-")),

@@ -68,3 +68,41 @@ test("quoted escaped table and assignment keys are decoded without changing thei
   expect(text).toBe(`${unrelated}${header}\n${repoKey} = ["acme/app"]\n'merge' = "none"\n`);
   expect(Bun.TOML.parse(text)).toMatchObject({ github: { repos: ["acme/app"], merge: "none" } });
 });
+
+test("inline GitHub patches only required values across quoted keys, nested values and string delimiters", () => {
+  const original =
+    String.raw`'github'  = { token_env = "X", notes = { text = '} , # \\"', list = ["a,b", { x = "}" }] }, "re\u0070os"  = [ 'acme/app' ], 'merge' = 'none', "github.repos" = "unrelated" } # note` +
+    "\r\n";
+  const github = { repos: ["acme/app", "acme/lib"], merge: "pr" };
+  const text = patchSetupConfig(original, github, [], [], false);
+  expect(text).toBe(original.replace("[ 'acme/app' ]", '["acme/app", "acme/lib"]').replace("'none'", '"pr"'));
+  expect(Bun.TOML.parse(text)).toMatchObject({ github });
+});
+
+for (const members of ["", 'token_env = "X", poll = 60'])
+  test(`inline GitHub missing keys are inserted without rewriting existing bytes: ${members || "empty"}`, () => {
+    const original = `github\t= { ${members}\t } # note\n`;
+    const github = { repos: ["acme/app"], merge: "pr" };
+    const text = patchSetupConfig(original, github, [], [], false);
+    expect(text).toBe(
+      `github\t= { ${members}${members ? ", " : ""}repos = ["acme/app"], merge = "pr"${members ? "" : " "}\t } # note\n`,
+    );
+    expect(Bun.TOML.parse(text)).toMatchObject({ github });
+  });
+
+test("unchanged inline GitHub assignment survives adding providers byte for byte", () => {
+  const github = { repos: ["acme/app"], merge: "none" };
+  const original = 'github = { token_env = "X", repos = [ "acme/app" ], merge = \'none\' } # note\n';
+  const text = patchSetupConfig(original, github, [{ preset: "claude" }], ["claude"], false);
+  expect(text).toStartWith(original);
+  expect(Bun.TOML.parse(text)).toMatchObject({ github, providers: [{ preset: "claude" }] });
+});
+
+for (const quotes of [4, 5])
+  test(`inline GitHub edits preserve multiline comments, trailing commas and ${quotes}-quote string endings`, () => {
+    const original = `github = {\n # keep leading comment\n notes = """quoted } , #${'"'.repeat(quotes)},\n repos = [] # keep value comment\n ,\n} # note\n`;
+    const github = { repos: ["acme/app"], merge: "pr" };
+    const text = patchSetupConfig(original, github, [], [], false);
+    expect(text).toBe(original.replace("[]", '["acme/app"], merge = "pr"'));
+    expect(Bun.TOML.parse(text)).toMatchObject({ github });
+  });
