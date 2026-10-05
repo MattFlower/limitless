@@ -36,7 +36,9 @@ function failure(n = 1, name = "test", conclusion = "timed_out") {
     labels: ["ubuntu-latest"],
     steps: [] as { name: string; status: string; conclusion: string | null }[],
   };
-  const state = { log: 'Image: ubuntu-24.04\nerror: Test "smoke" timed out after 30000ms' };
+  const state = {
+    log: "Image: ubuntu-24.04\n(fail) slow [5000.01ms]\n  ^ this test timed out after 5000ms.",
+  };
   h.gh.responses.set(`repos/o/r/check-runs/${check.id}/annotations?per_page=100&page=1`, () =>
     respond(200, []),
   );
@@ -519,10 +521,16 @@ test.each(["timed_out", "startup_failure", "cancelled", "failure"])(
 );
 
 test.each([
-  ['error: Test "smoke" timed out after 30000ms', true],
+  ["(fail) slow [5000.01ms]\n  ^ this test timed out after 5000ms.", true],
+  [
+    "2026-10-05T00:00:00Z (fail) slow [5000.01ms]\n2026-10-05T00:00:00Z   ^ this test timed out after 5000ms.",
+    true,
+  ],
   ["2026-10-05T00:00:00Z Test timeout of 30000ms exceeded.", true],
   ['error: assertion failed: expected "timed out after 30000ms"', false],
   ['Expected: "error: Test \\"smoke\\" timed out after 30000ms"', false],
+  ['Expected: "  ^ this test timed out after 5000ms."', false],
+  ["  ^ this test timed out after 5000ms. assertion failed", false],
   ["error: smoke timed out after 30000ms", false],
 ])("timeout classification uses recognized diagnostics: %s", async (log, retry) => {
   h = pollerHarness();

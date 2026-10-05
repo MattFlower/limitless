@@ -43,7 +43,7 @@ const logLines = (log: string) =>
   log.split(/\r?\n/).map((line) => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ""));
 // Bun, Playwright, and the Actions runner's timeout diagnostics, matched as whole lines.
 const timeoutDiagnostic =
-  /^(?:error: Test "[^"\r\n]+" timed out after \d+(?:\.\d+)?\s*ms\.?|(?:Error: )?Test timeout of \d+ms exceeded\.|##\[error\]The job running on runner .+ has exceeded the maximum execution time of \d+ minutes\.)$/;
+  /^(?:\s*\^\s*this test timed out after \d+(?:\.\d+)?\s*ms\.?|(?:Error: )?Test timeout of \d+ms exceeded\.|##\[error\]The job running on runner .+ has exceeded the maximum execution time of \d+ minutes\.)$/;
 const pending = (f: CiFailure) => f.outcome === "rerunning" || f.outcome === "rerun_requested";
 /** Logs are data. Only these literal failure patterns participate in deterministic classification. */
 export function ciSignature(check: string, log: string, fallback: string, labels: string[] = []) {
