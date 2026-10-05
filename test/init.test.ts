@@ -97,7 +97,7 @@ for (const source of ["implicit", "lan", "unexpected"])
         [
           process.execPath,
           "--preload",
-          "./test/fixtures/setup-cli-preload.ts",
+          "./test/setup-cli-preload.ts",
           "src/cli/main.ts",
           "init",
           "--yes",
@@ -338,7 +338,7 @@ test("CLI help advertises setup and run --repo remains a scalar request", async 
       [
         "bun",
         "--preload",
-        "./test/fixtures/setup-cli-preload.ts",
+        "./test/setup-cli-preload.ts",
         "src/cli/main.ts",
         "run",
         "task",

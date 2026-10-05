@@ -59,22 +59,19 @@ async function doctor(
 ) {
   if (options.config) writeFileSync(join(dir, "config.toml"), options.config);
   const before = readdirSync(dir);
-  const child = Bun.spawn(
-    ["bun", "--preload", "./test/fixtures/setup-cli-preload.ts", "src/cli/main.ts", "doctor"],
-    {
-      cwd: join(import.meta.dir, ".."),
-      env: {
-        ...process.env,
-        LIMITLESS_URL: url,
-        LIMITLESS_HOME: dir,
-        LIMITLESS_CONFIG_DIR: dir,
-        LIMITLESS_TEST_SETUP_TRACE: "1",
-        LIMITLESS_TEST_SETUP_MUTATION: options.mutation ? "1" : "",
-      },
-      stdout: "pipe",
-      stderr: "pipe",
+  const child = Bun.spawn(["bun", "--preload", "./test/setup-cli-preload.ts", "src/cli/main.ts", "doctor"], {
+    cwd: join(import.meta.dir, ".."),
+    env: {
+      ...process.env,
+      LIMITLESS_URL: url,
+      LIMITLESS_HOME: dir,
+      LIMITLESS_CONFIG_DIR: dir,
+      LIMITLESS_TEST_SETUP_TRACE: "1",
+      LIMITLESS_TEST_SETUP_MUTATION: options.mutation ? "1" : "",
     },
-  );
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   const [stdout, stderr, exit] = await Promise.all([
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
