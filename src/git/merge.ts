@@ -27,7 +27,8 @@ export async function validateMerge(cwd: string, head: string, base: string): Pr
   const [sha = "", ...parents] = (await mergeGit(cwd, ["rev-list", "--parents", "-n", "1", "HEAD"])).stdout
     .trim()
     .split(/\s+/);
-  if (parents.length < 2 || parents[0] !== head || !parents.includes(base))
+  // Factory merges join exactly one base: an extra parent would bring in commits nothing checked.
+  if (parents.length !== 2 || parents[0] !== head || parents[1] !== base)
     throw new Error(`Invalid merge ancestry: HEAD must have parents ${head} and ${base}`);
   if (await mergeHead(cwd)) throw new Error("Completed merge still has MERGE_HEAD");
   return sha;

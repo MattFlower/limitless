@@ -10,6 +10,8 @@ dir="${3:-.}"
 repo="MattFlower/limitless"
 private_check="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-private-strings.ts"
 [[ "${LIMITLESS_CONFIG_DIR-/}" = /* ]] || export LIMITLESS_CONFIG_DIR="$PWD/$LIMITLESS_CONFIG_DIR"
+# The checkout's own CLI: `limitless` need not be on PATH.
+cli="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/cli/main.ts"
 cd "$dir"
 checker=""
 trap '[ -z "$checker" ] || { kill -TERM "$checker" 2>/dev/null || :; wait "$checker" || :; }; exit 1' TERM INT
@@ -23,9 +25,9 @@ paths="$(check_private --record)"
 # A planted graft could hide ancestry from the scan and still be pushed.
 export GIT_GRAFT_FILE=/dev/null
 export GIT_WORK_TREE GIT_DIR GIT_COMMON_DIR
-env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR bun install --frozen-lockfile >/dev/null
+env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE bun install --frozen-lockfile >/dev/null
 log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
-if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR bun run check >"$log" 2>&1; then
+if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE bun "$cli" gate-slot --name "land-pr #$pr" -- bun run check >"$log" 2>&1; then
   echo "bun run check failed; see $log" >&2
   exit 1
 fi

@@ -1223,6 +1223,35 @@ test("private config excludes common git directories and all linked worktrees ca
   }
 });
 
+test("waiting behind a lease does not spend the internal gate's execution timeout", async () => {
+  const previous = gateSlots.limit;
+  gateSlots.setLimit(1);
+  const id = await gateSlots.lease("deploy");
+  const queued = Promise.withResolvers<void>();
+  try {
+    const run = runGates(
+      process.cwd(),
+      {
+        setup: [],
+        checks: [{ name: "short", run: "true", timeoutSec: 0.1 }],
+        source: "detected",
+        protectedPaths: [],
+      },
+      new AbortController().signal,
+      { holder: "run-timeout", onWait: () => queued.resolve() },
+    );
+    await queued.promise;
+    await Bun.sleep(200);
+    expect(gateSlots.snapshot().holders).toEqual(["deploy"]);
+    gateSlots.heartbeat(id, true);
+    expect((await run).checks[0]?.ok).toBe(true);
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    gateSlots.heartbeat(id, true);
+    gateSlots.setLimit(previous);
+  }
+});
+
 test("gate subprocess excludes an arbitrary unselected provider credential", async () => {
   const { customProvider, providerFixture } = await import("./provider-config-support.ts");
   const fixture = providerFixture([{ ...customProvider, api_key_env: "MAC_MLX_KEY" }]);

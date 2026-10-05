@@ -333,6 +333,9 @@ proxy_cache off;
 proxy_read_timeout 1h;
 ```
 
+The daemon's streams also send `X-Accel-Buffering: no`, which nginx honours per response, and the
+UI re-fetches its runs from the API whenever a stream reconnects.
+
 The daemon trusts the proxy's socket IP for UI/API access (including SSE), never forwarded
 client-address headers. Proxy mutations require the configured public Origin and JSON.
 Administration (`/api/admin/*`, including drain/resume) and `/mcp` remain loopback-only;

@@ -20,6 +20,9 @@ export const TERMINAL_STATUSES: readonly RunStatus[] = [
   "resolved",
 ];
 
+/** The most runs one `GET /api/runs?ids=` request may name. */
+export const MAX_RUN_IDS = 200;
+
 export type Profile = "auto" | "quick" | "standard" | "deep";
 export type ResolvedProfile = Exclude<Profile, "auto">;
 
@@ -258,11 +261,53 @@ export interface ArtifactMeta {
 }
 
 export interface RunDetail {
+  stoppingStage?: StageName | null;
+  blockingFindings?: string[];
+  prSnapshot?: {
+    state?: string;
+    isDraft?: boolean;
+    mergeable?: string | null;
+    ci?: string | null;
+  } | null;
+  worktreePath?: string | null;
   run: Run;
   stages: Stage[];
   invocations: Invocation[];
   questions: Question[];
   artifacts: ArtifactMeta[];
+  /** For a run with a PR: its latest approval and the review rounds applied to it. */
+  review?: { approval: ReviewApproval | null; rounds: ReviewRound[] };
+}
+
+export interface ReviewFinding {
+  severity: "blocker" | "major" | "minor" | "nit";
+  title: string;
+  file?: string;
+  line?: number;
+  detail: string;
+}
+
+/** `POST /api/runs/:id/review`; `reviewedSha` must be the PR's current head. */
+export interface ReviewVerdict {
+  verdict: "changes" | "approve";
+  reviewedSha: string;
+  findings?: ReviewFinding[];
+  reviewer?: string;
+}
+
+/** The latest approval of a PR; `stale` once its head is seen anywhere else or changes are requested. */
+export interface ReviewApproval {
+  sha: string;
+  stale: boolean;
+}
+
+export interface ReviewRound {
+  runId: string;
+  round: number;
+  status: RunStatus;
+  reviewedSha: string;
+  deliveredSha: string | null;
+  findings: ReviewFinding[];
 }
 
 export interface QuotaWindow {
@@ -360,6 +405,7 @@ export type FeedKind =
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged" | "resolved"}`
   | "eval.finished"
   | "daemon.started"
+  | `review.${"round_started" | "round_delivered" | "approved"}`
   | GitHubFeedKind;
 export type GitHubFeedKind =
   | `pr.${"ci_passed" | "ci_failed" | "conflicting" | "behind" | "review" | "comment" | "merged" | "closed"}`
@@ -393,6 +439,7 @@ export interface DrainState {
 }
 
 export interface HealthResponse extends DrainState {
+  gateSlots?: { occupied: number; limit: number; holders: string[] };
   ok: boolean;
   uptimeMs: number;
   sha: string;

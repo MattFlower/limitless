@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { renderToString } from "solid-js/web";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Repo, Role, RunStatus, StageName } from "../src/core/types.ts";
@@ -58,6 +59,7 @@ import { sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { reviewOutput } from "./evals-reading-support.ts";
 import { deferred } from "./evals-support.ts";
+import { buildNeedsYouUi } from "./needs-you-ui-support.ts";
 import { attributionEvidence, findingEvidence } from "./review-support.ts";
 import { seeded } from "./seeded.ts";
 import { waitClock } from "./wait-clock.ts";
@@ -2871,6 +2873,79 @@ exec '${gitBin}' "$@"
     expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
     expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
   });
+
+  test.each(["succeeded", "failed"] as const)(
+    "review remains the stopping stage when needs-human draft delivery %s during drain",
+    async (deliveryStatus) => {
+      const bare = await githubFixture();
+      if (deliveryStatus === "failed") {
+        writeFileSync(
+          join(home, "bin", "gh"),
+          `#!/bin/sh\nif [ "$2" = create ]; then echo 'Draft PR rejected' >&2; exit 1; fi\n`,
+        );
+      }
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review")
+          return {
+            structured: {
+              verdict: "request_changes",
+              summary: "Needs work",
+              findings: [
+                {
+                  label: "unaddressed",
+                  prior: "P1",
+                  severity: "blocker",
+                  security: false,
+                  ...findingEvidence,
+                  file: "farewell.txt",
+                  line: 1,
+                  title: "Incorrect output",
+                  detail: "Needs work",
+                  suggestion: "Fix it",
+                },
+              ],
+            },
+          };
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      f.cfg.maxRounds = 1;
+      registerGithub(f, bare);
+      const addEvent = f.store.addEvent.bind(f.store);
+      f.store.addEvent = (event) => {
+        if (event.message?.startsWith("Run needs a human")) f.scheduler.drain();
+        return addEvent(event);
+      };
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+      if (deliveryStatus === "succeeded") expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
+      else {
+        expect(f.store.getRun(run.id)?.prUrl).toBeNull();
+        expect(f.store.listEvents(run.id).some((e) => e.message?.startsWith("Could not open draft PR"))).toBe(
+          true,
+        );
+      }
+      expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe(
+        deliveryStatus,
+      );
+      expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+      const detail = f.store.getRunDetail(run.id);
+      if (!detail) throw new Error("missing draft detail");
+      expect(detail.run.stage).toBe("deliver");
+      expect(detail.stoppingStage).toBe("review");
+      const ui = await buildNeedsYouUi(join(home, "needs-you-ui"));
+      try {
+        ui.mount(detail);
+        const html = renderToString(() => ui.render());
+        expect(html).toContain('aria-label="Needs you"');
+        expect(html).toContain("review · Still failing after");
+        expect(html).not.toContain("deliver · Still failing after");
+      } finally {
+        ui.dispose();
+      }
+    },
+  );
 
   test("panel reviews R1-R3: fix-diff scope, tightening blocks, restart, then needs_human with a draft", async () => {
     const bare = await githubFixture();
@@ -7090,6 +7165,59 @@ for (const failure of ["throw", "timeout", "quota", "cancelled"] as const) {
     for (const path of paths) expect(existsSync(path)).toBe(false);
   });
 }
+
+test("a recovered implement failure followed by a review block names review in Needs you", async () => {
+  const f = start((s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review")
+      return {
+        structured: {
+          ...approve,
+          verdict: "request_changes",
+          findings: [
+            {
+              label: "unaddressed",
+              prior: "P1",
+              severity: "major",
+              security: false,
+              ...findingEvidence,
+              file: "farewell.txt",
+              line: 1,
+              title: "Incorrect output",
+              detail: "Needs work",
+              suggestion: "Fix it",
+            },
+          ],
+        },
+      };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  });
+  f.deps.cfg.maxRounds = 1;
+  f.deps.faults = { "stage:implement:before": { action: "throw" } };
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+  expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+  const detail = f.store.getRunDetail(run.id);
+  if (!detail) throw new Error("missing recovered run detail");
+  expect(detail.stages.filter((stage) => stage.name === "implement").map((stage) => stage.status)).toEqual([
+    "failed",
+    "succeeded",
+    "succeeded",
+    "succeeded",
+  ]);
+  expect(f.store.getRunState<RunState>(run.id)?.lastReview?.verdict).toBe("request_changes");
+  expect(detail.stoppingStage).toBe("review");
+  const ui = await buildNeedsYouUi(join(home, "needs-you-ui"));
+  try {
+    ui.mount(detail);
+    const html = renderToString(() => ui.render());
+    expect(html).toContain('aria-label="Needs you"');
+    expect(html).toContain("review · Still failing after");
+    expect(html).not.toContain("implement · Still failing after");
+  } finally {
+    ui.dispose();
+  }
+});
 
 test("completed environment retry stays consumed after persisted-state restart", async () => {
   let implementations = 0;

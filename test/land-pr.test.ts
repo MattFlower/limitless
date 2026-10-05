@@ -262,7 +262,12 @@ test.each(["redirect", "redirect-and-move-head"])(
         `#!${process.execPath}
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-const args = process.argv.slice(2);
+let args = process.argv.slice(2);
+// The gate-slot wrapper is unwrapped here, so the test never reaches a daemon.
+if (args[1] === "gate-slot") {
+  const command = args.slice(args.indexOf("--") + 1);
+  args = command[0] === "bun" ? command.slice(1) : command;
+}
 const paths = [process.env.GIT_WORK_TREE, process.env.GIT_DIR, process.env.GIT_COMMON_DIR];
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ tool: "bun", args, paths }) + "\\n");
 if (args[0] === "install" || args[0] === "run") {
@@ -492,7 +497,7 @@ test("land records the worktree's Git paths before any PR code runs", async () =
     const calls = join(root, "calls");
     writeFileSync(
       join(bin, "bun"),
-      `#!/bin/sh\necho "$*" >> '${calls}'\n[ "$2" = --record ] && printf '%s\\n' "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"\n[ "$1" = run ] && exit 1\nexit 0\n`,
+      `#!/bin/sh\necho "$*" >> '${calls}'\n[ "$2" = --record ] && printf '%s\\n' "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"\n[ "$2" = gate-slot ] && exit 1\nexit 0\n`,
       {
         mode: 0o755,
       },
@@ -511,7 +516,11 @@ test("land records the worktree's Git paths before any PR code runs", async () =
     });
     const lines = readFileSync(calls, "utf8").trim().split("\n");
     expect(lines[0]).toEndWith("check-private-strings.ts --record");
-    expect(lines.indexOf("run check")).toBeGreaterThan(0);
+    // The check runs through the checkout's own CLI in a named gate slot; `limitless` need not be on PATH.
+    const check = lines.findIndex((line) =>
+      line.endsWith("/src/cli/main.ts gate-slot --name land-pr #123 -- bun run check"),
+    );
+    expect(check).toBeGreaterThan(0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
