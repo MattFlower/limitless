@@ -366,8 +366,8 @@ export class LandQueue {
     this.store.updateLandEntry(entry.id, { state: "merging", pushedSha: sha });
     // A land never arms auto-merge: it would let a later push land without the factory checking it,
     // and the squash message is what was reviewed rather than whatever the PR says today.
-    const outcome = await mergePullRequest(entry.prUrl, cwd, run.title, signal, undefined, {
-      expectedHead: sha,
+    const outcome = await mergePullRequest(entry.prUrl, cwd, sha, signal, undefined, undefined, {
+      title: run.title ?? undefined,
       body: this.store.getArtifact(run.id, "report.md") ?? undefined,
       auto: false,
     });

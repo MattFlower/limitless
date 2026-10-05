@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseRunModels } from "../src/core/run-models.ts";
 
 type Seen = { method: string; path: string; type: string | null; body: unknown };
 
@@ -36,6 +37,49 @@ async function cli(args: string[], respond: (path: string) => Response, command 
     server.stop();
   }
 }
+
+test("run and retry send repeatable --model chains, show displays them", async () => {
+  const flags = [
+    "--model",
+    "implement=omlx/qwen-flash",
+    "--model",
+    "review=claude/opus@high|codex/sol,codex/luna",
+  ];
+  const models = { implement: ["omlx/qwen-flash"], review: ["claude/opus@high|codex/sol", "codex/luna"] };
+  const reply = () => Response.json({ id: "new", repoSlug: "o/r", status: "queued" });
+  const run = await cli(["Do it", "--repo", "o/r", ...flags], reply, "run");
+  expect(run.exit).toBe(0);
+  expect(run.seen[0]?.body).toMatchObject({ models });
+  const retry = await cli(["run 1", ...flags], reply, "retry");
+  expect(retry.exit).toBe(0);
+  expect(retry.seen[0]).toMatchObject({ path: "/api/runs/run%201/retry", body: { models } });
+  const inherit = await cli(["run 1"], reply, "retry");
+  expect(inherit.seen[0]?.body).toEqual({});
+  expect(() => parseRunModels(["chat=codex/sol"])).toThrow("Invalid --model");
+  expect(() => parseRunModels(["review=codex/sol", "review=claude/opus"])).toThrow("Duplicate");
+  const shown = await cli(
+    ["run 1"],
+    () =>
+      Response.json({
+        run: {
+          id: "run 1",
+          title: "Test",
+          repoSlug: "o/r",
+          status: "queued",
+          costUsd: 0,
+          costEquivUsd: 0,
+          models,
+        },
+        stages: [],
+        invocations: [],
+        questions: [],
+      }),
+    "show",
+  );
+  expect(shown.exit).toBe(0);
+  expect(shown.stdout).toContain("Model experiment: implement = omlx/qwen-flash");
+  expect(shown.stdout).toContain("review = claude/opus@high|codex/sol, codex/luna");
+});
 
 test("resolve posts the kind, ref and note once and reports the outcome or the daemon's error", async () => {
   const ok = await cli(

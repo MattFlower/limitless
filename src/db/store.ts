@@ -23,6 +23,7 @@ import type {
   InvocationStatus,
   LandEntry,
   LandFeedKind,
+  OperatorRoutingCell,
   Question,
   QuotaAlert,
   Repo,
@@ -30,6 +31,7 @@ import type {
   ReviewApproval,
   ReviewFinding,
   ReviewRound,
+  RoutingChange,
   Run,
   RunDetail,
   RunEvent,
@@ -196,6 +198,7 @@ const toRun = (r: Row): Run => ({
   finishedAt: (r.finished_at as number) ?? null,
   priority: r.priority as number,
   ...(r.no_baseline_cache === 1 ? { noBaselineCache: true } : {}),
+  models: parse(r.models_json, {}),
   allow: AUDIT_ALLOWANCES.filter((kind) => parse<unknown[]>(r.audit_allow, []).includes(kind)),
 });
 
@@ -970,8 +973,8 @@ export class Store {
     const allow = validateAllow([...validateAllow(req.allow), ...(composed ? [] : parseAllow(req.prompt))]);
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url, models_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -994,6 +997,7 @@ export class Store {
         req.noBaselineCache === true ? 1 : 0,
         json(allow),
         round?.prUrl ?? null,
+        json(req.models ?? {}),
       );
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });
@@ -1790,6 +1794,75 @@ export class Store {
     );
   }
 
+  routingCells(): OperatorRoutingCell[] {
+    return this.db
+      .query<Row, []>("SELECT * FROM routing_cells ORDER BY role, cell")
+      .all()
+      .map((row) => ({
+        role: row.role as OperatorRoutingCell["role"],
+        cell: row.cell as OperatorRoutingCell["cell"],
+        groups: JSON.parse(row.groups_json as string) as string[],
+        note: row.note as string | null,
+        updatedAt: row.updated_at as number,
+        updatedBy: row.updated_by as string,
+      }));
+  }
+
+  routingPrefer(): string[] | null {
+    const row = this.db.query<Row, []>("SELECT providers_json FROM routing_prefer WHERE id = 1").get();
+    return row ? (JSON.parse(row.providers_json as string) as string[]) : null;
+  }
+
+  routingHistory(): RoutingChange[] {
+    return this.db
+      .query<Row, []>("SELECT * FROM routing_history ORDER BY id DESC")
+      .all()
+      .map((row) => ({
+        id: row.id as number,
+        key: row.key as string,
+        oldValue: parse<string[] | null>(row.old_json, null),
+        newValue: parse<string[] | null>(row.new_json, null),
+        note: row.note as string | null,
+        at: row.at as number,
+        by: row.actor as string,
+      }));
+  }
+
+  writeRouting(key: string, value: string[] | null, note: string | null, by: string): RoutingChange {
+    return this.db.transaction(() => {
+      const at = Date.now();
+      const [role, cell] = key.split(".");
+      const old =
+        key === "prefer"
+          ? this.routingPrefer()
+          : (this.routingCells().find((r) => r.role === role && r.cell === cell)?.groups ?? null);
+      if (key === "prefer") {
+        if (value === null) this.db.query("DELETE FROM routing_prefer WHERE id = 1").run();
+        else
+          this.db
+            .query("INSERT OR REPLACE INTO routing_prefer VALUES (1, ?, ?, ?, ?)")
+            .run(JSON.stringify(value), note, at, by);
+      } else {
+        if (value === null)
+          this.db.query("DELETE FROM routing_cells WHERE role = ? AND cell = ?").run(role ?? "", cell ?? "");
+        else
+          this.db
+            .query("INSERT OR REPLACE INTO routing_cells VALUES (?, ?, ?, ?, ?, ?)")
+            .run(role ?? "", cell ?? "", JSON.stringify(value), note, at, by);
+      }
+      const result = this.db
+        .query(
+          "INSERT INTO routing_history (key, old_json, new_json, note, at, actor) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .run(key, json(old), json(value), note, at, by);
+      return { id: Number(result.lastInsertRowid), key, oldValue: old, newValue: value, note, at, by };
+    })();
+  }
+
+  publishRouting(change: RoutingChange): void {
+    this.publish({ kind: "routing", change });
+  }
+
   // ---- provider state ------------------------------------------------------
 
   listAlerts(now = Date.now()): QuotaAlert[] {
@@ -1805,6 +1878,7 @@ export class Store {
       utilization: (r.utilization as number) ?? null,
       resetsAt: (r.resets_at as number) ?? null,
       severity: r.severity as QuotaAlert["severity"],
+      source: (r.source as QuotaAlert["source"]) ?? null,
       routing: r.routing as string,
       createdAt: r.created_at as number,
     }));
@@ -1814,13 +1888,20 @@ export class Store {
     const boundary = alert.resetsAt ?? 0;
     const previous = this.db
       .query(
-        "SELECT severity, created_at FROM quota_alerts WHERE provider = ? AND window = ? AND boundary = ?",
+        "SELECT severity, source, created_at FROM quota_alerts WHERE provider = ? AND window = ? AND boundary = ?",
       )
       .get(alert.provider, alert.window, boundary) as Row | null;
     const current: QuotaAlert = previous
       ? {
           ...alert,
           severity: previous.severity === "exhausted" ? "exhausted" : alert.severity,
+          // Telemetry must not erase a rejection or disambiguate an older exhausted alert.
+          source:
+            previous.source === "rejection" || alert.source === "rejection"
+              ? "rejection"
+              : previous.severity === "exhausted" && previous.source == null
+                ? null
+                : alert.source,
           createdAt: previous.created_at as number,
         }
       : alert;
@@ -1832,8 +1913,8 @@ export class Store {
     const inserted =
       this.db
         .query(
-          `INSERT OR IGNORE INTO quota_alerts (provider, window, boundary, resets_at, utilization, severity, routing, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT OR IGNORE INTO quota_alerts (provider, window, boundary, resets_at, utilization, severity, source, routing, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           current.provider,
@@ -1842,17 +1923,19 @@ export class Store {
           current.resetsAt,
           current.utilization,
           current.severity,
+          current.source ?? null,
           current.routing,
           current.createdAt,
         ).changes > 0;
     if (!inserted)
       this.db
         .query(
-          "UPDATE quota_alerts SET utilization = ?, severity = ?, routing = ?, active = 1 WHERE provider = ? AND window = ? AND boundary = ?",
+          "UPDATE quota_alerts SET utilization = ?, severity = ?, source = ?, routing = ?, active = 1 WHERE provider = ? AND window = ? AND boundary = ?",
         )
         .run(
           current.utilization,
           current.severity,
+          current.source ?? null,
           current.routing,
           current.provider,
           current.window,

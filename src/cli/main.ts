@@ -4,6 +4,7 @@ import { parseArgs } from "node:util";
 import { validateAllow } from "../core/allow.ts";
 import { formatCost } from "../core/cost-format.ts";
 import { observationAge, utilizationPercent } from "../core/quota-format.ts";
+import { parseRunModels } from "../core/run-models.ts";
 import type { Profile, ReviewApproval, Run, RunDetail, RunEvent } from "../core/types.ts";
 import { parseMaxWait } from "./deploy-wait.ts";
 import { ApiError } from "./feed.ts";
@@ -16,6 +17,8 @@ Usage:
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
         [--no-baseline-cache]  Always execute the baseline gates; a passing one refreshes the cache
         [--allow submodules|gitattributes|binary]  Allow that blocked audit change (repeatable)
+        [--model role=model[@effort][,fallback]]  Pin a role's chain (repeatable; | joins alternatives)
+  limitless retry <run> [--model role=chain]  Retry, inheriting or replacing model chains
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
         review only: --systems <file.json> [--replay-finders <evalId>] instead of --models
@@ -46,7 +49,12 @@ Usage:
   limitless providers export [--write] [--yes]     Export effective provider config (offline)
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
-  limitless doctor                        Report GitHub access problems the PR poller recorded
+  limitless routing show [--role r] [--run id]
+  limitless routing set <role>.<cell> <chain> [--note …]
+  limitless routing reset <role>.<cell> | --all
+  limitless routing preview <role> [<complexity>] [--run id]
+  limitless init [--yes] [--repo owner/name]... [--json]  Idempotent machine setup
+  limitless doctor [--json]                Read-only machine and access diagnosis
   limitless auth add-passkey              Print a one-time link (10 minutes) that registers a UI passkey
   limitless auth passkeys [remove <id>]   List or remove UI passkeys
   limitless auth set-password             Set the UI sign-in password (prompted, never echoed)
@@ -211,6 +219,7 @@ async function main(): Promise<void> {
     options: {
       evals: { type: "string" },
       models: { type: "string" },
+      model: { type: "string", multiple: true },
       systems: { type: "string" },
       "replay-finders": { type: "string" },
       k: { type: "string" },
@@ -226,7 +235,9 @@ async function main(): Promise<void> {
       after: { type: "string" },
       consumer: { type: "string" },
       wait: { type: "string" },
-      repo: { type: "string", short: "r" },
+      repo: { type: "string", short: "r", multiple: true },
+      role: { type: "string" },
+      run: { type: "string" },
       profile: { type: "string", short: "p" },
       title: { type: "string", short: "t" },
       follow: { type: "boolean", short: "f" },
@@ -252,6 +263,7 @@ async function main(): Promise<void> {
     },
   });
   const [cmd, ...rest] = positionals;
+  const repo = values.repo?.at(-1);
   if (!cmd || values.help) {
     console.log(USAGE);
     return;
@@ -312,13 +324,14 @@ async function main(): Promise<void> {
     }
     case "run": {
       const prompt = rest.join(" ").trim() || (await Bun.stdin.text()).trim();
-      if (!prompt || !values.repo) throw new Error('usage: limitless run "<prompt>" --repo <repo>');
+      if (!prompt || !repo) throw new Error('usage: limitless run "<prompt>" --repo <repo>');
       const allow = validateAllow(values.allow);
       const run = await api<Run>("/api/runs", {
         method: "POST",
         body: JSON.stringify({
-          repo: values.repo,
+          repo,
           prompt,
+          models: parseRunModels(values.model),
           ...(values.after !== undefined ? { dependsOn: values.after.split(",") } : {}),
           profile: (values.profile as Profile | undefined) ?? "auto",
           ...(values.title ? { title: values.title } : {}),
@@ -329,6 +342,16 @@ async function main(): Promise<void> {
         }),
       });
       console.log(`Created run ${color.bold(run.id)} on ${run.repoSlug}: ${run.status}`);
+      if (values.follow) await follow(run.id);
+      return;
+    }
+    case "retry": {
+      if (rest.length !== 1) throw new Error("usage: limitless retry <run> [--model role=chain]");
+      const run = await api<Run>(`/api/runs/${encodeURIComponent(rest[0] ?? "")}/retry`, {
+        method: "POST",
+        body: JSON.stringify({ models: parseRunModels(values.model) }),
+      });
+      console.log(`Created retry ${color.bold(run.id)} on ${run.repoSlug}: ${run.status}`);
       if (values.follow) await follow(run.id);
       return;
     }
@@ -353,6 +376,8 @@ async function main(): Promise<void> {
         `repo ${r.repoSlug}  status ${statusColor(r.status)}  profile ${r.resolvedProfile ?? r.profile}`,
       );
       if (r.prUrl) console.log(`PR ${r.prUrl}`);
+      for (const [role, chain] of Object.entries(r.models ?? {}))
+        console.log(`Model experiment: ${role} = ${chain.join(", ")}`);
       if (r.error) console.log(color.red(r.error));
       const cost = formatCost(r.costUsd, r.costEquivUsd);
       console.log(`cost ${cost.primary}${cost.paid ? ` ${cost.paid} paid` : ""} (${cost.title})`);
@@ -451,6 +476,8 @@ async function main(): Promise<void> {
         now: values.now === true,
       });
     }
+    case "routing":
+      return (await import("./routing.ts")).routingCommand(rest, values, api);
     case "providers": {
       if (rest[0] === "export") {
         if (rest.length !== 1) throw new Error("usage: limitless providers export [--write] [--yes]");
@@ -485,6 +512,7 @@ async function main(): Promise<void> {
             state: string;
             reason: string | null;
             maxConcurrent: number;
+            quota?: import("../core/types.ts").QuotaMode;
             windows: Record<string, { utilization: number; observedAt?: number | null }>;
           }[]
         >("/api/providers");
@@ -493,16 +521,25 @@ async function main(): Promise<void> {
           .map(([k, v]) => `${k} ${utilizationPercent(v.utilization)} (${observationAge(v.observedAt)})`)
           .join(", ");
         console.log(
-          `${p.id.padEnd(11)} ${p.state.padEnd(9)} maxConcurrent ${p.maxConcurrent} ${w} ${p.reason ? color.dim(p.reason) : ""}`,
+          `${p.id.padEnd(11)} ${p.state.padEnd(9)} maxConcurrent ${p.maxConcurrent} ${p.quota === "unlimited" ? "No limit (configured) " : ""}${w} ${p.reason ? color.dim(p.reason) : ""}`,
         );
       }
       return;
     }
+    case "init":
     case "doctor": {
-      const problems = await api<import("../core/types.ts").GitHubAccessProblem[]>("/api/github/access");
-      const lines = (await import("../integrations/github-poller.ts")).githubDoctor(problems);
-      console.log(lines.join("\n"));
-      if (lines.length > 1) process.exitCode = 1;
+      const { setupCommand, setupDeps } = await import("./setup.ts");
+      let deps: ReturnType<typeof setupDeps>;
+      try {
+        deps = setupDeps();
+      } catch {
+        const error = "Invalid configuration; fix config.toml before running setup";
+        if (values.json) console.log(JSON.stringify({ ok: false, failedStep: "config", error }));
+        else console.error(error);
+        process.exitCode = 1;
+        return;
+      }
+      process.exitCode = await setupCommand(cmd, values, deps);
       return;
     }
     case "gc": {
@@ -565,7 +602,7 @@ async function main(): Promise<void> {
         throw new Error("usage: limitless gates clear-cache [--repo owner/name]");
       const { cleared } = await api<{ cleared: number }>("/api/gates/clear-cache", {
         method: "POST",
-        body: JSON.stringify(values.repo === undefined ? {} : { repo: values.repo }),
+        body: JSON.stringify(repo === undefined ? {} : { repo }),
       });
       console.log(`Cleared ${cleared} cached baselines`);
       return;

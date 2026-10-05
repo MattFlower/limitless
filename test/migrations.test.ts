@@ -31,6 +31,39 @@ function legacyDatabase(path: string): void {
   db.close();
 }
 
+test("model chains upgrade legacy runs, persist on reopen and preserve prior-schema reads and writes", () => {
+  temporary((_directory, path) => {
+    legacyDatabase(path);
+    const legacy = new Database(path);
+    legacy.exec("INSERT INTO repos (id, slug, kind, created_at) VALUES ('repo', 'local', 'local', 1)");
+    legacy.exec(
+      "INSERT INTO runs (id, repo_id, title, prompt, source, status, created_at) VALUES ('old', 'repo', 'old', 'old', 'cli', 'queued', 1)",
+    );
+    legacy.close();
+    let store = new Store(path);
+    expect(store.getRun("old")?.models).toEqual({});
+    const repo = store.getRepo("repo");
+    if (!repo) throw new Error("missing repo");
+    const models = { implement: ["codex/sol@high", "claude/opus"], review: ["claude/opus|codex/sol"] };
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "experiment", models });
+    store.close();
+    // Prior-release SQL names only its known columns, so the default handles its inserts.
+    const previous = new Database(path);
+    expect(previous.query("SELECT title, prompt FROM runs WHERE id = ?").get(run.id)).toEqual({
+      title: "experiment",
+      prompt: "experiment",
+    });
+    previous.exec(
+      "INSERT INTO runs (id, repo_id, title, prompt, source, status, created_at) VALUES ('rollback', 'repo', 'rollback', 'rollback', 'cli', 'queued', 2)",
+    );
+    previous.close();
+    store = new Store(path);
+    expect(store.getRun(run.id)?.models).toEqual(models);
+    expect(store.getRun("rollback")?.models).toEqual({});
+    store.close();
+  });
+});
+
 const legacyRows = (db: Database) => db.query("SELECT * FROM schema_migrations ORDER BY version").all();
 const fileNames = (db: Database) =>
   (db.query("SELECT name FROM applied_migrations ORDER BY rowid").all() as { name: string }[]).map(
@@ -43,6 +76,37 @@ test("the legacy migration array is frozen", () => {
 
 test("repository migration files are validly named", () => {
   expect(() => migrationNames(MIGRATION_DIR)).not.toThrow();
+});
+
+test("operator routing migration upgrades an existing DB and permits previous-release reopen", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-operator-routing.sql"),
+    });
+    let previous = new Store(path, before);
+    previous.setSetting("sentinel", "unchanged");
+    const legacy = legacyRows(previous.db);
+    previous.close();
+    const current = new Store(path);
+    current.writeRouting("triage.default", ["codex/sol"], "live", "tester");
+    current.writeRouting("prefer", ["codex"], null, "tester");
+    expect(legacyRows(current.db)).toEqual(legacy);
+    current.close();
+    previous = new Store(path, before);
+    expect(previous.getSetting("sentinel", "")).toBe("unchanged");
+    previous.setSetting("rollback", "works");
+    previous.close();
+    const reopened = new Store(path);
+    expect(reopened.getSetting("rollback", "")).toBe("works");
+    expect(reopened.routingCells()).toMatchObject([
+      { role: "triage", cell: "default", groups: ["codex/sol"] },
+    ]);
+    expect(reopened.routingPrefer()).toEqual(["codex"]);
+    expect(reopened.routingHistory()).toHaveLength(2);
+    reopened.close();
+  });
 });
 
 test("fresh Store applies legacy and file migrations and reopens without new records", () => {

@@ -325,7 +325,10 @@ export async function reportChecks(
     budgetMs: SMOKE_BUDGET_MS,
     ...options,
     onStart: (check) => print(`${check.name.padEnd(width)}  RUN`),
-    onRow: (row) => print(formatRow(row, width)),
+    onRow: (row) => {
+      print(formatRow(row, width));
+      options.onRow?.(row);
+    },
   });
   return exitCode(rows);
 }
@@ -905,7 +908,7 @@ export function backendChecks(
   return checks;
 }
 
-export async function main(): Promise<number> {
+export async function main(print = console.log, options: RunOptions = {}): Promise<number> {
   const index = process.argv.indexOf("--models");
   if (index >= 0) {
     const references = process.argv[index + 1];
@@ -923,7 +926,7 @@ export async function main(): Promise<number> {
           liveCheck(provider.id === "claude" ? runClaude : runCodex, target, "structured", signal),
       };
     });
-    return reportChecks(checks);
+    return reportChecks(checks, print, options);
   }
   const { secrets } = loadConfig();
   const checks: SmokeCheck[] = [];
@@ -956,7 +959,7 @@ export async function main(): Promise<number> {
     }
   }
   checks.push(...backendChecks(secrets));
-  return reportChecks(checks);
+  return reportChecks(checks, print, options);
 }
 
 if (import.meta.main) process.exitCode = await main();

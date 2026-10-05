@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -17,6 +17,7 @@ import { renderToString } from "solid-js/web";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Repo, Role, RunStatus, StageName } from "../src/core/types.ts";
+import { Store } from "../src/db/store.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { recordWorktree } from "../src/git/command.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
@@ -42,6 +43,7 @@ import {
   type RunState,
 } from "../src/pipeline/context.ts";
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
+import { SimulatedTermination } from "../src/pipeline/faults.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
 import {
@@ -54,6 +56,7 @@ import {
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
+import { RuntimePolicy } from "../src/router/runtime-policy.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement } from "./confinement.ts";
@@ -204,6 +207,251 @@ const pass = {
   overall: "pass",
   notes: "",
 };
+
+describe("per-run model chains", () => {
+  const reply: Handler = (s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review") return { structured: approve };
+    if (role === "verify") return { structured: pass };
+    return { files: { "farewell.txt": "goodbye\n" } };
+  };
+  test("retry inherits or replaces the chain used by the next run", async () => {
+    const f = start(reply);
+    const original = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "quick",
+      models: { implement: ["beta/m"] },
+    });
+    const check = async (run: { id: string }, modelId: string) => {
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(
+        f.store
+          .listInvocations(run.id)
+          .filter((i) => i.role === "implement")
+          .map((i) => i.modelId),
+      ).toEqual([modelId]);
+    };
+    await check(original, "beta/m");
+    await check(await f.retryRun(original.id), "beta/m");
+    await check(await f.retryRun(original.id, { implement: ["alpha/m"] }), "alpha/m");
+  });
+  test("failed stage summaries retain pinned-chain provenance", async () => {
+    const f = start((s) =>
+      roleOf(s) === "spec"
+        ? {
+            structured: {
+              ...spec,
+              acceptance_criteria: [
+                { id: "H-1", criterion: "farewell exists", how_to_verify: "cat farewell.txt" },
+              ],
+            },
+          }
+        : reply(s),
+    );
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "standard",
+      models: { spec: ["beta/m"] },
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+    expect(f.store.listStages(run.id).find((s) => s.name === "spec")?.summary).toContain(
+      "pinned chain: beta/m",
+    );
+  });
+  test("escalation remembers pinned implementers that failed during capacity fallback", async () => {
+    const f = start((s) => {
+      if (roleOf(s) !== "implement") return reply(s);
+      return s.target.modelId === "alpha/m"
+        ? {
+            status: "quota",
+            error: "transient quota",
+            quota: { windows: {}, exhaustedUntil: Date.now() - 1 },
+          }
+        : { files: { "farewell.txt": "BAD\n" } };
+    });
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "quick",
+      models: { implement: ["alpha/m", "beta/m"] },
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.modelId),
+    ).toEqual(["alpha/m", "beta/m", "beta/m"]);
+    expect(f.store.listQuestions(run.id).at(-1)?.question).toContain("alpha/m (already tried)");
+  });
+  test("unpinned fallback history prevents escalation from returning to either dispatched model", async () => {
+    const alpha = models[0];
+    if (!alpha) throw new Error("missing fixture model");
+    let quota = true;
+    const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
+    factory = new Factory(cfg, {
+      confinement: fakeConfinement,
+      providers,
+      models: [...models, { ...alpha, id: "alpha/next", model: "alpha-next" }],
+      policy: { ...policy, implement: { default: ["alpha/m", "beta/m", "alpha/next"] } },
+      harnesses: {
+        fake: fakeHarness((s) => {
+          if (roleOf(s) !== "implement") return reply(s);
+          if (s.target.modelId === "alpha/m" && quota) {
+            quota = false;
+            return {
+              status: "quota",
+              error: "transient quota",
+              quota: { windows: {}, exhaustedUntil: Date.now() - 1 },
+            };
+          }
+          return { files: { "farewell.txt": s.target.modelId === "beta/m" ? "BAD\n" : "goodbye\n" } };
+        }),
+      },
+      bootSha: "test-build",
+    });
+    const f = factory;
+    f.start();
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.modelId),
+    ).toEqual(["alpha/m", "beta/m", "beta/m", "alpha/next"]);
+    expect(f.store.getRunState<RunState>(run.id)?.triedImplementers).toEqual([
+      { modelId: "alpha/m", effort: null },
+      { modelId: "beta/m", effort: null },
+      { modelId: "alpha/next", effort: null },
+    ]);
+  });
+  test.each(["trivial", "large"] as const)(
+    "implement override wins at %s complexity; other roles use policy",
+    async (complexity) => {
+      const f = start((s) => (roleOf(s) === "triage" ? { structured: triage({ complexity }) } : reply(s)));
+      const run = await f.createRun({
+        repo: repoDir,
+        prompt: "Add farewell",
+        profile: "standard",
+        models: { implement: ["beta/m"] },
+      });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      const inv = f.store.listInvocations(run.id);
+      expect(inv.filter((i) => i.role === "implement").map((i) => i.modelId)).toEqual(["beta/m"]);
+      expect(inv.find((i) => i.role === "triage")?.modelId).toBe("alpha/m");
+      expect(f.store.listStages(run.id).find((s) => s.name === "implement")?.summary).toContain(
+        "pinned chain: beta/m",
+      );
+      expect(f.store.getArtifact(run.id, "report.md")).toContain("Routing — model experiment");
+    },
+  );
+  test("explicit review, holdout and verify chains override independence and warn", async () => {
+    const f = start(reply);
+    const models = { implement: ["alpha/m"], review: ["alpha/m"], holdout: ["alpha/m"], verify: ["alpha/m"] };
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard", models });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    for (const role of ["review", "holdout", "verify"] as const) {
+      expect(
+        f.store
+          .listInvocations(run.id)
+          .filter((i) => i.role === role)
+          .map((i) => i.modelId),
+      ).toEqual(["alpha/m"]);
+      expect(
+        f.store
+          .listEvents(run.id)
+          .some(
+            (e) =>
+              e.level === "warn" &&
+              e.message.startsWith(role) &&
+              e.message.includes("because this run pinned it"),
+          ),
+      ).toBe(true);
+    }
+  });
+  test("a review chain replaces configured finder preferences and listed panel verifiers", async () => {
+    const f = start((s) => {
+      if (s.prompt.startsWith("You are a code-review verifier"))
+        return {
+          structured: {
+            results: [
+              {
+                id: "C1",
+                verdict: "REFUTED",
+                severity: "low",
+                category: "correctness",
+                evidence: "Checked farewell text",
+                trigger: "none",
+              },
+            ],
+          },
+        };
+      return roleOf(s) === "review" ? { structured: reviewOutput(1, "minor", "farewell.txt") } : reply(s);
+    });
+    f.deps.reviewSystem = {
+      name: "panel",
+      mode: "panel",
+      implementerReport: "include",
+      finders: [{ target: "beta/m", prompt: "standard" }],
+      verifier: { targets: ["alpha/m"] },
+    };
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "quick",
+      models: { review: ["alpha/m", "beta/m"] },
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "review")
+        .map((i) => i.modelId),
+    ).toEqual(["alpha/m", "beta/m"]);
+  });
+  test.each([false, true])(
+    "escalation stays inside its two-entry chain (exhausted: %s)",
+    async (exhausted) => {
+      const implemented: string[] = [];
+      const f = start(
+        (s) => {
+          if (roleOf(s) !== "implement") return reply(s);
+          implemented.push(s.target.modelId);
+          return {
+            files: { "farewell.txt": exhausted || s.target.modelId === "alpha/m" ? "BAD\n" : "goodbye\n" },
+          };
+        },
+        false,
+        true,
+      );
+      f.cfg.maxRounds = 5;
+      const run = await f.createRun({
+        repo: repoDir,
+        prompt: "Add farewell",
+        profile: "standard",
+        models: { implement: ["alpha/m", "beta/m"] },
+      });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        exhausted ? "needs_human" : "succeeded",
+      );
+      expect(implemented).toEqual(
+        exhausted ? ["alpha/m", "alpha/m", "beta/m", "beta/m"] : ["alpha/m", "alpha/m", "beta/m"],
+      );
+      if (exhausted) {
+        const question = f.store.listQuestions(run.id).at(-1)?.question;
+        expect(question).toContain("implement; pinned chain: alpha/m, beta/m");
+        expect(question).toContain("alpha/m (already tried)");
+        expect(question).toContain("beta/m (already tried)");
+      }
+    },
+  );
+});
 
 function start(handler: Handler, effortRouting = false, freeProviders = false): Factory {
   const alpha = models[0];
@@ -1125,15 +1373,51 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
-      exhausted ? "failed" : "succeeded",
+      exhausted ? "needs_human" : "succeeded",
     );
-    expect(prompts).toHaveLength(2);
+    expect(prompts).toHaveLength(exhausted ? 4 : 2);
     expect(prompts[1]).toContain("Invalid spec");
     expect(prompts[1]).toContain("Invalid id H-1: use AC-n");
     expect(implementations).toBe(exhausted ? 0 : 1);
     if (exhausted) {
       expect(f.store.getArtifact(run.id, "spec.md")).toBeNull();
       expect(f.store.getRunState<RunState>(run.id)?.spec).toBeUndefined();
+    } else expect(f.store.getArtifact(run.id, "spec.md")).toContain("AC-1");
+  });
+
+  test.each([false, true])("pinned spec criterion id fallback (exhausted=%s)", async (exhausted) => {
+    const calls: AgentSpec[] = [];
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") {
+        calls.push(s);
+        return {
+          structured:
+            s.target.modelId === "alpha/m"
+              ? { ...spec, acceptance_criteria: [{ ...spec.acceptance_criteria[0], id: "H-1" }] }
+              : spec,
+        };
+      }
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") return { structured: pass };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const chain = exhausted ? ["alpha/m"] : ["alpha/m", "beta/m"];
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", models: { spec: chain } });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+      exhausted ? "needs_human" : "succeeded",
+    );
+    expect(calls.map((s) => s.target.modelId)).toEqual(
+      exhausted ? ["alpha/m", "alpha/m"] : ["alpha/m", "alpha/m", "beta/m"],
+    );
+    expect(calls[1]?.prompt).toContain("Invalid id H-1: use AC-n");
+    if (exhausted) {
+      const question = f.store.listQuestions(run.id).at(-1)?.question;
+      expect(question).toContain("spec; pinned chain: alpha/m");
+      expect(question).toContain("alpha/m (validation failed: Invalid id H-1: use AC-n");
+      expect(f.store.getArtifact(run.id, "spec.md")).toBeNull();
     } else expect(f.store.getArtifact(run.id, "spec.md")).toContain("AC-1");
   });
 
@@ -1227,7 +1511,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       `#!/bin/sh
 echo "$*" >> '${calls}'
 case "$1 $2" in
-  'pr view') echo '{"state":"'"$(cat '${stateFile}')"'","url":"${url}"}' ;;
+  'pr view') echo '{"state":"'"$(cat '${stateFile}')"'","url":"${url}","title":"Add farewell","body":"Safe body","headRefOid":"'"$(git rev-parse HEAD)"'"}' ;;
   'pr list') if [ -f '${stateFile}' ]; then
     if [ "$*" = "pr list --repo test/repo --head $6 --state all --json state,url" ]; then
       echo '[{"state":"'"$(cat '${stateFile}')"'","url":"${url}"}]'
@@ -1475,6 +1759,61 @@ esac
       expect(escalated).toBe(roundsOnImplementer === 2);
     },
   );
+
+  test("an in-flight run picks up an operator cell and leaves its removed sticky implementer", async () => {
+    const reached = deferred<void>();
+    const resume = deferred<void>();
+    const invoked: string[] = [];
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      invoked.push(s.target.modelId);
+      if (invoked.length === 1) {
+        reached.resolve();
+        await resume.promise;
+      }
+      return { files: { "farewell.txt": invoked.length === 1 ? "BAD goodbye\n" : "goodbye\n" } };
+    });
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    await reached.promise;
+    f.routing.setCell("implement", "small", ["beta/m"], "subscription depleted");
+    resume.resolve();
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(invoked).toEqual(["alpha/m", "beta/m"]);
+    expect(f.store.getRunState<RunState>(run.id)?.implementer?.modelId).toBe("beta/m");
+  });
+
+  test("an escalation selected after a live edit stays sticky on the fourth round", async () => {
+    const reached = deferred<void>();
+    const resume = deferred<void>();
+    const invoked: string[] = [];
+    const f = start(
+      async (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        invoked.push(s.target.modelId);
+        if (invoked.length === 1) {
+          reached.resolve();
+          await resume.promise;
+        }
+        return { files: { "farewell.txt": invoked.length < 4 ? "BAD goodbye\n" : "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    await reached.promise;
+    f.routing.setCell("implement", "small", ["alpha/m"]);
+    resume.resolve();
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(invoked).toEqual(["alpha/m", "alpha/m", "delta/m", "delta/m"]);
+    expect(f.store.getRunState<RunState>(run.id)?.implementer).toMatchObject({
+      modelId: "delta/m",
+      policyRevision: f.router.cellRevision("implement", "small"),
+    });
+  });
 
   test("Dependabot uses free models across quick stages and keeps them on feedback rounds", async () => {
     const seen: { role: string; provider: string }[] = [];
@@ -2503,6 +2842,375 @@ esac
     expect(f.store.getRun(run.id)?.prUrl).toBe("https://github.com/test/repo/pull/1");
     expect(f.store.listStages(run.id).filter((stage) => stage.name === "gates")).toHaveLength(2);
     expect(readFileSync(join(home, "gh-calls"), "utf8").match(/^pr create/gm)).toHaveLength(1);
+  });
+
+  test.each([
+    "commit",
+    "title",
+    "body",
+    "draft-body",
+    "unreadable",
+    "branch",
+    "history",
+    "message-body",
+    "encoded-body",
+    "draft-history",
+    "lfs-history",
+    "cache-config",
+    "author-email",
+    "utf16-author-email",
+    "utf16-message-body",
+  ])("private strings stop %s delivery before any push", async (scenario) => {
+    const bare = await githubFixture();
+    const entry = scenario === "branch" ? "secret-host-example" : "secret-host.example";
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage")
+        return {
+          structured: triage({
+            title: scenario === "title" ? entry : "Add farewell",
+            suggested_profile: "quick",
+          }),
+        };
+      if (role === "review") {
+        if (scenario === "unreadable") {
+          rmSync(join(home, "cfg", "private-strings.txt"));
+          mkdirSync(join(home, "cfg", "private-strings.txt"));
+        }
+        return {
+          structured: ["draft-body", "draft-history"].includes(scenario)
+            ? {
+                ...approve,
+                verdict: "request_changes",
+                summary: scenario === "draft-body" ? entry : "Repair required",
+                findings: [
+                  {
+                    label: "new",
+                    prior: "",
+                    severity: "blocker",
+                    security: false,
+                    ...findingEvidence,
+                    file: "farewell.txt",
+                    line: 1,
+                    title: "Fix",
+                    detail: "Fix",
+                    suggestion: "Fix",
+                  },
+                ],
+              }
+            : approve,
+        };
+      }
+      if (scenario.startsWith("utf16-"))
+        await sh(["git", "config", "i18n.logOutputEncoding", "UTF-16"], { cwd: s.cwd });
+      if (
+        ["history", "message-body", "utf16-message-body", "draft-history", "lfs-history"].includes(scenario)
+      ) {
+        let content = scenario.endsWith("message-body") ? "safe" : entry;
+        if (scenario === "lfs-history") {
+          const oid = createHash("sha256").update(entry).digest("hex");
+          const common = (await sh(["git", "rev-parse", "--git-common-dir"], { cwd: s.cwd })).stdout.trim();
+          const object = resolve(s.cwd, common, "lfs/objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+          mkdirSync(dirname(object), { recursive: true });
+          writeFileSync(object, entry);
+          content = `version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize ${entry.length}\n`;
+        }
+        writeFileSync(join(s.cwd, "transient.txt"), content);
+        await sh(["git", "add", "."], { cwd: s.cwd });
+        await sh(
+          [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            scenario.endsWith("message-body") ? `Safe subject\n\n${entry}` : "safe",
+          ],
+          { cwd: s.cwd },
+        );
+        rmSync(join(s.cwd, "transient.txt"));
+        await sh(["git", "add", "."], { cwd: s.cwd });
+        await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "remove transient"], {
+          cwd: s.cwd,
+        });
+      }
+      if (["commit", "author-email", "utf16-author-email"].includes(scenario)) {
+        writeFileSync(join(s.cwd, "farewell.txt"), "goodbye\n");
+        await sh(["git", "add", "."], { cwd: s.cwd });
+        await sh(
+          [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            scenario === "commit" ? entry.toUpperCase() : "safe",
+          ],
+          {
+            cwd: s.cwd,
+            env: {
+              ...process.env,
+              ...(scenario.endsWith("author-email")
+                ? { GIT_AUTHOR_NAME: "Fake", GIT_AUTHOR_EMAIL: `fake@${entry}` }
+                : {}),
+            },
+          },
+        );
+      }
+      return {
+        files: { "farewell.txt": "goodbye\n" },
+        text: scenario === "body" ? entry : scenario === "encoded-body" ? "%73ecret-host.example" : "Done",
+      };
+    });
+    f.cfg.maxRounds = 1;
+    if (scenario === "cache-config") f.cfg.paths.configDir = join(f.cfg.paths.repos, "config");
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), entry);
+    registerGithub(f, bare);
+    const calls: string[] = [];
+    const originalGit = Bun.which("git");
+    if (!originalGit) throw new Error("git unavailable");
+    writeFileSync(
+      join(home, "bin", "git"),
+      `#!/bin/sh\nfor arg in "$@"; do [ "$arg" = push ] && echo push >> '${join(home, "push-calls")}'; done\nexec '${originalGit}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    const run = await f.createRun({
+      repo: "test/repo",
+      prompt: scenario === "branch" ? "Secret Host Example" : "Add farewell",
+      profile: "quick",
+    });
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe(
+      scenario === "cache-config" ? "failed" : "needs_human",
+    );
+    expect(existsSync(join(home, "push-calls"))).toBe(false);
+    expect(f.store.getRun(run.id)?.prUrl).toBeNull();
+    const error = f.store.getRun(run.id)?.error ?? "";
+    expect(error.toLowerCase()).not.toContain(entry);
+    if (scenario.endsWith("author-email")) expect(error).toContain("author email");
+    if (scenario === "cache-config") expect(error).toContain("inside repository");
+    else if (scenario !== "unreadable") expect(error).toContain("entry 1 in private-strings.txt");
+    calls.push(
+      ...f.store
+        .listEvents(run.id)
+        .filter((e) => e.type === "status" || e.type === "error")
+        .map((e) => e.message),
+    );
+    expect(calls.join("\n").toLowerCase()).not.toContain(entry);
+    expect(
+      (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+        .stdout,
+    ).toBe("");
+  });
+
+  test.each(["diff", "publication"])("run cancellation stops the production %s blob scan", async (stage) => {
+    const bare = await githubFixture();
+    const armed = join(home, "scan-armed");
+    const started = join(home, "scan-started");
+    const pushed = join(home, "push-calls");
+    const gitBin = Bun.which("git");
+    if (!gitBin) throw new Error("missing git");
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        if (stage === "publication") writeFileSync(armed, "ready");
+        return { structured: approve };
+      }
+      if (stage === "diff") writeFileSync(armed, "ready");
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+    registerGithub(f, bare);
+    writeFileSync(
+      join(home, "bin", "git"),
+      `#!/bin/sh
+for arg in "$@"; do [ "$arg" = push ] && echo push >> '${pushed}'; done
+if [ -f '${armed}' ] && [ "$1" = --no-replace-objects ] && [ "$2" = cat-file ] && [ "$3" = --batch ]; then
+  sleep 60 & scan=$!
+  printf '%s %s' "$$" "$scan" > '${started}'
+  wait
+  exit 1
+fi
+exec '${gitBin}' "$@"
+`,
+      { mode: 0o755 },
+    );
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    const deadline = Date.now() + 10000;
+    while (!existsSync(started) && Date.now() < deadline) await Bun.sleep(10);
+    expect(existsSync(started)).toBe(true);
+    const pids = readFileSync(started, "utf8").split(" ").map(Number);
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      const at = Date.now();
+      expect(f.cancelRun(run.id)).toBe(true);
+      while (
+        (pids.some(alive) || f.store.listStages(run.id).at(-1)?.status !== "cancelled") &&
+        Date.now() - at < 4900
+      )
+        await Bun.sleep(10);
+      expect(Date.now() - at).toBeLessThan(5000);
+      expect(pids.some(alive)).toBe(false);
+      expect(f.store.listStages(run.id).at(-1)?.status).toBe("cancelled");
+      expect(f.store.getRun(run.id)?.status).toBe("cancelled");
+      expect(existsSync(pushed)).toBe(false);
+      expect(existsSync(join(home, "gh-calls"))).toBe(false);
+    } finally {
+      const group = pids[0];
+      if (group && pids.some(alive)) {
+        try {
+          process.kill(-group, "SIGKILL");
+        } catch {
+          /* already exited */
+        }
+      }
+    }
+  });
+
+  test("private strings outside the published range permit clean delivery", async () => {
+    writeFileSync(join(repoDir, "old.txt"), "secret-host.example");
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "secret-host.example"], {
+      cwd: repoDir,
+    });
+    rmSync(join(repoDir, "old.txt"));
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "removed"], {
+      cwd: repoDir,
+    });
+    const bare = await githubFixture();
+    const f = start((s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(f.store.getRun(run.id)?.prUrl).toBe("https://github.com/test/repo/pull/1");
+  });
+
+  test("private strings stop existing-branch delivery before pushing repairs", async () => {
+    const bare = await githubFixture();
+    const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: repoDir })).stdout.trim();
+    const base = await git("rev-parse", "HEAD");
+    writeFileSync(join(repoDir, "version.txt"), "dependency 2\n");
+    await git("add", ".");
+    await git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "dependency update");
+    const head = await git("rev-parse", "HEAD");
+    await git("push", bare, "HEAD:refs/heads/dependabot/pkg");
+    let reviews = 0;
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ task_class: "dependency_update" }) };
+      if (role === "review")
+        return {
+          structured: reviews++
+            ? approve
+            : {
+                ...approve,
+                verdict: "request_changes",
+                findings: [
+                  {
+                    ...findingEvidence,
+                    severity: "major",
+                    security: false,
+                    file: "version.txt",
+                    line: 1,
+                    title: "Repair",
+                    detail: "Repair",
+                    suggestion: "Repair",
+                  },
+                ],
+              },
+        };
+      return { files: { "farewell.txt": "goodbye\n" }, text: "secret-host.example" };
+    });
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+    registerGithub(f, bare);
+    const run = await f.createRun(
+      {
+        repo: "test/repo",
+        prompt: "Repair dependency",
+        profile: "quick",
+        source: "github",
+        requestedBy: "dependabot[bot]",
+        baseBranch: "dependabot/pkg",
+        deliveryBranch: "dependabot/pkg",
+        sourceRef: {
+          kind: "pull_request",
+          repo: "test/repo",
+          number: 1,
+          headSha: head,
+          baseSha: base,
+          baseRef: "main",
+        },
+      },
+      true,
+    );
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+    expect(reviews).toBe(2);
+    expect(await git("ls-remote", bare, "refs/heads/dependabot/pkg")).toContain(head);
+    expect(f.store.getRun(run.id)?.error).toContain("PR body contains a private string (entry 1");
+    expect(f.store.getRun(run.id)?.error).not.toContain("secret-host.example");
+  });
+
+  test("needs-human draft delivery continues during drain", async () => {
+    const bare = await githubFixture();
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review")
+        return {
+          structured: {
+            verdict: "request_changes",
+            summary: "Needs work",
+            findings: [
+              {
+                label: "unaddressed",
+                prior: "P1",
+                severity: "blocker",
+                security: false,
+                ...findingEvidence,
+                file: "farewell.txt",
+                line: 1,
+                title: "Incorrect output",
+                detail: "Needs work",
+                suggestion: "Fix it",
+              },
+            ],
+          },
+        };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    f.cfg.maxRounds = 1;
+    registerGithub(f, bare);
+    const addEvent = f.store.addEvent.bind(f.store);
+    f.store.addEvent = (event) => {
+      if (event.message?.startsWith("Run needs a human")) f.scheduler.drain();
+      return addEvent(event);
+    };
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+    expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
+    expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
+    expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
   });
 
   test.each(["succeeded", "failed"] as const)(
@@ -3718,6 +4426,8 @@ esac
     "base-script",
     "pr-script",
     "pr-script-removed",
+    "private-comment",
+    "private-marker",
   ])(
     "verify-change: %s",
     async (scenario) => {
@@ -3829,6 +4539,8 @@ protected_paths = ["protected.txt"]
             await commit();
             await git("push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2");
           }
+          if (scenario === "private-comment")
+            return { structured: { ...approve, summary: `${approve.summary} Checked secret-host.example.` } };
           return { structured: approve };
         }
         expect(role).toBe("implement");
@@ -3854,6 +4566,13 @@ protected_paths = ["protected.txt"]
         };
       };
       let f = start(handler);
+      if (["private-comment", "private-marker"].includes(scenario)) {
+        mkdirSync(f.cfg.paths.configDir, { recursive: true });
+        writeFileSync(
+          join(f.cfg.paths.configDir, "private-strings.txt"),
+          scenario === "private-marker" ? "<!-- limitless-verification:" : "secret-host.example",
+        );
+      }
       const calls: string[][] = [];
       const gh = async (args: string[]) => {
         calls.push(args);
@@ -3941,7 +4660,9 @@ protected_paths = ["protected.txt"]
         expect(before?.verification?.headSha).toBe(head);
         if (scenario === "restart-repair") expect(before?.implementedRound).toBe(0);
       }
-      const blocked = prScript || ["persistent", "repair-audit", "empty"].includes(scenario);
+      const blocked =
+        prScript ||
+        ["persistent", "repair-audit", "empty", "private-comment", "private-marker"].includes(scenario);
       expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human", "cancelled"])).toBe(
         scenario === "head-moved" ? "cancelled" : stale ? "failed" : blocked ? "needs_human" : "succeeded",
       );
@@ -3954,6 +4675,15 @@ protected_paths = ["protected.txt"]
       const baseRuns = scenario === "baseline" ? [baseTip, baseTip] : [baseTip];
       expect(revisions.slice(0, baseRuns.length + 1)).toEqual([...baseRuns, head]);
       const remote = (await git("ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).split("\t")[0];
+      if (["private-comment", "private-marker"].includes(scenario)) {
+        expect(calls.some((call) => call.at(-1)?.includes("limitless-verification"))).toBe(false);
+        expect(JSON.stringify(calls)).not.toContain("secret-host.example");
+        expect(remote).toBe(head);
+        expect(f.store.getRun(runId)?.error).toBe(
+          "PR comment contains a private string (entry 1 in private-strings.txt)",
+        );
+        return;
+      }
       if (stale) {
         expect(implementations).toBe(0);
         expect(
@@ -7356,6 +8086,24 @@ describe("review shadow panel: single reviews decide, the panel only records", (
   };
   const shadowOf = (f: Factory, runId: string, round: number) =>
     JSON.parse(f.store.getArtifact(runId, `review-${round}.shadow.json`) ?? "null");
+
+  test("a pinned production reviewer leaves the shadow panel's targets unchanged", async () => {
+    const calls = newCalls();
+    const f = start(scenario(calls));
+    shadowOn(f);
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell",
+      profile: "quick",
+      models: { implement: ["alpha/m"], review: ["alpha/m"] },
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(calls.primary.map((s) => s.target.modelId)).toEqual(["alpha/m", "alpha/m"]);
+    expect(calls.shadow.map((s) => s.target.modelId)).toContain("beta/m");
+    expect(
+      f.store.listInvocations(run.id).some((i) => i.role === "review_shadow" && i.modelId === "beta/m"),
+    ).toBe(true);
+  });
   // Runs differ only in commit SHAs and run ids.
   const normalize = (specs: AgentSpec[], runId: string) =>
     specs.map((s) => s.prompt.replaceAll(runId, "RUN").replace(/\b[0-9a-f]{40}\b/g, "SHA"));
@@ -7809,13 +8557,15 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       billing: "subscription",
       maxConcurrent: 2,
     };
-    const startWithOmega = (calls: Calls) => {
+    const startWithOmega = (calls: Calls, unlimited: string[]) => {
       const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
       const alpha = models[0] as ModelDef;
       factory = new Factory(cfg, {
         confinement: fakeConfinement,
         harnesses: { fake: fakeHarness(scenario(calls)) },
-        providers: [...providers, omega],
+        providers: [...providers, omega].map((p) =>
+          unlimited.includes(p.id) ? { ...p, quota: "unlimited" } : p,
+        ),
         models: [...models, { ...alpha, id: "omega/m", provider: "omega", vendor: "google" }],
         policy,
         bootSha: "test-build",
@@ -7824,10 +8574,10 @@ describe("review shadow panel: single reviews decide, the panel only records", (
       factory.deps.cfg.reviewShadow = "panel";
       return factory;
     };
-    const outcome = async (observed: string[], low?: string) => {
+    const outcome = async (observed: string[], low?: string, unlimited: string[] = []) => {
       await reset();
       const calls = newCalls();
-      const f = startWithOmega(calls);
+      const f = startWithOmega(calls, unlimited);
       for (const id of observed)
         f.tracker.observeWindows(id, { five_hour: { utilization: 0, resetsAt: null } });
       const headroom = f.tracker.headroom.bind(f.tracker);
@@ -7839,6 +8589,13 @@ describe("review shadow panel: single reviews decide, the panel only records", (
     // Omega is enabled but no review route reaches it: unknown or low there never skips the shadow.
     expect((await outcome(["alpha", "beta"])).shadow.status).toBe("completed");
     expect((await outcome(["alpha", "beta"], "omega")).shadow.status).toBe("completed");
+    const noLimit = await outcome([], undefined, ["alpha", "beta"]);
+    expect(noLimit.shadow.status).toBe("completed");
+    expect(noLimit.calls.shadow.length).toBeGreaterThan(0);
+    expect((await outcome([], undefined, ["alpha"])).shadow).toMatchObject({
+      status: "skipped",
+      reason: "beta quota headroom is unknown",
+    });
     // Beta is the roster's route, alpha a fallback (and verifier) route: either unknown skips it.
     for (const [observed, reason] of [
       [["alpha"], "beta quota headroom is unknown"],
@@ -8536,6 +9293,7 @@ describe("routing bounded slot waits", () => {
     catalog = models,
     routing = policy,
     reply?: (s: AgentSpec) => FakeReply | Promise<FakeReply>,
+    runModels?: CreateRunRequest["models"],
   ) {
     const clock = waitClock();
     const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
@@ -8574,7 +9332,7 @@ describe("routing bounded slot waits", () => {
       defaultBranch: "main",
       mergePolicy: "none",
     });
-    const run = factory.store.createRun(repo, { repo: repo.slug, prompt: "wait" });
+    const run = factory.store.createRun(repo, { repo: repo.slug, prompt: "wait", models: runModels });
     const controller = new AbortController();
     const context = new RunContext({ ...factory.deps, tracker, router }, run, repo, controller.signal);
     const stage = factory.store.startStage(run.id, "triage", 0);
@@ -8590,8 +9348,250 @@ describe("routing bounded slot waits", () => {
         deadline,
       });
     const events = () => context.store.listEvents(run.id).filter((e) => e.message.startsWith("waiting for"));
-    return { clock, cfg, tracker, calls, controller, context, run, invoke, events };
+    return { clock, cfg, tracker, router, calls, controller, context, run, invoke, events };
   }
+
+  test.each([false, true])(
+    "implement dispatch history survives a crash inside the harness and database reopen (pinned=%s)",
+    async (pinned) => {
+      const f = fixture(
+        models,
+        policy,
+        () => {
+          throw new SimulatedTermination("daemon terminated during implement harness");
+        },
+        pinned ? { implement: ["alpha/m", "beta/m"] } : undefined,
+      );
+      await expect(f.invoke(undefined, "implement")).rejects.toThrow(SimulatedTermination);
+      expect(f.calls.map((s) => s.target.modelId)).toEqual(["alpha/m"]);
+      f.context.store.close();
+      const reopened = new Store(f.cfg.paths.db);
+      try {
+        const tracker = new ProviderTracker(providers, reopened, f.cfg.reserves, {}, {});
+        const router = new Router(tracker, policy, models);
+        const loaded = new RunContext(
+          { ...f.context.deps, store: reopened, tracker, router },
+          f.run,
+          f.context.repo,
+          new AbortController().signal,
+        );
+        expect(loaded.state.triedImplementers).toEqual([{ modelId: "alpha/m", effort: null }]);
+        expect(
+          router
+            .route("implement", "small", { exclude: loaded.state.triedImplementers })
+            .candidates.map((t) => t.modelId),
+        ).toEqual(["beta/m"]);
+      } finally {
+        reopened.close();
+      }
+    },
+  );
+
+  test.each(["cell", "prefer"])(
+    "live %s edits cancel obsolete capacity waits before invoking",
+    async (edit) => {
+      const routing = { ...policy, implement: { default: ["alpha/m|beta/m"] } };
+      const f = fixture(models, routing);
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], routing);
+      const slots = await Promise.all(
+        ["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      try {
+        const pending = f.invoke(undefined, "implement");
+        expect(f.events()[0]?.message).toContain("waiting for alpha slot");
+        await f.clock.advance(2_500);
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        const outcome = await pending;
+        expect(outcome.target.modelId).toBe("beta/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+        expect(outcome.invocation.waitMs).toBe(2_500);
+        // The obsolete wait is gone even though the old provider has not freed any capacity.
+        expect(f.tracker.status("alpha")?.inFlight).toBe(2);
+        expect(f.tracker.status("beta")?.inFlight).toBe(0);
+        expect(f.clock.pending).toBe(0);
+      } finally {
+        for (const release of slots) release();
+      }
+      expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+    },
+  );
+
+  test.each(["cell", "prefer"])(
+    "a queued pinned implementer survives live %s edits without being tried early",
+    async (edit) => {
+      const f = fixture(models, policy, undefined, { implement: ["alpha/m", "beta/m"] });
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], policy);
+      const slots = await Promise.all(
+        ["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      try {
+        const pending = f.invoke(undefined, "implement");
+        expect(f.events()[0]?.message).toContain("waiting for alpha slot");
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        await f.clock.flush();
+        expect(f.calls).toEqual([]);
+        expect(f.context.state.triedImplementers).toEqual([]);
+        slots[0]?.();
+        expect((await pending).target.modelId).toBe("alpha/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["alpha/m"]);
+        expect(f.context.state.triedImplementers).toEqual([{ modelId: "alpha/m", effort: null }]);
+      } finally {
+        for (const release of slots) release();
+      }
+    },
+  );
+
+  test.each([
+    ["cell", false],
+    ["cell", true],
+    ["prefer", false],
+    ["prefer", true],
+  ] as const)(
+    "a live %s edit cancelling a call before dispatch leaves it eligible for escalation (pinned=%s)",
+    async (edit, pinned) => {
+      const chain = ["alpha/m", "beta/m"];
+      const f = fixture(models, policy, undefined, pinned ? { implement: chain } : undefined);
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], policy);
+      const slots = await Promise.all(
+        ["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      const reached = deferred<void>();
+      const resume = deferred<void>();
+      const save = f.context.save.bind(f.context);
+      const persist = spyOn(f.context, "save").mockImplementationOnce(async () => {
+        reached.resolve();
+        await resume.promise;
+        await save();
+      });
+      try {
+        const pending = f.invoke(undefined, "implement");
+        expect(f.events()[0]?.message).toContain("waiting for alpha slot");
+        // First edit lands while queued; a second races the saved candidate before dispatch.
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        await f.clock.flush();
+        slots[0]?.();
+        await reached.promise;
+        f.tracker.blockModel("alpha/m", "temporarily rejected", 1_000);
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m", "alpha/m"]);
+        else runtime.setPrefer([]);
+        resume.resolve();
+        expect((await pending).target.modelId).toBe("beta/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+        expect(f.context.store.listInvocations(f.run.id).map((i) => i.status)).toEqual(["cancelled", "ok"]);
+        expect(f.context.state.triedImplementers).toEqual([{ modelId: "beta/m", effort: null }]);
+        const loaded = new RunContext(
+          { ...f.context.deps, tracker: f.tracker, router: f.router },
+          f.run,
+          f.context.repo,
+          f.controller.signal,
+        );
+        expect(loaded.state.triedImplementers).toEqual(f.context.state.triedImplementers);
+        await f.clock.advance(1_000);
+        expect(
+          f.router
+            .route("implement", "small", {
+              ...(pinned ? { chain } : {}),
+              exclude: loaded.state.triedImplementers,
+            })
+            .candidates.map((t) => t.modelId),
+        ).toEqual(["alpha/m"]);
+      } finally {
+        resume.resolve();
+        persist.mockRestore();
+        for (const release of slots) release();
+      }
+    },
+  );
+
+  test.each(["cell", "prefer"])(
+    "live %s edits during preflight release the obsolete reservation",
+    async (edit) => {
+      const routing = { ...policy, implement: { default: ["alpha/m|beta/m"] } };
+      const f = fixture(models, routing);
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], routing);
+      const reached = deferred<void>();
+      const resume = deferred<boolean>();
+      const preflight = f.tracker.preflight.bind(f.tracker);
+      const probe = spyOn(f.tracker, "preflight").mockImplementation((provider) => {
+        if (provider !== "alpha") return preflight(provider);
+        reached.resolve();
+        return resume.promise;
+      });
+      try {
+        const pending = f.invoke(undefined, "implement");
+        await reached.promise;
+        expect(f.tracker.status("alpha")?.inFlight).toBe(1);
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        resume.resolve(true);
+        expect((await pending).target.modelId).toBe("beta/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+        expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+        expect(f.tracker.status("beta")?.inFlight).toBe(0);
+      } finally {
+        probe.mockRestore();
+      }
+    },
+  );
+
+  test("a reset reroutes all-provider waits without leaving losing reservations", async () => {
+    const routing = { ...policy, implement: { default: ["beta/m"] } };
+    const f = fixture(models, routing);
+    const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], routing);
+    runtime.setCell("implement", "small", ["alpha/m", "beta/m"]);
+    f.cfg.waitBudgetS.implement = 0;
+    const slots = await Promise.all(
+      ["alpha", "alpha", "beta", "beta"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+    );
+    try {
+      const pending = f.invoke(undefined, "implement");
+      await f.clock.flush();
+      expect(f.events().map((e) => e.message)).toContain("waiting for beta slot (0 ahead), up to unbounded");
+      runtime.setCell("implement", "small", null);
+      // Free the obsolete provider too, racing admission against the routing edit.
+      slots[0]?.();
+      slots[2]?.();
+      expect((await pending).target.modelId).toBe("beta/m");
+      expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+      expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+      expect(f.clock.pending).toBe(0);
+    } finally {
+      for (const release of slots) release();
+    }
+    expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+    expect(f.tracker.status("beta")?.inFlight).toBe(0);
+  });
+
+  test("a live edit during implementer persistence revalidates before the model call", async () => {
+    const f = fixture();
+    const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], policy);
+    const reached = deferred<void>();
+    const resume = deferred<void>();
+    const save = f.context.save.bind(f.context);
+    const persist = spyOn(f.context, "save").mockImplementationOnce(async () => {
+      reached.resolve();
+      await resume.promise;
+      await save();
+    });
+    try {
+      const pending = f.invoke(undefined, "implement");
+      await reached.promise;
+      runtime.setCell("implement", "small", ["beta/m"]);
+      resume.resolve();
+      expect((await pending).target.modelId).toBe("beta/m");
+      expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+      expect(f.context.state.implementer?.modelId).toBe("beta/m");
+      expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+      expect(f.tracker.status("beta")?.inFlight).toBe(0);
+    } finally {
+      persist.mockRestore();
+    }
+  });
 
   test("expiry falls through without an invocation; immediate admission records zero and no wait event", async () => {
     const f = fixture();
@@ -8876,9 +9876,124 @@ describe("routing bounded slot waits", () => {
       for (const release of slots) release();
     }
   });
+
+  test.each(["before routing", "waiting", "admitted", "cancel"])(
+    "a run's pinned chain records deadline exhaustion: %s",
+    async (expiry) => {
+      const f = fixture(models, policy, undefined, { triage: ["alpha/m", "beta/m"] });
+      const now = spyOn(Date, "now").mockImplementation(f.clock.now);
+      const slots = await Promise.all(
+        ["alpha", "alpha", "beta", "beta"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      const waiting = deferred<void>();
+      const unsubscribe = f.context.store.subscribe((message) => {
+        if (
+          message.kind === "event" &&
+          message.event.runId === f.run.id &&
+          message.event.message.startsWith("waiting for")
+        )
+          waiting.resolve();
+      });
+      const invoke = RunContext.prototype.invoke;
+      const invocation = spyOn(RunContext.prototype, "invoke").mockImplementation(async function (
+        this: RunContext,
+        opts,
+      ) {
+        const deadline = f.clock.now() + 60_000;
+        if (expiry === "before routing") await f.clock.advance(60_000);
+        return invoke.call(this, { ...opts, deadline });
+      });
+      const acquire = f.tracker.acquire;
+      function admit(id: string, signal: AbortSignal): Promise<() => void>;
+      function admit(
+        id: string,
+        signal: AbortSignal,
+        ms: number | undefined,
+        onWait?: (ahead: number) => void,
+      ): Promise<(() => void) | null>;
+      async function admit(id: string, signal: AbortSignal, ms?: number, onWait?: (ahead: number) => void) {
+        const release = await acquire.call(f.tracker, id, signal, ms, onWait);
+        if (release && expiry === "admitted") await f.clock.advance(60_000);
+        return release;
+      }
+      const admission = spyOn(f.tracker, "acquire").mockImplementation(admit);
+      try {
+        const pending = executeRun(f.context.deps, f.run.id, f.controller.signal);
+        if (expiry !== "before routing") {
+          await waiting.promise;
+          if (expiry === "cancel") f.controller.abort();
+          else if (expiry === "admitted") slots[0]?.();
+          else {
+            await f.clock.advance(20_000);
+            await f.clock.advance(20_000);
+            await f.clock.advance(20_000);
+          }
+        }
+        expect(await pending).toBe(expiry === "cancel" ? "cancelled" : "needs_human");
+        expect(f.context.store.getRun(f.run.id)?.status).toBe(
+          expiry === "cancel" ? "cancelled" : "needs_human",
+        );
+        const questions = f.context.store.listQuestions(f.run.id);
+        if (expiry === "cancel") expect(questions).toHaveLength(0);
+        else {
+          expect(questions).toHaveLength(1);
+          expect(questions[0]?.question).toContain("triage; pinned chain: alpha/m, beta/m");
+          for (const id of ["alpha/m", "beta/m"])
+            expect(questions[0]?.question).toMatch(new RegExp(`${id} \\([^)]*(busy|deadline)`));
+        }
+        expect(f.calls).toHaveLength(0);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(0);
+        expect(f.clock.pending).toBe(0);
+        for (const release of slots) release();
+        expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+        expect(f.tracker.status("beta")?.inFlight).toBe(0);
+        const release = await f.tracker.acquire(
+          "alpha",
+          f.controller.signal.aborted ? new AbortController().signal : f.controller.signal,
+        );
+        release();
+      } finally {
+        admission.mockRestore();
+        invocation.mockRestore();
+        now.mockRestore();
+        unsubscribe();
+        for (const release of slots) release();
+      }
+    },
+  );
 });
 
 describe("audit allowances (fake agents, real git)", () => {
+  test("private-string audit events and retry feedback redact filenames and values", async () => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "test", run = 'for file in *.txt; do if test "$file" != greeting.txt; then echo "$file"; exit 1; fi; done' }]\n`,
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "gate fixture"], {
+      cwd: repoDir,
+    });
+    const prompts: string[] = [];
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      prompts.push(s.prompt);
+      return { files: { "secret-host.example.txt": "secret-host.example\n" } };
+    });
+    f.cfg.maxRounds = 1;
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+    const events = f.store.listEvents(run.id).filter((e) => e.type === "audit");
+    expect(events.length).toBeGreaterThan(0);
+    expect(JSON.stringify(events)).toContain("entry 1 in private-strings.txt");
+    expect(JSON.stringify(events)).not.toContain("secret-host.example");
+    expect(prompts[1]).toContain("entry 1 in private-strings.txt");
+    expect(prompts[1]).not.toContain("secret-host.example");
+  });
+
   /** Commits a nested repository into the implementer's worktree, which Git records as a gitlink. */
   const nestedRepository = async (cwd: string) => {
     const nested = join(cwd, "vendor");

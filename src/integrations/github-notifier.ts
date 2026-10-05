@@ -1,5 +1,6 @@
 import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
 import { sh } from "../util/proc.ts";
 import type { GhRunner } from "./github.ts";
 import { type Context, rollup } from "./github-poller.ts";
@@ -175,6 +176,8 @@ export function startGitHubNotifier(
   gh: GhRunner,
   log: (message: string) => void = console.warn,
   client: GitHubPrClient = getGitHubPr,
+  configDir?: string,
+  roots: string[] = [],
 ): () => void {
   const seen = new Set<string>();
   let stopped = false;
@@ -232,6 +235,13 @@ export function startGitHubNotifier(
     const body = terminal
       ? `Limitless run ${run.id} finished: **${run.status}**.\nPR: ${run.prUrl ?? "none"}\nCost: $${run.costUsd.toFixed(2)} (${run.costEquivUsd.toFixed(2)} subscription equivalent).`
       : `Limitless run created: ${run.id}`;
+    try {
+      const cwd = store.getRunState<{ worktreePath?: string }>(run.id)?.worktreePath;
+      const entries = loadPrivateStrings(configDir, [cwd, store.getRepo(run.repoId)?.localPath, ...roots]);
+      checkPrivateText(body, "Factory comment", entries);
+    } catch {
+      return log("Factory comment blocked by private-string policy");
+    }
     void gh([
       ref.kind === "issue" ? "issue" : "pr",
       "comment",

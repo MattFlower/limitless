@@ -12,6 +12,7 @@ import {
   singleFlight,
 } from "../gates/cache.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
+import { checkPrivateText, loadPrivateStrings, PrivateError, redactPrivate } from "../gates/private.ts";
 import {
   compareGates,
   type GateComparison,
@@ -22,10 +23,11 @@ import {
   retryRegressions,
   runGates,
 } from "../gates/run.ts";
-import { worktreeGitScope } from "../git/command.ts";
+import { worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
   checkoutCommitted,
+  checkPrivateRange,
   commitAll,
   createPullRequest,
   createWorktree,
@@ -54,6 +56,7 @@ import { commandScope, confinementScope, seatbeltBackend } from "../harness/sand
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
+import { processScope } from "../util/proc.ts";
 import {
   CancelledError,
   type EngineDeps,
@@ -139,10 +142,13 @@ export async function executeRun(
     return "failed";
   }
   // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
-  return confinementScope.run(deps.confinement ?? seatbeltBackend, () =>
-    worktreeGitScope.run(true, () =>
-      executeScopedRun(new RunContext(deps, run, repo, signal, isDraining, drainEvents), signal),
-    ),
+  const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
+  return processScope.run(
+    { signal: ctx.signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set() },
+    () =>
+      confinementScope.run(deps.confinement ?? seatbeltBackend, () =>
+        worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
+      ),
   );
 }
 
@@ -247,7 +253,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       (!ctx.run.prUrl || !!ctx.state.needsHumanReason) &&
       (ctx.state.phase === "deliver" || ctx.state.conflictRound !== undefined);
     const needsHuman = e instanceof NeedsHumanError || e instanceof NoCapacityError || !!verifiedFailure;
-    const message = (e as Error).message;
+    let message = (e as Error).message;
     const failureStage =
       ctx.state.conflictRound !== undefined
         ? "conflict resolution"
@@ -280,6 +286,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           (err instanceof SimulatedTermination || ctx.termination || err instanceof InjectedFault)
         )
           return "running";
+        if (err instanceof NeedsHumanError) message = err.message;
         ctx.log(`Could not open verified-work draft PR: ${(err as Error).message}`, "warn");
       }
     } else if (
@@ -303,6 +310,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           return "running";
         // Cancellation or shutdown during the draft must not be recorded as the original failure.
         if (err instanceof CancelledError || signal.aborted) return cancelled();
+        if (err instanceof NeedsHumanError) message = err.message;
         ctx.log(`Could not open draft PR: ${(err as Error).message}`, "warn");
       }
     }
@@ -910,6 +918,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
                 current.effort === undefined
                   ? (current.targetId ?? current.modelId)
                   : { modelId: current.modelId, effort: current.effort },
+              preferPolicyRevision: current.policyRevision,
             }
           : {};
         if (escalate) {
@@ -919,12 +928,13 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             { exclude: ctx.state.triedImplementers },
             {},
           ];
-          constraints =
-            options.find(
-              (c) =>
-                ctx.deps.router.route("implement", ctx.complexity, ctx.routingConstraints(c)).candidates
-                  .length,
-            ) ?? {};
+          constraints = ctx.run.models?.implement
+            ? { exclude: ctx.state.triedImplementers }
+            : (options.find(
+                (c) =>
+                  ctx.deps.router.route("implement", ctx.complexity, ctx.routingConstraints(c)).candidates
+                    .length,
+              ) ?? {});
           ctx.log(`Escalating implementer beyond ${current.modelId}`, "warn", { constraints });
           ctx.state.roundsOnImplementer = 0;
         }
@@ -947,13 +957,6 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             resolution: merge,
           }),
         });
-        ctx.state.implementer = {
-          modelId: target.modelId,
-          targetId: target.targetId,
-          effort: target.effort ?? null,
-          tier: target.tier,
-          vendor: target.vendor,
-        };
         if (
           !ctx.state.triedImplementers.some(
             (ref) =>
@@ -1022,7 +1025,9 @@ async function oneRound(
   const cwd = ctx.state.worktreePath as string;
   const gates = ctx.state.gatesConfig as GateConfig;
   const baseSha = ctx.state.verification?.baseSha ?? (ctx.run.baseSha as string);
-  const changeDiff = () => diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change");
+  const privateStrings = () => privateEntries(ctx, cwd);
+  const changeDiff = () =>
+    diffSince(cwd, baseSha, undefined, ctx.state.flow === "verify-change", privateStrings());
   const system =
     ctx.deps.reviewSystem ?? configuredReviewSystem(ctx.deps.cfg, profile(ctx), ctx.state.reviewLenses);
   const resolution = ctx.state.conflictRound === round;
@@ -1135,6 +1140,7 @@ async function oneRound(
     "audit",
     async () => {
       const findings = auditDiff(diff, {
+        configDir: ctx.deps.cfg.paths.configDir,
         allow: ctx.run.allow ?? [],
         taskClass: ctx.state.verification && ctx.run.taskClass === "question" ? null : ctx.run.taskClass,
         protectedPaths: gates.protectedPaths,
@@ -1154,10 +1160,17 @@ async function oneRound(
         },
       });
       if (ctx.state.verification) {
-        const repairs = await diffSince(cwd, ctx.state.verification.headSha);
+        const repairs = await diffSince(
+          cwd,
+          ctx.state.verification.headSha,
+          undefined,
+          false,
+          privateStrings(),
+        );
         if (repairs.files.length)
           findings.push(
             ...auditDiff(repairs, {
+              configDir: ctx.deps.cfg.paths.configDir,
               allow: ctx.run.allow ?? [],
               taskClass: ctx.run.taskClass,
               protectedPaths: gates.protectedPaths,
@@ -1199,6 +1212,7 @@ async function oneRound(
       ? `### Your previous session ended early\n${ctx.state.implementerIssue}\nKeep the next attempt focused and finish by running the checks.`
       : "";
     ctx.state.feedback = [issue, gateFeedback, auditFeedback].filter(Boolean).join("\n\n");
+    ctx.state.feedback = redactPrivate(ctx.state.feedback, privateStrings());
     await ctx.save();
     ctx.log(
       comparison.some((c) => c.blocking && c.result.timedOut)
@@ -1305,7 +1319,7 @@ async function oneRound(
             try {
               return await call(request, constraints, finder?.target, deadline);
             } catch (error) {
-              if ((finder?.local || shadow) && error instanceof NoCapacityError)
+              if ((shadow || (finder?.local && !ctx.run.models?.review)) && error instanceof NoCapacityError)
                 throw new FinderSkipped(error.message);
               throw error;
             }
@@ -1316,7 +1330,7 @@ async function oneRound(
             const skip = (error: unknown): never => {
               throw error instanceof Preempted ? new FinderSkipped(error.message) : error;
             };
-            if (!system.verifier?.targets)
+            if (!system.verifier?.targets || (ctx.run.models?.review && !shadow))
               return call(request, constraints, system.verifier?.target).catch(skip);
             // Picked per batch, as evals do, and offered alone: a routed fallback could share its vendor.
             const listed = system.verifier.targets.map((target) => {
@@ -1606,6 +1620,48 @@ function deliveryBudget(ctx: RunContext): GitHubBudget {
   return budget;
 }
 
+function privateEntries(ctx: RunContext, cwd: string) {
+  const { configDir, repos, work } = ctx.deps.cfg.paths;
+  return loadPrivateStrings(configDir, [cwd, ctx.repo.localPath, repos, work]);
+}
+
+/** Without `pr`, `body` is a PR comment and only its text is checked. */
+async function checkPublication(ctx: RunContext, body: string, pr?: { sha: string; title: string }) {
+  const cwd = ctx.state.worktreePath as string;
+  try {
+    const entries = privateEntries(ctx, cwd);
+    if (!entries.length) return;
+    checkPrivateText(body, pr ? "PR body" : "PR comment", entries);
+    if (!pr) return;
+    checkPrivateText(pr.title, "PR title", entries);
+    checkPrivateText(ctx.run.deliveryBranch ?? ctx.run.branch ?? "", "Branch name", entries);
+    await checkPrivateRange(cwd, `${ctx.run.baseSha}..${pr.sha}`, entries);
+    const messages = await worktreeGit(
+      [
+        "git",
+        "-c",
+        "i18n.logOutputEncoding=UTF-8",
+        "log",
+        "--encoding=UTF-8",
+        "--format=%B",
+        `${ctx.run.baseSha}..${pr.sha}`,
+      ],
+      { cwd },
+    );
+    checkPrivateText(messages.stdout, "Commit message", entries);
+    const findings = auditDiff(await diffSince(cwd, ctx.run.baseSha as string, undefined, false, entries), {
+      configDir: ctx.deps.cfg.paths.configDir,
+      taskClass: ctx.run.taskClass,
+      protectedPaths: [],
+    });
+    const hit = findings.find((f) => f.rule === "private-string");
+    if (hit) throw new PrivateError(hit.detail);
+  } catch (error) {
+    const reason = error instanceof PrivateError ? error.message : "Private-string check blocked";
+    throw new NeedsHumanError(reason);
+  }
+}
+
 async function deliverVerifiedDraft(
   ctx: RunContext,
   sha: string,
@@ -1630,6 +1686,7 @@ async function deliverVerifiedDraft(
   }
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
+  await checkPublication(ctx, report, { sha, title: `[needs human] ${ctx.run.title}` });
   await pushBranch(ctx.repo, cwd, branch, sha, ctx.signal, budget);
   ctx.checkCancelled();
   const url = await createPullRequest(ctx.repo, {
@@ -1843,7 +1900,9 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
               ctx.checkCancelled();
-              await runner([...comment, "--body", `${marker}\n${report}`], ctx.signal);
+              const body = `${marker}\n${report}`;
+              await checkPublication(ctx, body);
+              await runner([...comment, "--body", body], ctx.signal);
             },
             { budget, signal: ctx.signal },
           ).catch(async (error: unknown) => {
@@ -1902,6 +1961,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         note("the branch does not contain the recorded base");
     }
     const report = buildReport(ctx, success);
+    const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
+    await checkPublication(ctx, report, { sha: await headSha(cwd), title });
 
     const publish = () => {
       ctx.store.putArtifact(ctx.run.id, "report.md", "report", report);
@@ -1959,7 +2020,6 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     ctx.checkCancelled();
     await pushBranch(ctx.repo, cwd, ctx.run.branch as string, "HEAD", ctx.signal, budget);
     ctx.checkCancelled();
-    const title = success ? ctx.run.title : `[needs human] ${ctx.run.title}`;
     const url = await createPullRequest(ctx.repo, {
       branch: ctx.run.branch as string,
       base: ctx.run.baseBranch as string,
@@ -1984,7 +2044,14 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     let summary = `PR ${url}`;
     if (policy === "auto") {
       ctx.checkCancelled();
-      const outcome = await mergePullRequest(url, cwd, ctx.run.title, ctx.signal, budget);
+      const outcome = await mergePullRequest(
+        url,
+        cwd,
+        ctx.run.headSha as string,
+        ctx.signal,
+        budget,
+        privateEntries(ctx, cwd),
+      );
       if (outcome === "merged") ctx.run = ctx.store.updateRun(ctx.run.id, { merged: true });
       summary += ` — ${outcome === "merged" ? "merged" : outcome === "auto" ? "auto-merge enabled" : `merge failed (left open)${outcome === "unavailable" ? ": GitHub unavailable" : ""}`}`;
       ctx.log(summary, outcome === "failed" || outcome === "unavailable" ? "warn" : "info");

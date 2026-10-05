@@ -8,31 +8,60 @@ pr="$1"
 subject="$2"
 dir="${3:-.}"
 repo="MattFlower/limitless"
+private_check="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-private-strings.ts"
+[[ "${LIMITLESS_CONFIG_DIR-/}" = /* ]] || export LIMITLESS_CONFIG_DIR="$PWD/$LIMITLESS_CONFIG_DIR"
 # The checkout's own CLI: `limitless` need not be on PATH.
 cli="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/cli/main.ts"
 cd "$dir"
+checker=""
+trap '[ -z "$checker" ] || { kill -TERM "$checker" 2>/dev/null || :; wait "$checker" || :; }; exit 1' TERM INT
+# The worktree's bunfig.toml (preload) and .env must not reach the checker.
+check_private() { bun --config=/dev/null --no-env-file "$private_check" "$@" & checker=$!; wait "$checker"; checker=""; }
+# Factory git after PR code has run: no hooks (files or config), filters, fsmonitor, forged commit-graph or bitmaps.
+export LIMITLESS_GIT_EMPTY_HOOK=""
+safe_git() {
+  # Key names never contain newlines (git forbids them in subsections); no temp files, which confined runs can't create.
+  local keys key flags=()
+  keys="$(git config --name-only --get-regexp '^(hook|filter)\.')" || [ $? = 1 ] || return 1
+  set -f
+  local IFS=$'\n'
+  for key in $keys; do flags+=("--config-env=$key=LIMITLESS_GIT_EMPTY_HOOK"); done
+  set +f
+  git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
+    ${flags[@]+"${flags[@]}"} "$@"
+}
 
-bun install --frozen-lockfile >/dev/null
-check_log="${TMPDIR:-/tmp}/land-pr-check.log"
-if ! bun "$cli" gate-slot --name "land-pr #$pr" -- bun run check >"$check_log" 2>&1; then
-  echo "bun run check failed; see $check_log" >&2
+admin="$(cd "$(git rev-parse --absolute-git-dir)" && pwd -P)"
+common="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)" && pwd -P)"
+paths="$(check_private --record)"
+{ IFS= read -r GIT_WORK_TREE; IFS= read -r GIT_DIR; IFS= read -r GIT_COMMON_DIR; ! IFS= read -r extra; } <<< "$paths" || exit 1
+[[ "$GIT_WORK_TREE" = "$(pwd -P)" && "$GIT_DIR" = "$admin" && "$GIT_COMMON_DIR" = "$common" ]] || exit 1
+# A planted graft or shallow file could hide ancestry from the scan and still be pushed.
+export GIT_GRAFT_FILE=/dev/null/none GIT_SHALLOW_FILE=""
+export GIT_WORK_TREE GIT_DIR GIT_COMMON_DIR
+env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun install --frozen-lockfile >/dev/null
+log="${LAND_PR_LOG:-${TMPDIR:-/tmp}/land-pr-check.$$.log}"
+if ! env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_GRAFT_FILE -u GIT_SHALLOW_FILE bun "$cli" gate-slot --name "land-pr #$pr" -- bun run check >"$log" 2>&1; then
+  echo "bun run check failed; see $log" >&2
   exit 1
 fi
 
-git add -A
-if ! git diff --cached --quiet || [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
-  git commit -q -m "Merge main into PR $pr
+safe_git add -A
+check_private "$pr" "$repo" "$subject"
+if ! safe_git diff --cached --quiet || [ -f "$(safe_git rev-parse --git-path MERGE_HEAD)" ]; then
+  safe_git commit --no-verify -q -m "Merge main into PR $pr
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 fi
-if [ -n "$(git status --porcelain)" ]; then
+if [ -n "$(safe_git status --porcelain)" ]; then
   echo "worktree still dirty after commit" >&2
   exit 1
 fi
 
+sha="$(safe_git rev-parse HEAD)"
 head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
-git push -q origin "HEAD:refs/heads/$head_ref"
-sha="$(git rev-parse HEAD)"
+check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
+safe_git push --no-verify -q --no-follow-tags origin "$sha:refs/heads/$head_ref"
 
 # Wait for the CI run on exactly this commit, then require success.
 run=""
@@ -50,5 +79,5 @@ if ! gh run watch "$run" -R "$repo" --exit-status >/dev/null; then
   exit 1
 fi
 
-gh pr merge "$pr" -R "$repo" --squash --delete-branch --subject "$subject" --match-head-commit "$sha"
+check_private "$pr" "$repo" --merge "$sha"
 echo "landed #$pr at $sha"

@@ -21,13 +21,16 @@ import { parseAllow } from "../src/core/allow.ts";
 import type { AuditAllowance, Repo } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { attributeRules, auditDiff } from "../src/gates/audit.ts";
+import { loadPrivateStrings } from "../src/gates/private.ts";
 import { collectGarbage } from "../src/gc.ts";
 import { recordWorktree, worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
 import {
   addDetachedWorktree,
   attributeLimits,
+  blobPrivateEntries,
   checkoutCommitted,
+  checkPrivateRange,
   commitAll,
   createWorktree,
   diffSince,
@@ -40,7 +43,7 @@ import {
   resetTo,
   sweepClassificationScratch,
 } from "../src/git/repos.ts";
-import { sh } from "../src/util/proc.ts";
+import { processScope, sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -90,6 +93,41 @@ async function audited(files = ["sample.test.ts"]) {
     expect(await readFileAt(work, "HEAD", file)).toBe(edited);
   }
 }
+
+test.each([false, true])(
+  "private strings in binary or -diff content block (replacement: %s)",
+  async (replace) => {
+    const configDir = join(dir, "config");
+    mkdirSync(configDir);
+    writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\n");
+    writeFileSync(join(work, ".gitattributes"), "*.dat -diff\n");
+    writeFileSync(join(work, "hidden.dat"), "SECRET-HOST.EXAMPLE\n");
+    // The entry straddles a 64 KiB stream chunk boundary.
+    const blob = Buffer.alloc(200_000);
+    blob.write("secret-host.example", 65_530);
+    writeFileSync(join(work, "blob.bin"), blob);
+    await commitAll(work, "hidden content");
+    if (replace) {
+      const original = (await git(work, "rev-parse", "HEAD:blob.bin")).stdout.trim();
+      const clean = (
+        await sh(["git", "hash-object", "-w", "--stdin"], { cwd: work, stdin: "clean\0" })
+      ).stdout.trim();
+      await git(work, "replace", original, clean);
+      expect((await git(work, "cat-file", "blob", original)).stdout).toBe("clean\0");
+    }
+    // Without a denylist no blob is read.
+    expect((await diffSince(work, base)).privateHits).toEqual([]);
+    const diff = await diffSince(work, base, undefined, false, loadPrivateStrings(configDir));
+    expect(diff.privateHits).toContainEqual({ path: "blob.bin", entry: 1 });
+    expect(diff.patch).not.toContain("secret-host.example");
+    const findings = auditDiff(diff, { configDir, taskClass: null, protectedPaths: [] }).filter(
+      (f) => f.rule === "private-string",
+    );
+    expect(findings.map((f) => f.file).sort()).toEqual(["blob.bin", "hidden.dat"]);
+    expect(findings.every((f) => f.severity === "block")).toBe(true);
+    expect(JSON.stringify(findings).toLowerCase()).not.toContain("secret-host.example");
+  },
+);
 
 test("committed -diff attributes cannot hide skipped tests, while 500 KB binaries stay compact", async () => {
   writeFileSync(join(work, ".gitattributes"), "*.ts -diff\n*.png diff\n");
@@ -1593,6 +1631,10 @@ test.each([
   ["onnx", "valid", false],
   ["\npointer.png", "valid", false],
   ["ts", "valid", true],
+  ["ts", "crlf", true],
+  ["ts", "legacy", true],
+  ["png", "crlf", false],
+  ["png", "legacy", false],
   ["png", "missing oid", true],
   ["psd", "missing oid", true],
   ["png", "missing size", true],
@@ -1600,6 +1642,8 @@ test.each([
   ["png", "invalid size", true],
 ])("LFS pointer %s (%s) receives only the non-source-path exemption", async (extension, kind, blocks) => {
   let pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 68\n`;
+  if (kind === "crlf") pointer = pointer.replaceAll("\n", "\r\n");
+  if (kind === "legacy") pointer = pointer.replace("git-lfs", "hawser");
   if (kind === "missing oid") pointer = pointer.replace(/oid.*\n/, "");
   if (kind === "missing size") pointer = pointer.replace(/size.*\n/, "");
   if (kind === "invalid hash") pointer = pointer.replace("a".repeat(64), "bad");
@@ -1629,7 +1673,15 @@ test.each([
   await factory("commit", "-qm", "LFS pointer fixture");
   const findings = auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] });
   expect(attributeBlocksOf(findings).length > 0).toBe(blocks);
-  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+  if (["valid", "crlf", "legacy"].includes(kind))
+    expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+  else
+    expect(findings.filter((f) => f.rule === "binary-content")).toEqual([
+      expect.objectContaining({
+        severity: "block",
+        detail: expect.stringContaining("Malformed LFS pointer"),
+      }),
+    ]);
 });
 
 test.each(["diff", "-diff"])(
@@ -1789,7 +1841,7 @@ test("16,000 added files use stdin pathspecs without uncertainty findings", asyn
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
 }, 120_000);
 
-test("LFS inspection skips short blobs and checks repeated candidate blobs once", async () => {
+test("LFS inspection batches short and repeated candidate blobs per tree", async () => {
   const pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 2\n`;
   for (let i = 0; i < 128; i++) {
     writeFileSync(join(work, `short-${i}.dat`), `small text ${i}\n`);
@@ -1808,9 +1860,9 @@ test("LFS inspection skips short blobs and checks repeated candidate blobs once"
   const diff = await diffSince(work, revision, shim.env);
   expect(diff.binaryErrors).toBeUndefined();
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
-  // The two distinct candidate blobs at base are read in one batch; head has no candidates.
+  // Short blobs also need classification: each tree still uses only one batch.
   expect(shim.calls().filter((call) => ` ${call} `.includes(" cat-file -p "))).toEqual([]);
-  expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(1);
+  expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(2);
 }, 30_000);
 
 test("failed binary classification blocks even with attribute and binary allowances", async () => {
@@ -1909,7 +1961,16 @@ test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size
     );
     await factory("commit", "-qm", "binary LFS edit");
     const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
-    expect(findings.filter((f) => f.rule === "binary-content").length).toBe(kind === "valid" ? 0 : 3);
+    expect(findings.filter((f) => f.rule === "binary-content")).toEqual(
+      kind === "valid"
+        ? []
+        : [
+            expect.objectContaining({
+              severity: "block",
+              detail: expect.stringContaining("Malformed LFS pointer"),
+            }),
+          ],
+    );
   },
 );
 
@@ -2098,3 +2159,338 @@ test("recorded directories override inherited Git authority; missing records fai
   await expect(commitAll(work, "unrecorded")).rejects.toThrow("Missing trusted Git paths");
   await expect(checkoutCommitted(work)).rejects.toThrow("Missing trusted Git paths");
 });
+
+test.each([
+  ["GIT_AUTHOR_NAME", "author name"],
+  ["GIT_AUTHOR_EMAIL", "author email"],
+  ["GIT_COMMITTER_NAME", "committer name"],
+  ["GIT_COMMITTER_EMAIL", "committer email"],
+])("publication checks %s even after its changes are removed", async (variable, field) => {
+  const config = join(dir, "config");
+  mkdirSync(config);
+  writeFileSync(join(config, "private-strings.txt"), "secret-host.example");
+  writeFileSync(join(work, "transient.txt"), "safe");
+  await git(work, "add", ".");
+  await sh(["git", "commit", "-qm", "safe"], {
+    cwd: work,
+    env: { ...(process.env as Record<string, string>), [variable]: "secret-host.example" },
+  });
+  rmSync(join(work, "transient.txt"));
+  await commitAll(work, "remove transient");
+  const error = await checkPrivateRange(work, `${base}..HEAD`, loadPrivateStrings(config)).catch(
+    (error: unknown) => error,
+  );
+  expect(error).toBeInstanceOf(Error);
+  expect(String(error)).toContain(field);
+  expect(String(error)).not.toContain("secret-host.example");
+});
+
+test.each(["author-email", "message", "clean"])(
+  "publication ignores UTF-16 log config: %s",
+  async (scenario) => {
+    await git(work, "config", "i18n.logOutputEncoding", "UTF-16");
+    writeFileSync(join(work, "safe.txt"), "safe");
+    await git(work, "add", ".");
+    await git(
+      work,
+      "commit",
+      "--author=Safe <" +
+        (scenario === "author-email" ? "fake@secret-host.example" : "safe@example.com") +
+        ">",
+      "-qm",
+      scenario === "message" ? "Safe subject\n\nsecret-host.example" : "safe",
+    );
+    const scan = checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]);
+    if (scenario === "clean") await scan;
+    else {
+      const error = await scan.catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain("entry 1");
+      expect(String(error)).not.toContain("secret-host.example");
+      if (scenario === "author-email") expect(String(error)).toContain("author email");
+    }
+  },
+);
+
+test("a planted graft cannot hide a published ancestor from the range check", async () => {
+  writeFileSync(join(work, "transient.txt"), "safe");
+  await commitAll(work, "hidden subject\n\nsecret-host.example");
+  const hidden = await headSha(work);
+  writeFileSync(join(work, "safe.txt"), "safe");
+  await commitAll(work, "safe");
+  const tip = await headSha(work);
+  // The graft makes the tip look parentless, hiding the denylisted commit from rev-list.
+  const common = (
+    await sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: work })
+  ).stdout.trim();
+  mkdirSync(join(common, "info"), { recursive: true });
+  writeFileSync(join(common, "info", "grafts"), `${tip}\n`);
+  expect(hidden).not.toBe(tip);
+  await expect(
+    checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]),
+  ).rejects.toThrow("entry 1");
+});
+
+/** Points one parent slot of `target` in a commit-graph file's CDAT chunk at `parent`, as a forged graph would. */
+function forgeGraphParent(path: string, target: string, slot: number, parent: string) {
+  const data = readFileSync(path);
+  const hashLength = data[5] === 1 ? 20 : 32;
+  const chunks = new Map<string, number>();
+  for (let i = 0; i <= (data[6] ?? 0); i++) {
+    const at = 8 + i * 12;
+    chunks.set(data.subarray(at, at + 4).toString("latin1"), Number(data.readBigUInt64BE(at + 4)));
+  }
+  const [fanout, lookup, cdat] = ["OIDF", "OIDL", "CDAT"].map((id) => chunks.get(id));
+  if (fanout === undefined || lookup === undefined || cdat === undefined)
+    throw new Error("unexpected commit-graph");
+  const oids = Array.from({ length: data.readUInt32BE(fanout + 255 * 4) }, (_, i) =>
+    data.subarray(lookup + i * hashLength, lookup + (i + 1) * hashLength).toString("hex"),
+  );
+  data.writeUInt32BE(
+    oids.indexOf(parent),
+    cdat + oids.indexOf(target) * (hashLength + 16) + hashLength + 4 * slot,
+  );
+  writeFileSync(path, data);
+}
+
+test.each(["shallow", "commit-graph"])(
+  "a planted %s cannot hide a published ancestor from the range check",
+  async (kind) => {
+    writeFileSync(join(work, "transient.txt"), "safe");
+    await commitAll(work, "hidden subject\n\nsecret-host.example");
+    const hidden = await headSha(work);
+    writeFileSync(join(work, "mid.txt"), "safe");
+    await commitAll(work, "mid");
+    const mid = await headSha(work);
+    writeFileSync(join(work, "safe.txt"), "safe");
+    await commitAll(work, "safe");
+    const tip = await headSha(work);
+    const common = (
+      await sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: work })
+    ).stdout.trim();
+    // Either one makes `mid` look parentless or based directly on `base`, skipping the denylisted commit.
+    if (kind === "shallow") writeFileSync(join(common, "shallow"), `${mid}\n`);
+    else {
+      await sh(["git", "commit-graph", "write", "--reachable"], { cwd: work });
+      const graph = join(common, "objects", "info", "commit-graph");
+      chmodSync(graph, 0o644);
+      forgeGraphParent(graph, mid, 0, base);
+    }
+    expect((await sh(["git", "rev-list", `${base}..${tip}`], { cwd: work })).stdout).not.toContain(hidden);
+    await expect(
+      checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]),
+    ).rejects.toThrow("entry 1");
+  },
+);
+
+test("factory git ignores commit-graphs and pack bitmaps, which could change what a push sends", async () => {
+  const bin = join(dir, "logging-bin");
+  const calls = join(dir, "git-calls");
+  mkdirSync(bin);
+  const real = Bun.which("git");
+  if (!real) throw new Error("missing git");
+  writeFileSync(join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\nexec '${real}' "$@"\n`, {
+    mode: 0o755,
+  });
+  await worktreeGit(["git", "rev-parse", "HEAD"], {
+    cwd: work,
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } as Record<string, string>,
+  });
+  const call = readFileSync(calls, "utf8")
+    .split("\n")
+    .find((line) => line.endsWith("rev-parse HEAD"));
+  expect(call).toContain("-c core.commitGraph=false -c pack.useBitmaps=false");
+});
+
+test.each(["mergetag", "gpgsig", "encoding", "utf8", "invalid-utf8", "message-header", "replacement"])(
+  "publication inspects raw commit headers: %s",
+  async (scenario) => {
+    const tree = (await git(work, "rev-parse", `${base}^{tree}`)).stdout.trim();
+    const tag = `mergetag object ${base}\n type commit\n tag safe\n tagger Safe <fake@secret-host.example> 1 +0000\n \n safe tag\n`;
+    const extra =
+      scenario === "gpgsig"
+        ? "gpgsig safe\n secret-host.example\n"
+        : ["mergetag", "replacement"].includes(scenario)
+          ? tag
+          : scenario === "encoding"
+            ? "encoding ISO-8859-1\n"
+            : scenario === "utf8"
+              ? "encoding UTF-8\n"
+              : "";
+    const raw = `tree ${tree}\nparent ${base}\nauthor Safe <safe@example.com> 1 +0000\ncommitter Safe <safe@example.com> 1 +0000\n${extra}\nsafe${scenario === "message-header" ? "\nencoding ISO-8859-1" : ""}\n`;
+    const object = join(dir, "commit-object");
+    writeFileSync(
+      object,
+      scenario === "invalid-utf8" ? Buffer.concat([Buffer.from(raw), Buffer.from([0xff])]) : raw,
+    );
+    const sha = (await git(work, "hash-object", "-t", "commit", "-w", object)).stdout.trim();
+    await git(work, "reset", "--hard", sha);
+    if (scenario === "replacement") await git(work, "replace", sha, base);
+    expect((await git(work, "tag", "--list")).stdout).toBe("");
+    const scan = checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]);
+    if (["utf8", "message-header"].includes(scenario)) await scan;
+    else {
+      const error = await scan.catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain(["encoding", "invalid-utf8"].includes(scenario) ? "UTF-8" : "entry 1");
+      expect(String(error)).not.toContain("secret-host.example");
+      expect(String(error)).not.toContain("safe@example.com");
+      expect(String(error)).not.toContain("ISO-8859-1");
+    }
+  },
+);
+
+test.each(["patch", "message", "merge", "excluded"])("publication range checks %s", async (scenario) => {
+  const entries = [{ value: "secret-host.example", entry: 1 }];
+  writeFileSync(
+    join(work, "transient.txt"),
+    ["message", "merge"].includes(scenario) ? "safe" : "secret-host.example",
+  );
+  await commitAll(work, scenario === "message" ? "safe subject\n\nsecret-host.example" : "safe");
+  if (scenario === "merge") {
+    const side = await headSha(work);
+    await git(work, "reset", "--hard", base);
+    writeFileSync(join(work, "other.txt"), "safe");
+    await commitAll(work, "other");
+    await git(work, "merge", "--no-ff", "--no-commit", side);
+    writeFileSync(join(work, "transient.txt"), "secret-host.example");
+    await commitAll(work, "safe merge");
+  }
+  rmSync(join(work, "transient.txt"));
+  await commitAll(work, "remove transient");
+  const start = scenario === "excluded" ? await headSha(work) : base;
+  writeFileSync(join(work, "safe.txt"), "safe");
+  await commitAll(work, "safe");
+  const scan = checkPrivateRange(work, `${start}..HEAD`, entries);
+  if (scenario === "excluded") await scan;
+  else await expect(scan).rejects.toThrow("entry 1");
+});
+
+test("publication range checks gitlink paths even when config ignores submodules", async () => {
+  await git(work, "config", "diff.ignoreSubmodules", "all");
+  await git(work, "update-index", "--add", "--cacheinfo", `160000,${base},secret-host.example`);
+  await git(work, "commit", "--no-verify", "-qm", "safe");
+  await git(work, "rm", "-q", "--cached", "secret-host.example");
+  await git(work, "commit", "--no-verify", "-qm", "remove gitlink");
+  await expect(
+    checkPrivateRange(work, `${base}..HEAD`, [{ value: "secret-host.example", entry: 1 }]),
+  ).rejects.toThrow("entry 1");
+});
+
+test.each([
+  "matching",
+  "clean",
+  "missing",
+  "unreadable",
+  "removed",
+  "staged",
+  "extended",
+  "extended-clean",
+  "corrupt",
+  "crlf",
+  "legacy",
+  "legacy-crlf",
+  "crlf-clean",
+  "legacy-clean",
+  "malformed",
+  "bad-extension",
+])("LFS payload inspection: %s", async (scenario) => {
+  const payload = Buffer.from(scenario.includes("clean") ? "safe\0" : "%73ecret-host.example\0");
+  const oid = createHash("sha256").update(payload).digest("hex");
+  const object = join(seed, ".git", "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+  mkdirSync(join(object, ".."), { recursive: true });
+  if (scenario === "unreadable") mkdirSync(object);
+  else if (scenario !== "missing")
+    writeFileSync(object, scenario === "corrupt" ? Buffer.alloc(payload.length, 97) : payload);
+  let pointer = `version https://${scenario.startsWith("legacy") ? "hawser" : "git-lfs"}.github.com/spec/v1\n${scenario.startsWith("extended") ? `ext-0-test sha256:${"a".repeat(64)}\n` : ""}oid sha256:${oid}\nsize ${payload.length}\n`;
+  if (scenario.includes("crlf")) pointer = pointer.replaceAll("\n", "\r\n");
+  if (scenario === "malformed") pointer = pointer.replace("size ", "unknown ");
+  if (scenario === "bad-extension") pointer = pointer.replace("oid ", "ext-0-test broken\noid ");
+  writeFileSync(join(work, "asset.dat"), pointer);
+  if (scenario === "staged") await git(work, "add", ".");
+  else await commitAll(work, "asset");
+  if (scenario === "removed") {
+    rmSync(join(work, "asset.dat"));
+    await commitAll(work, "remove asset");
+  }
+  const entries = [{ value: "secret-host.example", entry: 1 }];
+  const scan = checkPrivateRange(work, `${base}..HEAD`, entries, scenario === "staged");
+  if (scenario.includes("clean")) {
+    await scan;
+    expect((await diffSince(work, base, undefined, false, entries)).privateHits).toEqual([]);
+  } else
+    await expect(scan).rejects.toThrow(
+      ["malformed", "bad-extension"].includes(scenario)
+        ? "Malformed LFS pointer"
+        : ["missing", "unreadable", "corrupt"].includes(scenario)
+          ? "Cannot inspect local LFS payload"
+          : "entry 1",
+    );
+  if (!["removed", "staged"].includes(scenario)) {
+    const classified = await diffSince(work, base);
+    const findings = auditDiff(classified, { taskClass: "feature", protectedPaths: [] });
+    if (["malformed", "bad-extension"].includes(scenario))
+      expect(findings.some((f) => f.severity === "block" && f.detail.includes("Malformed LFS pointer"))).toBe(
+        true,
+      );
+    else expect(classified.attributeMatches).toBeDefined();
+    if (!["missing", "unreadable", "corrupt", "malformed", "bad-extension"].includes(scenario)) {
+      const inspected = await diffSince(work, base, undefined, false, entries);
+      expect(inspected.privateHits?.length).toBe(scenario.includes("clean") ? 0 : 1);
+    }
+  }
+});
+
+test.each(["complete", "truncated", "failed", "timeout", "timeout-exit-0", "cancelled"])(
+  "one byte-framed batch, %s",
+  async (scenario) => {
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const ids = ["a".repeat(40), "b".repeat(40), "c".repeat(40)];
+    const bytes = Buffer.concat([
+      Buffer.from("\0é"),
+      Buffer.alloc(65_530, 97),
+      Buffer.from("%73ecret-host.example"),
+    ]);
+    const response = Buffer.concat(
+      ids.map((id) => Buffer.concat([Buffer.from(`${id} blob ${bytes.length}\n`), bytes, Buffer.from("\n")])),
+    );
+    const output = join(dir, "batch");
+    writeFileSync(output, scenario === "truncated" ? response.subarray(0, -1) : response);
+    const calls = join(dir, "calls");
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\necho "$*" >> '${calls}'\ncat >/dev/null\n${["timeout", "cancelled"].includes(scenario) ? "sleep 10" : `cat '${output}'`}\n${scenario === "timeout-exit-0" ? "trap 'exit 0' TERM\nsleep 10 &\nwait\n" : ""}exit ${scenario === "failed" ? 1 : 0}\n`,
+      { mode: 0o755 },
+    );
+    const limit = attributeLimits.timeoutMs;
+    const controller = new AbortController();
+    const scope = {
+      signal: controller.signal,
+      killGraceMs: 10,
+      children: new Map(),
+      scratchDirs: new Set<string>(),
+    };
+    try {
+      if (scenario.startsWith("timeout")) attributeLimits.timeoutMs = 250;
+      const scan = processScope.run(scope, () =>
+        worktreeGitScope.run(false, () =>
+          blobPrivateEntries(work, { ...process.env, PATH: `${bin}:${process.env.PATH}` }, ids, [
+            { value: "secret-host.example", entry: 1 },
+          ]),
+        ),
+      );
+      if (scenario === "cancelled") {
+        while (!existsSync(calls)) await Bun.sleep(1);
+        controller.abort();
+      }
+      if (scenario === "complete") expect(await scan).toEqual(ids.map((id) => [id, 1]));
+      else await expect(scan).rejects.toThrow();
+      expect(readFileSync(calls, "utf8").trim().split("\n")).toEqual([
+        "--no-replace-objects cat-file --batch",
+      ]);
+    } finally {
+      attributeLimits.timeoutMs = limit;
+    }
+  },
+);
