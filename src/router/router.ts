@@ -17,6 +17,8 @@ export interface RouteConstraints {
   exclude?: (string | ModelSelection)[];
   /** Put this target first when it is available (stick with the current implementer). */
   prefer?: string | ModelSelection;
+  /** Applicable policy revision when the preferred implementer was selected. */
+  preferPolicyRevision?: string;
   /** Offer this target and nothing else, policy included (a listed panel verifier never falls back). */
   only?: string | ModelSelection;
   /** Put this vendor's models first, as if every other vendor were avoided. */
@@ -46,7 +48,7 @@ export interface RoutePreview {
 export class Router {
   private readonly models: Map<string, ModelDef>;
   private policyChange = new AbortController();
-  private readonly changedCells = new Set<string>();
+  private cellRevisions = new Map<string, string>();
   private readonly lastRoute = new Map<
     string,
     { role: Role; complexity: Complexity; constraints: RouteConstraints }
@@ -77,16 +79,26 @@ export class Router {
     previous.abort();
   }
 
-  setPolicy(policy: Policy): void {
+  cellRevision(role: Role, complexity: Complexity): string {
+    const entry = this.policy[role];
+    return JSON.stringify([
+      entry?.[complexity] ?? entry?.default ?? [],
+      this.cellRevisions.get(`${role}.${complexity}`),
+      entry?.[complexity] === undefined ? this.cellRevisions.get(`${role}.default`) : null,
+    ]);
+  }
+
+  setPolicy(policy: Policy, revisions?: Map<string, string>): void {
     for (const role of Object.keys(policy) as Role[]) {
       const cells = new Set([...Object.keys(this.policy[role] ?? {}), ...Object.keys(policy[role])]);
       for (const cell of cells) {
         const key = cell as keyof Policy[Role];
-        if (JSON.stringify(this.policy[role]?.[key]) !== JSON.stringify(policy[role][key]))
-          this.changedCells.add(`${role}.${cell}`);
+        if (!revisions && JSON.stringify(this.policy[role]?.[key]) !== JSON.stringify(policy[role][key]))
+          this.cellRevisions.set(`${role}.${cell}`, crypto.randomUUID());
       }
     }
     this.policy = policy;
+    if (revisions) this.cellRevisions = new Map(revisions);
     this.invalidateRouting();
   }
 
@@ -100,6 +112,16 @@ export class Router {
     this.decideRoute(role, complexity, {}, preview);
     return preview;
   }
+
+  /** Interchangeable candidates prefer configured providers, then more headroom. */
+  private compareCandidates = (a?: Pick<ModelDef, "provider">, b?: Pick<ModelDef, "provider">) => {
+    if (!a || !b) return 0;
+    const pref = (provider: string) => (this.preferProviders.includes(provider) ? 0 : 1);
+    return (
+      pref(a.provider) - pref(b.provider) ||
+      this.tracker.headroom(b.provider) - this.tracker.headroom(a.provider)
+    );
+  };
 
   model(id: string): ModelDef | undefined {
     return this.models.get(id);
@@ -254,8 +276,10 @@ export class Router {
     const excluded = new Set(c.exclude?.map(identity));
     const excludedCheckpoints = new Set(c.excludeModels?.map(this.checkpointIdentity));
     const edited =
-      this.changedCells.has(`${role}.${complexity}`) ||
-      (entry?.[complexity] === undefined && this.changedCells.has(`${role}.default`));
+      c.preferPolicyRevision !== undefined
+        ? c.preferPolicyRevision !== this.cellRevision(role, complexity)
+        : this.cellRevisions.has(`${role}.${complexity}`) ||
+          (entry?.[complexity] === undefined && this.cellRevisions.has(`${role}.default`));
     // A live edit can remove a saved target, including its explicit effort.
     let preference = c.prefer ? identity(c.prefer) : undefined;
     if (edited && !groups.some((g) => g.split("|").some((id) => identity(id) === preference)))
@@ -310,22 +334,11 @@ export class Router {
         }
         group.push(this.toTarget(m, effort ?? null));
       }
-      // Interchangeable models: preferred providers first, then most headroom (spreads load).
-      const pref = (m: ModelTarget) => (this.preferProviders.includes(m.provider) ? 0 : 1);
-      group.sort(
-        (a, b) => pref(a) - pref(b) || this.tracker.headroom(b.provider) - this.tracker.headroom(a.provider),
-      );
+      group.sort(this.compareCandidates);
       if (preview) {
-        const orderedIds = [...visited].sort((a, b) => {
-          const ma = this.model(parseTarget(a).modelId);
-          const mb = this.model(parseTarget(b).modelId);
-          if (!ma || !mb) return 0;
-          const pref = (provider: string) => (this.preferProviders.includes(provider) ? 0 : 1);
-          return (
-            pref(ma.provider) - pref(mb.provider) ||
-            this.tracker.headroom(mb.provider) - this.tracker.headroom(ma.provider)
-          );
-        });
+        const orderedIds = visited.sort((a, b) =>
+          this.compareCandidates(this.model(parseTarget(a).modelId), this.model(parseTarget(b).modelId)),
+        );
         for (const modelId of orderedIds) {
           const reason = skipped.slice(start).find((s) => s.modelId === modelId)?.reason ?? null;
           preview.push({ modelId, eligible: reason === null, reason });

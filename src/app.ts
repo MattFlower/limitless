@@ -20,7 +20,7 @@ import type { EngineDeps } from "./pipeline/context.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
-import { overlayPolicy, readPolicy, validatePolicy } from "./router/policy.ts";
+import { readPolicy, validatePolicy } from "./router/policy.ts";
 import { ProviderTracker } from "./router/providers.ts";
 import { Router } from "./router/router.ts";
 import { RuntimePolicy } from "./router/runtime-policy.ts";
@@ -95,8 +95,6 @@ export class Factory {
       opts.policy || opts.policyPath === undefined
         ? {}
         : readPolicy(opts.policyPath, this.models, this.providerDefs);
-    const policy = Object.keys(evals).length ? overlayPolicy(code, evals) : code;
-    if (!opts.models && !opts.providers) validatePolicy(policy, this.models, this.providerDefs);
     this.store = opts.store ?? new Store(cfg.paths.db);
     this.cleanup = opts.cleanup ?? ((dryRun) => collectGarbage(this.store, cfg, { dryRun }));
     this.gcTimer = opts.gcTimer ?? { set: setInterval, clear: clearInterval };
@@ -111,7 +109,7 @@ export class Factory {
       opts.providerTimer,
       opts.healthFetch,
     );
-    this.router = new Router(this.tracker, policy, this.models, cfg.preferProviders);
+    this.router = new Router(this.tracker, code, this.models, cfg.preferProviders);
     this.routing = new RuntimePolicy(
       this.store,
       this.router,
@@ -121,6 +119,8 @@ export class Factory {
       code,
       evals,
     );
+    if (!opts.models && !opts.providers)
+      validatePolicy(this.router.getPolicy(), this.models, this.providerDefs);
     this.tracker.setRoutingDescription((provider, exhausted) =>
       this.router.describeFallback(provider, exhausted),
     );

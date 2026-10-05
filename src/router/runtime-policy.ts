@@ -1,4 +1,4 @@
-import type { Complexity, Role, RoutingCell } from "../core/types.ts";
+import type { Complexity, Role, RoutingCell, RoutingChange } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef, REMOVED_MODELS } from "./catalog.ts";
 import { overlayPolicy, type PolicyOverlay, validatePolicy } from "./policy.ts";
@@ -9,6 +9,7 @@ const CELLS: RoutingCell[] = ["default", "trivial", "small", "medium", "large"];
 /** Validates before persistence; routing and API reads share the Router's effective policy. */
 export class RuntimePolicy {
   private operator: PolicyOverlay = {};
+  private readonly revisions = new Map<string, string>();
   private operatorPrefer: string[] | null;
 
   constructor(
@@ -26,13 +27,26 @@ export class RuntimePolicy {
     }
     this.operatorPrefer = store.routingPrefer();
     if (this.operatorPrefer !== null) this.validatePrefer(this.operatorPrefer);
-    router.setPolicy(this.merge(this.operator));
+    // History IDs survive restart and distinguish edits even when a cell is reset to its old value.
+    for (const change of store.routingHistory())
+      if (this.changesCell(change) && !this.revisions.has(change.key))
+        this.revisions.set(change.key, String(change.id));
+    router.setPolicy(this.merge(this.operator), this.revisions);
     router.setPreferProviders(this.prefer);
   }
 
   private merge(operator: PolicyOverlay): Policy {
     const base = Object.keys(this.evals).length ? overlayPolicy(this.code, this.evals) : this.code;
     return Object.keys(operator).length ? overlayPolicy(base, operator) : base;
+  }
+
+  private changesCell(change: RoutingChange): boolean {
+    const [role, cell] = change.key.split(".") as [Role, RoutingCell];
+    const base = this.evals[role]?.[cell] ?? this.code[role]?.[cell];
+    return (
+      change.key !== "prefer" &&
+      JSON.stringify(change.oldValue ?? base) !== JSON.stringify(change.newValue ?? base)
+    );
   }
 
   private entry(role: string, cell: string): { role: Role; cell: RoutingCell } {
@@ -114,7 +128,8 @@ export class RuntimePolicy {
     const merged = this.merge(next);
     const change = this.store.writeRouting(`${role}.${cell}`, groups, this.note(note), by);
     this.operator = next;
-    this.router.setPolicy(merged);
+    if (this.changesCell(change)) this.revisions.set(change.key, String(change.id));
+    this.router.setPolicy(merged, this.revisions);
     this.store.publishRouting(change);
     return this.snapshot();
   }

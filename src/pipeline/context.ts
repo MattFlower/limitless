@@ -87,6 +87,7 @@ export interface RunState {
   answers: string[];
   round: number;
   implementer?: {
+    policyRevision?: string;
     targetId?: string;
     effort?: ModelSelection["effort"];
     modelId: string;
@@ -462,6 +463,7 @@ export class RunContext {
           `Timed out routing ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}`,
         );
       const revision = router.policyRevision;
+      const cellRevision = router.cellRevision(opts.role, opts.complexity);
       const decision = router.route(
         opts.role,
         opts.complexity,
@@ -576,6 +578,7 @@ export class RunContext {
       tried.push({ modelId: target.modelId, effort: target.effort ?? null });
       if (opts.role === "implement") {
         this.state.implementer = {
+          policyRevision: cellRevision,
           modelId: target.modelId,
           targetId: target.targetId,
           effort: target.effort ?? null,

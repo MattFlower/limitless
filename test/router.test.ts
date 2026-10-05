@@ -102,15 +102,23 @@ function setup(secrets: Record<string, string> = {}) {
 
 test("live policy removes sticky targets, preserves exclusions and tiers, and explicit only targets win", () => {
   const { router } = setup();
+  const selected = router.cellRevision("implement", "small");
   expect(router.route("implement", "small").candidates[0]?.modelId).toBe("claude/sonnet");
   router.setPolicy({ ...policy, implement: { default: ["codex/sol"] } });
-  expect(router.route("implement", "small", { prefer: "claude/sonnet" }).candidates[0]?.modelId).toBe(
-    "codex/sol",
-  );
+  expect(
+    router.route("implement", "small", { prefer: "claude/sonnet", preferPolicyRevision: selected })
+      .candidates[0]?.modelId,
+  ).toBe("codex/sol");
+  const escalated = router.cellRevision("implement", "small");
+  expect(
+    router.route("implement", "small", { prefer: "claude/opus", preferPolicyRevision: escalated })
+      .candidates[0]?.modelId,
+  ).toBe("claude/opus");
   expect(
     router
       .route("implement", "small", {
         prefer: "claude/sonnet",
+        preferPolicyRevision: selected,
         minTier: 5,
         exclude: ["claude/sonnet", "codex/sol"],
       })
@@ -176,6 +184,47 @@ test("preview includes every skip reason in order without observations, alerts o
   expect(router.describeFallback("p6", false)).toBe(description);
   expect(store.listAlerts(now)).toEqual(alerts);
   expect(messages).toEqual([]);
+});
+
+test("preview and route share alternative ordering under preference and headroom changes", () => {
+  const tracker = new ProviderTracker(
+    providers,
+    store,
+    reserves,
+    { OPENROUTER_API_KEY: "key" },
+    { openrouter: 50 },
+    () => 1_000_000,
+  );
+  const router = new Router(tracker, policy, models);
+  router.setPolicy({ ...policy, implement: { default: ["claude/sonnet|codex/sol|openrouter/ds"] } });
+  tracker.setEnabled("openrouter", false);
+  const check = (expected: string[]) => {
+    const status = tracker.all();
+    const alerts = store.listAlerts(tracker.now());
+    const fallback = router.describeFallback("claude", false);
+    const messages: unknown[] = [];
+    const unsubscribe = store.subscribe((message) => messages.push(message));
+    const preview = router.preview("implement", "small");
+    expect(preview.filter((p) => p.eligible).map((p) => p.modelId)).toEqual(expected);
+    expect(preview.find((p) => p.modelId === "openrouter/ds")).toEqual({
+      modelId: "openrouter/ds",
+      eligible: false,
+      reason: "disabled",
+    });
+    expect(tracker.all()).toEqual(status);
+    expect(store.listAlerts(tracker.now())).toEqual(alerts);
+    expect(router.describeFallback("claude", false)).toBe(fallback);
+    expect(messages).toEqual([]);
+    unsubscribe();
+    expect(router.route("implement", "small").candidates.map((c) => c.modelId)).toEqual(expected);
+  };
+  tracker.observeWindows("claude", { five_hour: { utilization: 0.6, resetsAt: 2_000_000 } });
+  check(["codex/sol", "claude/sonnet"]);
+  router.setPreferProviders(["claude"]);
+  check(["claude/sonnet", "codex/sol"]);
+  router.setPreferProviders([]);
+  tracker.observeWindows("codex", { five_hour: { utilization: 0.7, resetsAt: 2_000_000 } });
+  check(["claude/sonnet", "codex/sol"]);
 });
 
 test("verifier routing excludes checkpoints across backends, including pinned targets", () => {

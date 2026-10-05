@@ -148,3 +148,32 @@ test("Factory startup restores cells and preferences; clearing preference restor
     ["triage.default", null, ["codex/luna"]],
   ]);
 });
+
+test("saved implementer revisions survive restart and only later cell edits dislodge escalation", () => {
+  const cfg = loadConfig({ home: dir, configDir: dir });
+  const reopen = () => new Factory(cfg, { store });
+  let factory = reopen();
+  factory.routing.setCell("implement", "small", ["codex/sol"]);
+  const constraints = {
+    prefer: "claude/opus",
+    preferPolicyRevision: factory.router.cellRevision("implement", "small"),
+  };
+  const selected = () => factory.router.route("implement", "small", constraints).candidates[0]?.modelId;
+  expect(selected()).toBe("claude/opus");
+  store.close();
+  store = new Store(join(dir, "db.sqlite"));
+  factory = reopen();
+  expect(selected()).toBe("claude/opus");
+  factory.routing.setCell("triage", "default", ["codex/luna"]);
+  factory.routing.setPrefer(["codex"]);
+  expect(selected()).toBe("claude/opus");
+  factory.routing.setCell("implement", "small", ["codex/sol"], "note only");
+  expect(selected()).toBe("claude/opus");
+  store.close();
+  store = new Store(join(dir, "db.sqlite"));
+  factory = reopen();
+  expect(selected()).toBe("claude/opus");
+  factory.routing.setCell("implement", "small", ["codex/luna"]);
+  factory.routing.setCell("implement", "small", ["codex/sol"]);
+  expect(selected()).toBe("codex/sol");
+});

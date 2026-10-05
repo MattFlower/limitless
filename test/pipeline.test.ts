@@ -1501,6 +1501,37 @@ esac
     expect(f.store.getRunState<RunState>(run.id)?.implementer?.modelId).toBe("beta/m");
   });
 
+  test("an escalation selected after a live edit stays sticky on the fourth round", async () => {
+    const reached = deferred<void>();
+    const resume = deferred<void>();
+    const invoked: string[] = [];
+    const f = start(
+      async (s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (role === "review") return { structured: approve };
+        invoked.push(s.target.modelId);
+        if (invoked.length === 1) {
+          reached.resolve();
+          await resume.promise;
+        }
+        return { files: { "farewell.txt": invoked.length < 4 ? "BAD goodbye\n" : "goodbye\n" } };
+      },
+      false,
+      true,
+    );
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    await reached.promise;
+    f.routing.setCell("implement", "small", ["alpha/m"]);
+    resume.resolve();
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(invoked).toEqual(["alpha/m", "alpha/m", "delta/m", "delta/m"]);
+    expect(f.store.getRunState<RunState>(run.id)?.implementer).toMatchObject({
+      modelId: "delta/m",
+      policyRevision: f.router.cellRevision("implement", "small"),
+    });
+  });
+
   test("Dependabot uses free models across quick stages and keeps them on feedback rounds", async () => {
     const seen: { role: string; provider: string }[] = [];
     let implementations = 0;
