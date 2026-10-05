@@ -85,7 +85,13 @@ function sse(
     },
   });
   return new Response(stream, {
-    headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" },
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      // A buffering reverse proxy would otherwise hold frames until its buffer fills.
+      "x-accel-buffering": "no",
+    },
   });
 }
 
@@ -384,8 +390,11 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle((req) => {
         const url = new URL(req.url);
         const status = url.searchParams.get("status")?.split(",").filter(Boolean) as RunStatus[] | undefined;
+        const ids = url.searchParams.get("ids")?.split(",").filter(Boolean);
         const limit = Number(url.searchParams.get("limit") ?? 100);
-        return json(store.listRuns({ ...(status ? { status } : {}), limit }));
+        return json(
+          store.listRuns({ ...(status ? { status } : {}), ...(ids?.length ? { ids } : {}), limit }),
+        );
       }),
       POST: handle(async (req) => {
         const input = await body<CreateRunRequest>(req);
