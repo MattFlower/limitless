@@ -30,7 +30,17 @@ export const OBSERVE_QUERY = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on Pu
 
 type Conn<T> = { nodes?: (T | null)[] } | null | undefined;
 type Activity = { id: string; createdAt?: string; updatedAt: string }; // createdAt: absent only in old markers
-type Context = { name?: string; conclusion?: string | null; state?: string; url?: string | null };
+/** One check: GraphQL's `name`/`conclusion`/`state`, or REST's `context`/`status`/`targetUrl`. */
+export type Context = {
+  name?: string;
+  context?: string;
+  conclusion?: string | null;
+  state?: string;
+  status?: string;
+  url?: string | null;
+  targetUrl?: string | null;
+  detailsUrl?: string | null;
+};
 const REQUIRED = ["id", "url", "headRefOid", "state", "mergeable", "mergeStateStatus", "updatedAt"] as const;
 type Base = Record<(typeof REQUIRED)[number], string> & GitHubPrState;
 type GqlPr = Base & {
@@ -54,6 +64,38 @@ export type PrSnapshot = Known & {
 };
 type Saved = PrSnapshot & { revision: number; unknown: number; nudged: string | null };
 const FAILING = new Set(["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
+const PENDING = new Set(["PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "EXPECTED"]);
+const checkName = (c: Context) => c.name ?? c.context;
+// A check still running reports its status, not a conclusion; a status context only has `state`.
+const checkVerdict = (c: Context) =>
+  c.status && c.status !== "COMPLETED" ? c.status : (c.conclusion ?? c.status ?? c.state ?? "");
+
+/**
+ * A rollup's state and failing checks, from a GraphQL `statusCheckRollup` or REST's array of
+ * contexts (`gh pr view --json statusCheckRollup`), which carries no state of its own.
+ */
+export function rollup(source: { state?: string; contexts?: Conn<Context> } | Context[] | null | undefined): {
+  ci: string | null;
+  failing: { name: string; url: string | null }[];
+} {
+  const contexts = Array.isArray(source) ? source : nodes(source?.contexts);
+  const failing = contexts.flatMap((x) =>
+    checkName(x) && FAILING.has(checkVerdict(x))
+      ? [{ name: checkName(x) as string, url: x.url ?? x.targetUrl ?? x.detailsUrl ?? null }]
+      : [],
+  );
+  const stated = !Array.isArray(source) ? (source?.state ?? null) : null;
+  const pending = contexts.some((x) => PENDING.has(checkVerdict(x)));
+  return {
+    ci: stated ?? (failing.length ? "FAILURE" : pending ? "PENDING" : contexts.length ? "SUCCESS" : null),
+    failing: failing.sort((a, b) => a.name.localeCompare(b.name)),
+  };
+}
+
+/** The poller's last saved observation of a PR, or null when it holds nothing usable. */
+export function savedSnapshot(data: string | null | undefined): PrSnapshot | null {
+  return saved(data);
+}
 const nodes = <T>(c: Conn<T>): T[] => (c?.nodes ?? []).filter((n): n is T => n !== null);
 /** Every item as `createdAt@updatedAt@id`, in page (oldest first) order. */
 const mark = (a: Activity) => `${a.createdAt ?? a.updatedAt}@${a.updatedAt}@${a.id}`;
@@ -85,16 +127,14 @@ export function normalizePr(node: unknown, id?: string | null): PrSnapshot | nul
   const pr = node as GqlPr | null;
   if (!pr || REQUIRED.some((k) => typeof pr[k] !== "string") || (id && pr.id !== id)) return null;
   const { commits, reviews, comments, latestReviews, ...base } = pr;
-  const rollup = nodes(commits).at(-1)?.commit?.statusCheckRollup ?? null;
+  const head = nodes(commits).at(-1)?.commit?.statusCheckRollup ?? null;
   const all = nodes(reviews);
-  const failing = nodes(rollup?.contexts).flatMap((x) =>
-    x.name && FAILING.has(x.conclusion ?? x.state ?? "") ? [{ name: x.name, url: x.url ?? null }] : [],
-  );
+  const { ci, failing } = rollup(head);
   return {
     ...base,
-    ci: rollup?.state ?? null,
-    failing: failing.sort((a, b) => a.name.localeCompare(b.name)),
-    truncated: nodes(rollup?.contexts).length >= 100 || undefined,
+    ci,
+    failing,
+    truncated: nodes(head?.contexts).length >= 100 || undefined,
     reviews: nodes(latestReviews).map((r) => `${r.author?.login ?? "ghost"}:${r.state}`),
     reviewComments: Object.fromEntries(all.map((r) => [r.id, newest(nodes(r.comments))])),
     activity: {

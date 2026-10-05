@@ -2,6 +2,7 @@ import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { sh } from "../util/proc.ts";
 import type { GhRunner } from "./github.ts";
+import { type Context, rollup } from "./github-poller.ts";
 
 export interface GitHubPrState {
   url: string;
@@ -18,7 +19,7 @@ export interface GitHubPrView extends GitHubPrState {
   failing: string[];
 }
 
-export type GitHubPrClient = ((url: string) => Promise<GitHubPrState | null>) & {
+export type GitHubPrClient = ((url: string, signal?: AbortSignal) => Promise<GitHubPrState | null>) & {
   fresh?: GitHubPrClient | null; // null for cache-only clients
   beginPass?: () => void;
   observed?: (url: string) => boolean;
@@ -36,38 +37,24 @@ const passes = new WeakMap<
   }
 >();
 
-// The poller keeps its own copy for GraphQL contexts; `gh pr view` reports the rollup the same way.
-const CI_FAILURES = new Set([
-  "FAILURE",
-  "ERROR",
-  "TIMED_OUT",
-  "CANCELLED",
-  "ACTION_REQUIRED",
-  "STARTUP_FAILURE",
-]);
+/** `gh pr view` reports the rollup as an array of check and status contexts, not a rollup object. */
+type GhPrView = GitHubPrView & { statusCheckRollup?: Context[] | null };
 
-type GhPrView = GitHubPrView & {
-  statusCheckRollup?: {
-    state?: string;
-    contexts?: { name?: string; conclusion?: string; state?: string }[];
-  } | null;
-};
-
-export const getGitHubPr = async (url: string): Promise<GitHubPrView> => {
+export const getGitHubPr = async (url: string, signal?: AbortSignal): Promise<GitHubPrView> => {
   const { stdout } = await sh(
     ["gh", "pr", "view", url, "--json", "url,state,mergedAt,mergedBy,headRefOid,statusCheckRollup"],
-    { cwd: process.cwd(), timeoutMs: 30_000 },
+    { cwd: process.cwd(), timeoutMs: 30_000, signal },
   );
   const view = JSON.parse(stdout) as GhPrView;
-  const contexts = view.statusCheckRollup?.contexts ?? [];
+  const { ci, failing } = rollup(view.statusCheckRollup);
   return {
     url: view.url,
     state: view.state,
     mergedAt: view.mergedAt,
     mergedBy: view.mergedBy,
     headRefOid: view.headRefOid,
-    ci: view.statusCheckRollup?.state ?? null,
-    failing: contexts.filter((c) => CI_FAILURES.has(c.conclusion ?? c.state ?? "")).map((c) => c.name ?? ""),
+    ci,
+    failing: failing.map((f) => f.name),
   };
 };
 
