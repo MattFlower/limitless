@@ -354,17 +354,22 @@ test("isolated CLI config errors never echo TOML or validation input", async () 
   }
 });
 
-test("feed credentials are redacted in plain, URL, form, and base64 encodings", async () => {
+test("feed credentials are redacted in plain, mixed-case URL, form, and base64 encodings", async () => {
   const f = setupFixture();
-  const secret = "sk-SENTINEL:/? +private";
+  const secret = "sk-SENTINEL:/? +[private]ÿ";
   const forms = [
     secret,
     encodeURIComponent(secret),
     encodeURIComponent(secret).replace(/%[\dA-F]{2}/g, (s) => s.toLowerCase()),
+    encodeURIComponent(secret).replace("%3A", "%3a"),
+    encodeURIComponent(secret).replace("%BF", "%Bf"),
+    encodeURI(secret).replace("%BF", "%bF"),
     new URLSearchParams({ key: secret }).toString().slice(4),
+    new URLSearchParams({ key: secret }).toString().slice(4).replace("%3A", "%3a"),
     Buffer.from(secret).toString("base64"),
     Buffer.from(secret).toString("base64url"),
   ];
+  const differentCredential = encodeURIComponent(secret.toLowerCase()).replace("%3A", "%3a");
   try {
     writeFileSync(join(f.configDir, "secrets.env"), `FEED_TOKEN=${secret}\n`);
     f.reload();
@@ -372,7 +377,14 @@ test("feed credentials are redacted in plain, URL, form, and base64 encodings", 
     f.d.fetch = (url, init) =>
       url.endsWith("/api/github/access")
         ? Promise.resolve(
-            Response.json([{ repo: "acme/app", reason: "auth", since: 0, detail: forms.join(" | ") }]),
+            Response.json([
+              {
+                repo: "acme/app",
+                reason: "auth",
+                since: 0,
+                detail: [...forms, differentCredential].join(" | "),
+              },
+            ]),
           )
         : fetch(url, init);
     for (const json of [false, true]) {
@@ -381,6 +393,7 @@ test("feed credentials are redacted in plain, URL, form, and base64 encodings", 
       const output = f.output.join("\n");
       expect(output).toContain("[redacted]");
       for (const form of forms) expect(output).not.toContain(form);
+      expect(output).toContain(differentCredential);
     }
   } finally {
     f.close();

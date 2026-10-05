@@ -32,7 +32,6 @@ function safe(d: SetupDeps, text: string): string {
     return [
       v,
       url,
-      url.replace(/%[\dA-F]{2}/g, (s) => s.toLowerCase()),
       url.replace(/%20/g, "+"),
       new URLSearchParams({ key: v }).toString().slice(4),
       encodeURI(v),
@@ -41,8 +40,15 @@ function safe(d: SetupDeps, text: string): string {
       Buffer.from(v).toString("base64url"),
     ];
   });
-  for (const value of [...new Set(forms)].sort((a, b) => b.length - a.length))
-    text = text.replaceAll(value, "[redacted]");
+  for (const value of [...new Set(forms)].sort((a, b) => b.length - a.length)) {
+    // Percent escapes accept mixed hex casing; literal credential characters do not.
+    const pattern = value
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      .replace(/%[\dA-F]{2}/gi, (s) =>
+        s.replace(/[a-f]/gi, (hex) => `[${hex.toLowerCase()}${hex.toUpperCase()}]`),
+      );
+    text = text.replace(new RegExp(pattern, "g"), "[redacted]");
+  }
   return text;
 }
 function encoded(d: SetupDeps, value: unknown): string {
