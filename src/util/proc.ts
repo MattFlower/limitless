@@ -13,6 +13,7 @@ export interface ProcOptions {
   cwd: string;
   env: Record<string, string>;
   stdin?: string;
+  encoding?: BufferEncoding;
   signal?: AbortSignal;
   /** Hard wall-clock limit. */
   timeoutMs?: number;
@@ -163,7 +164,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       );
     }
 
-    child.stdout.setEncoding("utf8");
+    child.stdout.setEncoding(opts.encoding ?? "utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       lastActivity = Date.now();
@@ -238,6 +239,7 @@ export async function sh(
     allowFail?: boolean;
     stdin?: string;
     signal?: AbortSignal;
+    encoding?: BufferEncoding;
   },
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   opts.signal?.throwIfAborted();
@@ -249,6 +251,7 @@ export async function sh(
     timeoutMs: opts.timeoutMs ?? 120_000,
     // Callers parse this output (diffs, JSON); never silently hand them a truncated tail.
     tailLimit: SH_OUTPUT_LIMIT,
+    encoding: opts.encoding,
     ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
   });
   // Cancellation must stop command sequences even when a nonzero exit is allowed.
@@ -256,7 +259,7 @@ export async function sh(
   if (res.truncated) {
     throw new Error(`Output of \`${cmd.join(" ")}\` exceeded ${SH_OUTPUT_LIMIT} characters`);
   }
-  if (res.exitCode !== 0 && !opts.allowFail) {
+  if ((res.exitCode !== 0 || res.timedOut) && !opts.allowFail) {
     throw new CommandError(
       `Command failed (${res.exitCode ?? res.signal}): ${cmd.join(" ")}\n${res.stderr.trim() || res.stdout.trim()}`.slice(
         0,

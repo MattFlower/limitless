@@ -31,6 +31,8 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
     console.warn,
     // While polling, merge reconciliation reads the poller's observations for the PRs it tracks.
     factory.cfg.githubPoll ? observedPrs(factory.store, prClient) : prClient,
+    factory.cfg.paths.configDir,
+    [factory.cfg.paths.repos, factory.cfg.paths.work],
   );
   const seconds = factory.cfg.githubPollSeconds;
   const stopPoller = factory.cfg.githubPoll
