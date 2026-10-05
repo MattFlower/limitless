@@ -228,8 +228,9 @@ function queue(
 /** Answer CI for whatever each entry waits on, then let promise chains settle on the fake clock. */
 async function tick(answer: { ci: string; failing?: string[] }): Promise<void> {
   for (const entry of store.listLandEntries({ active: true }))
-    if (entry.state === "waiting_ci" || entry.state === "merging")
-      observers.get(entry.prUrl)?.(entry.pushedSha ?? entry.approvedSha, answer.ci, answer.failing ?? []);
+    // A claimed entry with a pushed commit is in its CI phase, whatever the claim left it as.
+    if (entry.pushedSha)
+      observers.get(entry.prUrl)?.(entry.pushedSha, answer.ci, answer.failing ?? []);
   await clock.advance(100);
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 }
@@ -291,6 +292,51 @@ test("two approved entries on one repository land in order, never checking at on
   // One repository, one entry at a time: the second check starts only after the first ends.
   expect(gateLog()).toEqual(["start", "end", "start", "end"]);
   expect(ghCalls("pr merge")).toHaveLength(2);
+});
+
+test("three requests submitted together all land, with no further request", async () => {
+  const prs = [1, 2, 3].map((n) => delivered(n, `pr-${n}`));
+  for (const n of [1, 2, 3]) {
+    const head = await pushBranch(`pr-${n}`, `change-${n}.txt`, `change ${n}\n`, n);
+    observe(n, head);
+    approve(n, head);
+  }
+  const q = queue();
+  for (const pr of prs) q.request({ runId: pr.run.id });
+  await settle();
+  expect(store.listLandEntries().map((e) => e.state)).toEqual(["landed", "landed", "landed"]);
+  expect(gateLog()).toEqual(["start", "end", "start", "end", "start", "end"]);
+});
+
+test("a checking entry whose merge commit is already on the remote resumes and lands", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "change-1.txt", "one\n", 1);
+  await advanceBase();
+  // The commit a land would have pushed: the approved head with the base merged in.
+  await sh(["git", "checkout", "-q", "pr-1"], { cwd: seed });
+  await sh(["git", "merge", "-q", "--no-ff", "-m", "limitless: merge base", "main"], { cwd: seed });
+  const mergeSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: seed })).stdout.trim();
+  await sh(["git", "push", "-q", bare, "HEAD:refs/heads/pr-1"], { cwd: seed });
+  observe(1, mergeSha, "PENDING");
+  approve(1, head);
+  // What a crash between the push and the waiting_ci update leaves behind.
+  const entry = store.createLandEntry({
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: url(1),
+    baseBranch: "main",
+    headBranch: "pr-1",
+    approvedSha: head,
+  });
+  store.updateLandEntry(entry.id, { state: "checking", pushedSha: mergeSha, attempts: 1 });
+  queue();
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: mergeSha, attempts: 2 });
+  expect(await remoteHead("pr-1")).toBe(mergeSha); // nothing was pushed again
+  expect(ghCalls("pr merge")).toEqual([
+    `pr merge ${url(1)} --squash --delete-branch --match-head-commit ${mergeSha}`,
+  ]);
+  expect(gateLog()).toEqual([]); // the checks had already run before the crash
 });
 
 test("a base that moved is merged in and pushed with the lease; an up-to-date entry pushes nothing", async () => {

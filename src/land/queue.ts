@@ -219,10 +219,7 @@ export class LandQueue {
     this.inFlight.set(entry.id, controller);
     const signal = controller.signal;
     // `checking` re-runs the checks from the start, like a `queued` entry.
-    const work = () =>
-      entry.state === "queued" || entry.state === "checking"
-        ? this.land(entry, signal)
-        : this.resume(entry, signal);
+    const work = () => this.land(entry, signal);
     try {
       await (this.deps.confinement ? confinementScope.run(this.deps.confinement, work) : work());
     } catch (error) {
@@ -236,23 +233,40 @@ export class LandQueue {
 
   // ---- the land itself -----------------------------------------------------
 
+  /**
+   * One checkout for a first attempt and for a resume. `pushed_sha` is the entry's progress: with it
+   * recorded, this queue already pushed that commit and has only CI and the merge left. A crash
+   * between the push and the `waiting_ci` update therefore resumes instead of pushing the factory's
+   * own merge commit again, which the lease would refuse as a head that moved after approval.
+   */
   private async land(entry: LandEntry, signal: AbortSignal): Promise<void> {
     const { repo, run } = this.context(entry);
     // The claim already moved the entry into `checking` and counted this attempt.
     this.log(`[land] ${entry.id}: checking ${entry.prUrl} at ${entry.approvedSha.slice(0, 12)}`);
     const cache = await ensureCache(this.deps.paths, repo, signal);
-    const cwd = await this.checkout(entry, repo, cache, entry.approvedSha, signal);
+    const cwd = await this.checkout(entry, repo, cache, entry.pushedSha ?? entry.approvedSha, signal);
     try {
-      const baseSha = await fetchBase(this.deps.paths, repo, entry.baseBranch, signal);
-      const head = await this.mergeBase(cwd, entry, baseSha);
-      await this.checks(cwd, baseSha, signal);
-      if (head !== entry.approvedSha) await this.pushApproved(entry, cwd, repo, head, signal);
-      this.store.updateLandEntry(entry.id, { state: "waiting_ci", pushedSha: head });
-      await this.awaitCi(entry, head, signal);
+      let head = entry.pushedSha;
+      if (!head) {
+        const baseSha = await fetchBase(this.deps.paths, repo, entry.baseBranch, signal);
+        head = await this.mergeBase(cwd, entry, baseSha);
+        await this.checks(cwd, baseSha, signal);
+        if (head !== entry.approvedSha) await this.pushApproved(entry, cwd, repo, head, signal);
+        // Recorded either way: with it, a resume waits for this commit instead of checking again.
+        this.store.updateLandEntry(entry.id, { pushedSha: head, state: "waiting_ci" });
+      }
+      if ((await this.awaitCi(entry, head, signal)) === "merged") return this.landed(entry, run, head);
       await this.merge(entry, run, cwd, head, signal);
     } finally {
       await this.discard(repo, cwd);
     }
+  }
+
+  /** A PR that already merged is recorded, never merged again. */
+  private landed(entry: LandEntry, run: Run, sha: string): void {
+    this.store.updateRun(run.id, { merged: true });
+    this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
+    this.log(`[land] ${entry.id}: merged ${entry.prUrl}`);
   }
 
   /** The approved head, with the base merged in when it is not already an ancestor. */
@@ -294,16 +308,16 @@ export class LandQueue {
   }
 
   /** Wait for CI on exactly `sha`; nothing else counts as the green that lets the merge happen. */
-  private async awaitCi(entry: LandEntry, sha: string, signal: AbortSignal): Promise<void> {
+  private async awaitCi(entry: LandEntry, sha: string, signal: AbortSignal): Promise<"green" | "merged"> {
     const pollMs = this.deps.ciPollMs ?? DEFAULTS.ciPollMs;
     const deadline = this.now() + (this.deps.ciTimeoutMs ?? DEFAULTS.ciTimeoutMs);
     for (;;) {
       signal.throwIfAborted();
       const seen = await this.observe(entry);
-      if (seen && seen.state === "MERGED") return;
+      if (seen && seen.state === "MERGED") return "merged";
       if (seen?.head === sha) {
         // Only SUCCESS is green; a rollup that is not there yet means the push has no checks yet.
-        if (seen.ci === "SUCCESS") return;
+        if (seen.ci === "SUCCESS") return "green";
         if (seen.ci && seen.ci !== "PENDING" && seen.ci !== "EXPECTED")
           throw new LandBlocked(`CI failed: ${seen.failing.join(", ") || "unknown check"}`);
       }
@@ -329,36 +343,7 @@ export class LandQueue {
       await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
       throw new LandBlocked(outcome === "unavailable" ? "GitHub unavailable" : "merge failed");
     }
-    this.store.updateRun(run.id, { merged: true });
-    this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
-    this.log(`[land] ${entry.id}: merged ${entry.prUrl}`);
-  }
-
-  // ---- restart -------------------------------------------------------------
-
-  /** The commit to wait on: what the queue pushed, or the approved head when it pushed nothing. */
-  private landedSha(entry: LandEntry): string {
-    return entry.pushedSha ?? entry.approvedSha;
-  }
-
-  /** Picks up an entry a stopped daemon left waiting or merging, at the commit it recorded. */
-  private async resume(entry: LandEntry, signal: AbortSignal): Promise<void> {
-    const { repo, run } = this.context(entry);
-    const sha = this.landedSha(entry);
-    const cache = await ensureCache(this.deps.paths, repo, signal);
-    const cwd = await this.checkout(entry, repo, cache, sha, signal);
-    try {
-      // A merge that landed before the daemon stopped is never attempted again.
-      if (entry.state === "merging" && (await this.observe(entry))?.state === "MERGED") {
-        this.store.updateRun(run.id, { merged: true });
-        this.finish(entry.id, "landed", `merged ${sha.slice(0, 12)}`);
-        return;
-      }
-      await this.awaitCi(entry, sha, signal);
-      await this.merge(entry, run, cwd, sha, signal);
-    } finally {
-      await this.discard(repo, cwd);
-    }
+    this.landed(entry, run, sha);
   }
 
   // ---- helpers -------------------------------------------------------------
