@@ -20,11 +20,13 @@ check_private() { bun --config=/dev/null --no-env-file "$private_check" "$@" & c
 # Factory git after PR code has run: no hooks (files or config), filters, fsmonitor, forged commit-graph or bitmaps.
 export LIMITLESS_GIT_EMPTY_HOOK=""
 safe_git() {
-  local keys flags=() key
-  keys="$(mktemp)"
-  git config --null --name-only --get-regexp '^(hook|filter)\.' >"$keys" || [ $? = 1 ] || { rm -f "$keys"; return 1; }
-  while IFS= read -r -d '' key; do flags+=("--config-env=$key=LIMITLESS_GIT_EMPTY_HOOK"); done <"$keys"
-  rm -f "$keys"
+  # Key names never contain newlines (git forbids them in subsections); no temp files, which confined runs can't create.
+  local keys key flags=()
+  keys="$(git config --name-only --get-regexp '^(hook|filter)\.')" || [ $? = 1 ] || return 1
+  set -f
+  local IFS=$'\n'
+  for key in $keys; do flags+=("--config-env=$key=LIMITLESS_GIT_EMPTY_HOOK"); done
+  set +f
   git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
     ${flags[@]+"${flags[@]}"} "$@"
 }

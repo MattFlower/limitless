@@ -1,10 +1,39 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
-import type { Role } from "../core/types.ts";
+import { type Role, RUN_ROLES, type RunModels } from "../core/types.ts";
 import { DEFAULT_POLICY, type ModelDef, type Policy, PROVIDERS, type ProviderDef } from "./catalog.ts";
 import { resolveTarget, transportError } from "./targets.ts";
 
 export type PolicyOverlay = Partial<Policy>;
+export function validateRunModels(value: unknown, models: ModelDef[], providers: ProviderDef[]): RunModels {
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    throw new Error("models: expected a role-to-chain map");
+  for (const [role, chain] of Object.entries(value)) {
+    if (!RUN_ROLES.some((allowed) => allowed === role))
+      throw new Error(`models.${role}: unknown run role (entry ${JSON.stringify(chain)})`);
+  }
+  const overlay = Object.fromEntries(
+    Object.entries(value).map(([role, chain]) => [role, { default: chain }]),
+  );
+  try {
+    validatePolicy(overlay, models, providers);
+  } catch (error) {
+    const reason =
+      error instanceof z.ZodError
+        ? error.issues
+            .map((issue) => {
+              const role = String(issue.path[0]);
+              const chain = (value as Record<string, unknown>)[role];
+              const entry =
+                Array.isArray(chain) && typeof issue.path[2] === "number" ? chain[issue.path[2]] : chain;
+              return `models.${role} entry ${JSON.stringify(entry)}: ${issue.message}`;
+            })
+            .join("; ")
+        : `models: ${String(error)}`;
+    throw new Error(reason);
+  }
+  return structuredClone(value) as RunModels;
+}
 export function validatePolicy(
   value: unknown,
   models: ModelDef[],
