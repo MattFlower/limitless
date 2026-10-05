@@ -30,6 +30,12 @@ which stage runs next. The implementer never grades its own work: the factory ru
 model from a different vendor (when one is available) reviews the change, and a separate session
 verifies it against acceptance criteria and against scenarios the implementer never saw.
 
+### Private strings
+
+List private hostnames, endpoints, addresses, or other strings in the optional local file `~/.config/limitless/private-strings.txt` (or `$LIMITLESS_CONFIG_DIR/private-strings.txt`), outside repositories.
+Use one literal string per line; surrounding whitespace is trimmed, blank lines and lines starting with `#` are ignored, and matching is case-insensitive.
+Audit, delivery and `land-pr.sh` block publication with redacted diagnostics naming the entry's line number. Missing files have no effect; unreadable files block.
+
 ### The pipeline
 
 ```mermaid

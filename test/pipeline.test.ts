@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -1227,7 +1227,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       `#!/bin/sh
 echo "$*" >> '${calls}'
 case "$1 $2" in
-  'pr view') echo '{"state":"'"$(cat '${stateFile}')"'","url":"${url}"}' ;;
+  'pr view') echo '{"state":"'"$(cat '${stateFile}')"'","url":"${url}","title":"Add farewell","body":"Safe body","headRefOid":"'"$(git rev-parse HEAD)"'"}' ;;
   'pr list') if [ -f '${stateFile}' ]; then
     if [ "$*" = "pr list --repo test/repo --head $6 --state all --json state,url" ]; then
       echo '[{"state":"'"$(cat '${stateFile}')"'","url":"${url}"}]'
@@ -2505,6 +2505,375 @@ esac
     expect(readFileSync(join(home, "gh-calls"), "utf8").match(/^pr create/gm)).toHaveLength(1);
   });
 
+  test.each([
+    "commit",
+    "title",
+    "body",
+    "draft-body",
+    "unreadable",
+    "branch",
+    "history",
+    "message-body",
+    "encoded-body",
+    "draft-history",
+    "lfs-history",
+    "cache-config",
+    "author-email",
+    "utf16-author-email",
+    "utf16-message-body",
+  ])("private strings stop %s delivery before any push", async (scenario) => {
+    const bare = await githubFixture();
+    const entry = scenario === "branch" ? "secret-host-example" : "secret-host.example";
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage")
+        return {
+          structured: triage({
+            title: scenario === "title" ? entry : "Add farewell",
+            suggested_profile: "quick",
+          }),
+        };
+      if (role === "review") {
+        if (scenario === "unreadable") {
+          rmSync(join(home, "cfg", "private-strings.txt"));
+          mkdirSync(join(home, "cfg", "private-strings.txt"));
+        }
+        return {
+          structured: ["draft-body", "draft-history"].includes(scenario)
+            ? {
+                ...approve,
+                verdict: "request_changes",
+                summary: scenario === "draft-body" ? entry : "Repair required",
+                findings: [
+                  {
+                    label: "new",
+                    prior: "",
+                    severity: "blocker",
+                    security: false,
+                    ...findingEvidence,
+                    file: "farewell.txt",
+                    line: 1,
+                    title: "Fix",
+                    detail: "Fix",
+                    suggestion: "Fix",
+                  },
+                ],
+              }
+            : approve,
+        };
+      }
+      if (scenario.startsWith("utf16-"))
+        await sh(["git", "config", "i18n.logOutputEncoding", "UTF-16"], { cwd: s.cwd });
+      if (
+        ["history", "message-body", "utf16-message-body", "draft-history", "lfs-history"].includes(scenario)
+      ) {
+        let content = scenario.endsWith("message-body") ? "safe" : entry;
+        if (scenario === "lfs-history") {
+          const oid = createHash("sha256").update(entry).digest("hex");
+          const common = (await sh(["git", "rev-parse", "--git-common-dir"], { cwd: s.cwd })).stdout.trim();
+          const object = resolve(s.cwd, common, "lfs/objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+          mkdirSync(dirname(object), { recursive: true });
+          writeFileSync(object, entry);
+          content = `version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize ${entry.length}\n`;
+        }
+        writeFileSync(join(s.cwd, "transient.txt"), content);
+        await sh(["git", "add", "."], { cwd: s.cwd });
+        await sh(
+          [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            scenario.endsWith("message-body") ? `Safe subject\n\n${entry}` : "safe",
+          ],
+          { cwd: s.cwd },
+        );
+        rmSync(join(s.cwd, "transient.txt"));
+        await sh(["git", "add", "."], { cwd: s.cwd });
+        await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "remove transient"], {
+          cwd: s.cwd,
+        });
+      }
+      if (["commit", "author-email", "utf16-author-email"].includes(scenario)) {
+        writeFileSync(join(s.cwd, "farewell.txt"), "goodbye\n");
+        await sh(["git", "add", "."], { cwd: s.cwd });
+        await sh(
+          [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            scenario === "commit" ? entry.toUpperCase() : "safe",
+          ],
+          {
+            cwd: s.cwd,
+            env: {
+              ...process.env,
+              ...(scenario.endsWith("author-email")
+                ? { GIT_AUTHOR_NAME: "Fake", GIT_AUTHOR_EMAIL: `fake@${entry}` }
+                : {}),
+            },
+          },
+        );
+      }
+      return {
+        files: { "farewell.txt": "goodbye\n" },
+        text: scenario === "body" ? entry : scenario === "encoded-body" ? "%73ecret-host.example" : "Done",
+      };
+    });
+    f.cfg.maxRounds = 1;
+    if (scenario === "cache-config") f.cfg.paths.configDir = join(f.cfg.paths.repos, "config");
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), entry);
+    registerGithub(f, bare);
+    const calls: string[] = [];
+    const originalGit = Bun.which("git");
+    if (!originalGit) throw new Error("git unavailable");
+    writeFileSync(
+      join(home, "bin", "git"),
+      `#!/bin/sh\nfor arg in "$@"; do [ "$arg" = push ] && echo push >> '${join(home, "push-calls")}'; done\nexec '${originalGit}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    const run = await f.createRun({
+      repo: "test/repo",
+      prompt: scenario === "branch" ? "Secret Host Example" : "Add farewell",
+      profile: "quick",
+    });
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe(
+      scenario === "cache-config" ? "failed" : "needs_human",
+    );
+    expect(existsSync(join(home, "push-calls"))).toBe(false);
+    expect(f.store.getRun(run.id)?.prUrl).toBeNull();
+    const error = f.store.getRun(run.id)?.error ?? "";
+    expect(error.toLowerCase()).not.toContain(entry);
+    if (scenario.endsWith("author-email")) expect(error).toContain("author email");
+    if (scenario === "cache-config") expect(error).toContain("inside repository");
+    else if (scenario !== "unreadable") expect(error).toContain("entry 1 in private-strings.txt");
+    calls.push(
+      ...f.store
+        .listEvents(run.id)
+        .filter((e) => e.type === "status" || e.type === "error")
+        .map((e) => e.message),
+    );
+    expect(calls.join("\n").toLowerCase()).not.toContain(entry);
+    expect(
+      (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/heads/limitless"], { cwd: bare }))
+        .stdout,
+    ).toBe("");
+  });
+
+  test.each(["diff", "publication"])("run cancellation stops the production %s blob scan", async (stage) => {
+    const bare = await githubFixture();
+    const armed = join(home, "scan-armed");
+    const started = join(home, "scan-started");
+    const pushed = join(home, "push-calls");
+    const gitBin = Bun.which("git");
+    if (!gitBin) throw new Error("missing git");
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        if (stage === "publication") writeFileSync(armed, "ready");
+        return { structured: approve };
+      }
+      if (stage === "diff") writeFileSync(armed, "ready");
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+    registerGithub(f, bare);
+    writeFileSync(
+      join(home, "bin", "git"),
+      `#!/bin/sh
+for arg in "$@"; do [ "$arg" = push ] && echo push >> '${pushed}'; done
+if [ -f '${armed}' ] && [ "$1" = --no-replace-objects ] && [ "$2" = cat-file ] && [ "$3" = --batch ]; then
+  sleep 60 & scan=$!
+  printf '%s %s' "$$" "$scan" > '${started}'
+  wait
+  exit 1
+fi
+exec '${gitBin}' "$@"
+`,
+      { mode: 0o755 },
+    );
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    const deadline = Date.now() + 10000;
+    while (!existsSync(started) && Date.now() < deadline) await Bun.sleep(10);
+    expect(existsSync(started)).toBe(true);
+    const pids = readFileSync(started, "utf8").split(" ").map(Number);
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      const at = Date.now();
+      expect(f.cancelRun(run.id)).toBe(true);
+      while (
+        (pids.some(alive) || f.store.listStages(run.id).at(-1)?.status !== "cancelled") &&
+        Date.now() - at < 4900
+      )
+        await Bun.sleep(10);
+      expect(Date.now() - at).toBeLessThan(5000);
+      expect(pids.some(alive)).toBe(false);
+      expect(f.store.listStages(run.id).at(-1)?.status).toBe("cancelled");
+      expect(f.store.getRun(run.id)?.status).toBe("cancelled");
+      expect(existsSync(pushed)).toBe(false);
+      expect(existsSync(join(home, "gh-calls"))).toBe(false);
+    } finally {
+      const group = pids[0];
+      if (group && pids.some(alive)) {
+        try {
+          process.kill(-group, "SIGKILL");
+        } catch {
+          /* already exited */
+        }
+      }
+    }
+  });
+
+  test("private strings outside the published range permit clean delivery", async () => {
+    writeFileSync(join(repoDir, "old.txt"), "secret-host.example");
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "secret-host.example"], {
+      cwd: repoDir,
+    });
+    rmSync(join(repoDir, "old.txt"));
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "removed"], {
+      cwd: repoDir,
+    });
+    const bare = await githubFixture();
+    const f = start((s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(f.store.getRun(run.id)?.prUrl).toBe("https://github.com/test/repo/pull/1");
+  });
+
+  test("private strings stop existing-branch delivery before pushing repairs", async () => {
+    const bare = await githubFixture();
+    const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: repoDir })).stdout.trim();
+    const base = await git("rev-parse", "HEAD");
+    writeFileSync(join(repoDir, "version.txt"), "dependency 2\n");
+    await git("add", ".");
+    await git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "dependency update");
+    const head = await git("rev-parse", "HEAD");
+    await git("push", bare, "HEAD:refs/heads/dependabot/pkg");
+    let reviews = 0;
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ task_class: "dependency_update" }) };
+      if (role === "review")
+        return {
+          structured: reviews++
+            ? approve
+            : {
+                ...approve,
+                verdict: "request_changes",
+                findings: [
+                  {
+                    ...findingEvidence,
+                    severity: "major",
+                    security: false,
+                    file: "version.txt",
+                    line: 1,
+                    title: "Repair",
+                    detail: "Repair",
+                    suggestion: "Repair",
+                  },
+                ],
+              },
+        };
+      return { files: { "farewell.txt": "goodbye\n" }, text: "secret-host.example" };
+    });
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+    registerGithub(f, bare);
+    const run = await f.createRun(
+      {
+        repo: "test/repo",
+        prompt: "Repair dependency",
+        profile: "quick",
+        source: "github",
+        requestedBy: "dependabot[bot]",
+        baseBranch: "dependabot/pkg",
+        deliveryBranch: "dependabot/pkg",
+        sourceRef: {
+          kind: "pull_request",
+          repo: "test/repo",
+          number: 1,
+          headSha: head,
+          baseSha: base,
+          baseRef: "main",
+        },
+      },
+      true,
+    );
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+    expect(reviews).toBe(2);
+    expect(await git("ls-remote", bare, "refs/heads/dependabot/pkg")).toContain(head);
+    expect(f.store.getRun(run.id)?.error).toContain("PR body contains a private string (entry 1");
+    expect(f.store.getRun(run.id)?.error).not.toContain("secret-host.example");
+  });
+
+  test("needs-human draft delivery continues during drain", async () => {
+    const bare = await githubFixture();
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review")
+        return {
+          structured: {
+            verdict: "request_changes",
+            summary: "Needs work",
+            findings: [
+              {
+                label: "unaddressed",
+                prior: "P1",
+                severity: "blocker",
+                security: false,
+                ...findingEvidence,
+                file: "farewell.txt",
+                line: 1,
+                title: "Incorrect output",
+                detail: "Needs work",
+                suggestion: "Fix it",
+              },
+            ],
+          },
+        };
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    f.cfg.maxRounds = 1;
+    registerGithub(f, bare);
+    const addEvent = f.store.addEvent.bind(f.store);
+    f.store.addEvent = (event) => {
+      if (event.message?.startsWith("Run needs a human")) f.scheduler.drain();
+      return addEvent(event);
+    };
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+    expect(f.store.getRun(run.id)?.prUrl).toContain("/pull/1");
+    expect(f.store.listStages(run.id).find((stage) => stage.name === "deliver")?.status).toBe("succeeded");
+    expect(f.store.getRunState<RunState>(run.id)?.parked).toBe(false);
+  });
+
   test.each(["succeeded", "failed"] as const)(
     "review remains the stopping stage when needs-human draft delivery %s during drain",
     async (deliveryStatus) => {
@@ -3718,6 +4087,8 @@ esac
     "base-script",
     "pr-script",
     "pr-script-removed",
+    "private-comment",
+    "private-marker",
   ])(
     "verify-change: %s",
     async (scenario) => {
@@ -3829,6 +4200,8 @@ protected_paths = ["protected.txt"]
             await commit();
             await git("push", bare, "HEAD:refs/heads/dependabot/npm/pkg-2");
           }
+          if (scenario === "private-comment")
+            return { structured: { ...approve, summary: `${approve.summary} Checked secret-host.example.` } };
           return { structured: approve };
         }
         expect(role).toBe("implement");
@@ -3854,6 +4227,13 @@ protected_paths = ["protected.txt"]
         };
       };
       let f = start(handler);
+      if (["private-comment", "private-marker"].includes(scenario)) {
+        mkdirSync(f.cfg.paths.configDir, { recursive: true });
+        writeFileSync(
+          join(f.cfg.paths.configDir, "private-strings.txt"),
+          scenario === "private-marker" ? "<!-- limitless-verification:" : "secret-host.example",
+        );
+      }
       const calls: string[][] = [];
       const gh = async (args: string[]) => {
         calls.push(args);
@@ -3941,7 +4321,9 @@ protected_paths = ["protected.txt"]
         expect(before?.verification?.headSha).toBe(head);
         if (scenario === "restart-repair") expect(before?.implementedRound).toBe(0);
       }
-      const blocked = prScript || ["persistent", "repair-audit", "empty"].includes(scenario);
+      const blocked =
+        prScript ||
+        ["persistent", "repair-audit", "empty", "private-comment", "private-marker"].includes(scenario);
       expect(await waitFor(f, runId, ["succeeded", "failed", "needs_human", "cancelled"])).toBe(
         scenario === "head-moved" ? "cancelled" : stale ? "failed" : blocked ? "needs_human" : "succeeded",
       );
@@ -3954,6 +4336,15 @@ protected_paths = ["protected.txt"]
       const baseRuns = scenario === "baseline" ? [baseTip, baseTip] : [baseTip];
       expect(revisions.slice(0, baseRuns.length + 1)).toEqual([...baseRuns, head]);
       const remote = (await git("ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).split("\t")[0];
+      if (["private-comment", "private-marker"].includes(scenario)) {
+        expect(calls.some((call) => call.at(-1)?.includes("limitless-verification"))).toBe(false);
+        expect(JSON.stringify(calls)).not.toContain("secret-host.example");
+        expect(remote).toBe(head);
+        expect(f.store.getRun(runId)?.error).toBe(
+          "PR comment contains a private string (entry 1 in private-strings.txt)",
+        );
+        return;
+      }
       if (stale) {
         expect(implementations).toBe(0);
         expect(
@@ -8879,6 +9270,36 @@ describe("routing bounded slot waits", () => {
 });
 
 describe("audit allowances (fake agents, real git)", () => {
+  test("private-string audit events and retry feedback redact filenames and values", async () => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nchecks = [{ name = "test", run = 'for file in *.txt; do if test "$file" != greeting.txt; then echo "$file"; exit 1; fi; done' }]\n`,
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "gate fixture"], {
+      cwd: repoDir,
+    });
+    const prompts: string[] = [];
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      prompts.push(s.prompt);
+      return { files: { "secret-host.example.txt": "secret-host.example\n" } };
+    });
+    f.cfg.maxRounds = 1;
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), "secret-host.example");
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["needs_human", "failed", "succeeded"])).toBe("needs_human");
+    const events = f.store.listEvents(run.id).filter((e) => e.type === "audit");
+    expect(events.length).toBeGreaterThan(0);
+    expect(JSON.stringify(events)).toContain("entry 1 in private-strings.txt");
+    expect(JSON.stringify(events)).not.toContain("secret-host.example");
+    expect(prompts[1]).toContain("entry 1 in private-strings.txt");
+    expect(prompts[1]).not.toContain("secret-host.example");
+  });
+
   /** Commits a nested repository into the implementer's worktree, which Git records as a gitlink. */
   const nestedRepository = async (cwd: string) => {
     const nested = join(cwd, "vendor");
