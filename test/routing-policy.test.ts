@@ -13,12 +13,13 @@ import { createHttpRoutes } from "../src/server/http.ts";
 import { evidence, local, subscription } from "./evals-policy-support.ts";
 import { evalFixture } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
-import { customModel } from "./provider-config-support.ts";
+import { customModel, providerFixture } from "./provider-config-support.ts";
 import { identitySnapshot } from "./routing-identity-support.ts";
 
 test("runtime models stay out of escalation and free widening unless explicitly named", () => {
+  const fixture = providerFixture([], "OMLX_API_KEY=fake-key\n");
   const store = new Store(":memory:");
-  const factory = new Factory(loadConfig(), { store });
+  const factory = new Factory(fixture.load(), { store });
   try {
     factory.catalog.add({ ...customModel, provider: "codex", id: "experimental", tier: 5 });
     factory.catalog.add({ ...customModel, provider: "omlx", id: "experimental", tier: 5, effort: undefined });
@@ -45,6 +46,7 @@ test("runtime models stay out of escalation and free widening unless explicitly 
     );
   } finally {
     store.close();
+    fixture.close();
   }
 });
 
