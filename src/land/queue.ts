@@ -127,8 +127,8 @@ export class LandQueue {
   }
 
   /**
-   * Queue a land for `runId`. `sha` is the approval and must be the PR's current head; without it
-   * the head the poller last saw is approved, which is what a reviewed PR means.
+   * Queue a land for `runId`. The approval is the PR's recorded review approval; `sha` names one
+   * explicitly instead and must be the PR's current head.
    */
   request(input: { runId: string; sha?: string }): LandEntry {
     const run = this.store.getRun(input.runId);
@@ -138,12 +138,7 @@ export class LandQueue {
     if (!run.prUrl) throw new Error("run has no pull request");
     const observed = this.deps.polling === false ? null : saved(this.store.githubPrData(run.prUrl));
     if (observed && observed.state !== "OPEN") throw new Error(`pull request is ${observed.state}`);
-    const head = observed?.head;
-    const sha = input.sha?.trim();
-    if (sha && !/^[a-fA-F0-9]{40}$/.test(sha)) throw new Error("sha must be a full commit id");
-    if (sha && head && sha !== head) throw new Error("sha is not the pull request's current head");
-    const approved = sha ?? head;
-    if (!approved) throw new Error("no observed head; pass --sha to approve one");
+    const approved = this.approval(run.prUrl, input.sha, observed?.head);
     const headBranch = run.deliveryBranch ?? run.branch;
     if (!headBranch) throw new Error("run has no delivery branch");
     const entry = this.store.createLandEntry({
@@ -159,6 +154,20 @@ export class LandQueue {
     });
     this.pump(entry.repo);
     return entry;
+  }
+
+  /** The approval that may land: the recorded review approval, or an explicit head that is the PR's. */
+  private approval(prUrl: string, sha: string | undefined, head: string | undefined): string {
+    const given = sha?.trim();
+    if (given) {
+      if (!/^[a-fA-F0-9]{40}$/.test(given)) throw new Error("sha must be a full commit id");
+      if (head && head !== given) throw new Error("sha is not the pull request's current head");
+      return given;
+    }
+    const approval = this.store.approvalFor(prUrl);
+    if (!approval) throw new Error("no review approval for this pull request");
+    if (approval.stale) throw new Error("review approval is stale: the head moved after it");
+    return approval.sha;
   }
 
   cancel(id: number): boolean {

@@ -105,6 +105,14 @@ if(args[0]==="pr"&&args[1]==="view") console.log(existsSync(file+".merged")?"MER
 
 /** The poller's saved observation of each PR: the head and its CI rollup. */
 const observers = new Map<string, (head: string, ci: string, failing?: string[]) => void>();
+const runs = new Map<number, Run>();
+
+/** The review approval `limitless land` reads: this head, reviewed. */
+const approve = (n: number, head: string) => {
+  const run = runs.get(n);
+  if (!run) throw new Error(`no run for PR ${n}`);
+  store.recordApproval(run.id, url(n), head, "orchestrator");
+};
 
 /** A succeeded run that delivered `branch` as PR `n`, with the poller's observation of its head. */
 function delivered(n: number, branch: string): { run: Run; prUrl: string } {
@@ -117,6 +125,7 @@ function delivered(n: number, branch: string): { run: Run; prUrl: string } {
     mergePolicy: "pr",
   });
   const run = store.createRun(repo, { repo: SLUG, prompt: `pr ${n}` });
+  runs.set(n, run);
   store.updateRun(run.id, {
     prUrl: url(n),
     branch,
@@ -239,9 +248,13 @@ const gateLog = () =>
 
 test("two approved entries on one repository land in order, never checking at once", async () => {
   const first = delivered(1, "pr-1");
-  observe(1, await pushBranch("pr-1", "one.txt", "one\n"));
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head1);
+  approve(1, head1);
   const second = delivered(2, "pr-2");
-  observe(2, await pushBranch("pr-2", "two.txt", "two\n"));
+  const head2 = await pushBranch("pr-2", "two.txt", "two\n");
+  observe(2, head2);
+  approve(2, head2);
   const q = queue();
   q.request({ runId: first.run.id });
   q.request({ runId: second.run.id });
@@ -261,9 +274,12 @@ test("a base that moved is merged in and pushed with the lease; an up-to-date en
   const behind = delivered(1, "pr-1");
   const behindHead = await pushBranch("pr-1", "one.txt", "one\n");
   observe(1, behindHead);
+  approve(1, behindHead);
   await advanceBase();
   const upToDate = delivered(2, "pr-2");
-  observe(2, await pushBranch("pr-2", "two.txt", "two\n"));
+  const head2 = await pushBranch("pr-2", "two.txt", "two\n");
+  observe(2, head2);
+  approve(2, head2);
   const q = queue();
   q.request({ runId: behind.run.id });
   q.request({ runId: upToDate.run.id });
@@ -290,13 +306,16 @@ test("a base that moved is merged in and pushed with the lease; an up-to-date en
 
 test("a push to the PR after approval blocks the entry and merges nothing", async () => {
   const pr = delivered(1, "pr-1");
-  observe(1, await pushBranch("pr-1", "one.txt", "one\n"));
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head1);
+  approve(1, head1);
   await advanceBase(); // forces the factory merge commit, so the entry has to push
   const q = queue();
   const entry = q.request({ runId: pr.run.id });
   // Someone pushes to the branch after the operator approved the head.
   const pushedByHand = await pushBranch("pr-1", "one.txt", "one\nedited\n");
   observe(1, pushedByHand);
+  approve(1, pushedByHand);
   await settle();
   expect(store.getLandEntry(entry.id)).toMatchObject({
     state: "blocked",
@@ -311,6 +330,7 @@ test("a conflicting base blocks the entry without pushing", async () => {
   const pr = delivered(1, "pr-1");
   const approved = await pushBranch("pr-1", "shared.txt", "from the pr\n");
   observe(1, approved);
+  approve(1, approved);
   await sh(["git", "checkout", "-q", "main"], { cwd: seed });
   writeFileSync(join(seed, "shared.txt"), "from the base\n");
   await sh(["git", "add", "."], { cwd: seed });
@@ -328,6 +348,7 @@ test("red CI on the pushed commit blocks the entry with the failing check names"
   const pr = delivered(1, "pr-1");
   const approved = await pushBranch("pr-1", "one.txt", "one\n");
   observe(1, approved);
+  approve(1, approved);
   const q = queue();
   const entry = q.request({ runId: pr.run.id });
   await settle({ ci: "FAILURE", failing: ["build", "typecheck"] });
@@ -350,7 +371,9 @@ test("a failing land check blocks the entry with the check names and no output",
   await sh(["git", "commit", "-qam", "failing check"], { cwd: seed });
   await sh(["git", "push", "-q", bare, "main"], { cwd: seed });
   const pr = delivered(1, "pr-1");
-  observe(1, await pushBranch("pr-1", "one.txt", "one\n"));
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head1);
+  approve(1, head1);
   const q = queue();
   const entry = q.request({ runId: pr.run.id });
   await settle();
@@ -362,7 +385,9 @@ test("a failing land check blocks the entry with the check names and no output",
 
 test("a restart during checking re-runs the checks from the start", async () => {
   const pr = delivered(1, "pr-1");
-  observe(1, await pushBranch("pr-1", "one.txt", "one\n"));
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head1);
+  approve(1, head1);
   const first = queue();
   const entry = first.request({ runId: pr.run.id });
   await waitFor(() => gateLog().length === 1); // the check is running
@@ -403,7 +428,9 @@ test("a restart during waiting_ci resumes waiting on the pushed commit", async (
 
 test("a restart during merging takes an already merged PR as landed without merging again", async () => {
   const pr = delivered(1, "pr-1");
-  observe(1, await pushBranch("pr-1", "one.txt", "one\n"));
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head1);
+  approve(1, head1);
   writeFileSync(join(root, "gh.hang"), "");
   const q = queue();
   const entry = q.request({ runId: pr.run.id });
@@ -423,7 +450,9 @@ test("a restart during merging takes an already merged PR as landed without merg
 
 test("CI that never finishes gives up with a reason", async () => {
   const pr = delivered(1, "pr-1");
-  observe(1, await pushBranch("pr-1", "one.txt", "one\n"));
+  const head1 = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head1);
+  approve(1, head1);
   const q = queue({ ciTimeoutMs: 5_000 });
   const entry = q.request({ runId: pr.run.id });
   await settle({ ci: "PENDING" });
@@ -431,18 +460,22 @@ test("CI that never finishes gives up with a reason", async () => {
   expect(ghCalls("pr merge")).toEqual([]);
 });
 
-test("a request must name an open PR on a GitHub repository and approve its current head", () => {
+test("a request needs a review approval, or an explicit head that is the PR's", () => {
   const pr = delivered(1, "pr-1");
   const q = queue({ start: false });
   expect(() => q.request({ runId: "missing" })).toThrow("run not found");
-  expect(() => q.request({ runId: pr.run.id })).toThrow("no observed head");
+  expect(() => q.request({ runId: pr.run.id })).toThrow("no review approval");
   observe(1, "c".repeat(40));
+  approve(1, "c".repeat(40));
+  // A head that moved after the approval makes it stale.
+  store.observePrHead(url(1), "b".repeat(40));
+  expect(() => q.request({ runId: pr.run.id })).toThrow("approval is stale");
+  expect(q.request({ runId: pr.run.id, sha: "c".repeat(40) }).approvedSha).toBe("c".repeat(40));
   expect(() => q.request({ runId: pr.run.id, sha: "d".repeat(40) })).toThrow(
     "not the pull request's current head",
   );
   expect(() => q.request({ runId: pr.run.id, sha: "short" })).toThrow("full commit id");
-  expect(q.request({ runId: pr.run.id }).approvedSha).toBe("c".repeat(40));
-  expect(() => q.request({ runId: pr.run.id })).toThrow("already in the land queue");
+  expect(() => q.request({ runId: pr.run.id, sha: "c".repeat(40) })).toThrow("already in the land queue");
   store.saveGithubPr({
     url: url(1),
     repo: SLUG,
@@ -459,6 +492,7 @@ test("cancelling a queued land stops it before any git runs", async () => {
   const pr = delivered(1, "pr-1");
   const approved = await pushBranch("pr-1", "one.txt", "one\n");
   observe(1, approved);
+  approve(1, approved);
   store.createLandEntry({
     runId: pr.run.id,
     repo: SLUG,
