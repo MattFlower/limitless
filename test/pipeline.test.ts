@@ -6686,6 +6686,53 @@ test("drain blocks queued starts and parks the active run at its next boundary",
   }
 });
 
+test.each(["missing", "mismatched"])("legacy worktree resumes with %s record", async (record) => {
+  let resumedRecord: string | undefined;
+  let resumedBytes: string | undefined;
+  const handler: Handler = (s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review") {
+      if (!resumedRecord || resumedBytes === undefined) throw new Error("Missing resumed worktree record");
+      expect(readFileSync(resumedRecord, "utf8")).toBe(resumedBytes);
+      return { structured: approve };
+    }
+    factory?.scheduler.drain();
+    return { files: { "farewell.txt": "goodbye\n" } };
+  };
+  const f = start(handler);
+  const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+  expect(await waitFor(f, run.id, ["queued"])).toBe("queued");
+  const state = f.store.getRunState<RunState>(run.id);
+  expect(state).toMatchObject({ phase: "loop", implementedRound: 0, parked: true });
+  if (!state?.worktreePath) throw new Error("Missing parked worktree");
+  const sidecar = `${resolve(state.worktreePath)}.git-paths`;
+  const original = readFileSync(sidecar, "utf8");
+  await f.stop();
+  // Also exercise the Git call made while restoring pre-upgrade preview state.
+  delete state.previewConfig;
+  f.store.setRunState(run.id, state);
+  f.store.close();
+  if (record === "missing") rmSync(sidecar);
+  else {
+    const paths = JSON.parse(original) as string[];
+    paths[0] = repoDir;
+    writeFileSync(sidecar, JSON.stringify(paths));
+  }
+  resumedRecord = sidecar;
+  resumedBytes = record === "missing" ? original : readFileSync(sidecar, "utf8");
+  const resumed = start(handler);
+  expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+    record === "missing" ? "succeeded" : "failed",
+  );
+  expect(readFileSync(sidecar, "utf8")).toBe(resumedBytes);
+  expect(
+    resumed.store.listEvents(run.id).filter((event) => event.message.includes("recorded legacy worktree")),
+  ).toHaveLength(record === "missing" ? 1 : 0);
+  if (record === "mismatched")
+    expect(resumed.store.getRun(run.id)?.error).toContain("Unsafe worktree Git administration");
+});
+
 for (const profile of ["quick", "standard"] as const) {
   test(`drain after implement preserves the ${profile} checkpoint and resumes at gates after restart`, async () => {
     const holdoutDone = Promise.withResolvers<void>();

@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { assertExistingBranchDelivery, assertFactoryBranchPush, isBranchName } from "../core/delivery.ts";
 import type { ResolvedProfile, Run, RunStatus } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
@@ -23,7 +23,7 @@ import {
   retryRegressions,
   runGates,
 } from "../gates/run.ts";
-import { worktreeGit, worktreeGitScope } from "../git/command.ts";
+import { recordWorktree, worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
   checkoutCommitted,
@@ -175,6 +175,15 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     await ctx.save();
     if (ctx.state.flow === "verify-change" && ctx.state.phase !== "prepare" && !ctx.state.verification)
       throw new Error("Verification state is missing its recorded PR revisions");
+    const worktree = ctx.state.worktreePath;
+    if (
+      worktree &&
+      lstatSync(join(worktree, ".git"), { throwIfNoEntry: false })?.isFile() &&
+      !lstatSync(`${resolve(worktree)}.git-paths`, { throwIfNoEntry: false })
+    ) {
+      await recordWorktree(worktree);
+      ctx.log(`recorded legacy worktree: ${worktree}`);
+    }
     if (ctx.state.phase !== "prepare" && ctx.state.previewConfig === undefined) {
       if (!ctx.run.baseSha || !ctx.state.worktreePath)
         throw new Error("Cannot restore base preview configuration: missing base SHA or worktree");
