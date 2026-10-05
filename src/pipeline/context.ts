@@ -782,7 +782,9 @@ export class RunContext {
       if (result.status !== "ok")
         failures.set(
           target.targetId ?? target.modelId,
-          opts.privateOutput ? result.status : `${result.status}: ${result.error ?? "already tried"}`,
+          opts.privateOutput
+            ? result.status
+            : `${result.status}: ${redact?.(result.error ?? "already tried") ?? result.error ?? "already tried"}`,
         );
 
       if (this.termination) throw this.termination;
