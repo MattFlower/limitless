@@ -28,6 +28,33 @@ const rollup = (state: string, contexts: Record<string, unknown>[] = []) => ({
   contexts: { nodes: contexts },
 });
 
+test("CI details are inspected on changes, retried after REST errors, and idle after success", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  h.start(15);
+  await h.advance(0);
+  const baseline = h.gh.rest().length;
+  await h.advance(15000);
+  expect(h.gh.rest()).toHaveLength(baseline);
+  let attempts = 0;
+  h.gh.responses.set("repos/o/r/commits/main", () =>
+    ++attempts === 1 ? respond(503, { message: "unavailable" }) : respond(200, { sha: "b".repeat(40) }),
+  );
+  ci(h.node("o/r", 1), rollup("FAILURE", [{ name: "test", conclusion: "FAILURE" }]));
+  await h.advance(15000);
+  expect(attempts).toBe(1);
+  expect(h.store.readFeed().items.filter((i) => i.kind === "ci.needs_fix")).toHaveLength(0);
+  h.reopen();
+  h.start(15);
+  await h.advance(0);
+  expect(attempts).toBe(2);
+  expect(h.store.readFeed().items.filter((i) => i.kind === "ci.needs_fix")).toHaveLength(1);
+  const count = h.gh.rest().length;
+  await h.advance(15000);
+  expect(h.gh.rest()).toHaveLength(count);
+  expect(h.gh.maxInFlight).toBe(1);
+});
+
 test("tracks only factory PRs from run records, one nodes(ids:) query per repository", async () => {
   h = pollerHarness(["o/r", "o/s", "o/empty"]);
   for (let n = 1; n <= 51; n++) h.factoryPr("o/r", n);

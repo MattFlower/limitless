@@ -36,7 +36,7 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
   );
   const seconds = factory.cfg.githubPollSeconds;
   const stopPoller = factory.cfg.githubPoll
-    ? startGitHubPoller(factory.store, { client: deps.github, seconds })
+    ? startGitHubPoller(factory.store, { client: deps.github, seconds, ciReruns: factory.cfg.githubCiReruns })
     : () => {};
   return {
     routes: {

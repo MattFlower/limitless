@@ -408,6 +408,7 @@ export type FeedKind =
   | `review.${"round_started" | "round_delivered" | "approved"}`
   | GitHubFeedKind;
 export type GitHubFeedKind =
+  | `ci.${"main_red" | "needs_fix"}`
   | `pr.${"ci_passed" | "ci_failed" | "conflicting" | "behind" | "review" | "comment" | "merged" | "closed"}`
   | "github.access_problem";
 /** A factory PR the poller observes; `delivered` (0/1): a run waits on its merge; `data`: its saved state. */
@@ -416,6 +417,16 @@ export type TrackedPr = { url: string; repo: string; runId: string; delivered: n
   data: string | null;
 };
 export type GitHubAccessProblem = { repo: string; reason: string; detail: string; since: number };
+export type CiFailure = {
+  prUrl: string;
+  sha: string;
+  signature: string;
+  check: string;
+  line: string;
+  image: string | null;
+  rerunMarker: string | null;
+  outcome: "failed" | "rerun_requested" | "rerunning" | "failed_again" | "failed_then_passed";
+};
 export interface FeedItem {
   id: number;
   ts: number;

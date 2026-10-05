@@ -1,0 +1,281 @@
+import { z } from "zod";
+import type { CiFailure, GitHubFeedKind, TrackedPr } from "../core/types.ts";
+import type { Store } from "../db/store.ts";
+import type { GitHubResponse, PrSnapshot } from "./github-poller.ts";
+
+const bad = new Set(["failure", "error", "timed_out", "startup_failure", "action_required", "cancelled"]);
+const security = /security|codeql|dependenc(?:y|ies)[ -]?review|secret[ -]?scan|sast|dast|vulnerab/i;
+const checkSchema = z.object({
+  id: z.number().int().positive(),
+  name: z.string(),
+  head_sha: z.string(),
+  status: z.string(),
+  conclusion: z.string().nullable(),
+  completed_at: z.string().nullable().optional(),
+  details_url: z.string().nullable().optional(),
+  app: z.object({ slug: z.string() }).nullable().optional(),
+  output: z
+    .object({
+      title: z.string().nullable(),
+      summary: z.string().nullable(),
+      text: z.string().nullable().optional(),
+    })
+    .optional(),
+});
+const jobSchema = z.object({
+  id: z.number().int().positive(),
+  head_sha: z.string(),
+  status: z.string(),
+  conclusion: z.string().nullable(),
+  check_run_url: z.string(),
+  name: z.string(),
+  labels: z.array(z.string()).optional(),
+  started_at: z.string().nullable().optional(),
+});
+type Check = z.infer<typeof checkSchema>;
+type Call = (repo: string, path: string, body?: unknown) => Promise<GitHubResponse | null>;
+const bounded = (text: string) => text.trim().slice(0, 500);
+/** Logs are data. Only these literal failure patterns participate in deterministic classification. */
+export function ciSignature(check: string, log: string, fallback: string, labels: string[] = []) {
+  const lines = log.split(/\r?\n/).map((line) => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ""));
+  const line = bounded(
+    lines.find((l) => /timed out after|##\[error\]|\b(?:error|fail(?:ed|ure)?)\b/i.test(l)) ?? fallback,
+  );
+  const image =
+    bounded(
+      lines.find((l) => /^\s*Image:/.test(l))?.replace(/^\s*Image:\s*/, "") ??
+        labels.find((label) => /^(?:ubuntu|windows|macos)-/.test(label)) ??
+        "",
+    ) || null;
+  return { check, line, image, signature: JSON.stringify([check, line, image]) };
+}
+const quote = (s: string) => `> ${s.replace(/\r?\n/g, "\n> ")}`;
+
+/** Serial REST inspection. False retains the persisted pending inspection for a later poll. */
+export async function classifyCi(
+  store: Store,
+  pr: TrackedPr,
+  snap: PrSnapshot,
+  call: Call,
+  reruns: boolean,
+  ready: () => boolean,
+  current: () => boolean,
+): Promise<boolean> {
+  const root = `repos/${pr.repo}`;
+  const read = async (path: string) => {
+    const res = await call(pr.repo, `${root}/${path}`);
+    if (res?.status !== 200)
+      throw new Error(`Incomplete CI inspection: ${path} (${res?.status ?? "paused"})`);
+    return res.body;
+  };
+  const checks = async (ref: string): Promise<Check[]> => {
+    const all: Check[] = [];
+    for (let page = 1; ; page++) {
+      const parsed = z
+        .object({ total_count: z.number().int().nonnegative(), check_runs: z.array(checkSchema) })
+        .parse(
+          await read(`commits/${encodeURIComponent(ref)}/check-runs?filter=latest&per_page=100&page=${page}`),
+        );
+      all.push(...parsed.check_runs);
+      if (all.length === parsed.total_count) break;
+      if (!parsed.check_runs.length || all.length > parsed.total_count)
+        throw new Error("Incomplete CI check page");
+    }
+    if (snap.statusNames?.length || snap.truncated) {
+      const latest = new Map<string, Check>();
+      for (let page = 1; ; page++) {
+        const statuses = z
+          .array(
+            z.object({
+              id: z.number(),
+              context: z.string(),
+              state: z.string(),
+              description: z.string().nullable(),
+            }),
+          )
+          .parse(await read(`commits/${encodeURIComponent(ref)}/statuses?per_page=100&page=${page}`));
+        for (const s of statuses)
+          if (!latest.has(s.context))
+            latest.set(s.context, {
+              id: s.id,
+              name: s.context,
+              head_sha: ref,
+              status: s.state === "pending" ? "in_progress" : "completed",
+              conclusion: s.state,
+              output: { title: s.description, summary: s.description },
+            });
+        if (statuses.length < 100) break;
+      }
+      all.push(...latest.values());
+    }
+    return all;
+  };
+  const emit = (
+    kind: GitHubFeedKind,
+    f: ReturnType<typeof ciSignature>,
+    key: string,
+    repository = false,
+    excerpt = f.line,
+  ) => {
+    store.saveGithubPr(null, false, [
+      {
+        kind,
+        repo: pr.repo,
+        runId: repository ? null : pr.runId,
+        key,
+        summary: repository ? "Default branch CI is failing" : "CI failure needs a code or environment fix",
+        data: {
+          ...(repository ? {} : { url: pr.url, head: snap.headRefOid }),
+          signature: { check: quote(f.check), line: quote(f.line), image: f.image && quote(f.image) },
+          excerpt: quote(excerpt.trim().slice(0, 2000)),
+          untrusted: true,
+        },
+      },
+    ]);
+  };
+  const branch = store.getRepoBySlug(pr.repo)?.defaultBranch ?? "main";
+  const mainSha = z
+    .object({ sha: z.string().regex(/^[a-f0-9]{40}$/i) })
+    .parse(await read(`commits/${encodeURIComponent(branch)}`)).sha;
+  const main = await checks(mainSha);
+  if (main.some((c) => c.head_sha !== mainSha)) throw new Error("Incomplete default branch CI");
+  const episodes = store.getSetting<Record<string, { red: boolean; episode: number }>>(
+    `ci.main:${pr.repo}`,
+    {},
+  );
+  const state = new Map(Object.entries(episodes));
+  for (const name of state.keys())
+    if (!main.some((c) => c.name === name)) {
+      const old = state.get(name);
+      if (old) state.set(name, { ...old, red: false });
+    }
+  for (const [name, group] of Map.groupBy(main, (c) => c.name)) {
+    const failed = group.find(
+      (c) => c.status === "completed" && bad.has(c.conclusion ?? "") && c.conclusion !== "cancelled",
+    );
+    const red = !!failed;
+    const old = state.get(name);
+    const episode = (old?.episode ?? 0) + (red && !old?.red ? 1 : 0);
+    if (failed && snap.failing.some((f) => f.name === name))
+      emit(
+        "ci.main_red",
+        ciSignature(name, "", failed.conclusion ?? "failure"),
+        `${pr.repo}:${name}:${episode}`,
+        true,
+      );
+    state.set(name, { red, episode });
+  }
+  store.setSetting(`ci.main:${pr.repo}`, Object.fromEntries(state));
+  if (!current()) return true;
+  if (snap.ci === "SUCCESS") return true;
+  const failures = await checks(snap.headRefOid);
+  if (failures.some((c) => c.head_sha !== snap.headRefOid)) throw new Error("Incomplete PR CI");
+  const names = new Set([
+    ...snap.failing.map((c) => c.name),
+    ...failures.filter((c) => c.status === "completed" && bad.has(c.conclusion ?? "")).map((c) => c.name),
+  ]);
+  if (!names.size) throw new Error("Incomplete CI failure: no failing checks");
+  for (const name of names) {
+    const matches = failures.filter(
+      (c) => c.name === name && c.status === "completed" && bad.has(c.conclusion ?? ""),
+    );
+    // Missing or still-running check data cannot resolve the GraphQL failure.
+    if (!matches.length) throw new Error(`Incomplete failing check: ${name}`);
+    for (const c of matches) {
+      const times = snap.completed?.filter((t) => t.name === c.name) ?? [];
+      const completedAt = c.completed_at;
+      if (completedAt && times.length && !times.some((t) => Date.parse(t.time) === Date.parse(completedAt)))
+        throw new Error("Outdated CI check completion");
+      let log = c.output?.text ?? c.output?.summary ?? "";
+      if (state.get(c.name)?.red) {
+        emit(
+          "ci.main_red",
+          ciSignature(c.name, log, c.conclusion ?? "failure"),
+          `${pr.repo}:${c.name}:${state.get(c.name)?.episode}`,
+          true,
+        );
+        const f = {
+          ...ciSignature(c.name, log, c.output?.title ?? c.conclusion ?? "failure"),
+          prUrl: pr.url,
+          sha: snap.headRefOid,
+          outcome: "failed",
+          rerunMarker: null,
+        } as const;
+        if (!security.test(c.name) && !security.test(f.line)) store.recordCiFailure(f);
+        continue;
+      }
+      let job: z.infer<typeof jobSchema> | undefined;
+      const prefix = `https://github.com/${pr.repo}/`;
+      const ids =
+        c.details_url?.toLowerCase().startsWith(prefix.toLowerCase()) &&
+        c.details_url.slice(prefix.length).match(/^(?:actions\/)?runs\/\d+\/jobs?\/(\d+)(?:\?.*)?$/);
+      if (c.app?.slug === "github-actions" && ids) {
+        job = jobSchema.parse(await read(`actions/jobs/${ids[1]}`));
+        if (
+          job.check_run_url !== `https://api.github.com/${root}/check-runs/${c.id}` ||
+          job.head_sha !== snap.headRefOid ||
+          job.status !== "completed" ||
+          !bad.has(job.conclusion ?? "")
+        )
+          throw new Error("Incomplete failing job");
+        // A job that never started has no downloadable logs.
+        if (
+          job.started_at !== null &&
+          job.conclusion !== "startup_failure" &&
+          c.conclusion !== "startup_failure"
+        ) {
+          const body = await read(`actions/jobs/${job.id}/logs`);
+          if (typeof body !== "string") throw new Error("Incomplete CI log");
+          log = body;
+        }
+      }
+      const f: CiFailure = {
+        ...ciSignature(c.name, log, c.output?.title ?? c.conclusion ?? "failure", job?.labels),
+        prUrl: pr.url,
+        sha: snap.headRefOid,
+        outcome: "failed",
+        rerunMarker: null,
+      };
+      const unsafe = security.test(c.name) || security.test(job?.name ?? "") || security.test(f.line);
+      const marker = JSON.stringify([c.id, c.completed_at ?? snap.ciKey]);
+      const prior = store
+        .ciFailures(pr.url, snap.headRefOid)
+        .filter(
+          (p) =>
+            p.check === c.name &&
+            p.outcome !== "failed" &&
+            (p.signature === f.signature || p.rerunMarker !== marker),
+        );
+      if (prior.some((p) => p.outcome === "rerunning" && p.rerunMarker === marker)) continue;
+      if (!unsafe) store.recordCiFailure(f);
+      const needsFix = () =>
+        emit("ci.needs_fix", f, `${pr.url}:${snap.headRefOid}:${f.signature}`, false, log || f.line);
+      const transient =
+        [c.conclusion, job?.conclusion].some((v) =>
+          ["timed_out", "startup_failure", "cancelled"].includes(v ?? ""),
+        ) ||
+        job?.started_at === null ||
+        /timed out after/i.test(log);
+      if (!unsafe && !prior.length && job && transient && reruns) {
+        if (!ready()) return false;
+        const remote = z
+          .object({ head: z.object({ sha: z.string() }), state: z.string() })
+          .parse(await read(`pulls/${pr.url.split("/").at(-1)}`));
+        if (remote.head.sha !== snap.headRefOid || remote.state !== "open" || !current()) continue;
+        if (!ready()) return false;
+        if (store.claimCiRerun(f, marker)) {
+          const res = await call(pr.repo, `${root}/actions/jobs/${job.id}/rerun`, {});
+          if (res?.status !== 201) throw new Error("CI job rerun was not confirmed");
+          store.finishCiFailure(f, "rerunning");
+          continue;
+        }
+      }
+      if (!current()) return true;
+      for (const p of prior)
+        if (p.outcome === "rerunning" || p.outcome === "rerun_requested")
+          store.finishCiFailure(p, "failed_again");
+      needsFix();
+    }
+  }
+  return true;
+}

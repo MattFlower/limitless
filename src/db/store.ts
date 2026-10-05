@@ -10,6 +10,7 @@ import type {
   ChatOrigin,
   ChatProposal,
   ChatProposalFields,
+  CiFailure,
   CreateRunRequest,
   EvalRun,
   EvalTrial,
@@ -1987,6 +1988,37 @@ export class Store {
   }
 
   // ---- GitHub poller -------------------------------------------------------
+
+  ciFailures(prUrl: string, sha: string): CiFailure[] {
+    return this.db
+      .query<CiFailure, [string, string]>(`SELECT pr_url AS prUrl, sha, signature,
+      check_name AS "check", error_line AS line, runner_image AS image, outcome, rerun_marker AS rerunMarker
+      FROM ci_failures WHERE pr_url = ? AND sha = ?`)
+      .all(prUrl, sha);
+  }
+
+  recordCiFailure(f: CiFailure): void {
+    this.db
+      .query(`INSERT INTO ci_failures (pr_url, sha, signature, check_name, error_line, runner_image)
+      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`)
+      .run(f.prUrl, f.sha, f.signature, f.check, f.line, f.image);
+  }
+
+  /** Claim before the POST; an ambiguous response must never permit another paid CI attempt. */
+  claimCiRerun(f: CiFailure, marker: string): boolean {
+    return (
+      this.db
+        .query(`UPDATE ci_failures SET rerun_claimed = 1, outcome = 'rerun_requested', rerun_marker = ?
+      WHERE pr_url = ? AND sha = ? AND signature = ? AND rerun_claimed = 0`)
+        .run(marker, f.prUrl, f.sha, f.signature).changes === 1
+    );
+  }
+
+  finishCiFailure(f: CiFailure, outcome: CiFailure["outcome"]): void {
+    this.db
+      .query("UPDATE ci_failures SET outcome = ? WHERE pr_url = ? AND sha = ? AND signature = ?")
+      .run(outcome, f.prUrl, f.sha, f.signature);
+  }
 
   /** Unmerged PRs factory runs opened; PRs runs only verified, or abandoned over 7 days while open, are excluded. */
   githubTracked(now = Date.now()): TrackedPr[] {
