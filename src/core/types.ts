@@ -425,6 +425,7 @@ export type CiFailure = {
   line: string;
   image: string | null;
   rerunMarker: string | null;
+  rerunJob?: { id: number; runId: number; attempt: number; name: string } | null;
   outcome: "failed" | "rerun_requested" | "rerunning" | "failed_again" | "failed_then_passed";
 };
 export interface FeedItem {

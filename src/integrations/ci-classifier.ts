@@ -24,6 +24,8 @@ const checkSchema = z.object({
 });
 const jobSchema = z.object({
   id: z.number().int().positive(),
+  run_id: z.number().int().positive(),
+  run_attempt: z.number().int().positive(),
   head_sha: z.string(),
   status: z.string(),
   conclusion: z.string().nullable(),
@@ -67,6 +69,17 @@ export async function classifyCi(
     if (res?.status !== 200)
       throw new Error(`Incomplete CI inspection: ${path} (${res?.status ?? "paused"})`);
     return res.body;
+  };
+  const jobs = async (run: number, attempt: number) => {
+    const all: z.infer<typeof jobSchema>[] = [];
+    for (let page = 1; ; page++) {
+      const parsed = z
+        .object({ total_count: z.number().int().nonnegative(), jobs: z.array(jobSchema) })
+        .parse(await read(`actions/runs/${run}/attempts/${attempt}/jobs?per_page=100&page=${page}`));
+      all.push(...parsed.jobs);
+      if (all.length === parsed.total_count) return all;
+      if (!parsed.jobs.length || all.length > parsed.total_count) throw new Error("Incomplete CI job page");
+    }
   };
   const checks = async (ref: string): Promise<Check[]> => {
     const all: Check[] = [];
@@ -167,7 +180,50 @@ export async function classifyCi(
   }
   store.setSetting(`ci.main:${pr.repo}`, Object.fromEntries(state));
   if (!current()) return true;
-  if (snap.ci === "SUCCESS") return true;
+  const resolved = new Set<number>();
+  // Only a later attempt of the originating workflow job can resolve a rerun.
+  for (const f of store.ciFailures(pr.url, snap.headRefOid)) {
+    const origin = f.rerunJob;
+    if (f.outcome !== "rerunning" || !origin) continue;
+    const run = z
+      .object({ head_sha: z.string(), run_attempt: z.number().int().positive() })
+      .parse(await read(`actions/runs/${origin.runId}`));
+    if (run.head_sha !== f.sha) throw new Error("Outdated CI rerun SHA");
+    if (run.run_attempt <= origin.attempt) continue;
+    const matches = (await jobs(origin.runId, run.run_attempt)).filter((j) => j.name === origin.name);
+    if (matches.length !== 1) throw new Error("Ambiguous CI rerun job");
+    const job = matches[0];
+    if (
+      !job ||
+      job.run_id !== origin.runId ||
+      job.run_attempt !== run.run_attempt ||
+      job.head_sha !== f.sha ||
+      job.id === origin.id
+    )
+      throw new Error("Incomplete CI rerun job");
+    if (!current()) return true;
+    if (job.status !== "completed") continue;
+    if (job.conclusion === "success") store.finishCiFailure(f, "failed_then_passed");
+    else if (bad.has(job.conclusion ?? "") && !state.get(f.check)?.red) {
+      const log =
+        job.started_at === null || job.conclusion === "startup_failure"
+          ? ""
+          : z.string().parse(await read(`actions/jobs/${job.id}/logs`));
+      if (!current()) return true;
+      const failure = {
+        ...f,
+        ...ciSignature(f.check, log, job.conclusion ?? "failure", job.labels),
+        outcome: "failed",
+        rerunMarker: null,
+        rerunJob: null,
+      } as const;
+      if (!security.test(job.name) && !security.test(failure.line)) store.recordCiFailure(failure);
+      store.finishCiFailure(f, "failed_again");
+      emit("ci.needs_fix", failure, `${pr.url}:${f.sha}:${failure.signature}`, false, log || failure.line);
+    } else continue;
+    resolved.add(job.id);
+  }
+  if (snap.ci !== "FAILURE" && snap.ci !== "ERROR") return true;
   const failures = await checks(snap.headRefOid);
   if (failures.some((c) => c.head_sha !== snap.headRefOid)) throw new Error("Incomplete PR CI");
   const names = new Set([
@@ -242,11 +298,12 @@ export async function classifyCi(
         .ciFailures(pr.url, snap.headRefOid)
         .filter(
           (p) =>
-            p.check === c.name &&
             p.outcome !== "failed" &&
-            (p.signature === f.signature || p.rerunMarker !== marker),
+            (p.signature === f.signature ||
+              (job && p.rerunJob?.runId === job.run_id && p.rerunJob.name === job.name)),
         );
-      if (prior.some((p) => p.outcome === "rerunning" && p.rerunMarker === marker)) continue;
+      if (job && resolved.has(job.id)) continue;
+      if (prior.some((p) => p.outcome === "rerunning")) continue;
       if (!unsafe) store.recordCiFailure(f);
       const needsFix = () =>
         emit("ci.needs_fix", f, `${pr.url}:${snap.headRefOid}:${f.signature}`, false, log || f.line);
@@ -257,13 +314,23 @@ export async function classifyCi(
         job?.started_at === null ||
         /timed out after/i.test(log);
       if (!unsafe && !prior.length && job && transient && reruns) {
+        const siblings = (await jobs(job.run_id, job.run_attempt)).filter((j) => j.name === job.name);
+        if (siblings.length !== 1 || siblings[0]?.id !== job.id)
+          throw new Error("Ambiguous originating CI job");
         if (!ready()) return false;
         const remote = z
           .object({ head: z.object({ sha: z.string() }), state: z.string() })
           .parse(await read(`pulls/${pr.url.split("/").at(-1)}`));
         if (remote.head.sha !== snap.headRefOid || remote.state !== "open" || !current()) continue;
         if (!ready()) return false;
-        if (store.claimCiRerun(f, marker)) {
+        if (
+          store.claimCiRerun(f, marker, {
+            id: job.id,
+            runId: job.run_id,
+            attempt: job.run_attempt,
+            name: job.name,
+          })
+        ) {
           const res = await call(pr.repo, `${root}/actions/jobs/${job.id}/rerun`, {});
           if (res?.status !== 201) throw new Error("CI job rerun was not confirmed");
           store.finishCiFailure(f, "rerunning");
@@ -271,9 +338,7 @@ export async function classifyCi(
         }
       }
       if (!current()) return true;
-      for (const p of prior)
-        if (p.outcome === "rerunning" || p.outcome === "rerun_requested")
-          store.finishCiFailure(p, "failed_again");
+      for (const p of prior) if (p.outcome === "rerun_requested") store.finishCiFailure(p, "failed_again");
       needsFix();
     }
   }

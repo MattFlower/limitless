@@ -21,11 +21,13 @@ function failure(n = 1, name = "test", conclusion = "timed_out") {
     status: "completed",
     conclusion,
     head_sha: SHA,
-    details_url: `https://github.com/o/r/actions/runs/1/job/${n + 20}`,
+    details_url: `https://github.com/o/r/actions/runs/${n}/job/${n + 20}`,
     app: { slug: "github-actions" },
   };
   const job = {
     id: n + 20,
+    run_id: n,
+    run_attempt: 1,
     name,
     status: "completed",
     conclusion,
@@ -56,7 +58,30 @@ function failure(n = 1, name = "test", conclusion = "timed_out") {
   h.gh.responses.set(`repos/o/r/actions/jobs/${job.id}`, () => respond(200, job));
   h.gh.responses.set(`repos/o/r/actions/jobs/${job.id}/logs`, () => respond(200, state.log));
   h.gh.responses.set(`repos/o/r/actions/jobs/${job.id}/rerun`, () => respond(201, {}));
-  return { node, check, job, state, observe };
+  h.gh.responses.set(`repos/o/r/actions/runs/${n}`, () =>
+    respond(200, { head_sha: SHA, run_attempt: job.run_attempt }),
+  );
+  const original = { ...job };
+  h.gh.responses.set(`repos/o/r/actions/runs/${n}/attempts/1/jobs?per_page=100&page=1`, () =>
+    respond(200, { total_count: 1, jobs: [original] }),
+  );
+  h.gh.responses.set(`repos/o/r/actions/runs/${n}/attempts/2/jobs?per_page=100&page=1`, () =>
+    respond(200, { total_count: 1, jobs: [job] }),
+  );
+  const rerun = (result: string, status = "completed") => {
+    job.id = original.id + 100;
+    job.run_attempt = 2;
+    job.status = status;
+    job.conclusion = result;
+    check.id += 100;
+    check.conclusion = result;
+    check.status = status;
+    check.details_url = `https://github.com/o/r/actions/runs/${n}/job/${job.id}`;
+    job.check_run_url = `https://api.github.com/repos/o/r/check-runs/${check.id}`;
+    h.gh.responses.set(`repos/o/r/actions/jobs/${job.id}`, () => respond(200, job));
+    h.gh.responses.set(`repos/o/r/actions/jobs/${job.id}/logs`, () => respond(200, state.log));
+  };
+  return { node, check, job, state, observe, rerun };
 }
 
 test("a timed-out job reruns once and a pass at its SHA is flake evidence", async () => {
@@ -70,6 +95,7 @@ test("a timed-out job reruns once and a pass at its SHA is flake evidence", asyn
   await h.advance(15000);
   expect(h.gh.rest()).toHaveLength(count);
   f.observe("SUCCESS", "rerun");
+  f.rerun("success");
   await h.advance(15000);
   expect(h.store.ciFailures(url("o/r", 1), SHA)[0]).toMatchObject({
     outcome: "failed_then_passed",
@@ -85,6 +111,7 @@ test("a failed rerun reports needs-fix and the cap survives reopening SQLite", a
   await h.advance(0);
   h.reopen();
   f.observe("FAILURE", "rerun");
+  f.rerun("timed_out");
   h.start(15);
   await h.advance(0);
   expect(reruns()).toHaveLength(1);
@@ -92,6 +119,154 @@ test("a failed rerun reports needs-fix and the cap survives reopening SQLite", a
   expect(h.store.ciFailures(url("o/r", 1), SHA)[0]?.outcome).toBe("failed_again");
   h.reopen();
   f.observe("FAILURE", "another-observation");
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(1);
+  expect(items("ci.needs_fix")).toHaveLength(1);
+});
+
+test.each([false, true])("same-name checks have independent reruns (same workflow=%s)", async (sameRun) => {
+  h = pollerHarness();
+  const f = failure();
+  f.job.name = "first job";
+  const other = { ...f.check, id: 12, details_url: "https://github.com/o/r/actions/runs/2/job/22" };
+  const job = {
+    ...f.job,
+    id: 22,
+    name: sameRun ? "second job" : "first job",
+    run_id: sameRun ? 1 : 2,
+    check_run_url: "https://api.github.com/repos/o/r/check-runs/12",
+  };
+  const original = { ...f.job };
+  h.gh.responses.set(checksPath(SHA), () => respond(200, { total_count: 2, check_runs: [f.check, other] }));
+  h.gh.responses.set("repos/o/r/actions/jobs/22", () => respond(200, job));
+  h.gh.responses.set("repos/o/r/actions/jobs/22/logs", () =>
+    respond(200, "error: different test timed out after 10000ms"),
+  );
+  h.gh.responses.set("repos/o/r/actions/jobs/22/rerun", () => respond(201, {}));
+  for (const run of new Set([1, job.run_id])) {
+    const jobs = [original, job].filter((j) => j.run_id === run);
+    h.gh.responses.set(`repos/o/r/actions/runs/${run}/attempts/1/jobs?per_page=100&page=1`, () =>
+      respond(200, { total_count: jobs.length, jobs }),
+    );
+    h.gh.responses.set(`repos/o/r/actions/runs/${run}`, () =>
+      respond(200, { head_sha: SHA, run_attempt: 1 }),
+    );
+  }
+  h.start(15);
+  await h.advance(0);
+  expect(reruns().map((c) => c.path)).toEqual([
+    "repos/o/r/actions/jobs/21/rerun",
+    "repos/o/r/actions/jobs/22/rerun",
+  ]);
+  expect(h.store.ciFailures(f.node.url, SHA).map((r) => r.outcome)).toEqual(["rerunning", "rerunning"]);
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  h.reopen();
+  f.observe("FAILURE", "sibling changed");
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(2);
+  expect(h.store.ciFailures(f.node.url, SHA).every((r) => r.outcome === "rerunning")).toBe(true);
+  f.rerun("timed_out", "in_progress");
+  job.id = 122;
+  job.run_attempt = 2;
+  other.id = 112;
+  other.details_url = `https://github.com/o/r/actions/runs/${job.run_id}/job/${job.id}`;
+  job.check_run_url = "https://api.github.com/repos/o/r/check-runs/112";
+  h.gh.responses.set("repos/o/r/actions/jobs/122", () => respond(200, job));
+  h.gh.responses.set("repos/o/r/actions/jobs/122/logs", () =>
+    respond(200, "error: different test timed out after 10000ms"),
+  );
+  for (const run of new Set([1, job.run_id])) {
+    const jobs = [f.job, job].filter((j) => j.run_id === run);
+    h.gh.responses.set(`repos/o/r/actions/runs/${run}/attempts/2/jobs?per_page=100&page=1`, () =>
+      respond(200, { total_count: jobs.length, jobs }),
+    );
+    h.gh.responses.set(`repos/o/r/actions/runs/${run}`, () =>
+      respond(200, { head_sha: SHA, run_attempt: 2 }),
+    );
+  }
+  f.observe("FAILURE", "second job failed again");
+  await h.advance(15000);
+  const records = h.store.ciFailures(f.node.url, SHA);
+  expect(records.find((r) => r.rerunJob?.id === 21)?.outcome).toBe("rerunning");
+  expect(records.find((r) => r.rerunJob?.id === 22)?.outcome).toBe("failed_again");
+  expect(items("ci.needs_fix")).toHaveLength(1);
+  expect(reruns()).toHaveLength(2);
+});
+
+test("a successful sibling cannot resolve an in-progress rerun, even across restart", async () => {
+  h = pollerHarness();
+  const f = failure();
+  h.start(15);
+  await h.advance(0);
+  f.rerun("success", "in_progress");
+  const head = f.node.commits.nodes[0];
+  if (!head) throw new Error("missing fixture commit");
+  head.commit.statusCheckRollup = {
+    state: "PENDING",
+    contexts: {
+      nodes: [
+        { name: "test", conclusion: "SUCCESS", status: "COMPLETED" },
+        { name: "test", conclusion: null, status: "IN_PROGRESS" },
+      ],
+    },
+  };
+  h.reopen();
+  h.start(15);
+  await h.advance(0);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
+  const calls = h.gh.rest().length;
+  await h.advance(15000);
+  expect(h.gh.rest()).toHaveLength(calls);
+  // Even the aggregate success must be confirmed by this job's completed attempt.
+  f.observe("SUCCESS", "rollup ahead of REST");
+  await h.advance(15000);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
+  f.job.status = "completed";
+  f.observe("SUCCESS", "rerun completed");
+  await h.advance(15000);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_then_passed");
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(reruns()).toHaveLength(1);
+});
+
+test("incomplete rerun evidence stays retryable without accepting GraphQL success", async () => {
+  h = pollerHarness();
+  const f = failure();
+  h.start(15);
+  await h.advance(0);
+  f.rerun("success");
+  f.observe("SUCCESS", "rerun");
+  const path = "repos/o/r/actions/runs/1/attempts/2/jobs?per_page=100&page=1";
+  h.gh.responses.set(path, () => respond(200, { total_count: 1, jobs: [] }));
+  await h.advance(15000);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
+  h.gh.responses.set(path, () => respond(200, { total_count: 1, jobs: [f.job] }));
+  await h.advance(15000);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_then_passed");
+  const calls = h.gh.rest().length;
+  await h.advance(15000);
+  expect(h.gh.rest()).toHaveLength(calls);
+  expect(reruns()).toHaveLength(1);
+});
+
+test("a changed error on the originating rerun is reported without another attempt", async () => {
+  h = pollerHarness();
+  const f = failure();
+  h.start(15);
+  await h.advance(0);
+  f.rerun("failure");
+  f.state.log = "Image: ubuntu-24.04\nerror: another test failed";
+  f.observe("FAILURE", "new error");
+  await h.advance(15000);
+  const records = h.store.ciFailures(f.node.url, SHA);
+  expect(records.find((r) => r.rerunJob?.id === 21)?.outcome).toBe("failed_again");
+  expect(records.find((r) => r.line === "error: another test failed")?.outcome).toBe("failed");
+  expect(items("ci.needs_fix")[0]?.data.signature).toMatchObject({ line: "> error: another test failed" });
+  h.reopen();
+  f.observe("FAILURE", "still failing");
   h.start(15);
   await h.advance(0);
   expect(reruns()).toHaveLength(1);
@@ -240,7 +415,7 @@ test("a pass on a different SHA does not prove nondeterminism", async () => {
   expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
 });
 
-test.each(["checks", "job", "logs", "main"])(
+test.each(["checks", "job", "logs", "main", "attempt"])(
   "incomplete %s details remain retryable and cannot rerun",
   async (part) => {
     h = pollerHarness();
@@ -252,7 +427,9 @@ test.each(["checks", "job", "logs", "main"])(
           ? `repos/o/r/actions/jobs/${f.job.id}`
           : part === "logs"
             ? `repos/o/r/actions/jobs/${f.job.id}/logs`
-            : checksPath(mainSha);
+            : part === "attempt"
+              ? "repos/o/r/actions/runs/1/attempts/1/jobs?per_page=100&page=1"
+              : checksPath(mainSha);
     const original = h.gh.responses.get(path);
     h.gh.responses.set(path, () => respond(200, null));
     h.start(15);

@@ -292,9 +292,11 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     const nudge = unknown >= 3 && prev?.nudged !== head;
     const changes = diffPr(prev, snap);
     const ciChanged = !same || prev?.ciKey !== snap.ciKey;
+    const outstanding = store.ciFailures(pr.url, head).some((f) => f.outcome === "rerunning");
     let ciPending =
       (same && prev?.ciPending) ||
       (snap.state === "OPEN" && (snap.ci === "FAILURE" || snap.ci === "ERROR") && ciChanged) ||
+      (ciChanged && outstanding) ||
       false;
     const revision = (prev?.revision ?? 0) + (changes.length ? 1 : 0);
     const items = changes.map((c) => {
@@ -309,15 +311,6 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     // One nudge per UNKNOWN episode on a head: a known value ends the episode.
     save(unknown ? (prev?.nudged ?? null) : null);
     settled ||= snap.state !== (prev?.state ?? "OPEN");
-    for (const f of store.ciFailures(pr.url, head))
-      if (
-        f.outcome === "rerunning" &&
-        (snap.ci === "SUCCESS" ||
-          (!snap.truncated &&
-            snap.passing?.includes(f.check) &&
-            !snap.failing.some((c) => c.name === f.check)))
-      )
-        store.finishCiFailure(f, "failed_then_passed");
     const mainEpisode = store.getSetting<Record<string, { red: boolean }>>(`ci.main:${pr.repo}`, {});
     if (ciPending || (ciChanged && snap.ci === "SUCCESS" && Object.values(mainEpisode).some((e) => e.red))) {
       const ciCall = async (repo: string, path: string, body?: unknown) => {

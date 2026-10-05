@@ -1991,10 +1991,15 @@ export class Store {
 
   ciFailures(prUrl: string, sha: string): CiFailure[] {
     return this.db
-      .query<CiFailure, [string, string]>(`SELECT pr_url AS prUrl, sha, signature,
-      check_name AS "check", error_line AS line, runner_image AS image, outcome, rerun_marker AS rerunMarker
+      .query<
+        Omit<CiFailure, "rerunJob"> & { rerunJob: string | null },
+        [string, string]
+      >(`SELECT pr_url AS prUrl, sha, signature,
+      check_name AS "check", error_line AS line, runner_image AS image, outcome, rerun_marker AS rerunMarker,
+      rerun_job AS rerunJob
       FROM ci_failures WHERE pr_url = ? AND sha = ?`)
-      .all(prUrl, sha);
+      .all(prUrl, sha)
+      .map((f) => ({ ...f, rerunJob: f.rerunJob ? JSON.parse(f.rerunJob) : null }));
   }
 
   recordCiFailure(f: CiFailure): void {
@@ -2005,12 +2010,12 @@ export class Store {
   }
 
   /** Claim before the POST; an ambiguous response must never permit another paid CI attempt. */
-  claimCiRerun(f: CiFailure, marker: string): boolean {
+  claimCiRerun(f: CiFailure, marker: string, job: NonNullable<CiFailure["rerunJob"]>): boolean {
     return (
       this.db
-        .query(`UPDATE ci_failures SET rerun_claimed = 1, outcome = 'rerun_requested', rerun_marker = ?
+        .query(`UPDATE ci_failures SET rerun_claimed = 1, outcome = 'rerun_requested', rerun_marker = ?, rerun_job = ?
       WHERE pr_url = ? AND sha = ? AND signature = ? AND rerun_claimed = 0`)
-        .run(marker, f.prUrl, f.sha, f.signature).changes === 1
+        .run(marker, JSON.stringify(job), f.prUrl, f.sha, f.signature).changes === 1
     );
   }
 
