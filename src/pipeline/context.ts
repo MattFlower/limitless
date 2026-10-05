@@ -461,6 +461,7 @@ export class RunContext {
         throw new NoCapacityError(
           `Timed out routing ${opts.role}${lastFailure ? ` after: ${lastFailure}` : ""}`,
         );
+      const revision = router.policyRevision;
       const decision = router.route(
         opts.role,
         opts.complexity,
@@ -511,15 +512,17 @@ export class RunContext {
         admission = { provider: target.provider, release: free };
       } else {
         const provider = target.provider;
+        const admissionSignal = AbortSignal.any([this.signal, revision]);
         admission = await (allBusy
-          ? tracker.acquireFirst(providers, this.signal, limit, onWait)
+          ? tracker.acquireFirst(providers, admissionSignal, limit, onWait)
           : tracker
-              .acquire(provider, this.signal, busy.has(provider) ? 0 : limit, (ahead) =>
+              .acquire(provider, admissionSignal, busy.has(provider) ? 0 : limit, (ahead) =>
                 onWait(provider, ahead),
               )
               .then((release) => release && { provider, release })
         ).catch((error: unknown) => {
           this.checkCancelled();
+          if (revision.aborted) return null;
           throw error;
         });
       }
@@ -531,12 +534,24 @@ export class RunContext {
         this.checkCancelled();
         throw new NoCapacityError(`${target.targetId ?? target.modelId}: busy until the deadline`);
       }
+      if (revision.aborted) {
+        release?.();
+        busy.clear();
+        attempt--;
+        continue;
+      }
       if (!release) {
         busy.add(target.provider);
         attempt--;
         continue;
       }
       const ready = shadow ? tracker.isAvailable(target.provider) : await tracker.preflight(target.provider);
+      if (revision.aborted) {
+        release();
+        busy.clear();
+        attempt--;
+        continue;
+      }
       if (!ready || tracker.modelUnavailableReason(target.modelId)) {
         release();
         tried.push({ modelId: target.modelId, effort: target.effort ?? null });
@@ -640,6 +655,18 @@ export class RunContext {
         this.checkCancelled();
         const stream = await this.faults.hit("harness:stream", faultContext, this.signal);
         this.checkCancelled();
+        // Saving state, preparing redaction and fault hooks can also yield before the model call.
+        if (revision.aborted) {
+          store.updateInvocation(invocation.id, {
+            status: "cancelled",
+            error: "routing changed before model call",
+            finishedAt: Date.now(),
+          });
+          tried.pop();
+          busy.clear();
+          attempt--;
+          continue;
+        }
         if (stream) result = parseFakeStream(stream, spec.onEvent);
         else if (!noTools) {
           // Every tool-enabled call is confined to its cwd plus a scratch this call owns.

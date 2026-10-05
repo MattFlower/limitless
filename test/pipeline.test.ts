@@ -54,6 +54,7 @@ import {
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
+import { RuntimePolicy } from "../src/router/runtime-policy.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement, recordingConfinement } from "./confinement.ts";
@@ -8614,8 +8615,125 @@ describe("routing bounded slot waits", () => {
         deadline,
       });
     const events = () => context.store.listEvents(run.id).filter((e) => e.message.startsWith("waiting for"));
-    return { clock, cfg, tracker, calls, controller, context, run, invoke, events };
+    return { clock, cfg, tracker, router, calls, controller, context, run, invoke, events };
   }
+
+  test.each(["cell", "prefer"])(
+    "live %s edits cancel obsolete capacity waits before invoking",
+    async (edit) => {
+      const routing = { ...policy, implement: { default: ["alpha/m|beta/m"] } };
+      const f = fixture(models, routing);
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], routing);
+      const slots = await Promise.all(
+        ["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+      );
+      try {
+        const pending = f.invoke(undefined, "implement");
+        expect(f.events()[0]?.message).toContain("waiting for alpha slot");
+        await f.clock.advance(2_500);
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        const outcome = await pending;
+        expect(outcome.target.modelId).toBe("beta/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+        expect(outcome.invocation.waitMs).toBe(2_500);
+        // The obsolete wait is gone even though the old provider has not freed any capacity.
+        expect(f.tracker.status("alpha")?.inFlight).toBe(2);
+        expect(f.tracker.status("beta")?.inFlight).toBe(0);
+        expect(f.clock.pending).toBe(0);
+      } finally {
+        for (const release of slots) release();
+      }
+      expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+    },
+  );
+
+  test.each(["cell", "prefer"])(
+    "live %s edits during preflight release the obsolete reservation",
+    async (edit) => {
+      const routing = { ...policy, implement: { default: ["alpha/m|beta/m"] } };
+      const f = fixture(models, routing);
+      const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], routing);
+      const reached = deferred<void>();
+      const resume = deferred<boolean>();
+      const preflight = f.tracker.preflight.bind(f.tracker);
+      const probe = spyOn(f.tracker, "preflight").mockImplementation((provider) => {
+        if (provider !== "alpha") return preflight(provider);
+        reached.resolve();
+        return resume.promise;
+      });
+      try {
+        const pending = f.invoke(undefined, "implement");
+        await reached.promise;
+        expect(f.tracker.status("alpha")?.inFlight).toBe(1);
+        if (edit === "cell") runtime.setCell("implement", "small", ["beta/m"]);
+        else runtime.setPrefer(["beta"]);
+        resume.resolve(true);
+        expect((await pending).target.modelId).toBe("beta/m");
+        expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+        expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+        expect(f.tracker.status("beta")?.inFlight).toBe(0);
+      } finally {
+        probe.mockRestore();
+      }
+    },
+  );
+
+  test("a reset reroutes all-provider waits without leaving losing reservations", async () => {
+    const routing = { ...policy, implement: { default: ["beta/m"] } };
+    const f = fixture(models, routing);
+    const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], routing);
+    runtime.setCell("implement", "small", ["alpha/m", "beta/m"]);
+    f.cfg.waitBudgetS.implement = 0;
+    const slots = await Promise.all(
+      ["alpha", "alpha", "beta", "beta"].map((p) => f.tracker.acquire(p, f.controller.signal)),
+    );
+    try {
+      const pending = f.invoke(undefined, "implement");
+      await f.clock.flush();
+      expect(f.events().map((e) => e.message)).toContain("waiting for beta slot (0 ahead), up to unbounded");
+      runtime.setCell("implement", "small", null);
+      // Free the obsolete provider too, racing admission against the routing edit.
+      slots[0]?.();
+      slots[2]?.();
+      expect((await pending).target.modelId).toBe("beta/m");
+      expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+      expect(f.context.store.listInvocations(f.run.id)).toHaveLength(1);
+      expect(f.clock.pending).toBe(0);
+    } finally {
+      for (const release of slots) release();
+    }
+    expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+    expect(f.tracker.status("beta")?.inFlight).toBe(0);
+  });
+
+  test("a live edit during implementer persistence revalidates before the model call", async () => {
+    const f = fixture();
+    const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], policy);
+    const reached = deferred<void>();
+    const resume = deferred<void>();
+    const save = f.context.save.bind(f.context);
+    const persist = spyOn(f.context, "save").mockImplementationOnce(async () => {
+      reached.resolve();
+      await resume.promise;
+      await save();
+    });
+    try {
+      const pending = f.invoke(undefined, "implement");
+      await reached.promise;
+      runtime.setCell("implement", "small", ["beta/m"]);
+      resume.resolve();
+      expect((await pending).target.modelId).toBe("beta/m");
+      expect(f.calls.map((s) => s.target.modelId)).toEqual(["beta/m"]);
+      expect(f.context.state.implementer?.modelId).toBe("beta/m");
+      expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+      expect(f.tracker.status("beta")?.inFlight).toBe(0);
+    } finally {
+      persist.mockRestore();
+    }
+  });
 
   test("expiry falls through without an invocation; immediate admission records zero and no wait event", async () => {
     const f = fixture();

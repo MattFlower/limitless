@@ -45,6 +45,7 @@ export interface RoutePreview {
 
 export class Router {
   private readonly models: Map<string, ModelDef>;
+  private policyChange = new AbortController();
   private readonly changedCells = new Set<string>();
   private readonly lastRoute = new Map<
     string,
@@ -65,6 +66,17 @@ export class Router {
     return this.policy;
   }
 
+  /** Captures a routing revision; aborted by edits so queued calls can reroute. */
+  get policyRevision(): AbortSignal {
+    return this.policyChange.signal;
+  }
+
+  private invalidateRouting(): void {
+    const previous = this.policyChange;
+    this.policyChange = new AbortController();
+    previous.abort();
+  }
+
   setPolicy(policy: Policy): void {
     for (const role of Object.keys(policy) as Role[]) {
       const cells = new Set([...Object.keys(this.policy[role] ?? {}), ...Object.keys(policy[role])]);
@@ -75,10 +87,12 @@ export class Router {
       }
     }
     this.policy = policy;
+    this.invalidateRouting();
   }
 
   setPreferProviders(prefer: string[]): void {
     this.preferProviders = [...prefer];
+    this.invalidateRouting();
   }
 
   preview(role: Role, complexity: Complexity): RoutePreview[] {
