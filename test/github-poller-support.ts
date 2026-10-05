@@ -28,7 +28,6 @@ export function prNode(repo: string, n: number) {
     state: "OPEN",
     mergeable: "MERGEABLE",
     mergeStateStatus: "CLEAN",
-    reviewDecision: null as string | null,
     updatedAt: "2026-10-03T00:00:00Z",
     mergedAt: null as string | null,
     mergedBy: null as { login: string } | null,

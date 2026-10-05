@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { WebAuthnCredential } from "@simplewebauthn/server";
 import { AUDIT_ALLOWANCES, parseAllow, validateAllow } from "../core/allow.ts";
-import { assertExistingBranchDelivery } from "../core/delivery.ts";
+import { assertExistingBranchDelivery, type FactoryBranchGrant } from "../core/delivery.ts";
 import type {
   ArtifactMeta,
   AuthPasskey,
@@ -24,6 +24,9 @@ import type {
   QuotaAlert,
   Repo,
   ResolutionKind,
+  ReviewApproval,
+  ReviewFinding,
+  ReviewRound,
   Run,
   RunDetail,
   RunEvent,
@@ -35,7 +38,7 @@ import type {
   StreamMessage,
   TrackedPr,
 } from "../core/types.ts";
-import { DEFAULT_EVAL_CONCURRENCY } from "../core/types.ts";
+import { DEFAULT_EVAL_CONCURRENCY, TERMINAL_STATUSES } from "../core/types.ts";
 import type { RunState } from "../pipeline/context.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
@@ -914,19 +917,38 @@ export class Store {
 
   // Provenance is an internal argument, never taken from the public request object.
   createRun(repo: Repo, req: CreateRunRequest, verifiedGitHubWebhook = false): Run {
-    assertExistingBranchDelivery(repo, { ...req, githubWebhookVerified: verifiedGitHubWebhook });
+    if (req.sourceRef?.kind === "review-round")
+      throw new Error("review rounds are created only by a review verdict");
+    return this.insertRun(repo, req, verifiedGitHubWebhook);
+  }
+
+  /** `round`: the review handler's grant; such a run's prompt quotes findings, so it allows nothing itself. */
+  private insertRun(
+    repo: Repo,
+    req: CreateRunRequest,
+    verifiedGitHubWebhook: boolean,
+    round?: { prUrl: string; grant: FactoryBranchGrant },
+  ): Run {
+    assertExistingBranchDelivery(
+      repo,
+      { ...req, githubWebhookVerified: verifiedGitHubWebhook },
+      round?.grant,
+    );
     const id = newId();
     const dependsOn = this.validateDependencies(req.dependsOn, id);
     const dependency = this.dependencyStatus(dependsOn);
     const title = req.title ?? req.prompt.split("\n")[0]?.slice(0, 80) ?? "Untitled";
     // Composed/model prompts cannot grant allowances; these sources use explicit options only.
     const composed =
-      verifiedGitHubWebhook || ["github", "mcp"].includes(req.source ?? "") || !!req.sourceRef?.proposalId;
+      verifiedGitHubWebhook ||
+      !!round ||
+      ["github", "mcp"].includes(req.source ?? "") ||
+      !!req.sourceRef?.proposalId;
     const allow = validateAllow([...validateAllow(req.allow), ...(composed ? [] : parseAllow(req.prompt))]);
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -948,10 +970,183 @@ export class Store {
         dependency.finishedAt ?? null,
         req.noBaselineCache === true ? 1 : 0,
         json(allow),
+        round?.prUrl ?? null,
       );
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });
     return run;
+  }
+
+  // ---- review rounds and approvals -------------------------------------------
+
+  /**
+   * Creates a round run with the record that authorizes it, at most one in flight and `cap` in all
+   * per PR. Over the cap it creates nothing and leaves `owner` needs_human instead.
+   */
+  createReviewRound(
+    repo: Repo,
+    owner: Run,
+    review: { prUrl: string; reviewedSha: string; findings: ReviewFinding[]; cap: number },
+    request: (round: number) => CreateRunRequest,
+  ): { run: Run } | { active: ReviewRound } | { limited: Run } {
+    return this.chatTransaction(() => {
+      const rounds = this.reviewRounds(review.prUrl);
+      const active = rounds.find((r) => !TERMINAL_STATUSES.includes(r.status));
+      if (active) return { active };
+      // The newest verdict wins: changes requested now outrank an earlier approval, even over the cap.
+      this.db
+        .query("UPDATE review_approvals SET stale_reason = ? WHERE pr_url = ? AND stale_reason IS NULL")
+        .run(`changes requested at ${review.reviewedSha}`, review.prUrl);
+      if (rounds.length >= review.cap)
+        return {
+          limited: this.updateRun(owner.id, { status: "needs_human", error: "review round limit reached" }),
+        };
+      const round = rounds.length + 1;
+      const grant = { owner, prUrl: review.prUrl, head: review.reviewedSha };
+      const run = this.insertRun(repo, request(round), false, { prUrl: review.prUrl, grant });
+      this.db
+        .query(
+          "INSERT INTO review_rounds (run_id, source_run_id, pr_url, round, reviewed_sha, findings, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          run.id,
+          owner.id,
+          review.prUrl,
+          round,
+          review.reviewedSha,
+          JSON.stringify(review.findings),
+          Date.now(),
+        );
+      return { run };
+    });
+  }
+
+  /** The review handler's record for `runId`, which alone authorizes it to push onto `owner`'s PR branch. */
+  reviewRound(
+    runId: string,
+  ): { owner: Run; prUrl: string; round: number; reviewedSha: string; findings: ReviewFinding[] } | null {
+    const sql = `SELECT source_run_id AS sourceRunId, pr_url AS prUrl, round, reviewed_sha AS reviewedSha, findings
+      FROM review_rounds WHERE run_id = ?`;
+    const row = this.db.query(sql).get(runId) as {
+      sourceRunId: string;
+      prUrl: string;
+      round: number;
+      reviewedSha: string;
+      findings: string;
+    } | null;
+    const owner = row && this.getRun(row.sourceRunId);
+    if (!row || !owner) return null;
+    const { prUrl, round, reviewedSha } = row;
+    return { owner, prUrl, round, reviewedSha, findings: parse(row.findings, []) };
+  }
+
+  reviewRounds(prUrl: string): ReviewRound[] {
+    const sql = `SELECT rr.run_id AS runId, rr.round, runs.status, rr.reviewed_sha AS reviewedSha,
+        rr.delivered_sha AS deliveredSha, rr.findings
+      FROM review_rounds rr JOIN runs ON runs.id = rr.run_id WHERE rr.pr_url = ? ORDER BY rr.round`;
+    return (this.db.query(sql).all(prUrl) as Row[]).map((r) => ({
+      ...(r as unknown as ReviewRound),
+      findings: parse(r.findings, []),
+    }));
+  }
+
+  markRoundDelivered(runId: string, sha: string): void {
+    this.db
+      .query("UPDATE review_rounds SET delivered_sha = ? WHERE run_id = ? AND delivered_sha IS NULL")
+      .run(sha, runId);
+    this.publishFeed();
+  }
+
+  /** `findings_resolved` counts the findings of the PR's delivered rounds. */
+  recordApproval(runId: string, prUrl: string, sha: string, reviewer: string): ReviewApproval {
+    this.db
+      .query(
+        `INSERT INTO review_approvals (run_id, pr_url, sha, reviewer, findings_resolved, created_at)
+        SELECT ?1, ?2, ?3, ?4, coalesce(sum(json_array_length(findings)), 0), ?5
+        FROM review_rounds WHERE pr_url = ?2 AND delivered_sha IS NOT NULL`,
+      )
+      .run(runId, prUrl, sha, reviewer, Date.now());
+    this.publishFeed();
+    return this.approvalFor(prUrl) as ReviewApproval;
+  }
+
+  approvalFor(prUrl: string): ReviewApproval | null {
+    const row = this.db
+      .query("SELECT sha, stale_reason FROM review_approvals WHERE pr_url = ? ORDER BY id DESC LIMIT 1")
+      .get(prUrl) as Row | null;
+    return row ? { sha: row.sha as string, stale: row.stale_reason !== null } : null;
+  }
+
+  /** The last head seen on a PR, and its version (0 before any). */
+  prHead(prUrl: string): { sha: string; version: number } | null {
+    return this.db.query("SELECT sha, version FROM pr_heads WHERE pr_url = ?").get(prUrl) as {
+      sha: string;
+      version: number;
+    } | null;
+  }
+
+  /**
+   * Records a head seen on a PR; an approval of any other commit goes stale. With `since`, the
+   * version read before looking, the observation is refused (false) while a round is pushing to the
+   * PR or once the epoch has moved on at all, even to the same head: a head recorded when a push
+   * began is only what the push intended, so agreeing with it proves nothing.
+   */
+  observePrHead(prUrl: string, head: string, since?: number): boolean {
+    return this.db.transaction(() => {
+      const last = this.prHead(prUrl);
+      if (since !== undefined && (this.pushingTo(prUrl) || (last ? last.version : 0) !== since)) return false;
+      if (last?.sha !== head) this.writePrHead(prUrl, head, null);
+      this.staleApprovals(prUrl, head);
+      return true;
+    })();
+  }
+
+  /** A round's push begins: earlier lookups are overtaken and approvals of other heads go stale. */
+  beginPrPush(prUrl: string, head: string, runId: string): void {
+    this.db.transaction(() => {
+      this.writePrHead(prUrl, head, runId);
+      this.staleApprovals(prUrl, head);
+    })();
+  }
+
+  /** It ends with `head` on the remote (null: unknown): the epoch moves on again, past any lookup made meanwhile. */
+  endPrPush(prUrl: string, head: string | null): void {
+    this.db.transaction(() => {
+      if (head === null)
+        this.db
+          .query(
+            "UPDATE pr_heads SET version = version + 1, observed_at = ?, pushing = NULL WHERE pr_url = ?",
+          )
+          .run(Date.now(), prUrl);
+      else {
+        this.writePrHead(prUrl, head, null);
+        this.staleApprovals(prUrl, head);
+      }
+    })();
+  }
+
+  /** A round run, not yet finished, recorded as pushing to the PR (a crash can leave one behind). */
+  private pushingTo(prUrl: string): boolean {
+    const sql = `SELECT 1 FROM pr_heads h JOIN runs ON runs.id = h.pushing
+      WHERE h.pr_url = ? AND runs.status NOT IN (${TERMINAL_STATUSES.map(() => "?").join(", ")})`;
+    return this.db.query(sql).get(prUrl, ...TERMINAL_STATUSES) !== null;
+  }
+
+  private writePrHead(prUrl: string, head: string, pushing: string | null): void {
+    this.db
+      .query(
+        `INSERT INTO pr_heads (pr_url, sha, version, observed_at, pushing) VALUES (?1, ?2, 1, ?3, ?4)
+        ON CONFLICT (pr_url) DO UPDATE SET sha = ?2, version = version + 1, observed_at = ?3, pushing = ?4`,
+      )
+      .run(prUrl, head, Date.now(), pushing);
+  }
+
+  private staleApprovals(prUrl: string, head: string): void {
+    this.db
+      .query(
+        "UPDATE review_approvals SET stale_reason = 'head moved to ' || ?2 WHERE pr_url = ?1 AND stale_reason IS NULL AND sha <> ?2",
+      )
+      .run(prUrl, head);
   }
 
   private validateDependencies(input: unknown, candidateId: string): string[] {
@@ -1113,6 +1308,8 @@ export class Store {
     if (sets.length)
       this.db.query(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
     const run = this.getRun(id) as Run;
+    if (run.prUrl && patch.prClosedUnmerged !== undefined)
+      this.observeGithubPrState(run.prUrl, patch.prClosedUnmerged ? "CLOSED" : "OPEN");
     this.publish({ kind: "run", run });
     if (patch.merged) this.supersedeByIssue(run);
     return run;
@@ -1243,6 +1440,9 @@ export class Store {
       invocations: this.listInvocations(id),
       questions: this.listQuestions(id),
       artifacts: this.listArtifacts(id),
+      ...(run.prUrl
+        ? { review: { approval: this.approvalFor(run.prUrl), rounds: this.reviewRounds(run.prUrl) } }
+        : {}),
     };
   }
 
@@ -1780,17 +1980,19 @@ export class Store {
   // ---- GitHub poller -------------------------------------------------------
 
   /** Unmerged PRs factory runs opened; PRs runs only verified, or abandoned over 7 days while open, are excluded. */
-  githubTracked(): TrackedPr[] {
+  githubTracked(now = Date.now()): TrackedPr[] {
     const sql = `SELECT r.pr_url AS url, repos.slug AS repo, min(r.id) AS runId, g.node_id AS nodeId, g.data,
         max(r.status IN ('succeeded', 'needs_human')) AS delivered
       FROM runs r JOIN repos ON repos.id = r.repo_id LEFT JOIN github_prs g ON g.url = r.pr_url
+      LEFT JOIN github_pr_expiry e ON e.url = r.pr_url
       WHERE repos.kind = 'github' AND r.pr_url IS NOT NULL
         AND NOT r.merged AND r.delivery_branch IS NULL AND coalesce(g.data ->> 'state', '') <> 'MERGED'
+        AND (e.closed_at IS NULL OR e.closed_at >= ?1 - 604800000)
         AND coalesce(json_extract(r.source_ref, '$.kind'), '') <> 'pull_request'
         AND (r.status NOT IN ('failed', 'cancelled') OR coalesce(r.finished_at, ?1) >= ?1 - 604800000
-          OR r.pr_closed_unmerged OR g.data ->> 'state' = 'CLOSED')
+          OR r.pr_closed_unmerged OR g.data ->> 'state' = 'CLOSED' OR e.reopened_at >= ?1 - 604800000)
       GROUP BY r.pr_url ORDER BY repos.slug, r.pr_url`;
-    return (this.db.query(sql).all(Date.now()) as TrackedPr[]).filter((pr) => {
+    return (this.db.query(sql).all(now) as TrackedPr[]).filter((pr) => {
       const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/.exec(pr.url);
       return match?.[1]?.toLowerCase() === pr.repo.toLowerCase();
     });
@@ -1801,11 +2003,51 @@ export class Store {
     return query.get(url)?.data ?? null;
   }
 
-  /** Advance a PR's saved state (when given) and write feed items in one transaction. */
-  saveGithubPr(pr: TrackedPr | null, terminal = false, items: GitHubFeedInput[] = []): void {
+  githubPrExpired(url: string, now = Date.now()): boolean {
+    const row = this.db
+      .query<{ closed_at: number | null }, [string]>("SELECT closed_at FROM github_pr_expiry WHERE url = ?")
+      .get(url);
+    return row?.closed_at != null && row.closed_at < now - 604800000;
+  }
+
+  /** Wake polling for known PRs even after closed snapshots have expired. */
+  reopenGithubPr(url: string): void {
+    const runs = this.db
+      .query<{ id: string }, [string]>("SELECT id FROM runs WHERE pr_url = ? COLLATE NOCASE AND NOT merged")
+      .all(url);
+    for (const run of runs) this.updateRun(run.id, { prClosedUnmerged: false });
+  }
+
+  /** Reconciliation/reopen observations retain the poller's other saved fields. */
+  observeGithubPrState(url: string, state: string, now = Date.now()): void {
     this.db.transaction(() => {
-      const save = this.db.query("INSERT OR REPLACE INTO github_prs VALUES (?, ?, ?, ?)");
-      if (pr) save.run(pr.url, pr.nodeId, pr.data, terminal);
+      this.db
+        .query(`INSERT INTO github_pr_expiry (url, closed_at) VALUES (?, ?)
+      ON CONFLICT(url) DO UPDATE SET reopened_at = CASE WHEN ? = 'OPEN' AND github_pr_expiry.closed_at IS NOT NULL
+        THEN ? ELSE github_pr_expiry.reopened_at END, closed_at = CASE WHEN ? = 'CLOSED'
+        THEN coalesce(github_pr_expiry.closed_at, excluded.closed_at) ELSE NULL END`)
+        .run(url, state === "CLOSED" ? now : null, state, now, state);
+      this.db
+        .query("UPDATE github_prs SET data = json_set(data, '$.state', ?) WHERE url = ?")
+        .run(state, url);
+    })();
+  }
+
+  /** Advance a PR's saved state (when given) and write feed items in one transaction. */
+  saveGithubPr(
+    pr: TrackedPr | null,
+    terminal = false,
+    items: GitHubFeedInput[] = [],
+    now = Date.now(),
+  ): void {
+    this.db.transaction(() => {
+      const save = this.db.query(`INSERT INTO github_prs (url, node_id, data, terminal) VALUES (?, ?, ?, ?)
+        ON CONFLICT(url) DO UPDATE SET node_id = excluded.node_id, data = excluded.data, terminal = excluded.terminal`);
+      if (pr) {
+        save.run(pr.url, pr.nodeId, pr.data, terminal);
+        const state = pr.data && (JSON.parse(pr.data) as { state?: string }).state;
+        if (state) this.observeGithubPrState(pr.url, state, now);
+      }
       const insert =
         this.db.query(`INSERT INTO feed (ts, kind, run_id, repo, title, summary, data, dedupe_key)
         VALUES (?, ?, ?, ?, substr(?, 1, 200), substr(?, 1, 500), ?, ?) ON CONFLICT (dedupe_key) DO NOTHING`);

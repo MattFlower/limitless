@@ -594,6 +594,7 @@ test("deploy restores the previous checkout when injected smoke fails before res
   try {
     await expect(
       deploy(7400, "feature", true, {
+        leaseClient: async () => ({ id: "lease", acquired: true }),
         releaseDir: dir,
         lockPath: join(dir, "deploy.lock"),
         command,
