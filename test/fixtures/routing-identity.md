@@ -44,3 +44,5 @@ before routing and supplies only fake tokens, including the static-token fallbac
 All other target fields and endpoint paths remain part of the full decision comparison.
 No real config, credentials, timestamps, network access or live quota readings are used.
 Do not regenerate expectations during routine tests.
+
+Later edits: the `omlx/qwen-flash` served model was renamed in place (2026-10-04) when oMLX stopped serving the REAP-pruned build; routing decisions are otherwise unchanged.

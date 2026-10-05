@@ -7,6 +7,7 @@ import { ChatRequestSchema } from "../concierge.ts";
 import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
+import { gateSlots } from "../gates/slots.ts";
 import { runGh } from "../integrations/github.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
@@ -84,7 +85,13 @@ function sse(
     },
   });
   return new Response(stream, {
-    headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" },
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      // A buffering reverse proxy would otherwise hold frames until its buffer fills.
+      "x-accel-buffering": "no",
+    },
   });
 }
 
@@ -213,6 +220,25 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     return id;
   };
   const routes: Record<string, unknown> = {
+    "/api/admin/gate-slot": {
+      POST: handle(async (req) => {
+        if (req.headers.has("forwarded")) return error("forbidden", 403);
+        const { name, id, release, immediate, running } = await body<Record<string, unknown>>(req);
+        if (id !== undefined) {
+          if (typeof id !== "string" || (release !== undefined && typeof release !== "boolean"))
+            return error("invalid lease");
+          const acquired = gateSlots.heartbeat(id, release === true);
+          return json({ id, acquired: acquired ?? false, expired: acquired === undefined });
+        }
+        if (typeof name !== "string" || !name.trim()) return error("invalid holder name");
+        if (running !== undefined && typeof running !== "boolean") return error("invalid running flag");
+        req.signal.throwIfAborted();
+        const lease = await gateSlots.lease(name, immediate === true, undefined, undefined, running === true);
+        if (req.signal.aborted) gateSlots.heartbeat(lease, true);
+        req.signal.throwIfAborted();
+        return json({ id: lease, acquired: gateSlots.heartbeat(lease) ?? false });
+      }, true),
+    },
     "/api/admin/drain": admin("drain"),
     "/api/admin/resume": admin("resume"),
     "/api/admin/auth/password": {
@@ -306,6 +332,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         ok: true,
         uptimeMs: Date.now() - factory.startedAt,
         sha: factory.bootSha,
+        gateSlots: gateSlots.snapshot(),
         ...drainState(),
       } satisfies HealthResponse),
     ),
@@ -363,8 +390,11 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle((req) => {
         const url = new URL(req.url);
         const status = url.searchParams.get("status")?.split(",").filter(Boolean) as RunStatus[] | undefined;
+        const ids = url.searchParams.get("ids")?.split(",").filter(Boolean);
         const limit = Number(url.searchParams.get("limit") ?? 100);
-        return json(store.listRuns({ ...(status ? { status } : {}), limit }));
+        return json(
+          store.listRuns({ ...(status ? { status } : {}), ...(ids?.length ? { ids } : {}), limit }),
+        );
       }),
       POST: handle(async (req) => {
         const input = await body<CreateRunRequest>(req);

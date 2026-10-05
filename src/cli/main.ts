@@ -55,6 +55,7 @@ Usage:
   limitless service install [--tunnel] [--mtplx]   launchd agents: daemon (+ mtplx, tunnel)
   limitless service uninstall|status
   limitless local up|down|status          Report oMLX health; manage twilight
+  limitless gate-slot [--name <holder>] [--max-wait <seconds>] -- <command...>
   limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]
         Deploy origin/main by default; drain for up to 2700s (45m). --now skips waiting.
 
@@ -197,6 +198,10 @@ function parseSince(value: string): number {
 }
 
 async function main(): Promise<void> {
+  if (Bun.argv[2] === "gate-slot") {
+    process.exitCode = await (await import("./gate-slot.ts")).gateSlotCommand(Bun.argv.slice(3));
+    return;
+  }
   const { values, positionals } = parseArgs({
     args: Bun.argv.slice(2),
     allowPositionals: true,

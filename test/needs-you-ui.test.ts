@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { renderToString } from "solid-js/web";
-import type { Run, RunDetail, StreamMessage } from "../src/core/types.ts";
+import type { Question, Run, RunDetail, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { normalizePr } from "../src/integrations/github-poller.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -705,5 +705,200 @@ test("a resolution that arrives after its SSE update still refreshes the run's d
         globalThis.fetch = originalFetch;
       }
     },
+  );
+});
+
+test("a pushed update beats an older read in flight, and the next read after a gap replaces it", async () => {
+  const asked: Question = {
+    id: 1,
+    runId: run.id,
+    question: "Which database should it use?",
+    answer: null,
+    askedAt: 1,
+    answeredAt: null,
+    answeredBy: null,
+  };
+  const stage = detail.stages[0];
+  if (!stage) throw new Error("missing fixture stage");
+  const other = store.createRun(repo, { repo: repo.slug, prompt: "Invocation source" });
+  const running = {
+    ...store.createInvocation({
+      runId: other.id,
+      stageId: null,
+      role: "implement",
+      harness: "fake",
+      provider: "fake",
+      model: "test",
+      modelId: "fake/test",
+    }),
+    runId: run.id,
+  };
+  const stale = deferred<Response>();
+  await withStream(
+    (request) =>
+      request === 2
+        ? stale.promise
+        : Promise.resolve(
+            Response.json(request === 1 ? { ...detail, questions: [asked], invocations: [running] } : detail),
+          ),
+    async ({ stream, clock, requests }) => {
+      expect(render()).toContain(asked.question);
+      expect(render()).toContain(">running</span>");
+      stream.onopen?.();
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(requests()).toBe(2);
+      stream.emit({ kind: "question", question: { ...asked, answer: "Postgres", answeredAt: 2 } });
+      stream.emit({ kind: "invocation", invocation: { ...running, status: "ok" } });
+      stream.emit({ kind: "stage", stage: { ...stage, status: "succeeded" } });
+      expect(render()).not.toContain(asked.question);
+      expect(render()).toContain(">ok</span>");
+      stale.resolve(Response.json({ ...detail, questions: [asked], invocations: [running] }));
+      await clock.flush();
+      expect(render()).not.toContain(asked.question);
+      expect(render()).not.toContain(">running</span>");
+      expect(render()).toContain("timeline-bar succeeded");
+
+      stream.emit({ kind: "stage", stage: { ...stage, status: "running" } });
+      expect(render()).toContain("timeline-bar running");
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+      expect(render()).toContain(`timeline-bar ${stage.status}`);
+      expect(render()).not.toContain("timeline-bar running");
+    },
+  );
+});
+
+test("an older reconnect read cannot erase a newer artifact refresh", async () => {
+  const reconnectRead = deferred<Response>();
+  const finished = detail.stages[0];
+  if (!finished) throw new Error("missing fixture stage");
+  await withStream(
+    async (request) =>
+      request === 1
+        ? Response.json(detail)
+        : request === 2
+          ? reconnectRead.promise
+          : Response.json(newerDetail),
+    async ({ stream, clock, requests }) => {
+      stream.onopen?.();
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      stream.emit({ kind: "stage", stage: finished });
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+      expect(render()).toContain("current.json");
+      reconnectRead.resolve(Response.json(detail));
+      await clock.flush();
+      expect(render()).toContain("current.json");
+      expect(render()).not.toContain("review-1.json");
+    },
+  );
+});
+
+test("reconnect reads are single-flight: flapping adds one read and one follow-up; an early error adds none", async () => {
+  const inFlight = deferred<Response>();
+  await withStream(
+    (request) => (request === 2 ? inFlight.promise : Promise.resolve(Response.json(detail))),
+    async ({ stream, clock, requests }) => {
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(1000);
+      expect(requests()).toBe(1);
+      for (let flap = 0; flap < 100; flap++) {
+        stream.onerror?.();
+        stream.onopen?.();
+        await clock.advance(100);
+      }
+      expect(requests()).toBe(2);
+      inFlight.resolve(Response.json(detail));
+      await clock.flush();
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+      await clock.advance(1000);
+      expect(requests()).toBe(3);
+    },
+  );
+});
+
+test("a stalled, superseded read does not hold back the reconnect refresh", async () => {
+  const stalled = deferred<Response>();
+  await withStream(
+    (request) => (request === 1 ? stalled.promise : Promise.resolve(Response.json(newerDetail))),
+    async ({ stream, clock, requests }) => {
+      stream.onopen?.();
+      stream.emit(observation());
+      await clock.advance(100);
+      expect(requests()).toBe(2);
+      expect(render()).toContain("Current finding");
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+      await clock.advance(1000);
+      expect(requests()).toBe(3);
+      stalled.resolve(Response.json(detail));
+      await clock.flush();
+      await clock.advance(1000);
+      expect(requests()).toBe(3);
+      expect(render()).toContain("Current finding");
+    },
+    true,
+  );
+});
+
+test("only the current read holds back a reconnect refresh: older reads settling or a newer generation release nothing extra", async () => {
+  const stalled = deferred<Response>();
+  const current = deferred<Response>();
+  await withStream(
+    (request) =>
+      request === 1
+        ? stalled.promise
+        : request === 2
+          ? current.promise
+          : Promise.resolve(Response.json(newerDetail)),
+    async ({ stream, clock, requests }) => {
+      stream.onopen?.();
+      stream.emit(observation());
+      await clock.advance(100);
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(requests()).toBe(2);
+      // The superseded read settling first must not start the follow-up early.
+      stalled.resolve(Response.json(detail));
+      await clock.flush();
+      await clock.advance(100);
+      expect(requests()).toBe(2);
+      current.resolve(Response.json(newerDetail));
+      await clock.flush();
+      await clock.advance(100);
+      expect(requests()).toBe(3);
+    },
+    true,
+  );
+  const superseded = deferred<Response>();
+  await withStream(
+    (request) => (request === 1 ? superseded.promise : Promise.resolve(Response.json(newerDetail))),
+    async ({ stream, clock, requests }) => {
+      stream.onopen?.();
+      // A run update supersedes the stalled read; a reconnect right after needs only the one read.
+      stream.emit({ kind: "run", run: detail.run });
+      stream.onerror?.();
+      stream.onopen?.();
+      await clock.advance(100);
+      expect(requests()).toBe(2);
+      await clock.advance(1000);
+      expect(requests()).toBe(2);
+      superseded.resolve(Response.json(detail));
+      await clock.flush();
+      await clock.advance(1000);
+      expect(requests()).toBe(2);
+    },
+    true,
   );
 });

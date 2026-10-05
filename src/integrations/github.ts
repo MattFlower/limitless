@@ -244,6 +244,22 @@ export function githubWebhook(
     if (!factory.store.recordInbox({ id, source: "github", kind: event, payload, status: "processing" }))
       return new Response("duplicate delivery", { status: 200 });
     try {
+      const p = object(payload);
+      const repo = string(object(p?.repository)?.full_name);
+      const pr = object(p?.pull_request);
+      const prNumber = number(pr?.number) ?? number(p?.number);
+      if (
+        event === "pull_request" &&
+        p?.action === "reopened" &&
+        pr?.state === "open" &&
+        repo &&
+        /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) &&
+        prNumber &&
+        repo.split("/")[0] === factory.cfg.githubOwner &&
+        (login(p.sender) === factory.cfg.githubOwner || login(p.sender) === "dependabot[bot]") &&
+        string(object(object(pr.base)?.repo)?.full_name) === repo
+      )
+        factory.store.reopenGithubPr(`https://github.com/${repo}/pull/${prNumber}`);
       const mapped = mapGitHubEvent(event, payload, factory.cfg.githubOwner);
       if (!mapped.request) {
         factory.store.finishInbox(id, mapped.error ? "error" : "ignored", mapped.note);

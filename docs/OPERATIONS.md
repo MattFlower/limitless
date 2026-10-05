@@ -118,7 +118,7 @@ environment. An attempted check that fails exits nonzero; skips alone do not. Us
 
 - **Mac (oMLX):** start the server with oMLX.app / `omlx start`; Limitless does not manage it.
   Put `OMLX_API_KEY` in `~/.config/limitless/secrets.env` (used by both inference transports and
-  health probes). The default is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-REAP-288-MLX-4bit`);
+  health probes). The default is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
   `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in and needs far more memory.
   Limitless allows 4 concurrent requests by default; override with `[providers.omlx]` and
   `max_concurrent = 8` in `config.toml`. This does not tune oMLX's own scheduler.
@@ -332,6 +332,9 @@ proxy_buffering off;
 proxy_cache off;
 proxy_read_timeout 1h;
 ```
+
+The daemon's streams also send `X-Accel-Buffering: no`, which nginx honours per response, and the
+UI re-fetches its runs from the API whenever a stream reconnects.
 
 The daemon trusts the proxy's socket IP for UI/API access (including SSE), never forwarded
 client-address headers. Proxy mutations require the configured public Origin and JSON.

@@ -176,7 +176,7 @@ Limitless defaults to 4 concurrent oMLX requests; override in `config.toml` with
 max_concurrent = 8
 ```
 
-The default local model is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-REAP-288-MLX-4bit`);
+The default local model is `omlx/qwen-flash` (backend `Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
 `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first routing
 among free models the policy does not name, take catalog order, so they use Flash. Tool-free roles accept
 `omlx/qwen-flash@none` / `omlx/qwen-flash@high` to turn thinking off/on; compare them with

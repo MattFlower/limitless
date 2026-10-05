@@ -106,6 +106,7 @@ export const RunDetail: Component = () => {
     if (feedbackTimer) clearTimeout(feedbackTimer);
     clearTimeout(refreshTimer);
     generation++;
+    refreshAfterRead = false;
   });
 
   const stages = createMemo(() => Object.values(stagesById).sort((a, b) => a.id - b.id));
@@ -116,41 +117,61 @@ export const RunDetail: Component = () => {
 
   let generation = 0;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  // The newest read still in flight; superseded reads do not hold back a reconnect refresh.
+  let currentRead = 0;
+  let loaded = false;
+  let refreshAfterRead = false;
+  // Stage, invocation and question updates pushed while a read is in flight are newer than it.
+  const pushed = new Set<string>();
+  const fresh = <T extends { id: number }>(kind: string, items: T[]) =>
+    items.filter((item) => !pushed.has(`${kind}:${item.id}`));
   const scheduleRefresh = () => {
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(refetchArtifacts, 100);
   };
   const refetchArtifacts = () => {
     const request = ++generation;
+    pushed.clear();
+    currentRead = request;
     getRunDetail(params.id)
       .then((detail) => {
         if (request !== generation) return;
+        loaded = true;
         setLoadError(null);
         setRun(detail.run);
         setDetails(detail);
         setStagesById(
           produce((d) => {
-            for (const s of detail.stages) d[s.id] = s;
+            for (const s of fresh("stage", detail.stages)) d[s.id] = s;
           }),
         );
         setInvocationsById(
           produce((d) => {
-            for (const i of detail.invocations) d[i.id] = i;
+            for (const i of fresh("invocation", detail.invocations)) d[i.id] = i;
           }),
         );
         setQuestionsById(
           produce((d) => {
-            for (const q of detail.questions) d[q.id] = q;
+            for (const q of fresh("question", detail.questions)) d[q.id] = q;
           }),
         );
         setArtifacts(detail.artifacts);
       })
-      .catch((e) => request === generation && setLoadError((e as Error).message));
+      .catch((e) => request === generation && setLoadError((e as Error).message))
+      .finally(() => {
+        if (request !== currentRead) return;
+        currentRead = 0;
+        if (refreshAfterRead) {
+          refreshAfterRead = false;
+          scheduleRefresh();
+        }
+      });
   };
 
   onMount(() => {
     refetchArtifacts();
-    let reconnect = false;
+    let wasOpen = false;
+    let missedUpdates = false;
 
     const close = openRunStream(
       params.id,
@@ -163,6 +184,7 @@ export const RunDetail: Component = () => {
         } else if (msg.kind === "feed" && msg.item.runId === params.id) scheduleRefresh();
         else if (msg.kind === "stage") {
           const stage = msg.stage;
+          pushed.add(`stage:${stage.id}`);
           setStagesById(
             produce((d) => {
               d[stage.id] = stage;
@@ -171,6 +193,7 @@ export const RunDetail: Component = () => {
           if (stage.status !== "running") scheduleRefresh();
         } else if (msg.kind === "invocation") {
           const invocation = msg.invocation;
+          pushed.add(`invocation:${invocation.id}`);
           setInvocationsById(
             produce((d) => {
               d[invocation.id] = invocation;
@@ -178,6 +201,7 @@ export const RunDetail: Component = () => {
           );
         } else if (msg.kind === "question") {
           const question = msg.question;
+          pushed.add(`question:${question.id}`);
           setQuestionsById(
             produce((d) => {
               d[question.id] = question;
@@ -194,8 +218,16 @@ export const RunDetail: Component = () => {
       },
       (value) => {
         setConnected(value);
-        if (value && reconnect) scheduleRefresh();
-        reconnect = true;
+        // Only a drop after the stream was open is a gap. A read already in flight may predate it,
+        // so reconnects during one wait for it and refresh once afterwards.
+        if (!value) missedUpdates ||= wasOpen;
+        else {
+          wasOpen = true;
+          const reading = currentRead !== 0 && currentRead === generation;
+          if (missedUpdates && reading) refreshAfterRead = true;
+          else if (missedUpdates || (!loaded && !reading)) scheduleRefresh();
+          missedUpdates = false;
+        }
       },
     );
     onCleanup(close);

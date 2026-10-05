@@ -7,6 +7,10 @@ import type { renderToString } from "solid-js/web";
 import type { RunDetail } from "../src/core/types.ts";
 
 const solid = createRequire(import.meta.url)("babel-preset-solid") as PresetTarget<object>;
+// Server-rendered signals and memos never track reads, so the page's own reactive state comes from
+// Solid's client build; components still render on the server.
+const clientSolid = join(import.meta.dir, "../node_modules/solid-js/dist/solid.js");
+const clientStore = join(import.meta.dir, "../node_modules/solid-js/store/dist/store.js");
 type Handler = (event?: { currentTarget: { value: string } }) => void | Promise<void>;
 export type NeedsYouUi = {
   mount: (detail: RunDetail, initiallyEmpty?: boolean) => void;
@@ -26,10 +30,20 @@ export async function buildNeedsYouUi(dir: string): Promise<NeedsYouUi> {
       {
         name: "needs-you-ssr-events",
         setup(builder) {
+          builder.onResolve({ filter: /^solid-js$/ }, (args) =>
+            args.importer === clientStore ? { path: clientSolid } : undefined,
+          );
           builder.onLoad({ filter: /\.tsx$/ }, async (args) => {
             let source = await Bun.file(args.path).text();
             if (args.path.endsWith("/RunDetail.tsx")) {
               source = source.replace("onCleanup, onMount, ", "");
+              source = source.replace(/import \{ ([^}]+) \} from "solid-js";/, (_line, names: string) => {
+                const list = names.split(",").map((name) => name.trim());
+                const components = list.filter((name) => /^[A-Z]/.test(name));
+                const reactive = list.filter((name) => !/^[A-Z]/.test(name));
+                return `import { ${components.join(", ")} } from "solid-js"; import { ${reactive.join(", ")} } from ${JSON.stringify(clientSolid)};`;
+              });
+              source = source.replace('from "solid-js/store";', `from ${JSON.stringify(clientStore)};`);
               source = source.replace(
                 'import { useNavigate, useParams } from "@solidjs/router";',
                 "const useNavigate = () => (path: string) => navigated.push(path); const useParams = <T,>(): T => ({ id: fixture.run.id }) as T;",
