@@ -223,12 +223,21 @@ test("a successful sibling cannot resolve an in-progress rerun, even across rest
   f.observe("SUCCESS", "rollup ahead of REST");
   await h.advance(15000);
   expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
-  f.job.status = "completed";
-  f.observe("SUCCESS", "rerun completed");
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
+  const pendingCalls = h.gh.rest().length;
   await h.advance(15000);
+  expect(h.gh.rest().length).toBeGreaterThan(pendingCalls);
+  h.reopen();
+  f.job.status = "completed";
+  h.start(15);
+  await h.advance(0);
   expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_then_passed");
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
   expect(items("ci.needs_fix")).toHaveLength(0);
   expect(reruns()).toHaveLength(1);
+  const completedCalls = h.gh.rest().length;
+  await h.advance(15000);
+  expect(h.gh.rest()).toHaveLength(completedCalls);
 });
 
 test("incomplete rerun evidence stays retryable without accepting GraphQL success", async () => {

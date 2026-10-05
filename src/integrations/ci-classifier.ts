@@ -223,7 +223,13 @@ export async function classifyCi(
     } else continue;
     resolved.add(job.id);
   }
-  if (snap.ci !== "FAILURE" && snap.ci !== "ERROR") return true;
+  if (snap.ci !== "FAILURE" && snap.ci !== "ERROR") {
+    // The rollup can finish before REST; retry unchanged success until every rerun is confirmed.
+    return (
+      snap.ci !== "SUCCESS" ||
+      !store.ciFailures(pr.url, snap.headRefOid).some((f) => f.outcome === "rerunning")
+    );
+  }
   const failures = await checks(snap.headRefOid);
   if (failures.some((c) => c.head_sha !== snap.headRefOid)) throw new Error("Incomplete PR CI");
   const names = new Set([
