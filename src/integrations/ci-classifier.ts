@@ -237,7 +237,9 @@ export async function classifyCi(
     ...failures.filter((c) => c.status === "completed" && bad.has(c.conclusion ?? "")).map((c) => c.name),
   ]);
   if (!names.size) throw new Error("Incomplete CI failure: no failing checks");
-  let pendingRerun = false;
+  // Retain unresolved prior attempts even when their checks now pass or are absent below.
+  // Reruns requested in this inspection wait for a new GraphQL observation first.
+  const pendingRerun = store.ciFailures(pr.url, snap.headRefOid).some((f) => f.outcome === "rerunning");
   for (const name of names) {
     const matches = failures.filter(
       (c) => c.name === name && c.status === "completed" && bad.has(c.conclusion ?? ""),
@@ -311,8 +313,6 @@ export async function classifyCi(
         );
       if (job && resolved.has(job.id)) continue;
       if (prior.some((p) => p.outcome === "rerunning")) {
-        // A new failure can precede REST's attempt update; keep retrying until it is reconciled.
-        pendingRerun ||= prior.some((p) => p.outcome === "rerunning" && p.rerunMarker !== marker);
         continue;
       }
       if (!unsafe) store.recordCiFailure(f);

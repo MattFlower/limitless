@@ -168,6 +168,56 @@ test.each([
   expect(h.gh.rest()).toHaveLength(completedCalls);
 });
 
+test.each(["attempt", "job"])(
+  "a passing rerun with lagging REST %s reconciles while another check keeps CI red",
+  async (lag) => {
+    h = pollerHarness();
+    const f = failure();
+    h.start(15);
+    await h.advance(0);
+    f.rerun("success", lag === "job" ? "in_progress" : "completed");
+    f.check.status = "completed";
+    let attempt = lag === "attempt" ? 1 : 2;
+    h.gh.responses.set("repos/o/r/actions/runs/1", () =>
+      respond(200, { head_sha: SHA, run_attempt: attempt }),
+    );
+    const other = { ...f.check, id: 12, name: "other", conclusion: "failure", details_url: null };
+    h.gh.responses.set(checksPath(SHA), () => respond(200, { total_count: 2, check_runs: [f.check, other] }));
+    const head = f.node.commits.nodes[0];
+    if (!head) throw new Error("missing fixture commit");
+    head.commit.statusCheckRollup = {
+      state: "FAILURE",
+      contexts: {
+        nodes: [
+          { name: "test", conclusion: "SUCCESS", status: "COMPLETED" },
+          { name: "other", conclusion: "FAILURE", status: "COMPLETED" },
+        ],
+      },
+    };
+    await h.advance(15000);
+    expect(h.store.ciFailures(f.node.url, SHA).find((f) => f.check === "test")?.outcome).toBe("rerunning");
+    expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
+    h.reopen();
+    h.start(15);
+    await h.advance(0);
+    expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
+    // REST catches up without another GraphQL change.
+    attempt = 2;
+    f.job.status = "completed";
+    await h.advance(15000);
+    expect(h.store.ciFailures(f.node.url, SHA).find((f) => f.check === "test")?.outcome).toBe(
+      "failed_then_passed",
+    );
+    expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
+    expect(items("ci.needs_fix")).toHaveLength(1);
+    expect(items("ci.needs_fix")[0]?.data.signature).toMatchObject({ check: "> other" });
+    expect(reruns()).toHaveLength(1);
+    const calls = h.gh.rest().length;
+    await h.advance(15000);
+    expect(h.gh.rest()).toHaveLength(calls);
+  },
+);
+
 test.each([false, true])("same-name checks have independent reruns (same workflow=%s)", async (sameRun) => {
   h = pollerHarness();
   const f = failure();
@@ -598,7 +648,7 @@ test("another check changing cannot turn the original failed job into a failed r
   expect(items("ci.needs_fix")).toHaveLength(0);
   expect(reruns()).toHaveLength(1);
   expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
-  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
 });
 
 test("a completed cancellation that never started reruns without requiring nonexistent logs", async () => {
