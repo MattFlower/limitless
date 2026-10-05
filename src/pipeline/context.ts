@@ -671,7 +671,6 @@ export class RunContext {
         // Persist tried history without yielding between recording it and starting the harness.
         if (
           opts.role === "implement" &&
-          chain &&
           !this.state.triedImplementers.some(
             (ref) =>
               (typeof ref === "string" ? ref : formatTarget(ref.modelId, ref.effort)) === target.targetId,

@@ -17,6 +17,7 @@ import { renderToString } from "solid-js/web";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Repo, Role, RunStatus, StageName } from "../src/core/types.ts";
+import { Store } from "../src/db/store.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { recordWorktree } from "../src/git/command.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
@@ -42,6 +43,7 @@ import {
   type RunState,
 } from "../src/pipeline/context.ts";
 import { executeRun, readingTimeout } from "../src/pipeline/engine.ts";
+import { SimulatedTermination } from "../src/pipeline/faults.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { LOCAL_FINDER_TIMEOUT_MS } from "../src/pipeline/review.ts";
 import {
@@ -286,6 +288,48 @@ describe("per-run model chains", () => {
         .map((i) => i.modelId),
     ).toEqual(["alpha/m", "beta/m", "beta/m"]);
     expect(f.store.listQuestions(run.id).at(-1)?.question).toContain("alpha/m (already tried)");
+  });
+  test("unpinned fallback history prevents escalation from returning to either dispatched model", async () => {
+    const alpha = models[0];
+    if (!alpha) throw new Error("missing fixture model");
+    let quota = true;
+    const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
+    factory = new Factory(cfg, {
+      confinement: fakeConfinement,
+      providers,
+      models: [...models, { ...alpha, id: "alpha/next", model: "alpha-next" }],
+      policy: { ...policy, implement: { default: ["alpha/m", "beta/m", "alpha/next"] } },
+      harnesses: {
+        fake: fakeHarness((s) => {
+          if (roleOf(s) !== "implement") return reply(s);
+          if (s.target.modelId === "alpha/m" && quota) {
+            quota = false;
+            return {
+              status: "quota",
+              error: "transient quota",
+              quota: { windows: {}, exhaustedUntil: Date.now() - 1 },
+            };
+          }
+          return { files: { "farewell.txt": s.target.modelId === "beta/m" ? "BAD\n" : "goodbye\n" } };
+        }),
+      },
+      bootSha: "test-build",
+    });
+    const f = factory;
+    f.start();
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(
+      f.store
+        .listInvocations(run.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.modelId),
+    ).toEqual(["alpha/m", "beta/m", "beta/m", "alpha/next"]);
+    expect(f.store.getRunState<RunState>(run.id)?.triedImplementers).toEqual([
+      { modelId: "alpha/m", effort: null },
+      { modelId: "beta/m", effort: null },
+      { modelId: "alpha/next", effort: null },
+    ]);
   });
   test.each(["trivial", "large"] as const)(
     "implement override wins at %s complexity; other roles use policy",
@@ -9298,6 +9342,42 @@ describe("routing bounded slot waits", () => {
     return { clock, cfg, tracker, router, calls, controller, context, run, invoke, events };
   }
 
+  test.each([false, true])(
+    "implement dispatch history survives a crash inside the harness and database reopen (pinned=%s)",
+    async (pinned) => {
+      const f = fixture(
+        models,
+        policy,
+        () => {
+          throw new SimulatedTermination("daemon terminated during implement harness");
+        },
+        pinned ? { implement: ["alpha/m", "beta/m"] } : undefined,
+      );
+      await expect(f.invoke(undefined, "implement")).rejects.toThrow(SimulatedTermination);
+      expect(f.calls.map((s) => s.target.modelId)).toEqual(["alpha/m"]);
+      f.context.store.close();
+      const reopened = new Store(f.cfg.paths.db);
+      try {
+        const tracker = new ProviderTracker(providers, reopened, f.cfg.reserves, {}, {});
+        const router = new Router(tracker, policy, models);
+        const loaded = new RunContext(
+          { ...f.context.deps, store: reopened, tracker, router },
+          f.run,
+          f.context.repo,
+          new AbortController().signal,
+        );
+        expect(loaded.state.triedImplementers).toEqual([{ modelId: "alpha/m", effort: null }]);
+        expect(
+          router
+            .route("implement", "small", { exclude: loaded.state.triedImplementers })
+            .candidates.map((t) => t.modelId),
+        ).toEqual(["beta/m"]);
+      } finally {
+        reopened.close();
+      }
+    },
+  );
+
   test.each(["cell", "prefer"])(
     "live %s edits cancel obsolete capacity waits before invoking",
     async (edit) => {
@@ -9355,11 +9435,16 @@ describe("routing bounded slot waits", () => {
     },
   );
 
-  test.each(["cell", "prefer"])(
-    "a live %s edit cancelling a pinned call before dispatch leaves it eligible for escalation",
-    async (edit) => {
+  test.each([
+    ["cell", false],
+    ["cell", true],
+    ["prefer", false],
+    ["prefer", true],
+  ] as const)(
+    "a live %s edit cancelling a call before dispatch leaves it eligible for escalation (pinned=%s)",
+    async (edit, pinned) => {
       const chain = ["alpha/m", "beta/m"];
-      const f = fixture(models, policy, undefined, { implement: chain });
+      const f = fixture(models, policy, undefined, pinned ? { implement: chain } : undefined);
       const runtime = new RuntimePolicy(f.context.store, f.router, models, providers, [], policy);
       const slots = await Promise.all(
         ["alpha", "alpha"].map((p) => f.tracker.acquire(p, f.controller.signal)),
@@ -9400,7 +9485,7 @@ describe("routing bounded slot waits", () => {
         expect(
           f.router
             .route("implement", "small", {
-              chain,
+              ...(pinned ? { chain } : {}),
               exclude: loaded.state.triedImplementers,
             })
             .candidates.map((t) => t.modelId),
