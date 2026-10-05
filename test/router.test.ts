@@ -121,34 +121,44 @@ test("verifier routing excludes checkpoints across backends, including pinned ta
   expect(router.route("review", "small", constraints).candidates).toEqual([]);
 });
 
-test("unlimited quota ignores windows and reserves but honors rejections until their deadline", () => {
-  let now = 1_000_000;
-  const defs: ProviderDef[] = providers.map((p) => ({ ...p, quota: "unlimited" }));
-  const tracker = new ProviderTracker(defs, store, reserves, {}, {}, () => now);
-  expect(tracker.headroom("claude")).toBe(1);
-  const window = { utilization: 0.99, resetsAt: now + 500_000 };
-  tracker.observeWindows("claude", { five_hour: window });
-  expect(tracker.headroom("claude")).toBe(1);
-  expect(tracker.isAvailable("claude")).toBe(true);
-  expect(tracker.status("claude")).toMatchObject({
-    quota: "unlimited",
-    state: "ok",
-    windows: { five_hour: { ...window, observedAt: now } },
-  });
-  const exhaustedUntil = now + 100_000;
-  tracker.record("claude", "quota", { exhaustedUntil, error: "CLI quota rejection" });
-  tracker.record("claude", "ok");
-  const reloaded = new ProviderTracker(defs, store, reserves, {}, {}, () => now);
-  now = exhaustedUntil - 1;
-  expect(reloaded.isAvailable("claude")).toBe(false);
-  expect(reloaded.status("claude")).toMatchObject({ state: "exhausted", until: exhaustedUntil });
-  now = exhaustedUntil;
-  expect(reloaded.isAvailable("claude")).toBe(true);
-  expect(reloaded.status("claude")?.state).toBe("ok");
-  reloaded.record("claude", "quota", { modelCooldown: { modelId: "claude/sonnet", ms: 100_000 } });
-  expect(reloaded.isAvailable("claude")).toBe(true);
-  expect(reloaded.modelUnavailableReason("claude/sonnet")).toContain("model cooling down");
-});
+for (const billing of ["free", "metered", "subscription"] as const) {
+  for (const quota of ["windows", "unlimited"] as const) {
+    test(`${billing} ${quota} quota honors reserves or ignores windows, with durable rejection deadlines`, () => {
+      let now = 1_000_000;
+      const defs: ProviderDef[] = [
+        { id: "claude", label: "Claude", harness: "fake", billing, quota, maxConcurrent: 1 },
+      ];
+      const limits = { ...reserves, windows: { claude: { five_hour: 0.9 } } };
+      const tracker = new ProviderTracker(defs, store, limits, {}, {}, () => now);
+      expect(tracker.headroom("claude")).toBe(1);
+      const window = { utilization: 0.99, resetsAt: now + 500_000 };
+      tracker.observeWindows("claude", { five_hour: window });
+      if (quota === "unlimited") expect(tracker.headroom("claude")).toBe(1);
+      else expect(tracker.headroom("claude")).toBeCloseTo(-0.1);
+      expect(tracker.isAvailable("claude")).toBe(quota === "unlimited");
+      expect(tracker.status("claude")).toMatchObject({
+        quota,
+        state: quota === "unlimited" ? "ok" : "exhausted",
+        windows: { five_hour: { ...window, observedAt: now } },
+      });
+      if (quota === "windows") return;
+      const exhaustedUntil = now + 100_000;
+      tracker.record("claude", "quota", { exhaustedUntil, error: "CLI quota rejection" });
+      tracker.record("claude", "ok");
+      expect(tracker.isAvailable("claude")).toBe(false);
+      const reloaded = new ProviderTracker(defs, store, limits, {}, {}, () => now);
+      now = exhaustedUntil - 1;
+      expect(reloaded.isAvailable("claude")).toBe(false);
+      expect(reloaded.status("claude")).toMatchObject({ state: "exhausted", until: exhaustedUntil });
+      now = exhaustedUntil;
+      expect(reloaded.isAvailable("claude")).toBe(true);
+      expect(reloaded.status("claude")?.state).toBe("ok");
+      reloaded.record("claude", "quota", { modelCooldown: { modelId: "claude/sonnet", ms: 100_000 } });
+      expect(reloaded.isAvailable("claude")).toBe(true);
+      expect(reloaded.modelUnavailableReason("claude/sonnet")).toContain("model cooling down");
+    });
+  }
+}
 
 test("quota windows keep independent observation times and reject older boundaries", () => {
   let now = 1_000_000;

@@ -150,6 +150,13 @@ export class ProviderTracker {
         shadows: new Set(),
       });
     }
+    for (const alert of store.listAlerts(clock())) {
+      if (
+        this.def(alert.provider)?.quota === "unlimited" &&
+        (alert.source === "window" || (alert.source == null && alert.severity === "warning"))
+      )
+        store.clearAlert(alert.provider, alert.window);
+    }
   }
 
   now(): number {
@@ -345,9 +352,7 @@ export class ProviderTracker {
     const p = this.providers.get(id);
     if (!p) return 0;
     let min = 1;
-    for (const [name, w] of Object.entries(
-      p.def.billing === "subscription" && p.def.quota === "unlimited" ? {} : p.windows,
-    )) {
+    for (const [name, w] of Object.entries(p.def.quota === "unlimited" ? {} : p.windows)) {
       const cap = this.reserveFor(id, name);
       const util = w.resetsAt !== null && w.resetsAt <= now ? 0 : w.utilization;
       min = Math.min(min, (cap - util) / cap);
@@ -591,6 +596,7 @@ export class ProviderTracker {
           window.utilization,
           window.resetsAt,
           window.utilization >= cap ? "exhausted" : "warning",
+          "window",
         );
       }
     }
@@ -602,6 +608,7 @@ export class ProviderTracker {
     utilization: number | null,
     resetsAt: number | null,
     severity: QuotaAlert["severity"],
+    source: QuotaAlert["source"],
   ): void {
     const routing =
       this.routingFor?.(id, this.status(id)?.state === "exhausted") ??
@@ -614,6 +621,7 @@ export class ProviderTracker {
       utilization,
       resetsAt,
       severity,
+      source,
       routing,
       createdAt: this.clock(),
     });
@@ -656,7 +664,14 @@ export class ProviderTracker {
             .find((alert) => alert.provider === id && alert.window === "hard_limit");
           if (existing) resetsAt = existing.resetsAt;
         }
-        this.alert(id, known?.[0] ?? "hard_limit", known?.[1].utilization ?? null, resetsAt, "exhausted");
+        this.alert(
+          id,
+          known?.[0] ?? "hard_limit",
+          known?.[1].utilization ?? null,
+          resetsAt,
+          "exhausted",
+          "rejection",
+        );
       }
     } else if (status === "unavailable" || status === "timeout") {
       p.consecutiveFailures++;

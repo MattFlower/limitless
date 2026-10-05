@@ -368,6 +368,8 @@ export interface QuotaAlert {
   utilization: number | null;
   resetsAt: number | null;
   severity: "warning" | "exhausted";
+  /** Missing on older alerts whose origin cannot be determined. */
+  source?: "window" | "rejection" | null;
   routing: string;
   createdAt: number;
 }
