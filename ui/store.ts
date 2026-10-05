@@ -1,11 +1,19 @@
-// Process-wide live state: one SSE connection to /api/stream, hydrated from REST on first use.
+// Process-wide live state: one SSE connection to /api/stream, hydrated from REST on first use
+// and again after each gap in the stream.
 // Solid stores/signals declared at module scope behave like a singleton — every page that reads
 // `live.runs` / `live.providers` sees the same reactive data, and the nav's connection dot reflects
 // the one shared EventSource regardless of which route is mounted.
 import { createSignal } from "solid-js";
-import { createStore, produce } from "solid-js/store";
-import type { HealthResponse, ProviderStatus, QuotaAlert, Run } from "../src/core/types.ts";
+import { createStore, produce, reconcile } from "solid-js/store";
+import {
+  type HealthResponse,
+  MAX_RUN_IDS,
+  type ProviderStatus,
+  type QuotaAlert,
+  type Run,
+} from "../src/core/types.ts";
 import { getAlerts, getHealth, getProviders, listRuns, openGlobalStream } from "./api.ts";
+import { createCatchUp, type Timers } from "./lib/catch-up.ts";
 
 const [runsById, setRunsById] = createStore<Record<string, Run>>({});
 const [providersById, setProvidersById] = createStore<Record<string, ProviderStatus>>(Object.create(null));
@@ -45,6 +53,7 @@ export function ensureLiveStore(
       setInterval(fn, ms);
     },
   },
+  timers?: Timers,
 ): void {
   if (started) return;
   started = true;
@@ -67,16 +76,36 @@ export function ensureLiveStore(
   let alertsHydrated = false;
   const pendingAlerts = new Map<string, QuotaAlert | null>();
 
-  Promise.all([deps.listRuns({ limit: 200 }), deps.getProviders(), deps.getAlerts()])
-    .then(([runs, providers, alerts]) => {
+  const sync = createCatchUp(
+    async () => {
+      alertsHydrated = false;
+      pendingAlerts.clear();
+      const [runs, providers, alerts] = await Promise.all([
+        deps.listRuns({ limit: 200 }),
+        deps.getProviders(),
+        deps.getAlerts(),
+      ]);
+      // Cached runs outside that window, such as an old run resolved during a gap, are re-read by id.
+      const listed = new Set(runs.map((r) => r.id));
+      const omitted = Object.values(runsById)
+        .filter((r) => !listed.has(r.id))
+        .map((r) => r.id);
+      const refreshed: Run[] = [];
+      for (let i = 0; i < omitted.length; i += MAX_RUN_IDS) {
+        const ids = omitted.slice(i, i + MAX_RUN_IDS);
+        refreshed.push(...(await deps.listRuns({ ids, limit: ids.length })));
+      }
+      return [[...runs, ...refreshed], providers, alerts] as const;
+    },
+    ([runs, providers, alerts], pushed) => {
       setRunsById(
         produce((draft) => {
-          for (const r of runs) draft[r.id] = r;
+          for (const r of runs) if (!pushed.has(`run:${r.id}`)) draft[r.id] = r;
         }),
       );
       setProvidersById(
         produce((draft) => {
-          for (const p of providers) draft[p.id] = p;
+          for (const p of providers) if (!pushed.has(`provider:${p.id}`)) draft[p.id] = p;
         }),
       );
       const snapshot = Object.fromEntries(alerts.map((a) => [`${a.provider}:${a.window}`, a]));
@@ -84,21 +113,28 @@ export function ensureLiveStore(
         if (alert) snapshot[key] = alert;
         else delete snapshot[key];
       }
-      setAlertsByKey(snapshot);
+      setAlertsByKey(reconcile(snapshot));
       alertsHydrated = true;
       pendingAlerts.clear();
       setHydrated(true);
-    })
-    .catch(() => {
+    },
+    () => {
       alertsHydrated = true;
       setHydrated(true);
-    });
+    },
+    timers,
+  );
+  sync.load();
 
   deps.openGlobalStream(
     (msg) => {
-      if (msg.kind === "run") upsertRun(msg.run);
-      else if (msg.kind === "provider") upsertProvider(msg.provider);
-      else if (msg.kind === "alert") {
+      if (msg.kind === "run") {
+        sync.pushed(`run:${msg.run.id}`);
+        upsertRun(msg.run);
+      } else if (msg.kind === "provider") {
+        sync.pushed(`provider:${msg.provider.id}`);
+        upsertProvider(msg.provider);
+      } else if (msg.kind === "alert") {
         const key = `${msg.provider}:${msg.window}`;
         if (!alertsHydrated) pendingAlerts.set(key, msg.alert);
         if (msg.alert) setAlertsByKey(key, msg.alert);
@@ -113,6 +149,7 @@ export function ensureLiveStore(
     (connected) => {
       setConnected(connected);
       if (connected) void refreshHealth();
+      sync.connected(connected);
     },
   );
 }

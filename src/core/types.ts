@@ -20,6 +20,9 @@ export const TERMINAL_STATUSES: readonly RunStatus[] = [
   "resolved",
 ];
 
+/** The most runs one `GET /api/runs?ids=` request may name. */
+export const MAX_RUN_IDS = 200;
+
 export type Profile = "auto" | "quick" | "standard" | "deep";
 export type ResolvedProfile = Exclude<Profile, "auto">;
 

@@ -38,7 +38,7 @@ import type {
   StreamMessage,
   TrackedPr,
 } from "../core/types.ts";
-import { DEFAULT_EVAL_CONCURRENCY, TERMINAL_STATUSES } from "../core/types.ts";
+import { DEFAULT_EVAL_CONCURRENCY, MAX_RUN_IDS, TERMINAL_STATUSES } from "../core/types.ts";
 import type { RunState } from "../pipeline/context.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
@@ -46,6 +46,9 @@ type Row = Record<string, unknown>;
 type Listener = (msg: StreamMessage) => void;
 
 const MAX_EVENT_DATA = 16_000;
+
+/** A run id as `newId()` makes it: lowercase base 36. */
+const RUN_ID = /^[0-9a-z]{1,32}$/;
 
 export function newId(prefix = ""): string {
   const time = Date.now().toString(36);
@@ -1248,9 +1251,15 @@ export class Store {
     return row ? toRun(row) : null;
   }
 
-  listRuns(opts: { status?: RunStatus[]; limit?: number; repoId?: string } = {}): Run[] {
+  listRuns(opts: { status?: RunStatus[]; limit?: number; repoId?: string; ids?: string[] } = {}): Run[] {
     const where: string[] = [];
     const params: (string | number)[] = [];
+    if (opts.ids) {
+      if (opts.ids.length > MAX_RUN_IDS || !opts.ids.every((id) => RUN_ID.test(id)))
+        throw new Error(`ids must list at most ${MAX_RUN_IDS} valid run ids`);
+      where.push(`runs.id IN (${opts.ids.map(() => "?").join(",")})`);
+      params.push(...opts.ids);
+    }
     if (opts.status?.length) {
       where.push(`runs.status IN (${opts.status.map(() => "?").join(",")})`);
       params.push(...opts.status);
