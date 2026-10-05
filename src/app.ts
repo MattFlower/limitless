@@ -249,7 +249,7 @@ export class Factory {
     if (!req.repo?.trim()) throw new Error("repo is required");
     if (req.models !== undefined)
       req = { ...req, models: validateRunModels(req.models, this.models, this.providerDefs) };
-    const repo = await resolveRepo(this.store, req.repo);
+    const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
     const run = chat
       ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
       : this.store.createRun(repo, req, verifiedGitHubWebhook);

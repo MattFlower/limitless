@@ -49,7 +49,8 @@ Usage:
   limitless routing set <role>.<cell> <chain> [--note …]
   limitless routing reset <role>.<cell> | --all
   limitless routing preview <role> [<complexity>] [--run id]
-  limitless doctor                        Report GitHub access problems the PR poller recorded
+  limitless init [--yes] [--repo owner/name]... [--json]  Idempotent machine setup
+  limitless doctor [--json]                Read-only machine and access diagnosis
   limitless auth add-passkey              Print a one-time link (10 minutes) that registers a UI passkey
   limitless auth passkeys [remove <id>]   List or remove UI passkeys
   limitless auth set-password             Set the UI sign-in password (prompted, never echoed)
@@ -230,7 +231,7 @@ async function main(): Promise<void> {
       after: { type: "string" },
       consumer: { type: "string" },
       wait: { type: "string" },
-      repo: { type: "string", short: "r" },
+      repo: { type: "string", short: "r", multiple: true },
       role: { type: "string" },
       run: { type: "string" },
       profile: { type: "string", short: "p" },
@@ -258,6 +259,7 @@ async function main(): Promise<void> {
     },
   });
   const [cmd, ...rest] = positionals;
+  const repo = values.repo?.at(-1);
   if (!cmd || values.help) {
     console.log(USAGE);
     return;
@@ -318,12 +320,12 @@ async function main(): Promise<void> {
     }
     case "run": {
       const prompt = rest.join(" ").trim() || (await Bun.stdin.text()).trim();
-      if (!prompt || !values.repo) throw new Error('usage: limitless run "<prompt>" --repo <repo>');
+      if (!prompt || !repo) throw new Error('usage: limitless run "<prompt>" --repo <repo>');
       const allow = validateAllow(values.allow);
       const run = await api<Run>("/api/runs", {
         method: "POST",
         body: JSON.stringify({
-          repo: values.repo,
+          repo,
           prompt,
           models: parseRunModels(values.model),
           ...(values.after !== undefined ? { dependsOn: values.after.split(",") } : {}),
@@ -493,11 +495,20 @@ async function main(): Promise<void> {
       }
       return;
     }
+    case "init":
     case "doctor": {
-      const problems = await api<import("../core/types.ts").GitHubAccessProblem[]>("/api/github/access");
-      const lines = (await import("../integrations/github-poller.ts")).githubDoctor(problems);
-      console.log(lines.join("\n"));
-      if (lines.length > 1) process.exitCode = 1;
+      const { setupCommand, setupDeps } = await import("./setup.ts");
+      let deps: ReturnType<typeof setupDeps>;
+      try {
+        deps = setupDeps();
+      } catch {
+        const error = "Invalid configuration; fix config.toml before running setup";
+        if (values.json) console.log(JSON.stringify({ ok: false, failedStep: "config", error }));
+        else console.error(error);
+        process.exitCode = 1;
+        return;
+      }
+      process.exitCode = await setupCommand(cmd, values, deps);
       return;
     }
     case "gc": {
@@ -560,7 +571,7 @@ async function main(): Promise<void> {
         throw new Error("usage: limitless gates clear-cache [--repo owner/name]");
       const { cleared } = await api<{ cleared: number }>("/api/gates/clear-cache", {
         method: "POST",
-        body: JSON.stringify(values.repo === undefined ? {} : { repo: values.repo }),
+        body: JSON.stringify(repo === undefined ? {} : { repo }),
       });
       console.log(`Cleared ${cleared} cached baselines`);
       return;
