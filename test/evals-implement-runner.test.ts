@@ -307,6 +307,52 @@ test("implement invokes once in edit mode with shared prompt, isolates head/hidd
   }
 });
 
+test("a reused implementation trial reports no cache of its own, so a mixed run's split sums to its tokens", async () => {
+  const f = await fixture();
+  try {
+    // Only a call with cache traffic can tell a reused trial's counters from the source's.
+    f.respond(() => ({
+      files: { answer: "correct", overwrite: "candidate" },
+      text: "Implemented",
+      costUsd: 0.1,
+      usage: { input: 10, cacheRead: 2, cacheWrite: 3, output: 4 },
+    }));
+    const first = await f.run();
+    expect(first.trials[0]).toMatchObject({
+      tokensIn: 15,
+      details: { cacheReadTokens: 2, cacheWriteTokens: 3 },
+    });
+    expect(first.summaries[0]).toMatchObject({ tokensIn: 15, cacheReadTokens: 2, cacheWriteTokens: 3 });
+
+    // Reusing the trial spends nothing, so it must also report no cached or written tokens.
+    const cached = await f.run();
+    expect(cached.trials[0]).toMatchObject({
+      tokensIn: 0,
+      details: { cache: { tokensIn: 15 }, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    });
+    const cachedText = formatEvalReport(cached);
+    expect(cachedText).toContain("  cache n/a of 0 prompt tokens (0 cached, 0 written, 0 not cached)");
+    expect(f.calls).toHaveLength(1);
+
+    // The second model runs for the first time, so the run mixes a reused and an executed trial.
+    const mixed = await f.run({ models: ["candidate-a", "candidate-b"], k: 1 });
+    expect(
+      mixed.trials.map((t) => [t.modelId, t.tokensIn, t.details.cacheReadTokens, t.details.cacheWriteTokens]),
+    ).toEqual([
+      ["candidate-a", 0, 0, 0],
+      ["candidate-b", 15, 2, 3],
+    ]);
+    const mixedText = formatEvalReport(mixed);
+    expect(mixedText).toMatch(
+      /candidate-a \(effort: [^)]*\):[\s\S]*?cache n\/a of 0 prompt tokens \(0 cached, 0 written, 0 not cached\)/,
+    );
+    expect(mixedText).toContain("  cache 13.3% of 15 prompt tokens (2 cached, 3 written, 10 not cached)");
+    expect(mixedText).not.toMatch(/-\d[\d,]* (cached|written|not cached)/);
+  } finally {
+    await f.close();
+  }
+});
+
 for (const [kind, files, gate, reason] of [
   ["hidden", { answer: "wrong" }, "true", "hidden_tests"],
   ["gates", { answer: "correct", broken: "yes", protected: "changed" }, "test ! -f broken", "gates"],

@@ -19,7 +19,7 @@ export const ghClient: GitHubClient = async (path, body, signal) => {
 };
 
 export const OBSERVE_QUERY = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on PullRequest {
-  id url headRefOid state mergeable mergeStateStatus reviewDecision updatedAt mergedAt mergedBy { login }
+  id url headRefOid state isDraft mergeable mergeStateStatus updatedAt mergedAt mergedBy { login }
   commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
     ... on CheckRun { name conclusion url: detailsUrl }
     ... on StatusContext { name: context state url: targetUrl } } } } } } }
@@ -32,8 +32,9 @@ type Conn<T> = { nodes?: (T | null)[] } | null | undefined;
 type Activity = { id: string; createdAt?: string; updatedAt: string }; // createdAt: absent only in old markers
 type Context = { name?: string; conclusion?: string | null; state?: string; url?: string | null };
 const REQUIRED = ["id", "url", "headRefOid", "state", "mergeable", "mergeStateStatus", "updatedAt"] as const;
-type Base = Record<(typeof REQUIRED)[number], string> & GitHubPrState & { reviewDecision: string | null };
+type Base = Record<(typeof REQUIRED)[number], string> & GitHubPrState;
 type GqlPr = Base & {
+  isDraft?: boolean;
   commits?: Conn<{ commit?: { statusCheckRollup?: { state: string; contexts?: Conn<Context> } | null } }>;
   reviews?: Conn<Activity & { comments?: Conn<Activity> }>;
   comments?: Conn<Activity>;
@@ -43,6 +44,7 @@ type GqlPr = Base & {
 const MERGE = ["mergeable", "mergeStateStatus"] as const; // null until GitHub reports other than UNKNOWN
 type Known = Omit<Base, (typeof MERGE)[number]> & Record<(typeof MERGE)[number], string | null>;
 export type PrSnapshot = Known & {
+  isDraft?: boolean;
   ci: string | null;
   failing: { name: string; url: string | null }[];
   truncated?: boolean; // all 100 fetched check contexts were used, so there may be more
@@ -108,6 +110,7 @@ const OUTCOME: Record<string, string> = { SUCCESS: "passed", FAILURE: "failed", 
 /** Changes from `prev` to `next`; a first observation reports the head's state but baselines activity. */
 export function diffPr(prev: PrSnapshot | null, next: PrSnapshot): Change[] {
   const out: Change[] = [];
+  if (!prev && next.state !== "OPEN") return out;
   const at = `at ${next.headRefOid.slice(0, 12)}`;
   const add = (kind: GitHubFeedKind, key = "", data = {}, summary = `${kind} ${at}`) =>
     out.push({ kind, key, data, summary });
@@ -115,13 +118,16 @@ export function diffPr(prev: PrSnapshot | null, next: PrSnapshot): Change[] {
   if (ci && (!prev || prev.headRefOid !== next.headRefOid || OUTCOME[prev.ci ?? ""] !== ci)) {
     const { failing, truncated } = next;
     const names = next.failing.map((f) => f.name).join(", ") || "unknown";
-    if (ci === "passed") add("pr.ci_passed");
-    else add("pr.ci_failed", "", { failing, truncated }, `Failing ${at}: ${names}`);
+    if (ci === "passed" && prev) add("pr.ci_passed", ci);
+    else if (ci === "failed") add("pr.ci_failed", ci, { failing, truncated }, `Failing ${at}: ${names}`);
   }
   if (next.mergeable === "CONFLICTING" && prev?.mergeable !== "CONFLICTING") add("pr.conflicting");
-  if (next.mergeStateStatus === "BEHIND" && prev?.mergeStateStatus !== "BEHIND") add("pr.behind");
+  if (prev && next.mergeStateStatus === "BEHIND" && prev?.mergeStateStatus !== "BEHIND") add("pr.behind");
   for (const review of next.reviews ?? [])
-    if (prev?.reviews && !prev.reviews.includes(review) && /:(APPROVED|CHANGES_REQUESTED)$/.test(review))
+    if (
+      (prev?.reviews ? !prev.reviews.includes(review) : !prev && review.endsWith(":CHANGES_REQUESTED")) &&
+      /:(APPROVED|CHANGES_REQUESTED)$/.test(review)
+    )
       add("pr.review", review, { review });
   for (const [category, value] of Object.entries(next.activity)) {
     const pages = category === "review_comment" ? next.reviewComments : undefined;
@@ -171,11 +177,19 @@ const closed = (pr: TrackedPr) => saved(pr.data)?.state === "CLOSED";
 const backoff = (failures: number, base = 60_000) => Math.min(base * 2 ** failures, 900_000);
 /** Merge reconciliation's PR client while polling: the poller's observations for PRs it tracks, else `fallback`. */
 export function observedPrs(store: Store, fallback?: GitHubPrClient): GitHubPrClient {
-  return async (url) => {
+  let tracked: Set<string> | undefined;
+  const client: GitHubPrClient = async (url) => {
     const pr = saved(store.githubPrData(url));
-    if (!fallback || pr?.state === "MERGED" || store.githubTracked().some((p) => p.url === url)) return pr;
+    tracked ??= new Set(store.githubTracked().map((p) => p.url));
+    if (!fallback || pr?.state === "MERGED" || tracked.has(url)) return pr;
     return fallback(url);
   };
+  client.beginPass = () => {
+    tracked = undefined;
+  };
+  client.observed = (url) => !fallback || !!tracked?.has(url);
+  client.fresh = fallback ?? null;
+  return client;
 }
 
 export interface PollerOptions {
@@ -212,13 +226,24 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     else cooldownUntil = until || now() + backoff(failures++);
     if (until !== null) log(`GitHub rate limit: paused until ${new Date(cooldownUntil).toISOString()}`);
     if (access) store.setGithubAccess(repo, access);
+    if (
+      until !== null &&
+      res.status === 200 &&
+      !/rate limit|RATE_LIMITED/i.test(JSON.stringify(errorsOf(res)))
+    ) {
+      failures = 0;
+      blocks.delete(repo);
+      return res;
+    }
     return null;
   };
 
   /** Saves the observation; returns the mergeability nudge's response (null: not sent) or undefined. */
-  const record = async (pr: TrackedPr, snap: PrSnapshot) => {
+  /** `since`: the PR's head version before the request, so an overtaken observation is dropped. */
+  const record = async (pr: TrackedPr, snap: PrSnapshot, since: number) => {
     const prev = saved(pr.data);
     const head = snap.headRefOid;
+    store.observePrHead(pr.url, head, since);
     const same = prev?.headRefOid === head;
     const unknown = snap.mergeable !== "UNKNOWN" ? 0 : same ? (prev?.unknown ?? 0) + 1 : 1;
     // Mergeability is per head; UNKNOWN is no observation, so this head's last known value stands.
@@ -228,12 +253,13 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     const changes = diffPr(prev, snap);
     const revision = (prev?.revision ?? 0) + (changes.length ? 1 : 0);
     const items = changes.map((c) => {
+      // Status items are emitted only on entry; the revision distinguishes a returning episode.
       const key = `${pr.url}:${head}:${/conflicting|behind/.test(c.kind) ? "" : revision}:${c.key}`;
       return { ...c, runId: pr.runId, repo: pr.repo, data: { ...c.data, url: pr.url, head }, key };
     });
     const save = (nudged: string | null, feed = items) => {
       const data = JSON.stringify({ ...snap, revision, unknown, nudged } satisfies Saved);
-      store.saveGithubPr({ ...pr, data }, snap.state !== "OPEN", feed);
+      store.saveGithubPr({ ...pr, data }, snap.state !== "OPEN", feed, now());
     };
     // One nudge per UNKNOWN episode on a head: a known value ends the episode.
     save(unknown ? (prev?.nudged ?? null) : null);
@@ -260,6 +286,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     const resolved = prs.filter((p) => p.nodeId);
     for (let known = resolved.splice(0, 100); known.length; known = resolved.splice(0, 100)) {
       const ids = known.map((p) => p.nodeId);
+      const since = known.map((p) => store.prHead(p.url)?.version ?? 0);
       const res = await call(repo, "graphql", { query: OBSERVE_QUERY, variables: { ids } });
       if (!res) return;
       // An access failure of the whole query (SSO, IP allow list, HTTP 404) says nothing about any PR.
@@ -272,7 +299,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         return log(`GitHub observation of ${repo} failed with HTTP ${res.status}`);
       for (const [i, pr] of known.entries()) {
         const snap = normalizePr(found[i], pr.nodeId);
-        const nudged = snap ? await record(pr, snap) : null;
+        const nudged = snap ? await record(pr, snap, since[i] ?? 0) : null;
         // A nudge that failed (perhaps an access problem) must not let this cycle clear an episode.
         if (nudged === null) complete = false;
         if (found[i] === null || nudged?.status === 404) missing ??= pr;
@@ -283,7 +310,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   };
   /** Each repository with tracked PRs and when it is next due; delivered PRs use the fast cadence. */
   const plan = () =>
-    [...Map.groupBy(store.githubTracked(), (pr) => pr.repo)].map(([repo, prs]) => {
+    [...Map.groupBy(store.githubTracked(now()), (pr) => pr.repo)].map(([repo, prs]) => {
       const interval = prs.some((p) => p.delivered && !closed(p)) ? 15_000 : normal;
       const key = (p: TrackedPr) => (closed(p) ? p.url : repo); // open PRs share a deadline and a query
       const last = (k: string) => observedAt.get(k) ?? -Infinity;
@@ -316,7 +343,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         // A repository a rate limit interrupted is due again as soon as the cooldown ends.
         if (now() >= cooldownUntil) for (const pr of prs) observedAt.set(pr.url, now()).set(key(pr), now());
       }
-      if (settled) await reconcileMergedRuns(store, observedPrs(store), log);
+      if (settled) await reconcileMergedRuns(store, observedPrs(store), log, now);
       [settled, crashes, retryAt] = [false, 0, 0];
     } catch (e) {
       log(`GitHub poll failed: ${String(e)}`);

@@ -33,6 +33,7 @@ import type { GhRunner } from "../integrations/github.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, Router } from "../router/router.ts";
 import { recordEffort } from "../router/targets.ts";
+import { redactCredentialData } from "../util/proc.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
@@ -61,6 +62,8 @@ export interface RunState {
   parked?: boolean;
   flow?: "build" | "verify-change";
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
+  /** A review round's chosen base tip, saved before it is merged into the PR branch. */
+  reviewBaseSha?: string;
   verdictCommentPosted?: boolean;
   verdictCommentPending?: boolean;
   phase: Phase;
@@ -688,15 +691,17 @@ export class RunContext {
             };
       }
 
+      result = redactCredentialData(result);
       const updated = store.updateInvocation(invocation.id, {
         status: result.status,
         fastModeState: result.fastModeState ?? null,
         fastModeDisabledReason: result.fastModeDisabledReason ?? null,
         costUsd: result.costUsd,
         costEquivUsd: result.costEquivUsd,
-        inputTokens: result.usage.input + result.usage.cacheWrite,
+        inputTokens: result.usage.input,
         outputTokens: result.usage.output,
         cacheReadTokens: result.usage.cacheRead,
+        cacheWriteTokens: result.usage.cacheWrite,
         numTurns: result.numTurns,
         sessionId: result.sessionId,
         // A failed confinement probe ran before the agent, so its error holds no private output.

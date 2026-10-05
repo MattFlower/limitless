@@ -430,8 +430,9 @@ The PR body is the evidence report, also saved as `report.md`. It contains:
 - **Code review:** the model, verdict and findings. **Review follow-ups** lists non-blocking
   findings from later rounds.
 - **Audit flags:** any audit findings. On a run that passed, these are warnings only.
-- **Work log:** each invocation's role, model, effort, status, tokens, cost and duration, then the
-  totals: dollars spent and the API-equivalent value on subscriptions.
+- **Work log:** each invocation's role, model, effort, status, tokens (in = uncached + cached +
+  cache-write, with the cached and cache-write columns and the run's cache hit rate), cost and
+  duration, then the totals: dollars spent and the API-equivalent value on subscriptions.
 - `Closes #n` for issue-triggered runs, and a link to the run in the UI (`ui_url`).
 
 ## 5. Models and routing
@@ -457,7 +458,7 @@ skips them.
 its provider card (Dashboard or **Models** page). The setting persists across restarts. A provider
 whose API key is missing stays disabled.
 
-For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-REAP-288-MLX-4bit`);
+For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
 `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first
 routing among free models the policy does not name, take catalog order, so they use Flash. Put `OMLX_API_KEY`
 in `secrets.env`; inference and health probes authenticate with it. Default concurrency is 4;
@@ -927,3 +928,105 @@ The daemon serves the UI shell only for `/`, `/runs/*`, `/new`, `/models` and `/
 - [EVALS](EVALS.md): datasets, graders, statistics and policy generation.
 - [REASONING_EFFORT](REASONING_EFFORT.md): effort as a routing dimension.
 - [PLAN](PLAN.md): milestones, including what is still to come.
+
+## Providers
+
+Define providers in `~/.config/limitless/config.toml` (or `$LIMITLESS_CONFIG_DIR/config.toml`).
+The first two entries alone are a valid subscription setup. This complete example also adds
+an unauthenticated local server and a metered API:
+
+```toml
+[[providers]]
+preset = "claude"
+
+[[providers]]
+preset = "codex"
+
+[[providers]]
+id = "local-models"
+kind = "openai-compatible"
+label = "Local models"
+base_url = "http://127.0.0.1:8989/v1"
+billing = "free"
+max_concurrent = 4
+
+[[providers.models]]
+id = "flash"
+model = "example/flash"
+vendor = "qwen"
+origin = "CN"
+base_origin = "CN"
+tier = 2
+price = { input = 0, output = 0 }
+efforts = ["none", "high"]
+effort = "none"
+
+[[providers]]
+id = "metered-api"
+kind = "anthropic-compatible"
+label = "Example API"
+base_url = "https://example.com/anthropic"
+openai_base_url = "https://example.com/v1"
+api_key_env = "EXAMPLE_API_KEY"
+billing = "metered"
+max_concurrent = 2
+
+[[providers.models]]
+id = "coder"
+model = "example/coder"
+vendor = "other"
+origin = "US"
+base_origin = "unknown"
+tier = 4
+price = { input = 1, output = 3, cache_read = 0.1 }
+efforts = []
+checkpoint = "example-coder"
+notes = "Optional model metadata"
+```
+
+Kinds are `claude-cli`, `codex-cli`, `anthropic-compatible`, `openai-compatible`, and
+`decisions`. OpenAI-compatible providers support tool-free triage, chat and summaries;
+agentic policy targets and production roster pins require an agent-capable transport.
+Decisions providers support triage only and accept `decisions_base_url` or `base_url`.
+Endpoint paths are used exactly as configured. `openai_base_url` takes precedence over
+`base_url` for OpenAI-compatible providers. Optional `health_url` enables health probes;
+`ssh_forward = { host = "example.com", local_port = 18080, remote_port = 8080 }` configures a tunnel.
+
+Public presets are `claude`, `codex`, `openrouter`, and `typesafe`. Without an explicit `id`,
+the preset name is the provider ID. With a new `id`, inherited models use that prefix.
+Explicit fields override preset or same-ID built-in defaults. Prices and SSH settings merge
+by field; models merge by local `id`, retaining omitted models and appending new ones.
+Model IDs remain `<provider>/<local id>`; backend `model` names may contain `/`. IDs must
+not contain whitespace, `/`, `@`, or `|`. Model metadata includes `notes`, `checkpoint`,
+`price.cache_read`, and `base_origin`; a default `effort` must appear in `efforts`.
+
+`api_key_env` is a variable name, never a key value. Put its value in `secrets.env` or the
+process environment. Provider credentials resolve from a nonempty secrets-file value first,
+then the environment; unrelated integration secrets retain their existing precedence.
+A missing key disables the provider and reports `missing key EXAMPLE_API_KEY` in startup
+notes, `limitless providers`, and the UI. Enabling cannot bypass this requirement.
+Omit `api_key_env` for CLI login authentication or an unauthenticated server. Literal-token
+fields such as `apiKey` are rejected. During this migration only, the deprecated built-in
+mtplx provider retains its internal static-token fallback under its original ID; export omits
+that token. An explicit `api_key_env` replaces the fallback.
+
+Part 1 keeps built-ins alongside configured providers: a matching ID takes precedence;
+omission does not remove a provider. Startup notes identify implicit deprecated machine
+providers until they have explicit definitions. Legacy `[providers.omlx]` tables with
+`max_concurrent = 4` still work, but do not count as migrated definitions. TOML provider
+arrays and legacy tables are alternative formats in one file.
+
+Run `limitless providers export` offline to print the effective catalog as `[[providers]]`
+TOML. Diagnostics go to stderr and credentials are never exported. Use
+`limitless providers export --write` to replace the provider configuration, preserving
+unrelated settings semantically and creating a uniquely named `config.toml.<id>.bak` with
+the original bytes. Comments/formatting are regenerated; previous backups and `secrets.env`
+remain untouched. Replacing an existing config requires affirmative interactive confirmation;
+use `--write --yes` for automation. Empty, negative, EOF, or non-interactive input refuses
+replacement without `--yes`. The warning and prompt show the planned backup path before writing.
+This is a one-way migration for the previous release: it cannot load `[[providers]]`.
+Before rolling back, restore the named original backup over `config.toml`, then start the older
+release. Creating a new config has no previous backup; remove it before rollback.
+Startup never migrates configuration automatically. Validation or backup failures leave the original config intact. Restart
+the daemon after editing configuration. Export includes disabled providers, without transient
+health, quota, or enablement state.

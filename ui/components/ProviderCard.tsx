@@ -121,7 +121,9 @@ export const ProviderCard: Component<{ provider: ProviderStatus; workload?: Prov
           <span>
             in-flight <span class="mono">{props.provider.inFlight}</span>/{props.provider.maxConcurrent}
           </span>
-          <span class="text-faint">{props.provider.billing}</span>
+          <span class="text-faint">
+            {props.provider.billing} {props.provider.kind}
+          </span>
         </div>
         <div class="provider-workload">
           <div class="provider-workload-head">

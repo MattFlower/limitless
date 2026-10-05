@@ -2,6 +2,7 @@ import type { Billing, Complexity, Effort, Role, Vendor } from "../core/types.ts
 
 export interface ProviderDef {
   id: string;
+  kind?: "claude-cli" | "codex-cli" | "openai-compatible" | "anthropic-compatible" | "decisions";
   label: string;
   harness: "claude" | "codex" | "decisions" | "fake";
   billing: Billing;
@@ -40,6 +41,7 @@ export interface ModelDef {
   notes?: string;
 }
 
+/** omlx, mtplx and twilight are deprecated implicit defaults pending config migration. */
 export const PROVIDERS: ProviderDef[] = [
   {
     id: "claude",
@@ -399,7 +401,7 @@ export const MODELS: ModelDef[] = [
   {
     id: "omlx/qwen-flash",
     provider: "omlx",
-    model: "Qwen3.8-Flash-Next-REAP-288-MLX-4bit",
+    model: "Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp",
     vendor: "qwen",
     origin: "CN",
     baseOrigin: "CN",
@@ -407,7 +409,7 @@ export const MODELS: ModelDef[] = [
     tier: 2,
     price: { input: 0, output: 0 },
     notes:
-      "Local Qwen3.8 Flash Next (REAP-pruned, 4-bit MLX), served by oMLX on this Mac; the default local model",
+      "Local Qwen3.8 Flash Next (oQ5e quantisation, with MTP), served by oMLX on this Mac; the default local model",
   },
   {
     id: "omlx/qwen-27b",

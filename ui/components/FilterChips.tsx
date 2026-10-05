@@ -2,7 +2,11 @@ import type { Component } from "solid-js";
 import { For } from "solid-js";
 import type { RunStatus } from "../../src/core/types.ts";
 
-const ALL_STATUSES: RunStatus[] = [
+export type RunFilter = RunStatus | "needs_you";
+export const matchesRunFilter = (status: RunStatus, filter: RunFilter) =>
+  filter === "needs_you" ? status === "failed" || status === "needs_human" : status === filter;
+const ALL_STATUSES: RunFilter[] = [
+  "needs_you",
   "waiting",
   "running",
   "waiting_input",
@@ -15,8 +19,8 @@ const ALL_STATUSES: RunStatus[] = [
 ];
 
 export const FilterChips: Component<{
-  active: RunStatus | null;
-  onChange: (status: RunStatus | null) => void;
+  active: RunFilter | null;
+  onChange: (status: RunFilter | null) => void;
 }> = (props) => (
   <div class="chips">
     <button
@@ -35,7 +39,7 @@ export const FilterChips: Component<{
           classList={{ active: props.active === s }}
           onClick={() => props.onChange(props.active === s ? null : s)}
         >
-          {s.replace("_", " ")}
+          {s === "needs_you" ? "Needs you" : s.replace("_", " ")}
         </button>
       )}
     </For>

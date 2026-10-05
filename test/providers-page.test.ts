@@ -7,6 +7,8 @@ import { type PresetTarget, transformAsync } from "@babel/core";
 import ts from "@babel/preset-typescript";
 import type { ProviderStatus, QuotaAlert } from "../src/core/types.ts";
 import type { ProviderWorkload } from "../src/db/stats.ts";
+import { computeStats } from "../src/db/stats.ts";
+import { Store } from "../src/db/store.ts";
 import type { TestNode } from "./providers-page-support.ts";
 
 const solid = createRequire(import.meta.url)("babel-preset-solid") as PresetTarget<object>;
@@ -155,6 +157,30 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
     await flush();
     expect(fixture.workloadReads).toBe(3);
     expect(text(codex)).toContain("Invocations2317");
+    fixture.setProviders("custom", {
+      ...provider,
+      id: "custom",
+      label: "Configured MLX",
+      ...{ apiKey: "never-publish-sentinel" },
+      inFlight: 1,
+      kind: "openai-compatible",
+      billing: "free",
+      supportsFast: false,
+      maxConcurrent: 4,
+      enabled: false,
+      state: "disabled",
+      reason: "missing key EXAMPLE_KEY",
+    });
+    const custom = cards(root).find((card) => text(card).startsWith("Configured MLX"));
+    if (!custom) throw new Error("missing configured provider card");
+    expect(text(custom)).toContain("openai-compatible");
+    expect(text(custom)).toContain("missing key EXAMPLE_KEY");
+    expect(text(custom)).toContain("in-flight 1/4");
+    fixture.setProviders("custom", { enabled: true, state: "ok", reason: null, inFlight: 2 });
+    expect(text(custom)).not.toContain("missing key EXAMPLE_KEY");
+    expect(text(custom)).toContain("in-flight 2/4");
+    expect(text(custom)).toContain("Disable");
+    expect(text(root)).not.toContain("never-publish-sentinel");
     dispose();
     expect(fixture.timerCount()).toBe(0);
     fixture.advanceTimers(30_000);
@@ -180,7 +206,74 @@ test("Providers keeps controls, sorted live cards and polling; Dashboard retains
     expect(text(dashboard)).toContain("Quota warning: codex · five_hour");
     expect(text(dashboard)).toContain("90.0% utilization");
     expect(fixture.workloadReads).toBe(3);
+    expect(fixture.statsRequests.map((r) => r.days)).toEqual([14]);
+    const store = new Store(":memory:");
+    try {
+      const repo = store.upsertRepo({
+        slug: "owner/repo",
+        kind: "github",
+        url: "unused",
+        localPath: null,
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const run = store.createRun(repo, { repo: repo.slug, prompt: "Dashboard work" });
+      store.updateRun(run.id, { status: "running", stage: "implement" });
+      const publish = () => {
+        const updated = store.getRun(run.id);
+        if (!updated) throw new Error("missing dashboard run");
+        // Replace the whole record, as the live store does for SSE run messages.
+        fixture.setRuns(run.id, () => updated);
+      };
+      publish();
+      for (const stage of ["gates", "review", "implement"] as const) {
+        store.updateRun(run.id, { stage });
+        publish();
+        publish();
+      }
+      expect(fixture.statsRequests).toHaveLength(1);
+      store.updateRun(run.id, { status: "failed" });
+      publish();
+      expect(fixture.statsRequests).toHaveLength(2);
+      store.updateRun(run.id, { status: "needs_human" });
+      publish();
+      expect(fixture.statsRequests).toHaveLength(2);
+      const beforeResolution = computeStats(store);
+      fixture.statsRequests[1]?.resolve(beforeResolution);
+      await flush();
+      const needsYou = () => nodes(dashboard).find((n) => n.tag === "button" && text(n) === "Needs you");
+      const filter = needsYou();
+      if (!filter) throw new Error("missing Needs you filter");
+      (filter.props.onClick as () => void)();
+      expect(text(dashboard)).toContain("Dashboard work");
+      const attentionCount = () => {
+        const kpi = nodes(dashboard).find(
+          (n) => n.props.class === "kpi" && text(n).includes("Needs you (14d)"),
+        );
+        if (!kpi) throw new Error("missing Needs you KPI");
+        return text(kpi);
+      };
+      expect(attentionCount()).toContain("Needs you (14d)1");
+      store.resolveRun(run.id, { kind: "wont_do", by: "human" });
+      publish();
+      expect(fixture.statsRequests).toHaveLength(3);
+      fixture.statsRequests[2]?.resolve(computeStats(store));
+      await flush();
+      expect(text(dashboard)).not.toContain("Dashboard work");
+      expect(attentionCount()).toContain("Needs you (14d)0");
+      // A pending initial request must not overwrite the newer resolution statistics.
+      fixture.statsRequests[0]?.resolve(beforeResolution);
+      await flush();
+      expect(attentionCount()).toContain("Needs you (14d)0");
+      fixture.advanceTimers(29_999);
+      expect(fixture.statsRequests).toHaveLength(3);
+      fixture.advanceTimers(1);
+      expect(fixture.statsRequests).toHaveLength(4);
+    } finally {
+      store.close();
+    }
     dispose();
+    expect(fixture.timerCount()).toBe(0);
 
     const nav = fixture.node();
     dispose = fixture.render(() => fixture.NavBar(), nav);

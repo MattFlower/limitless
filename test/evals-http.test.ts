@@ -1,12 +1,55 @@
 import { expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
-import { formatEvalReport } from "../src/cli/eval.ts";
+import { evalCommand, formatEvalReport } from "../src/cli/eval.ts";
 import { loadRoleCases, VerifyCaseFileSchema } from "../src/evals/cases.ts";
 import type { EvalReport } from "../src/evals/stats.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 import { answer, deferred, evalFixture } from "./evals-support.ts";
 import { type Route, requestWithParams, localServer as server } from "./mcp-support.ts";
+import { customProvider, providerFixture } from "./provider-config-support.ts";
+
+test("thrown eval credentials are redacted in stored trials, API responses and JSON reports", async () => {
+  const key = "FAKE_EVAL_CREDENTIAL_318";
+  const config = providerFixture(
+    [{ ...customProvider, api_key_env: "LIMITLESS_TEST_EVAL_KEY" }],
+    `LIMITLESS_TEST_EVAL_KEY=${key}\n`,
+  );
+  const f = await evalFixture();
+  try {
+    config.load();
+    f.respond(() => ({ fault: "throw", error: `provider rejected token=${key}; token=${key};` }));
+    const report = await f.run({ models: ["candidate-a"], caseIds: ["a"], k: 1 });
+    const expected = "provider rejected token=[redacted]; token=[redacted];";
+    const stored = f.factory.store.listEvalTrials(report.run.id);
+    const route = createHttpRoutes(f.factory)["/api/evals/:id"] as Route;
+    const response = await route(
+      requestWithParams(`http://localhost/api/evals/${report.run.id}`, {}, { id: report.run.id }),
+      server,
+    );
+    expect(response.status).toBe(200);
+    const json = await response.text();
+    const printed: string[] = [];
+    await evalCommand(
+      ["report", report.run.id],
+      { json: true },
+      {
+        api: async <T>() => JSON.parse(json) as T,
+        print: (text) => printed.push(text),
+        wait: async () => {},
+      },
+    );
+    expect(stored[0]).toMatchObject({ status: "error", details: { reason: expected } });
+    for (const output of [JSON.stringify(stored), json, ...printed]) {
+      expect(output).toContain(expected);
+      expect(output).not.toContain(key);
+    }
+    expect(printed).toHaveLength(1);
+  } finally {
+    await f.close();
+    config.close();
+  }
+});
 
 test("API persists immediately, runs in background, lists and reports trials and partial metrics", async () => {
   const f = await evalFixture();

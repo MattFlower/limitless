@@ -1026,3 +1026,58 @@ test.skipIf(seatbeltSkip !== null)(
     }
   },
 );
+
+test("waiting behind a lease does not spend the internal gate's execution timeout", async () => {
+  const previous = gateSlots.limit;
+  gateSlots.setLimit(1);
+  const id = await gateSlots.lease("deploy");
+  const queued = Promise.withResolvers<void>();
+  try {
+    const run = runGates(
+      process.cwd(),
+      {
+        setup: [],
+        checks: [{ name: "short", run: "true", timeoutSec: 0.1 }],
+        source: "detected",
+        protectedPaths: [],
+      },
+      new AbortController().signal,
+      { holder: "run-timeout", onWait: () => queued.resolve() },
+    );
+    await queued.promise;
+    await Bun.sleep(200);
+    expect(gateSlots.snapshot().holders).toEqual(["deploy"]);
+    gateSlots.heartbeat(id, true);
+    expect((await run).checks[0]?.ok).toBe(true);
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  } finally {
+    gateSlots.heartbeat(id, true);
+    gateSlots.setLimit(previous);
+  }
+});
+
+test("gate subprocess excludes an arbitrary unselected provider credential", async () => {
+  const { customProvider, providerFixture } = await import("./provider-config-support.ts");
+  const fixture = providerFixture([{ ...customProvider, api_key_env: "MAC_MLX_KEY" }]);
+  const saved = process.env.MAC_MLX_KEY;
+  try {
+    process.env.MAC_MLX_KEY = "FAKE_GATE_CREDENTIAL_733";
+    fixture.load();
+    const gate = await runGates(
+      fixture.root,
+      {
+        setup: [],
+        checks: [{ name: "env", run: 'test -z "$MAC_MLX_KEY" && printf "credential=absent CI=%s" "$CI"' }],
+        source: "detected",
+        protectedPaths: [],
+        merge: "pr",
+      },
+      new AbortController().signal,
+    );
+    expect(gate.checks[0]).toMatchObject({ ok: true, output: "credential=absent CI=1" });
+  } finally {
+    if (saved === undefined) delete process.env.MAC_MLX_KEY;
+    else process.env.MAC_MLX_KEY = saved;
+    fixture.close();
+  }
+});

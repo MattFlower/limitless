@@ -1,3 +1,4 @@
+import { cacheHitRate } from "../core/cache-format.ts";
 import { effortLabel } from "../core/effort-format.ts";
 import type { EvalReport } from "./stats.ts";
 import { wilson } from "./stats.ts";
@@ -124,6 +125,7 @@ export function formatEvalReport(report: EvalReport): string {
           ]
         : []),
       `  metered $${m.costUsd.toFixed(4)}; API-equivalent $${m.costEquivUsd.toFixed(4)}; p50 ${report.run.role === "implement" ? "trial" : "invocation"} ${number(m.p50LatencyMs)} ms (n=${m.latencyDenominator})`,
+      `  cache ${cacheHitRate(m.cacheReadTokens, m.tokensIn)} of ${m.tokensIn.toLocaleString("en-US")} prompt tokens (${m.cacheReadTokens.toLocaleString("en-US")} cached, ${m.cacheWriteTokens.toLocaleString("en-US")} written, ${(m.tokensIn - m.cacheReadTokens - m.cacheWriteTokens).toLocaleString("en-US")} not cached)`,
       `  vs ${c.bestModel ?? "n/a"}: difference ${number(c.meanDifference)}, one-sided 95% lower ${number(c.lowerBound)}, nonInferior=${c.nonInferior ?? "n/a"}; paired cases=${c.pairedCases} (candidate complete=${c.candidateCompleteCases}, best complete=${c.bestCompleteCases}), delta=${c.delta}, resamples=${c.resamples}, seed=${c.seed}`,
     );
   }

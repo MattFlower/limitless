@@ -18,7 +18,23 @@ export interface GitHubPrView extends GitHubPrState {
   failing: string[];
 }
 
-export type GitHubPrClient = (url: string) => Promise<GitHubPrState | null>;
+export type GitHubPrClient = ((url: string) => Promise<GitHubPrState | null>) & {
+  fresh?: GitHubPrClient | null; // null for cache-only clients
+  beginPass?: () => void;
+  observed?: (url: string) => boolean;
+};
+
+export const RECONCILE_REQUEST_CAP = 25;
+const passes = new WeakMap<
+  Store,
+  {
+    cursor: string;
+    checked: Map<string, number>;
+    /** Last probe attempt of an expired PR; PRs in backoff rotate by it. */
+    attempted: Map<string, number>;
+    retries: Map<string, { failures: number; at: number }>;
+  }
+>();
 
 // The poller keeps its own copy for GraphQL contexts; `gh pr view` reports the rollup the same way.
 const CI_FAILURES = new Set([
@@ -59,26 +75,107 @@ export async function reconcileMergedRuns(
   store: Store,
   client: GitHubPrClient,
   log: (message: string) => void = console.warn,
+  now: () => number = Date.now,
 ): Promise<void> {
-  for (const run of store.listRuns({
-    status: ["needs_human", "succeeded", "resolved"],
-    limit: Number.MAX_SAFE_INTEGER,
-  })) {
+  let pass = passes.get(store);
+  if (!pass) {
+    pass = { cursor: "", checked: new Map(), attempted: new Map(), retries: new Map() };
+    passes.set(store, pass);
+  }
+  client.beginPass?.();
+  const runs = store
+    .listRuns({
+      status: ["needs_human", "succeeded", "resolved", "failed", "cancelled"],
+      limit: Number.MAX_SAFE_INTEGER,
+    })
+    .filter(
+      (run) =>
+        !["failed", "cancelled"].includes(run.status) ||
+        (run.prUrl &&
+          !run.deliveryBranch &&
+          run.sourceRef?.kind !== "pull_request" &&
+          store.githubPrExpired(run.prUrl, now())),
+    )
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const start = runs.findIndex((run) => run.id > pass.cursor);
+  const ordered = start < 0 ? runs : [...runs.slice(start), ...runs.slice(0, start)];
+  const expired = new Set(
+    ordered.flatMap((r) => (r.prUrl && store.githubPrExpired(r.prUrl, now()) ? [r.prUrl] : [])),
+  );
+  // A PR in backoff rotates by its last attempt, so inaccessible PRs can't hold the reserved slot.
+  const lastTry = (url: string) =>
+    ((pass.retries.get(url)?.failures ?? 0) >= 2 ? pass.attempted.get(url) : undefined) ??
+    pass.checked.get(url) ??
+    Infinity;
+  ordered.sort(
+    (a, b) =>
+      Number(expired.has(a.prUrl ?? "")) - Number(expired.has(b.prUrl ?? "")) ||
+      (expired.has(a.prUrl ?? "") ? lastTry(a.prUrl ?? "") - lastTry(b.prUrl ?? "") : 0),
+  );
+  const overdue = new Set(
+    ordered.flatMap((run) =>
+      run.prUrl &&
+      client.fresh !== null &&
+      expired.has(run.prUrl) &&
+      (!run.merged || run.status === "needs_human") &&
+      pass.checked.has(run.prUrl) &&
+      now() >= (pass.checked.get(run.prUrl) ?? 0) + 86_400_000 &&
+      (pass.retries.get(run.prUrl)?.at ?? 0) <= now()
+        ? [run.prUrl]
+        : [],
+    ),
+  );
+  let calls = 0;
+  const results = new Map<string, GitHubPrState | null>();
+  const failed = new Set<string>();
+  for (const run of ordered) {
     if (!run.prUrl || (run.merged && run.status !== "needs_human")) continue;
+    if (failed.has(run.prUrl)) continue;
+    if (expired.has(run.prUrl) && !results.has(run.prUrl)) {
+      if (!pass.checked.has(run.prUrl)) pass.checked.set(run.prUrl, now());
+      if (now() < (pass.checked.get(run.prUrl) ?? 0) + 86_400_000) continue;
+      if (client.fresh === null) continue;
+    }
+    if ((pass.retries.get(run.prUrl)?.at ?? 0) > now()) continue;
+    // Keep the final slot available for an overdue probe even under a full healthy backlog.
+    const cap = RECONCILE_REQUEST_CAP - Number(!expired.has(run.prUrl) && overdue.size > 0);
+    if (!results.has(run.prUrl) && calls >= cap) continue;
     try {
-      const pr = await client(run.prUrl);
-      if (!pr || pr.url !== run.prUrl || store.getRun(run.id)?.prUrl !== pr.url) continue;
+      if (!results.has(run.prUrl)) {
+        calls++;
+        overdue.delete(run.prUrl);
+        if (expired.has(run.prUrl)) pass.attempted.set(run.prUrl, now());
+        if (!expired.has(run.prUrl)) pass.cursor = run.id;
+        if (!expired.has(run.prUrl)) pass.checked.set(run.prUrl, now());
+        results.set(run.prUrl, await (expired.has(run.prUrl) ? (client.fresh ?? client) : client)(run.prUrl));
+      }
+      const pr = results.get(run.prUrl);
+      if (!pr || pr.url !== run.prUrl) {
+        if (expired.has(run.prUrl) || !client.observed?.(run.prUrl))
+          throw new Error("No matching PR observation");
+        continue;
+      }
+      if (expired.has(run.prUrl)) pass.checked.set(run.prUrl, now());
+      pass.retries.delete(run.prUrl);
+      if (store.getRun(run.id)?.prUrl !== pr.url) continue;
       const mergedAt = pr.mergedAt ? Date.parse(pr.mergedAt) : NaN;
       if (pr.state === "MERGED" && Number.isFinite(mergedAt)) {
         store.resolveMergedRun(run.id, pr.mergedBy?.login ?? null, mergedAt);
       } else if ((pr.state === "CLOSED" || pr.state === "OPEN") && !store.getRun(run.id)?.merged) {
         const closed = pr.state === "CLOSED";
+        store.observeGithubPrState(pr.url, pr.state, now());
         if (closed && !pr.mergedAt && run.status === "needs_human") {
           const resolution = { kind: "pr_closed", ref: pr.url, by: "github" } as const;
           store.resolveRun(run.id, resolution, { from: ["needs_human"], patch: { prClosedUnmerged: true } });
         } else if (run.prClosedUnmerged !== closed) store.updateRun(run.id, { prClosedUnmerged: closed });
       }
     } catch (error) {
+      failed.add(run.prUrl);
+      const failures = (pass.retries.get(run.prUrl)?.failures ?? 0) + 1;
+      pass.retries.set(run.prUrl, {
+        failures,
+        at: failures < 2 ? 0 : now() + Math.min(60_000 * 2 ** (failures - 2), 900_000),
+      });
       log(`GitHub PR check failed for ${run.id}: ${String(error)}`);
     }
   }

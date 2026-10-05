@@ -289,7 +289,7 @@ describe("Router", () => {
     tracker.setEnabled("openrouter", true);
     expect(tracker.status("openrouter")).toMatchObject({
       enabled: false,
-      reason: "missing OPENROUTER_API_KEY",
+      reason: "missing key OPENROUTER_API_KEY",
     });
     expect(() => tracker.setEnabled("unknown", false)).toThrow("unknown provider unknown");
     expect(store.getProviderEnabledOverride("unknown")).toBeNull();
@@ -978,7 +978,7 @@ test("oMLX catalog targets and authenticated health gate routing", async () => {
   expect(calls).toBe(4);
   const missing = trackerFor({});
   await missing.probe();
-  expect(missing.unavailableReason("omlx")).toBe("missing OMLX_API_KEY");
+  expect(missing.unavailableReason("omlx")).toBe("missing key OMLX_API_KEY");
   store.setProviderEnabledOverride("omlx", false);
   const disabled = trackerFor({ OMLX_API_KEY: "key" });
   await disabled.probe();
