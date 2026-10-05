@@ -1018,6 +1018,7 @@ export async function pushExistingBranch(
   baseSha: string,
   signal?: AbortSignal,
   budget?: GitHubBudget,
+  sha = "HEAD",
 ): Promise<void> {
   if (repo.kind !== "github" || !repo.url) throw new Error("existing PR delivery requires a GitHub repo");
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") || branch.endsWith("/"))
@@ -1025,13 +1026,13 @@ export async function pushExistingBranch(
   const ref = `refs/heads/${branch}`;
   const remote = await remoteSh(["git", "ls-remote", repo.url, ref], { cwd, signal, budget });
   if (remote.stdout.split("\t")[0] !== baseSha) throw new Error("PR head moved since the run started");
-  const ancestor = await worktreeGit(["git", "merge-base", "--is-ancestor", baseSha, "HEAD"], {
+  const ancestor = await worktreeGit(["git", "merge-base", "--is-ancestor", baseSha, sha], {
     cwd,
     allowFail: true,
     signal,
   });
   if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
-  await remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
+  await remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, repo.url, `${sha}:${ref}`], {
     cwd,
     timeoutMs: 300_000,
     signal,
@@ -1154,6 +1155,7 @@ export async function mergePullRequest(
         const data = schema.parse(JSON.parse((await sh(view, { cwd, signal })).stdout));
         if (!/^[a-f0-9]{40,64}$/.test(sha) || data.headRefOid !== sha) throw new Error("PR head moved");
         const rawTitle = opts.title ?? data.title;
+        if (!rawTitle.trim()) throw new Error("missing merge subject");
         const title = number ? `${rawTitle} (#${number})` : rawTitle;
         const body = opts.body ?? data.body;
         privacy.checkPrivateText(`${title}\n${body}`, "PR text", entries);

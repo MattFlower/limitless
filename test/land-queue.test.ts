@@ -98,14 +98,18 @@ function fakeGh(): void {
   writeFileSync(
     join(bin, "gh"),
     `#!${process.execPath}
-import {appendFileSync,existsSync,readFileSync,writeFileSync} from "node:fs";
+import {appendFileSync,existsSync,readFileSync,writeFileSync,rmSync} from "node:fs";
 const file=${JSON.stringify(join(root, "gh"))}, args=process.argv.slice(2);
 appendFileSync(file+".calls",args.join(" ")+"\\n");
 const pr=args[2].match(/pull\\/(\\d+)/)?.[1]??"0", merged=existsSync(file+".merged-"+pr);
 const branch=existsSync(file+".branch-"+pr)?readFileSync(file+".branch-"+pr,"utf8").trim():"";
 const head=()=>branch?new TextDecoder().decode(Bun.spawnSync(["/usr/bin/git","--git-dir",${JSON.stringify(bare)},"rev-parse","refs/heads/"+branch]).stdout).trim():"";
 const flag=(n)=>args.includes(n);
-if(args[0]!=="pr"||args[1]!=="merge"){ if(args[1]==="view") console.log(merged?"MERGED":"OPEN"); process.exit(0); }
+if(args[0]!=="pr"||args[1]!=="merge"){
+ if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({title:"PR text",body:"PR body",headRefOid:head()}));
+ process.exit(0);
+}
+if(flag("--body-file")) writeFileSync(file+".body-"+pr,await Bun.stdin.text());
 if(flag("--auto")) writeFileSync(file+".auto","");
 if(flag("--disable-auto")){ rmSync(file+".auto",{force:true}); process.exit(0); }
 if(existsSync(file+".hang")) await Bun.sleep(600000);
@@ -900,4 +904,56 @@ test("the API queues, lists and cancels lands behind the loopback and content-ty
   } finally {
     await f.close();
   }
+});
+
+for (const location of ["commit", "author email", "subject", "body"]) {
+  test(`publication blocks a private string in the ${location} without disclosing it`, async () => {
+    const secret = "denylisted-private-value";
+    mkdirSync(paths.configDir, { recursive: true });
+    writeFileSync(join(paths.configDir, "private-strings.txt"), secret);
+    const pr = delivered(1, "pr-1");
+    let head = await pushBranch("pr-1", "one.txt", location === "commit" ? secret : "one\n");
+    if (location === "author email") {
+      await sh(
+        [
+          "git",
+          "-c",
+          `user.email=${secret}@example.test`,
+          "commit",
+          "--amend",
+          "--no-edit",
+          "--reset-author",
+        ],
+        { cwd: seed },
+      );
+      await sh(["git", "push", "-q", "--force", bare, "pr-1"], { cwd: seed });
+      head = await remoteHead("pr-1");
+    }
+    if (location === "subject") store.updateRun(pr.run.id, { title: secret });
+    if (location === "body") store.putArtifact(pr.run.id, "report.md", "report", secret);
+    observe(1, head);
+    approve(1, head);
+    await advanceBase();
+    const entry = queue().request({ target: pr.run.id });
+    await settle();
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "blocked" });
+    expect(store.getLandEntry(entry.id)?.reason).toContain("private string");
+    expect(store.getLandEntry(entry.id)?.reason).not.toContain(secret);
+    expect(landLog.join("\n")).not.toContain(secret);
+    expect(await remoteHead("pr-1")).toBe(head);
+    expect(ghCalls("pr merge")).toEqual([]);
+  });
+}
+
+test("an empty report sends an explicit empty merge body", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  store.putArtifact(pr.run.id, "report.md", "report", "");
+  const entry = queue().request({ target: pr.run.id });
+  await settle();
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+  expect(ghCalls("pr merge")[0]).toContain("--body-file -");
+  expect(readFileSync(join(root, "gh.body-1"), "utf8")).toBe("");
 });

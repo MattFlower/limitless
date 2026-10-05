@@ -5,11 +5,13 @@ import type { LandEntry, Repo, Run } from "../core/types.ts";
 import { ACTIVE_LAND_STATES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { detectGates } from "../gates/detect.ts";
+import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
 import { runGates } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
 import { completeMerge, prepareMerge } from "../git/merge.ts";
 import {
   addDetachedWorktree,
+  checkPrivateRange,
   disableAutoMerge,
   ensureCache,
   exportCommit,
@@ -235,15 +237,18 @@ export class LandQueue {
     const cache = await ensureCache(this.deps.paths, repo, signal);
     const cwd = await this.checkout(entry, repo, cache, entry.pushedSha ?? entry.approvedSha, signal);
     try {
+      const baseSha = await fetchBase(this.deps.paths, repo, entry.baseBranch, signal);
       let head = entry.pushedSha;
       if (!head) {
-        const baseSha = await fetchBase(this.deps.paths, repo, entry.baseBranch, signal);
         head = await this.mergeBase(cwd, entry, baseSha);
         await this.checks(entry, cwd, baseSha, signal);
+        await checkPrivateRange(cwd, `${baseSha}..${head}`, this.publication(entry, run, cwd));
         if (head !== entry.approvedSha) await this.pushApproved(entry, cwd, repo, head, signal);
         // Recorded either way: with it, a resume waits for this commit instead of checking again.
         this.store.updateLandEntry(entry.id, { pushedSha: head, state: "waiting_ci" });
       }
+      if (entry.pushedSha)
+        await checkPrivateRange(cwd, `${baseSha}..${head}`, this.publication(entry, run, cwd));
       if ((await this.awaitCi(entry, head, signal)) === "merged") return this.landed(entry, run, head);
       await this.merge(entry, run, cwd, head, signal);
     } finally {
@@ -300,7 +305,7 @@ export class LandQueue {
     const remote = await remoteBranchSha(repo, cwd, entry.headBranch, signal);
     if (remote !== entry.approvedSha) throw new LandBlocked("head moved after approval");
     this.store.updateLandEntry(entry.id, { pushedSha: head });
-    await pushExistingBranch(repo, cwd, entry.headBranch, entry.approvedSha, signal);
+    await pushExistingBranch(repo, cwd, entry.headBranch, entry.approvedSha, signal, undefined, head);
   }
 
   /** Wait for CI on exactly `sha`; nothing else counts as the green that lets the merge happen. */
@@ -366,11 +371,19 @@ export class LandQueue {
     this.store.updateLandEntry(entry.id, { state: "merging", pushedSha: sha });
     // A land never arms auto-merge: it would let a later push land without the factory checking it,
     // and the squash message is what was reviewed rather than whatever the PR says today.
-    const outcome = await mergePullRequest(entry.prUrl, cwd, sha, signal, undefined, undefined, {
-      title: run.title ?? undefined,
-      body: this.store.getArtifact(run.id, "report.md") ?? undefined,
-      auto: false,
-    });
+    const outcome = await mergePullRequest(
+      entry.prUrl,
+      cwd,
+      sha,
+      signal,
+      undefined,
+      this.publication(entry, run, cwd),
+      {
+        title: run.title ?? "",
+        body: this.store.getArtifact(run.id, "report.md") ?? "",
+        auto: false,
+      },
+    );
     if (outcome !== "merged") {
       await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
       throw new LandBlocked(outcome === "unavailable" ? "GitHub unavailable" : "merge failed");
@@ -379,6 +392,25 @@ export class LandQueue {
   }
 
   // ---- helpers -------------------------------------------------------------
+
+  private publication(entry: LandEntry, run: Run, cwd: string) {
+    const { configDir, repos, work } = this.deps.paths;
+    const entries = loadPrivateStrings(configDir, [
+      cwd,
+      this.store.getRepoBySlug(entry.repo)?.localPath,
+      repos,
+      work,
+    ]);
+    if (!run.title?.trim()) throw new LandBlocked("missing merge subject");
+    checkPrivateText(
+      `${run.title} (#${entry.prUrl.match(/\/pull\/(\d+)/)?.[1] ?? ""})`,
+      "Merge subject",
+      entries,
+    );
+    checkPrivateText(this.store.getArtifact(run.id, "report.md") ?? "", "Merge body", entries);
+    checkPrivateText(entry.headBranch, "Branch name", entries);
+    return entries;
+  }
 
   private context(entry: LandEntry): { repo: Repo; run: Run } {
     const run = this.store.getRun(entry.runId);
