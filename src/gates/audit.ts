@@ -109,7 +109,7 @@ export function splitPatch(patch: string): FilePatch[] {
 
 export const SOURCE_PATH =
   /\.(ts|tsx|js|mjs|cjs|json|toml|yml|yaml|md|sh|py|go|rs|java|kt|rb|php|cs|c|h|cpp|swift|sql|html|css)$/i;
-export const INERT_MEDIA_PATH = /\.(png|jpe?g|gif|webp|ico|woff2?|ttf|otf|mp3|ogg|wav|flac)$/i;
+export const INERT_MEDIA_PATH = /\.(png|jpe?g|gif|webp|ico)$/i;
 
 const BUILTIN_DIFF_DRIVER =
   /^(ada|bash|bibtex|cpp|csharp|css|dts|elixir|fortran|fountain|golang|html|java|kotlin|markdown|matlab|objc|pascal|perl|php|python|ruby|rust|scheme)$/;

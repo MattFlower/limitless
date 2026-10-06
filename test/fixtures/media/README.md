@@ -1,5 +1,5 @@
 These are generated audit fixtures, with two complete, distinct variants of each format.
-Images are colored squares (FFmpeg; lossless WebP via cwebp), audio is a short sine wave
+Images are colored squares (FFmpeg; lossless and lossy WebP via cwebp), audio is a short sine wave
 (FFmpeg), and fonts contain only an original triangle glyph (fontTools FontBuilder).
 JPEG encoder comments were removed; ICO embeds the PNG; WOFF2 covers both untransformed
 CFF and transformed TrueType outlines. The bytes are base64 in files.json, following the
@@ -34,3 +34,7 @@ requires big-endian sample serialization. The stereo-mid-side fixture encodes
 opposite channels using mid/side decorrelation. These were encoded with stock
 flac at level 8 and 192-sample blocks, and decoded to verify channel recovery.
 Neither their raw bytes nor interleaved PCM contain a ZIP local-header signature.
+
+lossy.webp and extended.webp are cwebp default lossy encodings of the square
+fixtures; the extended variants include a compressed alpha plane and VP8X canvas.
+Fonts and audio always require an explicit binary allowance.

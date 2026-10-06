@@ -1615,7 +1615,7 @@ test.each([
   ["src/**/*.impl.ts -diff", "block"],
   ["*.png -diff", "warn"],
   ["*.zip binary", "block"],
-  ["*.woff2 -diff", "warn"],
+  ["*.woff2 -diff", "block"],
   ["*.mp4 -diff", "block"],
   ["*.pdf binary", "block"],
   ["*.bmp -diff", "block"],
@@ -1892,16 +1892,8 @@ const assetExtensions = [
   "literal.webp",
   "distance-wide.webp",
   "distance-narrow.webp",
-  "mp3",
-  "ogg",
-  "wav",
-  "flac",
-  "stereo.flac",
-  "woff",
-  "woff2",
-  "transformed.woff2",
-  "ttf",
-  "otf",
+  "lossy.webp",
+  "extended.webp",
 ];
 test("validated media exempt new and edited assets and eligible unmatched attribute rules", async () => {
   writeFileSync(join(work, ".gitattributes"), assetExtensions.map((ext) => `*.${ext} binary\n`).join(""));
@@ -2171,7 +2163,12 @@ test("decoded WebP and FLAC payloads and cross-table WOFF signatures require an 
   for (const { file, original } of files) writeFileSync(join(work, file), mediaFixture(original));
   await commitAll(work, "clean decoded media");
   const mediaBase = await headSha(work);
-  expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toEqual([]);
+  expect((await diffSince(work, base)).binaryPaths?.sort()).toEqual(
+    files
+      .filter(({ file }) => !file.endsWith(".webp"))
+      .map(({ file }) => file)
+      .sort(),
+  );
   for (const { file, changed } of files) writeFileSync(join(work, file), mediaFixture(changed));
   await commitAll(work, "payloads concealed in media encoding");
   for (const revision of [base, mediaBase]) {
@@ -2250,7 +2247,12 @@ test("executable signatures in WAV samples, JPEG thumbnails and ICO pixels requi
   for (const { path, original } of files) writeFileSync(join(work, path), original);
   await commitAll(work, "ordinary raw media regions");
   const mediaBase = await headSha(work);
-  expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toEqual([]);
+  expect((await diffSince(work, base)).binaryPaths?.sort()).toEqual(
+    files
+      .filter(({ path }) => path.endsWith(".wav"))
+      .map(({ path }) => path)
+      .sort(),
+  );
   for (const { path, changed } of files) writeFileSync(join(work, path), changed);
   await commitAll(work, "embedded executable signatures");
   for (const revision of [base, mediaBase]) {
@@ -2960,3 +2962,13 @@ test.each(["complete", "truncated", "failed", "timeout", "timeout-exit-0", "canc
     }
   },
 );
+
+test("fonts and audio require a binary allowance even with complete media structures", async () => {
+  const extensions = ["woff", "woff2", "ttf", "otf", "mp3", "ogg", "wav", "flac"];
+  for (const ext of extensions) writeFileSync(join(work, `asset.${ext}`), mediaFixture(ext));
+  await commitAll(work, "font and audio fixtures");
+  const diff = await diffSince(work, base);
+  expect(diff.binaryPaths?.sort()).toEqual(extensions.map((ext) => `asset.${ext}`).sort());
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(extensions.length);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
