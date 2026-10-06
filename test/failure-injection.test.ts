@@ -428,6 +428,107 @@ for (const [name, failure] of Object.entries(failures))
     });
   }
 
+for (const failures of [0, 1, 2])
+  test(`stalled implementer's writer stops before cleanup (${failures} clean failures)`, async () => {
+    writeFileSync(
+      join(source, ".limitless.toml"),
+      '[gates]\nchecks = [{name="check",run="! test -f ui/change.txt || grep -qx done ui/change.txt"}]\n',
+    );
+    await sh(["git", "commit", "-qam", "check completed implementation"], { cwd: source });
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const active = join(root, "failed-round");
+    const pidFile = join(root, "writer-pid");
+    const calls = join(root, "cleanup-calls");
+    const alive = join(root, "writer-alive-at-clean");
+    const realGit = Bun.which("git");
+    if (!realGit) throw new Error("git not found");
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh
+if [ -f '${active}' ]; then
+  case "$*" in
+    (*" reset --hard -q HEAD") echo reset >> '${calls}';;
+    (*" clean -ffdxq")
+      if kill -0 "$(cat '${pidFile}')" 2>/dev/null; then touch '${alive}'; fi
+      echo clean >> '${calls}'
+      attempts=$(grep -c '^clean$' '${calls}')
+      if [ "$attempts" -le ${failures} ]; then echo 'warning: could not lstat node_modules/writer' >&2; exit 1; fi;;
+  esac
+fi
+exec '${realGit}' "$@"
+`,
+      { mode: 0o755 },
+    );
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${bin}:${oldPath}`;
+    let writerPid: number | undefined;
+    const attempts: { state: RunState | null; prompt: string }[] = [];
+    const f = factory(undefined, async (s) => {
+      if (s.mode !== "edit") return answer(s);
+      attempts.push({ state: f.store.getRunState<RunState>(id), prompt: s.prompt });
+      if (attempts.length > 1) {
+        rmSync(active);
+        return answer(s);
+      }
+      writeFileSync(active, "");
+      writeFileSync(join(s.cwd, ".gitignore"), "node_modules/\n");
+      const stalled = new AbortController();
+      const result = await runProcess({
+        cmd: [
+          "/bin/sh",
+          "-c",
+          `mkdir -p node_modules; (trap '' TERM; while :; do echo writing >> node_modules/.ci-check-final.log; sleep 0.01; done) >/dev/null 2>&1 & echo $! > '${pidFile}'; trap 'exit 0' TERM; while [ ! -s node_modules/.ci-check-final.log ]; do sleep 0.01; done; echo ready; wait`,
+        ],
+        cwd: s.cwd,
+        env: process.env as Record<string, string>,
+        signal: AbortSignal.any([s.signal, stalled.signal]),
+        onStdoutLine: () => {
+          writerPid = Number(readFileSync(pidFile, "utf8"));
+          stalled.abort();
+        },
+      });
+      expect(result.cancelled).toBe(true);
+      expect(writerPid).toBeGreaterThan(0);
+      expect(() => process.kill(writerPid ?? 0, 0)).toThrow();
+      return { status: "stuck", error: "repeated shell call", files: { "ui/change.txt": "partial\n" } };
+    });
+    const id = await run(f);
+    try {
+      await settled(f, id);
+      expect(f.store.getRun(id)).toMatchObject({ status: "succeeded", error: null });
+      expect(attempts.map((a) => a.state?.round)).toEqual([0, 1]);
+      expect(existsSync(alive)).toBe(false);
+      expect(readFileSync(calls, "utf8").trim().split("\n")).toEqual([
+        "reset",
+        "clean",
+        ...(failures ? ["clean"] : []),
+      ]);
+      expect(attempts[1]?.prompt).toContain("stuck: repeated shell call");
+      if (failures === 2) {
+        expect(attempts[1]?.state?.feedback).toContain("Worktree cleanup failed after retry");
+        expect(attempts[1]?.prompt).toContain("could not lstat node_modules/writer");
+        expect(f.store.listStages(id).find((s) => s.name === "gates")).toMatchObject({
+          status: "failed",
+          round: 0,
+          summary: expect.stringContaining("could not lstat"),
+        });
+      }
+      const cwd = f.store.getRunState<RunState>(id)?.worktreePath ?? "";
+      expect((await sh(["git", "show", "HEAD~1:ui/change.txt"], { cwd })).stdout).toBe("partial\n");
+      expect(existsSync(join(cwd, "node_modules/.ci-check-final.log"))).toBe(false);
+      history(f, id);
+    } finally {
+      await f.stop();
+      process.env.PATH = oldPath;
+      if (writerPid !== undefined) {
+        try {
+          process.kill(writerPid, "SIGKILL");
+        } catch {}
+      }
+    }
+  });
+
 for (const status of ["timeout", "stuck", "error"] as const)
   test(`implement ${status} preserves partial work and uses task feedback in the next round`, async () => {
     writeFileSync(

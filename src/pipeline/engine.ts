@@ -23,7 +23,7 @@ import {
   retryRegressions,
   runGates,
 } from "../gates/run.ts";
-import { worktreeGit, worktreeGitScope } from "../git/command.ts";
+import { WorktreeCleanError, worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
   checkoutCommitted,
@@ -1059,14 +1059,14 @@ async function oneRound(
   }
 
   // --- gates
-  const comparison = await ctx.stage(
+  const checks = ctx.stage(
     "gates",
     commandScope(cwd, async () => {
       const events = gateEvents(ctx);
       let cmp: GateComparison[];
       let baseTimeout = false;
       try {
-        await checkoutCommitted(cwd);
+        await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
         let after = await runGates(cwd, gates, ctx.signal, events);
         ctx.checkCancelled();
         baseTimeout = after.checks.some(
@@ -1133,6 +1133,15 @@ async function oneRound(
     }),
     round,
   );
+  const comparison = await checks.catch(async (error: unknown) => {
+    ctx.checkCancelled();
+    if (!(error instanceof WorktreeCleanError) || !ctx.state.implementerIssue) throw error;
+    ctx.state.feedback = `### Your previous session ended early\n${ctx.state.implementerIssue}\n\nWorktree cleanup failed after retry:\n${error.message}`;
+    ctx.log(ctx.state.feedback, "warn");
+    await ctx.save();
+    return null;
+  });
+  if (comparison === null) return false;
 
   // --- audit
   const diff = await changeDiff();

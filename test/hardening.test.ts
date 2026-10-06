@@ -1,6 +1,6 @@
 // Regression tests for defects found by the cross-vendor (Codex) review of the M1 core.
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -39,21 +39,30 @@ describe("process handling", () => {
     expect(res.exitCode).toBe(3);
   });
 
-  test("background processes left by the child are reaped", async () => {
-    const marker = join(dir, "alive");
-    // The leftover keeps touching the marker; the child exits only once it is running. Should reaping
-    // fail, the leftover still stops once afterEach removes `dir`, or after about 5 s.
-    const leftover = `i=0; while [ $i -lt 100 ] && [ -d ${dir} ]; do touch ${marker}; i=$((i+1)); sleep 0.05; done`;
-    await runProcess({
-      cmd: ["/bin/sh", "-c", `(${leftover}) >/dev/null 2>&1 & while [ ! -e ${marker} ]; do sleep 0.01; done`],
-      cwd: dir,
-      env: process.env as Record<string, string>,
-    });
-    await Bun.sleep(20);
-    rmSync(marker);
-    await Bun.sleep(300);
-    expect(await Bun.file(marker).exists()).toBe(false);
-  });
+  test.each(["", ">/dev/null 2>&1"])(
+    "background processes left by the child are reaped (%s)",
+    async (stdio) => {
+      const marker = join(dir, "alive");
+      const pidFile = join(dir, "pid");
+      // The leftover keeps touching the marker; the child exits only once it is running. Should reaping
+      // fail, the leftover still stops once afterEach removes `dir`, or after about 5 s.
+      const leftover = `i=0; while [ $i -lt 100 ] && [ -d ${dir} ]; do touch ${marker}; i=$((i+1)); sleep 0.05; done`;
+      await runProcess({
+        cmd: [
+          "/bin/sh",
+          "-c",
+          `(${leftover}) ${stdio} & echo $! > ${pidFile}; while [ ! -e ${marker} ]; do sleep 0.01; done`,
+        ],
+        cwd: dir,
+        env: process.env as Record<string, string>,
+      });
+      expect(() => process.kill(Number(readFileSync(pidFile, "utf8")), 0)).toThrow();
+      await Bun.sleep(20);
+      rmSync(marker);
+      await Bun.sleep(300);
+      expect(await Bun.file(marker).exists()).toBe(false);
+    },
+  );
 
   test("a descendant ignoring SIGTERM cannot recreate removed scratch after return", async () => {
     const scratch = join(dir, "scratch");

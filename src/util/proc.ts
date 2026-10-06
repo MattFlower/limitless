@@ -83,7 +83,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     scope?.children.set(
       child,
       new Promise<void>((resolve) =>
-        child.once("close", () => {
+        child.once("close", async () => {
+          await descendantsStopped;
           scope.children.delete(child);
           resolve();
         }),
@@ -112,6 +113,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       if (child.pid === undefined) return;
       try {
         process.kill(-child.pid, sig);
+        return true;
       } catch {
         try {
           child.kill(sig);
@@ -119,7 +121,24 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
           // already gone
         }
       }
+      return false;
     };
+    let descendantsStopped = Promise.resolve();
+    child.once("exit", () => {
+      // Exit precedes close: background children may still hold the stdio pipes open.
+      const killed = killTree("SIGKILL");
+      descendantsStopped = (async () => {
+        if (!killed || child.pid === undefined) return;
+        for (;;) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          try {
+            process.kill(-child.pid, 0);
+          } catch {
+            return;
+          }
+        }
+      })();
+    });
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     const terminate = (graceMs = 5_000) => {
       if (killTimer) return;
@@ -181,7 +200,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       stderr = appendTail(stderr, `\n[spawn error] ${e.message}`);
     });
 
-    child.on("close", (code, sig) => {
+    child.on("close", async (code, sig) => {
       if (settled) return;
       settled = true;
       clearTimeout(killTimer);
@@ -190,8 +209,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       for (const t of timers) clearTimeout(t);
       if (idleTimer) clearInterval(idleTimer);
       opts.signal?.removeEventListener("abort", onAbort);
-      // No descendants may keep writing after callers begin scratch/worktree cleanup.
-      killTree("SIGKILL");
+      await descendantsStopped;
       resolve({
         exitCode: code,
         signal: sig,

@@ -464,11 +464,15 @@ export async function resetTo(cwd: string, sha: string): Promise<void> {
  * skip-worktree and assume-unchanged flags, and `-x` removes ignored payloads (including
  * info/exclude ones) along with dependencies, which gate setup installs again.
  */
-export async function checkoutCommitted(cwd: string, env?: Record<string, string>): Promise<void> {
+export async function checkoutCommitted(
+  cwd: string,
+  env?: Record<string, string>,
+  retryClean = false,
+): Promise<void> {
   const index = await worktreeGit(["git", "rev-parse", "--git-path", "index"], { cwd, env });
   rmSync(resolve(cwd, index.stdout.trim()), { force: true });
   await worktreeGit(["git", "reset", "--hard", "-q", "HEAD"], { cwd, env });
-  await worktreeGit(["git", "clean", "-ffdxq"], { cwd, env });
+  await worktreeGit(["git", "clean", "-ffdxq"], { cwd, env }, retryClean);
 }
 
 /** Throw away any uncommitted changes (used after read-only stages). */
