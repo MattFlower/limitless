@@ -6,11 +6,18 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
-import { diffPr, githubDoctor, normalizePr, OBSERVE_QUERY } from "../src/integrations/github-poller.ts";
+import {
+  diffPr,
+  githubDoctor,
+  normalizePr,
+  OBSERVE_QUERY,
+  rollup as rollupOf,
+} from "../src/integrations/github-poller.ts";
 import { type PrNode, pollerHarness, prNode, respond, SHA, url } from "./github-poller-support.ts";
 
+// The pure rollup test at the end of this file uses no harness at all.
 let h: ReturnType<typeof pollerHarness>;
-afterEach(() => h.close());
+afterEach(() => h?.close());
 
 const S = 1000;
 const kinds = (): string[] => h.fresh().map((i) => i.kind);
@@ -1553,4 +1560,52 @@ test("an approval goes stale on any head the poller sees, and an overtaken poll 
   expect(h.store.observePrHead(prUrl, "e".repeat(40), version + 1)).toBe(false);
   h.store.endPrPush(prUrl, "e".repeat(40));
   expect(h.store.observePrHead(prUrl, "f".repeat(40), version + 2)).toBe(true);
+});
+
+/** `gh pr view --json statusCheckRollup` reports an array of contexts, not a rollup object. */
+const check = (name: string, extra: Record<string, string | null> = {}) => ({
+  __typename: "CheckRun",
+  name,
+  status: "COMPLETED",
+  conclusion: "SUCCESS",
+  detailsUrl: `https://github.com/o/r/runs/${name}`,
+  ...extra,
+});
+const status = (context: string, state: string) => ({
+  __typename: "StatusContext",
+  context,
+  state,
+  targetUrl: `https://status.example/${context}`,
+});
+
+test("a REST statusCheckRollup array reduces to the state and failing checks", () => {
+  // A GraphQL rollup keeps its own state, so the poller and `gh` agree on one reduction.
+  expect(rollupOf({ state: "SUCCESS", contexts: { nodes: [check("build")] } })).toEqual({
+    ci: "SUCCESS",
+    failing: [],
+  });
+  expect(rollupOf([check("build"), check("lint", { conclusion: "FAILURE" })])).toEqual({
+    ci: "FAILURE",
+    failing: [{ name: "lint", url: "https://github.com/o/r/runs/lint" }],
+  });
+  // Status contexts carry their name in `context` and their verdict in `state`.
+  expect(rollupOf([status("ci/circleci", "FAILURE"), status("codecov", "SUCCESS")])).toEqual({
+    ci: "FAILURE",
+    failing: [{ name: "ci/circleci", url: "https://status.example/ci/circleci" }],
+  });
+  expect(rollupOf([check("build", { status: "IN_PROGRESS", conclusion: null })])).toEqual({
+    ci: "PENDING",
+    failing: [],
+  });
+  expect(rollupOf([status("legacy", "PENDING")])).toEqual({ ci: "PENDING", failing: [] });
+  expect(rollupOf([check("a"), check("b", { conclusion: "CANCELLED" }), status("c", "ERROR")])).toEqual({
+    ci: "FAILURE",
+    failing: [
+      { name: "b", url: "https://github.com/o/r/runs/b" },
+      { name: "c", url: "https://status.example/c" },
+    ],
+  });
+  // No contexts at all is no rollup, not a pass: a fresh push has none yet.
+  expect(rollupOf([])).toEqual({ ci: null, failing: [] });
+  expect(rollupOf(null)).toEqual({ ci: null, failing: [] });
 });
