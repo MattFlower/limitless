@@ -63,6 +63,10 @@ export interface AgentSpec {
    * not home directories, other temporary directories or `denyRead`.
    */
   confineReads?: boolean;
+  /** Verifier commands use the factory reader sandbox, including ephemeral loopback sockets. */
+  loopbackTests?: boolean;
+  /** Invocation-owned MCP endpoint; installed by the harness, never supplied by the model. */
+  readerCommandUrl?: string;
   timeoutMs: number;
   idleTimeoutMs: number;
   maxToolCalls: number;

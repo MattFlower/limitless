@@ -696,6 +696,7 @@ export class RunContext {
           systemAppend: [opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n"),
           target,
           mode: opts.mode,
+          ...(opts.role === "verify" && opts.mode === "readonly" && !noTools ? { loopbackTests: true } : {}),
           ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
           ...(opts.schema ? { schema: opts.schema } : {}),
           ...(opts.decisionTask ? { decisionTask: opts.decisionTask } : {}),

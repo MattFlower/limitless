@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { fakeHarness } from "../src/harness/fake.ts";
+import { runReaderCommand } from "../src/harness/reader.ts";
 import {
   formatVerifyFeedback,
   holdoutPrompt,
@@ -19,6 +21,7 @@ import {
   VerifySchema,
 } from "../src/pipeline/schemas.ts";
 import { blockedOnly, normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
+import { readerFixture, readerSkip } from "./reader-fixture.ts";
 
 const spec: Spec = {
   summary: "test",
@@ -31,6 +34,41 @@ const spec: Spec = {
 const holdout: Holdout = {
   scenarios: [{ id: "H-1", description: "private", steps: "secret input", expected: "ok", edge_case: true }],
 };
+
+test.skipIf(readerSkip !== null)(
+  `a fake verifier executes its local-server test in the reader profile${readerSkip ? ` (skipped: ${readerSkip})` : ""}`,
+  async () => {
+    const fixture = readerFixture();
+    try {
+      const verify = fakeHarness(async (reader) => {
+        expect(reader.mode).toBe("readonly");
+        expect(reader.loopbackTests).toBe(true);
+        const test = await runReaderCommand(reader, fixture.command);
+        expect(test.exitCode).toBe(0);
+        return {
+          structured: {
+            overall: "pass",
+            notes: "",
+            criteria: ["AC-1", "H-1"].map((id) => ({
+              id,
+              status: "met",
+              evidence: test.stdout.trim(),
+              publicSummary: "",
+            })),
+          },
+        };
+      });
+      const result = await verify(fixture.spec);
+      expect(result.status).toBe("ok");
+      const verdict = normalizeVerify(VerifySchema.parse(result.structured), spec, holdout);
+      expect(verdict.overall).toBe("pass");
+      expect(blockedOnly(verdict)).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  },
+  180_000,
+);
 
 test("holdout prompt reads the base repository and grounds outcomes in the request", () => {
   const prompt = holdoutPrompt({ prompt: "Add a --json flag", spec });

@@ -2,6 +2,7 @@ import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
+import { withReaderCommands } from "./reader.ts";
 import { runSandboxed } from "./sandbox.ts";
 import {
   readConfinement,
@@ -221,7 +222,9 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
     args.push(
       "--strict-mcp-config",
       "--mcp-config",
-      '{"mcpServers":{}}',
+      JSON.stringify({
+        mcpServers: spec.readerCommandUrl ? { reader: { type: "http", url: spec.readerCommandUrl } } : {},
+      }),
       "--settings",
       JSON.stringify({
         ...fastSettings,
@@ -248,8 +251,8 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
   if (spec.noTools) {
     args.push("--tools", "");
   } else if (spec.mode === "readonly") {
-    args.push("--tools", "Read,Grep,Glob,Bash");
-    args.push("--allowedTools", ...readTools, "Bash");
+    args.push("--tools", spec.readerCommandUrl ? "Read,Grep,Glob" : "Read,Grep,Glob,Bash");
+    args.push("--allowedTools", ...readTools, spec.readerCommandUrl ? "mcp__reader__command" : "Bash");
     denied.push("Bash(git commit:*)", "Bash(git reset:*)", "Bash(git checkout:*)");
   } else {
     args.push(
@@ -283,6 +286,8 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
 }
 
 export async function runClaude(spec: AgentSpec, processRunner = runProcess): Promise<AgentResult> {
+  if (spec.loopbackTests && !spec.readerCommandUrl)
+    return withReaderCommands(spec, (reader) => runClaude(reader, processRunner));
   spec = protectCredentials(spec);
   const sessionId = crypto.randomUUID();
   const t = spec.target;
@@ -296,6 +301,7 @@ export async function runClaude(spec: AgentSpec, processRunner = runProcess): Pr
     roots ? runSandboxed(opts, roots, processRunner) : processRunner(opts);
   appendFileSync(spec.logPath, redactCredentials(`# claude ${t.model} ${new Date().toISOString()}\n`));
   const envExtra: Record<string, string> = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
+  if (spec.readerCommandUrl) envExtra.MCP_TOOL_TIMEOUT = String(spec.timeoutMs);
   // Agent tool read isolation for this key file is tracked in #335.
   if (keyFile) writeFileSync(keyFile, t.backend?.authToken ?? "", { flag: "wx", mode: 0o600 });
   if (t.backend) {

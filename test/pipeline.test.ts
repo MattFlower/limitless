@@ -7396,6 +7396,7 @@ for (const scenario of [
       }
       if (role === "review") return { structured: approve };
       if (role === "verify") {
+        expect(s.loopbackTests).toBe(true);
         verifierModels.push(s.target.modelId);
         const n = verifierModels.length;
         if (path === "no-alternative") f.tracker.blockModel("alpha/m", "unavailable alternative");
