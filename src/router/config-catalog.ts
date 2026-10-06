@@ -10,6 +10,7 @@ const url = z.string().refine((s) => {
   return /^https?:\/\/\S+$/i.test(s) && u !== null && !u.username && !u.password;
 });
 const positive = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const quota = z.enum(["windows", "unlimited"]);
 const price = z.strictObject({
   input: z.number().nonnegative(),
   output: z.number().nonnegative(),
@@ -56,6 +57,7 @@ const providerSchema = z.strictObject({
   kind: z.enum(["claude-cli", "codex-cli", "openai-compatible", "anthropic-compatible", "decisions"]),
   label: text,
   billing: z.enum(["free", "metered", "subscription"]),
+  quota: quota.default("windows"),
   max_concurrent: positive,
   base_url: url.optional(),
   openai_base_url: url.optional(),
@@ -84,6 +86,11 @@ function checked<T>(schema: z.ZodType<T>, value: unknown, path: string): T {
         .join("; "),
     );
   return result.data;
+}
+function validateQuota(value: unknown, path: string): void {
+  if (!value || typeof value !== "object" || !("quota" in value)) return;
+  if (!quota.safeParse(value.quota).success)
+    throw new Error(`${path}.quota: expected windows or unlimited, received ${JSON.stringify(value.quota)}`);
 }
 export function providerKind(p: ProviderDef) {
   if (p.kind) return p.kind;
@@ -116,7 +123,10 @@ function modelFields(m: ModelDef) {
   return checked(modelSchema, { ...mapFields(fields, true), id: id.slice(provider.length + 1) }, "models");
 }
 export function resolveCatalog(raw: unknown = undefined) {
-  const providers = structuredClone(PROVIDERS),
+  const providers: ProviderDef[] = structuredClone(PROVIDERS).map((p) => ({
+      ...p,
+      quota: p.quota ?? "windows",
+    })),
     models = structuredClone(MODELS);
   const explicit = new Set<string>();
   const providerMaxConcurrent: Record<string, number> = Object.create(null);
@@ -126,19 +136,23 @@ export function resolveCatalog(raw: unknown = undefined) {
       const p = providers.find((p) => p.id === name);
       if (!p) throw new Error(`providers.${name}: unknown provider`);
       const limit = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+      validateQuota(value, `providers.${name}`);
       if (limit.max_concurrent !== undefined && !positive.safeParse(limit.max_concurrent).success)
         throw new Error(`providers.${name}.max_concurrent must be a positive safe integer`);
       const legacy = checked(
-        z.strictObject({ max_concurrent: positive.optional() }),
+        z.strictObject({ max_concurrent: positive.optional(), quota: quota.optional() }),
         value,
         `providers.${name}`,
       );
       if (legacy.max_concurrent !== undefined)
         providerMaxConcurrent[name] = p.maxConcurrent = legacy.max_concurrent;
+      p.quota = legacy.quota ?? "windows";
     }
   }
   for (const [index, value] of (Array.isArray(raw) ? raw : []).entries()) {
     const path = `providers[${index}]`;
+    const identity = value && typeof value === "object" ? (value.id ?? value.preset) : undefined;
+    validateQuota(value, `${path}${identity ? `.${identity}` : ""}`);
     const c = checked(definition, value, path);
     const name = checked(id, c.id ?? c.preset, `${path}.id`);
     if (explicit.has(name)) throw new Error(`${path}.id: duplicate provider`);

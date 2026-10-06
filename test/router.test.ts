@@ -100,6 +100,190 @@ function setup(secrets: Record<string, string> = {}) {
   return { tracker, router: new Router(tracker, policy, models) };
 }
 
+test("live policy removes sticky targets, preserves exclusions and tiers, and explicit only targets win", () => {
+  const { router } = setup();
+  const selected = router.cellRevision("implement", "small");
+  expect(router.route("implement", "small").candidates[0]?.modelId).toBe("claude/sonnet");
+  router.setPolicy({ ...policy, implement: { default: ["codex/sol"] } });
+  expect(
+    router.route("implement", "small", { prefer: "claude/sonnet", preferPolicyRevision: selected })
+      .candidates[0]?.modelId,
+  ).toBe("codex/sol");
+  const escalated = router.cellRevision("implement", "small");
+  expect(
+    router.route("implement", "small", { prefer: "claude/opus", preferPolicyRevision: escalated })
+      .candidates[0]?.modelId,
+  ).toBe("claude/opus");
+  expect(
+    router
+      .route("implement", "small", {
+        prefer: "claude/sonnet",
+        preferPolicyRevision: selected,
+        minTier: 5,
+        exclude: ["claude/sonnet", "codex/sol"],
+      })
+      .candidates.map((m) => m.modelId),
+  ).toEqual(["claude/opus"]);
+  expect(
+    router.route("implement", "small", { only: "claude/sonnet" }).candidates.map((m) => m.modelId),
+  ).toEqual(["claude/sonnet"]);
+  router.setPreferProviders(["codex"]);
+  router.setPolicy(policy);
+  expect(router.route("implement", "small").candidates[0]?.modelId).toBe("codex/sol");
+  router.setPreferProviders([]);
+  expect(router.route("implement", "small").candidates[0]?.modelId).toBe("claude/sonnet");
+});
+
+test("preview includes every skip reason in order without observations, alerts or slot claims", () => {
+  const now = 1_000_000;
+  const defs: ProviderDef[] = Array.from({ length: 8 }, (_, i) => ({
+    id: `p${i}`,
+    label: `P${i}`,
+    harness: i === 5 ? "decisions" : "fake",
+    billing: "subscription",
+    maxConcurrent: 1,
+  }));
+  const model = models[0];
+  if (!model) throw new Error("missing fixture model");
+  const catalog = defs.map((p) => ({ ...model, id: `${p.id}/m`, provider: p.id }));
+  const tracker = new ProviderTracker(defs, store, reserves, {}, {}, () => now);
+  const router = new Router(
+    tracker,
+    {
+      ...policy,
+      implement: { default: catalog.map((m) => m.id) },
+      summarize: { default: ["p6/m"] },
+    },
+    catalog,
+  );
+  tracker.setEnabled("p0", false);
+  tracker.setHealthy("p1", false);
+  tracker.record("p2", "quota", { exhaustedUntil: now + 60_000 });
+  tracker.observeWindows("p3", { five_hour: { utilization: 1, resetsAt: now + 60_000 } });
+  for (let i = 0; i < 3; i++) tracker.record("p4", "unavailable", { error: "failed" });
+  router.route("summarize", "small");
+  const status = tracker.all();
+  const description = router.describeFallback("p6", false);
+  const alerts = store.listAlerts(now);
+  const messages: unknown[] = [];
+  store.subscribe((message) => messages.push(message));
+  const preview = router.preview("implement", "small");
+  expect(preview.map((c) => [c.modelId, c.eligible])).toEqual(catalog.map((m, i) => [m.id, i >= 6]));
+  expect(preview.map((c) => c.reason)).toEqual([
+    "disabled",
+    "p1: server not reachable",
+    `p2: quota exhausted; exhausted until ${new Date(now + 60_000).toISOString()}`,
+    "p3: at reserve limit",
+    "p4: circuit open after 3 failures",
+    "p5/m is a decision model; the implement role has no decisions mapping",
+    null,
+    null,
+  ]);
+  expect(router.preview("implement", "small")).toEqual(preview);
+  expect(tracker.all()).toEqual(status);
+  expect(router.describeFallback("p6", false)).toBe(description);
+  expect(store.listAlerts(now)).toEqual(alerts);
+  expect(messages).toEqual([]);
+});
+
+test("preview and route share alternative ordering under preference and headroom changes", () => {
+  const tracker = new ProviderTracker(
+    providers,
+    store,
+    reserves,
+    { OPENROUTER_API_KEY: "key" },
+    { openrouter: 50 },
+    () => 1_000_000,
+  );
+  const router = new Router(tracker, policy, models);
+  router.setPolicy({ ...policy, implement: { default: ["claude/sonnet|codex/sol|openrouter/ds"] } });
+  tracker.setEnabled("openrouter", false);
+  const check = (expected: string[]) => {
+    const status = tracker.all();
+    const alerts = store.listAlerts(tracker.now());
+    const fallback = router.describeFallback("claude", false);
+    const messages: unknown[] = [];
+    const unsubscribe = store.subscribe((message) => messages.push(message));
+    const preview = router.preview("implement", "small");
+    expect(preview.filter((p) => p.eligible).map((p) => p.modelId)).toEqual(expected);
+    expect(preview.find((p) => p.modelId === "openrouter/ds")).toEqual({
+      modelId: "openrouter/ds",
+      eligible: false,
+      reason: "disabled",
+    });
+    expect(tracker.all()).toEqual(status);
+    expect(store.listAlerts(tracker.now())).toEqual(alerts);
+    expect(router.describeFallback("claude", false)).toBe(fallback);
+    expect(messages).toEqual([]);
+    unsubscribe();
+    expect(router.route("implement", "small").candidates.map((c) => c.modelId)).toEqual(expected);
+  };
+  tracker.observeWindows("claude", { five_hour: { utilization: 0.6, resetsAt: 2_000_000 } });
+  check(["codex/sol", "claude/sonnet"]);
+  router.setPreferProviders(["claude"]);
+  check(["claude/sonnet", "codex/sol"]);
+  router.setPreferProviders([]);
+  tracker.observeWindows("codex", { five_hour: { utilization: 0.7, resetsAt: 2_000_000 } });
+  check(["claude/sonnet", "codex/sol"]);
+});
+test("run chains replace every complexity, retain groups and never extend for escalation or billing", () => {
+  const { tracker, router } = setup({ OPENROUTER_API_KEY: "key" });
+  const chain = ["openrouter/ds", "codex/sol|claude/opus"];
+  expect(
+    router
+      .route("review", "small", { chain: ["claude/opus", "codex/sol"], prefer: "codex/sol" })
+      .candidates.map((m) => m.modelId),
+  ).toEqual(["claude/opus", "codex/sol"]);
+  tracker.observeWindows("claude", { five_hour: { utilization: 0.1, resetsAt: null } });
+  tracker.observeWindows("codex", { five_hour: { utilization: 0.5, resetsAt: null } });
+  for (const complexity of ["trivial", "small", "medium", "large"] as const)
+    expect(
+      router
+        .route("implement", complexity, { chain, minTier: 5, avoidVendor: "deepseek", billing: "free_first" })
+        .candidates.map((m) => m.modelId),
+    ).toEqual(["openrouter/ds", "claude/opus", "codex/sol"]);
+  expect(
+    router.route("implement", "small", {
+      chain,
+      exclude: ["openrouter/ds", "claude/opus", "codex/sol"],
+      minTier: 5,
+    }).candidates,
+  ).toEqual([]);
+  for (const id of ["codex", "openrouter", "claude"]) tracker.setEnabled(id, false);
+  expect(router.route("implement", "large", { chain }).skipped).toEqual([
+    { modelId: "openrouter/ds", reason: "disabled" },
+    { modelId: "codex/sol", reason: "disabled" },
+    { modelId: "claude/opus", reason: "disabled" },
+  ]);
+});
+
+test.each(["health", "quota", "reserve", "circuit", "rejection"])(
+  "pinned routing retains availability filtering: %s",
+  (reason) => {
+    const { tracker, router } = setup();
+    if (reason === "health") tracker.setHealthy("claude", false);
+    if (reason === "quota")
+      tracker.record("claude", "quota", { exhaustedUntil: Date.now() + 60000, error: "quota exhausted" });
+    if (reason === "reserve")
+      tracker.observeWindows("claude", { five_hour: { utilization: 0.9, resetsAt: Date.now() + 60000 } });
+    if (reason === "circuit")
+      for (let i = 0; i < 3; i++) tracker.record("claude", "unavailable", { error: "offline" });
+    if (reason === "rejection") tracker.blockModel("claude/opus", "plan does not support model");
+    const result = router.route("implement", "small", { chain: ["claude/opus"] });
+    expect(result.candidates).toEqual([]);
+    expect(result.skipped).toHaveLength(1);
+    expect(result.skipped[0]?.reason).toContain(
+      {
+        health: "server not reachable",
+        quota: "quota exhausted",
+        reserve: "at reserve limit",
+        circuit: "circuit open",
+        rejection: "plan does not support model",
+      }[reason],
+    );
+  },
+);
+
 test("verifier routing excludes checkpoints across backends, including pinned targets", () => {
   const tracker = new ProviderTracker(PROVIDERS, store, reserves, { OMLX_API_KEY: "key" });
   tracker.setHealthy("omlx", true);
@@ -120,6 +304,45 @@ test("verifier routing excludes checkpoints across backends, including pinned ta
   tracker.setHealthy("omlx", false);
   expect(router.route("review", "small", constraints).candidates).toEqual([]);
 });
+
+for (const billing of ["free", "metered", "subscription"] as const) {
+  for (const quota of ["windows", "unlimited"] as const) {
+    test(`${billing} ${quota} quota honors reserves or ignores windows, with durable rejection deadlines`, () => {
+      let now = 1_000_000;
+      const defs: ProviderDef[] = [
+        { id: "claude", label: "Claude", harness: "fake", billing, quota, maxConcurrent: 1 },
+      ];
+      const limits = { ...reserves, windows: { claude: { five_hour: 0.9 } } };
+      const tracker = new ProviderTracker(defs, store, limits, {}, {}, () => now);
+      expect(tracker.headroom("claude")).toBe(1);
+      const window = { utilization: 0.99, resetsAt: now + 500_000 };
+      tracker.observeWindows("claude", { five_hour: window });
+      if (quota === "unlimited") expect(tracker.headroom("claude")).toBe(1);
+      else expect(tracker.headroom("claude")).toBeCloseTo(-0.1);
+      expect(tracker.isAvailable("claude")).toBe(quota === "unlimited");
+      expect(tracker.status("claude")).toMatchObject({
+        quota,
+        state: quota === "unlimited" ? "ok" : "exhausted",
+        windows: { five_hour: { ...window, observedAt: now } },
+      });
+      if (quota === "windows") return;
+      const exhaustedUntil = now + 100_000;
+      tracker.record("claude", "quota", { exhaustedUntil, error: "CLI quota rejection" });
+      tracker.record("claude", "ok");
+      expect(tracker.isAvailable("claude")).toBe(false);
+      const reloaded = new ProviderTracker(defs, store, limits, {}, {}, () => now);
+      now = exhaustedUntil - 1;
+      expect(reloaded.isAvailable("claude")).toBe(false);
+      expect(reloaded.status("claude")).toMatchObject({ state: "exhausted", until: exhaustedUntil });
+      now = exhaustedUntil;
+      expect(reloaded.isAvailable("claude")).toBe(true);
+      expect(reloaded.status("claude")?.state).toBe("ok");
+      reloaded.record("claude", "quota", { modelCooldown: { modelId: "claude/sonnet", ms: 100_000 } });
+      expect(reloaded.isAvailable("claude")).toBe(true);
+      expect(reloaded.modelUnavailableReason("claude/sonnet")).toContain("model cooling down");
+    });
+  }
+}
 
 test("quota windows keep independent observation times and reject older boundaries", () => {
   let now = 1_000_000;

@@ -4,7 +4,7 @@ import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simp
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
 import { ChatRequestSchema } from "../concierge.ts";
-import type { CreateRunRequest, HealthResponse, RunStatus, StreamMessage } from "../core/types.ts";
+import type { CreateRunRequest, HealthResponse, RunModels, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderWorkload, computeStats } from "../db/stats.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { gateSlots } from "../gates/slots.ts";
@@ -426,7 +426,13 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       POST: handle((req) => json({ cancelled: factory.cancelRun(req.params.id as string, "ui") })),
     },
     "/api/runs/:id/retry": {
-      POST: handle(async (req) => json(await factory.retryRun(req.params.id as string), 201)),
+      POST: handle(async (req) => {
+        const text = await req.text();
+        const input = text ? (JSON.parse(text) as { models?: RunModels }) : {};
+        if (!input || typeof input !== "object" || Array.isArray(input))
+          throw new Error("invalid retry body");
+        return json(await factory.retryRun(req.params.id as string, input.models), 201);
+      }),
     },
     "/api/runs/:id/resolve": {
       POST: handle(async (req) => {
@@ -528,6 +534,40 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle(() => json(store.listRepos())),
     },
     "/api/providers": handle(() => json(factory.tracker.all())),
+    "/api/routing": handle((req) =>
+      json(factory.routing.snapshot(new URL(req.url).searchParams.get("run") ?? undefined)),
+    ),
+    "/api/routing/preview": handle((req) => {
+      const query = new URL(req.url).searchParams;
+      return json(
+        factory.routing.preview(
+          query.get("role") ?? "",
+          query.get("complexity") ?? "medium",
+          query.get("run") ?? undefined,
+        ),
+      );
+    }),
+    "/api/routing/cells/:role/:cell": {
+      PUT: handle(async (req) => {
+        const data = await body<{ groups?: unknown; note?: unknown }>(req);
+        if (!data || !Array.isArray(data.groups))
+          throw new Error(`${req.params.role}.${req.params.cell}: groups must be a nonempty chain`);
+        return json(
+          factory.routing.setCell(req.params.role ?? "", req.params.cell ?? "", data.groups, data.note),
+        );
+      }),
+      DELETE: handle((req) =>
+        json(factory.routing.setCell(req.params.role ?? "", req.params.cell ?? "", null)),
+      ),
+    },
+    "/api/routing/prefer": {
+      PUT: handle(async (req) => {
+        const data = await body<{ prefer?: unknown; note?: unknown }>(req);
+        if (!data || !Array.isArray(data.prefer)) throw new Error("prefer: expected provider IDs");
+        return json(factory.routing.setPrefer(data.prefer, data.note));
+      }),
+      DELETE: handle(() => json(factory.routing.setPrefer(null))),
+    },
     "/api/stats/providers": handle(() => json(computeProviderWorkload(store))),
     "/api/providers/:id/fast": {
       POST: handle(async (req) => {
