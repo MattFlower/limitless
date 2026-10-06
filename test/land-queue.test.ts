@@ -111,7 +111,7 @@ const branch=existsSync(file+".branch-"+pr)?readFileSync(file+".branch-"+pr,"utf
 const head=()=>branch?new TextDecoder().decode(Bun.spawnSync(["/usr/bin/git","--git-dir",${JSON.stringify(bare)},"rev-parse","refs/heads/"+branch]).stdout).trim():"";
 const flag=(n)=>args.includes(n);
 if(args[0]!=="pr"||args[1]!=="merge"){
- if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({title:"PR text",body:"PR body",headRefOid:head()}));
+ if(args[1]==="view") console.log(args.includes("--jq")? (merged?"MERGED":"OPEN") : JSON.stringify({title:"PR text",body:"PR body",headRefOid:head(),state:merged?"MERGED":"OPEN",statusCheckRollup:[]}));
  process.exit(0);
 }
 if(flag("--body-file")) writeFileSync(file+".body-"+pr,await Bun.stdin.text());
@@ -756,19 +756,23 @@ test("a transient CI failure twice blocks, and a real one is not re-run", async 
   expect(ghCalls("run rerun")).toHaveLength(1);
 });
 
-test("a head that changes while waiting blocks at once", async () => {
+test("a head that changes while CI stays pending blocks without advancing the clock", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head);
   approve(1, head);
-  ci = () => ({ ci: "PENDING" });
-  const q = queue();
-  const entry = q.request({ target: pr.run.id });
+  ci = () => null;
+  const entry = queue().request({ target: pr.run.id });
   await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
   const moved = await pushBranch("pr-1", "one.txt", "one\nagain\n", 1);
-  ci = () => null; // the moved head is the last thing this PR reports
-  observers.get(url(1))?.(moved, "SUCCESS");
-  await waitFor(() => store.getLandEntry(entry.id)?.state === "blocked");
+  const before = clock.now();
+  observe(1, moved, "PENDING");
+  const deadline = Date.now() + 5_000;
+  while (store.getLandEntry(entry.id)?.state !== "blocked") {
+    if (Date.now() > deadline) throw new Error("head observation did not block the land");
+    await settleIdle();
+  }
+  expect(clock.now()).toBe(before);
   expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
   expect(ghCalls("pr merge")).toEqual([]);
 });

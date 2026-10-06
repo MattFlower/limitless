@@ -2317,6 +2317,7 @@ export class Store {
       this.addFeedItems(items);
     })();
     this.publishFeed();
+    if (pr) this.publish({ kind: "github_pr", url: pr.url });
   }
 
   private addFeedItems(items: FeedInsert[]): void {

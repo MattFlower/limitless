@@ -113,7 +113,7 @@ export class LandQueue {
     return this.deps.clock?.now ?? Date.now;
   }
 
-  /** Take over whatever the previous daemon left in flight, then wait for new requests. */
+  /** Resume unowned or expired claims, then wait for new requests. */
   start(): void {
     this.stopped = false;
     if (!this.workers.size) this.store.releaseLandClaims(this.owner);
@@ -326,25 +326,20 @@ export class LandQueue {
     await pushExistingBranch(repo, cwd, entry.headBranch, entry.approvedSha, signal, undefined, head);
   }
 
-  /** Wait for CI on exactly `sha`; nothing else counts as the green that lets the merge happen. */
   /**
-   * Wait for CI on exactly `sha`. The poller's `pr.ci_passed` / `pr.ci_failed` items move the wait;
+   * Wait for CI on exactly `sha`. Every saved PR observation moves the wait;
    * the fallback read covers a restart and polling off. A head that moved after we saw ours blocks
    * at once, and a transient failure is re-run once.
    */
   private async awaitCi(entry: LandEntry, sha: string, signal: AbortSignal): Promise<"green" | "merged"> {
     const deadline = this.now() + (this.deps.ciTimeoutMs ?? DEFAULTS.ciTimeoutMs);
-    let observed = false;
     let rerun = entry.ciRerun ? ciRunsSchema.parse(JSON.parse(entry.ciRerun)) : null;
     for (;;) {
       signal.throwIfAborted();
-      const seen = await this.observe(entry.prUrl, signal);
+      const seen = await this.observe(entry.prUrl, signal, sha);
       if (seen?.state === "MERGED") return "merged";
-      if (seen && seen.head === sha) observed = true;
-      // Only a head we have already seen at our own commit counts as moved: before that, the
-      // poller's saved observation may simply predate our push.
-      else if (observed && seen?.head) throw new LandBlocked("head moved after approval");
-      if (observed && rerun) {
+      if (seen?.head && seen.head !== sha) throw new LandBlocked("head moved after approval");
+      if (rerun) {
         const current = await getGitHubCiRuns(entry.repo, sha, signal, this.deps.gh);
         const attempts = rerun.map((old) => current.find((run) => run.databaseId === old.databaseId));
         if (
@@ -364,7 +359,7 @@ export class LandQueue {
         await this.ciWake(entry, signal);
         continue;
       }
-      if (observed && seen?.ci && !UNSETTLED_CI.has(seen.ci)) {
+      if (seen?.head === sha && seen.ci && !UNSETTLED_CI.has(seen.ci)) {
         if (seen.ci === "SUCCESS") return "green";
         if (!rerun && seen.failing.length > 0 && seen.failing.every((n) => TRANSIENT_CI.test(n))) {
           const runs = await getGitHubCiRuns(entry.repo, sha, signal, this.deps.gh);
@@ -394,14 +389,18 @@ export class LandQueue {
     }
   }
 
-  /** Resolves on the poller's next CI item for this PR, the fallback tick, or an abort. */
+  /** Resolves on the next observation for this PR, the fallback tick, or an abort. */
   private ciWake(entry: LandEntry, signal: AbortSignal): Promise<void> {
     const set = this.deps.clock?.set ?? ((fn, ms) => setTimeout(fn, ms));
     const clear = this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
     return new Promise((resolve) => {
       const id = set(() => done(), this.deps.ciPollMs ?? DEFAULTS.ciPollMs);
       const unsubscribe = this.store.subscribe((msg) => {
-        if (msg.kind === "feed" && CI_FEED.has(msg.item.kind) && msg.item.data.url === entry.prUrl) done();
+        if (
+          (msg.kind === "github_pr" && msg.url === entry.prUrl) ||
+          (msg.kind === "feed" && CI_FEED.has(msg.item.kind) && msg.item.data.url === entry.prUrl)
+        )
+          done();
       });
       function done() {
         clear(id);
@@ -521,9 +520,9 @@ export class LandQueue {
   }
 
   /** The saved observation when polling is on, `gh pr view` otherwise; cancellable either way. */
-  private async observe(url: string, signal: AbortSignal): Promise<LandObservation | null> {
+  private async observe(url: string, signal: AbortSignal, sha: string): Promise<LandObservation | null> {
     const saved = this.deps.polling === false ? null : this.savedReport(url);
-    if (saved) return saved;
+    if (saved && (saved.head === sha || saved.state === "MERGED")) return saved;
     const pr = await (this.deps.client ?? getGitHubPr)(url, signal);
     return pr ? { head: pr.headRefOid ?? "", state: pr.state, ci: pr.ci ?? null, failing: pr.failing } : null;
   }

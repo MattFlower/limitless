@@ -410,7 +410,8 @@ export type StreamMessage =
   | { kind: "provider"; provider: ProviderStatus }
   | { kind: "alert"; alert: QuotaAlert | null; provider: string; window: string; created: boolean }
   | { kind: "question"; question: Question }
-  | { kind: "feed"; item: FeedItem };
+  | { kind: "feed"; item: FeedItem }
+  | { kind: "github_pr"; url: string };
 
 export type RoutingCell = Complexity | "default";
 export interface OperatorRoutingCell {
