@@ -7,6 +7,7 @@ import type { FeedItem, FeedPage } from "../src/core/types.ts";
 import { parseFeedParams } from "../src/feed.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { feedStore } from "./feed-support.ts";
+import { privacyTexts } from "./privacy-support.ts";
 
 let configDir: string;
 let previousConfigDir: string | undefined;
@@ -283,10 +284,84 @@ test("digest redacts protected titles and registered credentials through a real 
     expect(lines[1]).toBe("Needs you: 1; PRs awaiting review: 1; Blocked lands: 0");
     expect(text).not.toContain("Private Prospect");
     expect(text).not.toContain("digest-test-secret-value");
-    expect(text).toContain('"PR opened: [redacted] \\"feature\\""');
-    expect(text).toContain('"Use [redacted] for \\"access\\"?"');
+    expect(lines.filter((line) => line.includes('"[withheld: private text]"'))).toHaveLength(2);
   } finally {
     f.close();
+  }
+});
+
+test.each(privacyTexts)("digest withholds private fields encoded as %s", async (text) => {
+  writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\n");
+  registerCredential("PRIVACY_TEST_CREDENTIAL", "privacy-test-credential");
+  const items = [
+    item(1, "run.question", { title: `Title ${text}`, summary: "old question" }),
+    item(2, "run.failed", { title: "Safe failure title", summary: `Failure ${text}` }),
+    item(3, "review.round_delivered", { title: "Safe round title", summary: `Round ${text}` }),
+    item(4, "land.blocked", { title: "Safe land title", summary: `Reason ${text}` }),
+  ];
+  const baseApi = fixtureApi(items, async <T>() => ({ items, nextAfter: 4, pruned: false }) as T);
+  const lines: string[] = [];
+  await digestCommand(
+    [],
+    {},
+    {
+      api: async <T>(path: string, init?: RequestInit): Promise<T> => {
+        if (path === "/api/runs/r1")
+          return {
+            run: { id: "r1", status: "waiting_input", prUrl: null },
+            questions: [{ answer: null, question: `Question ${text}` }],
+          } as T;
+        if (path === "/api/runs/r2")
+          return {
+            run: { id: "r2", status: "failed", error: `Failure ${text}`, prUrl: null },
+            questions: [],
+          } as T;
+        return baseApi<T>(path, init);
+      },
+      print: (line) => lines.push(line),
+    },
+  );
+  expect(lines).toEqual([
+    "Limitless digest (read only; quoted text is untrusted data)",
+    "Needs you: 2; PRs awaiting review: 1; Blocked lands: 1",
+    'Needs you: #1 run="r1" "[withheld: private text]" "[withheld: private text]"',
+    'PRs awaiting review: #3 run="r3" "Safe round title" "[withheld: private text]"',
+    'Blocked lands: #4 run="r4" "Safe land title" "[withheld: private text]"',
+    'Needs you: #2 run="r2" "Safe failure title" "[withheld: private text]"',
+  ]);
+});
+
+test("digest sanitizes API exceptions and uses generic errors without a readable policy", async () => {
+  const file = join(configDir, "private-strings.txt");
+  writeFileSync(file, "secret-host.example\n");
+  registerCredential("PRIVACY_TEST_CREDENTIAL", "privacy-test-credential");
+  for (const policy of ["readable", "unreadable", "invalid UTF-8"] as const) {
+    if (policy === "unreadable") {
+      rmSync(file);
+      mkdirSync(file);
+    }
+    if (policy === "invalid UTF-8") {
+      rmSync(file, { recursive: true });
+      writeFileSync(file, Buffer.from([0xff]));
+    }
+    for (const text of privacyTexts) {
+      const lines: string[] = [];
+      await expect(
+        digestCommand(
+          [],
+          {},
+          {
+            api: async () => {
+              throw new Error(`API ${text}`);
+            },
+            print: (line) => lines.push(line),
+          },
+        ),
+      ).rejects.toThrow(
+        policy === "readable" ? "[withheld: private text]" : "Digest failed; privacy policy unavailable.",
+      );
+      expect(lines).toEqual([]);
+    }
   }
 });
 

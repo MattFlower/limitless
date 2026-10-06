@@ -12,6 +12,7 @@ import {
 } from "../core/types.ts";
 import { FeedAckSchema, FeedQuerySchema, waitForFeed } from "../feed.ts";
 import { ReviewVerdictSchema, submitReview } from "../pipeline/review-round.ts";
+import { loadOutputPrivacy, type OutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { explainStatus, statusDetailSchema, statusLandsSchema } from "./mcp-status.ts";
 
 const nonblank = z.string().trim().min(1);
@@ -223,16 +224,16 @@ export function createMcpServer(backend: McpBackend): Server {
     name: string,
     description: string,
     schema: S,
-    execute: (input: z.output<S>, signal: AbortSignal) => Promise<unknown>,
+    execute: (input: z.output<S>, signal: AbortSignal, privacy: OutputPrivacy | null) => Promise<unknown>,
   ) {
     return {
       name,
       description,
       inputSchema: z.toJSONSchema(schema, { io: "input" }),
-      execute: async (input: unknown, signal: AbortSignal) => {
+      execute: async (input: unknown, signal: AbortSignal, privacy: OutputPrivacy | null) => {
         const args = schema.parse(input);
         try {
-          return await execute(args, signal);
+          return await execute(args, signal, privacy);
         } catch (e) {
           if (e instanceof z.ZodError) throw new Error(`Malformed backend response: ${e.message}`);
           throw e;
@@ -272,9 +273,9 @@ export function createMcpServer(backend: McpBackend): Server {
       "limitless_status",
       "Explain a run's state and concrete next action using saved PR observations, review state and the land queue. Supply run. Reports unknown PR observations without claiming readiness; use get_run for evidence. Unknown run IDs are errors, and this read never changes a run or its feed cursor.",
       z.object({ run: nonblank }).strict(),
-      async ({ run }) => {
+      async ({ run }, _signal, privacy) => {
         const detail = statusDetailSchema.parse(await backend.detail(run));
-        return explainStatus(detail, statusLandsSchema.parse(await backend.lands(detail.run.id)));
+        return explainStatus(detail, statusLandsSchema.parse(await backend.lands(detail.run.id)), privacy);
       },
     ),
     tool(
@@ -375,13 +376,22 @@ export function createMcpServer(backend: McpBackend): Server {
     tools: tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
   }));
   server.setRequestHandler(CallToolRequestSchema, async ({ params }, { signal }) => {
+    const privacy = loadOutputPrivacy();
     try {
       const tool = tools.find((tool) => tool.name === params.name);
       if (!tool) throw new Error(`Unknown tool: ${params.name}`);
-      const result = await tool.execute(params.arguments ?? {}, signal);
-      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      const result = await tool.execute(params.arguments ?? {}, signal, privacy);
+      const output = privacy
+        ? privateOutputData(result, privacy)
+        : params.name === "limitless_status"
+          ? result
+          : { message: "Tool output withheld; privacy policy unavailable." };
+      return { content: [{ type: "text", text: JSON.stringify(output) }] };
     } catch (e) {
-      return { isError: true, content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }] };
+      const text = privacy
+        ? privacy(e instanceof Error ? e.message : String(e))
+        : "MCP tool failed; privacy policy unavailable.";
+      return { isError: true, content: [{ type: "text", text }] };
     }
   });
   return server;

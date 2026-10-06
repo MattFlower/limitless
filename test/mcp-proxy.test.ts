@@ -3,11 +3,12 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { Question, Run } from "../src/core/types.ts";
+import type { FeedPage, Question, Run } from "../src/core/types.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { connect, fixture, localServer, type Route, requestWithParams, resultValue } from "./mcp-support.ts";
+import { privacyTexts } from "./privacy-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
 beforeEach(async () => {
@@ -606,12 +607,15 @@ test.each([
     if (policy === "readable") {
       expect(resultValue(result)).toMatchObject({
         run: run.id,
-        state: "[redacted]",
-        nextAction: "[redacted] the land reason, resolve the blocker, then request limitless_land again.",
-        land: { id: land.id, runId: "[redacted] [redacted]", reason: "CI failed for [redacted] [redacted]" },
+        state: "[withheld: private text]",
+        nextAction: "[withheld: private text]",
+        land: { id: land.id, runId: "[withheld: private text]", reason: "[withheld: private text]" },
       });
     } else {
-      expect(resultValue<unknown>(result)).toEqual({ land: { id: land.id, state: "blocked" }, openQuestions: 1 });
+      expect(resultValue<unknown>(result)).toEqual({
+        land: { id: land.id, state: "blocked" },
+        openQuestions: 1,
+      });
       expect(text).not.toContain(run.id);
       expect(text).not.toContain("CI failed");
     }
@@ -619,6 +623,143 @@ test.each([
     await conn.close();
     if (previousConfigDir === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
     else process.env.LIMITLESS_CONFIG_DIR = previousConfigDir;
+  }
+});
+
+test.each(["direct", "proxy"] as const)(
+  "%s MCP withholds encoded private fields and errors",
+  async (backend) => {
+    const previous = process.env.LIMITLESS_CONFIG_DIR;
+    const configDir = join(f.home, "privacy-config");
+    mkdirSync(configDir);
+    process.env.LIMITLESS_CONFIG_DIR = configDir;
+    const file = join(configDir, "private-strings.txt");
+    writeFileSync(file, "secret-host.example\n");
+    registerCredential("PRIVACY_TEST_CREDENTIAL", "privacy-test-credential");
+    const routes = createHttpRoutes(f.factory);
+    const conn = await connect(
+      backend === "direct"
+        ? factoryBackend(f.factory)
+        : httpBackend("http://daemon.invalid", async (url, init) => {
+            const path = new URL(url).pathname;
+            const match = path.match(/^\/api\/runs\/([^/]+)(\/events)?$/);
+            const route = routes[match ? `/api/runs/:id${match[2] ?? ""}` : path];
+            const handler = (typeof route === "function" ? route : (route as { GET: Route }).GET) as Route;
+            return handler(
+              requestWithParams(url, init, { id: decodeURIComponent(match?.[1] ?? "") }),
+              localServer,
+            );
+          }),
+    );
+    try {
+      for (const text of privacyTexts) {
+        const run = await f.factory.createRun({ repo: f.repo, prompt: "work", title: `Title ${text}` });
+        f.factory.store.updateRun(run.id, { status: "failed", error: `Failure ${text}` });
+        f.factory.store.askQuestion(run.id, `Question ${text}`);
+        const land = f.factory.store.createLandEntry({
+          runId: run.id,
+          repo: "o/r",
+          prUrl: "https://github.com/o/r/pull/1",
+          baseBranch: "main",
+          headBranch: "feature",
+          approvedSha: "a".repeat(40),
+        });
+        f.factory.store.updateLandEntry(land.id, { state: "blocked", reason: `Reason ${text}` });
+        const detail = resultValue<{ title: string; error: string; questions: { question: string }[] }>(
+          await conn.client.callTool({ name: "limitless_get_run", arguments: { id: run.id } }),
+        );
+        expect(detail).toMatchObject({
+          title: "[withheld: private text]",
+          error: "[withheld: private text]",
+          questions: [{ question: "[withheld: private text]" }],
+        });
+        const status = resultValue<{ land: { reason: string }; state: string }>(
+          await conn.client.callTool({ name: "limitless_status", arguments: { run: run.id } }),
+        );
+        expect(status).toMatchObject({
+          state: "Landing blocked",
+          land: { reason: "[withheld: private text]" },
+        });
+        f.factory.store.db
+          .query(`INSERT INTO feed (ts, kind, run_id, title, summary, dedupe_key)
+          VALUES (1, 'review.round_delivered', ?, 'Safe round title', ?, ?)`)
+          .run(run.id, `Round ${text}`, run.id);
+        const feed = resultValue<FeedPage>(
+          await conn.client.callTool({ name: "limitless_feed", arguments: { after: 0 } }),
+        );
+        expect(feed.items.filter((item) => item.runId === run.id).map((item) => item.summary)).toEqual([
+          "[withheld: private text]",
+          "[withheld: private text]",
+          "[withheld: private text]",
+        ]);
+        const error = await conn.client.callTool({ name: "limitless_status", arguments: { run: text } });
+        expect(error.isError).toBe(true);
+        expect(error.content).toEqual([
+          {
+            type: "text",
+            text:
+              backend === "direct" ? "[withheld: private text]" : 'Daemon HTTP 404: {"error":"not found"}',
+          },
+        ]);
+      }
+      mkdirSync(join(configDir, "bad"));
+      process.env.LIMITLESS_CONFIG_DIR = join(configDir, "bad");
+      mkdirSync(join(configDir, "bad", "private-strings.txt"));
+      const error = await conn.client.callTool({
+        name: "limitless_status",
+        arguments: { run: privacyTexts[0] },
+      });
+      expect(error.isError).toBe(true);
+      expect(error.content).toEqual([{ type: "text", text: "MCP tool failed; privacy policy unavailable." }]);
+    } finally {
+      await conn.close();
+      if (previous === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+      else process.env.LIMITLESS_CONFIG_DIR = previous;
+    }
+  },
+);
+
+test("status filters proxy response and connection exception text, including unreadable policy", async () => {
+  const previous = process.env.LIMITLESS_CONFIG_DIR;
+  const configDir = join(f.home, "proxy-error-config");
+  mkdirSync(configDir);
+  process.env.LIMITLESS_CONFIG_DIR = configDir;
+  writeFileSync(join(configDir, "private-strings.txt"), "secret-host.example\n");
+  registerCredential("PRIVACY_TEST_CREDENTIAL", "privacy-test-credential");
+  try {
+    for (const mode of ["http", "json", "connection", "unreadable"] as const) {
+      if (mode === "unreadable") process.env.LIMITLESS_CONFIG_DIR = join(configDir, "private-strings.txt");
+      for (const text of privacyTexts) {
+        const conn = await connect(
+          httpBackend(`http://daemon.invalid/${text}`, async () => {
+            if (mode === "connection") throw new Error(`Connection ${text}`);
+            if (mode === "json") return Response.json({ error: `Upstream ${text}` }, { status: 503 });
+            return new Response(`Upstream ${text}`, { status: 503 });
+          }),
+        );
+        try {
+          const result = await conn.client.callTool({
+            name: "limitless_status",
+            arguments: { run: "missing" },
+          });
+          expect(result.isError).toBe(true);
+          expect(result.content).toEqual([
+            {
+              type: "text",
+              text:
+                mode === "unreadable"
+                  ? "MCP tool failed; privacy policy unavailable."
+                  : "[withheld: private text]",
+            },
+          ]);
+        } finally {
+          await conn.close();
+        }
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+    else process.env.LIMITLESS_CONFIG_DIR = previous;
   }
 });
 

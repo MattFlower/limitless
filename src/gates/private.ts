@@ -45,7 +45,10 @@ export function loadPrivateStrings(
 export type PrivateStrings = ReturnType<typeof loadPrivateStrings>;
 const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
 const decoded = (text: string) =>
-  text.replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString());
+  text
+    .replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString())
+    // Diagnostics may JSON-quote a field's literal Unicode escapes.
+    .replace(/\\+u([0-9a-f]{4})/gi, (_escape, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
 export const privateMatches = (text: string, entries: PrivateStrings) =>
   entries.filter(({ value }) => normalize(`${text}\n${decoded(text)}`).includes(normalize(value)));
 export const privateReason = (location: string, entry: number) =>

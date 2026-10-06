@@ -1126,6 +1126,9 @@ test("private policy rejects broken lists and repository aliases; normalizes bot
       "secret-host.example",
       "ＳＥＣＲＥＴ－ＨＯＳＴ．ＥＸＡＭＰＬＥ",
       "%73ecret-host%2Eexample",
+      "\\u0073ecret-host.example",
+      "%5Cu0073ecret-host.example",
+      JSON.stringify("\\u0073\\u0065\\u0063\\u0072\\u0065\\u0074-host.example"),
       "%bad% secret-host.example",
     ]) {
       expect(privateMatches(text, entries)).toHaveLength(1);
