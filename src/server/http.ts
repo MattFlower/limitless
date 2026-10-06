@@ -530,6 +530,23 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       ),
     ),
     "/api/github/access": handle(() => json(store.githubAccessProblems())),
+    "/api/land": {
+      GET: handle(() => json(factory.land.list())),
+      POST: handle(async (req) => {
+        const input = await body<{ target?: unknown; runId?: unknown; sha?: unknown }>(req);
+        const target = typeof input.target === "string" ? input.target : input.runId;
+        if (typeof target !== "string" || !target.trim())
+          return error("target is required: a run id, a PR URL or a PR number");
+        if (input.sha !== undefined && typeof input.sha !== "string") return error("sha must be a string");
+        return json(factory.land.request({ target, sha: input.sha as string | undefined }), 201);
+      }, true),
+    },
+    "/api/land/:id/cancel": {
+      POST: handle((req) => {
+        const cancelled = factory.land.cancel(Number(req.params.id as string));
+        return cancelled ? json({ cancelled: true }) : error("land entry not found", 404);
+      }, true),
+    },
     "/api/repos": {
       GET: handle(() => json(store.listRepos())),
     },

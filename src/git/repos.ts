@@ -1018,6 +1018,7 @@ export async function pushExistingBranch(
   baseSha: string,
   signal?: AbortSignal,
   budget?: GitHubBudget,
+  sha = "HEAD",
 ): Promise<void> {
   if (repo.kind !== "github" || !repo.url) throw new Error("existing PR delivery requires a GitHub repo");
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") || branch.endsWith("/"))
@@ -1025,13 +1026,13 @@ export async function pushExistingBranch(
   const ref = `refs/heads/${branch}`;
   const remote = await remoteSh(["git", "ls-remote", repo.url, ref], { cwd, signal, budget });
   if (remote.stdout.split("\t")[0] !== baseSha) throw new Error("PR head moved since the run started");
-  const ancestor = await worktreeGit(["git", "merge-base", "--is-ancestor", baseSha, "HEAD"], {
+  const ancestor = await worktreeGit(["git", "merge-base", "--is-ancestor", baseSha, sha], {
     cwd,
     allowFail: true,
     signal,
   });
   if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
-  await remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, repo.url, `HEAD:${ref}`], {
+  await remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, repo.url, `${sha}:${ref}`], {
     cwd,
     timeoutMs: 300_000,
     signal,
@@ -1118,7 +1119,12 @@ export async function findPullRequest(
   return url.startsWith("http") ? url : null;
 }
 
-/** Merge now if possible; if branch protection requires checks, enable auto-merge instead. */
+/**
+ * Merge now if possible; if branch protection requires checks, enable auto-merge instead.
+ * `expectedHead` pins the merge to the commit the factory checked (`--match-head-commit`), `body`
+ * is the squash message the factory reviewed, and `auto: false` never arms auto-merge, which would
+ * let a later push land unchecked.
+ */
 export async function mergePullRequest(
   prUrl: string,
   cwd: string,
@@ -1126,8 +1132,8 @@ export async function mergePullRequest(
   signal?: AbortSignal,
   budget?: GitHubBudget,
   entries: PrivateStrings = privacy.loadPrivateStrings(undefined, [cwd]),
+  opts: { body?: string; title?: string; auto?: boolean } = {},
 ): Promise<"merged" | "auto" | "failed" | "unavailable"> {
-  // Squash with the PR title as the subject, not the first round's commit message.
   const number = prUrl.match(/\/pull\/(\d+)/)?.[1];
   // After a transient failure or timeout the merge may still have landed. Until a state lookup
   // settles that, every attempt reconciles first; a failed lookup retries like any other call.
@@ -1148,12 +1154,18 @@ export async function mergePullRequest(
         const schema = z.object({ title: z.string().min(1), body: z.string(), headRefOid: z.string() });
         const data = schema.parse(JSON.parse((await sh(view, { cwd, signal })).stdout));
         if (!/^[a-f0-9]{40,64}$/.test(sha) || data.headRefOid !== sha) throw new Error("PR head moved");
-        const title = number ? `${data.title} (#${number})` : data.title;
-        privacy.checkPrivateText(`${title}\n${data.body}`, "PR text", entries);
+        const rawTitle = opts.title ?? data.title;
+        if (!rawTitle.trim()) throw new Error("missing merge subject");
+        const title = number ? `${rawTitle} (#${number})` : rawTitle;
+        const body = opts.body ?? data.body;
+        privacy.checkPrivateText(`${title}\n${body}`, "PR text", entries);
         blocked = false;
-        const subject = ["--subject", title, "--body", data.body, "--match-head-commit", sha];
+        const subject =
+          opts.body !== undefined
+            ? ["--match-head-commit", sha, "--subject", title, "--body-file", "-"]
+            : ["--subject", title, "--body", body, "--match-head-commit", sha];
         const cmd = ["gh", "pr", "merge", prUrl, "--squash", ...extra, "--delete-branch", ...subject];
-        return sh(cmd, { cwd, signal }).then(
+        return sh(cmd, { cwd, signal, stdin: body }).then(
           () => "ok" as const,
           async (e) => {
             if (signal?.aborted || !isTransient(e)) throw e;
@@ -1170,12 +1182,17 @@ export async function mergePullRequest(
     });
   const now = await merge([]);
   if (now === "ok" || now === "merged") return "merged";
-  if (blocked) return "failed";
+  if (blocked || opts.auto === false) return now;
   // As on main, fall back to auto-merge; it shares the budget and reconciles an unsure merge first.
   const auto = await merge(["--auto"]);
   if (auto === "merged") return "merged";
   if (auto === "ok") return "auto";
   return now === "unavailable" || auto === "unavailable" ? "unavailable" : "failed";
+}
+
+/** Turn off a PR's auto-merge, so no later push can land without the factory checking it. */
+export async function disableAutoMerge(prUrl: string, cwd: string, signal?: AbortSignal): Promise<void> {
+  await sh(["gh", "pr", "merge", prUrl, "--disable-auto"], { cwd, signal, allowFail: true });
 }
 
 /** Same stable top-level representation used in pipeline and eval prompts. */

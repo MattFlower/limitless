@@ -46,8 +46,11 @@ test("pushes verified descendant only to existing head and refuses moved head", 
   writeFileSync(join(work, "file.txt"), "fixed\n");
   await git(work, "add", ".");
   await git(work, "commit", "-qm", "fix");
-  await pushExistingBranch(repo, work, "dependabot/npm/pkg-2", base);
   const updated = (await git(work, "rev-parse", "HEAD")).stdout.trim();
+  // Publication scans `updated`; a later local HEAD must not change what gets pushed.
+  writeFileSync(join(work, "file.txt"), "unscanned change\n");
+  await git(work, "commit", "-qam", "unscanned");
+  await pushExistingBranch(repo, work, "dependabot/npm/pkg-2", base, undefined, undefined, updated);
   expect((await git(work, "ls-remote", bare, "refs/heads/dependabot/npm/pkg-2")).stdout).toContain(updated);
   expect((await git(work, "ls-remote", bare, "refs/heads/main")).stdout).toBe("");
   await expect(pushExistingBranch(repo, work, "dependabot/npm/pkg-2", base)).rejects.toThrow("moved");
