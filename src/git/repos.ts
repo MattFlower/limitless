@@ -733,15 +733,15 @@ async function attributeInfo(
     }
     return result;
   };
-  // Text means no NUL in the first 8,000 bytes. The explicit empty attribute source applies
-  // even where worktreeGit is unhardened, so the run's own attributes cannot classify content.
+  // Git supplies an initial classification; verify apparent text across the complete blob.
+  // The empty attribute source prevents repository attributes from deciding what is text.
   // The empty tree's id depends on the repository's object format (SHA-1 or SHA-256).
   let emptyTree: Promise<string> | undefined;
   const emptyTreeOf = () =>
     (emptyTree ??= emptyTreeId({ cwd, env, timeoutMs: Math.max(1, deadline - Date.now()) }));
   const matches = new Set<string>();
   const headPointers = new Map<string, string>();
-  const contents = new Map<string, { pointer: string | null; forbidden: boolean }>();
+  const contents = new Map<string, { pointer: string | null; forbidden: boolean; binary: boolean }>();
   const scratch = mkdtempSync(join(tmpdir(), "limitless-classify-"));
   let indexes = 0;
   const scratchGit = (args: string[], stdin?: string, index = join(scratch, "index")) =>
@@ -825,13 +825,14 @@ async function attributeInfo(
         contents.set(oid, {
           pointer: size < 1024 ? lfsPointer(bytes.toString("utf8")) : null,
           forbidden: isForbiddenFormat("", bytes),
+          binary: bytes.includes(0) || bytes.includes(Buffer.from("%PDF-")),
         });
         at = end + size + 2;
       }
       if (at !== result.stdout.length) throw new Error("Unexpected blob batch output");
     }
     for (const { path, oid } of sized) {
-      if (contents.get(oid)?.forbidden || /\.pdf$/i.test(path)) raw.delete(path);
+      if (contents.get(oid)?.forbidden || contents.get(oid)?.binary || /\.pdf$/i.test(path)) raw.delete(path);
     }
     const text = new Set(raw);
     for (const { path, oid } of sized) {

@@ -1381,7 +1381,7 @@ test("built-in diff drivers and binary-only patterns are harmless; text at eithe
     ["*.pdf binary", {}, true],
     ["*.pdf -diff", {}, true],
     ["*.dat binary", { "edge.dat": nulAt(7_999) }, false],
-    ["*.dat binary", { "edge.dat": nulAt(8_000) }, true],
+    ["*.dat binary", { "edge.dat": nulAt(8_000) }, false],
     ["*.bmp binary", { "icon.bmp": Buffer.from([0x89, 0, 1]) }, true],
     ["*.gif binary", { "logo.gif": Buffer.from([0, 1]) }, true],
     ["*.jpg -diff", { "photo.jpg": "now text\n" }, true],
@@ -3042,5 +3042,28 @@ test("PDF and container formats cannot use the text-content exclusion", async ()
   const diff = await diffSince(work, base);
   expect(diff.binaryPaths?.sort()).toEqual(["archive.txt", "ascii.pdf", "disguised.txt", "plain.pdf"]);
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(4);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
+
+test("whole-blob classification catches a valid V7 TAR with its first NUL at 9728", async () => {
+  // V7 headers allow space-terminated octal fields and full-width names without NULs.
+  const header = Buffer.alloc(512, 0x20);
+  header.fill(0x61, 0, 100);
+  header.write("0000644 ", 100);
+  header.write("0000000 ", 108);
+  header.write("0000000 ", 116);
+  header.write("00000000000 ", 124);
+  header.write("00000000000 ", 136);
+  header[156] = 0x30;
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  header.write(`${checksum.toString(8).padStart(6, "0")}  `, 148);
+  const tar = Buffer.concat([...Array.from({ length: 19 }, () => header), Buffer.alloc(1024)]);
+  writeFileSync(join(work, "late.tar"), tar);
+  writeFileSync(join(work, "late.txt"), Buffer.concat([Buffer.alloc(9728, 0x61), Buffer.from([0])]));
+  writeFileSync(join(work, "late-signature.txt"), `${"a".repeat(9728)}%PDF-1.4\n%%EOF\n`);
+  await commitAll(work, "late binary bytes");
+  const diff = await diffSince(work, base);
+  expect(diff.binaryPaths?.sort()).toEqual(["late-signature.txt", "late.tar", "late.txt"]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
 });
