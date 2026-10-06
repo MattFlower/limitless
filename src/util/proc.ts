@@ -129,14 +129,25 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       const killed = killTree("SIGKILL");
       descendantsStopped = (async () => {
         if (!killed || child.pid === undefined) return;
-        for (;;) {
+        const deadline = performance.now() + 10_000;
+        let nextKill = performance.now() + 1_000;
+        while (performance.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 5));
           try {
             process.kill(-child.pid, 0);
           } catch {
             return;
           }
+          if (performance.now() >= nextKill) {
+            killTree("SIGKILL");
+            nextKill = performance.now() + 1_000;
+          }
         }
+        // An unkillable descendant must not hold close (or the run) open indefinitely.
+        killTree("SIGKILL");
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
       })();
     });
     let killTimer: ReturnType<typeof setTimeout> | undefined;

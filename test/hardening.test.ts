@@ -1,5 +1,6 @@
 // Regression tests for defects found by the cross-vendor (Codex) review of the M1 core.
-import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +14,7 @@ import { parseNameStatus, resolveRepo } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { startHttp } from "../src/server/http.ts";
-import { runProcess, sh } from "../src/util/proc.ts";
+import { processScope, runProcess, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { findingEvidence } from "./review-support.ts";
 
@@ -91,6 +92,53 @@ describe("process handling", () => {
     await Bun.sleep(100);
     expect(existsSync(scratch)).toBe(false);
   });
+
+  test("surviving descendants are signalled again and cannot hold invocation cleanup open", async () => {
+    const children = new Map<ChildProcess, Promise<void>>();
+    const kill = process.kill.bind(process);
+    let groupPid: number | undefined;
+    let kills = 0;
+    const killSpy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+      // Simulate an unkillable descendant only in this invocation's own group.
+      if (signal === "SIGKILL" && [...children.keys()].some((child) => child.pid === -pid)) {
+        groupPid = -pid;
+        kills++;
+        return true;
+      }
+      return kill(pid, signal);
+    });
+    const started = performance.now();
+    try {
+      const result = await processScope.run(
+        {
+          signal: new AbortController().signal,
+          killGraceMs: 0,
+          children,
+          scratchDirs: new Set(),
+        },
+        () =>
+          runProcess({
+            // The parent exits normally; sleep keeps the group's stdout/stderr pipes open.
+            cmd: ["/bin/sh", "-c", "sleep 30 & exit 0"],
+            cwd: dir,
+            env: process.env as Record<string, string>,
+          }),
+      );
+      expect(result.exitCode).toBe(0);
+      expect(kills).toBeGreaterThan(1);
+      expect(performance.now() - started).toBeLessThan(15_000);
+      expect(children.size).toBe(0);
+      expect(groupPid).toBeGreaterThan(0);
+      expect(kill(-(groupPid ?? 0), 0)).toBe(true);
+    } finally {
+      killSpy.mockRestore();
+      if (groupPid !== undefined) {
+        try {
+          kill(-groupPid, "SIGKILL");
+        } catch {}
+      }
+    }
+  }, 20_000);
 
   test("sh refuses to return truncated output", async () => {
     const res = await sh(["/bin/sh", "-c", "head -c 70000 /dev/zero | tr '\\0' a"], { cwd: dir });
