@@ -514,7 +514,12 @@ test("tracked text and triage recovery examples use neutral service labels", () 
     .split("\0")
     .filter(Boolean)
     .filter((path) => {
-      const content = readFileSync(path);
+      // The factory stages deletions after checks; keep scanning their indexed bytes until then.
+      const indexed = existsSync(path)
+        ? null
+        : Bun.spawnSync(["git", "show", `:${path}`], { stdout: "pipe" });
+      if (indexed) expect(indexed.exitCode).toBe(0);
+      const content = indexed?.stdout ?? readFileSync(path);
       return !content.includes(0) && forbidden.test(content.toString());
     });
   expect(violations).toEqual([]);

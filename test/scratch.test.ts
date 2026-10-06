@@ -13,8 +13,6 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
@@ -24,8 +22,6 @@ import {
   type ReaderProbeOptions,
   runCodex,
 } from "../src/harness/codex.ts";
-import { readerSeatbeltProfile, runReaderCommand, withReaderCommands } from "../src/harness/reader.ts";
-import { SANDBOX_EXEC } from "../src/harness/sandbox.ts";
 import {
   createScratch,
   privateReadRoots,
@@ -37,9 +33,8 @@ import {
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
-import { type ProcOptions, type ProcResult, runProcess } from "../src/util/proc.ts";
+import type { ProcOptions, ProcResult, runProcess } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
-import { callReaderTool, readerFixture, readerSkip, recordingReaderLauncher } from "./reader-fixture.ts";
 
 const specFor = (cwd: string, scratchDir: string): AgentSpec => ({
   cwd,
@@ -73,176 +68,6 @@ const procResult: ProcResult = {
   truncated: false,
   durationMs: 1,
 };
-
-test("verifiers expose the reader command tool and keep native command networking disabled", async () => {
-  const { spec, cleanup } = readerFixture();
-  let url = "";
-  try {
-    await withReaderCommands(spec, async (reader) => {
-      url = reader.readerCommandUrl ?? "";
-      const codex = buildCodexArgs(reader);
-      expect(codex).toContain("shell_tool");
-      expect(codex).toContain(`mcp_servers={reader={url=${JSON.stringify(url)},tool_timeout_sec=180}}`);
-      expect(codex.find((arg) => arg.startsWith("permissions="))).toContain("network={enabled=false}");
-      const claude = buildClaudeArgs(reader, "id");
-      expect(claude[claude.indexOf("--tools") + 1]).toBe("Read,Grep,Glob");
-      expect(claude).toContain("mcp__reader__command");
-      expect(JSON.parse(claude[claude.indexOf("--mcp-config") + 1] ?? "{}")).toEqual({
-        mcpServers: { reader: { type: "http", url } },
-      });
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { origin: "https://example.invalid" },
-        body: "{}",
-      });
-      expect(response.status).toBe(403);
-      const client = new Client({ name: "test-reader", version: "1" });
-      try {
-        await client.connect(new StreamableHTTPClientTransport(new URL(url)));
-        expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(["command"]);
-      } finally {
-        await client.close();
-      }
-    });
-    await expect(fetch(url)).rejects.toThrow();
-    await expect(
-      withReaderCommands(spec, async (reader) => {
-        url = reader.readerCommandUrl ?? "";
-        throw new Error("failed invocation");
-      }),
-    ).rejects.toThrow("failed invocation");
-    await expect(fetch(url)).rejects.toThrow();
-  } finally {
-    cleanup();
-  }
-});
-
-test("reader network rules cover both ephemeral boundaries and deny fixed service ports", () => {
-  const { spec, cleanup } = readerFixture();
-  try {
-    const profile = readerSeatbeltProfile(spec);
-    const listenAllowed = [
-      ...profile.matchAll(
-        /\(allow network-inbound \(require-all \(local tcp "localhost:\*"\) \(local tcp ([^)]+)\)\)\)/g,
-      ),
-    ].flatMap((match) => [...(match[1] ?? "").matchAll(/\*:(\d+)/g)].map((port) => Number(port[1])));
-    const connectAllowed = [
-      ...profile.matchAll(
-        /\(allow network-outbound \(require-all \(remote tcp "localhost:\*"\) \(remote tcp ([^)]+)\)\)\)/g,
-      ),
-    ].flatMap((match) => [...(match[1] ?? "").matchAll(/\*:(\d+)/g)].map((port) => Number(port[1])));
-    expect(listenAllowed).toHaveLength(16384);
-    expect(listenAllowed[0]).toBe(49152);
-    expect(listenAllowed.at(-1)).toBe(65535);
-    expect(connectAllowed).toHaveLength(16384);
-    expect(connectAllowed[0]).toBe(49152);
-    expect(connectAllowed.at(-1)).toBe(65535);
-    expect(profile).toContain("(deny network*)");
-    expect(profile).not.toContain('tcp "*:*"');
-    expect(() => readerSeatbeltProfile({ ...spec, addDirs: [tmpdir()] })).toThrow("additional directories");
-  } finally {
-    cleanup();
-  }
-});
-
-test.skipIf(process.platform !== "darwin")(
-  "reader tools/call executes commands and reuses a protected invocation profile",
-  async () => {
-    const { spec, loopbackCommand, cleanup } = readerFixture();
-    const launcher = recordingReaderLauncher();
-    try {
-      await withReaderCommands(
-        spec,
-        async (reader) => {
-          const local = await callReaderTool(reader, loopbackCommand);
-          expect(local.isError).toBe(false);
-          expect(local.result.exitCode).toBe(0);
-          expect(local.result.stdout.trim()).toBe("local-server tests passed");
-          const failed = await callReaderTool(reader, "exit 7");
-          expect(failed.isError).toBe(true);
-          expect(failed.result.exitCode).toBe(7);
-          expect(launcher.calls).toHaveLength(2);
-          const first = launcher.calls[0];
-          expect(first?.path).toBe(launcher.calls[1]?.path);
-          expect(first?.profile).toContain(`(deny file-read* (subpath "${dirname(first?.path ?? "")}"))`);
-          expect(first?.opts.env.TMPDIR).toBe(realpathSync(spec.scratchDir ?? ""));
-          expect(existsSync(first?.path ?? "")).toBe(true);
-        },
-        launcher.run,
-      );
-      for (const { path } of launcher.calls) expect(existsSync(dirname(path))).toBe(false);
-      await expect(
-        withReaderCommands(
-          spec,
-          async (reader) => callReaderTool(reader, "exit 0"),
-          async () => procResult,
-        ),
-      ).rejects.toThrow("payload did not start");
-    } finally {
-      cleanup();
-    }
-  },
-);
-
-test.skipIf(process.platform !== "darwin")(
-  "the generated reader profile applies or reaches only the nested Seatbelt denial",
-  async () => {
-    const { spec, cleanup } = readerFixture();
-    try {
-      const profile = join(spec.cwd, "profile.sb");
-      writeFileSync(profile, readerSeatbeltProfile(spec));
-      const result = await runProcess({
-        cmd: [SANDBOX_EXEC, "-f", profile, "/usr/bin/true"],
-        cwd: spec.cwd,
-        env: {},
-        timeoutMs: 5000,
-      });
-      expect(result.timedOut).toBe(false);
-      expect(result.signal).toBeNull();
-      if (result.exitCode !== 0)
-        expect(result.stderr.trim()).toBe("sandbox-exec: sandbox_apply: Operation not permitted");
-    } finally {
-      cleanup();
-    }
-  },
-);
-
-test.skipIf(process.platform !== "darwin")(
-  "reader commands fail closed when the profile cannot start",
-  async () => {
-    const { spec, command, cleanup } = readerFixture();
-    let profilePath = "";
-    try {
-      await expect(
-        runReaderCommand(spec, command, spec.signal, async (opts) => {
-          profilePath = opts.cmd[opts.cmd.indexOf("-f") + 1] ?? "";
-          expect(readFileSync(profilePath, "utf8")).toContain("(deny network*)");
-          return { ...procResult, exitCode: 125, stderr: "sandbox_apply: Operation not permitted" };
-        }),
-      ).rejects.toThrow("payload did not start");
-      expect(existsSync(dirname(profilePath))).toBe(false);
-    } finally {
-      cleanup();
-    }
-  },
-);
-
-test.skipIf(readerSkip !== null)(
-  `reader permits local servers while denying non-loopback sockets and private files${readerSkip ? ` (skipped: ${readerSkip})` : ""}`,
-  async () => {
-    const { spec, command, ipv6, cleanup } = readerFixture();
-    try {
-      const result = await runReaderCommand(spec, command);
-      expect(result.exitCode, result.stderr).toBe(0);
-      expect(result.stdout.trim()).toBe("local-server tests passed");
-      expect(result.stderr).toContain("loopback exchange passed: 127.0.0.1");
-      if (ipv6) expect(result.stderr).toContain("loopback exchange passed: ::1");
-    } finally {
-      cleanup();
-    }
-  },
-  180_000,
-);
 
 // Inside a confined gate the only writable temp roots are the checkout and its scratch, so there is no
 // directory outside an inherited in-checkout TMPDIR to pick; the property is checked in development and at landing.

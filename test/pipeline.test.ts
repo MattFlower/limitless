@@ -7392,6 +7392,156 @@ test("engine persists selected effort through a feedback round without changing 
   expect(f.router.model("alpha/m")?.effort).toBe("low");
 });
 
+for (const evidence of [
+  "matching",
+  "suite",
+  "absent",
+  "unrelated",
+  "different-sha",
+  "prior-round",
+  "resume",
+] as const) {
+  test(`loopback verification uses confined gate evidence: ${evidence}`, async () => {
+    mkdirSync(join(repoDir, "test"));
+    writeFileSync(
+      join(repoDir, "test/loopback.test.ts"),
+      `import { expect, test } from "bun:test";
+test("loopback server", () => {
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("ok") });
+  try { expect(server.port).toBeGreaterThan(0); } finally { server.stop(true); }
+  ${evidence === "suite" ? 'console.error("x".repeat(8000));' : ""}
+});\n`,
+    );
+    const command = evidence === "suite" ? "bun run test" : "bun test test/loopback.test.ts";
+    writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: "bun test" } }));
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      evidence === "absent"
+        ? "[gates]\nchecks = []\n"
+        : evidence === "unrelated"
+          ? `[gates]\nchecks = [{ name = "unrelated", run = "true" }]\n`
+          : `[gates]\nchecks = [{ name = "test", run = "${command}" }]\n`,
+    );
+    await sh(["git", "add", "."], { cwd: repoDir });
+    await sh(["git", "commit", "-qm", "loopback gate fixture"], { cwd: repoDir });
+    let attempts = 0;
+    let initialGateSha = "";
+    let priorGates: RunState["gateEvidence"];
+    const loopbackSpec = {
+      ...spec,
+      acceptance_criteria: [
+        {
+          id: "AC-1",
+          criterion: "loopback-server test passes",
+          how_to_verify: "bun test test/loopback.test.ts",
+        },
+      ],
+    };
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: loopbackSpec };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") {
+        if (evidence === "different-sha") {
+          initialGateSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+          await sh(["git", "commit", "--allow-empty", "-qm", "advance after gates"], { cwd: s.cwd });
+        }
+        return { structured: approve };
+      }
+      if (role === "verify") {
+        attempts++;
+        if (evidence === "prior-round" && attempts === 1) {
+          const runId = f.store.listRuns()[0]?.id;
+          const prior = runId ? f.store.getRunState<RunState>(runId) : null;
+          initialGateSha = prior?.gateEvidence?.sha ?? "";
+          priorGates = prior?.gateEvidence;
+          return {
+            structured: {
+              ...pass,
+              overall: "fail",
+              criteria: pass.criteria.map((c) =>
+                c.id === "H-1"
+                  ? { ...c, status: "unmet", evidence: "wrong output", publicSummary: "wrong output" }
+                  : c,
+              ),
+            },
+          };
+        }
+        return {
+          structured: {
+            ...pass,
+            overall: "fail",
+            criteria: pass.criteria.map((c) =>
+              c.id === "AC-1"
+                ? {
+                    ...c,
+                    status: "blocked",
+                    evidence: "bun test test/loopback.test.ts: EPERM listen 127.0.0.1:0",
+                  }
+                : c,
+            ),
+          },
+        };
+      }
+      return {
+        files: {
+          "farewell.txt": `goodbye\n${evidence === "prior-round" && attempts ? "next commit\n" : ""}`,
+        },
+      };
+    });
+    if (evidence === "resume") f.deps.faults = { "stage:verify:after": { action: "kill", occurrence: 1 } };
+    // Exercise stale evidence retained from an earlier round while the next round has a new SHA.
+    if (evidence === "prior-round")
+      f.deps.faults = { "stage:verify:before": { action: "kill", occurrence: 2 } };
+    const interrupted = deferred<void>();
+    const unsubscribe = f.store.subscribe((message) => {
+      if (message.kind === "stage" && message.stage.status === "cancelled") interrupted.resolve();
+    });
+    const run = await f.createRun({
+      repo: repoDir,
+      prompt: "Add farewell with a passing loopback-server test",
+      profile: "standard",
+    });
+    let terminal: RunStatus;
+    if (evidence === "resume" || evidence === "prior-round") {
+      await interrupted.promise;
+      await f.stop();
+      const state = f.store.getRunState<RunState>(run.id);
+      expect(state).not.toBeNull();
+      if (state && evidence === "prior-round") {
+        expect(priorGates).toBeDefined();
+        state.gateEvidence = priorGates;
+        f.store.setRunState(run.id, state);
+      }
+      f.deps.faults = undefined;
+      terminal = await executeRun(f.deps, run.id, new AbortController().signal);
+    } else terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
+    unsubscribe();
+    const succeeds = ["matching", "suite", "resume"].includes(evidence);
+    expect(terminal).toBe(succeeds ? "succeeded" : "needs_human");
+    const state = f.store.getRunState<RunState>(run.id);
+    const result = state?.lastVerify?.criteria.find((c) => c.id === "AC-1");
+    if (succeeds) {
+      const gate = state?.gateEvidence;
+      expect(result?.status).toBe("met");
+      expect(gate?.sha).toMatch(/^[a-f0-9]{40}$/);
+      expect(result?.evidence).toContain(`verified by gate run ${gate?.stageId} on ${gate?.sha}`);
+      expect(result?.evidence).toContain("check test");
+      expect(f.store.getStage(gate?.stageId ?? -1)?.status).toBe("succeeded");
+      expect(f.store.getArtifact(run.id, "verify-0.json")).toContain(
+        `verified by gate run ${gate?.stageId} on ${gate?.sha}`,
+      );
+      expect(attempts).toBe(1);
+    } else {
+      expect(result?.status).toBe("blocked");
+      expect(result?.gateEvidence).toBeUndefined();
+      expect(f.store.getRun(run.id)?.error).toContain("verification blocked by the environment");
+      if (initialGateSha) expect(state?.verifyResults?.at(-1)?.sha).not.toBe(initialGateSha);
+    }
+  });
+}
+
 for (const scenario of [
   "blocked",
   "passes",
@@ -7425,7 +7575,6 @@ for (const scenario of [
       }
       if (role === "review") return { structured: approve };
       if (role === "verify") {
-        expect(s.loopbackTests).toBe(true);
         verifierModels.push(s.target.modelId);
         const n = verifierModels.length;
         if (path === "no-alternative") f.tracker.blockModel("alpha/m", "unavailable alternative");

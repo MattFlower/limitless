@@ -16,7 +16,6 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
 import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
-import { withReaderCommands } from "./reader.ts";
 import {
   createScratch,
   readConfinement,
@@ -719,16 +718,6 @@ export function buildCodexArgs(spec: AgentSpec): string[] {
     );
     if (spec.mode === "readonly") args.push("-c", 'web_search="disabled"');
   } else args.push("-s", "read-only");
-  if (spec.readerCommandUrl) {
-    args.push(
-      "--disable",
-      "shell_tool",
-      "-c",
-      "orchestrator.mcp.enabled=true",
-      "-c",
-      `mcp_servers={reader={url=${JSON.stringify(spec.readerCommandUrl)},tool_timeout_sec=${Math.ceil(spec.timeoutMs / 1000)}}}`,
-    );
-  }
   for (const dir of spec.addDirs ?? []) args.push("--add-dir", dir);
   if (spec.jsonSchema) {
     const schemaPath = `${spec.logPath}.schema.json`;
@@ -746,8 +735,6 @@ export async function runCodex(
   processRunner = runProcess,
   readerProbe = codexReaderProbe,
 ): Promise<AgentResult> {
-  if (spec.loopbackTests && !spec.readerCommandUrl)
-    return withReaderCommands(spec, (reader) => runCodex(reader, processRunner, readerProbe));
   spec = protectCredentials(spec);
   const t = spec.target;
   const editing = spec.mode === "edit" && !spec.noTools;

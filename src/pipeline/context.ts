@@ -36,6 +36,7 @@ import type { RouteConstraints, RouteDecision, Router } from "../router/router.t
 import { formatTarget, recordEffort } from "../router/targets.ts";
 import { redactCredentialData } from "../util/proc.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
+import type { GateEvidence } from "./gate-evidence.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, redactHoldoutText } from "./prompts.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
@@ -125,6 +126,7 @@ export interface RunState {
   baselineScripts?: Record<string, string>;
   feedback: string | null;
   lastGates?: GateComparison[];
+  gateEvidence?: GateEvidence;
   gateTimeoutReruns?: number;
   lastAudit?: AuditFinding[];
   lastReview?: Review & { modelId: string };
@@ -142,7 +144,7 @@ export interface RunState {
   }[];
   reviewFollowUps?: Review["findings"];
   lastVerify?: (Verify & { modelId: string }) | null;
-  verifyResults?: (Verify & { modelId: string; round: number; attempt?: number })[];
+  verifyResults?: (Verify & { modelId: string; round: number; attempt?: number; sha?: string })[];
   /** Round whose retry is reserved; a restart resumes it, and a recorded attempt 1 ends retrying. */
   environmentRetryRound?: number;
   terminalReason?: string;
@@ -696,7 +698,6 @@ export class RunContext {
           systemAppend: [opts.systemAppend, FACTORY_PREAMBLE].filter(Boolean).join("\n\n"),
           target,
           mode: opts.mode,
-          ...(opts.role === "verify" && opts.mode === "readonly" && !noTools ? { loopbackTests: true } : {}),
           ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
           ...(opts.schema ? { schema: opts.schema } : {}),
           ...(opts.decisionTask ? { decisionTask: opts.decisionTask } : {}),

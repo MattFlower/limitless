@@ -347,7 +347,12 @@ export const VerifySchema = z.object({
   overall: z.enum(["pass", "fail"]),
   notes: z.string(),
 });
-export type Verify = z.input<typeof VerifySchema>;
+export type Verify = Omit<z.input<typeof VerifySchema>, "criteria"> & {
+  criteria: (z.input<typeof VerifySchema>["criteria"][number] & {
+    /** Factory-only substitution; VerifySchema strips any model-supplied provenance. */
+    gateEvidence?: { stageId: number; sha: string; check: string; command: string; blockedEvidence: string };
+  })[];
+};
 export type HoldoutRequirement = NonNullable<Verify["criteria"][number]["requirement"]>;
 
 const flatText = (s: string) => s.replace(/[*`]/g, "").replace(/\s+/g, " ").toLowerCase();
