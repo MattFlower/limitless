@@ -336,6 +336,7 @@ export class LandQueue {
     let rerun = entry.ciRerun ? ciRunsSchema.parse(JSON.parse(entry.ciRerun)) : null;
     for (;;) {
       signal.throwIfAborted();
+      const snapshot = this.store.githubPrData(entry.prUrl);
       const seen = await this.observe(entry.prUrl, signal, sha);
       if (seen?.state === "MERGED") return "merged";
       if (seen?.head && seen.head !== sha) throw new LandBlocked("head moved after approval");
@@ -348,7 +349,7 @@ export class LandQueue {
           )
         ) {
           if (this.now() >= deadline) throw new LandBlocked("CI did not finish");
-          await this.ciWake(entry, signal);
+          await this.ciWake(entry, signal, snapshot);
           continue;
         }
         if (attempts.some((run) => run?.conclusion !== "success"))
@@ -356,7 +357,7 @@ export class LandQueue {
       }
       if (rerun && seen?.ci !== "SUCCESS") {
         if (this.now() >= deadline) throw new LandBlocked("CI did not finish");
-        await this.ciWake(entry, signal);
+        await this.ciWake(entry, signal, snapshot);
         continue;
       }
       if (seen?.head === sha && seen.ci && !UNSETTLED_CI.has(seen.ci)) {
@@ -379,18 +380,18 @@ export class LandQueue {
               signal,
             );
           this.log(`[land] ${entry.id}: transient CI failure; re-running`);
-          await this.ciWake(entry, signal);
+          await this.ciWake(entry, signal, snapshot);
           continue;
         }
         throw new LandBlocked(`CI failed: ${seen.failing.join(", ") || "unknown check"}`);
       }
       if (this.now() >= deadline) throw new LandBlocked("CI did not finish");
-      await this.ciWake(entry, signal);
+      await this.ciWake(entry, signal, snapshot);
     }
   }
 
   /** Resolves on the next observation for this PR, the fallback tick, or an abort. */
-  private ciWake(entry: LandEntry, signal: AbortSignal): Promise<void> {
+  private ciWake(entry: LandEntry, signal: AbortSignal, snapshot: string | null): Promise<void> {
     const set = this.deps.clock?.set ?? ((fn, ms) => setTimeout(fn, ms));
     const clear = this.deps.clock?.clear ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
     return new Promise((resolve) => {
@@ -408,7 +409,7 @@ export class LandQueue {
         signal.removeEventListener("abort", done);
         resolve();
       }
-      if (signal.aborted) done();
+      if (signal.aborted || this.store.githubPrData(entry.prUrl) !== snapshot) done();
       else signal.addEventListener("abort", done, { once: true });
     });
   }

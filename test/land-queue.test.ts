@@ -1038,3 +1038,38 @@ test("a second process cannot reclaim a heartbeating land, but can reclaim its e
   await q.stop();
   expect(store.releaseLandClaims("second-process")).toBe(1);
 });
+
+test("a head observation received during a CI read blocks without a timer", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  ci = () => null;
+  const moved = "b".repeat(40);
+  let reads = 0;
+  const q = queue({
+    polling: false,
+    client: async () => {
+      if (++reads === 1) observe(1, moved, "PENDING");
+      return {
+        url: url(1),
+        state: "OPEN",
+        mergedAt: null,
+        mergedBy: null,
+        headRefOid: reads === 1 ? head : moved,
+        ci: "PENDING",
+        failing: [],
+      };
+    },
+  });
+  const before = clock.now();
+  const entry = q.request({ target: pr.run.id });
+  const deadline = Date.now() + 5_000;
+  while (store.getLandEntry(entry.id)?.state !== "blocked") {
+    if (Date.now() > deadline) throw new Error("CI read lost the head observation");
+    await settleIdle();
+  }
+  expect(clock.now()).toBe(before);
+  expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
+  expect(ghCalls("pr merge")).toEqual([]);
+});
