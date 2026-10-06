@@ -55,6 +55,18 @@ let work: string;
 let base: string;
 const original = 'test("ok", () => {});\n';
 const edited = 'test.skip("ok", () => {});\n';
+const mediaBytes = JSON.parse(
+  readFileSync(new URL("./fixtures/media/files.json", import.meta.url), "utf8"),
+) as Record<string, string>;
+const mediaRegressions = JSON.parse(
+  readFileSync(new URL("./fixtures/media/regressions.json", import.meta.url), "utf8"),
+) as Record<string, string>;
+const mediaFixture = (extension: string, variant = 0) => {
+  const file = `${variant}.${extension.toLowerCase().replace("jpeg", "jpg")}`;
+  const encoded = mediaBytes[file] ?? mediaRegressions[file];
+  if (!encoded) throw new Error(`Missing media fixture: ${file}`);
+  return Buffer.from(encoded, "base64");
+};
 const git = (cwd: string, ...args: string[]) => sh(["git", ...args], { cwd });
 const factory = (...args: string[]) => worktreeGit(["git", ...args], { cwd: work });
 
@@ -182,11 +194,7 @@ test("committed nested repositories and changed gitlink commits block, but reque
       file: "nested repo",
       detail: expect.stringContaining("nested repo: nested repository contents are absent from the diff"),
     });
-    expect(
-      auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["submodules"] }).some(
-        (f) => f.rule === "gitlink",
-      ),
-    ).toBe(false);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["submodules"] })).toEqual([]);
   };
   await assertGitlink(base);
   writeFileSync(join(nested, "hidden.test.ts"), `${edited}// next\n`);
@@ -1366,10 +1374,10 @@ test("built-in diff drivers and binary-only patterns are harmless; text at eithe
     ["*.md diff=markdown", { "README.md": "# changed\n" }, false],
     ["*.png binary", { "icon.png": Buffer.from([0x89, 0, 1]) }, false],
     ["*.ico -diff", { "icon.ico": Buffer.from([0x89, 0, 1]) }, false],
-    ["*.pdf binary", {}, false],
-    ["*.pdf -diff", {}, false],
+    ["*.pdf binary", {}, true],
+    ["*.pdf -diff", {}, true],
     ["*.dat binary", { "edge.dat": nulAt(7_999) }, false],
-    ["*.dat binary", { "edge.dat": nulAt(8_000) }, true],
+    ["*.dat binary", { "edge.dat": nulAt(8_000) }, false],
     ["*.bmp binary", { "icon.bmp": Buffer.from([0x89, 0, 1]) }, true],
     ["*.gif binary", { "logo.gif": Buffer.from([0, 1]) }, true],
     ["*.jpg -diff", { "photo.jpg": "now text\n" }, true],
@@ -1428,8 +1436,10 @@ test("pointer candidates are read in one batch per tree, and multi-byte text can
   const findings = await worktreeGitScope.run(false, async () =>
     auditDiff(await diffSince(work, revision, shim.env), { taskClass: null, protectedPaths: [] }),
   );
-  // Still recognized as a strict pointer, the edited base pointer keeps its exemption.
-  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+  // A base pointer cannot exempt the opaque bytes that replace it.
+  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([
+    expect.objectContaining({ file: "zz-asset.png", severity: "block" }),
+  ]);
   expect(shim.calls().filter((call) => ` ${call} `.includes(" cat-file -p "))).toEqual([]);
   expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(2);
 });
@@ -1566,7 +1576,7 @@ test.each([
     await commitAll(work, "base blob");
   }
   const revision = await headSha(work);
-  writeFileSync(join(work, path), Buffer.from([0, 2]));
+  writeFileSync(join(work, path), path.endsWith(".png") ? mediaFixture("png") : Buffer.from([0, 2]));
   await commitAll(work, "binary blob");
   const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
   expect(findings.some((f) => f.rule === "binary-content" && f.severity === "block")).toBe(blocks);
@@ -1602,9 +1612,14 @@ test("a rename from text to a binary image keeps its text origin", async () => {
 test.each([
   ["src/**/*.impl.ts -diff", "block"],
   ["*.png -diff", "warn"],
-  ["*.zip binary", "warn"],
-  ["*.woff2 -diff", "warn"],
-  ["*.mp4 -diff", "warn"],
+  ["*.zip binary", "block"],
+  ["*.woff2 -diff", "block"],
+  ["*.mp4 -diff", "block"],
+  ["*.pdf binary", "block"],
+  ["*.bmp -diff", "block"],
+  ["*.psd -diff", "block"],
+  ["*.eot -diff", "block"],
+  ["*.glb -diff", "block"],
   ["*.unknown -diff", "block"],
   ["* -diff", "block"],
 ])("unmatched hiding rule %s produces a %s", async (line, severity) => {
@@ -1674,7 +1689,9 @@ test.each([
   const findings = auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] });
   expect(attributeBlocksOf(findings).length > 0).toBe(blocks);
   if (["valid", "crlf", "legacy"].includes(kind))
-    expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+    expect(findings.filter((f) => f.rule === "binary-content")).toEqual([
+      expect.objectContaining({ severity: "block", file: `pointer.${extension}` }),
+    ]);
   else
     expect(findings.filter((f) => f.rule === "binary-content")).toEqual([
       expect.objectContaining({
@@ -1785,35 +1802,100 @@ test.each(["nul.test.mts", "nul.cts", "nul.jsx", "lib/helper.dat", "script", "st
   },
 );
 
+test("new and edited opaque binaries require the binary allowance", async () => {
+  const paths = [
+    "wasm",
+    "WASM",
+    "so",
+    "dll",
+    "dylib",
+    "exe",
+    "class",
+    "pyc",
+    "zip",
+    "jar",
+    "war",
+    "apk",
+    "whl",
+    "tar",
+    "gz",
+    "bz2",
+    "xz",
+    "7z",
+    "rar",
+    "zst",
+    "docx",
+    "xlsx",
+    "pptx",
+    "odt",
+    "docm",
+    "sqlite",
+    "db",
+    "ai",
+    "unknown",
+    "pdf",
+    "bmp",
+    "psd",
+    "eot",
+    "glb",
+    "mp4",
+    "avif",
+    "tif",
+    "tiff",
+    "heic",
+    "m4a",
+    "mkv",
+    "mov",
+    "avi",
+    "webm",
+    "aac",
+    "fbx",
+    "blend",
+  ].map((ext, i) => `opaque-${i}.${ext}`);
+  paths.push("bun.lockb");
+  for (const path of paths) writeFileSync(join(work, path), Buffer.from([0, 1]));
+  await commitAll(work, "opaque binary additions");
+  const binaryBase = await headSha(work);
+  for (const path of paths) writeFileSync(join(work, path), Buffer.from([0, 2]));
+  await commitAll(work, "opaque binary edits");
+  for (const revision of [base, binaryBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] }).filter(
+      (f) => f.rule === "binary-content",
+    );
+    expect(findings).toHaveLength(paths.length);
+    for (const path of paths)
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file: path,
+          severity: "block",
+          detail: expect.stringContaining(`${path}:`),
+        }),
+      );
+    expect(findings.every((f) => f.detail.includes("Allow: binary"))).toBe(true);
+    expect(
+      auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] }).filter(
+        (f) => f.rule === "binary-content",
+      ),
+    ).toEqual([]);
+  }
+});
+
 const assetExtensions = [
   "png",
-  "pdf",
-  "woff2",
-  "jar",
-  "war",
-  "apk",
-  "whl",
-  "docx",
-  "xlsx",
-  "pptx",
-  "odt",
-  "psd",
-  "ai",
-  "heic",
-  "wasm",
-  "so",
-  "dll",
-  "dylib",
-  "exe",
-  "class",
-  "pyc",
-  "sqlite",
-  "db",
-  "glb",
-  "fbx",
-  "blend",
+  "PNG",
+  "jpg",
+  "jpeg",
+  "gif",
+  "ico",
+  "webp",
+  "literal.webp",
+  "distance-wide.webp",
+  "distance-narrow.webp",
+  "lossy.webp",
+  "extended.webp",
 ];
-test("known binary extensions exempt assets and unmatched attribute rules", async () => {
+test("validated media exempt new and edited assets and eligible unmatched attribute rules", async () => {
   writeFileSync(join(work, ".gitattributes"), assetExtensions.map((ext) => `*.${ext} binary\n`).join(""));
   await commitAll(work, "unmatched asset rules");
   let diff = await diffSince(work, base);
@@ -1821,13 +1903,368 @@ test("known binary extensions exempt assets and unmatched attribute rules", asyn
   expect(findings.filter((f) => f.severity === "block")).toEqual([]);
   expect(findings).toHaveLength(assetExtensions.length);
   const revision = await headSha(work);
-  for (const ext of assetExtensions) writeFileSync(join(work, `asset.${ext}`), Buffer.from([0, 1, 2]));
+  for (const [i, ext] of assetExtensions.entries())
+    writeFileSync(join(work, `asset-${i}.${ext}`), mediaFixture(ext));
+  const incidental = JSON.parse(
+    readFileSync(new URL("./fixtures/media/incidental-mz.json", import.meta.url), "utf8"),
+  ) as Record<string, string>;
+  writeFileSync(join(work, "noise.webp"), Buffer.from(incidental.webp ?? "", "base64"));
   await commitAll(work, "ordinary assets");
-  diff = await diffSince(work, revision);
-  findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
-  expect(diff.attributeErrors).toBeUndefined();
-  expect(findings).toEqual([]);
+  const binaryBase = await headSha(work);
+  for (const [i, ext] of assetExtensions.entries())
+    writeFileSync(join(work, `asset-${i}.${ext}`), mediaFixture(ext, 1));
+  await commitAll(work, "edited assets");
+  for (const start of [revision, binaryBase]) {
+    diff = await diffSince(work, start);
+    findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(diff.attributeErrors).toBeUndefined();
+    expect(findings).toEqual([]);
+  }
 }, 30_000);
+
+test("complete PDFs, ZIPs, JARs, UTF-8 TARs and WASM still require an allowance on additions and edits", async () => {
+  const paths = ["pdf", "zip", "jar", "tar", "wasm"].map((ext) => `opaque.${ext}`);
+  for (const path of paths) writeFileSync(join(work, path), mediaFixture(path.split(".")[1] ?? ""));
+  await commitAll(work, "complete opaque additions");
+  const binaryBase = await headSha(work);
+  for (const path of paths) writeFileSync(join(work, path), mediaFixture(path.split(".")[1] ?? "", 1));
+  await commitAll(work, "complete opaque edits");
+  for (const revision of [base, binaryBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(findings).toHaveLength(paths.length);
+    for (const file of paths)
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file,
+          rule: "binary-content",
+          severity: "block",
+          detail: expect.stringContaining(`${file}:`),
+        }),
+      );
+    expect(findings.every((f) => f.detail.includes("Allow: binary"))).toBe(true);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+  }
+});
+
+test("eligible media must have complete structures, matching signatures and no appended or concatenated payload", async () => {
+  const files: { path: string; original: Buffer; changed: Buffer }[] = [];
+  for (const [index, extension] of assetExtensions.entries()) {
+    const original = mediaFixture(extension);
+    const variants = [
+      Buffer.concat([original, Buffer.from("hidden trailing bytes")]),
+      Buffer.concat([original, mediaFixture("zip")]),
+      original.subarray(0, Math.floor(original.length / 2)),
+      mediaFixture(extension.toLowerCase() === "png" ? "wav" : "png"),
+      Buffer.from([0, 1, 2]),
+    ];
+    for (const [i, changed] of variants.entries())
+      files.push({ path: `tampered-${index}-${i}.${extension}`, original, changed });
+  }
+  for (const { path, original } of files) writeFileSync(join(work, path), original);
+  await commitAll(work, "media base");
+  const mediaBase = await headSha(work);
+  for (const { path, changed } of files) writeFileSync(join(work, path), changed);
+  // The binary allowance must not suppress an independent attribute finding.
+  writeFileSync(join(work, ".gitattributes"), "*.mp4 binary\n");
+  await commitAll(work, "malformed media");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    const binary = findings.filter((f) => f.rule === "binary-content");
+    expect(binary).toHaveLength(files.length);
+    for (const { path } of files)
+      expect(binary).toContainEqual(expect.objectContaining({ file: path, severity: "block" }));
+    const allowed = auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] });
+    expect(allowed).toEqual(findings.filter((f) => f.rule !== "binary-content"));
+    expect(allowed).toContainEqual(expect.objectContaining({ rule: "gitattributes", severity: "block" }));
+  }
+});
+
+test("embedded image, font and audio payloads remain opaque even inside declared metadata", async () => {
+  const png = mediaFixture("png"),
+    gif = mediaFixture("gif"),
+    jpeg = mediaFixture("jpg"),
+    wav = mediaFixture("wav"),
+    woff = mediaFixture("woff"),
+    webp = mediaFixture("webp");
+  const payload = Buffer.from("hidden opaque bytes");
+  const pngChunk = Buffer.alloc(payload.length + 12);
+  pngChunk.writeUInt32BE(payload.length, 0);
+  pngChunk.write("tEXt", 4);
+  payload.copy(pngChunk, 8);
+  pngChunk.writeUInt32BE(Bun.hash.crc32(pngChunk.subarray(4, -4)), pngChunk.length - 4);
+  const jpegComment = Buffer.alloc(payload.length + 4);
+  jpegComment.writeUInt16BE(0xfffe, 0);
+  jpegComment.writeUInt16BE(payload.length + 2, 2);
+  payload.copy(jpegComment, 4);
+  const riffChunk = Buffer.alloc(8 + payload.length + (payload.length & 1));
+  riffChunk.write("JUNK");
+  riffChunk.writeUInt32LE(payload.length, 4);
+  payload.copy(riffChunk, 8);
+  const riffPayload = (b: Buffer) => {
+    const result = Buffer.concat([b, riffChunk]);
+    result.writeUInt32LE(result.length - 8, 4);
+    return result;
+  };
+  const privateWoff = Buffer.concat([woff, payload]);
+  privateWoff.writeUInt32BE(privateWoff.length, 8);
+  privateWoff.writeUInt32BE(woff.length, 36);
+  privateWoff.writeUInt32BE(payload.length, 40);
+  let codecWebp = Buffer.concat([webp.subarray(0, 20 + webp.readUInt32LE(16)), payload]);
+  codecWebp.writeUInt32LE(codecWebp.length - 20, 16);
+  if (codecWebp.readUInt32LE(16) & 1) {
+    // RIFF padding is outside the codec's declared byte range.
+    codecWebp = Buffer.concat([codecWebp, Buffer.from([0])]);
+  }
+  codecWebp.writeUInt32LE(codecWebp.length - 8, 4);
+  // Keep the font's directory, checksums and declared cmap length consistent while
+  // inserting bytes the character mapping never references.
+  const ttf = mediaFixture("ttf"),
+    count = ttf.readUInt16BE(4);
+  const directory = Buffer.from(ttf.subarray(0, 12 + count * 16)),
+    tables: Buffer[] = [];
+  let offset = directory.length,
+    headOffset = 0;
+  const checksum = (bytes: Buffer) => {
+    let sum = 0;
+    for (let i = 0; i < bytes.length; i += 4) sum = (sum + bytes.readUInt32BE(i)) >>> 0;
+    return sum;
+  };
+  for (let i = 0; i < count; i++) {
+    const at = 12 + i * 16,
+      tag = ttf.toString("ascii", at, at + 4);
+    let data = Buffer.from(
+      ttf.subarray(ttf.readUInt32BE(at + 8), ttf.readUInt32BE(at + 8) + ttf.readUInt32BE(at + 12)),
+    );
+    if (tag === "cmap") {
+      data = Buffer.concat([data, Buffer.from("hidden opaque bytes!")]);
+      const subtable = data.readUInt32BE(8);
+      data.writeUInt16BE(data.readUInt16BE(subtable + 2) + 20, subtable + 2);
+    }
+    if (tag === "head") {
+      headOffset = offset;
+      data.writeUInt32BE(0, 8);
+    }
+    const padded = Buffer.alloc((data.length + 3) & ~3);
+    data.copy(padded);
+    directory.writeUInt32BE(checksum(padded), at + 4);
+    directory.writeUInt32BE(offset, at + 8);
+    directory.writeUInt32BE(data.length, at + 12);
+    tables.push(padded);
+    offset += padded.length;
+  }
+  const tablePayload = Buffer.concat([directory, ...tables]);
+  tablePayload.writeUInt32BE((0xb1b0afba - checksum(tablePayload)) >>> 0, headOffset + 8);
+  const ancillaryMp3 = mediaFixture("mp3");
+  payload.copy(ancillaryMp3, ancillaryMp3.length - payload.length - 8);
+  const files: Record<string, Buffer> = {
+    "embedded.png": Buffer.concat([png.subarray(0, -12), pngChunk, png.subarray(-12)]),
+    "embedded.gif": Buffer.concat([
+      gif.subarray(0, -1),
+      Buffer.from([0x21, 0xfe, payload.length]),
+      payload,
+      Buffer.from([0, 0x3b]),
+    ]),
+    "embedded.jpg": Buffer.concat([jpeg.subarray(0, 2), jpegComment, jpeg.subarray(2)]),
+    "embedded.webp": riffPayload(webp),
+    "embedded-codec.webp": codecWebp,
+    "embedded-entropy.jpg": Buffer.concat([jpeg.subarray(0, -2), payload, jpeg.subarray(-2)]),
+    "embedded.wav": riffPayload(wav),
+    "embedded.woff": privateWoff,
+    "embedded-table.ttf": tablePayload,
+    "embedded.mp3": Buffer.concat([Buffer.from("ID3\x04\0\0\0\0\0\x13"), payload, mediaFixture("mp3")]),
+    "embedded-ancillary.mp3": ancillaryMp3,
+  };
+  for (const [path, bytes] of Object.entries(files)) writeFileSync(join(work, path), bytes);
+  await commitAll(work, "embedded payloads");
+  const diff = await diffSince(work, base);
+  const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+  expect(findings).toHaveLength(Object.keys(files).length);
+  for (const file of Object.keys(files))
+    expect(findings).toContainEqual(
+      expect.objectContaining({ file, rule: "binary-content", severity: "block" }),
+    );
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
+
+test("GIF LZW pixel bytes are outside foreign-format recognition on additions and edits", async () => {
+  const payload = mediaFixture("zip");
+  const encode = (pixels: Buffer, frameWidth: number) => {
+    const screen = Buffer.alloc(7);
+    screen.writeUInt16LE(frameWidth, 0);
+    screen.writeUInt16LE(1, 2);
+    screen[4] = 0xf7; // A 256-color global palette permits every byte as a pixel index.
+    const frames: Buffer[] = [];
+    for (let offset = 0; offset < pixels.length; offset += frameWidth) {
+      const frame = pixels.subarray(offset, offset + frameWidth),
+        image = Buffer.alloc(10);
+      image[0] = 0x2c;
+      image.writeUInt16LE(frame.length, 5);
+      image.writeUInt16LE(1, 7);
+      // Clearing before each literal keeps every code nine bits wide and re-encodes
+      // the archive so its signatures do not appear in the raw GIF stream.
+      const codes = [...[...frame].flatMap((byte) => [256, byte]), 257];
+      const packed = Buffer.alloc(Math.ceil((codes.length * 9) / 8));
+      let bit = 0;
+      for (const code of codes)
+        for (let i = 0; i < 9; i++, bit++)
+          packed[bit >> 3] = (packed[bit >> 3] ?? 0) | (((code >> i) & 1) << (bit & 7));
+      const blocks: Buffer[] = [];
+      for (let at = 0; at < packed.length; at += 255) {
+        const block = packed.subarray(at, at + 255);
+        blocks.push(Buffer.from([block.length]), block);
+      }
+      frames.push(Buffer.concat([image, Buffer.from([8]), ...blocks, Buffer.from([0])]));
+    }
+    return Buffer.concat([Buffer.from("GIF89a"), screen, Buffer.alloc(768), ...frames, Buffer.from([0x3b])]);
+  };
+  const files = [payload.length, 1, 3].map((frameWidth) => ({
+    file: `encoded-payload-${frameWidth}.gif`,
+    frameWidth,
+  }));
+  for (const { file, frameWidth } of files)
+    writeFileSync(join(work, file), encode(Buffer.alloc(payload.length, 65), frameWidth));
+  await commitAll(work, "ordinary encoded pixels");
+  const mediaBase = await headSha(work);
+  expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toEqual([]);
+  for (const { file, frameWidth } of files) writeFileSync(join(work, file), encode(payload, frameWidth));
+  await commitAll(work, "ZIP encoded as pixels");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
+  }
+});
+
+test("supported WebP pixels pass while opaque transforms, FLAC and WOFF require an allowance", async () => {
+  const files = [
+    { file: "predictor.webp", original: "literal.webp", changed: "predictor.webp" },
+    { file: "literal-payload.webp", original: "literal.webp", changed: "literal-payload.webp" },
+    { file: "indexed.webp", original: "webp", changed: "indexed.webp" },
+    { file: "distance-one-payload.webp", original: "literal.webp", changed: "distance-one-payload.webp" },
+    { file: "distance-two-payload.webp", original: "literal.webp", changed: "distance-two-payload.webp" },
+    { file: "fixed.flac", original: "flac", changed: "predicted-0.flac" },
+    { file: "lpc.flac", original: "flac", changed: "predicted-8.flac" },
+    { file: "frames.flac", original: "flac", changed: "frames.flac" },
+    { file: "big-endian.flac", original: "flac", changed: "big-endian.flac" },
+    { file: "stereo-left.flac", original: "stereo.flac", changed: "stereo-left.flac" },
+    { file: "stereo-right-be.flac", original: "stereo.flac", changed: "stereo-right-be.flac" },
+    { file: "stereo-mid-side.flac", original: "stereo.flac", changed: "stereo-mid-side.flac" },
+    { file: "split.woff", original: "clean.woff", changed: "split.woff" },
+  ];
+  for (const { file, original } of files) writeFileSync(join(work, file), mediaFixture(original));
+  await commitAll(work, "clean decoded media");
+  const mediaBase = await headSha(work);
+  expect((await diffSince(work, base)).binaryPaths?.sort()).toEqual(
+    files
+      .filter(({ file }) => !file.endsWith(".webp"))
+      .map(({ file }) => file)
+      .sort(),
+  );
+  for (const { file, changed } of files) writeFileSync(join(work, file), mediaFixture(changed));
+  await commitAll(work, "payloads concealed in media encoding");
+  // Predictor transforms still fail structural validation independently of pixel content.
+  const opaque = files.filter(({ file }) => !file.endsWith(".webp") || file === "predictor.webp");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(findings).toHaveLength(opaque.length);
+    for (const { file } of opaque)
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file,
+          rule: "binary-content",
+          severity: "block",
+          detail: expect.stringContaining(`${file}:`),
+        }),
+      );
+    expect(findings.every((finding) => finding.detail.includes("Allow: binary"))).toBe(true);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+  }
+});
+
+test("JPEG thumbnails and ICO pixels may contain signatures while WAV requires an allowance", async () => {
+  const files: { path: string; original: Buffer; changed: Buffer }[] = [];
+  const magics = [
+    "feedface", // Mach-O, both byte orders and word sizes, including fat binaries.
+    "cefaedfe",
+    "feedfacf",
+    "cffaedfe",
+    "cafebabe", // Also the Java class signature.
+    "bebafeca",
+    "cafebabf",
+    "bfbafeca",
+    "6465780a30333500", // DEX and compact DEX.
+    "6364657830303100",
+    "4d5a", // DOS/NE/LX executables need not have a PE signature.
+  ];
+  for (const magic of magics) {
+    const original = mediaFixture("wav"),
+      changed = Buffer.from(original);
+    Buffer.from(magic, "hex").copy(changed, changed.indexOf("data") + 8);
+    files.push({ path: `executable-${magic}.wav`, original, changed });
+  }
+  const jpeg = mediaFixture("jpg"),
+    thumbnail = Buffer.alloc(24);
+  thumbnail.writeUInt16BE(0xffe0, 0);
+  thumbnail.writeUInt16BE(22, 2);
+  thumbnail.write("JFIF\0", 4);
+  thumbnail[9] = 1;
+  thumbnail[10] = 1;
+  thumbnail.writeUInt16BE(1, 12);
+  thumbnail.writeUInt16BE(1, 14);
+  thumbnail[16] = 2;
+  thumbnail[17] = 1;
+  const originalJpeg = Buffer.concat([jpeg.subarray(0, 2), thumbnail, jpeg.subarray(2)]);
+  Buffer.from("cffaedfe", "hex").copy(thumbnail, 18);
+  files.push({
+    path: "executable-thumbnail.jpg",
+    original: originalJpeg,
+    changed: Buffer.concat([jpeg.subarray(0, 2), thumbnail, jpeg.subarray(2)]),
+  });
+  const ico = Buffer.alloc(86);
+  ico.writeUInt16LE(1, 2);
+  ico.writeUInt16LE(1, 4);
+  ico[6] = ico[7] = 2;
+  ico.writeUInt16LE(1, 10);
+  ico.writeUInt16LE(24, 12);
+  ico.writeUInt32LE(64, 14);
+  ico.writeUInt32LE(22, 18);
+  ico.writeUInt32LE(40, 22);
+  ico.writeInt32LE(2, 26);
+  ico.writeInt32LE(4, 30);
+  ico.writeUInt16LE(1, 34);
+  ico.writeUInt16LE(24, 36);
+  const changedIco = Buffer.from(ico);
+  Buffer.from("cafebabe", "hex").copy(changedIco, 62);
+  files.push({ path: "executable-pixels.ico", original: ico, changed: changedIco });
+  for (const { path, original } of files) writeFileSync(join(work, path), original);
+  await commitAll(work, "ordinary raw media regions");
+  const mediaBase = await headSha(work);
+  expect((await diffSince(work, base)).binaryPaths?.sort()).toEqual(
+    files
+      .filter(({ path }) => path.endsWith(".wav"))
+      .map(({ path }) => path)
+      .sort(),
+  );
+  for (const { path, changed } of files) writeFileSync(join(work, path), changed);
+  await commitAll(work, "embedded executable signatures");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(findings).toHaveLength(files.filter(({ path }) => path.endsWith(".wav")).length);
+    for (const { path } of files.filter(({ path }) => path.endsWith(".wav")))
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file: path,
+          rule: "binary-content",
+          severity: "block",
+          detail: expect.stringContaining("Allow: binary"),
+        }),
+      );
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+  }
+});
 
 test("16,000 added files use stdin pathspecs without uncertainty findings", async () => {
   const files = Array.from({ length: 16_000 }, (_, i) => `${i}-${"long-name-".repeat(12)}.dat`);
@@ -1859,7 +2296,8 @@ test("LFS inspection batches short and repeated candidate blobs per tree", async
   const shim = gitShim();
   const diff = await diffSince(work, revision, shim.env);
   expect(diff.binaryErrors).toBeUndefined();
-  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
+  expect(diff.binaryPaths).toHaveLength(128);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
   // Short blobs also need classification: each tree still uses only one batch.
   expect(shim.calls().filter((call) => ` ${call} `.includes(" cat-file -p "))).toEqual([]);
   expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(2);
@@ -1892,7 +2330,7 @@ test("existing hiding warnings group text paths per rule and omit binary PNGs", 
   for (const directory of ["gen", "other"]) mkdirSync(join(work, directory));
   for (let i = 0; i < 312; i++) writeFileSync(join(work, "gen", `${i}.dat`), "generated text\n");
   for (let i = 0; i < 2; i++) writeFileSync(join(work, "other", `${i}.dat`), "other generated text\n");
-  writeFileSync(join(work, "photo.png"), Buffer.from([0, 1]));
+  writeFileSync(join(work, "photo.png"), mediaFixture("png"));
   await commitAll(work, "generated text and binary asset");
   const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
   expect(findings).toHaveLength(2);
@@ -1911,8 +2349,35 @@ test("existing hiding warnings group text paths per rule and omit binary PNGs", 
   expect(findings.some((f) => f.file === "photo.png")).toBe(false);
 }, 30_000);
 
+test("a new strict LFS pointer under an existing rule is not warned about as text", async () => {
+  writeFileSync(join(work, ".gitattributes"), "*.dat filter=lfs diff=lfs merge=lfs -text\n");
+  await commitAll(work, "base LFS rule");
+  const revision = await headSha(work);
+  writeFileSync(
+    join(work, "asset.dat"),
+    `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 68\n`,
+  );
+  // Commit the pointer bytes without invoking an installed LFS clean filter.
+  await factory(
+    "-c",
+    "filter.lfs.process=",
+    "-c",
+    "filter.lfs.clean=cat",
+    "-c",
+    "filter.lfs.required=false",
+    "add",
+    "-A",
+  );
+  await factory("commit", "-qm", "new LFS pointer");
+  const diff = await diffSince(work, revision);
+  expect(diff.headTextPaths).toEqual([]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([
+    expect.objectContaining({ rule: "binary-content", severity: "block" }),
+  ]);
+});
+
 test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size", "extra line"])(
-  "binary edits of %s base LFS pointers require a strict pointer exemption",
+  "binary edits of %s base LFS pointers are judged on the new content",
   async (kind) => {
     let pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 2\n`;
     if (kind === "missing oid") pointer = pointer.replace(/oid.*\n/, "");
@@ -1963,7 +2428,9 @@ test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size
     const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
     expect(findings.filter((f) => f.rule === "binary-content")).toEqual(
       kind === "valid"
-        ? []
+        ? ["tracked.dat", "tracked.png", "tracked.ts"].map((file) =>
+            expect.objectContaining({ severity: "block", file }),
+          )
         : [
             expect.objectContaining({
               severity: "block",
@@ -2494,3 +2961,99 @@ test.each(["complete", "truncated", "failed", "timeout", "timeout-exit-0", "canc
     }
   },
 );
+
+test("fonts and audio require a binary allowance even with complete media structures", async () => {
+  const extensions = ["woff", "woff2", "ttf", "otf", "mp3", "ogg", "wav", "flac"];
+  for (const ext of extensions) writeFileSync(join(work, `asset.${ext}`), mediaFixture(ext));
+  await commitAll(work, "font and audio fixtures");
+  const diff = await diffSince(work, base);
+  expect(diff.binaryPaths?.sort()).toEqual(extensions.map((ext) => `asset.${ext}`).sort());
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(extensions.length);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
+
+test("LFS binary allowance follows the available new payload", async () => {
+  const pointer = (bytes: Buffer, local: boolean) => {
+    const oid = createHash("sha256").update(bytes).digest("hex");
+    if (local) {
+      const folder = join(seed, ".git", "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4));
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(join(folder, oid), bytes);
+    }
+    return `version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize ${bytes.length}\n`;
+  };
+  writeFileSync(join(work, "replacement.png"), pointer(mediaFixture("png"), false));
+  await commitAll(work, "base pointer");
+  const revision = await headSha(work);
+  let previous = revision;
+  for (const variant of [0, 1]) {
+    writeFileSync(join(work, "missing.png"), pointer(Buffer.from(`unavailable ${variant}`), false));
+    writeFileSync(join(work, "archive.png"), pointer(mediaFixture("zip", variant), true));
+    writeFileSync(join(work, "image.png"), pointer(mediaFixture("png", variant), true));
+    writeFileSync(join(work, "replacement.png"), mediaFixture("zip", variant));
+    await commitAll(work, "new LFS content");
+    const diff = await diffSince(work, variant === 0 ? revision : previous);
+    expect(diff.binaryErrors).toBeUndefined();
+    expect(diff.binaryPaths?.sort()).toEqual(["archive.png", "missing.png", "replacement.png"]);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+    previous = await headSha(work);
+  }
+});
+
+test("executable image additions and mode-only changes need a binary allowance", async () => {
+  await factory("config", "core.filemode", "true");
+  for (const file of ["upgrade.png", "downgrade.png", "unchanged.png"])
+    writeFileSync(join(work, file), mediaFixture("png"));
+  chmodSync(join(work, "downgrade.png"), 0o755);
+  await commitAll(work, "image modes base");
+  const revision = await headSha(work);
+  writeFileSync(join(work, "added.png"), mediaFixture("png"), { mode: 0o755 });
+  chmodSync(join(work, "upgrade.png"), 0o755);
+  chmodSync(join(work, "downgrade.png"), 0o644);
+  writeFileSync(join(work, "unchanged.png"), mediaFixture("png", 1));
+  await commitAll(work, "image mode changes");
+  const diff = await diffSince(work, revision);
+  expect(diff.binaryPaths?.sort()).toEqual(["added.png", "downgrade.png", "upgrade.png"]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
+
+test("PDF and container formats cannot use the text-content exclusion", async () => {
+  const files = {
+    "ascii.pdf": "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "disguised.txt": " \n%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "plain.pdf": "ordinary text\n",
+    "archive.txt": "Rar!\x1a\x07\x01opaque ASCII container",
+    "ordinary.txt": "ordinary text\n",
+  };
+  for (const [file, bytes] of Object.entries(files)) writeFileSync(join(work, file), bytes);
+  await commitAll(work, "text-like forbidden formats");
+  const diff = await diffSince(work, base);
+  expect(diff.binaryPaths?.sort()).toEqual(["archive.txt", "ascii.pdf", "disguised.txt", "plain.pdf"]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(4);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
+
+test("whole-blob classification catches a valid V7 TAR with its first NUL at 9728", async () => {
+  // V7 headers allow space-terminated octal fields and full-width names without NULs.
+  const header = Buffer.alloc(512, 0x20);
+  header.fill(0x61, 0, 100);
+  header.write("0000644 ", 100);
+  header.write("0000000 ", 108);
+  header.write("0000000 ", 116);
+  header.write("00000000000 ", 124);
+  header.write("00000000000 ", 136);
+  header[156] = 0x30;
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  header.write(`${checksum.toString(8).padStart(6, "0")}  `, 148);
+  const tar = Buffer.concat([...Array.from({ length: 19 }, () => header), Buffer.alloc(1024)]);
+  writeFileSync(join(work, "late.tar"), tar);
+  writeFileSync(join(work, "late.txt"), Buffer.concat([Buffer.alloc(9728, 0x61), Buffer.from([0])]));
+  writeFileSync(join(work, "late-signature.txt"), `${"a".repeat(9728)}%PDF-1.4\n%%EOF\n`);
+  await commitAll(work, "late binary bytes");
+  const diff = await diffSince(work, base);
+  expect(diff.binaryPaths?.sort()).toEqual(["late-signature.txt", "late.tar", "late.txt"]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});

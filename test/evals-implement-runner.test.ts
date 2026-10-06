@@ -638,6 +638,8 @@ for (const strategy of ["retry", "effort", "switch"] as const)
       if (!stronger) throw new Error("missing model");
       stronger.tier = 2;
       f.factory.policy.implement.small = ["candidate-a@low", "candidate-b"];
+      // This recovery fixture intentionally preserves an executable-mode change.
+      f.item.prompt += "\nAllow: binary";
       f.item.hidden.command +=
         "; result=$?; echo SECRET-OUTPUT; echo SECRET-ERR >&2; touch grading-artifact; git add -A; git -c user.name=grader -c user.email=grader@example.invalid -c core.hooksPath=/dev/null -c commit.gpgsign=false commit --allow-empty -qm SECRET-HIDDEN-COMMIT; exit $result";
       f.save();
