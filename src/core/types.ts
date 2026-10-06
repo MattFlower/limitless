@@ -410,7 +410,8 @@ export type StreamMessage =
   | { kind: "provider"; provider: ProviderStatus }
   | { kind: "alert"; alert: QuotaAlert | null; provider: string; window: string; created: boolean }
   | { kind: "question"; question: Question }
-  | { kind: "feed"; item: FeedItem };
+  | { kind: "feed"; item: FeedItem }
+  | { kind: "github_pr"; url: string };
 
 export type RoutingCell = Complexity | "default";
 export interface OperatorRoutingCell {
@@ -433,11 +434,39 @@ export interface RoutingChange {
 
 export type FeedKind =
   | "run.gate_timeout_retry"
+  | LandFeedKind
   | `run.${"pr_opened" | "question" | "needs_human" | "failed" | "succeeded" | "cancelled" | "released" | "merged" | "resolved"}`
   | "eval.finished"
   | "daemon.started"
   | `review.${"round_started" | "round_delivered" | "approved"}`
   | GitHubFeedKind;
+export type LandFeedKind = "land.queued" | "land.landed" | "land.blocked";
+/** Where an approved pull request is in the land queue; the active states are resumed on restart. */
+export type LandState = "queued" | "checking" | "waiting_ci" | "merging" | "landed" | "blocked" | "cancelled";
+export const ACTIVE_LAND_STATES: readonly LandState[] = ["queued", "checking", "waiting_ci", "merging"];
+
+export interface LandEntry {
+  id: number;
+  runId: string;
+  repo: string;
+  prUrl: string;
+  baseBranch: string;
+  headBranch: string;
+  /** The approved head: only it, or a base merge of it, may land. */
+  approvedSha: string;
+  state: LandState;
+  /** The commit the queue pushed (the merge commit, or the approved one when it needed no merge). */
+  pushedSha: string | null;
+  /** Failed workflow attempts for the single durable CI rerun. */
+  ciRerun: string | null;
+  /** Where this land's check output was written. */
+  logPath: string | null;
+  attempts: number;
+  reason: string | null;
+  createdAt: number;
+  updatedAt: number;
+  finishedAt: number | null;
+}
 export type GitHubFeedKind =
   | `ci.${"main_red" | "needs_fix"}`
   | `pr.${"ci_passed" | "ci_failed" | "conflicting" | "behind" | "review" | "comment" | "merged" | "closed"}`

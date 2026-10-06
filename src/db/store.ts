@@ -19,8 +19,11 @@ import type {
   FeedItem,
   FeedPage,
   GitHubAccessProblem,
+  GitHubFeedKind,
   Invocation,
   InvocationStatus,
+  LandEntry,
+  LandFeedKind,
   OperatorRoutingCell,
   Question,
   QuotaAlert,
@@ -41,7 +44,12 @@ import type {
   StreamMessage,
   TrackedPr,
 } from "../core/types.ts";
-import { DEFAULT_EVAL_CONCURRENCY, MAX_RUN_IDS, TERMINAL_STATUSES } from "../core/types.ts";
+import {
+  ACTIVE_LAND_STATES,
+  DEFAULT_EVAL_CONCURRENCY,
+  MAX_RUN_IDS,
+  TERMINAL_STATUSES,
+} from "../core/types.ts";
 import type { RunState } from "../pipeline/context.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
@@ -65,7 +73,20 @@ function json(v: unknown): string | null {
 
 const FEED_SELECT =
   "SELECT id, ts, kind, run_id AS runId, eval_id AS evalId, repo, title, summary, data FROM feed";
-type GitHubFeedInput = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
+type FeedInsert = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
+type GitHubFeedInput = FeedInsert & { kind: GitHubFeedKind };
+const LAND_SELECT = `SELECT id, run_id AS runId, repo, pr_url AS prUrl, base_branch AS baseBranch,
+  head_branch AS headBranch, approved_sha AS approvedSha, state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
+  log_path AS logPath, attempts, reason, created_at AS createdAt, updated_at AS updatedAt,
+  finished_at AS finishedAt FROM land_entries`;
+const LAND_PATCH_COLUMNS: Record<string, string> = {
+  state: "state",
+  pushedSha: "pushed_sha",
+  ciRerun: "ci_rerun",
+  logPath: "log_path",
+  attempts: "attempts",
+  reason: "reason",
+};
 const toFeedItem = (r: Row) => ({ ...r, data: parse(r.data, {}) }) as FeedItem;
 /** The highest id retention has removed, so a cursor before it is told items were pruned. */
 const FEED_PRUNED = "feed_pruned_through";
@@ -2070,6 +2091,159 @@ export class Store {
       .run(key, JSON.stringify(value));
   }
 
+  // ---- land queue ----------------------------------------------------------
+
+  createLandEntry(entry: {
+    runId: string;
+    repo: string;
+    prUrl: string;
+    baseBranch: string;
+    headBranch: string;
+    approvedSha: string;
+  }): LandEntry {
+    const now = Date.now();
+    let id: number;
+    try {
+      const res = this.db
+        .query(
+          `INSERT INTO land_entries (run_id, repo, pr_url, base_branch, head_branch, approved_sha, state, attempts, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
+        )
+        .run(
+          entry.runId,
+          entry.repo,
+          entry.prUrl,
+          entry.baseBranch,
+          entry.headBranch,
+          entry.approvedSha,
+          now,
+          now,
+        );
+      id = Number(res.lastInsertRowid);
+    } catch (error) {
+      // The partial unique index holds at most one in-flight entry per PR.
+      if (String(error).includes("land_entries.pr_url")) throw new Error("PR is already in the land queue");
+      throw error;
+    }
+    return this.getLandEntry(id) as LandEntry;
+  }
+
+  getLandEntry(id: number): LandEntry | null {
+    return (this.db.query(`${LAND_SELECT} WHERE id = ?`).get(id) as LandEntry | null) ?? null;
+  }
+
+  listLandEntries(opts: { repo?: string; active?: boolean; limit?: number } = {}): LandEntry[] {
+    const where: string[] = [];
+    const params: string[] = [];
+    if (opts.repo) {
+      where.push("repo = ?");
+      params.push(opts.repo);
+    }
+    if (opts.active) {
+      where.push(`state IN (${ACTIVE_LAND_STATES.map(() => "?").join(", ")})`);
+      params.push(...ACTIVE_LAND_STATES);
+    }
+    params.push(String(opts.limit ?? 100));
+    const sql = `${LAND_SELECT}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY id LIMIT ?`;
+    return this.db.query(sql).all(...params) as LandEntry[];
+  }
+
+  /**
+   * The oldest entry this repository may start now, claimed by moving it into `checking`. A queued
+   * entry is free; one already in flight is only taken when its claim has gone quiet for `staleMs`,
+   * so a live heartbeat keeps its owner while a crashed process expires. The
+   * claim is a compare-and-swap on `attempts`, so two queues racing for one row see one winner, and
+   * `land_entries_one_running` refuses a second entry while one runs for the repository.
+   */
+  claimLandEntry(repo: string, staleMs: number, owner: string, now = Date.now()): LandEntry | null {
+    try {
+      return (
+        this.db.transaction(() => {
+          const row = this.db
+            .query(
+              `${LAND_SELECT} WHERE repo = ? AND state IN ('queued', 'checking', 'waiting_ci', 'merging')
+                 AND (state = 'queued' OR claim_heartbeat_at IS NULL OR claim_heartbeat_at <= ?) ORDER BY id LIMIT 1`,
+            )
+            .get(repo, now - staleMs) as Row | null;
+          if (!row) return null;
+          const claimed = this.db
+            .query(
+              `UPDATE land_entries SET state = 'checking', attempts = attempts + 1, updated_at = ?, claim_owner = ?, claim_heartbeat_at = ?
+               WHERE id = ? AND attempts = ? AND state IN ('queued', 'checking', 'waiting_ci', 'merging')`,
+            )
+            .run(now, owner, now, row.id as number, row.attempts as number).changes;
+          return claimed ? this.getLandEntry(row.id as number) : null;
+        })() ?? null
+      );
+    } catch (error) {
+      // The partial unique index names its column, not the index, when it refuses the update.
+      if (String(error).includes("land_entries_one_running") || String(error).includes("land_entries.repo"))
+        return null;
+      throw error;
+    }
+  }
+
+  /** Renew only the claim this queue owns; loss of ownership aborts its worker. */
+  heartbeatLandClaim(id: number, owner: string, now = Date.now()): boolean {
+    return (
+      this.db
+        .query(`UPDATE land_entries SET claim_heartbeat_at = ? WHERE id = ? AND claim_owner = ?
+      AND state IN ('checking', 'waiting_ci', 'merging')`)
+        .run(now, id, owner).changes === 1
+    );
+  }
+
+  /** Only this queue's stopped workers may be freed, never another process's live claims. */
+  releaseLandClaims(owner: string): number {
+    return this.db
+      .query(`UPDATE land_entries SET claim_owner = NULL, claim_heartbeat_at = NULL
+        WHERE claim_owner = ? AND state IN ('checking', 'waiting_ci', 'merging')`)
+      .run(owner).changes;
+  }
+
+  updateLandEntry(
+    id: number,
+    patch: Partial<Pick<LandEntry, "state" | "pushedSha" | "ciRerun" | "logPath" | "attempts" | "reason">>,
+  ): LandEntry {
+    const { sets, values } = buildUpdate(patch, LAND_PATCH_COLUMNS);
+    sets.push("updated_at = ?");
+    values.push(Date.now());
+    if (patch.state && !ACTIVE_LAND_STATES.includes(patch.state)) {
+      sets.push("finished_at = ?");
+      values.push(Date.now());
+    }
+    this.db.query(`UPDATE land_entries SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
+    return this.getLandEntry(id) as LandEntry;
+  }
+
+  /** Feed items for the queue: the PR URL, the SHA and, when it failed, the reason. */
+  landFeed(kind: LandFeedKind, entry: LandEntry, summary: string, data: Record<string, unknown> = {}): void {
+    this.db.transaction(() =>
+      this.addFeedItems([
+        {
+          kind,
+          runId: entry.runId,
+          repo: entry.repo,
+          summary,
+          data: { url: entry.prUrl, sha: entry.approvedSha, ...data },
+          key: String(entry.id),
+        },
+      ]),
+    )();
+    this.publishFeed();
+  }
+
+  /** The newest run that opened `pr`: a pull request URL, or its number (`7`). */
+  runForPr(pr: string): Run | null {
+    const number = /^\d+$/.test(pr);
+    const row = this.db
+      .query(
+        `${RUN_SELECT} WHERE runs.pr_url ${number ? "LIKE ?" : "= ?"} COLLATE NOCASE ORDER BY runs.created_at DESC LIMIT 1`,
+      )
+      .get(number ? `%/pull/${pr}` : pr) as Row | null;
+    return row ? toRun(row) : null;
+  }
+
   // ---- GitHub poller -------------------------------------------------------
 
   ciFailures(prUrl: string, sha: string): CiFailure[] {
@@ -2194,15 +2368,19 @@ export class Store {
         const state = pr.data && (JSON.parse(pr.data) as { state?: string }).state;
         if (state) this.observeGithubPrState(pr.url, state, now);
       }
-      const insert =
-        this.db.query(`INSERT INTO feed (ts, kind, run_id, repo, title, summary, data, dedupe_key)
-        VALUES (?, ?, ?, ?, substr(?, 1, 200), substr(?, 1, 500), ?, ?) ON CONFLICT (dedupe_key) DO NOTHING`);
-      for (const { kind, runId, repo, summary, data, key } of items) {
-        const title = `${kind}: ${String(data.url ?? repo)}`;
-        insert.run(Date.now(), kind, runId, repo, title, summary, JSON.stringify(data), `${kind}:${key}`);
-      }
+      this.addFeedItems(items);
     })();
     this.publishFeed();
+    if (pr) this.publish({ kind: "github_pr", url: pr.url });
+  }
+
+  private addFeedItems(items: FeedInsert[]): void {
+    const insert = this.db.query(`INSERT INTO feed (ts, kind, run_id, repo, title, summary, data, dedupe_key)
+      VALUES (?, ?, ?, ?, substr(?, 1, 200), substr(?, 1, 500), ?, ?) ON CONFLICT (dedupe_key) DO NOTHING`);
+    for (const { kind, runId, repo, summary, data, key } of items) {
+      const title = `${kind}: ${String(data.url ?? repo)}`;
+      insert.run(Date.now(), kind, runId, repo, title, summary, JSON.stringify(data), `${kind}:${key}`);
+    }
   }
 
   /** Open (once per episode) or clear a repository's access problem; `head` is the last known PR head. */
