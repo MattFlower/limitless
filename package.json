@@ -8,7 +8,7 @@
     "limitless": "./src/cli/main.ts"
   },
   "scripts": {
-    "postinstall": "PLAYWRIGHT_BROWSERS_PATH=0 playwright install chromium-headless-shell",
+    "postinstall": "if [ -x node_modules/.bin/playwright ]; then PLAYWRIGHT_BROWSERS_PATH=0 playwright install chromium-headless-shell; fi",
     "dev": "bun --watch src/cli/main.ts serve",
     "serve": "bun src/cli/main.ts serve",
     "build:ui": "bun scripts/build-ui.ts",
