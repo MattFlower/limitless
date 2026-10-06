@@ -541,16 +541,21 @@ export async function diffSince(
   const gitlinks: string[] = [];
   const blobs = new Map<string, string>();
   const origins = new Map(files.map((file) => [file.path, file.from]));
-  const changes: { path: string; from?: string }[] = [];
+  const changes: { path: string; from?: string; modeRequiresAllowance: boolean }[] = [];
   const entries = raw.stdout.split("\0");
   for (let i = 0; i + 1 < entries.length; i += 2) {
+    const [oldMode, newMode, oldOid, newOid] = entries[i]?.split(" ") ?? [];
     if (entries[i]?.split(" ")[1] === "160000") gitlinks.push(entries[i + 1] ?? "");
     const status = entries[i]?.split(" ").at(-1) ?? "";
     const path = entries[i + 1] ?? "";
     if (status.startsWith("D")) continue;
     blobs.set(path, entries[i]?.split(" ")[3] ?? "");
     const from = origins.get(path);
-    changes.push({ path, ...(from ? { from } : status.startsWith("A") ? {} : { from: path }) });
+    changes.push({
+      path,
+      ...(from ? { from } : status.startsWith("A") ? {} : { from: path }),
+      modeRequiresAllowance: newMode === "100755" || (oldMode !== `:${newMode}` && oldOid === newOid),
+    });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
   const inspection = await attributeInfo(cwd, env, range, revision, changes);
@@ -705,7 +710,7 @@ async function attributeInfo(
   env: Record<string, string> | undefined,
   range: string,
   base: string,
-  changes: { path: string; from?: string }[],
+  changes: { path: string; from?: string; modeRequiresAllowance: boolean }[],
 ): Promise<Partial<DiffInfo>> {
   // Attribute files must be inspected even if binary or renamed into place.
   const pathspecs = [":(icase).gitattributes", ":(icase)**/.gitattributes"];
@@ -918,10 +923,11 @@ async function attributeInfo(
       .map((change) => change.path);
     const binaryPaths = changes
       .filter(
-        ({ path, from }) =>
-          matches.has(path) &&
-          (!afterText.raw.has(path) || headPointers.has(path)) &&
-          (beforeText.text.has(from ?? "") || !inert.has(path)),
+        ({ path, from, modeRequiresAllowance }) =>
+          modeRequiresAllowance ||
+          (matches.has(path) &&
+            (!afterText.raw.has(path) || headPointers.has(path)) &&
+            (beforeText.text.has(from ?? "") || !inert.has(path))),
       )
       .map((c) => c.path);
     const attributeMatches: Record<string, string[]> = {};
