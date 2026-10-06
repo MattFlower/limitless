@@ -69,12 +69,12 @@ test("twelve discoverable tools, create defaults and overrides, get and queued c
     "prompt",
   ]);
   expect(tools.find((t) => t.name === "limitless_review")?.inputSchema).toMatchObject({
-    required: ["run", "verdict", "reviewedSha", "findings"],
+    required: ["run", "verdict", "reviewedSha"],
     additionalProperties: false,
     properties: {
       verdict: { enum: ["changes", "approve"] },
       reviewedSha: { type: "string", pattern: "^[a-fA-F0-9]{40}$" },
-      findings: { type: "array", items: { required: ["severity", "title", "detail"] } },
+      findings: { type: "array", default: [], items: { required: ["severity", "title", "detail"] } },
     },
   });
   expect(tools.find((t) => t.name === "limitless_land")?.inputSchema).toMatchObject({

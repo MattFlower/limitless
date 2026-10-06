@@ -322,5 +322,5 @@ The five agent verbs are submit (`limitless_create_run`), inbox/ack (`limitless_
 `limitless_feed_ack`, only after handling), answer (`limitless_answer_question`), review
 (`limitless_review` followed by authorized `limitless_land`), and status (`limitless_status`).
 Review takes `run`, `verdict` (`changes` or `approve`), `reviewedSha` (full SHA), and `findings`
-(nonempty for changes, empty for approve). Land takes `run` and optional `sha`; status takes
+(nonempty for changes, omitted or empty for approve). Land takes `run` and optional `sha`; status takes
 `run` and explains the saved observations and next action. An absent PR observation is unknown.

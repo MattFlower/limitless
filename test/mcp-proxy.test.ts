@@ -211,6 +211,9 @@ test("review and land forward validated payloads and return API results", async 
         }),
       ),
     ).toEqual({ approval: { sha, stale: false } });
+    expect(
+      resultValue<unknown>(await call("review", { run: "r/1", verdict: "approve", reviewedSha: sha })),
+    ).toEqual({ approval: { sha, stale: false } });
     response = { round: { id: "round1", status: "queued" } };
     expect(
       resultValue<unknown>(
@@ -229,6 +232,11 @@ test("review and land forward validated payloads and return API results", async 
       {
         path: "/api/runs/r%2F1/review",
         method: "POST",
+        body: { verdict: "approve", reviewedSha: sha, findings: [] },
+      },
+      {
+        path: "/api/runs/r%2F1/review",
+        method: "POST",
         body: { verdict: "changes", reviewedSha: sha, findings: [finding] },
       },
       { path: "/api/land", method: "POST", body: { target: "r/1" } },
@@ -239,7 +247,7 @@ test("review and land forward validated payloads and return API results", async 
       { verdict: "changes", findings: [] },
       { verdict: "other", findings: [] },
       { verdict: "approve", findings: [], reviewedSha: "short" },
-      { verdict: "approve" },
+      { verdict: "changes" },
       { verdict: "changes", findings: [{ ...finding, line: 0 }] },
       { verdict: "changes", findings: [{ ...finding, title: " " }] },
       { verdict: "changes", findings: [{ ...finding, severity: "critical" }] },
@@ -248,7 +256,7 @@ test("review and land forward validated payloads and return API results", async 
       expect((await call("review", { run: "r/1", reviewedSha: sha, ...input })).isError).toBe(true);
     expect((await call("land", { run: " " })).isError).toBe(true);
     expect((await call("land", { run: "r/1", sha: 12 })).isError).toBe(true);
-    expect(requests).toHaveLength(4);
+    expect(requests).toHaveLength(5);
   } finally {
     await proxy.close();
   }

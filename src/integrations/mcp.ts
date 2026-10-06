@@ -246,7 +246,7 @@ export function createMcpServer(backend: McpBackend): Server {
       run: nonblank,
       verdict: ReviewVerdictSchema.shape.verdict,
       reviewedSha: ReviewVerdictSchema.shape.reviewedSha,
-      findings: ReviewVerdictSchema.shape.findings.removeDefault(),
+      findings: ReviewVerdictSchema.shape.findings,
     })
     .strict()
     .superRefine(({ run: _run, ...input }, ctx) => {
@@ -258,7 +258,7 @@ export function createMcpServer(backend: McpBackend): Server {
   const tools = [
     tool(
       "limitless_review",
-      "Review a run's current PR head. Supply run, verdict (changes or approve), reviewedSha (full commit SHA), and findings (severity, title, detail; optional file and line). Changes requires findings; approve requires an empty array. Returns the approval or new review round. Inspect status after an uncertain response before retrying.",
+      "Review a run's current PR head. Supply run, verdict (changes or approve), reviewedSha (full commit SHA), and findings (severity, title, detail; optional file and line). Changes requires findings; approve accepts omitted findings or an empty array. Returns the approval or new review round. Inspect status after an uncertain response before retrying.",
       reviewSchema,
       async ({ run, ...input }) => backend.review(run, ReviewVerdictSchema.parse(input)),
     ),

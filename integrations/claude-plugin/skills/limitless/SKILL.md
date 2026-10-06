@@ -35,7 +35,7 @@ Use five verbs to manage work:
 - **Review**: inspect the current PR diff and full head SHA, then call `limitless_review` with
   `run`, `verdict` (`changes` or `approve`), `reviewedSha`, and `findings`. Findings have severity
   (`blocker`, `major`, `minor`, `nit`), title, detail, optional file and line. Changes requires at
-  least one finding; approve requires `[]`. The result is an approval or a new review round.
+  least one finding; approve accepts omitted findings or `[]`. The result is an approval or a new review round.
   When authorized, `limitless_land` with `run` and optional `sha` queues landing; it does not
   confirm a merge. Do not retry mutations after an uncertain response without inspecting state.
 - **Status**: `limitless_status` with `run` explains saved PR/review/land state and the next action.
