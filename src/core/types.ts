@@ -457,6 +457,8 @@ export type CiFailure = {
   image: string | null;
   rerunMarker: string | null;
   rerunJob?: { id: number; runId: number; attempt: number; name: string } | null;
+  rerunRetryAt?: number | null;
+  rerunRetryUsed?: number;
   outcome:
     | "failed"
     | "rerun_requested"

@@ -4,7 +4,13 @@ import { sh } from "../util/proc.ts";
 import { classifyCi } from "./ci-classifier.ts";
 import { type GitHubPrClient, type GitHubPrState, reconcileMergedRuns } from "./github-notifier.ts";
 
-export type GitHubResponse = { status: number; headers: Headers; body: unknown };
+export type GitHubResponse = {
+  status: number;
+  headers: Headers;
+  body: unknown;
+  /** Explicitly refused rerun POST; the poller's cooldown is also its retry deadline. */
+  rerunRetryAt?: number;
+};
 /** One authenticated API call: POST when `body` is given, else GET (logs return text). */
 export type GitHubClient = (path: string, body?: unknown, signal?: AbortSignal) => Promise<GitHubResponse>;
 
@@ -199,9 +205,10 @@ function accessProblem(res: GitHubResponse, subject: string) {
 function limitedUntil(res: GitHubResponse, now: number): number | null {
   const retry = res.headers.get("retry-after"); // delta-seconds or an HTTP date
   const until = retry && (/^\d+$/.test(retry) ? now + Number(retry) * 1000 : Date.parse(retry));
-  if (until && until > now) return until;
+  if (until && Number.isFinite(until) && until > now && until <= 8.64e15) return until;
   const reset = Number(res.headers.get("x-ratelimit-reset")) * 1000;
-  if (res.headers.get("x-ratelimit-remaining") === "0") return reset > now ? reset : 0;
+  if (res.headers.get("x-ratelimit-remaining") === "0")
+    return Number.isFinite(reset) && reset > now && reset <= 8.64e15 ? reset : 0;
   const text = JSON.stringify(res.status === 200 ? errorsOf(res) : res.body);
   return res.status === 429 || retry !== null || /rate limit|RATE_LIMITED/i.test(text) ? 0 : null;
 }
@@ -272,8 +279,13 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
       blocks.delete(repo);
       return res;
     }
-    // A definitive rerun refusal must end its claim even when access is now blocked.
-    return until === null && path.endsWith("/rerun") ? res : null;
+    // Preserve explicit refusals for the classifier while every subsequent call honors the cooldown.
+    if (path.endsWith("/rerun")) {
+      if (until !== null && [403, 422, 429].includes(res.status))
+        return { ...res, rerunRetryAt: cooldownUntil };
+      return res;
+    }
+    return null;
   };
 
   /** Saves the observation; returns the mergeability nudge's response (null: not sent) or undefined. */
@@ -318,12 +330,12 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     if (ciPending || (ciChanged && snap.ci === "SUCCESS" && Object.values(mainEpisode).some((e) => e.red))) {
       const ciCall = async (repo: string, path: string, body?: unknown) => {
         const res = await call(repo, path, body);
-        const access = res && accessProblem(res, repo);
+        const access = res && res.rerunRetryAt === undefined && accessProblem(res, repo);
         if (access) store.setGithubAccess(repo, access, head);
         return res;
       };
       const ready = () => !stopped && now() >= cooldownUntil && now() >= (blocks.get(pr.repo)?.until ?? 0);
-      if (await classifyCi(store, pr, snap, ciCall, opts.ciReruns !== false, ready, current)) {
+      if (await classifyCi(store, pr, snap, ciCall, opts.ciReruns !== false, ready, current, now)) {
         ciPending = false;
         if (current()) save(unknown ? (prev?.nudged ?? null) : null, []);
       } else return null;

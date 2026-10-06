@@ -2079,7 +2079,7 @@ export class Store {
         [string, string]
       >(`SELECT pr_url AS prUrl, sha, signature,
       check_name AS "check", error_line AS line, runner_image AS image, outcome, rerun_marker AS rerunMarker,
-      rerun_job AS rerunJob
+      rerun_job AS rerunJob, rerun_retry_at AS rerunRetryAt, rerun_retry_used AS rerunRetryUsed
       FROM ci_failures WHERE pr_url = ? AND sha = ?`)
       .all(prUrl, sha)
       .map((f) => ({ ...f, rerunJob: f.rerunJob ? JSON.parse(f.rerunJob) : null }));
@@ -2106,6 +2106,23 @@ export class Store {
     this.db
       .query("UPDATE ci_failures SET outcome = ? WHERE pr_url = ? AND sha = ? AND signature = ?")
       .run(outcome, f.prUrl, f.sha, f.signature);
+  }
+
+  deferCiRerun(f: CiFailure, until: number): void {
+    this.db
+      .query("UPDATE ci_failures SET rerun_retry_at = ? WHERE pr_url = ? AND sha = ? AND signature = ?")
+      .run(until, f.prUrl, f.sha, f.signature);
+  }
+
+  /** Consume the retry before sending: losing its response cannot allow another POST. */
+  claimCiRerunRetry(f: CiFailure, now: number): boolean {
+    return (
+      this.db
+        .query(`UPDATE ci_failures SET rerun_retry_used = 1, rerun_retry_at = NULL
+        WHERE pr_url = ? AND sha = ? AND signature = ? AND outcome = 'rerun_requested'
+        AND rerun_retry_used = 0 AND rerun_retry_at <= ?`)
+        .run(f.prUrl, f.sha, f.signature, now).changes === 1
+    );
   }
 
   /** Unmerged PRs factory runs opened; PRs runs only verified, or abandoned over 7 days while open, are excluded. */

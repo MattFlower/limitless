@@ -40,11 +40,14 @@ type Check = z.infer<typeof checkSchema>;
 type Call = (repo: string, path: string, body?: unknown) => Promise<GitHubResponse | null>;
 const bounded = (text: string) => text.trim().slice(0, 500);
 const logLines = (log: string) =>
-  log.split(/\r?\n/).map((line) => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ""));
+  Bun.stripANSI(log)
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ""));
 const securityFailure = (log: string) =>
   logLines(log).some(
     (line) =>
-      /^\s*(?:\(fail\)|FAIL\b|[×✗✕❌]|not ok\b|##\[error\]|error:)/i.test(line) && security.test(line),
+      /^\s*(?:\(fail\)|FAIL(?:ED)?\b|[×✗✕❌●]|--- FAIL:|not ok\b|##\[error\]|error:)/i.test(line) &&
+      security.test(line),
   );
 // Bun, Playwright, and the Actions runner's timeout diagnostics, matched as whole lines.
 const timeoutDiagnostic =
@@ -75,6 +78,7 @@ export async function classifyCi(
   reruns: boolean,
   ready: () => boolean,
   current: () => boolean,
+  now: () => number = Date.now,
 ): Promise<boolean> {
   const root = `repos/${pr.repo}`;
   const read = async (path: string) => {
@@ -189,6 +193,24 @@ export async function classifyCi(
       },
     ]);
   };
+  const reject = (f: CiFailure, excerpt = f.line) => {
+    store.finishCiFailure(f, "rerun_rejected");
+    emit("ci.needs_fix", f, `${pr.url}:${f.sha}:${f.signature}`, false, excerpt);
+  };
+  const requestRerun = async (f: CiFailure, job: number, excerpt: string) => {
+    const res = await call(pr.repo, `${root}/actions/jobs/${job}/rerun`, {});
+    if (res?.rerunRetryAt !== undefined) {
+      if (reruns && !f.rerunRetryUsed) store.deferCiRerun(f, res.rerunRetryAt);
+      else reject(f, excerpt);
+      return;
+    }
+    if (res && res.status >= 400 && res.status < 500 && res.status !== 408) {
+      reject(f, excerpt);
+      return;
+    }
+    if (res?.status !== 201) throw new Error("CI job rerun was not confirmed");
+    store.finishCiFailure(f, "rerunning");
+  };
   const branch = store.getRepoBySlug(pr.repo)?.defaultBranch ?? "main";
   const mainSha = z
     .object({ sha: z.string().regex(/^[a-f0-9]{40}$/i) })
@@ -224,8 +246,10 @@ export async function classifyCi(
   store.setSetting(`ci.main:${pr.repo}`, Object.fromEntries(state));
   if (!current()) return true;
   const resolved = new Set<number>();
+  const outstanding = store.ciFailures(pr.url, snap.headRefOid).filter(pending);
+  const retries: { failure: CiFailure; job: number; excerpt: string }[] = [];
   // Only a later attempt of the originating workflow job can resolve a rerun.
-  for (const f of store.ciFailures(pr.url, snap.headRefOid)) {
+  for (const f of outstanding) {
     const origin = f.rerunJob;
     if (!pending(f) || !origin) continue;
     const run = z
@@ -286,7 +310,6 @@ export async function classifyCi(
   if (!names.size) throw new Error("Incomplete CI failure: no failing checks");
   // Retain unresolved prior attempts even when their checks now pass or are absent below.
   // Reruns requested in this inspection wait for a new GraphQL observation first.
-  const pendingRerun = store.ciFailures(pr.url, snap.headRefOid).some(pending);
   let paused = false;
   for (const name of names) {
     const matches = failures.filter(
@@ -362,6 +385,23 @@ export async function classifyCi(
         );
       if (job && resolved.has(job.id)) continue;
       if (prior.some(pending)) {
+        const refused = prior.find((p) => pending(p) && p.rerunRetryAt != null);
+        if (!refused) continue;
+        if (!reruns || unsafe || refused.rerunRetryUsed) {
+          reject(refused, log || f.line);
+          continue;
+        }
+        if (now() < (refused.rerunRetryAt ?? Infinity)) continue;
+        const origin = refused.rerunJob;
+        if (
+          !job ||
+          !origin ||
+          origin.id !== job.id ||
+          origin.runId !== job.run_id ||
+          origin.attempt !== job.run_attempt
+        )
+          throw new Error("Incomplete refused CI rerun job");
+        retries.push({ failure: refused, job: job.id, excerpt: log || f.line });
         continue;
       }
       if (!unsafe) store.recordCiFailure(f);
@@ -391,14 +431,9 @@ export async function classifyCi(
             name: job.name,
           })
         ) {
-          const res = await call(pr.repo, `${root}/actions/jobs/${job.id}/rerun`, {});
-          if (res && res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
-            store.finishCiFailure(f, "rerun_rejected");
-            needsFix();
-            continue;
-          }
-          if (res?.status !== 201) throw new Error("CI job rerun was not confirmed");
-          store.finishCiFailure(f, "rerunning");
+          await requestRerun(f, job.id, log || f.line);
+          const deferred = store.ciFailures(pr.url, f.sha).some((p) => pending(p) && p.rerunRetryAt != null);
+          if (deferred) return false;
           continue;
         }
       }
@@ -406,6 +441,25 @@ export async function classifyCi(
       needsFix();
     }
   }
+  // Send retries after REST inspection so a repeated refusal's cooldown cannot hide its terminal result.
+  for (const retry of retries) {
+    if (!current()) return true;
+    if (!ready()) return false;
+    const remote = z
+      .object({ head: z.object({ sha: z.string() }), state: z.string() })
+      .parse(await read(`pulls/${pr.url.split("/").at(-1)}`));
+    if (!current()) return true;
+    if (remote.head.sha !== retry.failure.sha || remote.state !== "open") {
+      reject(retry.failure, retry.excerpt);
+      continue;
+    }
+    if (!ready()) return false;
+    if (store.claimCiRerunRetry(retry.failure, now()))
+      await requestRerun({ ...retry.failure, rerunRetryUsed: 1 }, retry.job, retry.excerpt);
+  }
   // The existing persisted pending inspection also tracks main-red pauses across restarts.
+  const pendingRerun = store
+    .ciFailures(pr.url, snap.headRefOid)
+    .some((f) => pending(f) && outstanding.some((p) => p.signature === f.signature));
   return !pendingRerun && !paused;
 }

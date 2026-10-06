@@ -11,6 +11,17 @@ const mainSha = "b".repeat(40);
 const checksPath = (sha: string) => `repos/o/r/commits/${sha}/check-runs?filter=latest&per_page=100&page=1`;
 const items = (kind: string) => h.store.readFeed({ limit: 1000 }).items.filter((i) => i.kind === kind);
 const reruns = () => h.gh.rest().filter((c) => c.path.endsWith("/rerun"));
+const securityRecords = [
+  "(fail) security tests [1ms]",
+  "\u001b[31m(fail) security tests\u001b[0m [1ms]",
+  "FAILED tests/test_security.py::test_authorization - AssertionError",
+  "  ✕ security tests (1 ms)",
+  "  ● security tests › authorization",
+  "--- FAIL: TestSecurityAuthorization (0.00s)",
+  "FAIL security tests",
+  "not ok 1 security tests",
+  "##[error]security tests failed",
+];
 
 function failure(n = 1, name = "test", conclusion = "timed_out") {
   h.factoryPr("o/r", n);
@@ -158,6 +169,131 @@ test.each([401, 403, 404, 422])(
     expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
     expect(items("ci.needs_fix")).toHaveLength(1);
     expect(reruns()).toHaveLength(1);
+  },
+);
+
+test.each([
+  [429, { "retry-after": "30" }, 201, true],
+  [429, { "retry-after": "30" }, 429, true],
+  [403, { "retry-after": "30" }, 403, true],
+  [422, { "x-ratelimit-remaining": "0" }, 422, true],
+  [429, {}, 201, false],
+  [429, { "retry-after": "invalid" }, 201, false],
+])(
+  "a rate-limited rerun (%s) gets one persisted retry, then resolves (%s)",
+  async (status, headers, next, restart) => {
+    h = pollerHarness();
+    const f = failure();
+    const start = h.clock.now();
+    const cooldown = new Headers(headers).get("retry-after") === "30" ? 30000 : 60000;
+    let accepted = 0;
+    let attempts = 0;
+    h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () => {
+      const response = ++attempts === 1 ? status : next;
+      if (response === 201) accepted++;
+      return respond(response, {}, response === 201 ? {} : headers);
+    });
+    h.start(15);
+    await h.advance(0);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]).toMatchObject({
+      outcome: "rerun_requested",
+      rerunRetryAt: start + cooldown,
+      rerunRetryUsed: 0,
+    });
+    expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
+    expect(items("ci.needs_fix")).toHaveLength(0);
+    if (restart) {
+      h.reopen();
+      h.start(15);
+      await h.advance(0);
+    }
+    await h.advance(cooldown - 15000);
+    expect(reruns()).toHaveLength(1);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]?.rerunRetryAt).toBe(start + cooldown);
+    await h.advance(15000);
+    expect(reruns()).toHaveLength(2);
+    const postTimes = h.gh.calls.flatMap((call, i) => (call.path.endsWith("/rerun") ? [h.gh.times[i]] : []));
+    expect(postTimes).toEqual([start, start + cooldown]);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]?.rerunRetryUsed).toBe(1);
+    if (next === 201) {
+      expect(accepted).toBe(1);
+      expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
+      f.rerun("success");
+      f.observe("SUCCESS", "rerun");
+      await h.advance(15000);
+      expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_then_passed");
+      expect(items("ci.needs_fix")).toHaveLength(0);
+    } else {
+      expect(accepted).toBe(0);
+      expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_rejected");
+      expect(items("ci.needs_fix")).toHaveLength(1);
+    }
+    expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
+    await h.advance(60000);
+    h.reopen();
+    h.start(15);
+    await h.advance(0);
+    await h.advance(60000);
+    expect(reruns()).toHaveLength(2);
+    expect(items("ci.needs_fix")).toHaveLength(next === 201 ? 0 : 1);
+  },
+);
+
+test.each(["disabled", "security"])("a refused rerun that becomes %s cannot retry", async (reason) => {
+  h = pollerHarness();
+  const f = failure();
+  h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () =>
+    respond(429, {}, { "retry-after": "30" }),
+  );
+  h.start(15);
+  await h.advance(0);
+  h.reopen();
+  if (reason === "security") f.state.log += "\nFAILED tests/test_security.py::test_authorization";
+  h.start(15, reason !== "disabled");
+  await h.advance(0);
+  await h.advance(30000);
+  expect(h.store.ciFailures(f.node.url, SHA)).toHaveLength(1);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_rejected");
+  expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
+  expect(reruns()).toHaveLength(1);
+  expect(items("ci.needs_fix")).toHaveLength(1);
+  h.reopen();
+  h.start(15);
+  await h.advance(0);
+  await h.advance(30000);
+  expect(reruns()).toHaveLength(1);
+  expect(items("ci.needs_fix")).toHaveLength(1);
+});
+
+test.each([408, 500, "lost"])(
+  "an ambiguous retry response (%s) consumes the allowance across restart",
+  async (status) => {
+    h = pollerHarness();
+    const f = failure();
+    let attempts = 0;
+    h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () => {
+      if (++attempts === 1) return respond(429, {}, { "retry-after": "30" });
+      if (status === "lost") throw new Error("connection reset");
+      return respond(status, {});
+    });
+    h.start(15);
+    await h.advance(0);
+    await h.advance(30000);
+    expect(reruns()).toHaveLength(2);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]).toMatchObject({
+      outcome: "rerun_requested",
+      rerunRetryAt: null,
+      rerunRetryUsed: 1,
+    });
+    h.reopen();
+    h.start(15);
+    await h.advance(0);
+    expect(reruns()).toHaveLength(2);
+    expect(items("ci.needs_fix")).toHaveLength(0);
+    f.rerun("success");
+    await h.advance(15000);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_then_passed");
+    expect(reruns()).toHaveLength(2);
   },
 );
 
@@ -604,7 +740,16 @@ test.each(["step", "annotation", "later annotation", "log", "test line"])(
 test("passing security output and unrelated text do not block a timeout rerun or its ledger", async () => {
   h = pollerHarness();
   const f = failure();
-  f.state.log += "\n(pass) security tests [1ms]\nRunning security tests";
+  f.state.log += [
+    "",
+    "\u001b[32m(pass) security tests\u001b[0m [1ms]",
+    "tests/test_security.py::test_authorization PASSED",
+    "PASS tests/test_security.py",
+    "  ✓ security tests (1 ms)",
+    "--- PASS: TestSecurityAuthorization (0.00s)",
+    "ok 1 security tests",
+    "Running security tests",
+  ].join("\n");
   f.job.steps.push({ name: "security tests", status: "completed", conclusion: "success" });
   h.gh.responses.set(checksPath(SHA), () =>
     respond(200, {
@@ -628,7 +773,19 @@ test("passing security output and unrelated text do not block a timeout rerun or
   expect(reruns()).toHaveLength(1);
 });
 
-test.each(["passing output", "step", "annotation", "test line"])(
+test.each(securityRecords)("a failing security record blocks reruns and the ledger: %s", async (record) => {
+  h = pollerHarness();
+  const f = failure();
+  f.state.log += `\n${record}`;
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(0);
+  expect(h.store.ciFailures(f.node.url, SHA)).toHaveLength(0);
+  expect(items("ci.needs_fix")).toHaveLength(1);
+  expect(items("ci.needs_fix")[0]?.data?.untrusted).toBe(true);
+});
+
+test.each(["passing output", "step", "annotation", "test line", ...securityRecords])(
   "rerun reconciliation uses failure-only security evidence from %s",
   async (source) => {
     h = pollerHarness();
@@ -646,6 +803,7 @@ test.each(["passing output", "step", "annotation", "test line"])(
         respond(200, [{ annotation_level: "failure", title: "tests", message: "security test failed" }]),
       );
     if (source === "test line") f.state.log += "\n(fail) security tests [1ms]";
+    if (securityRecords.includes(source)) f.state.log += `\n${source}`;
     f.observe("FAILURE", "rerun");
     h.start(15);
     await h.advance(0);
@@ -756,30 +914,25 @@ test.each(["success", "failure"])("a lost rerun response reconciles %s after res
   expect(reruns()).toHaveLength(1);
 });
 
-test.each([408, 500, 429, 403])(
-  "an uncertain rerun response (%s) remains claimed and reconciles",
-  async (status) => {
-    h = pollerHarness();
-    const f = failure();
-    h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () =>
-      respond(status, {}, status === 403 ? { "retry-after": "2" } : {}),
-    );
-    h.start(15);
-    await h.advance(0);
-    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_requested");
-    expect(items("ci.needs_fix")).toHaveLength(0);
-    h.reopen();
-    h.start(15);
-    await h.advance(0);
-    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_requested");
-    expect(reruns()).toHaveLength(1);
-    f.rerun("success");
-    await h.advance(15000);
-    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_then_passed");
-    expect(items("ci.needs_fix")).toHaveLength(0);
-    expect(reruns()).toHaveLength(1);
-  },
-);
+test.each([408, 500])("an uncertain rerun response (%s) remains claimed and reconciles", async (status) => {
+  h = pollerHarness();
+  const f = failure();
+  h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () => respond(status, {}));
+  h.start(15);
+  await h.advance(0);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_requested");
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  h.reopen();
+  h.start(15);
+  await h.advance(0);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_requested");
+  expect(reruns()).toHaveLength(1);
+  f.rerun("success");
+  await h.advance(15000);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_then_passed");
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(reruns()).toHaveLength(1);
+});
 
 test("a last-window log response pauses before claiming the rerun, then retries", async () => {
   h = pollerHarness();
