@@ -183,7 +183,7 @@ test.each([
               .run(
                 1791099998000,
                 1791099999000,
-                evidence === "earlier failed" ? "failed" : "succeeded",
+                ["earlier failed", "multiple interrupted"].includes(evidence) ? "failed" : "succeeded",
                 earlier.id,
               );
           }
@@ -209,9 +209,9 @@ test.each([
         false,
         false,
         false,
-        false,
-        false,
-        false,
+        eligible,
+        eligible,
+        eligible,
       ]);
       const completed = ids[0];
       if (!completed) throw new Error("missing completed run");
@@ -228,9 +228,9 @@ test.each([
         false,
         false,
         false,
-        false,
-        false,
-        false,
+        eligible,
+        eligible,
+        eligible,
       ]);
       reopened.close();
     });

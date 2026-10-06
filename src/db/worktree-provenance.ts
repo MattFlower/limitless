@@ -41,7 +41,6 @@ export function markLegacyWorktree(db: Database, runId: string): void {
   if (cutoff === null) return;
   db.query(`UPDATE runs SET worktree_provenance = 'legacy'
     WHERE id = ?1 AND worktree_provenance IS NULL
-    AND (SELECT COUNT(*) FROM stages WHERE run_id = runs.id AND name = 'prepare') = 1
     AND NOT EXISTS (
       SELECT 1 FROM stages WHERE run_id = runs.id AND name = 'prepare'
         AND started_at >= ?2

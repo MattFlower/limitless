@@ -7163,7 +7163,8 @@ test.each(["legacy missing", "bundled legacy missing", "modern missing", "legacy
   },
 );
 
-test.each([true, false])("interrupted prepare worktree (legacy: %s)", async (legacy) => {
+test.each(["legacy", "legacy retry", "modern"])("interrupted prepare worktree (%s)", async (history) => {
+  const legacy = history !== "modern";
   let parking = true;
   const handler: Handler = (s) => {
     const role = roleOf(s);
@@ -7184,6 +7185,7 @@ test.each([true, false])("interrupted prepare worktree (legacy: %s)", async (leg
   delete state.worktreePath;
   state.phase = "prepare";
   f.store.setRunState(run.id, state);
+  if (history === "legacy retry") f.store.startStage(run.id, "prepare");
   if (legacy) legacyWorktreeFixture(f, run.id, true);
   f.store.close();
   const resumed = start(handler, false, false, false);
