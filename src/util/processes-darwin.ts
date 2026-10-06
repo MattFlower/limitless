@@ -15,7 +15,12 @@ const { symbols } = dlopen("/usr/lib/libSystem.B.dylib", {
   },
 });
 
-export function markedDarwinProcesses(uid: number, marker: string, group: number, started: number): number[] {
+export function markedDarwinProcesses(
+  uid: number,
+  marker: string,
+  group: number,
+  known: ReadonlySet<number> = new Set(),
+): number[] {
   const bytes = symbols.proc_listpids(4 /* PROC_UID_ONLY */, uid, null, 0);
   if (bytes <= 0) throw new Error("Process enumeration failed");
   const processes = new Int32Array(Math.ceil(bytes / 4) + 256);
@@ -24,10 +29,10 @@ export function markedDarwinProcesses(uid: number, marker: string, group: number
     throw new Error("Process enumeration could not be confirmed");
 
   const info = new Uint32Array(16); // proc_bsdshortinfo: 64 bytes
-  const birth = new Uint8Array(136); // proc_bsdinfo, with start timeval at offsets 120/128
   const args = new Uint8Array(1024 * 1024);
   const size = new BigUint64Array(1);
   const token = Buffer.from(`\0LIMITLESS_INVOCATION=${marker}\0`);
+  const inheritedToken = Buffer.from(`\0LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}=1\0`);
   const marked: number[] = [];
   const gone = () => {
     const errno = symbols.__error();
@@ -67,22 +72,16 @@ export function markedDarwinProcesses(uid: number, marker: string, group: number
     const environment = Buffer.from(args.buffer, 0, length);
     // SIP omits environment data for platform tools such as sh/sleep. Members of the
     // group we created still inherit our marker; detached processes need an exact match.
-    if (environment.includes(token, offset - 1) || (offset === length && info[2] === group)) marked.push(pid);
-    else if (offset === length && info[1] === 1) {
-      if (
-        symbols.proc_pidinfo(pid, 3 /* PROC_PIDTBSDINFO */, 0, ptr(birth), birth.byteLength) !==
-        birth.byteLength
-      ) {
-        if (gone()) continue;
-        throw new Error(`Process start time inspection failed for ${pid}`);
-      }
-      const view = new DataView(birth.buffer);
-      const created =
-        Number(view.getBigUint64(120, true)) * 1000 + Number(view.getBigUint64(128, true)) / 1000;
-      // A new orphan with a withheld environment could be an escaped tagged child.
-      // Refuse cleanup instead of signalling a process we cannot attribute.
-      if (created >= started) throw new Error(`Cannot inspect environment of reparented process ${pid}`);
-    }
+    if (
+      environment.includes(token, offset - 1) ||
+      environment.includes(inheritedToken, offset - 1) ||
+      (offset === length && info[2] === group)
+    )
+      marked.push(pid);
+    else if (offset === length && known.has(pid))
+      throw new Error(`Cannot inspect environment of marked process ${pid}`);
+    // A hidden environment outside our group gives no evidence of membership. In
+    // particular, unrelated orphaned platform tools must not block this invocation.
   }
   return marked;
 }

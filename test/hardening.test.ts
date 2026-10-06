@@ -119,8 +119,10 @@ describe("process handling", () => {
       );
       writeFileSync(
         launcher,
-        `require("node:child_process").spawn(process.execPath,
-        [${JSON.stringify(writer)}], {detached:true, stdio:"ignore"}).unref();`,
+        `const {runProcess, agentEnv} = await import(${JSON.stringify(join(process.cwd(), "src/util/proc.ts"))});
+        runProcess({cmd:["/bin/sh", "-c", 'exec "$1" "$2"', "sh", process.execPath, ${JSON.stringify(writer)}],
+          cwd:process.cwd(), env:agentEnv()});
+        process.exit(0);`,
       );
       writeFileSync(
         parent,
@@ -263,18 +265,17 @@ describe("process handling", () => {
     },
   );
 
-  test.skipIf(process.platform !== "darwin")(
-    "macOS native inspection refuses a new orphan with a withheld environment",
-    async () => {
+  test.skipIf(process.platform !== "darwin").each([false, true])(
+    "macOS native inspection handles a withheld orphan environment (known marked: %s)",
+    async (marked) => {
       const { markedDarwinProcesses } = await import("../src/util/processes-darwin.ts");
       const pidFile = join(dir, "hidden-pid");
-      const started = Date.now();
       const launcher = spawn(
         process.execPath,
         [
           "-e",
           `require("node:child_process").spawn("/bin/sh", ["-c", 'echo $$ > "$1"; sleep 15', "sh", ${JSON.stringify(pidFile)}],
-          {detached:true, stdio:"ignore", env:{LIMITLESS_INVOCATION:"hidden-writer"}}).unref();`,
+          {detached:true, stdio:"ignore", env:${marked ? '{LIMITLESS_INVOCATION:"hidden-writer"}' : "{}"}}).unref();`,
         ],
         { stdio: "ignore" },
       );
@@ -286,21 +287,21 @@ describe("process handling", () => {
           await Bun.sleep(10);
         pid = Number(readFileSync(pidFile, "utf8"));
         expect(pid).toBeGreaterThan(0);
-        const message = `Cannot inspect environment of reparented process ${pid}`;
-        let failure: Error | undefined;
-        // Other processes can exec during inspection; wait for a complete observation of this orphan.
-        while (Date.now() < deadline) {
-          try {
-            markedDarwinProcesses(process.getuid?.() ?? 0, "hidden-writer", launcher.pid ?? 0, started);
-          } catch (error) {
-            if (error instanceof Error && error.message === message) {
-              failure = error;
-              break;
-            }
-          }
-          await Bun.sleep(10);
-        }
-        expect(failure?.message).toBe(message);
+        if (marked) {
+          const known = new Set([pid]);
+          expect(() =>
+            markedDarwinProcesses(process.getuid?.() ?? 0, "hidden-writer", launcher.pid ?? 0, known),
+          ).toThrow(`Cannot inspect environment of marked process ${pid}`);
+        } else
+          expect(
+            markedDarwinProcesses(process.getuid?.() ?? 0, "hidden-writer", launcher.pid ?? 0),
+          ).not.toContain(pid);
+        const result = await runProcess({
+          cmd: [process.execPath, "-e", "process.exit(0)"],
+          cwd: dir,
+          env: process.env as Record<string, string>,
+        });
+        expect(result.exitCode).toBe(0);
         expect(process.kill(pid, 0)).toBe(true);
       } finally {
         launcher.kill("SIGKILL");
@@ -347,7 +348,12 @@ describe("process handling", () => {
                 cwd: dir,
                 env: process.env as Record<string, string>,
               });
+              let stopped = false;
+              void Promise.all(children.values()).then(() => {
+                stopped = true;
+              });
               await expect(invocation).rejects.toBeInstanceOf(ProcessTerminationError);
+              expect(stopped).toBe(false);
               expect(processScope.getStore()?.terminationError?.message).toContain(
                 "Marked processes still alive",
               );

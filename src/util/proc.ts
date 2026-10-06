@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
 
 export const processScope = new AsyncLocalStorage<{
   signal: AbortSignal;
@@ -24,12 +25,12 @@ export function assertProcessesStopped(): void {
 export const processInspection = new AsyncLocalStorage<
   (withEnvironment: boolean, marker: string, pids?: number[]) => Promise<string>
 >();
-let darwinNativeInspection = false;
+const inspectionPlatform = process.platform;
 
 async function markedProcesses(
   marker: string,
   group: number,
-  started: number,
+  known: Set<number>,
   attempt = 0,
 ): Promise<number[]> {
   const uid = process.getuid?.();
@@ -39,16 +40,16 @@ async function markedProcesses(
   const nativeProcesses = async () => {
     const { markedDarwinProcesses } = await import("./processes-darwin.ts");
     try {
-      return markedDarwinProcesses(uid, marker, group, started);
+      return markedDarwinProcesses(uid, marker, group, known);
     } catch (error) {
       // KERN_PROCARGS2 can return EIO/EINVAL while a process is exec'ing. Require
       // a complete snapshot, but give these transient states time to settle.
       if (attempt >= 10) throw error;
       await Bun.sleep(10);
-      return markedProcesses(marker, group, started, attempt + 1);
+      return markedProcesses(marker, group, known, attempt + 1);
     }
   };
-  if (darwinNativeInspection && !processInspection.getStore()) return nativeProcesses();
+  if (inspectionPlatform === "darwin" && !processInspection.getStore()) return nativeProcesses();
   const env = { ...process.env };
   delete env.LIMITLESS_INVOCATION;
   env.LIMITLESS_PROCESS_SCAN = marker;
@@ -60,7 +61,7 @@ async function markedProcesses(
       const scanner = execFile(
         "/bin/ps",
         [
-          ...(withEnvironment ? [process.platform === "darwin" ? "-E" : "eww"] : []),
+          ...(withEnvironment ? [inspectionPlatform === "darwin" ? "-E" : "eww"] : []),
           "-ww",
           ...(pids ? ["-p", pids.join(",")] : ["-U", String(uid)]),
           "-o",
@@ -80,21 +81,7 @@ async function markedProcesses(
       .trim()
       .split("\n")
       .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/));
-  let output: string;
-  try {
-    output = await inspect(true);
-  } catch (error) {
-    if (
-      process.platform !== "darwin" ||
-      processInspection.getStore() ||
-      ((error as NodeJS.ErrnoException).code ??
-        (error instanceof Error ? (error.cause as NodeJS.ErrnoException | undefined)?.code : undefined)) !==
-        "EPERM"
-    )
-      throw error;
-    darwinNativeInspection = true;
-    return markedProcesses(marker, group, started, attempt);
-  }
+  const output = await inspect(true);
   const environments = rows(output);
   if (
     !environments.some(
@@ -107,10 +94,11 @@ async function markedProcesses(
     )
   )
     throw new Error("Process environment inspection could not be confirmed");
-  const token = `LIMITLESS_INVOCATION=${marker}`;
+  const tokens = [`LIMITLESS_INVOCATION=${marker}`, `LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}=1`];
+  const carriesMarker = (entries: string[]) => tokens.some((token) => entries.includes(token));
   const candidates = environments.filter(
     (row) =>
-      row && Number(row[2]) === uid && !row[3]?.startsWith("Z") && row[4]?.split(/\s+/).includes(token),
+      row && Number(row[2]) === uid && !row[3]?.startsWith("Z") && carriesMarker((row[4] ?? "").split(/\s+/)),
   );
   if (!candidates.length) return [];
   const commands = rows(
@@ -130,36 +118,45 @@ async function markedProcesses(
       changed = true;
       return [];
     }
-    return full.slice(args.length).split(/\s+/).includes(token) ? [Number(row?.[1])] : [];
+    return carriesMarker(full.slice(args.length).split(/\s+/)) ? [Number(row?.[1])] : [];
   });
   if (!changed) {
     // ps flattens environment entries with spaces. Verify their NUL-delimited
-    // boundaries on macOS so a marker-looking value cannot select an unmarked process.
-    if (process.platform === "darwin" && !processInspection.getStore()) return nativeProcesses();
+    // boundaries so a marker-looking value cannot select an unmarked process.
+    if (inspectionPlatform === "linux" && !processInspection.getStore()) {
+      const marked: number[] = [];
+      for (const pid of pids) {
+        try {
+          if ((await stat(`/proc/${pid}`)).uid !== uid) continue;
+          const environment = await readFile(`/proc/${pid}/environ`, "utf8");
+          if (carriesMarker(environment.split("\0"))) marked.push(pid);
+        } catch (error) {
+          if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        }
+      }
+      return marked;
+    }
     return pids;
   }
   // A shell may exec between snapshots; never signal it based on mismatched argv.
-  if (attempt < 3) return markedProcesses(marker, group, started, attempt + 1);
+  if (attempt < 3) return markedProcesses(marker, group, known, attempt + 1);
   throw new Error("Process arguments changed during inspection");
 }
 
-async function stopMarkedProcesses(
-  marker: string,
-  group: number,
-  graceMs: number,
-  spawnedAt: number,
-): Promise<void> {
+async function stopMarkedProcesses(marker: string, group: number, graceMs: number): Promise<void> {
   const started = performance.now();
   const termed = new Set<number>();
+  const known = new Set([group]);
   let empty = false;
   for (;;) {
-    const pids = await markedProcesses(marker, group, spawnedAt);
+    const pids = await markedProcesses(marker, group, known);
     // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
     if (!pids.length && empty) return;
     empty = !pids.length;
     if (performance.now() - started >= graceMs + 10_000)
       throw new Error(`Marked processes still alive: ${pids.join(", ")}`);
     for (const pid of pids) {
+      known.add(pid);
       const signal = termed.has(pid) && performance.now() - started >= graceMs ? "SIGKILL" : "SIGTERM";
       if (signal === "SIGTERM" && termed.has(pid)) continue;
       try {
@@ -242,7 +239,12 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     const marker = randomUUID();
     const child = spawn(bin, args, {
       cwd: opts.cwd,
-      env: { ...opts.env, LIMITLESS_INVOCATION: marker },
+      // Retain ancestor tags when candidate code itself invokes runProcess (e.g. its test suite).
+      env: {
+        ...opts.env,
+        LIMITLESS_INVOCATION: marker,
+        [`LIMITLESS_INVOCATION_${marker.replaceAll("-", "_")}`]: "1",
+      },
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -278,7 +280,11 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
       shutdown ??= (async () => {
         try {
           if (child.pid !== undefined)
-            await stopMarkedProcesses(marker, child.pid, scope?.killGraceMs ?? 100, started);
+            await stopMarkedProcesses(
+              marker,
+              child.pid,
+              timedOut || idleTimedOut ? 5_000 : (scope?.killGraceMs ?? 100),
+            );
         } catch (error) {
           terminationError = new ProcessTerminationError(
             `${ProcessTerminationError.prefix}: ${(error as Error).message}`,
@@ -289,7 +295,6 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
           child.kill("SIGKILL");
           settled = true;
           finishTimers();
-          resolveStopped?.();
           reject(terminationError);
         } finally {
           child.stdin.destroy();
@@ -487,7 +492,11 @@ export function agentEnv(extra: Record<string, string> = {}): Record<string, str
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined || isCredential([k, v])) continue;
-    if (/^(OPENROUTER_|DISCORD_|GITHUB_WEBHOOK_|LIMITLESS_)/.test(k)) continue;
+    if (
+      /^(OPENROUTER_|DISCORD_|GITHUB_WEBHOOK_|LIMITLESS_)/.test(k) &&
+      !(/^LIMITLESS_INVOCATION_[0-9a-f_]{36}$/.test(k) && v === "1")
+    )
+      continue;
     // Don't let a parent Claude Code session's markers change the child's behavior.
     if (k === "CLAUDECODE" || k.startsWith("CLAUDE_CODE_") || k === "CLAUDE_PLUGIN_DATA") continue;
     if (k.startsWith("ANTHROPIC_")) continue;
