@@ -25,6 +25,7 @@ import {
   runCodex,
 } from "../src/harness/codex.ts";
 import { readerSeatbeltProfile, runReaderCommand, withReaderCommands } from "../src/harness/reader.ts";
+import { SANDBOX_EXEC } from "../src/harness/sandbox.ts";
 import {
   createScratch,
   privateReadRoots,
@@ -36,9 +37,9 @@ import {
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { withholdText } from "../src/pipeline/context.ts";
-import type { ProcOptions, ProcResult, runProcess } from "../src/util/proc.ts";
+import { type ProcOptions, type ProcResult, runProcess } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
-import { readerFixture, readerSkip } from "./reader-fixture.ts";
+import { callReaderTool, readerFixture, readerSkip, recordingReaderLauncher } from "./reader-fixture.ts";
 
 const specFor = (cwd: string, scratchDir: string): AgentSpec => ({
   cwd,
@@ -120,12 +121,16 @@ test("reader network rules cover both ephemeral boundaries and deny fixed servic
   const { spec, cleanup } = readerFixture();
   try {
     const profile = readerSeatbeltProfile(spec);
-    const listenAllowed = [...profile.matchAll(/\(allow network-inbound \(local tcp ([^)]+)\)\)/g)].flatMap(
-      (match) => [...(match[1] ?? "").matchAll(/localhost:(\d+)/g)].map((port) => Number(port[1])),
-    );
+    const listenAllowed = [
+      ...profile.matchAll(
+        /\(allow network-inbound \(require-all \(local tcp "localhost:\*"\) \(local tcp ([^)]+)\)\)\)/g,
+      ),
+    ].flatMap((match) => [...(match[1] ?? "").matchAll(/\*:(\d+)/g)].map((port) => Number(port[1])));
     const connectAllowed = [
-      ...profile.matchAll(/\(allow network-outbound \(remote tcp ([^)]+)\)\)/g),
-    ].flatMap((match) => [...(match[1] ?? "").matchAll(/localhost:(\d+)/g)].map((port) => Number(port[1])));
+      ...profile.matchAll(
+        /\(allow network-outbound \(require-all \(remote tcp "localhost:\*"\) \(remote tcp ([^)]+)\)\)\)/g,
+      ),
+    ].flatMap((match) => [...(match[1] ?? "").matchAll(/\*:(\d+)/g)].map((port) => Number(port[1])));
     expect(listenAllowed).toHaveLength(16384);
     expect(listenAllowed[0]).toBe(49152);
     expect(listenAllowed.at(-1)).toBe(65535);
@@ -139,6 +144,68 @@ test("reader network rules cover both ephemeral boundaries and deny fixed servic
     cleanup();
   }
 });
+
+test.skipIf(process.platform !== "darwin")(
+  "reader tools/call executes commands and reuses a protected invocation profile",
+  async () => {
+    const { spec, loopbackCommand, cleanup } = readerFixture();
+    const launcher = recordingReaderLauncher();
+    try {
+      await withReaderCommands(
+        spec,
+        async (reader) => {
+          const local = await callReaderTool(reader, loopbackCommand);
+          expect(local.isError).toBe(false);
+          expect(local.result.exitCode).toBe(0);
+          expect(local.result.stdout.trim()).toBe("local-server tests passed");
+          const failed = await callReaderTool(reader, "exit 7");
+          expect(failed.isError).toBe(true);
+          expect(failed.result.exitCode).toBe(7);
+          expect(launcher.calls).toHaveLength(2);
+          const first = launcher.calls[0];
+          expect(first?.path).toBe(launcher.calls[1]?.path);
+          expect(first?.profile).toContain(`(deny file-read* (subpath "${dirname(first?.path ?? "")}"))`);
+          expect(first?.opts.env.TMPDIR).toBe(realpathSync(spec.scratchDir ?? ""));
+          expect(existsSync(first?.path ?? "")).toBe(true);
+        },
+        launcher.run,
+      );
+      for (const { path } of launcher.calls) expect(existsSync(dirname(path))).toBe(false);
+      await expect(
+        withReaderCommands(
+          spec,
+          async (reader) => callReaderTool(reader, "exit 0"),
+          async () => procResult,
+        ),
+      ).rejects.toThrow("payload did not start");
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+test.skipIf(process.platform !== "darwin")(
+  "the generated reader profile applies or reaches only the nested Seatbelt denial",
+  async () => {
+    const { spec, cleanup } = readerFixture();
+    try {
+      const profile = join(spec.cwd, "profile.sb");
+      writeFileSync(profile, readerSeatbeltProfile(spec));
+      const result = await runProcess({
+        cmd: [SANDBOX_EXEC, "-f", profile, "/usr/bin/true"],
+        cwd: spec.cwd,
+        env: {},
+        timeoutMs: 5000,
+      });
+      expect(result.timedOut).toBe(false);
+      expect(result.signal).toBeNull();
+      if (result.exitCode !== 0)
+        expect(result.stderr.trim()).toBe("sandbox-exec: sandbox_apply: Operation not permitted");
+    } finally {
+      cleanup();
+    }
+  },
+);
 
 test.skipIf(process.platform !== "darwin")(
   "reader commands fail closed when the profile cannot start",

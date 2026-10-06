@@ -1,9 +1,12 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SANDBOX_EXEC } from "../src/harness/sandbox.ts";
 import { createScratch, removeScratch } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
+import { type ProcOptions, type ProcResult, runProcess } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
 
 export const readerSkip =
@@ -14,6 +17,34 @@ export const readerSkip =
   }).exitCode === 0
     ? null
     : "Seatbelt cannot start in this environment");
+
+export async function callReaderTool(spec: AgentSpec, command: string) {
+  if (!spec.readerCommandUrl) throw new Error("Missing reader command URL");
+  const client = new Client({ name: "fake-verifier", version: "1" });
+  try {
+    await client.connect(new StreamableHTTPClientTransport(new URL(spec.readerCommandUrl)));
+    const reply = await client.callTool({ name: "command", arguments: { command } });
+    const content = reply.content;
+    if (!Array.isArray(content) || content[0]?.type !== "text") throw new Error("Missing command result");
+    return { isError: reply.isError, result: JSON.parse(content[0].text) as ProcResult };
+  } finally {
+    await client.close();
+  }
+}
+
+/** Exercise real subprocess output and MCP dispatch under factory gates, which cannot nest Seatbelt. */
+export function recordingReaderLauncher() {
+  const calls: { opts: ProcOptions; profile: string; path: string }[] = [];
+  const run: typeof runProcess = async (opts) => {
+    const path = opts.cmd[2];
+    if (opts.cmd[0] !== SANDBOX_EXEC || opts.cmd[1] !== "-f" || !path)
+      throw new Error("Missing Seatbelt launcher");
+    calls.push({ opts, path, profile: readFileSync(path, "utf8") });
+    // Keep runSandboxed's startup marker and real payload; OS enforcement has separate host tests.
+    return runProcess({ ...opts, cmd: opts.cmd.slice(10) });
+  };
+  return { calls, run };
+}
 
 export function readerFixture() {
   const parent = mkdtempSync(join(tmpdir(), "reader-test-"));
@@ -34,7 +65,7 @@ export function readerFixture() {
   writeFileSync(
     join(cwd, "sockets.py"),
     `
-import errno, os, socket
+import errno, os, socket, sys
 
 def exchange(family, host):
     with socket.socket(family, socket.SOCK_STREAM) as server:
@@ -71,6 +102,9 @@ def connect(host, port, family=socket.AF_INET):
 
 exchange(socket.AF_INET, "127.0.0.1")
 ${ipv6 ? 'exchange(socket.AF_INET6, "::1")' : ""}
+if "--exchange-only" in sys.argv:
+    print("local-server tests passed")
+    sys.exit(0)
 denied(lambda: bind("0.0.0.0", 0))
 denied(lambda: bind("127.0.0.1", 12345))
 denied(lambda: connect("192.0.2.1", 49152))
@@ -111,6 +145,7 @@ print("local-server tests passed")
   return {
     spec,
     command: "/usr/bin/python3 sockets.py",
+    loopbackCommand: "/usr/bin/python3 sockets.py --exchange-only",
     cleanup: () => {
       removeScratch(scratchDir);
       rmSync(parent, { recursive: true, force: true });

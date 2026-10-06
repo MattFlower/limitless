@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { fakeHarness } from "../src/harness/fake.ts";
-import { runReaderCommand } from "../src/harness/reader.ts";
+import { withReaderCommands } from "../src/harness/reader.ts";
 import {
   formatVerifyFeedback,
   holdoutPrompt,
@@ -21,7 +21,7 @@ import {
   VerifySchema,
 } from "../src/pipeline/schemas.ts";
 import { blockedOnly, normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
-import { readerFixture, readerSkip } from "./reader-fixture.ts";
+import { callReaderTool, readerFixture, readerSkip, recordingReaderLauncher } from "./reader-fixture.ts";
 
 const spec: Spec = {
   summary: "test",
@@ -43,7 +43,8 @@ test.skipIf(readerSkip !== null)(
       const verify = fakeHarness(async (reader) => {
         expect(reader.mode).toBe("readonly");
         expect(reader.loopbackTests).toBe(true);
-        const test = await runReaderCommand(reader, fixture.command);
+        const { isError, result: test } = await callReaderTool(reader, fixture.command);
+        expect(isError).toBe(false);
         expect(test.exitCode).toBe(0);
         return {
           structured: {
@@ -58,7 +59,7 @@ test.skipIf(readerSkip !== null)(
           },
         };
       });
-      const result = await verify(fixture.spec);
+      const result = await withReaderCommands(fixture.spec, verify);
       expect(result.status).toBe("ok");
       const verdict = normalizeVerify(VerifySchema.parse(result.structured), spec, holdout);
       expect(verdict.overall).toBe("pass");
@@ -68,6 +69,42 @@ test.skipIf(readerSkip !== null)(
     }
   },
   180_000,
+);
+
+test.skipIf(process.platform !== "darwin")(
+  "a fake verifier dispatches its local-server test through MCP inside factory gates",
+  async () => {
+    const fixture = readerFixture();
+    const launcher = recordingReaderLauncher();
+    try {
+      const verify = fakeHarness(async (reader) => {
+        const { isError, result } = await callReaderTool(reader, fixture.loopbackCommand);
+        expect(isError).toBe(false);
+        expect(result.exitCode).toBe(0);
+        return {
+          structured: {
+            overall: "pass",
+            notes: "",
+            criteria: ["AC-1", "H-1"].map((id) => ({
+              id,
+              status: "met",
+              evidence: result.stdout.trim(),
+              publicSummary: "",
+            })),
+          },
+        };
+      });
+      const result = await withReaderCommands(fixture.spec, verify, launcher.run);
+      expect(launcher.calls).toHaveLength(1);
+      expect(result.status).toBe("ok");
+      const verdict = normalizeVerify(VerifySchema.parse(result.structured), spec, holdout);
+      expect(verdict.overall).toBe("pass");
+      expect(blockedOnly(verdict)).toBe(false);
+      expect(verdict.criteria[0]?.evidence).toBe("local-server tests passed");
+    } finally {
+      fixture.cleanup();
+    }
+  },
 );
 
 test("holdout prompt reads the base repository and grounds outcomes in the request", () => {

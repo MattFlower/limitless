@@ -24,15 +24,15 @@ const paths = (list: string[]) =>
     return `(subpath "${path}")`;
   });
 
-/** Seatbelt accepts individual ports, not ranges. Small groups stay within its parser limits. */
+/** Factor the address out: repeating localhost for every port exceeds Seatbelt's compiled limit. */
 function portRules(operation: string, side: "local" | "remote", first: number, last: number): string[] {
   const rules: string[] = [];
   for (let start = first; start <= last; start += 256) {
     const ports = Array.from(
       { length: Math.min(256, last - start + 1) },
-      (_, offset) => `"localhost:${start + offset}"`,
+      (_, offset) => `"*:${start + offset}"`,
     );
-    rules.push(`(${operation} (${side} tcp ${ports.join(" ")}))`);
+    rules.push(`(${operation} (require-all (${side} tcp "localhost:*") (${side} tcp ${ports.join(" ")})))`);
   }
   return rules;
 }
@@ -57,20 +57,18 @@ export function readerSeatbeltProfile(spec: AgentSpec): string {
   ].join("\n");
 }
 
-/** Probe and payload share one profile/process, so an unenforced reader never executes a command. */
-export async function runReaderCommand(
-  spec: AgentSpec,
-  command: string,
-  signal = spec.signal,
-  run = runProcess,
-): Promise<ProcResult> {
+interface ReaderProfile {
+  scratch: string;
+  profile: string;
+  outside: string;
+}
+
+/** The profile and its read canary stay outside agent-writable scratch for the whole invocation. */
+async function withReaderProfile<T>(spec: AgentSpec, invoke: (profile: ReaderProfile) => Promise<T>) {
   if (spec.mode !== "readonly" || spec.noTools)
     throw new ConfinementError("Reader commands require a tool-enabled read-only invocation");
-  if (process.platform !== "darwin") throw new ConfinementError("Reader commands require macOS Seatbelt");
   const scratch = validateScratch(spec);
   const owned = createScratch(scratch);
-  const inside = join(scratch, `reader-${crypto.randomUUID()}`);
-  const blocked = join(spec.cwd, `reader-${crypto.randomUUID()}`);
   try {
     const outside = join(owned, "canary");
     const profile = join(owned, "profile.sb");
@@ -78,6 +76,33 @@ export async function runReaderCommand(
     writeFileSync(profile, readerSeatbeltProfile({ ...spec, denyRead: [...(spec.denyRead ?? []), owned] }), {
       mode: 0o600,
     });
+    return await invoke({ scratch, profile, outside });
+  } finally {
+    removeScratch(owned);
+  }
+}
+
+/** Probe and payload share one profile/process, so an unenforced reader never executes a command. */
+export async function runReaderCommand(
+  spec: AgentSpec,
+  command: string,
+  signal = spec.signal,
+  run = runProcess,
+): Promise<ProcResult> {
+  return withReaderProfile(spec, (profile) => executeReaderCommand(spec, profile, command, signal, run));
+}
+
+async function executeReaderCommand(
+  spec: AgentSpec,
+  { scratch, profile, outside }: ReaderProfile,
+  command: string,
+  signal: AbortSignal,
+  run: typeof runProcess,
+): Promise<ProcResult> {
+  if (process.platform !== "darwin") throw new ConfinementError("Reader commands require macOS Seatbelt");
+  const inside = join(scratch, `reader-${crypto.randomUUID()}`);
+  const blocked = join(spec.cwd, `reader-${crypto.randomUUID()}`);
+  try {
     return await runSandboxed(
       {
         cmd: ["/bin/sh", "-c", command],
@@ -116,16 +141,25 @@ export async function runReaderCommand(
   } finally {
     rmSync(inside, { force: true });
     rmSync(blocked, { force: true });
-    removeScratch(owned);
   }
 }
 
 /** The CLI stays outside Seatbelt for model transport; only its command tool runs this profile. */
-export async function withReaderCommands<T>(spec: AgentSpec, invoke: (spec: AgentSpec) => Promise<T>) {
+export async function withReaderCommands<T>(
+  spec: AgentSpec,
+  invoke: (spec: AgentSpec) => Promise<T>,
+  run = runProcess,
+) {
   if (!spec.loopbackTests || spec.readerCommandUrl) return invoke(spec);
-  validateScratch(spec);
-  if (spec.mode !== "readonly" || spec.noTools)
-    throw new ConfinementError("Loopback tests require a tool-enabled reader");
+  return withReaderProfile(spec, (profile) => serveReaderCommands(spec, profile, invoke, run));
+}
+
+async function serveReaderCommands<T>(
+  spec: AgentSpec,
+  profile: ReaderProfile,
+  invoke: (spec: AgentSpec) => Promise<T>,
+  run: typeof runProcess,
+) {
   const path = `/${crypto.randomUUID()}`;
   const stopped = new AbortController();
   const commands = new Set<Promise<ProcResult>>();
@@ -158,10 +192,12 @@ export async function withReaderCommands<T>(spec: AgentSpec, invoke: (spec: Agen
           .object({ command: z.string().min(1) })
           .strict()
           .parse(request.params.arguments);
-        const pending = runReaderCommand(
+        const pending = executeReaderCommand(
           spec,
+          profile,
           command,
           AbortSignal.any([spec.signal, req.signal, extra.signal, stopped.signal]),
+          run,
         );
         commands.add(pending);
         let result: ProcResult;
