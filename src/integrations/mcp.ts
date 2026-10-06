@@ -113,7 +113,7 @@ export interface McpBackend {
   resolve(id: string, input: z.output<typeof ResolveRunSchema>): Promise<unknown>;
   review(id: string, input: z.output<typeof ReviewVerdictSchema>): Promise<unknown>;
   land(input: { target: string; sha?: string }): Promise<unknown>;
-  lands(): Promise<unknown>;
+  lands(run: string): Promise<unknown>;
   providers(): Promise<unknown>;
   feed(query: z.output<typeof feedArgsSchema>, signal: AbortSignal): Promise<unknown>;
   feedAck(ack: FeedAck): Promise<unknown>;
@@ -147,7 +147,7 @@ export function factoryBackend(factory: Factory): McpBackend {
     providers: async () => factory.tracker.all(),
     review: (id, input) => submitReview(factory, id, input),
     land: async (input) => factory.land.request(input),
-    lands: async () => factory.land.list(),
+    lands: async (run) => factory.land.list(run),
     feed: (query, signal) => waitForFeed(factory.store, { ...query, limit: 100 }, signal),
     feedAck: async ({ consumer, id }) => factory.store.ackFeed(consumer, id),
   };
@@ -205,7 +205,7 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
     resolve: (id, input) => api(`${path(id)}/resolve`, input),
     review: (id, input) => api(`${path(id)}/review`, input),
     land: (input) => api("/api/land", input),
-    lands: () => api("/api/land"),
+    lands: (run) => api(`/api/land?${new URLSearchParams({ run })}`),
     providers: () => api("/api/providers"),
     feed: (query, signal) => {
       const params = Object.entries(query).flatMap(([k, v]) => (v === undefined ? [] : [[k, String(v)]]));
@@ -274,7 +274,7 @@ export function createMcpServer(backend: McpBackend): Server {
       z.object({ run: nonblank }).strict(),
       async ({ run }) => {
         const detail = statusDetailSchema.parse(await backend.detail(run));
-        return explainStatus(detail, statusLandsSchema.parse(await backend.lands()));
+        return explainStatus(detail, statusLandsSchema.parse(await backend.lands(detail.run.id)));
       },
     ),
     tool(

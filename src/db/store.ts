@@ -2208,6 +2208,14 @@ export class Store {
     return (this.db.query(`${LAND_SELECT} WHERE id = ?`).get(id) as LandEntry | null) ?? null;
   }
 
+  latestLandEntry(runId: string, prUrl: string | null): LandEntry | null {
+    return (
+      (this.db
+        .query(`${LAND_SELECT} WHERE run_id = ? OR pr_url = ? ORDER BY id DESC LIMIT 1`)
+        .get(runId, prUrl) as LandEntry | null) ?? null
+    );
+  }
+
   listLandEntries(opts: { repo?: string; active?: boolean; limit?: number } = {}): LandEntry[] {
     const where: string[] = [];
     const params: string[] = [];

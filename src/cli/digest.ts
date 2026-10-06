@@ -46,7 +46,9 @@ export async function digestCommand(
     pruned ||= page.pruned;
     for (const item of page.items)
       for (const [index, group] of groups.entries()) {
-        const key = String((index === 0 ? item.runId : (item.data.prUrl ?? item.runId)) ?? item.id);
+        const key = String(
+          (index === 0 ? item.runId : (item.data.prUrl ?? item.data.url ?? item.runId)) ?? item.id,
+        );
         if (group.kinds.includes(item.kind)) group.items.set(key, item);
         if (group.clears.includes(item.kind)) group.items.delete(key);
       }

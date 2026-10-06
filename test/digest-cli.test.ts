@@ -83,6 +83,48 @@ test("digest quotes hostile titles and summaries, caps lines, and keeps all cate
   expect(text).not.toContain("\u001b");
 });
 
+test.each(["land.queued", "land.landed", "pr.merged", "pr.closed"] as const)(
+  "digest clears a PR-opened item with the %s producer's URL payload",
+  async (kind) => {
+    const prUrl = "https://github.com/o/r/pull/1";
+    const items = [
+      item(1, "run.pr_opened", { runId: "r1", data: { prUrl, status: "succeeded" } }),
+      item(2, kind, {
+        runId: "r1",
+        data: kind.startsWith("land.")
+          ? { url: prUrl, sha: "a".repeat(40), state: kind.slice(5) }
+          : { url: prUrl, head: "a".repeat(40), mergedBy: null },
+      }),
+    ];
+    const lines: string[] = [];
+    await digestCommand(
+      [],
+      {},
+      { api: async <T>() => ({ items, nextAfter: 2, pruned: false }) as T, print: (l) => lines.push(l) },
+    );
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toBe("Needs you: 0; PRs awaiting review: 0; Blocked lands: 0");
+  },
+);
+
+test("digest groups review rounds and landing retries by PR across different runs", async () => {
+  const prUrl = "https://github.com/o/r/pull/1";
+  const items = [
+    item(1, "run.pr_opened", { runId: "parent", data: { prUrl } }),
+    item(2, "review.round_delivered", { runId: "round", data: { prUrl } }),
+    item(3, "land.blocked", { runId: "parent", data: { url: prUrl, sha: "a".repeat(40) } }),
+    item(4, "land.queued", { runId: "round", data: { url: prUrl, sha: "b".repeat(40) } }),
+  ];
+  const lines: string[] = [];
+  await digestCommand(
+    [],
+    {},
+    { api: async <T>() => ({ items, nextAfter: 4, pruned: false }) as T, print: (l) => lines.push(l) },
+  );
+  expect(lines).toHaveLength(2);
+  expect(lines[1]).toBe("Needs you: 0; PRs awaiting review: 0; Blocked lands: 0");
+});
+
 test("digest counts beyond one feed page, drops handled items, and validates before reading", async () => {
   const pages: FeedPage[] = [
     {

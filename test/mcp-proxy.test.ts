@@ -306,7 +306,9 @@ test("status explains review, input, land and terminal states using saved observ
     httpBackend("http://daemon.invalid", async (url) => {
       urls.push(new URL(url).pathname);
       if (url.includes("missing")) return Response.json({ error: "not found" }, { status: 404 });
-      return Response.json(url.endsWith("/api/land") ? lands : detail);
+      const parsed = new URL(url);
+      if (parsed.pathname === "/api/land") expect(parsed.searchParams.get("run")).toBe(run.id);
+      return Response.json(parsed.pathname === "/api/land" ? lands : detail);
     }),
   );
   const read = () => proxy.client.callTool({ name: "limitless_status", arguments: { run: run.id } });
@@ -384,6 +386,67 @@ test("status explains review, input, land and terminal states using saved observ
     expect(urls.slice(before)).toEqual(["/api/runs/missing"]);
   } finally {
     await proxy.close();
+  }
+});
+
+test("status finds the latest land by run or PR beyond 100 historical entries on both backends", async () => {
+  const { store } = f.factory;
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "work" });
+  const prUrl = "https://github.com/o/r/pull/101";
+  const sha = "a".repeat(40);
+  store.updateRun(run.id, { status: "succeeded", prUrl });
+  store.saveGithubPr({
+    url: prUrl,
+    repo: "o/r",
+    runId: run.id,
+    delivered: 1,
+    nodeId: "PR_101",
+    data: JSON.stringify({ state: "OPEN", headRefOid: sha }),
+  });
+  store.recordApproval(run.id, prUrl, sha, "reviewer");
+  const createEntry = (runId: string, pr: string) =>
+    store.createLandEntry({
+      runId,
+      repo: "o/r",
+      prUrl: pr,
+      baseBranch: "main",
+      headBranch: "pr-branch",
+      approvedSha: sha,
+    });
+  store.db.transaction(() => {
+    for (let i = 1; i <= 100; i++) {
+      const entry = createEntry(`historical-${i}`, `https://github.com/o/r/pull/${i}`);
+      store.updateLandEntry(entry.id, { state: "landed" });
+    }
+  })();
+  const blocked = createEntry("review-round", prUrl);
+  store.updateLandEntry(blocked.id, { state: "blocked", reason: "CI failed" });
+  const routes = createHttpRoutes(f.factory);
+  const proxy = await connect(
+    httpBackend("http://daemon.invalid", async (url, init) => {
+      const path = new URL(url).pathname;
+      const route = routes[path === "/api/land" ? path : "/api/runs/:id"];
+      const handler = (typeof route === "function" ? route : (route as { GET: Route }).GET) as Route;
+      return handler(requestWithParams(url, init, { id: run.id }), localServer);
+    }),
+  );
+  const direct = await connect(factoryBackend(f.factory));
+  const check = async (state: string, id: number, reason: string | null) => {
+    for (const conn of [proxy, direct]) {
+      const result = await conn.client.callTool({ name: "limitless_status", arguments: { run: run.id } });
+      expect(resultValue(result)).toMatchObject({ state, land: { id, reason } });
+    }
+  };
+  try {
+    expect(f.factory.land.list()).toHaveLength(100);
+    await check("Landing blocked", blocked.id, "CI failed");
+    const queued = createEntry(run.id, prUrl);
+    await check("Landing in progress (queued)", queued.id, null);
+    store.updateLandEntry(queued.id, { state: "landed" });
+    await check("Landed", queued.id, null);
+  } finally {
+    await proxy.close();
+    await direct.close();
   }
 });
 
