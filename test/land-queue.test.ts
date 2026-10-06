@@ -22,6 +22,7 @@ import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { fakeGitHub, respond } from "./github-poller-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -40,6 +41,7 @@ let paths: Paths;
 let clock: ReturnType<typeof waitClock>;
 let originalPath: string | undefined;
 let slots: number;
+let github: ReturnType<typeof fakeGitHub>;
 const queues: LandQueue[] = [];
 
 beforeEach(async () => {
@@ -59,6 +61,7 @@ beforeEach(async () => {
   ci = () => ({ ci: "SUCCESS" });
   landLog.length = 0;
   clock = waitClock();
+  github = fakeGitHub(clock.now);
   slots = gateSlots.limit;
   gateSlots.setLimit(1);
   bare = join(root, "remote.git");
@@ -166,7 +169,15 @@ function delivered(n: number, branch: string): { run: Run; prUrl: string } {
     title: `PR ${n}`,
   });
   store.putArtifact(run.id, "report.md", "report", `report for ${n}\n`);
-  observers.set(url(n), (head, ci, failing = []) =>
+  const node = github.add(SLUG, n);
+  observers.set(url(n), (head, ci, failing = []) => {
+    node.headRefOid = head;
+    const commit = node.commits.nodes[0]?.commit;
+    if (commit)
+      commit.statusCheckRollup = {
+        state: ci,
+        contexts: { nodes: failing.map((name) => ({ name, conclusion: "FAILURE" })) },
+      };
     store.saveGithubPr({
       url: url(n),
       repo: SLUG,
@@ -179,8 +190,8 @@ function delivered(n: number, branch: string): { run: Run; prUrl: string } {
         ci,
         failing: failing.map((name) => ({ name, url: null })),
       }),
-    }),
-  );
+    });
+  });
   return { run, prUrl: url(n) };
 }
 
@@ -229,6 +240,7 @@ function queue(
   const q = new LandQueue({
     store,
     paths,
+    github: github.client,
     confinement: fakeConfinement,
     clock: {
       now: clock.now,
@@ -267,6 +279,12 @@ async function settle(answer?: { ci: string; failing?: string[] }): Promise<void
 /** Lets the queue's promise chains settle without answering CI or moving the clock. */
 async function settleIdle(): Promise<void> {
   for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
+async function waitWithoutClock(check: () => boolean): Promise<void> {
+  const end = Date.now() + 1_000;
+  while (!check() && Date.now() < end) await settleIdle();
+  expect(check()).toBe(true);
 }
 
 async function waitFor(check: () => boolean, answer?: { ci: string; failing?: string[] }): Promise<void> {
@@ -689,6 +707,41 @@ test("a CI feed item lands the entry without the clock moving", async () => {
 });
 
 function workflow(head: string, attempt: number, conclusion: string, status = "completed"): void {
+  const job = {
+    id: 20 + attempt,
+    run_id: 42,
+    run_attempt: attempt,
+    name: "network",
+    head_sha: head,
+    status,
+    conclusion: conclusion === "failure" ? "timed_out" : conclusion,
+    check_run_url: `https://api.github.com/repos/${SLUG}/check-runs/${10 + attempt}`,
+    steps: [],
+  };
+  const check = {
+    id: 10 + attempt,
+    name: "network",
+    head_sha: head,
+    status,
+    conclusion: job.conclusion,
+    details_url: `https://github.com/${SLUG}/actions/runs/42/job/${job.id}`,
+    app: { slug: "github-actions" },
+  };
+  github.responses.set(`repos/${SLUG}/commits/${head}/check-runs?filter=latest&per_page=100&page=1`, () =>
+    respond(200, { total_count: 1, check_runs: [check] }),
+  );
+  github.responses.set(`repos/${SLUG}/actions/runs/42`, () =>
+    respond(200, { head_sha: head, run_attempt: attempt }),
+  );
+  github.responses.set(`repos/${SLUG}/actions/runs/42/attempts/${attempt}/jobs?per_page=100&page=1`, () =>
+    respond(200, { total_count: 1, jobs: [job] }),
+  );
+  github.responses.set(`repos/${SLUG}/actions/jobs/${job.id}`, () => respond(200, job));
+  github.responses.set(`repos/${SLUG}/actions/jobs/${job.id}/logs`, () => respond(200, "runner timed out"));
+  github.responses.set(`repos/${SLUG}/check-runs/${check.id}/annotations?per_page=100&page=1`, () =>
+    respond(200, []),
+  );
+  github.responses.set(`repos/${SLUG}/actions/jobs/${job.id}/rerun`, () => respond(201, {}));
   writeFileSync(
     join(root, "gh.runs"),
     JSON.stringify([{ databaseId: 42, headSha: head, attempt, conclusion, status }]),
@@ -708,11 +761,16 @@ test("a transient CI failure is re-run once and lands", async () => {
   workflow(await published(), 1, "failure");
   observers.get(url(1))?.(await published(), "FAILURE", ["network"]);
   await waitFor(() => landLog.some((l) => l.includes("transient CI failure")));
-  expect(ghCalls("run rerun")).toEqual([`run rerun 42 --failed --repo ${SLUG}`]);
+  expect(
+    github
+      .rest()
+      .filter((c) => c.path.endsWith("/rerun"))
+      .map((c) => c.path),
+  ).toEqual([`repos/${SLUG}/actions/jobs/21/rerun`]);
   // A stale red rollup does not count as the rerun's result or trigger another request.
   await tick();
   expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
-  expect(ghCalls("run rerun")).toHaveLength(1);
+  expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toHaveLength(1);
   workflow(await published(), 2, "", "in_progress");
   observers.get(url(1))?.(await published(), "SUCCESS");
   await tick();
@@ -725,7 +783,7 @@ test("a transient CI failure is re-run once and lands", async () => {
   await settle();
   expect(store.getLandEntry(entry.id)?.state).toBe("landed");
   expect(landLog.filter((l) => l.includes("transient CI failure"))).toHaveLength(1);
-  expect(ghCalls("run rerun")).toHaveLength(1);
+  expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toHaveLength(1);
 });
 
 test("a transient CI failure twice blocks, and a real one is not re-run", async () => {
@@ -759,7 +817,87 @@ test("a transient CI failure twice blocks, and a real one is not re-run", async 
   expect(store.getLandEntry(second.id)).toMatchObject({ state: "blocked", reason: "CI failed: build" });
   expect(landLog.some((l) => l.includes("transient"))).toBe(false);
   expect(ghCalls("pr merge")).toEqual([]);
-  expect(ghCalls("run rerun")).toHaveLength(1);
+  expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toHaveLength(1);
+});
+
+test("non-transient main-red CI blocks with names", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  ci = () => null;
+  const main = "b".repeat(40);
+  github.responses.set(`repos/${SLUG}/commits/${main}/check-runs?filter=latest&per_page=100&page=1`, () =>
+    respond(200, {
+      total_count: 2,
+      check_runs: ["build", "lint"].map((name, i) => ({
+        id: 99 + i,
+        name,
+        head_sha: main,
+        status: "completed",
+        conclusion: "failure",
+      })),
+    }),
+  );
+  const entry = queue().request({ target: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  const before = clock.now();
+  observe(1, store.getLandEntry(entry.id)?.pushedSha ?? "", "FAILURE", ["build", "lint"]);
+  await waitWithoutClock(() => store.getLandEntry(entry.id)?.state === "blocked");
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "blocked",
+    reason: "CI failed: build, lint",
+  });
+  expect(clock.now()).toBe(before);
+  expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toEqual([]);
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("moved head discovered by rerun preflight blocks immediately", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  ci = () => null;
+  const entry = queue().request({ target: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  const pinned = store.getLandEntry(entry.id)?.pushedSha ?? "";
+  workflow(pinned, 1, "failure");
+  github.responses.set(`repos/${SLUG}/pulls/1`, () =>
+    respond(200, { head: { sha: "c".repeat(40) }, state: "open" }),
+  );
+  const before = clock.now();
+  observe(1, pinned, "FAILURE", ["network"]);
+  await waitWithoutClock(() => store.getLandEntry(entry.id)?.state === "blocked");
+  expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
+  expect(clock.now()).toBe(before);
+  expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toEqual([]);
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("moved head interrupts a stalled classifier read", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  ci = () => null;
+  const entry = queue().request({ target: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  const pinned = store.getLandEntry(entry.id)?.pushedSha ?? "";
+  github.hold = new Promise<void>(() => {});
+  observe(1, pinned, "FAILURE", ["build"]);
+  await waitWithoutClock(() => github.inFlight === 1);
+  const readSignal = github.signals.at(-1);
+  expect(readSignal?.aborted).toBe(false);
+  const before = clock.now();
+  observe(1, "c".repeat(40), "PENDING");
+  await waitWithoutClock(() => store.getLandEntry(entry.id)?.state === "blocked");
+  expect(readSignal?.aborted).toBe(true);
+  expect(github.inFlight).toBe(0);
+  expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
+  expect(clock.now()).toBe(before);
+  expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toEqual([]);
+  expect(ghCalls("pr merge")).toEqual([]);
 });
 
 test("a saved moved head blocks without advancing the clock even when a CI read stalls", async () => {

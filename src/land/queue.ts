@@ -24,14 +24,20 @@ import {
   removeWorktree,
 } from "../git/repos.ts";
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
-import { type GhRunner, runGh } from "../integrations/github.ts";
+import { ciDecision } from "../integrations/ci-classifier.ts";
+import type { GhRunner } from "../integrations/github.ts";
 import {
   ciRunsSchema,
   type GitHubPrView,
   getGitHubCiRuns,
   getGitHubPr,
 } from "../integrations/github-notifier.ts";
-import { savedSnapshot } from "../integrations/github-poller.ts";
+import {
+  type GitHubClient,
+  ghClient,
+  type PrSnapshot,
+  savedSnapshot,
+} from "../integrations/github-poller.ts";
 
 /** A land the factory will not retry: the operator has to look at it. */
 export class LandBlocked extends Error {}
@@ -43,6 +49,8 @@ export interface LandObservation {
   /** The CI rollup state: "SUCCESS", "FAILURE", "PENDING", "EXPECTED" or null (no checks). */
   ci: string | null;
   failing: string[];
+  statusNames?: string[];
+  truncated?: boolean;
 }
 
 /** The `gh pr view` client a land reads its CI from when polling is off. */
@@ -62,6 +70,8 @@ export interface LandDeps {
   polling?: boolean;
   client?: LandPrClient;
   gh?: GhRunner;
+  github?: GitHubClient;
+  ciReruns?: boolean;
   clock?: LandClock;
   /** How often CI is looked at while a land waits; 15s, like a delivered PR's poll. */
   ciPollMs?: number;
@@ -75,12 +85,6 @@ const DEFAULTS = { ciPollMs: 15_000, ciTimeoutMs: 60 * 60_000 };
 /** The poller's verdicts, as feed items; they are what moves a CI wait. */
 const CI_FEED = new Set(["pr.ci_passed", "pr.ci_failed"]);
 const UNSETTLED_CI = new Set(["PENDING", "EXPECTED"]);
-/**
- * Checks whose failures are the infrastructure's rather than the change's: one rerun, then block.
- * #353 replaces this with a policy over the whole run; it is deliberately a short explicit list.
- */
-const TRANSIENT_CI =
-  /flaky|network|timed? ?out|timeout|cancel|beacon|startup|action required|infrastructure/i;
 /** A claim has to be this quiet before another queue may take the entry it holds. */
 const CLAIM_STALE_MS = 30_000;
 
@@ -334,7 +338,7 @@ export class LandQueue {
    */
   private async awaitCi(entry: LandEntry, sha: string, signal: AbortSignal): Promise<"green" | "merged"> {
     const deadline = this.now() + (this.deps.ciTimeoutMs ?? DEFAULTS.ciTimeoutMs);
-    let rerun = entry.ciRerun ? ciRunsSchema.parse(JSON.parse(entry.ciRerun)) : null;
+    const rerun = entry.ciRerun ? ciRunsSchema.parse(JSON.parse(entry.ciRerun)) : null;
     for (;;) {
       signal.throwIfAborted();
       const snapshot = this.store.githubPrData(entry.prUrl);
@@ -347,6 +351,7 @@ export class LandQueue {
         saved.headRefOid !== entry.approvedSha
       )
         throw new LandBlocked("head moved after approval");
+      const since = this.store.prHead(entry.prUrl)?.version ?? 0;
       const seen = await this.observe(entry.prUrl, signal, sha);
       if (seen?.state === "MERGED") return "merged";
       if (seen?.head && seen.head !== sha) throw new LandBlocked("head moved after approval");
@@ -371,29 +376,86 @@ export class LandQueue {
         continue;
       }
       if (seen?.head === sha && seen.ci && !UNSETTLED_CI.has(seen.ci)) {
-        if (seen.ci === "SUCCESS") return "green";
-        if (!rerun && seen.failing.length > 0 && seen.failing.every((n) => TRANSIENT_CI.test(n))) {
-          const runs = await getGitHubCiRuns(entry.repo, sha, signal, this.deps.gh);
-          rerun = runs.filter(
-            (run) =>
-              run.status === "completed" &&
-              ["failure", "timed_out", "cancelled", "startup_failure", "action_required"].includes(
-                run.conclusion ?? "",
-              ),
+        const outstanding = this.store
+          .ciFailures(entry.prUrl, sha)
+          .some((f) => f.outcome === "rerunning" || f.outcome === "rerun_requested");
+        if (seen.ci === "SUCCESS" && !outstanding) return "green";
+        if (!this.store.observePrHead(entry.prUrl, sha, since))
+          throw new LandBlocked("head moved after approval");
+        const version = this.store.prHead(entry.prUrl)?.version;
+        const inspection = new AbortController();
+        const inspectionSignal = AbortSignal.any([signal, inspection.signal]);
+        const current = () =>
+          !inspectionSignal.aborted && this.store.prHead(entry.prUrl)?.version === version;
+        const snap: PrSnapshot = {
+          ...(saved?.headRefOid === sha ? saved : {}),
+          id: saved?.id ?? "",
+          url: entry.prUrl,
+          headRefOid: sha,
+          state: seen.state,
+          mergeable: null,
+          mergeStateStatus: null,
+          updatedAt: "",
+          mergedAt: null,
+          mergedBy: null,
+          activity: { review: [], review_comment: [], comment: [] },
+          ci: seen.ci,
+          failing: seen.failing.map((name) => ({ name, url: null })),
+          statusNames: seen.statusNames ?? saved?.statusNames,
+          truncated: seen.truncated ?? saved?.truncated,
+        };
+        const pr = {
+          url: entry.prUrl,
+          repo: entry.repo,
+          runId: entry.runId,
+          nodeId: null,
+          data: null,
+          delivered: 1,
+        };
+        const before = this.store.ciFailures(entry.prUrl, sha).filter((f) => f.rerunJob).length;
+        let decision: Awaited<ReturnType<typeof ciDecision>> | undefined;
+        const checkHead = () => {
+          const observed = this.savedReport(entry.prUrl);
+          if (
+            !current() ||
+            (observed?.state !== "MERGED" &&
+              observed?.head &&
+              observed.head !== sha &&
+              observed.head !== entry.approvedSha)
+          )
+            inspection.abort(new LandBlocked("head moved after approval"));
+        };
+        const unsubscribe = this.store.subscribe((msg) => {
+          if (msg.kind === "github_pr" && msg.url === entry.prUrl) checkHead();
+        });
+        try {
+          checkHead();
+          decision = await ciDecision(
+            this.store,
+            pr,
+            snap,
+            (_repo, path, body) => (this.deps.github ?? ghClient)(path, body, inspectionSignal),
+            this.deps.ciReruns !== false && !rerun,
+            current,
+            current,
+            "land",
           );
-          if (!rerun.length) throw new LandBlocked("CI has no failed workflow to rerun");
-          // Persist before requesting: a crash must never request a second rerun for this land.
-          this.store.updateLandEntry(entry.id, { ciRerun: JSON.stringify(rerun) });
-          for (const run of rerun)
-            await (this.deps.gh ?? runGh)(
-              ["run", "rerun", String(run.databaseId), "--failed", "--repo", entry.repo],
-              signal,
-            );
-          this.log(`[land] ${entry.id}: transient CI failure; re-running`);
-          await this.ciWake(entry, signal, snapshot);
-          continue;
+        } catch (error) {
+          signal.throwIfAborted();
+          if (inspection.signal.aborted) throw inspection.signal.reason;
+          this.log(`[land] ${entry.id}: CI inspection pending: ${String(error)}`);
+        } finally {
+          unsubscribe();
         }
-        throw new LandBlocked(`CI failed: ${seen.failing.join(", ") || "unknown check"}`);
+        if (decision?.state === "head_moved" || !current()) {
+          signal.throwIfAborted();
+          throw new LandBlocked("head moved after approval");
+        }
+        if (this.store.ciFailures(entry.prUrl, sha).filter((f) => f.rerunJob).length > before)
+          this.log(`[land] ${entry.id}: transient CI failure; re-running`);
+        if (decision?.state === "green") return "green";
+        if (decision?.state === "failed")
+          throw new LandBlocked(`CI failed: ${seen.failing.join(", ") || "unknown check"}`);
       }
       if (this.now() >= deadline) throw new LandBlocked("CI did not finish");
       await this.ciWake(entry, signal, snapshot);
@@ -526,6 +588,8 @@ export class LandQueue {
           state: snapshot.state,
           ci: snapshot.ci,
           failing: snapshot.failing.map((f) => f.name),
+          statusNames: snapshot.statusNames,
+          truncated: snapshot.truncated,
         }
       : null;
   }
@@ -535,7 +599,16 @@ export class LandQueue {
     const saved = this.deps.polling === false ? null : this.savedReport(url);
     if (saved && (saved.head === sha || saved.state === "MERGED")) return saved;
     const pr = await (this.deps.client ?? getGitHubPr)(url, signal);
-    return pr ? { head: pr.headRefOid ?? "", state: pr.state, ci: pr.ci ?? null, failing: pr.failing } : null;
+    return pr
+      ? {
+          head: pr.headRefOid ?? "",
+          state: pr.state,
+          ci: pr.ci ?? null,
+          failing: pr.failing,
+          statusNames: pr.statusNames,
+          truncated: pr.truncated,
+        }
+      : null;
   }
 
   private block(id: number, reason: string): void {

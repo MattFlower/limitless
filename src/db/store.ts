@@ -10,6 +10,7 @@ import type {
   ChatOrigin,
   ChatProposal,
   ChatProposalFields,
+  CiFailure,
   CreateRunRequest,
   EvalRun,
   EvalTrial,
@@ -2296,6 +2297,45 @@ export class Store {
   }
 
   // ---- GitHub poller -------------------------------------------------------
+
+  ciFailures(prUrl: string, sha: string): CiFailure[] {
+    return this.db
+      .query<
+        Omit<CiFailure, "rerunJob"> & { rerunJob: string | null },
+        [string, string]
+      >(`SELECT pr_url AS prUrl, sha, signature,
+      check_name AS "check", error_line AS line, runner_image AS image, outcome, rerun_marker AS rerunMarker,
+      rerun_job AS rerunJob, rerun_retry_at AS rerunRetryAt, rerun_retry_used AS rerunRetryUsed
+      FROM ci_failures WHERE pr_url = ? AND sha = ?`)
+      .all(prUrl, sha)
+      .map((f) => ({ ...f, rerunJob: f.rerunJob ? JSON.parse(f.rerunJob) : null }));
+  }
+
+  recordCiFailure(f: CiFailure): void {
+    this.db
+      .query(`INSERT INTO ci_failures (pr_url, sha, signature, check_name, error_line, runner_image)
+      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`)
+      .run(f.prUrl, f.sha, f.signature, f.check, f.line, f.image);
+  }
+
+  /** One claim per PR head, before the POST; refusals and lost responses retain it. */
+  claimCiRerun(f: CiFailure, marker: string, job: NonNullable<CiFailure["rerunJob"]>): boolean {
+    return (
+      this.db
+        .query(`UPDATE ci_failures SET rerun_claimed = 1, outcome = 'rerun_requested', rerun_marker = ?, rerun_job = ?
+      WHERE pr_url = ? AND sha = ? AND signature = ? AND rerun_claimed = 0
+      AND NOT EXISTS (SELECT 1 FROM ci_failures WHERE pr_url = ? AND sha = ? AND rerun_claimed = 1)
+      AND NOT EXISTS (SELECT 1 FROM land_entries WHERE pr_url = ? AND pushed_sha = ? AND ci_rerun IS NOT NULL)`)
+        .run(marker, JSON.stringify(job), f.prUrl, f.sha, f.signature, f.prUrl, f.sha, f.prUrl, f.sha)
+        .changes === 1
+    );
+  }
+
+  finishCiFailure(f: CiFailure, outcome: CiFailure["outcome"]): void {
+    this.db
+      .query("UPDATE ci_failures SET outcome = ? WHERE pr_url = ? AND sha = ? AND signature = ?")
+      .run(outcome, f.prUrl, f.sha, f.signature);
+  }
 
   /** Unmerged PRs factory runs opened; PRs runs only verified, or abandoned over 7 days while open, are excluded. */
   githubTracked(now = Date.now()): TrackedPr[] {

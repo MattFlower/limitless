@@ -57,6 +57,7 @@ export function fakeGitHub(now: () => number = Date.now) {
   const signals: AbortSignal[] = [];
   const next: (GitHubResponse | Error)[] = [];
   const restNext: (GitHubResponse | Error)[] = [];
+  const responses = new Map<string, () => GitHubResponse>();
   const deny = new Map<string, () => GitHubResponse>();
   let inFlight = 0;
   let maxInFlight = 0;
@@ -78,9 +79,48 @@ export function fakeGitHub(now: () => number = Date.now) {
     if (queued instanceof Error) throw queued;
     if (queued) return queued;
     if (ids) return respond(200, { data: { nodes: ids.map((id) => nodes.get(id) ?? null) } });
+    const response = responses.get(path);
+    if (response) return response();
+    const statuses = path.match(/^repos\/(.+)\/commits\/([^/?]+)\/statuses\?/);
+    if (statuses) {
+      const node = [...nodes.values()].find(
+        (n) => n.url.startsWith(`https://github.com/${statuses[1]}/`) && n.headRefOid === statuses[2],
+      );
+      const rollup = node?.commits.nodes[0]?.commit.statusCheckRollup as {
+        contexts?: { nodes: { name: string; state?: string }[] };
+      } | null;
+      return respond(
+        200,
+        (rollup?.contexts?.nodes ?? [])
+          .filter((c) => c.state)
+          .map((c, i) => ({ id: i + 1, context: c.name, state: c.state?.toLowerCase(), description: null })),
+      );
+    }
+    const commit = path.match(/^repos\/(.+)\/commits\/([^/?]+)(\/check-runs\?.*)?$/);
+    if (commit) {
+      if (!commit[3]) return respond(200, { sha: "b".repeat(40) });
+      const pr = [...nodes.values()].find(
+        (n) => n.url.startsWith(`https://github.com/${commit[1]}/`) && n.headRefOid === commit[2],
+      );
+      const rollup = pr?.commits.nodes[0]?.commit.statusCheckRollup as {
+        contexts?: { nodes: { name: string; conclusion?: string; state?: string }[] };
+      } | null;
+      const checks = (rollup?.contexts?.nodes ?? [])
+        .filter((c) => c.state === undefined)
+        .map((c, i) => ({
+          id: i + 1,
+          name: c.name,
+          head_sha: commit[2],
+          status: "completed",
+          conclusion: (c.conclusion ?? c.state ?? "success").toLowerCase(),
+        }));
+      return respond(200, { total_count: checks.length, check_runs: checks });
+    }
     const match = path.match(/^repos\/(.+)\/pulls\/(\d+)$/);
     const node = [...nodes.values()].find((n) => match && n.url === url(match[1] ?? "", Number(match[2])));
-    return node ? respond(200, { node_id: node.id }) : respond(404, { message: "Not Found" });
+    return node
+      ? respond(200, { node_id: node.id, head: { sha: node.headRefOid }, state: node.state.toLowerCase() })
+      : respond(404, { message: "Not Found" });
   };
   const fake = {
     /** While set, requests wait on it (a deferred response). */
@@ -93,6 +133,7 @@ export function fakeGitHub(now: () => number = Date.now) {
     next,
     /** Overrides for REST calls only, consumed before `next`. */
     restNext,
+    responses,
     client,
     get maxInFlight() {
       return maxInFlight;
@@ -147,10 +188,11 @@ export function pollerHarness(repos = ["o/r"]) {
       return run;
     },
     node: (repo: string, n: number) => gh.nodes.get(`PR_${repo}_${n}`) as PrNode,
-    start(seconds?: number) {
+    start(seconds?: number, ciReruns?: boolean) {
       stop = startGitHubPoller(h.store, {
         client: gh.client,
         seconds,
+        ciReruns,
         log: (m) => logs.push(m),
         clock: {
           now: clock.now,
