@@ -27,21 +27,25 @@ test("Run Detail opens saved chains and retry submits a replacement map, retaini
     models: { implement: ["claude/opus@high|codex/sol", "codex/luna"] },
   });
   const run = { ...created, status: "failed" as const };
+  const defaultRun = store.createRun(repo, { repo: repo.slug, prompt: "Retry without overrides" });
   const detail = store.getRunDetail(run.id);
   if (!detail) throw new Error("missing detail");
   const page = await buildNeedsYouUi(join(dir, "page"));
   const picker = await buildSetupUi(join(dir, "picker"), "RetryModels");
   let fail = true;
   let catalog = MODELS;
+  const requests: string[] = [];
   const bodies: { models: RunModels }[] = [];
   globalThis.fetch = Object.assign(
     async (path: string | URL | Request, init?: RequestInit) => {
+      requests.push(String(path));
       if (String(path) === "/api/catalog") return Response.json({ models: catalog, providers: [] });
       if (String(path) === "/api/routing")
         return Response.json({
           effective: { implement: { default: { groups: ["codex/sol@high"], layer: "operator" } } },
         });
-      if (String(path) !== `/api/runs/${run.id}/retry`) throw new Error(`Unexpected request ${path}`);
+      if (String(path) !== `/api/runs/${run.id}/retry` && String(path) !== `/api/runs/${defaultRun.id}/retry`)
+        throw new Error(`Unexpected request ${path}`);
       bodies.push(JSON.parse(String(init?.body)) as { models: RunModels });
       return fail
         ? Response.json({ error: "models.implement: invalid choice" }, { status: 400 })
@@ -83,10 +87,14 @@ test("Run Detail opens saved chains and retry submits a replacement map, retaini
     fail = false;
     await picker.invoke(picker.render(), "button", "Retry with selected models");
     expect(picker.navigated).toEqual(["/runs/replacement"]);
-    picker.mount({ run: { ...run, models: undefined }, onRetried: () => {}, onCancel: () => {} });
+    expect(requests).not.toContain("/api/routing");
+    expect(defaultRun.models).toEqual({});
+    picker.mount({ run: defaultRun, onRetried: () => {}, onCancel: () => {} });
     await settle();
+    expect(requests).toContain("/api/routing");
     expect(picker.render()).toContain('value="codex/sol"');
     await picker.invoke(picker.render(), "button", "Retry with selected models");
+    expect(requests.at(-1)).toBe(`/api/runs/${defaultRun.id}/retry`);
     expect(bodies.at(-1)).toEqual({ models: { implement: ["codex/sol@high"] } });
   } finally {
     page.dispose();

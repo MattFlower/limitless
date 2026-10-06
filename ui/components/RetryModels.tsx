@@ -5,7 +5,7 @@ import { RunModelPicker } from "./RunModelPicker.tsx";
 
 export const RetryModels = (props: { run: Run; onRetried: (id: string) => void; onCancel: () => void }) => {
   const [models, setModels] = createSignal<RunModels>(structuredClone(props.run.models ?? {}));
-  const [loading, setLoading] = createSignal(props.run.models == null);
+  const [loading, setLoading] = createSignal(Object.keys(props.run.models ?? {}).length === 0);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
   onMount(() => {
