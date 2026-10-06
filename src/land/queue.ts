@@ -420,6 +420,7 @@ export class LandQueue {
             this.deps.ciReruns !== false && !rerun,
             current,
             current,
+            "land",
           );
         } catch (error) {
           signal.throwIfAborted();

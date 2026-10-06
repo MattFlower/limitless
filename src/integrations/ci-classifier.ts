@@ -79,6 +79,7 @@ async function inspectCi(
   ready: () => boolean,
   current: () => boolean,
   onFailure: () => void,
+  consumer: "poller" | "land",
 ): Promise<boolean> {
   const root = `repos/${pr.repo}`;
   const read = async (path: string) => {
@@ -323,14 +324,16 @@ async function inspectCi(
         throw new Error("Outdated CI check completion");
       let log = c.output?.text ?? c.output?.summary ?? "";
       if (state.get(c.name)?.red) {
-        paused = true;
         emit(
           "ci.main_red",
           ciSignature(c.name, log, c.conclusion ?? "failure"),
           `${pr.repo}:${c.name}:${state.get(c.name)?.episode}`,
           true,
         );
-        continue;
+        if (consumer === "poller") {
+          paused = true;
+          continue;
+        }
       }
       let job: z.infer<typeof jobSchema> | undefined;
       let jobUnsafe = false;
@@ -407,6 +410,11 @@ async function inspectCi(
         ) ||
         job?.started_at === null ||
         logLines(log).some((line) => timeoutDiagnostic.test(line));
+      // A land must report real failures even when main has the same red check.
+      if (state.get(c.name)?.red && transient && !unsafe) {
+        paused = true;
+        continue;
+      }
       if (!unsafe && !prior.length && job && transient && reruns) {
         const siblings = (await jobs(job.run_id, job.run_attempt)).filter((j) => j.name === job.name);
         if (siblings.length !== 1 || siblings[0]?.id !== job.id)
@@ -455,6 +463,7 @@ export function ciDecision(
   reruns: boolean,
   ready: () => boolean,
   current: () => boolean,
+  consumer: "poller" | "land" = "poller",
 ): Promise<CiDecision> {
   let active = inspections.get(store);
   if (!active) {
@@ -467,9 +476,19 @@ export function ciDecision(
     await previous?.catch(() => undefined);
     if (!current()) return { complete: false, state: "pending" };
     let failed = false;
-    const complete = await inspectCi(store, pr, snap, call, reruns, ready, current, () => {
-      failed = true;
-    });
+    const complete = await inspectCi(
+      store,
+      pr,
+      snap,
+      call,
+      reruns,
+      ready,
+      current,
+      () => {
+        failed = true;
+      },
+      consumer,
+    );
     const waiting = store.ciFailures(pr.url, snap.headRefOid).some(pending);
     return {
       complete,

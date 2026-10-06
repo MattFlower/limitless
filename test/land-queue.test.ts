@@ -281,6 +281,12 @@ async function settleIdle(): Promise<void> {
   for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
+async function waitWithoutClock(check: () => boolean): Promise<void> {
+  const end = Date.now() + 1_000;
+  while (!check() && Date.now() < end) await settleIdle();
+  expect(check()).toBe(true);
+}
+
 async function waitFor(check: () => boolean, answer?: { ci: string; failing?: string[] }): Promise<void> {
   const end = Date.now() + 15_000;
   while (!check()) {
@@ -812,6 +818,39 @@ test("a transient CI failure twice blocks, and a real one is not re-run", async 
   expect(landLog.some((l) => l.includes("transient"))).toBe(false);
   expect(ghCalls("pr merge")).toEqual([]);
   expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toHaveLength(1);
+});
+
+test("non-transient main-red CI blocks with names", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  ci = () => null;
+  const main = "b".repeat(40);
+  github.responses.set(`repos/${SLUG}/commits/${main}/check-runs?filter=latest&per_page=100&page=1`, () =>
+    respond(200, {
+      total_count: 2,
+      check_runs: ["build", "lint"].map((name, i) => ({
+        id: 99 + i,
+        name,
+        head_sha: main,
+        status: "completed",
+        conclusion: "failure",
+      })),
+    }),
+  );
+  const entry = queue().request({ target: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  const before = clock.now();
+  observe(1, store.getLandEntry(entry.id)?.pushedSha ?? "", "FAILURE", ["build", "lint"]);
+  await waitWithoutClock(() => store.getLandEntry(entry.id)?.state === "blocked");
+  expect(store.getLandEntry(entry.id)).toMatchObject({
+    state: "blocked",
+    reason: "CI failed: build, lint",
+  });
+  expect(clock.now()).toBe(before);
+  expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toEqual([]);
+  expect(ghCalls("pr merge")).toEqual([]);
 });
 
 test("a saved moved head blocks without advancing the clock even when a CI read stalls", async () => {
