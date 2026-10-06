@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { MIGRATIONS } from "./migrations.ts";
+import { legacySidecarStarts } from "./worktree-provenance.ts";
 
 export const MIGRATION_DIR = join(import.meta.dir, "migrations");
 const FILE_NAME = /^\d{8}T\d{4}(?:\d{2})?-[a-z0-9]+(?:-[a-z0-9]+)*\.sql$/;
@@ -83,6 +84,7 @@ export function runMigrations(db: Database, directory = MIGRATION_DIR): void {
       continue;
     }
     db.transaction(() => {
+      if (name === "20261005T134145-worktree-provenance.sql") legacySidecarStarts(db);
       db.exec(sql);
       db.query("INSERT INTO applied_migrations (name, sha256, applied_at) VALUES (?, ?, ?)").run(
         name,

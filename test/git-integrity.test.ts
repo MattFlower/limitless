@@ -109,7 +109,8 @@ test.each([
     const sibling = join(common, "worktrees", "sibling");
     mkdirSync(sibling);
     if (tampering === "non-file sibling backlink") mkdirSync(join(sibling, "gitdir"));
-    if (tampering === "duplicate backlink") writeFileSync(join(sibling, "gitdir"), `${pointer}\n`);
+    if (tampering === "duplicate backlink")
+      writeFileSync(join(sibling, "gitdir"), readFileSync(join(admin, "gitdir")));
   }
   if (tampering === "rewritten pointer") writeFileSync(pointer, `gitdir: ${join(seed, ".git")}\n`);
   if (tampering === "symlinked pointer") {

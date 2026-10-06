@@ -7057,13 +7057,16 @@ test("drain blocks queued starts and parks the active run at its next boundary",
 });
 
 // Serialize the factory evidence and schema that a release without sidecars left behind.
-function legacyWorktreeFixture(f: Factory, runId: string, interrupted = false): void {
+function legacyWorktreeFixture(f: Factory, runId: string, interrupted = false, modern = false): void {
+  f.store.daemonStarted("sidecar-release", "0.1.0", "7405d9f0555a61526a657992f1fe972bfeafed37");
+  f.store.db.exec("UPDATE feed SET ts = 1791100100000 WHERE dedupe_key = 'daemon.started:sidecar-release'");
+  const created = modern ? 1791100150000 : 1791100000000;
   f.store.db
     .query(
-      "UPDATE stages SET started_at = 1791000000000, finished_at = 1791000001000, status = ? WHERE run_id = ? AND name = 'prepare'",
+      "UPDATE stages SET started_at = ?, finished_at = ?, status = ? WHERE run_id = ? AND name = 'prepare'",
     )
-    .run(interrupted ? "failed" : "succeeded", runId);
-  f.store.db.query("UPDATE events SET ts = 1791000000500 WHERE run_id = ? AND type = 'gate'").run(runId);
+    .run(created, created + 1000, interrupted ? "failed" : "succeeded", runId);
+  f.store.db.query("UPDATE events SET ts = ? WHERE run_id = ? AND type = 'gate'").run(created + 500, runId);
   f.store.db.exec("ALTER TABLE runs DROP COLUMN worktree_provenance");
   f.store.db.exec("DELETE FROM applied_migrations WHERE name = '20261005T134145-worktree-provenance.sql'");
 }
@@ -7089,7 +7092,7 @@ test.each(["legacy missing", "modern missing", "legacy mismatched"])(
     await f.stop();
     delete state.previewConfig;
     f.store.setRunState(run.id, state);
-    if (record.startsWith("legacy")) legacyWorktreeFixture(f, run.id);
+    legacyWorktreeFixture(f, run.id, false, record === "modern missing");
     f.store.close();
     if (record.endsWith("missing")) rmSync(sidecar);
     else {
@@ -7112,6 +7115,9 @@ test.each(["legacy missing", "modern missing", "legacy mismatched"])(
       ).toHaveLength(1);
       // Once adopted, this worktree requires its record just like a newly created one.
       expect(again.store.hasLegacyWorktree(run.id)).toBe(false);
+      expect(again.store.db.query("SELECT worktree_provenance FROM runs WHERE id = ?").get(run.id)).toEqual({
+        worktree_provenance: "recorded",
+      });
       again.store.setRunState(run.id, state);
       again.store.updateRun(run.id, { status: "queued" });
       again.store.close();

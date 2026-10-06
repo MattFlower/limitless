@@ -70,63 +70,123 @@ const fileNames = (db: Database) =>
     (r) => r.name,
   );
 
-test("worktree provenance upgrade requires pre-sidecar factory evidence and survives reopen", () => {
-  temporary((directory, path) => {
-    const before = join(directory, "before");
-    cpSync(MIGRATION_DIR, before, {
-      recursive: true,
-      filter: (src) => !src.endsWith("-worktree-provenance.sql"),
-    });
-    const old = new Store(path, before);
-    const repo = old.upsertRepo({
-      slug: "local",
-      kind: "local",
-      localPath: directory,
-      url: null,
-      defaultBranch: "main",
-      mergePolicy: "pr",
-    });
-    const cases = ["completed", "interrupted", "creation only", "modern", "ambiguous", "no worktree"];
-    const ids = cases.map((evidence) => {
-      const run = old.createRun(repo, { repo: repo.slug, prompt: evidence });
-      old.db.query("UPDATE runs SET created_at = 1 WHERE id = ?").run(run.id);
-      if (evidence !== "creation only") {
-        const stage = old.startStage(run.id, "prepare");
-        old.db
-          .query("UPDATE stages SET started_at = ?, finished_at = ?, status = ? WHERE id = ?")
-          .run(
-            evidence === "modern" ? 1791100000000 : 1791000000000,
-            evidence === "modern" ? 1791100001000 : 1791000001000,
-            ["interrupted", "no worktree"].includes(evidence) ? "failed" : "succeeded",
-            stage.id,
-          );
-        if (evidence === "interrupted") {
-          old.addEvent({ runId: run.id, type: "gate", message: "baseline passed" });
-          old.db.query("UPDATE events SET ts = 1791000000500 WHERE run_id = ?").run(run.id);
-        }
-        if (evidence === "ambiguous") old.startStage(run.id, "prepare");
+test.each(["verified", "missing", "unknown", "pre-sidecar", "malformed", "pruned"])(
+  "worktree provenance upgrade requires pre-sidecar factory evidence (%s) and survives reopen",
+  (startup) => {
+    temporary((directory, path) => {
+      const before = join(directory, "before");
+      cpSync(MIGRATION_DIR, before, {
+        recursive: true,
+        filter: (src) => !src.endsWith("-worktree-provenance.sql"),
+      });
+      const old = new Store(path, before);
+      if (startup !== "missing") {
+        old.daemonStarted(
+          "first",
+          "0.1.0",
+          startup === "unknown"
+            ? "unknown"
+            : startup === "pre-sidecar"
+              ? "d72c4f9e7f1730d8620844c3147b332fef6fdce5"
+              : "7405d9f0555a61526a657992f1fe972bfeafed37",
+        );
+        old.db.query("UPDATE feed SET ts = 1791100100000 WHERE kind = 'daemon.started'").run();
+        if (startup === "malformed") old.db.exec("UPDATE feed SET data = '{' WHERE kind = 'daemon.started'");
+        if (startup === "pruned") old.setSetting("feed_pruned_through", 1);
       }
-      return run.id;
+      // An unverified earlier event is insufficient, and a later recording boot must not move the cutoff.
+      old.daemonStarted("unverified", "0.1.0", "unknown");
+      old.db.exec("UPDATE feed SET ts = 1791090000000 WHERE dedupe_key = 'daemon.started:unverified'");
+      if (startup === "verified") {
+        old.daemonStarted("later", "0.1.0", "50e74bfd1831592896d03da21b2c49fe1cfcc4e5");
+        old.db.exec("UPDATE feed SET ts = 1791100200000 WHERE dedupe_key = 'daemon.started:later'");
+      }
+      const repo = old.upsertRepo({
+        slug: "local",
+        kind: "local",
+        localPath: directory,
+        url: null,
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const cases = [
+        "completed",
+        "interrupted",
+        "old completed",
+        "creation only",
+        "modern",
+        "boundary",
+        "crossed boundary",
+        "ambiguous",
+        "no worktree",
+      ];
+      const ids = cases.map((evidence) => {
+        const run = old.createRun(repo, { repo: repo.slug, prompt: evidence });
+        old.db.query("UPDATE runs SET created_at = 1 WHERE id = ?").run(run.id);
+        if (evidence !== "creation only") {
+          const stage = old.startStage(run.id, "prepare");
+          old.db
+            .query("UPDATE stages SET started_at = ?, finished_at = ?, status = ? WHERE id = ?")
+            .run(
+              evidence === "old completed"
+                ? 1791000000000
+                : evidence === "modern"
+                  ? 1791100150000
+                  : evidence === "boundary"
+                    ? 1791100100000
+                    : 1791100000000,
+              evidence === "old completed"
+                ? 1791000001000
+                : evidence === "modern"
+                  ? 1791100151000
+                  : ["boundary", "crossed boundary"].includes(evidence)
+                    ? 1791100101000
+                    : 1791100001000,
+              ["interrupted", "no worktree"].includes(evidence) ? "failed" : "succeeded",
+              stage.id,
+            );
+          if (evidence === "interrupted") {
+            old.addEvent({ runId: run.id, type: "gate", message: "baseline passed" });
+            old.db.query("UPDATE events SET ts = 1791100000500 WHERE run_id = ?").run(run.id);
+          }
+          if (evidence === "ambiguous") old.startStage(run.id, "prepare");
+        }
+        return run.id;
+      });
+      old.close();
+      const current = new Store(path);
+      const eligible = startup === "verified";
+      expect(ids.map((id) => current.hasLegacyWorktree(id))).toEqual([
+        eligible,
+        eligible,
+        eligible,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+      ]);
+      const completed = ids[0];
+      if (!completed) throw new Error("missing completed run");
+      current.markModernWorktree(completed);
+      current.close();
+      const reopened = new Store(path);
+      expect(ids.map((id) => reopened.hasLegacyWorktree(id))).toEqual([
+        false,
+        eligible,
+        eligible,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+      ]);
+      reopened.close();
     });
-    old.close();
-    const current = new Store(path);
-    expect(ids.map((id) => current.hasLegacyWorktree(id))).toEqual([true, true, false, false, false, false]);
-    const completed = ids[0];
-    if (!completed) throw new Error("missing completed run");
-    current.markModernWorktree(completed);
-    current.close();
-    const reopened = new Store(path);
-    expect(ids.map((id) => reopened.hasLegacyWorktree(id))).toEqual([
-      false,
-      true,
-      false,
-      false,
-      false,
-      false,
-    ]);
-    reopened.close();
-  });
-});
+  },
+);
 
 test("the legacy migration array is frozen", () => {
   expect(MIGRATIONS.map((m) => m.version)).toEqual(Array.from({ length: 12 }, (_, i) => i + 1));
