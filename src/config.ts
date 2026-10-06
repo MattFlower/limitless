@@ -81,6 +81,7 @@ export interface Config {
   githubMerge?: "auto" | "pr" | "none";
   githubPoll: boolean; // [github] poll: observe factory PRs; off restores the notifier's per-run PR checks
   githubPollSeconds: number; // [github] poll_seconds: the normal polling interval, at least 15
+  githubCiReruns: boolean; // [github] ci_reruns: retry transient CI failures once
   discordOwnerId: string | null;
   discordChannelId: string | null;
   discordNotifyAll: boolean;
@@ -270,6 +271,8 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     throw new Error("github.merge must be auto, pr or none");
   if (github.poll !== undefined && typeof github.poll !== "boolean")
     throw new Error("github.poll must be true or false");
+  if (github.ci_reruns !== undefined && typeof github.ci_reruns !== "boolean")
+    throw new Error("github.ci_reruns must be true or false");
   if (github.poll_seconds !== undefined && !Number.isFinite(github.poll_seconds))
     throw new Error("github.poll_seconds must be a number of seconds");
   const gates = (raw.gates ?? {}) as Record<string, unknown>;
@@ -365,6 +368,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     githubMerge: github.merge as Config["githubMerge"],
     githubPoll: github.poll !== false,
     githubPollSeconds: Math.max(15, num(github.poll_seconds, 45)),
+    githubCiReruns: github.ci_reruns !== false,
     discordOwnerId: str(owners.discord, null),
     discordChannelId: str(discord.channel_id, null),
     discordNotifyAll: discord.notify_all === true,

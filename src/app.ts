@@ -179,6 +179,7 @@ export class Factory {
       store: this.store,
       paths: cfg.paths,
       polling: cfg.githubPoll,
+      ciReruns: cfg.githubCiReruns,
       client: getGitHubPr,
       confinement: this.deps.confinement,
       ...opts.land,
