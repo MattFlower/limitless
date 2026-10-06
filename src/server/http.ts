@@ -531,7 +531,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     ),
     "/api/github/access": handle(() => json(store.githubAccessProblems())),
     "/api/land": {
-      GET: handle(() => json(factory.land.list())),
+      GET: handle((req) => json(factory.land.list(new URL(req.url).searchParams.get("run") ?? undefined))),
       POST: handle(async (req) => {
         const input = await body<{ target?: unknown; runId?: unknown; sha?: unknown }>(req);
         const target = typeof input.target === "string" ? input.target : input.runId;

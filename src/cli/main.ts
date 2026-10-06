@@ -45,6 +45,7 @@ Usage:
   limitless feed [--consumer <name>] [--after <id>] [--wait <seconds>] [--json]
         Items to act on after the consumer's cursor; --wait long-polls until one arrives
   limitless feed ack <id> --consumer <name>  Acknowledge items through id once handled
+  limitless digest [--consumer <name>]  Read-only session summary of what needs attention
   limitless providers                     Provider health and quota
   limitless catalog list                  Effective models and discovery
   limitless catalog add <provider>/<id> --model <backend> --origin <country> --base-origin <country> --vendor <vendor> --tier N --price-input N --price-output N [--efforts none,high] [--effort high] [--notes …]
@@ -285,6 +286,12 @@ async function main(): Promise<void> {
     case "eval": {
       const { evalCommand } = await import("./eval.ts");
       return evalCommand(rest, values, { api, print: console.log, wait: (ms) => Bun.sleep(ms) });
+    }
+    case "digest": {
+      const { digestCommand } = await import("./digest.ts");
+      const { loadConfig } = await import("../config.ts");
+      loadConfig({ readOnly: true });
+      return digestCommand(rest, values, { api, print: console.log });
     }
     case "feed": {
       const { feedCommand } = await import("./feed.ts");
