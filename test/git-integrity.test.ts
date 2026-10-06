@@ -194,11 +194,7 @@ test("committed nested repositories and changed gitlink commits block, but reque
       file: "nested repo",
       detail: expect.stringContaining("nested repo: nested repository contents are absent from the diff"),
     });
-    expect(
-      auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["submodules"] }).some(
-        (f) => f.rule === "gitlink",
-      ),
-    ).toBe(false);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["submodules"] })).toEqual([]);
   };
   await assertGitlink(base);
   writeFileSync(join(nested, "hidden.test.ts"), `${edited}// next\n`);

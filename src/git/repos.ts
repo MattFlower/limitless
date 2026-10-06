@@ -774,13 +774,15 @@ async function attributeInfo(
     // avoids a tree walk per `tree:path`, which dominates audits of many thousand files.
     const entries = out.stdout.split("\0");
     for (let i = 0; i < entries.length; i++) {
-      const blob = entries[i]?.match(/^:\d+ \d+ \S+ (\S+) /);
-      if (blob?.[1]) {
-        blobs.set(entries[++i] ?? "", blob[1]);
+      const blob = entries[i]?.match(/^:\d+ (\d+) \S+ (\S+) /);
+      if (blob?.[2]) {
+        const path = entries[++i] ?? "";
+        // Gitlinks name commits in another repository, not blobs we can inspect here.
+        if (blob[1] !== "160000") blobs.set(path, blob[2]);
         continue;
       }
       const match = entries[i]?.match(/^(\d+|-)\t(?:\d+|-)\t([\s\S]+)$/);
-      if (match?.[2]) {
+      if (match?.[2] && blobs.has(match[2])) {
         seen.add(match[2]);
         if (match[1] !== "-") raw.add(match[2]);
       }
