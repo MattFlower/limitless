@@ -10,6 +10,7 @@ import { ArtifactsPanel } from "../components/ArtifactsPanel.tsx";
 import { EventLog } from "../components/EventLog.tsx";
 import { InvocationsTable } from "../components/InvocationsTable.tsx";
 import { OriginalPrompt } from "../components/OriginalPrompt.tsx";
+import { RetryModels } from "../components/RetryModels.tsx";
 import { StageTimeline } from "../components/StageTimeline.tsx";
 import { RunStatusPill } from "../components/StatusPill.tsx";
 import { compactNumber, duration, relativeTime } from "../lib/format.ts";
@@ -75,6 +76,7 @@ export const RunDetail: Component = () => {
   const [connected, setConnected] = createSignal(false);
   const [selectedInvocation, setSelectedInvocation] = createSignal<number | null>(null);
   const [busyAction, setBusyAction] = createSignal<"cancel" | "retry" | "resolve" | "copy" | null>(null);
+  const [retryModelsOpen, setRetryModelsOpen] = createSignal(false);
   const [actionError, setActionError] = createSignal<string | null>(null);
   const [copyFeedback, setCopyFeedback] = createSignal<"Copied" | "Selected — press ⌘C or Ctrl+C" | null>(
     null,
@@ -385,6 +387,14 @@ export const RunDetail: Component = () => {
                     >
                       {busyAction() === "retry" ? "Retrying…" : "Retry — start a new run"}
                     </button>
+                    <button
+                      type="button"
+                      class="btn"
+                      disabled={busyAction() !== null}
+                      onClick={() => setRetryModelsOpen(true)}
+                    >
+                      Retry with different models…
+                    </button>
                   </Show>
                 </div>
               </div>
@@ -425,6 +435,16 @@ export const RunDetail: Component = () => {
                 <div class="error-box">{r().error}</div>
               </Show>
             </div>
+
+            <Show
+              when={retryModelsOpen() && TERMINAL_STATUSES.includes(r().status) && r().status !== "resolved"}
+            >
+              <RetryModels
+                run={r()}
+                onCancel={() => setRetryModelsOpen(false)}
+                onRetried={(id) => navigate(`/runs/${id}`)}
+              />
+            </Show>
 
             <Show when={r().status === "needs_human" || r().status === "failed"}>
               <section class="card card-pad stack" aria-label="Needs you">

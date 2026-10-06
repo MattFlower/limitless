@@ -1,8 +1,9 @@
 import { useNavigate } from "@solidjs/router";
 import type { Component } from "solid-js";
 import { createSignal, For, onMount, Show } from "solid-js";
-import { type Profile, RUN_ROLES, type RunModels } from "../../src/core/types.ts";
+import type { Profile, RunModels } from "../../src/core/types.ts";
 import { createRun, getRepos } from "../api.ts";
+import { RunModelPicker } from "../components/RunModelPicker.tsx";
 
 const PROFILES: { id: Profile; desc: string }[] = [
   { id: "auto", desc: "Let triage size the task and pick a profile automatically." },
@@ -18,7 +19,7 @@ export const NewRun: Component = () => {
   const [prompt, setPrompt] = createSignal("");
   const [title, setTitle] = createSignal("");
   const [profile, setProfile] = createSignal<Profile>("auto");
-  const [models, setModels] = createSignal<Partial<Record<(typeof RUN_ROLES)[number], string>>>({});
+  const [models, setModels] = createSignal<RunModels>({});
   const [submitting, setSubmitting] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
@@ -40,11 +41,7 @@ export const NewRun: Component = () => {
         ...(title().trim() ? { title: title().trim() } : {}),
         profile: profile(),
         source: "ui",
-        models: Object.fromEntries(
-          Object.entries(models())
-            .filter(([, chain]) => chain.trim())
-            .map(([role, chain]) => [role, chain.split(",").map((group) => group.trim())]),
-        ) as RunModels,
+        models: models(),
       });
       navigate(`/runs/${run.id}`);
     } catch (err) {
@@ -122,28 +119,7 @@ export const NewRun: Component = () => {
 
         <details open={error()?.startsWith("models") || undefined}>
           <summary>Models (optional)</summary>
-          <span class="field-hint">
-            Ordered groups separated by commas; | joins alternatives. Entries accept @effort.
-          </span>
-          <For each={RUN_ROLES}>
-            {(role) => (
-              <div class="field">
-                <label for={`model-${role}`}>{role}</label>
-                <input
-                  id={`model-${role}`}
-                  type="text"
-                  value={models()[role] ?? ""}
-                  placeholder="Use policy defaults"
-                  onInput={(e) => setModels({ ...models(), [role]: e.currentTarget.value })}
-                />
-                <Show when={error()?.includes(`models.${role} entry `)}>
-                  <span class="error-box" role="alert">
-                    {error()}
-                  </span>
-                </Show>
-              </div>
-            )}
-          </For>
+          <RunModelPicker models={models()} onChange={setModels} error={error()} />
         </details>
 
         <Show when={error()}>

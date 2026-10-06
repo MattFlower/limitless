@@ -11,6 +11,7 @@ import type {
   Run,
   RunDetail,
   RunEvent,
+  RunModels,
   RunStatus,
   StreamMessage,
 } from "../src/core/types.ts";
@@ -86,8 +87,11 @@ export function cancelRun(id: string): Promise<{ cancelled: boolean }> {
   return request(`/api/runs/${id}/cancel`, { method: "POST" });
 }
 
-export function retryRun(id: string): Promise<Run> {
-  return request<Run>(`/api/runs/${id}/retry`, { method: "POST" });
+export function retryRun(id: string, models?: RunModels): Promise<Run> {
+  return request<Run>(`/api/runs/${id}/retry`, {
+    method: "POST",
+    ...(models ? { body: JSON.stringify({ models }) } : {}),
+  });
 }
 
 export function resolveRun(
@@ -256,3 +260,24 @@ export function getEvalPolicy(): Promise<import("../src/evals/policy.ts").EvalPo
 export function getEvalReport(id: string): Promise<import("../src/evals/stats.ts").EvalReport> {
   return request(`/api/evals/${encodeURIComponent(id)}`);
 }
+
+export type RoutingSnapshot = ReturnType<import("../src/router/runtime-policy.ts").RuntimePolicy["snapshot"]>;
+export type CatalogSnapshot = ReturnType<
+  import("../src/router/runtime-catalog.ts").RuntimeCatalog["snapshot"]
+>;
+export const getRouting = () => request<RoutingSnapshot>("/api/routing");
+export const getCatalog = () => request<CatalogSnapshot>("/api/catalog");
+export const getRoutingPreview = (role: string, complexity: string) =>
+  request<import("../src/router/router.ts").RoutePreview[]>(
+    `/api/routing/preview?${new URLSearchParams({ role, complexity })}`,
+  );
+export const updateRouting = (key: string, method: "PUT" | "DELETE", value?: object) =>
+  request<RoutingSnapshot>(`/api/routing/${key}`, {
+    method,
+    ...(value ? { body: JSON.stringify(value) } : {}),
+  });
+export const updateCatalog = (method: "POST" | "PATCH" | "DELETE", id?: string, value?: object) =>
+  request<CatalogSnapshot>(`/api/catalog/models${id ? `/${encodeURIComponent(id)}` : ""}`, {
+    method,
+    ...(value ? { body: JSON.stringify(value) } : {}),
+  });

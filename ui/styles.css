@@ -1570,6 +1570,7 @@ p {
   outline-offset: 1px;
 }
 .field input[type="text"],
+.field input[type="number"],
 .field textarea,
 .field select {
   background: var(--bg-inset);
@@ -1720,4 +1721,34 @@ p {
 .badge-blocked {
   color: var(--warning);
   border: 1px solid currentColor;
+}
+
+/* Setup cells and pickers stack on phones; long backend names wrap within each card. */
+.setup-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: 14px;
+}
+.setup-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.setup-page,
+.setup-grid > *,
+.chain-picker,
+.setup-controls > * {
+  min-width: 0;
+  max-width: 100%;
+}
+.setup-page {
+  overflow-wrap: anywhere;
+}
+.setup-page .chip-tag {
+  white-space: normal;
+}
+.setup-controls select,
+.chain-picker select {
+  max-width: 100%;
 }
