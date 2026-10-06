@@ -14,6 +14,8 @@ import type { Paths } from "../src/config.ts";
 import type { LandEntry, Run } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { gateSlots } from "../src/gates/slots.ts";
+import { worktreeGitScope } from "../src/git/command.ts";
+import { ensureCache } from "../src/git/repos.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { GitHubPrView } from "../src/integrations/github-notifier.ts";
 import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
@@ -1072,4 +1074,32 @@ test("a head observation received during a CI read blocks without a timer", asyn
   expect(clock.now()).toBe(before);
   expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
   expect(ghCalls("pr merge")).toEqual([]);
+});
+
+test("land ignores an inherited local Git scope and a graft hiding private ancestry", async () => {
+  const secret = "denylisted-private-parent";
+  mkdirSync(paths.configDir, { recursive: true });
+  writeFileSync(join(paths.configDir, "private-strings.txt"), secret);
+  const pr = delivered(1, "pr-1");
+  await pushBranch("pr-1", "one.txt", secret);
+  const head = await pushBranch("pr-1", "one.txt", "clean\n");
+  observe(1, head);
+  approve(1, head);
+  const repo = store.getRepoBySlug(SLUG);
+  if (!repo) throw new Error("missing test repo");
+  await ensureCache(paths, repo);
+  const graft = join(root, "grafts");
+  writeFileSync(graft, `${head} ${await remoteHead("main")}\n`);
+  const previous = process.env.GIT_GRAFT_FILE;
+  process.env.GIT_GRAFT_FILE = graft;
+  try {
+    const entry = worktreeGitScope.run(false, () => queue().request({ target: pr.run.id }));
+    await settle();
+    expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
+    expect(store.getLandEntry(entry.id)?.reason).toContain("private string");
+    expect(ghCalls("pr merge")).toEqual([]);
+  } finally {
+    if (previous === undefined) delete process.env.GIT_GRAFT_FILE;
+    else process.env.GIT_GRAFT_FILE = previous;
+  }
 });

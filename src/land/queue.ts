@@ -8,7 +8,7 @@ import type { Store } from "../db/store.ts";
 import { detectGates } from "../gates/detect.ts";
 import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
 import { runGates } from "../gates/run.ts";
-import { worktreeGit } from "../git/command.ts";
+import { worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, prepareMerge } from "../git/merge.ts";
 import {
   addDetachedWorktree,
@@ -228,7 +228,7 @@ export class LandQueue {
     };
     let heartbeat = set(beat, CLAIM_STALE_MS / 3);
     // `checking` re-runs the checks from the start, like a `queued` entry.
-    const work = () => this.land(entry, signal);
+    const work = () => worktreeGitScope.run(true, () => this.land(entry, signal));
     try {
       await (this.deps.confinement ? confinementScope.run(this.deps.confinement, work) : work());
     } catch (error) {
