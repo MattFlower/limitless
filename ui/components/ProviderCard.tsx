@@ -108,7 +108,9 @@ export const ProviderCard: Component<{ provider: ProviderStatus; workload?: Prov
         <Show when={props.provider.reason}>
           <div class="provider-reason">{props.provider.reason}</div>
         </Show>
-        <Show when={props.provider.discovery?.catalogNotServed.length}>
+        <Show
+          when={props.provider.discovery?.served != null && props.provider.discovery.catalogNotServed.length}
+        >
           <div class="provider-reason" role="alert">
             Catalog models not served by {props.provider.id}:{" "}
             {props.provider.discovery?.catalogNotServed.join(", ")}

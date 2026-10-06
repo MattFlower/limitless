@@ -11,6 +11,7 @@ import {
   type ProviderStatus,
   type QuotaAlert,
   type Run,
+  type StreamMessage,
 } from "../src/core/types.ts";
 import { getAlerts, getHealth, getProviders, listRuns, openGlobalStream } from "./api.ts";
 import { createCatchUp, type Timers } from "./lib/catch-up.ts";
@@ -24,6 +25,15 @@ const [draining, setDraining] = createSignal(false);
 const [hydrated, setHydrated] = createSignal(false);
 
 let started = false;
+const listeners = new Set<(message: StreamMessage | { kind: "reconnected" }) => void>();
+export function subscribeLiveUpdates(
+  listener: (message: StreamMessage | { kind: "reconnected" }) => void,
+): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
 
 function upsertRun(run: Run): void {
   setRunsById(
@@ -128,6 +138,7 @@ export function ensureLiveStore(
 
   deps.openGlobalStream(
     (msg) => {
+      for (const listener of listeners) listener(msg);
       if (msg.kind === "run") {
         sync.pushed(`run:${msg.run.id}`);
         upsertRun(msg.run);
@@ -148,7 +159,10 @@ export function ensureLiveStore(
     },
     (connected) => {
       setConnected(connected);
-      if (connected) void refreshHealth();
+      if (connected) {
+        void refreshHealth();
+        for (const listener of listeners) listener({ kind: "reconnected" });
+      }
       sync.connected(connected);
     },
   );
