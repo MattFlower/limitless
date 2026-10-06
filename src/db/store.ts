@@ -76,7 +76,7 @@ type FeedInsert = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data">
 type GitHubFeedInput = FeedInsert & { kind: GitHubFeedKind };
 const LAND_SELECT = `SELECT id, run_id AS runId, repo, pr_url AS prUrl, base_branch AS baseBranch,
   head_branch AS headBranch, approved_sha AS approvedSha, state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
-  attempts, reason, created_at AS createdAt, updated_at AS updatedAt,
+  log_path AS logPath, attempts, reason, created_at AS createdAt, updated_at AS updatedAt,
   finished_at AS finishedAt FROM land_entries`;
 const LAND_PATCH_COLUMNS: Record<string, string> = {
   state: "state",
