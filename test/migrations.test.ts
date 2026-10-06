@@ -140,6 +140,9 @@ test.each([
         "crossed boundary",
         "ambiguous",
         "no worktree",
+        "multiple completed",
+        "earlier failed",
+        "multiple interrupted",
       ];
       const ids = cases.map((evidence) => {
         const run = old.createRun(repo, { repo: repo.slug, prompt: evidence });
@@ -163,14 +166,27 @@ test.each([
                   : ["boundary", "crossed boundary"].includes(evidence)
                     ? 1791100101000
                     : 1791100001000,
-              ["interrupted", "no worktree"].includes(evidence) ? "failed" : "succeeded",
+              ["interrupted", "no worktree", "multiple interrupted"].includes(evidence)
+                ? "failed"
+                : "succeeded",
               stage.id,
             );
-          if (evidence === "interrupted") {
+          if (["interrupted", "multiple interrupted"].includes(evidence)) {
             old.addEvent({ runId: run.id, type: "gate", message: "baseline passed" });
             old.db.query("UPDATE events SET ts = 1791100000500 WHERE run_id = ?").run(run.id);
           }
           if (evidence === "ambiguous") old.startStage(run.id, "prepare");
+          if (["multiple completed", "earlier failed", "multiple interrupted"].includes(evidence)) {
+            const earlier = old.startStage(run.id, "prepare");
+            old.db
+              .query("UPDATE stages SET started_at = ?, finished_at = ?, status = ? WHERE id = ?")
+              .run(
+                1791099998000,
+                1791099999000,
+                evidence === "earlier failed" ? "failed" : "succeeded",
+                earlier.id,
+              );
+          }
         }
         return run.id;
       });
@@ -193,6 +209,9 @@ test.each([
         false,
         false,
         false,
+        false,
+        false,
+        false,
       ]);
       const completed = ids[0];
       if (!completed) throw new Error("missing completed run");
@@ -203,6 +222,9 @@ test.each([
         false,
         eligible,
         eligible,
+        false,
+        false,
+        false,
         false,
         false,
         false,
