@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import type { ChildProcess } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
 import {
   existsSync,
@@ -3009,8 +3010,12 @@ esac
 
   test.each(["diff", "publication"])("run cancellation stops the production %s blob scan", async (stage) => {
     const bare = await githubFixture();
-    const armed = join(home, "scan-armed");
-    const started = join(home, "scan-started");
+    let armed = false;
+    const reached = deferred<AbortSignal>();
+    const stopped = deferred<proc.ProcResult>();
+    let child: ChildProcess | undefined;
+    let closed: Promise<void> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const pushed = join(home, "push-calls");
     const gitBin = Bun.which("git");
     if (!gitBin) throw new Error("missing git");
@@ -3018,10 +3023,10 @@ esac
       const role = roleOf(s);
       if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
       if (role === "review") {
-        if (stage === "publication") writeFileSync(armed, "ready");
+        if (stage === "publication") armed = true;
         return { structured: approve };
       }
-      if (stage === "diff") writeFileSync(armed, "ready");
+      if (stage === "diff") armed = true;
       return { files: { "farewell.txt": "goodbye\n" } };
     });
     mkdirSync(f.cfg.paths.configDir, { recursive: true });
@@ -3031,51 +3036,75 @@ esac
       join(home, "bin", "git"),
       `#!/bin/sh
 for arg in "$@"; do [ "$arg" = push ] && echo push >> '${pushed}'; done
-if [ -f '${armed}' ] && [ "$1" = --no-replace-objects ] && [ "$2" = cat-file ] && [ "$3" = --batch ]; then
-  sleep 60 & scan=$!
-  printf '%s %s' "$$" "$scan" > '${started}'
-  wait
-  exit 1
-fi
 exec '${gitBin}' "$@"
 `,
       { mode: 0o755 },
     );
-    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-    const deadline = Date.now() + 10000;
-    while (!existsSync(started) && Date.now() < deadline) await Bun.sleep(10);
-    expect(existsSync(started)).toBe(true);
-    const pids = readFileSync(started, "utf8").split(" ").map(Number);
-    const alive = (pid: number) => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    };
+    const realProcess = proc.runProcess;
+    const scan = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (!armed || opts.cmd.join(" ") !== "git --no-replace-objects cat-file --batch")
+        return realProcess(opts);
+      const scope = proc.processScope.getStore();
+      if (!scope) throw new Error("blob scan missing run process scope");
+      armed = false;
+      const existing = new Set(scope.children.keys());
+      // Keep the production sh/runProcess cancellation path; only replace the scan executable.
+      // The child stays alive after stdin closes and announces readiness from inside the process.
+      const running = realProcess({
+        ...opts,
+        cmd: [process.execPath, "-e", 'setInterval(() => {}, 60_000); console.log("scan-ready");'],
+        timeoutMs: undefined,
+        onStdoutLine: (line) => {
+          if (line === "scan-ready") reached.resolve(scope.signal);
+        },
+      });
+      child = [...scope.children.keys()].find((candidate) => !existing.has(candidate));
+      if (!child) throw new Error("blob scan child not registered");
+      closed = scope.children.get(child);
+      const result = await running;
+      stopped.resolve(result);
+      return result;
+    });
     try {
-      const at = Date.now();
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      const signal = await reached.promise;
+      const activeStage = f.store.listStages(run.id).at(-1);
+      if (!activeStage) throw new Error("blob scan missing active stage");
+      expect(activeStage).toMatchObject({ name: stage === "diff" ? "gates" : "deliver", status: "running" });
+      if (!child?.pid) throw new Error("blob scan child missing pid");
+      const pid = child.pid;
+      expect(child.exitCode).toBeNull();
+      expect(child.signalCode).toBeNull();
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      expect(signal.aborted).toBe(false);
       expect(f.cancelRun(run.id)).toBe(true);
-      while (
-        (pids.some(alive) || f.store.listStages(run.id).at(-1)?.status !== "cancelled") &&
-        Date.now() - at < 4900
-      )
-        await Bun.sleep(10);
-      expect(Date.now() - at).toBeLessThan(5000);
-      expect(pids.some(alive)).toBe(false);
-      expect(f.store.listStages(run.id).at(-1)?.status).toBe("cancelled");
+      expect(signal.aborted).toBe(true);
+      // A watchdog bounds broken cancellation; readiness and exit, not elapsed time, order the test.
+      const result = await Promise.race([
+        stopped.promise,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("running blob scan survived cancellation")), 10_000);
+        }),
+      ]);
+      clearTimeout(timer);
+      expect(result.cancelled).toBe(true);
+      expect(result.signal === "SIGTERM" || result.signal === "SIGKILL").toBe(true);
+      expect(child.signalCode === "SIGTERM" || child.signalCode === "SIGKILL").toBe(true);
+      expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+      expect(await waitFor(f, run.id, ["cancelled", "failed", "needs_human", "succeeded"])).toBe("cancelled");
+      expect(f.store.getStage(activeStage.id)?.status).toBe("cancelled");
       expect(f.store.getRun(run.id)?.status).toBe("cancelled");
       expect(existsSync(pushed)).toBe(false);
       expect(existsSync(join(home, "gh-calls"))).toBe(false);
     } finally {
-      const group = pids[0];
-      if (group && pids.some(alive)) {
-        try {
-          process.kill(-group, "SIGKILL");
-        } catch {
-          /* already exited */
-        }
+      clearTimeout(timer);
+      // Reap only our controlled child, including when a cancellation mutation leaves it blocked.
+      if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await closed;
+      try {
+        await f.stop();
+      } finally {
+        scan.mockRestore();
       }
     }
   });
