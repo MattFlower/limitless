@@ -64,10 +64,17 @@ export class Router {
   ) {
     this.models = new Map(models.map((m) => [m.id, m]));
     for (const model of models) this.resolve(model.id);
+    this.tracker.onDiscoveryChanged(() => this.invalidateRouting());
   }
 
   getPolicy(): Policy {
     return this.policy;
+  }
+
+  setModels(models: ModelDef[]): void {
+    this.models.clear();
+    for (const model of models) this.models.set(model.id, model);
+    this.invalidateRouting();
   }
 
   /** Captures a routing revision; aborted by edits so queued calls can reroute. */
@@ -334,6 +341,10 @@ export class Router {
           skipped.push({ modelId: id, reason: why === "disabled" ? "disabled" : `${m.provider}: ${why}` });
           continue;
         }
+        if (this.tracker.notServed(m)) {
+          skipped.push({ modelId: id, reason: `not served by ${m.provider}` });
+          continue;
+        }
         group.push(this.toTarget(m, effort ?? null));
       }
       group.sort(this.compareCandidates);
@@ -369,12 +380,22 @@ export class Router {
     if (c.prefer && preference) consider([c.prefer]);
     if (c.billing !== undefined) {
       for (const m of this.models.values())
-        if (this.tracker.def(m.provider)?.billing === "free" && !policyFreeModels.has(m.id)) consider([m.id]);
+        if (
+          m.source !== "runtime" &&
+          this.tracker.def(m.provider)?.billing === "free" &&
+          !policyFreeModels.has(m.id)
+        )
+          consider([m.id]);
     }
     // Escalation beyond the policy list: any remaining catalog model at a sufficient tier.
     if (c.minTier !== undefined) {
       const rest = [...this.models.values()]
-        .filter((m) => m.tier >= (c.minTier as number) && !seen.has(formatTarget(m.id, m.effort)))
+        .filter(
+          (m) =>
+            m.source !== "runtime" &&
+            m.tier >= (c.minTier as number) &&
+            !seen.has(formatTarget(m.id, m.effort)),
+        )
         .sort((a, b) => a.tier - b.tier)
         .map((m) => m.id);
       for (const id of rest) consider([id]);

@@ -320,9 +320,18 @@ export interface QuotaWindow {
   resetsAt: number | null; // epoch ms
 }
 
+export interface ModelDiscovery {
+  served: string[] | null;
+  observedAt: number | null;
+  servedNotInCatalog: string[];
+  catalogNotServed: string[];
+  observations: { model: string; firstSeen: number; lastSeen: number }[];
+}
+
 export type QuotaMode = "windows" | "unlimited";
 
 export interface ProviderStatus {
+  discovery?: ModelDiscovery;
   quota?: QuotaMode;
   kind?: string;
   fast?: boolean;
@@ -403,6 +412,7 @@ export interface CreateRunRequest {
 export type StreamMessage =
   | ChatStreamMessage
   | { kind: "routing"; change: RoutingChange }
+  | { kind: "catalog" }
   | { kind: "run"; run: Run }
   | { kind: "stage"; stage: Stage }
   | { kind: "invocation"; invocation: Invocation }

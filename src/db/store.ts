@@ -50,6 +50,7 @@ import {
   TERMINAL_STATUSES,
 } from "../core/types.ts";
 import type { RunState } from "../pipeline/context.ts";
+import type { ModelDef } from "../router/catalog.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 
 type Row = Record<string, unknown>;
@@ -1793,6 +1794,57 @@ export class Store {
     return (this.db.query("SELECT * FROM questions WHERE run_id = ? ORDER BY id").all(runId) as Row[]).map(
       toQuestion,
     );
+  }
+
+  runtimeModels(): ModelDef[] {
+    return this.db
+      .query<{ definition_json: string }, []>("SELECT definition_json FROM runtime_models ORDER BY rowid")
+      .all()
+      .map((row) => JSON.parse(row.definition_json) as ModelDef);
+  }
+
+  writeRuntimeModel(id: string, model: ModelDef | null): void {
+    if (model)
+      this.db.query("INSERT OR REPLACE INTO runtime_models VALUES (?, ?)").run(id, JSON.stringify(model));
+    else this.db.query("DELETE FROM runtime_models WHERE id = ?").run(id);
+  }
+
+  publishCatalog(): void {
+    this.publish({ kind: "catalog" });
+  }
+
+  writeDiscovery(provider: string, served: string[] | null, at: number): void {
+    this.db.transaction(() => {
+      if (served !== null) {
+        for (const model of served)
+          this.db
+            .query(`INSERT INTO served_models VALUES (?, ?, ?, ?)
+            ON CONFLICT(provider, model) DO UPDATE SET last_seen = excluded.last_seen`)
+            .run(provider, model, at, at);
+      }
+      this.db
+        .query(`INSERT INTO model_discovery VALUES (?, ?, ?)
+        ON CONFLICT(provider) DO UPDATE SET served_json = excluded.served_json,
+        observed_at = CASE WHEN excluded.served_json IS NULL THEN observed_at ELSE excluded.observed_at END`)
+        .run(provider, served === null ? null : JSON.stringify(served), served === null ? null : at);
+    })();
+  }
+
+  discovery(provider: string) {
+    const row = this.db
+      .query<{ served_json: string | null; observed_at: number | null }, [string]>(
+        "SELECT served_json, observed_at FROM model_discovery WHERE provider = ?",
+      )
+      .get(provider);
+    return {
+      served: row?.served_json ? (JSON.parse(row.served_json) as string[]) : null,
+      observedAt: row?.observed_at ?? null,
+      observations: this.db
+        .query<{ model: string; firstSeen: number; lastSeen: number }, [string]>(
+          "SELECT model, first_seen AS firstSeen, last_seen AS lastSeen FROM served_models WHERE provider = ? ORDER BY model",
+        )
+        .all(provider),
+    };
   }
 
   routingCells(): OperatorRoutingCell[] {
