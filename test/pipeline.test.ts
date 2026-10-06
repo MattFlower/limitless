@@ -3009,8 +3009,10 @@ esac
 
   test.each(["diff", "publication"])("run cancellation stops the production %s blob scan", async (stage) => {
     const bare = await githubFixture();
-    const armed = join(home, "scan-armed");
-    const started = join(home, "scan-started");
+    let armed = false;
+    const reached = deferred<AbortSignal>();
+    const resume = deferred<void>();
+    const stopped = deferred<unknown>();
     const pushed = join(home, "push-calls");
     const gitBin = Bun.which("git");
     if (!gitBin) throw new Error("missing git");
@@ -3018,10 +3020,10 @@ esac
       const role = roleOf(s);
       if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
       if (role === "review") {
-        if (stage === "publication") writeFileSync(armed, "ready");
+        if (stage === "publication") armed = true;
         return { structured: approve };
       }
-      if (stage === "diff") writeFileSync(armed, "ready");
+      if (stage === "diff") armed = true;
       return { files: { "farewell.txt": "goodbye\n" } };
     });
     mkdirSync(f.cfg.paths.configDir, { recursive: true });
@@ -3031,51 +3033,50 @@ esac
       join(home, "bin", "git"),
       `#!/bin/sh
 for arg in "$@"; do [ "$arg" = push ] && echo push >> '${pushed}'; done
-if [ -f '${armed}' ] && [ "$1" = --no-replace-objects ] && [ "$2" = cat-file ] && [ "$3" = --batch ]; then
-  sleep 60 & scan=$!
-  printf '%s %s' "$$" "$scan" > '${started}'
-  wait
-  exit 1
-fi
 exec '${gitBin}' "$@"
 `,
       { mode: 0o755 },
     );
-    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-    const deadline = Date.now() + 10000;
-    while (!existsSync(started) && Date.now() < deadline) await Bun.sleep(10);
-    expect(existsSync(started)).toBe(true);
-    const pids = readFileSync(started, "utf8").split(" ").map(Number);
-    const alive = (pid: number) => {
+    const realSh = proc.sh;
+    const scan = spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
+      if (!armed || cmd.join(" ") !== "git --no-replace-objects cat-file --batch") return realSh(cmd, opts);
+      const scope = proc.processScope.getStore();
+      if (!scope) throw new Error("blob scan missing run process scope");
+      armed = false;
+      reached.resolve(scope.signal);
+      await resume.promise;
       try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
+        const result = await realSh(cmd, opts);
+        stopped.resolve(null);
+        return result;
+      } catch (error) {
+        stopped.resolve(error);
+        throw error;
       }
-    };
+    });
     try {
-      const at = Date.now();
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      const signal = await reached.promise;
+      const activeStage = f.store.listStages(run.id).at(-1);
+      if (!activeStage) throw new Error("blob scan missing active stage");
+      expect(activeStage).toMatchObject({ name: stage === "diff" ? "gates" : "deliver", status: "running" });
+      expect(signal.aborted).toBe(false);
       expect(f.cancelRun(run.id)).toBe(true);
-      while (
-        (pids.some(alive) || f.store.listStages(run.id).at(-1)?.status !== "cancelled") &&
-        Date.now() - at < 4900
-      )
-        await Bun.sleep(10);
-      expect(Date.now() - at).toBeLessThan(5000);
-      expect(pids.some(alive)).toBe(false);
-      expect(f.store.listStages(run.id).at(-1)?.status).toBe("cancelled");
+      expect(signal.aborted).toBe(true);
+      resume.resolve();
+      // Exercise the real command's cancellation check after releasing the scan boundary.
+      expect(await stopped.promise).toMatchObject({ name: "AbortError" });
+      expect(await waitFor(f, run.id, ["cancelled", "failed", "needs_human", "succeeded"])).toBe("cancelled");
+      expect(f.store.getStage(activeStage.id)?.status).toBe("cancelled");
       expect(f.store.getRun(run.id)?.status).toBe("cancelled");
       expect(existsSync(pushed)).toBe(false);
       expect(existsSync(join(home, "gh-calls"))).toBe(false);
     } finally {
-      const group = pids[0];
-      if (group && pids.some(alive)) {
-        try {
-          process.kill(-group, "SIGKILL");
-        } catch {
-          /* already exited */
-        }
+      resume.resolve();
+      try {
+        await f.stop();
+      } finally {
+        scan.mockRestore();
       }
     }
   });
