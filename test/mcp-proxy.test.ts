@@ -177,9 +177,214 @@ test("ids are encoded in every proxy path", async () => {
   await backend.cancel(id);
   await backend.answer(id, "answer");
   await backend.resolve(id, { kind: "wont_do" });
+  await backend.review(id, { verdict: "approve", reviewedSha: "a".repeat(40), findings: [] });
   expect(
     urls.every((url) => url.startsWith(`http://localhost:7400/api/runs/${encodeURIComponent(id)}`)),
   ).toBe(true);
+});
+
+test("review and land forward validated payloads and return API results", async () => {
+  const requests: { path: string; body: unknown; method: string | undefined }[] = [];
+  const sha = "a".repeat(40);
+  const finding = { severity: "major", title: "Bug", file: "app.ts", line: 2, detail: "Fix it" };
+  let response: unknown = { approval: { sha, stale: false } };
+  const proxy = await connect(
+    httpBackend("http://daemon.invalid", async (url, init) => {
+      requests.push({
+        path: new URL(url).pathname,
+        body: JSON.parse(String(init?.body)),
+        method: init?.method,
+      });
+      return Response.json(response);
+    }),
+  );
+  const call = (name: string, args: Record<string, unknown>) =>
+    proxy.client.callTool({ name: `limitless_${name}`, arguments: args });
+  try {
+    expect(
+      resultValue<unknown>(
+        await call("review", {
+          run: "r/1",
+          verdict: "approve",
+          reviewedSha: sha.toUpperCase(),
+          findings: [],
+        }),
+      ),
+    ).toEqual({ approval: { sha, stale: false } });
+    response = { round: { id: "round1", status: "queued" } };
+    expect(
+      resultValue<unknown>(
+        await call("review", { run: "r/1", verdict: "changes", reviewedSha: sha, findings: [finding] }),
+      ),
+    ).toEqual({ round: { id: "round1", status: "queued" } });
+    response = { id: 7, state: "queued" };
+    expect(resultValue<unknown>(await call("land", { run: "r/1" }))).toEqual({ id: 7, state: "queued" });
+    expect(resultValue<unknown>(await call("land", { run: "r/1", sha }))).toEqual({ id: 7, state: "queued" });
+    expect(requests).toEqual([
+      {
+        path: "/api/runs/r%2F1/review",
+        method: "POST",
+        body: { verdict: "approve", reviewedSha: sha, findings: [] },
+      },
+      {
+        path: "/api/runs/r%2F1/review",
+        method: "POST",
+        body: { verdict: "changes", reviewedSha: sha, findings: [finding] },
+      },
+      { path: "/api/land", method: "POST", body: { target: "r/1" } },
+      { path: "/api/land", method: "POST", body: { target: "r/1", sha } },
+    ]);
+    for (const input of [
+      { verdict: "approve", findings: [finding] },
+      { verdict: "changes", findings: [] },
+      { verdict: "other", findings: [] },
+      { verdict: "approve", findings: [], reviewedSha: "short" },
+      { verdict: "approve" },
+      { verdict: "changes", findings: [{ ...finding, line: 0 }] },
+      { verdict: "changes", findings: [{ ...finding, title: " " }] },
+      { verdict: "changes", findings: [{ ...finding, severity: "critical" }] },
+      { verdict: "approve", findings: [], extra: true },
+    ])
+      expect((await call("review", { run: "r/1", reviewedSha: sha, ...input })).isError).toBe(true);
+    expect((await call("land", { run: " " })).isError).toBe(true);
+    expect((await call("land", { run: "r/1", sha: 12 })).isError).toBe(true);
+    expect(requests).toHaveLength(4);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("review and land refusals or uncertain responses are MCP errors without retries", async () => {
+  for (const response of [
+    () => Response.json({ error: "reviewed SHA moved; land rejected" }, { status: 409 }),
+    () => {
+      throw new Error("connection lost");
+    },
+    () => new Response("invalid JSON"),
+  ]) {
+    let requests = 0;
+    const proxy = await connect(
+      httpBackend("http://daemon.invalid", async () => {
+        requests++;
+        return response();
+      }),
+    );
+    try {
+      for (const name of ["review", "land"]) {
+        const result = await proxy.client.callTool({
+          name: `limitless_${name}`,
+          arguments:
+            name === "review"
+              ? { run: "r1", verdict: "approve", reviewedSha: "a".repeat(40), findings: [] }
+              : { run: "r1" },
+        });
+        expect(result.isError).toBe(true);
+        expect(JSON.stringify(result.content)).toMatch(/HTTP 409|Cannot reach|Malformed JSON/);
+      }
+      expect(requests).toBe(2);
+    } finally {
+      await proxy.close();
+    }
+  }
+});
+
+test("status explains review, input, land and terminal states using saved observations", async () => {
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "work" });
+  const sha = "a".repeat(40),
+    prUrl = "https://github.com/o/r/pull/1";
+  const base = {
+    ...f.factory.store.getRunDetail(run.id),
+    run: { ...run, status: "succeeded", prUrl },
+    prSnapshot: { state: "OPEN", headRefOid: sha },
+    review: { approval: null, rounds: [] },
+  };
+  const entry = { id: 1, runId: run.id, prUrl, state: "queued", reason: null };
+  let detail: unknown = base;
+  let lands: unknown = [];
+  const urls: string[] = [];
+  const proxy = await connect(
+    httpBackend("http://daemon.invalid", async (url) => {
+      urls.push(new URL(url).pathname);
+      if (url.includes("missing")) return Response.json({ error: "not found" }, { status: 404 });
+      return Response.json(url.endsWith("/api/land") ? lands : detail);
+    }),
+  );
+  const read = () => proxy.client.callTool({ name: "limitless_status", arguments: { run: run.id } });
+  try {
+    for (const [patch, land, state, action] of [
+      [{}, [], "Review needed", "limitless_review"],
+      [{ prSnapshot: null }, [], "PR state unknown", "Inspect the PR"],
+      [
+        { prSnapshot: { state: "OPEN" }, review: { approval: { sha, stale: false }, rounds: [] } },
+        [],
+        "PR head unknown",
+        "current PR head",
+      ],
+      [
+        { review: { approval: { sha, stale: false }, rounds: [] } },
+        [],
+        "Approved; landing not queued",
+        "limitless_land",
+      ],
+      [{ review: { approval: { sha, stale: true }, rounds: [] } }, [], "Review needed", "limitless_review"],
+      [
+        {
+          prSnapshot: { state: "OPEN", headRefOid: "b".repeat(40) },
+          review: { approval: { sha, stale: false }, rounds: [] },
+        },
+        [],
+        "Review needed",
+        "limitless_review",
+      ],
+      [{}, [entry], "Landing in progress (queued)", "Wait"],
+      [{}, [{ ...entry, state: "waiting_ci" }], "Landing in progress (waiting_ci)", "Wait"],
+      [{}, [{ ...entry, state: "blocked", reason: "CI failed" }], "Landing blocked", "resolve the blocker"],
+      [{}, [{ ...entry, state: "landed" }], "Landed", "No action needed"],
+      [{ prSnapshot: { state: "MERGED" } }, [], "Landed", "No action needed"],
+      [{ run: { ...run, status: "succeeded", prUrl: null } }, [], "Completed", "delivery results"],
+      [{ run: { ...run, status: "failed" } }, [], "Failed", "error"],
+      [{ run: { ...run, status: "cancelled" } }, [], "Cancelled", "new run"],
+      [{ run: { ...run, status: "queued" } }, [], "Work pending", "Wait"],
+      [{ questions: [{ answer: null }] }, [], "Input needed", "limitless_answer_question"],
+      [
+        { review: { approval: null, rounds: [{ runId: "round1", status: "running" }] } },
+        [],
+        "Review changes in progress",
+        "round1",
+      ],
+      [
+        { review: { approval: null, rounds: [{ runId: "round1", status: "waiting_input" }] } },
+        [],
+        "Input needed",
+        "round1",
+      ],
+      [
+        { review: { approval: null, rounds: [{ runId: "round1", status: "failed" }] } },
+        [],
+        "Review changes failed",
+        "round1",
+      ],
+    ] as const) {
+      detail = { ...base, ...patch };
+      lands = land;
+      const result = resultValue<{ state: string; nextAction: string }>(await read());
+      expect(result.state).toBe(state);
+      expect(result.nextAction).toContain(action);
+    }
+    lands = [
+      { ...entry, id: 2, state: "landed" },
+      { ...entry, state: "blocked" },
+    ];
+    detail = base;
+    expect(resultValue(await read())).toMatchObject({ state: "Landed" });
+    const before = urls.length;
+    const missing = await proxy.client.callTool({ name: "limitless_status", arguments: { run: "missing" } });
+    expect(missing.isError).toBe(true);
+    expect(JSON.stringify(missing.content)).toContain("not found");
+    expect(urls.slice(before)).toEqual(["/api/runs/missing"]);
+  } finally {
+    await proxy.close();
+  }
 });
 
 test("connection, HTTP and malformed responses are MCP errors and mutations are never retried", async () => {
@@ -216,7 +421,7 @@ test("connection, HTTP and malformed responses are MCP errors and mutations are 
       });
       expect(resolved.isError).toBe(true);
       expect(calls).toBe(1);
-      expect((await proxy.client.listTools()).tools).toHaveLength(9);
+      expect((await proxy.client.listTools()).tools).toHaveLength(12);
     } finally {
       await proxy.close();
     }
@@ -261,7 +466,7 @@ test("stdio streams emit only protocol JSON and survive daemon errors", async ()
     expect(messages).toHaveLength(3);
     expect(messages.every((message) => message.jsonrpc === "2.0")).toBe(true);
     expect(messages.find((m) => m.id === 2).result.isError).toBe(true);
-    expect(messages.find((m) => m.id === 3).result.tools).toHaveLength(9);
+    expect(messages.find((m) => m.id === 3).result.tools).toHaveLength(12);
   } finally {
     await server.close();
     stdin.destroy();

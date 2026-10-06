@@ -254,6 +254,24 @@ stable checkout, so moving/caching the plugin does not break resolution. Keep th
 and export the variable for every Claude Code launch. See the official [MCP environment expansion](https://code.claude.com/docs/en/mcp#environment-variable-expansion-in-mcpjson)
 and [marketplace documentation](https://code.claude.com/docs/en/plugin-marketplaces).
 
+For an opt-in session digest, manually merge this into `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "limitless digest --consumer claude" }] }
+    ]
+  }
+}
+```
+
+Ensure `limitless` is on Claude Code's PATH and the daemon is running. If using a source checkout,
+replace `limitless` with `bun '/absolute/path/to/limitless/src/cli/main.ts'` in the command.
+The digest reads since the consumer's feed cursor, prints at most 20 lines with quoted untrusted
+text, and never acknowledges. `limitless init` and `limitless integrations install` offer an
+absolute-path example; neither installs or overwrites hooks.
+
 ### Codex and the installer
 
 Run `limitless integrations install` to print the skill destination, an absolute-path TOML snippet,
@@ -299,3 +317,10 @@ Execution is asynchronous. Terminal statuses are `succeeded`, `failed`, `cancell
 `needs_human`; report the evidence and error, not just that submission worked. `prUrl` and `stage`
 can be null, and a PR is not guaranteed (local-only repositories deliver a branch). `costUsd` is
 actual metered spend; `costEquivUsd` is subscription-equivalent usage, not an additional bill.
+
+The five agent verbs are submit (`limitless_create_run`), inbox/ack (`limitless_feed` and
+`limitless_feed_ack`, only after handling), answer (`limitless_answer_question`), review
+(`limitless_review` followed by authorized `limitless_land`), and status (`limitless_status`).
+Review takes `run`, `verdict` (`changes` or `approve`), `reviewedSha` (full SHA), and `findings`
+(nonempty for changes, empty for approve). Land takes `run` and optional `sha`; status takes
+`run` and explains the saved observations and next action. An absent PR observation is unknown.

@@ -24,6 +24,10 @@ test("empty --yes --json setup detects providers, writes validated config, start
     expect(result.providers.added).toEqual(["claude", "codex", "local-1234"]);
     expect(result.repos.added).toEqual(["acme/app", "acme/lib"]);
     expect(result.merge).toBe("pr");
+    expect(result.sessionStart).toContain("Optional: manually merge");
+    const hook = JSON.parse(result.sessionStart.split("acknowledging:\n")[1]);
+    expect(hook.hooks.SessionStart[0].hooks[0]).toMatchObject({ type: "command" });
+    expect(hook.hooks.SessionStart[0].hooks[0].command).toEndWith("digest --consumer claude");
     expect(result.discreet).toContain("not available yet (#37)");
     expect(result.discreet).toContain("off (deferred to #37");
     expect(result.warnings[0]).toContain("One-way migration");

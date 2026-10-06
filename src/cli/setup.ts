@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { loadConfig, repoName } from "../config.ts";
 import type { GitHubAccessProblem } from "../core/types.ts";
 import { githubDoctor } from "../integrations/github-poller.ts";
-import { installIntegrations, repositoryRoot } from "../integrations/install.ts";
+import { installIntegrations, repositoryRoot, sessionStartInstructions } from "../integrations/install.ts";
 import { resolveCatalog } from "../router/config-catalog.ts";
 import { sh } from "../util/proc.ts";
 import { patchSetupConfig } from "./setup-config.ts";
@@ -330,6 +330,7 @@ async function runSetup(
     service,
     smoke,
     mcp,
+    sessionStart: sessionStartInstructions(d.appDir),
     discreet,
     warnings: transaction.warnings,
   };
