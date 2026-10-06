@@ -109,8 +109,7 @@ export function splitPatch(patch: string): FilePatch[] {
 
 export const SOURCE_PATH =
   /\.(ts|tsx|js|mjs|cjs|json|toml|yml|yaml|md|sh|py|go|rs|java|kt|rb|php|cs|c|h|cpp|swift|sql|html|css)$/i;
-export const BINARY_PATH =
-  /\.(png|jpe?g|gif|bmp|ico|webp|avif|tiff?|pdf|zip|gz|bz2|xz|7z|rar|tar|zst|woff2?|ttf|otf|eot|mp3|mp4|m4a|mkv|mov|avi|webm|ogg|wav|flac|aac|jar|war|apk|whl|docx|xlsx|pptx|odt|psd|ai|heic|wasm|so|dll|dylib|exe|class|pyc|sqlite|db|glb|fbx|blend)$/i;
+export const INERT_MEDIA_PATH = /\.(png|jpe?g|gif|webp|ico)$/i;
 
 const BUILTIN_DIFF_DRIVER =
   /^(ada|bash|bibtex|cpp|csharp|css|dts|elixir|fortran|fountain|golang|html|java|kotlin|markdown|matlab|objc|pascal|perl|php|python|ruby|rust|scheme)$/;
@@ -254,7 +253,7 @@ export function auditDiff(
   )) {
     const text = diff.attributeMatches?.[key];
     const unmatched = diff.attributeUnmatched?.includes(key);
-    if (!exemptable || text?.length !== 0 || (unmatched && !BINARY_PATH.test(pattern)))
+    if (!exemptable || text?.length !== 0 || (unmatched && !INERT_MEDIA_PATH.test(pattern)))
       hidden(file, `${file}: ${pattern} (${attributes}) can hide text diffs for ${text?.[0] ?? pattern}.`);
     else if (unmatched) warn(file, `${file}: new ${pattern} (${attributes}) rule matches no files yet.`);
   }
