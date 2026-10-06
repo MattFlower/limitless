@@ -289,6 +289,8 @@ async function main(): Promise<void> {
     }
     case "digest": {
       const { digestCommand } = await import("./digest.ts");
+      const { loadConfig } = await import("../config.ts");
+      loadConfig({ readOnly: true });
       return digestCommand(rest, values, { api, print: console.log });
     }
     case "feed": {

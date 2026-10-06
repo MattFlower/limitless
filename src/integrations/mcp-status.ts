@@ -19,7 +19,8 @@ export const statusDetailSchema = z.object({
   review: z
     .object({
       approval: z.object({ sha: z.string(), stale: z.boolean() }).nullable(),
-      rounds: z.array(z.object({ runId: z.string(), status: z.string() })),
+      approvedAt: z.number().optional(),
+      rounds: z.array(z.object({ runId: z.string(), status: z.string(), createdAt: z.number().optional() })),
     })
     .optional(),
 });
@@ -78,7 +79,20 @@ export function explainStatus(
       "Input needed",
       "Inspect limitless_get_run and address the stopping error or resolve the run.",
     );
-  const round = review?.rounds.at(-1);
+  const approval = review?.approval;
+  const latestRound = review?.rounds.toSorted((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0)).at(-1);
+  const approvalPredatesRound =
+    review?.approvedAt !== undefined &&
+    latestRound?.createdAt !== undefined &&
+    review.approvedAt < latestRound.createdAt;
+  const approvalIsLatest =
+    approval &&
+    !approval.stale &&
+    approval.sha === pr?.headRefOid &&
+    review?.approvedAt !== undefined &&
+    latestRound?.createdAt !== undefined &&
+    review.approvedAt >= latestRound.createdAt;
+  const round = approvalIsLatest ? undefined : latestRound;
   if (round && ["waiting_input", "needs_human"].includes(round.status))
     return result(
       "Input needed",
@@ -107,10 +121,14 @@ export function explainStatus(
       "Draft PR needs attention",
       "Inspect the draft and its delivery evidence before reviewing.",
     );
-  const approval = review?.approval;
   if (approval && !approval.stale && !pr.headRefOid)
     return result("PR head unknown", "Inspect the current PR head before requesting limitless_land.");
-  if (!approval || approval.stale || (pr.headRefOid && pr.headRefOid !== approval.sha))
+  if (
+    !approval ||
+    approval.stale ||
+    approvalPredatesRound ||
+    (pr.headRefOid && pr.headRefOid !== approval.sha)
+  )
     return result(
       "Review needed",
       "Review the current PR head; submit limitless_review with its full SHA and findings.",

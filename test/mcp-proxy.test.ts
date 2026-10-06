@@ -374,6 +374,33 @@ test("status explains review, input, land and terminal states using saved observ
         "Review changes failed",
         "round1",
       ],
+      [
+        {
+          review: {
+            approval: { sha, stale: false },
+            approvedAt: 20,
+            rounds: [
+              { runId: "newer", status: "waiting_input", createdAt: 30 },
+              { runId: "older", status: "failed", createdAt: 10 },
+            ],
+          },
+        },
+        [],
+        "Input needed",
+        "newer",
+      ],
+      [
+        {
+          review: {
+            approval: { sha, stale: false },
+            approvedAt: 20,
+            rounds: [{ runId: "delivered", status: "succeeded", createdAt: 30 }],
+          },
+        },
+        [],
+        "Review needed",
+        "limitless_review",
+      ],
     ] as const) {
       detail = { ...base, ...patch };
       lands = land;
@@ -396,6 +423,72 @@ test("status explains review, input, land and terminal states using saved observ
     await proxy.close();
   }
 });
+
+test.each(["failed", "cancelled"] as const)(
+  "status lets a later approval supersede a %s round on both backends",
+  async (status) => {
+    const { store } = f.factory;
+    const repo = store.upsertRepo({
+      slug: "o/r",
+      kind: "github",
+      url: "https://github.com/o/r",
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "work" });
+    const prUrl = "https://github.com/o/r/pull/1",
+      sha = "a".repeat(40);
+    store.updateRun(run.id, { status: "succeeded", prUrl, branch: "limitless/feature" });
+    store.saveGithubPr({
+      url: prUrl,
+      repo: "o/r",
+      runId: run.id,
+      delivered: 1,
+      nodeId: "PR_1",
+      data: JSON.stringify({ state: "OPEN", headRefOid: sha }),
+    });
+    const round = store.createReviewRound(
+      repo,
+      store.getRun(run.id) as Run,
+      { prUrl, reviewedSha: sha, findings: [{ severity: "major", title: "Fix", detail: "Bug" }], cap: 3 },
+      (round) => ({
+        repo: repo.slug,
+        prompt: "Fix findings",
+        baseBranch: "limitless/feature",
+        deliveryBranch: "limitless/feature",
+        sourceRef: { kind: "review-round", runId: run.id, round, prUrl, reviewedSha: sha },
+      }),
+    );
+    if (!("run" in round)) throw new Error("Expected a review round");
+    store.updateRun(round.run.id, { status });
+    store.db.query("UPDATE review_rounds SET created_at = ? WHERE run_id = ?").run(10, round.run.id);
+    store.recordApproval(run.id, prUrl, sha, "reviewer");
+    store.db.query("UPDATE review_approvals SET created_at = ? WHERE pr_url = ?").run(20, prUrl);
+    const routes = createHttpRoutes(f.factory);
+    const proxy = await connect(
+      httpBackend("http://daemon.invalid", async (url, init) => {
+        const path = new URL(url).pathname;
+        const route = routes[path === "/api/land" ? path : "/api/runs/:id"];
+        const handler = (typeof route === "function" ? route : (route as { GET: Route }).GET) as Route;
+        return handler(requestWithParams(url, init, { id: run.id }), localServer);
+      }),
+    );
+    const direct = await connect(factoryBackend(f.factory));
+    try {
+      for (const conn of [proxy, direct]) {
+        const result = resultValue<{ state: string; nextAction: string }>(
+          await conn.client.callTool({ name: "limitless_status", arguments: { run: run.id } }),
+        );
+        expect(result.state).toBe("Approved; landing not queued");
+        expect(result.nextAction).toContain("limitless_land");
+      }
+    } finally {
+      await proxy.close();
+      await direct.close();
+    }
+  },
+);
 
 test("status finds the latest land by run or PR beyond 100 historical entries on both backends", async () => {
   const { store } = f.factory;

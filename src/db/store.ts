@@ -1072,7 +1072,7 @@ export class Store {
 
   reviewRounds(prUrl: string): ReviewRound[] {
     const sql = `SELECT rr.run_id AS runId, rr.round, runs.status, rr.reviewed_sha AS reviewedSha,
-        rr.delivered_sha AS deliveredSha, rr.findings
+        rr.delivered_sha AS deliveredSha, rr.findings, rr.created_at AS createdAt
       FROM review_rounds rr JOIN runs ON runs.id = rr.run_id WHERE rr.pr_url = ? ORDER BY rr.round`;
     return (this.db.query(sql).all(prUrl) as Row[]).map((r) => ({
       ...(r as unknown as ReviewRound),
@@ -1442,6 +1442,14 @@ export class Store {
   getRunDetail(id: string): RunDetail | null {
     const run = this.getRun(id);
     if (!run) return null;
+    const approval = run.prUrl && this.approvalFor(run.prUrl);
+    const approvalTime =
+      approval &&
+      (this.db
+        .query(
+          "SELECT created_at AS createdAt FROM review_approvals WHERE pr_url = ? ORDER BY id DESC LIMIT 1",
+        )
+        .get(run.prUrl) as { createdAt: number } | null);
     const latest = this.listArtifacts(id).findLast((a) => a.kind === "review");
     const review = parse<{ blocking?: { title?: string }[] }>(this.getArtifact(id, latest?.name ?? ""), {});
     const state = this.getRunState<RunState>(id);
@@ -1477,7 +1485,13 @@ export class Store {
       questions: this.listQuestions(id),
       artifacts: this.listArtifacts(id),
       ...(run.prUrl
-        ? { review: { approval: this.approvalFor(run.prUrl), rounds: this.reviewRounds(run.prUrl) } }
+        ? {
+            review: {
+              approval: approval || null,
+              ...(approvalTime ? { approvedAt: approvalTime.createdAt } : {}),
+              rounds: this.reviewRounds(run.prUrl),
+            },
+          }
         : {}),
     };
   }
