@@ -1136,7 +1136,10 @@ async function oneRound(
   const comparison = await checks.catch(async (error: unknown) => {
     ctx.checkCancelled();
     if (!(error instanceof WorktreeCleanError) || !ctx.state.implementerIssue) throw error;
-    ctx.state.feedback = `### Your previous session ended early\n${ctx.state.implementerIssue}\n\nWorktree cleanup failed after retry:\n${error.message}`;
+    ctx.state.feedback = redactPrivate(
+      `### Your previous session ended early\n${ctx.state.implementerIssue}\n\nWorktree cleanup failed after retry:\n${error.message}`,
+      privateStrings(),
+    );
     ctx.log(ctx.state.feedback, "warn");
     await ctx.save();
     return null;

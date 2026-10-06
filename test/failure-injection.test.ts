@@ -430,6 +430,10 @@ for (const [name, failure] of Object.entries(failures))
 
 for (const failures of [0, 1, 2])
   test(`stalled implementer's writer stops before cleanup (${failures} clean failures)`, async () => {
+    const invocationSecret = "PRIVATE_REPEATED_COMMAND_377";
+    const cleanupSecret = "PRIVATE_WORKTREE_PATH_377";
+    mkdirSync(join(root, "cfg"), { recursive: true });
+    writeFileSync(join(root, "cfg/private-strings.txt"), `${invocationSecret}\n${cleanupSecret}\n`);
     writeFileSync(
       join(source, ".limitless.toml"),
       '[gates]\nchecks = [{name="check",run="! test -f ui/change.txt || grep -qx done ui/change.txt"}]\n',
@@ -453,7 +457,7 @@ if [ -f '${active}' ]; then
       if kill -0 "$(cat '${pidFile}')" 2>/dev/null; then touch '${alive}'; fi
       echo clean >> '${calls}'
       attempts=$(grep -c '^clean$' '${calls}')
-      if [ "$attempts" -le ${failures} ]; then echo 'warning: could not lstat node_modules/writer' >&2; exit 1; fi;;
+      if [ "$attempts" -le ${failures} ]; then echo 'warning: could not lstat node_modules/writer/${cleanupSecret}' >&2; exit 1; fi;;
   esac
 fi
 exec '${realGit}' "$@"
@@ -491,7 +495,11 @@ exec '${realGit}' "$@"
       expect(result.cancelled).toBe(true);
       expect(writerPid).toBeGreaterThan(0);
       expect(() => process.kill(writerPid ?? 0, 0)).toThrow();
-      return { status: "stuck", error: "repeated shell call", files: { "ui/change.txt": "partial\n" } };
+      return {
+        status: "stuck",
+        error: `repeated shell call ${invocationSecret}`,
+        files: { "ui/change.txt": "partial\n" },
+      };
     });
     const id = await run(f);
     try {
@@ -508,6 +516,16 @@ exec '${realGit}' "$@"
       if (failures === 2) {
         expect(attempts[1]?.state?.feedback).toContain("Worktree cleanup failed after retry");
         expect(attempts[1]?.prompt).toContain("could not lstat node_modules/writer");
+        const warning = f.store
+          .listEvents(id)
+          .find((e) => e.message?.startsWith("### Your previous session ended early"));
+        expect(warning?.level).toBe("warn");
+        for (const text of [attempts[1]?.state?.feedback, attempts[1]?.prompt, warning?.message]) {
+          expect(text).toContain("stuck: repeated shell call [redacted]");
+          expect(text).toContain("could not lstat node_modules/writer/[redacted]");
+          expect(text).not.toContain(invocationSecret);
+          expect(text).not.toContain(cleanupSecret);
+        }
         expect(f.store.listStages(id).find((s) => s.name === "gates")).toMatchObject({
           status: "failed",
           round: 0,
