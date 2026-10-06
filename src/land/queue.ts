@@ -124,6 +124,7 @@ export class LandQueue {
   async stop(): Promise<void> {
     this.stopped = true;
     for (const controller of this.inFlight.values()) controller.abort();
+    if (!this.workers.size) return;
     await Promise.all([...this.workers.values()].map((worker) => worker.catch(() => undefined)));
     this.store.releaseLandClaims(this.owner);
   }
