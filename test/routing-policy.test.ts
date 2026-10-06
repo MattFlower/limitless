@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import { Store } from "../src/db/store.ts";
 import { evalSettings } from "../src/evals/settings.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
 import { exportProviders, resolveCatalog } from "../src/router/config-catalog.ts";
@@ -12,7 +13,42 @@ import { createHttpRoutes } from "../src/server/http.ts";
 import { evidence, local, subscription } from "./evals-policy-support.ts";
 import { evalFixture } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { customModel, providerFixture } from "./provider-config-support.ts";
 import { identitySnapshot } from "./routing-identity-support.ts";
+
+test("runtime models stay out of escalation and free widening unless explicitly named", () => {
+  const fixture = providerFixture([], "OMLX_API_KEY=fake-key\n");
+  const store = new Store(":memory:");
+  const factory = new Factory(fixture.load(), { store });
+  try {
+    factory.catalog.add({ ...customModel, provider: "codex", id: "experimental", tier: 5 });
+    factory.catalog.add({ ...customModel, provider: "omlx", id: "experimental", tier: 5, effort: undefined });
+    factory.tracker.setHealthy("omlx", true);
+    expect(
+      factory.router
+        .route("implement", "small", { minTier: 5 })
+        .candidates.some((m) => m.modelId.endsWith("/experimental")),
+    ).toBe(false);
+    for (const billing of ["free_first", "free_only"] as const)
+      expect(
+        factory.router
+          .route("triage", "small", { billing })
+          .candidates.some((m) => m.modelId === "omlx/experimental"),
+      ).toBe(false);
+    for (const id of ["omlx/experimental", "codex/experimental"]) {
+      expect(factory.router.route("triage", "small", { chain: [id] }).candidates[0]?.modelId).toBe(id);
+      factory.routing.setCell("triage", "small", [id]);
+      expect(factory.router.route("triage", "small").candidates[0]?.modelId).toBe(id);
+    }
+    factory.routing.setCell("implement", "small", ["omlx/experimental"]);
+    expect(factory.router.route("implement", "small", { minTier: 5 }).candidates[0]?.modelId).toBe(
+      "omlx/experimental",
+    );
+  } finally {
+    store.close();
+    fixture.close();
+  }
+});
 
 test("policy files: absent, empty, partial, pipe groups, complexity preservation and immutable defaults", () => {
   const dir = mkdtempSync(join(tmpdir(), "policy-"));

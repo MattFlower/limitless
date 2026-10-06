@@ -78,6 +78,24 @@ test("OpenRouter card keeps one budget gauge and reports only material differenc
     updatedAt: 1_000_000,
   };
   const html = renderToString(() => ProviderCard({ provider: status }));
+  const discovered = renderToString(() =>
+    ProviderCard({
+      provider: {
+        ...status,
+        id: "local",
+        discovery: {
+          served: ["new-build"],
+          observedAt: 100,
+          observations: [],
+          servedNotInCatalog: ["new-build"],
+          catalogNotServed: ["local/old"],
+        },
+      },
+    }),
+  );
+  expect(discovered).toContain("Catalog models not served by local: local/old");
+  expect(discovered).toContain('role="alert"');
+  expect(discovered).toContain("Served models not in catalog: new-build");
   expect(html).not.toContain('role="switch"');
   for (const id of ["codex", "claude"]) {
     const card = renderToString(() =>

@@ -6,11 +6,18 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
-import { diffPr, githubDoctor, normalizePr, OBSERVE_QUERY } from "../src/integrations/github-poller.ts";
+import {
+  diffPr,
+  githubDoctor,
+  normalizePr,
+  OBSERVE_QUERY,
+  rollup as rollupOf,
+} from "../src/integrations/github-poller.ts";
 import { type PrNode, pollerHarness, prNode, respond, SHA, url } from "./github-poller-support.ts";
 
+// The pure rollup test at the end of this file uses no harness at all.
 let h: ReturnType<typeof pollerHarness>;
-afterEach(() => h.close());
+afterEach(() => h?.close());
 
 const S = 1000;
 const kinds = (): string[] => h.fresh().map((i) => i.kind);
@@ -26,6 +33,33 @@ const snapshotOf = (prUrl: string) => {
 const rollup = (state: string, contexts: Record<string, unknown>[] = []) => ({
   state,
   contexts: { nodes: contexts },
+});
+
+test("CI details are inspected on changes, retried after REST errors, and idle after success", async () => {
+  h = pollerHarness();
+  h.factoryPr("o/r", 1);
+  h.start(15);
+  await h.advance(0);
+  const baseline = h.gh.rest().length;
+  await h.advance(15000);
+  expect(h.gh.rest()).toHaveLength(baseline);
+  let attempts = 0;
+  h.gh.responses.set("repos/o/r/commits/main", () =>
+    ++attempts === 1 ? respond(503, { message: "unavailable" }) : respond(200, { sha: "b".repeat(40) }),
+  );
+  ci(h.node("o/r", 1), rollup("FAILURE", [{ name: "test", conclusion: "FAILURE" }]));
+  await h.advance(15000);
+  expect(attempts).toBe(1);
+  expect(h.store.readFeed().items.filter((i) => i.kind === "ci.needs_fix")).toHaveLength(0);
+  h.reopen();
+  h.start(15);
+  await h.advance(0);
+  expect(attempts).toBe(2);
+  expect(h.store.readFeed().items.filter((i) => i.kind === "ci.needs_fix")).toHaveLength(1);
+  const count = h.gh.rest().length;
+  await h.advance(15000);
+  expect(h.gh.rest()).toHaveLength(count);
+  expect(h.gh.maxInFlight).toBe(1);
 });
 
 test("tracks only factory PRs from run records, one nodes(ids:) query per repository", async () => {
@@ -1553,4 +1587,52 @@ test("an approval goes stale on any head the poller sees, and an overtaken poll 
   expect(h.store.observePrHead(prUrl, "e".repeat(40), version + 1)).toBe(false);
   h.store.endPrPush(prUrl, "e".repeat(40));
   expect(h.store.observePrHead(prUrl, "f".repeat(40), version + 2)).toBe(true);
+});
+
+/** `gh pr view --json statusCheckRollup` reports an array of contexts, not a rollup object. */
+const check = (name: string, extra: Record<string, string | null> = {}) => ({
+  __typename: "CheckRun",
+  name,
+  status: "COMPLETED",
+  conclusion: "SUCCESS",
+  detailsUrl: `https://github.com/o/r/runs/${name}`,
+  ...extra,
+});
+const status = (context: string, state: string) => ({
+  __typename: "StatusContext",
+  context,
+  state,
+  targetUrl: `https://status.example/${context}`,
+});
+
+test("a REST statusCheckRollup array reduces to the state and failing checks", () => {
+  // A GraphQL rollup keeps its own state, so the poller and `gh` agree on one reduction.
+  expect(rollupOf({ state: "SUCCESS", contexts: { nodes: [check("build")] } })).toEqual({
+    ci: "SUCCESS",
+    failing: [],
+  });
+  expect(rollupOf([check("build"), check("lint", { conclusion: "FAILURE" })])).toEqual({
+    ci: "FAILURE",
+    failing: [{ name: "lint", url: "https://github.com/o/r/runs/lint" }],
+  });
+  // Status contexts carry their name in `context` and their verdict in `state`.
+  expect(rollupOf([status("ci/circleci", "FAILURE"), status("codecov", "SUCCESS")])).toEqual({
+    ci: "FAILURE",
+    failing: [{ name: "ci/circleci", url: "https://status.example/ci/circleci" }],
+  });
+  expect(rollupOf([check("build", { status: "IN_PROGRESS", conclusion: null })])).toEqual({
+    ci: "PENDING",
+    failing: [],
+  });
+  expect(rollupOf([status("legacy", "PENDING")])).toEqual({ ci: "PENDING", failing: [] });
+  expect(rollupOf([check("a"), check("b", { conclusion: "CANCELLED" }), status("c", "ERROR")])).toEqual({
+    ci: "FAILURE",
+    failing: [
+      { name: "b", url: "https://github.com/o/r/runs/b" },
+      { name: "c", url: "https://status.example/c" },
+    ],
+  });
+  // No contexts at all is no rollup, not a pass: a fresh push has none yet.
+  expect(rollupOf([])).toEqual({ ci: null, failing: [] });
+  expect(rollupOf(null)).toEqual({ ci: null, failing: [] });
 });

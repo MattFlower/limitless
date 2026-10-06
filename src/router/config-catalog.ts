@@ -119,7 +119,7 @@ function providerFields(p: ProviderDef) {
   return checked(providerSchema, { ...mapFields(fields, true), kind: providerKind(p) }, "providers");
 }
 function modelFields(m: ModelDef) {
-  const { provider, id, ...fields } = m;
+  const { provider, id, source: _source, ...fields } = m;
   return checked(modelSchema, { ...mapFields(fields, true), id: id.slice(provider.length + 1) }, "models");
 }
 export function resolveCatalog(raw: unknown = undefined) {
@@ -230,6 +230,7 @@ export function resolveCatalog(raw: unknown = undefined) {
       if (m.effort !== undefined && !m.efforts.includes(m.effort))
         throw new Error(`${path}.models.${m.id}.effort: absent from efforts`);
       const model = { ...mapFields(m, false), id: `${name}/${m.id}`, provider: name } as unknown as ModelDef;
+      if (seen.has(m.id) || (c.preset && name !== c.preset)) model.source = "config";
       const at = models.findIndex((m) => m.id === model.id);
       if (at < 0) models.push(model);
       else models[at] = model;
@@ -241,6 +242,22 @@ export function resolveCatalog(raw: unknown = undefined) {
   return { providers, models, providerMaxConcurrent, notes };
 }
 export type EffectiveCatalog = ReturnType<typeof resolveCatalog>;
+/** Runtime entries require the same complete metadata as config-defined models. */
+export function runtimeModel(value: unknown, providers: ProviderDef[]): ModelDef {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("expected model object");
+  const { provider, ...fields } = value as Record<string, unknown>;
+  if (typeof provider !== "string" || !providers.some((p) => p.id === provider))
+    throw new Error(`unknown provider ${String(provider)}`);
+  const m = checked(modelSchema, mapFields(fields, true), "model");
+  if (m.effort !== undefined && !m.efforts.includes(m.effort))
+    throw new Error("model.effort: absent from efforts");
+  return {
+    ...mapFields(m, false),
+    id: `${provider}/${m.id}`,
+    provider,
+    source: "runtime",
+  } as unknown as ModelDef;
+}
 /** TOML inline values also preserve unrelated nested settings during migration. */
 export function tomlValue(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(tomlValue).join(", ")}]`;

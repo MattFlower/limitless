@@ -38,10 +38,17 @@ Usage:
   limitless answer <run> "<text>"         Answer a run's open question(s)
   limitless resolve <run> --as done_elsewhere|superseded|wont_do|pr_closed [--ref <run|url>] [--note "..."]
         Record that a needs_human or failed run was dealt with outside the factory
+  limitless land <run|pr|https://.../pull/7> [--sha <sha>]
+        Queue an open PR for landing; --sha approves a head explicitly (default: the recorded approval)
+  limitless land list                    Show the land queue
+  limitless land cancel <id>             Drop a queued or in-flight land
   limitless feed [--consumer <name>] [--after <id>] [--wait <seconds>] [--json]
         Items to act on after the consumer's cursor; --wait long-polls until one arrives
   limitless feed ack <id> --consumer <name>  Acknowledge items through id once handled
   limitless providers                     Provider health and quota
+  limitless catalog list                  Effective models and discovery
+  limitless catalog add <provider>/<id> --model <backend> --origin <country> --base-origin <country> --vendor <vendor> --tier N --price-input N --price-output N [--efforts none,high] [--effort high] [--notes …]
+  limitless catalog remove <id>            Remove a runtime model
   limitless providers export [--write] [--yes]     Export effective provider config (offline)
   limitless providers enable|disable <id>  Change runtime provider availability
   limitless providers fast on|off <id>     Toggle native provider fast mode
@@ -105,7 +112,7 @@ const color = {
 
 function statusColor(s: string): string {
   const status = s.trim();
-  if (status === "succeeded") return color.green(s);
+  if (status === "succeeded" || status === "landed") return color.green(s);
   if (status === "resolved") return color.cyan(s);
   if (status === "failed" || status === "needs_human") return color.red(s);
   if (status === "running") return color.cyan(s);
@@ -215,6 +222,16 @@ async function main(): Promise<void> {
     options: {
       evals: { type: "string" },
       models: { type: "string" },
+      origin: { type: "string" },
+      "base-origin": { type: "string" },
+      vendor: { type: "string" },
+      tier: { type: "string" },
+      efforts: { type: "string" },
+      effort: { type: "string" },
+      "price-input": { type: "string" },
+      "price-output": { type: "string" },
+      "price-cache-read": { type: "string" },
+      notes: { type: "string" },
       model: { type: "string", multiple: true },
       systems: { type: "string" },
       "replay-finders": { type: "string" },
@@ -252,10 +269,10 @@ async function main(): Promise<void> {
       as: { type: "string" },
       ref: { type: "string" },
       note: { type: "string" },
+      sha: { type: "string" },
       all: { type: "boolean" },
       changes: { type: "string" },
       approve: { type: "boolean" },
-      sha: { type: "string" },
     },
   });
   const [cmd, ...rest] = positionals;
@@ -424,6 +441,32 @@ async function main(): Promise<void> {
       console.log(`Resolved ${run.id} as ${run.resolution?.kind ?? values.as}`);
       return;
     }
+    case "land": {
+      const [sub, ...args] = rest;
+      if (sub === "list") {
+        const entries = await api<import("../core/types.ts").LandEntry[]>("/api/land");
+        for (const entry of entries)
+          console.log(
+            `${entry.id}  ${statusColor(entry.state.padEnd(11))} ${entry.repo.padEnd(28)} ${entry.approvedSha.slice(0, 12)}  ${entry.prUrl}${entry.reason ? color.dim(`  ${entry.reason}`) : ""}`,
+          );
+        return;
+      }
+      if (sub === "cancel" && args.length === 1) {
+        await api(`/api/land/${encodeURIComponent(args[0] as string)}/cancel`, { method: "POST" });
+        console.log("Cancelled");
+        return;
+      }
+      if (!sub)
+        throw new Error("usage: limitless land <run|pr> [--sha <sha>] | land list | land cancel <id>");
+      const entry = await api<import("../core/types.ts").LandEntry>("/api/land", {
+        method: "POST",
+        body: JSON.stringify({ target: sub, ...(values.sha ? { sha: values.sha } : {}) }),
+      });
+      console.log(
+        `Land ${color.bold(String(entry.id))} queued for ${entry.prUrl} at ${entry.approvedSha.slice(0, 12)}`,
+      );
+      return;
+    }
     case "service": {
       const svc = await import("./service.ts");
       const port = Number(process.env.LIMITLESS_PORT ?? 7400);
@@ -446,6 +489,8 @@ async function main(): Promise<void> {
         now: values.now === true,
       });
     }
+    case "catalog":
+      return (await import("./catalog.ts")).catalogCommand(rest, values, api);
     case "routing":
       return (await import("./routing.ts")).routingCommand(rest, values, api);
     case "providers": {
@@ -484,6 +529,7 @@ async function main(): Promise<void> {
             maxConcurrent: number;
             quota?: import("../core/types.ts").QuotaMode;
             windows: Record<string, { utilization: number; observedAt?: number | null }>;
+            discovery?: import("../core/types.ts").ModelDiscovery;
           }[]
         >("/api/providers");
       for (const p of ps) {
@@ -493,6 +539,10 @@ async function main(): Promise<void> {
         console.log(
           `${p.id.padEnd(11)} ${p.state.padEnd(9)} maxConcurrent ${p.maxConcurrent} ${p.quota === "unlimited" ? "No limit (configured) " : ""}${w} ${p.reason ? color.dim(p.reason) : ""}`,
         );
+        if (p.discovery) {
+          console.log(`  served-not-in-catalog: ${p.discovery.servedNotInCatalog.join(", ") || "none"}`);
+          console.log(`  catalog-not-served: ${p.discovery.catalogNotServed.join(", ") || "none"}`);
+        }
       }
       return;
     }

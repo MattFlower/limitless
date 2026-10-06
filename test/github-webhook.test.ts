@@ -11,6 +11,7 @@ import { Store } from "../src/db/store.ts";
 import { githubWebhook, mapGitHubEvent } from "../src/integrations/github.ts";
 import type { GitHubClient } from "../src/integrations/github-poller.ts";
 import { type IntegrationDeps, type Integrations, mountIntegrations } from "../src/integrations/index.ts";
+import { LandQueue } from "../src/land/queue.ts";
 
 const fixture = (name: string): string => readFileSync(join(import.meta.dir, "data", name), "utf8").trim();
 let dir: string;
@@ -49,7 +50,8 @@ const noGitHub: GitHubClient = async (path, body) => {
 
 /** Mounts with fake GitHub, gh and tool probes unless a test overrides one. */
 function mount(deps: IntegrationDeps = {}): Promise<Integrations> {
-  return mountIntegrations({ cfg, store } as Factory, {
+  const land = new LandQueue({ store, paths: cfg.paths, log: () => {} });
+  return mountIntegrations({ cfg, store, land } as Factory, {
     toolVersions: async () => [],
     gh: async () => {},
     prClient: async () => null,

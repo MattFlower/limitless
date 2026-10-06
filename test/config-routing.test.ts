@@ -12,8 +12,81 @@ import { DEFAULT_POLICY, MODELS, PROVIDERS, REMOVED_MODELS } from "../src/router
 import { exportProviders, resolveCatalog, tomlValue } from "../src/router/config-catalog.ts";
 import { validatePolicy, validateRunModels } from "../src/router/policy.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
+import { Router } from "../src/router/router.ts";
 import { answer, evalFixture } from "./evals-support.ts";
 import { customModel, customProvider, providerFixture } from "./provider-config-support.ts";
+
+test("authenticated discovery replaces the served set, preserves history, and skips absent targets in routes and previews", async () => {
+  const f = providerFixture(
+    [{ ...customProvider, health_url: "http://localhost/v1/models" }],
+    "LIMITLESS_TEST_MLX_KEY=discovery-key",
+  );
+  const store = new Store(":memory:");
+  let now = 100;
+  let payload: unknown = { data: [{ id: "org/backend" }, { id: "uncataloged" }, { id: "uncataloged" }] };
+  let status = 200;
+  const fetchHealth = (async (_url, init) => {
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer discovery-key");
+    return Response.json(payload, { status });
+  }) as typeof fetch;
+  try {
+    const cfg = f.load();
+    const catalog = cfg.catalog ?? resolveCatalog();
+    const defs = catalog.providers.filter((p) => p.id === "mac-mlx");
+    const tracker = new ProviderTracker(
+      defs,
+      store,
+      cfg.reserves,
+      cfg.secrets,
+      {},
+      () => now,
+      undefined,
+      undefined,
+      fetchHealth,
+    );
+    tracker.setModels(catalog.models);
+    const router = new Router(tracker, undefined, catalog.models);
+    await tracker.probe();
+    expect(tracker.status("mac-mlx")?.discovery).toMatchObject({
+      served: ["org/backend", "uncataloged"],
+      servedNotInCatalog: ["uncataloged"],
+      catalogNotServed: [],
+    });
+    now = 200;
+    payload = { data: [{ id: "uncataloged" }] };
+    const revision = router.policyRevision;
+    await tracker.probe();
+    expect(revision.aborted).toBe(true);
+    expect(tracker.status("mac-mlx")?.discovery?.catalogNotServed).toEqual(["mac-mlx/flash"]);
+    const route = router.route("triage", "small", { chain: ["mac-mlx/flash"] });
+    expect(route.candidates).toEqual([]);
+    expect(route.skipped).toEqual([{ modelId: "mac-mlx/flash@none", reason: "not served by mac-mlx" }]);
+    expect(router.preview("triage", "small", { chain: ["mac-mlx/flash"] })).toEqual([
+      { modelId: "mac-mlx/flash@none", eligible: false, reason: "not served by mac-mlx" },
+    ]);
+    expect(store.discovery("mac-mlx").observations).toEqual([
+      { model: "org/backend", firstSeen: 100, lastSeen: 100 },
+      { model: "uncataloged", firstSeen: 100, lastSeen: 200 },
+    ]);
+    for (const malformed of [{}, { data: [{ id: 1 }] }, { data: null }]) {
+      payload = malformed;
+      await tracker.probe();
+      expect(tracker.status("mac-mlx")?.discovery?.served).toBeNull();
+      expect(router.route("triage", "small", { chain: ["mac-mlx/flash"] }).candidates).toHaveLength(1);
+    }
+    payload = { data: [] };
+    await tracker.probe();
+    expect(router.route("triage", "small", { chain: ["mac-mlx/flash"] }).candidates).toEqual([]);
+    status = 503;
+    await tracker.probe();
+    expect(store.discovery("mac-mlx").served).toBeNull();
+    expect(tracker.status("mac-mlx")?.discovery?.catalogNotServed).toEqual([]);
+    expect(store.discovery("mac-mlx").observations).toHaveLength(2);
+  } finally {
+    store.close();
+    f.close();
+  }
+});
 
 test("provider quota modes validate both config shapes and survive export", () => {
   for (const array of [false, true]) {
@@ -84,6 +157,62 @@ test("Dependabot routing defaults to free-first and accepts either configured mo
     expect(config).toThrow('routing.dependabot must be "free_first" or "policy"');
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("[routing] prefer takes provider IDs and fails on model, retired, unknown or malformed entries", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-prefer-config-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const file = join(configDir, "config.toml");
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  const set = (prefer: string) => writeFileSync(file, `[routing]\nprefer = ${prefer}\n`);
+  try {
+    expect(config().preferProviders).toEqual([]);
+    set("[]");
+    expect(config().preferProviders).toEqual([]);
+    set('["codex"]');
+    expect(config().preferProviders).toEqual(["codex"]);
+    // A retired model names its removal reason; an active model is named as a model, not a provider.
+    set('["codex/astra"]');
+    expect(config).toThrow(
+      `routing.prefer: "codex/astra" is a retired model ID: ${REMOVED_MODELS.get("codex/astra")}`,
+    );
+    set('["claude/fable"]');
+    expect(config).toThrow(
+      `routing.prefer: "claude/fable" is a retired model ID: ${REMOVED_MODELS.get("claude/fable")}`,
+    );
+    set('["claude/opus"]');
+    expect(config).toThrow('routing.prefer: "claude/opus" is a model ID, not a provider');
+    set('["nonexistent"]');
+    expect(config).toThrow('routing.prefer: "nonexistent" is not a known provider ID');
+    // A valid provider stays valid; the offending entry in the list is the one named.
+    set('["codex", "claude/opus"]');
+    expect(config).toThrow('routing.prefer: "claude/opus" is a model ID');
+    // Malformed values point at routing.prefer instead of being ignored.
+    set('"codex"');
+    expect(config).toThrow("routing.prefer must be an array of provider IDs");
+    set('["codex", 3]');
+    expect(config).toThrow("routing.prefer[1] must be a provider ID string");
+    expect(() =>
+      loadConfig({ home: join(root, "data"), configDir, raw: { routing: { prefer: null } } }),
+    ).toThrow("routing.prefer must be an array of provider IDs");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("prefer keeps the requested order and accepts configured provider IDs", () => {
+  const fixture = providerFixture();
+  try {
+    const providers = `providers = ${tomlValue([customProvider])}`;
+    writeFileSync(fixture.file, `${providers}\n[routing]\nprefer = ["mac-mlx", "codex"]\n`);
+    expect(fixture.load().preferProviders).toEqual(["mac-mlx", "codex"]);
+    // The entry is only routable through the configured provider, so the effective catalog is used.
+    writeFileSync(fixture.file, `${providers}\n[routing]\nprefer = ["mac-mlx/flash"]\n`);
+    expect(fixture.load).toThrow('routing.prefer: "mac-mlx/flash" is a model ID, not a provider');
+  } finally {
+    fixture.close();
   }
 });
 

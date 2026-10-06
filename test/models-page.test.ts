@@ -64,7 +64,8 @@ test("Models table renders checkpoint origins with aligned loaded and loading ro
         const jev = rows.find((row) => row.includes("typesafe/jev"));
         expect(jev).toContain(">US</td>");
         expect(jev).toContain(">unknown</td>");
-        expect(html).toContain("codex/luna@low|claude/opus@high");
+        expect(html).toContain('href="/setup"');
+        expect(html).toContain("Configure routing, fallbacks and models in Setup");
         expect(table).toContain("Supported efforts");
         expect(table).toContain("default: medium");
         expect(table).toContain("backend default");

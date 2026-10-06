@@ -530,10 +530,37 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       ),
     ),
     "/api/github/access": handle(() => json(store.githubAccessProblems())),
+    "/api/land": {
+      GET: handle(() => json(factory.land.list())),
+      POST: handle(async (req) => {
+        const input = await body<{ target?: unknown; runId?: unknown; sha?: unknown }>(req);
+        const target = typeof input.target === "string" ? input.target : input.runId;
+        if (typeof target !== "string" || !target.trim())
+          return error("target is required: a run id, a PR URL or a PR number");
+        if (input.sha !== undefined && typeof input.sha !== "string") return error("sha must be a string");
+        return json(factory.land.request({ target, sha: input.sha as string | undefined }), 201);
+      }, true),
+    },
+    "/api/land/:id/cancel": {
+      POST: handle((req) => {
+        const cancelled = factory.land.cancel(Number(req.params.id as string));
+        return cancelled ? json({ cancelled: true }) : error("land entry not found", 404);
+      }, true),
+    },
     "/api/repos": {
       GET: handle(() => json(store.listRepos())),
     },
     "/api/providers": handle(() => json(factory.tracker.all())),
+    "/api/catalog": handle(() => json(factory.catalog.snapshot())),
+    "/api/catalog/models": {
+      POST: handle(async (req) => json(factory.catalog.add(await body<unknown>(req)), 201)),
+    },
+    "/api/catalog/models/:id": {
+      PATCH: handle(async (req) =>
+        json(factory.catalog.patch(req.params.id ?? "", await body<unknown>(req))),
+      ),
+      DELETE: handle((req) => json(factory.catalog.remove(req.params.id ?? ""))),
+    },
     "/api/routing": handle((req) =>
       json(factory.routing.snapshot(new URL(req.url).searchParams.get("run") ?? undefined)),
     ),
@@ -598,7 +625,17 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     for (const [path, file] of Object.entries(extras.ui)) routes[path] = handle(() => new Response(file));
     const index = extras.ui["/index.html"];
     if (index)
-      for (const path of ["/", "/runs/*", "/new", "/models", "/providers", "/chat", "/evals", "/evals/*"])
+      for (const path of [
+        "/",
+        "/runs/*",
+        "/new",
+        "/setup",
+        "/models",
+        "/providers",
+        "/chat",
+        "/evals",
+        "/evals/*",
+      ])
         routes[path] = handle(() => new Response(index));
   }
   routes["/*"] = handle((req) =>

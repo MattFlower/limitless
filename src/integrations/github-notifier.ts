@@ -1,17 +1,29 @@
+import { z } from "zod";
 import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
 import { sh } from "../util/proc.ts";
-import type { GhRunner } from "./github.ts";
+import { type GhRunner, runGh } from "./github.ts";
+import { type Context, rollup } from "./github-poller.ts";
 
 export interface GitHubPrState {
   url: string;
   state: string;
   mergedAt: string | null;
   mergedBy: { login: string } | null;
+  /** The head the client saw; a client that reports only state leaves it undefined. */
+  headRefOid?: string;
 }
 
-export type GitHubPrClient = ((url: string) => Promise<GitHubPrState | null>) & {
+/** `gh pr view`'s full report: the head and the CI rollup the land queue waits on. */
+export interface GitHubPrView extends GitHubPrState {
+  ci: string | null;
+  failing: string[];
+  statusNames?: string[];
+  truncated?: boolean;
+}
+
+export type GitHubPrClient = ((url: string, signal?: AbortSignal) => Promise<GitHubPrState | null>) & {
   fresh?: GitHubPrClient | null; // null for cache-only clients
   beginPass?: () => void;
   observed?: (url: string) => boolean;
@@ -29,13 +41,59 @@ const passes = new WeakMap<
   }
 >();
 
-export const getGitHubPr: GitHubPrClient = async (url) => {
-  const { stdout } = await sh(["gh", "pr", "view", url, "--json", "url,state,mergedAt,mergedBy"], {
-    cwd: process.cwd(),
-    timeoutMs: 30_000,
-  });
-  return JSON.parse(stdout) as GitHubPrState;
+/** `gh pr view` reports the rollup as an array of check and status contexts, not a rollup object. */
+type GhPrView = GitHubPrView & { statusCheckRollup?: Context[] | null };
+
+export const getGitHubPr = async (url: string, signal?: AbortSignal): Promise<GitHubPrView> => {
+  const { stdout } = await sh(
+    ["gh", "pr", "view", url, "--json", "url,state,mergedAt,mergedBy,headRefOid,statusCheckRollup"],
+    { cwd: process.cwd(), timeoutMs: 30_000, signal },
+  );
+  const view = JSON.parse(stdout) as GhPrView;
+  const { ci, failing } = rollup(view.statusCheckRollup);
+  return {
+    url: view.url,
+    state: view.state,
+    mergedAt: view.mergedAt,
+    mergedBy: view.mergedBy,
+    headRefOid: view.headRefOid,
+    ci,
+    failing: failing.map((f) => f.name),
+    statusNames: (view.statusCheckRollup ?? []).flatMap((c) =>
+      c.state !== undefined && (c.name ?? c.context) ? [c.name ?? c.context ?? ""] : [],
+    ),
+    truncated: (view.statusCheckRollup?.length ?? 0) >= 100 || undefined,
+  };
 };
+
+/** Workflow attempts let landing distinguish a rerun from its stale, failed rollup. */
+export const ciRunsSchema = z.array(
+  z.object({
+    databaseId: z.number().int().positive(),
+    headSha: z.string(),
+    attempt: z.number().int().positive(),
+    status: z.string(),
+    conclusion: z.string().nullable(),
+  }),
+);
+export async function getGitHubCiRuns(repo: string, sha: string, signal: AbortSignal, gh: GhRunner = runGh) {
+  const json = await gh(
+    [
+      "run",
+      "list",
+      "--repo",
+      repo,
+      "--commit",
+      sha,
+      "--limit",
+      "100",
+      "--json",
+      "databaseId,headSha,attempt,status,conclusion",
+    ],
+    signal,
+  );
+  return ciRunsSchema.parse(JSON.parse(String(json))).filter((run) => run.headSha === sha);
+}
 
 export async function reconcileMergedRuns(
   store: Store,

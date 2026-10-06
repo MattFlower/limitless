@@ -72,6 +72,10 @@ export async function buildNeedsYouUi(dir: string): Promise<NeedsYouUi> {
                 );
               }
               source = source.replace(
+                "onClick={() => setRetryModelsOpen(true)}",
+                '{...capture("retry-models", () => setRetryModelsOpen(true))}',
+              );
+              source = source.replace(
                 "onChange={(e) => setKind(e.currentTarget.value as Kind)}",
                 '{...capture("kind", (e: { currentTarget: { value: Kind } }) => setKind(e.currentTarget.value))}',
               );
