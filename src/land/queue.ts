@@ -383,7 +383,10 @@ export class LandQueue {
         if (!this.store.observePrHead(entry.prUrl, sha, since))
           throw new LandBlocked("head moved after approval");
         const version = this.store.prHead(entry.prUrl)?.version;
-        const current = () => !signal.aborted && this.store.prHead(entry.prUrl)?.version === version;
+        const inspection = new AbortController();
+        const inspectionSignal = AbortSignal.any([signal, inspection.signal]);
+        const current = () =>
+          !inspectionSignal.aborted && this.store.prHead(entry.prUrl)?.version === version;
         const snap: PrSnapshot = {
           ...(saved?.headRefOid === sha ? saved : {}),
           id: saved?.id ?? "",
@@ -411,12 +414,27 @@ export class LandQueue {
         };
         const before = this.store.ciFailures(entry.prUrl, sha).filter((f) => f.rerunJob).length;
         let decision: Awaited<ReturnType<typeof ciDecision>> | undefined;
+        const checkHead = () => {
+          const observed = this.savedReport(entry.prUrl);
+          if (
+            !current() ||
+            (observed?.state !== "MERGED" &&
+              observed?.head &&
+              observed.head !== sha &&
+              observed.head !== entry.approvedSha)
+          )
+            inspection.abort(new LandBlocked("head moved after approval"));
+        };
+        const unsubscribe = this.store.subscribe((msg) => {
+          if (msg.kind === "github_pr" && msg.url === entry.prUrl) checkHead();
+        });
         try {
+          checkHead();
           decision = await ciDecision(
             this.store,
             pr,
             snap,
-            (_repo, path, body) => (this.deps.github ?? ghClient)(path, body, signal),
+            (_repo, path, body) => (this.deps.github ?? ghClient)(path, body, inspectionSignal),
             this.deps.ciReruns !== false && !rerun,
             current,
             current,
@@ -424,7 +442,10 @@ export class LandQueue {
           );
         } catch (error) {
           signal.throwIfAborted();
+          if (inspection.signal.aborted) throw inspection.signal.reason;
           this.log(`[land] ${entry.id}: CI inspection pending: ${String(error)}`);
+        } finally {
+          unsubscribe();
         }
         if (decision?.state === "head_moved" || !current()) {
           signal.throwIfAborted();

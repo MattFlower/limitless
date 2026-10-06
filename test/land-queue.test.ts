@@ -875,6 +875,31 @@ test("moved head discovered by rerun preflight blocks immediately", async () => 
   expect(ghCalls("pr merge")).toEqual([]);
 });
 
+test("moved head interrupts a stalled classifier read", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  ci = () => null;
+  const entry = queue().request({ target: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  const pinned = store.getLandEntry(entry.id)?.pushedSha ?? "";
+  github.hold = new Promise<void>(() => {});
+  observe(1, pinned, "FAILURE", ["build"]);
+  await waitWithoutClock(() => github.inFlight === 1);
+  const readSignal = github.signals.at(-1);
+  expect(readSignal?.aborted).toBe(false);
+  const before = clock.now();
+  observe(1, "c".repeat(40), "PENDING");
+  await waitWithoutClock(() => store.getLandEntry(entry.id)?.state === "blocked");
+  expect(readSignal?.aborted).toBe(true);
+  expect(github.inFlight).toBe(0);
+  expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
+  expect(clock.now()).toBe(before);
+  expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toEqual([]);
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
 test("a saved moved head blocks without advancing the clock even when a CI read stalls", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
