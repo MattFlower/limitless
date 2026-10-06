@@ -43,7 +43,7 @@ test("config validates LAN settings; exact binds share routes, stop together and
   const f = await fixture();
   try {
     const configDir = join(f.home, "config");
-    mkdirSync(configDir);
+    mkdirSync(configDir, { recursive: true });
     const config = (toml: string) => {
       writeFileSync(join(configDir, "config.toml"), `[server]\n${toml}`);
       return loadConfig({ home: join(f.home, "data"), configDir });

@@ -270,6 +270,7 @@ export interface RunDetail {
   blockingFindings?: string[];
   prSnapshot?: {
     state?: string;
+    headRefOid?: string;
     isDraft?: boolean;
     mergeable?: string | null;
     ci?: string | null;
@@ -281,7 +282,7 @@ export interface RunDetail {
   questions: Question[];
   artifacts: ArtifactMeta[];
   /** For a run with a PR: its latest approval and the review rounds applied to it. */
-  review?: { approval: ReviewApproval | null; rounds: ReviewRound[] };
+  review?: { approval: ReviewApproval | null; approvedAt?: number; rounds: ReviewRound[] };
 }
 
 export interface ReviewFinding {
@@ -313,6 +314,7 @@ export interface ReviewRound {
   reviewedSha: string;
   deliveredSha: string | null;
   findings: ReviewFinding[];
+  createdAt?: number;
 }
 
 export interface QuotaWindow {

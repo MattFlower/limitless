@@ -23,6 +23,10 @@ export async function fixture(bootSha?: string | ((repo: string) => Promise<stri
   );
   const resolvedBootSha = typeof bootSha === "function" ? await bootSha(repo) : bootSha;
   const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "config"), port: 7400 });
+  mkdirSync(cfg.paths.configDir);
+  writeFileSync(join(cfg.paths.configDir, "private-strings.txt"), "");
+  const previousConfigDir = process.env.LIMITLESS_CONFIG_DIR;
+  process.env.LIMITLESS_CONFIG_DIR = cfg.paths.configDir;
   cfg.secrets = {};
   const factory = new Factory(cfg, {
     ...(resolvedBootSha ? { bootSha: resolvedBootSha } : {}),
@@ -50,6 +54,8 @@ export async function fixture(bootSha?: string | ((repo: string) => Promise<stri
     async close() {
       await factory.stop();
       factory.store.close();
+      if (previousConfigDir === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+      else process.env.LIMITLESS_CONFIG_DIR = previousConfigDir;
       rmSync(home, { recursive: true, force: true });
     },
   };

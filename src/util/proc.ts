@@ -277,6 +277,7 @@ export async function sh(
 // Retain registrations across config reloads while older invocations may still be running.
 const credentialNames = new Set<string>();
 const credentialValues = new Set<string>();
+export const registeredCredentials = (): readonly string[] => [...credentialValues];
 export function registerCredential(name: string, value?: string): void {
   credentialNames.add(name);
   for (const secret of [value, process.env[name]])

@@ -22,7 +22,7 @@ import {
   singleFlight,
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
-import { loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
+import { checkPrivateText, loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
 import {
   compareGates,
   type GateRun,
@@ -39,6 +39,7 @@ import { formatAuditFeedback, formatGateFeedback } from "../src/pipeline/prompts
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
+import { truncationEncodings } from "./privacy-support.ts";
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -371,6 +372,45 @@ describe("audit allowances and attribute rules", () => {
 });
 
 describe("private strings", () => {
+  test.each(truncationEncodings)("protects every clipped %s escape boundary", (_name, encode) => {
+    const entries = [{ value: "private-prospect.example", entry: 3 }];
+    const text = encode(entries[0]?.value ?? "");
+    // Include every cutoff after the first complete encoded character, including partial escapes.
+    for (let cut = encode("p").length; cut < text.length; cut++)
+      expect(privateMatches(`Public: ${text.slice(0, cut)}`, entries, true)).toEqual(entries);
+    expect(privateMatches("Public: ＰＲＩＶＡＴＥ-pro", entries, true)).toEqual(entries);
+    expect(privateMatches("Public: private-pro", entries)).toEqual([]);
+    expect(privateMatches("Public: private-pro unrelated", entries, true)).toEqual([]);
+  });
+
+  test.each([
+    ["double URL", "%2573ecret-host.example"],
+    ["Unicode-escaped percent", "\\u002573ecret-host.example"],
+    ["URL of Unicode", "%5Cu0073ecret-host.example"],
+    ["alternating layers", "%5Cu002573ecret-host.example"],
+  ])("blocks %s encoding in publication and diagnostics", (_kind, text) => {
+    const entries = [{ value: "secret-host.example", entry: 3 }];
+    expect(privateMatches(text, entries)).toEqual(entries);
+    expect(() => checkPrivateText(text, "body", entries)).toThrow("entry 3");
+    expect(redactPrivate(text, entries)).toBe("[redacted diagnostic]");
+  });
+
+  test("private decoding fails closed at the round bound even without denylist entries", () => {
+    const entries = [{ value: "secret-host.example", entry: 3 }];
+    let nested = "%61 harmless";
+    for (let i = 0; i < 3; i++) nested = encodeURIComponent(nested);
+    expect(privateMatches(nested, entries)).toEqual([]);
+    expect(redactPrivate(nested, entries)).toBe(nested);
+    nested = encodeURIComponent(nested);
+    for (const policy of [entries, []]) {
+      expect(privateMatches(nested, policy)).toHaveLength(1);
+      expect(() => checkPrivateText(nested, "body", policy)).toThrow("decoding limit");
+      expect(redactPrivate(nested, policy)).toBe("[redacted diagnostic]");
+    }
+    for (let i = 0; i < 3; i++) nested = encodeURIComponent(nested);
+    expect(() => checkPrivateText(nested, "body", [])).toThrow("decoding limit");
+  });
+
   test.each(["A", "R100"])("quoted %s filename and unrelated diagnostics cannot reveal entries", (status) => {
     const configDir = mkdtempSync(join(tmpdir(), "private-strings-"));
     try {
@@ -1126,6 +1166,9 @@ test("private policy rejects broken lists and repository aliases; normalizes bot
       "secret-host.example",
       "ＳＥＣＲＥＴ－ＨＯＳＴ．ＥＸＡＭＰＬＥ",
       "%73ecret-host%2Eexample",
+      "\\u0073ecret-host.example",
+      "%5Cu0073ecret-host.example",
+      JSON.stringify("\\u0073\\u0065\\u0063\\u0072\\u0065\\u0074-host.example"),
       "%bad% secret-host.example",
     ]) {
       expect(privateMatches(text, entries)).toHaveLength(1);
