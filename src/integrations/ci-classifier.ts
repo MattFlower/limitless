@@ -80,7 +80,7 @@ async function inspectCi(
   current: () => boolean,
   onFailure: () => void,
   consumer: "poller" | "land",
-): Promise<boolean> {
+): Promise<boolean | "head_moved"> {
   const root = `repos/${pr.repo}`;
   const read = async (path: string) => {
     const res = await call(pr.repo, `${root}/${path}`);
@@ -423,7 +423,8 @@ async function inspectCi(
         const remote = z
           .object({ head: z.object({ sha: z.string() }), state: z.string() })
           .parse(await read(`pulls/${pr.url.split("/").at(-1)}`));
-        if (remote.head.sha !== snap.headRefOid || remote.state !== "open" || !current()) continue;
+        if (remote.head.sha !== snap.headRefOid) return "head_moved";
+        if (remote.state !== "open" || !current()) continue;
         if (!ready()) return false;
         if (
           store.claimCiRerun(f, marker, {
@@ -451,7 +452,7 @@ async function inspectCi(
   return !pendingRerun && !paused;
 }
 
-export type CiDecision = { complete: boolean; state: "pending" | "failed" | "green" };
+export type CiDecision = { complete: boolean; state: "pending" | "failed" | "green" | "head_moved" };
 const inspections = new WeakMap<Store, Map<string, Promise<CiDecision>>>();
 
 /** Both CI consumers use the same inspection and durable head-wide claim, including after restart. */
@@ -489,6 +490,7 @@ export function ciDecision(
       },
       consumer,
     );
+    if (complete === "head_moved") return { complete: false, state: "head_moved" };
     const waiting = store.ciFailures(pr.url, snap.headRefOid).some(pending);
     return {
       complete,

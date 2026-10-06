@@ -426,7 +426,7 @@ export class LandQueue {
           signal.throwIfAborted();
           this.log(`[land] ${entry.id}: CI inspection pending: ${String(error)}`);
         }
-        if (!current()) {
+        if (decision?.state === "head_moved" || !current()) {
           signal.throwIfAborted();
           throw new LandBlocked("head moved after approval");
         }

@@ -853,6 +853,28 @@ test("non-transient main-red CI blocks with names", async () => {
   expect(ghCalls("pr merge")).toEqual([]);
 });
 
+test("moved head discovered by rerun preflight blocks immediately", async () => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head);
+  approve(1, head);
+  ci = () => null;
+  const entry = queue().request({ target: pr.run.id });
+  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+  const pinned = store.getLandEntry(entry.id)?.pushedSha ?? "";
+  workflow(pinned, 1, "failure");
+  github.responses.set(`repos/${SLUG}/pulls/1`, () =>
+    respond(200, { head: { sha: "c".repeat(40) }, state: "open" }),
+  );
+  const before = clock.now();
+  observe(1, pinned, "FAILURE", ["network"]);
+  await waitWithoutClock(() => store.getLandEntry(entry.id)?.state === "blocked");
+  expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
+  expect(clock.now()).toBe(before);
+  expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toEqual([]);
+  expect(ghCalls("pr merge")).toEqual([]);
+});
+
 test("a saved moved head blocks without advancing the clock even when a CI read stalls", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
