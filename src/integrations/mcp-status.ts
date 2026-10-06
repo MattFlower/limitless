@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { loadPrivateStrings, type PrivateStrings, redactPrivate } from "../gates/private.ts";
+import { redactCredentials } from "../util/proc.ts";
 
 export const statusDetailSchema = z.object({
   run: z.object({
@@ -42,12 +44,25 @@ export function explainStatus(
   const land = lands
     .filter((entry) => entry.runId === run.id || (run.prUrl && entry.prUrl === run.prUrl))
     .sort((a, b) => b.id - a.id)[0];
-  const result = (state: string, nextAction: string) => ({
-    run: run.id,
-    state,
-    nextAction,
-    land: land ?? null,
-  });
+  const result = (state: string, nextAction: string) => {
+    let privateStrings: PrivateStrings;
+    try {
+      privateStrings = loadPrivateStrings();
+    } catch {
+      // Only validated enum values and counts are safe without the privacy policy.
+      return {
+        land: land ? { id: land.id, state: land.state } : null,
+        openQuestions: questions.filter((q) => q.answer === null).length,
+      };
+    }
+    const output = { run: run.id, state, nextAction, land: land ?? null };
+    // Redact the whole result so nested metadata and generated guidance share the digest's policy.
+    return JSON.parse(
+      JSON.stringify(output, (_key, value: unknown) =>
+        typeof value === "string" ? redactPrivate(redactCredentials(value), privateStrings) : value,
+      ),
+    ) as typeof output;
+  };
   if (pr?.state === "MERGED" || run.resolution?.kind === "merged" || land?.state === "landed")
     return result("Landed", "No action needed; the PR has merged.");
   if (land?.state === "blocked")

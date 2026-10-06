@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Question, Run } from "../src/core/types.ts";
 import { createMcpServer, type Fetch, factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { connect, fixture, localServer, type Route, requestWithParams, resultValue } from "./mcp-support.ts";
 
 let f: Awaited<ReturnType<typeof fixture>>;
@@ -548,6 +551,74 @@ test("status finds the latest land by run or PR beyond 100 historical entries on
   } finally {
     await proxy.close();
     await direct.close();
+  }
+});
+
+test.each([
+  ["direct", "readable"],
+  ["proxy", "readable"],
+  ["direct", "unreadable"],
+  ["proxy", "unreadable"],
+  ["direct", "invalid UTF-8"],
+  ["proxy", "invalid UTF-8"],
+] as const)("status protects every output field on %s with a %s denylist", async (backend, policy) => {
+  const previousConfigDir = process.env.LIMITLESS_CONFIG_DIR;
+  const configDir = join(f.home, "status-config");
+  mkdirSync(configDir);
+  process.env.LIMITLESS_CONFIG_DIR = configDir;
+  const file = join(configDir, "private-strings.txt");
+  const credential = "status-test-long-credential";
+  const sensitive = `Private Prospect ${credential}`;
+  registerCredential("STATUS_TEST_CREDENTIAL", credential);
+  const { store } = f.factory;
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "work", title: sensitive });
+  const prUrl = `https://github.com/o/r/pull/1?${sensitive}`;
+  store.updateRun(run.id, { status: "succeeded", prUrl });
+  store.askQuestion(run.id, `Question about ${sensitive}`);
+  const land = store.createLandEntry({
+    runId: sensitive,
+    repo: "o/r",
+    prUrl,
+    baseBranch: "main",
+    headBranch: "feature",
+    approvedSha: "a".repeat(40),
+  });
+  store.updateLandEntry(land.id, { state: "blocked", reason: `CI failed for ${sensitive}` });
+  if (policy === "readable") writeFileSync(file, "Private Prospect\nLanding blocked\nInspect\n");
+  else if (policy === "unreadable") mkdirSync(file);
+  else writeFileSync(file, Buffer.from([0xff]));
+  const routes = createHttpRoutes(f.factory);
+  const conn = await connect(
+    backend === "direct"
+      ? factoryBackend(f.factory)
+      : httpBackend("http://daemon.invalid", async (url, init) => {
+          const path = new URL(url).pathname;
+          const route = routes[path === "/api/land" ? path : "/api/runs/:id"];
+          const handler = (typeof route === "function" ? route : (route as { GET: Route }).GET) as Route;
+          return handler(requestWithParams(url, init, { id: run.id }), localServer);
+        }),
+  );
+  try {
+    const result = await conn.client.callTool({ name: "limitless_status", arguments: { run: run.id } });
+    const text = JSON.stringify(result);
+    expect(text).not.toContain("Private Prospect");
+    expect(text).not.toContain(credential);
+    if (policy === "readable") {
+      expect(resultValue(result)).toMatchObject({
+        run: run.id,
+        state: "[redacted]",
+        nextAction: "[redacted] the land reason, resolve the blocker, then request limitless_land again.",
+        land: { id: land.id, runId: "[redacted] [redacted]", reason: "CI failed for [redacted] [redacted]" },
+      });
+    } else {
+      expect(resultValue<unknown>(result)).toEqual({ land: { id: land.id, state: "blocked" }, openQuestions: 1 });
+      expect(text).not.toContain(run.id);
+      expect(text).not.toContain("CI failed");
+    }
+  } finally {
+    await conn.close();
+    if (previousConfigDir === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+    else process.env.LIMITLESS_CONFIG_DIR = previousConfigDir;
   }
 });
 
