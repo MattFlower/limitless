@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
 import {
   existsSync,
@@ -7057,9 +7058,24 @@ test("drain blocks queued starts and parks the active run at its next boundary",
 });
 
 // Serialize the factory evidence and schema that a release without sidecars left behind.
-function legacyWorktreeFixture(f: Factory, runId: string, interrupted = false, modern = false): void {
-  f.store.daemonStarted("sidecar-release", "0.1.0", "7405d9f0555a61526a657992f1fe972bfeafed37");
+const deployedSidecarBuild = execFileSync("git", ["rev-parse", "HEAD"], {
+  cwd: join(import.meta.dir, ".."),
+  encoding: "utf8",
+}).trim();
+
+function sidecarReleaseStarted(f: Factory): void {
+  f.store.daemonStarted("sidecar-release", "0.1.0", deployedSidecarBuild);
   f.store.db.exec("UPDATE feed SET ts = 1791100100000 WHERE dedupe_key = 'daemon.started:sidecar-release'");
+}
+
+function legacyWorktreeFixture(
+  f: Factory,
+  runId: string,
+  interrupted = false,
+  modern = false,
+  bundled = false,
+): void {
+  if (!bundled) sidecarReleaseStarted(f);
   const created = modern ? 1791100150000 : 1791100000000;
   f.store.db
     .query(
@@ -7071,7 +7087,7 @@ function legacyWorktreeFixture(f: Factory, runId: string, interrupted = false, m
   f.store.db.exec("DELETE FROM applied_migrations WHERE name = '20261005T134145-worktree-provenance.sql'");
 }
 
-test.each(["legacy missing", "modern missing", "legacy mismatched"])(
+test.each(["legacy missing", "bundled legacy missing", "modern missing", "legacy mismatched"])(
   "legacy worktree resumes with %s record",
   async (record) => {
     const handler: Handler = (s) => {
@@ -7092,7 +7108,7 @@ test.each(["legacy missing", "modern missing", "legacy mismatched"])(
     await f.stop();
     delete state.previewConfig;
     f.store.setRunState(run.id, state);
-    legacyWorktreeFixture(f, run.id, false, record === "modern missing");
+    legacyWorktreeFixture(f, run.id, false, record === "modern missing", record === "bundled legacy missing");
     f.store.close();
     if (record.endsWith("missing")) rmSync(sidecar);
     else {
@@ -7102,8 +7118,12 @@ test.each(["legacy missing", "modern missing", "legacy mismatched"])(
     }
     const bytes = existsSync(sidecar) ? readFileSync(sidecar, "utf8") : undefined;
     const resumed = start(handler, false, false, false);
+    if (record === "bundled legacy missing") {
+      expect(resumed.store.hasLegacyWorktree(run.id)).toBe(false);
+      sidecarReleaseStarted(resumed);
+    }
     const controller = new AbortController();
-    if (record === "legacy missing") {
+    if (record === "legacy missing" || record === "bundled legacy missing") {
       // Re-park after registration, then reopen the persisted state once more.
       expect(await executeRun(resumed.deps, run.id, controller.signal, () => true)).toBe("queued");
       expect(readFileSync(sidecar, "utf8")).toBe(original);

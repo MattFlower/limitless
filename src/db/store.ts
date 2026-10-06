@@ -43,6 +43,7 @@ import type {
 import { DEFAULT_EVAL_CONCURRENCY, MAX_RUN_IDS, TERMINAL_STATUSES } from "../core/types.ts";
 import type { RunState } from "../pipeline/context.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
+import { markLegacyWorktree } from "./worktree-provenance.ts";
 
 type Row = Record<string, unknown>;
 type Listener = (msg: StreamMessage) => void;
@@ -1413,6 +1414,8 @@ export class Store {
   }
 
   hasLegacyWorktree(runId: string): boolean {
+    if (this.db.query("SELECT id FROM runs WHERE id = ? AND worktree_provenance IS NULL").get(runId))
+      markLegacyWorktree(this.db, runId);
     return !!this.db.query("SELECT id FROM runs WHERE id = ? AND worktree_provenance = 'legacy'").get(runId);
   }
 

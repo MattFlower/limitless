@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,12 @@ import type { AuditAllowance, CreateRunRequest, Run } from "../src/core/types.ts
 import { MIGRATION_DIR, migrationNames, runMigrations } from "../src/db/migration-runner.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
 import { Store } from "../src/db/store.ts";
+import { SIDECAR_BUILD } from "../src/db/worktree-provenance.ts";
+
+const deployedBuild = execFileSync("git", ["rev-parse", "HEAD"], {
+  cwd: join(import.meta.dir, ".."),
+  encoding: "utf8",
+}).trim();
 
 function temporary(testBody: (directory: string, path: string) => void): void {
   const directory = mkdtempSync(join(tmpdir(), "limitless-migrations-"));
@@ -70,7 +77,16 @@ const fileNames = (db: Database) =>
     (r) => r.name,
   );
 
-test.each(["verified", "missing", "unknown", "pre-sidecar", "malformed", "pruned"])(
+test.each([
+  "verified",
+  "bundled",
+  "missing",
+  "unknown",
+  "unresolvable",
+  "pre-sidecar",
+  "malformed",
+  "pruned",
+])(
   "worktree provenance upgrade requires pre-sidecar factory evidence (%s) and survives reopen",
   (startup) => {
     temporary((directory, path) => {
@@ -80,15 +96,20 @@ test.each(["verified", "missing", "unknown", "pre-sidecar", "malformed", "pruned
         filter: (src) => !src.endsWith("-worktree-provenance.sql"),
       });
       const old = new Store(path, before);
-      if (startup !== "missing") {
+      if (!["missing", "bundled"].includes(startup)) {
         old.daemonStarted(
           "first",
           "0.1.0",
           startup === "unknown"
             ? "unknown"
-            : startup === "pre-sidecar"
-              ? "d72c4f9e7f1730d8620844c3147b332fef6fdce5"
-              : "7405d9f0555a61526a657992f1fe972bfeafed37",
+            : startup === "unresolvable"
+              ? "0000000000000000000000000000000000000000"
+              : startup === "pre-sidecar"
+                ? execFileSync("git", ["rev-parse", `${SIDECAR_BUILD}^`], {
+                    cwd: join(import.meta.dir, ".."),
+                    encoding: "utf8",
+                  }).trim()
+                : deployedBuild,
         );
         old.db.query("UPDATE feed SET ts = 1791100100000 WHERE kind = 'daemon.started'").run();
         if (startup === "malformed") old.db.exec("UPDATE feed SET data = '{' WHERE kind = 'daemon.started'");
@@ -98,7 +119,7 @@ test.each(["verified", "missing", "unknown", "pre-sidecar", "malformed", "pruned
       old.daemonStarted("unverified", "0.1.0", "unknown");
       old.db.exec("UPDATE feed SET ts = 1791090000000 WHERE dedupe_key = 'daemon.started:unverified'");
       if (startup === "verified") {
-        old.daemonStarted("later", "0.1.0", "50e74bfd1831592896d03da21b2c49fe1cfcc4e5");
+        old.daemonStarted("later", "0.1.0", deployedBuild);
         old.db.exec("UPDATE feed SET ts = 1791100200000 WHERE dedupe_key = 'daemon.started:later'");
       }
       const repo = old.upsertRepo({
@@ -155,7 +176,13 @@ test.each(["verified", "missing", "unknown", "pre-sidecar", "malformed", "pruned
       });
       old.close();
       const current = new Store(path);
-      const eligible = startup === "verified";
+      if (startup === "bundled") {
+        // Migration ran before App.start recorded this install's first sidecar release.
+        expect(ids.map((id) => current.hasLegacyWorktree(id))).toEqual(cases.map(() => false));
+        current.daemonStarted("first", "0.1.0", deployedBuild);
+        current.db.exec("UPDATE feed SET ts = 1791100100000 WHERE dedupe_key = 'daemon.started:first'");
+      }
+      const eligible = ["verified", "bundled"].includes(startup);
       expect(ids.map((id) => current.hasLegacyWorktree(id))).toEqual([
         eligible,
         eligible,

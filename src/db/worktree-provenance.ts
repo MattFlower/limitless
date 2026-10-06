@@ -2,17 +2,16 @@ import type { Database } from "bun:sqlite";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 
-const SIDECAR_BUILD = "7405d9f0555a61526a657992f1fe972bfeafed37";
+// The #323 squash on main first introduced recordWorktree in deployed releases.
+export const SIDECAR_BUILD = "50e74bfd1831592896d03da21b2c49fe1cfcc4e5";
 
 /** Verify historical boots against application history, never against a run's checkout. */
-export function legacySidecarStarts(db: Database): void {
-  db.exec("CREATE TEMP TABLE legacy_sidecar_starts (ts INTEGER NOT NULL)");
-  if (!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'feed'").get()) return;
+function legacySidecarStart(db: Database): number | null {
   // Pruned history cannot establish the first recording release's start.
   if (
     db.query("SELECT 1 FROM settings WHERE key = 'feed_pruned_through' AND CAST(value AS INTEGER) > 0").get()
   )
-    return;
+    return null;
   const starts = db
     .query<{ ts: number; data: string }, []>(
       "SELECT ts, data FROM feed WHERE kind = 'daemon.started' ORDER BY ts",
@@ -24,16 +23,34 @@ export function legacySidecarStarts(db: Database): void {
       if (!data || typeof data !== "object" || !("sha" in data)) continue;
       const { sha } = data;
       if (typeof sha !== "string" || !/^[0-9a-f]{40}$/.test(sha)) continue;
-      // This commit introduced recordWorktree; commit identity alone supplies no time boundary.
-      if (sha !== SIDECAR_BUILD)
-        execFileSync("git", ["--no-replace-objects", "merge-base", "--is-ancestor", SIDECAR_BUILD, sha], {
-          cwd: join(import.meta.dir, "../.."),
-          stdio: "ignore",
-        });
-      db.query("INSERT INTO legacy_sidecar_starts VALUES (?)").run(start.ts);
-      break;
+      execFileSync("git", ["--no-replace-objects", "merge-base", "--is-ancestor", SIDECAR_BUILD, sha], {
+        cwd: join(import.meta.dir, "../.."),
+        stdio: "ignore",
+      });
+      return start.ts;
     } catch {
       // Unknown builds, malformed records and unavailable history cannot grant trust.
     }
   }
+  return null;
+}
+
+/** Retry after startup: the migration can precede the first persisted recording boot. */
+export function markLegacyWorktree(db: Database, runId: string): void {
+  const cutoff = legacySidecarStart(db);
+  if (cutoff === null) return;
+  db.query(`UPDATE runs SET worktree_provenance = 'legacy'
+    WHERE id = ?1 AND worktree_provenance IS NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM stages WHERE run_id = runs.id AND name = 'prepare'
+        AND started_at >= ?2
+    ) AND EXISTS (
+      SELECT 1 FROM stages WHERE run_id = runs.id AND name = 'prepare'
+        AND started_at < ?2
+        AND ((status = 'succeeded' AND finished_at < ?2)
+          OR EXISTS (SELECT 1 FROM events WHERE run_id = runs.id AND type = 'gate'
+            AND ts >= stages.started_at
+            AND ts <= COALESCE(stages.finished_at, ?2 - 1)
+            AND ts < ?2))
+    )`).run(runId, cutoff);
 }
