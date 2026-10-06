@@ -134,6 +134,33 @@ test("a failed rerun reports needs-fix and the cap survives reopening SQLite", a
   expect(items("ci.needs_fix")).toHaveLength(1);
 });
 
+test.each([401, 403, 404, 422])(
+  "a rejected rerun (%s) is terminal across polls and restart",
+  async (status) => {
+    h = pollerHarness();
+    const f = failure();
+    h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () =>
+      respond(status, { message: "Rerun rejected" }),
+    );
+    h.start(15);
+    await h.advance(0);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_rejected");
+    expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
+    expect(items("ci.needs_fix")).toHaveLength(1);
+    f.observe("FAILURE", "another-observation");
+    await h.advance(60000);
+    h.reopen();
+    f.observe("FAILURE", "after-restart");
+    h.start(15);
+    await h.advance(0);
+    await h.advance(15000);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_rejected");
+    expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
+    expect(items("ci.needs_fix")).toHaveLength(1);
+    expect(reruns()).toHaveLength(1);
+  },
+);
+
 test.each([
   ["FAILURE", "attempt"],
   ["ERROR", "attempt"],
@@ -542,7 +569,7 @@ test.each([
   expect(items("ci.needs_fix")).toHaveLength(retry ? 0 : 1);
 });
 
-test.each(["step", "annotation", "later annotation", "log"])(
+test.each(["step", "annotation", "later annotation", "log", "test line"])(
   "security failure in a %s blocks a generic timeout job",
   async (source) => {
     h = pollerHarness();
@@ -552,6 +579,7 @@ test.each(["step", "annotation", "later annotation", "log"])(
     if (source === "step")
       f.job.steps.push({ name: "security tests", status: "completed", conclusion: "failure" });
     if (source === "log") f.state.log += "\nerror: security test failed";
+    if (source === "test line") f.state.log += "\n2026-10-05T00:00:00Z (fail) security tests [1ms]";
     const page = `repos/o/r/check-runs/${f.check.id}/annotations?per_page=100&page=`;
     h.gh.responses.set(`${page}1`, () =>
       respond(
@@ -570,6 +598,63 @@ test.each(["step", "annotation", "later annotation", "log"])(
     expect(items("ci.needs_fix")).toHaveLength(1);
     expect(h.store.ciFailures(f.node.url, SHA)).toHaveLength(0);
     if (source === "later annotation") expect(h.gh.rest().some((c) => c.path === `${page}2`)).toBe(true);
+  },
+);
+
+test("passing security output and unrelated text do not block a timeout rerun or its ledger", async () => {
+  h = pollerHarness();
+  const f = failure();
+  f.state.log += "\n(pass) security tests [1ms]\nRunning security tests";
+  f.job.steps.push({ name: "security tests", status: "completed", conclusion: "success" });
+  h.gh.responses.set(checksPath(SHA), () =>
+    respond(200, {
+      total_count: 1,
+      check_runs: [{ ...f.check, output: { title: "tests", summary: "(pass) security tests" } }],
+    }),
+  );
+  h.gh.responses.set(`repos/o/r/check-runs/${f.check.id}/annotations?per_page=100&page=1`, () =>
+    respond(200, [{ annotation_level: "notice", title: "security tests", message: "passed" }]),
+  );
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(1);
+  expect(h.store.ciFailures(f.node.url, SHA)).toHaveLength(1);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
+  f.rerun("success");
+  f.observe("SUCCESS", "rerun");
+  await h.advance(15000);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_then_passed");
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(reruns()).toHaveLength(1);
+});
+
+test.each(["passing output", "step", "annotation", "test line"])(
+  "rerun reconciliation uses failure-only security evidence from %s",
+  async (source) => {
+    h = pollerHarness();
+    const f = failure();
+    h.start(15);
+    await h.advance(0);
+    const original = h.store.ciFailures(f.node.url, SHA)[0];
+    h.reopen();
+    f.rerun("failure");
+    f.state.log = "error: smoke failed\n(pass) security tests [1ms]";
+    if (source === "step")
+      f.job.steps.push({ name: "security tests", status: "completed", conclusion: "failure" });
+    if (source === "annotation")
+      h.gh.responses.set(`repos/o/r/check-runs/${f.check.id}/annotations?per_page=100&page=1`, () =>
+        respond(200, [{ annotation_level: "failure", title: "tests", message: "security test failed" }]),
+      );
+    if (source === "test line") f.state.log += "\n(fail) security tests [1ms]";
+    f.observe("FAILURE", "rerun");
+    h.start(15);
+    await h.advance(0);
+    const ledger = h.store.ciFailures(f.node.url, SHA);
+    expect(ledger).toHaveLength(source === "passing output" ? 2 : 1);
+    expect(ledger.find((row) => row.signature === original?.signature)?.outcome).toBe("failed_again");
+    expect(items("ci.needs_fix")).toHaveLength(1);
+    expect(reruns()).toHaveLength(1);
+    expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
   },
 );
 
@@ -670,6 +755,31 @@ test.each(["success", "failure"])("a lost rerun response reconciles %s after res
   await h.advance(0);
   expect(reruns()).toHaveLength(1);
 });
+
+test.each([408, 500, 429, 403])(
+  "an uncertain rerun response (%s) remains claimed and reconciles",
+  async (status) => {
+    h = pollerHarness();
+    const f = failure();
+    h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () =>
+      respond(status, {}, status === 403 ? { "retry-after": "2" } : {}),
+    );
+    h.start(15);
+    await h.advance(0);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_requested");
+    expect(items("ci.needs_fix")).toHaveLength(0);
+    h.reopen();
+    h.start(15);
+    await h.advance(0);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_requested");
+    expect(reruns()).toHaveLength(1);
+    f.rerun("success");
+    await h.advance(15000);
+    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_then_passed");
+    expect(items("ci.needs_fix")).toHaveLength(0);
+    expect(reruns()).toHaveLength(1);
+  },
+);
 
 test("a last-window log response pauses before claiming the rerun, then retries", async () => {
   h = pollerHarness();

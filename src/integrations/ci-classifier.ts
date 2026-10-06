@@ -41,6 +41,11 @@ type Call = (repo: string, path: string, body?: unknown) => Promise<GitHubRespon
 const bounded = (text: string) => text.trim().slice(0, 500);
 const logLines = (log: string) =>
   log.split(/\r?\n/).map((line) => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ""));
+const securityFailure = (log: string) =>
+  logLines(log).some(
+    (line) =>
+      /^\s*(?:\(fail\)|FAIL\b|[×✗✕❌]|not ok\b|##\[error\]|error:)/i.test(line) && security.test(line),
+  );
 // Bun, Playwright, and the Actions runner's timeout diagnostics, matched as whole lines.
 const timeoutDiagnostic =
   /^(?:\s*\^\s*this test timed out after \d+(?:\.\d+)?\s*ms\.?|(?:Error: )?Test timeout of \d+ms exceeded\.|##\[error\]The job running on runner .+ has exceeded the maximum execution time of \d+ minutes\.)$/;
@@ -95,7 +100,7 @@ export async function classifyCi(
     evidence: string,
     count?: number,
   ) => {
-    let unsafe = security.test(job.name) || security.test(evidence);
+    let unsafe = security.test(job.name) || securityFailure(evidence);
     for (const step of job.steps) if (bad.has(step.conclusion ?? "")) unsafe ||= security.test(step.name);
     let seen = 0;
     for (let page = 1; ; page++) {
@@ -110,7 +115,9 @@ export async function classifyCi(
         )
         .parse(await read(`check-runs/${check}/annotations?per_page=100&page=${page}`));
       seen += annotations.length;
-      for (const a of annotations) unsafe ||= security.test([a.title, a.message, a.raw_details].join("\n"));
+      for (const a of annotations)
+        if (a.annotation_level === "failure")
+          unsafe ||= security.test([a.title, a.message, a.raw_details].join("\n"));
       if (annotations.length < 100) {
         if (count !== undefined && seen !== count) throw new Error("Incomplete CI annotations");
         return unsafe;
@@ -258,7 +265,7 @@ export async function classifyCi(
         job.check_run_url.startsWith(checkPrefix) &&
         job.check_run_url.slice(checkPrefix.length).match(/^(\d+)$/);
       if (!checkId) throw new Error("Incomplete CI rerun check");
-      const unsafe = await unsafeEvidence(Number(checkId[1]), job, `${f.check}\n${log}\n${failure.line}`);
+      const unsafe = security.test(f.check) || (await unsafeEvidence(Number(checkId[1]), job, log));
       if (!current()) return true;
       if (!unsafe) store.recordCiFailure(failure);
       store.finishCiFailure(f, "failed_again");
@@ -343,7 +350,7 @@ export async function classifyCi(
         rerunMarker: null,
       };
       const evidence = [c.name, c.output?.title, c.output?.summary, c.output?.text, log].join("\n");
-      const unsafe = jobUnsafe || security.test(evidence);
+      const unsafe = jobUnsafe || security.test(c.name) || securityFailure(evidence);
       const marker = JSON.stringify([c.id, c.completed_at ?? snap.ciKey]);
       const prior = store
         .ciFailures(pr.url, snap.headRefOid)
@@ -385,6 +392,11 @@ export async function classifyCi(
           })
         ) {
           const res = await call(pr.repo, `${root}/actions/jobs/${job.id}/rerun`, {});
+          if (res && res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+            store.finishCiFailure(f, "rerun_rejected");
+            needsFix();
+            continue;
+          }
           if (res?.status !== 201) throw new Error("CI job rerun was not confirmed");
           store.finishCiFailure(f, "rerunning");
           continue;

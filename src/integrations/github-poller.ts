@@ -272,7 +272,8 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
       blocks.delete(repo);
       return res;
     }
-    return null;
+    // A definitive rerun refusal must end its claim even when access is now blocked.
+    return until === null && path.endsWith("/rerun") ? res : null;
   };
 
   /** Saves the observation; returns the mergeability nudge's response (null: not sent) or undefined. */
