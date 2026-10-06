@@ -26,6 +26,17 @@ const PAYLOADS = [
   "1f8b08",
 ].map((s) => Buffer.from(s, "hex"));
 
+export function isForbiddenFormat(path: string, bytes: Buffer): boolean {
+  return (
+    /\.pdf$/i.test(path) ||
+    bytes.subarray(0, 1024).includes(Buffer.from("%PDF-")) ||
+    PAYLOADS.some((magic) => bytes.includes(magic)) ||
+    bytes.includes(Buffer.from("ustar")) ||
+    bytes.includes(Buffer.from("SQLite format 3")) ||
+    bytes.subarray(0, 4).equals(Buffer.from("RIFF"))
+  );
+}
+
 function valid(ok: unknown): asserts ok {
   if (!ok) throw new Error("Opaque media");
 }

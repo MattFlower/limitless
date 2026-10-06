@@ -3028,3 +3028,19 @@ test("executable image additions and mode-only changes need a binary allowance",
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
 });
+
+test("PDF and container formats cannot use the text-content exclusion", async () => {
+  const files = {
+    "ascii.pdf": "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "disguised.txt": " \n%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "plain.pdf": "ordinary text\n",
+    "archive.txt": "Rar!\x1a\x07\x01opaque ASCII container",
+    "ordinary.txt": "ordinary text\n",
+  };
+  for (const [file, bytes] of Object.entries(files)) writeFileSync(join(work, file), bytes);
+  await commitAll(work, "text-like forbidden formats");
+  const diff = await diffSince(work, base);
+  expect(diff.binaryPaths?.sort()).toEqual(["archive.txt", "ascii.pdf", "disguised.txt", "plain.pdf"]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(4);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});

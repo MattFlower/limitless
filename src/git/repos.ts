@@ -7,7 +7,7 @@ import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
-import { isInertMedia, MEDIA_LIMIT } from "../gates/media.ts";
+import { isForbiddenFormat, isInertMedia, MEDIA_LIMIT } from "../gates/media.ts";
 import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
 import { CommandError, sh } from "../util/proc.ts";
@@ -741,7 +741,7 @@ async function attributeInfo(
     (emptyTree ??= emptyTreeId({ cwd, env, timeoutMs: Math.max(1, deadline - Date.now()) }));
   const matches = new Set<string>();
   const headPointers = new Map<string, string>();
-  const pointers = new Map<string, string | null>();
+  const contents = new Map<string, { pointer: string | null; forbidden: boolean }>();
   const scratch = mkdtempSync(join(tmpdir(), "limitless-classify-"));
   let indexes = 0;
   const scratchGit = (args: string[], stdin?: string, index = join(scratch, "index")) =>
@@ -785,37 +785,61 @@ async function attributeInfo(
         if (match[1] !== "-") raw.add(match[2]);
       }
     }
-    // A Git LFS pointer, which `git lfs` commits for a tracked file, stands for binary content.
-    const text = new Set(raw);
+    // Inspect bytes with length framing: a blob may contain embedded NULs or multi-byte text.
     const candidates = [...raw];
-    if (candidates.length) {
-      const input = candidates.map((path) => `${blobs.get(path)}\n`).join("");
-      const sizes = (
-        await git(["cat-file", "--batch-check=%(objectname) %(objectsize)"], input)
-      ).stdout.split("\n");
-      const sized = candidates.flatMap((path, i) => {
-        const [oid = "", bytes] = (sizes[i] ?? "").split(" ");
-        const size = Number(bytes);
-        return size < 1024 ? [{ path, oid }] : [];
+    const input = candidates.map((path) => `${blobs.get(path)}\n`).join("");
+    const sizes = candidates.length
+      ? (await git(["cat-file", "--batch-check=%(objectname) %(objectsize)"], input)).stdout.split("\n")
+      : [];
+    const sized = candidates.map((path, i) => {
+      const [oid = "", bytes] = (sizes[i] ?? "").split(" ");
+      const size = Number(bytes);
+      if (!Number.isSafeInteger(size) || size < 0) throw new Error("Cannot inspect blob size");
+      return { path, oid, size };
+    });
+    const unread = [...new Map(sized.map((entry) => [entry.oid, entry])).values()].filter(
+      ({ oid }) => !contents.has(oid),
+    );
+    while (unread.length) {
+      const batch = [];
+      let bytes = 0;
+      do {
+        const next = unread.shift();
+        if (!next) break;
+        batch.push(next);
+        bytes += next.size;
+      } while (unread.length && bytes + (unread[0]?.size ?? 0) < MEDIA_LIMIT);
+      const result = await worktreeGit(["git", "cat-file", "--batch", "-Z"], {
+        cwd,
+        env,
+        encoding: "latin1",
+        stdin: batch.map(({ oid }) => `${oid}\0`).join(""),
+        timeoutMs: Math.max(1, deadline - Date.now()),
       });
-      // One read for every blob not classified yet. These are text blobs below 1024 bytes,
-      // so they hold no NUL and -Z output splits unambiguously; malformed pointers block classification.
-      const unread = [...new Set(sized.map(({ oid }) => oid))].filter((oid) => !pointers.has(oid));
-      if (unread.length) {
-        const records = (
-          await git(["cat-file", "--batch", "-Z"], unread.map((oid) => `${oid}\0`).join(""))
-        ).stdout.split("\0");
-        for (const [i, oid] of unread.entries())
-          pointers.set(
-            oid,
-            (records[2 * i] ?? "").startsWith(`${oid} blob `) ? lfsPointer(records[2 * i + 1] ?? "") : null,
-          );
+      let at = 0;
+      for (const { oid, size } of batch) {
+        const end = result.stdout.indexOf("\0", at);
+        if (result.stdout.slice(at, end) !== `${oid} blob ${size}` || result.stdout[end + size + 1] !== "\0")
+          throw new Error("Cannot inspect complete blob");
+        const bytes = Buffer.from(result.stdout.slice(end + 1, end + 1 + size), "latin1");
+        contents.set(oid, {
+          pointer: size < 1024 ? lfsPointer(bytes.toString("utf8")) : null,
+          forbidden: isForbiddenFormat("", bytes),
+        });
+        at = end + size + 2;
       }
-      for (const { path, oid } of sized)
-        if (pointers.get(oid)) {
-          if (tree === "HEAD") headPointers.set(path, pointers.get(oid) ?? "");
-          if (!SOURCE_PATH.test(path)) text.delete(path);
-        }
+      if (at !== result.stdout.length) throw new Error("Unexpected blob batch output");
+    }
+    for (const { path, oid } of sized) {
+      if (contents.get(oid)?.forbidden || /\.pdf$/i.test(path)) raw.delete(path);
+    }
+    const text = new Set(raw);
+    for (const { path, oid } of sized) {
+      const pointer = contents.get(oid)?.pointer;
+      if (pointer) {
+        if (tree === "HEAD") headPointers.set(path, pointer);
+        if (!SOURCE_PATH.test(path)) text.delete(path);
+      }
     }
     return { raw, text, blobs };
   };
