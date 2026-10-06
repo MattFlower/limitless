@@ -87,6 +87,62 @@ test("Dependabot routing defaults to free-first and accepts either configured mo
   }
 });
 
+test("[routing] prefer takes provider IDs and fails on model, retired, unknown or malformed entries", () => {
+  const root = mkdtempSync(join(tmpdir(), "limitless-prefer-config-"));
+  const configDir = join(root, "config");
+  mkdirSync(configDir);
+  const file = join(configDir, "config.toml");
+  const config = () => loadConfig({ home: join(root, "data"), configDir });
+  const set = (prefer: string) => writeFileSync(file, `[routing]\nprefer = ${prefer}\n`);
+  try {
+    expect(config().preferProviders).toEqual([]);
+    set("[]");
+    expect(config().preferProviders).toEqual([]);
+    set('["codex"]');
+    expect(config().preferProviders).toEqual(["codex"]);
+    // A retired model names its removal reason; an active model is named as a model, not a provider.
+    set('["codex/astra"]');
+    expect(config).toThrow(
+      `routing.prefer: "codex/astra" is a retired model ID: ${REMOVED_MODELS.get("codex/astra")}`,
+    );
+    set('["claude/fable"]');
+    expect(config).toThrow(
+      `routing.prefer: "claude/fable" is a retired model ID: ${REMOVED_MODELS.get("claude/fable")}`,
+    );
+    set('["claude/opus"]');
+    expect(config).toThrow('routing.prefer: "claude/opus" is a model ID, not a provider');
+    set('["nonexistent"]');
+    expect(config).toThrow('routing.prefer: "nonexistent" is not a known provider ID');
+    // A valid provider stays valid; the offending entry in the list is the one named.
+    set('["codex", "claude/opus"]');
+    expect(config).toThrow('routing.prefer: "claude/opus" is a model ID');
+    // Malformed values point at routing.prefer instead of being ignored.
+    set('"codex"');
+    expect(config).toThrow("routing.prefer must be an array of provider IDs");
+    set('["codex", 3]');
+    expect(config).toThrow("routing.prefer[1] must be a provider ID string");
+    expect(() =>
+      loadConfig({ home: join(root, "data"), configDir, raw: { routing: { prefer: null } } }),
+    ).toThrow("routing.prefer must be an array of provider IDs");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("prefer keeps the requested order and accepts configured provider IDs", () => {
+  const fixture = providerFixture();
+  try {
+    const providers = `providers = ${tomlValue([customProvider])}`;
+    writeFileSync(fixture.file, `${providers}\n[routing]\nprefer = ["mac-mlx", "codex"]\n`);
+    expect(fixture.load().preferProviders).toEqual(["mac-mlx", "codex"]);
+    // The entry is only routable through the configured provider, so the effective catalog is used.
+    writeFileSync(fixture.file, `${providers}\n[routing]\nprefer = ["mac-mlx/flash"]\n`);
+    expect(fixture.load).toThrow('routing.prefer: "mac-mlx/flash" is a model ID, not a provider');
+  } finally {
+    fixture.close();
+  }
+});
+
 test("the baseline cache kill switch defaults on and accepts only booleans", () => {
   const root = mkdtempSync(join(tmpdir(), "limitless-gates-config-"));
   const configDir = join(root, "config");
