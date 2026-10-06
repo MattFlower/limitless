@@ -12,6 +12,7 @@ import { gateScriptNames, pickScripts } from "../src/gates/detect.ts";
 import { compareGates } from "../src/gates/run.ts";
 import { parseNameStatus, resolveRepo } from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { startHttp } from "../src/server/http.ts";
 import {
@@ -154,7 +155,15 @@ describe("process handling", () => {
             argumentControl = spawn(
               process.execPath,
               ["-e", "setInterval(() => {}, 1000)", `LIMITLESS_INVOCATION=${marker}`],
-              { env, stdio: "ignore" },
+              {
+                env: {
+                  ...env,
+                  LIMITLESS_INVOCATION: `${marker}-other`,
+                  OTHER_LIMITLESS_INVOCATION: marker,
+                  UNMARKED_VALUE: `prefix LIMITLESS_INVOCATION=${marker} suffix`,
+                },
+                stdio: "ignore",
+              },
             );
             if (ending === "cancelled" || ending === "stuck") controller.abort(new Error(ending));
           },
@@ -250,6 +259,56 @@ describe("process handling", () => {
               : new Promise<void>((resolve) => child.once("close", () => resolve())),
           ),
         );
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "darwin")(
+    "macOS native inspection refuses a new orphan with a withheld environment",
+    async () => {
+      const { markedDarwinProcesses } = await import("../src/util/processes-darwin.ts");
+      const pidFile = join(dir, "hidden-pid");
+      const started = Date.now();
+      const launcher = spawn(
+        process.execPath,
+        [
+          "-e",
+          `require("node:child_process").spawn("/bin/sh", ["-c", 'echo $$ > "$1"; sleep 15', "sh", ${JSON.stringify(pidFile)}],
+          {detached:true, stdio:"ignore", env:{LIMITLESS_INVOCATION:"hidden-writer"}}).unref();`,
+        ],
+        { stdio: "ignore" },
+      );
+      let pid: number | undefined;
+      try {
+        await new Promise<void>((resolve) => launcher.once("close", () => resolve()));
+        const deadline = Date.now() + 3000;
+        while ((!existsSync(pidFile) || !readFileSync(pidFile, "utf8").trim()) && Date.now() < deadline)
+          await Bun.sleep(10);
+        pid = Number(readFileSync(pidFile, "utf8"));
+        expect(pid).toBeGreaterThan(0);
+        const message = `Cannot inspect environment of reparented process ${pid}`;
+        let failure: Error | undefined;
+        // Other processes can exec during inspection; wait for a complete observation of this orphan.
+        while (Date.now() < deadline) {
+          try {
+            markedDarwinProcesses(process.getuid?.() ?? 0, "hidden-writer", launcher.pid ?? 0, started);
+          } catch (error) {
+            if (error instanceof Error && error.message === message) {
+              failure = error;
+              break;
+            }
+          }
+          await Bun.sleep(10);
+        }
+        expect(failure?.message).toBe(message);
+        expect(process.kill(pid, 0)).toBe(true);
+      } finally {
+        launcher.kill("SIGKILL");
+        if (pid !== undefined) {
+          try {
+            process.kill(-pid, "SIGKILL");
+          } catch {}
+        }
       }
     },
   );
@@ -578,13 +637,14 @@ describe("pipeline hardening", () => {
     }
   }
 
-  test("an unconfirmed shutdown fails the implement round without starting cleanup or another round", () =>
+  test.each([false, true])("an unconfirmed termination blocks cleanup and resume (shutdown=%s)", (shutdown) =>
     processInspection.run(
       async (_withEnvironment, marker) =>
         `${process.pid} ${process.getuid?.()} S inspector LIMITLESS_PROCESS_SCAN=${marker}`,
       async () => {
         const repo = await setupRepo({ "a.txt": "a\n" });
         let implementCalls = 0;
+        const controller = new AbortController();
         const cfg = loadConfig({ home: join(dir, "data"), configDir: join(dir, "cfg") });
         const f = new Factory(cfg, {
           confinement: fakeConfinement,
@@ -612,32 +672,46 @@ describe("pipeline hardening", () => {
                   throw new Error("cannot inspect marked descendant");
                 },
                 async () => {
-                  await runProcess({
-                    cmd: ["/bin/sh", "-c", "exit 0"],
-                    cwd: spec.cwd,
-                    env: process.env as Record<string, string>,
-                  });
+                  try {
+                    await runProcess({
+                      cmd: ["/bin/sh", "-c", "exit 0"],
+                      cwd: spec.cwd,
+                      env: process.env as Record<string, string>,
+                    });
+                  } finally {
+                    if (shutdown) controller.abort(new Error("shutdown"));
+                  }
                   return {};
                 },
               );
             }),
           },
         });
-        f.start();
+        if (!shutdown) f.start();
         try {
           const run = await f.createRun({ repo, prompt: "change a" });
+          if (shutdown) {
+            expect(await executeRun(f.deps, run.id, controller.signal)).toBe("queued");
+            expect(f.store.getRunState<{ needsHumanReason: string }>(run.id)?.needsHumanReason).toContain(
+              "cannot inspect marked descendant",
+            );
+            expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
+          }
           expect(await waitDone(f, run.id)).toBe("needs_human");
           expect(implementCalls).toBe(1);
           expect(f.store.getRun(run.id)?.error).toContain("Invocation termination could not be confirmed");
           expect(f.store.getRunState<{ feedback: string }>(run.id)?.feedback).toContain(
             "cannot inspect marked descendant",
           );
-          expect(f.store.listInvocations(run.id).find((i) => i.role === "implement")).toMatchObject({
-            status: "error",
-            error: expect.stringContaining("cannot inspect marked descendant"),
-          });
+          const invocation = f.store.listInvocations(run.id).find((i) => i.role === "implement");
+          if (shutdown) expect(invocation?.status).toBe("cancelled");
+          else
+            expect(invocation).toMatchObject({
+              status: "error",
+              error: expect.stringContaining("cannot inspect marked descendant"),
+            });
           expect(f.store.listStages(run.id).find((s) => s.name === "implement")).toMatchObject({
-            status: "failed",
+            status: shutdown ? "cancelled" : "failed",
             round: 0,
           });
           expect(f.store.listStages(run.id).some((s) => s.name === "gates" && s.round === 0)).toBe(false);
@@ -646,7 +720,8 @@ describe("pipeline hardening", () => {
           f.store.close();
         }
       },
-    ));
+    ),
+  );
 
   test("a verifier that skips criteria cannot pass, and an 'approve' with a blocker is a rejection", async () => {
     const repo = await setupRepo({ "a.txt": "a\n" });

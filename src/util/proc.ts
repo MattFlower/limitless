@@ -24,18 +24,40 @@ export function assertProcessesStopped(): void {
 export const processInspection = new AsyncLocalStorage<
   (withEnvironment: boolean, marker: string, pids?: number[]) => Promise<string>
 >();
+let darwinNativeInspection = false;
 
-async function markedProcesses(marker: string, attempt = 0): Promise<number[]> {
+async function markedProcesses(
+  marker: string,
+  group: number,
+  started: number,
+  attempt = 0,
+): Promise<number[]> {
   const uid = process.getuid?.();
   if (uid === undefined) throw new Error("Process ownership cannot be determined");
+  // macOS ps is setuid and cannot launch inside a worker sandbox. Read the same kernel
+  // process/environment data directly, without needing elevated privileges.
+  const nativeProcesses = async () => {
+    const { markedDarwinProcesses } = await import("./processes-darwin.ts");
+    try {
+      return markedDarwinProcesses(uid, marker, group, started);
+    } catch (error) {
+      // KERN_PROCARGS2 can return EIO/EINVAL while a process is exec'ing. Require
+      // a complete snapshot, but give these transient states time to settle.
+      if (attempt >= 10) throw error;
+      await Bun.sleep(10);
+      return markedProcesses(marker, group, started, attempt + 1);
+    }
+  };
+  if (darwinNativeInspection && !processInspection.getStore()) return nativeProcesses();
   const env = { ...process.env };
   delete env.LIMITLESS_INVOCATION;
   env.LIMITLESS_PROCESS_SCAN = marker;
+  let inspectionPid: number | undefined;
   const inspect = (withEnvironment: boolean, pids?: number[]) => {
     const injected = processInspection.getStore();
     if (injected) return injected(withEnvironment, marker, pids);
     return new Promise<string>((resolve, reject) => {
-      execFile(
+      const scanner = execFile(
         "/bin/ps",
         [
           ...(withEnvironment ? [process.platform === "darwin" ? "-E" : "eww"] : []),
@@ -47,9 +69,10 @@ async function markedProcesses(marker: string, attempt = 0): Promise<number[]> {
         { env, timeout: 2000, maxBuffer: 32 * 1024 * 1024 },
         (error, stdout) =>
           error && !(pids && error.code === 1 && !stdout.trim())
-            ? reject(new Error("Process environment inspection failed"))
+            ? reject(new Error("Process environment inspection failed", { cause: error }))
             : resolve(stdout),
       );
+      inspectionPid = scanner.pid;
     });
   };
   const rows = (output: string) =>
@@ -57,11 +80,30 @@ async function markedProcesses(marker: string, attempt = 0): Promise<number[]> {
       .trim()
       .split("\n")
       .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/));
-  const environments = rows(await inspect(true));
+  let output: string;
+  try {
+    output = await inspect(true);
+  } catch (error) {
+    if (
+      process.platform !== "darwin" ||
+      processInspection.getStore() ||
+      ((error as NodeJS.ErrnoException).code ??
+        (error instanceof Error ? (error.cause as NodeJS.ErrnoException | undefined)?.code : undefined)) !==
+        "EPERM"
+    )
+      throw error;
+    darwinNativeInspection = true;
+    return markedProcesses(marker, group, started, attempt);
+  }
+  const environments = rows(output);
   if (
     !environments.some(
       (row) =>
-        row && Number(row[2]) === uid && row[4]?.split(/\s+/).includes(`LIMITLESS_PROCESS_SCAN=${marker}`),
+        row &&
+        // macOS ps is setuid; its effective uid need not be ours. Verify the scanner
+        // we launched, while the candidate filtering below always requires our uid.
+        (inspectionPid === undefined ? Number(row[2]) === uid : Number(row[1]) === inspectionPid) &&
+        row[4]?.split(/\s+/).includes(`LIMITLESS_PROCESS_SCAN=${marker}`),
     )
   )
     throw new Error("Process environment inspection could not be confirmed");
@@ -90,18 +132,28 @@ async function markedProcesses(marker: string, attempt = 0): Promise<number[]> {
     }
     return full.slice(args.length).split(/\s+/).includes(token) ? [Number(row?.[1])] : [];
   });
-  if (!changed) return pids;
+  if (!changed) {
+    // ps flattens environment entries with spaces. Verify their NUL-delimited
+    // boundaries on macOS so a marker-looking value cannot select an unmarked process.
+    if (process.platform === "darwin" && !processInspection.getStore()) return nativeProcesses();
+    return pids;
+  }
   // A shell may exec between snapshots; never signal it based on mismatched argv.
-  if (attempt < 3) return markedProcesses(marker, attempt + 1);
+  if (attempt < 3) return markedProcesses(marker, group, started, attempt + 1);
   throw new Error("Process arguments changed during inspection");
 }
 
-async function stopMarkedProcesses(marker: string, graceMs: number): Promise<void> {
+async function stopMarkedProcesses(
+  marker: string,
+  group: number,
+  graceMs: number,
+  spawnedAt: number,
+): Promise<void> {
   const started = performance.now();
   const termed = new Set<number>();
   let empty = false;
   for (;;) {
-    const pids = await markedProcesses(marker);
+    const pids = await markedProcesses(marker, group, spawnedAt);
     // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
     if (!pids.length && empty) return;
     empty = !pids.length;
@@ -117,7 +169,7 @@ async function stopMarkedProcesses(marker: string, graceMs: number): Promise<voi
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }
     }
-    await Bun.sleep(10);
+    if (pids.length) await Bun.sleep(10);
   }
 }
 
@@ -225,7 +277,8 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
     const terminate = () => {
       shutdown ??= (async () => {
         try {
-          if (child.pid !== undefined) await stopMarkedProcesses(marker, scope?.killGraceMs ?? 100);
+          if (child.pid !== undefined)
+            await stopMarkedProcesses(marker, child.pid, scope?.killGraceMs ?? 100, started);
         } catch (error) {
           terminationError = new ProcessTerminationError(
             `${ProcessTerminationError.prefix}: ${(error as Error).message}`,
@@ -239,10 +292,13 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
           resolveStopped?.();
           reject(terminationError);
         } finally {
-          // Shutdown is confirmed or explicitly failed; inherited pipes cannot delay reporting it.
           child.stdin.destroy();
-          child.stdout.destroy();
-          child.stderr.destroy();
+          // Confirmed shutdown closes inherited pipes naturally. Let their buffered output
+          // drain before close; only a failed shutdown must bypass still-open descendants.
+          if (terminationError) {
+            child.stdout.destroy();
+            child.stderr.destroy();
+          }
         }
       })();
       return shutdown;

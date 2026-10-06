@@ -214,6 +214,14 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.log("Run succeeded");
     return "succeeded";
   } catch (e) {
+    const terminationError = processScope.getStore()?.terminationError;
+    if (terminationError && ctx.state.needsHumanReason !== terminationError.message) {
+      ctx.state.feedback = `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`;
+      ctx.state.needsHumanReason = terminationError.message;
+      // Shutdown can re-queue this run. Persist the cleanup block even with an aborted
+      // signal, so a fresh process scope on resume cannot start another round.
+      deps.store.setRunState(runId, ctx.state);
+    }
     if (!signal.aborted && (e instanceof SimulatedTermination || ctx.termination)) return "running";
     if (e instanceof InjectedFault && !signal.aborted) {
       ctx.log(`Run interrupted: ${e.message}; re-queued to resume`, "warn");
