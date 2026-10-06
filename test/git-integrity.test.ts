@@ -2085,6 +2085,139 @@ test("embedded image, font and audio payloads remain opaque even inside declared
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
 });
 
+test("GIF LZW pixels carrying a ZIP require an allowance on additions and edits", async () => {
+  const payload = mediaFixture("zip");
+  const encode = (pixels: Buffer) => {
+    const screen = Buffer.alloc(7),
+      image = Buffer.alloc(10);
+    screen.writeUInt16LE(pixels.length, 0);
+    screen.writeUInt16LE(1, 2);
+    screen[4] = 0xf7; // A 256-color global palette permits every byte as a pixel index.
+    image[0] = 0x2c;
+    image.writeUInt16LE(pixels.length, 5);
+    image.writeUInt16LE(1, 7);
+    // Clearing before each literal keeps every code nine bits wide and re-encodes
+    // the archive so its signatures do not appear in the raw GIF stream.
+    const codes = [...[...pixels].flatMap((byte) => [256, byte]), 257];
+    const packed = Buffer.alloc(Math.ceil((codes.length * 9) / 8));
+    let bit = 0;
+    for (const code of codes)
+      for (let i = 0; i < 9; i++, bit++)
+        packed[bit >> 3] = (packed[bit >> 3] ?? 0) | (((code >> i) & 1) << (bit & 7));
+    const blocks: Buffer[] = [];
+    for (let at = 0; at < packed.length; at += 255) {
+      const block = packed.subarray(at, at + 255);
+      blocks.push(Buffer.from([block.length]), block);
+    }
+    return Buffer.concat([
+      Buffer.from("GIF89a"),
+      screen,
+      Buffer.alloc(768),
+      image,
+      Buffer.from([8]),
+      ...blocks,
+      Buffer.from([0, 0x3b]),
+    ]);
+  };
+  const file = "encoded-payload.gif";
+  writeFileSync(join(work, file), encode(Buffer.alloc(payload.length, 65)));
+  await commitAll(work, "ordinary encoded pixels");
+  const mediaBase = await headSha(work);
+  expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toEqual([]);
+  writeFileSync(join(work, file), encode(payload));
+  await commitAll(work, "ZIP encoded as pixels");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([
+      expect.objectContaining({
+        file,
+        rule: "binary-content",
+        severity: "block",
+        detail: expect.stringContaining("Allow: binary"),
+      }),
+    ]);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+  }
+});
+
+test("executable signatures in WAV samples, JPEG thumbnails and ICO pixels require an allowance", async () => {
+  const files: { path: string; original: Buffer; changed: Buffer }[] = [];
+  const magics = [
+    "feedface", // Mach-O, both byte orders and word sizes, including fat binaries.
+    "cefaedfe",
+    "feedfacf",
+    "cffaedfe",
+    "cafebabe", // Also the Java class signature.
+    "bebafeca",
+    "cafebabf",
+    "bfbafeca",
+    "6465780a30333500", // DEX and compact DEX.
+    "6364657830303100",
+    "4d5a", // DOS/NE/LX executables need not have a PE signature.
+  ];
+  for (const magic of magics) {
+    const original = mediaFixture("wav"),
+      changed = Buffer.from(original);
+    Buffer.from(magic, "hex").copy(changed, changed.indexOf("data") + 8);
+    files.push({ path: `executable-${magic}.wav`, original, changed });
+  }
+  const jpeg = mediaFixture("jpg"),
+    thumbnail = Buffer.alloc(24);
+  thumbnail.writeUInt16BE(0xffe0, 0);
+  thumbnail.writeUInt16BE(22, 2);
+  thumbnail.write("JFIF\0", 4);
+  thumbnail[9] = 1;
+  thumbnail[10] = 1;
+  thumbnail.writeUInt16BE(1, 12);
+  thumbnail.writeUInt16BE(1, 14);
+  thumbnail[16] = 2;
+  thumbnail[17] = 1;
+  const originalJpeg = Buffer.concat([jpeg.subarray(0, 2), thumbnail, jpeg.subarray(2)]);
+  Buffer.from("cffaedfe", "hex").copy(thumbnail, 18);
+  files.push({
+    path: "executable-thumbnail.jpg",
+    original: originalJpeg,
+    changed: Buffer.concat([jpeg.subarray(0, 2), thumbnail, jpeg.subarray(2)]),
+  });
+  const ico = Buffer.alloc(86);
+  ico.writeUInt16LE(1, 2);
+  ico.writeUInt16LE(1, 4);
+  ico[6] = ico[7] = 2;
+  ico.writeUInt16LE(1, 10);
+  ico.writeUInt16LE(24, 12);
+  ico.writeUInt32LE(64, 14);
+  ico.writeUInt32LE(22, 18);
+  ico.writeUInt32LE(40, 22);
+  ico.writeInt32LE(2, 26);
+  ico.writeInt32LE(4, 30);
+  ico.writeUInt16LE(1, 34);
+  ico.writeUInt16LE(24, 36);
+  const changedIco = Buffer.from(ico);
+  Buffer.from("cafebabe", "hex").copy(changedIco, 62);
+  files.push({ path: "executable-pixels.ico", original: ico, changed: changedIco });
+  for (const { path, original } of files) writeFileSync(join(work, path), original);
+  await commitAll(work, "ordinary raw media regions");
+  const mediaBase = await headSha(work);
+  expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toEqual([]);
+  for (const { path, changed } of files) writeFileSync(join(work, path), changed);
+  await commitAll(work, "embedded executable signatures");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(findings).toHaveLength(files.length);
+    for (const { path } of files)
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file: path,
+          rule: "binary-content",
+          severity: "block",
+          detail: expect.stringContaining("Allow: binary"),
+        }),
+      );
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+  }
+});
+
 test("16,000 added files use stdin pathspecs without uncertainty findings", async () => {
   const files = Array.from({ length: 16_000 }, (_, i) => `${i}-${"long-name-".repeat(12)}.dat`);
   for (const path of files) writeFileSync(join(work, path), "new text\n");

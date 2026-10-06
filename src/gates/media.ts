@@ -9,6 +9,17 @@ const PAYLOADS = [
   "504b0506",
   "504b0708",
   "7f454c46",
+  "feedface",
+  "cefaedfe",
+  "feedfacf",
+  "cffaedfe",
+  "cafebabe",
+  "bebafeca",
+  "cafebabf",
+  "bfbafeca",
+  "6465780a",
+  "63646578",
+  "4d5a",
   "0061736d01000000",
   "377abcaf271c",
   "526172211a07",
@@ -21,10 +32,6 @@ function valid(ok: unknown): asserts ok {
 function clean(b: Buffer) {
   valid(!PAYLOADS.some((magic) => b.includes(magic)));
   valid(!/%PDF-|ustar|SQLite format 3|<script\b|<\?php|#!\s*\//i.test(b.toString("latin1")));
-  for (let at = b.indexOf("MZ"); at >= 0; at = b.indexOf("MZ", at + 2)) {
-    const pe = at + 64 <= b.length ? at + b.readUInt32LE(at + 60) : b.length;
-    valid(b.toString("latin1", pe, pe + 4) !== "PE\0\0");
-  }
 }
 function slice(b: Buffer, at: number, length: number) {
   valid(length >= 0 && at >= 0 && at + length <= b.length);
@@ -216,6 +223,8 @@ function gif(b: Buffer) {
     const packed = blocks(),
       clear = 1 << min,
       end = clear + 1;
+    valid(width * height <= MEDIA_LIMIT);
+    const decoded = Buffer.alloc(width * height);
     let pos = 0,
       size = min + 1,
       next = end + 1,
@@ -248,6 +257,7 @@ function gif(b: Buffer) {
       valid(entry.every((n) => n < colors));
       count += entry.length;
       valid(count <= width * height && count <= MEDIA_LIMIT);
+      decoded.set(entry, count - entry.length);
       if (previous && next < 4096) {
         dict[next++] = [...previous, entry[0] ?? 0];
         if (next === 1 << size && size < 12) size++;
@@ -255,6 +265,7 @@ function gif(b: Buffer) {
       previous = entry;
     }
     valid(count === width * height && Math.ceil(pos / 8) === packed.length);
+    clean(decoded);
     images++;
   }
   valid(false);
