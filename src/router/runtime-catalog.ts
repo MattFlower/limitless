@@ -1,9 +1,11 @@
+import { z } from "zod";
 import type { Store } from "../db/store.ts";
 import type { ModelDef, ProviderDef } from "./catalog.ts";
 import { runtimeModel } from "./config-catalog.ts";
-import { validatePolicy } from "./policy.ts";
+import { validatePolicy, validateRunModels } from "./policy.ts";
 import type { ProviderTracker } from "./providers.ts";
 import type { Router } from "./router.ts";
+import type { RuntimePolicy } from "./runtime-policy.ts";
 import { parseTarget } from "./targets.ts";
 
 export class RuntimeCatalog {
@@ -13,6 +15,7 @@ export class RuntimeCatalog {
     private readonly providers: ProviderDef[],
     private readonly router: Router,
     private readonly tracker: ProviderTracker,
+    private readonly routing: RuntimePolicy,
   ) {}
 
   snapshot() {
@@ -35,6 +38,25 @@ export class RuntimeCatalog {
   private apply(id: string, model: ModelDef | null) {
     const next = this.models.filter((m) => m.id !== id);
     if (model) next.push(model);
+    for (const [layer, policy] of Object.entries(this.routing.snapshot().layers)) {
+      try {
+        validatePolicy(policy, next, this.providers);
+      } catch (error) {
+        const reason =
+          error instanceof z.ZodError
+            ? error.issues.map((issue) => `${issue.path.slice(0, 2).join(".")}: ${issue.message}`).join("; ")
+            : String(error);
+        throw new Error(`${layer} policy: ${reason}`);
+      }
+    }
+    for (const run of this.store.listRuns({ limit: Number.MAX_SAFE_INTEGER })) {
+      if (run.models == null) continue;
+      try {
+        validateRunModels(run.models, next, this.providers);
+      } catch (error) {
+        throw new Error(`run ${run.id}: ${String(error)}`);
+      }
+    }
     this.store.writeRuntimeModel(id, model);
     this.models.splice(0, this.models.length, ...next);
     this.router.setModels(this.models);
@@ -68,11 +90,6 @@ export class RuntimeCatalog {
       this.providers,
     );
     if (model.id !== id) throw new Error("model id and provider are immutable");
-    validatePolicy(
-      this.router.getPolicy(),
-      this.models.map((m) => (m.id === id ? model : m)),
-      this.providers,
-    );
     return this.apply(id, model);
   }
 
@@ -82,7 +99,9 @@ export class RuntimeCatalog {
       .routingCells()
       .filter((cell) => cell.groups.some((g) => g.split("|").some((ref) => parseTarget(ref).modelId === id)));
     if (cells.length)
-      throw new Error(`${id} is referenced by ${cells.map((c) => `${c.role}.${c.cell}`).join(", ")}`);
+      throw new Error(
+        `${id} is referenced by operator policy: ${cells.map((c) => `${c.role}.${c.cell}`).join(", ")}`,
+      );
     return this.apply(id, null);
   }
 }

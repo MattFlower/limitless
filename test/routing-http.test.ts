@@ -7,6 +7,7 @@ import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { RunContext } from "../src/pipeline/context.ts";
+import type { Policy } from "../src/router/catalog.ts";
 import { Auth } from "../src/server/auth.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
@@ -19,26 +20,42 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "limitless-routing-http-"));
   const overlay = join(dir, "policy.json");
   writeFileSync(overlay, JSON.stringify({ triage: { default: ["claude/opus"] } }));
-  const cfg = loadConfig({ home: dir, configDir: dir, port: 7400 });
-  cfg.preferProviders = ["claude"];
-  cfg.secrets.OMLX_API_KEY = "fake-key";
   calls = [];
-  const harness = fakeHarness((spec) => {
-    calls.push(spec.target.modelId);
-    return { text: "ok" };
-  });
-  factory = new Factory(cfg, {
-    store: new Store(":memory:"),
-    policyPath: overlay,
-    harnesses: { claude: harness, codex: harness, llm: harness },
-    healthFetch: (async (_url: Parameters<typeof fetch>[0]) =>
-      Response.json({ data: [{ id: "org/backend" }, { id: "uncataloged" }] })) as typeof fetch,
-  });
+  factory = makeFactory(new Store(":memory:"));
 });
 afterEach(() => {
   factory.store.close();
   rmSync(dir, { recursive: true, force: true });
 });
+
+function makeFactory(store: Store, policy?: Policy) {
+  const cfg = loadConfig({ home: dir, configDir: dir, port: 7400 });
+  cfg.preferProviders = ["claude"];
+  cfg.secrets.OMLX_API_KEY = "fake-key";
+  const harness = fakeHarness((spec) => {
+    calls.push(spec.target.modelId);
+    return { text: "ok" };
+  });
+  return new Factory(cfg, {
+    store,
+    policy,
+    clock: () => 1_000,
+    policyPath: join(dir, "policy.json"),
+    harnesses: { claude: harness, codex: harness, llm: harness },
+    healthFetch: (async (_url: Parameters<typeof fetch>[0]) =>
+      Response.json({ data: [{ id: "org/backend" }, { id: "uncataloged" }] })) as typeof fetch,
+  });
+}
+
+function catalogState() {
+  return structuredClone({
+    stored: factory.store.runtimeModels(),
+    models: factory.models,
+    catalog: factory.catalog.snapshot(),
+    providers: factory.tracker.all(),
+    routing: factory.routing.snapshot(),
+  });
+}
 
 function client() {
   const routes = createHttpRoutes(factory);
@@ -144,18 +161,202 @@ test("catalog API adds, patches, validates live policy, blocks referenced deleti
     });
     factory.routing.setCell("triage", "default", null);
     factory.routing.setCell("triage", "small", null);
-    expect((await call(path, "DELETE")).status).toBe(200);
-    expect(factory.store.runtimeModels()).toEqual([]);
-    const deleted = factory.router.route("triage", "small", { chain: ["codex/experiment"] });
+    const pinned = await call(path, "DELETE");
+    expect(pinned.status).toBe(400);
+    expect((await pinned.json()).error).toContain(`run ${run.id}`);
+    expect(factory.router.resolveFor("triage", "codex/experiment@high").model.model).toBe("updated-build");
+    expect((await call("/api/catalog/models", "POST", { ...input, id: "unused" })).status).toBe(201);
+    expect((await call("/api/catalog/models/codex%2Funused", "DELETE")).status).toBe(200);
+    expect(factory.store.runtimeModels()).toHaveLength(1);
+    const deleted = factory.router.route("triage", "small", { chain: ["codex/unused"] });
     expect(deleted.candidates).toEqual([]);
-    expect(deleted.skipped[0]?.reason).toContain('unknown model ID "codex/experiment"');
-    await expect(invoke(run)).rejects.toThrow('unknown model ID "codex/experiment"');
+    expect(deleted.skipped[0]?.reason).toContain('unknown model ID "codex/unused"');
+    await expect(invoke({ ...run, models: { triage: ["codex/unused"] } })).rejects.toThrow(
+      'unknown model ID "codex/unused"',
+    );
     expect(factory.store.listInvocations(run.id)).toHaveLength(1);
     expect(calls).toHaveLength(2);
   } finally {
     await reader.cancel();
   }
 });
+
+test("catalog rejects shadowed evals references and a compatible patch survives Factory reconstruction", async () => {
+  factory.store.close();
+  const db = join(dir, "routing.db");
+  factory = makeFactory(new Store(db));
+  expect(
+    (await client()("/api/catalog/models", "POST", { ...customModel, provider: "codex", id: "experiment" }))
+      .status,
+  ).toBe(201);
+  writeFileSync(join(dir, "policy.json"), JSON.stringify({ triage: { default: ["codex/experiment@high"] } }));
+  factory = makeFactory(factory.store);
+  factory.routing.setCell("triage", "default", ["codex/sol@high"]);
+  const repo = factory.store.upsertRepo({
+    slug: "catalog/restart",
+    kind: "local",
+    localPath: dir,
+    url: null,
+    defaultBranch: "main",
+    mergePolicy: "none",
+  });
+  const run = factory.store.createRun(repo, {
+    repo: repo.slug,
+    prompt: "pinned",
+    models: { review: ["codex/experiment@high|claude/opus"] },
+  });
+  const before = catalogState();
+  const events: unknown[] = [];
+  factory.store.subscribe((event) => events.push(event));
+  const path = "/api/catalog/models/codex%2Fexperiment";
+  for (const method of ["PATCH", "DELETE"]) {
+    const rejected = await client()(path, method, { efforts: ["none"] });
+    expect(rejected.status).toBe(400);
+    const error = (await rejected.json()).error;
+    expect(error).toContain("evals");
+    expect(error).toContain("triage.default");
+    expect(error).toContain(method === "PATCH" ? 'Unsupported effort "high"' : "unknown model ID");
+    expect(catalogState()).toEqual(before);
+    expect(factory.router.resolveFor("triage", "codex/experiment@high").effort).toBe("high");
+    expect(events).toEqual([]);
+  }
+  expect(
+    (await client()(path, "PATCH", { model: "compatible-build", efforts: ["none", "high", "medium"] }))
+      .status,
+  ).toBe(200);
+  expect(events.filter((event) => (event as { kind: string }).kind === "catalog")).toHaveLength(1);
+  factory.store.close();
+  factory = makeFactory(new Store(db));
+  expect(factory.store.runtimeModels()[0]?.supportedEfforts).toEqual(["none", "high", "medium"]);
+  expect(factory.router.resolveFor("triage", "codex/experiment@high").model.model).toBe("compatible-build");
+  expect(factory.routing.preview("review", "small", run.id)).toContainEqual(
+    expect.objectContaining({ modelId: "codex/experiment@high", eligible: true }),
+  );
+  expect(factory.router.route("triage", "small").candidates[0]).toMatchObject({
+    modelId: "codex/sol",
+    effort: "high",
+  });
+  factory.routing.setCell("triage", "default", null);
+  expect(factory.router.route("triage", "small").candidates[0]).toMatchObject({
+    modelId: "codex/experiment",
+    effort: "high",
+  });
+});
+
+test.each(["code", "operator"] as const)(
+  "catalog PATCH and DELETE preserve references in the %s layer",
+  async (layer) => {
+    expect(
+      (await client()("/api/catalog/models", "POST", { ...customModel, provider: "codex", id: "experiment" }))
+        .status,
+    ).toBe(201);
+    if (layer === "code") {
+      const code = structuredClone(factory.routing.code);
+      code.triage.small = ["codex/experiment@high"];
+      factory = makeFactory(factory.store, code);
+      factory.routing.setCell("triage", "small", ["codex/sol"]);
+    } else {
+      factory.routing.setCell("triage", "small", ["codex/experiment@high"]);
+    }
+    const before = catalogState();
+    const events: unknown[] = [];
+    factory.store.subscribe((event) => events.push(event));
+    for (const method of ["PATCH", "DELETE"]) {
+      const response = await client()("/api/catalog/models/codex%2Fexperiment", method, {
+        efforts: ["none"],
+      });
+      expect(response.status).toBe(400);
+      const error = (await response.json()).error;
+      expect(error).toContain(layer);
+      expect(error).toContain("triage.small");
+      expect(error).toContain("codex/experiment");
+      expect(catalogState()).toEqual(before);
+      expect(factory.router.resolveFor("triage", "codex/experiment@high").effort).toBe("high");
+      expect(events).toEqual([]);
+    }
+  },
+);
+
+test("catalog validates stored chains beyond the default run limit and regardless of status", async () => {
+  expect(
+    (await client()("/api/catalog/models", "POST", { ...customModel, provider: "codex", id: "experiment" }))
+      .status,
+  ).toBe(201);
+  const repo = factory.store.upsertRepo({
+    slug: "catalog/chains",
+    kind: "local",
+    localPath: dir,
+    url: null,
+    defaultBranch: "main",
+    mergePolicy: "none",
+  });
+  const run = factory.store.createRun(repo, {
+    repo: repo.slug,
+    prompt: "finished pinned run",
+    models: { review: ["claude/opus|codex/experiment@high"] },
+  });
+  factory.store.updateRun(run.id, { status: "succeeded" });
+  factory.store.db.query("UPDATE runs SET created_at = 0 WHERE id = ?").run(run.id);
+  for (let i = 0; i < 100; i++) factory.store.createRun(repo, { repo: repo.slug, prompt: "unpinned" });
+  const before = catalogState();
+  const events: unknown[] = [];
+  factory.store.subscribe((event) => events.push(event));
+  for (const method of ["PATCH", "DELETE"]) {
+    const response = await client()("/api/catalog/models/codex%2Fexperiment", method, { efforts: ["none"] });
+    expect(response.status).toBe(400);
+    const error = (await response.json()).error;
+    expect(error).toContain(`run ${run.id}`);
+    expect(error).toContain("review");
+    expect(error).toContain(method === "PATCH" ? 'Unsupported effort "high"' : "unknown model ID");
+    expect(catalogState()).toEqual(before);
+    expect(factory.routing.preview("review", "small", run.id)[1]?.eligible).toBe(true);
+    expect(events).toEqual([]);
+  }
+});
+
+test.each(["code", "evals", "operator", "run"] as const)(
+  "catalog POST refuses a retained invalid %s reference before publishing or persisting",
+  async (layer) => {
+    // Seed an invalid retained reference: additions must validate the whole proposed catalog too.
+    factory = makeFactory(factory.store, structuredClone(factory.routing.code));
+    let provenance: string;
+    if (layer === "run") {
+      const repo = factory.store.upsertRepo({
+        slug: "catalog/invalid",
+        kind: "local",
+        localPath: dir,
+        url: null,
+        defaultBranch: "main",
+        mergePolicy: "none",
+      });
+      const run = factory.store.createRun(repo, {
+        repo: repo.slug,
+        prompt: "invalid legacy chain",
+        models: { implement: ["codex/missing"] },
+      });
+      provenance = `run ${run.id}`;
+    } else {
+      factory.routing.snapshot().layers[layer].triage = { small: ["codex/missing"] };
+      provenance = layer;
+    }
+    const before = catalogState();
+    const events: unknown[] = [];
+    factory.store.subscribe((event) => events.push(event));
+    const response = await client()("/api/catalog/models", "POST", {
+      ...customModel,
+      provider: "codex",
+      id: "experiment",
+    });
+    expect(response.status).toBe(400);
+    const error = (await response.json()).error;
+    expect(error).toContain(provenance);
+    expect(error).toContain(layer === "run" ? "implement" : "triage.small");
+    expect(error).toContain('unknown model ID "codex/missing"');
+    expect(catalogState()).toEqual(before);
+    expect(() => factory.router.resolveFor("triage", "codex/experiment")).toThrow("unknown model ID");
+    expect(events).toEqual([]);
+  },
+);
 
 test("catalog discovery skips stale targets in live and run previews without an invocation attempt", async () => {
   const call = client();

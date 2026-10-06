@@ -119,7 +119,6 @@ export class Factory {
     );
     this.router = new Router(this.tracker, code, this.models, cfg.preferProviders);
     this.tracker.setModels(this.models);
-    this.catalog = new RuntimeCatalog(this.store, this.models, this.providerDefs, this.router, this.tracker);
     this.routing = new RuntimePolicy(
       this.store,
       this.router,
@@ -128,6 +127,14 @@ export class Factory {
       cfg.preferProviders,
       code,
       evals,
+    );
+    this.catalog = new RuntimeCatalog(
+      this.store,
+      this.models,
+      this.providerDefs,
+      this.router,
+      this.tracker,
+      this.routing,
     );
     if (!opts.models && !opts.providers)
       validatePolicy(this.router.getPolicy(), this.models, this.providerDefs);
