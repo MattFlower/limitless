@@ -6,7 +6,8 @@ import { z } from "zod";
 import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { attributeRules, BINARY_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
+import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
+import { isForbiddenFormat, isInertMedia, MEDIA_LIMIT } from "../gates/media.ts";
 import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
 import { CommandError, sh } from "../util/proc.ts";
@@ -540,16 +541,21 @@ export async function diffSince(
   const gitlinks: string[] = [];
   const blobs = new Map<string, string>();
   const origins = new Map(files.map((file) => [file.path, file.from]));
-  const changes: { path: string; from?: string }[] = [];
+  const changes: { path: string; from?: string; modeRequiresAllowance: boolean }[] = [];
   const entries = raw.stdout.split("\0");
   for (let i = 0; i + 1 < entries.length; i += 2) {
+    const [oldMode, newMode, oldOid, newOid] = entries[i]?.split(" ") ?? [];
     if (entries[i]?.split(" ")[1] === "160000") gitlinks.push(entries[i + 1] ?? "");
     const status = entries[i]?.split(" ").at(-1) ?? "";
     const path = entries[i + 1] ?? "";
     if (status.startsWith("D")) continue;
     blobs.set(path, entries[i]?.split(" ")[3] ?? "");
     const from = origins.get(path);
-    changes.push({ path, ...(from ? { from } : status.startsWith("A") ? {} : { from: path }) });
+    changes.push({
+      path,
+      ...(from ? { from } : status.startsWith("A") ? {} : { from: path }),
+      modeRequiresAllowance: newMode === "100755" || (oldMode !== `:${newMode}` && oldOid === newOid),
+    });
   }
   const revision = threeDot ? await mergeBase(cwd, baseSha, "HEAD") : baseSha;
   const inspection = await attributeInfo(cwd, env, range, revision, changes);
@@ -610,13 +616,21 @@ export async function blobPrivateEntries(
 
 /** The local payload of an LFS pointer. Payloads are never fetched, so a missing one blocks. */
 async function lfsPayload(cwd: string, env: Record<string, string> | undefined, pointer: string) {
+  const bytes = await localLfsPayload(cwd, env, pointer);
+  if (bytes) return bytes.toString("utf8");
+  throw new privacy.PrivateError("Cannot inspect local LFS payload; publication blocked");
+}
+
+async function localLfsPayload(cwd: string, env: Record<string, string> | undefined, pointer: string) {
   const oid = pointer.match(/^oid sha256:([a-f0-9]{64})$/m)?.[1] ?? "";
   const common = await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd, env });
   const path = resolve(cwd, common.stdout.trim(), "lfs/objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+  const stat = await fs.promises.stat(path).catch(() => undefined);
+  if (!stat?.isFile() || stat.size !== Number(pointer.match(/^size (\d+)$/m)?.[1])) return undefined;
   const bytes = await fs.promises.readFile(path).catch(() => undefined);
   if (bytes && pointer.endsWith(`oid sha256:${Bun.SHA256.hash(bytes, "hex")}\nsize ${bytes.length}\n`))
-    return bytes.toString("utf8");
-  throw new privacy.PrivateError("Cannot inspect local LFS payload; publication blocked");
+    return bytes;
+  return undefined;
 }
 
 /** Checks raw commits and patches (and optionally the index), not the net diff. */
@@ -696,7 +710,7 @@ async function attributeInfo(
   env: Record<string, string> | undefined,
   range: string,
   base: string,
-  changes: { path: string; from?: string }[],
+  changes: { path: string; from?: string; modeRequiresAllowance: boolean }[],
 ): Promise<Partial<DiffInfo>> {
   // Attribute files must be inspected even if binary or renamed into place.
   const pathspecs = [":(icase).gitattributes", ":(icase)**/.gitattributes"];
@@ -719,15 +733,15 @@ async function attributeInfo(
     }
     return result;
   };
-  // Text means no NUL in the first 8,000 bytes. The explicit empty attribute source applies
-  // even where worktreeGit is unhardened, so the run's own attributes cannot classify content.
+  // Git supplies an initial classification; verify apparent text across the complete blob.
+  // The empty attribute source prevents repository attributes from deciding what is text.
   // The empty tree's id depends on the repository's object format (SHA-1 or SHA-256).
   let emptyTree: Promise<string> | undefined;
   const emptyTreeOf = () =>
     (emptyTree ??= emptyTreeId({ cwd, env, timeoutMs: Math.max(1, deadline - Date.now()) }));
   const matches = new Set<string>();
-  const basePointers = new Set<string>();
-  const pointers = new Map<string, boolean>();
+  const headPointers = new Map<string, string>();
+  const contents = new Map<string, { pointer: string | null; forbidden: boolean; binary: boolean }>();
   const scratch = mkdtempSync(join(tmpdir(), "limitless-classify-"));
   let indexes = 0;
   const scratchGit = (args: string[], stdin?: string, index = join(scratch, "index")) =>
@@ -740,7 +754,8 @@ async function attributeInfo(
   /** `raw` is every text path; `text` excludes LFS pointers standing in for binary files. */
   const textAt = async (tree: string, pathspecs: string[], seen = matches) => {
     const raw = new Set<string>();
-    if (!pathspecs.length) return { raw, text: raw };
+    const blobs = new Map<string, string>();
+    if (!pathspecs.length) return { raw, text: raw, blobs };
     const empty = await emptyTreeOf();
     // A fresh index per query lets classifications run concurrently.
     const index = join(scratch, `index-${indexes++}`);
@@ -757,54 +772,79 @@ async function attributeInfo(
     rmSync(index, { force: true });
     // Raw entries (blob id, then path) precede the numstat entries. Looking blobs up by id
     // avoids a tree walk per `tree:path`, which dominates audits of many thousand files.
-    const blobs = new Map<string, string>();
     const entries = out.stdout.split("\0");
     for (let i = 0; i < entries.length; i++) {
-      const blob = entries[i]?.match(/^:\d+ \d+ \S+ (\S+) /);
-      if (blob?.[1]) {
-        blobs.set(entries[++i] ?? "", blob[1]);
+      const blob = entries[i]?.match(/^:\d+ (\d+) \S+ (\S+) /);
+      if (blob?.[2]) {
+        const path = entries[++i] ?? "";
+        // Gitlinks name commits in another repository, not blobs we can inspect here.
+        if (blob[1] !== "160000") blobs.set(path, blob[2]);
         continue;
       }
       const match = entries[i]?.match(/^(\d+|-)\t(?:\d+|-)\t([\s\S]+)$/);
-      if (match?.[2]) {
+      if (match?.[2] && blobs.has(match[2])) {
         seen.add(match[2]);
         if (match[1] !== "-") raw.add(match[2]);
       }
     }
-    // A Git LFS pointer, which `git lfs` commits for a tracked file, stands for binary content.
-    const text = new Set(raw);
+    // Inspect bytes with length framing: a blob may contain embedded NULs or multi-byte text.
     const candidates = [...raw];
-    if (candidates.length) {
-      const input = candidates.map((path) => `${blobs.get(path)}\n`).join("");
-      const sizes = (
-        await git(["cat-file", "--batch-check=%(objectname) %(objectsize)"], input)
-      ).stdout.split("\n");
-      const sized = candidates.flatMap((path, i) => {
-        const [oid = "", bytes] = (sizes[i] ?? "").split(" ");
-        const size = Number(bytes);
-        return size < 1024 ? [{ path, oid }] : [];
+    const input = candidates.map((path) => `${blobs.get(path)}\n`).join("");
+    const sizes = candidates.length
+      ? (await git(["cat-file", "--batch-check=%(objectname) %(objectsize)"], input)).stdout.split("\n")
+      : [];
+    const sized = candidates.map((path, i) => {
+      const [oid = "", bytes] = (sizes[i] ?? "").split(" ");
+      const size = Number(bytes);
+      if (!Number.isSafeInteger(size) || size < 0) throw new Error("Cannot inspect blob size");
+      return { path, oid, size };
+    });
+    const unread = [...new Map(sized.map((entry) => [entry.oid, entry])).values()].filter(
+      ({ oid }) => !contents.has(oid),
+    );
+    while (unread.length) {
+      const batch = [];
+      let bytes = 0;
+      do {
+        const next = unread.shift();
+        if (!next) break;
+        batch.push(next);
+        bytes += next.size;
+      } while (unread.length && bytes + (unread[0]?.size ?? 0) < MEDIA_LIMIT);
+      const result = await worktreeGit(["git", "cat-file", "--batch", "-Z"], {
+        cwd,
+        env,
+        encoding: "latin1",
+        stdin: batch.map(({ oid }) => `${oid}\0`).join(""),
+        timeoutMs: Math.max(1, deadline - Date.now()),
       });
-      // One read for every blob not classified yet. These are text blobs below 1024 bytes,
-      // so they hold no NUL and -Z output splits unambiguously; malformed pointers block classification.
-      const unread = [...new Set(sized.map(({ oid }) => oid))].filter((oid) => !pointers.has(oid));
-      if (unread.length) {
-        const records = (
-          await git(["cat-file", "--batch", "-Z"], unread.map((oid) => `${oid}\0`).join(""))
-        ).stdout.split("\0");
-        for (const [i, oid] of unread.entries())
-          pointers.set(
-            oid,
-            (records[2 * i] ?? "").startsWith(`${oid} blob `) &&
-              lfsPointer(records[2 * i + 1] ?? "") !== null,
-          );
+      let at = 0;
+      for (const { oid, size } of batch) {
+        const end = result.stdout.indexOf("\0", at);
+        if (result.stdout.slice(at, end) !== `${oid} blob ${size}` || result.stdout[end + size + 1] !== "\0")
+          throw new Error("Cannot inspect complete blob");
+        const bytes = Buffer.from(result.stdout.slice(end + 1, end + 1 + size), "latin1");
+        contents.set(oid, {
+          pointer: size < 1024 ? lfsPointer(bytes.toString("utf8")) : null,
+          forbidden: isForbiddenFormat("", bytes),
+          binary: bytes.includes(0) || bytes.includes(Buffer.from("%PDF-")),
+        });
+        at = end + size + 2;
       }
-      for (const { path, oid } of sized)
-        if (pointers.get(oid)) {
-          if (tree === base) basePointers.add(path);
-          if (!SOURCE_PATH.test(path)) text.delete(path);
-        }
+      if (at !== result.stdout.length) throw new Error("Unexpected blob batch output");
     }
-    return { raw, text };
+    for (const { path, oid } of sized) {
+      if (contents.get(oid)?.forbidden || contents.get(oid)?.binary || /\.pdf$/i.test(path)) raw.delete(path);
+    }
+    const text = new Set(raw);
+    for (const { path, oid } of sized) {
+      const pointer = contents.get(oid)?.pointer;
+      if (pointer) {
+        if (tree === "HEAD") headPointers.set(path, pointer);
+        if (!SOURCE_PATH.test(path)) text.delete(path);
+      }
+    }
+    return { raw, text, blobs };
   };
   const textAtEither = async (pathspecs: string[], seen: Set<string>) => {
     const [before, after] = await Promise.all([
@@ -870,6 +910,38 @@ async function attributeInfo(
       );
     };
     const existing = await existingRules();
+    const inert = new Set<string>();
+    const eligible = changes.filter(
+      ({ path, from }) =>
+        matches.has(path) &&
+        (!afterText.raw.has(path) || headPointers.has(path)) &&
+        INERT_MEDIA_PATH.test(path) &&
+        !beforeText.text.has(from ?? ""),
+    );
+    for (const { path } of eligible) {
+      const pointer = headPointers.get(path);
+      if (pointer) {
+        const size = Number(pointer.match(/^size (\d+)$/m)?.[1]);
+        if (size > 0 && size <= MEDIA_LIMIT) {
+          const bytes = await localLfsPayload(cwd, env, pointer);
+          if (bytes && isInertMedia(path, bytes)) inert.add(path);
+        }
+        continue;
+      }
+      const oid = afterText.blobs.get(path);
+      if (!oid) continue;
+      const size = Number((await git(["cat-file", "-s", oid])).stdout.trim());
+      // Large or unreadable media remains opaque; never validate a truncated subprocess tail.
+      if (!Number.isSafeInteger(size) || size <= 0 || size > MEDIA_LIMIT) continue;
+      const result = await worktreeGit(["git", "cat-file", "blob", oid], {
+        cwd,
+        env,
+        encoding: "latin1",
+        timeoutMs: Math.max(1, deadline - Date.now()),
+      });
+      if (result.stdout.length === size && isInertMedia(path, Buffer.from(result.stdout, "latin1")))
+        inert.add(path);
+    }
     // Hidden paths are a subset of the changes classified above.
     const textPaths = hidden
       .filter(
@@ -878,11 +950,11 @@ async function attributeInfo(
       .map((change) => change.path);
     const binaryPaths = changes
       .filter(
-        ({ path, from }) =>
-          matches.has(path) &&
-          !afterText.raw.has(path) &&
-          !basePointers.has(from ?? "") &&
-          (beforeText.text.has(from ?? "") || !BINARY_PATH.test(path)),
+        ({ path, from, modeRequiresAllowance }) =>
+          modeRequiresAllowance ||
+          (matches.has(path) &&
+            (!afterText.raw.has(path) || headPointers.has(path)) &&
+            (beforeText.text.has(from ?? "") || !inert.has(path))),
       )
       .map((c) => c.path);
     const attributeMatches: Record<string, string[]> = {};
@@ -900,7 +972,7 @@ async function attributeInfo(
       attributePatch,
       attributes,
       textPaths,
-      headTextPaths: [...afterText.raw],
+      headTextPaths: [...afterText.text],
       existingRuleKeys,
       attributeMatches,
       binaryPaths,
