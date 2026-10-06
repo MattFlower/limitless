@@ -611,13 +611,21 @@ export async function blobPrivateEntries(
 
 /** The local payload of an LFS pointer. Payloads are never fetched, so a missing one blocks. */
 async function lfsPayload(cwd: string, env: Record<string, string> | undefined, pointer: string) {
+  const bytes = await localLfsPayload(cwd, env, pointer);
+  if (bytes) return bytes.toString("utf8");
+  throw new privacy.PrivateError("Cannot inspect local LFS payload; publication blocked");
+}
+
+async function localLfsPayload(cwd: string, env: Record<string, string> | undefined, pointer: string) {
   const oid = pointer.match(/^oid sha256:([a-f0-9]{64})$/m)?.[1] ?? "";
   const common = await worktreeGit(["git", "rev-parse", "--git-common-dir"], { cwd, env });
   const path = resolve(cwd, common.stdout.trim(), "lfs/objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+  const stat = await fs.promises.stat(path).catch(() => undefined);
+  if (!stat?.isFile() || stat.size !== Number(pointer.match(/^size (\d+)$/m)?.[1])) return undefined;
   const bytes = await fs.promises.readFile(path).catch(() => undefined);
   if (bytes && pointer.endsWith(`oid sha256:${Bun.SHA256.hash(bytes, "hex")}\nsize ${bytes.length}\n`))
-    return bytes.toString("utf8");
-  throw new privacy.PrivateError("Cannot inspect local LFS payload; publication blocked");
+    return bytes;
+  return undefined;
 }
 
 /** Checks raw commits and patches (and optionally the index), not the net diff. */
@@ -727,8 +735,8 @@ async function attributeInfo(
   const emptyTreeOf = () =>
     (emptyTree ??= emptyTreeId({ cwd, env, timeoutMs: Math.max(1, deadline - Date.now()) }));
   const matches = new Set<string>();
-  const basePointers = new Set<string>();
-  const pointers = new Map<string, boolean>();
+  const headPointers = new Map<string, string>();
+  const pointers = new Map<string, string | null>();
   const scratch = mkdtempSync(join(tmpdir(), "limitless-classify-"));
   let indexes = 0;
   const scratchGit = (args: string[], stdin?: string, index = join(scratch, "index")) =>
@@ -795,13 +803,12 @@ async function attributeInfo(
         for (const [i, oid] of unread.entries())
           pointers.set(
             oid,
-            (records[2 * i] ?? "").startsWith(`${oid} blob `) &&
-              lfsPointer(records[2 * i + 1] ?? "") !== null,
+            (records[2 * i] ?? "").startsWith(`${oid} blob `) ? lfsPointer(records[2 * i + 1] ?? "") : null,
           );
       }
       for (const { path, oid } of sized)
         if (pointers.get(oid)) {
-          if (tree === base) basePointers.add(path);
+          if (tree === "HEAD") headPointers.set(path, pointers.get(oid) ?? "");
           if (!SOURCE_PATH.test(path)) text.delete(path);
         }
     }
@@ -875,12 +882,20 @@ async function attributeInfo(
     const eligible = changes.filter(
       ({ path, from }) =>
         matches.has(path) &&
-        !afterText.raw.has(path) &&
+        (!afterText.raw.has(path) || headPointers.has(path)) &&
         INERT_MEDIA_PATH.test(path) &&
-        !beforeText.text.has(from ?? "") &&
-        !basePointers.has(from ?? ""),
+        !beforeText.text.has(from ?? ""),
     );
     for (const { path } of eligible) {
+      const pointer = headPointers.get(path);
+      if (pointer) {
+        const size = Number(pointer.match(/^size (\d+)$/m)?.[1]);
+        if (size > 0 && size <= MEDIA_LIMIT) {
+          const bytes = await localLfsPayload(cwd, env, pointer);
+          if (bytes && isInertMedia(path, bytes)) inert.add(path);
+        }
+        continue;
+      }
       const oid = afterText.blobs.get(path);
       if (!oid) continue;
       const size = Number((await git(["cat-file", "-s", oid])).stdout.trim());
@@ -905,8 +920,7 @@ async function attributeInfo(
       .filter(
         ({ path, from }) =>
           matches.has(path) &&
-          !afterText.raw.has(path) &&
-          !basePointers.has(from ?? "") &&
+          (!afterText.raw.has(path) || headPointers.has(path)) &&
           (beforeText.text.has(from ?? "") || !inert.has(path)),
       )
       .map((c) => c.path);

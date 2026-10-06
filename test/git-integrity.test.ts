@@ -1440,8 +1440,10 @@ test("pointer candidates are read in one batch per tree, and multi-byte text can
   const findings = await worktreeGitScope.run(false, async () =>
     auditDiff(await diffSince(work, revision, shim.env), { taskClass: null, protectedPaths: [] }),
   );
-  // Still recognized as a strict pointer, the edited base pointer keeps its exemption.
-  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+  // A base pointer cannot exempt the opaque bytes that replace it.
+  expect(findings.filter((f) => f.rule === "binary-content")).toEqual([
+    expect.objectContaining({ file: "zz-asset.png", severity: "block" }),
+  ]);
   expect(shim.calls().filter((call) => ` ${call} `.includes(" cat-file -p "))).toEqual([]);
   expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(2);
 });
@@ -1691,7 +1693,9 @@ test.each([
   const findings = auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] });
   expect(attributeBlocksOf(findings).length > 0).toBe(blocks);
   if (["valid", "crlf", "legacy"].includes(kind))
-    expect(findings.filter((f) => f.rule === "binary-content")).toEqual([]);
+    expect(findings.filter((f) => f.rule === "binary-content")).toEqual([
+      expect.objectContaining({ severity: "block", file: `pointer.${extension}` }),
+    ]);
   else
     expect(findings.filter((f) => f.rule === "binary-content")).toEqual([
       expect.objectContaining({
@@ -2302,7 +2306,8 @@ test("LFS inspection batches short and repeated candidate blobs per tree", async
   const shim = gitShim();
   const diff = await diffSince(work, revision, shim.env);
   expect(diff.binaryErrors).toBeUndefined();
-  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
+  expect(diff.binaryPaths).toHaveLength(128);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
   // Short blobs also need classification: each tree still uses only one batch.
   expect(shim.calls().filter((call) => ` ${call} `.includes(" cat-file -p "))).toEqual([]);
   expect(shim.calls().filter((call) => call.includes("cat-file --batch -Z"))).toHaveLength(2);
@@ -2376,11 +2381,13 @@ test("a new strict LFS pointer under an existing rule is not warned about as tex
   await factory("commit", "-qm", "new LFS pointer");
   const diff = await diffSince(work, revision);
   expect(diff.headTextPaths).toEqual([]);
-  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([
+    expect.objectContaining({ rule: "binary-content", severity: "block" }),
+  ]);
 });
 
 test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size", "extra line"])(
-  "binary edits of %s base LFS pointers require a strict pointer exemption",
+  "binary edits of %s base LFS pointers are judged on the new content",
   async (kind) => {
     let pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 2\n`;
     if (kind === "missing oid") pointer = pointer.replace(/oid.*\n/, "");
@@ -2431,7 +2438,9 @@ test.each(["valid", "missing oid", "missing size", "invalid hash", "invalid size
     const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
     expect(findings.filter((f) => f.rule === "binary-content")).toEqual(
       kind === "valid"
-        ? []
+        ? ["tracked.dat", "tracked.png", "tracked.ts"].map((file) =>
+            expect.objectContaining({ severity: "block", file }),
+          )
         : [
             expect.objectContaining({
               severity: "block",
@@ -2971,4 +2980,33 @@ test("fonts and audio require a binary allowance even with complete media struct
   expect(diff.binaryPaths?.sort()).toEqual(extensions.map((ext) => `asset.${ext}`).sort());
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(extensions.length);
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
+
+test("LFS binary allowance follows the available new payload", async () => {
+  const pointer = (bytes: Buffer, local: boolean) => {
+    const oid = createHash("sha256").update(bytes).digest("hex");
+    if (local) {
+      const folder = join(seed, ".git", "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4));
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(join(folder, oid), bytes);
+    }
+    return `version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize ${bytes.length}\n`;
+  };
+  writeFileSync(join(work, "replacement.png"), pointer(mediaFixture("png"), false));
+  await commitAll(work, "base pointer");
+  const revision = await headSha(work);
+  let previous = revision;
+  for (const variant of [0, 1]) {
+    writeFileSync(join(work, "missing.png"), pointer(Buffer.from(`unavailable ${variant}`), false));
+    writeFileSync(join(work, "archive.png"), pointer(mediaFixture("zip", variant), true));
+    writeFileSync(join(work, "image.png"), pointer(mediaFixture("png", variant), true));
+    writeFileSync(join(work, "replacement.png"), mediaFixture("zip", variant));
+    await commitAll(work, "new LFS content");
+    const diff = await diffSince(work, variant === 0 ? revision : previous);
+    expect(diff.binaryErrors).toBeUndefined();
+    expect(diff.binaryPaths?.sort()).toEqual(["archive.png", "missing.png", "replacement.png"]);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toHaveLength(3);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+    previous = await headSha(work);
+  }
 });
