@@ -681,9 +681,9 @@ test.each(["direct", "proxy"] as const)(
           land: { reason: "[withheld: private text]" },
         });
         f.factory.store.db
-          .query(`INSERT INTO feed (ts, kind, run_id, title, summary, dedupe_key)
-          VALUES (1, 'review.round_delivered', ?, 'Safe round title', ?, ?)`)
-          .run(run.id, `Round ${text}`, run.id);
+          .query(`INSERT INTO feed (ts, kind, run_id, title, summary, data, dedupe_key)
+          VALUES (1, 'review.round_delivered', ?, 'Safe round title', ?, ?, ?)`)
+          .run(run.id, `Round ${text}`, JSON.stringify({ nested: [{ [text]: text }] }), run.id);
         const feed = resultValue<FeedPage>(
           await conn.client.callTool({ name: "limitless_feed", arguments: { after: 0 } }),
         );
@@ -692,6 +692,9 @@ test.each(["direct", "proxy"] as const)(
           "[withheld: private text]",
           "[withheld: private text]",
         ]);
+        expect(
+          feed.items.find((item) => item.runId === run.id && item.kind === "review.round_delivered")?.data,
+        ).toEqual({ nested: [{ "[withheld: private text]": "[withheld: private text]" }] });
         const error = await conn.client.callTool({ name: "limitless_status", arguments: { run: text } });
         expect(error.isError).toBe(true);
         expect(error.content).toEqual([

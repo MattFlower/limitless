@@ -49,10 +49,24 @@ const decoded = (text: string) =>
     .replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString())
     // Diagnostics may JSON-quote a field's literal Unicode escapes.
     .replace(/\\+u([0-9a-f]{4})/gi, (_escape, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
-export const privateMatches = (text: string, entries: PrivateStrings) =>
-  entries.filter(({ value }) => normalize(`${text}\n${decoded(text)}`).includes(normalize(value)));
+export function privateMatches(text: string, entries: PrivateStrings): PrivateStrings {
+  let layers = text;
+  for (let round = 0; round < 5; round++) {
+    const next = decoded(text);
+    if (next === text) {
+      const normalized = normalize(layers);
+      return entries.filter(({ value }) => normalized.includes(normalize(value)));
+    }
+    layers += `\n${next}`;
+    text = next;
+  }
+  // Entry zero marks unsafe decoding, including when the denylist is empty.
+  return [{ value: "", entry: 0 }];
+}
 export const privateReason = (location: string, entry: number) =>
-  `${location} contains a private string (entry ${entry} in private-strings.txt)`;
+  entry === 0
+    ? `${location} exceeds the private text decoding limit; publication blocked`
+    : `${location} contains a private string (entry ${entry} in private-strings.txt)`;
 export function redactPrivate(text: string, entries: PrivateStrings): string {
   for (const { value } of entries)
     text = text.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]");

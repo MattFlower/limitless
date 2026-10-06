@@ -22,7 +22,7 @@ import {
   singleFlight,
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
-import { loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
+import { checkPrivateText, loadPrivateStrings, privateMatches, redactPrivate } from "../src/gates/private.ts";
 import {
   compareGates,
   type GateRun,
@@ -371,6 +371,34 @@ describe("audit allowances and attribute rules", () => {
 });
 
 describe("private strings", () => {
+  test.each([
+    ["double URL", "%2573ecret-host.example"],
+    ["Unicode-escaped percent", "\\u002573ecret-host.example"],
+    ["URL of Unicode", "%5Cu0073ecret-host.example"],
+    ["alternating layers", "%5Cu002573ecret-host.example"],
+  ])("blocks %s encoding in publication and diagnostics", (_kind, text) => {
+    const entries = [{ value: "secret-host.example", entry: 3 }];
+    expect(privateMatches(text, entries)).toEqual(entries);
+    expect(() => checkPrivateText(text, "body", entries)).toThrow("entry 3");
+    expect(redactPrivate(text, entries)).toBe("[redacted diagnostic]");
+  });
+
+  test("private decoding fails closed at the round bound even without denylist entries", () => {
+    const entries = [{ value: "secret-host.example", entry: 3 }];
+    let nested = "%61 harmless";
+    for (let i = 0; i < 3; i++) nested = encodeURIComponent(nested);
+    expect(privateMatches(nested, entries)).toEqual([]);
+    expect(redactPrivate(nested, entries)).toBe(nested);
+    nested = encodeURIComponent(nested);
+    for (const policy of [entries, []]) {
+      expect(privateMatches(nested, policy)).toHaveLength(1);
+      expect(() => checkPrivateText(nested, "body", policy)).toThrow("decoding limit");
+      expect(redactPrivate(nested, policy)).toBe("[redacted diagnostic]");
+    }
+    for (let i = 0; i < 3; i++) nested = encodeURIComponent(nested);
+    expect(() => checkPrivateText(nested, "body", [])).toThrow("decoding limit");
+  });
+
   test.each(["A", "R100"])("quoted %s filename and unrelated diagnostics cannot reveal entries", (status) => {
     const configDir = mkdtempSync(join(tmpdir(), "private-strings-"));
     try {
