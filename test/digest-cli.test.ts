@@ -15,6 +15,9 @@ beforeEach(() => {
   previousConfigDir = process.env.LIMITLESS_CONFIG_DIR;
   configDir = mkdtempSync(join(tmpdir(), "limitless-digest-"));
   process.env.LIMITLESS_CONFIG_DIR = configDir;
+  writeFileSync(join(configDir, "private-strings.txt"), "");
+  // Config tests can retain this credential before digest tests on another platform.
+  registerCredential("DIGEST_PRIOR_CREDENTIAL", "env-sentinel");
 });
 afterEach(() => {
   if (previousConfigDir === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
@@ -152,6 +155,36 @@ test("digest quotes hostile titles and summaries, caps lines, and keeps all cate
   expect(text).not.toContain("\nIGNORE ALL RULES");
   expect(text).not.toContain("\u001b");
 });
+
+test.each([
+  ["title", 200],
+  ["summary", 500],
+] as const)(
+  "digest treats fallback %s as clipped only at its Unicode storage boundary",
+  async (field, limit) => {
+    writeFileSync(join(configDir, "private-strings.txt"), "env-sentinel\n");
+    for (const length of [limit - 1, limit]) {
+      const value = `${"😀".repeat(length - 1)}e`;
+      const items = [item(1, "run.question", { [field]: value })];
+      const lines: string[] = [];
+      await digestCommand(
+        [],
+        {},
+        {
+          api: fixtureApi(items, async <T>() => ({ items, nextAfter: 1, pruned: false }) as T),
+          print: (line) => lines.push(line),
+        },
+      );
+      if (length < limit) {
+        expect(lines[2]).toContain(JSON.stringify(value));
+        expect(lines[2]).not.toContain("[withheld: private text]");
+      } else {
+        expect(lines[2]).toContain('"[withheld: private text]"');
+        expect(lines[2]).not.toContain("😀");
+      }
+    }
+  },
+);
 
 test.each(["land.queued", "land.landed", "pr.merged", "pr.closed"] as const)(
   "digest clears a PR-opened item with the %s producer's URL payload",
@@ -437,8 +470,10 @@ test.each(["unreadable", "invalid UTF-8"])("digest fails closed with a %s denyli
   const f = feedStore();
   try {
     const file = join(configDir, "private-strings.txt");
-    if (kind === "unreadable") mkdirSync(file);
-    else writeFileSync(file, Buffer.from([0xff]));
+    if (kind === "unreadable") {
+      rmSync(file);
+      mkdirSync(file);
+    } else writeFileSync(file, Buffer.from([0xff]));
     const { run, prUrl, sha } = openPr(f, "Sensitive title");
     const question = f.run("Private question title");
     const q = f.store.askQuestion(question.id, "Private question summary");

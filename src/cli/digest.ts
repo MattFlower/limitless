@@ -144,7 +144,11 @@ async function printDigest(
               : item.kind === "run.pr_opened" && typeof item.data.prUrl === "string"
                 ? item.data.prUrl
                 : undefined;
-      return `${g.label}: #${item.id} run=${safeQuote(item.runId ?? "unknown")} ${safeQuote(title ?? item.title, title === undefined, 200)} ${safeQuote(summary ?? item.summary, summary == null, 500)}`;
+      // SQLite substr clips feed fields by Unicode code points. Only a value at the
+      // storage boundary can end with a clipped private prefix; shorter copies are complete.
+      const clippedTitle = title === undefined && [...item.title].length >= 200;
+      const clippedSummary = summary == null && [...item.summary].length >= 500;
+      return `${g.label}: #${item.id} run=${safeQuote(item.runId ?? "unknown")} ${safeQuote(title ?? item.title, clippedTitle, 200)} ${safeQuote(summary ?? item.summary, clippedSummary, 500)}`;
     }),
   );
   // Interleave categories so a busy input queue cannot hide blocked lands or review requests.
