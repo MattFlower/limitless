@@ -7,6 +7,7 @@ import type { Paths } from "../config.ts";
 import type { Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
+import { isInertMedia, MEDIA_LIMIT } from "../gates/media.ts";
 import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
 import { CommandError, sh } from "../util/proc.ts";
@@ -740,7 +741,8 @@ async function attributeInfo(
   /** `raw` is every text path; `text` excludes LFS pointers standing in for binary files. */
   const textAt = async (tree: string, pathspecs: string[], seen = matches) => {
     const raw = new Set<string>();
-    if (!pathspecs.length) return { raw, text: raw };
+    const blobs = new Map<string, string>();
+    if (!pathspecs.length) return { raw, text: raw, blobs };
     const empty = await emptyTreeOf();
     // A fresh index per query lets classifications run concurrently.
     const index = join(scratch, `index-${indexes++}`);
@@ -757,7 +759,6 @@ async function attributeInfo(
     rmSync(index, { force: true });
     // Raw entries (blob id, then path) precede the numstat entries. Looking blobs up by id
     // avoids a tree walk per `tree:path`, which dominates audits of many thousand files.
-    const blobs = new Map<string, string>();
     const entries = out.stdout.split("\0");
     for (let i = 0; i < entries.length; i++) {
       const blob = entries[i]?.match(/^:\d+ \d+ \S+ (\S+) /);
@@ -804,7 +805,7 @@ async function attributeInfo(
           if (!SOURCE_PATH.test(path)) text.delete(path);
         }
     }
-    return { raw, text };
+    return { raw, text, blobs };
   };
   const textAtEither = async (pathspecs: string[], seen: Set<string>) => {
     const [before, after] = await Promise.all([
@@ -870,6 +871,30 @@ async function attributeInfo(
       );
     };
     const existing = await existingRules();
+    const inert = new Set<string>();
+    const eligible = changes.filter(
+      ({ path, from }) =>
+        matches.has(path) &&
+        !afterText.raw.has(path) &&
+        INERT_MEDIA_PATH.test(path) &&
+        !beforeText.text.has(from ?? "") &&
+        !basePointers.has(from ?? ""),
+    );
+    for (const { path } of eligible) {
+      const oid = afterText.blobs.get(path);
+      if (!oid) continue;
+      const size = Number((await git(["cat-file", "-s", oid])).stdout.trim());
+      // Large or unreadable media remains opaque; never validate a truncated subprocess tail.
+      if (!Number.isSafeInteger(size) || size <= 0 || size > MEDIA_LIMIT) continue;
+      const result = await worktreeGit(["git", "cat-file", "blob", oid], {
+        cwd,
+        env,
+        encoding: "latin1",
+        timeoutMs: Math.max(1, deadline - Date.now()),
+      });
+      if (result.stdout.length === size && isInertMedia(path, Buffer.from(result.stdout, "latin1")))
+        inert.add(path);
+    }
     // Hidden paths are a subset of the changes classified above.
     const textPaths = hidden
       .filter(
@@ -882,7 +907,7 @@ async function attributeInfo(
           matches.has(path) &&
           !afterText.raw.has(path) &&
           !basePointers.has(from ?? "") &&
-          (beforeText.text.has(from ?? "") || !INERT_MEDIA_PATH.test(path)),
+          (beforeText.text.has(from ?? "") || !inert.has(path)),
       )
       .map((c) => c.path);
     const attributeMatches: Record<string, string[]> = {};

@@ -55,6 +55,15 @@ let work: string;
 let base: string;
 const original = 'test("ok", () => {});\n';
 const edited = 'test.skip("ok", () => {});\n';
+const mediaBytes = JSON.parse(
+  readFileSync(new URL("./fixtures/media/files.json", import.meta.url), "utf8"),
+) as Record<string, string>;
+const mediaFixture = (extension: string, variant = 0) => {
+  const file = `${variant}.${extension.toLowerCase().replace("jpeg", "jpg")}`;
+  const encoded = mediaBytes[file];
+  if (!encoded) throw new Error(`Missing media fixture: ${file}`);
+  return Buffer.from(encoded, "base64");
+};
 const git = (cwd: string, ...args: string[]) => sh(["git", ...args], { cwd });
 const factory = (...args: string[]) => worktreeGit(["git", ...args], { cwd: work });
 
@@ -1366,8 +1375,8 @@ test("built-in diff drivers and binary-only patterns are harmless; text at eithe
     ["*.md diff=markdown", { "README.md": "# changed\n" }, false],
     ["*.png binary", { "icon.png": Buffer.from([0x89, 0, 1]) }, false],
     ["*.ico -diff", { "icon.ico": Buffer.from([0x89, 0, 1]) }, false],
-    ["*.pdf binary", {}, false],
-    ["*.pdf -diff", {}, false],
+    ["*.pdf binary", {}, true],
+    ["*.pdf -diff", {}, true],
     ["*.dat binary", { "edge.dat": nulAt(7_999) }, false],
     ["*.dat binary", { "edge.dat": nulAt(8_000) }, true],
     ["*.bmp binary", { "icon.bmp": Buffer.from([0x89, 0, 1]) }, true],
@@ -1566,7 +1575,7 @@ test.each([
     await commitAll(work, "base blob");
   }
   const revision = await headSha(work);
-  writeFileSync(join(work, path), Buffer.from([0, 2]));
+  writeFileSync(join(work, path), path.endsWith(".png") ? mediaFixture("png") : Buffer.from([0, 2]));
   await commitAll(work, "binary blob");
   const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
   expect(findings.some((f) => f.rule === "binary-content" && f.severity === "block")).toBe(blocks);
@@ -1604,7 +1613,12 @@ test.each([
   ["*.png -diff", "warn"],
   ["*.zip binary", "block"],
   ["*.woff2 -diff", "warn"],
-  ["*.mp4 -diff", "warn"],
+  ["*.mp4 -diff", "block"],
+  ["*.pdf binary", "block"],
+  ["*.bmp -diff", "block"],
+  ["*.psd -diff", "block"],
+  ["*.eot -diff", "block"],
+  ["*.glb -diff", "block"],
   ["*.unknown -diff", "block"],
   ["* -diff", "block"],
 ])("unmatched hiding rule %s produces a %s", async (line, severity) => {
@@ -1816,6 +1830,24 @@ test("new and edited opaque binaries require the binary allowance", async () => 
     "db",
     "ai",
     "unknown",
+    "pdf",
+    "bmp",
+    "psd",
+    "eot",
+    "glb",
+    "mp4",
+    "avif",
+    "tif",
+    "tiff",
+    "heic",
+    "m4a",
+    "mkv",
+    "mov",
+    "avi",
+    "webm",
+    "aac",
+    "fbx",
+    "blend",
   ].map((ext, i) => `opaque-${i}.${ext}`);
   paths.push("bun.lockb");
   for (const path of paths) writeFileSync(join(work, path), Buffer.from([0, 1]));
@@ -1852,36 +1884,19 @@ const assetExtensions = [
   "jpg",
   "jpeg",
   "gif",
-  "bmp",
   "ico",
   "webp",
-  "avif",
-  "tif",
-  "tiff",
-  "heic",
-  "psd",
   "mp3",
-  "mp4",
-  "m4a",
-  "mkv",
-  "mov",
-  "avi",
-  "webm",
   "ogg",
   "wav",
   "flac",
-  "aac",
   "woff",
   "woff2",
+  "transformed.woff2",
   "ttf",
   "otf",
-  "eot",
-  "pdf",
-  "glb",
-  "fbx",
-  "blend",
 ];
-test("inert media extensions exempt new and edited assets and unmatched attribute rules", async () => {
+test("validated media exempt new and edited assets and eligible unmatched attribute rules", async () => {
   writeFileSync(join(work, ".gitattributes"), assetExtensions.map((ext) => `*.${ext} binary\n`).join(""));
   await commitAll(work, "unmatched asset rules");
   let diff = await diffSince(work, base);
@@ -1890,11 +1905,11 @@ test("inert media extensions exempt new and edited assets and unmatched attribut
   expect(findings).toHaveLength(assetExtensions.length);
   const revision = await headSha(work);
   for (const [i, ext] of assetExtensions.entries())
-    writeFileSync(join(work, `asset-${i}.${ext}`), Buffer.from([0, 1, 2]));
+    writeFileSync(join(work, `asset-${i}.${ext}`), mediaFixture(ext));
   await commitAll(work, "ordinary assets");
   const binaryBase = await headSha(work);
   for (const [i, ext] of assetExtensions.entries())
-    writeFileSync(join(work, `asset-${i}.${ext}`), Buffer.from([0, 3, 4]));
+    writeFileSync(join(work, `asset-${i}.${ext}`), mediaFixture(ext, 1));
   await commitAll(work, "edited assets");
   for (const start of [revision, binaryBase]) {
     diff = await diffSince(work, start);
@@ -1903,6 +1918,172 @@ test("inert media extensions exempt new and edited assets and unmatched attribut
     expect(findings).toEqual([]);
   }
 }, 30_000);
+
+test("complete PDFs, ZIPs, JARs, UTF-8 TARs and WASM still require an allowance on additions and edits", async () => {
+  const paths = ["pdf", "zip", "jar", "tar", "wasm"].map((ext) => `opaque.${ext}`);
+  for (const path of paths) writeFileSync(join(work, path), mediaFixture(path.split(".")[1] ?? ""));
+  await commitAll(work, "complete opaque additions");
+  const binaryBase = await headSha(work);
+  for (const path of paths) writeFileSync(join(work, path), mediaFixture(path.split(".")[1] ?? "", 1));
+  await commitAll(work, "complete opaque edits");
+  for (const revision of [base, binaryBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(findings).toHaveLength(paths.length);
+    for (const file of paths)
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file,
+          rule: "binary-content",
+          severity: "block",
+          detail: expect.stringContaining(`${file}:`),
+        }),
+      );
+    expect(findings.every((f) => f.detail.includes("Allow: binary"))).toBe(true);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+  }
+});
+
+test("eligible media must have complete structures, matching signatures and no appended or concatenated payload", async () => {
+  const files: { path: string; original: Buffer; changed: Buffer }[] = [];
+  for (const [index, extension] of assetExtensions.entries()) {
+    const original = mediaFixture(extension);
+    const variants = [
+      Buffer.concat([original, Buffer.from("hidden trailing bytes")]),
+      Buffer.concat([original, mediaFixture("zip")]),
+      original.subarray(0, Math.floor(original.length / 2)),
+      mediaFixture(extension.toLowerCase() === "png" ? "wav" : "png"),
+      Buffer.from([0, 1, 2]),
+    ];
+    for (const [i, changed] of variants.entries())
+      files.push({ path: `tampered-${index}-${i}.${extension}`, original, changed });
+  }
+  for (const { path, original } of files) writeFileSync(join(work, path), original);
+  await commitAll(work, "media base");
+  const mediaBase = await headSha(work);
+  for (const { path, changed } of files) writeFileSync(join(work, path), changed);
+  // The binary allowance must not suppress an independent attribute finding.
+  writeFileSync(join(work, ".gitattributes"), "*.mp4 binary\n");
+  await commitAll(work, "malformed media");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    const binary = findings.filter((f) => f.rule === "binary-content");
+    expect(binary).toHaveLength(files.length);
+    for (const { path } of files)
+      expect(binary).toContainEqual(expect.objectContaining({ file: path, severity: "block" }));
+    const allowed = auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] });
+    expect(allowed).toEqual(findings.filter((f) => f.rule !== "binary-content"));
+    expect(allowed).toContainEqual(expect.objectContaining({ rule: "gitattributes", severity: "block" }));
+  }
+});
+
+test("embedded image, font and audio payloads remain opaque even inside declared metadata", async () => {
+  const png = mediaFixture("png"),
+    gif = mediaFixture("gif"),
+    jpeg = mediaFixture("jpg"),
+    wav = mediaFixture("wav"),
+    woff = mediaFixture("woff"),
+    webp = mediaFixture("webp");
+  const payload = Buffer.from("hidden opaque bytes");
+  const pngChunk = Buffer.alloc(payload.length + 12);
+  pngChunk.writeUInt32BE(payload.length, 0);
+  pngChunk.write("tEXt", 4);
+  payload.copy(pngChunk, 8);
+  pngChunk.writeUInt32BE(Bun.hash.crc32(pngChunk.subarray(4, -4)), pngChunk.length - 4);
+  const jpegComment = Buffer.alloc(payload.length + 4);
+  jpegComment.writeUInt16BE(0xfffe, 0);
+  jpegComment.writeUInt16BE(payload.length + 2, 2);
+  payload.copy(jpegComment, 4);
+  const riffChunk = Buffer.alloc(8 + payload.length + (payload.length & 1));
+  riffChunk.write("JUNK");
+  riffChunk.writeUInt32LE(payload.length, 4);
+  payload.copy(riffChunk, 8);
+  const riffPayload = (b: Buffer) => {
+    const result = Buffer.concat([b, riffChunk]);
+    result.writeUInt32LE(result.length - 8, 4);
+    return result;
+  };
+  const privateWoff = Buffer.concat([woff, payload]);
+  privateWoff.writeUInt32BE(privateWoff.length, 8);
+  privateWoff.writeUInt32BE(woff.length, 36);
+  privateWoff.writeUInt32BE(payload.length, 40);
+  let codecWebp = Buffer.concat([webp.subarray(0, 20 + webp.readUInt32LE(16)), payload]);
+  codecWebp.writeUInt32LE(codecWebp.length - 20, 16);
+  if (codecWebp.readUInt32LE(16) & 1) {
+    // RIFF padding is outside the codec's declared byte range.
+    codecWebp = Buffer.concat([codecWebp, Buffer.from([0])]);
+  }
+  codecWebp.writeUInt32LE(codecWebp.length - 8, 4);
+  // Keep the font's directory, checksums and declared cmap length consistent while
+  // inserting bytes the character mapping never references.
+  const ttf = mediaFixture("ttf"),
+    count = ttf.readUInt16BE(4);
+  const directory = Buffer.from(ttf.subarray(0, 12 + count * 16)),
+    tables: Buffer[] = [];
+  let offset = directory.length,
+    headOffset = 0;
+  const checksum = (bytes: Buffer) => {
+    let sum = 0;
+    for (let i = 0; i < bytes.length; i += 4) sum = (sum + bytes.readUInt32BE(i)) >>> 0;
+    return sum;
+  };
+  for (let i = 0; i < count; i++) {
+    const at = 12 + i * 16,
+      tag = ttf.toString("ascii", at, at + 4);
+    let data = Buffer.from(
+      ttf.subarray(ttf.readUInt32BE(at + 8), ttf.readUInt32BE(at + 8) + ttf.readUInt32BE(at + 12)),
+    );
+    if (tag === "cmap") {
+      data = Buffer.concat([data, Buffer.from("hidden opaque bytes!")]);
+      const subtable = data.readUInt32BE(8);
+      data.writeUInt16BE(data.readUInt16BE(subtable + 2) + 20, subtable + 2);
+    }
+    if (tag === "head") {
+      headOffset = offset;
+      data.writeUInt32BE(0, 8);
+    }
+    const padded = Buffer.alloc((data.length + 3) & ~3);
+    data.copy(padded);
+    directory.writeUInt32BE(checksum(padded), at + 4);
+    directory.writeUInt32BE(offset, at + 8);
+    directory.writeUInt32BE(data.length, at + 12);
+    tables.push(padded);
+    offset += padded.length;
+  }
+  const tablePayload = Buffer.concat([directory, ...tables]);
+  tablePayload.writeUInt32BE((0xb1b0afba - checksum(tablePayload)) >>> 0, headOffset + 8);
+  const ancillaryMp3 = mediaFixture("mp3");
+  payload.copy(ancillaryMp3, ancillaryMp3.length - payload.length - 8);
+  const files: Record<string, Buffer> = {
+    "embedded.png": Buffer.concat([png.subarray(0, -12), pngChunk, png.subarray(-12)]),
+    "embedded.gif": Buffer.concat([
+      gif.subarray(0, -1),
+      Buffer.from([0x21, 0xfe, payload.length]),
+      payload,
+      Buffer.from([0, 0x3b]),
+    ]),
+    "embedded.jpg": Buffer.concat([jpeg.subarray(0, 2), jpegComment, jpeg.subarray(2)]),
+    "embedded.webp": riffPayload(webp),
+    "embedded-codec.webp": codecWebp,
+    "embedded-entropy.jpg": Buffer.concat([jpeg.subarray(0, -2), payload, jpeg.subarray(-2)]),
+    "embedded.wav": riffPayload(wav),
+    "embedded.woff": privateWoff,
+    "embedded-table.ttf": tablePayload,
+    "embedded.mp3": Buffer.concat([Buffer.from("ID3\x04\0\0\0\0\0\x13"), payload, mediaFixture("mp3")]),
+    "embedded-ancillary.mp3": ancillaryMp3,
+  };
+  for (const [path, bytes] of Object.entries(files)) writeFileSync(join(work, path), bytes);
+  await commitAll(work, "embedded payloads");
+  const diff = await diffSince(work, base);
+  const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+  expect(findings).toHaveLength(Object.keys(files).length);
+  for (const file of Object.keys(files))
+    expect(findings).toContainEqual(
+      expect.objectContaining({ file, rule: "binary-content", severity: "block" }),
+    );
+  expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+});
 
 test("16,000 added files use stdin pathspecs without uncertainty findings", async () => {
   const files = Array.from({ length: 16_000 }, (_, i) => `${i}-${"long-name-".repeat(12)}.dat`);
@@ -1967,7 +2148,7 @@ test("existing hiding warnings group text paths per rule and omit binary PNGs", 
   for (const directory of ["gen", "other"]) mkdirSync(join(work, directory));
   for (let i = 0; i < 312; i++) writeFileSync(join(work, "gen", `${i}.dat`), "generated text\n");
   for (let i = 0; i < 2; i++) writeFileSync(join(work, "other", `${i}.dat`), "other generated text\n");
-  writeFileSync(join(work, "photo.png"), Buffer.from([0, 1]));
+  writeFileSync(join(work, "photo.png"), mediaFixture("png"));
   await commitAll(work, "generated text and binary asset");
   const findings = auditDiff(await diffSince(work, revision), { taskClass: null, protectedPaths: [] });
   expect(findings).toHaveLength(2);
