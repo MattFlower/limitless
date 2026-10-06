@@ -254,6 +254,14 @@ test("provider card renders each window's label, bar, and full-width details in 
   }
   expect(html.match(/class="gauge-details"/g)).toHaveLength(3);
   expect(html).not.toContain("Confined readers");
+  expect(html).not.toContain("No limit (configured)");
+  for (const windows of [status.windows, {}]) {
+    const unlimited = renderToString(() =>
+      ProviderCard({ provider: { ...status, quota: "unlimited", windows } }),
+    );
+    expect(unlimited).toContain("No limit (configured)");
+    if (Object.keys(windows).length) expect(unlimited).toContain("73%");
+  }
 
   const codex = (confinement: ProviderStatus["confinement"]) =>
     renderToString(() => ProviderCard({ provider: { ...status, id: "codex", label: "Codex", confinement } }))

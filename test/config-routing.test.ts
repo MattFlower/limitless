@@ -9,7 +9,7 @@ import { fakeHarness } from "../src/harness/fake.ts";
 import { seatbeltBackend } from "../src/harness/sandbox.ts";
 import { DEFAULT_ROSTERS } from "../src/pipeline/review-system.ts";
 import { DEFAULT_POLICY, MODELS, PROVIDERS, REMOVED_MODELS } from "../src/router/catalog.ts";
-import { resolveCatalog, tomlValue } from "../src/router/config-catalog.ts";
+import { exportProviders, resolveCatalog, tomlValue } from "../src/router/config-catalog.ts";
 import { validatePolicy, validateRunModels } from "../src/router/policy.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
@@ -85,6 +85,35 @@ test("authenticated discovery replaces the served set, preserves history, and sk
   } finally {
     store.close();
     f.close();
+  }
+});
+
+test("provider quota modes validate both config shapes and survive export", () => {
+  for (const array of [false, true]) {
+    const fixture = providerFixture();
+    try {
+      for (const mode of [undefined, "windows", "unlimited"] as const) {
+        writeFileSync(
+          fixture.file,
+          `${array ? '[[providers]]\npreset = "claude"' : "[providers.claude]"}\n${mode ? `quota = "${mode}"\n` : ""}`,
+        );
+        const catalog = fixture.load().catalog;
+        expect(catalog?.providers.find((p) => p.id === "claude")?.quota).toBe(mode ?? "windows");
+        if (!catalog) throw new Error("missing catalog");
+        writeFileSync(fixture.file, exportProviders(catalog));
+        expect(fixture.load().catalog?.providers).toEqual(catalog.providers);
+      }
+      for (const value of ['"lots"', "42", "false", '""']) {
+        writeFileSync(
+          fixture.file,
+          `${array ? '[[providers]]\nid = "work"\npreset = "claude"' : "[providers.claude]"}\nquota = ${value}\n`,
+        );
+        expect(fixture.load).toThrow(`${array ? "providers[0].work" : "providers.claude"}.quota`);
+        expect(fixture.load).toThrow(value);
+      }
+    } finally {
+      fixture.close();
+    }
   }
 });
 

@@ -1910,6 +1910,7 @@ export class Store {
       utilization: (r.utilization as number) ?? null,
       resetsAt: (r.resets_at as number) ?? null,
       severity: r.severity as QuotaAlert["severity"],
+      source: (r.source as QuotaAlert["source"]) ?? null,
       routing: r.routing as string,
       createdAt: r.created_at as number,
     }));
@@ -1919,13 +1920,20 @@ export class Store {
     const boundary = alert.resetsAt ?? 0;
     const previous = this.db
       .query(
-        "SELECT severity, created_at FROM quota_alerts WHERE provider = ? AND window = ? AND boundary = ?",
+        "SELECT severity, source, created_at FROM quota_alerts WHERE provider = ? AND window = ? AND boundary = ?",
       )
       .get(alert.provider, alert.window, boundary) as Row | null;
     const current: QuotaAlert = previous
       ? {
           ...alert,
           severity: previous.severity === "exhausted" ? "exhausted" : alert.severity,
+          // Telemetry must not erase a rejection or disambiguate an older exhausted alert.
+          source:
+            previous.source === "rejection" || alert.source === "rejection"
+              ? "rejection"
+              : previous.severity === "exhausted" && previous.source == null
+                ? null
+                : alert.source,
           createdAt: previous.created_at as number,
         }
       : alert;
@@ -1937,8 +1945,8 @@ export class Store {
     const inserted =
       this.db
         .query(
-          `INSERT OR IGNORE INTO quota_alerts (provider, window, boundary, resets_at, utilization, severity, routing, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT OR IGNORE INTO quota_alerts (provider, window, boundary, resets_at, utilization, severity, source, routing, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           current.provider,
@@ -1947,17 +1955,19 @@ export class Store {
           current.resetsAt,
           current.utilization,
           current.severity,
+          current.source ?? null,
           current.routing,
           current.createdAt,
         ).changes > 0;
     if (!inserted)
       this.db
         .query(
-          "UPDATE quota_alerts SET utilization = ?, severity = ?, routing = ?, active = 1 WHERE provider = ? AND window = ? AND boundary = ?",
+          "UPDATE quota_alerts SET utilization = ?, severity = ?, source = ?, routing = ?, active = 1 WHERE provider = ? AND window = ? AND boundary = ?",
         )
         .run(
           current.utilization,
           current.severity,
+          current.source ?? null,
           current.routing,
           current.provider,
           current.window,

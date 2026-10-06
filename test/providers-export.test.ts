@@ -20,6 +20,7 @@ test("export round-trips ordered catalog identities, metadata, nested fields and
       },
       {
         id: "claude",
+        quota: "unlimited",
         label: 'A label with "quotes"\nnew line\\backslash',
         models: [{ ...customModel, id: "extra", efforts: [], effort: undefined }],
       },
@@ -36,7 +37,7 @@ test("export round-trips ordered catalog identities, metadata, nested fields and
     expect(after.models.every((m) => m.source === "config")).toBe(true);
     expect(after.notes).toEqual([]);
   }
-  expect(defaults.providers).toEqual(PROVIDERS);
+  expect(defaults.providers).toEqual(PROVIDERS.map((p) => ({ ...p, quota: "windows" })));
   expect(defaults.models).toEqual(MODELS);
   expect(
     resolveCatalog(parse(exportProviders(defaults)).providers).providers.find((p) => p.id === "mtplx")

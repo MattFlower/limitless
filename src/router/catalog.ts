@@ -1,4 +1,4 @@
-import type { Billing, Complexity, Effort, Role, Vendor } from "../core/types.ts";
+import type { Billing, Complexity, Effort, QuotaMode, Role, Vendor } from "../core/types.ts";
 
 export interface ProviderDef {
   id: string;
@@ -6,6 +6,7 @@ export interface ProviderDef {
   label: string;
   harness: "claude" | "codex" | "decisions" | "fake";
   billing: Billing;
+  quota?: QuotaMode;
   maxConcurrent: number;
   /** Anthropic-compatible endpoint for the claude harness (OpenRouter, mtplx, llama.cpp). */
   baseUrl?: string;

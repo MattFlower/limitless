@@ -157,7 +157,7 @@ test("catalog API adds, patches, validates live policy, blocks referenced deleti
   }
 });
 
-test("catalog discovery API differences and pinned stale targets make no invocation attempt", async () => {
+test("catalog discovery skips stale targets in live and run previews without an invocation attempt", async () => {
   const call = client();
   expect(
     (await call("/api/catalog/models", "POST", { ...customModel, provider: "omlx", id: "experiment" }))
@@ -169,6 +169,16 @@ test("catalog discovery API differences and pinned stale targets make no invocat
   expect(discovery.servedNotInCatalog).toEqual(["uncataloged"]);
   expect(discovery.catalogNotServed).toContain("omlx/qwen-flash");
   expect(discovery.catalogNotServed).not.toContain("omlx/experiment");
+  const chain = ["omlx/qwen-flash", "omlx/experiment"];
+  const expectedPreview = [
+    { modelId: "omlx/qwen-flash", eligible: false, reason: "not served by omlx" },
+    { modelId: "omlx/experiment@none", eligible: true, reason: null },
+  ];
+  factory.routing.setCell("triage", "small", chain);
+  expect(await (await call("/api/routing/preview?role=triage&complexity=small")).json()).toEqual(
+    expectedPreview,
+  );
+  expect(calls).toEqual([]);
   const repo = factory.store.upsertRepo({
     slug: "discovery/repo",
     kind: "local",
@@ -180,8 +190,13 @@ test("catalog discovery API differences and pinned stale targets make no invocat
   const run = factory.store.createRun(repo, {
     repo: repo.slug,
     prompt: "test",
-    models: { triage: ["omlx/qwen-flash", "omlx/experiment"] },
+    models: { triage: chain },
   });
+  factory.routing.setCell("triage", "small", ["codex/sol"]);
+  expect(
+    await (await call(`/api/routing/preview?role=triage&complexity=small&run=${run.id}`)).json(),
+  ).toEqual(expectedPreview);
+  expect(calls).toEqual([]);
   const context = new RunContext(factory.deps, run, repo, new AbortController().signal);
   const result = await context.invoke({
     role: "triage",

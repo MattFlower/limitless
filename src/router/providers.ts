@@ -177,6 +177,13 @@ export class ProviderTracker {
         shadows: new Set(),
       });
     }
+    for (const alert of store.listAlerts(clock())) {
+      if (
+        this.def(alert.provider)?.quota === "unlimited" &&
+        (alert.source === "window" || (alert.source == null && alert.severity === "warning"))
+      )
+        store.clearAlert(alert.provider, alert.window);
+    }
   }
 
   now(): number {
@@ -373,7 +380,7 @@ export class ProviderTracker {
     const p = this.providers.get(id);
     if (!p) return 0;
     let min = 1;
-    for (const [name, w] of Object.entries(p.windows)) {
+    for (const [name, w] of Object.entries(p.def.quota === "unlimited" ? {} : p.windows)) {
       const cap = this.reserveFor(id, name);
       const util = w.resetsAt !== null && w.resetsAt <= now ? 0 : w.utilization;
       min = Math.min(min, (cap - util) / cap);
@@ -601,7 +608,7 @@ export class ProviderTracker {
     p.windows = { ...p.windows, ...current };
     for (const name of Object.keys(current)) p.windowObservedAt[name] = now;
     this.persist(id);
-    if (p.def.billing !== "subscription") return;
+    if (p.def.billing !== "subscription" || p.def.quota === "unlimited") return;
     for (const [name, window] of Object.entries(current)) {
       const cap = this.reserveFor(id, name);
       if (window.resetsAt !== null && window.resetsAt <= now) {
@@ -621,6 +628,7 @@ export class ProviderTracker {
           window.utilization,
           window.resetsAt,
           window.utilization >= cap ? "exhausted" : "warning",
+          "window",
         );
       }
     }
@@ -632,6 +640,7 @@ export class ProviderTracker {
     utilization: number | null,
     resetsAt: number | null,
     severity: QuotaAlert["severity"],
+    source: QuotaAlert["source"],
   ): void {
     const routing =
       this.routingFor?.(id, this.status(id)?.state === "exhausted") ??
@@ -644,6 +653,7 @@ export class ProviderTracker {
       utilization,
       resetsAt,
       severity,
+      source,
       routing,
       createdAt: this.clock(),
     });
@@ -672,7 +682,9 @@ export class ProviderTracker {
         const known = Object.entries(p.windows)
           .filter(
             ([name, w]) =>
-              (w.resetsAt === null || w.resetsAt > now) && w.utilization >= this.reserveFor(id, name),
+              p.def.quota !== "unlimited" &&
+              (w.resetsAt === null || w.resetsAt > now) &&
+              w.utilization >= this.reserveFor(id, name),
           )
           .sort((a, b) => (a[1].resetsAt ?? Infinity) - (b[1].resetsAt ?? Infinity))[0];
         let resetsAt = known ? known[1].resetsAt : (detail?.exhaustedUntil ?? null);
@@ -684,7 +696,14 @@ export class ProviderTracker {
             .find((alert) => alert.provider === id && alert.window === "hard_limit");
           if (existing) resetsAt = existing.resetsAt;
         }
-        this.alert(id, known?.[0] ?? "hard_limit", known?.[1].utilization ?? null, resetsAt, "exhausted");
+        this.alert(
+          id,
+          known?.[0] ?? "hard_limit",
+          known?.[1].utilization ?? null,
+          resetsAt,
+          "exhausted",
+          "rejection",
+        );
       }
     } else if (status === "unavailable" || status === "timeout") {
       p.consecutiveFailures++;
@@ -778,6 +797,7 @@ export class ProviderTracker {
       label: p.def.label,
       kind: providerKind(p.def),
       billing: p.def.billing,
+      quota: p.def.quota ?? "windows",
       enabled: p.enabled,
       fast: p.fast,
       supportsFast: id === "codex" || id === "claude",

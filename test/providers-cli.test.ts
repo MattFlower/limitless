@@ -21,6 +21,22 @@ test("providers CLI shows rounded utilization and independent reading ages", asy
             future: { utilization: 0, resetsAt: null, observedAt: now + 60_000 },
           },
         },
+        {
+          id: "work",
+          state: "ok",
+          reason: null,
+          maxConcurrent: 1,
+          quota: "unlimited",
+          windows: {},
+        },
+        {
+          id: "work-observed",
+          state: "ok",
+          reason: null,
+          maxConcurrent: 1,
+          quota: "unlimited",
+          windows: { five_hour: { utilization: 0.99, observedAt: now } },
+        },
       ]),
   });
   const dir = mkdtempSync(join(tmpdir(), "limitless-providers-cli-"));
@@ -46,6 +62,11 @@ test("providers CLI shows rounded utilization and independent reading ages", asy
     expect(stdout).toContain("maxConcurrent 5");
     expect(stdout).toContain("served-not-in-catalog: new-backend");
     expect(stdout).toContain("catalog-not-served: claude/old");
+    expect(stdout.split("\n").find((line) => line.startsWith("claude"))).not.toContain("No limit");
+    expect(stdout.split("\n").find((line) => line.startsWith("work "))).toContain("No limit (configured)");
+    expect(stdout.split("\n").find((line) => line.startsWith("work-observed"))).toContain(
+      "No limit (configured) five_hour 99%",
+    );
   } finally {
     server.stop();
     rmSync(dir, { recursive: true, force: true });

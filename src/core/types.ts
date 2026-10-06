@@ -328,8 +328,11 @@ export interface ModelDiscovery {
   observations: { model: string; firstSeen: number; lastSeen: number }[];
 }
 
+export type QuotaMode = "windows" | "unlimited";
+
 export interface ProviderStatus {
   discovery?: ModelDiscovery;
+  quota?: QuotaMode;
   kind?: string;
   fast?: boolean;
   supportsFast?: boolean;
@@ -379,6 +382,8 @@ export interface QuotaAlert {
   utilization: number | null;
   resetsAt: number | null;
   severity: "warning" | "exhausted";
+  /** Missing on older alerts whose origin cannot be determined. */
+  source?: "window" | "rejection" | null;
   routing: string;
   createdAt: number;
 }
