@@ -25,6 +25,7 @@ export interface ProviderDef {
 }
 
 export interface ModelDef {
+  source?: "code" | "config" | "runtime";
   id: string; // "<provider>/<short>"
   /** Shared checkpoint identity across backends; defaults to the catalog id. */
   checkpoint?: string;

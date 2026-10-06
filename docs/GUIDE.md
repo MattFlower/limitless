@@ -481,14 +481,44 @@ The PR body is the evidence report, also saved as `report.md`. It contains:
 | `twilight` | free | same, `http://twilight:8080` | a LAN llama.cpp server and `TWILIGHT_API_KEY` |
 | `typesafe` | metered | `decisions`: typed questions over HTTP (`https://api.typesafe.ai/v1/systemone`); triage only | `TYPESAFE_API_KEY` |
 
-The provider and model catalog, including these endpoints, is currently built into
-`src/router/catalog.ts`. Defining providers in config is planned (M6 in [PLAN](PLAN.md)). Local
+The effective catalog combines built-in definitions, `[[providers]]` and
+`[[providers.models]]` in config.toml, and runtime model additions stored in SQLite. Local
 servers are probed every minute and show `down` until they answer. That is harmless: the router
 skips them.
 
 **Enable or disable** a provider with `limitless providers enable|disable <id>` or the button on
 its provider card on the **Providers** page. The setting persists across restarts. A provider
 whose API key is missing stays disabled.
+
+Use `limitless catalog list` to see model sources and the latest served IDs from eligible
+authenticated `/v1/models` probes. `limitless providers` and provider cards show served models
+missing from the catalog and catalog models missing from the served list. A healthy provider's
+current served list prevents stale catalog entries from consuming an invocation attempt.
+Failed or malformed probes leave historical first/last-seen observations intact but make
+discovery inconclusive. Claude CLI, Codex CLI, and OpenRouter are excluded from discovery.
+
+To try a newly served local build, copy its exact backend ID from discovery and add explicit
+checkpoint origins (use `unknown` when unknown), vendor, tier, supported efforts, and prices
+in dollars per million tokens. For example:
+
+```sh
+limitless catalog add omlx/new-local --model New-Qwen-Build --origin CN --base-origin CN \
+  --vendor qwen --tier 2 --price-input 0 --price-output 0 --efforts none,high --effort none \
+  --notes 'Local experiment'
+limitless run 'Classify this task' --repo owner/repo --model triage=omlx/new-local@high
+limitless routing set triage.default omlx/new-local@high,codex/luna
+```
+
+Runtime models are immediately available and survive restarts. They participate only when
+explicitly named in a policy cell or run chain; automatic escalation and free-model widening
+exclude them. For agent roles on local Claude-backed servers, omit a default effort and use
+the bare model ID. `POST /api/catalog/models` accepts config-style metadata plus `provider`;
+`PATCH /api/catalog/models/:id` updates runtime entries. Code and config entries are read-only.
+Encode the full ID in the API path (for example `omlx%2Fnew-local`). Before
+`limitless catalog remove omlx/new-local`, clear every operator cell referencing it with
+`limitless routing reset <role>.<cell>`. Deletion names blocking cells; saved run chains retain
+deleted IDs and skip them as missing catalog entries. Provider definitions still require
+config.toml and a daemon restart.
 
 For the Mac, the default local model is `omlx/qwen-flash` (`Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`);
 `omlx/qwen-27b` (`Swift-1.5-Qwen3.8-27b-oQ8e-mtp`) is opt-in. The smoke check, and free-first
@@ -874,7 +904,7 @@ debug events according to `[retention]`. Run it by hand with `limitless gc --dry
 
 `limitless local up|down|status` reports oMLX reachability even on `down`, without managing its
 lifecycle or enablement, and manages the llama.cpp unit on twilight. See [OPERATIONS](OPERATIONS.md#local-models). These endpoints are specific to the reference
-setup until providers become configurable.
+setup; additional providers can be defined in config.toml.
 
 <a id="remote-ui"></a>
 

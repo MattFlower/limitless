@@ -551,6 +551,16 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       GET: handle(() => json(store.listRepos())),
     },
     "/api/providers": handle(() => json(factory.tracker.all())),
+    "/api/catalog": handle(() => json(factory.catalog.snapshot())),
+    "/api/catalog/models": {
+      POST: handle(async (req) => json(factory.catalog.add(await body<unknown>(req)), 201)),
+    },
+    "/api/catalog/models/:id": {
+      PATCH: handle(async (req) =>
+        json(factory.catalog.patch(req.params.id ?? "", await body<unknown>(req))),
+      ),
+      DELETE: handle((req) => json(factory.catalog.remove(req.params.id ?? ""))),
+    },
     "/api/routing": handle((req) =>
       json(factory.routing.snapshot(new URL(req.url).searchParams.get("run") ?? undefined)),
     ),

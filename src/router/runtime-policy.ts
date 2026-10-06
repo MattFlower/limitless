@@ -1,7 +1,8 @@
 import type { Complexity, Role, RoutingCell, RoutingChange, RunModels, RunRole } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
-import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef, REMOVED_MODELS } from "./catalog.ts";
+import { DEFAULT_POLICY, type ModelDef, type Policy, type ProviderDef } from "./catalog.ts";
 import { overlayPolicy, type PolicyOverlay, validatePolicy } from "./policy.ts";
+import { validatePrefer } from "./prefer.ts";
 import type { Router } from "./router.ts";
 
 const CELLS: RoutingCell[] = ["default", "trivial", "small", "medium", "large"];
@@ -26,7 +27,8 @@ export class RuntimePolicy {
       this.operator[role] = { ...this.operator[role], [cell]: this.groups(role, cell, row.groups) };
     }
     this.operatorPrefer = store.routingPrefer();
-    if (this.operatorPrefer !== null) this.validatePrefer(this.operatorPrefer);
+    if (this.operatorPrefer !== null)
+      this.operatorPrefer = validatePrefer(this.operatorPrefer, this.models, this.providers);
     // History IDs survive restart and distinguish edits even when a cell is reset to its old value.
     for (const change of store.routingHistory())
       if (this.changesCell(change) && !this.revisions.has(change.key))
@@ -64,19 +66,6 @@ export class RuntimePolicy {
     if (value === undefined) return null;
     if (typeof value !== "string") throw new Error("note must be a string");
     return value;
-  }
-
-  private validatePrefer(value: unknown): string[] {
-    if (!Array.isArray(value)) throw new Error("prefer: expected provider IDs");
-    for (const id of value) {
-      if (typeof id !== "string" || !this.providers.some((p) => p.id === id)) {
-        const retired = typeof id === "string" ? REMOVED_MODELS.get(id) : undefined;
-        throw new Error(
-          `prefer: unknown provider ${String(id)}${retired ? `: ${retired}` : " (use provider IDs, not model IDs)"}`,
-        );
-      }
-    }
-    return [...value] as string[];
   }
 
   get prefer(): string[] {
@@ -145,7 +134,7 @@ export class RuntimePolicy {
   }
 
   setPrefer(value: unknown, note?: unknown, by = "operator") {
-    const prefer = value === null ? null : this.validatePrefer(value);
+    const prefer = value === null ? null : validatePrefer(value, this.models, this.providers);
     const change = this.store.writeRouting("prefer", prefer, this.note(note), by);
     this.operatorPrefer = prefer;
     this.router.setPreferProviders(this.prefer);

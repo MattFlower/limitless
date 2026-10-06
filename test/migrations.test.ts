@@ -3,10 +3,55 @@ import { expect, test } from "bun:test";
 import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Factory } from "../src/app.ts";
+import { loadConfig } from "../src/config.ts";
 import type { AuditAllowance, CreateRunRequest, Run } from "../src/core/types.ts";
 import { MIGRATION_DIR, migrationNames, runMigrations } from "../src/db/migration-runner.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
 import { Store } from "../src/db/store.ts";
+import { customModel } from "./provider-config-support.ts";
+
+test("runtime catalog and discovery upgrade legacy databases and restore before operator policy", () => {
+  temporary((directory, path) => {
+    legacyDatabase(path);
+    const cfg = loadConfig({ home: directory, configDir: directory });
+    let store = new Store(path);
+    const factory = new Factory(cfg, { store });
+    factory.catalog.add({ ...customModel, provider: "codex", id: "experiment" });
+    factory.routing.setCell("triage", "default", ["codex/experiment@high"]);
+    store.writeDiscovery("omlx", ["first", "second"], 100);
+    store.writeDiscovery("omlx", ["second"], 200);
+    store.close();
+    const previous = new Database(path);
+    expect(previous.query("SELECT value FROM settings WHERE key = 'sentinel'").get()).toEqual({
+      value: "unchanged",
+    });
+    previous.exec("INSERT INTO settings VALUES ('rollback', 'works')");
+    previous.close();
+    store = new Store(path);
+    try {
+      const restored = new Factory(cfg, { store });
+      expect(restored.router.route("triage", "small").candidates[0]?.targetId).toBe("codex/experiment@high");
+      expect(restored.catalog.snapshot().models.find((m) => m.id === "codex/experiment")?.source).toBe(
+        "runtime",
+      );
+      expect(store.discovery("omlx")).toEqual({
+        served: ["second"],
+        observedAt: 200,
+        observations: [
+          { model: "first", firstSeen: 100, lastSeen: 100 },
+          { model: "second", firstSeen: 100, lastSeen: 200 },
+        ],
+      });
+      expect(restored.tracker.status("omlx")?.discovery?.served).toBeNull();
+      expect(store.db.query("SELECT value FROM settings WHERE key = 'rollback'").get()).toEqual({
+        value: "works",
+      });
+    } finally {
+      store.close();
+    }
+  });
+});
 
 function temporary(testBody: (directory: string, path: string) => void): void {
   const directory = mkdtempSync(join(tmpdir(), "limitless-migrations-"));

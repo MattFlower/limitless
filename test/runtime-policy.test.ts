@@ -5,10 +5,11 @@ import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
-import { DEFAULT_POLICY, MODELS, PROVIDERS } from "../src/router/catalog.ts";
+import { DEFAULT_POLICY, MODELS, PROVIDERS, REMOVED_MODELS } from "../src/router/catalog.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 import { RuntimePolicy } from "../src/router/runtime-policy.ts";
+import { customProvider } from "./provider-config-support.ts";
 
 let dir: string;
 let store: Store;
@@ -86,12 +87,74 @@ test.each([
   expect(store.routingCells()).toEqual([]);
 });
 
-test.each(["unknown", "codex/sol", "claude/fable", 42])("rejects provider preference %s atomically", (id) => {
-  const { runtime } = setup();
-  const before = runtime.snapshot();
-  expect(() => runtime.setPrefer([id])).toThrow("prefer:");
-  if (id === "claude/fable") expect(() => runtime.setPrefer([id])).toThrow("owner decision");
-  expect(runtime.snapshot()).toEqual(before);
+function errorMessage(action: () => unknown): string {
+  try {
+    action();
+  } catch (error) {
+    if (error instanceof Error) return error.message;
+    throw error;
+  }
+  throw new Error("expected validation failure");
+}
+
+test.each([
+  [
+    ["codex/astra"],
+    `routing.prefer: "codex/astra" is a retired model ID: ${REMOVED_MODELS.get("codex/astra")}`,
+  ],
+  [
+    ["claude/fable"],
+    `routing.prefer: "claude/fable" is a retired model ID: ${REMOVED_MODELS.get("claude/fable")}`,
+  ],
+  [
+    ["claude/opus"],
+    'routing.prefer: "claude/opus" is a model ID, not a provider; prefer takes provider IDs (use "claude")',
+  ],
+  [
+    ["codex/sol"],
+    'routing.prefer: "codex/sol" is a model ID, not a provider; prefer takes provider IDs (use "codex")',
+  ],
+  [
+    ["mac-mlx/flash"],
+    'routing.prefer: "mac-mlx/flash" is a model ID, not a provider; prefer takes provider IDs (use "mac-mlx")',
+  ],
+  [["nonexistent"], 'routing.prefer: "nonexistent" is not a known provider ID'],
+  [["unknown"], 'routing.prefer: "unknown" is not a known provider ID'],
+  ["codex", "routing.prefer must be an array of provider IDs"],
+  [[42], "routing.prefer[0] must be a provider ID string"],
+  [["codex", 3], "routing.prefer[1] must be a provider ID string"],
+  [["codex"], null],
+  [["mac-mlx", "codex"], null],
+  [["codex", "mac-mlx", "codex"], null],
+  [[], null],
+] as const)("config and runtime validate prefer %j identically", (prefer, expectedError) => {
+  const config = (value: unknown) =>
+    loadConfig({
+      home: dir,
+      configDir: dir,
+      raw: { providers: [customProvider], routing: { prefer: value } },
+    });
+  const cfg = config(["claude"]);
+  const catalog = cfg.catalog;
+  if (!catalog) throw new Error("missing catalog");
+  const tracker = new ProviderTracker(catalog.providers, store, cfg.reserves, {});
+  const router = new Router(tracker, DEFAULT_POLICY, catalog.models);
+  const runtime = new RuntimePolicy(store, router, catalog.models, catalog.providers, cfg.preferProviders);
+  if (expectedError === null) {
+    expect(config(prefer).preferProviders).toEqual<unknown>(prefer);
+    expect(runtime.setPrefer(prefer).prefer).toEqual<unknown>(prefer);
+    expect(store.routingPrefer()).toEqual<unknown>(prefer);
+  } else {
+    runtime.setPrefer(["codex"]);
+    const before = runtime.snapshot();
+    const route = router.route("implement", "small");
+    const configError = errorMessage(() => config(prefer));
+    expect(configError).toBe(expectedError);
+    expect(errorMessage(() => runtime.setPrefer(prefer))).toBe(configError);
+    expect(runtime.snapshot()).toEqual(before);
+    expect(store.routingPrefer()).toEqual(["codex"]);
+    expect(router.route("implement", "small")).toEqual(route);
+  }
 });
 
 test("history insertion failure rolls back the current cell and leaves routing unchanged", () => {
@@ -112,7 +175,9 @@ test("startup validates persisted operator cells and preferences against today's
   expect(setup).toThrow("owner decision");
   store.writeRouting("triage.default", null, null, "tester");
   store.writeRouting("prefer", ["codex/sol"], null, "previous release");
-  expect(setup).toThrow("prefer: unknown provider codex/sol");
+  expect(setup).toThrow(
+    'routing.prefer: "codex/sol" is a model ID, not a provider; prefer takes provider IDs (use "codex")',
+  );
   expect(store.routingHistory()).toHaveLength(3);
 });
 
