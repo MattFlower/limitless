@@ -163,7 +163,9 @@ function png(b: Buffer) {
 function gif(b: Buffer) {
   valid(/^GIF8[79]a$/.test(b.toString("ascii", 0, 6)) && b.readUInt16LE(6) > 0 && b.readUInt16LE(8) > 0);
   let at = 13,
-    images = 0;
+    images = 0,
+    total = 0;
+  const decodedFrames: Buffer[] = [];
   const global = (b[10] ?? 0) & 128 ? 1 << (((b[10] ?? 0) & 7) + 1) : 0;
   slice(b, at, global * 3);
   at += global * 3;
@@ -182,6 +184,8 @@ function gif(b: Buffer) {
     const marker = b[at++];
     if (marker === 0x3b) {
       valid(images > 0 && at === b.length);
+      // Payload signatures can span frames even when each frame is individually clean.
+      clean(Buffer.concat(decodedFrames));
       return;
     }
     if (marker === 0x21) {
@@ -223,7 +227,8 @@ function gif(b: Buffer) {
     const packed = blocks(),
       clear = 1 << min,
       end = clear + 1;
-    valid(width * height <= MEDIA_LIMIT);
+    total += width * height;
+    valid(total <= MEDIA_LIMIT);
     const decoded = Buffer.alloc(width * height);
     let pos = 0,
       size = min + 1,
@@ -265,7 +270,7 @@ function gif(b: Buffer) {
       previous = entry;
     }
     valid(count === width * height && Math.ceil(pos / 8) === packed.length);
-    clean(decoded);
+    decodedFrames.push(decoded);
     images++;
   }
   valid(false);

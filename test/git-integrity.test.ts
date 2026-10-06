@@ -2087,55 +2087,60 @@ test("embedded image, font and audio payloads remain opaque even inside declared
 
 test("GIF LZW pixels carrying a ZIP require an allowance on additions and edits", async () => {
   const payload = mediaFixture("zip");
-  const encode = (pixels: Buffer) => {
-    const screen = Buffer.alloc(7),
-      image = Buffer.alloc(10);
-    screen.writeUInt16LE(pixels.length, 0);
+  const encode = (pixels: Buffer, frameWidth: number) => {
+    const screen = Buffer.alloc(7);
+    screen.writeUInt16LE(frameWidth, 0);
     screen.writeUInt16LE(1, 2);
     screen[4] = 0xf7; // A 256-color global palette permits every byte as a pixel index.
-    image[0] = 0x2c;
-    image.writeUInt16LE(pixels.length, 5);
-    image.writeUInt16LE(1, 7);
-    // Clearing before each literal keeps every code nine bits wide and re-encodes
-    // the archive so its signatures do not appear in the raw GIF stream.
-    const codes = [...[...pixels].flatMap((byte) => [256, byte]), 257];
-    const packed = Buffer.alloc(Math.ceil((codes.length * 9) / 8));
-    let bit = 0;
-    for (const code of codes)
-      for (let i = 0; i < 9; i++, bit++)
-        packed[bit >> 3] = (packed[bit >> 3] ?? 0) | (((code >> i) & 1) << (bit & 7));
-    const blocks: Buffer[] = [];
-    for (let at = 0; at < packed.length; at += 255) {
-      const block = packed.subarray(at, at + 255);
-      blocks.push(Buffer.from([block.length]), block);
+    const frames: Buffer[] = [];
+    for (let offset = 0; offset < pixels.length; offset += frameWidth) {
+      const frame = pixels.subarray(offset, offset + frameWidth),
+        image = Buffer.alloc(10);
+      image[0] = 0x2c;
+      image.writeUInt16LE(frame.length, 5);
+      image.writeUInt16LE(1, 7);
+      // Clearing before each literal keeps every code nine bits wide and re-encodes
+      // the archive so its signatures do not appear in the raw GIF stream.
+      const codes = [...[...frame].flatMap((byte) => [256, byte]), 257];
+      const packed = Buffer.alloc(Math.ceil((codes.length * 9) / 8));
+      let bit = 0;
+      for (const code of codes)
+        for (let i = 0; i < 9; i++, bit++)
+          packed[bit >> 3] = (packed[bit >> 3] ?? 0) | (((code >> i) & 1) << (bit & 7));
+      const blocks: Buffer[] = [];
+      for (let at = 0; at < packed.length; at += 255) {
+        const block = packed.subarray(at, at + 255);
+        blocks.push(Buffer.from([block.length]), block);
+      }
+      frames.push(Buffer.concat([image, Buffer.from([8]), ...blocks, Buffer.from([0])]));
     }
-    return Buffer.concat([
-      Buffer.from("GIF89a"),
-      screen,
-      Buffer.alloc(768),
-      image,
-      Buffer.from([8]),
-      ...blocks,
-      Buffer.from([0, 0x3b]),
-    ]);
+    return Buffer.concat([Buffer.from("GIF89a"), screen, Buffer.alloc(768), ...frames, Buffer.from([0x3b])]);
   };
-  const file = "encoded-payload.gif";
-  writeFileSync(join(work, file), encode(Buffer.alloc(payload.length, 65)));
+  const files = [payload.length, 1, 3].map((frameWidth) => ({
+    file: `encoded-payload-${frameWidth}.gif`,
+    frameWidth,
+  }));
+  for (const { file, frameWidth } of files)
+    writeFileSync(join(work, file), encode(Buffer.alloc(payload.length, 65), frameWidth));
   await commitAll(work, "ordinary encoded pixels");
   const mediaBase = await headSha(work);
   expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toEqual([]);
-  writeFileSync(join(work, file), encode(payload));
+  for (const { file, frameWidth } of files) writeFileSync(join(work, file), encode(payload, frameWidth));
   await commitAll(work, "ZIP encoded as pixels");
   for (const revision of [base, mediaBase]) {
     const diff = await diffSince(work, revision);
-    expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([
-      expect.objectContaining({
-        file,
-        rule: "binary-content",
-        severity: "block",
-        detail: expect.stringContaining("Allow: binary"),
-      }),
-    ]);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(findings).toHaveLength(files.length);
+    for (const { file } of files)
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file,
+          rule: "binary-content",
+          severity: "block",
+          detail: expect.stringContaining(`${file}:`),
+        }),
+      );
+    expect(findings.every((finding) => finding.detail.includes("Allow: binary"))).toBe(true);
     expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
   }
 });
