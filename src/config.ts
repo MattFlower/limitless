@@ -8,6 +8,7 @@ import { evalSettings } from "./evals/settings.ts";
 import { defaultGateSlots } from "./gates/slots.ts";
 import { parseReviewRosters } from "./pipeline/review-system.ts";
 import { type EffectiveCatalog, resolveCatalog } from "./router/config-catalog.ts";
+import { validatePrefer } from "./router/prefer.ts";
 import { isLanAddress, isLoopback, publicOrigin } from "./server/access.ts";
 import { registerCredential } from "./util/proc.ts";
 
@@ -220,6 +221,11 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
       throw new Error(`routing.wait_budget_s.${role} must be nonnegative integer seconds`);
     waitBudgetS[role as Role] = seconds;
   }
+  const prefer = validatePrefer(
+    routing.prefer === undefined ? [] : routing.prefer,
+    catalog.models,
+    catalog.providers,
+  );
   const rawReview = raw.review ?? {};
   if (typeof rawReview !== "object" || rawReview === null || Array.isArray(rawReview))
     throw new Error("review must be a table");
@@ -345,9 +351,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
         ]),
       ),
     },
-    preferProviders: Array.isArray(routing.prefer)
-      ? routing.prefer.filter((p): p is string => typeof p === "string")
-      : [],
+    preferProviders: prefer,
     waitBudgetS,
     dependabotRouting: routing.dependabot === "policy" ? "policy" : "free_first",
     reviewImplementerReport: review.implementer_report === "omit" ? "omit" : "include",

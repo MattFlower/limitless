@@ -296,17 +296,39 @@ detection, per-invocation budget, process-group kill on cancel.
 SQLite (`bun:sqlite`, WAL) at `~/.limitless/limitless.db`; large artifacts (event logs, diffs,
 prompts) as files under `~/.limitless/runs/<run-id>/`. Tables: `repos`, `runs`, `stages`,
 `invocations`, `events`, `artifacts`, `questions`, `provider_state`, `inbox` (webhook dedupe +
-audit), `chat_messages`, `settings`. The frozen legacy migrations and timestamped SQL files are applied at startup.
+audit), `chat_messages`, `settings`, `land_entries` (the approved-PR queue). The frozen legacy
+migrations and timestamped SQL files are applied at startup.
 
 On startup, runs left `running` by a crash/restart are re-queued and resume at the start of their
-current stage (the worktree is preserved; Claude sessions can be resumed).
+current stage (the worktree is preserved; Claude sessions can be resumed). Land entries left in
+flight are resumed too: `checking` re-runs the checks, `waiting_ci` keeps waiting on the recorded
+commit, and `merging` first asks GitHub whether the PR already merged.
+
+### Landing (the land queue)
+
+`limitless land <run|pr>` (or `POST /api/land`) approves a pull request for landing: the approval is
+the run's recorded review approval, or an explicit `--sha` that must be the PR's current head. Only
+the approved SHA — plus a base merge the factory itself made — may land. One entry lands at a time
+per repository, oldest first, and the claim that gives a repository to one queue is a store
+transaction (`claimLandEntry`, one running land per repository), so a restart resumes and two queues
+cannot check the same repository at once.
+
+Each entry checks out the approved head from the bare cache, merges the base in when it has moved,
+runs the repository's checks (from the base commit's `.limitless.toml`) in one gate slot with the
+output written to `<runs>/<run>/land-<entry>.log`, pushes any merge commit with a lease on the
+approved head, and waits for CI on exactly that commit — moved by the poller's `pr.ci_passed` /
+`pr.ci_failed` items, with a timed read for a restart and for polling being off. A transient CI
+failure is re-run once. The squash-merge is pinned with `--match-head-commit` and carries the
+reviewed title and body; it never arms auto-merge. A conflict, a failing check, a moved head, red CI
+or CI that never finishes blocks the entry with a reason and merges nothing; a cancel or a shutdown
+aborts in-flight git, gates and `gh` calls through one signal.
 
 ## 8. Interfaces
 
 | Surface | What it does |
 |---|---|
 | **Web UI** (SolidJS) | Mission control: live runs, queue, quota gauges, spend; run detail with stage timeline, invocations (model/cost/tokens/duration), live event log, spec/diff/review/verdict artifacts, questions, cancel/retry; chat to start runs. Loopback needs no sign-in; through the LAN proxy it takes a passkey (or password) and a long-lived session cookie ([OPERATIONS](OPERATIONS.md#signing-in)). |
-| **CLI** `limitless` | `run`, `ls`, `show`, `logs -f`, `cancel`, `answer`, `serve`, `mcp`, `deploy`, `auth` (UI passkeys, password and sessions). |
+| **CLI** `limitless` | `run`, `ls`, `show`, `logs -f`, `cancel`, `answer`, `land` (queue, list, cancel), `serve`, `mcp`, `deploy`, `auth` (UI passkeys, password and sessions). |
 | **Chat concierge** | Shared by UI chat and Discord: turns free text into a confirmed run, answers status questions. Runs on a local model when available. |
 | **GitHub** | `POST /webhooks/github` (HMAC-verified): Dependabot PRs → `quick` verify-and-merge; issue labeled `limitless` or `/limitless …` comment by the owner → run; CI failure on a factory PR → fix run. |
 | **Discord** | `/build`, `/runs`, `/show`, `/cancel`; one thread per run with progress, questions and the final report. |

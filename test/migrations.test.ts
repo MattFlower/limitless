@@ -448,6 +448,53 @@ test("the baseline cache ships as one migration with no unused table", () => {
   });
 });
 
+test("the previous release opens the migrated database and can still write runs and invocations", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    // The shipped migrations minus the land queue: exactly what the last release knows.
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-land-queue.sql"),
+    });
+    new Store(path).close(); // the new release applies every file, including the land queue
+    const store = new Store(path, before);
+    const repo = store.upsertRepo({
+      slug: "owner/name",
+      kind: "github",
+      url: "git@github.com:owner/name.git",
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "old release work" });
+    const invocation = store.createInvocation({
+      runId: run.id,
+      stageId: null,
+      role: "implement",
+      harness: "claude-cli",
+      provider: "claude",
+      model: "claude-opus-5",
+      modelId: "claude/opus",
+    });
+    store.updateInvocation(invocation.id, { status: "ok", finishedAt: Date.now() });
+    store.updateRun(run.id, { status: "succeeded", prUrl: "https://github.com/owner/name/pull/1" });
+    store.close();
+    const tables = (db: Database) =>
+      (
+        db
+          .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'land_entries'")
+          .all() as unknown[]
+      ).length;
+    const reopened = new Database(path);
+    expect(tables(reopened)).toBe(1); // the land queue's table is additive: the old release ignores it
+    reopened.close();
+    const again = new Store(path, before);
+    expect(again.getRun(run.id)?.status).toBe("succeeded");
+    expect(again.listInvocations(run.id)[0]).toMatchObject({ status: "ok", role: "implement" });
+    again.close();
+  });
+});
+
 test("audit allowances persist from requester text and options; legacy runs allow nothing", () => {
   temporary((_directory, path) => {
     let store = new Store(path);

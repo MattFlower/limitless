@@ -5798,6 +5798,7 @@ protected_paths = ["protected.txt"]
   test("interrupted holdout is retried after restart and remains unpublished while stopped", async () => {
     let holdoutCalls = 0;
     let slow = true;
+    let implementStarted = false;
     const holdoutCwds: string[] = [];
     const handler: Handler = (s) => {
       const role = roleOf(s);
@@ -5810,18 +5811,24 @@ protected_paths = ["protected.txt"]
       }
       if (role === "review") return { structured: approve };
       if (role === "verify") return { structured: pass };
-      return { files: { "farewell.txt": "goodbye\n" } };
+      implementStarted = true;
+      // Stop inside the fake harness, never in a racing git add/commit that can leave a lock behind.
+      return slow ? { fault: "block" } : { files: { "farewell.txt": "goodbye\n" } };
     };
     const f = start(handler);
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
     const deadline = Date.now() + 10_000;
     while (
-      (f.store.getRunState<RunState>(run.id)?.holdoutStatus !== "generating" || !holdoutCwds.length) &&
+      (f.store.getRunState<RunState>(run.id)?.holdoutStatus !== "generating" ||
+        !holdoutCwds.length ||
+        !implementStarted) &&
       Date.now() < deadline
     )
       await Bun.sleep(10);
     expect(f.store.getRunState<RunState>(run.id)?.holdoutStatus).toBe("generating");
+    expect(implementStarted).toBe(true);
     await f.stop();
+    expect(f.store.listInvocations(run.id).find((i) => i.role === "implement")?.status).toBe("cancelled");
     // Cancellation removes the snapshot but leaves the implementer's worktree for the restart.
     expect(holdoutCwds).toHaveLength(1);
     expect(existsSync(holdoutCwds[0] ?? "")).toBe(false);
