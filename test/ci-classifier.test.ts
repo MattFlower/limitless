@@ -2,7 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { ciSignature } from "../src/integrations/ci-classifier.ts";
+import { Store } from "../src/db/store.ts";
+import { ciDecision, ciSignature } from "../src/integrations/ci-classifier.ts";
+import { normalizePr } from "../src/integrations/github-poller.ts";
 import { pollerHarness, respond, SHA, url } from "./github-poller-support.ts";
 
 let h: ReturnType<typeof pollerHarness>;
@@ -172,72 +174,24 @@ test.each([401, 403, 404, 422])(
   },
 );
 
-test.each([
-  [429, { "retry-after": "30" }, 201, true],
-  [429, { "retry-after": "30" }, 429, true],
-  [403, { "retry-after": "30" }, 403, true],
-  [422, { "x-ratelimit-remaining": "0" }, 422, true],
-  [429, {}, 201, false],
-  [429, { "retry-after": "invalid" }, 201, false],
-])(
-  "a rate-limited rerun (%s) gets one persisted retry, then resolves (%s)",
-  async (status, headers, next, restart) => {
-    h = pollerHarness();
-    const f = failure();
-    const start = h.clock.now();
-    const cooldown = new Headers(headers).get("retry-after") === "30" ? 30000 : 60000;
-    let accepted = 0;
-    let attempts = 0;
-    h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () => {
-      const response = ++attempts === 1 ? status : next;
-      if (response === 201) accepted++;
-      return respond(response, {}, response === 201 ? {} : headers);
-    });
-    h.start(15);
-    await h.advance(0);
-    expect(h.store.ciFailures(f.node.url, SHA)[0]).toMatchObject({
-      outcome: "rerun_requested",
-      rerunRetryAt: start + cooldown,
-      rerunRetryUsed: 0,
-    });
-    expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(true);
-    expect(items("ci.needs_fix")).toHaveLength(0);
-    if (restart) {
-      h.reopen();
-      h.start(15);
-      await h.advance(0);
-    }
-    await h.advance(cooldown - 15000);
-    expect(reruns()).toHaveLength(1);
-    expect(h.store.ciFailures(f.node.url, SHA)[0]?.rerunRetryAt).toBe(start + cooldown);
-    await h.advance(15000);
-    expect(reruns()).toHaveLength(2);
-    const postTimes = h.gh.calls.flatMap((call, i) => (call.path.endsWith("/rerun") ? [h.gh.times[i]] : []));
-    expect(postTimes).toEqual([start, start + cooldown]);
-    expect(h.store.ciFailures(f.node.url, SHA)[0]?.rerunRetryUsed).toBe(1);
-    if (next === 201) {
-      expect(accepted).toBe(1);
-      expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerunning");
-      f.rerun("success");
-      f.observe("SUCCESS", "rerun");
-      await h.advance(15000);
-      expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_then_passed");
-      expect(items("ci.needs_fix")).toHaveLength(0);
-    } else {
-      expect(accepted).toBe(0);
-      expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_rejected");
-      expect(items("ci.needs_fix")).toHaveLength(1);
-    }
-    expect(JSON.parse(h.store.githubPrData(f.node.url) ?? "{}").ciPending).toBe(false);
-    await h.advance(60000);
-    h.reopen();
-    h.start(15);
-    await h.advance(0);
-    await h.advance(60000);
-    expect(reruns()).toHaveLength(2);
-    expect(items("ci.needs_fix")).toHaveLength(next === 201 ? 0 : 1);
-  },
-);
+test.each([429, 403, 422])("a rate-limited rerun (%s) cannot make another request", async (status) => {
+  h = pollerHarness();
+  const f = failure();
+  h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () =>
+    respond(status, {}, { "retry-after": "30" }),
+  );
+  h.start(15);
+  await h.advance(0);
+  expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_rejected");
+  expect(items("ci.needs_fix")).toHaveLength(1);
+  await h.advance(30000);
+  h.reopen();
+  h.start(15);
+  await h.advance(0);
+  await h.advance(60000);
+  expect(reruns()).toHaveLength(1);
+  expect(items("ci.needs_fix")).toHaveLength(1);
+});
 
 test.each(["disabled", "security"])("a refused rerun that becomes %s cannot retry", async (reason) => {
   h = pollerHarness();
@@ -264,38 +218,6 @@ test.each(["disabled", "security"])("a refused rerun that becomes %s cannot retr
   expect(reruns()).toHaveLength(1);
   expect(items("ci.needs_fix")).toHaveLength(1);
 });
-
-test.each([408, 500, "lost"])(
-  "an ambiguous retry response (%s) consumes the allowance across restart",
-  async (status) => {
-    h = pollerHarness();
-    const f = failure();
-    let attempts = 0;
-    h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () => {
-      if (++attempts === 1) return respond(429, {}, { "retry-after": "30" });
-      if (status === "lost") throw new Error("connection reset");
-      return respond(status, {});
-    });
-    h.start(15);
-    await h.advance(0);
-    await h.advance(30000);
-    expect(reruns()).toHaveLength(2);
-    expect(h.store.ciFailures(f.node.url, SHA)[0]).toMatchObject({
-      outcome: "rerun_requested",
-      rerunRetryAt: null,
-      rerunRetryUsed: 1,
-    });
-    h.reopen();
-    h.start(15);
-    await h.advance(0);
-    expect(reruns()).toHaveLength(2);
-    expect(items("ci.needs_fix")).toHaveLength(0);
-    f.rerun("success");
-    await h.advance(15000);
-    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("failed_then_passed");
-    expect(reruns()).toHaveLength(2);
-  },
-);
 
 test.each([
   ["FAILURE", "attempt"],
@@ -390,7 +312,7 @@ test.each(["attempt", "job"])(
   },
 );
 
-test.each([false, true])("same-name checks have independent reruns (same workflow=%s)", async (sameRun) => {
+test.each([false, true])("same-name checks share the head rerun cap (same workflow=%s)", async (sameRun) => {
   h = pollerHarness();
   const f = failure();
   f.job.name = "first job";
@@ -421,45 +343,15 @@ test.each([false, true])("same-name checks have independent reruns (same workflo
   }
   h.start(15);
   await h.advance(0);
-  expect(reruns().map((c) => c.path)).toEqual([
-    "repos/o/r/actions/jobs/21/rerun",
-    "repos/o/r/actions/jobs/22/rerun",
-  ]);
-  expect(h.store.ciFailures(f.node.url, SHA).map((r) => r.outcome)).toEqual(["rerunning", "rerunning"]);
-  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(reruns().map((c) => c.path)).toEqual(["repos/o/r/actions/jobs/21/rerun"]);
+  expect(h.store.ciFailures(f.node.url, SHA).map((r) => r.outcome)).toEqual(["rerunning", "failed"]);
+  expect(items("ci.needs_fix")).toHaveLength(1);
   h.reopen();
   f.observe("FAILURE", "sibling changed");
   h.start(15);
   await h.advance(0);
-  expect(reruns()).toHaveLength(2);
-  expect(h.store.ciFailures(f.node.url, SHA).every((r) => r.outcome === "rerunning")).toBe(true);
-  f.rerun("timed_out", "in_progress");
-  job.id = 122;
-  job.run_attempt = 2;
-  other.id = 112;
-  other.details_url = `https://github.com/o/r/actions/runs/${job.run_id}/job/${job.id}`;
-  job.check_run_url = "https://api.github.com/repos/o/r/check-runs/112";
-  h.gh.responses.set("repos/o/r/check-runs/112/annotations?per_page=100&page=1", () => respond(200, []));
-  h.gh.responses.set("repos/o/r/actions/jobs/122", () => respond(200, job));
-  h.gh.responses.set("repos/o/r/actions/jobs/122/logs", () =>
-    respond(200, "error: different test timed out after 10000ms"),
-  );
-  for (const run of new Set([1, job.run_id])) {
-    const jobs = [f.job, job].filter((j) => j.run_id === run);
-    h.gh.responses.set(`repos/o/r/actions/runs/${run}/attempts/2/jobs?per_page=100&page=1`, () =>
-      respond(200, { total_count: jobs.length, jobs }),
-    );
-    h.gh.responses.set(`repos/o/r/actions/runs/${run}`, () =>
-      respond(200, { head_sha: SHA, run_attempt: 2 }),
-    );
-  }
-  f.observe("FAILURE", "second job failed again");
-  await h.advance(15000);
-  const records = h.store.ciFailures(f.node.url, SHA);
-  expect(records.find((r) => r.rerunJob?.id === 21)?.outcome).toBe("rerunning");
-  expect(records.find((r) => r.rerunJob?.id === 22)?.outcome).toBe("failed_again");
+  expect(reruns()).toHaveLength(1);
   expect(items("ci.needs_fix")).toHaveLength(1);
-  expect(reruns()).toHaveLength(2);
 });
 
 test("a successful sibling cannot resolve an in-progress rerun, even across restart", async () => {
@@ -1077,4 +969,148 @@ test("a REST completion older than GraphQL stays pending until consistent detail
   restTime = completion;
   await h.advance(15000);
   expect(reruns()).toHaveLength(1);
+});
+
+test.each(["accepted", "lost", "security"])(
+  "the land decision and poller share one head claim (%s)",
+  async (response) => {
+    h = pollerHarness();
+    const f = failure();
+    if (response === "security") f.state.log += "\nFAIL security authorization";
+    if (response === "lost")
+      h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () => {
+        throw new Error("response lost");
+      });
+    const snap = normalizePr(f.node);
+    const pr = h.store.githubTracked()[0];
+    if (!snap || !pr) throw new Error("missing PR fixture");
+    const decide = () =>
+      ciDecision(
+        h.store,
+        pr,
+        snap,
+        (_repo, path, body) => h.gh.client(path, body),
+        true,
+        () => true,
+        () => true,
+      );
+    h.start(15);
+    const decision = decide().catch(() => null);
+    await h.advance(0);
+    const result = await decision;
+    expect(reruns()).toHaveLength(response === "security" ? 0 : 1);
+    if (response === "security") expect(result?.state).toBe("failed");
+    else {
+      if (response === "accepted") expect(result?.state).toBe("pending");
+      h.reopen();
+      // Reopening changes the Store object: the durable claim must stand without the in-memory lock.
+      expect((await decide()).state).toBe("pending");
+      expect(reruns()).toHaveLength(1);
+      f.rerun("success");
+      f.observe("SUCCESS", "rerun");
+      const green = normalizePr(f.node);
+      if (!green) throw new Error("missing successful PR fixture");
+      expect(
+        (
+          await ciDecision(
+            h.store,
+            pr,
+            green,
+            (_repo, path, body) => h.gh.client(path, body),
+            true,
+            () => true,
+            () => true,
+          )
+        ).state,
+      ).toBe("green");
+      expect(reruns()).toHaveLength(1);
+    }
+  },
+);
+
+test("independent Store connections share the atomic head claim without a false needs-fix", async () => {
+  h = pollerHarness();
+  const f = failure();
+  const snap = normalizePr(f.node);
+  const pr = h.store.githubTracked()[0];
+  if (!snap || !pr) throw new Error("missing PR fixture");
+  const other = new Store(join(h.dir, "db.sqlite"));
+  try {
+    const decide = (store: Store) =>
+      ciDecision(
+        store,
+        pr,
+        snap,
+        (_repo, path, body) => h.gh.client(path, body),
+        true,
+        () => true,
+        () => true,
+      );
+    const decisions = await Promise.all([decide(h.store), decide(other)]);
+    expect(decisions.map((d) => d.state)).toEqual(["pending", "pending"]);
+    expect(reruns()).toHaveLength(1);
+    expect(items("ci.needs_fix")).toHaveLength(0);
+  } finally {
+    other.close();
+  }
+});
+
+test("REST-confirmed success waits for the old failed rollup without a false failure", async () => {
+  h = pollerHarness();
+  const f = failure();
+  const pr = h.store.githubTracked()[0];
+  const red = normalizePr(f.node);
+  if (!pr || !red) throw new Error("missing PR fixture");
+  const decide = () =>
+    ciDecision(
+      h.store,
+      pr,
+      red,
+      (_repo, path, body) => h.gh.client(path, body),
+      true,
+      () => true,
+      () => true,
+    );
+  await decide();
+  const old = { ...f.check };
+  const oldJob = { ...f.job };
+  f.rerun("success");
+  h.gh.responses.set(`repos/o/r/actions/jobs/${oldJob.id}`, () => respond(200, oldJob));
+  h.gh.responses.set(checksPath(SHA), () => respond(200, { total_count: 1, check_runs: [old] }));
+  expect((await decide()).state).toBe("pending");
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(reruns()).toHaveLength(1);
+});
+
+test("a pre-upgrade land rerun consumes the shared PR head claim", async () => {
+  h = pollerHarness();
+  const f = failure();
+  const pr = h.store.githubTracked()[0];
+  const snap = normalizePr(f.node);
+  if (!pr || !snap) throw new Error("missing PR fixture");
+  const entry = h.store.createLandEntry({
+    runId: pr.runId,
+    repo: pr.repo,
+    prUrl: pr.url,
+    baseBranch: "main",
+    headBranch: "pr",
+    approvedSha: SHA,
+  });
+  h.store.updateLandEntry(entry.id, {
+    pushedSha: SHA,
+    ciRerun: JSON.stringify([
+      { databaseId: 1, headSha: SHA, attempt: 1, status: "completed", conclusion: "failure" },
+    ]),
+  });
+  const result = await ciDecision(
+    h.store,
+    pr,
+    snap,
+    (_repo, path, body) => h.gh.client(path, body),
+    true,
+    () => true,
+    () => true,
+  );
+  expect(result.state).toBe("failed");
+  expect(reruns()).toHaveLength(0);
 });

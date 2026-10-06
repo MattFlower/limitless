@@ -1,14 +1,14 @@
 import type { GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { sh } from "../util/proc.ts";
-import { classifyCi } from "./ci-classifier.ts";
+import { ciDecision } from "./ci-classifier.ts";
 import { type GitHubPrClient, type GitHubPrState, reconcileMergedRuns } from "./github-notifier.ts";
 
 export type GitHubResponse = {
   status: number;
   headers: Headers;
   body: unknown;
-  /** Explicitly refused rerun POST; the poller's cooldown is also its retry deadline. */
+  /** Explicitly refused rerun POST, with the poller's request cooldown (never permission to retry). */
   rerunRetryAt?: number;
 };
 /** One authenticated API call: POST when `body` is given, else GET (logs return text). */
@@ -369,7 +369,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         return res;
       };
       const ready = () => !stopped && now() >= cooldownUntil && now() >= (blocks.get(pr.repo)?.until ?? 0);
-      if (await classifyCi(store, pr, snap, ciCall, opts.ciReruns !== false, ready, current, now)) {
+      if ((await ciDecision(store, pr, snap, ciCall, opts.ciReruns !== false, ready, current)).complete) {
         ciPending = false;
         if (current()) save(unknown ? (prev?.nudged ?? null) : null, []);
       } else return null;

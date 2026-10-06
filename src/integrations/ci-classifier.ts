@@ -70,7 +70,7 @@ export function ciSignature(check: string, log: string, fallback: string, labels
 const quote = (s: string) => `> ${s.replace(/\r?\n/g, "\n> ")}`;
 
 /** Serial REST inspection. False retains the persisted pending inspection for a later poll. */
-export async function classifyCi(
+async function inspectCi(
   store: Store,
   pr: TrackedPr,
   snap: PrSnapshot,
@@ -78,7 +78,7 @@ export async function classifyCi(
   reruns: boolean,
   ready: () => boolean,
   current: () => boolean,
-  now: () => number = Date.now,
+  onFailure: () => void,
 ): Promise<boolean> {
   const root = `repos/${pr.repo}`;
   const read = async (path: string) => {
@@ -177,6 +177,7 @@ export async function classifyCi(
     repository = false,
     excerpt = f.line,
   ) => {
+    if (kind === "ci.needs_fix") onFailure();
     store.saveGithubPr(null, false, [
       {
         kind,
@@ -200,8 +201,7 @@ export async function classifyCi(
   const requestRerun = async (f: CiFailure, job: number, excerpt: string) => {
     const res = await call(pr.repo, `${root}/actions/jobs/${job}/rerun`, {});
     if (res?.rerunRetryAt !== undefined) {
-      if (reruns && !f.rerunRetryUsed) store.deferCiRerun(f, res.rerunRetryAt);
-      else reject(f, excerpt);
+      reject(f, excerpt);
       return;
     }
     if (res && res.status >= 400 && res.status < 500 && res.status !== 408) {
@@ -247,7 +247,6 @@ export async function classifyCi(
   if (!current()) return true;
   const resolved = new Set<number>();
   const outstanding = store.ciFailures(pr.url, snap.headRefOid).filter(pending);
-  const retries: { failure: CiFailure; job: number; excerpt: string }[] = [];
   // Only a later attempt of the originating workflow job can resolve a rerun.
   for (const f of outstanding) {
     const origin = f.rerunJob;
@@ -384,24 +383,19 @@ export async function classifyCi(
               (job && p.rerunJob?.runId === job.run_id && p.rerunJob.name === job.name)),
         );
       if (job && resolved.has(job.id)) continue;
+      // GraphQL and check-runs can still describe the original failure after REST confirms its retry.
+      if (
+        job &&
+        prior.some(
+          (p) => p.outcome === "failed_then_passed" && p.rerunJob && job.run_attempt <= p.rerunJob.attempt,
+        )
+      )
+        continue;
       if (prior.some(pending)) {
         const refused = prior.find((p) => pending(p) && p.rerunRetryAt != null);
         if (!refused) continue;
-        if (!reruns || unsafe || refused.rerunRetryUsed) {
-          reject(refused, log || f.line);
-          continue;
-        }
-        if (now() < (refused.rerunRetryAt ?? Infinity)) continue;
-        const origin = refused.rerunJob;
-        if (
-          !job ||
-          !origin ||
-          origin.id !== job.id ||
-          origin.runId !== job.run_id ||
-          origin.attempt !== job.run_attempt
-        )
-          throw new Error("Incomplete refused CI rerun job");
-        retries.push({ failure: refused, job: job.id, excerpt: log || f.line });
+        // Older versions deferred explicit refusals; they also retain the head's claim.
+        reject(refused, log || f.line);
         continue;
       }
       if (!unsafe) store.recordCiFailure(f);
@@ -432,34 +426,67 @@ export async function classifyCi(
           })
         ) {
           await requestRerun(f, job.id, log || f.line);
-          const deferred = store.ciFailures(pr.url, f.sha).some((p) => pending(p) && p.rerunRetryAt != null);
-          if (deferred) return false;
           continue;
         }
+        // Another Store/daemon may win the atomic claim while this inspection awaits the head read.
+        if (store.ciFailures(pr.url, snap.headRefOid).some((p) => pending(p) && p.rerunJob?.id === job.id))
+          continue;
       }
       if (!current()) return true;
       needsFix();
     }
-  }
-  // Send retries after REST inspection so a repeated refusal's cooldown cannot hide its terminal result.
-  for (const retry of retries) {
-    if (!current()) return true;
-    if (!ready()) return false;
-    const remote = z
-      .object({ head: z.object({ sha: z.string() }), state: z.string() })
-      .parse(await read(`pulls/${pr.url.split("/").at(-1)}`));
-    if (!current()) return true;
-    if (remote.head.sha !== retry.failure.sha || remote.state !== "open") {
-      reject(retry.failure, retry.excerpt);
-      continue;
-    }
-    if (!ready()) return false;
-    if (store.claimCiRerunRetry(retry.failure, now()))
-      await requestRerun({ ...retry.failure, rerunRetryUsed: 1 }, retry.job, retry.excerpt);
   }
   // The existing persisted pending inspection also tracks main-red pauses across restarts.
   const pendingRerun = store
     .ciFailures(pr.url, snap.headRefOid)
     .some((f) => pending(f) && outstanding.some((p) => p.signature === f.signature));
   return !pendingRerun && !paused;
+}
+
+export type CiDecision = { complete: boolean; state: "pending" | "failed" | "green" };
+const inspections = new WeakMap<Store, Map<string, Promise<CiDecision>>>();
+
+/** Both CI consumers use the same inspection and durable head-wide claim, including after restart. */
+export function ciDecision(
+  store: Store,
+  pr: TrackedPr,
+  snap: PrSnapshot,
+  call: Call,
+  reruns: boolean,
+  ready: () => boolean,
+  current: () => boolean,
+): Promise<CiDecision> {
+  let active = inspections.get(store);
+  if (!active) {
+    active = new Map();
+    inspections.set(store, active);
+  }
+  const key = `${pr.url}:${snap.headRefOid}`;
+  const previous = active.get(key);
+  const result = (async (): Promise<CiDecision> => {
+    await previous?.catch(() => undefined);
+    if (!current()) return { complete: false, state: "pending" };
+    let failed = false;
+    const complete = await inspectCi(store, pr, snap, call, reruns, ready, current, () => {
+      failed = true;
+    });
+    const waiting = store.ciFailures(pr.url, snap.headRefOid).some(pending);
+    return {
+      complete,
+      state: !current()
+        ? "pending"
+        : failed
+          ? "failed"
+          : !complete || waiting || snap.ci !== "SUCCESS"
+            ? "pending"
+            : "green",
+    };
+  })();
+  active.set(key, result);
+  void result
+    .finally(() => {
+      if (active.get(key) === result) active.delete(key);
+    })
+    .catch(() => undefined);
+  return result;
 }

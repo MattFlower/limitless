@@ -2266,13 +2266,16 @@ export class Store {
       .run(f.prUrl, f.sha, f.signature, f.check, f.line, f.image);
   }
 
-  /** Claim before the POST; an ambiguous response must never permit another paid CI attempt. */
+  /** One claim per PR head, before the POST; refusals and lost responses retain it. */
   claimCiRerun(f: CiFailure, marker: string, job: NonNullable<CiFailure["rerunJob"]>): boolean {
     return (
       this.db
         .query(`UPDATE ci_failures SET rerun_claimed = 1, outcome = 'rerun_requested', rerun_marker = ?, rerun_job = ?
-      WHERE pr_url = ? AND sha = ? AND signature = ? AND rerun_claimed = 0`)
-        .run(marker, JSON.stringify(job), f.prUrl, f.sha, f.signature).changes === 1
+      WHERE pr_url = ? AND sha = ? AND signature = ? AND rerun_claimed = 0
+      AND NOT EXISTS (SELECT 1 FROM ci_failures WHERE pr_url = ? AND sha = ? AND rerun_claimed = 1)
+      AND NOT EXISTS (SELECT 1 FROM land_entries WHERE pr_url = ? AND pushed_sha = ? AND ci_rerun IS NOT NULL)`)
+        .run(marker, JSON.stringify(job), f.prUrl, f.sha, f.signature, f.prUrl, f.sha, f.prUrl, f.sha)
+        .changes === 1
     );
   }
 
@@ -2280,23 +2283,6 @@ export class Store {
     this.db
       .query("UPDATE ci_failures SET outcome = ? WHERE pr_url = ? AND sha = ? AND signature = ?")
       .run(outcome, f.prUrl, f.sha, f.signature);
-  }
-
-  deferCiRerun(f: CiFailure, until: number): void {
-    this.db
-      .query("UPDATE ci_failures SET rerun_retry_at = ? WHERE pr_url = ? AND sha = ? AND signature = ?")
-      .run(until, f.prUrl, f.sha, f.signature);
-  }
-
-  /** Consume the retry before sending: losing its response cannot allow another POST. */
-  claimCiRerunRetry(f: CiFailure, now: number): boolean {
-    return (
-      this.db
-        .query(`UPDATE ci_failures SET rerun_retry_used = 1, rerun_retry_at = NULL
-        WHERE pr_url = ? AND sha = ? AND signature = ? AND outcome = 'rerun_requested'
-        AND rerun_retry_used = 0 AND rerun_retry_at <= ?`)
-        .run(f.prUrl, f.sha, f.signature, now).changes === 1
-    );
   }
 
   /** Unmerged PRs factory runs opened; PRs runs only verified, or abandoned over 7 days while open, are excluded. */

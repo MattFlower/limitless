@@ -19,6 +19,8 @@ export interface GitHubPrState {
 export interface GitHubPrView extends GitHubPrState {
   ci: string | null;
   failing: string[];
+  statusNames?: string[];
+  truncated?: boolean;
 }
 
 export type GitHubPrClient = ((url: string, signal?: AbortSignal) => Promise<GitHubPrState | null>) & {
@@ -57,6 +59,10 @@ export const getGitHubPr = async (url: string, signal?: AbortSignal): Promise<Gi
     headRefOid: view.headRefOid,
     ci,
     failing: failing.map((f) => f.name),
+    statusNames: (view.statusCheckRollup ?? []).flatMap((c) =>
+      c.state !== undefined && (c.name ?? c.context) ? [c.name ?? c.context ?? ""] : [],
+    ),
+    truncated: (view.statusCheckRollup?.length ?? 0) >= 100 || undefined,
   };
 };
 
