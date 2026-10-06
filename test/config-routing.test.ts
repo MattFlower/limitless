@@ -121,6 +121,9 @@ test("[routing] prefer takes provider IDs and fails on model, retired, unknown o
     expect(config).toThrow("routing.prefer must be an array of provider IDs");
     set('["codex", 3]');
     expect(config).toThrow("routing.prefer[1] must be a provider ID string");
+    expect(() =>
+      loadConfig({ home: join(root, "data"), configDir, raw: { routing: { prefer: null } } }),
+    ).toThrow("routing.prefer must be an array of provider IDs");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
