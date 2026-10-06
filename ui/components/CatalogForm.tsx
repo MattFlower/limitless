@@ -63,7 +63,7 @@ export const CatalogForm = (props: {
           ?.split(",")
           .map((v) => v.trim())
           .filter(Boolean) ?? [],
-      ...(f.effort ? { effort: f.effort } : {}),
+      ...(f.effort ? { effort: f.effort } : old ? { effort: null } : {}),
       notes: f.notes,
     };
     setBusy(true);

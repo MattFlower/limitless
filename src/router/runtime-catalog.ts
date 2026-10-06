@@ -20,6 +20,7 @@ export class RuntimeCatalog {
 
   snapshot() {
     return {
+      history: this.store.catalogHistory(),
       models: this.models.map((m) => ({ ...m, source: m.source ?? "code" })),
       providers: this.tracker
         .all()
@@ -35,7 +36,7 @@ export class RuntimeCatalog {
     return model;
   }
 
-  private apply(id: string, model: ModelDef | null) {
+  private apply(id: string, model: ModelDef | null, note: string | null = null) {
     const next = this.models.filter((m) => m.id !== id);
     if (model) next.push(model);
     for (const [layer, policy] of Object.entries(this.routing.snapshot().layers)) {
@@ -57,7 +58,7 @@ export class RuntimeCatalog {
         throw new Error(`run ${run.id}: ${String(error)}`);
       }
     }
-    this.store.writeRuntimeModel(id, model);
+    this.store.writeRuntimeModel(id, model, note);
     this.models.splice(0, this.models.length, ...next);
     this.router.setModels(this.models);
     this.tracker.setModels(this.models);
@@ -68,7 +69,7 @@ export class RuntimeCatalog {
   add(value: unknown) {
     const model = runtimeModel(value, this.providers);
     if (this.models.some((m) => m.id === model.id)) throw new Error(`catalog collision: ${model.id}`);
-    return this.apply(model.id, model);
+    return this.apply(model.id, model, model.notes ?? null);
   }
 
   patch(id: string, value: unknown) {
@@ -80,6 +81,8 @@ export class RuntimeCatalog {
         ...old,
         id: id.slice(old.provider.length + 1),
         ...patch,
+        // Omitted effort inherits; null explicitly clears the optional default.
+        effort: patch.effort === null ? undefined : patch.effort === undefined ? old.effort : patch.effort,
         price:
           patch.price && typeof patch.price === "object" && !Array.isArray(patch.price)
             ? { ...old.price, ...patch.price }
@@ -90,7 +93,7 @@ export class RuntimeCatalog {
       this.providers,
     );
     if (model.id !== id) throw new Error("model id and provider are immutable");
-    return this.apply(id, model);
+    return this.apply(id, model, typeof patch.notes === "string" ? patch.notes : null);
   }
 
   remove(id: string) {

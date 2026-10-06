@@ -1804,10 +1804,34 @@ export class Store {
       .map((row) => JSON.parse(row.definition_json) as ModelDef);
   }
 
-  writeRuntimeModel(id: string, model: ModelDef | null): void {
-    if (model)
-      this.db.query("INSERT OR REPLACE INTO runtime_models VALUES (?, ?)").run(id, JSON.stringify(model));
-    else this.db.query("DELETE FROM runtime_models WHERE id = ?").run(id);
+  writeRuntimeModel(id: string, model: ModelDef | null, note: string | null = null): void {
+    this.db.transaction(() => {
+      const old = this.db
+        .query<{ definition_json: string }, [string]>(
+          "SELECT definition_json FROM runtime_models WHERE id = ?",
+        )
+        .get(id);
+      const value = model === null ? null : JSON.stringify(model);
+      if (model) this.db.query("INSERT OR REPLACE INTO runtime_models VALUES (?, ?)").run(id, value);
+      else this.db.query("DELETE FROM runtime_models WHERE id = ?").run(id);
+      this.db
+        .query("INSERT INTO catalog_history (model_id, old_json, new_json, note, at) VALUES (?, ?, ?, ?, ?)")
+        .run(id, old?.definition_json ?? null, value, note, Date.now());
+    })();
+  }
+
+  catalogHistory() {
+    return this.db
+      .query<Row, []>("SELECT * FROM catalog_history ORDER BY id DESC LIMIT 100")
+      .all()
+      .map((row) => ({
+        id: row.id as number,
+        modelId: row.model_id as string,
+        oldValue: parse<ModelDef | null>(row.old_json, null),
+        newValue: parse<ModelDef | null>(row.new_json, null),
+        note: row.note as string | null,
+        at: row.at as number,
+      }));
   }
 
   publishCatalog(): void {

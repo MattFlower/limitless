@@ -243,6 +243,64 @@ test("catalog rejects shadowed evals references and a compatible patch survives 
   });
 });
 
+test("catalog effort clears and successful mutation history survive store reopening", async () => {
+  factory.store.close();
+  const db = join(dir, "catalog.db");
+  factory = makeFactory(new Store(db));
+  const input = { ...customModel, provider: "codex", id: "history" };
+  const path = "/api/catalog/models/codex%2Fhistory";
+  expect((await client()("/api/catalog/models", "POST", input)).status).toBe(201);
+  const old = factory.store.runtimeModels()[0];
+  expect(old?.effort).toBe("none");
+  // Omitting effort still preserves it; an explicit null removes it.
+  expect((await client()(path, "PATCH", { model: "updated-backend" })).status).toBe(200);
+  expect(factory.store.runtimeModels()[0]?.effort).toBe("none");
+  expect((await client()(path, "PATCH", { effort: null, notes: "Clear default" })).status).toBe(200);
+  expect(factory.store.runtimeModels()[0]).not.toHaveProperty("effort");
+  const cleared = factory.store.runtimeModels()[0];
+  const history = factory.store.catalogHistory();
+  expect(history).toHaveLength(3);
+  expect(history[0]).toMatchObject({
+    modelId: "codex/history",
+    oldValue: { effort: "none" },
+    newValue: cleared,
+    note: "Clear default",
+  });
+  expect(history[2]).toMatchObject({ oldValue: null, newValue: old, note: customModel.notes });
+  for (const entry of history) expect(entry.at).toBeGreaterThan(0);
+  const invalid = await client()(path, "PATCH", { effort: "max" });
+  expect(invalid.status).toBe(400);
+  expect((await invalid.json()).error).toContain("effort");
+  expect(factory.store.catalogHistory()).toEqual(history);
+
+  factory.store.close();
+  factory = makeFactory(new Store(db));
+  expect(factory.store.runtimeModels()[0]).not.toHaveProperty("effort");
+  expect((await (await client()("/api/catalog")).json()).history).toEqual(history);
+  expect((await client()(path, "DELETE")).status).toBe(200);
+  const deleted = factory.store.catalogHistory();
+  expect(deleted).toHaveLength(4);
+  expect(deleted[0]).toMatchObject({ modelId: "codex/history", oldValue: cleared, newValue: null });
+  expect((await client()(path, "DELETE")).status).toBe(400);
+  expect(factory.store.catalogHistory()).toEqual(deleted);
+  factory.store.close();
+  factory = makeFactory(new Store(db));
+  expect(factory.store.runtimeModels()).toEqual([]);
+  expect((await (await client()("/api/catalog")).json()).history).toEqual(deleted);
+});
+
+test("catalog history and model mutations commit together", async () => {
+  factory.store.db.exec(
+    "CREATE TRIGGER reject_history BEFORE INSERT ON catalog_history BEGIN SELECT RAISE(ABORT, 'history disk failure'); END",
+  );
+  const before = catalogState();
+  expect(
+    (await client()("/api/catalog/models", "POST", { ...customModel, provider: "codex", id: "failed" }))
+      .status,
+  ).toBe(400);
+  expect(catalogState()).toEqual(before);
+});
+
 test.each(["code", "operator"] as const)(
   "catalog PATCH and DELETE preserve references in the %s layer",
   async (layer) => {

@@ -35,7 +35,7 @@ test("Run Detail opens saved chains and retry submits a replacement map, retaini
   let fail = true;
   let catalog = MODELS;
   const requests: string[] = [];
-  const bodies: { models: RunModels }[] = [];
+  const bodies: { models?: RunModels }[] = [];
   globalThis.fetch = Object.assign(
     async (path: string | URL | Request, init?: RequestInit) => {
       requests.push(String(path));
@@ -46,7 +46,7 @@ test("Run Detail opens saved chains and retry submits a replacement map, retaini
         });
       if (String(path) !== `/api/runs/${run.id}/retry` && String(path) !== `/api/runs/${defaultRun.id}/retry`)
         throw new Error(`Unexpected request ${path}`);
-      bodies.push(JSON.parse(String(init?.body)) as { models: RunModels });
+      bodies.push(JSON.parse(String(init?.body ?? "{}")) as { models?: RunModels });
       return fail
         ? Response.json({ error: "models.implement: invalid choice" }, { status: 400 })
         : Response.json({ id: "replacement" });
@@ -87,7 +87,7 @@ test("Run Detail opens saved chains and retry submits a replacement map, retaini
     fail = false;
     await picker.invoke(picker.render(), "button", "Retry with selected models");
     expect(picker.navigated).toEqual(["/runs/replacement"]);
-    expect(requests).not.toContain("/api/routing");
+    expect(requests).toContain("/api/routing");
     expect(defaultRun.models).toEqual({});
     picker.mount({ run: defaultRun, onRetried: () => {}, onCancel: () => {} });
     await settle();
@@ -95,7 +95,7 @@ test("Run Detail opens saved chains and retry submits a replacement map, retaini
     expect(picker.render()).toContain('value="codex/sol"');
     await picker.invoke(picker.render(), "button", "Retry with selected models");
     expect(requests.at(-1)).toBe(`/api/runs/${defaultRun.id}/retry`);
-    expect(bodies.at(-1)).toEqual({ models: { implement: ["codex/sol@high"] } });
+    expect(bodies.at(-1)).toEqual({});
   } finally {
     page.dispose();
     picker.dispose();

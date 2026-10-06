@@ -34,11 +34,46 @@ export const Setup = () => {
   const [errors, setErrors] = createSignal<Record<string, string>>({});
   const [busy, setBusy] = createSignal<Record<string, boolean>>({});
   const [forms, setForms] = createSignal<Record<string, boolean>>({});
-  const [session, setSession] = createSignal<{ key: string; old: unknown; value: unknown; at: number }[]>([]);
+  const [now, setNow] = createSignal(Date.now());
   const models = () => catalog()?.models ?? [];
   let generation = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
+  const visible = () => typeof document === "undefined" || document.visibilityState !== "hidden";
+  const schedule = () => {
+    clearTimeout(timer);
+    if (disposed || !visible()) return;
+    const time = Date.now();
+    const expiries = [
+      ...providers().flatMap((p) => [p.until, ...Object.values(p.windows).map((w) => w.resetsAt)]),
+      ...Object.values(previews()).flatMap((p) =>
+        p.candidates.flatMap((c) =>
+          [...(c.reason ?? "").matchAll(/\buntil\s+(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2}))/g)].map(
+            (m) => Date.parse(m[1] ?? ""),
+          ),
+        ),
+      ),
+    ].filter((at): at is number => at !== null && Number.isFinite(at) && at > time);
+    timer = setTimeout(
+      () => {
+        setNow(Date.now());
+        void refresh();
+      },
+      Math.min(60_000, ...expiries.map((at) => at - time + 1)),
+    );
+  };
+  const currentProvider = (p: ProviderStatus): ProviderStatus => ({
+    ...p,
+    windows: Object.fromEntries(
+      Object.entries(p.windows).map(([name, w]) => [
+        name,
+        w.resetsAt !== null && w.resetsAt <= now() ? { ...w, utilization: 0, observedAt: null } : w,
+      ]),
+    ),
+  });
   const error = (key: string, value = "") => setErrors((old) => ({ ...old, [key]: value }));
   const refresh = async () => {
+    clearTimeout(timer);
     const version = ++generation;
     try {
       const [r, c, p, w] = await Promise.all([
@@ -48,11 +83,6 @@ export const Setup = () => {
         getProviderWorkload().catch(() => workload()),
       ]);
       if (version !== generation) return;
-      setRouting(r);
-      setCatalog(c);
-      setProviders(p);
-      setWorkload(w);
-      error("load");
       const entries = await Promise.all(
         Object.entries(r.effective).flatMap(([role, cells]) =>
           Object.keys(cells).map(async (cell) => {
@@ -70,16 +100,36 @@ export const Setup = () => {
           }),
         ),
       );
-      if (version === generation) setPreviews(Object.fromEntries(entries));
+      if (version !== generation) return;
+      setNow(Date.now());
+      setRouting(r);
+      setCatalog(c);
+      setProviders(p);
+      setWorkload(w);
+      setPreviews(Object.fromEntries(entries));
+      error("load");
     } catch (e) {
       if (version === generation) error("load", String(e));
+    } finally {
+      if (version === generation) schedule();
     }
   };
   onMount(() => {
     const close = subscribeLiveUpdates((msg) => {
       if (["routing", "catalog", "provider", "reconnected"].includes(msg.kind)) void refresh();
     });
+    const visibility = () => {
+      clearTimeout(timer);
+      if (visible()) {
+        setNow(Date.now());
+        void refresh();
+      }
+    };
+    if (typeof document !== "undefined") document.addEventListener("visibilitychange", visibility);
     onCleanup(() => {
+      disposed = true;
+      clearTimeout(timer);
+      if (typeof document !== "undefined") document.removeEventListener("visibilitychange", visibility);
       close();
       generation++;
     });
@@ -131,15 +181,11 @@ export const Setup = () => {
       setBusy((old) => ({ ...old, prefer: false }));
     }
   };
-  const record = (key: string, old: unknown, value: unknown) =>
-    setSession((items) => [{ key, old, value, at: Date.now() }, ...items]);
   const remove = async (id: string) => {
     setBusy((old) => ({ ...old, [id]: true }));
     error(id);
     try {
-      const old = models().find((m) => m.id === id);
       setCatalog(await updateCatalog("DELETE", id));
-      record(id, old, null);
       await refresh();
     } catch (e) {
       error(id, String(e));
@@ -467,7 +513,7 @@ export const Setup = () => {
           <For each={providers()}>
             {(p) => (
               <div class="stack">
-                <ProviderCard provider={p} workload={workloadFor(p.id, workload())} />
+                <ProviderCard provider={currentProvider(p)} workload={workloadFor(p.id, workload())} />
                 <Show when={p.billing === "subscription"}>
                   <div class="card card-pad stack">
                     <strong>{p.label} headroom</strong>
@@ -482,9 +528,11 @@ export const Setup = () => {
                             {([name, w]) => (
                               <span>
                                 {name}:{" "}
-                                {w.observedAt === null
-                                  ? "unobserved"
-                                  : `${Math.round((1 - w.utilization) * 100)}% headroom`}{" "}
+                                {w.resetsAt !== null && w.resetsAt <= now()
+                                  ? "window expired; awaiting telemetry"
+                                  : w.observedAt === null
+                                    ? "unobserved"
+                                    : `${Math.round((1 - w.utilization) * 100)}% headroom`}{" "}
                                 · resets{" "}
                                 {w.resetsAt === null ? "unavailable" : new Date(w.resetsAt).toLocaleString()}
                               </span>
@@ -534,9 +582,8 @@ export const Setup = () => {
                         backend={model()?.model ?? ""}
                         existing={model()}
                         onCancel={() => setForms((old) => ({ ...old, [id]: false }))}
-                        onSaved={(c, old, value) => {
+                        onSaved={(c) => {
                           setCatalog(c);
-                          record(id, old, value);
                           setForms((f) => ({ ...f, [id]: false }));
                           void refresh();
                         }}
@@ -587,9 +634,8 @@ export const Setup = () => {
                             provider={id}
                             backend={backend}
                             onCancel={() => setForms((f) => ({ ...f, [key]: false }))}
-                            onSaved={(c, old, value) => {
+                            onSaved={(c) => {
                               setCatalog(c);
-                              record(key, old, value);
                               setForms((f) => ({ ...f, [key]: false }));
                               void refresh();
                             }}
@@ -616,12 +662,11 @@ export const Setup = () => {
         </For>
       </section>
       <section class="card card-pad stack">
-        <h2>Catalog session history</h2>
-        <p>Changes made in this open UI session</p>
-        <For each={session()}>
+        <h2>Catalog history</h2>
+        <For each={catalog()?.history ?? []}>
           {(h) => (
             <div>
-              {h.key}: {JSON.stringify(h.old ?? null)} → {JSON.stringify(h.value)} ·{" "}
+              {h.modelId}: {JSON.stringify(h.oldValue)} → {JSON.stringify(h.newValue)} · {h.note} ·{" "}
               <time>{new Date(h.at).toLocaleString()}</time>
             </div>
           )}

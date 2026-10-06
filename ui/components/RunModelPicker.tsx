@@ -7,6 +7,7 @@ import { ChainPicker } from "./ChainPicker.tsx";
 
 export const RunModelPicker = (props: {
   models: RunModels;
+  inherited?: RunModels;
   onChange: (models: RunModels) => void;
   error?: string | null;
 }) => {
@@ -54,13 +55,18 @@ export const RunModelPicker = (props: {
               <input
                 type="checkbox"
                 checked={props.models[role] !== undefined}
-                onChange={(e) => change(role, e.currentTarget.checked ? [""] : undefined)}
+                onChange={(e) =>
+                  change(role, e.currentTarget.checked ? [...(props.inherited?.[role] ?? [""])] : undefined)
+                }
               />{" "}
               {role} override
             </label>
-            <Show when={props.models[role] !== undefined}>
+            <Show when={props.models[role] !== undefined || props.inherited?.[role] !== undefined}>
+              <Show when={props.models[role] === undefined}>
+                <span class="text-faint">Inherited from policy; editing creates an override.</span>
+              </Show>
               <ChainPicker
-                groups={props.models[role] ?? []}
+                groups={props.models[role] ?? props.inherited?.[role] ?? []}
                 models={catalog()}
                 onChange={(groups) => change(role, groups)}
               />
