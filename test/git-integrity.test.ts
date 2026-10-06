@@ -58,9 +58,12 @@ const edited = 'test.skip("ok", () => {});\n';
 const mediaBytes = JSON.parse(
   readFileSync(new URL("./fixtures/media/files.json", import.meta.url), "utf8"),
 ) as Record<string, string>;
+const mediaRegressions = JSON.parse(
+  readFileSync(new URL("./fixtures/media/regressions.json", import.meta.url), "utf8"),
+) as Record<string, string>;
 const mediaFixture = (extension: string, variant = 0) => {
   const file = `${variant}.${extension.toLowerCase().replace("jpeg", "jpg")}`;
-  const encoded = mediaBytes[file];
+  const encoded = mediaBytes[file] ?? mediaRegressions[file];
   if (!encoded) throw new Error(`Missing media fixture: ${file}`);
   return Buffer.from(encoded, "base64");
 };
@@ -1886,6 +1889,7 @@ const assetExtensions = [
   "gif",
   "ico",
   "webp",
+  "literal.webp",
   "mp3",
   "ogg",
   "wav",
@@ -2127,6 +2131,41 @@ test("GIF LZW pixels carrying a ZIP require an allowance on additions and edits"
   expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toEqual([]);
   for (const { file, frameWidth } of files) writeFileSync(join(work, file), encode(payload, frameWidth));
   await commitAll(work, "ZIP encoded as pixels");
+  for (const revision of [base, mediaBase]) {
+    const diff = await diffSince(work, revision);
+    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
+    expect(findings).toHaveLength(files.length);
+    for (const { file } of files)
+      expect(findings).toContainEqual(
+        expect.objectContaining({
+          file,
+          rule: "binary-content",
+          severity: "block",
+          detail: expect.stringContaining(`${file}:`),
+        }),
+      );
+    expect(findings.every((finding) => finding.detail.includes("Allow: binary"))).toBe(true);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+  }
+});
+
+test("decoded WebP and FLAC payloads and cross-table WOFF signatures require an allowance", async () => {
+  const files = [
+    { file: "predictor.webp", original: "literal.webp", changed: "predictor.webp" },
+    { file: "literal-payload.webp", original: "literal.webp", changed: "literal-payload.webp" },
+    { file: "indexed.webp", original: "webp", changed: "indexed.webp" },
+    { file: "fixed.flac", original: "flac", changed: "predicted-0.flac" },
+    { file: "lpc.flac", original: "flac", changed: "predicted-8.flac" },
+    { file: "frames.flac", original: "flac", changed: "frames.flac" },
+    { file: "big-endian.flac", original: "flac", changed: "big-endian.flac" },
+    { file: "split.woff", original: "clean.woff", changed: "split.woff" },
+  ];
+  for (const { file, original } of files) writeFileSync(join(work, file), mediaFixture(original));
+  await commitAll(work, "clean decoded media");
+  const mediaBase = await headSha(work);
+  expect(auditDiff(await diffSince(work, base), { taskClass: null, protectedPaths: [] })).toEqual([]);
+  for (const { file, changed } of files) writeFileSync(join(work, file), mediaFixture(changed));
+  await commitAll(work, "payloads concealed in media encoding");
   for (const revision of [base, mediaBase]) {
     const diff = await diffSince(work, revision);
     const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });

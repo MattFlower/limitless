@@ -588,7 +588,8 @@ function prefix(lengths: number[], bits: LittleBits): () => number {
 }
 function lossless(b: Buffer) {
   const bits = new LittleBits(b, 1);
-  let width = bits.read(14) + 1;
+  const originalWidth = bits.read(14) + 1;
+  let width = originalWidth;
   const height = bits.read(14) + 1;
   bits.read(1);
   valid(bits.read(3) === 0);
@@ -675,22 +676,45 @@ function lossless(b: Buffer) {
     clean(Buffer.from(output.buffer));
     return output;
   };
-  const transforms = new Set<number>();
+  let colors: Uint32Array | undefined;
   while (bits.read(1)) {
     const type = bits.read(2);
-    valid(!transforms.has(type));
-    transforms.add(type);
-    if (type === 0 || type === 1) {
-      const n = bits.read(3) + 2;
-      image(Math.ceil(width / (1 << n)), Math.ceil(height / (1 << n)));
-    } else if (type === 3) {
-      const colors = bits.read(8) + 1;
-      image(colors, 1);
-      const n = colors <= 2 ? 3 : colors <= 4 ? 2 : colors <= 16 ? 1 : 0;
-      width = Math.ceil(width / (1 << n));
+    // Only color indexing has a supported inverse; other transforms remain opaque.
+    valid(type === 3 && !colors);
+    const count = bits.read(8) + 1;
+    colors = image(count, 1);
+    for (let i = 1; i < count; i++) {
+      let pixel = 0;
+      for (let shift = 0; shift < 32; shift += 8)
+        pixel |= ((((colors[i] ?? 0) >>> shift) + ((colors[i - 1] ?? 0) >>> shift)) & 255) << shift;
+      colors[i] = pixel >>> 0;
     }
+    const n = count <= 2 ? 3 : count <= 4 ? 2 : count <= 16 ? 1 : 0;
+    width = Math.ceil(width / (1 << n));
   }
-  image(width, height, true);
+  let pixels = image(width, height, true);
+  if (colors) {
+    valid(originalWidth * height * 4 <= MEDIA_LIMIT);
+    const packed = colors.length <= 2 ? 8 : colors.length <= 4 ? 4 : colors.length <= 16 ? 2 : 1,
+      output = new Uint32Array(originalWidth * height);
+    for (let y = 0; y < height; y++)
+      for (let x = 0; x < originalWidth; x++) {
+        const index =
+          ((pixels[y * width + Math.floor(x / packed)] ?? 0) >>> (8 + (x % packed) * (8 / packed))) &
+          ((1 << (8 / packed)) - 1);
+        output[y * originalWidth + x] = colors[index] ?? 0;
+      }
+    pixels = output;
+  }
+  const decoded = Buffer.from(pixels.buffer);
+  clean(decoded);
+  // Both BGRA and RGBA expose recoverable pixel bytes.
+  for (let at = 0; at < decoded.length; at += 4) {
+    const blue = decoded[at] ?? 0;
+    decoded[at] = decoded[at + 2] ?? 0;
+    decoded[at + 2] = blue;
+  }
+  clean(decoded);
   valid(Math.ceil(bits.pos / 8) === b.length);
   while (bits.pos < b.length * 8) valid(bits.read(1) === 0);
 }
@@ -1413,7 +1437,11 @@ function font(b: Buffer, kind: string) {
     }
     valid(b.length >= end && b.length <= ((end + 3) & ~3));
     zero(b.subarray(end));
-    if (woff) valid(b.readUInt32BE(16) === total);
+    if (woff) {
+      valid(b.readUInt32BE(16) === total);
+      // Scan the reconstituted sfnt data, including signatures crossing table boundaries.
+      clean(Buffer.concat([...tables.values()].flatMap((c) => [c, Buffer.alloc(-c.length & 3)])));
+    }
   }
   valid(
     flavor === 0x10000
@@ -1680,6 +1708,8 @@ function flac(b: Buffer) {
   valid(rate > 0 && depth >= 4 && depth <= 32);
   let samples = 0,
     frames = 0;
+  const pcm: Buffer[] = [],
+    bytesPerSample = Math.ceil(depth / 8);
   while (at < b.length) {
     const start = at;
     valid(b[at] === 255 && ((b[at + 1] ?? 0) & 0xfe) === 0xf8 && !((b[at + 3] ?? 1) & 1));
@@ -1732,7 +1762,9 @@ function flac(b: Buffer) {
         block > 0,
     );
     valid(crc(slice(b, start, at - start), 8, 7) === b[at++]);
+    valid((samples + block) * channels * bytesPerSample <= MEDIA_LIMIT);
     const bits = new Bits(b, at);
+    const decoded: number[][] = [];
     for (let channel = 0; channel < channels; channel++) {
       valid(bits.read(1) === 0);
       const type = bits.read(6),
@@ -1743,17 +1775,26 @@ function flac(b: Buffer) {
         (assignment === 10 && channel === 1);
       const sampleBits = depth + (side ? 1 : 0) - wasted;
       valid(sampleBits > 0);
-      if (type === 0) bits.skip(sampleBits);
-      else if (type === 1) bits.skip(block * sampleBits);
+      const signed = (n: number) => {
+        const sign = bits.read(1);
+        return bits.read(n - 1) - sign * 2 ** (n - 1);
+      };
+      let values: number[] = [];
+      if (type === 0) values = Array(block).fill(signed(sampleBits));
+      else if (type === 1) for (let i = 0; i < block; i++) values.push(signed(sampleBits));
       else {
         valid((type >= 8 && type <= 12) || type >= 32);
         const order = type >= 32 ? (type & 31) + 1 : type - 8;
         valid(order <= block);
-        bits.skip(order * sampleBits);
+        for (let i = 0; i < order; i++) values.push(signed(sampleBits));
+        let shift = 0;
+        const coefficients = type >= 32 ? [] : [[], [1], [2, -1], [3, -3, 1], [4, -6, 4, -1]][order];
+        valid(coefficients);
         if (type >= 32) {
           const precision = bits.read(4) + 1;
           valid(precision <= 15);
-          bits.skip(5 + order * precision);
+          shift = signed(5);
+          for (let i = 0; i < order; i++) coefficients.push(signed(precision));
         }
         const method = bits.read(2),
           partition = bits.read(4);
@@ -1763,15 +1804,52 @@ function flac(b: Buffer) {
           const n = block / (1 << partition) - (p === 0 ? order : 0);
           valid(n >= 0);
           const rice = bits.read(paramBits);
-          if (rice === (1 << paramBits) - 1) bits.skip(n * bits.read(5));
-          else
-            for (let i = 0; i < n; i++) {
-              bits.unary();
-              bits.skip(rice);
+          const raw = rice === (1 << paramBits) - 1 ? bits.read(5) : undefined;
+          for (let i = 0; i < n; i++) {
+            let residual = 0;
+            if (raw !== undefined) residual = raw ? signed(raw) : 0;
+            else {
+              const folded = bits.unary() * 2 ** rice + bits.read(rice);
+              valid(Number.isSafeInteger(folded));
+              residual = folded % 2 ? -(folded + 1) / 2 : folded / 2;
             }
+            const prediction = coefficients.reduce(
+              (sum, coefficient, j) => sum + coefficient * (values[values.length - j - 1] ?? 0),
+              0,
+            );
+            valid(Number.isSafeInteger(prediction));
+            values.push(residual + Math.floor(prediction / 2 ** shift));
+          }
         }
       }
+      valid(values.length === block);
+      decoded.push(
+        values.map((v) => {
+          const sample = v * 2 ** wasted;
+          valid(
+            Number.isSafeInteger(sample) &&
+              sample >= -(2 ** (depth + (side ? 1 : 0) - 1)) &&
+              sample < 2 ** (depth + (side ? 1 : 0) - 1),
+          );
+          return sample;
+        }),
+      );
     }
+    const frame = Buffer.alloc(block * channels * bytesPerSample);
+    for (let i = 0; i < block; i++) {
+      const first = decoded[0]?.[i] ?? 0,
+        second = decoded[1]?.[i] ?? 0,
+        mid = first * 2 + (second & 1);
+      for (let channel = 0; channel < channels; channel++) {
+        let value = decoded[channel]?.[i] ?? 0;
+        if (assignment === 8 && channel === 1) value = first - second;
+        else if (assignment === 9 && channel === 0) value = first + second;
+        else if (assignment === 10) value = (mid + (channel === 0 ? second : -second)) / 2;
+        valid(Number.isSafeInteger(value) && value >= -(2 ** (depth - 1)) && value < 2 ** (depth - 1));
+        frame.writeIntLE(value, (i * channels + channel) * bytesPerSample, bytesPerSample);
+      }
+    }
+    pcm.push(frame);
     while (bits.pos & 7) valid(bits.read(1) === 0);
     at = bits.pos / 8;
     valid(crc(slice(b, start, at - start), 16, 0x8005) === b.readUInt16BE(at));
@@ -1780,6 +1858,12 @@ function flac(b: Buffer) {
     frames++;
   }
   valid(frames > 0 && (total === 0 || total === samples));
+  const decoded = Buffer.concat(pcm);
+  clean(decoded);
+  // PCM can be recovered in either byte order; scan both across frame boundaries.
+  for (let at = 0; at < decoded.length; at += bytesPerSample)
+    decoded.subarray(at, at + bytesPerSample).reverse();
+  clean(decoded);
 }
 
 /** A failed parse removes the exemption; Allow: binary still permits the opaque blob. */
