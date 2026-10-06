@@ -44,8 +44,10 @@ test.skipIf(readerSkip !== null)(
         expect(reader.mode).toBe("readonly");
         expect(reader.loopbackTests).toBe(true);
         const { isError, result: test } = await callReaderTool(reader, fixture.command);
-        expect(isError).toBe(false);
-        expect(test.exitCode).toBe(0);
+        expect(isError, test.stderr).toBe(false);
+        expect(test.exitCode, test.stderr).toBe(0);
+        expect(test.stderr).toContain("loopback exchange passed: 127.0.0.1");
+        if (fixture.ipv6) expect(test.stderr).toContain("loopback exchange passed: ::1");
         return {
           structured: {
             overall: "pass",

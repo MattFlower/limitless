@@ -18,6 +18,11 @@ export const readerSkip =
     ? null
     : "Seatbelt cannot start in this environment");
 
+// The macOS CI job must execute the enforcement tests, including IPv6 and listen(), rather
+// than succeeding with skips when its host unexpectedly disallows Seatbelt.
+if (process.env.LIMITLESS_REQUIRE_READER_SANDBOX === "1" && readerSkip !== null)
+  throw new Error(`Reader sandbox enforcement is required: ${readerSkip}`);
+
 export async function callReaderTool(spec: AgentSpec, command: string) {
   if (!spec.readerCommandUrl) throw new Error("Missing reader command URL");
   const client = new Client({ name: "fake-verifier", version: "1" });
@@ -81,14 +86,15 @@ def exchange(family, host):
                 assert accepted.recv(5) == b"hello"
                 accepted.sendall(b"ok")
                 assert client.recv(2) == b"ok"
+    print("loopback exchange passed: " + host, file=sys.stderr)
 
-def denied(operation):
+def denied(operation, description):
     try:
         operation()
     except OSError as error:
-        assert error.errno in (errno.EPERM, errno.EACCES, errno.EROFS), error
+        assert error.errno in (errno.EPERM, errno.EACCES, errno.EROFS), (description, error)
     else:
-        raise AssertionError("sandbox allowed a forbidden operation")
+        raise AssertionError("sandbox allowed " + description)
 
 def bind(host, port, family=socket.AF_INET):
     with socket.socket(family, socket.SOCK_STREAM) as sock:
@@ -105,17 +111,17 @@ ${ipv6 ? 'exchange(socket.AF_INET6, "::1")' : ""}
 if "--exchange-only" in sys.argv:
     print("local-server tests passed")
     sys.exit(0)
-denied(lambda: bind("0.0.0.0", 0))
-denied(lambda: bind("127.0.0.1", 12345))
-denied(lambda: connect("192.0.2.1", 49152))
-denied(lambda: connect("127.0.0.1", 12345))
-${ipv6 ? 'denied(lambda: bind("::", 0, socket.AF_INET6))\ndenied(lambda: connect("2001:db8::1", 49152, socket.AF_INET6))' : ""}
+denied(lambda: bind("0.0.0.0", 0), "non-loopback IPv4 listener")
+denied(lambda: bind("127.0.0.1", 12345), "fixed-port bind/listen")
+denied(lambda: connect("192.0.2.1", 49152), "non-loopback IPv4 connection")
+denied(lambda: connect("127.0.0.1", 12345), "fixed-port connection")
+${ipv6 ? 'denied(lambda: bind("::", 0, socket.AF_INET6), "non-loopback IPv6 listener")\ndenied(lambda: connect("2001:db8::1", 49152, socket.AF_INET6), "non-loopback IPv6 connection")' : ""}
 assert open("base.txt").read() == "base"
 with open(os.path.join(os.environ["TMPDIR"], "note"), "w") as note:
     note.write("scratch")
-denied(lambda: open("forbidden.txt", "w"))
-denied(lambda: open(${JSON.stringify(privateFile)}).read())
-denied(lambda: os.listdir(${JSON.stringify(homedir())}))
+denied(lambda: open("forbidden.txt", "w"), "checkout write")
+denied(lambda: open(${JSON.stringify(privateFile)}).read(), "private file read")
+denied(lambda: os.listdir(${JSON.stringify(homedir())}), "home directory read")
 print("local-server tests passed")
 `,
   );
@@ -144,6 +150,7 @@ print("local-server tests passed")
   };
   return {
     spec,
+    ipv6,
     command: "/usr/bin/python3 sockets.py",
     loopbackCommand: "/usr/bin/python3 sockets.py --exchange-only",
     cleanup: () => {

@@ -230,11 +230,13 @@ test.skipIf(process.platform !== "darwin")(
 test.skipIf(readerSkip !== null)(
   `reader permits local servers while denying non-loopback sockets and private files${readerSkip ? ` (skipped: ${readerSkip})` : ""}`,
   async () => {
-    const { spec, command, cleanup } = readerFixture();
+    const { spec, command, ipv6, cleanup } = readerFixture();
     try {
       const result = await runReaderCommand(spec, command);
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode, result.stderr).toBe(0);
       expect(result.stdout.trim()).toBe("local-server tests passed");
+      expect(result.stderr).toContain("loopback exchange passed: 127.0.0.1");
+      if (ipv6) expect(result.stderr).toContain("loopback exchange passed: ::1");
     } finally {
       cleanup();
     }
