@@ -1909,6 +1909,10 @@ test("validated media exempt new and edited assets and eligible unmatched attrib
   const revision = await headSha(work);
   for (const [i, ext] of assetExtensions.entries())
     writeFileSync(join(work, `asset-${i}.${ext}`), mediaFixture(ext));
+  const incidental = JSON.parse(
+    readFileSync(new URL("./fixtures/media/incidental-mz.json", import.meta.url), "utf8"),
+  ) as Record<string, string>;
+  writeFileSync(join(work, "noise.webp"), Buffer.from(incidental.webp ?? "", "base64"));
   await commitAll(work, "ordinary assets");
   const binaryBase = await headSha(work);
   for (const [i, ext] of assetExtensions.entries())
@@ -2088,7 +2092,7 @@ test("embedded image, font and audio payloads remain opaque even inside declared
   expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
 });
 
-test("GIF LZW pixels carrying a ZIP require an allowance on additions and edits", async () => {
+test("GIF LZW pixel bytes are outside foreign-format recognition on additions and edits", async () => {
   const payload = mediaFixture("zip");
   const encode = (pixels: Buffer, frameWidth: number) => {
     const screen = Buffer.alloc(7);
@@ -2132,23 +2136,11 @@ test("GIF LZW pixels carrying a ZIP require an allowance on additions and edits"
   await commitAll(work, "ZIP encoded as pixels");
   for (const revision of [base, mediaBase]) {
     const diff = await diffSince(work, revision);
-    const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
-    expect(findings).toHaveLength(files.length);
-    for (const { file } of files)
-      expect(findings).toContainEqual(
-        expect.objectContaining({
-          file,
-          rule: "binary-content",
-          severity: "block",
-          detail: expect.stringContaining(`${file}:`),
-        }),
-      );
-    expect(findings.every((finding) => finding.detail.includes("Allow: binary"))).toBe(true);
-    expect(auditDiff(diff, { taskClass: null, protectedPaths: [], allow: ["binary"] })).toEqual([]);
+    expect(auditDiff(diff, { taskClass: null, protectedPaths: [] })).toEqual([]);
   }
 });
 
-test("decoded WebP and FLAC payloads and cross-table WOFF signatures require an allowance", async () => {
+test("supported WebP pixels pass while opaque transforms, FLAC and WOFF require an allowance", async () => {
   const files = [
     { file: "predictor.webp", original: "literal.webp", changed: "predictor.webp" },
     { file: "literal-payload.webp", original: "literal.webp", changed: "literal-payload.webp" },
@@ -2175,11 +2167,13 @@ test("decoded WebP and FLAC payloads and cross-table WOFF signatures require an 
   );
   for (const { file, changed } of files) writeFileSync(join(work, file), mediaFixture(changed));
   await commitAll(work, "payloads concealed in media encoding");
+  // Predictor transforms still fail structural validation independently of pixel content.
+  const opaque = files.filter(({ file }) => !file.endsWith(".webp") || file === "predictor.webp");
   for (const revision of [base, mediaBase]) {
     const diff = await diffSince(work, revision);
     const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
-    expect(findings).toHaveLength(files.length);
-    for (const { file } of files)
+    expect(findings).toHaveLength(opaque.length);
+    for (const { file } of opaque)
       expect(findings).toContainEqual(
         expect.objectContaining({
           file,
@@ -2193,7 +2187,7 @@ test("decoded WebP and FLAC payloads and cross-table WOFF signatures require an 
   }
 });
 
-test("executable signatures in WAV samples, JPEG thumbnails and ICO pixels require an allowance", async () => {
+test("JPEG thumbnails and ICO pixels may contain signatures while WAV requires an allowance", async () => {
   const files: { path: string; original: Buffer; changed: Buffer }[] = [];
   const magics = [
     "feedface", // Mach-O, both byte orders and word sizes, including fat binaries.
@@ -2262,8 +2256,8 @@ test("executable signatures in WAV samples, JPEG thumbnails and ICO pixels requi
   for (const revision of [base, mediaBase]) {
     const diff = await diffSince(work, revision);
     const findings = auditDiff(diff, { taskClass: null, protectedPaths: [] });
-    expect(findings).toHaveLength(files.length);
-    for (const { path } of files)
+    expect(findings).toHaveLength(files.filter(({ path }) => path.endsWith(".wav")).length);
+    for (const { path } of files.filter(({ path }) => path.endsWith(".wav")))
       expect(findings).toContainEqual(
         expect.objectContaining({
           file: path,

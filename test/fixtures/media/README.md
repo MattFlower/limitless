@@ -38,3 +38,9 @@ Neither their raw bytes nor interleaved PCM contain a ZIP local-header signature
 lossy.webp and extended.webp are cwebp default lossy encodings of the square
 fixtures; the extended variants include a compressed alpha plane and VP8X canvas.
 Fonts and audio always require an explicit binary allowance.
+
+incidental-mz.json stores a cwebp 1.6.0 default lossy encoding of a 128 x 128
+RGB noise image (Python Random(4).randbytes), verified with dwebp. Its compressed
+stream contains incidental `MZ` at byte 1517. Tests use stored bytes and need no
+encoder. Encoded pixel data is outside foreign-format recognition; standard tools
+cannot open or execute a foreign file merely because its bytes occur in pixels.

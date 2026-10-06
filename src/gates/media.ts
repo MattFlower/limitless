@@ -4,45 +4,87 @@ import { inflateSync } from "node:zlib";
 // exemption never depends on a truncated read or unbounded allocation.
 export const MEDIA_LIMIT = 32 * 1024 * 1024;
 const PNG = Buffer.from("89504e470d0a1a0a", "hex");
-const PAYLOADS = [
-  "504b0304",
-  "504b0506",
-  "504b0708",
-  "7f454c46",
+const HEADERS = [
+  "7f454c46", // ELF
   "feedface",
   "cefaedfe",
   "feedfacf",
-  "cffaedfe",
+  "cffaedfe", // Mach-O
   "cafebabe",
   "bebafeca",
   "cafebabf",
-  "bfbafeca",
+  "bfbafeca", // Fat Mach-O / Java
   "6465780a",
-  "63646578",
-  "4d5a",
-  "0061736d01000000",
+  "63646578", // DEX
+  "0061736d", // WASM
   "377abcaf271c",
   "526172211a07",
-  "1f8b08",
+  "1f8b08", // 7z, RAR, gzip
 ].map((s) => Buffer.from(s, "hex"));
+
+/** ZIP readers search backwards for EOCD, and allow a prefix before the archive. */
+function zip(b: Buffer): boolean {
+  for (let end = b.length - 22; end >= Math.max(0, b.length - 22 - 65535); end--) {
+    if (b.readUInt32LE(end) !== 0x06054b50 || end + 22 + b.readUInt16LE(end + 20) !== b.length) continue;
+    const count = b.readUInt16LE(end + 10),
+      size = b.readUInt32LE(end + 12),
+      offset = b.readUInt32LE(end + 16),
+      start = end - size,
+      prefix = start - offset;
+    if (
+      b.readUInt16LE(end + 4) !== 0 ||
+      b.readUInt16LE(end + 6) !== 0 ||
+      b.readUInt16LE(end + 8) !== count ||
+      prefix < 0 ||
+      start < 0
+    )
+      continue;
+    let at = start,
+      entries = 0;
+    while (entries < count && at + 46 <= end && b.readUInt32LE(at) === 0x02014b50) {
+      const name = b.readUInt16LE(at + 28),
+        extra = b.readUInt16LE(at + 30),
+        comment = b.readUInt16LE(at + 32),
+        local = prefix + b.readUInt32LE(at + 42);
+      if (
+        b.readUInt16LE(at + 34) !== 0 ||
+        local + 30 > start ||
+        b.readUInt32LE(local) !== 0x04034b50 ||
+        local + 30 + b.readUInt16LE(local + 26) + b.readUInt16LE(local + 28) + b.readUInt32LE(at + 20) >
+          start ||
+        b.readUInt16LE(local + 26) !== name ||
+        !b.subarray(local + 30, local + 30 + name).equals(b.subarray(at + 46, at + 46 + name))
+      )
+        break;
+      at += 46 + name + extra + comment;
+      entries++;
+    }
+    if (entries === count && at === end) return true;
+  }
+  return false;
+}
+
+function executable(b: Buffer): boolean {
+  if (HEADERS.some((magic) => b.subarray(0, magic.length).equals(magic))) return true;
+  if (b.length < 64 || b.toString("ascii", 0, 2) !== "MZ") return false;
+  const pe = b.readUInt32LE(60);
+  return pe >= 64 && pe + 24 <= b.length && b.readUInt32LE(pe) === 0x00004550;
+}
 
 export function isForbiddenFormat(path: string, bytes: Buffer): boolean {
   return (
     /\.pdf$/i.test(path) ||
-    bytes.subarray(0, 1024).includes(Buffer.from("%PDF-")) ||
-    PAYLOADS.some((magic) => bytes.includes(magic)) ||
-    bytes.includes(Buffer.from("ustar")) ||
-    bytes.includes(Buffer.from("SQLite format 3")) ||
+    bytes.subarray(0, 5).equals(Buffer.from("%PDF-")) ||
+    executable(bytes) ||
+    zip(bytes) ||
+    bytes.toString("ascii", 257, 262) === "ustar" ||
+    bytes.subarray(0, 16).equals(Buffer.from("SQLite format 3\0")) ||
     bytes.subarray(0, 4).equals(Buffer.from("RIFF"))
   );
 }
 
 function valid(ok: unknown): asserts ok {
   if (!ok) throw new Error("Opaque media");
-}
-function clean(b: Buffer) {
-  valid(!PAYLOADS.some((magic) => b.includes(magic)));
-  valid(!/%PDF-|ustar|SQLite format 3|<script\b|<\?php|#!\s*\//i.test(b.toString("latin1")));
 }
 function slice(b: Buffer, at: number, length: number) {
   valid(length >= 0 && at >= 0 && at + length <= b.length);
@@ -58,7 +100,6 @@ function inflate(b: Buffer) {
     engine: { bytesWritten: number };
   };
   valid(result.engine.bytesWritten === b.length);
-  clean(result.buffer);
   return result.buffer;
 }
 function png(b: Buffer) {
@@ -164,7 +205,6 @@ function gif(b: Buffer) {
   let at = 13,
     images = 0,
     total = 0;
-  const decodedFrames: Buffer[] = [];
   const global = (b[10] ?? 0) & 128 ? 1 << (((b[10] ?? 0) & 7) + 1) : 0;
   slice(b, at, global * 3);
   at += global * 3;
@@ -183,8 +223,6 @@ function gif(b: Buffer) {
     const marker = b[at++];
     if (marker === 0x3b) {
       valid(images > 0 && at === b.length);
-      // Payload signatures can span frames even when each frame is individually clean.
-      clean(Buffer.concat(decodedFrames));
       return;
     }
     if (marker === 0x21) {
@@ -228,7 +266,6 @@ function gif(b: Buffer) {
       end = clear + 1;
     total += width * height;
     valid(total <= MEDIA_LIMIT);
-    const decoded = Buffer.alloc(width * height);
     let pos = 0,
       size = min + 1,
       next = end + 1,
@@ -261,7 +298,6 @@ function gif(b: Buffer) {
       valid(entry.every((n) => n < colors));
       count += entry.length;
       valid(count <= width * height && count <= MEDIA_LIMIT);
-      decoded.set(entry, count - entry.length);
       if (previous && next < 4096) {
         dict[next++] = [...previous, entry[0] ?? 0];
         if (next === 1 << size && size < 12) size++;
@@ -269,7 +305,6 @@ function gif(b: Buffer) {
       previous = entry;
     }
     valid(count === width * height && Math.ceil(pos / 8) === packed.length);
-    decodedFrames.push(decoded);
     images++;
   }
   valid(false);
@@ -763,7 +798,6 @@ function lossless(b: Buffer) {
         put(cache[code - 280] ?? 0);
       }
     }
-    clean(Buffer.from(output.buffer));
     return output;
   };
   let colors: Uint32Array | undefined;
@@ -796,15 +830,6 @@ function lossless(b: Buffer) {
       }
     pixels = output;
   }
-  const decoded = Buffer.from(pixels.buffer);
-  clean(decoded);
-  // Both BGRA and RGBA expose recoverable pixel bytes.
-  for (let at = 0; at < decoded.length; at += 4) {
-    const blue = decoded[at] ?? 0;
-    decoded[at] = decoded[at + 2] ?? 0;
-    decoded[at + 2] = blue;
-  }
-  clean(decoded);
   valid(Math.ceil(bits.pos / 8) === b.length);
   while (bits.pos < b.length * 8) valid(bits.read(1) === 0);
 }
@@ -848,7 +873,7 @@ export function isInertMedia(path: string, bytes: Buffer): boolean {
   const extension = path.split(".").at(-1)?.toLowerCase();
   try {
     valid(bytes.length > 0 && bytes.length <= MEDIA_LIMIT);
-    clean(bytes);
+    valid(!executable(bytes) && !zip(bytes));
     switch (extension) {
       case "png":
         png(bytes);
