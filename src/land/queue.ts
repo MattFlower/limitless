@@ -338,6 +338,15 @@ export class LandQueue {
     for (;;) {
       signal.throwIfAborted();
       const snapshot = this.store.githubPrData(entry.prUrl);
+      const saved = savedSnapshot(snapshot);
+      // The approved head can lag our push; any other head must block before a read can stall.
+      if (
+        saved?.state !== "MERGED" &&
+        saved?.headRefOid &&
+        saved.headRefOid !== sha &&
+        saved.headRefOid !== entry.approvedSha
+      )
+        throw new LandBlocked("head moved after approval");
       const seen = await this.observe(entry.prUrl, signal, sha);
       if (seen?.state === "MERGED") return "merged";
       if (seen?.head && seen.head !== sha) throw new LandBlocked("head moved after approval");

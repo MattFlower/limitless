@@ -762,24 +762,33 @@ test("a transient CI failure twice blocks, and a real one is not re-run", async 
   expect(ghCalls("run rerun")).toHaveLength(1);
 });
 
-test("a head that changes while CI stays pending blocks without advancing the clock", async () => {
+test("a saved moved head blocks without advancing the clock even when a CI read stalls", async () => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, head);
   approve(1, head);
   ci = () => null;
-  const entry = queue().request({ target: pr.run.id });
+  let reads = 0;
+  const entry = queue({
+    client: (_url, signal) =>
+      new Promise<GitHubPrView | null>((_resolve, reject) => {
+        reads++;
+        // Never answer the read; reject only on shutdown so a failed test can clean up.
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+  }).request({ target: pr.run.id });
   await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
   const moved = await pushBranch("pr-1", "one.txt", "one\nagain\n", 1);
   const before = clock.now();
   observe(1, moved, "PENDING");
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + 800;
   while (store.getLandEntry(entry.id)?.state !== "blocked") {
     if (Date.now() > deadline) throw new Error("head observation did not block the land");
     await settleIdle();
   }
   expect(clock.now()).toBe(before);
   expect(store.getLandEntry(entry.id)?.reason).toBe("head moved after approval");
+  expect(reads).toBe(0);
   expect(ghCalls("pr merge")).toEqual([]);
 });
 
