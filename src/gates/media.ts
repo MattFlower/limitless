@@ -586,6 +586,13 @@ function prefix(lengths: number[], bits: LittleBits): () => number {
     throw new Error("Invalid prefix code");
   };
 }
+// libwebp's kCodeToPlane: high nibble is y; low nibble encodes 8 - x.
+const WEBP_DISTANCE_PLANE = Buffer.from(
+  "1807171928062729161a262a38053739151b363a252b48044749141c353b464a242c58454b343c035759" +
+    "131d565a232d444c555b333d68026769121e666a222e545c434d656b323e78017779535d111f646c424e" +
+    "767a212f757b313f636d525e00747c414f1020626e30737d515f40727e616f50717f6070",
+  "hex",
+);
 function lossless(b: Buffer) {
   const bits = new LittleBits(b, 1);
   const originalWidth = bits.read(14) + 1;
@@ -665,8 +672,13 @@ function lossless(b: Buffer) {
       } else if (code < 280) {
         const n = number(code - 256),
           d = number(distance());
-        const offset = d > 120 ? d - 120 : [1, w, w + 1, w - 1][d - 1];
-        valid(offset !== undefined && offset > 0 && offset <= at && at + n <= output.length);
+        let offset = d - 120;
+        if (d <= 120) {
+          const plane = WEBP_DISTANCE_PLANE[d - 1];
+          valid(plane !== undefined);
+          offset = Math.max(1, (plane >> 4) * w + 8 - (plane & 15));
+        }
+        valid(offset > 0 && offset <= at && at + n <= output.length);
         for (let i = 0; i < n; i++) put(output[at - offset] ?? 0);
       } else {
         valid(cacheBits && code - 280 < cache.length);
@@ -1859,11 +1871,23 @@ function flac(b: Buffer) {
   }
   valid(frames > 0 && (total === 0 || total === samples));
   const decoded = Buffer.concat(pcm);
-  clean(decoded);
-  // PCM can be recovered in either byte order; scan both across frame boundaries.
-  for (let at = 0; at < decoded.length; at += bytesPerSample)
-    decoded.subarray(at, at + bytesPerSample).reverse();
-  clean(decoded);
+  const views = [decoded];
+  // Split reconstructed channels after stereo decorrelation, across frame boundaries.
+  if (channels > 1)
+    for (let channel = 0; channel < channels; channel++) {
+      const view = Buffer.alloc(samples * bytesPerSample);
+      for (let sample = 0; sample < samples; sample++) {
+        const at = (sample * channels + channel) * bytesPerSample;
+        decoded.copy(view, sample * bytesPerSample, at, at + bytesPerSample);
+      }
+      views.push(view);
+    }
+  // Interleaved and separate PCM channels can be recovered in either byte order.
+  for (const view of views) {
+    clean(view);
+    for (let at = 0; at < view.length; at += bytesPerSample) view.subarray(at, at + bytesPerSample).reverse();
+    clean(view);
+  }
 }
 
 /** A failed parse removes the exemption; Allow: binary still permits the opaque blob. */
