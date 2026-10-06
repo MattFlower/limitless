@@ -24,7 +24,13 @@ import {
   removeWorktree,
 } from "../git/repos.ts";
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
-import { type GitHubPrView, getGitHubPr } from "../integrations/github-notifier.ts";
+import { type GhRunner, runGh } from "../integrations/github.ts";
+import {
+  ciRunsSchema,
+  type GitHubPrView,
+  getGitHubCiRuns,
+  getGitHubPr,
+} from "../integrations/github-notifier.ts";
 import { savedSnapshot } from "../integrations/github-poller.ts";
 
 /** A land the factory will not retry: the operator has to look at it. */
@@ -55,6 +61,7 @@ export interface LandDeps {
   /** GitHub polling is on: read the poller's saved observations instead of calling `gh` every cycle. */
   polling?: boolean;
   client?: LandPrClient;
+  gh?: GhRunner;
   clock?: LandClock;
   /** How often CI is looked at while a land waits; 15s, like a delivered PR's poll. */
   ciPollMs?: number;
@@ -327,8 +334,8 @@ export class LandQueue {
    */
   private async awaitCi(entry: LandEntry, sha: string, signal: AbortSignal): Promise<"green" | "merged"> {
     const deadline = this.now() + (this.deps.ciTimeoutMs ?? DEFAULTS.ciTimeoutMs);
-    let observed = false,
-      reruns = 0;
+    let observed = false;
+    let rerun = entry.ciRerun ? ciRunsSchema.parse(JSON.parse(entry.ciRerun)) : null;
     for (;;) {
       signal.throwIfAborted();
       const seen = await this.observe(entry.prUrl, signal);
@@ -337,11 +344,46 @@ export class LandQueue {
       // Only a head we have already seen at our own commit counts as moved: before that, the
       // poller's saved observation may simply predate our push.
       else if (observed && seen?.head) throw new LandBlocked("head moved after approval");
+      if (observed && rerun) {
+        const current = await getGitHubCiRuns(entry.repo, sha, signal, this.deps.gh);
+        const attempts = rerun.map((old) => current.find((run) => run.databaseId === old.databaseId));
+        if (
+          attempts.some(
+            (run, i) => !run || run.attempt <= (rerun?.[i]?.attempt ?? 0) || run.status !== "completed",
+          )
+        ) {
+          if (this.now() >= deadline) throw new LandBlocked("CI did not finish");
+          await this.ciWake(entry, signal);
+          continue;
+        }
+        if (attempts.some((run) => run?.conclusion !== "success"))
+          throw new LandBlocked(`CI failed: ${seen?.failing.join(", ") || "rerun"}`);
+      }
+      if (rerun && seen?.ci !== "SUCCESS") {
+        if (this.now() >= deadline) throw new LandBlocked("CI did not finish");
+        await this.ciWake(entry, signal);
+        continue;
+      }
       if (observed && seen?.ci && !UNSETTLED_CI.has(seen.ci)) {
         if (seen.ci === "SUCCESS") return "green";
-        if (reruns < 1 && seen.failing.length > 0 && seen.failing.every((n) => TRANSIENT_CI.test(n))) {
-          reruns++;
-          this.log(`[land] ${entry.id}: transient CI failure (${seen.failing.join(", ")}); re-running`);
+        if (!rerun && seen.failing.length > 0 && seen.failing.every((n) => TRANSIENT_CI.test(n))) {
+          const runs = await getGitHubCiRuns(entry.repo, sha, signal, this.deps.gh);
+          rerun = runs.filter(
+            (run) =>
+              run.status === "completed" &&
+              ["failure", "timed_out", "cancelled", "startup_failure", "action_required"].includes(
+                run.conclusion ?? "",
+              ),
+          );
+          if (!rerun.length) throw new LandBlocked("CI has no failed workflow to rerun");
+          // Persist before requesting: a crash must never request a second rerun for this land.
+          this.store.updateLandEntry(entry.id, { ciRerun: JSON.stringify(rerun) });
+          for (const run of rerun)
+            await (this.deps.gh ?? runGh)(
+              ["run", "rerun", String(run.databaseId), "--failed", "--repo", entry.repo],
+              signal,
+            );
+          this.log(`[land] ${entry.id}: transient CI failure; re-running`);
           await this.ciWake(entry, signal);
           continue;
         }

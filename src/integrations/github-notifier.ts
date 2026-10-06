@@ -1,8 +1,9 @@
+import { z } from "zod";
 import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { checkPrivateText, loadPrivateStrings } from "../gates/private.ts";
 import { sh } from "../util/proc.ts";
-import type { GhRunner } from "./github.ts";
+import { type GhRunner, runGh } from "./github.ts";
 import { type Context, rollup } from "./github-poller.ts";
 
 export interface GitHubPrState {
@@ -58,6 +59,35 @@ export const getGitHubPr = async (url: string, signal?: AbortSignal): Promise<Gi
     failing: failing.map((f) => f.name),
   };
 };
+
+/** Workflow attempts let landing distinguish a rerun from its stale, failed rollup. */
+export const ciRunsSchema = z.array(
+  z.object({
+    databaseId: z.number().int().positive(),
+    headSha: z.string(),
+    attempt: z.number().int().positive(),
+    status: z.string(),
+    conclusion: z.string().nullable(),
+  }),
+);
+export async function getGitHubCiRuns(repo: string, sha: string, signal: AbortSignal, gh: GhRunner = runGh) {
+  const json = await gh(
+    [
+      "run",
+      "list",
+      "--repo",
+      repo,
+      "--commit",
+      sha,
+      "--limit",
+      "100",
+      "--json",
+      "databaseId,headSha,attempt,status,conclusion",
+    ],
+    signal,
+  );
+  return ciRunsSchema.parse(JSON.parse(String(json))).filter((run) => run.headSha === sha);
+}
 
 export async function reconcileMergedRuns(
   store: Store,

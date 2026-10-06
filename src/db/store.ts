@@ -75,12 +75,13 @@ const FEED_SELECT =
 type FeedInsert = Pick<FeedItem, "kind" | "runId" | "repo" | "summary" | "data"> & { key: string };
 type GitHubFeedInput = FeedInsert & { kind: GitHubFeedKind };
 const LAND_SELECT = `SELECT id, run_id AS runId, repo, pr_url AS prUrl, base_branch AS baseBranch,
-  head_branch AS headBranch, approved_sha AS approvedSha, state, pushed_sha AS pushedSha,
+  head_branch AS headBranch, approved_sha AS approvedSha, state, pushed_sha AS pushedSha, ci_rerun AS ciRerun,
   attempts, reason, created_at AS createdAt, updated_at AS updatedAt,
   finished_at AS finishedAt FROM land_entries`;
 const LAND_PATCH_COLUMNS: Record<string, string> = {
   state: "state",
   pushedSha: "pushed_sha",
+  ciRerun: "ci_rerun",
   logPath: "log_path",
   attempts: "attempts",
   reason: "reason",
@@ -2201,7 +2202,7 @@ export class Store {
 
   updateLandEntry(
     id: number,
-    patch: Partial<Pick<LandEntry, "state" | "pushedSha" | "logPath" | "attempts" | "reason">>,
+    patch: Partial<Pick<LandEntry, "state" | "pushedSha" | "ciRerun" | "logPath" | "attempts" | "reason">>,
   ): LandEntry {
     const { sets, values } = buildUpdate(patch, LAND_PATCH_COLUMNS);
     sets.push("updated_at = ?");

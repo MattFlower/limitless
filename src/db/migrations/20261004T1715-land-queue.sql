@@ -11,6 +11,7 @@ CREATE TABLE land_entries (
   state TEXT NOT NULL CHECK (state IN
     ('queued', 'checking', 'waiting_ci', 'merging', 'landed', 'blocked', 'cancelled')),
   pushed_sha TEXT,
+  ci_rerun TEXT,
   log_path TEXT,
   claim_owner TEXT,
   claim_heartbeat_at INTEGER,

@@ -456,6 +456,8 @@ export interface LandEntry {
   state: LandState;
   /** The commit the queue pushed (the merge commit, or the approved one when it needed no merge). */
   pushedSha: string | null;
+  /** Failed workflow attempts for the single durable CI rerun. */
+  ciRerun: string | null;
   /** Where this land's check output was written. */
   logPath: string | null;
   attempts: number;
