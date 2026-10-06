@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { type PresetTarget, types as t, transformAsync } from "@babel/core";
 import ts from "@babel/preset-typescript";
+import { chromium } from "playwright";
 import { renderToString } from "solid-js/web";
 import type { StreamMessage } from "../src/core/types.ts";
 
@@ -189,4 +190,47 @@ export async function buildSetupUi(
 
 export async function settle(): Promise<void> {
   for (let i = 0; i < 15; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+/** Measure the rendered UI with real CSS, offline and over pipes (no local server or socket). */
+export async function setupLayout(html: string, viewport: { width: number; height: number }) {
+  const cache = join(import.meta.dir, "../node_modules/playwright-core/.local-browsers");
+  const binaries = new Bun.Glob("chromium_headless_shell-*/**/chrome-headless-shell{,.exe}").scan({
+    cwd: cache,
+    absolute: true,
+  });
+  const executable = (await binaries.next()).value;
+  if (!executable) throw new Error("Headless browser missing; run bun install first.");
+  const browser = await chromium.launch({
+    executablePath: executable,
+    // Factory confinement disallows Chromium's macOS child-process rendezvous.
+    args: ["--single-process", "--no-zygote", "--disable-gpu"],
+  });
+  try {
+    const page = await browser.newPage({ viewport });
+    await page.route("**/*", (route) => route.abort());
+    const css = await Bun.file(join(import.meta.dir, "../ui/styles.css")).text();
+    await page.setContent(`<style>${css}</style><div id="root">${html}</div>`);
+    return await page.evaluate(() => {
+      const page = document.querySelector<HTMLElement>(".setup-page");
+      if (!page) throw new Error("Setup page missing");
+      const bounds = (element: Element) => {
+        const { left, right, width } = element.getBoundingClientRect();
+        return { label: element.getAttribute("aria-label") ?? element.textContent, left, right, width };
+      };
+      return {
+        viewport: window.innerWidth,
+        scrollWidth: document.documentElement.scrollWidth,
+        pageWidth: page.clientWidth,
+        pageScrollWidth: page.scrollWidth,
+        cells: [...page.querySelectorAll("article[aria-label]")].map(bounds),
+        controls: [...page.querySelectorAll("input, select, button")].map(bounds),
+        overflowingCards: [...page.querySelectorAll<HTMLElement>(".card")]
+          .filter((card) => card.scrollWidth > card.clientWidth + 1)
+          .map(bounds),
+      };
+    });
+  } finally {
+    await browser.close();
+  }
 }

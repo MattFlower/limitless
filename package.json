@@ -8,6 +8,7 @@
     "limitless": "./src/cli/main.ts"
   },
   "scripts": {
+    "postinstall": "PLAYWRIGHT_BROWSERS_PATH=0 playwright install chromium-headless-shell",
     "dev": "bun --watch src/cli/main.ts serve",
     "serve": "bun src/cli/main.ts serve",
     "build:ui": "bun scripts/build-ui.ts",
@@ -33,6 +34,7 @@
     "@types/babel__core": "^7.20.5",
     "@types/bun": "^1.4.2",
     "babel-preset-solid": "^1.9.15",
+    "playwright": "^1.63.0",
     "typescript": "^7.0.2"
   }
 }

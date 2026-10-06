@@ -6,7 +6,7 @@ import type { ProviderStatus } from "../src/core/types.ts";
 import { DEFAULT_POLICY, MODELS } from "../src/router/catalog.ts";
 import type { CatalogSnapshot, RoutingSnapshot } from "../ui/api.ts";
 import { deferred } from "./evals-support.ts";
-import { buildSetupUi, settle, type Ui } from "./setup-ui-support.ts";
+import { buildSetupUi, settle, setupLayout, type Ui } from "./setup-ui-support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "limitless-setup-ui-"));
 const catalog: CatalogSnapshot = {
@@ -136,6 +136,41 @@ async function fixture(
 }
 const cell = (html: string) =>
   html.match(/<article[^>]*aria-label="implement large"[\s\S]*?<\/article>/)?.[0] ?? "";
+
+test("responsive Setup wraps cells and open editors at a 375px viewport without horizontal overflow", async () => {
+  await fixture(async (_sent, state) => {
+    const longId = `local/${"long-model-name-".repeat(12)}`;
+    state.catalog.models.push({ ...first, id: longId, model: longId, source: "runtime" });
+    state.routing.effective.implement = {
+      ...state.routing.effective.implement,
+      large: { groups: [`${longId}@high|${second.id}`, first.id], layer: "operator", evals: [longId] },
+    };
+    ui.emit({ kind: "routing", change: state.routing.history[0] as RoutingSnapshot["history"][number] });
+    await settle();
+    for (const editing of [false, true]) {
+      if (editing) {
+        await ui.invoke(cell(ui.render()), "button", "Edit chain");
+        await ui.invoke(ui.render(), "button", "Edit preference");
+        await ui.invoke(ui.render(), "button", ">Add<");
+        await ui.invoke(ui.render(), "button", "Edit model");
+      }
+      const layout = await setupLayout(ui.render(), { width: 375, height: 812 });
+      expect(layout.viewport).toBe(375);
+      expect(layout.scrollWidth).toBeLessThanOrEqual(375);
+      expect(layout.pageScrollWidth).toBeLessThanOrEqual(layout.pageWidth);
+      expect(layout.cells).toHaveLength(3);
+      // At phone width each cell occupies the same column.
+      expect(new Set(layout.cells.map((c) => c.left)).size).toBe(1);
+      expect(layout.controls.length).toBeGreaterThan(editing ? 30 : 0);
+      for (const control of [...layout.cells, ...layout.controls]) {
+        expect(control.left, control.label ?? "").toBeGreaterThanOrEqual(0);
+        expect(control.right, control.label ?? "").toBeLessThanOrEqual(375);
+        expect(control.width, control.label ?? "").toBeGreaterThan(0);
+      }
+      expect(layout.overflowingCards).toEqual([]);
+    }
+  });
+});
 
 test("grid renders layers, recommendations, concrete previews, history and distinct quota telemetry", async () => {
   await fixture(async (sent) => {
