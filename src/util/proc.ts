@@ -143,7 +143,9 @@ async function markedProcesses(
   throw new Error("Process arguments changed during inspection");
 }
 
-async function stopMarkedProcesses(marker: string, group: number, graceMs: number): Promise<void> {
+async function stopMarkedProcesses(marker: string, child: ChildProcess, graceMs: number): Promise<void> {
+  const group = child.pid;
+  if (group === undefined) return;
   const started = performance.now();
   const termed = new Set<number>();
   const known = new Set([group]);
@@ -151,10 +153,13 @@ async function stopMarkedProcesses(marker: string, group: number, graceMs: numbe
   for (;;) {
     const pids = await markedProcesses(marker, group, known);
     // Recheck after a disappearing parent: it may have forked between the two ps snapshots.
-    if (!pids.length && empty) return;
-    empty = !pids.length;
+    const exited = child.exitCode !== null || child.signalCode !== null;
+    if (!pids.length && empty && exited) return;
+    empty = !pids.length && exited;
     if (performance.now() - started >= graceMs + 10_000)
-      throw new Error(`Marked processes still alive: ${pids.join(", ")}`);
+      throw new Error(
+        `Marked processes still alive: ${[...new Set([...pids, ...(!exited ? [group] : [])])].join(", ")}`,
+      );
     for (const pid of pids) {
       known.add(pid);
       const signal = termed.has(pid) && performance.now() - started >= graceMs ? "SIGKILL" : "SIGTERM";
@@ -166,7 +171,10 @@ async function stopMarkedProcesses(marker: string, group: number, graceMs: numbe
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }
     }
-    if (pids.length) await Bun.sleep(10);
+    // Yield even for empty snapshots: spawn/exit notifications and a racing fork
+    // must have an opportunity to arrive before we confirm shutdown.
+    if (pids.length || !exited) await Bun.sleep(10);
+    else await new Promise<void>((resolve) => setImmediate(resolve));
   }
 }
 
@@ -282,7 +290,7 @@ export function runProcess(opts: ProcOptions): Promise<ProcResult> {
           if (child.pid !== undefined)
             await stopMarkedProcesses(
               marker,
-              child.pid,
+              child,
               timedOut || idleTimedOut ? 5_000 : (scope?.killGraceMs ?? 100),
             );
         } catch (error) {

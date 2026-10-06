@@ -200,6 +200,61 @@ describe("process handling", () => {
     },
   );
 
+  test("empty startup snapshots cannot confirm shutdown before the direct child exits", async () => {
+    const controller = new AbortController();
+    const uid = process.getuid?.() ?? 0;
+    let pid: number | undefined;
+    let snapshots = 0;
+    try {
+      await processInspection.run(
+        async (withEnvironment, marker) => {
+          if (withEnvironment) snapshots++;
+          let alive = false;
+          if (pid !== undefined) {
+            try {
+              alive = process.kill(pid, 0);
+            } catch {}
+          }
+          return [
+            `${process.pid} ${uid} S inspector LIMITLESS_PROCESS_SCAN=${marker}`,
+            ...(alive && snapshots > 2
+              ? [`${pid} ${uid} S child${withEnvironment ? ` LIMITLESS_INVOCATION=${marker}` : ""}`]
+              : []),
+          ].join("\n");
+        },
+        async () => {
+          const result = await runProcess({
+            cmd: [
+              process.execPath,
+              "-e",
+              "console.log(process.pid); setInterval(() => {}, 1000); setTimeout(() => process.exit(1), 3000)",
+            ],
+            cwd: dir,
+            env: process.env as Record<string, string>,
+            signal: controller.signal,
+            onStdoutLine: (line) => {
+              pid = Number(line);
+              controller.abort();
+            },
+          });
+          expect(result.cancelled).toBe(true);
+          expect(snapshots).toBeGreaterThan(2);
+          expect(pid).toBeGreaterThan(0);
+          expect(() => process.kill(pid ?? 0, 0)).toThrow();
+          // This callback represents the cleanup that is allowed only after shutdown.
+          writeFileSync(join(dir, "cleanup-started"), "");
+        },
+      );
+      expect(existsSync(join(dir, "cleanup-started"))).toBe(true);
+    } finally {
+      if (pid !== undefined) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+    }
+  });
+
   test.each([false, true])(
     "inspection selects exact markers and uid, excluding argv matches (exec race: %s)",
     async (changing) => {
